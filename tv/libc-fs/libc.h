@@ -1,14 +1,24 @@
 /*
- * sud/libc.h — Freestanding mini-libc header for the sudtrace project.
+ * libc-fs/libc.h — Public header for the libc-fs freestanding mini-libc.
  *
- * Provides all type definitions, constants, and function declarations
- * needed by the freestanding (-nostdlib -ffreestanding) sud32/sud64
- * binaries.  NO glibc headers are included; only compiler-provided
- * freestanding headers and Linux UAPI headers are used.
+ * libc-fs is a self-contained static library providing just enough
+ * libc functionality (types, syscall aliases, string/mem ops, I/O,
+ * formatted output, mmap/proc helpers) for code built with
+ * `-nostdlib -ffreestanding`.  NO glibc headers are pulled in; only
+ * compiler-provided freestanding headers (`stdarg.h`, `stddef.h`,
+ * `stdint.h`) and Linux UAPI (`asm/unistd.h`) are used.
+ *
+ * Consumers should `#include "libc-fs/libc.h"` and link against the
+ * archive built by `libc-fs/Makefile` (`libc-fs.a`).
+ *
+ * `mpaland/printf` is an *internal* implementation detail — its
+ * `printf_/snprintf_/vsnprintf_/sprintf_/vprintf_/fctprintf` symbols
+ * are re-exported under the standard libc names below.  Callers must
+ * never include `deps/printf/printf.h` directly.
  */
 
-#ifndef SUD_LIBC_H
-#define SUD_LIBC_H
+#ifndef LIBC_FS_LIBC_H
+#define LIBC_FS_LIBC_H
 
 /* ================================================================
  * Compiler-provided freestanding headers (no libc dependency)
@@ -756,4 +766,34 @@ int            closedir(DIR *dirp);
 #define STDERR_FILENO 2
 #endif
 
-#endif /* SUD_LIBC_H */
+/* ================================================================
+ * Formatted output — re-exported from the internal mpaland/printf.
+ *
+ * libc-fs vendors mpaland/printf under `libc-fs/deps/printf/`.  That
+ * library defines `printf_/snprintf_/vsnprintf_/sprintf_/vprintf_/
+ * fctprintf` symbols and uses macros to redirect the standard names
+ * to them, so its consumers always see the standard libc spelling.
+ *
+ * We mirror that scheme here so consumers of libc-fs see the standard
+ * names (`printf`, `snprintf`, `vsnprintf`, `sprintf`, `vprintf`,
+ * `fctprintf`) without ever including `deps/printf/printf.h`.
+ * ================================================================ */
+int  printf_  (const char *fmt, ...);
+int  sprintf_ (char *buf, const char *fmt, ...);
+int  snprintf_(char *buf, size_t count, const char *fmt, ...);
+int  vsnprintf_(char *buf, size_t count, const char *fmt, va_list va);
+int  vprintf_ (const char *fmt, va_list va);
+int  fctprintf(void (*out)(char ch, void *arg), void *arg,
+               const char *fmt, ...);
+
+/* The *snprintf prototypes that some headers above already declared
+ * become straightforward macro aliases for the underscored versions.
+ * `fprintf` is supplied directly by libc-fs (see libc.c) — it is NOT
+ * routed through mpaland/printf because it requires per-call fd state. */
+#define printf    printf_
+#define sprintf   sprintf_
+#define snprintf  snprintf_
+#define vsnprintf vsnprintf_
+#define vprintf   vprintf_
+
+#endif /* LIBC_FS_LIBC_H */

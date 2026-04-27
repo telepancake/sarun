@@ -2,7 +2,7 @@
 	path = deps/zstd
 	url = https://github.com/facebook/zstd
 [submodule "deps/printf"]
-	path = deps/printf
+	path = libc-fs/deps/printf
 	url = https://github.com/mpaland/printf
 [submodule "deps/duckdb"]
 	path = deps/duckdb
