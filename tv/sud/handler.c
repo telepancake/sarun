@@ -8,7 +8,7 @@
 
 #include "sud/handler.h"
 #include "sud/raw.h"
-#include "sud/event.h"
+#include "sud/addin.h"
 #include "sud/elf.h"
 
 /* ================================================================
@@ -195,38 +195,7 @@ void prepare_child_sud(void)
     install_sigsys_handler_raw();
     reset_sigmask_raw();
     reenable_sud_in_child();
-    /* Grab a fresh wire stream_id and reset the delta encoder so this
-     * child doesn't share encoding state with its parent — see
-     * sud_wire_postfork() for the full rationale. */
-    sud_wire_postfork();
-}
-
-/* ================================================================
- * is_proc_self_exe — check if a path is /proc/self/exe or
- * /proc/<our-pid>/exe.  Used by the SIGSYS handler to intercept
- * readlink/readlinkat and return the target program's path instead
- * of sudtrace's.
- * ================================================================ */
-static int is_proc_self_exe(const char *rpath)
-{
-    if (!rpath) return 0;
-    const char *p = rpath;
-    if (p[0] != '/' || p[1] != 'p' || p[2] != 'r' ||
-        p[3] != 'o' || p[4] != 'c' || p[5] != '/') return 0;
-    p += 6;
-    if (p[0] == 's' && p[1] == 'e' && p[2] == 'l' &&
-        p[3] == 'f' && p[4] == '/') {
-        p += 5;
-        return (p[0] == 'e' && p[1] == 'x' && p[2] == 'e' && p[3] == '\0');
-    }
-    /* /proc/<digits>/exe — check if digits match our PID */
-    pid_t mypid = (pid_t)raw_syscall6(SYS_getpid, 0, 0, 0, 0, 0, 0);
-    pid_t parsed = 0;
-    const char *d = p;
-    while (*d >= '0' && *d <= '9')
-        parsed = parsed * 10 + (*d++ - '0');
-    return (d > p && *d == '/' && d[1] == 'e' && d[2] == 'x' &&
-            d[3] == 'e' && d[4] == '\0' && parsed == mypid);
+    sud_addins_fork_child();
 }
 
 /* ================================================================
@@ -241,7 +210,7 @@ static int is_proc_self_exe(const char *rpath)
  * Build with:  make SIGSYS_DIAG=1 sud32   (or sud64)
  * ================================================================ */
 #ifdef SUDTRACE_SIGSYS_DIAG
-#include "sud/fmt.h"
+#include "libc-fs/fmt.h"
 static void sigsys_diag_dump(const char *tag, ucontext_t *uc,
                               unsigned long sp_now)
 {
@@ -423,6 +392,18 @@ static void sigsys_handler_inner(int sig, siginfo_t *info, void *uctx_raw)
     long a3  = UC_ARG3(uc);
     long a4  = UC_ARG4(uc);
     long a5  = UC_ARG5(uc);
+
+    char addin_scratch[PATH_MAX * 2];
+    struct sud_syscall_ctx ctx = {
+        nr, { a0, a1, a2, a3, a4, a5 }, 0, tid,
+        addin_scratch, sizeof(addin_scratch)
+    };
+    if (sud_addins_pre_syscall(&ctx)) {
+        UC_SET_RET(uc, ctx.ret);
+        return;
+    }
+    a0 = ctx.args[0]; a1 = ctx.args[1]; a2 = ctx.args[2];
+    a3 = ctx.args[3]; a4 = ctx.args[4]; a5 = ctx.args[5];
 
     long ret;
 
@@ -760,42 +741,6 @@ static void sigsys_handler_inner(int sig, siginfo_t *info, void *uctx_raw)
     }
 #endif
 
-#ifdef SYS_readlinkat
-    /* Intercept readlinkat to mask /proc/self/exe and /proc/<pid>/exe.
-     *
-     * When the traced program reads the /proc/self/exe symlink (or the
-     * /proc/<pid>/exe variant with its own PID), the kernel returns the
-     * path to sudtrace (sud64/sud32).  This confuses programs like Perl
-     * that use /proc/self/exe to determine $^X.
-     *
-     * readlinkat(dirfd=a0, pathname=a1, buf=a2, bufsz=a3) */
-    if (nr == SYS_readlinkat && g_target_exe[0] &&
-        is_proc_self_exe((const char *)a1)) {
-        size_t tlen = strlen(g_target_exe);
-        char *obuf = (char *)a2;
-        size_t obsz = (size_t)a3;
-        if (tlen > obsz) tlen = obsz;
-        memcpy(obuf, g_target_exe, tlen);
-        UC_SET_RET(uc, (long)tlen);
-        return;
-    }
-#endif
-
-#ifdef SYS_readlink
-    /* Also intercept the legacy readlink(pathname=a0, buf=a1, bufsz=a2)
-     * syscall.  glibc's readlink() uses this on x86_64. */
-    if (nr == SYS_readlink && g_target_exe[0] &&
-        is_proc_self_exe((const char *)a0)) {
-        size_t tlen = strlen(g_target_exe);
-        char *obuf = (char *)a1;
-        size_t obsz = (size_t)a2;
-        if (tlen > obsz) tlen = obsz;
-        memcpy(obuf, g_target_exe, tlen);
-        UC_SET_RET(uc, (long)tlen);
-        return;
-    }
-#endif
-
 #ifdef SYS_rt_sigaction
     if (nr == SYS_rt_sigaction) {
         struct kernel_sigaction {
@@ -875,100 +820,10 @@ static void sigsys_handler_inner(int sig, siginfo_t *info, void *uctx_raw)
                      0, sizeof(saved_mask), 0, 0);
     }
 
-    /* Post-syscall tracing */
-
-#ifdef SYS_openat
-    if (nr == SYS_openat) {
-        const char *path = (const char *)a1;
-        emit_open_event(tid, path, (int)a2, ret);
-    }
-#endif
-#ifdef SYS_open
-    if (nr == SYS_open) {
-        const char *path = (const char *)a0;
-        emit_open_event(tid, path, (int)a1, ret);
-    }
-#endif
-
-#ifdef SYS_unlinkat
-    if (nr == SYS_unlinkat && ret == 0) {
-        const char *path = (const char *)a1;
-        emit_unlink_event(tid, path, ret);
-    }
-#endif
-#ifdef SYS_unlink
-    if (nr == SYS_unlink && ret == 0) {
-        const char *path = (const char *)a0;
-        emit_unlink_event(tid, path, ret);
-    }
-#endif
-
-#ifdef SYS_chdir
-    if (nr == SYS_chdir) {
-        if (ret == 0)
-            emit_cwd_event(tid);
-    }
-#endif
-#ifdef SYS_fchdir
-    if (nr == SYS_fchdir) {
-        if (ret == 0)
-            emit_cwd_event(tid);
-    }
-#endif
-
-    if (nr == SYS_write) {
-        unsigned int fd = (unsigned int)a0;
-        if (ret > 0) {
-            if (fd == 2) {
-                emit_write_event(tid, "STDERR", (const void *)a1,
-                                 (size_t)ret);
-            } else if (fd == 1 && fd1_is_creator_stdout(tid)) {
-                emit_write_event(tid, "STDOUT", (const void *)a1,
-                                 (size_t)ret);
-            }
-        }
-    }
-
-    /* Intercept wait4/waitid to emit EXIT events for reaped children.
-     *
-     * Without this, child EXIT events would only be emitted from
-     * the wrapper / normal-mode parent wait loops.  Now that wrapper
-     * mode no longer forks a dedicated wait-loop process, the SIGSYS
-     * handler must emit EXIT events when the traced program reaps
-     * its children. */
-#ifdef SYS_wait4
-    if (nr == SYS_wait4 && ret > 0) {
-        /* wait4(pid, wstatus_ptr, options, rusage):
-         *   ret > 0 → a child was reaped, ret = child pid
-         *   a1 = pointer to wstatus in traced program's memory */
-        int wstatus = 0;
-        if (a1) wstatus = *(int *)a1;
-        if (WIFEXITED(wstatus) || WIFSIGNALED(wstatus))
-            emit_exit_event((pid_t)ret, wstatus);
-    }
-#endif
-#ifdef SYS_waitid
-    if (nr == SYS_waitid && ret == 0) {
-        /* waitid(idtype, id, siginfo_ptr, options):
-         *   ret == 0 → success; siginfo at a2 has child info */
-        if (a2) {
-            siginfo_t *si = (siginfo_t *)a2;
-            if (si->si_pid > 0 &&
-                (si->si_code == CLD_EXITED || si->si_code == CLD_KILLED ||
-                 si->si_code == CLD_DUMPED)) {
-                int wstatus;
-                if (si->si_code == CLD_EXITED)
-                    wstatus = si->si_status << 8;
-                else {
-                    wstatus = si->si_status & 0x7f;
-                    if (si->si_code == CLD_DUMPED)
-                        wstatus |= 0x80;
-                }
-                emit_exit_event(si->si_pid, wstatus);
-            }
-        }
-    }
-#endif
+    ctx.ret = ret;
+    ctx.args[0] = a0; ctx.args[1] = a1; ctx.args[2] = a2;
+    ctx.args[3] = a3; ctx.args[4] = a4; ctx.args[5] = a5;
+    sud_addins_post_syscall(&ctx);
 
 #ifdef SUDTRACE_SIGSYS_DIAG
     {

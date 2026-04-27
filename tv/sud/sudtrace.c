@@ -40,7 +40,7 @@
 /* Reserve two high FDs so children are unlikely to clobber them.
  *   SUD_OUTPUT_FD : the wire output file
  *   SUD_STATE_FD  : MAP_SHARED anon page with the atomic stream-id
- *                   counter (no lock — see sud/event.c). */
+ *                   counter (no lock — see sud/trace/event.c). */
 #define SUD_OUTPUT_FD        1023
 #define SUD_STATE_FD         1022
 #define SUD_STATE_PAGE_SIZE  4096
@@ -155,7 +155,7 @@ static int detect_target_class(const char *path)
  *
  * The launcher is itself a wire producer: it writes the version atom
  * at the head of the stream and emits EXIT events for the children it
- * reaps. With the new per-process delta design (see sud/event.c), the
+ * reaps. With the new per-process delta design (see sud/trace/event.c), the
  * launcher gets its own stream_id from the same shared atomic counter
  * the children use, and keeps its own process-local ev_state. No
  * cross-process lock involved.
@@ -163,7 +163,7 @@ static int detect_target_class(const char *path)
 
 static int g_out_fd = -1;
 
-/* Shared page layout — must match `struct sud_shared` in sud/event.c.
+/* Shared page layout — must match `struct sud_shared` in sud/trace/event.c.
  * Only one field, the atomic stream-id counter; no lock anywhere. */
 struct sud_shared_launcher {
     volatile uint32_t next_stream_id;
@@ -501,7 +501,7 @@ int main(int argc, char **argv)
      *
      * memfd_create gives us an anonymous file that survives fork+exec.
      * The page now holds only an atomic stream-id counter (no lock, no
-     * shared ev_state — see sud/event.c). We dup it to SUD_STATE_FD
+     * shared ev_state — see sud/trace/event.c). We dup it to SUD_STATE_FD
      * so every traced child inherits the fd and grabs its own
      * stream_id via sud_wire_init(). The launcher does the same so
      * its own EXIT events sit on a distinct stream. */

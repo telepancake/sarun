@@ -7,10 +7,10 @@
  * deleted — these work in both the SIGSYS handler and parent process.
  */
 
-#include "sud/libc.h"
+#include "libc-fs/libc.h"
 #include "sud/raw.h"
-#include "sud/fmt.h"
-#include "sud/event.h"
+#include "libc-fs/fmt.h"
+#include "sud/state.h"
 #include "sud/elf.h"
 
 /* ELF ident helpers not provided by our minimal libc.h */

@@ -39,6 +39,7 @@ unload:
 
 clean:
 	$(MAKE) -C $(MOD_DIR) clean
+	$(MAKE) -C libc-fs clean
 	rm -f tv sudtrace upttrace sud32 sud64
 
 install:
@@ -71,7 +72,17 @@ SIGSYS_DIAG ?= 0
 ifeq ($(SIGSYS_DIAG),1)
 SUD_CFLAGS  += -DSUDTRACE_SIGSYS_DIAG
 endif
-SUD_SRCS    := sud/wrapper.c sud/libc.c sud/raw.c sud/event.c sud/elf.c sud/handler.c sud/loader.c deps/printf/printf.c
+SUD_ADDINS ?= sud/trace
+SUD_SRCS    := sud/wrapper.c sud/state.c sud/addin.c sud/raw.c sud/elf.c sud/handler.c sud/loader.c
+SUD_SRCS    += libc-fs/libc.c libc-fs/deps/printf/printf.c
+ifneq ($(filter sud/trace,$(SUD_ADDINS)),)
+SUD_CFLAGS  += -DSUD_ADDIN_TRACE
+SUD_SRCS    += sud/trace/event.c sud/trace/addin.c
+endif
+ifneq ($(filter sud/path_remap,$(SUD_ADDINS)),)
+SUD_CFLAGS  += -DSUD_ADDIN_PATH_REMAP
+SUD_SRCS    += sud/path_remap/addin.c
+endif
 SUD_NATIVE  := $(if $(filter x86_64,$(shell uname -m)),sud64,sud32)
 
 $(ZSTD_LIB):
@@ -155,12 +166,16 @@ sud64: $(SUD_SRCS) sudtrace.lds
 sud32: $(SUD_SRCS) sudtrace.lds
 	$(CC) -m32 $(SUD_CFLAGS) $(SUD_LDFLAGS) -Wl,-Ttext-segment=0x20000000 -T sudtrace.lds -o sud32 $(SUD_SRCS) -lgcc
 
+.PHONY: libc-fs-test
+libc-fs-test:
+	$(MAKE) -C libc-fs test
+
 .PHONY: wire-test
 wire-test: tv
 	./tv dump --selftest
 
 .PHONY: all keygen sign load unload clean clean-bins install test
-test: tv
+test: tv libc-fs-test
 	./tv test
 
 clean-bins:

@@ -1,5 +1,5 @@
 /*
- * sud/event.h — Wire-format event emission for sudtrace.
+ * sud/trace/event.h — Wire-format event emission for sudtrace.
  *
  * Emits events in the trace format defined by trace/trace.h.
  * All emit_* functions are async-signal-safe: raw syscalls only,
@@ -11,7 +11,8 @@
 #ifndef SUD_EVENT_H
 #define SUD_EVENT_H
 
-#include "sud/libc.h"
+#include "libc-fs/libc.h"
+#include "sud/state.h"
 
 /* ================================================================
  * Constants
@@ -34,12 +35,6 @@
 extern int        g_out_fd;
 extern stat_buf_t g_creator_stdout_stbuf;
 extern int        g_creator_stdout_valid;
-extern char       g_self_exe[PATH_MAX];
-extern char       g_self_exe32[PATH_MAX];
-extern char       g_self_exe64[PATH_MAX];
-extern char       g_target_exe[PATH_MAX];
-extern char      *g_path_env;
-extern int        g_trace_exec_env;
 
 /* ================================================================
  * Wire setup — must be called once per process after g_out_fd is set.

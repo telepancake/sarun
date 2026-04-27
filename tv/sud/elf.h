@@ -10,7 +10,7 @@
 #ifndef SUD_ELF_H
 #define SUD_ELF_H
 
-#include "sud/libc.h"
+#include "libc-fs/libc.h"
 
 /* Shebang/ELF inspection */
 int check_shebang(const char *path, char *interp, int interp_sz,

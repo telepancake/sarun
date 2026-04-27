@@ -1,5 +1,5 @@
 /*
- * sud/event.c — TRACE-format event emission for sudtrace.
+ * sud/trace/event.c — TRACE-format event emission for sudtrace.
  *
  * Emits events using the format from trace/trace.h:
  *   [version atom is written once by the launcher]
@@ -37,10 +37,11 @@
  * Stream id 1 is the launcher's; children get 2, 3, 4, …
  */
 
-#include "sud/libc.h"
+#include "libc-fs/libc.h"
 #include "sud/raw.h"
-#include "sud/fmt.h"
-#include "sud/event.h"
+#include "libc-fs/fmt.h"
+#include "sud/trace/event.h"
+#include "sud/state.h"
 #include "wire/wire.h"
 #include "trace/trace.h"
 
@@ -50,12 +51,6 @@
 int        g_out_fd               = -1;
 stat_buf_t g_creator_stdout_stbuf;
 int        g_creator_stdout_valid;
-char       g_self_exe[PATH_MAX];
-char       g_self_exe32[PATH_MAX];
-char       g_self_exe64[PATH_MAX];
-char       g_target_exe[PATH_MAX];
-char      *g_path_env;
-int        g_trace_exec_env       = 1;
 
 /* ================================================================
  * Shared atomic counter + per-process delta state.

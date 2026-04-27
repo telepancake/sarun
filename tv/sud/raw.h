@@ -11,7 +11,7 @@
 #ifndef SUD_RAW_H
 #define SUD_RAW_H
 
-#include "sud/libc.h"
+#include "libc-fs/libc.h"
 
 /* ================================================================
  * Raw syscall — bypass the C library's errno-mangling wrapper.
@@ -141,7 +141,7 @@ static inline ssize_t raw_write(int fd, const void *buf, size_t count)
 /* writev: emit `iovcnt` (≤ IOV_MAX) (iov_base, iov_len) fragments
  * to `fd` as a single atomic operation against other writers, with
  * no in-band copying. We use `struct iovec` from the host headers
- * via sud/libc.h's narrow forward decl, but wire only the syscall;
+ * via libc-fs/libc.h's narrow forward decl, but wire only the syscall;
  * the kernel reads the iovec array directly. */
 struct sud_iovec { const void *iov_base; size_t iov_len; };
 

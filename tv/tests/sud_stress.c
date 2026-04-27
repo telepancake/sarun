@@ -8,7 +8,7 @@
  * a 32-bit sysroot.
  *
  * Infrastructure re-uses sud/raw.h (raw_syscall6, raw_mmap, raw_open3,
- * raw_write, raw_close) and sud/libc.h (all types and SYS_* aliases).
+ * raw_write, raw_close) and libc-fs/libc.h (all types and SYS_* aliases).
  * No sud object files are linked.
  *
  * Threads use a raw clone(CLONE_VM|CLONE_THREAD|…) + inline-asm
@@ -26,11 +26,11 @@
  * Includes — only project-internal freestanding headers
  * ================================================================ */
 #include "sud/raw.h"   /* raw_syscall6, raw_mmap, raw_write, etc. */
-                       /* transitively includes sud/libc.h:         */
+                       /* transitively includes libc-fs/libc.h:         */
                        /*   SYS_* aliases, types, constants          */
 
 /* ================================================================
- * Extra constants not (yet) in sud/libc.h
+ * Extra constants not (yet) in libc-fs/libc.h
  * ================================================================ */
 /* waitpid / waitid flags */
 #define T_WNOHANG    1
@@ -75,7 +75,7 @@ struct t_itimerval {
 #define T_PTRACE_CONT 7
 
 /* ================================================================
- * Required globals (extern-declared in sud/libc.h)
+ * Required globals (extern-declared in libc-fs/libc.h)
  * ================================================================ */
 int    g_errno_value;
 char **environ;          /* unused; satisfies extern decl */

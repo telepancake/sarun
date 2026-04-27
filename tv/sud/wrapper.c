@@ -15,14 +15,14 @@
  * That is the job of the separate sudtrace launcher (sud/sudtrace.c).
  */
 
-#include "sud/libc.h"
+#include "libc-fs/libc.h"
 #include "sud/raw.h"
-#include "sud/fmt.h"
-#include "sud/event.h"
+#include "libc-fs/fmt.h"
 #include "sud/elf.h"
 #include "sud/handler.h"
 #include "sud/loader.h"
-#include "deps/printf/printf.h"
+#include "sud/addin.h"
+#include "sud/state.h"
 
 /* ================================================================
  * Wrapper argument parsing
@@ -131,31 +131,6 @@ static void init_path_env(void)
     g_path_env = strdup(path);
 }
 
-static void init_output_fd(void)
-{
-    /*
-     * The launcher (sudtrace) either:
-     *   a) dup2'd the output to SUD_OUTPUT_FD before exec, or
-     *   b) set SUDTRACE_OUTFILE env var for us to open.
-     * If neither, fall back to stdout.
-     */
-    stat_buf_t stbuf;
-    if (fstat(SUD_OUTPUT_FD, (struct stat *)&stbuf) == 0) {
-        g_out_fd = SUD_OUTPUT_FD;
-    } else {
-        const char *out_path = getenv(SUDTRACE_OUTFILE_ENV);
-        if (out_path && out_path[0]) {
-            int ofd = open(out_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
-            if (ofd >= 0)
-                g_out_fd = ofd;
-            else
-                g_out_fd = STDOUT_FILENO;
-        } else {
-            g_out_fd = STDOUT_FILENO;
-        }
-    }
-}
-
 /* ================================================================
  * Rewrite /proc/self/cmdline
  *
@@ -229,18 +204,7 @@ int main(int argc, char **argv)
         _exit(127);
     }
 
-    /* Set up output fd */
-    init_output_fd();
-
-    /* Attach to the shared wire state page set up by the launcher on
-     * SUD_STATE_FD and grab this process's own stream_id from it
-     * (atomic — no lock). Falls back to a process-local counter if
-     * the fd isn't present (stand-alone wrapper runs). */
-    sud_wire_init();
-
-    /* Record stdout stat for fd1_is_creator_stdout */
-    g_creator_stdout_valid =
-        (fstat(STDOUT_FILENO, (struct stat *)&g_creator_stdout_stbuf) == 0);
+    sud_addins_wrapper_init();
 
     /* Make safe copies of run_argv for cmdline rewrite.
      * Allocated once at startup based on actual argc — no fixed-size

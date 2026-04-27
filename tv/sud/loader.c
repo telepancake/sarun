@@ -5,14 +5,14 @@
  * to its entry point.  Used by wrapper mode (sud32/sud64).
  */
 
-#include "sud/libc.h"
+#include "libc-fs/libc.h"
 #include "sud/raw.h"
-#include "sud/fmt.h"
-#include "sud/event.h"
+#include "libc-fs/fmt.h"
 #include "sud/elf.h"
 #include "sud/handler.h"
 #include "sud/loader.h"
-#include "deps/printf/printf.h"
+#include "sud/addin.h"
+#include "sud/state.h"
 
 /*
  * crash_diagnostic_handler — SIGSEGV handler for debugging.
@@ -331,7 +331,7 @@ static void crash_diagnostic_handler(int sig, siginfo_t *info, void *uctx_raw)
     }
     pos = append_ch(buf, pos, max, '\n');
     /* CS/SS aren't named in the i386 REG_ enum; their gregs indices
-     * are 15 and 18 (see sud/libc.h). */
+     * are 15 and 18 (see libc-fs/libc.h). */
     pos = append_str(buf, pos, max, "  CS=");
     pos = append_ptr(buf, pos, max,
                      (unsigned long)uc->uc_mcontext.gregs[15]);
@@ -396,22 +396,11 @@ void load_and_run_elf(const char *path, int argc, char **argv,
     char **vis_argv = argv + drop_count;
     if (vis_argc < 0) vis_argc = 0;
 
-    /* Record the target program's resolved path so the SIGSYS handler can
-     * mask /proc/self/exe and other identity queries. */
-    {
-        const char *tgt = (vis_argc > 0 && vis_argv[0]) ? vis_argv[0] : path;
-        char tgt_resolved[PATH_MAX];
-        if (resolve_path(tgt, tgt_resolved, sizeof(tgt_resolved)))
-            snprintf_(g_target_exe, sizeof(g_target_exe), "%s", tgt_resolved);
-        else
-            snprintf_(g_target_exe, sizeof(g_target_exe), "%s", tgt);
-    }
-
-    pid_t self = raw_gettid();
     const char *event_exe = (vis_argc > 0 && vis_argv[0]) ? vis_argv[0] : path;
-    emit_cwd_event(self);
-    emit_exec_event(self, event_exe, vis_argc, vis_argv);
-    emit_inherited_open_events(self);
+    struct sud_tracee_launch launch = {
+        path, argc, argv, drop_count, event_exe, vis_argc, vis_argv
+    };
+    sud_addins_target_launch(&launch);
 
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
@@ -526,7 +515,7 @@ void load_and_run_elf(const char *path, int argc, char **argv,
         char target_resolved[PATH_MAX];
         const char *target_name = argv[1];
         if (!resolve_path(target_name, target_resolved, sizeof(target_resolved)))
-            snprintf_(target_resolved, sizeof(target_resolved), "%s", target_name);
+            snprintf(target_resolved, sizeof(target_resolved), "%s", target_name);
 
         target_fd = open(target_resolved, O_RDONLY);
         if (target_fd >= 0) {

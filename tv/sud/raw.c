@@ -6,7 +6,7 @@
  * signal-safe arena allocator buffer.
  */
 
-#include "sud/libc.h"
+#include "libc-fs/libc.h"
 #include "sud/raw.h"
 
 /* ================================================================

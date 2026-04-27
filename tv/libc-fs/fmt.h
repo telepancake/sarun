@@ -1,5 +1,5 @@
 /*
- * sud/fmt.h — TLS-free integer and string formatting for signal handlers.
+ * libc-fs/fmt.h — TLS-free integer and string formatting for signal handlers.
  *
  * snprintf uses glibc internals that access %fs (stack canary,
  * locale data, errno).  These helpers format numbers directly
@@ -20,7 +20,7 @@
 #ifndef SUD_FMT_H
 #define SUD_FMT_H
 
-#include "sud/libc.h"
+#include "libc-fs/libc.h"
 
 /* ================================================================
  * Parsing helpers

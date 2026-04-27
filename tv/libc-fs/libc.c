@@ -4,7 +4,7 @@
  * Provides just enough libc functionality to build sudtrace as a fully
  * standalone static binary (-nostdlib -ffreestanding).  NO glibc headers
  * are included; only compiler-provided freestanding headers and the
- * Linux UAPI syscall-number header are used (via sud/libc.h).
+ * Linux UAPI syscall-number header are used (via libc-fs/libc.h).
  *
  * Formatted-output primitives (snprintf_, vsnprintf_, printf_) are
  * supplied by deps/printf/printf.c (mpaland/printf).  This file provides
@@ -12,8 +12,7 @@
  * wrapper that formats into a stack buffer then writes via raw syscall.
  */
 
-#include "sud/libc.h"
-#include "deps/printf/printf.h"
+#include "libc-fs/libc.h"
 
 /* ================================================================
  * Global state
@@ -377,7 +376,7 @@ int fprintf(FILE *stream, const char *fmt, ...)
     char buf[1024];
     va_list ap;
     va_start(ap, fmt);
-    int len = vsnprintf_(buf, sizeof(buf), fmt, ap);
+    int len = vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
     int fd = (int)(intptr_t)stream;
     int wlen = (len < (int)sizeof(buf)) ? len : (int)sizeof(buf) - 1;
