@@ -1,0 +1,31 @@
+uproctrace
+tv
+fv
+mod/proctrace.ko
+mod/modtrace
+tv_sql.h
+gen_sql_h
+build/
+tests/sud_stress
+tests/sud_stress32
+tests/sud_stress64
+deps/duckdb/src/amalgamation/
+# kernel module build artifacts
+*.o
+*.mod
+*.mod.c
+*.mod.o
+*.cmd
+*.symvers
+modules.order
+sudtrace
+sud32
+sud64
+/yeetdump
+/wire2parquet
+tests/trace_compare/hello_static
+tests/trace_compare/hello_dynamic
+
+# Live trace databases (created by )
+tv-live-*.tvdb
+tools/__pycache__/
