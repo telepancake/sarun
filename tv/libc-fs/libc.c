@@ -1,5 +1,5 @@
 /*
- * sud/libc.c — Freestanding mini-libc implementation for the sudtrace project.
+ * libc-fs/libc.c — Freestanding mini-libc implementation.
  *
  * Provides just enough libc functionality to build sudtrace as a fully
  * standalone static binary (-nostdlib -ffreestanding).  NO glibc headers
@@ -7,7 +7,7 @@
  * Linux UAPI syscall-number header are used (via libc-fs/libc.h).
  *
  * Formatted-output primitives (snprintf_, vsnprintf_, printf_) are
- * supplied by deps/printf/printf.c (mpaland/printf).  This file provides
+ * supplied by libc-fs/deps/printf/printf.c (mpaland/printf).  This file provides
  * the _putchar() callback required by that library and a thin fprintf()
  * wrapper that formats into a stack buffer then writes via raw syscall.
  */

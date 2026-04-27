@@ -17,8 +17,8 @@
  * Included in exactly one translation unit (the freestanding sud binary).
  */
 
-#ifndef SUD_FMT_H
-#define SUD_FMT_H
+#ifndef LIBC_FS_FMT_H
+#define LIBC_FS_FMT_H
 
 #include "libc-fs/libc.h"
 
@@ -151,4 +151,4 @@ static inline char *fmt_proc_path(char *buf, pid_t pid, const char *name)
     return p;
 }
 
-#endif /* SUD_FMT_H */
+#endif /* LIBC_FS_FMT_H */
