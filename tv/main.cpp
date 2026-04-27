@@ -40,43 +40,33 @@
 #include "tv_db.h"
 #include "data_source.h"
 
-extern int uproctrace_main(int argc, char **argv);
 extern int run_tests(); /* tests.cpp */
 extern int fv_main(int argc, char **argv); /* fv.cpp */
-extern "C" int sudtrace_main(int argc, char **argv);  /* sud/sudtrace.c */
 extern "C" int wiredump_main(int argc, char **argv);  /* tools/wiredump/wiredump.c */
 
 namespace {
-
-enum live_trace_backend {
-    LIVE_TRACE_BACKEND_AUTO = 0,
-    LIVE_TRACE_BACKEND_MODULE,
-    LIVE_TRACE_BACKEND_SUD,
-    LIVE_TRACE_BACKEND_PTRACE,
-    LIVE_TRACE_BACKEND_EXTERNAL,  /* user-supplied tracer via --tracer */
-};
 
 const char *USAGE =
     "tv - process trace viewer (DuckDB-backed)\n"
     "\n"
     "Subcommands:\n"
-    "  tv [--module|--sud|--ptrace|--tracer EXE] -- <cmd> [args...]\n"
-    "                              record live and view\n"
-    "  tv --trace <file.wire[.zst]>      ingest into <file>.tvdb and view\n"
+    "  tv --tracer EXE -- <cmd> [args...]\n"
+    "                              record live (via tracer) and view\n"
+    "  tv --trace <file.bin[.zst]>       ingest into <file>.tvdb and view\n"
     "  tv --open  <file.tvdb>            open existing tvdb and view\n"
     "  tv --dump                         dump mode 1 (process tree) to stdout (with --trace/--open)\n"
     "\n"
-    "Tools (folded in from former separate binaries):\n"
-    "  tv sud [args...]            sudtrace launcher (former sudtrace)\n"
-    "  tv dump <trace-file>...     hexdump a trace stream (former yeetdump/wiredump)\n"
-    "  tv dump --selftest          wire-format roundtrip test\n"
-    "  tv fv [path]                file viewer (former fv)\n"
-    "  tv module -- <cmd> ...      shorthand for `tv uproctrace --module --`\n"
-    "  tv ptrace -- <cmd> ...      shorthand for `tv uproctrace --ptrace --`\n"
-    "  tv uproctrace [-o FILE] [--module|--sud|--ptrace|--tracer EXE] -- <cmd> ...\n"
-    "                              raw recorder (writes wire to fd/file)\n"
+    "Tracer binaries are now separate executables — pick one with --tracer:\n"
+    "  upttrace    ptrace-based, works anywhere\n"
+    "  sudtrace    syscall-user-dispatch, fastest\n"
+    "  modtrace    kernel module, lowest overhead\n"
+    "\n"
+    "Tools:\n"
+    "  tv dump <trace-file>...     hexdump a trace stream\n"
+    "  tv dump --selftest          atom-format roundtrip test\n"
+    "  tv fv [path]                file viewer\n"
     "  tv test                     run built-in self-tests\n"
-    "  tv ingest <wire> [-o OUT]   convert wire to .tvdb without UI\n";
+    "  tv ingest <trace> [-o OUT]  convert trace to .tvdb without UI\n";
 
 /* -- ingest helpers ------------------------------------------------- */
 
@@ -767,45 +757,25 @@ int ingest_main(int argc, char **argv) {
 
 int main(int argc, char **argv) {
     /* Subcommand dispatch (must be the first positional arg, before any
-     * --flag). This consolidates what used to be separate binaries. */
+     * --flag). */
     if (argc >= 2 && argv[1][0] != '-') {
         const char *sub = argv[1];
-        if (!std::strcmp(sub, "sud"))
-            return sudtrace_main(argc - 1, argv + 1);
         if (!std::strcmp(sub, "dump"))
             return wiredump_main(argc - 1, argv + 1);
         if (!std::strcmp(sub, "fv"))
             return fv_main(argc - 1, argv + 1);
         if (!std::strcmp(sub, "test"))
             return run_tests();
-        if (!std::strcmp(sub, "uproctrace"))
-            return uproctrace_main(argc - 1, argv + 1);
         if (!std::strcmp(sub, "ingest"))
             return ingest_main(argc - 1, argv + 1);
-        if (!std::strcmp(sub, "module") || !std::strcmp(sub, "ptrace")) {
-            /* tv module -- <cmd>  ==  tv uproctrace --module -- <cmd> */
-            std::vector<char*> nargv;
-            nargv.push_back((char*)"uproctrace");
-            std::string flag = std::string("--") + sub;
-            nargv.push_back((char*)flag.c_str());
-            for (int i = 2; i < argc; i++) nargv.push_back(argv[i]);
-            return uproctrace_main((int)nargv.size(), nargv.data());
-        }
-        /* Fall through: not a known subcommand. Treat as a usage error
-         * rather than silently feeding it to the TUI parser, which
-         * would just print USAGE again. */
         std::fprintf(stderr, "tv: unknown subcommand: %s\n\n", sub);
         std::fputs(USAGE, stderr);
         return 1;
     }
 
-    /* Legacy long-flag entry points (kept for back-compat). */
-    if (argc >= 2 && std::strcmp(argv[1], "--uproctrace") == 0)
-        return uproctrace_main(argc - 1, argv + 1);
     if (argc >= 2 && std::strcmp(argv[1], "--test") == 0)
         return run_tests();
 
-    live_trace_backend live_backend = LIVE_TRACE_BACKEND_AUTO;
     const char *live_tracer = nullptr;
     int no_env = 0;
     const char *trace_file = nullptr;
@@ -835,12 +805,8 @@ int main(int argc, char **argv) {
         else if (!std::strncmp(argv[i], "--search=", 9))
             dump_search = argv[i] + 9;
         else if (!std::strcmp(argv[i], "--no-env")) no_env = 1;
-        else if (!std::strcmp(argv[i], "--module"))  live_backend = LIVE_TRACE_BACKEND_MODULE;
-        else if (!std::strcmp(argv[i], "--sud"))     live_backend = LIVE_TRACE_BACKEND_SUD;
-        else if (!std::strcmp(argv[i], "--ptrace"))  live_backend = LIVE_TRACE_BACKEND_PTRACE;
         else if (!std::strcmp(argv[i], "--tracer") && i + 1 < argc) {
             live_tracer = argv[++i];
-            live_backend = LIVE_TRACE_BACKEND_EXTERNAL;
         }
         else if (!std::strcmp(argv[i], "--") && i + 1 < argc) { cmd = argv + i + 1; break; }
         else {
@@ -852,6 +818,11 @@ int main(int argc, char **argv) {
 
     if (!trace_file && !open_file && !cmd) {
         std::fputs(USAGE, stderr);
+        return 1;
+    }
+    if (cmd && !live_tracer) {
+        std::fprintf(stderr,
+            "tv: live recording requires --tracer EXE (e.g. --tracer upttrace)\n");
         return 1;
     }
 
@@ -902,28 +873,28 @@ int main(int argc, char **argv) {
         lt.child_pid = ::fork();
         if (lt.child_pid < 0) { std::perror("fork"); return 1; }
         if (lt.child_pid == 0) {
+            /* Child: exec the user-chosen tracer. The tracer writes its
+             * trace bytes to stdout, which we've redirected into our
+             * pipe; tv reads & ingests them on the parent side. */
             ::close(pipefd[0]);
             if (::dup2(pipefd[1], STDOUT_FILENO) < 0) _exit(127);
             ::close(pipefd[1]);
             size_t cmdc = 0; while (cmd[cmdc]) cmdc++;
-            size_t extra = 2 + cmdc + 1;
-            if (no_env) extra++;
-            if (live_tracer) extra += 2;
-            else if (live_backend != LIVE_TRACE_BACKEND_AUTO) extra++;
+            /* tracer + [--no-env] + -- + cmd... + NULL */
+            size_t extra = 1 + (no_env ? 1 : 0) + 1 + cmdc + 1;
             char **uargv = (char **)std::calloc(extra, sizeof(char*));
             size_t ui = 0;
-            uargv[ui++] = (char*)"--uproctrace";
+            uargv[ui++] = (char*)live_tracer;
             if (no_env) uargv[ui++] = (char*)"--no-env";
-            if (live_tracer) {
-                uargv[ui++] = (char*)"--tracer";
-                uargv[ui++] = (char*)live_tracer;
-            } else if (live_backend == LIVE_TRACE_BACKEND_MODULE) uargv[ui++] = (char*)"--module";
-            else if (live_backend == LIVE_TRACE_BACKEND_SUD) uargv[ui++] = (char*)"--sud";
-            else if (live_backend == LIVE_TRACE_BACKEND_PTRACE) uargv[ui++] = (char*)"--ptrace";
             uargv[ui++] = (char*)"--";
             for (size_t j = 0; j < cmdc; j++) uargv[ui++] = cmd[j];
             uargv[ui] = nullptr;
-            _exit(uproctrace_main((int)ui, uargv));
+            if (std::strchr(live_tracer, '/'))
+                ::execv(live_tracer, uargv);
+            else
+                ::execvp(live_tracer, uargv);
+            std::perror("tv: exec tracer");
+            _exit(127);
         }
         ::close(pipefd[1]);
         lt.fd = pipefd[0];

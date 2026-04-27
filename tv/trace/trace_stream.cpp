@@ -62,10 +62,12 @@ struct TraceDecoder::Impl {
         stream_id = (uint32_t)sid64;
 
         ev_state &st = states[stream_id];
-        ev_state snapshot = st;
-        ev_decode_header(&st, &hdr, &derr, &stream_id,
+        /* Decode into a tentative copy and only commit on full success.
+         * Avoids leaving st partially mutated on a truncation error. */
+        ev_state tentative = st;
+        ev_decode_header(&tentative, &hdr, &derr, &stream_id,
                          &type, &ts_ns, &pid, &tgid, &ppid, &nspid, &nstgid);
-        if (derr != WIRE_OK) { st = snapshot; error = true; return (size_t)-1; }
+        if (derr != WIRE_OK) { error = true; return (size_t)-1; }
 
         int64_t extras[7] = {0};
         unsigned n_extras = 0;
@@ -77,7 +79,8 @@ struct TraceDecoder::Impl {
         for (unsigned i = 0; i < n_extras; i++) {
             extras[i] = wire_get_i64(&hdr, &derr);
         }
-        if (derr != WIRE_OK) { st = snapshot; error = true; return (size_t)-1; }
+        if (derr != WIRE_OK) { error = true; return (size_t)-1; }
+        st = tentative;
 
         TraceEvent ev{};
         ev.type      = type;

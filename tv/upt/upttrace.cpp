@@ -1,13 +1,16 @@
 /*
- * uproctrace.cpp — Userspace process tracer using ptrace (C++23 rewrite).
+ * upt/upttrace.cpp — userspace process tracer using ptrace.
  *
- * Produces the same binary wire-format event stream as proctrace.c
- * (kernel module) and sudtrace, but runs entirely in userspace via
- * PTRACE. Meant to be accessible in environments where loading a
- * kernel module is impractical.
+ * Standalone tracer binary. Produces the same trace stream as
+ * mod/modtrace and sud/sudtrace, but works in any environment that
+ * permits ptrace (no kernel module, no syscall-user-dispatch).
  *
- * Built into the tv binary.  Invoked as:
- *   tv --uproctrace [-o FILE] -- command [args...]
+ * Usage:
+ *   upttrace [-o FILE[.zst]] [--no-env] -- command [args...]
+ *
+ * If -o is omitted the trace is written to stdout, e.g. for piping:
+ *
+ *   upttrace -- foo bar | tv --trace -
  *
  * Events emitted: CWD, EXEC, ARGV, ENV, AUXV, OPEN (real + inherited),
  * EXIT, STDOUT, STDERR.
@@ -114,8 +117,6 @@ static pthread_mutex_t g_ev_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Forward declarations */
 static int trace_output_enqueue(const char *buf, size_t len);
-static int build_exec_argv(char ***out_argv, const char *exe,
-                           const char *outfile, int no_env, char **cmd);
 
 static bool path_has_suffix(const char *path, const char *suffix)
 {
@@ -1350,6 +1351,7 @@ static int handle_syscall_exit(pid_t pid, proc_state *ps)
     return 0;
 }
 
+
 /* ================================================================
  * Main tracer loop
  * ================================================================ */
@@ -1357,234 +1359,9 @@ static int handle_syscall_exit(pid_t pid, proc_state *ps)
 static void usage(const char *prog)
 {
     std::fprintf(stderr,
-            "Usage: %s [-o FILE[.zst]] [--no-env] [--tracer EXE] [--backend auto|module|sud|ptrace] [--module|--sud|--ptrace] -- command [args...]\n",
+            "Usage: %s [-o FILE[.zst]] [--no-env] -- command [args...]\n",
             prog);
     std::exit(1);
-}
-
-enum trace_backend {
-    TRACE_BACKEND_AUTO = 0,
-    TRACE_BACKEND_MODULE,
-    TRACE_BACKEND_SUD,
-    TRACE_BACKEND_PTRACE,
-    TRACE_BACKEND_EXTERNAL,  /* user-supplied tracer via --tracer */
-};
-
-static const char *trace_backend_name(enum trace_backend backend)
-{
-    switch (backend) {
-    case TRACE_BACKEND_MODULE: return "module";
-    case TRACE_BACKEND_SUD:    return "sud";
-    case TRACE_BACKEND_PTRACE: return "ptrace";
-    default:                   return "auto";
-    }
-}
-
-static int parse_trace_backend(const char *name, enum trace_backend *backend)
-{
-    std::string_view sv(name);
-    if (sv == "auto") *backend = TRACE_BACKEND_AUTO;
-    else if (sv == "module") *backend = TRACE_BACKEND_MODULE;
-    else if (sv == "sud") *backend = TRACE_BACKEND_SUD;
-    else if (sv == "ptrace") *backend = TRACE_BACKEND_PTRACE;
-    else return -1;
-    return 0;
-}
-
-static int resolve_self_exe(char *buf, size_t bufsz)
-{
-    ssize_t n = readlink("/proc/self/exe", buf, bufsz - 1);
-    if (n <= 0) return -1;
-    buf[n] = '\0';
-    return 0;
-}
-
-/* Resolve a named helper (e.g. "modtrace", "sudtrace") by checking the
- * directory of the tv binary first, then falling back to PATH/CWD. */
-static int resolve_default_tracer_exe(const char *name, char *buf, size_t bufsz)
-{
-    char self_exe[PATH_MAX];
-    if (resolve_self_exe(self_exe, sizeof(self_exe)) == 0) {
-        char *slash = std::strrchr(self_exe, '/');
-        if (slash) {
-            int len = snprintf(buf, bufsz, "%.*s/%s",
-                               static_cast<int>(slash - self_exe), self_exe, name);
-            if (len > 0 && static_cast<size_t>(len) < bufsz && access(buf, X_OK) == 0)
-                return 0;
-        }
-    }
-    if (snprintf(buf, bufsz, "%s", name) >= static_cast<int>(bufsz))
-        return -1;
-    return access(buf, X_OK) == 0 ? 0 : -1;
-}
-
-static int resolve_exec_path(const char *cmd, char *out, size_t out_sz)
-{
-    if (!cmd || !cmd[0] || out_sz == 0)
-        return -1;
-    if (cmd[0] == '/' || std::strchr(cmd, '/')) {
-        if (realpath(cmd, out) != nullptr)
-            return 0;
-        if (snprintf(out, out_sz, "%s", cmd) >= static_cast<int>(out_sz))
-            return -1;
-        return access(out, X_OK) == 0 ? 0 : -1;
-    }
-
-    const char *path_env = getenv("PATH");
-    if (!path_env || !path_env[0])
-        path_env = "/usr/bin:/bin";
-
-    char path_copy[4096];
-    if (snprintf(path_copy, sizeof(path_copy), "%s", path_env) >= static_cast<int>(sizeof(path_copy)))
-        return -1;
-
-    char *saveptr = nullptr;
-    for (char *dir = strtok_r(path_copy, ":", &saveptr);
-         dir; dir = strtok_r(nullptr, ":", &saveptr)) {
-        if (snprintf(out, out_sz, "%s/%s", dir, cmd) >= static_cast<int>(out_sz))
-            continue;
-        if (access(out, X_OK) == 0)
-            return 0;
-    }
-
-    return -1;
-}
-
-static int check_shebang(const char *path, char *interp, size_t interp_sz,
-                         char *interp_arg, size_t arg_sz)
-{
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) return 0;
-
-    char buf[256];
-    ssize_t n = read(fd, buf, sizeof(buf) - 1);
-    close(fd);
-    if (n < 3) return 0;
-    buf[n] = '\0';
-
-    if (buf[0] != '#' || buf[1] != '!')
-        return 0;
-
-    char *nl = std::strchr(buf + 2, '\n');
-    if (nl) *nl = '\0';
-
-    char *p = buf + 2;
-    while (*p == ' ' || *p == '\t') p++;
-    if (!*p) return 0;
-
-    char *end = p;
-    while (*end && *end != ' ' && *end != '\t') end++;
-
-    size_t ilen = static_cast<size_t>(end - p);
-    if (ilen >= interp_sz) ilen = interp_sz - 1;
-    std::memcpy(interp, p, ilen);
-    interp[ilen] = '\0';
-
-    if (interp_arg && arg_sz > 0) {
-        interp_arg[0] = '\0';
-        while (*end == ' ' || *end == '\t') end++;
-        if (*end) {
-            size_t alen = std::strlen(end);
-            if (alen >= arg_sz) alen = arg_sz - 1;
-            std::memcpy(interp_arg, end, alen);
-            interp_arg[alen] = '\0';
-        }
-    }
-
-    return 1;
-}
-
-static int read_elf_class(const char *path, int *elf_class)
-{
-    int fd = open(path, O_RDONLY);
-    if (fd < 0)
-        return -1;
-
-    unsigned char ident[EI_NIDENT];
-    ssize_t n = read(fd, ident, sizeof(ident));
-    close(fd);
-    if (n != static_cast<ssize_t>(sizeof(ident)))
-        return -1;
-    if (std::memcmp(ident, ELFMAG, SELFMAG) != 0)
-        return -1;
-    if (ident[EI_CLASS] != ELFCLASS32 && ident[EI_CLASS] != ELFCLASS64)
-        return -1;
-    if (elf_class)
-        *elf_class = ident[EI_CLASS];
-    return 0;
-}
-
-static int resolve_command_elf_class(const char *cmd, int *elf_class)
-{
-    char current[PATH_MAX];
-    if (resolve_exec_path(cmd, current, sizeof(current)) != 0)
-        return -1;
-
-    for (int depth = 0; depth < 16; depth++) {
-        char interp[PATH_MAX], interp_arg[256];
-        if (check_shebang(current, interp, sizeof(interp), interp_arg, sizeof(interp_arg))) {
-            (void)interp_arg;
-            if (resolve_exec_path(interp, current, sizeof(current)) != 0)
-                return -1;
-            continue;
-        }
-        return read_elf_class(current, elf_class);
-    }
-
-    return -1;
-}
-
-static int resolve_sud_launcher_exe(char *buf, size_t bufsz,
-                                    const char *sudtrace_exe, char **cmd)
-{
-    int elf_class = 0;
-    if (resolve_command_elf_class(cmd[0], &elf_class) != 0) {
-        if (snprintf(buf, bufsz, "%s", sudtrace_exe) >= static_cast<int>(bufsz))
-            return -1;
-        return 0;
-    }
-    if (elf_class != ELFCLASS32 && elf_class != ELFCLASS64) {
-        if (snprintf(buf, bufsz, "%s", sudtrace_exe) >= static_cast<int>(bufsz))
-            return -1;
-        return 0;
-    }
-
-    char launcher[PATH_MAX];
-    if (std::strchr(sudtrace_exe, '/')) {
-        char base[PATH_MAX];
-        if (snprintf(base, sizeof(base), "%s", sudtrace_exe) >= static_cast<int>(sizeof(base)))
-            return -1;
-        char *slash = std::strrchr(base, '/');
-        if (slash) {
-            *slash = '\0';
-            if (snprintf(launcher, sizeof(launcher), "%s/%s", base,
-                         elf_class == ELFCLASS32 ? "sud32" : "sud64")
-                < static_cast<int>(sizeof(launcher)) && access(launcher, X_OK) == 0) {
-                if (snprintf(buf, bufsz, "%s", launcher) >= static_cast<int>(bufsz))
-                    return -1;
-                return 0;
-            }
-        }
-    }
-
-    if (snprintf(buf, bufsz, "%s", sudtrace_exe) >= static_cast<int>(bufsz))
-        return -1;
-    return 0;
-}
-
-static int kernel_supports_sud(void)
-{
-    errno = 0;
-    return prctl(PR_SET_SYSCALL_USER_DISPATCH, PR_SYS_DISPATCH_OFF, 0, 0, 0) == 0;
-}
-
-static int kernel_supports_proctrace_module(void)
-{
-    int fd = open("/proc/proctrace/new", O_RDONLY);
-    if (fd < 0)
-        return 0;
-    close(fd);
-    return 1;
 }
 
 static int trace_output_uses_zstd(const char *outfile)
@@ -1698,7 +1475,7 @@ static int close_trace_output(const char *outfile)
     pthread_join(g_out.writer, nullptr);
 
     if (g_out.error) {
-        std::fprintf(stderr, "uproctrace: trace output failed\n");
+        std::fprintf(stderr, "upttrace: trace output failed\n");
         rc = -1;
     }
     if (outfile && g_out.owns_stream && std::fclose(g_out.stream) != 0)
@@ -1731,153 +1508,6 @@ static int close_trace_output(const char *outfile)
     return rc;
 }
 
-static int copy_fd_to_output(int fd)
-{
-    char buf[8192];
-    
-    /* Both module and sud backends now produce wire format, which is
-     * binary and has no line structure. Just pass through. */
-    for (;;) {
-        ssize_t n = read(fd, buf, sizeof(buf));
-        if (n == 0) return 0;
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            perror("read");
-            return -1;
-        }
-        if (trace_output_enqueue(buf, static_cast<size_t>(n)) != 0) {
-            std::fprintf(stderr, "uproctrace: trace output queue failed\n");
-            return -1;
-        }
-    }
-}
-
-static int wait_for_child(pid_t child)
-{
-    int status;
-    while (waitpid(child, &status, 0) < 0) {
-        if (errno != EINTR) {
-            perror("waitpid");
-            return 1;
-        }
-    }
-    return 0;
-}
-
-static int wait_for_child_status(pid_t child)
-{
-    int status;
-    while (waitpid(child, &status, 0) < 0) {
-        if (errno != EINTR) {
-            perror("waitpid");
-            return 1;
-        }
-    }
-    if (WIFEXITED(status))
-        return WEXITSTATUS(status);
-    if (WIFSIGNALED(status))
-        return 128 + WTERMSIG(status);
-    return 1;
-}
-
-static int build_exec_argv(char ***out_argv, const char *exe,
-                           const char *outfile, int no_env, char **cmd)
-{
-    size_t cmdc = 0;
-    while (cmd[cmdc]) cmdc++;
-
-    size_t argc = 1 + (outfile ? 2 : 0) + (no_env ? 1 : 0) + 1 + cmdc + 1;
-    char **sub_argv = static_cast<char **>(calloc(argc, sizeof(*sub_argv)));
-    if (!sub_argv) {
-        perror("calloc");
-        return -1;
-    }
-
-    size_t i = 0;
-    sub_argv[i++] = const_cast<char *>(exe);
-    if (outfile) {
-        sub_argv[i++] = const_cast<char *>("-o");
-        sub_argv[i++] = const_cast<char *>(outfile);
-    }
-    if (no_env)
-        sub_argv[i++] = const_cast<char *>("--no-env");
-    sub_argv[i++] = const_cast<char *>("--");
-    for (size_t j = 0; j < cmdc; j++)
-        sub_argv[i++] = cmd[j];
-    sub_argv[i] = nullptr;
-
-    *out_argv = sub_argv;
-    return 0;
-}
-
-/* Single unified launcher for any external tracer (modtrace, sudtrace,
- * or a user-supplied binary).  Both module and sud backends, as well as
- * user-supplied tracers, are executed by this one function. */
-static int run_external_trace(const char *exe, char **cmd,
-                               const char *outfile, int no_env)
-{
-    if (trace_output_uses_zstd(outfile)) {
-        int pipefd[2];
-        if (pipe(pipefd) < 0) {
-            perror("pipe");
-            return 1;
-        }
-        if (open_trace_output(outfile) < 0) {
-            close(pipefd[0]);
-            close(pipefd[1]);
-            return 1;
-        }
-        pid_t child = fork();
-        if (child < 0) {
-            perror("fork");
-            close(pipefd[0]);
-            close(pipefd[1]);
-            (void)close_trace_output(outfile);
-            return 1;
-        }
-        if (child == 0) {
-            char **sub_argv = nullptr;
-            close(pipefd[0]);
-            if (dup2(pipefd[1], STDOUT_FILENO) < 0) _exit(127);
-            close(pipefd[1]);
-            if (build_exec_argv(&sub_argv, exe, nullptr, no_env, cmd) != 0)
-                _exit(127);
-            if (std::strchr(exe, '/'))
-                execv(exe, sub_argv);
-            else
-                execvp(exe, sub_argv);
-            perror("exec tracer");
-            _exit(127);
-        }
-        close(pipefd[1]);
-        int rc = copy_fd_to_output(pipefd[0]);
-        close(pipefd[0]);
-        int child_rc = wait_for_child_status(child);
-        if (close_trace_output(outfile) != 0)
-            rc = 1;
-        if (rc != 0)
-            return 1;
-        return child_rc;
-    }
-
-    pid_t child = fork();
-    if (child < 0) {
-        perror("fork");
-        return 1;
-    }
-    if (child == 0) {
-        char **sub_argv = nullptr;
-        if (build_exec_argv(&sub_argv, exe, outfile, no_env, cmd) != 0)
-            _exit(127);
-        if (std::strchr(exe, '/'))
-            execv(exe, sub_argv);
-        else
-            execvp(exe, sub_argv);
-        perror("exec tracer");
-        _exit(127);
-    }
-    return wait_for_child_status(child);
-}
 
 static int run_ptrace_trace(char **cmd, const char *outfile)
 {
@@ -1907,7 +1537,7 @@ static int run_ptrace_trace(char **cmd, const char *outfile)
     int status;
     waitpid(child, &status, 0);
     if (!WIFSTOPPED(status)) {
-        std::fprintf(stderr, "uproctrace: child did not stop\n");
+        std::fprintf(stderr, "upttrace: child did not stop\n");
         std::exit(1);
     }
 
@@ -2096,11 +1726,10 @@ static int run_ptrace_trace(char **cmd, const char *outfile)
     return 0;
 }
 
-int uproctrace_main(int argc, char **argv)
+
+int main(int argc, char **argv)
 {
     const char *outfile = nullptr;
-    const char *custom_tracer = nullptr;
-    enum trace_backend requested = TRACE_BACKEND_AUTO;
     int cmd_start = -1;
 
     for (int i = 1; i < argc; i++) {
@@ -2113,26 +1742,6 @@ int uproctrace_main(int argc, char **argv)
             outfile = argv[++i];
         } else if (arg == "--no-env") {
             g_trace_exec_env = 0;
-        } else if ((arg == "--tracer" || arg == "--backend") && i + 1 < argc) {
-            if (arg == "--tracer") {
-                custom_tracer = argv[++i];
-                requested = TRACE_BACKEND_EXTERNAL;
-            } else {
-                if (parse_trace_backend(argv[++i], &requested) != 0)
-                    usage(argv[0]);
-            }
-        } else if (arg.starts_with("--tracer=")) {
-            custom_tracer = argv[i] + 9;
-            requested = TRACE_BACKEND_EXTERNAL;
-        } else if (arg.starts_with("--backend=")) {
-            if (parse_trace_backend(argv[i] + 10, &requested) != 0)
-                usage(argv[0]);
-        } else if (arg == "--module") {
-            requested = TRACE_BACKEND_MODULE;
-        } else if (arg == "--sud") {
-            requested = TRACE_BACKEND_SUD;
-        } else if (arg == "--ptrace") {
-            requested = TRACE_BACKEND_PTRACE;
         } else if (arg == "-h" || arg == "--help") {
             usage(argv[0]);
         } else {
@@ -2144,52 +1753,5 @@ int uproctrace_main(int argc, char **argv)
     if (cmd_start < 0 || cmd_start >= argc)
         usage(argv[0]);
 
-    char **cmd = argv + cmd_start;
-
-    /* User-supplied tracer: exec it directly without any availability checks. */
-    if (custom_tracer)
-        return run_external_trace(custom_tracer, cmd, outfile, !g_trace_exec_env);
-
-    char modtrace_exe[PATH_MAX];
-    char sudtrace_exe[PATH_MAX];
-    int have_module = resolve_default_tracer_exe("modtrace", modtrace_exe, sizeof(modtrace_exe)) == 0 &&
-                      kernel_supports_proctrace_module();
-    int have_sud = resolve_default_tracer_exe("sudtrace", sudtrace_exe, sizeof(sudtrace_exe)) == 0 &&
-                   kernel_supports_sud();
-
-    enum trace_backend selected = requested;
-    if (selected == TRACE_BACKEND_AUTO) {
-        if (have_module) selected = TRACE_BACKEND_MODULE;
-        else if (have_sud) selected = TRACE_BACKEND_SUD;
-        else selected = TRACE_BACKEND_PTRACE;
-    }
-
-    switch (selected) {
-    case TRACE_BACKEND_MODULE:
-        if (!have_module) {
-            std::fprintf(stderr, "uproctrace: requested backend '%s' is unavailable\n",
-                    trace_backend_name(selected));
-            return 1;
-        }
-        return run_external_trace(modtrace_exe, cmd, outfile, !g_trace_exec_env);
-    case TRACE_BACKEND_SUD: {
-        if (!have_sud) {
-            std::fprintf(stderr, "uproctrace: requested backend '%s' is unavailable\n",
-                    trace_backend_name(selected));
-            return 1;
-        }
-        char sud_launcher_exe[PATH_MAX];
-        if (resolve_sud_launcher_exe(sud_launcher_exe, sizeof(sud_launcher_exe),
-                                     sudtrace_exe, cmd) != 0) {
-            std::fprintf(stderr, "uproctrace: cannot resolve sud launcher\n");
-            return 1;
-        }
-        return run_external_trace(sud_launcher_exe, cmd, outfile, !g_trace_exec_env);
-    }
-    case TRACE_BACKEND_PTRACE:
-    case TRACE_BACKEND_EXTERNAL:
-    case TRACE_BACKEND_AUTO:
-    default:
-        return run_ptrace_trace(cmd, outfile);
-    }
+    return run_ptrace_trace(argv + cmd_start, outfile);
 }

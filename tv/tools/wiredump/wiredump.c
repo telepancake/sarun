@@ -436,7 +436,7 @@ static int selftest(void) {
         ASSERT(d.p);
         size_t delta = (size_t)((uint8_t *)d.p - buf) - before;
         fprintf(stderr, "tiny-event size: %zu bytes\n", delta);
-        ASSERT(delta <= 20);  /* slight slack vs. v2: extra inner-atom prefix */
+        ASSERT(delta <= 20);  /* second event of same stream packs tight */
     }
 
     fprintf(stderr, "wiredump selftest: OK\n");

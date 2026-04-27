@@ -443,7 +443,7 @@ static char **build_wrapper_argv(int cmd_argc, char **cmd_argv,
  * Main — sudtrace launcher
  * ================================================================ */
 
-int sudtrace_main(int argc, char **argv)
+int main(int argc, char **argv)
 {
     init_wrapper_paths(argv[0]);
 

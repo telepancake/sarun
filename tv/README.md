@@ -56,23 +56,25 @@ f.close()
 `tv` is a TUI viewer over a DuckDB-backed trace store. The pipeline is:
 
 ```
-wire bytes ──► WireDecoder ──► DuckDB Appender ──► foo.tvdb (mmaped, columnar, zstd)
-                                                          │
-                                                          ▼
-                                                    SQL queries → TUI panels
+trace bytes ──► TraceDecoder ──► DuckDB Appender ──► foo.tvdb (mmaped, columnar, zstd)
+                                                            │
+                                                            ▼
+                                                      SQL queries → TUI panels
 ```
 
 The on-disk format is a single DuckDB native database file (`foo.tvdb`) with one
-table per wire event class (`exec`, `argv`, `env`, `auxv`, `exit_`, `open_`,
+table per trace event class (`exec`, `argv`, `env`, `auxv`, `exit_`, `open_`,
 `cwd`, `stdout_`, `stderr_`). Files are mmaped on open — "loading" a multi-GB
 trace is opening one fd. tv never builds an in-memory copy of the trace.
 
 ```bash
-# Live: stream a command's wire events into a fresh .tvdb and view them.
-tv -- make -j8
+# Live: pick a tracer, stream events into a fresh .tvdb and view them.
+tv --tracer upttrace  -- make -j8       # ptrace, works anywhere
+tv --tracer sudtrace  -- make -j8       # syscall-user-dispatch, fastest
+tv --tracer modtrace  -- make -j8       # kernel module, lowest overhead
 
-# Convert a wire file into a .tvdb (incremental, bounded memory) and open it.
-tv --trace trace.wire.zst         # creates trace.tvdb if missing/stale
+# Convert a trace file into a .tvdb (incremental, bounded memory) and open it.
+tv --trace trace.bin.zst          # creates trace.tvdb if missing/stale
 
 # Open an existing .tvdb directly (no ingest).
 tv --open trace.tvdb
@@ -82,12 +84,12 @@ tv --open trace.tvdb
 tv --open trace.tvdb --dump=1
 tv --open trace.tvdb --dump=4 --subject /path/to/output
 
-# Subcommands (single static `tv` binary; sud32/sud64 and mod/modtrace stay separate).
-tv sud  -- <cmd>          # syscall-user-dispatch tracer (was sudtrace)
-tv dump trace.wire        # hexdump a wire stream (was yeetdump)
-tv ptrace -- <cmd>        # short for `tv uproctrace --ptrace --`
-tv module -- <cmd>        # short for `tv uproctrace --module --`
+# Subcommands.
+tv dump trace.bin         # hexdump a trace stream
+tv dump --selftest        # roundtrip-test the atom encoding
+tv fv [path]              # file viewer
 tv test                   # built-in self-tests
+tv ingest <trace> -o OUT  # build .tvdb without launching the UI
 ```
 
 Pass `--no-env` to omit environment variables from emitted `EXEC` events.

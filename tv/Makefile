@@ -5,7 +5,7 @@ PWD     := $(shell pwd)
 MOK_KEY ?= $(PWD)/MOK.priv
 MOK_CER ?= $(PWD)/MOK.der
 
-all: tv sud-bins mod-bins
+all: tv sudtrace upttrace sud-bins mod-bins
 
 .PHONY: sud-bins mod-bins
 sud-bins:
@@ -39,7 +39,7 @@ unload:
 
 clean:
 	$(MAKE) -C $(MOD_DIR) clean
-	rm -f sudtrace sud32 sud64
+	rm -f tv sudtrace upttrace sud32 sud64
 
 install:
 	$(MAKE) -C $(MOD_DIR) install
@@ -104,12 +104,13 @@ $(DUCKDB_OBJ): $(DUCKDB_CPP)
 	$(DUCKDB_CXX) -std=c++17 $(DUCKDB_OPT) -I$(DUCKDB_INC) -c $(DUCKDB_CPP) -o $@
 
 # Single statically-linked tv binary with subcommands. Folds in what
-# used to be separate sudtrace/wiredump/fv binaries — see main.cpp's
-# subcommand dispatch (sud, dump, fv, module, ptrace, uproctrace, test).
-TV_CXX_SRCS := main.cpp engine.cpp uproctrace.cpp tests.cpp \
+# used to be separate wiredump/fv binaries — see main.cpp's subcommand
+# dispatch (dump, fv, ingest, test). Tracers (upttrace, sudtrace,
+# modtrace) are now separate binaries; pick one via `tv --tracer EXE`.
+TV_CXX_SRCS := main.cpp engine.cpp tests.cpp \
                trace/trace_stream.cpp \
                tv_db.cpp data_source.cpp fv.cpp
-TV_C_SRCS   := sud/sudtrace.c tools/wiredump/wiredump.c
+TV_C_SRCS   := tools/wiredump/wiredump.c
 TV_C_OBJS   := $(patsubst %.c,build/%.o,$(TV_C_SRCS))
 TV_HDRS := engine.h trace/trace_stream.h tv_db.h data_source.h \
            wire/wire.h trace/trace.h $(DUCKDB_HPP)
@@ -122,6 +123,17 @@ tv: $(TV_CXX_SRCS) $(TV_C_OBJS) $(TV_HDRS) $(ZSTD_LIB) $(DUCKDB_OBJ)
 	$(CXX) $(CXXFLAGS) $(TV_LDFLAGS) -o tv $(TV_CXX_SRCS) $(TV_C_OBJS) \
 	    $(DUCKDB_OBJ) $(TV_LIBS)
 
+# Standalone sudtrace launcher (the tracer binary itself; calls into
+# sud32/sud64 wrappers to drive the traced process). See sud/sudtrace.c
+# for the design notes.
+sudtrace: sud/sudtrace.c wire/wire.h trace/trace.h
+	$(CC) $(CFLAGS) -o $@ sud/sudtrace.c
+
+# Standalone upttrace (ptrace-based userspace tracer, works anywhere).
+UPTTRACE_HDRS := wire/wire.h trace/trace.h
+upttrace: upt/upttrace.cpp $(UPTTRACE_HDRS) $(ZSTD_LIB)
+	$(CXX) $(CXXFLAGS) -o $@ upt/upttrace.cpp -pthread $(ZSTD_LIB)
+
 # Release build: production-grade flags, asserts off, debug info stripped.
 # Use:  make release        (drop the dev-friendly default `tv` binary first)
 # Note: `tv` and `tv-release` share intermediate objects with the dev build
@@ -132,7 +144,7 @@ tv: $(TV_CXX_SRCS) $(TV_C_OBJS) $(TV_HDRS) $(ZSTD_LIB) $(DUCKDB_OBJ)
 release: CXXFLAGS := -std=c++23 -O2 -DNDEBUG -fno-stack-protector -I. -I$(ZSTD_DIR) -I$(DUCKDB_INC)
 release: CFLAGS   := -std=c11   -O2 -DNDEBUG -I. -I$(ZSTD_DIR)
 release: TV_LDFLAGS := -static -s
-release: tv
+release: tv sudtrace upttrace
 
 clean-tv:
 	rm -f tv $(TV_C_OBJS)
