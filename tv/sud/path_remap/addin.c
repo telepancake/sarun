@@ -102,11 +102,14 @@ static int open_is_write(long flags)
  * syscall.  Performing the delete inline (rather than across a
  * pre/post hook pair) keeps state purely on the SIGSYS handler's
  * stack — important because SIGSYS handlers can run concurrently on
- * different threads. */
+ * different threads.
+ *
+ * dirfd_idx may be -1 to indicate the syscall has no dirfd argument
+ * (i.e. SYS_unlink / __NR_rmdir); in that case AT_FDCWD is used. */
 static int handle_delete(struct sud_syscall_ctx *ctx, int dirfd_idx,
                          int path_idx, long unlink_nr, long unlink_flags)
 {
-    int   dirfd = (int)ctx->args[dirfd_idx];
+    int   dirfd = (dirfd_idx >= 0) ? (int)ctx->args[dirfd_idx] : AT_FDCWD;
     const char *path = (const char *)ctx->args[path_idx];
     if (!path) return 0;
 

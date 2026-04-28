@@ -29,3 +29,4 @@ tests/trace_compare/hello_dynamic
 # Live trace databases (created by )
 tv-live-*.tvdb
 tools/__pycache__/
+libc-fs/*.a

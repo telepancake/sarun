@@ -889,10 +889,12 @@ int sud_overlay_open_dir(const char *path, int flags, int mode)
         return (int)fd;
     }
 
-    /* Build synth dir: /tmp/.sud-overlay/<pid>/<seq>/ */
+    /* Build synth dir: /tmp/.sud-overlay/<pid>/<seq>/.  Atomic
+     * increment makes the seq counter race-safe across SIGSYS
+     * handlers running concurrently on different threads. */
     const char *parent = synth_pid_dir();
     if (!parent) return -ENOMEM;
-    int seq = ++g_synth_seq;
+    int seq = __atomic_add_fetch(&g_synth_seq, 1, __ATOMIC_RELAXED);
     char synth[PATH_MAX];
     int sn = snprintf(synth, sizeof(synth), "%s/%d", parent, seq);
     if (sn <= 0 || (size_t)sn >= sizeof(synth)) return -ENAMETOOLONG;
@@ -904,12 +906,19 @@ int sud_overlay_open_dir(const char *path, int flags, int mode)
     if (mr < 0 && mr != -EEXIST) return (int)mr;
     size_t synth_len = (size_t)sn;
 
-    /* Buffers for de-dup and whiteout tracking. 64KiB each handles
-     * O(thousands) of entries. */
-    static char seen_buf[65536];
-    static char white_buf[16384];
-    struct name_set seen     = { seen_buf,  sizeof(seen_buf),  0, 0 };
-    struct name_set whiteouts= { white_buf, sizeof(white_buf), 0, 0 };
+    /* Per-call de-dup and whiteout buffers.  Heap-allocated (not
+     * static) so concurrent calls on different threads don't trample
+     * each other's state.  64KiB / 16KiB handle O(thousands) of
+     * entries. */
+    char *seen_buf  = (char *)malloc(65536);
+    char *white_buf = (char *)malloc(16384);
+    if (!seen_buf || !white_buf) {
+        if (seen_buf) free(seen_buf);
+        if (white_buf) free(white_buf);
+        return -ENOMEM;
+    }
+    struct name_set seen     = { seen_buf,  65536, 0, 0 };
+    struct name_set whiteouts= { white_buf, 16384, 0, 0 };
 
     if (r->upper)
         merge_layer(r->upper, r->upper_len, tail,
@@ -917,6 +926,9 @@ int sud_overlay_open_dir(const char *path, int flags, int mode)
     for (int i = 0; i < r->lower_count; i++)
         merge_layer(r->lowers[i], r->lower_lens[i], tail,
                     synth, synth_len, &seen, &whiteouts, 0);
+
+    free(seen_buf);
+    free(white_buf);
 
     long fd = raw_syscall6(SYS_openat, AT_FDCWD, (long)synth,
                            flags | O_DIRECTORY, mode, 0, 0);
