@@ -129,6 +129,153 @@
 #endif
 #endif
 
+/* ----------------------------------------------------------------
+ * Path-bearing syscalls used by sud/path_remap and sud/handler.
+ * Every consumer should rely on these aliases instead of defining
+ * its own local `#ifndef SYS_xxx` fallback — one source of truth.
+ * Each is conditional so we silently skip on architectures that
+ * don't expose the underlying __NR_xxx (e.g. SYS_open is x86 only,
+ * stat64 family is i386 only, etc.).
+ * ---------------------------------------------------------------- */
+#if !defined(SYS_chdir) && defined(__NR_chdir)
+#define SYS_chdir          __NR_chdir
+#endif
+#if !defined(SYS_fchdir) && defined(__NR_fchdir)
+#define SYS_fchdir         __NR_fchdir
+#endif
+#if !defined(SYS_chroot) && defined(__NR_chroot)
+#define SYS_chroot         __NR_chroot
+#endif
+#if !defined(SYS_unlink) && defined(__NR_unlink)
+#define SYS_unlink         __NR_unlink
+#endif
+#if !defined(SYS_unlinkat) && defined(__NR_unlinkat)
+#define SYS_unlinkat       __NR_unlinkat
+#endif
+#if !defined(SYS_rmdir) && defined(__NR_rmdir)
+#define SYS_rmdir          __NR_rmdir
+#endif
+#if !defined(SYS_mkdir) && defined(__NR_mkdir)
+#define SYS_mkdir          __NR_mkdir
+#endif
+#if !defined(SYS_mkdirat) && defined(__NR_mkdirat)
+#define SYS_mkdirat        __NR_mkdirat
+#endif
+#if !defined(SYS_mknod) && defined(__NR_mknod)
+#define SYS_mknod          __NR_mknod
+#endif
+#if !defined(SYS_mknodat) && defined(__NR_mknodat)
+#define SYS_mknodat        __NR_mknodat
+#endif
+#if !defined(SYS_stat) && defined(__NR_stat)
+#define SYS_stat           __NR_stat
+#endif
+#if !defined(SYS_lstat) && defined(__NR_lstat)
+#define SYS_lstat          __NR_lstat
+#endif
+#if !defined(SYS_stat64) && defined(__NR_stat64)
+#define SYS_stat64         __NR_stat64
+#endif
+#if !defined(SYS_lstat64) && defined(__NR_lstat64)
+#define SYS_lstat64        __NR_lstat64
+#endif
+#if !defined(SYS_statx) && defined(__NR_statx)
+#define SYS_statx          __NR_statx
+#endif
+#if !defined(SYS_access) && defined(__NR_access)
+#define SYS_access         __NR_access
+#endif
+#if !defined(SYS_faccessat2) && defined(__NR_faccessat2)
+#define SYS_faccessat2     __NR_faccessat2
+#endif
+#if !defined(SYS_chmod) && defined(__NR_chmod)
+#define SYS_chmod          __NR_chmod
+#endif
+#if !defined(SYS_fchmodat) && defined(__NR_fchmodat)
+#define SYS_fchmodat       __NR_fchmodat
+#endif
+#if !defined(SYS_chown) && defined(__NR_chown)
+#define SYS_chown          __NR_chown
+#endif
+#if !defined(SYS_chown32) && defined(__NR_chown32)
+#define SYS_chown32        __NR_chown32
+#endif
+#if !defined(SYS_lchown) && defined(__NR_lchown)
+#define SYS_lchown         __NR_lchown
+#endif
+#if !defined(SYS_lchown32) && defined(__NR_lchown32)
+#define SYS_lchown32       __NR_lchown32
+#endif
+#if !defined(SYS_fchownat) && defined(__NR_fchownat)
+#define SYS_fchownat       __NR_fchownat
+#endif
+#if !defined(SYS_link) && defined(__NR_link)
+#define SYS_link           __NR_link
+#endif
+#if !defined(SYS_linkat) && defined(__NR_linkat)
+#define SYS_linkat         __NR_linkat
+#endif
+#if !defined(SYS_symlink) && defined(__NR_symlink)
+#define SYS_symlink        __NR_symlink
+#endif
+#if !defined(SYS_symlinkat) && defined(__NR_symlinkat)
+#define SYS_symlinkat      __NR_symlinkat
+#endif
+#if !defined(SYS_rename) && defined(__NR_rename)
+#define SYS_rename         __NR_rename
+#endif
+#if !defined(SYS_renameat) && defined(__NR_renameat)
+#define SYS_renameat       __NR_renameat
+#endif
+#if !defined(SYS_renameat2) && defined(__NR_renameat2)
+#define SYS_renameat2      __NR_renameat2
+#endif
+#if !defined(SYS_truncate) && defined(__NR_truncate)
+#define SYS_truncate       __NR_truncate
+#endif
+#if !defined(SYS_truncate64) && defined(__NR_truncate64)
+#define SYS_truncate64     __NR_truncate64
+#endif
+#if !defined(SYS_utime) && defined(__NR_utime)
+#define SYS_utime          __NR_utime
+#endif
+#if !defined(SYS_utimes) && defined(__NR_utimes)
+#define SYS_utimes         __NR_utimes
+#endif
+#if !defined(SYS_utimensat) && defined(__NR_utimensat)
+#define SYS_utimensat      __NR_utimensat
+#endif
+#if !defined(SYS_futimesat) && defined(__NR_futimesat)
+#define SYS_futimesat      __NR_futimesat
+#endif
+#if !defined(SYS_openat2) && defined(__NR_openat2)
+#define SYS_openat2        __NR_openat2
+#endif
+#if !defined(SYS_getxattr) && defined(__NR_getxattr)
+#define SYS_getxattr       __NR_getxattr
+#endif
+#if !defined(SYS_lgetxattr) && defined(__NR_lgetxattr)
+#define SYS_lgetxattr      __NR_lgetxattr
+#endif
+#if !defined(SYS_listxattr) && defined(__NR_listxattr)
+#define SYS_listxattr      __NR_listxattr
+#endif
+#if !defined(SYS_llistxattr) && defined(__NR_llistxattr)
+#define SYS_llistxattr     __NR_llistxattr
+#endif
+#if !defined(SYS_setxattr) && defined(__NR_setxattr)
+#define SYS_setxattr       __NR_setxattr
+#endif
+#if !defined(SYS_lsetxattr) && defined(__NR_lsetxattr)
+#define SYS_lsetxattr      __NR_lsetxattr
+#endif
+#if !defined(SYS_removexattr) && defined(__NR_removexattr)
+#define SYS_removexattr    __NR_removexattr
+#endif
+#if !defined(SYS_lremovexattr) && defined(__NR_lremovexattr)
+#define SYS_lremovexattr   __NR_lremovexattr
+#endif
+
 /* ================================================================
  * POSIX-like types
  * ================================================================ */
@@ -306,9 +453,12 @@ typedef struct ucontext_t {
 #define EBADF           9
 #define ENOMEM         12
 #define EACCES         13
+#define EEXIST         17
 #define EINVAL         22
+#define EROFS          30
 #define ENAMETOOLONG   36
 #define ENOSYS         38
+#define ENOTEMPTY      39
 
 extern int g_errno_value;
 #define errno g_errno_value
@@ -330,8 +480,22 @@ extern int g_errno_value;
 #define O_CLOEXEC       02000000
 #define O_TMPFILE       020200000
 
-#define AT_FDCWD        (-100)
-#define AT_EMPTY_PATH   0x1000
+#define AT_FDCWD            (-100)
+#define AT_SYMLINK_NOFOLLOW  0x100
+#define AT_REMOVEDIR         0x200
+#define AT_EMPTY_PATH        0x1000
+
+/* ================================================================
+ * File mode bits — st_mode
+ * ================================================================ */
+#define S_IFMT  0170000
+#define S_IFDIR 0040000
+#define S_IFCHR 0020000
+#define S_IFBLK 0060000
+#define S_IFREG 0100000
+#define S_IFIFO 0010000
+#define S_IFLNK 0120000
+#define S_IFSOCK 0140000
 
 /* ================================================================
  * Memory mapping

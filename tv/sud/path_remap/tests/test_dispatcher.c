@@ -34,10 +34,6 @@ void sud_rt_sigreturn_restorer(void) {}
 void sud_sigreturn_restorer(void) {}
 #endif
 
-#ifndef AT_REMOVEDIR
-#define AT_REMOVEDIR 0x200
-#endif
-
 /* ---- Trace addin stub (only when SUD_ADDIN_TRACE is defined) ----- */
 #ifdef SUD_ADDIN_TRACE
 

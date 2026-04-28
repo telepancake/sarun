@@ -58,31 +58,6 @@ struct sud_overlay_stat {
 };
 #endif
 
-#ifndef S_IFMT
-#define S_IFMT  0170000
-#endif
-#ifndef S_IFDIR
-#define S_IFDIR 0040000
-#endif
-#ifndef S_IFCHR
-#define S_IFCHR 0020000
-#endif
-#ifndef S_IFREG
-#define S_IFREG 0100000
-#endif
-#ifndef S_IFLNK
-#define S_IFLNK 0120000
-#endif
-
-#ifndef AT_SYMLINK_NOFOLLOW
-#define AT_SYMLINK_NOFOLLOW 0x100
-#endif
-
-/* AT_REMOVEDIR (unlinkat flag) — distinguishes rmdir-mode unlinkat. */
-#ifndef AT_REMOVEDIR
-#define AT_REMOVEDIR 0x200
-#endif
-
 /* ----------------------------------------------------------------
  *  Raw helper syscalls we need but that aren't in sud/raw.h.
  *  Defined here as static inlines so the test driver gets the same

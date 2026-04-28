@@ -25,20 +25,6 @@ void sud_rt_sigreturn_restorer(void) {}
 void sud_sigreturn_restorer(void) {}
 #endif
 
-#ifndef S_IFDIR
-#define S_IFDIR 0040000
-#endif
-#ifndef S_IFCHR
-#define S_IFCHR 0020000
-#endif
-#ifndef S_IFREG
-#define S_IFREG 0100000
-#endif
-
-#ifndef AT_REMOVEDIR
-#define AT_REMOVEDIR 0x200
-#endif
-
 /* ---- Tiny test framework ------------------------------------------- */
 
 static int g_failures;

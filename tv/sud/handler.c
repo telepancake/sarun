@@ -20,20 +20,6 @@ volatile unsigned char sud_selector_storage
 volatile unsigned char *g_sud_selector_ptr = &sud_selector_storage;
 
 /* ================================================================
- * SYS_chdir / SYS_fchdir — not always defined in libc.h
- * ================================================================ */
-#ifndef SYS_chdir
-#ifdef __NR_chdir
-#define SYS_chdir __NR_chdir
-#endif
-#endif
-#ifndef SYS_fchdir
-#ifdef __NR_fchdir
-#define SYS_fchdir __NR_fchdir
-#endif
-#endif
-
-/* ================================================================
  * install_sigsys_handler_raw — install SIGSYS handler with raw syscall.
  * ================================================================ */
 void install_sigsys_handler_raw(void)

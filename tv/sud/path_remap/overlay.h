@@ -52,16 +52,6 @@ enum {
     SUD_OVERLAY_READONLY    = 3,
 };
 
-#ifndef EROFS
-#define EROFS 30
-#endif
-#ifndef ENOTEMPTY
-#define ENOTEMPTY 39
-#endif
-#ifndef EEXIST
-#define EEXIST 17
-#endif
-
 /* Parse SUD_OVERLAY and SUD_REMAP from the environment.  Idempotent:
  * subsequent calls are no-ops.  Safe to call from wrapper_init time
  * (uses libc malloc which uses mmap). */
