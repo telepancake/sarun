@@ -275,35 +275,80 @@ void sud_ir_block_free(uint32_t off, uint32_t nblocks)
 }
 
 /* ================================================================
- * FAT allocator over the data shm (caller holds sb->lock)
+ * FAT allocator over the data shm — lock-free
  *
  * The data shm is a separate /dev/shm object holding only file
  * content, divided into fixed-size SUD_IR_BLOCK_SIZE blocks.
  * Allocation state lives entirely in the metadata region: a
- * uint32_t array of (fat_count + 1) entries plus a free-list head
- * and count in the super.  Index 0 is reserved (end-of-chain
- * sentinel); valid block ids are 1..fat_count.
+ * uint32_t array of (fat_count + 1) entries (`fat[]`) plus a tagged
+ * 64-bit free-list head in the super.  Index 0 is reserved (end-of-
+ * chain sentinel); valid block ids are 1..fat_count.
  *
  * For an in-use block, fat[id] holds the next-block-id in the
  * file's chain (0 if last).  For a free block, fat[id] holds the
- * next free-block-id.  Allocation pops from the head of the free
- * list (O(1)); free pushes onto the head (O(1)) and punches a hole
- * in the data shm so the kernel can reclaim the page.
+ * next free-block-id (Treiber stack).
+ *
+ * Concurrency: alloc/free are wait-free single-block operations
+ * implemented as CAS pop/push on `sb->fat_free_head_tagged`.  The
+ * tagged head packs an ABA counter into the upper 32 bits so a CAS
+ * succeeds iff no other process modified the head between our load
+ * and our store — without this, two processes interleaving as
+ *   T1: load head=(A,c0); read fat[A]=B
+ *   T2: pop A; pop B; push A   (head now (A,c2), but next ≠ B)
+ *   T1: CAS head:(A,c0)→(B,c1)   *** would corrupt the free list
+ * could install a stale next pointer.  With ABA tagging T1's CAS
+ * sees (A,c2) ≠ (A,c0) and retries.
+ *
+ * Crucially this means callers (chain_append / chain_truncate) do
+ * NOT take sb->lock for FAT operations.  Per-inode lock alone
+ * protects each file's chain shape, so two writers to two different
+ * files don't serialise on a global lock — exactly the property
+ * a FAT-style allocator should give us.
  *
  * No headers/footers in the data blocks themselves: hole-punch is
  * page-aligned and never touches a neighbour file's data.
  * ================================================================ */
 
+/* Pack/unpack helpers for the tagged head. */
+static inline uint64_t fat_head_pack(uint32_t id, uint32_t tag)
+{
+    return ((uint64_t)tag << 32) | (uint64_t)id;
+}
+static inline uint32_t fat_head_id(uint64_t h)  { return (uint32_t)h; }
+static inline uint32_t fat_head_tag(uint64_t h) { return (uint32_t)(h >> 32); }
+
 uint32_t sud_ir_fat_alloc(void)
 {
     struct sud_ir_super *sb = sud_ir_sb();
-    uint32_t id = sb->fat_free_head;
-    if (id == 0) return 0;          /* data shm exhausted */
     uint32_t *fat = sud_ir_fat();
-    sb->fat_free_head = fat[id];
-    if (sb->fat_free_count) sb->fat_free_count--;
-    fat[id] = 0;                    /* terminator until linked into a chain */
-    return id;
+    /* Cast away `volatile` qualification on the head: the C atomics
+     * builtins want a plain pointer; volatility is irrelevant when
+     * every access goes through __atomic_*. */
+    uint64_t *headp = (uint64_t *)&sb->fat_free_head_tagged;
+
+    for (;;) {
+        uint64_t old  = __atomic_load_n(headp, __ATOMIC_ACQUIRE);
+        uint32_t id   = fat_head_id(old);
+        if (id == 0) return 0;          /* data shm exhausted */
+        /* fat[id] read may be stale (a concurrent push/pop could have
+         * rewritten it).  That's OK: the CAS below only succeeds if
+         * `old` is still the current head — i.e. no other thread
+         * touched the free list since our load — so the next we
+         * computed is the current free-list-next of id. */
+        uint32_t next = __atomic_load_n(&fat[id], __ATOMIC_RELAXED);
+        uint64_t neu  = fat_head_pack(next, fat_head_tag(old) + 1);
+        if (__atomic_compare_exchange_n(headp, &old, neu,
+                                        0, __ATOMIC_ACQ_REL,
+                                        __ATOMIC_ACQUIRE)) {
+            /* fat[id] is now the caller's to overwrite (chain link
+             * pointer or 0 for end-of-chain).  We don't clear it
+             * here — chain_append explicitly stores a successor or
+             * 0 before the new run is published via fat[old_tail]. */
+            __atomic_fetch_sub(&sb->fat_free_count, 1, __ATOMIC_RELAXED);
+            return id;
+        }
+        /* CAS failed — retry. */
+    }
 }
 
 void sud_ir_fat_free(uint32_t block_id)
@@ -311,11 +356,16 @@ void sud_ir_fat_free(uint32_t block_id)
     struct sud_ir_super *sb = sud_ir_sb();
     if (block_id == 0 || block_id > sb->fat_count) return;
     uint32_t *fat = sud_ir_fat();
+    uint64_t *headp = (uint64_t *)&sb->fat_free_head_tagged;
 
     /* Best-effort hole-punch: drop the page from the data shm so
      * residency tracks live data, not high-water-mark.  Failure
      * (older kernels, tmpfs without punch-hole support) is not
-     * fatal — the page just stays around until the shm is unlinked. */
+     * fatal — the page just stays around until the shm is unlinked.
+     * Done before the CAS publish: even if a concurrent allocator
+     * pops `block_id` immediately after we publish, they will fault
+     * a fresh zero page in on first access — semantically equivalent
+     * to allocating a brand-new block. */
     if (g_data_fd >= 0) {
 #ifdef SYS_fallocate
         raw_syscall6(SYS_fallocate, g_data_fd,
@@ -325,9 +375,21 @@ void sud_ir_fat_free(uint32_t block_id)
 #endif
     }
 
-    fat[block_id]     = sb->fat_free_head;
-    sb->fat_free_head = block_id;
-    sb->fat_free_count++;
+    for (;;) {
+        uint64_t old = __atomic_load_n(headp, __ATOMIC_ACQUIRE);
+        /* Stage our next pointer.  Concurrent pops cannot read
+         * fat[block_id] meaningfully until the CAS publishes the
+         * push — they wouldn't see block_id as the head until then. */
+        __atomic_store_n(&fat[block_id], fat_head_id(old), __ATOMIC_RELAXED);
+        uint64_t neu = fat_head_pack(block_id, fat_head_tag(old) + 1);
+        if (__atomic_compare_exchange_n(headp, &old, neu,
+                                        0, __ATOMIC_ACQ_REL,
+                                        __ATOMIC_ACQUIRE)) {
+            __atomic_fetch_add(&sb->fat_free_count, 1, __ATOMIC_RELAXED);
+            return;
+        }
+        /* CAS failed — retry; we'll re-stage fat[block_id] next loop. */
+    }
 }
 
 /* ================================================================
@@ -347,6 +409,103 @@ void sud_ir_fat_free(uint32_t block_id)
  *     across processes that share the same SUD_INRAMFS prefix.
  * ================================================================ */
 
+/* ================================================================
+ * XXH64 — small inline 64-bit hash (Yann Collet, public-domain
+ * primitives).  Used at process init to derive a stable shm-key from
+ * the mount path; not on any data-path.  Inlined rather than pulling
+ * in the bundled zstd xxhash.h (~7 KLOC, drags in stdint/string
+ * headers that conflict with our freestanding build).  Values match
+ * the reference XXH64 with seed 0; verified against test vectors in
+ * test_inramfs.c::test_xxh64. */
+#define SUD_IR_XXH_P1 0x9E3779B185EBCA87ULL
+#define SUD_IR_XXH_P2 0xC2B2AE3D27D4EB4FULL
+#define SUD_IR_XXH_P3 0x165667B19E3779F9ULL
+#define SUD_IR_XXH_P4 0x85EBCA77C2B2AE63ULL
+#define SUD_IR_XXH_P5 0x27D4EB2F165667C5ULL
+
+static inline uint64_t sud_ir_rotl64(uint64_t x, int r)
+{
+    return (x << r) | (x >> (64 - r));
+}
+
+static inline uint64_t sud_ir_xxh_round(uint64_t acc, uint64_t input)
+{
+    acc += input * SUD_IR_XXH_P2;
+    acc  = sud_ir_rotl64(acc, 31);
+    acc *= SUD_IR_XXH_P1;
+    return acc;
+}
+
+static inline uint64_t sud_ir_xxh_merge(uint64_t acc, uint64_t val)
+{
+    val = sud_ir_xxh_round(0, val);
+    acc ^= val;
+    return acc * SUD_IR_XXH_P1 + SUD_IR_XXH_P4;
+}
+
+/* XXH64(data, len, seed=0). */
+uint64_t sud_ir_xxh64(const void *data, size_t len)
+{
+    const uint8_t *p   = (const uint8_t *)data;
+    const uint8_t *end = p + len;
+    uint64_t h64;
+
+    if (len >= 32) {
+        const uint8_t *limit = end - 32;
+        uint64_t v1 = SUD_IR_XXH_P1 + SUD_IR_XXH_P2;
+        uint64_t v2 = SUD_IR_XXH_P2;
+        uint64_t v3 = 0;
+        uint64_t v4 = 0 - SUD_IR_XXH_P1;
+        do {
+            uint64_t k1, k2, k3, k4;
+            memcpy(&k1, p,      8);
+            memcpy(&k2, p + 8,  8);
+            memcpy(&k3, p + 16, 8);
+            memcpy(&k4, p + 24, 8);
+            v1 = sud_ir_xxh_round(v1, k1);
+            v2 = sud_ir_xxh_round(v2, k2);
+            v3 = sud_ir_xxh_round(v3, k3);
+            v4 = sud_ir_xxh_round(v4, k4);
+            p += 32;
+        } while (p <= limit);
+        h64 = sud_ir_rotl64(v1, 1) + sud_ir_rotl64(v2, 7)
+            + sud_ir_rotl64(v3, 12) + sud_ir_rotl64(v4, 18);
+        h64 = sud_ir_xxh_merge(h64, v1);
+        h64 = sud_ir_xxh_merge(h64, v2);
+        h64 = sud_ir_xxh_merge(h64, v3);
+        h64 = sud_ir_xxh_merge(h64, v4);
+    } else {
+        h64 = SUD_IR_XXH_P5;
+    }
+    h64 += (uint64_t)len;
+    while (p + 8 <= end) {
+        uint64_t k1;
+        memcpy(&k1, p, 8);
+        k1  = sud_ir_xxh_round(0, k1);
+        h64 ^= k1;
+        h64  = sud_ir_rotl64(h64, 27) * SUD_IR_XXH_P1 + SUD_IR_XXH_P4;
+        p += 8;
+    }
+    if (p + 4 <= end) {
+        uint32_t v;
+        memcpy(&v, p, 4);
+        h64 ^= (uint64_t)v * SUD_IR_XXH_P1;
+        h64  = sud_ir_rotl64(h64, 23) * SUD_IR_XXH_P2 + SUD_IR_XXH_P3;
+        p += 4;
+    }
+    while (p < end) {
+        h64 ^= (uint64_t)(*p) * SUD_IR_XXH_P5;
+        h64  = sud_ir_rotl64(h64, 11) * SUD_IR_XXH_P1;
+        p++;
+    }
+    h64 ^= h64 >> 33;
+    h64 *= SUD_IR_XXH_P2;
+    h64 ^= h64 >> 29;
+    h64 *= SUD_IR_XXH_P3;
+    h64 ^= h64 >> 32;
+    return h64;
+}
+
 /* Compose the two shm paths:
  *   /dev/shm/sud-inramfs.<key>.meta     — metadata region
  *   /dev/shm/sud-inramfs.<key>.data     — small-files data store
@@ -363,12 +522,9 @@ static void compose_shm_paths(const char *user_key,
     if (user_key && user_key[0]) {
         snprintf(key, sizeof(key), "%s", user_key);
     } else {
-        /* FNV-1a 64-bit hash of the mount path. */
-        uint64_t h = 0xcbf29ce484222325ull;
-        for (const unsigned char *p = (const unsigned char *)mount_path; *p; p++) {
-            h ^= *p;
-            h *= 0x100000001b3ull;
-        }
+        size_t n = 0;
+        while (mount_path[n]) n++;
+        uint64_t h = sud_ir_xxh64(mount_path, n);
         snprintf(key, sizeof(key), "%016llx", (unsigned long long)h);
     }
     snprintf(meta_out, meta_sz, "/dev/shm/sud-inramfs.%s.meta", key);
@@ -478,8 +634,8 @@ static void init_meta_region(struct sud_ir_super *sb,
     fat[0] = 0;                  /* end-of-chain sentinel */
     for (uint32_t i = 1; i < data_blocks; i++) fat[i] = i + 1;
     if (data_blocks) fat[data_blocks] = 0;
-    sb->fat_free_head  = data_blocks ? 1 : 0;
-    sb->fat_free_count = data_blocks;
+    sb->fat_free_head_tagged = data_blocks ? fat_head_pack(1, 0) : 0;
+    sb->fat_free_count       = data_blocks;
 
     /* Reserve inode 0 (NULL sentinel) and initialise inode 1 (root). */
     uint8_t *bm = (uint8_t *)((char *)sb + sb->inode_bitmap_off);

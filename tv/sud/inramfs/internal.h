@@ -187,25 +187,40 @@ struct sud_ir_super {
      * in the metadata region so 32-bit and 64-bit processes share
      * the same view of which data blocks are free.
      *
-     * fat_off          — byte offset (within the metadata region) of
-     *                    a uint32_t array of size fat_count + 1.
-     *                    Index 0 is reserved as the end-of-chain
-     *                    marker.  Indexes 1..fat_count are valid
-     *                    block ids.  For an in-use chain, fat[i] is
-     *                    the id of the next block in that file's
-     *                    chain (0 = last block).  For a free block,
-     *                    fat[i] is the id of the next free block.
-     * fat_free_head    — id of the first free block (0 = no free
-     *                    blocks, i.e. data shm exhausted).
-     * fat_free_count   — invariant cache of the free-list length.
-     * fat_count        — total number of data blocks in the data shm.
-     * data_shm_size    — size of the data shm in bytes
-     *                    (= fat_count * SUD_IR_BLOCK_SIZE). */
+     * fat_off                 — byte offset (within the metadata
+     *                           region) of a uint32_t array of size
+     *                           fat_count + 1.  Index 0 is reserved
+     *                           as the end-of-chain marker.  Indexes
+     *                           1..fat_count are valid block ids.
+     *                           For an in-use chain, fat[i] is the id
+     *                           of the next block in that file's
+     *                           chain (0 = last block).  For a free
+     *                           block, fat[i] is the id of the next
+     *                           free block in the free list.
+     * fat_free_head_tagged    — Treiber-stack head, packed as
+     *                             { aba_counter:32 (high), block_id:32 (low) }
+     *                           so a 64-bit `__atomic_compare_exchange`
+     *                           pop/push survives the ABA hazard
+     *                           that would otherwise corrupt the
+     *                           free list under multi-process
+     *                           contention.  block_id == 0 means the
+     *                           free list is empty.  Forced to
+     *                           8-byte alignment so cmpxchg8b on
+     *                           i386 (where uint64_t struct fields
+     *                           default to 4-byte align under SysV)
+     *                           is genuinely atomic.
+     * fat_free_count          — atomic counter; used for stats /
+     *                           leak checks (relaxed memory order).
+     * fat_count               — total number of data blocks in the
+     *                           data shm.
+     * data_shm_size           — size of the data shm in bytes
+     *                           (= fat_count * SUD_IR_BLOCK_SIZE). */
     uint32_t fat_off;
     uint32_t fat_count;
-    uint32_t fat_free_head;
+    uint64_t fat_free_head_tagged __attribute__((aligned(8)));
     uint32_t fat_free_count;
-    uint64_t data_shm_size;
+    uint32_t _pad_tail;
+    uint64_t data_shm_size       __attribute__((aligned(8)));
 };
 
 /* ---- super.c: region access and locking ----------------------- */
@@ -239,6 +254,10 @@ static inline struct sud_ir_super *sud_ir_sb(void)
  * region.  Implemented in super.c. */
 void sud_ir_lock(volatile uint32_t *word);
 void sud_ir_unlock(volatile uint32_t *word);
+
+/* XXH64 (seed 0) — exposed for tests; used internally to derive a
+ * stable shm key from the mount path. */
+uint64_t sud_ir_xxh64(const void *data, size_t len);
 
 /* Allocate / free a metadata block (4 KiB, page-aligned) in the
  * metadata region.  Used for dirent blocks and symlink targets only;
@@ -276,13 +295,16 @@ static inline uint32_t *sud_ir_fat(void)
  * 1-based block id, or 0 if the data shm is full.  The block's bytes
  * are NOT pre-zeroed (callers that need a clean block must zero it
  * explicitly — file_grow does this so reads past the previous EOF
- * see zeros).  Caller MUST hold sb->lock. */
+ * see zeros).  Lock-free (CAS Treiber-stack pop with ABA tag); safe
+ * to call concurrently from multiple processes without any external
+ * lock. */
 uint32_t sud_ir_fat_alloc(void);
 
 /* Return one block (by id) to the free list.  Best-effort: punches a
  * hole in the data shm so the kernel can reclaim its physical page,
  * keeping resident-memory cost tracking the live file footprint
- * rather than the high-water-mark.  Caller MUST hold sb->lock. */
+ * rather than the high-water-mark.  Lock-free (CAS push with ABA
+ * tag); safe to call concurrently. */
 void     sud_ir_fat_free(uint32_t block_id);
 
 /* Allocate / free an inode index.  Caller MUST hold sb->lock.

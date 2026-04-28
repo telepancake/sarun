@@ -452,10 +452,11 @@ int sud_ir_walk_parent(const char *abs_path,
  * unlinks blocks one at a time (each free best-effort hole-punches
  * the data shm so resident memory tracks live data).
  *
- * Per-inode lock is held across read/write/truncate so the chain
- * shape is stable for the duration of one op.  FAT mutation needs
- * the global sb->lock as well; we acquire it briefly while
- * appending or freeing blocks.
+ * Per-inode lock is held across read/write/truncate so this file's
+ * chain shape is stable for the duration of one op.  FAT mutation
+ * (alloc/free of free-list blocks) is **lock-free** — the free list
+ * is an ABA-tagged Treiber stack — so two writers to two different
+ * files never serialise on a global lock during grow/shrink.
  * ================================================================ */
 
 /* Walk the FAT chain to the n'th block (0-based).  Returns the
@@ -472,58 +473,77 @@ static uint32_t chain_block_at(uint32_t head, uint32_t n)
 
 /* Append `n_new` blocks to the end of `ino`'s chain.  Blocks are
  * zeroed before being attached so reads past previous EOF see zeros
- * (POSIX requirement, see truncate(2) and write(2) past-EOF). */
+ * (POSIX requirement, see truncate(2) and write(2) past-EOF).
+ *
+ * Caller holds `ino->lock`.  We do NOT take `sb->lock` — FAT
+ * alloc/free are lock-free, and the chain we mutate is private to
+ * this inode (only the holder of ino->lock can change its shape).
+ * Two writers to two different files do not contend here. */
 static int chain_append(struct sud_ir_inode *ino, uint32_t n_new)
 {
     if (n_new == 0) return 0;
-    struct sud_ir_super *sb = sud_ir_sb();
     uint32_t *fat = sud_ir_fat();
 
-    sud_ir_lock(&sb->lock);
-
-    /* Find current tail (or 0 if the chain is empty). */
+    /* Find current tail (or 0 if the chain is empty).  Safe to walk
+     * without sb->lock: we hold ino->lock so this chain's shape is
+     * stable, and FAT entries for in-use blocks are only mutated by
+     * the inode-lock holder. */
     uint32_t tail = ino->u.reg.head_block;
     if (tail) while (fat[tail]) tail = fat[tail];
 
-    /* Remember what we've allocated so we can roll back on ENOSPC
-     * partway through (so a failed grow doesn't leak blocks). */
+    /* Build the new run unpublished — first_new..last_new, linked
+     * through fat[].  Other allocators cannot reach these blocks
+     * (they have been popped off the free list) and other readers
+     * of ino's chain cannot reach them either (we haven't spliced
+     * yet).  This means we can write fat[id] freely. */
     uint32_t first_new = 0;
     uint32_t last_new  = 0;
     for (uint32_t i = 0; i < n_new; i++) {
         uint32_t id = sud_ir_fat_alloc();
         if (id == 0) {
-            /* Roll back: free everything we've allocated this call. */
+            /* Roll back: free everything we've allocated this call.
+             * The new run is still unpublished, so no one else can
+             * see these blocks; we own the link pointers and can
+             * walk them via fat[] safely. */
             uint32_t b = first_new;
-            while (b) { uint32_t nxt = fat[b]; sud_ir_fat_free(b); b = nxt; }
-            sud_ir_unlock(&sb->lock);
+            while (b) {
+                uint32_t nxt = fat[b];
+                sud_ir_fat_free(b);
+                b = nxt;
+            }
             return -ENOSPC;
         }
         memset(sud_ir_data_block(id), 0, SUD_IR_BLOCK_SIZE);
+        /* sud_ir_fat_alloc leaves fat[id] holding stale free-list
+         * data; explicitly terminate the run-so-far so a partial
+         * rollback walks correctly. */
+        fat[id] = 0;
         if (!first_new) first_new = id;
-        if (last_new) fat[last_new] = id;
+        if (last_new)   fat[last_new] = id;
         last_new = id;
     }
-    /* fat[last_new] is already 0 from sud_ir_fat_alloc. */
 
-    /* Splice the new run onto the chain. */
+    /* Splice the new run onto the chain.  This single store is the
+     * publish point — until it lands, no other thread can reach the
+     * new blocks.  The store itself is naturally atomic for a
+     * 32-bit aligned word on x86/x86_64. */
     if (tail) fat[tail] = first_new;
     else      ino->u.reg.head_block = first_new;
     ino->u.reg.nblocks += n_new;
-
-    sud_ir_unlock(&sb->lock);
     return 0;
 }
 
 /* Truncate the chain down to `keep` blocks, freeing everything
- * beyond.  No-op if the chain is already shorter. */
+ * beyond.  No-op if the chain is already shorter.  Caller holds
+ * `ino->lock`; no `sb->lock` required (see chain_append rationale). */
 static void chain_truncate(struct sud_ir_inode *ino, uint32_t keep)
 {
     if (keep >= ino->u.reg.nblocks) return;
-    struct sud_ir_super *sb = sud_ir_sb();
     uint32_t *fat = sud_ir_fat();
 
-    sud_ir_lock(&sb->lock);
-
+    /* Detach the to-be-freed suffix from the live chain first.
+     * Once detached, the freed blocks belong only to us until we
+     * push them back to the free list. */
     uint32_t free_from;
     if (keep == 0) {
         free_from = ino->u.reg.head_block;
@@ -539,8 +559,6 @@ static void chain_truncate(struct sud_ir_inode *ino, uint32_t keep)
         free_from = nxt;
     }
     ino->u.reg.nblocks = keep;
-
-    sud_ir_unlock(&sb->lock);
 }
 
 /* Ensure the file has enough blocks to address `need_bytes`.  Caller

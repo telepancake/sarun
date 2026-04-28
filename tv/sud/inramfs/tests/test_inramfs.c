@@ -479,6 +479,152 @@ static void test_multi_block(void)
     teardown_mount();
 }
 
+/* XXH64 sanity test against published reference vectors (XXH64 of
+ * an empty string and of the canonical "Nobody inspects the
+ * spammish repetition" test string with seed 0).  Prevents subtle
+ * regressions in the inlined implementation. */
+static void test_xxh64(void)
+{
+    g_curtest = "xxh64";
+    /* XXH64("", 0, seed=0) == 0xEF46DB3751D8E999 */
+    TASSERT_EQ(sud_ir_xxh64("", 0), 0xEF46DB3751D8E999ULL,
+               "xxh64 empty matches reference");
+    /* XXH64("Nobody inspects the spammish repetition", seed=0)
+     *   == 0xFBCEA83C8A378BF1 (canonical xxhash test vector). */
+    const char *s = "Nobody inspects the spammish repetition";
+    TASSERT_EQ(sud_ir_xxh64(s, strlen(s)), 0xFBCEA83C8A378BF1ULL,
+               "xxh64 known string matches reference");
+    /* Avalanche smoke: single-bit difference must produce ≥ a few
+     * bit flips in the output (loose bound; just rules out
+     * accidentally identity-mapping). */
+    char a = 'a', b = 'b';
+    uint64_t ha = sud_ir_xxh64(&a, 1), hb = sud_ir_xxh64(&b, 1);
+    TASSERT(ha != hb, "single-bit avalanche");
+}
+
+/* High-concurrency FAT stress test.
+ *
+ * N child processes each loop ITERS times: alloc a per-child file,
+ * write a per-iteration-sized payload (multi-block), truncate down,
+ * unlink.  The whole point is to hammer the lock-free FAT free
+ * list across processes — alloc/free contend on a single tagged
+ * head, so any ABA bug or missing atomic would either corrupt the
+ * free list (manifesting as an allocation that returns an id
+ * already in use, or losing blocks entirely) or leak blocks.
+ *
+ * Invariant checked: after all children exit and all files are
+ * gone, fat_free_count must equal its initial value (no leaks),
+ * and the live free list (walked from the head) must contain
+ * exactly that many distinct ids in [1..fat_count] (no duplicates,
+ * no out-of-range entries). */
+static void test_fat_concurrency(void)
+{
+    g_curtest = "fat_concurrency";
+    /* 16 MiB data shm = 4096 blocks: enough headroom that ENOSPC
+     * won't be hit even with 8 children × 8 simultaneous files of
+     * 32 blocks each. */
+    setup_mount("/inramfs", 16, "test_fatconc");
+
+    struct sud_ir_super *sb = sud_ir_sb();
+    uint32_t initial_free = __atomic_load_n(&sb->fat_free_count,
+                                             __ATOMIC_ACQUIRE);
+    TASSERT(initial_free > 0, "data shm has free blocks");
+
+    enum { N_CHILDREN = 8, ITERS = 50 };
+    long pids[N_CHILDREN];
+    for (int c = 0; c < N_CHILDREN; c++) {
+        long pid = fork();
+        if (pid == 0) {
+            /* Per-child seed — distinct path prefix so no two
+             * children touch the same inode (this test isolates
+             * FAT contention; namespace contention is exercised
+             * elsewhere). */
+            char path[64];
+            for (int it = 0; it < ITERS; it++) {
+                snprintf(path, sizeof(path),
+                         "/inramfs/c%d_i%d", c, it);
+                int fd = (int)sud_inramfs_op_open(
+                    path, O_RDWR | O_CREAT, 0644);
+                if (fd < 0) raw_syscall6(SYS_exit, 21, 0, 0, 0, 0, 0);
+                /* Vary the size so allocations of different
+                 * lengths interleave, exposing ordering bugs. */
+                size_t bytes = (size_t)(((c + 1) * 7919u
+                                         + (uint32_t)it * 1031u)
+                                         % (32u * 4096u)) + 1024u;
+                static unsigned char buf[64 * 1024];
+                /* Pattern derived from (c, it) so each process's
+                 * writes are distinguishable on read-back. */
+                for (size_t k = 0; k < bytes; k++) {
+                    buf[k] = (unsigned char)((k * (c + 1)
+                                              + it * 17u) & 0xff);
+                }
+                if (sud_inramfs_op_write(fd, buf, bytes) != (long)bytes)
+                    raw_syscall6(SYS_exit, 22, 0, 0, 0, 0, 0);
+                /* Read back and verify in-process. */
+                static unsigned char rb[64 * 1024];
+                if (sud_inramfs_op_lseek(fd, 0, SEEK_SET) != 0)
+                    raw_syscall6(SYS_exit, 23, 0, 0, 0, 0, 0);
+                if (sud_inramfs_op_read(fd, rb, bytes) != (long)bytes)
+                    raw_syscall6(SYS_exit, 24, 0, 0, 0, 0, 0);
+                for (size_t k = 0; k < bytes; k++) {
+                    if (rb[k] != buf[k])
+                        raw_syscall6(SYS_exit, 25, 0, 0, 0, 0, 0);
+                }
+                /* Truncate down then back up — exercises both
+                 * free and re-alloc on the contended free list. */
+                if (sud_inramfs_op_ftruncate(fd, 1024) != 0)
+                    raw_syscall6(SYS_exit, 26, 0, 0, 0, 0, 0);
+                if (sud_inramfs_op_ftruncate(fd, bytes) != 0)
+                    raw_syscall6(SYS_exit, 27, 0, 0, 0, 0, 0);
+                sud_inramfs_op_close(fd);
+                if (sud_inramfs_op_unlink(path) != 0)
+                    raw_syscall6(SYS_exit, 28, 0, 0, 0, 0, 0);
+            }
+            raw_syscall6(SYS_exit, 0, 0, 0, 0, 0, 0);
+        }
+        pids[c] = pid;
+    }
+    int any_failed = 0;
+    for (int c = 0; c < N_CHILDREN; c++) {
+        int status = 0;
+        raw_syscall6(SYS_wait4, pids[c], (long)&status, 0, 0, 0, 0);
+        if ((status & 0xff7f) != 0) any_failed = 1;
+    }
+    TASSERT_EQ(any_failed, 0, "all children exited cleanly");
+
+    /* Leak check 1: counter restored. */
+    uint32_t final_free = __atomic_load_n(&sb->fat_free_count,
+                                          __ATOMIC_ACQUIRE);
+    TASSERT_EQ(final_free, initial_free,
+               "fat_free_count restored after all unlinks");
+
+    /* Leak check 2: walk the actual free list, assert it has
+     * exactly initial_free distinct, in-range, non-zero ids.
+     * Catches duplicates (would prove a double-free or a stale
+     * push) and bogus ids (would prove ABA corruption). */
+    static uint8_t seen[64 * 1024 / 8];   /* fat_count <= 4096 here */
+    memset(seen, 0, sizeof(seen));
+    uint32_t *fat = sud_ir_fat();
+    uint64_t head = __atomic_load_n(&sb->fat_free_head_tagged,
+                                     __ATOMIC_ACQUIRE);
+    uint32_t id = (uint32_t)head;
+    uint32_t count = 0;
+    int corrupt = 0;
+    while (id) {
+        if (id > sb->fat_count) { corrupt = 1; break; }
+        if (seen[id >> 3] & (1u << (id & 7))) { corrupt = 2; break; }
+        seen[id >> 3] |= (uint8_t)(1u << (id & 7));
+        count++;
+        if (count > sb->fat_count + 1) { corrupt = 3; break; }
+        id = fat[id];
+    }
+    TASSERT_EQ(corrupt, 0, "free list has no duplicates / bad ids");
+    TASSERT_EQ(count, initial_free,
+               "free list length matches counter (no leaks)");
+
+    teardown_mount();
+}
+
 /* ---- entrypoint ---- */
 
 int main(int argc, char **argv)
@@ -501,6 +647,8 @@ int main(int argc, char **argv)
     test_cross_process();
     test_mmap();
     test_multi_block();
+    test_xxh64();
+    test_fat_concurrency();
 
     if (g_failures) {
         char b[64];
