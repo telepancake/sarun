@@ -8,7 +8,7 @@ MOK_CER ?= $(PWD)/MOK.der
 all: tv sudtrace upttrace sud-bins mod-bins
 
 .PHONY: sud-bins mod-bins
-sud-bins:
+sud-bins: path-remap-test
 	$(MAKE) $(SUD_NATIVE)
 
 mod-bins:
@@ -41,6 +41,7 @@ clean:
 	$(MAKE) -C $(MOD_DIR) clean
 	$(MAKE) -C libc-fs clean
 	rm -f tv sudtrace upttrace sud32 sud64
+	rm -f build/path_remap_test32 build/path_remap_test64
 
 install:
 	$(MAKE) -C $(MOD_DIR) install
@@ -81,7 +82,7 @@ SUD_SRCS    += sud/trace/event.c sud/trace/addin.c
 endif
 ifneq ($(filter sud/path_remap,$(SUD_ADDINS)),)
 SUD_CFLAGS  += -DSUD_ADDIN_PATH_REMAP
-SUD_SRCS    += sud/path_remap/addin.c
+SUD_SRCS    += sud/path_remap/addin.c sud/path_remap/overlay.c
 endif
 SUD_NATIVE  := $(if $(filter x86_64,$(shell uname -m)),sud64,sud32)
 
@@ -169,6 +170,32 @@ sud32: $(SUD_SRCS) sudtrace.lds
 .PHONY: libc-fs-test
 libc-fs-test:
 	$(MAKE) -C libc-fs test
+
+# path_remap overlay self-tests.  Built freestanding for both 32-bit
+# and 64-bit just like the sud wrapper itself, so any architecture-
+# specific bug in path resolution / stat layout / syscall numbering
+# is caught in CI before the wrapper goes near a traced program.
+PATH_REMAP_TEST_SRCS := sud/path_remap/tests/test_overlay.c \
+                        sud/path_remap/overlay.c \
+                        libc-fs/libc.c libc-fs/deps/printf/printf.c
+PATH_REMAP_TEST_HDRS := sud/path_remap/overlay.h \
+                        libc-fs/libc.h libc-fs/fmt.h
+.PHONY: path-remap-test
+path-remap-test: build/path_remap_test64 build/path_remap_test32
+	@echo '--- running 64-bit path_remap overlay tests ---'
+	./build/path_remap_test64
+	@echo '--- running 32-bit path_remap overlay tests ---'
+	./build/path_remap_test32
+
+build/path_remap_test64: $(PATH_REMAP_TEST_SRCS) $(PATH_REMAP_TEST_HDRS)
+	@mkdir -p build
+	$(CC) -m64 $(SUD_CFLAGS) $(SUD_LDFLAGS) \
+	    -o $@ $(PATH_REMAP_TEST_SRCS) -lgcc
+
+build/path_remap_test32: $(PATH_REMAP_TEST_SRCS) $(PATH_REMAP_TEST_HDRS)
+	@mkdir -p build
+	$(CC) -m32 $(SUD_CFLAGS) $(SUD_LDFLAGS) \
+	    -o $@ $(PATH_REMAP_TEST_SRCS) -lgcc
 
 .PHONY: wire-test
 wire-test: tv
