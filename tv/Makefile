@@ -8,7 +8,7 @@ MOK_CER ?= $(PWD)/MOK.der
 all: tv sudtrace upttrace sud-bins mod-bins
 
 .PHONY: sud-bins mod-bins
-sud-bins: path-remap-test
+sud-bins: path-remap-test dispatcher-test
 	$(MAKE) $(SUD_NATIVE)
 
 mod-bins:
@@ -42,6 +42,9 @@ clean:
 	$(MAKE) -C libc-fs clean
 	rm -f tv sudtrace upttrace sud32 sud64
 	rm -f build/path_remap_test32 build/path_remap_test64
+	rm -f build/dispatcher_test_both32 build/dispatcher_test_both64
+	rm -f build/dispatcher_test_pathremap32 build/dispatcher_test_pathremap64
+	rm -f build/dispatcher_test_trace32 build/dispatcher_test_trace64
 
 install:
 	$(MAKE) -C $(MOD_DIR) install
@@ -196,6 +199,82 @@ build/path_remap_test32: $(PATH_REMAP_TEST_SRCS) $(PATH_REMAP_TEST_HDRS)
 	@mkdir -p build
 	$(CC) -m32 $(SUD_CFLAGS) $(SUD_LDFLAGS) \
 	    -o $@ $(PATH_REMAP_TEST_SRCS) -lgcc
+
+# path_remap × trace dispatch-order tests.  Built three times in each
+# bitness — both addins, path_remap-only, trace-only — to verify the
+# dispatcher contract: path_remap runs first and may short-circuit;
+# trace, when also linked, sees args that path_remap already mutated.
+# Either addin must work on its own.
+DISPATCH_TEST_BASE_CFLAGS := -O2 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 \
+                             -ffreestanding -fno-builtin -fno-stack-protector \
+                             -fno-pie -fomit-frame-pointer -I.
+DISPATCH_TEST_LDFLAGS     := -nostdlib -static -no-pie -Wl,--build-id=none
+DISPATCH_TEST_COMMON_SRCS := sud/path_remap/tests/test_dispatcher.c \
+                             sud/addin.c \
+                             libc-fs/libc.c libc-fs/deps/printf/printf.c
+DISPATCH_TEST_PATHREMAP_SRCS := sud/path_remap/addin.c sud/path_remap/overlay.c
+DISPATCH_TEST_HDRS := sud/addin.h sud/path_remap/overlay.h \
+                      libc-fs/libc.h libc-fs/fmt.h
+
+DISPATCH_TEST_BIN64_BOTH := build/dispatcher_test_both64
+DISPATCH_TEST_BIN32_BOTH := build/dispatcher_test_both32
+DISPATCH_TEST_BIN64_PR   := build/dispatcher_test_pathremap64
+DISPATCH_TEST_BIN32_PR   := build/dispatcher_test_pathremap32
+DISPATCH_TEST_BIN64_TR   := build/dispatcher_test_trace64
+DISPATCH_TEST_BIN32_TR   := build/dispatcher_test_trace32
+
+.PHONY: dispatcher-test
+dispatcher-test: $(DISPATCH_TEST_BIN64_BOTH) $(DISPATCH_TEST_BIN32_BOTH) \
+                 $(DISPATCH_TEST_BIN64_PR)   $(DISPATCH_TEST_BIN32_PR) \
+                 $(DISPATCH_TEST_BIN64_TR)   $(DISPATCH_TEST_BIN32_TR)
+	@echo '--- 64-bit dispatcher tests (both addins) ---'
+	./$(DISPATCH_TEST_BIN64_BOTH)
+	@echo '--- 32-bit dispatcher tests (both addins) ---'
+	./$(DISPATCH_TEST_BIN32_BOTH)
+	@echo '--- 64-bit dispatcher tests (path_remap only) ---'
+	./$(DISPATCH_TEST_BIN64_PR)
+	@echo '--- 32-bit dispatcher tests (path_remap only) ---'
+	./$(DISPATCH_TEST_BIN32_PR)
+	@echo '--- 64-bit dispatcher tests (trace only) ---'
+	./$(DISPATCH_TEST_BIN64_TR)
+	@echo '--- 32-bit dispatcher tests (trace only) ---'
+	./$(DISPATCH_TEST_BIN32_TR)
+
+$(DISPATCH_TEST_BIN64_BOTH): $(DISPATCH_TEST_COMMON_SRCS) $(DISPATCH_TEST_PATHREMAP_SRCS) $(DISPATCH_TEST_HDRS)
+	@mkdir -p build
+	$(CC) -m64 $(DISPATCH_TEST_BASE_CFLAGS) -DSUD_ADDIN_TRACE -DSUD_ADDIN_PATH_REMAP \
+	    $(DISPATCH_TEST_LDFLAGS) -o $@ \
+	    $(DISPATCH_TEST_COMMON_SRCS) $(DISPATCH_TEST_PATHREMAP_SRCS) -lgcc
+
+$(DISPATCH_TEST_BIN32_BOTH): $(DISPATCH_TEST_COMMON_SRCS) $(DISPATCH_TEST_PATHREMAP_SRCS) $(DISPATCH_TEST_HDRS)
+	@mkdir -p build
+	$(CC) -m32 $(DISPATCH_TEST_BASE_CFLAGS) -DSUD_ADDIN_TRACE -DSUD_ADDIN_PATH_REMAP \
+	    $(DISPATCH_TEST_LDFLAGS) -o $@ \
+	    $(DISPATCH_TEST_COMMON_SRCS) $(DISPATCH_TEST_PATHREMAP_SRCS) -lgcc
+
+$(DISPATCH_TEST_BIN64_PR): $(DISPATCH_TEST_COMMON_SRCS) $(DISPATCH_TEST_PATHREMAP_SRCS) $(DISPATCH_TEST_HDRS)
+	@mkdir -p build
+	$(CC) -m64 $(DISPATCH_TEST_BASE_CFLAGS) -DSUD_ADDIN_PATH_REMAP \
+	    $(DISPATCH_TEST_LDFLAGS) -o $@ \
+	    $(DISPATCH_TEST_COMMON_SRCS) $(DISPATCH_TEST_PATHREMAP_SRCS) -lgcc
+
+$(DISPATCH_TEST_BIN32_PR): $(DISPATCH_TEST_COMMON_SRCS) $(DISPATCH_TEST_PATHREMAP_SRCS) $(DISPATCH_TEST_HDRS)
+	@mkdir -p build
+	$(CC) -m32 $(DISPATCH_TEST_BASE_CFLAGS) -DSUD_ADDIN_PATH_REMAP \
+	    $(DISPATCH_TEST_LDFLAGS) -o $@ \
+	    $(DISPATCH_TEST_COMMON_SRCS) $(DISPATCH_TEST_PATHREMAP_SRCS) -lgcc
+
+$(DISPATCH_TEST_BIN64_TR): $(DISPATCH_TEST_COMMON_SRCS) $(DISPATCH_TEST_HDRS)
+	@mkdir -p build
+	$(CC) -m64 $(DISPATCH_TEST_BASE_CFLAGS) -DSUD_ADDIN_TRACE \
+	    $(DISPATCH_TEST_LDFLAGS) -o $@ \
+	    $(DISPATCH_TEST_COMMON_SRCS) -lgcc
+
+$(DISPATCH_TEST_BIN32_TR): $(DISPATCH_TEST_COMMON_SRCS) $(DISPATCH_TEST_HDRS)
+	@mkdir -p build
+	$(CC) -m32 $(DISPATCH_TEST_BASE_CFLAGS) -DSUD_ADDIN_TRACE \
+	    $(DISPATCH_TEST_LDFLAGS) -o $@ \
+	    $(DISPATCH_TEST_COMMON_SRCS) -lgcc
 
 .PHONY: wire-test
 wire-test: tv
