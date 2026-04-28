@@ -730,8 +730,26 @@ static long create_at(const char *abs_path, uint32_t type, uint32_t mode,
     return 0;
 }
 
+/* Returns 1 if abs_path is exactly the mount root (after stripping
+ * any trailing slashes).  Used by op_mkdir/op_rmdir/op_unlink to
+ * give the right errno when an operation targets the mount root
+ * itself — its parent is "/", which is outside the mount, so a
+ * naive walk_parent would surface -EINVAL where Linux returns
+ * -EEXIST/-EBUSY/-EISDIR. */
+static int is_mount_root(const char *abs_path)
+{
+    if (!abs_path) return 0;
+    const char *m = sud_ir_mount_path();
+    size_t mlen = sud_ir_mount_len();
+    if (!m) return 0;
+    size_t L = strlen(abs_path);
+    while (L > 1 && abs_path[L - 1] == '/') L--;
+    return L == mlen && memcmp(abs_path, m, mlen) == 0;
+}
+
 long sud_inramfs_op_mkdir(const char *abs_path, int mode)
 {
+    if (is_mount_root(abs_path)) return -EEXIST;
     return create_at(abs_path, SUD_IR_T_DIR, (uint32_t)(mode & 07777), 0, 0);
 }
 
@@ -759,6 +777,7 @@ long sud_inramfs_op_readlink(const char *abs_path, char *buf, size_t bufsz)
 
 long sud_inramfs_op_unlink(const char *abs_path)
 {
+    if (is_mount_root(abs_path)) return -EISDIR;
     uint32_t pidx;
     const char *base;
     size_t blen;
@@ -785,6 +804,7 @@ long sud_inramfs_op_unlink(const char *abs_path)
 
 long sud_inramfs_op_rmdir(const char *abs_path)
 {
+    if (is_mount_root(abs_path)) return -EBUSY;
     uint32_t pidx;
     const char *base;
     size_t blen;

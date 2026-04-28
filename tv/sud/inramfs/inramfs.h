@@ -154,4 +154,36 @@ void *sud_inramfs_op_mmap(void *addr, size_t length, int prot, int flags,
  * whether fd-bearing syscalls (read/write/lseek/...) should hijack. */
 int sud_inramfs_owns_fd(int fd);
 
+/* Duplicate an inramfs-owned fd.
+ *
+ *   sud_inramfs_op_dup(oldfd):                  dup(2)
+ *   sud_inramfs_op_dup3(oldfd, newfd, flags):   dup2(2) / dup3(2)
+ *                                               (flags == O_CLOEXEC ok)
+ *   sud_inramfs_op_fcntl_dupfd(oldfd, minfd, cloexec):
+ *                                               fcntl F_DUPFD[_CLOEXEC]
+ *
+ * On success returns the new fd (which is registered in the inramfs
+ * fd table, sharing the same inode/flags as oldfd).  Each duplicated
+ * fd has its own seek position (a documented divergence from
+ * Linux's "shared open file description" for dup2/3 — exercising
+ * shared positions across dup'd fds is rare in build workloads). */
+long sud_inramfs_op_dup(int oldfd);
+long sud_inramfs_op_dup3(int oldfd, int newfd, int flags);
+long sud_inramfs_op_fcntl_dupfd(int oldfd, int minfd, int cloexec);
+
+/* Return the file-status flags (O_RDONLY/O_WRONLY/O_RDWR | O_APPEND)
+ * for the given inramfs-owned fd.  Mirrors fcntl(F_GETFL). */
+long sud_inramfs_op_fcntl_getfl(int fd);
+
+/* Update the file-status flags on the given inramfs-owned fd.  Only
+ * O_APPEND/O_NONBLOCK can be changed (per fcntl(F_SETFL) semantics);
+ * the access mode is preserved.  Mirrors fcntl(F_SETFL). */
+long sud_inramfs_op_fcntl_setfl(int fd, int flags);
+
+/* Fill a `struct statx` (kernel ABI) for the given path.  `mask` is
+ * the caller's STATX_* mask; we always return the basic fields
+ * regardless.  `follow` controls trailing-symlink resolution. */
+long sud_inramfs_op_statx_fill(const char *abs_path, int follow,
+                               unsigned int mask, void *statx_buf);
+
 #endif /* SUD_INRAMFS_INRAMFS_H */

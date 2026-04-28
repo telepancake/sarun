@@ -294,12 +294,28 @@ INRAMFS_TEST_SRCS := sud/inramfs/tests/test_inramfs.c \
                      libc-fs/libc.c libc-fs/deps/printf/printf.c
 INRAMFS_TEST_HDRS := sud/inramfs/inramfs.h sud/inramfs/internal.h \
                      sud/addin.h libc-fs/libc.h libc-fs/fmt.h
-.PHONY: inramfs-test
+.PHONY: inramfs-test inramfs-test-e2e
 inramfs-test: build/inramfs_test64 build/inramfs_test32
 	@echo '--- running 64-bit inramfs tests ---'
 	./build/inramfs_test64
 	@echo '--- running 32-bit inramfs tests ---'
 	./build/inramfs_test32
+	@echo '--- running inramfs end-to-end harness ---'
+	$(MAKE) inramfs-test-e2e
+
+# inramfs end-to-end harness: runs sudtrace + strace over a tiny
+# shell workload and asserts zero kernel file syscalls touch any
+# path under the inramfs mount.  This is the "milestone 1" gate from
+# the inramfs plan — without it nothing else is verifiable.
+#
+# The harness needs both the wrapper (sud64) and the launcher
+# (sudtrace), built with the inramfs add-in compiled in.  We force
+# SUD_ADDINS to include the add-in so a developer running this
+# target directly (not via `make all`) gets a working build.
+inramfs-test-e2e: tests/inramfs_e2e.sh
+	@SUD_ADDINS="sud/trace sud/path_remap sud/inramfs" \
+	    $(MAKE) -s sud64 sudtrace
+	./tests/inramfs_e2e.sh
 
 build/inramfs_test64: $(INRAMFS_TEST_SRCS) $(INRAMFS_TEST_HDRS)
 	@mkdir -p build

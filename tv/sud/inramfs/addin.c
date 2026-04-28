@@ -94,6 +94,18 @@ static void fdtab_release(int fd)
 
 int sud_inramfs_owns_fd(int fd) { return fdtab_lookup(fd) != 0; }
 
+/* Public: scrub any fdtab entry for `fd` (used when the kernel is
+ * about to atomically replace it via dup2/dup3 from a NON-inramfs
+ * source — in that case we don't hijack the syscall, but we still
+ * need to forget our stale registration before the kernel does the
+ * dup, otherwise subsequent read/write on `fd` will be misrouted
+ * back into inramfs).  No effect if fd is not tracked. */
+static void fdtab_forget(int fd)
+{
+    struct sud_ir_open_file *of = fdtab_lookup(fd);
+    if (of) of->kfd = -1;
+}
+
 /* ================================================================
  * Path resolution helper (dirfd, relative path) → absolute path
  * ================================================================ */
@@ -637,6 +649,176 @@ long sud_inramfs_op_statx(const char *abs_path, int follow,
     return -ENOSYS;
 }
 
+/* statx adapter: walk the path, fill a `struct statx` for the
+ * basic-stats fields.  Glibc/coreutils gate on STATX_BASIC_STATS,
+ * so we always populate those bits regardless of the caller's mask
+ * (kernel statx is allowed to over-fill).  Newer fields (btime,
+ * mnt_id, dio align) are zeroed. */
+long sud_inramfs_op_statx_fill(const char *abs_path, int follow,
+                               unsigned int mask, void *statx_buf)
+{
+    (void)mask;
+    int err = 0;
+    uint32_t idx = sud_ir_walk(abs_path, follow ? 1 : 0, &err);
+    if (!idx) return err ? err : -ENOENT;
+    struct sud_ir_inode *ino = sud_ir_inode_get(idx);
+    if (!ino) return -ENOENT;
+
+    struct statx *stx = (struct statx *)statx_buf;
+    memset(stx, 0, sizeof(*stx));
+
+    stx->stx_mask    = STATX_BASIC_STATS;
+    stx->stx_blksize = SUD_IR_BLOCK_SIZE;
+    stx->stx_nlink   = ino->nlink;
+    stx->stx_uid     = ino->uid;
+    stx->stx_gid     = ino->gid;
+    uint32_t mode_bits = (ino->type == SUD_IR_T_DIR ? S_IFDIR
+                       :  ino->type == SUD_IR_T_LNK ? S_IFLNK
+                       :                              S_IFREG)
+                       | (ino->mode & 07777);
+    stx->stx_mode    = (uint16_t)mode_bits;
+    stx->stx_ino     = idx;
+    stx->stx_size    = ino->size;
+    stx->stx_blocks  = (ino->size + 511) / 512;
+    stx->stx_atime.tv_sec  = (int64_t)(ino->atime_ns / 1000000000ull);
+    stx->stx_atime.tv_nsec = (uint32_t)(ino->atime_ns % 1000000000ull);
+    stx->stx_mtime.tv_sec  = (int64_t)(ino->mtime_ns / 1000000000ull);
+    stx->stx_mtime.tv_nsec = (uint32_t)(ino->mtime_ns % 1000000000ull);
+    stx->stx_ctime.tv_sec  = (int64_t)(ino->ctime_ns / 1000000000ull);
+    stx->stx_ctime.tv_nsec = (uint32_t)(ino->ctime_ns % 1000000000ull);
+    /* No btime (creation time tracking) yet; mask bit stays clear. */
+    return 0;
+}
+
+/* ================================================================
+ * fd duplication.
+ *
+ * We delegate the actual fd-number allocation to the kernel via the
+ * raw dup/dup3 syscalls — the kernel knows which numbers are free,
+ * what FD_CLOEXEC needs to be set on the new fd, and how to close
+ * an existing entry at `newfd` for dup2/dup3.  After the kernel
+ * call returns the new fd number, we register it in our fd table so
+ * subsequent read/write/lseek/close on the new fd dispatch back into
+ * inramfs.
+ *
+ * Caveat: in Linux, dup2/dup3 produces two fds that share the same
+ * "open file description" (and therefore f_pos).  Our fd table
+ * stores a per-fd `pos`, so two duplicates each track their own
+ * position.  This is wrong only for code that reads/writes through
+ * one duplicate while another reads f_pos — uncommon in build
+ * workloads.  The shared inode means file *contents* are correctly
+ * shared, which is the property bash's redirect logic actually
+ * relies on.
+ * ================================================================ */
+
+static long fdtab_register_dup(struct sud_ir_open_file *src, int newkfd)
+{
+    /* Allocate a new fdtab slot for newkfd.  We can't reuse fdtab_alloc
+     * directly because it overwrites pos/flags; we want to inherit. */
+    fdtab_init();
+    /* Defensive: if newkfd already has an entry (e.g. dup2 onto an
+     * inramfs fd), the kernel already closed it on our behalf — drop
+     * the stale entry. */
+    {
+        struct sud_ir_open_file *stale = fdtab_lookup(newkfd);
+        if (stale) stale->kfd = -1;
+    }
+    for (int i = 0; i < SUD_IR_FD_TABLE_SIZE; i++) {
+        if (g_fdtab[i].kfd == -1) {
+            g_fdtab[i].kfd        = newkfd;
+            g_fdtab[i].inode_idx  = src->inode_idx;
+            g_fdtab[i].generation = src->generation;
+            g_fdtab[i].pos        = src->pos;
+            g_fdtab[i].flags      = src->flags;
+            g_fdtab[i].dir_cookie = src->dir_cookie;
+            return newkfd;
+        }
+    }
+    return -EMFILE;
+}
+
+long sud_inramfs_op_dup(int oldfd)
+{
+    struct sud_ir_open_file *of = fdtab_lookup(oldfd);
+    if (!of) return -EBADF;
+#ifdef SYS_dup
+    long newkfd = raw_syscall6(SYS_dup, oldfd, 0, 0, 0, 0, 0);
+#else
+    /* No SYS_dup on this arch (e.g. aarch64 only has dup3); use
+     * dup3 with newfd allocated by us via F_DUPFD trick — but for
+     * the platforms we ship on (x86_64 / i386) SYS_dup exists. */
+    long newkfd = -ENOSYS;
+#endif
+    if (newkfd < 0) return newkfd;
+    long rc = fdtab_register_dup(of, (int)newkfd);
+    if (rc < 0) raw_close((int)newkfd);
+    return rc;
+}
+
+long sud_inramfs_op_dup3(int oldfd, int newfd, int flags)
+{
+    struct sud_ir_open_file *of = fdtab_lookup(oldfd);
+    if (!of) return -EBADF;
+    if (oldfd == newfd) {
+        /* Linux's dup2 returns oldfd; dup3 returns -EINVAL for this.
+         * Caller distinguishes via flags-validation outside. */
+        return newfd;
+    }
+#ifdef SYS_dup3
+    long newkfd = raw_syscall6(SYS_dup3, oldfd, newfd, flags, 0, 0, 0);
+#else
+    long newkfd = raw_syscall6(SYS_dup2, oldfd, newfd, 0, 0, 0, 0);
+    (void)flags;
+#endif
+    if (newkfd < 0) return newkfd;
+    long rc = fdtab_register_dup(of, (int)newkfd);
+    if (rc < 0) raw_close((int)newkfd);
+    return rc;
+}
+
+long sud_inramfs_op_fcntl_dupfd(int oldfd, int minfd, int cloexec)
+{
+    struct sud_ir_open_file *of = fdtab_lookup(oldfd);
+    if (!of) return -EBADF;
+#if defined(SYS_fcntl)
+    long cmd = cloexec ? F_DUPFD_CLOEXEC : F_DUPFD;
+    long newkfd = raw_syscall6(SYS_fcntl, oldfd, cmd, minfd, 0, 0, 0);
+#elif defined(SYS_fcntl64)
+    long cmd = cloexec ? F_DUPFD_CLOEXEC : F_DUPFD;
+    long newkfd = raw_syscall6(SYS_fcntl64, oldfd, cmd, minfd, 0, 0, 0);
+#else
+    (void)minfd; (void)cloexec;
+    long newkfd = -ENOSYS;
+#endif
+    if (newkfd < 0) return newkfd;
+    long rc = fdtab_register_dup(of, (int)newkfd);
+    if (rc < 0) raw_close((int)newkfd);
+    return rc;
+}
+
+long sud_inramfs_op_fcntl_getfl(int fd)
+{
+    struct sud_ir_open_file *of = fdtab_lookup(fd);
+    if (!of) return -EBADF;
+    /* Return access-mode | O_APPEND | O_NONBLOCK that we recorded at
+     * open time (plus any later F_SETFL).  Other status bits are not
+     * meaningful for in-RAM files. */
+    return (long)(of->flags & (O_ACCMODE | O_APPEND | O_NONBLOCK));
+}
+
+long sud_inramfs_op_fcntl_setfl(int fd, int flags)
+{
+    struct sud_ir_open_file *of = fdtab_lookup(fd);
+    if (!of) return -EBADF;
+    /* fcntl(F_SETFL) only updates O_APPEND/O_NONBLOCK/O_DIRECT/O_ASYNC
+     * — access mode and creation flags are immutable.  We only model
+     * the first two. */
+    int keep = of->flags & ~(O_APPEND | O_NONBLOCK);
+    int set  = flags & (O_APPEND | O_NONBLOCK);
+    of->flags = keep | set;
+    return 0;
+}
+
 /* ================================================================
  * Pre-syscall dispatch
  * ================================================================ */
@@ -808,6 +990,114 @@ static int inramfs_pre_syscall(struct sud_syscall_ctx *ctx)
     }
 #endif
 
+    /* ---- dup family.  We hijack only when the SOURCE fd is an
+     * inramfs fd.  dup3 / dup2 with a non-inramfs source must pass
+     * through unchanged so the kernel's normal fd-table semantics
+     * apply.  Subtle case: dup2/dup3 with an inramfs source onto a
+     * destination fd that the kernel has assigned to *something else*
+     * (e.g. a pipe, a real file) — the kernel close-on-replace will
+     * close that other fd, then make `newfd` alias the inramfs memfd.
+     * If the destination was an inramfs fd, fdtab_register_dup
+     * scrubs the stale entry.
+     *
+     * Symmetric subtle case: dup2/dup3 with a NON-inramfs source
+     * onto an inramfs-tracked destination (e.g. bash restoring fd 1
+     * after `echo X >&5`).  The kernel will atomically replace fd 1,
+     * but our fdtab still has a stale entry tagging fd 1 as inramfs
+     * — so subsequent write(1, ...) would be misrouted back here.
+     * Scrub before falling through. */
+#ifdef SYS_dup
+    if (nr == SYS_dup && sud_inramfs_owns_fd((int)ctx->args[0])) {
+        return short_circuit(ctx, sud_inramfs_op_dup((int)ctx->args[0]));
+    }
+#endif
+#ifdef SYS_dup2
+    if (nr == SYS_dup2) {
+        int oldfd = (int)ctx->args[0];
+        int newfd = (int)ctx->args[1];
+        if (sud_inramfs_owns_fd(oldfd)) {
+            return short_circuit(ctx,
+                sud_inramfs_op_dup3(oldfd, newfd, 0));
+        }
+        if (sud_inramfs_owns_fd(newfd)) fdtab_forget(newfd);
+        /* fall through to kernel */
+    }
+#endif
+#ifdef SYS_dup3
+    if (nr == SYS_dup3) {
+        int oldfd = (int)ctx->args[0];
+        int newfd = (int)ctx->args[1];
+        if (sud_inramfs_owns_fd(oldfd)) {
+            return short_circuit(ctx,
+                sud_inramfs_op_dup3(oldfd, newfd, (int)ctx->args[2]));
+        }
+        if (sud_inramfs_owns_fd(newfd)) fdtab_forget(newfd);
+        /* fall through to kernel */
+    }
+#endif
+
+    /* ---- fcntl: only a small set of commands are inramfs-relevant.
+     *   F_DUPFD / F_DUPFD_CLOEXEC : new fd aliasing the same inode.
+     *   F_GETFL / F_SETFL         : query/update file-status flags.
+     *   F_GETFD / F_SETFD         : per-fd flags (FD_CLOEXEC).  These
+     *                               live on the underlying memfd and
+     *                               the kernel handles them correctly,
+     *                               so we DELIBERATELY do not hijack
+     *                               them — falling through to the
+     *                               kernel keeps cloexec correct.
+     * Anything else (advisory locks, etc.) is queued for follow-up
+     * milestones; for now pass through and let the kernel do whatever
+     * it does with a memfd (typically a clean errno).
+     */
+#define DO_FCNTL(SYSNR) \
+    if (nr == SYSNR && sud_inramfs_owns_fd((int)ctx->args[0])) { \
+        long cmd = ctx->args[1]; \
+        if (cmd == F_DUPFD) \
+            return short_circuit(ctx, \
+                sud_inramfs_op_fcntl_dupfd((int)ctx->args[0], \
+                                           (int)ctx->args[2], 0)); \
+        if (cmd == F_DUPFD_CLOEXEC) \
+            return short_circuit(ctx, \
+                sud_inramfs_op_fcntl_dupfd((int)ctx->args[0], \
+                                           (int)ctx->args[2], 1)); \
+        if (cmd == F_GETFL) \
+            return short_circuit(ctx, \
+                sud_inramfs_op_fcntl_getfl((int)ctx->args[0])); \
+        if (cmd == F_SETFL) \
+            return short_circuit(ctx, \
+                sud_inramfs_op_fcntl_setfl((int)ctx->args[0], \
+                                           (int)ctx->args[2])); \
+        /* fall through to kernel for F_GETFD/F_SETFD/etc. */ \
+    }
+#ifdef SYS_fcntl
+    DO_FCNTL(SYS_fcntl)
+#endif
+#ifdef SYS_fcntl64
+    DO_FCNTL(SYS_fcntl64)
+#endif
+#undef DO_FCNTL
+
+    /* ---- sync ops on inramfs fds: in-RAM storage is "durable" for
+     * our purposes, so these are no-ops returning success.  We still
+     * have to validate the fd exists to match Linux semantics
+     * (fsync(non-fd) → -EBADF). */
+#ifdef SYS_fsync
+    if (nr == SYS_fsync && sud_inramfs_owns_fd((int)ctx->args[0])) {
+        return short_circuit(ctx, 0);
+    }
+#endif
+#ifdef SYS_fdatasync
+    if (nr == SYS_fdatasync && sud_inramfs_owns_fd((int)ctx->args[0])) {
+        return short_circuit(ctx, 0);
+    }
+#endif
+#ifdef SYS_sync_file_range
+    if (nr == SYS_sync_file_range
+        && sud_inramfs_owns_fd((int)ctx->args[0])) {
+        return short_circuit(ctx, 0);
+    }
+#endif
+
     /* ---- Path-bearing syscalls: hijack only if path is under mount. */
 #ifdef SYS_openat
     if (nr == SYS_openat) {
@@ -895,6 +1185,23 @@ static int inramfs_pre_syscall(struct sud_syscall_ctx *ctx)
         if (r < 0)   return short_circuit(ctx, r);
         return short_circuit(ctx,
             sud_inramfs_op_stat(abs, (void *)ctx->args[1], 0));
+    }
+#endif
+#ifdef SYS_statx
+    if (nr == SYS_statx) {
+        /* statx(dirfd, pathname, flags, mask, statxbuf) */
+        const char *abs;
+        int dirfd = (int)ctx->args[0];
+        const char *p = (const char *)ctx->args[1];
+        int flags = (int)ctx->args[2];
+        unsigned int mask = (unsigned int)ctx->args[3];
+        void *buf = (void *)ctx->args[4];
+        int r = resolve_into_scratch(ctx, dirfd, p, &abs);
+        if (r == -1) return 0;
+        if (r < 0)   return short_circuit(ctx, r);
+        int follow = (flags & AT_SYMLINK_NOFOLLOW) ? 0 : 1;
+        return short_circuit(ctx,
+            sud_inramfs_op_statx_fill(abs, follow, mask, buf));
     }
 #endif
 

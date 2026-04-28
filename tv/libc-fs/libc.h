@@ -93,6 +93,29 @@
 #ifdef __NR_getdents64
 #define SYS_getdents64     __NR_getdents64
 #endif
+
+/* fd duplication and fcntl. */
+#ifdef __NR_dup
+#define SYS_dup            __NR_dup
+#endif
+#ifdef __NR_fcntl
+#define SYS_fcntl          __NR_fcntl
+#endif
+#ifdef __NR_fcntl64
+#define SYS_fcntl64        __NR_fcntl64
+#endif
+
+/* Sync ops — programs (sqlite, makefiles) call these often; we
+ * treat in-RAM storage as durable, so the addin makes them no-ops. */
+#ifdef __NR_fsync
+#define SYS_fsync          __NR_fsync
+#endif
+#ifdef __NR_fdatasync
+#define SYS_fdatasync      __NR_fdatasync
+#endif
+#ifdef __NR_sync_file_range
+#define SYS_sync_file_range __NR_sync_file_range
+#endif
 #ifdef __NR_getdents
 #define SYS_getdents       __NR_getdents
 #endif
@@ -676,6 +699,73 @@ extern int g_errno_value;
 #ifndef UTIME_OMIT
 #define UTIME_OMIT  ((1L << 30) - 2L)
 #endif
+
+/* fcntl(2) command numbers (Linux ABI). */
+#ifndef F_DUPFD
+#define F_DUPFD          0
+#define F_GETFD          1
+#define F_SETFD          2
+#define F_GETFL          3
+#define F_SETFL          4
+#endif
+#ifndef F_DUPFD_CLOEXEC
+#define F_DUPFD_CLOEXEC  1030
+#endif
+#ifndef FD_CLOEXEC
+#define FD_CLOEXEC       1
+#endif
+
+/* statx(2) — kernel ABI struct.  Layout is exactly as in
+ * <linux/stat.h> uapi (Linux ≥ 4.11).  We define it here so the
+ * freestanding addin doesn't need libc/uapi headers. */
+#ifndef STATX_TYPE
+#define STATX_TYPE        0x00000001U
+#define STATX_MODE        0x00000002U
+#define STATX_NLINK       0x00000004U
+#define STATX_UID         0x00000008U
+#define STATX_GID         0x00000010U
+#define STATX_ATIME       0x00000020U
+#define STATX_MTIME       0x00000040U
+#define STATX_CTIME       0x00000080U
+#define STATX_INO         0x00000100U
+#define STATX_SIZE        0x00000200U
+#define STATX_BLOCKS      0x00000400U
+#define STATX_BASIC_STATS 0x000007ffU
+#define STATX_BTIME       0x00000800U
+#endif
+
+struct statx_timestamp {
+    int64_t  tv_sec;
+    uint32_t tv_nsec;
+    int32_t  __reserved;
+};
+
+struct statx {
+    uint32_t stx_mask;
+    uint32_t stx_blksize;
+    uint64_t stx_attributes;
+    uint32_t stx_nlink;
+    uint32_t stx_uid;
+    uint32_t stx_gid;
+    uint16_t stx_mode;
+    uint16_t __spare0[1];
+    uint64_t stx_ino;
+    uint64_t stx_size;
+    uint64_t stx_blocks;
+    uint64_t stx_attributes_mask;
+    struct statx_timestamp stx_atime;
+    struct statx_timestamp stx_btime;
+    struct statx_timestamp stx_ctime;
+    struct statx_timestamp stx_mtime;
+    uint32_t stx_rdev_major;
+    uint32_t stx_rdev_minor;
+    uint32_t stx_dev_major;
+    uint32_t stx_dev_minor;
+    uint64_t stx_mnt_id;
+    uint32_t stx_dio_mem_align;
+    uint32_t stx_dio_offset_align;
+    uint64_t __spare3[12];
+};
 
 /* Linux directory-entry record as written by getdents64(2). */
 struct linux_dirent64 {
