@@ -122,8 +122,6 @@ long sud_inramfs_op_ftruncate(int fd, off_t length);
 long sud_inramfs_op_truncate(const char *abs_path, off_t length);
 long sud_inramfs_op_fstat(int fd, void *st_buf);          /* writes a struct stat for the running ABI */
 long sud_inramfs_op_stat(const char *abs_path, void *st_buf, int follow);
-long sud_inramfs_op_statx(const char *abs_path, int follow,
-                          unsigned int mask, void *statx_buf);
 long sud_inramfs_op_mkdir(const char *abs_path, int mode);
 long sud_inramfs_op_rmdir(const char *abs_path);
 long sud_inramfs_op_unlink(const char *abs_path);

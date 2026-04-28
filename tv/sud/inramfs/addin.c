@@ -640,15 +640,6 @@ void sud_inramfs_fill_stat(void *st_buf, uint32_t idx,
 #endif
 }
 
-/* statx is unimplemented in the initial cut — we return -ENOSYS so
- * callers that fall back to fstatat get the right answer. */
-long sud_inramfs_op_statx(const char *abs_path, int follow,
-                          unsigned int mask, void *statx_buf)
-{
-    (void)abs_path; (void)follow; (void)mask; (void)statx_buf;
-    return -ENOSYS;
-}
-
 /* statx adapter: walk the path, fill a `struct statx` for the
  * basic-stats fields.  Glibc/coreutils gate on STATX_BASIC_STATS,
  * so we always populate those bits regardless of the caller's mask
