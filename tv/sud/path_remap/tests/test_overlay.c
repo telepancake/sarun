@@ -591,10 +591,10 @@ int main(int argc, char **argv)
     if (g_failures) {
         char buf[64];
         snprintf(buf, sizeof(buf),
-                 "path_remap test: %d failure(s)\n", g_failures);
+                 "overlay test: %d failure(s)\n", g_failures);
         test_log(buf);
         return 1;
     }
-    test_log("path_remap test: all overlay tests passed\n");
+    test_log("overlay test: all overlay tests passed\n");
     return 0;
 }

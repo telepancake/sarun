@@ -438,6 +438,18 @@ static int ensure_parent_in_upper(const char *upper, size_t upper_len,
     return 0;
 }
 
+/* Copy NUL-terminated `src` into `out` of size `out_sz`, returning
+ * SUD_OVERLAY_RESOLVED on success or SUD_OVERLAY_PASSTHROUGH if the
+ * destination is too small.  Bounds-checks before writing so we never
+ * overflow `out`. */
+static int copy_resolved(char *out, size_t out_sz, const char *src)
+{
+    size_t n = strlen(src);
+    if (n + 1 > out_sz) return SUD_OVERLAY_PASSTHROUGH;
+    memcpy(out, src, n + 1);
+    return SUD_OVERLAY_RESOLVED;
+}
+
 int sud_overlay_resolve(const char *path, int for_write,
                         char *out, size_t out_sz)
 {
@@ -472,38 +484,25 @@ int sud_overlay_resolve(const char *path, int for_write,
     if (for_write) {
         if (!r->upper) return SUD_OVERLAY_READONLY;
         ensure_parent_in_upper(r->upper, r->upper_len, tail);
-        memcpy(out, upath, strlen(upath) + 1);
-        if (strlen(upath) + 1 > out_sz) return SUD_OVERLAY_PASSTHROUGH;
-        return SUD_OVERLAY_RESOLVED;
+        return copy_resolved(out, out_sz, upath);
     }
 
     /* Read path. */
     if (upper_state == 1) return SUD_OVERLAY_WHITEOUT;
-    if (upper_state == 2) {
-        if (strlen(upath) + 1 > out_sz) return SUD_OVERLAY_PASSTHROUGH;
-        memcpy(out, upath, strlen(upath) + 1);
-        return SUD_OVERLAY_RESOLVED;
-    }
+    if (upper_state == 2) return copy_resolved(out, out_sz, upath);
     /* Walk lowers. */
     for (int i = 0; i < r->lower_count; i++) {
         char buf[PATH_MAX];
         if (compose_layer(buf, sizeof(buf),
                           r->lowers[i], r->lower_lens[i], tail) < 0)
             continue;
-        if (stat_one(buf, &st) == 0) {
-            if (strlen(buf) + 1 > out_sz) return SUD_OVERLAY_PASSTHROUGH;
-            memcpy(out, buf, strlen(buf) + 1);
-            return SUD_OVERLAY_RESOLVED;
-        }
+        if (stat_one(buf, &st) == 0)
+            return copy_resolved(out, out_sz, buf);
     }
     /* Not found in any layer.  Return the upper path so the syscall
      * itself produces -ENOENT against a meaningful location.  If no
      * upper is configured, return the first lower. */
-    if (r->upper) {
-        if (strlen(upath) + 1 > out_sz) return SUD_OVERLAY_PASSTHROUGH;
-        memcpy(out, upath, strlen(upath) + 1);
-        return SUD_OVERLAY_RESOLVED;
-    }
+    if (r->upper) return copy_resolved(out, out_sz, upath);
     if (r->lower_count > 0) {
         if (compose_layer(out, out_sz,
                           r->lowers[0], r->lower_lens[0], tail) < 0)

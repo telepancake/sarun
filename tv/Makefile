@@ -202,9 +202,9 @@ build/path_remap_test32: $(PATH_REMAP_TEST_SRCS) $(PATH_REMAP_TEST_HDRS)
 
 # path_remap × trace dispatch-order tests.  Built three times in each
 # bitness — both addins, path_remap-only, trace-only — to verify the
-# dispatcher contract: path_remap runs first and may short-circuit;
-# trace, when also linked, sees args that path_remap already mutated.
-# Either addin must work on its own.
+# dispatcher contract: trace runs first and observes the program-
+# supplied args, path_remap runs second and rewrites them for the
+# kernel.  Either addin must work on its own.
 DISPATCH_TEST_BASE_CFLAGS := -O2 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 \
                              -ffreestanding -fno-builtin -fno-stack-protector \
                              -fno-pie -fomit-frame-pointer -I.

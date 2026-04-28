@@ -732,6 +732,145 @@ static void test_only_pathremap_rewrites_path(void)
 
 #endif /* SUD_ADDIN_PATH_REMAP only */
 
+#ifdef SUD_ADDIN_PATH_REMAP
+/* Regression: every syscall the path_remap dispatcher claims to
+ * intercept must actually be intercepted at runtime.  This used to
+ * silently fail when a SYS_xxx alias was missing from libc-fs/libc.h
+ * (e.g. SYS_chdir) — the corresponding `#ifdef SYS_xxx` block
+ * compiled out to nothing, ctx.args[0] was never rewritten, and the
+ * kernel saw the visible-only path → -ENOENT.  End-to-end this broke
+ * `make -C /visible/dir`, `git -C /visible/dir`, etc.
+ *
+ * For each path-bearing syscall we care about, set up a remap rule,
+ * dispatch a fake ctx, and assert that ctx.args[<path-arg>] was
+ * actually rewritten away from the program-supplied merged path —
+ * either to lower (read-side) or to upper (write-side / metadata).
+ * If a future code change accidentally compiles out a handler again,
+ * this test will catch it. */
+static void assert_path_arg_rewritten(long nr, int path_arg_idx,
+                                      int dirfd_arg_idx,
+                                      const char *label)
+{
+    g_curtest = label;
+    fixture_setup();
+    install_overlay();
+
+    /* Make the path we'll query exist in lower so resolve succeeds. */
+    char p[PATH_MAX]; snprintf(p, sizeof(p), "%s/foo", g_lower);
+    t_write_file(p, "x");
+
+    char merged_path[PATH_MAX];
+    snprintf(merged_path, sizeof(merged_path), "%s/foo", g_merged);
+    char want_lower[PATH_MAX], want_upper[PATH_MAX];
+    snprintf(want_lower, sizeof(want_lower), "%s/foo", g_lower);
+    snprintf(want_upper, sizeof(want_upper), "%s/foo", g_upper);
+
+    struct sud_syscall_ctx ctx = make_ctx();
+    ctx.nr = nr;
+    if (dirfd_arg_idx >= 0)
+        ctx.args[dirfd_arg_idx] = AT_FDCWD;
+    ctx.args[path_arg_idx] = (long)merged_path;
+
+    sud_addins_pre_syscall(&ctx);
+
+    const char *got = (const char *)ctx.args[path_arg_idx];
+    int rewritten_to_lower = strcmp(got, want_lower) == 0;
+    int rewritten_to_upper = strcmp(got, want_upper) == 0;
+    /* Acceptable: any layer-resolved path; not acceptable: the
+     * program-supplied merged path leaking through unchanged. */
+    if (!rewritten_to_lower && !rewritten_to_upper) {
+        TASSERT_STREQ(got, want_lower,
+                      "path arg rewritten by dispatcher (handler reachable?)");
+    }
+    fixture_teardown();
+}
+
+static void test_pathremap_intercepts_all_required_syscalls(void)
+{
+    /* If any of these asserts fails with the path NOT rewritten, the
+     * corresponding handler in path_remap/addin.c is unreachable —
+     * either the SYS_xxx alias is missing for the freestanding
+     * build, or the if-chain has a structural bug (early return,
+     * misordered #ifdef, wrong macro name, ...). */
+#ifdef __NR_chdir
+    assert_path_arg_rewritten(__NR_chdir, 0, -1,
+                              "intercept/__NR_chdir");
+#endif
+#ifdef __NR_open
+    assert_path_arg_rewritten(__NR_open, 0, -1,
+                              "intercept/__NR_open");
+#endif
+#ifdef __NR_openat
+    assert_path_arg_rewritten(__NR_openat, 1, 0,
+                              "intercept/__NR_openat");
+#endif
+#ifdef __NR_stat
+    assert_path_arg_rewritten(__NR_stat, 0, -1,
+                              "intercept/__NR_stat");
+#endif
+#ifdef __NR_lstat
+    assert_path_arg_rewritten(__NR_lstat, 0, -1,
+                              "intercept/__NR_lstat");
+#endif
+#ifdef __NR_newfstatat
+    assert_path_arg_rewritten(__NR_newfstatat, 1, 0,
+                              "intercept/__NR_newfstatat");
+#endif
+#ifdef __NR_statx
+    assert_path_arg_rewritten(__NR_statx, 1, 0,
+                              "intercept/__NR_statx");
+#endif
+#ifdef __NR_access
+    assert_path_arg_rewritten(__NR_access, 0, -1,
+                              "intercept/__NR_access");
+#endif
+#ifdef __NR_faccessat
+    assert_path_arg_rewritten(__NR_faccessat, 1, 0,
+                              "intercept/__NR_faccessat");
+#endif
+#ifdef __NR_faccessat2
+    assert_path_arg_rewritten(__NR_faccessat2, 1, 0,
+                              "intercept/__NR_faccessat2");
+#endif
+#ifdef __NR_readlink
+    assert_path_arg_rewritten(__NR_readlink, 0, -1,
+                              "intercept/__NR_readlink");
+#endif
+#ifdef __NR_readlinkat
+    assert_path_arg_rewritten(__NR_readlinkat, 1, 0,
+                              "intercept/__NR_readlinkat");
+#endif
+#ifdef __NR_execve
+    assert_path_arg_rewritten(__NR_execve, 0, -1,
+                              "intercept/__NR_execve");
+#endif
+#ifdef __NR_execveat
+    assert_path_arg_rewritten(__NR_execveat, 1, 0,
+                              "intercept/__NR_execveat");
+#endif
+#ifdef __NR_chmod
+    assert_path_arg_rewritten(__NR_chmod, 0, -1,
+                              "intercept/__NR_chmod");
+#endif
+#ifdef __NR_fchmodat
+    assert_path_arg_rewritten(__NR_fchmodat, 1, 0,
+                              "intercept/__NR_fchmodat");
+#endif
+#ifdef __NR_chown
+    assert_path_arg_rewritten(__NR_chown, 0, -1,
+                              "intercept/__NR_chown");
+#endif
+#ifdef __NR_truncate
+    assert_path_arg_rewritten(__NR_truncate, 0, -1,
+                              "intercept/__NR_truncate");
+#endif
+#ifdef __NR_utimensat
+    assert_path_arg_rewritten(__NR_utimensat, 1, 0,
+                              "intercept/__NR_utimensat");
+#endif
+}
+#endif /* SUD_ADDIN_PATH_REMAP */
+
 #if defined(SUD_ADDIN_TRACE) && !defined(SUD_ADDIN_PATH_REMAP)
 /* "trace only" mode: dispatcher must run trace and leave args alone.
  * path_remap symbol is NOT linked. */
@@ -779,9 +918,11 @@ int main(int argc, char **argv)
     test_both_readonly_overlay_blocks_writes_after_trace();
     test_both_no_rules_means_path_unchanged();
     test_both_unrelated_path_passthrough();
+    test_pathremap_intercepts_all_required_syscalls();
     const char *mode = "BOTH";
 #elif defined(SUD_ADDIN_PATH_REMAP)
     test_only_pathremap_rewrites_path();
+    test_pathremap_intercepts_all_required_syscalls();
     const char *mode = "PATH_REMAP_ONLY";
 #elif defined(SUD_ADDIN_TRACE)
     test_only_trace_leaves_path_alone();

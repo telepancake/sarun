@@ -27,10 +27,49 @@
 #define AT_REMOVEDIR 0x200
 #endif
 
-/* SYS_unlinkat is the modern delete syscall on both x86_64 and i386
- * but the libc may not alias it from __NR_unlinkat. */
+/* libc-fs/libc.h aliases SYS_xxx → __NR_xxx for the syscalls *it*
+ * uses, but path_remap dispatches on a much wider set.  For every
+ * SYS_xxx we test with #ifdef below, ensure the alias exists when
+ * the kernel exposes the underlying __NR_xxx.  Without these
+ * fallbacks the corresponding `#ifdef SYS_xxx` blocks would silently
+ * compile out — the syscall would never be intercepted, paths would
+ * never be remapped, and end-to-end programs (make -C, git -C, etc.)
+ * would mysteriously fail with -ENOENT against the visible-only path. */
 #if !defined(SYS_unlinkat) && defined(__NR_unlinkat)
-#define SYS_unlinkat __NR_unlinkat
+#define SYS_unlinkat   __NR_unlinkat
+#endif
+#if !defined(SYS_unlink) && defined(__NR_unlink)
+#define SYS_unlink     __NR_unlink
+#endif
+#if !defined(SYS_chdir) && defined(__NR_chdir)
+#define SYS_chdir      __NR_chdir
+#endif
+#if !defined(SYS_open) && defined(__NR_open)
+#define SYS_open       __NR_open
+#endif
+#if !defined(SYS_openat) && defined(__NR_openat)
+#define SYS_openat     __NR_openat
+#endif
+#if !defined(SYS_newfstatat) && defined(__NR_newfstatat)
+#define SYS_newfstatat __NR_newfstatat
+#endif
+#if !defined(SYS_fstatat64) && defined(__NR_fstatat64)
+#define SYS_fstatat64  __NR_fstatat64
+#endif
+#if !defined(SYS_faccessat) && defined(__NR_faccessat)
+#define SYS_faccessat  __NR_faccessat
+#endif
+#if !defined(SYS_readlink) && defined(__NR_readlink)
+#define SYS_readlink   __NR_readlink
+#endif
+#if !defined(SYS_readlinkat) && defined(__NR_readlinkat)
+#define SYS_readlinkat __NR_readlinkat
+#endif
+#if !defined(SYS_execve) && defined(__NR_execve)
+#define SYS_execve     __NR_execve
+#endif
+#if !defined(SYS_execveat) && defined(__NR_execveat)
+#define SYS_execveat   __NR_execveat
 #endif
 
 /* The kernel may not have all of these symbols on every libc, so each
