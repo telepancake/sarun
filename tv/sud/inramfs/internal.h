@@ -217,6 +217,8 @@ struct sud_ir_super {
      *                           (= fat_count * SUD_IR_BLOCK_SIZE). */
     uint32_t fat_off;
     uint32_t fat_count;
+    /* 8-byte aligned: cmpxchg8b on i386 requires it for atomicity
+     * (uint64_t struct fields default to 4-byte align under SysV). */
     uint64_t fat_free_head_tagged __attribute__((aligned(8)));
     uint32_t fat_free_count;
     uint32_t _pad_tail;

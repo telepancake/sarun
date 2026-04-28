@@ -601,8 +601,14 @@ static void test_fat_concurrency(void)
     /* Leak check 2: walk the actual free list, assert it has
      * exactly initial_free distinct, in-range, non-zero ids.
      * Catches duplicates (would prove a double-free or a stale
-     * push) and bogus ids (would prove ABA corruption). */
-    static uint8_t seen[64 * 1024 / 8];   /* fat_count <= 4096 here */
+     * push) and bogus ids (would prove ABA corruption).
+     *
+     * Bitmap sized at (1 << 16) bits = 8 KiB: comfortably covers
+     * fat_count for our 16 MiB data shm (4096 blocks) with room
+     * to grow.  Asserted against sb->fat_count below. */
+    static uint8_t seen[(1u << 16) / 8];
+    TASSERT(sb->fat_count < sizeof(seen) * 8,
+            "leak-check bitmap large enough for fat_count");
     memset(seen, 0, sizeof(seen));
     uint32_t *fat = sud_ir_fat();
     uint64_t head = __atomic_load_n(&sb->fat_free_head_tagged,

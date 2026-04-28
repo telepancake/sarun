@@ -452,6 +452,10 @@ uint64_t sud_ir_xxh64(const void *data, size_t len)
 
     if (len >= 32) {
         const uint8_t *limit = end - 32;
+        /* Reference XXH64 seed-derived initial accumulators (seed=0).
+         * `0 - P1` is the spec's two's-complement negation of P1 in
+         * unsigned uint64_t arithmetic — well-defined and matches
+         * the upstream reference implementation. */
         uint64_t v1 = SUD_IR_XXH_P1 + SUD_IR_XXH_P2;
         uint64_t v2 = SUD_IR_XXH_P2;
         uint64_t v3 = 0;
@@ -518,6 +522,8 @@ static void compose_shm_paths(const char *user_key,
                               char *meta_out, size_t meta_sz,
                               char *data_out, size_t data_sz)
 {
+    /* 64 bytes: holds a 16-hex-char XXH64 key (17 with NUL) or a
+     * caller-supplied SUD_INRAMFS_KEY (snprintf truncates safely). */
     char key[64];
     if (user_key && user_key[0]) {
         snprintf(key, sizeof(key), "%s", user_key);
