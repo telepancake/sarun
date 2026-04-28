@@ -444,47 +444,144 @@ int sud_ir_walk_parent(const char *abs_path,
 
 /* ================================================================
  * File data ops (use per-inode lock, not the namespace lock)
+ *
+ * File content lives in the data shm as a singly-linked chain of
+ * fixed-size SUD_IR_BLOCK_SIZE blocks: ino->u.reg.head_block is
+ * the first block id, super.fat[id] gives the next id (0 = last).
+ * Allocation appends one block at a time (no copy-on-grow); free
+ * unlinks blocks one at a time (each free best-effort hole-punches
+ * the data shm so resident memory tracks live data).
+ *
+ * Per-inode lock is held across read/write/truncate so the chain
+ * shape is stable for the duration of one op.  FAT mutation needs
+ * the global sb->lock as well; we acquire it briefly while
+ * appending or freeing blocks.
  * ================================================================ */
 
-/* Ensure the file's data extent has at least `need_bytes` of capacity.
- * Caller holds the per-inode lock.  Returns 0 on success or -errno. */
-static int file_grow(struct sud_ir_inode *ino, uint64_t need_bytes)
+/* Walk the FAT chain to the n'th block (0-based).  Returns the
+ * block id, or 0 if n is past the end of the chain.  Walks O(n);
+ * fine for the small chains we deal with (a 1 MiB file is 256
+ * blocks).  Caller holds the per-inode lock. */
+static uint32_t chain_block_at(uint32_t head, uint32_t n)
 {
-    if (need_bytes <= ino->u.reg.capacity_bytes) return 0;
-    if (need_bytes > 0xffffffffull) return -EFBIG;
+    uint32_t *fat = sud_ir_fat();
+    uint32_t b = head;
+    while (b && n--) b = fat[b];
+    return b;
+}
 
-    /* Grow geometrically (×2, rounded to block). */
-    uint64_t new_cap = ino->u.reg.capacity_bytes ? ino->u.reg.capacity_bytes : SUD_IR_BLOCK_SIZE;
-    while (new_cap < need_bytes) new_cap *= 2;
-    new_cap = (new_cap + SUD_IR_BLOCK_SIZE - 1) & ~(uint64_t)(SUD_IR_BLOCK_SIZE - 1);
-    if (new_cap > 0xffffffffull) new_cap = 0xffffffff & ~(SUD_IR_BLOCK_SIZE - 1u);
-
-    uint32_t new_blocks = (uint32_t)(new_cap / SUD_IR_BLOCK_SIZE);
-
-    /* Block allocation requires the namespace lock. */
+/* Append `n_new` blocks to the end of `ino`'s chain.  Blocks are
+ * zeroed before being attached so reads past previous EOF see zeros
+ * (POSIX requirement, see truncate(2) and write(2) past-EOF). */
+static int chain_append(struct sud_ir_inode *ino, uint32_t n_new)
+{
+    if (n_new == 0) return 0;
     struct sud_ir_super *sb = sud_ir_sb();
-    sud_ir_lock(&sb->lock);
-    uint32_t new_off = sud_ir_block_alloc(new_blocks);
-    if (!new_off) { sud_ir_unlock(&sb->lock); return -ENOSPC; }
+    uint32_t *fat = sud_ir_fat();
 
-    /* Copy existing data. */
-    if (ino->u.reg.data_block_offset && ino->u.reg.capacity_bytes) {
-        memcpy(sud_ir_ptr(new_off), sud_ir_ptr(ino->u.reg.data_block_offset),
-               ino->u.reg.capacity_bytes);
-        uint32_t old_blocks = (ino->u.reg.capacity_bytes + SUD_IR_BLOCK_SIZE - 1)
-                              / SUD_IR_BLOCK_SIZE;
-        sud_ir_block_free(ino->u.reg.data_block_offset, old_blocks);
+    sud_ir_lock(&sb->lock);
+
+    /* Find current tail (or 0 if the chain is empty). */
+    uint32_t tail = ino->u.reg.head_block;
+    if (tail) while (fat[tail]) tail = fat[tail];
+
+    /* Remember what we've allocated so we can roll back on ENOSPC
+     * partway through (so a failed grow doesn't leak blocks). */
+    uint32_t first_new = 0;
+    uint32_t last_new  = 0;
+    for (uint32_t i = 0; i < n_new; i++) {
+        uint32_t id = sud_ir_fat_alloc();
+        if (id == 0) {
+            /* Roll back: free everything we've allocated this call. */
+            uint32_t b = first_new;
+            while (b) { uint32_t nxt = fat[b]; sud_ir_fat_free(b); b = nxt; }
+            sud_ir_unlock(&sb->lock);
+            return -ENOSPC;
+        }
+        memset(sud_ir_data_block(id), 0, SUD_IR_BLOCK_SIZE);
+        if (!first_new) first_new = id;
+        if (last_new) fat[last_new] = id;
+        last_new = id;
     }
-    /* Zero tail of the new extent (already zero from block_alloc but
-     * be defensive in case the copy left junk past old size). */
-    if (ino->size < new_cap) {
-        uint64_t tail = new_cap - ino->size;
-        memset((char *)sud_ir_ptr(new_off) + ino->size, 0, (size_t)tail);
-    }
-    ino->u.reg.data_block_offset = new_off;
-    ino->u.reg.capacity_bytes    = (uint32_t)new_cap;
+    /* fat[last_new] is already 0 from sud_ir_fat_alloc. */
+
+    /* Splice the new run onto the chain. */
+    if (tail) fat[tail] = first_new;
+    else      ino->u.reg.head_block = first_new;
+    ino->u.reg.nblocks += n_new;
+
     sud_ir_unlock(&sb->lock);
     return 0;
+}
+
+/* Truncate the chain down to `keep` blocks, freeing everything
+ * beyond.  No-op if the chain is already shorter. */
+static void chain_truncate(struct sud_ir_inode *ino, uint32_t keep)
+{
+    if (keep >= ino->u.reg.nblocks) return;
+    struct sud_ir_super *sb = sud_ir_sb();
+    uint32_t *fat = sud_ir_fat();
+
+    sud_ir_lock(&sb->lock);
+
+    uint32_t free_from;
+    if (keep == 0) {
+        free_from = ino->u.reg.head_block;
+        ino->u.reg.head_block = 0;
+    } else {
+        uint32_t last_kept = chain_block_at(ino->u.reg.head_block, keep - 1);
+        free_from = fat[last_kept];
+        fat[last_kept] = 0;
+    }
+    while (free_from) {
+        uint32_t nxt = fat[free_from];
+        sud_ir_fat_free(free_from);
+        free_from = nxt;
+    }
+    ino->u.reg.nblocks = keep;
+
+    sud_ir_unlock(&sb->lock);
+}
+
+/* Ensure the file has enough blocks to address `need_bytes`.  Caller
+ * holds the per-inode lock. */
+static int file_grow(struct sud_ir_inode *ino, uint64_t need_bytes)
+{
+    uint64_t need_blocks = (need_bytes + SUD_IR_BLOCK_SIZE - 1) / SUD_IR_BLOCK_SIZE;
+    if (need_blocks <= ino->u.reg.nblocks) return 0;
+    if (need_blocks > 0xffffffffull) return -EFBIG;
+    return chain_append(ino, (uint32_t)(need_blocks - ino->u.reg.nblocks));
+}
+
+/* Copy `count` bytes between `buf` and the file, starting at
+ * `off`.  `to_file` selects the direction.  Caller holds the
+ * per-inode lock; the chain is walked block by block, copying up to
+ * SUD_IR_BLOCK_SIZE bytes per iteration. */
+static void chain_xfer(struct sud_ir_inode *ino, void *buf, size_t count,
+                       off_t off, int to_file)
+{
+    uint32_t *fat = sud_ir_fat();
+    uint32_t b   = chain_block_at(ino->u.reg.head_block,
+                                   (uint32_t)(off / SUD_IR_BLOCK_SIZE));
+    size_t   pos = 0;
+    size_t   in_block = (size_t)(off % SUD_IR_BLOCK_SIZE);
+
+    while (pos < count && b) {
+        size_t n = SUD_IR_BLOCK_SIZE - in_block;
+        if (n > count - pos) n = count - pos;
+        char *blk = (char *)sud_ir_data_block(b);
+        if (to_file) memcpy(blk + in_block, (const char *)buf + pos, n);
+        else         memcpy((char *)buf + pos, blk + in_block, n);
+        pos += n;
+        in_block = 0;
+        b = fat[b];
+    }
+    /* Tail past EOF when reading: zero-fill (only happens if the
+     * caller asked us to copy past nblocks, which file_read guards
+     * against — defensive). */
+    if (!to_file && pos < count) {
+        memset((char *)buf + pos, 0, count - pos);
+    }
 }
 
 long sud_ir_file_read(struct sud_ir_inode *ino, void *buf,
@@ -496,13 +593,7 @@ long sud_ir_file_read(struct sud_ir_inode *ino, void *buf,
     if ((uint64_t)off >= ino->size) { sud_ir_unlock(&ino->lock); return 0; }
     uint64_t avail = ino->size - (uint64_t)off;
     if ((uint64_t)count > avail) count = (size_t)avail;
-    if (ino->u.reg.data_block_offset && count) {
-        memcpy(buf,
-               (char *)sud_ir_ptr(ino->u.reg.data_block_offset) + off,
-               count);
-    } else {
-        memset(buf, 0, count);
-    }
+    if (count) chain_xfer(ino, buf, count, off, 0);
     ino->atime_ns = sud_ir_now_ns();
     sud_ir_unlock(&ino->lock);
     return (long)count;
@@ -518,11 +609,9 @@ long sud_ir_file_write(struct sud_ir_inode *ino, const void *buf,
     uint64_t end = (uint64_t)off + (uint64_t)count;
     int rc = file_grow(ino, end);
     if (rc) { sud_ir_unlock(&ino->lock); return rc; }
-    /* If we wrote past EOF, the gap is already zero (capacity is
-     * always memset to 0 by the allocator, and grow zeroes the
-     * tail).  Just commit the data. */
-    memcpy((char *)sud_ir_ptr(ino->u.reg.data_block_offset) + off,
-           buf, count);
+    /* Any blocks freshly allocated by file_grow are already zeroed,
+     * so a write past EOF leaves the gap as zeros (POSIX). */
+    chain_xfer(ino, (void *)buf, count, off, 1);
     if (end > ino->size) ino->size = end;
     uint64_t now = sud_ir_now_ns();
     ino->mtime_ns = now;
@@ -540,15 +629,21 @@ long sud_ir_file_truncate(struct sud_ir_inode *ino, off_t length)
     if (newsz > ino->size) {
         int rc = file_grow(ino, newsz);
         if (rc) { sud_ir_unlock(&ino->lock); return rc; }
-        /* file_grow already zeroed the tail. */
+        /* file_grow zeroed the new blocks. */
     } else if (newsz < ino->size) {
-        /* Zero the tail of the live region so subsequent reads of
-         * the (now-reachable) tail see zeros — defensive, since a
-         * later truncate-up will be expected to expose zeros. */
-        if (ino->u.reg.data_block_offset && ino->u.reg.capacity_bytes) {
-            uint64_t tail = ino->u.reg.capacity_bytes - newsz;
-            memset((char *)sud_ir_ptr(ino->u.reg.data_block_offset) + newsz,
-                   0, (size_t)tail);
+        /* Drop blocks beyond the new size, then zero the partial
+         * tail of the last surviving block (so a later truncate-up
+         * exposes zeros, not stale data). */
+        uint32_t keep = (uint32_t)((newsz + SUD_IR_BLOCK_SIZE - 1)
+                                   / SUD_IR_BLOCK_SIZE);
+        chain_truncate(ino, keep);
+        if (keep) {
+            uint32_t tail_id = chain_block_at(ino->u.reg.head_block, keep - 1);
+            uint32_t tail_used = (uint32_t)(newsz % SUD_IR_BLOCK_SIZE);
+            if (tail_used) {
+                memset((char *)sud_ir_data_block(tail_id) + tail_used, 0,
+                       SUD_IR_BLOCK_SIZE - tail_used);
+            }
         }
     }
     ino->size = newsz;

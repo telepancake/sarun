@@ -509,10 +509,11 @@ void *sud_inramfs_op_mmap(void *addr, size_t length, int prot, int flags,
     struct sud_ir_inode *ino = sud_ir_inode_get(of->inode_idx);
     if (!ino) { *err = EBADF; return MAP_FAILED; }
     if (ino->type != SUD_IR_T_REG) { *err = ENODEV; return MAP_FAILED; }
-    if (!ino->u.reg.data_block_offset) {
-        /* Empty file — nothing to map.  Return an anonymous read-only
-         * mapping of the requested length so callers like
-         * mmap()-then-fault behave sensibly. */
+    if (offset < 0) { *err = EINVAL; return MAP_FAILED; }
+
+    /* Empty file: hand back an anonymous mapping of the requested
+     * length so mmap()-then-fault programs behave sensibly. */
+    if (ino->u.reg.head_block == 0) {
         long r = (long)raw_mmap(addr, length, prot,
                                 flags | MAP_ANONYMOUS, -1, 0);
         if ((unsigned long)r >= (unsigned long)-4095) {
@@ -521,26 +522,31 @@ void *sud_inramfs_op_mmap(void *addr, size_t length, int prot, int flags,
         }
         return (void *)r;
     }
-    if (offset < 0 || (uint64_t)offset + length > ino->u.reg.capacity_bytes) {
-        *err = EINVAL;
+
+    /* Single-block fast path: when the requested range falls inside
+     * one FAT block we can hand back a direct pointer into the data
+     * shm, giving full MAP_SHARED semantics with no copy.  Multi-
+     * block ranges need page-table coalescing of non-contiguous
+     * blocks, which is the per-file shm work in M3b — refuse for
+     * now rather than silently lose MAP_SHARED writeback. */
+    uint64_t end = (uint64_t)offset + (uint64_t)length;
+    uint32_t block_ix = (uint32_t)(offset / SUD_IR_BLOCK_SIZE);
+    uint32_t in_block = (uint32_t)(offset % SUD_IR_BLOCK_SIZE);
+    if (end > (uint64_t)(block_ix + 1) * SUD_IR_BLOCK_SIZE) {
+        *err = ENOTSUP;
         return MAP_FAILED;
     }
-    /* The shm region was mapped at (sud_ir_base) starting from offset
-     * 0 of the shm file.  Our data extent starts at byte
-     * data_block_offset within the region.  We can simply hand back a
-     * pointer into the existing mapping for MAP_SHARED reads/writes
-     * — the caller's view of these bytes is exactly the inramfs
-     * view.  This trivially gives them aligned file data without
-     * requiring a second mmap call.
-     *
-     * Honour MAP_FIXED by validating that addr matches our pointer
-     * (otherwise we'd silently give them a non-fixed location). */
-    void *p = (char *)sud_ir_ptr(ino->u.reg.data_block_offset) + offset;
+    if (block_ix >= ino->u.reg.nblocks) { *err = EINVAL; return MAP_FAILED; }
+
+    uint32_t *fat = sud_ir_fat();
+    uint32_t b = ino->u.reg.head_block;
+    for (uint32_t i = 0; i < block_ix; i++) b = fat[b];
+    void *p = (char *)sud_ir_data_block(b) + in_block;
     if ((flags & MAP_FIXED) && addr && addr != p) {
         *err = EINVAL;
         return MAP_FAILED;
     }
-    (void)prot;     /* the underlying mapping is RW; PROT_READ-only
+    (void)prot;     /* underlying mapping is RW; PROT_READ-only
                      * callers see no harm. */
     return p;
 }

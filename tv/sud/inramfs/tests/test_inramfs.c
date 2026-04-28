@@ -407,6 +407,78 @@ static void test_mmap(void)
     teardown_mount();
 }
 
+/* Exercise the FAT chain: write a file that spans many blocks,
+ * with a deterministic byte pattern, then read it back in two
+ * passes (whole-file and a misaligned cross-block window) and
+ * verify every byte.  Then truncate down (releasing trailing
+ * blocks via FAT free) and back up (reallocating from the free
+ * list) and verify the post-grow tail reads as zeros. */
+static void test_multi_block(void)
+{
+    g_curtest = "multi_block";
+    setup_mount("/inramfs", 4, "test_mb");
+
+    /* Pick a size that's clearly multi-block (40 KiB = 10 blocks at
+     * 4 KiB each) and not a multiple of common sizes, so any
+     * off-by-one in chain_xfer's block boundary handling shows up
+     * as a byte mismatch. */
+    enum { N = 40 * 1024 };
+    static unsigned char src[N];
+    for (int i = 0; i < N; i++) src[i] = (unsigned char)((i * 31u + 7u) & 0xff);
+
+    int fd = (int)sud_inramfs_op_open("/inramfs/big",
+                                       O_RDWR | O_CREAT, 0644);
+    TASSERT(fd >= 0, "create big");
+    TASSERT_EQ(sud_inramfs_op_write(fd, src, N), N, "write N bytes");
+
+    /* Whole-file read. */
+    static unsigned char back[N];
+    TASSERT_EQ(sud_inramfs_op_lseek(fd, 0, SEEK_SET), 0, "rewind");
+    TASSERT_EQ(sud_inramfs_op_read(fd, back, N), N, "read N");
+    TASSERT(memcmp(src, back, N) == 0, "round-trip matches");
+
+    /* Misaligned cross-block window (starts mid-block-2, ends
+     * mid-block-5).  Catches block-boundary mistakes in chain_xfer. */
+    enum { OFF = 4096 * 2 + 123, LEN = 4096 * 3 + 456 };
+    static unsigned char window[LEN];
+    TASSERT_EQ(sud_inramfs_op_lseek(fd, OFF, SEEK_SET), OFF, "seek mid-block");
+    TASSERT_EQ(sud_inramfs_op_read(fd, window, LEN), LEN, "read window");
+    TASSERT(memcmp(window, src + OFF, LEN) == 0, "window matches");
+
+    /* Truncate down, then back up: the new tail must read as zeros. */
+    TASSERT_EQ(sud_inramfs_op_ftruncate(fd, 8 * 1024), 0, "truncate to 8 KiB");
+    TASSERT_EQ(sud_inramfs_op_ftruncate(fd, N), 0, "regrow to N");
+    TASSERT_EQ(sud_inramfs_op_lseek(fd, 8 * 1024, SEEK_SET),
+               8 * 1024, "seek past kept tail");
+    TASSERT_EQ(sud_inramfs_op_read(fd, back, N - 8 * 1024),
+               N - 8 * 1024, "read regrown tail");
+    int all_zero = 1;
+    for (int i = 0; i < N - 8 * 1024; i++) {
+        if (back[i]) { all_zero = 0; break; }
+    }
+    TASSERT(all_zero, "regrown tail is zero");
+
+    /* Original first 8 KiB must still be intact. */
+    TASSERT_EQ(sud_inramfs_op_lseek(fd, 0, SEEK_SET), 0, "rewind");
+    TASSERT_EQ(sud_inramfs_op_read(fd, back, 8 * 1024), 8 * 1024, "read kept");
+    TASSERT(memcmp(back, src, 8 * 1024) == 0, "kept prefix intact");
+
+    sud_inramfs_op_close(fd);
+
+    /* Unlink to exercise FAT free of a multi-block chain. */
+    TASSERT_EQ(sud_inramfs_op_unlink("/inramfs/big"), 0, "unlink big");
+
+    /* And we should still be able to allocate after unlink (free
+     * list reattached the blocks). */
+    int fd2 = (int)sud_inramfs_op_open("/inramfs/big2",
+                                        O_RDWR | O_CREAT, 0644);
+    TASSERT(fd2 >= 0, "create big2 after unlink");
+    TASSERT_EQ(sud_inramfs_op_write(fd2, src, N), N, "write again");
+    sud_inramfs_op_close(fd2);
+
+    teardown_mount();
+}
+
 /* ---- entrypoint ---- */
 
 int main(int argc, char **argv)
@@ -428,6 +500,7 @@ int main(int argc, char **argv)
     test_root_mount();
     test_cross_process();
     test_mmap();
+    test_multi_block();
 
     if (g_failures) {
         char b[64];

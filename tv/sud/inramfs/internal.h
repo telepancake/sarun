@@ -95,13 +95,17 @@ struct sud_ir_inode {
     /* Type-specific data.  The largest variant is the inline symlink
      * target buffer. */
     union {
-        /* Regular file: backing data is a single contiguous extent.
-         * data_block_offset == 0 means "no data extent yet".
-         * capacity_bytes is the allocated size (page-multiple);
-         * size <= capacity_bytes is the logical end-of-file. */
+        /* Regular file: data lives in the small-files data shm,
+         * organised as a singly-linked chain of fixed-size data
+         * blocks (SUD_IR_BLOCK_SIZE bytes each).  head_block is the
+         * 1-based FAT block id of the first block; 0 means "empty
+         * file, no blocks allocated yet".  nblocks is the number of
+         * blocks reachable from head_block; logical end-of-file
+         * (`size`) is always <= nblocks * BLOCK_SIZE.  Walk the
+         * chain via super.fat[block_id]; a 0 entry terminates. */
         struct {
-            uint32_t data_block_offset; /* offset into the region */
-            uint32_t capacity_bytes;
+            uint32_t head_block;
+            uint32_t nblocks;
         } reg;
         /* Directory: dirents stored in a singly-linked chain of
          * dirent blocks (each block is SUD_IR_BLOCK_SIZE bytes,
@@ -165,15 +169,43 @@ struct sud_ir_super {
     uint32_t inode_count;       /* size of inode table */
     uint32_t inode_bitmap_off;  /* byte offset to the bitmap */
     uint32_t inode_table_off;   /* byte offset to the inode table */
-    /* Block allocator: bitmap of 4 KiB blocks. */
+    /* Metadata block allocator (used for dirent blocks and symlink
+     * target blocks — not for regular-file data, which lives in the
+     * separate data shm and is allocated via the FAT below). */
     uint32_t block_count;
     uint32_t block_bitmap_off;
-    uint32_t block_data_off;    /* offset of first data block */
+    uint32_t block_data_off;    /* offset of first metadata block */
     uint32_t next_inode_hint;   /* allocator search hint */
     uint32_t next_block_hint;
     /* Statistics (best-effort, not authoritative). */
     uint32_t inodes_in_use;
-    uint32_t blocks_in_use;
+    uint32_t blocks_in_use;     /* metadata blocks in use */
+
+    /* ---- FAT allocator for the data shm ---------------------- */
+    /* A FAT-style block allocator for the small-files data shm
+     * (a separate /dev/shm object, see super.c).  Bookkeeping lives
+     * in the metadata region so 32-bit and 64-bit processes share
+     * the same view of which data blocks are free.
+     *
+     * fat_off          — byte offset (within the metadata region) of
+     *                    a uint32_t array of size fat_count + 1.
+     *                    Index 0 is reserved as the end-of-chain
+     *                    marker.  Indexes 1..fat_count are valid
+     *                    block ids.  For an in-use chain, fat[i] is
+     *                    the id of the next block in that file's
+     *                    chain (0 = last block).  For a free block,
+     *                    fat[i] is the id of the next free block.
+     * fat_free_head    — id of the first free block (0 = no free
+     *                    blocks, i.e. data shm exhausted).
+     * fat_free_count   — invariant cache of the free-list length.
+     * fat_count        — total number of data blocks in the data shm.
+     * data_shm_size    — size of the data shm in bytes
+     *                    (= fat_count * SUD_IR_BLOCK_SIZE). */
+    uint32_t fat_off;
+    uint32_t fat_count;
+    uint32_t fat_free_head;
+    uint32_t fat_free_count;
+    uint64_t data_shm_size;
 };
 
 /* ---- super.c: region access and locking ----------------------- */
@@ -208,10 +240,50 @@ static inline struct sud_ir_super *sud_ir_sb(void)
 void sud_ir_lock(volatile uint32_t *word);
 void sud_ir_unlock(volatile uint32_t *word);
 
-/* Allocate / free a block (4 KiB, page-aligned).  Caller MUST hold
- * sb->lock.  Returns block offset or 0 on out-of-space. */
+/* Allocate / free a metadata block (4 KiB, page-aligned) in the
+ * metadata region.  Used for dirent blocks and symlink targets only;
+ * regular-file content goes through sud_ir_fat_alloc/free instead.
+ * Caller MUST hold sb->lock.  Returns block offset or 0 on
+ * out-of-space. */
 uint32_t sud_ir_block_alloc(uint32_t nblocks);
 void     sud_ir_block_free(uint32_t off, uint32_t nblocks);
+
+/* ---- Data shm: small-files store with FAT block allocator ---- */
+
+/* Pointer to the start of the data shm in this process's address
+ * space, or NULL if the data shm is not currently mapped.  Walking a
+ * file's FAT chain requires knowing the in-process address of each
+ * data block: sud_ir_data_block(id) returns it as
+ *   sud_ir_data_base + (id - 1) * SUD_IR_BLOCK_SIZE.
+ * Both 32-bit and 64-bit map the data shm at process start (see
+ * super.c::map_data_shm).  Block ids are 1-based; id 0 is reserved
+ * as the FAT end-of-chain / "no block" sentinel. */
+extern volatile char *sud_ir_data_base;
+
+static inline void *sud_ir_data_block(uint32_t block_id)
+{
+    if (block_id == 0 || !sud_ir_data_base) return 0;
+    return (void *)(sud_ir_data_base
+                    + (size_t)(block_id - 1) * SUD_IR_BLOCK_SIZE);
+}
+
+static inline uint32_t *sud_ir_fat(void)
+{
+    return (uint32_t *)sud_ir_ptr(sud_ir_sb()->fat_off);
+}
+
+/* Allocate exactly one data block from the FAT free list.  Returns a
+ * 1-based block id, or 0 if the data shm is full.  The block's bytes
+ * are NOT pre-zeroed (callers that need a clean block must zero it
+ * explicitly — file_grow does this so reads past the previous EOF
+ * see zeros).  Caller MUST hold sb->lock. */
+uint32_t sud_ir_fat_alloc(void);
+
+/* Return one block (by id) to the free list.  Best-effort: punches a
+ * hole in the data shm so the kernel can reclaim its physical page,
+ * keeping resident-memory cost tracking the live file footprint
+ * rather than the high-water-mark.  Caller MUST hold sb->lock. */
+void     sud_ir_fat_free(uint32_t block_id);
 
 /* Allocate / free an inode index.  Caller MUST hold sb->lock.
  * Returns inode index (1-based) or 0 on out-of-space. */

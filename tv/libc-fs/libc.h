@@ -116,6 +116,18 @@
 #ifdef __NR_sync_file_range
 #define SYS_sync_file_range __NR_sync_file_range
 #endif
+#ifdef __NR_fallocate
+#define SYS_fallocate      __NR_fallocate
+#endif
+/* fallocate(2) flags — only the punch-hole pair we use here.  See
+ * <linux/falloc.h>; we don't pull that in to keep the freestanding
+ * libc-fs minimal. */
+#ifndef FALLOC_FL_KEEP_SIZE
+#define FALLOC_FL_KEEP_SIZE   0x01
+#endif
+#ifndef FALLOC_FL_PUNCH_HOLE
+#define FALLOC_FL_PUNCH_HOLE  0x02
+#endif
 #ifdef __NR_getdents
 #define SYS_getdents       __NR_getdents
 #endif

@@ -17,15 +17,19 @@
  * Module state
  * ================================================================ */
 
-volatile char *sud_ir_base;          /* base of the shared mapping */
+volatile char *sud_ir_base;          /* base of the metadata mapping */
+volatile char *sud_ir_data_base;     /* base of the data shm mapping */
 
 /* Mount config (parsed once from SUD_INRAMFS). */
 static char   g_mount_path[PATH_MAX];
 static size_t g_mount_len;
-static size_t g_region_size;         /* bytes — set from SUD_INRAMFS or default */
+static size_t g_meta_size;           /* metadata region bytes */
+static size_t g_data_size;           /* data shm bytes */
 static int    g_init_done;
 static int    g_active;              /* 1 once attach succeeded */
-static char   g_shm_path[PATH_MAX];
+static char   g_meta_shm_path[PATH_MAX];
+static char   g_data_shm_path[PATH_MAX];
+static int    g_data_fd = -1;        /* kept open for FALLOC_FL_PUNCH_HOLE */
 
 /* ================================================================
  * Public accessors
@@ -176,10 +180,15 @@ void sud_ir_inode_free(uint32_t index)
     struct sud_ir_inode *ino = sud_ir_inode_get(index);
     if (ino) {
         /* Reclaim type-specific data. */
-        if (ino->type == SUD_IR_T_REG && ino->u.reg.data_block_offset) {
-            uint32_t nblocks = (ino->u.reg.capacity_bytes
-                                + SUD_IR_BLOCK_SIZE - 1) / SUD_IR_BLOCK_SIZE;
-            sud_ir_block_free(ino->u.reg.data_block_offset, nblocks);
+        if (ino->type == SUD_IR_T_REG) {
+            uint32_t b = ino->u.reg.head_block;
+            while (b) {
+                uint32_t next = sud_ir_fat()[b];
+                sud_ir_fat_free(b);
+                b = next;
+            }
+            ino->u.reg.head_block = 0;
+            ino->u.reg.nblocks    = 0;
         } else if (ino->type == SUD_IR_T_DIR && ino->u.dir.dirblock_head_offset) {
             uint32_t off = ino->u.dir.dirblock_head_offset;
             while (off) {
@@ -198,13 +207,18 @@ void sud_ir_inode_free(uint32_t index)
 }
 
 /* ================================================================
- * Block allocator (caller holds sb->lock)
+ * Metadata block allocator (caller holds sb->lock)
  *
- * Bitmap of 4 KiB blocks.  nblocks > 1 finds a contiguous run.  This
- * is a simple first-fit scan from a hint — fine for workloads where
- * the file count is dominated by small files; degrades for highly
- * fragmented allocations of large extents (documented future work
- * is a buddy or extent-tree allocator).
+ * Bitmap-allocated 4 KiB blocks living *inside the metadata region*.
+ * Used for dirent blocks and symlink target blocks — anything that
+ * needs to be addressable by region offset and read by both 32-bit
+ * and 64-bit processes via the shared metadata mapping.  Regular-
+ * file content does NOT live here; see sud_ir_fat_alloc/free for
+ * that.
+ *
+ * Simple first-fit scan from a hint with two-pass wrap-around.  The
+ * usage pattern (small directories, occasional symlinks) doesn't
+ * stress this allocator enough to need anything fancier.
  * ================================================================ */
 
 uint32_t sud_ir_block_alloc(uint32_t nblocks)
@@ -261,6 +275,62 @@ void sud_ir_block_free(uint32_t off, uint32_t nblocks)
 }
 
 /* ================================================================
+ * FAT allocator over the data shm (caller holds sb->lock)
+ *
+ * The data shm is a separate /dev/shm object holding only file
+ * content, divided into fixed-size SUD_IR_BLOCK_SIZE blocks.
+ * Allocation state lives entirely in the metadata region: a
+ * uint32_t array of (fat_count + 1) entries plus a free-list head
+ * and count in the super.  Index 0 is reserved (end-of-chain
+ * sentinel); valid block ids are 1..fat_count.
+ *
+ * For an in-use block, fat[id] holds the next-block-id in the
+ * file's chain (0 if last).  For a free block, fat[id] holds the
+ * next free-block-id.  Allocation pops from the head of the free
+ * list (O(1)); free pushes onto the head (O(1)) and punches a hole
+ * in the data shm so the kernel can reclaim the page.
+ *
+ * No headers/footers in the data blocks themselves: hole-punch is
+ * page-aligned and never touches a neighbour file's data.
+ * ================================================================ */
+
+uint32_t sud_ir_fat_alloc(void)
+{
+    struct sud_ir_super *sb = sud_ir_sb();
+    uint32_t id = sb->fat_free_head;
+    if (id == 0) return 0;          /* data shm exhausted */
+    uint32_t *fat = sud_ir_fat();
+    sb->fat_free_head = fat[id];
+    if (sb->fat_free_count) sb->fat_free_count--;
+    fat[id] = 0;                    /* terminator until linked into a chain */
+    return id;
+}
+
+void sud_ir_fat_free(uint32_t block_id)
+{
+    struct sud_ir_super *sb = sud_ir_sb();
+    if (block_id == 0 || block_id > sb->fat_count) return;
+    uint32_t *fat = sud_ir_fat();
+
+    /* Best-effort hole-punch: drop the page from the data shm so
+     * residency tracks live data, not high-water-mark.  Failure
+     * (older kernels, tmpfs without punch-hole support) is not
+     * fatal — the page just stays around until the shm is unlinked. */
+    if (g_data_fd >= 0) {
+#ifdef SYS_fallocate
+        raw_syscall6(SYS_fallocate, g_data_fd,
+                     FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                     (long)(uint64_t)((block_id - 1) * SUD_IR_BLOCK_SIZE),
+                     (long)SUD_IR_BLOCK_SIZE, 0, 0);
+#endif
+    }
+
+    fat[block_id]     = sb->fat_free_head;
+    sb->fat_free_head = block_id;
+    sb->fat_free_count++;
+}
+
+/* ================================================================
  * Region attach / init
  *
  * Coordination:
@@ -277,26 +347,32 @@ void sud_ir_block_free(uint32_t off, uint32_t nblocks)
  *     across processes that share the same SUD_INRAMFS prefix.
  * ================================================================ */
 
-/* Compose the shm path: /dev/shm/sud-inramfs.<key>. */
-static void compose_shm_path(const char *user_key,
-                             const char *mount_path,
-                             char *out, size_t out_sz)
+/* Compose the two shm paths:
+ *   /dev/shm/sud-inramfs.<key>.meta     — metadata region
+ *   /dev/shm/sud-inramfs.<key>.data     — small-files data store
+ *
+ * Splitting them lets us mmap each at its own fixed address (the
+ * metadata region needs a stable layout; the data shm needs to be
+ * hole-punchable without disturbing metadata pages). */
+static void compose_shm_paths(const char *user_key,
+                              const char *mount_path,
+                              char *meta_out, size_t meta_sz,
+                              char *data_out, size_t data_sz)
 {
-    /* If the user provided SUD_INRAMFS_KEY use it verbatim, else hash
-     * the mount path into a hex string so that two different mount
-     * paths in the same UID never collide. */
+    char key[64];
     if (user_key && user_key[0]) {
-        snprintf(out, out_sz, "/dev/shm/sud-inramfs.%s", user_key);
-        return;
+        snprintf(key, sizeof(key), "%s", user_key);
+    } else {
+        /* FNV-1a 64-bit hash of the mount path. */
+        uint64_t h = 0xcbf29ce484222325ull;
+        for (const unsigned char *p = (const unsigned char *)mount_path; *p; p++) {
+            h ^= *p;
+            h *= 0x100000001b3ull;
+        }
+        snprintf(key, sizeof(key), "%016lx", (unsigned long)h);
     }
-    /* FNV-1a 64-bit hash. */
-    uint64_t h = 0xcbf29ce484222325ull;
-    for (const unsigned char *p = (const unsigned char *)mount_path; *p; p++) {
-        h ^= *p;
-        h *= 0x100000001b3ull;
-    }
-    snprintf(out, out_sz, "/dev/shm/sud-inramfs.%016lx",
-             (unsigned long)h);
+    snprintf(meta_out, meta_sz, "/dev/shm/sud-inramfs.%s.meta", key);
+    snprintf(data_out, data_sz, "/dev/shm/sud-inramfs.%s.data", key);
 }
 
 /* Choose the fixed mapping address.  sud32 lives at 0x20000000 and
@@ -319,80 +395,97 @@ static void *fixed_addr(void)
 #endif
 }
 
-/* Initialise a freshly-created region.  Caller has the init latch.
- *
- * Layout:
- *   [0]                              super (struct sud_ir_super)
- *   [aligned-up]                     inode bitmap (SUD_IR_MAX_INODES bits)
- *   [aligned-up]                     inode table (SUD_IR_MAX_INODES * sizeof(inode))
- *   [aligned-up]                     block bitmap
- *   [aligned-up to BLOCK_SIZE]       data blocks
- */
-static void init_region(struct sud_ir_super *sb, uint64_t region_size)
+/* Fixed mapping address for the **data** shm.  Like fixed_addr() but
+ * for the small-files store: kept at its own high address so 32-bit
+ * and 64-bit can both hand out raw pointers into a file's data via
+ * sud_ir_data_block(id), with the address being deterministic across
+ * processes that share the same mount. */
+static void *fixed_data_addr(void)
 {
-    /* Zero everything first.  This is the slow path (only the winner
-     * of the init race runs it), and it ensures the bitmaps and
-     * inode-table generation counters start at known values. */
-    memset((void *)sb, 0, region_size);
+#if defined(__x86_64__)
+    return (void *)0x600000000000UL;
+#else
+    /* Below the metadata mapping (0x80000000) and above the wrapper
+     * (0x20000000); leaves room for both even when the data shm is
+     * sized at the i386 cap of 256 MiB. */
+    return (void *)0x60000000UL;
+#endif
+}
+
+/* Initialise a freshly-created **metadata** region.  Caller has the
+ * init latch; meta_size is the metadata mapping length and
+ * data_blocks is the number of data blocks the FAT must address.
+ *
+ * Layout (all aligned up to 64 B, then BLOCK_SIZE for the metadata
+ * block area):
+ *
+ *   [0]                              super (struct sud_ir_super)
+ *   [aligned]                        inode bitmap (SUD_IR_MAX_INODES bits)
+ *   [aligned]                        inode table  (SUD_IR_MAX_INODES * sizeof(inode))
+ *   [aligned]                        FAT[data_blocks + 1]  (uint32_t per data block)
+ *   [aligned]                        metadata block bitmap
+ *   [BLOCK_SIZE-aligned]             metadata blocks (dirents, symlink targets)
+ */
+static void init_meta_region(struct sud_ir_super *sb,
+                             uint64_t meta_size, uint32_t data_blocks)
+{
+    memset((void *)sb, 0, meta_size);
 
     sb->version     = SUD_IR_VERSION;
-    sb->region_size = region_size;
+    sb->region_size = meta_size;
+    sb->data_shm_size = (uint64_t)data_blocks * SUD_IR_BLOCK_SIZE;
 
     uint32_t off = (uint32_t)((sizeof(*sb) + 63) & ~63u);
 
-    /* Scale inode count to the region size: at most ~1/8 of the
-     * region for the inode table.  This keeps small (test-sized)
-     * regions usable while still providing tens of thousands of
-     * inodes for default-sized regions. */
-    uint32_t inode_count = SUD_IR_MAX_INODES;
-    {
-        uint64_t cap = (region_size / 8) / sizeof(struct sud_ir_inode);
-        if (cap < 64) cap = 64;
-        if (cap < inode_count) inode_count = (uint32_t)cap;
-    }
-    sb->inode_count       = inode_count;
+    sb->inode_count       = SUD_IR_MAX_INODES;
     sb->inode_bitmap_off  = off;
-    off += (inode_count + 7) / 8;
+    off += (sb->inode_count + 7) / 8;
     off = (off + 63) & ~63u;
 
     sb->inode_table_off   = off;
-    off += inode_count * (uint32_t)sizeof(struct sud_ir_inode);
+    off += sb->inode_count * (uint32_t)sizeof(struct sud_ir_inode);
     off = (off + 63) & ~63u;
 
-    /* All remaining space is for the block bitmap + data blocks.  We
-     * size the bitmap to cover the data region; iterate to find the
-     * fixed point. */
-    uint64_t remaining = region_size - off;
-    /* Each (1 byte bitmap) covers 8 * 4096 = 32768 bytes of data.  Solve:
-     *   bitmap_bytes + 8*4096*bitmap_bytes >= remaining
-     *   bitmap_bytes >= remaining / (1 + 32768)
-     */
+    /* FAT: one uint32_t per data block plus index 0 (sentinel). */
+    sb->fat_off   = off;
+    sb->fat_count = data_blocks;
+    off += (data_blocks + 1) * (uint32_t)sizeof(uint32_t);
+    off = (off + 63) & ~63u;
+
+    /* Metadata block area: everything that's left in the metadata
+     * region, used for dirent blocks and symlink targets. */
+    uint64_t remaining = meta_size - off;
     uint64_t bitmap_bytes = remaining / (1 + 8 * SUD_IR_BLOCK_SIZE);
     if (bitmap_bytes < 1) bitmap_bytes = 1;
-    /* Round up bitmap to 64 B and align data area to BLOCK_SIZE. */
     bitmap_bytes = (bitmap_bytes + 63) & ~63ull;
 
     sb->block_bitmap_off = off;
     off += (uint32_t)bitmap_bytes;
     off = (off + SUD_IR_BLOCK_SIZE - 1) & ~(SUD_IR_BLOCK_SIZE - 1u);
     sb->block_data_off = off;
-
-    sb->block_count = (uint32_t)((region_size - off) / SUD_IR_BLOCK_SIZE);
-    /* Cap by what the bitmap can address. */
+    sb->block_count = (uint32_t)((meta_size - off) / SUD_IR_BLOCK_SIZE);
     if (sb->block_count > bitmap_bytes * 8)
         sb->block_count = (uint32_t)(bitmap_bytes * 8);
 
     sb->next_inode_hint = 2;     /* skip slot 0 (NULL) and 1 (root) */
     sb->next_block_hint = 0;
 
-    /* Mark inode 0 (NULL) and inode 1 (root) as in-use, but we'll
-     * initialise root's contents via the regular inode allocator. */
-    uint8_t *bm = (uint8_t *)sud_ir_ptr(sb->inode_bitmap_off);
-    bm_set(bm, 0);  /* sentinel — never returned as a real inode */
-    /* Root: type = DIR, mode = 0755, uid = current uid, gid = current gid,
-     * nlink = 2 (".", ".." from any future child). */
+    /* Build the FAT free list: thread blocks 1..data_blocks together,
+     * 1 → 2 → ... → data_blocks → 0.  Allocations pop from the head;
+     * the LIFO order means freshly-freed blocks are reused first
+     * (good for kernel page-cache locality). */
+    uint32_t *fat = (uint32_t *)((char *)sb + sb->fat_off);
+    fat[0] = 0;                  /* end-of-chain sentinel */
+    for (uint32_t i = 1; i < data_blocks; i++) fat[i] = i + 1;
+    if (data_blocks) fat[data_blocks] = 0;
+    sb->fat_free_head  = data_blocks ? 1 : 0;
+    sb->fat_free_count = data_blocks;
+
+    /* Reserve inode 0 (NULL sentinel) and initialise inode 1 (root). */
+    uint8_t *bm = (uint8_t *)((char *)sb + sb->inode_bitmap_off);
+    bm_set(bm, 0);
     struct sud_ir_inode *table =
-        (struct sud_ir_inode *)sud_ir_ptr(sb->inode_table_off);
+        (struct sud_ir_inode *)((char *)sb + sb->inode_table_off);
     bm_set(bm, 1);
     struct sud_ir_inode *root = &table[1];
     memset((void *)root, 0, sizeof(*root));
@@ -418,30 +511,6 @@ static void init_region(struct sud_ir_super *sb, uint64_t region_size)
     __atomic_store_n(&sb->magic, SUD_IR_MAGIC, __ATOMIC_RELEASE);
 }
 
-/* Open or create the /dev/shm backing file. */
-static int open_or_create_shm(const char *path, uint64_t size, int *created)
-{
-    *created = 0;
-    /* Try EXCL create first (we then own the ftruncate). */
-    int fd = (int)raw_syscall6(SYS_openat, AT_FDCWD, (long)path,
-                               O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC,
-                               0600, 0, 0);
-    if (fd >= 0) {
-        *created = 1;
-#ifdef SYS_ftruncate
-        long r = raw_syscall6(SYS_ftruncate, fd, (long)size, 0, 0, 0, 0);
-#else
-        long r = raw_syscall6(SYS_ftruncate64, fd, (long)size, 0, 0, 0, 0);
-#endif
-        if (r < 0) { raw_close(fd); return (int)r; }
-        return fd;
-    }
-    /* EEXIST: someone else got there first; just open. */
-    fd = (int)raw_syscall6(SYS_openat, AT_FDCWD, (long)path,
-                           O_RDWR | O_CLOEXEC, 0, 0, 0);
-    return fd;
-}
-
 /* Wait for the init latch to settle.  Used by losers of the init race. */
 static void wait_for_init(volatile uint32_t *init_state)
 {
@@ -455,7 +524,11 @@ static void wait_for_init(volatile uint32_t *init_state)
      * disables itself in that case. */
 }
 
-/* Parse SUD_INRAMFS=<path>[:<size_mb>]. */
+/* Parse SUD_INRAMFS=<path>[:<size_mb>].
+ *
+ * `size_mb` sizes the small-files **data** shm.  The metadata region
+ * is sized separately based on inode/dirent capacity (see
+ * choose_meta_size); it doesn't need to scale with file content. */
 static int parse_env(void)
 {
     const char *e = getenv("SUD_INRAMFS");
@@ -472,7 +545,7 @@ static int parse_env(void)
     g_mount_path[plen] = '\0';
     g_mount_len = plen;
 
-    /* Size. */
+    /* Data-shm size. */
     uint64_t size_mb = 256;
     if (p[plen] == ':') {
         const char *s = p + plen + 1;
@@ -483,15 +556,88 @@ static int parse_env(void)
         }
         if (v) size_mb = v;
     }
-    /* Cap at 16 GiB (16384 MiB) for sanity; cap at 1 GiB on i386 so
-     * we don't blow the 32-bit address space. */
+    /* Cap at 16 GiB on 64-bit; cap at 256 MiB on i386 so the data
+     * shm fits comfortably in the 32-bit address space alongside the
+     * metadata region, the wrapper, and the traced program. */
 #if defined(__i386__)
-    if (size_mb > 1024) size_mb = 1024;
+    if (size_mb > 256) size_mb = 256;
 #else
     if (size_mb > 16384) size_mb = 16384;
 #endif
-    g_region_size = (size_t)(size_mb * 1024ull * 1024ull);
+    g_data_size = (size_t)(size_mb * 1024ull * 1024ull);
+
+    /* Metadata sizing: enough for the default inode/dirent budget
+     * plus the FAT.  Computed lazily in choose_meta_size below. */
     return 1;
+}
+
+/* Choose the metadata region size.  Must hold:
+ *   - super
+ *   - inode bitmap (SUD_IR_MAX_INODES bits)
+ *   - inode table  (SUD_IR_MAX_INODES * sizeof(inode))
+ *   - metadata block bitmap + a few hundred 4 KiB metadata blocks
+ *     (for dirents and symlinks)
+ *   - FAT table sized to (data_size / BLOCK_SIZE + 1) uint32_ts
+ *
+ * The result is rounded up to a 4 KiB page. */
+static size_t choose_meta_size(size_t data_size)
+{
+    size_t inode_table = SUD_IR_MAX_INODES * sizeof(struct sud_ir_inode);
+    size_t inode_bitmap = (SUD_IR_MAX_INODES + 7) / 8;
+    size_t fat_entries = data_size / SUD_IR_BLOCK_SIZE + 1;
+    size_t fat_bytes   = fat_entries * sizeof(uint32_t);
+    /* Reserve room for ~1024 metadata blocks (dirents + symlinks);
+     * far more than any sane filesystem needs. */
+    size_t meta_blocks = 1024;
+    size_t meta_block_data = meta_blocks * SUD_IR_BLOCK_SIZE;
+    size_t meta_block_bitmap = (meta_blocks + 7) / 8;
+
+    size_t total = sizeof(struct sud_ir_super)
+                 + inode_bitmap + inode_table
+                 + fat_bytes
+                 + meta_block_bitmap + meta_block_data
+                 + 16 * SUD_IR_BLOCK_SIZE;          /* alignment slack */
+    return (total + SUD_IR_BLOCK_SIZE - 1) & ~(size_t)(SUD_IR_BLOCK_SIZE - 1);
+}
+
+/* Open or create a /dev/shm backing file at `path` and ftruncate it
+ * to `size`.  Returns an open fd or a negative -errno; sets
+ * *created to 1 if we won the create race. */
+static int open_or_create_shm_at(const char *path, uint64_t size, int *created)
+{
+    *created = 0;
+    int fd = (int)raw_syscall6(SYS_openat, AT_FDCWD, (long)path,
+                               O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC,
+                               0600, 0, 0);
+    if (fd >= 0) {
+        *created = 1;
+#ifdef SYS_ftruncate
+        long r = raw_syscall6(SYS_ftruncate, fd, (long)size, 0, 0, 0, 0);
+#else
+        long r = raw_syscall6(SYS_ftruncate64, fd, (long)size, 0, 0, 0, 0);
+#endif
+        if (r < 0) { raw_close(fd); return (int)r; }
+        return fd;
+    }
+    /* Lost the EXCL race; just open. */
+    return (int)raw_syscall6(SYS_openat, AT_FDCWD, (long)path,
+                             O_RDWR | O_CLOEXEC, 0, 0, 0);
+}
+
+/* mmap MAP_SHARED at exactly `want`.  Tries MAP_FIXED_NOREPLACE first
+ * so two add-ins arguing over the same address fail loudly rather
+ * than silently clobbering each other; falls back to MAP_FIXED on
+ * older kernels.  Returns the mapped address or NULL on failure. */
+static void *map_at_fixed(void *want, size_t size, int fd)
+{
+    int mflags = MAP_SHARED | MAP_FIXED;
+    void *p = raw_mmap(want, size, PROT_READ | PROT_WRITE,
+                       mflags | MAP_FIXED_NOREPLACE, fd, 0);
+    if ((unsigned long)p >= (unsigned long)-4095) {
+        p = raw_mmap(want, size, PROT_READ | PROT_WRITE, mflags, fd, 0);
+    }
+    if ((unsigned long)p >= (unsigned long)-4095) return 0;
+    return p;
 }
 
 void sud_inramfs_init(void)
@@ -501,54 +647,60 @@ void sud_inramfs_init(void)
 
     if (!parse_env()) return;            /* no mount configured */
 
-    compose_shm_path(getenv("SUD_INRAMFS_KEY"),
-                     g_mount_path, g_shm_path, sizeof(g_shm_path));
+    g_meta_size = choose_meta_size(g_data_size);
 
-    int created = 0;
-    int fd = open_or_create_shm(g_shm_path, g_region_size, &created);
-    if (fd < 0) return;                  /* can't attach — addin stays inactive */
+    compose_shm_paths(getenv("SUD_INRAMFS_KEY"), g_mount_path,
+                      g_meta_shm_path, sizeof(g_meta_shm_path),
+                      g_data_shm_path, sizeof(g_data_shm_path));
 
-    void *want = fixed_addr();
-    int  mflags = MAP_SHARED | MAP_FIXED;
-    void *base = raw_mmap(want, g_region_size,
-                          PROT_READ | PROT_WRITE,
-                          mflags | MAP_FIXED_NOREPLACE,
-                          fd, 0);
-    /* mmap returns the new mapping address on success or -errno
-     * (in [-4095, -1]) on failure.  Cast to unsigned long so the
-     * test works on i386 where a legitimate high address like
-     * 0x80000000 looks negative when interpreted as signed long. */
-    if ((unsigned long)base >= (unsigned long)-4095) {
-        base = raw_mmap(want, g_region_size,
-                        PROT_READ | PROT_WRITE,
-                        mflags, fd, 0);
-    }
-    raw_close(fd);
-    if ((unsigned long)base >= (unsigned long)-4095) {
+    /* ---- Attach metadata shm. ---- */
+    int meta_created = 0;
+    int meta_fd = open_or_create_shm_at(g_meta_shm_path, g_meta_size,
+                                        &meta_created);
+    if (meta_fd < 0) return;
+    void *meta_base = map_at_fixed(fixed_addr(), g_meta_size, meta_fd);
+    raw_close(meta_fd);
+    if (!meta_base) return;
+    sud_ir_base = (volatile char *)meta_base;
+
+    /* ---- Attach data shm. ----
+     * Held open across the lifetime of the addin so sud_ir_fat_free
+     * can punch holes in it. */
+    int data_created = 0;
+    g_data_fd = open_or_create_shm_at(g_data_shm_path, g_data_size,
+                                      &data_created);
+    if (g_data_fd < 0) {
+        munmap((void *)sud_ir_base, g_meta_size);
+        sud_ir_base = 0;
         return;
     }
+    void *data_base = map_at_fixed(fixed_data_addr(), g_data_size, g_data_fd);
+    if (!data_base) {
+        raw_close(g_data_fd); g_data_fd = -1;
+        munmap((void *)sud_ir_base, g_meta_size);
+        sud_ir_base = 0;
+        return;
+    }
+    sud_ir_data_base = (volatile char *)data_base;
 
-    sud_ir_base = (volatile char *)base;
+    /* ---- Initialise the metadata region (one process wins). ---- */
     struct sud_ir_super *sb = sud_ir_sb();
-
-    if (created) {
-        /* We created the region; we own init. */
-        init_region(sb, g_region_size);
+    uint32_t data_blocks = (uint32_t)(g_data_size / SUD_IR_BLOCK_SIZE);
+    if (meta_created) {
+        init_meta_region(sb, g_meta_size, data_blocks);
         sys_futex(&sb->init_state, FUTEX_WAKE, 0x7fffffff);
     } else {
-        /* Race winner may still be initialising. */
         for (int spins = 0; spins < 1000; spins++) {
             if (__atomic_load_n(&sb->magic, __ATOMIC_ACQUIRE) == SUD_IR_MAGIC)
                 break;
             __asm__ volatile("pause" ::: "memory");
         }
         if (__atomic_load_n(&sb->magic, __ATOMIC_ACQUIRE) != SUD_IR_MAGIC) {
-            /* Try to claim init for ourselves. */
             uint32_t expected = 0;
             if (__atomic_compare_exchange_n(&sb->init_state, &expected, 1u,
                                             0, __ATOMIC_ACQ_REL,
                                             __ATOMIC_RELAXED)) {
-                init_region(sb, g_region_size);
+                init_meta_region(sb, g_meta_size, data_blocks);
                 sys_futex(&sb->init_state, FUTEX_WAKE, 0x7fffffff);
             } else {
                 wait_for_init(&sb->init_state);
@@ -557,9 +709,16 @@ void sud_inramfs_init(void)
     }
 
     if (__atomic_load_n(&sb->magic, __ATOMIC_ACQUIRE) != SUD_IR_MAGIC) {
-        /* Init failed; leave inactive. */
+        /* Init failed somewhere; leave inactive but do not orphan
+         * the data fd. */
+        munmap((void *)sud_ir_data_base, g_data_size);
+        munmap((void *)sud_ir_base,      g_meta_size);
+        raw_close(g_data_fd); g_data_fd = -1;
+        sud_ir_data_base = 0;
+        sud_ir_base      = 0;
         return;
     }
+
     g_active = 1;
 }
 
@@ -568,20 +727,30 @@ void sud_inramfs_init(void)
  * ================================================================ */
 void sud_inramfs_reset_for_testing(void)
 {
-    if (sud_ir_base && g_region_size) {
-        munmap((void *)sud_ir_base, g_region_size);
+    if (sud_ir_base && g_meta_size) {
+        munmap((void *)sud_ir_base, g_meta_size);
     }
-    sud_ir_base = 0;
-    g_active = 0;
-    g_init_done = 0;
-    g_mount_len = 0;
-    g_mount_path[0] = '\0';
-    g_region_size = 0;
-    g_shm_path[0] = '\0';
+    if (sud_ir_data_base && g_data_size) {
+        munmap((void *)sud_ir_data_base, g_data_size);
+    }
+    if (g_data_fd >= 0) raw_close(g_data_fd);
+    sud_ir_base      = 0;
+    sud_ir_data_base = 0;
+    g_data_fd        = -1;
+    g_active         = 0;
+    g_init_done      = 0;
+    g_mount_len      = 0;
+    g_mount_path[0]  = '\0';
+    g_meta_size      = 0;
+    g_data_size      = 0;
+    g_meta_shm_path[0] = '\0';
+    g_data_shm_path[0] = '\0';
 }
 
 void sud_inramfs_unlink_backing_for_testing(void)
 {
-    if (g_shm_path[0])
-        raw_unlinkat(AT_FDCWD, g_shm_path, 0);
+    if (g_meta_shm_path[0])
+        raw_unlinkat(AT_FDCWD, g_meta_shm_path, 0);
+    if (g_data_shm_path[0])
+        raw_unlinkat(AT_FDCWD, g_data_shm_path, 0);
 }
