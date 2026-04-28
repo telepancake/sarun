@@ -13,25 +13,39 @@
  *      them, with no knowledge of any remapping that may follow.
  *      This is important: if the program calls open("/tmp/x"), the
  *      trace must record "/tmp/x" — the path the program actually
- *      asked for — regardless of whether a SUD_OVERLAY/SUD_REMAP
- *      rule will later rewrite "/tmp/x" to e.g. "/home/user/tmp/x"
- *      for the kernel.  Trace output must therefore be byte-for-byte
- *      identical whether path_remap is compiled in, enabled, or
- *      configured with rules — trace is remapping-agnostic.
+ *      asked for — regardless of whether a SUD_OVERLAY/SUD_REMAP/
+ *      SUD_INRAMFS rule will later rewrite or short-circuit the call.
+ *      Trace output must therefore be byte-for-byte identical
+ *      regardless of which mutator addins are compiled in or active.
  *
- *   2. sud_path_remap_addin runs SECOND.  Its pre_syscall mutates
+ *   2. sud_inramfs_addin runs SECOND.  It is the first mutator:
+ *      paths that fall under the in-RAM filesystem mount short-
+ *      circuit immediately, returning a real (memfd-backed) fd or
+ *      a -errno without ever reaching the kernel.  fds returned by
+ *      inramfs are also recognised by inramfs's hijack of fd-based
+ *      ops (read/write/lseek/...) so subsequent operations on them
+ *      are served from the shared shm region.  Paths NOT under the
+ *      mount fall through unchanged to path_remap.
+ *
+ *   3. sud_path_remap_addin runs THIRD.  Its pre_syscall mutates
  *      ctx->args[i] (overlay path resolution) so that the kernel
  *      receives the rewritten path, and may short-circuit the
  *      syscall entirely (whiteout → -ENOENT, read-only overlay →
- *      -EROFS, merged-dir openat → synthetic fd).
+ *      -EROFS, merged-dir openat → synthetic fd).  Because inramfs
+ *      ran first, any args still pointing at an inramfs-mount path
+ *      have already been intercepted; path_remap sees only paths
+ *      that should be passed through to the kernel filesystem.
  *
- * Either addin can be omitted at compile time (via the SUD_ADDIN_*
- * macros set by the Makefile from the SUD_ADDINS list); the other
- * keeps working unmodified.
+ * Any addin can be omitted at compile time (via the SUD_ADDIN_*
+ * macros set by the Makefile from the SUD_ADDINS list); the others
+ * keep working unmodified.
  */
 static const struct sud_addin *const g_addins[] = {
 #ifdef SUD_ADDIN_TRACE
     &sud_trace_addin,
+#endif
+#ifdef SUD_ADDIN_INRAMFS
+    &sud_inramfs_addin,
 #endif
 #ifdef SUD_ADDIN_PATH_REMAP
     &sud_path_remap_addin,

@@ -276,6 +276,53 @@
 #define SYS_lremovexattr   __NR_lremovexattr
 #endif
 
+/* ----------------------------------------------------------------
+ * In-RAM filesystem add-in needs futex (cross-process locking),
+ * memfd_create (process-local fd cookies for inramfs handles), and
+ * ftruncate (resize the shared shm segment on first attach).  These
+ * are useful enough on their own to deserve canonical aliases here
+ * rather than being redefined in addin code.
+ * ---------------------------------------------------------------- */
+#if !defined(SYS_futex) && defined(__NR_futex)
+#define SYS_futex          __NR_futex
+#endif
+#if !defined(SYS_memfd_create) && defined(__NR_memfd_create)
+#define SYS_memfd_create   __NR_memfd_create
+#endif
+#if !defined(SYS_ftruncate) && defined(__NR_ftruncate)
+#define SYS_ftruncate      __NR_ftruncate
+#endif
+#if !defined(SYS_ftruncate64) && defined(__NR_ftruncate64)
+#define SYS_ftruncate64    __NR_ftruncate64
+#endif
+#if !defined(SYS_lseek) && defined(__NR_lseek)
+#define SYS_lseek          __NR_lseek
+#endif
+#if !defined(SYS__llseek) && defined(__NR__llseek)
+#define SYS__llseek        __NR__llseek
+#endif
+#if !defined(SYS_pwrite64) && defined(__NR_pwrite64)
+#define SYS_pwrite64       __NR_pwrite64
+#endif
+#if !defined(SYS_fchmod) && defined(__NR_fchmod)
+#define SYS_fchmod         __NR_fchmod
+#endif
+#if !defined(SYS_fchown) && defined(__NR_fchown)
+#define SYS_fchown         __NR_fchown
+#endif
+#if !defined(SYS_getuid) && defined(__NR_getuid)
+#define SYS_getuid         __NR_getuid
+#endif
+#if !defined(SYS_getuid32) && defined(__NR_getuid32)
+#define SYS_getuid32       __NR_getuid32
+#endif
+#if !defined(SYS_getgid) && defined(__NR_getgid)
+#define SYS_getgid         __NR_getgid
+#endif
+#if !defined(SYS_getgid32) && defined(__NR_getgid32)
+#define SYS_getgid32       __NR_getgid32
+#endif
+
 /* ================================================================
  * POSIX-like types
  * ================================================================ */
@@ -460,6 +507,90 @@ typedef struct ucontext_t {
 #define ENOSYS         38
 #define ENOTEMPTY      39
 
+/* Additional errnos used by the in-RAM filesystem add-in. */
+#ifndef EBUSY
+#define EBUSY           16
+#endif
+#ifndef EXDEV
+#define EXDEV           18
+#endif
+#ifndef ENODEV
+#define ENODEV          19
+#endif
+#ifndef ENOTDIR
+#define ENOTDIR         20
+#endif
+#ifndef EISDIR
+#define EISDIR          21
+#endif
+#ifndef ENFILE
+#define ENFILE          23
+#endif
+#ifndef EMFILE
+#define EMFILE          24
+#endif
+#ifndef ESPIPE
+#define ESPIPE          29
+#endif
+#ifndef ELOOP
+#define ELOOP           40
+#endif
+#ifndef ENODATA
+#define ENODATA         61
+#endif
+#ifndef EOVERFLOW
+#define EOVERFLOW       75
+#endif
+#ifndef ENOTSUP
+#define ENOTSUP         95
+#endif
+#ifndef EAGAIN
+#define EAGAIN          11
+#endif
+#ifndef EFAULT
+#define EFAULT          14
+#endif
+#ifndef ENOSPC
+#define ENOSPC          28
+#endif
+#ifndef EFBIG
+#define EFBIG           27
+#endif
+
+/* Futex op codes used by inramfs's cross-process locks. */
+#ifndef FUTEX_WAIT
+#define FUTEX_WAIT          0
+#endif
+#ifndef FUTEX_WAKE
+#define FUTEX_WAKE          1
+#endif
+#ifndef FUTEX_PRIVATE_FLAG
+#define FUTEX_PRIVATE_FLAG  128
+#endif
+/* inramfs uses *non*-private futexes because the futex word lives in
+ * a MAP_SHARED region accessed by multiple processes; FUTEX_PRIVATE_FLAG
+ * is only valid for single-process use. */
+
+/* memfd_create flags (used by inramfs to allocate process-local fd
+ * cookies that the kernel recognises for close/dup/poll). */
+#ifndef MFD_CLOEXEC
+#define MFD_CLOEXEC         0x0001
+#endif
+#ifndef MFD_ALLOW_SEALING
+#define MFD_ALLOW_SEALING   0x0002
+#endif
+
+/* lseek whence constants. */
+#ifndef SEEK_SET
+#define SEEK_SET 0
+#endif
+#ifndef SEEK_CUR
+#define SEEK_CUR 1
+#endif
+#ifndef SEEK_END
+#define SEEK_END 2
+#endif
+
 extern int g_errno_value;
 #define errno g_errno_value
 
@@ -497,6 +628,64 @@ extern int g_errno_value;
 #define S_IFLNK 0120000
 #define S_IFSOCK 0140000
 
+/* Permission and special-mode bits used by inramfs's mode handling. */
+#ifndef S_ISUID
+#define S_ISUID  04000
+#endif
+#ifndef S_ISGID
+#define S_ISGID  02000
+#endif
+#ifndef S_ISVTX
+#define S_ISVTX  01000
+#endif
+#ifndef S_IRWXU
+#define S_IRWXU  00700
+#endif
+#ifndef S_IRWXG
+#define S_IRWXG  00070
+#endif
+#ifndef S_IRWXO
+#define S_IRWXO  00007
+#endif
+#ifndef S_ISDIR
+#define S_ISDIR(m)  (((m) & S_IFMT) == S_IFDIR)
+#endif
+#ifndef S_ISREG
+#define S_ISREG(m)  (((m) & S_IFMT) == S_IFREG)
+#endif
+#ifndef S_ISLNK
+#define S_ISLNK(m)  (((m) & S_IFMT) == S_IFLNK)
+#endif
+
+/* DT_* constants for getdents64(2) d_type field. */
+#ifndef DT_UNKNOWN
+#define DT_UNKNOWN 0
+#define DT_FIFO    1
+#define DT_CHR     2
+#define DT_DIR     4
+#define DT_BLK     6
+#define DT_REG     8
+#define DT_LNK    10
+#define DT_SOCK   12
+#endif
+
+/* AT_* additions used by inramfs (utimensat, etc.) */
+#ifndef UTIME_NOW
+#define UTIME_NOW   ((1L << 30) - 1L)
+#endif
+#ifndef UTIME_OMIT
+#define UTIME_OMIT  ((1L << 30) - 2L)
+#endif
+
+/* Linux directory-entry record as written by getdents64(2). */
+struct linux_dirent64 {
+    uint64_t       d_ino;
+    int64_t        d_off;
+    unsigned short d_reclen;
+    unsigned char  d_type;
+    char           d_name[];
+};
+
 /* ================================================================
  * Memory mapping
  * ================================================================ */
@@ -509,6 +698,14 @@ extern int g_errno_value;
 #define MAP_FIXED       0x10
 #define MAP_ANONYMOUS   0x20
 #define MAP_FAILED      ((void *)-1)
+
+/* Newer mmap flags used by the inramfs add-in to claim its high-
+ * address region without trampling an existing mapping.  May be
+ * absent on very old kernels; if so, addin code falls back to plain
+ * MAP_FIXED.  Numeric value matches Linux UAPI. */
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
 
 /* ================================================================
  * Signals

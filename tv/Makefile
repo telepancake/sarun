@@ -8,7 +8,7 @@ MOK_CER ?= $(PWD)/MOK.der
 all: tv sudtrace upttrace sud-bins mod-bins
 
 .PHONY: sud-bins mod-bins
-sud-bins: path-remap-test dispatcher-test
+sud-bins: path-remap-test dispatcher-test inramfs-test
 	$(MAKE) $(SUD_NATIVE)
 
 mod-bins:
@@ -45,6 +45,7 @@ clean:
 	rm -f build/dispatcher_test_both32 build/dispatcher_test_both64
 	rm -f build/dispatcher_test_pathremap32 build/dispatcher_test_pathremap64
 	rm -f build/dispatcher_test_trace32 build/dispatcher_test_trace64
+	rm -f build/inramfs_test32 build/inramfs_test64
 
 install:
 	$(MAKE) -C $(MOD_DIR) install
@@ -86,6 +87,10 @@ endif
 ifneq ($(filter sud/path_remap,$(SUD_ADDINS)),)
 SUD_CFLAGS  += -DSUD_ADDIN_PATH_REMAP
 SUD_SRCS    += sud/path_remap/addin.c sud/path_remap/overlay.c
+endif
+ifneq ($(filter sud/inramfs,$(SUD_ADDINS)),)
+SUD_CFLAGS  += -DSUD_ADDIN_INRAMFS
+SUD_SRCS    += sud/inramfs/addin.c sud/inramfs/super.c sud/inramfs/vfs.c
 endif
 SUD_NATIVE  := $(if $(filter x86_64,$(shell uname -m)),sud64,sud32)
 
@@ -279,6 +284,32 @@ $(DISPATCH_TEST_BIN32_TR): $(DISPATCH_TEST_COMMON_SRCS) $(DISPATCH_TEST_HDRS)
 .PHONY: wire-test
 wire-test: tv
 	./tv dump --selftest
+
+# inramfs add-in self-tests.  Built freestanding (-nostdlib) for both
+# 32-bit and 64-bit so any architecture-specific bug in layout, alloc,
+# locking, or the dispatch front-end is caught in CI.  The tests use
+# /dev/shm as the backing region; CI must allow writes there.
+INRAMFS_TEST_SRCS := sud/inramfs/tests/test_inramfs.c \
+                     sud/inramfs/super.c sud/inramfs/vfs.c sud/inramfs/addin.c \
+                     libc-fs/libc.c libc-fs/deps/printf/printf.c
+INRAMFS_TEST_HDRS := sud/inramfs/inramfs.h sud/inramfs/internal.h \
+                     sud/addin.h libc-fs/libc.h libc-fs/fmt.h
+.PHONY: inramfs-test
+inramfs-test: build/inramfs_test64 build/inramfs_test32
+	@echo '--- running 64-bit inramfs tests ---'
+	./build/inramfs_test64
+	@echo '--- running 32-bit inramfs tests ---'
+	./build/inramfs_test32
+
+build/inramfs_test64: $(INRAMFS_TEST_SRCS) $(INRAMFS_TEST_HDRS)
+	@mkdir -p build
+	$(CC) -m64 $(SUD_CFLAGS) -DSUD_ADDIN_INRAMFS $(SUD_LDFLAGS) \
+	    -o $@ $(INRAMFS_TEST_SRCS) -lgcc
+
+build/inramfs_test32: $(INRAMFS_TEST_SRCS) $(INRAMFS_TEST_HDRS)
+	@mkdir -p build
+	$(CC) -m32 $(SUD_CFLAGS) -DSUD_ADDIN_INRAMFS $(SUD_LDFLAGS) \
+	    -o $@ $(INRAMFS_TEST_SRCS) -lgcc
 
 .PHONY: all keygen sign load unload clean clean-bins install test
 test: tv libc-fs-test
