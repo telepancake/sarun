@@ -212,6 +212,57 @@ static inline int raw_access(const char *path, int mode)
                               0, 0, 0);
 }
 
+static inline int raw_unlinkat(int dirfd, const char *path, int flags)
+{
+#ifdef SYS_unlinkat
+    return (int)raw_syscall6(SYS_unlinkat, dirfd, (long)path, flags,
+                              0, 0, 0);
+#else
+    /* Pre-AT-syscalls fallback: only AT_FDCWD with no flags is meaningful. */
+    if (flags == 0)
+        return (int)raw_syscall6(SYS_unlink, (long)path, 0, 0, 0, 0, 0);
+    return (int)raw_syscall6(SYS_rmdir, (long)path, 0, 0, 0, 0, 0);
+#endif
+}
+
+static inline int raw_mkdirat(int dirfd, const char *path, int mode)
+{
+#ifdef SYS_mkdirat
+    return (int)raw_syscall6(SYS_mkdirat, dirfd, (long)path, mode,
+                              0, 0, 0);
+#else
+    return (int)raw_syscall6(SYS_mkdir, (long)path, mode, 0, 0, 0, 0);
+#endif
+}
+
+static inline int raw_mknodat(int dirfd, const char *path,
+                              unsigned int mode, unsigned int dev)
+{
+#ifdef SYS_mknodat
+    return (int)raw_syscall6(SYS_mknodat, dirfd, (long)path, mode, dev,
+                              0, 0);
+#else
+    return (int)raw_syscall6(SYS_mknod, (long)path, mode, dev, 0, 0, 0);
+#endif
+}
+
+static inline int raw_symlinkat(const char *target, int newdirfd,
+                                const char *linkpath)
+{
+#ifdef SYS_symlinkat
+    return (int)raw_syscall6(SYS_symlinkat, (long)target, newdirfd,
+                              (long)linkpath, 0, 0, 0);
+#else
+    return (int)raw_syscall6(SYS_symlink, (long)target, (long)linkpath,
+                              0, 0, 0, 0);
+#endif
+}
+
+static inline pid_t raw_getpid(void)
+{
+    return (pid_t)raw_syscall6(SYS_getpid, 0, 0, 0, 0, 0, 0);
+}
+
 static inline long raw_getdents64(int fd, void *buf, size_t count)
 {
 #ifdef SYS_getdents64

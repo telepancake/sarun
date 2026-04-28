@@ -59,9 +59,10 @@ struct sud_overlay_stat {
 #endif
 
 /* ----------------------------------------------------------------
- *  Raw helper syscalls we need but that aren't in sud/raw.h.
- *  Defined here as static inlines so the test driver gets the same
- *  helpers without pulling in extra headers.
+ *  Helper: lstat that fills our overlay-specific stat struct.
+ *  We can't use raw_fstatat() from sud/raw.h because it operates on
+ *  the libc-fs `struct stat`, while we need access to the kernel-
+ *  layout `st_rdev` to detect whiteouts (char-dev rdev==0).
  * ---------------------------------------------------------------- */
 static inline long sud_ov_lstat(const char *path,
                                 struct sud_overlay_stat *st)
@@ -70,55 +71,9 @@ static inline long sud_ov_lstat(const char *path,
     return raw_syscall6(SYS_newfstatat, AT_FDCWD, (long)path, (long)st,
                         AT_SYMLINK_NOFOLLOW, 0, 0);
 #else
-    return raw_syscall6(__NR_fstatat64, AT_FDCWD, (long)path, (long)st,
+    return raw_syscall6(SYS_fstatat64, AT_FDCWD, (long)path, (long)st,
                         AT_SYMLINK_NOFOLLOW, 0, 0);
 #endif
-}
-
-static inline long sud_ov_mkdir(const char *path, int mode)
-{
-#ifdef __NR_mkdirat
-    return raw_syscall6(__NR_mkdirat, AT_FDCWD, (long)path, mode, 0, 0, 0);
-#else
-    return raw_syscall6(__NR_mkdir, (long)path, mode, 0, 0, 0, 0);
-#endif
-}
-
-static inline long sud_ov_mknod(const char *path, unsigned int mode,
-                                unsigned int dev)
-{
-#ifdef __NR_mknodat
-    return raw_syscall6(__NR_mknodat, AT_FDCWD, (long)path, mode, dev,
-                        0, 0);
-#else
-    return raw_syscall6(__NR_mknod, (long)path, mode, dev, 0, 0, 0);
-#endif
-}
-
-static inline long sud_ov_symlink(const char *target, const char *linkpath)
-{
-#ifdef __NR_symlinkat
-    return raw_syscall6(__NR_symlinkat, (long)target, AT_FDCWD,
-                        (long)linkpath, 0, 0, 0);
-#else
-    return raw_syscall6(__NR_symlink, (long)target, (long)linkpath,
-                        0, 0, 0, 0);
-#endif
-}
-
-static inline long sud_ov_unlink(const char *path)
-{
-#ifdef __NR_unlinkat
-    return raw_syscall6(__NR_unlinkat, AT_FDCWD, (long)path, 0,
-                        0, 0, 0);
-#else
-    return raw_syscall6(__NR_unlink, (long)path, 0, 0, 0, 0, 0);
-#endif
-}
-
-static inline long sud_ov_getpid(void)
-{
-    return raw_syscall6(SYS_getpid, 0, 0, 0, 0, 0, 0);
 }
 
 /* ----------------------------------------------------------------
@@ -384,7 +339,7 @@ static void mkdir_p(char *dir)
         while (*p && *p != '/') p++;
         char saved = *p;
         *p = '\0';
-        long r = sud_ov_mkdir(dir, 0755);
+        long r = raw_mkdirat(AT_FDCWD, dir, 0755);
         (void)r;  /* ignore EEXIST and other errors; final caller will
                    * see the real failure on the actual operation. */
         *p = saved;
@@ -635,9 +590,9 @@ int sud_overlay_create_whiteout(const char *path)
      * upper has the modified file, which we now replace with the
      * whiteout marker. */
     if (stat_one(upath, &st) == 0)
-        sud_ov_unlink(upath);
+        raw_unlinkat(AT_FDCWD, upath, 0);
 
-    long rc = sud_ov_mknod(upath, S_IFCHR | 0, 0);
+    long rc = raw_mknodat(AT_FDCWD, upath, S_IFCHR | 0, 0);
     if (rc < 0) return (int)rc;
     return 0;
 }
@@ -680,7 +635,7 @@ static void scrub_dir(const char *dir)
             memcpy(child, dir, dlen);
             child[dlen] = '/';
             memcpy(child + dlen + 1, ent->d_name, nlen + 1);
-            raw_syscall6(__NR_unlinkat, AT_FDCWD, (long)child, 0, 0, 0, 0);
+            raw_unlinkat(AT_FDCWD, child, 0);
         }
     }
     raw_close(fd);
@@ -712,7 +667,7 @@ static const char *synth_pid_dir(void)
     if (!cached) {
         const char *root = synth_tmp_root();
         if (!root) return 0;
-        long pid = sud_ov_getpid();
+        long pid = raw_getpid();
         int n = snprintf(dir, sizeof(dir), "%s/.sud-overlay/%ld",
                          root, pid);
         if (n <= 0 || (size_t)n >= sizeof(dir)) { dir[0] = 0; return 0; }
@@ -730,9 +685,9 @@ static const char *synth_pid_dir(void)
     if (last > 0) {
         memcpy(parent, dir, (size_t)last);
         parent[last] = '\0';
-        sud_ov_mkdir(parent, 0755);
+        raw_mkdirat(AT_FDCWD, parent, 0755);
     }
-    sud_ov_mkdir(dir, 0755);
+    raw_mkdirat(AT_FDCWD, dir, 0755);
     return dir;
 }
 
@@ -839,7 +794,7 @@ static void merge_layer(const char *layer, size_t layer_len,
             memcpy(link, synth, synth_len);
             link[synth_len] = '/';
             memcpy(link + synth_len + 1, name, nlen + 1);
-            sud_ov_symlink(tgt, link);
+            raw_symlinkat(tgt, AT_FDCWD, link);
         }
     }
     raw_close(fd);
@@ -875,8 +830,8 @@ int sud_overlay_open_dir(const char *path, int flags, int mode)
     /* In case a stale dir from a previous run lingers, scrub then
      * recreate.  Mkdir failure is fatal. */
     scrub_dir(synth);
-    raw_syscall6(__NR_unlinkat, AT_FDCWD, (long)synth, AT_REMOVEDIR, 0, 0, 0);
-    long mr = sud_ov_mkdir(synth, 0755);
+    raw_unlinkat(AT_FDCWD, synth, AT_REMOVEDIR);
+    long mr = raw_mkdirat(AT_FDCWD, synth, 0755);
     if (mr < 0 && mr != -EEXIST) return (int)mr;
     size_t synth_len = (size_t)sn;
 
