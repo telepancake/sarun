@@ -187,8 +187,6 @@ int sud_ir_dir_unlink(uint32_t dir_idx, const char *name, size_t name_len,
     uint32_t off = dir->u.dir.dirblock_head_offset;
     struct sud_ir_dirblock *found_db = 0;
     int found_idx = -1;
-    uint32_t prev_off = 0;
-    (void)prev_off;
     while (off) {
         struct sud_ir_dirblock *db =
             (struct sud_ir_dirblock *)sud_ir_ptr(off);
@@ -311,6 +309,10 @@ static int walk_one(uint32_t cur, const char *name, size_t len,
     uint32_t child;
     int rc = sud_ir_dir_lookup(cur, name, len, &child);
     if (rc < 0) return rc;
+    /* Bounds check: parent_stack is fixed-size in sud_ir_walk; refuse
+     * paths that nest deeper than the stack rather than corrupting
+     * memory.  64 levels is well above any realistic FS tree. */
+    if (*sp >= SUD_IR_PARENT_STACK_MAX) return -ENAMETOOLONG;
     parent_stack[(*sp)++] = cur;
     *out = child;
     return 0;
@@ -330,7 +332,7 @@ uint32_t sud_ir_walk(const char *abs_path, int follow, int *err_out)
     memcpy(buf, rel, buf_used + 1);
     int sym_left = SUD_IR_MAX_SYMLINKS;
 
-    uint32_t parent_stack[64];
+    uint32_t parent_stack[SUD_IR_PARENT_STACK_MAX];
     int sp = 0;
     uint32_t cur = 1;        /* root */
 

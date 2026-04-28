@@ -306,11 +306,11 @@ static void compose_shm_path(const char *user_key,
 static void *fixed_addr(void)
 {
 #if defined(__x86_64__)
-    /* 0x600000000000 is well above ld.so's typical mmap region (~0x7f...) on
-     * stock Linux only on machines without ASLR randomising into our
-     * range; pick something inside the canonical user space.  We
-     * deliberately stay below the typical 0x7fffffff_ffff stack/vDSO
-     * area while still being far from the loader's text. */
+    /* Pick a high address well above ld.so's typical mmap region
+     * (~0x7f...) and the wrapper's text (sud64 lives at 0x40000000),
+     * while staying inside the canonical user-space half.  Every sud
+     * loader maps the shared region here so byte offsets within the
+     * region are stable across processes. */
     return (void *)0x500000000000UL;
 #else
     /* On i386, sud32 is at 0x20000000, the kernel takes >= 0xc0000000.

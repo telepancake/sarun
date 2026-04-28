@@ -48,6 +48,10 @@
 #define SUD_IR_MAX_INODES     (1u << 16)    /* 65536 */
 /* Per-block bitmap stride (bytes per byte of bitmap). */
 #define SUD_IR_BLOCK_GROUP    8u
+/* Maximum directory nesting handled by sud_ir_walk; deeper paths
+ * return -ENAMETOOLONG instead of overflowing the on-stack parent
+ * tracking buffer.  64 is well above any realistic FS tree. */
+#define SUD_IR_PARENT_STACK_MAX 64
 
 /* Forward declaration. */
 struct sud_ir_super;
