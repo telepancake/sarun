@@ -369,7 +369,7 @@ static void compose_shm_paths(const char *user_key,
             h ^= *p;
             h *= 0x100000001b3ull;
         }
-        snprintf(key, sizeof(key), "%016lx", (unsigned long)h);
+        snprintf(key, sizeof(key), "%016llx", (unsigned long long)h);
     }
     snprintf(meta_out, meta_sz, "/dev/shm/sud-inramfs.%s.meta", key);
     snprintf(data_out, data_sz, "/dev/shm/sud-inramfs.%s.data", key);
