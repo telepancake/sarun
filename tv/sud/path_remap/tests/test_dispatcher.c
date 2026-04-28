@@ -57,6 +57,9 @@ struct trace_observation {
 static struct trace_observation g_trace;
 static int g_pre_seq;
 static int g_post_seq;
+/* When set, the next pre_syscall short-circuits with this return. */
+static int  g_trace_short_circuit_next;
+static long g_trace_short_circuit_ret;
 
 static void trace_stub_init(void)        {}
 static void trace_stub_target_launch(const struct sud_tracee_launch *l) { (void)l; }
@@ -68,7 +71,12 @@ static int trace_stub_pre_syscall(struct sud_syscall_ctx *ctx)
     g_trace.pre_call_index = ++g_pre_seq;
     g_trace.pre_nr = ctx->nr;
     for (int i = 0; i < 6; i++) g_trace.pre_args[i] = ctx->args[i];
-    return 0;  /* never short-circuit from the trace stub */
+    if (g_trace_short_circuit_next) {
+        g_trace_short_circuit_next = 0;
+        ctx->ret = g_trace_short_circuit_ret;
+        return 1;
+    }
+    return 0;
 }
 
 static void trace_stub_post_syscall(const struct sud_syscall_ctx *ctx)
@@ -92,6 +100,10 @@ const struct sud_addin sud_trace_addin = {
 static void trace_observation_reset(void)
 {
     memset(&g_trace, 0, sizeof(g_trace));
+    g_pre_seq = 0;
+    g_post_seq = 0;
+    g_trace_short_circuit_next = 0;
+    g_trace_short_circuit_ret  = 0;
 }
 
 #endif /* SUD_ADDIN_TRACE */
@@ -312,12 +324,27 @@ static struct sud_syscall_ctx make_ctx(void)
 /* ---- Tests ------------------------------------------------------- */
 
 #if defined(SUD_ADDIN_TRACE) && defined(SUD_ADDIN_PATH_REMAP)
-/* "Both addins" mode: we expect path_remap to run before trace, and
- * trace's pre/post hooks to see the rewritten path. */
+/*
+ * "Both addins" mode.  The contract under test:
+ *
+ *   - The traced program passes a path P (e.g. "/merged/foo").
+ *   - trace MUST see exactly P in both pre_syscall and post_syscall.
+ *     trace must be remapping-agnostic: identical output regardless
+ *     of whether SUD_OVERLAY rules exist or how they would rewrite P.
+ *   - path_remap then mutates ctx->args[i] to the resolved path Q
+ *     (e.g. "/tmp/.../lower/foo") so the kernel actually opens Q.
+ *   - When the kernel returns, trace's post_syscall again sees P,
+ *     not Q.
+ *
+ * In dispatcher terms: trace runs FIRST in pre_syscall (sees P),
+ * path_remap runs SECOND and mutates ctx->args (kernel sees Q),
+ * the dispatcher restores args→orig_args before invoking
+ * post_syscall hooks so trace's post_syscall again sees P.
+ */
 
-static void test_both_trace_sees_remapped_openat(void)
+static void test_both_trace_sees_program_path_in_pre(void)
 {
-    g_curtest = "both/trace_sees_remapped_openat";
+    g_curtest = "both/trace_pre_sees_program_path";
     fixture_setup();
     install_overlay();
 
@@ -340,34 +367,199 @@ static void test_both_trace_sees_remapped_openat(void)
     TASSERT_EQ(sc, 0, "non-O_DIRECTORY openat should not short-circuit");
     TASSERT(g_trace.pre_called, "trace pre_syscall ran");
 
-    /* The path arg trace observed must be the rewritten lower path. */
-    char want[PATH_MAX];
-    snprintf(want, sizeof(want), "%s/foo", g_lower);
-    TASSERT_STREQ((const char *)g_trace.pre_args[1], want,
-                  "trace pre saw remapped path");
+    /* trace must see the path the program asked for, not the
+     * overlay-resolved one. */
+    TASSERT_STREQ((const char *)g_trace.pre_args[1], merged_path,
+                  "trace pre saw program-supplied path (NOT remapped)");
 
-    /* Simulate kernel ret then run post. */
+    /* But after pre_syscall, ctx.args MUST be rewritten so the kernel
+     * receives the resolved path. */
+    char want_kernel[PATH_MAX];
+    snprintf(want_kernel, sizeof(want_kernel), "%s/foo", g_lower);
+    TASSERT_STREQ((const char *)ctx.args[1], want_kernel,
+                  "ctx.args[1] rewritten by path_remap for the kernel");
+
+    /* And post_syscall must again show trace the program-supplied
+     * path. */
     ctx.ret = 42;
     sud_addins_post_syscall(&ctx);
     TASSERT(g_trace.post_called, "trace post_syscall ran");
-    TASSERT_STREQ((const char *)g_trace.post_args[1], want,
-                  "trace post saw remapped path");
+    TASSERT_STREQ((const char *)g_trace.post_args[1], merged_path,
+                  "trace post saw program-supplied path (NOT remapped)");
+    TASSERT_EQ(g_trace.post_ret, 42, "trace post saw kernel ret");
 
     fixture_teardown();
 }
 
-static void test_both_pre_called_in_correct_order(void)
+static void test_both_trace_dispatch_order_is_trace_first(void)
 {
-    /* path_remap must run before trace.  We can verify this by setting
-     * up a whiteout so that path_remap short-circuits with -ENOENT;
-     * if path_remap ran AFTER trace, trace would have run first and
-     * its pre_call_index would be 1.  With path_remap first, trace's
-     * pre_call_index stays 0 (never invoked). */
-    g_curtest = "both/short_circuit_skips_trace";
+    /* If trace ran SECOND (path_remap first), trace would see the
+     * already-rewritten path.  Assert ordering directly via the
+     * monotonic call-index counter. */
+    g_curtest = "both/trace_runs_first";
     fixture_setup();
     install_overlay();
 
-    /* lower has fileX, upper has whiteout for fileX. */
+    char p[PATH_MAX]; snprintf(p, sizeof(p), "%s/baz", g_lower);
+    t_write_file(p, "x");
+    char merged_path[PATH_MAX];
+    snprintf(merged_path, sizeof(merged_path), "%s/baz", g_merged);
+
+    trace_observation_reset();
+    struct sud_syscall_ctx ctx = make_ctx();
+    ctx.nr      = SYS_openat;
+    ctx.args[0] = AT_FDCWD;
+    ctx.args[1] = (long)merged_path;
+    ctx.args[2] = O_RDONLY;
+
+    int sc = sud_addins_pre_syscall(&ctx);
+    TASSERT_EQ(sc, 0, "no short-circuit");
+    TASSERT_EQ(g_trace.pre_call_index, 1,
+               "trace pre_syscall is invoked first (before path_remap)");
+
+    fixture_teardown();
+}
+
+/* The killer regression test: trace output must be byte-for-byte
+ * identical for the same program-level call across three configurations
+ * — no overlay rule at all, an overlay rule that DOES rewrite the path,
+ * and an overlay rule that LEAVES the path alone. */
+static void test_both_trace_output_is_remap_agnostic(void)
+{
+    g_curtest = "both/trace_output_is_remap_agnostic";
+    fixture_setup();
+
+    /* The program-level call we replay in each scenario. */
+    char merged_path[PATH_MAX];
+    snprintf(merged_path, sizeof(merged_path), "%s/qux", g_merged);
+
+    long pre_args_no_overlay[6], post_args_no_overlay[6];
+    long pre_args_active_remap[6], post_args_active_remap[6];
+    long pre_args_unrelated_rule[6], post_args_unrelated_rule[6];
+
+    /* Scenario A: no overlay rule. */
+    install_no_overlay();
+    trace_observation_reset();
+    {
+        struct sud_syscall_ctx ctx = make_ctx();
+        ctx.nr = SYS_openat;
+        ctx.args[0] = AT_FDCWD;
+        ctx.args[1] = (long)merged_path;
+        ctx.args[2] = O_RDONLY;
+        sud_addins_pre_syscall(&ctx);
+        ctx.ret = -ENOENT;
+        sud_addins_post_syscall(&ctx);
+        memcpy(pre_args_no_overlay,  g_trace.pre_args,  sizeof(pre_args_no_overlay));
+        memcpy(post_args_no_overlay, g_trace.post_args, sizeof(post_args_no_overlay));
+    }
+
+    /* Scenario B: active overlay rule that rewrites merged → lower. */
+    char p[PATH_MAX]; snprintf(p, sizeof(p), "%s/qux", g_lower);
+    t_write_file(p, "x");
+    install_overlay();
+    trace_observation_reset();
+    {
+        struct sud_syscall_ctx ctx = make_ctx();
+        ctx.nr = SYS_openat;
+        ctx.args[0] = AT_FDCWD;
+        ctx.args[1] = (long)merged_path;
+        ctx.args[2] = O_RDONLY;
+        sud_addins_pre_syscall(&ctx);
+        /* Sanity: kernel-facing path WAS rewritten. */
+        char want_kernel[PATH_MAX];
+        snprintf(want_kernel, sizeof(want_kernel), "%s/qux", g_lower);
+        TASSERT_STREQ((const char *)ctx.args[1], want_kernel,
+                      "scenario B: kernel sees rewritten path");
+        ctx.ret = 7;
+        sud_addins_post_syscall(&ctx);
+        memcpy(pre_args_active_remap,  g_trace.pre_args,  sizeof(pre_args_active_remap));
+        memcpy(post_args_active_remap, g_trace.post_args, sizeof(post_args_active_remap));
+    }
+
+    /* Scenario C: overlay rule that exists but doesn't apply to this
+     * path (path is outside any merged tree). */
+    install_overlay();   /* same overlay, but call a path outside it */
+    trace_observation_reset();
+    {
+        struct sud_syscall_ctx ctx = make_ctx();
+        ctx.nr = SYS_openat;
+        ctx.args[0] = AT_FDCWD;
+        ctx.args[1] = (long)merged_path;  /* same path as A and B */
+        ctx.args[2] = O_RDONLY;
+        sud_addins_pre_syscall(&ctx);
+        ctx.ret = 7;
+        sud_addins_post_syscall(&ctx);
+        memcpy(pre_args_unrelated_rule,  g_trace.pre_args,  sizeof(pre_args_unrelated_rule));
+        memcpy(post_args_unrelated_rule, g_trace.post_args, sizeof(post_args_unrelated_rule));
+    }
+
+    /* In all three scenarios, the *string* trace recorded for the
+     * path arg must be the program-supplied "/.../merged/qux". */
+    TASSERT_STREQ((const char *)pre_args_no_overlay[1],     merged_path,
+                  "scenario A pre: trace recorded program path");
+    TASSERT_STREQ((const char *)pre_args_active_remap[1],   merged_path,
+                  "scenario B pre: trace recorded program path despite remap");
+    TASSERT_STREQ((const char *)pre_args_unrelated_rule[1], merged_path,
+                  "scenario C pre: trace recorded program path");
+    TASSERT_STREQ((const char *)post_args_no_overlay[1],     merged_path,
+                  "scenario A post: trace recorded program path");
+    TASSERT_STREQ((const char *)post_args_active_remap[1],   merged_path,
+                  "scenario B post: trace recorded program path despite remap");
+    TASSERT_STREQ((const char *)post_args_unrelated_rule[1], merged_path,
+                  "scenario C post: trace recorded program path");
+
+    /* And the non-path args (dirfd, flags) must also match exactly. */
+    TASSERT_EQ(pre_args_active_remap[0], pre_args_no_overlay[0],
+               "scenario A vs B: trace pre dirfd identical");
+    TASSERT_EQ(pre_args_active_remap[2], pre_args_no_overlay[2],
+               "scenario A vs B: trace pre flags identical");
+    TASSERT_EQ(post_args_active_remap[0], post_args_no_overlay[0],
+               "scenario A vs B: trace post dirfd identical");
+    TASSERT_EQ(post_args_active_remap[2], post_args_no_overlay[2],
+               "scenario A vs B: trace post flags identical");
+
+    fixture_teardown();
+}
+
+/* trace.pre_syscall returning 1 (short-circuit, e.g. /proc/self/exe
+ * readlink) must prevent path_remap from running at all. */
+static void test_both_trace_short_circuit_skips_pathremap(void)
+{
+    g_curtest = "both/trace_short_circuit_skips_pathremap";
+    fixture_setup();
+    install_overlay();
+
+    char merged_path[PATH_MAX];
+    snprintf(merged_path, sizeof(merged_path), "%s/will_not_be_resolved", g_merged);
+
+    trace_observation_reset();
+    g_trace_short_circuit_next = 1;
+    g_trace_short_circuit_ret  = -EPERM;
+
+    struct sud_syscall_ctx ctx = make_ctx();
+    ctx.nr      = SYS_openat;
+    ctx.args[0] = AT_FDCWD;
+    ctx.args[1] = (long)merged_path;
+    ctx.args[2] = O_RDONLY;
+
+    int sc = sud_addins_pre_syscall(&ctx);
+    TASSERT_EQ(sc, 1, "trace short-circuited the dispatcher");
+    TASSERT_EQ(ctx.ret, -EPERM, "ctx.ret carries trace's return value");
+    TASSERT_STREQ((const char *)ctx.args[1], merged_path,
+                  "ctx.args[1] NOT rewritten — path_remap was skipped");
+
+    fixture_teardown();
+}
+
+/* Whiteout: path_remap (running second) returns -ENOENT.  trace ran
+ * first and recorded the program path; the dispatcher must propagate
+ * the short-circuit as a kernel-facing -ENOENT. */
+static void test_both_pathremap_whiteout_after_trace(void)
+{
+    g_curtest = "both/pathremap_whiteout_after_trace";
+    fixture_setup();
+    install_overlay();
+
     char p[PATH_MAX];
     snprintf(p, sizeof(p), "%s/fileX", g_lower); t_write_file(p, "secret");
     snprintf(p, sizeof(p), "%s/fileX", g_upper);
@@ -386,15 +578,18 @@ static void test_both_pre_called_in_correct_order(void)
     int sc = sud_addins_pre_syscall(&ctx);
     TASSERT_EQ(sc, 1, "whiteout short-circuits the dispatcher");
     TASSERT_EQ(ctx.ret, -ENOENT, "whiteout returns -ENOENT");
-    TASSERT_EQ(g_trace.pre_called, 0,
-               "trace pre_syscall NOT invoked after path_remap short-circuit");
+    /* trace ran first and saw the program-supplied path. */
+    TASSERT(g_trace.pre_called,
+            "trace pre_syscall ran before path_remap whiteout");
+    TASSERT_STREQ((const char *)g_trace.pre_args[1], merged_path,
+                  "trace recorded program path even though kernel never sees it");
 
     fixture_teardown();
 }
 
-static void test_both_readonly_overlay_blocks_writes_before_trace(void)
+static void test_both_readonly_overlay_blocks_writes_after_trace(void)
 {
-    g_curtest = "both/readonly_blocks_before_trace";
+    g_curtest = "both/readonly_blocks_writes_after_trace";
     fixture_setup();
     install_readonly_overlay();
 
@@ -412,8 +607,11 @@ static void test_both_readonly_overlay_blocks_writes_before_trace(void)
     int sc = sud_addins_pre_syscall(&ctx);
     TASSERT_EQ(sc, 1, "read-only overlay short-circuits writes");
     TASSERT(ctx.ret < 0, "EROFS or similar returned");
-    TASSERT_EQ(g_trace.pre_called, 0,
-               "trace pre NOT invoked after readonly short-circuit");
+    /* trace still ran and recorded the program's intent. */
+    TASSERT(g_trace.pre_called,
+            "trace pre_syscall ran before path_remap denied the write");
+    TASSERT_STREQ((const char *)g_trace.pre_args[1], merged_path,
+                  "trace recorded program path despite -EROFS short-circuit");
 
     fixture_teardown();
 }
@@ -421,7 +619,7 @@ static void test_both_readonly_overlay_blocks_writes_before_trace(void)
 static void test_both_no_rules_means_path_unchanged(void)
 {
     /* With no SUD_OVERLAY/SUD_REMAP env, path_remap is a no-op and
-     * trace simply sees the original args. */
+     * trace simply sees the original args, ctx.args is unchanged. */
     g_curtest = "both/no_rules_passthrough";
     fixture_setup();
     install_no_overlay();
@@ -439,6 +637,13 @@ static void test_both_no_rules_means_path_unchanged(void)
     TASSERT(g_trace.pre_called, "trace pre still ran");
     TASSERT_STREQ((const char *)g_trace.pre_args[1], path,
                   "trace pre saw original path (unchanged)");
+    TASSERT_STREQ((const char *)ctx.args[1], path,
+                  "ctx.args[1] left unchanged when no rules");
+
+    ctx.ret = 5;
+    sud_addins_post_syscall(&ctx);
+    TASSERT_STREQ((const char *)g_trace.post_args[1], path,
+                  "trace post saw original path (unchanged)");
 
     fixture_teardown();
 }
@@ -463,6 +668,8 @@ static void test_both_unrelated_path_passthrough(void)
     TASSERT(g_trace.pre_called, "trace pre still ran");
     TASSERT_STREQ((const char *)g_trace.pre_args[1], path,
                   "trace pre saw unmodified path");
+    TASSERT_STREQ((const char *)ctx.args[1], path,
+                  "ctx.args[1] unchanged for path outside any rule");
 
     fixture_teardown();
 }
@@ -543,9 +750,12 @@ int main(int argc, char **argv)
     dispatcher_init();
 
 #if defined(SUD_ADDIN_TRACE) && defined(SUD_ADDIN_PATH_REMAP)
-    test_both_trace_sees_remapped_openat();
-    test_both_pre_called_in_correct_order();
-    test_both_readonly_overlay_blocks_writes_before_trace();
+    test_both_trace_sees_program_path_in_pre();
+    test_both_trace_dispatch_order_is_trace_first();
+    test_both_trace_output_is_remap_agnostic();
+    test_both_trace_short_circuit_skips_pathremap();
+    test_both_pathremap_whiteout_after_trace();
+    test_both_readonly_overlay_blocks_writes_after_trace();
     test_both_no_rules_means_path_unchanged();
     test_both_unrelated_path_passthrough();
     const char *mode = "BOTH";

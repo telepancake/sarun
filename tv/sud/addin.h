@@ -10,6 +10,15 @@ struct sud_syscall_ctx {
     pid_t tid;
     char *scratch;
     size_t scratch_size;
+    /* Snapshot of args[] as the traced program passed them, taken by
+     * sud_addins_pre_syscall() before any addin runs.  Observer addins
+     * (e.g. trace) are invoked with args[] reset to this snapshot in
+     * sud_addins_post_syscall() so their output reflects the program's
+     * view of the syscall — never any mutation applied by a later
+     * mutator addin (e.g. path_remap).  Initialized by the dispatcher,
+     * not by handler.c, so the legacy positional initializer in
+     * handler.c keeps working unchanged. */
+    long orig_args[6];
 };
 
 struct sud_tracee_launch {
