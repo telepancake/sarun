@@ -291,6 +291,20 @@ static void install_readonly_overlay(void)
     sud_overlay_init();
 }
 
+static void install_unrelated_overlay(void)
+{
+    /* An overlay rule that targets a virtual mount point under
+     * /tmp which is unrelated to anything we'll query, so any path
+     * outside this rule passes through untouched. */
+    char env[PATH_MAX * 4];
+    snprintf(env, sizeof(env),
+             "%s/_unrelated=+%s", g_tmp, g_lower);
+    setenv("SUD_OVERLAY", env, 1);
+    unsetenv("SUD_REMAP");
+    sud_overlay_reset_for_testing();
+    sud_overlay_init();
+}
+
 static void install_no_overlay(void)
 {
     unsetenv("SUD_OVERLAY");
@@ -476,9 +490,13 @@ static void test_both_trace_output_is_remap_agnostic(void)
         memcpy(post_args_active_remap, g_trace.post_args, sizeof(post_args_active_remap));
     }
 
-    /* Scenario C: overlay rule that exists but doesn't apply to this
-     * path (path is outside any merged tree). */
-    install_overlay();   /* same overlay, but call a path outside it */
+    /* Scenario C: an overlay rule IS configured, but it targets
+     * a different virtual mount point — so the path we open here
+     * does not match any rule and path_remap leaves ctx.args
+     * alone.  This proves that the mere presence of path_remap
+     * (with rules) does not change trace output for paths outside
+     * those rules. */
+    install_unrelated_overlay();
     trace_observation_reset();
     {
         struct sud_syscall_ctx ctx = make_ctx();
@@ -487,6 +505,9 @@ static void test_both_trace_output_is_remap_agnostic(void)
         ctx.args[1] = (long)merged_path;  /* same path as A and B */
         ctx.args[2] = O_RDONLY;
         sud_addins_pre_syscall(&ctx);
+        /* Sanity: ctx.args was NOT rewritten in this scenario. */
+        TASSERT_STREQ((const char *)ctx.args[1], merged_path,
+                      "scenario C: ctx.args unchanged (path outside rule)");
         ctx.ret = 7;
         sud_addins_post_syscall(&ctx);
         memcpy(pre_args_unrelated_rule,  g_trace.pre_args,  sizeof(pre_args_unrelated_rule));
