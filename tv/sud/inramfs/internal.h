@@ -265,4 +265,10 @@ long sud_ir_file_write(struct sud_ir_inode *ino, const void *buf,
                        size_t count, off_t off);
 long sud_ir_file_truncate(struct sud_ir_inode *ino, off_t length);
 
+/* Fill a `struct stat` (kernel ABI for the running arch) for the
+ * given inode.  Implemented in addin.c so the layout is colocated
+ * with the per-arch ABI choices in op_fstat/op_stat. */
+void sud_inramfs_fill_stat(void *st_buf, uint32_t idx,
+                           const struct sud_ir_inode *ino);
+
 #endif /* SUD_INRAMFS_INTERNAL_H */

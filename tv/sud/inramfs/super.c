@@ -509,10 +509,10 @@ void sud_inramfs_init(void)
     if (fd < 0) return;                  /* can't attach — addin stays inactive */
 
     void *want = fixed_addr();
-    long mflags = MAP_SHARED | MAP_FIXED;
+    int  mflags = MAP_SHARED | MAP_FIXED;
     void *base = raw_mmap(want, g_region_size,
                           PROT_READ | PROT_WRITE,
-                          (int)(MAP_SHARED | MAP_FIXED_NOREPLACE),
+                          mflags | MAP_FIXED_NOREPLACE,
                           fd, 0);
     /* mmap returns the new mapping address on success or -errno
      * (in [-4095, -1]) on failure.  Cast to unsigned long so the
@@ -521,7 +521,7 @@ void sud_inramfs_init(void)
     if ((unsigned long)base >= (unsigned long)-4095) {
         base = raw_mmap(want, g_region_size,
                         PROT_READ | PROT_WRITE,
-                        (int)mflags, fd, 0);
+                        mflags, fd, 0);
     }
     raw_close(fd);
     if ((unsigned long)base >= (unsigned long)-4095) {
