@@ -510,20 +510,23 @@ void sud_inramfs_init(void)
 
     void *want = fixed_addr();
     long mflags = MAP_SHARED | MAP_FIXED;
-    /* Use MAP_FIXED_NOREPLACE if available so we crash loudly on
-     * collision instead of silently displacing an existing mapping. */
     void *base = raw_mmap(want, g_region_size,
                           PROT_READ | PROT_WRITE,
                           (int)(MAP_SHARED | MAP_FIXED_NOREPLACE),
                           fd, 0);
-    if (base == MAP_FAILED || (long)base < 0) {
-        /* Old kernel without MAP_FIXED_NOREPLACE — retry without. */
+    /* mmap returns the new mapping address on success or -errno
+     * (in [-4095, -1]) on failure.  Cast to unsigned long so the
+     * test works on i386 where a legitimate high address like
+     * 0x80000000 looks negative when interpreted as signed long. */
+    if ((unsigned long)base >= (unsigned long)-4095) {
         base = raw_mmap(want, g_region_size,
                         PROT_READ | PROT_WRITE,
                         (int)mflags, fd, 0);
     }
-    raw_close(fd);                       /* mapping keeps the file alive */
-    if (base == MAP_FAILED || (long)base < 0) return;
+    raw_close(fd);
+    if ((unsigned long)base >= (unsigned long)-4095) {
+        return;
+    }
 
     sud_ir_base = (volatile char *)base;
     struct sud_ir_super *sb = sud_ir_sb();

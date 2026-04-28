@@ -29,7 +29,6 @@ static int g_failures;
 static const char *g_curtest;
 
 static void tlog(const char *m) { write(2, m, strlen(m)); }
-static void tlog_test(const char *name) { tlog("=> "); tlog(name); tlog("\n"); }
 
 #define TASSERT(c, d) do { if (!(c)) { \
     char _b[256]; snprintf(_b, sizeof(_b), \
@@ -50,7 +49,6 @@ static void tlog_test(const char *name) { tlog("=> "); tlog(name); tlog("\n"); }
 
 static void setup_mount(const char *path, int size_mb, const char *key)
 {
-    tlog_test(key ? key : path);
     char val[PATH_MAX + 32];
     snprintf(val, sizeof(val), "%s:%d", path, size_mb);
     setenv("SUD_INRAMFS", val, 1);
