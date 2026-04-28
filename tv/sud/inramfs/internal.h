@@ -323,6 +323,12 @@ struct sud_ir_inode *sud_ir_inode_get(uint32_t index);
 const char *sud_ir_mount_path(void);
 size_t      sud_ir_mount_len(void);
 
+/* Sizes of the two backing shm regions, in bytes.  Used by the
+ * addin's munmap interceptor to decide whether a user munmap range
+ * lies inside our shared mappings. */
+size_t      sud_ir_meta_size(void);
+size_t      sud_ir_data_size(void);
+
 /* Current monotonic-ish wall-clock in ns — used to set i_*time. */
 uint64_t sud_ir_now_ns(void);
 

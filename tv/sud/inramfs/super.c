@@ -38,6 +38,8 @@ static int    g_data_fd = -1;        /* kept open for FALLOC_FL_PUNCH_HOLE */
 const char *sud_ir_mount_path(void) { return g_mount_len ? g_mount_path : 0; }
 size_t      sud_ir_mount_len (void) { return g_mount_len; }
 int         sud_inramfs_active(void) { return g_active; }
+size_t      sud_ir_meta_size (void) { return g_meta_size; }
+size_t      sud_ir_data_size (void) { return g_data_size; }
 
 uint64_t sud_ir_now_ns(void)
 {

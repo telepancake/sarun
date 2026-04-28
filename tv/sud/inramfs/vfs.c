@@ -1118,3 +1118,18 @@ long sud_inramfs_op_access(const char *abs_path, int mode)
     if (!idx) return err;
     return 0;
 }
+
+/* chdir(2) validation: confirm `abs_path` exists in the inramfs and
+ * is a directory.  Caller (the addin) handles the bookkeeping —
+ * stashing the path as the logical CWD for relative-path resolution
+ * — so we just resolve and check. */
+long sud_inramfs_op_chdir(const char *abs_path)
+{
+    int err = 0;
+    uint32_t idx = sud_ir_walk(abs_path, 1, &err);
+    if (!idx) return err;
+    struct sud_ir_inode *ino = sud_ir_inode_get(idx);
+    if (!ino) return -ENOENT;
+    if (ino->type != SUD_IR_T_DIR) return -ENOTDIR;
+    return 0;
+}

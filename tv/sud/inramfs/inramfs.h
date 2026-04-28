@@ -138,6 +138,10 @@ long sud_inramfs_op_utimensat(const char *abs_path,
                               const struct timespec ts[2], int follow);
 long sud_inramfs_op_futimens(int fd, const struct timespec ts[2]);
 long sud_inramfs_op_access(const char *abs_path, int mode);
+/* Validate that `abs_path` (under the mount) names an existing
+ * directory.  Returns 0 on success, -errno otherwise.  The addin
+ * stores the path itself; this op is the only inramfs-side check. */
+long sud_inramfs_op_chdir(const char *abs_path);
 long sud_inramfs_op_getdents64(int fd, void *buf, size_t count);
 /* Returns the (addr, length) for a successful mmap, or MAP_FAILED on
  * failure with errno-value in *err.  Maps the fd's underlying shm

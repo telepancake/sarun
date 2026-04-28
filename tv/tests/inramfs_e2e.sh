@@ -25,6 +25,7 @@ SUDTRACE=./sudtrace
 MOUNT=/inramfs_e2e
 KEY="e2e_$$_$(date +%s)"
 SHM_FILE="/dev/shm/sud-inramfs.${KEY}"
+SHM_GLOB="/dev/shm/sud-inramfs.${KEY}*"
 
 # Sanity: the binaries we need are present.
 for f in "$SUD64" "$SUDTRACE"; do
@@ -41,7 +42,7 @@ if ! command -v strace >/dev/null 2>&1; then
 fi
 
 TMPDIR=$(mktemp -d)
-trap 'rm -rf "$TMPDIR"; rm -f "$SHM_FILE"' EXIT
+trap 'rm -rf "$TMPDIR"; rm -f $SHM_GLOB' EXIT
 
 PASS=0 FAIL=0 TOTAL=0
 
@@ -59,7 +60,7 @@ run_e2e() {
     local name="$1" want="$2" cmd="$3"
     TOTAL=$((TOTAL + 1))
 
-    rm -f "$SHM_FILE"
+    rm -f $SHM_GLOB
 
     local strace_log="$TMPDIR/strace.$name"
     local stdout_log="$TMPDIR/stdout.$name"
@@ -150,15 +151,45 @@ run_e2e "exec-redir-builtins" "got: BB" \
 
 # T3: nested directories + cross-process write/read.  Verifies path
 # walking through user-created directories survives to a child
-# process.  We mkdir each component explicitly rather than using
-# `mkdir -p` because coreutils' -p switches CWD into each component
-# via chdir(2), and chdir on inramfs paths is intentionally a
-# no-pass-through (the host kernel can't see the mount).  Adding
-# chdir support is queued for a follow-up milestone.
+# process.  Now uses `mkdir -p` (which chdir's into each component
+# via chdir(2)) — chdir into inramfs is supported in the addin via
+# a logical-CWD layer that propagates across exec via SUD_INRAMFS_CWD.
 run_e2e "mkdir-and-nested" "deep:hello" \
-    "mkdir $MOUNT/a && mkdir $MOUNT/a/b && mkdir $MOUNT/a/b/c &&
+    "mkdir -p $MOUNT/a/b/c &&
      echo hello > $MOUNT/a/b/c/f &&
      printf 'deep:'; cat $MOUNT/a/b/c/f"
+
+# T4: chdir + getcwd + relative paths + cross-exec inheritance.
+# After `cd $MOUNT/d`, `pwd`, `ls`, and `cat foo` (relative path)
+# must all see the inramfs view, both in the parent shell (chdir
+# tracked locally) and in exec'd children (logical CWD inherited
+# via SUD_INRAMFS_CWD env var).
+run_e2e "chdir-and-relative" "/inramfs_e2e/d
+hello
+hello" \
+    "mkdir $MOUNT/d && cd $MOUNT/d && echo hello > foo &&
+     pwd && cat foo && /bin/sh -c 'cat foo'"
+
+# T5: cat-redirect via inherited fd.  Bash opens dst for write
+# (inramfs memfd), dup2's onto fd 1, exec's cat.  cat's process
+# starts with fd 1 inherited but not in the addin's fdtab; modern
+# coreutils cat uses copy_file_range() which the addin must steer
+# back to read/write, and the inherited fd 1 must be lazily adopted
+# so writes land in the inramfs file rather than its empty memfd.
+run_e2e "cat-redirect-inherited-fd" "HELLOWORLDHELLOWORLD" \
+    "printf HELLOWORLD > $MOUNT/a && cat $MOUNT/a > $MOUNT/b &&
+     cat $MOUNT/a; cat $MOUNT/b"
+
+# T6: ftw-style traversal via dup'd dir fd.  `rm -rf` opens a
+# directory, then fdopendir's it (which dups the fd internally),
+# then unlinkat's via the *dup*.  Without dir_path inheritance on
+# dup, the unlinkat would fail with EXDEV.
+run_e2e "rm-rf-deep" "ok" \
+    "mkdir -p $MOUNT/r/sub/sub2 &&
+     echo a > $MOUNT/r/x && echo b > $MOUNT/r/sub/y &&
+     echo c > $MOUNT/r/sub/sub2/z &&
+     rm -rf $MOUNT/r &&
+     [ ! -e $MOUNT/r ] && echo ok"
 
 echo "inramfs-e2e: $PASS/$TOTAL passed, $FAIL failed"
 [ $FAIL -eq 0 ]

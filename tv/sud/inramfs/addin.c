@@ -46,6 +46,14 @@ struct sud_ir_open_file {
     /* Directory-iteration cookie: byte offset into the dirblock chain
      * at which the next getdents64 call resumes. */
     uint32_t dir_cookie;
+    /* Absolute path under the mount used to open this fd, populated
+     * when the inode is a directory.  Used for *at(dirfd, relpath)
+     * resolution in absolutise().  Empty (path[0]==0) means "not
+     * a directory fd, or path-not-tracked" — relative resolution
+     * via this fd will fail with -EXDEV (caller falls through to
+     * the kernel which sees the underlying memfd, fails ENOTDIR,
+     * and propagates the right errno). */
+    char     dir_path[512];
 };
 
 static struct sud_ir_open_file g_fdtab[SUD_IR_FD_TABLE_SIZE];
@@ -80,6 +88,7 @@ static struct sud_ir_open_file *fdtab_alloc(int kfd, uint32_t inode_idx,
             g_fdtab[i].pos        = 0;
             g_fdtab[i].flags      = flags;
             g_fdtab[i].dir_cookie = 0;
+            g_fdtab[i].dir_path[0] = '\0';
             return &g_fdtab[i];
         }
     }
@@ -92,7 +101,95 @@ static void fdtab_release(int fd)
     if (of) of->kfd = -1;
 }
 
-int sud_inramfs_owns_fd(int fd) { return fdtab_lookup(fd) != 0; }
+static int try_adopt_inherited_fd(int fd);   /* defined below */
+
+int sud_inramfs_owns_fd(int fd)
+{
+    if (fdtab_lookup(fd)) return 1;
+    if (try_adopt_inherited_fd(fd)) return 1;
+    return 0;
+}
+
+/* Lazy adoption of inramfs memfds inherited across exec.
+ *
+ * Each open in this addin allocates a memfd named "sud-inramfs-<idx>"
+ * and registers (kfd → inode_idx) in g_fdtab.  The memfd itself
+ * survives exec when it's been dup'd onto a non-CLOEXEC fd (e.g.
+ * shell redirect: `cmd > file` ⇒ fd 1 = inramfs memfd in cmd).
+ * After exec, the memfd is still open in the kernel but our
+ * process-local g_fdtab is empty — so reads/writes/copy_file_range
+ * on that fd would skip the inramfs handlers, hit the kernel
+ * directly, and operate on the empty memfd backing instead of the
+ * real content in the data shm.
+ *
+ * Detect this by readlink-ing /proc/self/fd/N: a memfd's link
+ * target is "/memfd:sud-inramfs-<idx> (deleted)".  When we recognise
+ * the marker we fdtab_alloc the fd back into our table.
+ *
+ * Called lazily — the first time someone asks "does inramfs own
+ * fd N?".  Result is cached in g_fdtab so subsequent lookups are
+ * O(1) again.  Negative results are tracked in a small probed-fd
+ * bitmap so we don't readlink unknown host fds repeatedly. */
+#define SUD_IR_FD_PROBE_MAX 1024
+static unsigned char g_fd_probed[SUD_IR_FD_PROBE_MAX / 8];
+
+static int fd_was_probed(int fd)
+{
+    if (fd < 0 || fd >= SUD_IR_FD_PROBE_MAX) return 1;   /* don't probe */
+    return (g_fd_probed[fd >> 3] >> (fd & 7)) & 1u;
+}
+static void fd_mark_probed(int fd)
+{
+    if (fd < 0 || fd >= SUD_IR_FD_PROBE_MAX) return;
+    g_fd_probed[fd >> 3] |= (unsigned char)(1u << (fd & 7));
+}
+
+static int try_adopt_inherited_fd(int fd)
+{
+    if (fd < 0) return 0;
+    if (fd_was_probed(fd)) return 0;
+    fd_mark_probed(fd);
+
+    /* Build "/proc/self/fd/<fd>". */
+    char p[64];
+    int n = snprintf(p, sizeof(p), "/proc/self/fd/%d", fd);
+    if (n <= 0 || n >= (int)sizeof(p)) return 0;
+
+    char buf[128];
+    long r = raw_syscall6(SYS_readlinkat, AT_FDCWD, (long)p,
+                          (long)buf, (long)(sizeof(buf) - 1), 0, 0);
+    if (r <= 0) return 0;
+    buf[r] = '\0';
+
+    /* memfd link looks like "/memfd:sud-inramfs-<idx> (deleted)".
+     * Older kernels: "/memfd:sud-inramfs-<idx>". */
+    static const char marker[] = "/memfd:sud-inramfs-";
+    const size_t mlen = sizeof(marker) - 1;
+    if ((size_t)r < mlen || memcmp(buf, marker, mlen) != 0) return 0;
+
+    /* Parse the inode index. */
+    const char *q = buf + mlen;
+    uint32_t idx = 0;
+    int any = 0;
+    while (*q >= '0' && *q <= '9') {
+        idx = idx * 10u + (uint32_t)(*q - '0');
+        q++; any = 1;
+    }
+    if (!any || idx == 0) return 0;
+    /* Validate against the inode table — guard against bogus links
+     * (e.g. a user crafting a memfd with the same name).  An invalid
+     * idx would be silently absorbed and could cause later UB. */
+    struct sud_ir_inode *ino = sud_ir_inode_get(idx);
+    if (!ino) return 0;
+
+    /* Adopt: register fd in fdtab.  flags=O_RDWR is the safe
+     * superset; we don't actually enforce read/write distinction
+     * locally on inramfs fds (the underlying memfd's own perms
+     * gate the kernel-side access for the tools that talk to the
+     * kfd directly, e.g. fstat, dup, fcntl). */
+    fdtab_alloc(fd, idx, O_RDWR);
+    return 1;
+}
 
 /* Public: scrub any fdtab entry for `fd` (used when the kernel is
  * about to atomically replace it via dup2/dup3 from a NON-inramfs
@@ -109,6 +206,66 @@ static void fdtab_forget(int fd)
 /* ================================================================
  * Path resolution helper (dirfd, relative path) → absolute path
  * ================================================================ */
+
+/* ================================================================
+ * Logical CWD (chdir/getcwd/fchdir into inramfs)
+ *
+ * The kernel only knows about real filesystem paths, so a kernel
+ * chdir(/inramfs/...) returns ENOENT.  We maintain our own logical
+ * CWD: when chdir lands on an inramfs path we stash it here and
+ * point the kernel CWD at "/" (somewhere innocuous so /proc/self/cwd
+ * doesn't claim a path the kernel can't resolve).  Subsequent
+ * AT_FDCWD-relative path resolution in absolutise() consults
+ * g_logical_cwd before falling back to /proc/self/cwd.  Subsequent
+ * getcwd(2) returns g_logical_cwd verbatim.
+ *
+ * Empty string means "logical CWD not active" — kernel CWD is
+ * authoritative as before.
+ *
+ * Inheritance across exec: written into / read from the env var
+ * SUD_INRAMFS_CWD.  Children execed under our wrapper see the var,
+ * the addin reads it once on first chdir-related access and seeds
+ * g_logical_cwd.  Writers (chdir handler) update both the static
+ * state and the env so that any subsequent execve passes it along
+ * naturally.
+ * ================================================================ */
+
+static char g_logical_cwd[PATH_MAX];
+static int  g_cwd_env_seeded;     /* one-shot seed from SUD_INRAMFS_CWD */
+
+/* Read environ once into g_logical_cwd if it carries an
+ * SUD_INRAMFS_CWD entry.  Called lazily — we don't want to do this
+ * on every syscall, only the first time path resolution happens.
+ *
+ * libc-fs's environ is set up at process startup from the auxv,
+ * the same way super.c reads SUD_INRAMFS / SUD_INRAMFS_KEY.  After
+ * an execve the child's libc-fs re-initialises environ from the
+ * (potentially mutated) envp passed to execve, so a child whose
+ * envp was rewritten by execve_inject_cwd_env() correctly observes
+ * SUD_INRAMFS_CWD here. */
+static void cwd_seed_from_env(void)
+{
+    if (g_cwd_env_seeded) return;
+    g_cwd_env_seeded = 1;
+
+    const char *v = getenv("SUD_INRAMFS_CWD");
+    if (!v || v[0] != '/') return;
+    size_t vl = strlen(v);
+    if (vl >= sizeof(g_logical_cwd)) return;
+    memcpy(g_logical_cwd, v, vl + 1);
+}
+
+/* Set/clear the env var so a subsequent execve naturally passes
+ * the new value to the child.  Best-effort — if the libc-fs setenv
+ * fails (env table grew beyond what was reserved at startup) the
+ * static state still tracks correctly for the current process. */
+static void cwd_publish_to_env(const char *new_val)
+{
+    if (new_val && new_val[0])
+        setenv("SUD_INRAMFS_CWD", new_val, 1);
+    else
+        unsetenv("SUD_INRAMFS_CWD");
+}
 
 /* Read /proc/self/cwd via raw syscall.  Used to absolute-ify
  * AT_FDCWD relative paths.  Returns 0 / -errno. */
@@ -140,22 +297,48 @@ static int absolutise(int dirfd, const char *path, char *out, size_t out_sz)
     }
     if (dirfd != AT_FDCWD) {
         struct sud_ir_open_file *of = fdtab_lookup(dirfd);
+        if (of && of->dir_path[0]) {
+            /* inramfs dirfd with a known absolute path: resolve
+             * `path` relative to it.  Same join logic as the
+             * AT_FDCWD branch below.  Path components like ".."
+             * and symlinks are normalised by the inramfs walker
+             * downstream — we just hand it the joined string. */
+            size_t cl = strlen(of->dir_path);
+            size_t pl = strlen(path);
+            if (cl + 1 + pl + 1 > out_sz) return -ENAMETOOLONG;
+            memcpy(out, of->dir_path, cl);
+            out[cl] = '/';
+            memcpy(out + cl + 1, path, pl + 1);
+            return 0;
+        }
         if (of) {
-            /* inramfs dirfd: not yet usable for relative paths in
-             * this initial cut.  Tell the caller "not under mount"
-             * so it falls through to the kernel (which will fail
-             * sensibly with the kernel's view of the fd, since the
-             * fd is a real memfd). */
+            /* inramfs fd but we have no recorded path (e.g. fd was
+             * adopted from an inherited memfd: only the inode is
+             * known, not the original path).  Fall through so the
+             * kernel takes the call — it'll fail sensibly with the
+             * memfd's own errno. */
             return -EXDEV;
         }
         /* Real kernel fd we don't own; let it pass through. */
         return -EXDEV;
     }
-    /* AT_FDCWD: prepend cwd. */
+    /* AT_FDCWD: prepend cwd.  Logical CWD (set by an earlier
+     * chdir into inramfs) wins over the kernel CWD — without
+     * this, after `chdir(/ir/proj)` a relative `open("foo")`
+     * would resolve via /proc/self/cwd ("/" since we point the
+     * kernel at root during inramfs-chdir) and miss the mount. */
+    cwd_seed_from_env();
     char cwd[PATH_MAX];
-    long rc = read_cwd_abs(cwd, sizeof(cwd));
-    if (rc < 0) return (int)rc;
-    size_t cl = strlen(cwd);
+    size_t cl;
+    if (g_logical_cwd[0]) {
+        cl = strlen(g_logical_cwd);
+        if (cl >= sizeof(cwd)) return -ENAMETOOLONG;
+        memcpy(cwd, g_logical_cwd, cl + 1);
+    } else {
+        long rc = read_cwd_abs(cwd, sizeof(cwd));
+        if (rc < 0) return (int)rc;
+        cl = strlen(cwd);
+    }
     size_t pl = strlen(path);
     if (cl + 1 + pl + 1 > out_sz) return -ENAMETOOLONG;
     memcpy(out, cwd, cl);
@@ -272,6 +455,18 @@ long sud_inramfs_op_open(const char *abs_path, int flags, int mode)
     if (!of) {
         raw_close(kfd);
         return -EMFILE;
+    }
+    /* For directory fds, remember the absolute path so subsequent
+     * *at(dirfd, relpath) syscalls can resolve via this fd.  Skip
+     * for non-directories (saves the copy for the common case). */
+    if (ino->type == SUD_IR_T_DIR) {
+        size_t pl = strlen(abs_path);
+        if (pl < sizeof(of->dir_path)) {
+            memcpy(of->dir_path, abs_path, pl + 1);
+        }
+        /* If the path is too long, dir_path stays empty — relative
+         * resolution via this fd will fall back to the kernel.
+         * That's a graceful degradation, not a correctness bug. */
     }
     /* O_APPEND is honoured at write time via flags. */
     return kfd;
@@ -721,6 +916,14 @@ static long fdtab_register_dup(struct sud_ir_open_file *src, int newkfd)
             g_fdtab[i].pos        = src->pos;
             g_fdtab[i].flags      = src->flags;
             g_fdtab[i].dir_cookie = src->dir_cookie;
+            /* Inherit the abs-path used to open the source dirfd, if
+             * any.  Without this, dup'd directory fds (e.g. those
+             * minted by fdopendir, which is what `rm -rf` and many
+             * ftw-style traversals use) would lose their path and
+             * cause subsequent unlinkat/openat-relative ops on the
+             * dup to fail with EXDEV from absolutise(). */
+            memcpy(g_fdtab[i].dir_path, src->dir_path,
+                   sizeof(g_fdtab[i].dir_path));
             return newkfd;
         }
     }
@@ -1037,6 +1240,129 @@ static long h_utimensat(struct sud_syscall_ctx *c, const char *abs)
         (const struct timespec *)c->args[2], follow);
 }
 
+/* ---- chdir / getcwd / fchdir -----------------------------------
+ *
+ * chdir(path):
+ *   - Resolve `path` relative to the current logical CWD (already
+ *     handled by absolutise's seed).
+ *   - If the absolute path is under our mount, validate it's a
+ *     directory via sud_inramfs_op_chdir, then store it as the new
+ *     logical CWD and point the kernel CWD at "/" so /proc/self/cwd
+ *     reports something the kernel can resolve (rather than an
+ *     inramfs path it doesn't know about).  Update the env var so
+ *     the next execve naturally inherits the new logical CWD.
+ *   - If the absolute path is *outside* our mount, it's a transition
+ *     OUT of inramfs.  Clear the logical CWD, scrub the env var, and
+ *     fall through to the kernel which performs the real chdir.
+ *
+ * getcwd(buf, size):
+ *   - If logical CWD is active, copy it (incl. trailing NUL) into
+ *     the user buffer and return strlen+1, matching getcwd(2)'s
+ *     return-on-success contract.
+ *   - Else, fall through.
+ *
+ * fchdir(fd):
+ *   - inramfs dirfds are real memfds (not directories), so the
+ *     kernel would EBADF/ENOTDIR them anyway.  We don't support
+ *     fchdir-to-inramfs in this iteration (would require carrying
+ *     the dir's path on each open fd).
+ *   - For host fds we conservatively clear the logical CWD before
+ *     letting the kernel fchdir — once the user has fchdir'd to a
+ *     host directory they have left inramfs.
+ */
+static long h_chdir(struct sud_syscall_ctx *c)
+{
+    const char *path = (const char *)c->args[0];
+    if (!path) return -EFAULT;
+
+    char abs[PATH_MAX];
+    int rc = absolutise(AT_FDCWD, path, abs, sizeof(abs));
+    if (rc < 0) return rc;
+
+    if (!sud_inramfs_path_under_mount(abs)) {
+        /* Leaving inramfs.  Clear our state and let the kernel
+         * perform the actual chdir (return 0 from this handler =
+         * "not handled, continue to kernel"). */
+        if (g_logical_cwd[0]) {
+            g_logical_cwd[0] = '\0';
+            cwd_publish_to_env(0);
+        }
+        return 1;   /* sentinel: fall through to kernel */
+    }
+
+    long r = sud_inramfs_op_chdir(abs);
+    if (r < 0) return r;
+
+    /* Park the kernel CWD at "/" so /proc/self/cwd doesn't lie
+     * about a path the kernel can't resolve.  Best-effort — if
+     * even chdir("/") fails we still set our logical state; the
+     * worst that happens is /proc/self/cwd reports a stale
+     * (kernel-visible) directory, which is harmless for our own
+     * absolutise (it consults g_logical_cwd first). */
+    raw_syscall6(SYS_chdir, (long)"/", 0, 0, 0, 0, 0);
+
+    size_t l = strlen(abs);
+    if (l >= sizeof(g_logical_cwd)) return -ENAMETOOLONG;
+    memcpy(g_logical_cwd, abs, l + 1);
+    cwd_publish_to_env(g_logical_cwd);
+    return 0;
+}
+
+static long h_getcwd(struct sud_syscall_ctx *c)
+{
+    cwd_seed_from_env();
+    if (!g_logical_cwd[0]) return 1;   /* not active — fall through */
+
+    char *buf = (char *)c->args[0];
+    size_t size = (size_t)c->args[1];
+    if (!buf) return -EFAULT;
+    size_t l = strlen(g_logical_cwd);
+    if (l + 1 > size) return -ERANGE;
+    memcpy(buf, g_logical_cwd, l + 1);
+    /* Linux getcwd(2) returns the buffer length including NUL on
+     * success.  Glibc/musl wrap this and return the buffer pointer;
+     * raw syscall semantics are what we have to honour here. */
+    return (long)(l + 1);
+}
+
+static long h_fchdir(struct sud_syscall_ctx *c)
+{
+    int fd = (int)c->args[0];
+    struct sud_ir_open_file *of = fdtab_lookup(fd);
+    if (!of && sud_inramfs_owns_fd(fd))
+        of = fdtab_lookup(fd);          /* adopted just now */
+    if (of) {
+        /* Inramfs fd.  Only directory fds with a recorded path can
+         * become the logical CWD; without dir_path we can't name
+         * the destination.  Surface ENOTDIR for non-directory
+         * inramfs fds (memfds), and EXDEV-style fallback isn't
+         * applicable for chdir. */
+        struct sud_ir_inode *ino = sud_ir_inode_get(of->inode_idx);
+        if (!ino || ino->type != SUD_IR_T_DIR) return -ENOTDIR;
+        if (!of->dir_path[0])           return -EBADF;
+        size_t pl = strlen(of->dir_path);
+        if (pl >= sizeof(g_logical_cwd)) return -ENAMETOOLONG;
+        memcpy(g_logical_cwd, of->dir_path, pl + 1);
+        cwd_publish_to_env(g_logical_cwd);
+        /* Park the kernel CWD at "/" so /proc/self/cwd doesn't
+         * claim a path the kernel can't resolve.  Mirrors
+         * h_chdir's behaviour for absolute inramfs paths. */
+        raw_syscall6(SYS_chdir, (long)"/", 0, 0, 0, 0, 0);
+        return 0;
+    }
+    /* Host fd: a successful fchdir lands the process outside inramfs.
+     * Clear logical state pre-emptively; if the kernel call fails
+     * (EBADF/ENOTDIR/...) the worst case is we've forgotten an
+     * inramfs CWD, but the next chdir resets it.  This trade is
+     * preferred over allowing a stale logical CWD to silently mis-
+     * route relative paths after a successful host-side fchdir. */
+    if (g_logical_cwd[0]) {
+        g_logical_cwd[0] = '\0';
+        cwd_publish_to_env(0);
+    }
+    return 1;   /* fall through to kernel */
+}
+
 /* Two-path handlers. */
 static long h_rename(struct sud_syscall_ctx *c, const char *src, const char *dst)
 { (void)c; return sud_inramfs_op_rename(src, dst, 0); }
@@ -1297,6 +1623,95 @@ static int dispatch_dup_to(struct sud_syscall_ctx *ctx,
     return 0;
 }
 
+/* ---- execve envp injection -----------------------------------------
+ *
+ * The traced program does not see the addin's libc-fs `environ` —
+ * it has its own.  So setenv() called in our chdir handler updates
+ * libc-fs but does NOT propagate to children: when the user program
+ * execve's, it passes ITS OWN envp to the kernel, lacking
+ * SUD_INRAMFS_CWD.  The child wakes up with no idea that its parent
+ * had logically chdir'd into inramfs.
+ *
+ * To bridge that, we intercept SYS_execve in the addin's pre_syscall
+ * hook (which runs BEFORE handler.c's argv-rewrite) and rewrite
+ * envp to inject / replace / remove SUD_INRAMFS_CWD according to
+ * the current logical-CWD state.  We do NOT short-circuit — we
+ * mutate ctx->args[2] and return 0 so handler.c continues with the
+ * patched envp.
+ *
+ * Memory: a single mmap arena per execve.  On exec success the
+ * kernel discards the mapping with the rest of the address space;
+ * on exec failure we leak (rare, bounded), which is the same trade
+ * handler.c's argv arena makes.
+ */
+static void execve_inject_cwd_env(struct sud_syscall_ctx *ctx)
+{
+    cwd_seed_from_env();
+    char **envp = (char **)ctx->args[2];
+    if (!envp) return;
+
+    /* Count entries and detect any existing SUD_INRAMFS_CWD slot. */
+    static const char key[] = "SUD_INRAMFS_CWD=";
+    const size_t klen = sizeof(key) - 1;
+    int n = 0;
+    int existing = -1;
+    while (envp[n]) {
+        if (existing < 0 &&
+            strncmp(envp[n], key, klen) == 0)
+            existing = n;
+        n++;
+    }
+
+    int active = (g_logical_cwd[0] != '\0');
+
+    /* Fast path: nothing to do.  No active CWD AND no stale env
+     * entry to remove.  Leave envp untouched. */
+    if (!active && existing < 0) return;
+
+    /* Build a new envp.  Worst case size:
+     *   (n + 2) pointers + the new value string.
+     * 1 page is more than enough for normal env tables; pathological
+     * envs (>~500 entries) would need bigger but build tools are
+     * far below that. */
+    size_t newval_len = 0;
+    if (active) {
+        newval_len = klen + strlen(g_logical_cwd) + 1;   /* incl NUL */
+    }
+    size_t arena_sz = (size_t)(n + 2) * sizeof(char *) + newval_len;
+    /* Round up to a whole page. */
+    arena_sz = (arena_sz + 4095u) & ~(size_t)4095u;
+    void *arena = raw_mmap(0, arena_sz, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    /* OOM on the arena: leave envp untouched.  Child won't inherit
+     * the logical CWD, which falls back to "behaves like an
+     * exec out of inramfs" — incorrect but not corrupting. */
+    if ((unsigned long)arena >= (unsigned long)-4095) return;
+
+    char **new_envp = (char **)arena;
+    char  *strbuf   = (char *)arena
+                    + (size_t)(n + 2) * sizeof(char *);
+    char  *newval   = 0;
+    if (active) {
+        newval = strbuf;
+        memcpy(newval, key, klen);
+        memcpy(newval + klen, g_logical_cwd, strlen(g_logical_cwd) + 1);
+    }
+
+    int j = 0;
+    for (int i = 0; i < n; i++) {
+        if (i == existing) {
+            if (active) new_envp[j++] = newval;   /* replace */
+            /* else: drop (we are leaving inramfs) */
+            continue;
+        }
+        new_envp[j++] = envp[i];
+    }
+    if (active && existing < 0) new_envp[j++] = newval;   /* append */
+    new_envp[j] = 0;
+
+    ctx->args[2] = (long)new_envp;
+}
+
 /* fcntl: only F_DUPFD/F_DUPFD_CLOEXEC and F_GETFL/F_SETFL are
  * inramfs-relevant.  F_GETFD/F_SETFD (FD_CLOEXEC) deliberately fall
  * through to the kernel — cloexec lives on the underlying memfd and
@@ -1389,6 +1804,148 @@ static int inramfs_pre_syscall(struct sud_syscall_ctx *ctx)
         if (r == -1) return 0;
         if (r < 0)   return short_circuit(ctx, r);
         return short_circuit(ctx, h_utimensat(ctx, abs));
+    }
+#endif
+
+    /* chdir / fchdir / getcwd: all three need addin-side logical-CWD
+     * bookkeeping even when the call is "going outside inramfs"
+     * (we must clear the stored logical CWD).  Handlers return 1
+     * to signal "state updated, please fall through to the kernel"
+     * (used when the user is leaving inramfs and the kernel
+     * actually owns the operation). */
+#ifdef SYS_chdir
+    if (nr == SYS_chdir) {
+        long r = h_chdir(ctx);
+        if (r == 1) return 0;          /* leaving inramfs: kernel handles */
+        return short_circuit(ctx, r);
+    }
+#endif
+#ifdef SYS_fchdir
+    if (nr == SYS_fchdir) {
+        long r = h_fchdir(ctx);
+        if (r == 1) return 0;
+        return short_circuit(ctx, r);
+    }
+#endif
+#ifdef SYS_getcwd
+    if (nr == SYS_getcwd) {
+        long r = h_getcwd(ctx);
+        if (r == 1) return 0;
+        return short_circuit(ctx, r);
+    }
+#endif
+
+    /* execve: rewrite envp to carry SUD_INRAMFS_CWD across the
+     * exec boundary, then fall through (handler.c does the argv
+     * rewriting and issues the actual execve). */
+#ifdef SYS_execve
+    if (nr == SYS_execve) {
+        execve_inject_cwd_env(ctx);
+        return 0;
+    }
+#endif
+#ifdef SYS_execveat
+    if (nr == SYS_execveat) {
+        /* execveat: envp is arg index 3.  Temporarily aliases
+         * args[2] so the same helper can write through. */
+        long save = ctx->args[2];
+        ctx->args[2] = ctx->args[3];
+        execve_inject_cwd_env(ctx);
+        long maybe_new = ctx->args[2];
+        ctx->args[2] = save;
+        ctx->args[3] = maybe_new;
+        return 0;
+    }
+#endif
+
+    /* munmap interception.
+     *
+     * sud_inramfs_op_mmap returns a pointer directly *inside* our
+     * shared data mapping at sud_ir_data_base.  If the traced
+     * program later munmaps that pointer, the kernel obediently
+     * tears the page out of the process's address space — but the
+     * mapping is OURS, shared by every subsequent inramfs file
+     * operation in this process.  The next sud_ir_fat_alloc that
+     * hands back that block_id then SEGVs while zeroing it.
+     *
+     * Treat any munmap range that lies wholly inside one of our
+     * shared regions (data shm or metadata shm) as a no-op: the
+     * user thinks they unmapped their copy, our backing region
+     * stays intact, and reads/writes through the addin keep
+     * working.  Partial overlap (the unusual case of a single
+     * munmap straddling the region boundary) falls through to the
+     * kernel — that boundary case is rare and the kernel's
+     * partial-unmap will harm only the part outside our region.
+     *
+     * Real kernel-side munmap of MAP_FIXED user mappings inside the
+     * shm range would require a per-region refcount; punting on
+     * that is fine because the addin's mmap path is the only
+     * documented way to obtain such a pointer.
+     */
+#ifdef SYS_munmap
+    if (nr == SYS_munmap) {
+        unsigned long a = (unsigned long)ctx->args[0];
+        unsigned long l = (unsigned long)ctx->args[1];
+        unsigned long meta_b = (unsigned long)sud_ir_base;
+        unsigned long data_b = (unsigned long)sud_ir_data_base;
+        unsigned long meta_sz = (unsigned long)sud_ir_meta_size();
+        unsigned long data_sz = (unsigned long)sud_ir_data_size();
+        if ((meta_b && a >= meta_b && a + l <= meta_b + meta_sz) ||
+            (data_b && a >= data_b && a + l <= data_b + data_sz)) {
+            return short_circuit(ctx, 0);
+        }
+    }
+#endif
+
+    /* Zero-copy fast paths (copy_file_range / sendfile / splice).
+     *
+     * The kernel implements these in terms of the underlying file's
+     * page cache.  Our inramfs files are backed by *empty* memfds —
+     * the real content lives in the inramfs data shm and is only
+     * surfaced via the addin's read/write/pread/pwrite.  If we
+     * forwarded copy_file_range to the kernel, it would dutifully
+     * copy 0 bytes from one empty memfd to another and report
+     * success.  This silently corrupts workloads like coreutils
+     * `cat` (which uses copy_file_range as its primary path).
+     *
+     * Force the userland fallback by returning -EXDEV when any
+     * involved fd is inramfs-owned.  -EXDEV is the documented
+     * "different filesystems / not supported" errno that GNU
+     * coreutils, busybox, and similar tools handle by retrying via
+     * read/write.  Wholly host-fd calls fall through to the kernel
+     * unchanged.
+     */
+#ifdef SYS_copy_file_range
+    if (nr == SYS_copy_file_range) {
+        int in_fd  = (int)ctx->args[0];
+        int out_fd = (int)ctx->args[2];
+        if (sud_inramfs_owns_fd(in_fd) || sud_inramfs_owns_fd(out_fd)) {
+            return short_circuit(ctx, -ENOSYS);
+        }
+    }
+#endif
+#ifdef SYS_sendfile
+    if (nr == SYS_sendfile) {
+        int out_fd = (int)ctx->args[0];
+        int in_fd  = (int)ctx->args[1];
+        if (sud_inramfs_owns_fd(in_fd) || sud_inramfs_owns_fd(out_fd))
+            return short_circuit(ctx, -EINVAL);
+    }
+#endif
+#ifdef SYS_sendfile64
+    if (nr == SYS_sendfile64) {
+        int out_fd = (int)ctx->args[0];
+        int in_fd  = (int)ctx->args[1];
+        if (sud_inramfs_owns_fd(in_fd) || sud_inramfs_owns_fd(out_fd))
+            return short_circuit(ctx, -EINVAL);
+    }
+#endif
+#ifdef SYS_splice
+    if (nr == SYS_splice) {
+        int in_fd  = (int)ctx->args[0];
+        int out_fd = (int)ctx->args[2];
+        if (sud_inramfs_owns_fd(in_fd) || sud_inramfs_owns_fd(out_fd))
+            return short_circuit(ctx, -EINVAL);
     }
 #endif
 

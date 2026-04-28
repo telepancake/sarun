@@ -280,6 +280,18 @@
 #if !defined(SYS_utimensat) && defined(__NR_utimensat)
 #define SYS_utimensat      __NR_utimensat
 #endif
+#if !defined(SYS_copy_file_range) && defined(__NR_copy_file_range)
+#define SYS_copy_file_range __NR_copy_file_range
+#endif
+#if !defined(SYS_sendfile) && defined(__NR_sendfile)
+#define SYS_sendfile       __NR_sendfile
+#endif
+#if !defined(SYS_sendfile64) && defined(__NR_sendfile64)
+#define SYS_sendfile64     __NR_sendfile64
+#endif
+#if !defined(SYS_splice) && defined(__NR_splice)
+#define SYS_splice         __NR_splice
+#endif
 #if !defined(SYS_futimesat) && defined(__NR_futimesat)
 #define SYS_futimesat      __NR_futimesat
 #endif
@@ -590,6 +602,9 @@ typedef struct ucontext_t {
 #endif
 #ifndef EFBIG
 #define EFBIG           27
+#endif
+#ifndef ERANGE
+#define ERANGE          34
 #endif
 
 /* Futex op codes used by inramfs's cross-process locks. */
