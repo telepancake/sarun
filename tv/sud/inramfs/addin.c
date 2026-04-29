@@ -686,14 +686,29 @@ long sud_inramfs_op_getdents64(int fd, void *buf, size_t count)
 }
 
 /* ================================================================
- * mmap — map the file's data extent (or a slice of it) into the
- * caller's address space.  Strategy:
- *   - if the file's data lives in the shared region's data area
- *     (which is always the case here — single contiguous extent),
- *     re-mmap the underlying memfd-backed shm region at the
- *     extent's slot, MAP_SHARED.
- *   - the underlying shm fd is reopened by name from /dev/shm so
- *     we don't have to keep it pinned across processes.
+ * mmap — map the file's data into the caller's address space.
+ *
+ * Two-tier dispatch:
+ *
+ *   LARGE  → forward mmap to the per-file shm's kfd at `offset`.
+ *            Any aligned (offset, length) is supported with full
+ *            MAP_SHARED semantics; the per-file shm is the actual
+ *            backing object.
+ *
+ *   SMALL  → promote the file to LARGE first, then take the LARGE
+ *            path above.  This guarantees that a future grow of
+ *            the file (which would relocate the small extent) does
+ *            not silently invalidate the caller's mapping — the
+ *            per-file shm grows in place via ftruncate, no mapping
+ *            move is ever required.  Cost: a one-time copy of the
+ *            file's <=128 KiB body into the per-file shm.  This is
+ *            cheap and avoids the cross-process map-rewrite
+ *            machinery that a captive-mmap fast path would need.
+ *
+ * Failure modes are real-OS errors (out of physical RAM, fd-table
+ * exhaustion, etc.) — we never return synthetic errors like
+ * "couldn't pin a small file" because such an error would arise
+ * only from us being too lazy to relocate properly.
  * ================================================================ */
 
 void *sud_inramfs_op_mmap(void *addr, size_t length, int prot, int flags,
@@ -706,9 +721,12 @@ void *sud_inramfs_op_mmap(void *addr, size_t length, int prot, int flags,
     if (ino->type != SUD_IR_T_REG) { *err = ENODEV; return MAP_FAILED; }
     if (offset < 0) { *err = EINVAL; return MAP_FAILED; }
 
-    /* Empty file: hand back an anonymous mapping of the requested
-     * length so mmap()-then-fault programs behave sensibly. */
-    if (ino->u.reg.head_block == 0) {
+    /* Empty file with no extent: hand back an anonymous mapping of
+     * the requested length so mmap()-then-fault programs behave
+     * sensibly. */
+    if (ino->size == 0
+        && ino->u.reg.tag == SUD_IR_REG_SMALL
+        && ino->u.reg.u.small.start_block == 0) {
         long r = (long)raw_mmap(addr, length, prot,
                                 flags | MAP_ANONYMOUS, -1, 0);
         if ((unsigned long)r >= (unsigned long)-4095) {
@@ -718,32 +736,24 @@ void *sud_inramfs_op_mmap(void *addr, size_t length, int prot, int flags,
         return (void *)r;
     }
 
-    /* Single-block fast path: when the requested range falls inside
-     * one FAT block we can hand back a direct pointer into the data
-     * shm, giving full MAP_SHARED semantics with no copy.  Multi-
-     * block ranges need page-table coalescing of non-contiguous
-     * blocks, which is the per-file shm work in M3b — refuse for
-     * now rather than silently lose MAP_SHARED writeback. */
-    uint64_t end = (uint64_t)offset + (uint64_t)length;
-    uint32_t block_ix = (uint32_t)(offset / SUD_IR_BLOCK_SIZE);
-    uint32_t in_block = (uint32_t)(offset % SUD_IR_BLOCK_SIZE);
-    if (end > (uint64_t)(block_ix + 1) * SUD_IR_BLOCK_SIZE) {
-        *err = ENOTSUP;
-        return MAP_FAILED;
+    /* Promote SMALL → LARGE so the caller's mapping is backed by a
+     * file that can grow in place via ftruncate without ever
+     * needing to relocate. */
+    if (ino->u.reg.tag == SUD_IR_REG_SMALL) {
+        int rc = sud_ir_file_promote(ino);
+        if (rc) { *err = -rc; return MAP_FAILED; }
     }
-    if (block_ix >= ino->u.reg.nblocks) { *err = EINVAL; return MAP_FAILED; }
 
-    uint32_t *fat = sud_ir_fat();
-    uint32_t b = ino->u.reg.head_block;
-    for (uint32_t i = 0; i < block_ix; i++) b = fat[b];
-    void *p = (char *)sud_ir_data_block(b) + in_block;
-    if ((flags & MAP_FIXED) && addr && addr != p) {
-        *err = EINVAL;
+    /* LARGE: forward mmap to the per-file shm's kfd at `offset`. */
+    int kfd = sud_ir_large_open(ino->u.reg.u.large.file_idx,
+                                ino->u.reg.u.large.file_gen);
+    if (kfd < 0) { *err = -kfd; return MAP_FAILED; }
+    long r = (long)raw_mmap(addr, length, prot, flags, kfd, offset);
+    if ((unsigned long)r >= (unsigned long)-4095) {
+        *err = (int)-r;
         return MAP_FAILED;
     }
-    (void)prot;     /* underlying mapping is RW; PROT_READ-only
-                     * callers see no harm. */
-    return p;
+    return (void *)r;
 }
 
 /* ================================================================
@@ -1870,27 +1880,20 @@ static int inramfs_pre_syscall(struct sud_syscall_ctx *ctx)
 
     /* munmap interception.
      *
-     * sud_inramfs_op_mmap returns a pointer directly *inside* our
-     * shared data mapping at sud_ir_data_base.  If the traced
-     * program later munmaps that pointer, the kernel obediently
-     * tears the page out of the process's address space — but the
-     * mapping is OURS, shared by every subsequent inramfs file
-     * operation in this process.  The next sud_ir_fat_alloc that
-     * hands back that block_id then SEGVs while zeroing it.
+     * The metadata mapping AND (on 64-bit) the small-file shm
+     * mapping are shared backing regions used by the addin itself.
+     * If the traced program munmaps a range inside one of them, the
+     * kernel obediently tears it out of this process's address
+     * space — but the addin still relies on those mappings being
+     * present for every subsequent inramfs operation.
      *
      * Treat any munmap range that lies wholly inside one of our
-     * shared regions (data shm or metadata shm) as a no-op: the
-     * user thinks they unmapped their copy, our backing region
-     * stays intact, and reads/writes through the addin keep
-     * working.  Partial overlap (the unusual case of a single
-     * munmap straddling the region boundary) falls through to the
-     * kernel — that boundary case is rare and the kernel's
-     * partial-unmap will harm only the part outside our region.
-     *
-     * Real kernel-side munmap of MAP_FIXED user mappings inside the
-     * shm range would require a per-region refcount; punting on
-     * that is fine because the addin's mmap path is the only
-     * documented way to obtain such a pointer.
+     * shared regions as a no-op: the user thinks they unmapped
+     * their copy, our backing region stays intact.  Per-file LARGE
+     * shm mappings are NOT intercepted here — those are real
+     * per-file mappings the user got from op_mmap and is free to
+     * tear down.  Partial overlap with one of our regions falls
+     * through to the kernel; that boundary case is rare.
      */
 #ifdef SYS_munmap
     if (nr == SYS_munmap) {
@@ -1899,7 +1902,7 @@ static int inramfs_pre_syscall(struct sud_syscall_ctx *ctx)
         unsigned long meta_b = (unsigned long)sud_ir_base;
         unsigned long data_b = (unsigned long)sud_ir_data_base;
         unsigned long meta_sz = (unsigned long)sud_ir_meta_size();
-        unsigned long data_sz = (unsigned long)sud_ir_data_size();
+        unsigned long data_sz = (unsigned long)sud_ir_small_size();
         if ((meta_b && a >= meta_b && a + l <= meta_b + meta_sz) ||
             (data_b && a >= data_b && a + l <= data_b + data_sz)) {
             return short_circuit(ctx, 0);

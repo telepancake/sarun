@@ -53,6 +53,32 @@
  * tracking buffer.  64 is well above any realistic FS tree. */
 #define SUD_IR_PARENT_STACK_MAX 64
 
+/* Threshold for small→large promotion (bytes).  Files at or below
+ * this live as one contiguous extent in the shared small-file shm
+ * (zero-copy memcpy on 64-bit, pread/pwrite on 32-bit).  Files
+ * larger than this each get their own /dev/shm tmpfs object that
+ * grows as needed, accessed via a per-process kfd cache. */
+#define SUD_IR_LARGE_THRESHOLD (128u * 1024u)
+#define SUD_IR_LARGE_BLOCKS    (SUD_IR_LARGE_THRESHOLD / SUD_IR_BLOCK_SIZE)
+
+/* Sparse-allocation upper bound for the small-file shm.  This sizes
+ * the small-file allocator bitmap (which lives in the metadata shm).
+ * The shm itself is created sparse — physical pages are only
+ * allocated for blocks that actually get written.  When the bitmap
+ * is exhausted, new file growth promotes to a per-file shm; running
+ * out of bitmap bits is NOT an error, it just forces promotion.
+ *
+ * 65536 inodes × 32 blocks (128 KiB max small-file size) = 2 Mi
+ * blocks = 8 GiB sparse address range; bitmap = 256 KiB. */
+#define SUD_IR_SMALL_BLOCKS    (SUD_IR_MAX_INODES * SUD_IR_LARGE_BLOCKS)
+#define SUD_IR_SMALL_SHM_SIZE  ((uint64_t)SUD_IR_SMALL_BLOCKS * SUD_IR_BLOCK_SIZE)
+
+/* Inode regular-file storage tag. */
+enum {
+    SUD_IR_REG_SMALL = 0,    /* lives in shared small-file shm */
+    SUD_IR_REG_LARGE = 1,    /* lives in its own /dev/shm tmpfs */
+};
+
 /* Forward declaration. */
 struct sud_ir_super;
 struct sud_ir_inode;
@@ -92,20 +118,46 @@ struct sud_ir_inode {
      * 2 == locked-with-waiters.  Used as a non-recursive mutex for
      * file-content ops. */
     uint32_t lock;
+    /* Cross-process count of currently-open fds against this inode.
+     * Atomically updated by op_open / op_close / try_adopt_inherited_fd
+     * across all attached processes.  Used by op_mmap to decide
+     * whether a SMALL file can be mmap'd directly from the small-file
+     * shm (only when this is the sole opener, captive case) versus
+     * needing promote-to-LARGE first.  Process-death leaks are not
+     * fatal — the count is advisory; a stale-high count just forces
+     * conservative promote-first behaviour. */
+    uint32_t open_refs;
     /* Type-specific data.  The largest variant is the inline symlink
      * target buffer. */
     union {
-        /* Regular file: data lives in the small-files data shm,
-         * organised as a singly-linked chain of fixed-size data
-         * blocks (SUD_IR_BLOCK_SIZE bytes each).  head_block is the
-         * 1-based FAT block id of the first block; 0 means "empty
-         * file, no blocks allocated yet".  nblocks is the number of
-         * blocks reachable from head_block; logical end-of-file
-         * (`size`) is always <= nblocks * BLOCK_SIZE.  Walk the
-         * chain via super.fat[block_id]; a 0 entry terminates. */
+        /* Regular file storage.  `tag` discriminates between SMALL
+         * (one contiguous extent in the shared small-file shm,
+         * indexed by 1-based block id) and LARGE (its own /dev/shm
+         * tmpfs object, named by file_idx + file_gen).  Promotion
+         * SMALL→LARGE happens on write/truncate that crosses
+         * SUD_IR_LARGE_THRESHOLD or when the small allocator has no
+         * contiguous run of the required length. */
         struct {
-            uint32_t head_block;
-            uint32_t nblocks;
+            uint32_t tag;          /* SUD_IR_REG_SMALL / _LARGE */
+            union {
+                /* SMALL: contiguous run of `nblocks` blocks
+                 * starting at `start_block` (1-based).  0 means
+                 * "empty file, no extent allocated". */
+                struct {
+                    uint32_t start_block;
+                    uint32_t nblocks;
+                } small;
+                /* LARGE: per-file shm at
+                 * /dev/shm/sud-inramfs.<key>.f.<file_idx>.<file_gen>.
+                 * file_idx is the inode index (stable while the
+                 * inode lives); file_gen is the inode generation at
+                 * promotion time (so a new inode in the same slot
+                 * never collides with a stale shm path). */
+                struct {
+                    uint32_t file_idx;
+                    uint32_t file_gen;
+                } large;
+            } u;
         } reg;
         /* Directory: dirents stored in a singly-linked chain of
          * dirent blocks (each block is SUD_IR_BLOCK_SIZE bytes,
@@ -181,48 +233,40 @@ struct sud_ir_super {
     uint32_t inodes_in_use;
     uint32_t blocks_in_use;     /* metadata blocks in use */
 
-    /* ---- FAT allocator for the data shm ---------------------- */
-    /* A FAT-style block allocator for the small-files data shm
-     * (a separate /dev/shm object, see super.c).  Bookkeeping lives
-     * in the metadata region so 32-bit and 64-bit processes share
-     * the same view of which data blocks are free.
+    /* ---- Small-file shm: contiguous-extent allocator ---------- */
+    /* A bitmap-allocated, contiguous-extent allocator over the
+     * small-file shm (a separate /dev/shm object created sparse,
+     * see super.c).  Each SMALL regular file occupies exactly one
+     * contiguous run of `nblocks` blocks; runs are allocated by a
+     * first-fit scan over `small_bitmap`.  Bookkeeping lives in the
+     * metadata shm so 32-bit and 64-bit processes share one
+     * authoritative view of which blocks are free.
      *
-     * fat_off                 — byte offset (within the metadata
-     *                           region) of a uint32_t array of size
-     *                           fat_count + 1.  Index 0 is reserved
-     *                           as the end-of-chain marker.  Indexes
-     *                           1..fat_count are valid block ids.
-     *                           For an in-use chain, fat[i] is the id
-     *                           of the next block in that file's
-     *                           chain (0 = last block).  For a free
-     *                           block, fat[i] is the id of the next
-     *                           free block in the free list.
-     * fat_free_head_tagged    — Treiber-stack head, packed as
-     *                             { aba_counter:32 (high), block_id:32 (low) }
-     *                           so a 64-bit `__atomic_compare_exchange`
-     *                           pop/push survives the ABA hazard
-     *                           that would otherwise corrupt the
-     *                           free list under multi-process
-     *                           contention.  block_id == 0 means the
-     *                           free list is empty.  Forced to
-     *                           8-byte alignment so cmpxchg8b on
-     *                           i386 (where uint64_t struct fields
-     *                           default to 4-byte align under SysV)
-     *                           is genuinely atomic.
-     * fat_free_count          — atomic counter; used for stats /
-     *                           leak checks (relaxed memory order).
-     * fat_count               — total number of data blocks in the
-     *                           data shm.
-     * data_shm_size           — size of the data shm in bytes
-     *                           (= fat_count * SUD_IR_BLOCK_SIZE). */
-    uint32_t fat_off;
-    uint32_t fat_count;
-    /* 8-byte aligned: cmpxchg8b on i386 requires it for atomicity
-     * (uint64_t struct fields default to 4-byte align under SysV). */
-    uint64_t fat_free_head_tagged __attribute__((aligned(8)));
-    uint32_t fat_free_count;
-    uint32_t _pad_tail;
-    uint64_t data_shm_size       __attribute__((aligned(8)));
+     * small_bitmap_off — byte offset (within metadata) of the
+     *                    bitmap, sized SUD_IR_SMALL_BLOCKS bits.
+     * small_block_count — total bits in the bitmap (= max
+     *                    contiguous blocks ever addressable in the
+     *                    small-file shm).  When the bitmap is
+     *                    exhausted a new file growth is forced to
+     *                    promote to a per-file shm — this is NOT
+     *                    an error path, just the normal escape
+     *                    valve to the LARGE tier.
+     * small_blocks_in_use — atomic counter of allocated blocks
+     *                    (relaxed; stats only).
+     * small_alloc_hint — first-fit search hint; bumped past the
+     *                    most-recent allocation.  Caller MUST hold
+     *                    sb->lock for alloc/free (the search-and-
+     *                    set is not lock-free).
+     * small_shm_size  — size of the small-file shm in bytes
+     *                    (= small_block_count * BLOCK_SIZE).  The
+     *                    shm is created sparse so this is virtual
+     *                    address-space cost on 64-bit only; on
+     *                    32-bit the shm is never mapped. */
+    uint32_t small_bitmap_off;
+    uint32_t small_block_count;
+    uint32_t small_blocks_in_use;
+    uint32_t small_alloc_hint;
+    uint64_t small_shm_size       __attribute__((aligned(8)));
 };
 
 /* ---- super.c: region access and locking ----------------------- */
@@ -269,45 +313,84 @@ uint64_t sud_ir_xxh64(const void *data, size_t len);
 uint32_t sud_ir_block_alloc(uint32_t nblocks);
 void     sud_ir_block_free(uint32_t off, uint32_t nblocks);
 
-/* ---- Data shm: small-files store with FAT block allocator ---- */
+/* ---- Small-file shm: contiguous-extent allocator ------------- */
 
-/* Pointer to the start of the data shm in this process's address
- * space, or NULL if the data shm is not currently mapped.  Walking a
- * file's FAT chain requires knowing the in-process address of each
- * data block: sud_ir_data_block(id) returns it as
- *   sud_ir_data_base + (id - 1) * SUD_IR_BLOCK_SIZE.
- * Both 32-bit and 64-bit map the data shm at process start (see
- * super.c::map_data_shm).  Block ids are 1-based; id 0 is reserved
- * as the FAT end-of-chain / "no block" sentinel. */
+/* Pointer to the start of the small-file shm in this process's
+ * address space, or NULL if the shm is not currently mapped.
+ *
+ * 64-bit: mapped MAP_SHARED|MAP_NORESERVE at fixed_data_addr() so
+ * SMALL files are served by zero-copy memcpy via
+ * sud_ir_small_block_addr(id) (= sud_ir_data_base +
+ * (id - 1) * BLOCK_SIZE).
+ *
+ * 32-bit: deliberately NOT mapped (the small-file shm can grow
+ * arbitrarily and there is no spare 32-bit address space to spend
+ * on a fixed reservation).  All small-file content access on
+ * 32-bit goes through sud_ir_small_pread/pwrite, which pread/
+ * pwrite on the open small-file fd via offsets computed the same
+ * way.  Block ids are 1-based; id 0 is the "no extent" sentinel. */
 extern volatile char *sud_ir_data_base;
 
-static inline void *sud_ir_data_block(uint32_t block_id)
+static inline void *sud_ir_small_block_addr(uint32_t block_id)
 {
     if (block_id == 0 || !sud_ir_data_base) return 0;
     return (void *)(sud_ir_data_base
                     + (size_t)(block_id - 1) * SUD_IR_BLOCK_SIZE);
 }
 
-static inline uint32_t *sud_ir_fat(void)
+/* Byte offset within the small-file shm of the first byte of the
+ * block run starting at `start_block`.  Used by the 32-bit
+ * pread/pwrite path. */
+static inline uint64_t sud_ir_small_block_offset(uint32_t block_id)
 {
-    return (uint32_t *)sud_ir_ptr(sud_ir_sb()->fat_off);
+    if (block_id == 0) return 0;
+    return (uint64_t)(block_id - 1) * SUD_IR_BLOCK_SIZE;
 }
 
-/* Allocate exactly one data block from the FAT free list.  Returns a
- * 1-based block id, or 0 if the data shm is full.  The block's bytes
- * are NOT pre-zeroed (callers that need a clean block must zero it
- * explicitly — file_grow does this so reads past the previous EOF
- * see zeros).  Lock-free (CAS Treiber-stack pop with ABA tag); safe
- * to call concurrently from multiple processes without any external
- * lock. */
-uint32_t sud_ir_fat_alloc(void);
+/* Allocate a contiguous run of `nblocks` blocks from the small-file
+ * shm.  Returns the 1-based id of the first block, or 0 if no run
+ * of that length exists in the bitmap (callers escalate to a
+ * per-file LARGE shm — this is normal, not an error path).
+ * Caller MUST hold sb->lock. */
+uint32_t sud_ir_small_alloc(uint32_t nblocks);
 
-/* Return one block (by id) to the free list.  Best-effort: punches a
- * hole in the data shm so the kernel can reclaim its physical page,
- * keeping resident-memory cost tracking the live file footprint
- * rather than the high-water-mark.  Lock-free (CAS push with ABA
- * tag); safe to call concurrently. */
-void     sud_ir_fat_free(uint32_t block_id);
+/* Free a previously-allocated contiguous run of `nblocks` blocks
+ * starting at `start_block` (1-based).  Best-effort hole-punches
+ * the freed range so resident memory tracks live data.  Caller
+ * MUST hold sb->lock. */
+void     sud_ir_small_free(uint32_t start_block, uint32_t nblocks);
+
+/* 32-bit pread/pwrite onto the small-file shm fd at the given
+ * byte offset (computed by callers via
+ * sud_ir_small_block_offset(start_block) + intra-extent offset).
+ * On 64-bit these still work but the mapped fast path is faster.
+ * Returns -errno on failure, bytes-transferred on success. */
+long sud_ir_small_pread (void *buf, size_t count, uint64_t off);
+long sud_ir_small_pwrite(const void *buf, size_t count, uint64_t off);
+
+/* ---- Per-file LARGE shm (one /dev/shm object per LARGE inode) ---- */
+
+/* Open (creating + ftruncating to `size` if needed) the per-file
+ * shm for the given (file_idx, file_gen).  Returns a kernel fd
+ * cached process-locally for subsequent calls; subsequent calls
+ * with the same key return the same fd without a syscall.  Returns
+ * a negative -errno on failure. */
+int  sud_ir_large_open(uint32_t file_idx, uint32_t file_gen);
+
+/* ftruncate the per-file shm to `size`.  Returns 0 / -errno. */
+int  sud_ir_large_ftruncate(uint32_t file_idx, uint32_t file_gen,
+                            uint64_t size);
+
+/* Drop this process's cached kfd for (file_idx, file_gen).  No
+ * effect on the underlying shm — used when the inode is being
+ * freed or when another process unlinks the shm out from under us. */
+void sud_ir_large_forget(uint32_t file_idx, uint32_t file_gen);
+
+/* Unlink the per-file shm from /dev/shm and forget any cached fd.
+ * Called when the LARGE inode's link count and open-ref count
+ * both drop to zero.  Safe across processes (unlink is idempotent
+ * — losers see ENOENT and ignore it). */
+void sud_ir_large_unlink(uint32_t file_idx, uint32_t file_gen);
 
 /* Allocate / free an inode index.  Caller MUST hold sb->lock.
  * Returns inode index (1-based) or 0 on out-of-space. */
@@ -323,11 +406,13 @@ struct sud_ir_inode *sud_ir_inode_get(uint32_t index);
 const char *sud_ir_mount_path(void);
 size_t      sud_ir_mount_len(void);
 
-/* Sizes of the two backing shm regions, in bytes.  Used by the
- * addin's munmap interceptor to decide whether a user munmap range
- * lies inside our shared mappings. */
+/* Sizes of the metadata mapping and the small-file shm, in bytes.
+ * Used by the addin's munmap interceptor to decide whether a user
+ * munmap range lies inside one of our shared mappings.  On 32-bit,
+ * sud_ir_small_size() returns the *file* size (the shm is not
+ * mapped, so the munmap interceptor returns 0 there). */
 size_t      sud_ir_meta_size(void);
-size_t      sud_ir_data_size(void);
+size_t      sud_ir_small_size(void);
 
 /* Current monotonic-ish wall-clock in ns — used to set i_*time. */
 uint64_t sud_ir_now_ns(void);
@@ -366,6 +451,13 @@ long sud_ir_file_read (struct sud_ir_inode *ino, void *buf,
 long sud_ir_file_write(struct sud_ir_inode *ino, const void *buf,
                        size_t count, off_t off);
 long sud_ir_file_truncate(struct sud_ir_inode *ino, off_t length);
+
+/* Promote a SMALL inode to LARGE in place: allocate per-file shm,
+ * ftruncate to current size, copy bytes from the small extent into
+ * the per-file shm, free the small extent, switch the inode tag.
+ * No-op (returns 0) if the inode is already LARGE.  Takes the
+ * per-inode lock internally; returns 0 / -errno. */
+int  sud_ir_file_promote(struct sud_ir_inode *ino);
 
 /* Fill a `struct stat` (kernel ABI for the running arch) for the
  * given inode.  Implemented in addin.c so the layout is colocated

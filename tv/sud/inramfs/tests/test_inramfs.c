@@ -49,6 +49,12 @@ static void tlog(const char *m) { write(2, m, strlen(m)); }
 
 static void setup_mount(const char *path, int size_mb, const char *key)
 {
+    /* size_mb is the user-tunable metadata size.  The new layout
+     * (8 MiB inode table + 256 KiB small-file bitmap + dirent block
+     * area) needs ~12 MiB minimum; the addin's min_meta_size floor
+     * will round up smaller requests, but make the tests honest by
+     * passing at least 16 MiB. */
+    if (size_mb < 16) size_mb = 16;
     char val[PATH_MAX + 32];
     snprintf(val, sizeof(val), "%s:%d", path, size_mb);
     setenv("SUD_INRAMFS", val, 1);
@@ -502,43 +508,37 @@ static void test_xxh64(void)
     TASSERT(ha != hb, "single-bit avalanche");
 }
 
-/* High-concurrency FAT stress test.
+/* High-concurrency small-extent allocator stress test.
  *
  * N child processes each loop ITERS times: alloc a per-child file,
- * write a per-iteration-sized payload (multi-block), truncate down,
- * unlink.  The whole point is to hammer the lock-free FAT free
- * list across processes — alloc/free contend on a single tagged
- * head, so any ABA bug or missing atomic would either corrupt the
- * free list (manifesting as an allocation that returns an id
- * already in use, or losing blocks entirely) or leak blocks.
+ * write a per-iteration-sized payload, truncate down, unlink.  The
+ * goal is to hammer the contiguous-extent bitmap allocator across
+ * processes — alloc/free contend on sb->lock, so any locking bug
+ * would corrupt the bitmap (manifesting as overlapping extents,
+ * which read-back would catch via cross-contamination, or as
+ * leaked blocks visible in `small_blocks_in_use`).
  *
  * Invariant checked: after all children exit and all files are
- * gone, fat_free_count must equal its initial value (no leaks),
- * and the live free list (walked from the head) must contain
- * exactly that many distinct ids in [1..fat_count] (no duplicates,
- * no out-of-range entries). */
-static void test_fat_concurrency(void)
+ * gone, small_blocks_in_use must equal its initial value (no
+ * leaks).
+ *
+ * All payloads are kept under SUD_IR_LARGE_THRESHOLD so the SMALL
+ * tier is exercised exclusively (LARGE-tier promotion is covered
+ * by test_promotion). */
+static void test_smalldata_concurrency(void)
 {
-    g_curtest = "fat_concurrency";
-    /* 16 MiB data shm = 4096 blocks: enough headroom that ENOSPC
-     * won't be hit even with 8 children × 8 simultaneous files of
-     * 32 blocks each. */
-    setup_mount("/inramfs", 16, "test_fatconc");
+    g_curtest = "smalldata_concurrency";
+    setup_mount("/inramfs", 16, "test_smallconc");
 
     struct sud_ir_super *sb = sud_ir_sb();
-    uint32_t initial_free = __atomic_load_n(&sb->fat_free_count,
-                                             __ATOMIC_ACQUIRE);
-    TASSERT(initial_free > 0, "data shm has free blocks");
+    uint32_t initial_in_use = __atomic_load_n(&sb->small_blocks_in_use,
+                                              __ATOMIC_ACQUIRE);
 
     enum { N_CHILDREN = 8, ITERS = 50 };
     long pids[N_CHILDREN];
     for (int c = 0; c < N_CHILDREN; c++) {
         long pid = fork();
         if (pid == 0) {
-            /* Per-child seed — distinct path prefix so no two
-             * children touch the same inode (this test isolates
-             * FAT contention; namespace contention is exercised
-             * elsewhere). */
             char path[64];
             for (int it = 0; it < ITERS; it++) {
                 snprintf(path, sizeof(path),
@@ -546,21 +546,19 @@ static void test_fat_concurrency(void)
                 int fd = (int)sud_inramfs_op_open(
                     path, O_RDWR | O_CREAT, 0644);
                 if (fd < 0) raw_syscall6(SYS_exit, 21, 0, 0, 0, 0, 0);
-                /* Vary the size so allocations of different
-                 * lengths interleave, exposing ordering bugs. */
+                /* Vary size so allocations of different lengths
+                 * interleave (exposes ordering bugs).  Cap at half
+                 * the threshold so we stay in SMALL tier. */
                 size_t bytes = (size_t)(((c + 1) * 7919u
                                          + (uint32_t)it * 1031u)
-                                         % (32u * 4096u)) + 1024u;
+                                         % (32u * 1024u)) + 1024u;
                 static unsigned char buf[64 * 1024];
-                /* Pattern derived from (c, it) so each process's
-                 * writes are distinguishable on read-back. */
                 for (size_t k = 0; k < bytes; k++) {
                     buf[k] = (unsigned char)((k * (c + 1)
                                               + it * 17u) & 0xff);
                 }
                 if (sud_inramfs_op_write(fd, buf, bytes) != (long)bytes)
                     raw_syscall6(SYS_exit, 22, 0, 0, 0, 0, 0);
-                /* Read back and verify in-process. */
                 static unsigned char rb[64 * 1024];
                 if (sud_inramfs_op_lseek(fd, 0, SEEK_SET) != 0)
                     raw_syscall6(SYS_exit, 23, 0, 0, 0, 0, 0);
@@ -570,8 +568,6 @@ static void test_fat_concurrency(void)
                     if (rb[k] != buf[k])
                         raw_syscall6(SYS_exit, 25, 0, 0, 0, 0, 0);
                 }
-                /* Truncate down then back up — exercises both
-                 * free and re-alloc on the contended free list. */
                 if (sud_inramfs_op_ftruncate(fd, 1024) != 0)
                     raw_syscall6(SYS_exit, 26, 0, 0, 0, 0, 0);
                 if (sud_inramfs_op_ftruncate(fd, bytes) != 0)
@@ -592,42 +588,87 @@ static void test_fat_concurrency(void)
     }
     TASSERT_EQ(any_failed, 0, "all children exited cleanly");
 
-    /* Leak check 1: counter restored. */
-    uint32_t final_free = __atomic_load_n(&sb->fat_free_count,
-                                          __ATOMIC_ACQUIRE);
-    TASSERT_EQ(final_free, initial_free,
-               "fat_free_count restored after all unlinks");
+    uint32_t final_in_use = __atomic_load_n(&sb->small_blocks_in_use,
+                                            __ATOMIC_ACQUIRE);
+    TASSERT_EQ(final_in_use, initial_in_use,
+               "small_blocks_in_use restored after all unlinks");
 
-    /* Leak check 2: walk the actual free list, assert it has
-     * exactly initial_free distinct, in-range, non-zero ids.
-     * Catches duplicates (would prove a double-free or a stale
-     * push) and bogus ids (would prove ABA corruption).
-     *
-     * Bitmap sized at (1 << 16) bits = 8 KiB: comfortably covers
-     * fat_count for our 16 MiB data shm (4096 blocks) with room
-     * to grow.  Asserted against sb->fat_count below. */
-    static uint8_t seen[(1u << 16) / 8];
-    TASSERT(sb->fat_count < sizeof(seen) * 8,
-            "leak-check bitmap large enough for fat_count");
-    memset(seen, 0, sizeof(seen));
-    uint32_t *fat = sud_ir_fat();
-    uint64_t head = __atomic_load_n(&sb->fat_free_head_tagged,
-                                     __ATOMIC_ACQUIRE);
-    uint32_t id = (uint32_t)head;
-    uint32_t count = 0;
-    int corrupt = 0;
-    while (id) {
-        if (id > sb->fat_count) { corrupt = 1; break; }
-        if (seen[id >> 3] & (1u << (id & 7))) { corrupt = 2; break; }
-        seen[id >> 3] |= (uint8_t)(1u << (id & 7));
-        count++;
-        if (count > sb->fat_count + 1) { corrupt = 3; break; }
-        id = fat[id];
+    teardown_mount();
+}
+
+/* SMALL→LARGE promotion test.
+ *
+ * Write a file in SMALL tier (under 128 KiB), verify the inode is
+ * tagged SMALL.  Extend it past 128 KiB, verify the tag flips to
+ * LARGE and the per-file shm appears under /dev/shm.  Read back
+ * the full content and verify byte-for-byte that the small→large
+ * copy preserved the original bytes plus appended new bytes. */
+static void test_promotion(void)
+{
+    g_curtest = "promotion";
+    setup_mount("/inramfs", 16, "test_promote");
+
+    int fd = (int)sud_inramfs_op_open("/inramfs/big", O_RDWR | O_CREAT, 0644);
+    TASSERT(fd >= 0, "open big");
+
+    /* Phase 1: SMALL — write 64 KiB of pattern A. */
+    static unsigned char patA[64 * 1024];
+    for (size_t i = 0; i < sizeof(patA); i++)
+        patA[i] = (unsigned char)((i * 37u + 11u) & 0xff);
+    TASSERT_EQ(sud_inramfs_op_write(fd, patA, sizeof(patA)),
+               (long)sizeof(patA), "wrote 64 KiB");
+
+    struct sud_ir_inode *ino;
+    {
+        struct sud_ir_super *sb = sud_ir_sb();
+        struct sud_ir_inode *table =
+            (struct sud_ir_inode *)sud_ir_ptr(sb->inode_table_off);
+        /* Locate the inode by scanning the table for the unique
+         * REG inode whose size matches what we just wrote.  Fine
+         * for a single-process test: only one such file exists. */
+        ino = 0;
+        for (uint32_t i = 1; i < sb->inode_count; i++) {
+            if (table[i].type == SUD_IR_T_REG && table[i].size == sizeof(patA)) {
+                ino = &table[i]; break;
+            }
+        }
+        TASSERT(ino != 0, "located big inode");
     }
-    TASSERT_EQ(corrupt, 0, "free list has no duplicates / bad ids");
-    TASSERT_EQ(count, initial_free,
-               "free list length matches counter (no leaks)");
+    TASSERT_EQ(ino->u.reg.tag, SUD_IR_REG_SMALL, "starts SMALL");
 
+    /* Phase 2: extend to 200 KiB — must promote to LARGE. */
+    static unsigned char patB[200 * 1024 - 64 * 1024];
+    for (size_t i = 0; i < sizeof(patB); i++)
+        patB[i] = (unsigned char)((i * 53u + 7u) & 0xff);
+    TASSERT_EQ(sud_inramfs_op_write(fd, patB, sizeof(patB)),
+               (long)sizeof(patB), "extend to 200 KiB");
+    TASSERT_EQ(ino->u.reg.tag, SUD_IR_REG_LARGE, "promoted to LARGE");
+
+    /* Phase 3: read back, verify both halves. */
+    TASSERT_EQ(sud_inramfs_op_lseek(fd, 0, SEEK_SET), 0, "rewind");
+    static unsigned char rb[200 * 1024];
+    TASSERT_EQ(sud_inramfs_op_read(fd, rb, sizeof(rb)),
+               (long)sizeof(rb), "read 200 KiB");
+    int bad = 0;
+    for (size_t i = 0; i < sizeof(patA); i++) {
+        if (rb[i] != patA[i]) { bad = 1; break; }
+    }
+    TASSERT_EQ(bad, 0, "patA bytes preserved across promotion");
+    for (size_t i = 0; i < sizeof(patB); i++) {
+        if (rb[sizeof(patA) + i] != patB[i]) { bad = 2; break; }
+    }
+    TASSERT_EQ(bad, 0, "patB bytes correct after promotion");
+
+    /* Phase 4: mmap-of-LARGE returns a writable mapping at the
+     * right content; verify by reading the first byte. */
+    int err = 0;
+    void *m = sud_inramfs_op_mmap(0, 4096, PROT_READ, MAP_SHARED, fd, 0, &err);
+    TASSERT(m != MAP_FAILED, "mmap large succeeds");
+    TASSERT_EQ(((unsigned char *)m)[0], patA[0], "mmap content matches");
+    munmap(m, 4096);
+
+    sud_inramfs_op_close(fd);
+    sud_inramfs_op_unlink("/inramfs/big");
     teardown_mount();
 }
 
@@ -654,7 +695,8 @@ int main(int argc, char **argv)
     test_mmap();
     test_multi_block();
     test_xxh64();
-    test_fat_concurrency();
+    test_smalldata_concurrency();
+    test_promotion();
 
     if (g_failures) {
         char b[64];
