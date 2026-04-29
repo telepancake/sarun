@@ -541,8 +541,8 @@ static struct sud_ir_large_slot *large_cache_insert(int kfd,
 }
 
 /* Compose /dev/shm/sud-inramfs.<key>.f.<idx>.<gen> into `out`. */
-static void large_shm_path(uint32_t idx, uint32_t gen,
-                           char *out, size_t out_sz)
+void sud_ir_large_path(uint32_t idx, uint32_t gen,
+                       char *out, size_t out_sz)
 {
     snprintf(out, out_sz, "/dev/shm/sud-inramfs.%s.f.%u.%u",
              g_shm_key, idx, gen);
@@ -554,7 +554,7 @@ int sud_ir_large_open(uint32_t file_idx, uint32_t file_gen)
     if (s) return s->kfd;
 
     char p[PATH_MAX];
-    large_shm_path(file_idx, file_gen, p, sizeof(p));
+    sud_ir_large_path(file_idx, file_gen, p, sizeof(p));
     /* O_CREAT so the first opener (across all processes) materialises
      * the shm.  Subsequent opens just attach.  No O_EXCL: races are
      * benign — both openers end up with a valid fd. */
@@ -591,7 +591,7 @@ void sud_ir_large_unlink(uint32_t file_idx, uint32_t file_gen)
 {
     sud_ir_large_forget(file_idx, file_gen);
     char p[PATH_MAX];
-    large_shm_path(file_idx, file_gen, p, sizeof(p));
+    sud_ir_large_path(file_idx, file_gen, p, sizeof(p));
     raw_unlinkat(AT_FDCWD, p, 0);   /* ignore ENOENT (loser of unlink race) */
 }
 

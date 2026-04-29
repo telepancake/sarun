@@ -143,6 +143,15 @@ long sud_inramfs_op_access(const char *abs_path, int mode);
  * stores the path itself; this op is the only inramfs-side check. */
 long sud_inramfs_op_chdir(const char *abs_path);
 long sud_inramfs_op_getdents64(int fd, void *buf, size_t count);
+
+/* Return a real *kernel* fd for `abs_path` (must be under the mount),
+ * suitable for the kernel's own pread/mmap (e.g. the ELF loader in
+ * sud/loader.c).  If the file is currently SMALL, it is promoted to
+ * LARGE first (since SMALL files have no individual kernel fd — they
+ * live as runs in the shared smalldata shm).  The returned fd is
+ * O_CLOEXEC-flagged and owned by the caller (close with raw_close).
+ * Returns -errno on failure. */
+long sud_inramfs_op_get_kfd(const char *abs_path);
 /* Returns the (addr, length) for a successful mmap, or MAP_FAILED on
  * failure with errno-value in *err.  Maps the fd's underlying shm
  * extent into the caller's address space.  Only PROT_READ/WRITE and

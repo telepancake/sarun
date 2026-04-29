@@ -197,14 +197,22 @@ int main(int argc, char **argv)
     if (drop_count > argc - argi)
         drop_count = 0;
 
+    /* Initialise add-ins BEFORE resolving the target path: the inramfs
+     * add-in's resolve_path() needs sud_inramfs_active() to be true so
+     * that ir_access() / ir_open_ro() route mount-relative paths through
+     * the inramfs ops instead of falling through to raw_access against
+     * the kernel cwd.  Otherwise an absolute inramfs path handed to the
+     * wrapper (e.g. by a build_exec_argv rewrite of `./sqlite3`) would
+     * be rejected here with "sud: cannot find …" and the binary never
+     * launches. */
+    sud_addins_wrapper_init();
+
     /* Resolve target path */
     char resolved[PATH_MAX];
     if (!resolve_path(argv[argi], resolved, sizeof(resolved))) {
         fprintf(stderr, "sud: cannot find '%s'\n", argv[argi]);
         _exit(127);
     }
-
-    sud_addins_wrapper_init();
 
     /* Make safe copies of run_argv for cmdline rewrite.
      * Allocated once at startup based on actual argc — no fixed-size

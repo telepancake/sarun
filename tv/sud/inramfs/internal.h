@@ -377,6 +377,12 @@ long sud_ir_small_pwrite(const void *buf, size_t count, uint64_t off);
  * a negative -errno on failure. */
 int  sud_ir_large_open(uint32_t file_idx, uint32_t file_gen);
 
+/* Compose the /dev/shm path for the per-file shm of (idx, gen).
+ * Used by sud_inramfs_op_get_kfd() to open a fresh, caller-owned
+ * fd (separate from the cache maintained by sud_ir_large_open). */
+void sud_ir_large_path(uint32_t idx, uint32_t gen,
+                       char *out, size_t out_sz);
+
 /* ftruncate the per-file shm to `size`.  Returns 0 / -errno. */
 int  sud_ir_large_ftruncate(uint32_t file_idx, uint32_t file_gen,
                             uint64_t size);

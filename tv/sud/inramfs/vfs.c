@@ -731,10 +731,14 @@ static int small_extent_grow(struct sud_ir_inode *ino, uint32_t need_blocks)
 
 /* Ensure the file can address `need_bytes` (logical EOF or write
  * extent end).  Allocates / extends / promotes as needed.  Caller
- * holds ino->lock. */
+ * holds ino->lock.  Never SHRINKS — a write whose end-offset is
+ * below the current size must not destroy data past it. */
 static int file_ensure_capacity(struct sud_ir_inode *ino, uint64_t need_bytes)
 {
     if (need_bytes > 0xffffffffffffull) return -EFBIG;
+
+    /* No growth required. */
+    if (need_bytes <= ino->size) return 0;
 
     /* Already LARGE: just grow the per-file shm. */
     if (ino->u.reg.tag == SUD_IR_REG_LARGE) {
@@ -1347,4 +1351,34 @@ long sud_inramfs_op_chdir(const char *abs_path)
     if (!ino) return -ENOENT;
     if (ino->type != SUD_IR_T_DIR) return -ENOTDIR;
     return 0;
+}
+
+/* Return a real kernel fd backing the file at `abs_path`.  Used by
+ * the ELF loader (sud/loader.c) and any other consumer that needs to
+ * hand the kernel a real fd it can pread/mmap from for an inramfs
+ * file.  SMALL files don't have an individual kernel fd (they live as
+ * runs in the shared smalldata shm), so promote them to LARGE first.
+ * The caller owns the returned fd (open it fresh — sud_ir_large_open
+ * caches its fd internally and would conflict on close). */
+long sud_inramfs_op_get_kfd(const char *abs_path)
+{
+    int err = 0;
+    uint32_t idx = sud_ir_walk(abs_path, 1, &err);
+    if (!idx) return err;
+    struct sud_ir_inode *ino = sud_ir_inode_get(idx);
+    if (!ino) return -ENOENT;
+    if (ino->type != SUD_IR_T_REG) return -EISDIR;
+
+    /* Promote SMALL → LARGE so a per-file kernel fd exists. */
+    if (ino->u.reg.tag == SUD_IR_REG_SMALL) {
+        int rc = sud_ir_file_promote(ino);
+        if (rc) return rc;
+    }
+    char p[PATH_MAX];
+    sud_ir_large_path(ino->u.reg.u.large.file_idx,
+                      ino->u.reg.u.large.file_gen,
+                      p, sizeof(p));
+    long fd = raw_syscall6(SYS_openat, AT_FDCWD, (long)p,
+                           O_RDONLY | O_CLOEXEC, 0, 0, 0);
+    return fd;
 }

@@ -265,7 +265,40 @@ int resolve_path(const char *cmd, char *out, int out_sz)
      * trying to dereference cmd[0] before forwarding the syscall. */
     if (!cmd || !cmd[0] || out_sz <= 0) return 0;
 
-    if (cmd[0] == '/' || cmd[0] == '.') {
+    if (cmd[0] == '/') {
+        size_t clen = strlen(cmd);
+        if (clen >= (size_t)out_sz) clen = (size_t)out_sz - 1;
+        memcpy(out, cmd, clen);
+        out[clen] = '\0';
+        return (ir_access(out, X_OK) == 0);
+    }
+
+    /* Path containing a slash (./foo, ../foo, foo/bar) — POSIX execvp
+     * treats these as relative-to-cwd, no PATH search.  If the
+     * inramfs addin has a logical cwd inside the mount, absolutise
+     * via that; build_exec_argv then sees an absolute inramfs path
+     * and correctly prepends sud{32,64}.  Without this the relative
+     * path is handed to ir_access verbatim, which (a) requires
+     * absolute paths to enter the inramfs branch, so falls through
+     * to raw_access against the kernel cwd — which is "/" since
+     * inramfs points it at an innocuous root — and (b) returns 0,
+     * causing build_exec_argv to bail and the kernel to receive an
+     * uninstrumented execve("./foo", …) that ends in ENOENT. */
+#ifdef SUD_ADDIN_INRAMFS
+    if (cmd[0] == '.' || strchr(cmd, '/')) {
+        char abs[PATH_MAX];
+        int rc = sud_inramfs_resolve_at(AT_FDCWD, cmd, abs, sizeof(abs));
+        if (rc == 0) {
+            size_t clen = strlen(abs);
+            if (clen >= (size_t)out_sz) clen = (size_t)out_sz - 1;
+            memcpy(out, abs, clen);
+            out[clen] = '\0';
+            return (ir_access(out, X_OK) == 0);
+        }
+    }
+#endif
+
+    if (cmd[0] == '.' || strchr(cmd, '/')) {
         size_t clen = strlen(cmd);
         if (clen >= (size_t)out_sz) clen = (size_t)out_sz - 1;
         memcpy(out, cmd, clen);

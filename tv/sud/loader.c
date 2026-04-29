@@ -13,6 +13,29 @@
 #include "sud/loader.h"
 #include "sud/addin.h"
 #include "sud/state.h"
+#ifdef SUD_ADDIN_INRAMFS
+#include "sud/inramfs/inramfs.h"
+#endif
+
+/* Open a target ELF, transparently handling inramfs paths.  For paths
+ * under the inramfs mount we ask the addin for a real kernel fd
+ * (which promotes the file to LARGE if needed, since SMALL files
+ * have no individual kfd).  For everything else we fall through to
+ * the host kernel's open(2). */
+static int loader_open_elf(const char *path)
+{
+#ifdef SUD_ADDIN_INRAMFS
+    if (sud_inramfs_active() && path && path[0] == '/'
+        && sud_inramfs_path_under_mount(path)) {
+        long r = sud_inramfs_op_get_kfd(path);
+        if (r >= 0) return (int)r;
+        /* Path is under the mount but lookup failed — fall through
+         * to open(); it'll fail with the same errno the user
+         * would see on a host miss, which is the right reporting. */
+    }
+#endif
+    return open(path, O_RDONLY);
+}
 
 /*
  * crash_diagnostic_handler — SIGSEGV handler for debugging.
@@ -402,7 +425,7 @@ void load_and_run_elf(const char *path, int argc, char **argv,
     };
     sud_addins_target_launch(&launch);
 
-    int fd = open(path, O_RDONLY);
+    int fd = loader_open_elf(path);
     if (fd < 0) {
         perror("sudtrace: open ELF");
         _exit(127);
@@ -517,7 +540,7 @@ void load_and_run_elf(const char *path, int argc, char **argv,
         if (!resolve_path(target_name, target_resolved, sizeof(target_resolved)))
             snprintf(target_resolved, sizeof(target_resolved), "%s", target_name);
 
-        target_fd = open(target_resolved, O_RDONLY);
+        target_fd = loader_open_elf(target_resolved);
         if (target_fd >= 0) {
             if (read(target_fd, &target_ehdr, sizeof(target_ehdr)) == (ssize_t)sizeof(target_ehdr) &&
                 memcmp(target_ehdr.e_ident, ELFMAG, SELFMAG) == 0 &&

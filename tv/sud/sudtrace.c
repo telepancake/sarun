@@ -117,15 +117,57 @@ static void init_wrapper_paths(const char *argv0)
  * ================================================================ */
 
 static char g_ir_meta_path[PATH_MAX];
-static char g_ir_data_path[PATH_MAX];
+static char g_ir_smalldata_path[PATH_MAX];
+static char g_ir_shm_prefix[PATH_MAX];   /* `/dev/shm/sud-inramfs.<key>.` */
 static int  g_ir_owns_shm;              /* did we mint the key? */
+
+/* Walk /dev/shm and unlink every entry whose basename starts with
+ * `sud-inramfs.<key>.` — picks up the per-LARGE-file shms
+ * (`.f.<idx>.<gen>`) that get created on the fly during a session in
+ * addition to the launcher-known meta and smalldata shms.  Async-
+ * signal-safe: only uses raw syscalls (open/getdents64/unlinkat/close)
+ * via libc wrappers that boil down to the same. */
+static void ir_unlink_per_file_shms(void)
+{
+    if (!g_ir_shm_prefix[0]) return;
+    int dfd = open("/dev/shm", O_RDONLY | O_DIRECTORY);
+    if (dfd < 0) return;
+    /* Compose the basename prefix once: skip the "/dev/shm/" leading
+     * component.  prefix_len is the length of `sud-inramfs.<key>.`. */
+    const char *base_prefix = g_ir_shm_prefix + sizeof("/dev/shm/") - 1;
+    size_t prefix_len = strlen(base_prefix);
+    /* Use getdents64 directly to avoid pulling in opendir/readdir
+     * machinery that may allocate; the listing is small (at most a
+     * handful of files per session). */
+    struct linux_dirent64 {
+        unsigned long long d_ino;
+        long long          d_off;
+        unsigned short     d_reclen;
+        unsigned char      d_type;
+        char               d_name[];
+    };
+    char buf[4096];
+    for (;;) {
+        long n = syscall(SYS_getdents64, dfd, buf, sizeof(buf));
+        if (n <= 0) break;
+        for (long pos = 0; pos < n; ) {
+            struct linux_dirent64 *de = (void *)(buf + pos);
+            if (de->d_reclen == 0) break;
+            if (strncmp(de->d_name, base_prefix, prefix_len) == 0)
+                (void)unlinkat(dfd, de->d_name, 0);
+            pos += de->d_reclen;
+        }
+    }
+    close(dfd);
+}
 
 static void ir_unlink_backing(void)
 {
     /* Idempotent: unlink and don't care about ENOENT. */
     if (g_ir_owns_shm) {
-        if (g_ir_meta_path[0]) (void)unlink(g_ir_meta_path);
-        if (g_ir_data_path[0]) (void)unlink(g_ir_data_path);
+        if (g_ir_meta_path[0])      (void)unlink(g_ir_meta_path);
+        if (g_ir_smalldata_path[0]) (void)unlink(g_ir_smalldata_path);
+        ir_unlink_per_file_shms();
     }
 }
 
@@ -164,8 +206,10 @@ static void ir_setup_owned_shm(void)
     setenv("SUD_INRAMFS_KEY", key, 1);
     snprintf(g_ir_meta_path, sizeof(g_ir_meta_path),
              "/dev/shm/sud-inramfs.%s.meta", key);
-    snprintf(g_ir_data_path, sizeof(g_ir_data_path),
-             "/dev/shm/sud-inramfs.%s.data", key);
+    snprintf(g_ir_smalldata_path, sizeof(g_ir_smalldata_path),
+             "/dev/shm/sud-inramfs.%s.smalldata", key);
+    snprintf(g_ir_shm_prefix, sizeof(g_ir_shm_prefix),
+             "/dev/shm/sud-inramfs.%s.", key);
     g_ir_owns_shm = 1;
 
     atexit(ir_unlink_backing);
