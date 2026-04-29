@@ -17,6 +17,7 @@
 
 #include "sud/path_remap/overlay.h"
 #include "sud/raw.h"
+#include "sud/runtime_config.h"
 
 /* ----------------------------------------------------------------
  *  Architecture-specific stat layout (we only need st_mode and
@@ -154,91 +155,101 @@ static const char *path_under(const char *path, const char *prefix,
 /* ----------------------------------------------------------------
  *  Configuration parsing.
  * ---------------------------------------------------------------- */
+/* Parse one overlay segment "<merged>=<upper>+<lower>+...".  Length
+ * passed explicitly so the same function works on both NUL-terminated
+ * config values and views into a colon-delimited env value. */
+static void parse_overlay_segment(const char *seg, size_t len)
+{
+    if (g_rule_count >= SUD_OVERLAY_MAX_RULES) return;
+    const char *env = seg;
+    const char *end = seg + len;
+    /* Read merged path until '='. */
+    const char *merged = env;
+    while (env < end && *env != '=') env++;
+    if (env >= end) return;
+    size_t merged_len = (size_t)(env - merged);
+    env++;  /* skip '=' */
+
+    struct sud_overlay_rule *r = &g_rules[g_rule_count];
+    r->merged = 0; r->upper = 0; r->lower_count = 0; r->simple = 0;
+
+    if (merged_len == 0) return;
+    r->merged = dup_range(merged, merged_len);
+    r->merged_len = merged_len;
+    if (!r->merged) return;
+
+    /* Upper (may be empty: "+lower1+lower2"). */
+    const char *upper = env;
+    while (env < end && *env != '+') env++;
+    size_t upper_len = (size_t)(env - upper);
+    if (upper_len > 0) {
+        r->upper = dup_range(upper, upper_len);
+        r->upper_len = upper_len;
+        if (!r->upper) return;
+    }
+
+    /* Lowers: each '+'-separated path. */
+    while (env < end && *env == '+' &&
+           r->lower_count < SUD_OVERLAY_MAX_LOWERS) {
+        env++;
+        const char *low = env;
+        while (env < end && *env != '+') env++;
+        size_t low_len = (size_t)(env - low);
+        if (low_len == 0) continue;
+        char *p = dup_range(low, low_len);
+        if (!p) return;
+        r->lowers[r->lower_count] = p;
+        r->lower_lens[r->lower_count] = low_len;
+        r->lower_count++;
+    }
+
+    /* A rule must have at least an upper or one lower to be usable. */
+    if (r->upper || r->lower_count > 0) g_rule_count++;
+}
+
 static void parse_overlay_env(const char *env)
 {
     while (*env && g_rule_count < SUD_OVERLAY_MAX_RULES) {
-        /* Read merged path until '=' or ':' / end. */
-        const char *merged = env;
-        while (*env && *env != '=' && *env != ':') env++;
-        if (*env != '=') {
-            /* Malformed: skip up to next ':'. */
-            while (*env && *env != ':') env++;
-            if (*env == ':') env++;
-            continue;
-        }
-        size_t merged_len = (size_t)(env - merged);
-        env++;  /* skip '=' */
-
-        struct sud_overlay_rule *r = &g_rules[g_rule_count];
-        r->merged = 0; r->upper = 0; r->lower_count = 0; r->simple = 0;
-
-        if (merged_len == 0) goto skip;
-        r->merged = dup_range(merged, merged_len);
-        r->merged_len = merged_len;
-        if (!r->merged) goto skip;
-
-        /* Upper (may be empty: "+lower1+lower2"). */
-        const char *upper = env;
-        while (*env && *env != '+' && *env != ':') env++;
-        size_t upper_len = (size_t)(env - upper);
-        if (upper_len > 0) {
-            r->upper = dup_range(upper, upper_len);
-            r->upper_len = upper_len;
-            if (!r->upper) goto skip;
-        }
-
-        /* Lowers: each '+'-separated path. */
-        while (*env == '+' && r->lower_count < SUD_OVERLAY_MAX_LOWERS) {
-            env++;
-            const char *low = env;
-            while (*env && *env != '+' && *env != ':') env++;
-            size_t low_len = (size_t)(env - low);
-            if (low_len == 0) continue;
-            char *p = dup_range(low, low_len);
-            if (!p) goto skip;
-            r->lowers[r->lower_count] = p;
-            r->lower_lens[r->lower_count] = low_len;
-            r->lower_count++;
-        }
-
-        /* A rule must have at least an upper or one lower to be usable. */
-        if (r->upper || r->lower_count > 0) {
-            g_rule_count++;
-        }
-skip:
+        const char *seg = env;
         while (*env && *env != ':') env++;
+        parse_overlay_segment(seg, (size_t)(env - seg));
         if (*env == ':') env++;
     }
+}
+
+/* Parse one simple remap segment "<src>=<dst>". */
+static void parse_remap_segment(const char *seg, size_t len)
+{
+    if (g_rule_count >= SUD_OVERLAY_MAX_RULES) return;
+    const char *env = seg;
+    const char *end = seg + len;
+    const char *src = env;
+    while (env < end && *env != '=') env++;
+    if (env >= end) return;
+    size_t src_len = (size_t)(env - src);
+    env++;
+    const char *dst = env;
+    size_t dst_len = (size_t)(end - dst);
+    if (src_len == 0 || dst_len == 0) return;
+
+    struct sud_overlay_rule *r = &g_rules[g_rule_count];
+    r->merged = dup_range(src, src_len);
+    r->merged_len = src_len;
+    r->upper = dup_range(dst, dst_len);
+    r->upper_len = dst_len;
+    r->lowers[0] = r->upper;
+    r->lower_lens[0] = r->upper_len;
+    r->lower_count = 1;
+    r->simple = 1;
+    if (r->merged && r->upper) g_rule_count++;
 }
 
 static void parse_remap_env(const char *env)
 {
     while (*env && g_rule_count < SUD_OVERLAY_MAX_RULES) {
-        const char *src = env;
-        while (*env && *env != '=' && *env != ':') env++;
-        if (*env != '=') {
-            while (*env && *env != ':') env++;
-            if (*env == ':') env++;
-            continue;
-        }
-        size_t src_len = (size_t)(env - src);
-        env++;
-        const char *dst = env;
+        const char *seg = env;
         while (*env && *env != ':') env++;
-        size_t dst_len = (size_t)(env - dst);
-        if (src_len && dst_len) {
-            struct sud_overlay_rule *r = &g_rules[g_rule_count];
-            r->merged = dup_range(src, src_len);
-            r->merged_len = src_len;
-            r->upper = dup_range(dst, dst_len);
-            r->upper_len = dst_len;
-            r->lowers[0] = r->upper;
-            r->lower_lens[0] = r->upper_len;
-            r->lower_count = 1;
-            r->simple = 1;
-            if (r->merged && r->upper)
-                g_rule_count++;
-        }
+        parse_remap_segment(seg, (size_t)(env - seg));
         if (*env == ':') env++;
     }
 }
@@ -247,6 +258,38 @@ void sud_overlay_init(void)
 {
     if (g_init_done) return;
     g_init_done = 1;
+
+    /* Preferred path: read from runtime config.  Each
+     * "--remap-rule <kind>:<spec>" entry becomes one rule.  Inramfs
+     * rules are skipped here — they are owned by the inramfs addin
+     * (and, eventually, the path_remap inramfs glue). */
+    if (g_sud_runtime_config_present) {
+        for (int i = 0; i < g_sud_runtime_config.remap_rule_count; i++) {
+            const char *r = g_sud_runtime_config.remap_rules[i];
+            if (!r || !r[0]) continue;
+            const char *colon = r;
+            while (*colon && *colon != ':') colon++;
+            if (*colon != ':') continue;
+            size_t klen = (size_t)(colon - r);
+            const char *spec = colon + 1;
+            size_t slen = 0;
+            while (spec[slen]) slen++;
+            if (klen == 7 && r[0]=='o' && r[1]=='v' && r[2]=='e' &&
+                r[3]=='r' && r[4]=='l' && r[5]=='a' && r[6]=='y')
+                parse_overlay_segment(spec, slen);
+            else if (klen == 5 && r[0]=='r' && r[1]=='e' && r[2]=='m' &&
+                     r[3]=='a' && r[4]=='p')
+                parse_remap_segment(spec, slen);
+            /* "inramfs" / "passthrough" / "fakeroot": not yet
+             * implemented in path_remap; ignored here.  The inramfs
+             * addin reads the inramfs rule from runtime_config
+             * directly. */
+        }
+        return;
+    }
+
+    /* Transitional fallback for tests that have not yet migrated to
+     * populating g_sud_runtime_config. */
     const char *ov = getenv("SUD_OVERLAY");
     if (ov && ov[0]) parse_overlay_env(ov);
     const char *rm = getenv("SUD_REMAP");

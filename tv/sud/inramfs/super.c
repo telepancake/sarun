@@ -12,6 +12,7 @@
 #include "sud/inramfs/inramfs.h"
 #include "sud/inramfs/internal.h"
 #include "sud/raw.h"
+#include "sud/runtime_config.h"
 
 #ifndef MAP_NORESERVE
 #define MAP_NORESERVE  0x4000
@@ -885,49 +886,90 @@ static void wait_for_init(volatile uint32_t *init_state)
      * disables itself in that case. */
 }
 
-/* Parse SUD_INRAMFS=<path>[:<size_mb>].
+/* Populate g_mount_path / g_mount_len / g_meta_size from the runtime
+ * config (preferred) or, if no config is present, from the legacy
+ * SUD_INRAMFS env var (transitional, used only by tests that have
+ * not yet migrated).  Returns 1 if a mount was configured, 0 if not.
  *
- * `size_mb` sizes the **metadata** region.  This is the only
- * user-tunable size in the system: the metadata region is mapped
- * by every attached process (including 32-bit ones), so its size
- * is the cost the user pays in 32-bit address space for higher
- * inode/dirent capacity.  The small-file shm and per-large-file
- * shms grow on demand and are NOT user-sized — there is no
- * inramfs-imposed cap on file size or total stored bytes.
- *
- * Default: 16 MiB, which comfortably holds the inode table, the
- * small-file allocator bitmap, and a few hundred 4 KiB metadata
- * blocks for dirents + symlinks. */
+ * The mount path is sourced from a "--remap-rule inramfs:<path>"
+ * entry — once Part 1 of the layered split lands, only path_remap
+ * will read this rule, but for now inramfs continues to consult it
+ * directly so it knows which prefix it owns.  The metadata size
+ * comes from --inramfs-meta-mb. */
 static int parse_env(void)
 {
-    const char *e = getenv("SUD_INRAMFS");
-    if (!e || !e[0]) return 0;
-    /* Path. */
-    const char *p = e;
-    size_t plen = 0;
-    while (p[plen] && p[plen] != ':') plen++;
+    const char *path = NULL;
+    size_t      plen = 0;
+    uint64_t    size_mb = 16;       /* default */
+
+    if (g_sud_runtime_config_present) {
+        for (int i = 0; i < g_sud_runtime_config.remap_rule_count; i++) {
+            const char *r = g_sud_runtime_config.remap_rules[i];
+            if (!r) continue;
+            /* Only the first inramfs rule is honoured.  Match
+             * "inramfs:" prefix, then take the rest as the path
+             * (which may itself contain a trailing :<size> from a
+             * legacy translation — strip it). */
+            const char tag[] = "inramfs:";
+            const size_t tlen = sizeof(tag) - 1;
+            int match = 1;
+            for (size_t k = 0; k < tlen; k++)
+                if (r[k] != tag[k]) { match = 0; break; }
+            if (!match) continue;
+            const char *p = r + tlen;
+            const char *end = p;
+            while (*end && *end != ':') end++;
+            path = p;
+            plen = (size_t)(end - p);
+            break;
+        }
+        if (g_sud_runtime_config.inramfs_meta_mb > 0)
+            size_mb = (uint64_t)g_sud_runtime_config.inramfs_meta_mb;
+    }
+    if (!path) {
+        /* Transitional fallback: legacy env var.  Removed once all
+         * tests have switched to populating g_sud_runtime_config. */
+        const char *e = getenv("SUD_INRAMFS");
+        if (!e || !e[0]) return 0;
+        path = e;
+        plen = 0;
+        while (path[plen] && path[plen] != ':') plen++;
+        if (path[plen] == ':') {
+            const char *s = path + plen + 1;
+            uint64_t v = 0;
+            while (*s >= '0' && *s <= '9') {
+                v = v * 10 + (uint64_t)(*s - '0');
+                s++;
+            }
+            if (v) size_mb = v;
+        }
+    }
     if (plen == 0 || plen >= sizeof(g_mount_path)) return 0;
-    if (e[0] != '/') return 0;            /* must be absolute */
+    if (path[0] != '/') return 0;            /* must be absolute */
     /* Strip trailing slashes (but not the root). */
-    while (plen > 1 && p[plen - 1] == '/') plen--;
-    memcpy(g_mount_path, p, plen);
+    while (plen > 1 && path[plen - 1] == '/') plen--;
+    memcpy(g_mount_path, path, plen);
     g_mount_path[plen] = '\0';
     g_mount_len = plen;
 
-    /* Metadata size. */
-    uint64_t size_mb = 16;
-    if (p[plen] == ':') {
-        const char *s = p + plen + 1;
-        uint64_t v = 0;
-        while (*s >= '0' && *s <= '9') {
-            v = v * 10 + (uint64_t)(*s - '0');
-            s++;
-        }
-        if (v) size_mb = v;
-    }
-    /* Sanity floor: must be at least big enough for the inode table
-     * plus the small-file bitmap (computed in choose_meta_size). */
     g_meta_size = (size_t)(size_mb * 1024ull * 1024ull);
+    /* DEBUG */
+    {
+        char buf[256];
+        char *p = buf;
+        const char *m = "[ir parse_env] mount=";
+        while (*m) *p++ = *m++;
+        for (size_t i = 0; i < plen; i++) *p++ = path[i];
+        *p++ = ' '; *p++ = 'm'; *p++ = 'b'; *p++ = '=';
+        unsigned long v = (unsigned long)size_mb;
+        char tmp[16]; int k = 0;
+        do { tmp[k++] = '0' + (v % 10); v /= 10; } while (v);
+        while (k--) *p++ = tmp[k];
+        *p++ = ' '; *p++ = 'r'; *p++ = 'c'; *p++ = '=';
+        *p++ = g_sud_runtime_config_present ? '1' : '0';
+        *p++ = '\n';
+        raw_write(2, buf, (size_t)(p - buf));
+    }
     return 1;
 }
 
@@ -1010,7 +1052,15 @@ void sud_inramfs_init(void)
     size_t floor = min_meta_size();
     if (g_meta_size < floor) g_meta_size = floor;
 
-    compose_shm_paths(getenv("SUD_INRAMFS_KEY"), g_mount_path,
+    /* Source the inramfs key from the runtime config (preferred); on
+     * absence (test harness without a populated config) fall back to
+     * the legacy SUD_INRAMFS_KEY env var.  The compose_shm_paths
+     * helper accepts NULL meaning "no key suffix". */
+    const char *key = NULL;
+    if (g_sud_runtime_config_present)
+        key = g_sud_runtime_config.inramfs_key;
+    if (!key) key = getenv("SUD_INRAMFS_KEY");
+    compose_shm_paths(key, g_mount_path,
                       g_meta_shm_path,  sizeof(g_meta_shm_path),
                       g_small_shm_path, sizeof(g_small_shm_path),
                       g_shm_key,        sizeof(g_shm_key));

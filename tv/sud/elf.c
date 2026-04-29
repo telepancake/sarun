@@ -12,6 +12,7 @@
 #include "libc-fs/fmt.h"
 #include "sud/state.h"
 #include "sud/elf.h"
+#include "sud/runtime_config.h"
 #ifdef SUD_ADDIN_INRAMFS
 #include "sud/inramfs/inramfs.h"
 #endif
@@ -494,33 +495,49 @@ char **build_exec_argv(struct sud_arena *a, int orig_argc, char **orig_argv)
             if (!d_self) return NULL;
             args[0] = d_self;
             nargs++;
-            if (!g_trace_exec_env) {
-                na = ensure_args(a, args, nargs, 1, &max_args);
-                if (!na) return NULL;
-                args = na;
-                memmove(args + 2, args + 1,
-                        (size_t)nargs * sizeof(char *));
-                char *d_ne = sud_arena_strdup(a, "--no-env");
-                if (!d_ne) return NULL;
-                args[1] = d_ne;
-                nargs++;
+
+            /* Re-emit the wrapper flag block from the live runtime
+             * config so the child wrapper inherits the same set of
+             * --remap-rule / --inramfs-key / --cwd / --trace-outfile
+             * / --no-env values that this wrapper parsed.  drop_count
+             * is dynamic (computed from the depth-loop that prepended
+             * ld-linux a few iterations above), so we override it on
+             * a local clone of the live config without disturbing
+             * g_sud_runtime_config. */
+            struct sud_runtime_config emit_cfg;
+            if (g_sud_runtime_config_present) {
+                emit_cfg = g_sud_runtime_config;
+            } else {
+                sud_runtime_config_clear(&emit_cfg);
+                /* Honour the legacy g_trace_exec_env state when
+                 * the config slot has not been populated (e.g. unit
+                 * tests). */
+                emit_cfg.no_env = !g_trace_exec_env;
             }
-            /* Insert --drop-argv N after sudtrace's own flags */
-            if (drop_count > 0) {
-                int insert_pos = g_trace_exec_env ? 1 : 2;
-                na = ensure_args(a, args, nargs, 2, &max_args);
+            emit_cfg.drop_count = drop_count;
+
+            const char *flag_buf[SUD_RC_MAX_EMIT_ARGS];
+            char        int_scratch[64];
+            int n_flags = sud_runtime_config_emit(&emit_cfg, flag_buf,
+                                                  SUD_RC_MAX_EMIT_ARGS,
+                                                  int_scratch,
+                                                  sizeof(int_scratch));
+            if (n_flags < 0) return NULL;
+
+            if (n_flags > 0) {
+                na = ensure_args(a, args, nargs, n_flags, &max_args);
                 if (!na) return NULL;
                 args = na;
-                memmove(args + insert_pos + 2, args + insert_pos,
-                        ((size_t)(nargs - insert_pos) + 1) * sizeof(char *));
-                char *d_drop = sud_arena_strdup(a, "--drop-argv");
-                char drop_buf[16];
-                fmt_int(drop_buf, drop_count);
-                char *d_n = sud_arena_strdup(a, drop_buf);
-                if (!d_drop || !d_n) return NULL;
-                args[insert_pos] = d_drop;
-                args[insert_pos + 1] = d_n;
-                nargs += 2;
+                /* Open a hole at index 1 (right after the wrapper
+                 * binary) for the entire flag block. */
+                memmove(args + 1 + n_flags, args + 1,
+                        (size_t)nargs * sizeof(char *));
+                for (int i = 0; i < n_flags; i++) {
+                    char *d = sud_arena_strdup(a, flag_buf[i]);
+                    if (!d) return NULL;
+                    args[1 + i] = d;
+                }
+                nargs += n_flags;
             }
             break;
         }
@@ -591,6 +608,14 @@ size_t exec_arena_size_for(const char *fn, char **argv, int argc)
     /* Depth-loop prepends: 16 * (PATH_MAX interp + 256 small string +
      * a couple of duplicates of the resolved path). */
     need += 16 * (R16(PATH_MAX) + R16(256) + R16(PATH_MAX));
+
+    /* Wrapper flag block re-emitted via sud_runtime_config_emit().
+     * Bounded by SUD_RC_MAX_EMIT_ARGS string slots, each at most the
+     * length of a remap-rule spec (~PATH_MAX in the worst case for
+     * an overlay or remap rule).  Adds another arena allocation for
+     * the temporary args[] grow that absorbs the inserted block. */
+    need += R16((size_t)SUD_RC_MAX_EMIT_ARGS * PATH_MAX);
+    need += R16((size_t)SUD_RC_MAX_EMIT_ARGS * sizeof(char *));
 
     /* Page-round (mmap requires it). */
     need = (need + 4095u) & ~(size_t)4095u;
