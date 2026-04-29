@@ -12,6 +12,9 @@
 #include "libc-fs/fmt.h"
 #include "sud/state.h"
 #include "sud/elf.h"
+#ifdef SUD_ADDIN_INRAMFS
+#include "sud/inramfs/inramfs.h"
+#endif
 
 /* ELF ident helpers not provided by our minimal libc.h */
 #ifndef SELFMAG
@@ -25,18 +28,120 @@
 #endif
 
 /* ================================================================
+ * inramfs-aware low-level file helpers
+ *
+ * The traced program may execve() a binary that lives under the
+ * inramfs mount.  Under sud, the kernel only ever directly execs
+ * sud32/sud64 — handler.c's build_exec_argv() rewrites the argv to
+ * prepend the loader.  But to do that rewriting it must first
+ * inspect the target binary (resolve_path checks executability,
+ * check_shebang reads the first two bytes, check_elf_dynamic reads
+ * the ELF header + PT_INTERP).  Those inspections were issued via
+ * raw_open / raw_pread / raw_access, which go straight to the
+ * kernel.  The kernel doesn't know about inramfs paths, so
+ * raw_access returns -ENOENT and resolve_path answers 0; the rest
+ * of the pipeline then falls through and the kernel ends up trying
+ * to exec an inramfs path it can't see.
+ *
+ * Fix: route the read-only inspection ops through the inramfs addin
+ * for paths under the mount.  The inramfs ops are signal-safe (they
+ * use only raw syscalls themselves) and return -errno values in the
+ * kernel-syscall convention.  When inramfs is not built in, not
+ * active, or the path is not under the mount, we transparently fall
+ * back to the raw kernel syscalls — this is exactly the same
+ * dispatch policy the addin runs at the syscall layer.
+ *
+ * The fd handed back by ir_open_ro() is registered in inramfs's own
+ * fd table; ir_pread() / ir_close() must be paired with it.  We
+ * carry the (fd-is-inramfs?) bit out-of-band so callers don't have
+ * to know.  ================================================================ */
+
+#ifdef SUD_ADDIN_INRAMFS
+
+static int ir_path_is_inramfs(const char *path)
+{
+    return path && path[0] == '/'
+        && sud_inramfs_active()
+        && sud_inramfs_path_under_mount(path);
+}
+
+/* Mark inramfs-owned fds with this bit so we can dispatch close
+ * and pread without consulting the inramfs fd table on every call.
+ * The kernel will never hand us an fd this large; the inramfs fd
+ * table caps at SUD_IR_FD_TABLE_SIZE (1024). */
+#define IR_FD_TAG  0x40000000
+
+static int ir_open_ro(const char *path)
+{
+    if (ir_path_is_inramfs(path)) {
+        long r = sud_inramfs_op_open(path, O_RDONLY, 0);
+        if (r < 0) return -1;
+        return (int)r | IR_FD_TAG;
+    }
+    return raw_open(path, O_RDONLY);
+}
+
+static ssize_t ir_pread(int fd, void *buf, size_t n, off_t off)
+{
+    if (fd & IR_FD_TAG) {
+        long r = sud_inramfs_op_pread(fd & ~IR_FD_TAG, buf, n, off);
+        return (r < 0) ? -1 : (ssize_t)r;
+    }
+    return raw_pread(fd, buf, n, off);
+}
+
+static ssize_t ir_read(int fd, void *buf, size_t n)
+{
+    if (fd & IR_FD_TAG) {
+        long r = sud_inramfs_op_read(fd & ~IR_FD_TAG, buf, n);
+        return (r < 0) ? -1 : (ssize_t)r;
+    }
+    return raw_read(fd, buf, n);
+}
+
+static int ir_close(int fd)
+{
+    if (fd & IR_FD_TAG)
+        return (int)sud_inramfs_op_close(fd & ~IR_FD_TAG);
+    return raw_close(fd);
+}
+
+static int ir_access(const char *path, int mode)
+{
+    if (ir_path_is_inramfs(path)) {
+        long r = sud_inramfs_op_access(path, mode);
+        return (r < 0) ? -1 : 0;
+    }
+    return raw_access(path, mode);
+}
+
+#else  /* !SUD_ADDIN_INRAMFS */
+
+static inline int     ir_open_ro(const char *p)
+                        { return raw_open(p, O_RDONLY); }
+static inline ssize_t ir_pread(int fd, void *b, size_t n, off_t o)
+                        { return raw_pread(fd, b, n, o); }
+static inline ssize_t ir_read (int fd, void *b, size_t n)
+                        { return raw_read (fd, b, n); }
+static inline int     ir_close(int fd)              { return raw_close(fd); }
+static inline int     ir_access(const char *p, int m)
+                        { return raw_access(p, m); }
+
+#endif
+
+/* ================================================================
  * Shebang / ELF inspection
  * ================================================================ */
 
 int check_shebang(const char *path, char *interp, int interp_sz,
                   char *interp_arg, int arg_sz)
 {
-    int fd = raw_open(path, O_RDONLY);
+    int fd = ir_open_ro(path);
     if (fd < 0) return 0;
 
     char buf[256];
-    ssize_t n = raw_read(fd, buf, sizeof(buf) - 1);
-    raw_close(fd);
+    ssize_t n = ir_read(fd, buf, sizeof(buf) - 1);
+    ir_close(fd);
     if (n < 3) return 0;
     buf[n] = '\0';
 
@@ -83,7 +188,7 @@ int inspect_elf_dynamic_fd(int fd, char *interp, int interp_sz,
                            int *elf_class)
 {
     unsigned char ident[EI_NIDENT];
-    if (raw_pread(fd, ident, sizeof(ident), 0) != (ssize_t)sizeof(ident))
+    if (ir_pread(fd, ident, sizeof(ident), 0) != (ssize_t)sizeof(ident))
         return -1;
     if (memcmp(ident, ELFMAG, SELFMAG) != 0)
         return -1;
@@ -92,18 +197,18 @@ int inspect_elf_dynamic_fd(int fd, char *interp, int interp_sz,
 
     if (ident[EI_CLASS] == ELFCLASS64) {
         Elf64_Ehdr ehdr;
-        if (raw_pread(fd, &ehdr, sizeof(ehdr), 0) != sizeof(ehdr))
+        if (ir_pread(fd, &ehdr, sizeof(ehdr), 0) != sizeof(ehdr))
             return -1;
         for (int i = 0; i < ehdr.e_phnum; i++) {
             Elf64_Phdr phdr;
-            if (raw_pread(fd, &phdr, sizeof(phdr),
+            if (ir_pread(fd, &phdr, sizeof(phdr),
                           ehdr.e_phoff + i * ehdr.e_phentsize) != sizeof(phdr))
                 continue;
             if (phdr.p_type != PT_INTERP)
                 continue;
             size_t sz = phdr.p_filesz;
             if (sz >= (size_t)interp_sz) sz = (size_t)interp_sz - 1;
-            if (raw_pread(fd, interp, sz, phdr.p_offset) != (ssize_t)sz)
+            if (ir_pread(fd, interp, sz, phdr.p_offset) != (ssize_t)sz)
                 return -1;
             interp[sz] = '\0';
             trim_interp(interp);
@@ -114,18 +219,18 @@ int inspect_elf_dynamic_fd(int fd, char *interp, int interp_sz,
 
     if (ident[EI_CLASS] == ELFCLASS32) {
         Elf32_Ehdr ehdr;
-        if (raw_pread(fd, &ehdr, sizeof(ehdr), 0) != sizeof(ehdr))
+        if (ir_pread(fd, &ehdr, sizeof(ehdr), 0) != sizeof(ehdr))
             return -1;
         for (int i = 0; i < ehdr.e_phnum; i++) {
             Elf32_Phdr phdr;
-            if (raw_pread(fd, &phdr, sizeof(phdr),
+            if (ir_pread(fd, &phdr, sizeof(phdr),
                           ehdr.e_phoff + i * ehdr.e_phentsize) != sizeof(phdr))
                 continue;
             if (phdr.p_type != PT_INTERP)
                 continue;
             size_t sz = phdr.p_filesz;
             if (sz >= (size_t)interp_sz) sz = (size_t)interp_sz - 1;
-            if (raw_pread(fd, interp, sz, phdr.p_offset) != (ssize_t)sz)
+            if (ir_pread(fd, interp, sz, phdr.p_offset) != (ssize_t)sz)
                 return -1;
             interp[sz] = '\0';
             trim_interp(interp);
@@ -140,10 +245,10 @@ int inspect_elf_dynamic_fd(int fd, char *interp, int interp_sz,
 int check_elf_dynamic(const char *path, char *interp, int interp_sz,
                       int *elf_class)
 {
-    int fd = raw_open(path, O_RDONLY);
+    int fd = ir_open_ro(path);
     if (fd < 0) return -1;
     int ret = inspect_elf_dynamic_fd(fd, interp, interp_sz, elf_class);
-    raw_close(fd);
+    ir_close(fd);
     return ret;
 }
 
@@ -165,7 +270,7 @@ int resolve_path(const char *cmd, char *out, int out_sz)
         if (clen >= (size_t)out_sz) clen = (size_t)out_sz - 1;
         memcpy(out, cmd, clen);
         out[clen] = '\0';
-        return (raw_access(out, X_OK) == 0);
+        return (ir_access(out, X_OK) == 0);
     }
 
     const char *path_env = (g_path_env && g_path_env[0]) ? g_path_env : "/usr/bin:/bin";
@@ -181,7 +286,7 @@ int resolve_path(const char *cmd, char *out, int out_sz)
             out[dlen] = '/';
             memcpy(out + dlen + 1, cmd, clen);
             out[dlen + 1 + clen] = '\0';
-            if (raw_access(out, X_OK) == 0)
+            if (ir_access(out, X_OK) == 0)
                 return 1;
         }
         p = *colon ? colon + 1 : colon;
@@ -231,7 +336,7 @@ int resolve_execveat_path(int dirfd, const char *path, long flags,
         out[base_len++] = '/';
     memcpy(out + base_len, path, plen);
     out[base_len + plen] = '\0';
-    return (raw_access(out, X_OK) == 0);
+    return (ir_access(out, X_OK) == 0);
 }
 
 /* ================================================================
