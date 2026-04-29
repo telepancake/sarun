@@ -721,29 +721,93 @@ void *sud_inramfs_op_mmap(void *addr, size_t length, int prot, int flags,
     /* Single-block fast path: when the requested range falls inside
      * one FAT block we can hand back a direct pointer into the data
      * shm, giving full MAP_SHARED semantics with no copy.  Multi-
-     * block ranges need page-table coalescing of non-contiguous
-     * blocks, which is the per-file shm work in M3b — refuse for
-     * now rather than silently lose MAP_SHARED writeback. */
+     * block ranges fall through to the copy-into-anon path below.
+     * Per-file shm + cross-block coalescing (true zero-copy
+     * MAP_SHARED across block boundaries) is M3b future work. */
     uint64_t end = (uint64_t)offset + (uint64_t)length;
     uint32_t block_ix = (uint32_t)(offset / SUD_IR_BLOCK_SIZE);
     uint32_t in_block = (uint32_t)(offset % SUD_IR_BLOCK_SIZE);
-    if (end > (uint64_t)(block_ix + 1) * SUD_IR_BLOCK_SIZE) {
+
+    if (end <= (uint64_t)(block_ix + 1) * SUD_IR_BLOCK_SIZE) {
+        if (block_ix >= ino->u.reg.nblocks) {
+            *err = EINVAL;
+            return MAP_FAILED;
+        }
+        uint32_t *fat = sud_ir_fat();
+        uint32_t b = ino->u.reg.head_block;
+        for (uint32_t i = 0; i < block_ix; i++) b = fat[b];
+        void *p = (char *)sud_ir_data_block(b) + in_block;
+        if ((flags & MAP_FIXED) && addr && addr != p) {
+            *err = EINVAL;
+            return MAP_FAILED;
+        }
+        (void)prot;     /* underlying mapping is RW; PROT_READ-only
+                         * callers see no harm. */
+        return p;
+    }
+
+    /* ----- Multi-block path: copy-into-anonymous fallback.
+     *
+     * For ranges that span FAT blocks we can't hand back a pointer
+     * into the data shm directly (the blocks aren't contiguous in
+     * memory).  Allocate an anonymous mapping of the requested
+     * length and copy each block's data in.
+     *
+     * Correctness:
+     *   - MAP_PRIVATE callers (the common case: dynamic linker
+     *     reading binaries, git mmap'ing pack files, sqlite's
+     *     mmap-mode reads) get exactly the bytes they would have
+     *     gotten from a series of read()s.  Any writes they make
+     *     stay in their own anonymous pages, which is what
+     *     MAP_PRIVATE always means.
+     *   - MAP_SHARED with PROT_WRITE would silently lose writeback.
+     *     Refuse it explicitly so callers that need it (rare:
+     *     mostly mmaped IPC files) get a clear ENOTSUP rather than
+     *     phantom data corruption.  Read-only MAP_SHARED is fine —
+     *     no writeback to lose.
+     */
+    if ((flags & MAP_SHARED) && (prot & PROT_WRITE)) {
         *err = ENOTSUP;
         return MAP_FAILED;
     }
-    if (block_ix >= ino->u.reg.nblocks) { *err = EINVAL; return MAP_FAILED; }
 
-    uint32_t *fat = sud_ir_fat();
-    uint32_t b = ino->u.reg.head_block;
-    for (uint32_t i = 0; i < block_ix; i++) b = fat[b];
-    void *p = (char *)sud_ir_data_block(b) + in_block;
-    if ((flags & MAP_FIXED) && addr && addr != p) {
-        *err = EINVAL;
+    /* Allocate the anon backing.  We deliberately drop MAP_FIXED
+     * unless the caller is using MAP_FIXED_NOREPLACE: a fixed
+     * address is meant to land at a *file-backed* address, but
+     * we're substituting an anon mapping, so hint-only is safer. */
+    int amap_flags = MAP_PRIVATE | MAP_ANONYMOUS;
+#ifdef MAP_FIXED_NOREPLACE
+    if (flags & MAP_FIXED_NOREPLACE) amap_flags |= MAP_FIXED_NOREPLACE;
+#endif
+    void *out = raw_mmap(addr, length, PROT_READ | PROT_WRITE,
+                         amap_flags, -1, 0);
+    if ((unsigned long)out >= (unsigned long)-4095) {
+        *err = (int)-(long)out;
         return MAP_FAILED;
     }
-    (void)prot;     /* underlying mapping is RW; PROT_READ-only
-                     * callers see no harm. */
-    return p;
+
+    /* Reuse the existing read path for the actual byte copy: it
+     * already walks the FAT chain, handles short tail, and clamps
+     * to file size.  Any partial read just leaves zero-filled tail
+     * pages, matching kernel mmap semantics for ranges past EOF. */
+    long n = sud_ir_file_read(ino, out, length, (off_t)offset);
+    if (n < 0) {
+        munmap(out, length);
+        *err = (int)-n;
+        return MAP_FAILED;
+    }
+
+    /* Apply the requested protection.  We mapped RW so we could
+     * copy; downgrade to PROT_READ (or whatever prot says) now. */
+    if (prot != (PROT_READ | PROT_WRITE)) {
+        long pr = raw_syscall6(SYS_mprotect, (long)out, (long)length,
+                               (long)prot, 0, 0, 0);
+        /* mprotect failing here would be unusual (we control the
+         * mapping); leave the page RW rather than ripping the
+         * mapping out from under the caller. */
+        (void)pr;
+    }
+    return out;
 }
 
 /* ================================================================
@@ -1739,6 +1803,105 @@ static int dispatch_fcntl(struct sud_syscall_ctx *ctx)
     }
 }
 
+/* If the path arg of an execve points at an inramfs file, rewrite
+ * it to "/proc/self/fd/<N>" where N is a freshly-created memfd
+ * that has been *populated* with the file's bytes.  The kernel
+ * can't see inramfs paths, and (critically) it can't read inramfs
+ * file content from one of our normal kfds either — those are
+ * empty memfd cookies whose real content lives in the addin's
+ * data shm.  So for execve specifically we materialise the bytes
+ * into a real kernel-visible memfd here, then point execve at
+ * /proc/self/fd/N (the kernel resolves that magic symlink to the
+ * memfd and execs from it).
+ *
+ * Returns 0 if no rewrite was needed, 1 if rewritten, or -errno
+ * on a hard failure (caller should short-circuit).
+ *
+ * The materialised memfd is intentionally kept open across the
+ * execve.  It's MFD_CLOEXEC so the kernel closes it after the
+ * exec succeeds — but the close happens AFTER the binary has
+ * been loaded into memory, so the exec sees the correct bytes.
+ * On exec failure we leak the fd; bounded and rare. */
+static int execve_rewrite_inramfs_path(struct sud_syscall_ctx *ctx,
+                                       int path_arg_idx)
+{
+    const char *fn = (const char *)ctx->args[path_arg_idx];
+    if (!fn || !fn[0]) return 0;
+
+    /* Resolve relative paths against the logical CWD; reject if the
+     * result isn't under our mount. */
+    if (!ctx->scratch || ctx->scratch_size < PATH_MAX) return 0;
+    int rc = sud_inramfs_resolve_at(AT_FDCWD, fn,
+                                    ctx->scratch, ctx->scratch_size);
+    if (rc < 0) return 0;       /* not on inramfs: nothing to do */
+
+    /* Walk to the inode so we can size and read the file. */
+    int err = 0;
+    uint32_t idx = sud_ir_walk(ctx->scratch, /*follow=*/1, &err);
+    if (!idx) return err ? err : -ENOENT;
+    struct sud_ir_inode *ino = sud_ir_inode_get(idx);
+    if (!ino || ino->type != SUD_IR_T_REG) return -EACCES;
+    uint64_t sz = ino->size;
+
+    /* Create a fresh kernel-visible memfd named after the path's
+     * basename so /proc/PID/comm-style tools see something sane. */
+#ifdef SYS_memfd_create
+    const char *base = ctx->scratch;
+    for (const char *p = ctx->scratch; *p; p++)
+        if (*p == '/') base = p + 1;
+    char name[64];
+    int ni = 0;
+    const char *pfx = "sud-ir-exec:";
+    while (*pfx && ni < (int)sizeof(name) - 1) name[ni++] = *pfx++;
+    while (*base && ni < (int)sizeof(name) - 1) name[ni++] = *base++;
+    name[ni] = '\0';
+    long mfd = raw_syscall6(SYS_memfd_create, (long)name, 0u, 0, 0, 0, 0);
+#else
+    long mfd = -ENOSYS;
+#endif
+    if (mfd < 0) return (int)mfd;
+
+    /* Size the memfd, then stream the file's bytes in.  We reuse
+     * the existing inramfs read primitive (which walks the FAT
+     * chain and handles short reads at EOF). */
+    if (sz > 0) {
+#ifdef SYS_ftruncate
+        long t = raw_syscall6(SYS_ftruncate, mfd, (long)sz, 0, 0, 0, 0);
+        if (t < 0) { raw_close((int)mfd); return (int)t; }
+#endif
+        char  buf[8192];
+        off_t off = 0;
+        while ((uint64_t)off < sz) {
+            size_t want = (sz - (uint64_t)off) > sizeof(buf)
+                            ? sizeof(buf) : (size_t)(sz - (uint64_t)off);
+            long n = sud_ir_file_read(ino, buf, want, off);
+            if (n <= 0) { raw_close((int)mfd); return n ? (int)n : -EINVAL; }
+            long w = raw_syscall6(SYS_pwrite64, mfd,
+                                  (long)buf, n, off, 0, 0);
+            if (w < 0)  { raw_close((int)mfd); return (int)w; }
+            if (w == 0) { raw_close((int)mfd); return -EINVAL; }
+            off += w;
+        }
+    }
+
+    /* Now build the /proc/self/fd/<N> path.  Static buffer is fine:
+     * we are mid-syscall and either exec succeeds (path string is
+     * irrelevant after) or the syscall returns and the next call
+     * naturally overwrites it. */
+    static char path_buf[64];
+    int n = 0;
+    const char *p = "/proc/self/fd/";
+    while (*p && n < (int)sizeof(path_buf) - 1) path_buf[n++] = *p++;
+    char num[16]; int xi = 0;
+    int v = (int)mfd; if (v == 0) num[xi++] = '0';
+    while (v > 0 && xi < (int)sizeof(num)) { num[xi++] = '0' + v % 10; v /= 10; }
+    while (xi > 0 && n < (int)sizeof(path_buf) - 1) path_buf[n++] = num[--xi];
+    path_buf[n] = '\0';
+
+    ctx->args[path_arg_idx] = (long)path_buf;
+    return 1;
+}
+
 static int inramfs_pre_syscall(struct sud_syscall_ctx *ctx)
 {
     if (!sud_inramfs_active()) return 0;
@@ -1835,17 +1998,28 @@ static int inramfs_pre_syscall(struct sud_syscall_ctx *ctx)
     }
 #endif
 
-    /* execve: rewrite envp to carry SUD_INRAMFS_CWD across the
-     * exec boundary, then fall through (handler.c does the argv
-     * rewriting and issues the actual execve). */
+    /* execve: if the binary lives on inramfs, redirect to the
+     * memfd via /proc/self/fd/N (the kernel can't see inramfs
+     * paths).  Then inject the SUD_INRAMFS_CWD env var so the
+     * child starts up with the right logical CWD.  Always fall
+     * through to handler.c for argv-rewriting and the actual
+     * execve dispatch. */
 #ifdef SYS_execve
     if (nr == SYS_execve) {
+        execve_rewrite_inramfs_path(ctx, 0);
         execve_inject_cwd_env(ctx);
         return 0;
     }
 #endif
 #ifdef SYS_execveat
     if (nr == SYS_execveat) {
+        /* execveat(dirfd, path, argv, envp, flags).  Only rewrite
+         * the path when dirfd is AT_FDCWD; for an explicit dirfd
+         * the path is dirfd-relative and the kernel resolves it
+         * via the dirfd directly (which is a real kernel fd
+         * regardless of whether it points into our memfd). */
+        if ((int)ctx->args[0] == AT_FDCWD)
+            execve_rewrite_inramfs_path(ctx, 1);
         /* execveat: envp is arg index 3.  Temporarily aliases
          * args[2] so the same helper can write through. */
         long save = ctx->args[2];

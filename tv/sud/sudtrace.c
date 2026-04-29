@@ -104,6 +104,88 @@ static void init_wrapper_paths(const char *argv0)
 }
 
 /* ================================================================
+ * inramfs shm lifetime
+ *
+ * If the user gives us SUD_INRAMFS but no SUD_INRAMFS_KEY, we mint a
+ * unique key, publish it via the env var (so the addin in the traced
+ * children attaches to the same shm files), and remember to unlink
+ * the backing files on launcher exit.  Net effect: a sudtrace
+ * invocation owns its own backing shm and never leaves
+ * `/dev/shm/sud-inramfs.*` clutter behind, while the explicit-key
+ * workflow (multiple sudtrace invocations sharing the same mount)
+ * still works for users who supply their own key.
+ * ================================================================ */
+
+static char g_ir_meta_path[PATH_MAX];
+static char g_ir_data_path[PATH_MAX];
+static int  g_ir_owns_shm;              /* did we mint the key? */
+
+static void ir_unlink_backing(void)
+{
+    /* Idempotent: unlink and don't care about ENOENT. */
+    if (g_ir_owns_shm) {
+        if (g_ir_meta_path[0]) (void)unlink(g_ir_meta_path);
+        if (g_ir_data_path[0]) (void)unlink(g_ir_data_path);
+    }
+}
+
+static void ir_signal_cleanup(int sig)
+{
+    /* Async-signal-safe path: unlink (a syscall) is safe; we then
+     * restore the default handler and re-raise so the process dies
+     * with the right exit status / core-dump semantics. */
+    ir_unlink_backing();
+    struct sigaction sa = { 0 };
+    sa.sa_handler = SIG_DFL;
+    sigemptyset(&sa.sa_mask);
+    sigaction(sig, &sa, NULL);
+    raise(sig);
+}
+
+/* If SUD_INRAMFS is set and SUD_INRAMFS_KEY is not, mint a key and
+ * register cleanup hooks.  Called once from main() before fork. */
+static void ir_setup_owned_shm(void)
+{
+    const char *mount = getenv("SUD_INRAMFS");
+    if (!mount || !mount[0]) return;
+    if (getenv("SUD_INRAMFS_KEY")) return;   /* user-managed key */
+
+    /* Mint a key unique to this launcher: pid + monotonic ns gives
+     * an unambiguous identifier across rapid invocations and across
+     * pid wrap.  Hex-encoded for path safety. */
+    struct timespec ts = { 0, 0 };
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    char key[64];
+    snprintf(key, sizeof(key), "sudtrace-%d-%llx-%llx",
+             (int)getpid(),
+             (unsigned long long)ts.tv_sec,
+             (unsigned long long)ts.tv_nsec);
+
+    setenv("SUD_INRAMFS_KEY", key, 1);
+    snprintf(g_ir_meta_path, sizeof(g_ir_meta_path),
+             "/dev/shm/sud-inramfs.%s.meta", key);
+    snprintf(g_ir_data_path, sizeof(g_ir_data_path),
+             "/dev/shm/sud-inramfs.%s.data", key);
+    g_ir_owns_shm = 1;
+
+    atexit(ir_unlink_backing);
+
+    /* Catch the common termination signals so we still clean up
+     * when the user hits ^C or kills us.  Use SA_RESETHAND so the
+     * handler runs at most once; ir_signal_cleanup itself also
+     * restores SIG_DFL and re-raises to preserve exit semantics
+     * (e.g. shells care about WIFSIGNALED for ^C). */
+    struct sigaction sa = { 0 };
+    sa.sa_handler = ir_signal_cleanup;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags  = SA_RESETHAND;
+    sigaction(SIGINT,  &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGHUP,  &sa, NULL);
+    sigaction(SIGQUIT, &sa, NULL);
+}
+
+/* ================================================================
  * ELF class detection — determine if target is 32-bit or 64-bit
  * to pick the correct wrapper.
  * ================================================================ */
@@ -472,6 +554,12 @@ int main(int argc, char **argv)
 
     if (cmd_start < 0 || cmd_start >= argc)
         usage(argv[0]);
+
+    /* If the user wants inramfs but didn't pin a key, mint one and
+     * register cleanup so we don't leave shm files behind on exit
+     * (clean or signalled).  Must run before the env is snapshotted
+     * for the wrapper child. */
+    ir_setup_owned_shm();
 
     /* Setup output */
     if (outfile) {

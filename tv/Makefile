@@ -294,7 +294,7 @@ INRAMFS_TEST_SRCS := sud/inramfs/tests/test_inramfs.c \
                      libc-fs/libc.c libc-fs/deps/printf/printf.c
 INRAMFS_TEST_HDRS := sud/inramfs/inramfs.h sud/inramfs/internal.h \
                      sud/addin.h libc-fs/libc.h libc-fs/fmt.h
-.PHONY: inramfs-test inramfs-test-e2e
+.PHONY: inramfs-test inramfs-test-e2e inramfs-test-sqlite
 inramfs-test: build/inramfs_test64 build/inramfs_test32
 	@echo '--- running 64-bit inramfs tests ---'
 	./build/inramfs_test64
@@ -302,6 +302,8 @@ inramfs-test: build/inramfs_test64 build/inramfs_test32
 	./build/inramfs_test32
 	@echo '--- running inramfs end-to-end harness ---'
 	$(MAKE) inramfs-test-e2e
+	@echo '--- running inramfs sqlite end-to-end ---'
+	$(MAKE) inramfs-test-sqlite
 
 # inramfs end-to-end harness: runs sudtrace + strace over a tiny
 # shell workload and asserts zero kernel file syscalls touch any
@@ -316,6 +318,16 @@ inramfs-test-e2e: tests/inramfs_e2e.sh
 	@SUD_ADDINS="sud/trace sud/path_remap sud/inramfs" \
 	    $(MAKE) -s sud64 sudtrace
 	./tests/inramfs_e2e.sh
+
+# Ultimate end-to-end: clone sqlite source, build sqlite3 from
+# the amalgamation, then run two separate sqlite3 invocations
+# against an inramfs-resident db (CREATE+INSERT, then SELECT
+# validation).  Skipped automatically when the network is
+# unreachable (e.g. air-gapped CI).
+inramfs-test-sqlite: tests/inramfs_sqlite_e2e.sh
+	@SUD_ADDINS="sud/trace sud/path_remap sud/inramfs" \
+	    $(MAKE) -s sud64 sudtrace
+	./tests/inramfs_sqlite_e2e.sh
 
 build/inramfs_test64: $(INRAMFS_TEST_SRCS) $(INRAMFS_TEST_HDRS)
 	@mkdir -p build
