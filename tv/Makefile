@@ -78,7 +78,7 @@ ifeq ($(SIGSYS_DIAG),1)
 SUD_CFLAGS  += -DSUDTRACE_SIGSYS_DIAG
 endif
 SUD_ADDINS ?= sud/trace
-SUD_SRCS    := sud/wrapper.c sud/state.c sud/addin.c sud/raw.c sud/elf.c sud/handler.c sud/loader.c
+SUD_SRCS    := sud/wrapper.c sud/state.c sud/addin.c sud/raw.c sud/elf.c sud/handler.c sud/loader.c sud/runtime_config.c
 SUD_SRCS    += libc-fs/libc.c libc-fs/deps/printf/printf.c
 ifneq ($(filter sud/trace,$(SUD_ADDINS)),)
 SUD_CFLAGS  += -DSUD_ADDIN_TRACE
@@ -146,8 +146,8 @@ tv: $(TV_CXX_SRCS) $(TV_C_OBJS) $(TV_HDRS) $(ZSTD_LIB) $(DUCKDB_OBJ)
 # Standalone sudtrace launcher (the tracer binary itself; calls into
 # sud32/sud64 wrappers to drive the traced process). See sud/sudtrace.c
 # for the design notes.
-sudtrace: sud/sudtrace.c wire/wire.h trace/trace.h
-	$(CC) $(CFLAGS) -o $@ sud/sudtrace.c
+sudtrace: sud/sudtrace.c sud/runtime_config.c sud/runtime_config.h wire/wire.h trace/trace.h
+	$(CC) $(CFLAGS) -o $@ sud/sudtrace.c sud/runtime_config.c
 
 # Standalone upttrace (ptrace-based userspace tracer, works anywhere).
 UPTTRACE_HDRS := wire/wire.h trace/trace.h
@@ -185,8 +185,10 @@ libc-fs-test:
 # is caught in CI before the wrapper goes near a traced program.
 PATH_REMAP_TEST_SRCS := sud/path_remap/tests/test_overlay.c \
                         sud/path_remap/overlay.c \
+                        sud/runtime_config.c \
                         libc-fs/libc.c libc-fs/deps/printf/printf.c
 PATH_REMAP_TEST_HDRS := sud/path_remap/overlay.h \
+                        sud/runtime_config.h \
                         libc-fs/libc.h libc-fs/fmt.h
 .PHONY: path-remap-test
 path-remap-test: build/path_remap_test64 build/path_remap_test32
@@ -216,9 +218,11 @@ DISPATCH_TEST_BASE_CFLAGS := -O2 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 \
 DISPATCH_TEST_LDFLAGS     := -nostdlib -static -no-pie -Wl,--build-id=none
 DISPATCH_TEST_COMMON_SRCS := sud/path_remap/tests/test_dispatcher.c \
                              sud/addin.c \
+                             sud/runtime_config.c \
                              libc-fs/libc.c libc-fs/deps/printf/printf.c
 DISPATCH_TEST_PATHREMAP_SRCS := sud/path_remap/addin.c sud/path_remap/overlay.c
 DISPATCH_TEST_HDRS := sud/addin.h sud/path_remap/overlay.h \
+                      sud/runtime_config.h \
                       libc-fs/libc.h libc-fs/fmt.h
 
 DISPATCH_TEST_BIN64_BOTH := build/dispatcher_test_both64
@@ -291,9 +295,11 @@ wire-test: tv
 # /dev/shm as the backing region; CI must allow writes there.
 INRAMFS_TEST_SRCS := sud/inramfs/tests/test_inramfs.c \
                      sud/inramfs/super.c sud/inramfs/vfs.c sud/inramfs/addin.c \
+                     sud/runtime_config.c \
                      libc-fs/libc.c libc-fs/deps/printf/printf.c
 INRAMFS_TEST_HDRS := sud/inramfs/inramfs.h sud/inramfs/internal.h \
-                     sud/addin.h libc-fs/libc.h libc-fs/fmt.h
+                     sud/addin.h sud/runtime_config.h \
+                     libc-fs/libc.h libc-fs/fmt.h
 .PHONY: inramfs-test inramfs-test-e2e inramfs-test-sqlite
 inramfs-test: build/inramfs_test64 build/inramfs_test32
 	@echo '--- running 64-bit inramfs tests ---'

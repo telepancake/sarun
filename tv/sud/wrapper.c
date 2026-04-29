@@ -23,6 +23,7 @@
 #include "sud/loader.h"
 #include "sud/addin.h"
 #include "sud/state.h"
+#include "sud/runtime_config.h"
 
 /* ================================================================
  * Wrapper argument parsing
@@ -172,21 +173,20 @@ int main(int argc, char **argv)
     init_wrapper_paths();
     init_path_env();
 
-    /* Parse wrapper arguments:
-     *   sud64 [--no-env] [--drop-argv N] /path/to/binary [args...] */
+    /* Parse the wrapper flag block.  See sud/runtime_config.h for
+     * the supported flags.  Parsing terminates at the first non-flag
+     * argument (the target binary path). */
     int argi = 1;
-    int drop_count = 0;
-
-    if (argi < argc && argv[argi] && strcmp(argv[argi], "--no-env") == 0) {
-        g_trace_exec_env = 0;
-        argi++;
+    sud_runtime_config_clear(&g_sud_runtime_config);
+    if (sud_runtime_config_parse(argc, argv, &argi,
+                                 &g_sud_runtime_config) != 0) {
+        const char msg[] = "sud: malformed wrapper flag\n";
+        raw_write(2, msg, sizeof(msg) - 1);
+        _exit(2);
     }
-    if (argi + 1 < argc && argv[argi] &&
-        strcmp(argv[argi], "--drop-argv") == 0) {
-        drop_count = parse_int(argv[argi + 1]);
-        if (drop_count < 0) drop_count = 0;
-        argi += 2;
-    }
+    g_sud_runtime_config_present = 1;
+    g_trace_exec_env = !g_sud_runtime_config.no_env;
+    int drop_count   = g_sud_runtime_config.drop_count;
 
     if (argi >= argc || !argv[argi]) {
         const char msg[] = "sud: missing target binary\n";
