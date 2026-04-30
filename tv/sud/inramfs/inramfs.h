@@ -64,15 +64,21 @@
 
 /* ---------------------------------------------------------------- */
 
-/* Initialize the addin: parse environment, attach (or create) the
+/* Initialize the addin: parse runtime config, attach (or create) the
  * shared backing region, ensure the root inode exists.  Idempotent
  * across calls and across processes; safe to invoke from
- * wrapper_init time.  After this returns, sud_inramfs_active()
- * reflects whether the mount is configured. */
+ * wrapper_init time.  The data store attaches whenever either
+ * `--inramfs-key` or a `--remap-rule inramfs:<path>` is configured;
+ * neither requires the other.  After this returns,
+ * sud_inramfs_active() reflects whether the data store is attached. */
 void sud_inramfs_init(void);
 
-/* True if a mount prefix is configured and the backing region is
- * attached.  All syscall hijacking short-circuits when this is 0. */
+/* True if the inramfs data store is attached in this process — i.e.
+ * the shared metadata + smalldata regions are mapped and the root
+ * inode is present.  Independent of any path_remap mount: a process
+ * may attach the data store via `--inramfs-key` alone (e.g. an
+ * in-process unit test that drives the inode/data API directly).
+ * All fd-bearing syscall hijacking short-circuits when this is 0. */
 int  sud_inramfs_active(void);
 
 /* For test harnesses: tear down the in-process state (process-local

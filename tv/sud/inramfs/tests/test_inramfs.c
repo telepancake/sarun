@@ -66,6 +66,13 @@ static void setup_mount(const char *path, int size_mb, const char *key)
     cfg.inramfs_meta_mb = size_mb;
     cfg.inramfs_key = key;
     sud_runtime_config_test_install(&cfg);
+    /* Drive each addin's wrapper-init in the production order
+     * (path_remap → inramfs).  Path_remap parses the inramfs:<path>
+     * remap-rule into its mount-prefix table; inramfs then picks up
+     * (key, mount path) and attaches the data store.  After the
+     * mount-path-independence change, inramfs no longer reaches
+     * back into path_remap from its own init; the test driver does. */
+    sud_pr_path_init();
     sud_inramfs_init();
 }
 
@@ -73,6 +80,10 @@ static void teardown_mount(void)
 {
     sud_inramfs_unlink_backing_for_testing();
     sud_inramfs_reset_for_testing();
+    /* Clear path_remap's mount-prefix shadow so subsequent tests see
+     * a clean state — important for the data-store-without-mount
+     * test which asserts the mount is empty. */
+    sud_pr_inramfs_mount_set(0);
     sud_runtime_config_test_clear();
 }
 
@@ -678,6 +689,86 @@ static void test_promotion(void)
     teardown_mount();
 }
 
+/* Verifies the PLAN.md invariant: the inramfs data store attaches
+ * with --inramfs-key alone, *without* any --remap-rule inramfs:
+ * mount path being configured.  In that mode, sud_inramfs_active()
+ * is true, the root inode is present, and the inode-indexed
+ * primitives (sud_inramfs_op_*_inode / sud_inramfs_op_*_at_inode)
+ * fully function — but the path-based wrappers (which need a mount
+ * prefix to strip) do not, and that is by design.  Tests that drive
+ * the data store directly do not need a path layer. */
+static void test_data_store_no_mount(void)
+{
+    g_curtest = "data_store_no_mount";
+
+    /* Configure with --inramfs-key only.  No --remap-rule,
+     * no path_remap initialisation. */
+    struct sud_runtime_config cfg;
+    sud_runtime_config_clear(&cfg);
+    cfg.inramfs_meta_mb = 16;
+    cfg.inramfs_key     = "test_no_mount";
+    sud_runtime_config_test_install(&cfg);
+    sud_inramfs_init();
+
+    TASSERT(sud_inramfs_active(), "data store attached without mount");
+    TASSERT(sud_pr_inramfs_mount_path() == 0,
+            "no mount-path configured in path_remap");
+
+    /* Root inode is present and usable. */
+    struct sud_ir_inode *root = sud_ir_inode_get(1);
+    TASSERT(root != 0, "root inode exists");
+    TASSERT_EQ(root->type, SUD_IR_T_DIR, "root is DIR");
+
+    /* mkdir via the inode-indexed mutator (parent=root, name="d1"). */
+    long mk = sud_inramfs_op_mkdir_at_inode(1, "d1", 2, 0755);
+    TASSERT_EQ(mk, 0, "mkdir_at_inode under root");
+
+    /* Re-mkdir → EEXIST. */
+    TASSERT_EQ(sud_inramfs_op_mkdir_at_inode(1, "d1", 2, 0755),
+               -EEXIST, "EEXIST on second mkdir");
+
+    /* Look up the new dir's inode via the public superblock API. */
+    uint32_t d1_idx = 0;
+    struct sud_ir_super *sb = sud_ir_sb();
+    sud_ir_lock(&sb->lock);
+    int lrc = sud_ir_dir_lookup(1, "d1", 2, &d1_idx);
+    sud_ir_unlock(&sb->lock);
+    TASSERT_EQ(lrc, 0, "dir_lookup d1");
+    TASSERT(d1_idx != 0, "d1 has an inode");
+
+    /* Create-and-open a file under d1 via the inode-indexed creator. */
+    long fdl = sud_inramfs_op_create_open_inode(d1_idx, "f", 1,
+                                                O_WRONLY | O_CREAT, 0644,
+                                                /*abs_path*/0);
+    TASSERT(fdl >= 0, "create_open_inode");
+    int fd = (int)fdl;
+    TASSERT_EQ(sud_inramfs_op_write(fd, "hi", 2), 2, "write 2");
+    TASSERT_EQ(sud_inramfs_op_close(fd), 0, "close");
+
+    /* Read back via the leaf-inode open. */
+    uint32_t f_idx = 0;
+    sud_ir_lock(&sb->lock);
+    lrc = sud_ir_dir_lookup(d1_idx, "f", 1, &f_idx);
+    sud_ir_unlock(&sb->lock);
+    TASSERT_EQ(lrc, 0, "lookup f");
+    long rfd = sud_inramfs_op_open_inode(f_idx, O_RDONLY, /*abs_path*/0);
+    TASSERT(rfd >= 0, "open_inode RDONLY");
+    char buf[8] = {0};
+    long n = sud_inramfs_op_read((int)rfd, buf, sizeof(buf));
+    TASSERT_EQ(n, 2, "read 2");
+    TASSERT(buf[0] == 'h' && buf[1] == 'i', "content");
+    sud_inramfs_op_close((int)rfd);
+
+    /* stat via the inode-indexed leaf op. */
+    char stbuf[256];
+    TASSERT_EQ(sud_inramfs_op_stat_inode(f_idx, stbuf), 0, "stat_inode");
+
+    /* Tear down without going through path_remap. */
+    sud_inramfs_unlink_backing_for_testing();
+    sud_inramfs_reset_for_testing();
+    sud_runtime_config_test_clear();
+}
+
 /* ---- entrypoint ---- */
 
 int main(int argc, char **argv)
@@ -703,6 +794,7 @@ int main(int argc, char **argv)
     test_xxh64();
     test_smalldata_concurrency();
     test_promotion();
+    test_data_store_no_mount();
 
     if (g_failures) {
         char b[64];

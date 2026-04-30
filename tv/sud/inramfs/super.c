@@ -890,21 +890,32 @@ static void wait_for_init(volatile uint32_t *init_state)
      * disables itself in that case. */
 }
 
-/* Read --inramfs-meta-mb from the runtime config and ask path_remap
- * whether an inramfs mount has been registered (parsed from
- * --remap-rule inramfs:<path>).  Returns 1 if a mount is configured,
- * 0 if not.  After Part-1 of the layered split, super.c does NOT
- * parse the --remap-rule list itself — that is path_remap's job. */
+/* Read --inramfs-meta-mb from the runtime config and decide whether
+ * to attach the data store.  After Part-1 of the layered split, the
+ * data store is *mount-path independent*: it attaches whenever any
+ * caller has supplied enough configuration to identify the backing
+ * /dev/shm files — i.e. either an explicit `--inramfs-key` (preferred)
+ * or a `--remap-rule inramfs:<path>` whose path can be hashed into a
+ * default key.  PLAN.md: "sud_inramfs_active() becomes 'is the data
+ * store attached?', independent of any mount path."
+ *
+ * super.c does NOT parse the --remap-rule list itself — that is
+ * path_remap's job (and it runs before inramfs in the addin order).
+ *
+ * Returns 1 if attach should proceed, 0 otherwise. */
 static int parse_runtime_config(void)
 {
     uint64_t size_mb = 16;       /* default */
 
     if (!g_sud_runtime_config_present) return 0;
 
-    /* Make sure path_remap has parsed the inramfs:<path> rule.  This
-     * is idempotent and safe even if path_remap's own init runs first. */
-    sud_pr_inramfs_init_from_runtime_config();
-    if (!sud_pr_inramfs_mount_path()) return 0;
+    /* Attach only if at least one identification source is present.
+     * The mount path is read passively from path_remap (which has
+     * already initialised; see addin order in sud/addin.c). */
+    int have_key   = g_sud_runtime_config.inramfs_key
+                     && g_sud_runtime_config.inramfs_key[0];
+    int have_mount = sud_pr_inramfs_mount_path() != 0;
+    if (!have_key && !have_mount) return 0;
 
     if (g_sud_runtime_config.inramfs_meta_mb > 0)
         size_mb = (uint64_t)g_sud_runtime_config.inramfs_meta_mb;
@@ -998,8 +1009,10 @@ void sud_inramfs_init(void)
     if (g_sud_runtime_config_present)
         key = g_sud_runtime_config.inramfs_key;
     /* The mount path is owned by path_remap; consult it for the
-     * default-key hash (only used when no explicit --inramfs-key
-     * was given). */
+     * default-key hash when no explicit --inramfs-key was given.
+     * parse_runtime_config has already enforced the invariant that
+     * at least one of {key, mount_path} is non-NULL, so the fallback
+     * "/" below is defensive only. */
     const char *mount_for_key = sud_pr_inramfs_mount_path();
     compose_shm_paths(key, mount_for_key ? mount_for_key : "/",
                       g_meta_shm_path,  sizeof(g_meta_shm_path),
