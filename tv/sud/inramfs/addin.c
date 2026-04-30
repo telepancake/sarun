@@ -24,6 +24,7 @@
 #include "sud/inramfs/internal.h"
 #include "sud/addin.h"
 #include "sud/raw.h"
+#include "sud/runtime_config.h"
 
 /* ================================================================
  * Process-local fd table
@@ -222,49 +223,45 @@ static void fdtab_forget(int fd)
  * Empty string means "logical CWD not active" — kernel CWD is
  * authoritative as before.
  *
- * Inheritance across exec: written into / read from the env var
- * SUD_INRAMFS_CWD.  Children execed under our wrapper see the var,
- * the addin reads it once on first chdir-related access and seeds
- * g_logical_cwd.  Writers (chdir handler) update both the static
- * state and the env so that any subsequent execve passes it along
- * naturally.
+ * Inheritance across exec: we keep g_sud_runtime_config.cwd in
+ * lock-step with g_logical_cwd, and sud/elf.c::build_exec_argv re-
+ * emits "--cwd <abs>" on every child wrapper invocation as part of
+ * the standard runtime-config flag block.  Children parse the flag
+ * in their wrapper.c::main, populate their own
+ * g_sud_runtime_config.cwd, and our cwd_seed_from_runtime_config()
+ * picks it up on the first chdir-related access.  No env-var hop;
+ * no envp rewriting in execve.
  * ================================================================ */
 
 static char g_logical_cwd[PATH_MAX];
-static int  g_cwd_env_seeded;     /* one-shot seed from SUD_INRAMFS_CWD */
+static int  g_cwd_seeded;     /* one-shot seed from runtime config */
 
-/* Read environ once into g_logical_cwd if it carries an
- * SUD_INRAMFS_CWD entry.  Called lazily — we don't want to do this
- * on every syscall, only the first time path resolution happens.
- *
- * libc-fs's environ is set up at process startup from the auxv,
- * the same way super.c reads SUD_INRAMFS / SUD_INRAMFS_KEY.  After
- * an execve the child's libc-fs re-initialises environ from the
- * (potentially mutated) envp passed to execve, so a child whose
- * envp was rewritten by execve_inject_cwd_env() correctly observes
- * SUD_INRAMFS_CWD here. */
-static void cwd_seed_from_env(void)
+/* Read g_sud_runtime_config.cwd once into g_logical_cwd if it
+ * carries a usable absolute path.  Called lazily — we don't want to
+ * do this on every syscall, only the first time path resolution
+ * happens.  After an execve the child wrapper's main() repopulates
+ * g_sud_runtime_config.cwd from its --cwd argv flag, so the child's
+ * first call here observes the inherited value. */
+static void cwd_seed_from_runtime_config(void)
 {
-    if (g_cwd_env_seeded) return;
-    g_cwd_env_seeded = 1;
+    if (g_cwd_seeded) return;
+    g_cwd_seeded = 1;
 
-    const char *v = getenv("SUD_INRAMFS_CWD");
+    if (!g_sud_runtime_config_present) return;
+    const char *v = g_sud_runtime_config.cwd;
     if (!v || v[0] != '/') return;
     size_t vl = strlen(v);
     if (vl >= sizeof(g_logical_cwd)) return;
     memcpy(g_logical_cwd, v, vl + 1);
 }
 
-/* Set/clear the env var so a subsequent execve naturally passes
- * the new value to the child.  Best-effort — if the libc-fs setenv
- * fails (env table grew beyond what was reserved at startup) the
- * static state still tracks correctly for the current process. */
-static void cwd_publish_to_env(const char *new_val)
+/* Update g_sud_runtime_config.cwd so that the next execve interception
+ * (sud/elf.c::build_exec_argv) re-emits the new "--cwd <abs>" flag
+ * naturally.  Pass NULL/empty to clear. */
+static void cwd_publish_to_runtime_config(const char *new_val)
 {
-    if (new_val && new_val[0])
-        setenv("SUD_INRAMFS_CWD", new_val, 1);
-    else
-        unsetenv("SUD_INRAMFS_CWD");
+    if (!g_sud_runtime_config_present) return;
+    sud_runtime_config_set_cwd(&g_sud_runtime_config, new_val);
 }
 
 /* Read /proc/self/cwd via raw syscall.  Used to absolute-ify
@@ -327,7 +324,7 @@ static int absolutise(int dirfd, const char *path, char *out, size_t out_sz)
      * this, after `chdir(/ir/proj)` a relative `open("foo")`
      * would resolve via /proc/self/cwd ("/" since we point the
      * kernel at root during inramfs-chdir) and miss the mount. */
-    cwd_seed_from_env();
+    cwd_seed_from_runtime_config();
     char cwd[PATH_MAX];
     size_t cl;
     if (g_logical_cwd[0]) {
@@ -1295,7 +1292,7 @@ static long h_chdir(struct sud_syscall_ctx *c)
          * "not handled, continue to kernel"). */
         if (g_logical_cwd[0]) {
             g_logical_cwd[0] = '\0';
-            cwd_publish_to_env(0);
+            cwd_publish_to_runtime_config(0);
         }
         return 1;   /* sentinel: fall through to kernel */
     }
@@ -1314,13 +1311,13 @@ static long h_chdir(struct sud_syscall_ctx *c)
     size_t l = strlen(abs);
     if (l >= sizeof(g_logical_cwd)) return -ENAMETOOLONG;
     memcpy(g_logical_cwd, abs, l + 1);
-    cwd_publish_to_env(g_logical_cwd);
+    cwd_publish_to_runtime_config(g_logical_cwd);
     return 0;
 }
 
 static long h_getcwd(struct sud_syscall_ctx *c)
 {
-    cwd_seed_from_env();
+    cwd_seed_from_runtime_config();
     if (!g_logical_cwd[0]) return 1;   /* not active — fall through */
 
     char *buf = (char *)c->args[0];
@@ -1353,7 +1350,7 @@ static long h_fchdir(struct sud_syscall_ctx *c)
         size_t pl = strlen(of->dir_path);
         if (pl >= sizeof(g_logical_cwd)) return -ENAMETOOLONG;
         memcpy(g_logical_cwd, of->dir_path, pl + 1);
-        cwd_publish_to_env(g_logical_cwd);
+        cwd_publish_to_runtime_config(g_logical_cwd);
         /* Park the kernel CWD at "/" so /proc/self/cwd doesn't
          * claim a path the kernel can't resolve.  Mirrors
          * h_chdir's behaviour for absolute inramfs paths. */
@@ -1368,7 +1365,7 @@ static long h_fchdir(struct sud_syscall_ctx *c)
      * route relative paths after a successful host-side fchdir. */
     if (g_logical_cwd[0]) {
         g_logical_cwd[0] = '\0';
-        cwd_publish_to_env(0);
+        cwd_publish_to_runtime_config(0);
     }
     return 1;   /* fall through to kernel */
 }
@@ -1633,95 +1630,6 @@ static int dispatch_dup_to(struct sud_syscall_ctx *ctx,
     return 0;
 }
 
-/* ---- execve envp injection -----------------------------------------
- *
- * The traced program does not see the addin's libc-fs `environ` —
- * it has its own.  So setenv() called in our chdir handler updates
- * libc-fs but does NOT propagate to children: when the user program
- * execve's, it passes ITS OWN envp to the kernel, lacking
- * SUD_INRAMFS_CWD.  The child wakes up with no idea that its parent
- * had logically chdir'd into inramfs.
- *
- * To bridge that, we intercept SYS_execve in the addin's pre_syscall
- * hook (which runs BEFORE handler.c's argv-rewrite) and rewrite
- * envp to inject / replace / remove SUD_INRAMFS_CWD according to
- * the current logical-CWD state.  We do NOT short-circuit — we
- * mutate ctx->args[2] and return 0 so handler.c continues with the
- * patched envp.
- *
- * Memory: a single mmap arena per execve.  On exec success the
- * kernel discards the mapping with the rest of the address space;
- * on exec failure we leak (rare, bounded), which is the same trade
- * handler.c's argv arena makes.
- */
-static void execve_inject_cwd_env(struct sud_syscall_ctx *ctx)
-{
-    cwd_seed_from_env();
-    char **envp = (char **)ctx->args[2];
-    if (!envp) return;
-
-    /* Count entries and detect any existing SUD_INRAMFS_CWD slot. */
-    static const char key[] = "SUD_INRAMFS_CWD=";
-    const size_t klen = sizeof(key) - 1;
-    int n = 0;
-    int existing = -1;
-    while (envp[n]) {
-        if (existing < 0 &&
-            strncmp(envp[n], key, klen) == 0)
-            existing = n;
-        n++;
-    }
-
-    int active = (g_logical_cwd[0] != '\0');
-
-    /* Fast path: nothing to do.  No active CWD AND no stale env
-     * entry to remove.  Leave envp untouched. */
-    if (!active && existing < 0) return;
-
-    /* Build a new envp.  Worst case size:
-     *   (n + 2) pointers + the new value string.
-     * 1 page is more than enough for normal env tables; pathological
-     * envs (>~500 entries) would need bigger but build tools are
-     * far below that. */
-    size_t newval_len = 0;
-    if (active) {
-        newval_len = klen + strlen(g_logical_cwd) + 1;   /* incl NUL */
-    }
-    size_t arena_sz = (size_t)(n + 2) * sizeof(char *) + newval_len;
-    /* Round up to a whole page. */
-    arena_sz = (arena_sz + 4095u) & ~(size_t)4095u;
-    void *arena = raw_mmap(0, arena_sz, PROT_READ | PROT_WRITE,
-                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    /* OOM on the arena: leave envp untouched.  Child won't inherit
-     * the logical CWD, which falls back to "behaves like an
-     * exec out of inramfs" — incorrect but not corrupting. */
-    if ((unsigned long)arena >= (unsigned long)-4095) return;
-
-    char **new_envp = (char **)arena;
-    char  *strbuf   = (char *)arena
-                    + (size_t)(n + 2) * sizeof(char *);
-    char  *newval   = 0;
-    if (active) {
-        newval = strbuf;
-        memcpy(newval, key, klen);
-        memcpy(newval + klen, g_logical_cwd, strlen(g_logical_cwd) + 1);
-    }
-
-    int j = 0;
-    for (int i = 0; i < n; i++) {
-        if (i == existing) {
-            if (active) new_envp[j++] = newval;   /* replace */
-            /* else: drop (we are leaving inramfs) */
-            continue;
-        }
-        new_envp[j++] = envp[i];
-    }
-    if (active && existing < 0) new_envp[j++] = newval;   /* append */
-    new_envp[j] = 0;
-
-    ctx->args[2] = (long)new_envp;
-}
-
 /* fcntl: only F_DUPFD/F_DUPFD_CLOEXEC and F_GETFL/F_SETFL are
  * inramfs-relevant.  F_GETFD/F_SETFD (FD_CLOEXEC) deliberately fall
  * through to the kernel — cloexec lives on the underlying memfd and
@@ -1855,28 +1763,12 @@ static int inramfs_pre_syscall(struct sud_syscall_ctx *ctx)
     }
 #endif
 
-    /* execve: rewrite envp to carry SUD_INRAMFS_CWD across the
-     * exec boundary, then fall through (handler.c does the argv
-     * rewriting and issues the actual execve). */
-#ifdef SYS_execve
-    if (nr == SYS_execve) {
-        execve_inject_cwd_env(ctx);
-        return 0;
-    }
-#endif
-#ifdef SYS_execveat
-    if (nr == SYS_execveat) {
-        /* execveat: envp is arg index 3.  Temporarily aliases
-         * args[2] so the same helper can write through. */
-        long save = ctx->args[2];
-        ctx->args[2] = ctx->args[3];
-        execve_inject_cwd_env(ctx);
-        long maybe_new = ctx->args[2];
-        ctx->args[2] = save;
-        ctx->args[3] = maybe_new;
-        return 0;
-    }
-#endif
+    /* execve: nothing to do here.  The logical CWD is propagated to
+     * the child wrapper via the runtime-config "--cwd" argv flag,
+     * which sud/elf.c::build_exec_argv re-emits as part of the
+     * standard wrapper-flag block.  envp is passed through to the
+     * kernel byte-for-byte (the child program sees exactly the env
+     * the traced program supplied to execve). */
 
     /* munmap interception.
      *

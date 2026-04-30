@@ -130,6 +130,16 @@ void sud_runtime_config_test_install(const struct sud_runtime_config *src);
  * the global to its pre-test state. */
 void sud_runtime_config_test_clear(void);
 
+/* Replace cfg->cwd with an interned copy of new_cwd, or clear it if
+ * new_cwd is NULL/"".  The previous value is leaked (process-
+ * lifetime — chdir is a bounded operation in any sane workload).
+ * Used by the inramfs chdir handler to keep the live config's --cwd
+ * field in lock-step with the logical CWD, so that
+ * sud_runtime_config_emit() naturally re-emits --cwd <abs> on every
+ * child wrapper invocation without going through the environment. */
+void sud_runtime_config_set_cwd(struct sud_runtime_config *cfg,
+                                const char *new_cwd);
+
 /* The live runtime config populated by sud/wrapper.c::main before
  * sud_addins_wrapper_init() runs.  Each addin's wrapper_init reads
  * its slice of the configuration from here.  When the wrapper has

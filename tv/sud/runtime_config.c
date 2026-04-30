@@ -237,3 +237,14 @@ void sud_runtime_config_test_clear(void)
     sud_runtime_config_clear(&g_sud_runtime_config);
     g_sud_runtime_config_present = 0;
 }
+
+void sud_runtime_config_set_cwd(struct sud_runtime_config *cfg,
+                                const char *new_cwd)
+{
+    if (!cfg) return;
+    if (!new_cwd || !new_cwd[0]) {
+        cfg->cwd = 0;
+        return;
+    }
+    cfg->cwd = rc_strdup(new_cwd);
+}
