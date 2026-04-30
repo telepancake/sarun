@@ -902,48 +902,30 @@ static int parse_env(void)
     size_t      plen = 0;
     uint64_t    size_mb = 16;       /* default */
 
-    if (g_sud_runtime_config_present) {
-        for (int i = 0; i < g_sud_runtime_config.remap_rule_count; i++) {
-            const char *r = g_sud_runtime_config.remap_rules[i];
-            if (!r) continue;
-            /* Only the first inramfs rule is honoured.  Match
-             * "inramfs:" prefix, then take the rest as the path
-             * (which may itself contain a trailing :<size> from a
-             * legacy translation — strip it). */
-            const char tag[] = "inramfs:";
-            const size_t tlen = sizeof(tag) - 1;
-            int match = 1;
-            for (size_t k = 0; k < tlen; k++)
-                if (r[k] != tag[k]) { match = 0; break; }
-            if (!match) continue;
-            const char *p = r + tlen;
-            const char *end = p;
-            while (*end && *end != ':') end++;
-            path = p;
-            plen = (size_t)(end - p);
-            break;
-        }
-        if (g_sud_runtime_config.inramfs_meta_mb > 0)
-            size_mb = (uint64_t)g_sud_runtime_config.inramfs_meta_mb;
+    if (!g_sud_runtime_config_present) return 0;
+
+    for (int i = 0; i < g_sud_runtime_config.remap_rule_count; i++) {
+        const char *r = g_sud_runtime_config.remap_rules[i];
+        if (!r) continue;
+        /* Only the first inramfs rule is honoured.  Match
+         * "inramfs:" prefix, then take the rest as the path. */
+        const char tag[] = "inramfs:";
+        const size_t tlen = sizeof(tag) - 1;
+        int match = 1;
+        for (size_t k = 0; k < tlen; k++)
+            if (r[k] != tag[k]) { match = 0; break; }
+        if (!match) continue;
+        const char *p = r + tlen;
+        const char *end = p;
+        while (*end && *end != ':') end++;
+        path = p;
+        plen = (size_t)(end - p);
+        break;
     }
-    if (!path) {
-        /* Transitional fallback: legacy env var.  Removed once all
-         * tests have switched to populating g_sud_runtime_config. */
-        const char *e = getenv("SUD_INRAMFS");
-        if (!e || !e[0]) return 0;
-        path = e;
-        plen = 0;
-        while (path[plen] && path[plen] != ':') plen++;
-        if (path[plen] == ':') {
-            const char *s = path + plen + 1;
-            uint64_t v = 0;
-            while (*s >= '0' && *s <= '9') {
-                v = v * 10 + (uint64_t)(*s - '0');
-                s++;
-            }
-            if (v) size_mb = v;
-        }
-    }
+    if (g_sud_runtime_config.inramfs_meta_mb > 0)
+        size_mb = (uint64_t)g_sud_runtime_config.inramfs_meta_mb;
+
+    if (!path) return 0;
     if (plen == 0 || plen >= sizeof(g_mount_path)) return 0;
     if (path[0] != '/') return 0;            /* must be absolute */
     /* Strip trailing slashes (but not the root). */
@@ -1035,14 +1017,11 @@ void sud_inramfs_init(void)
     size_t floor = min_meta_size();
     if (g_meta_size < floor) g_meta_size = floor;
 
-    /* Source the inramfs key from the runtime config (preferred); on
-     * absence (test harness without a populated config) fall back to
-     * the legacy SUD_INRAMFS_KEY env var.  The compose_shm_paths
-     * helper accepts NULL meaning "no key suffix". */
+    /* Source the inramfs key from the runtime config.  The
+     * compose_shm_paths helper accepts NULL meaning "no key suffix". */
     const char *key = NULL;
     if (g_sud_runtime_config_present)
         key = g_sud_runtime_config.inramfs_key;
-    if (!key) key = getenv("SUD_INRAMFS_KEY");
     compose_shm_paths(key, g_mount_path,
                       g_meta_shm_path,  sizeof(g_meta_shm_path),
                       g_small_shm_path, sizeof(g_small_shm_path),

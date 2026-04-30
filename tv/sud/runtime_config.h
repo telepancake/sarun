@@ -117,6 +117,19 @@ int sud_runtime_config_emit(const struct sud_runtime_config *cfg,
  * field is set to NULL. */
 void sud_runtime_config_intern(struct sud_runtime_config *cfg);
 
+/* Test helper: copy *src into the live g_sud_runtime_config global,
+ * intern its strings, and mark it present.  Replaces the env-var
+ * configuration path for unit tests that previously called
+ * setenv("SUD_OVERLAY", ...) / setenv("SUD_INRAMFS", ...) before
+ * sud_overlay_init() / sud_inramfs_init().  Safe to call repeatedly
+ * across sub-tests; old interned strings leak (process-lifetime). */
+void sud_runtime_config_test_install(const struct sud_runtime_config *src);
+
+/* Test helper: clear the live config and mark it absent.  Symmetric
+ * to sud_runtime_config_test_install; lets a teardown step return
+ * the global to its pre-test state. */
+void sud_runtime_config_test_clear(void);
+
 /* The live runtime config populated by sud/wrapper.c::main before
  * sud_addins_wrapper_init() runs.  Each addin's wrapper_init reads
  * its slice of the configuration from here.  When the wrapper has

@@ -17,6 +17,7 @@
 #include "sud/inramfs/inramfs.h"
 #include "sud/inramfs/internal.h"
 #include "sud/raw.h"
+#include "sud/runtime_config.h"
 
 void sud_rt_sigreturn_restorer(void) {}
 #if defined(__i386__)
@@ -55,10 +56,15 @@ static void setup_mount(const char *path, int size_mb, const char *key)
      * will round up smaller requests, but make the tests honest by
      * passing at least 16 MiB. */
     if (size_mb < 16) size_mb = 16;
-    char val[PATH_MAX + 32];
-    snprintf(val, sizeof(val), "%s:%d", path, size_mb);
-    setenv("SUD_INRAMFS", val, 1);
-    if (key) setenv("SUD_INRAMFS_KEY", key, 1);
+    char rule[PATH_MAX + 32];
+    snprintf(rule, sizeof(rule), "inramfs:%s", path);
+    struct sud_runtime_config cfg;
+    sud_runtime_config_clear(&cfg);
+    cfg.remap_rules[0] = rule;
+    cfg.remap_rule_count = 1;
+    cfg.inramfs_meta_mb = size_mb;
+    cfg.inramfs_key = key;
+    sud_runtime_config_test_install(&cfg);
     sud_inramfs_init();
 }
 
@@ -66,8 +72,7 @@ static void teardown_mount(void)
 {
     sud_inramfs_unlink_backing_for_testing();
     sud_inramfs_reset_for_testing();
-    unsetenv("SUD_INRAMFS");
-    unsetenv("SUD_INRAMFS_KEY");
+    sud_runtime_config_test_clear();
 }
 
 /* ---- tests ---- */

@@ -207,16 +207,6 @@ static void parse_overlay_segment(const char *seg, size_t len)
     if (r->upper || r->lower_count > 0) g_rule_count++;
 }
 
-static void parse_overlay_env(const char *env)
-{
-    while (*env && g_rule_count < SUD_OVERLAY_MAX_RULES) {
-        const char *seg = env;
-        while (*env && *env != ':') env++;
-        parse_overlay_segment(seg, (size_t)(env - seg));
-        if (*env == ':') env++;
-    }
-}
-
 /* Parse one simple remap segment "<src>=<dst>". */
 static void parse_remap_segment(const char *seg, size_t len)
 {
@@ -244,56 +234,37 @@ static void parse_remap_segment(const char *seg, size_t len)
     if (r->merged && r->upper) g_rule_count++;
 }
 
-static void parse_remap_env(const char *env)
-{
-    while (*env && g_rule_count < SUD_OVERLAY_MAX_RULES) {
-        const char *seg = env;
-        while (*env && *env != ':') env++;
-        parse_remap_segment(seg, (size_t)(env - seg));
-        if (*env == ':') env++;
-    }
-}
-
 void sud_overlay_init(void)
 {
     if (g_init_done) return;
     g_init_done = 1;
 
-    /* Preferred path: read from runtime config.  Each
-     * "--remap-rule <kind>:<spec>" entry becomes one rule.  Inramfs
-     * rules are skipped here — they are owned by the inramfs addin
-     * (and, eventually, the path_remap inramfs glue). */
-    if (g_sud_runtime_config_present) {
-        for (int i = 0; i < g_sud_runtime_config.remap_rule_count; i++) {
-            const char *r = g_sud_runtime_config.remap_rules[i];
-            if (!r || !r[0]) continue;
-            const char *colon = r;
-            while (*colon && *colon != ':') colon++;
-            if (*colon != ':') continue;
-            size_t klen = (size_t)(colon - r);
-            const char *spec = colon + 1;
-            size_t slen = 0;
-            while (spec[slen]) slen++;
-            if (klen == 7 && r[0]=='o' && r[1]=='v' && r[2]=='e' &&
-                r[3]=='r' && r[4]=='l' && r[5]=='a' && r[6]=='y')
-                parse_overlay_segment(spec, slen);
-            else if (klen == 5 && r[0]=='r' && r[1]=='e' && r[2]=='m' &&
-                     r[3]=='a' && r[4]=='p')
-                parse_remap_segment(spec, slen);
-            /* "inramfs" / "passthrough" / "fakeroot": not yet
-             * implemented in path_remap; ignored here.  The inramfs
-             * addin reads the inramfs rule from runtime_config
-             * directly. */
-        }
-        return;
+    /* Read rules from the runtime config populated by sud/wrapper.c.
+     * Each "--remap-rule <kind>:<spec>" entry becomes one rule.
+     * Inramfs rules are skipped here — they are owned by the inramfs
+     * addin (and, eventually, the path_remap inramfs glue). */
+    if (!g_sud_runtime_config_present) return;
+    for (int i = 0; i < g_sud_runtime_config.remap_rule_count; i++) {
+        const char *r = g_sud_runtime_config.remap_rules[i];
+        if (!r || !r[0]) continue;
+        const char *colon = r;
+        while (*colon && *colon != ':') colon++;
+        if (*colon != ':') continue;
+        size_t klen = (size_t)(colon - r);
+        const char *spec = colon + 1;
+        size_t slen = 0;
+        while (spec[slen]) slen++;
+        if (klen == 7 && r[0]=='o' && r[1]=='v' && r[2]=='e' &&
+            r[3]=='r' && r[4]=='l' && r[5]=='a' && r[6]=='y')
+            parse_overlay_segment(spec, slen);
+        else if (klen == 5 && r[0]=='r' && r[1]=='e' && r[2]=='m' &&
+                 r[3]=='a' && r[4]=='p')
+            parse_remap_segment(spec, slen);
+        /* "inramfs" / "passthrough" / "fakeroot": not yet
+         * implemented in path_remap; ignored here.  The inramfs
+         * addin reads the inramfs rule from runtime_config
+         * directly. */
     }
-
-    /* Transitional fallback for tests that have not yet migrated to
-     * populating g_sud_runtime_config. */
-    const char *ov = getenv("SUD_OVERLAY");
-    if (ov && ov[0]) parse_overlay_env(ov);
-    const char *rm = getenv("SUD_REMAP");
-    if (rm && rm[0]) parse_remap_env(rm);
 }
 
 int sud_overlay_rule_count(void)

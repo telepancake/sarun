@@ -9,7 +9,8 @@
  *
  * Each test creates a fresh tmpdir tree (lower1, lower2, upper, and
  * an arbitrary "merged" mount point that doesn't actually exist on
- * disk), configures SUD_OVERLAY via setenv(), calls into the overlay
+ * disk), configures the overlay via the runtime-config test API
+ * (sud_runtime_config_test_install), calls into the overlay
  * API, and verifies the result.
  *
  * Tests run for both -m32 and -m64 builds — the Makefile does both.
@@ -19,6 +20,7 @@
 #include "libc-fs/fmt.h"
 #include "sud/path_remap/overlay.h"
 #include "sud/raw.h"
+#include "sud/runtime_config.h"
 
 void sud_rt_sigreturn_restorer(void) {}
 #if defined(__i386__)
@@ -214,33 +216,42 @@ static void fixture_teardown(void)
 
 static void install_overlay(void)
 {
-    char env[PATH_MAX * 4];
-    snprintf(env, sizeof(env), "%s=%s+%s+%s",
+    char spec[PATH_MAX * 4];
+    snprintf(spec, sizeof(spec), "overlay:%s=%s+%s+%s",
              g_merged, g_upper, g_lower1, g_lower2);
-    setenv("SUD_OVERLAY", env, 1);
-    unsetenv("SUD_REMAP");
+    struct sud_runtime_config cfg;
+    sud_runtime_config_clear(&cfg);
+    cfg.remap_rules[0] = spec;
+    cfg.remap_rule_count = 1;
+    sud_runtime_config_test_install(&cfg);
     sud_overlay_reset_for_testing();
     sud_overlay_init();
 }
 
 static void install_readonly_overlay(void)
 {
-    char env[PATH_MAX * 4];
+    char spec[PATH_MAX * 4];
     /* No upper — read-only overlay. */
-    snprintf(env, sizeof(env), "%s=+%s+%s",
+    snprintf(spec, sizeof(spec), "overlay:%s=+%s+%s",
              g_merged, g_lower1, g_lower2);
-    setenv("SUD_OVERLAY", env, 1);
-    unsetenv("SUD_REMAP");
+    struct sud_runtime_config cfg;
+    sud_runtime_config_clear(&cfg);
+    cfg.remap_rules[0] = spec;
+    cfg.remap_rule_count = 1;
+    sud_runtime_config_test_install(&cfg);
     sud_overlay_reset_for_testing();
     sud_overlay_init();
 }
 
 static void install_simple_remap(void)
 {
-    char env[PATH_MAX * 4];
-    snprintf(env, sizeof(env), "%s=%s", g_merged, g_lower1);
-    setenv("SUD_REMAP", env, 1);
-    unsetenv("SUD_OVERLAY");
+    char spec[PATH_MAX * 4];
+    snprintf(spec, sizeof(spec), "remap:%s=%s", g_merged, g_lower1);
+    struct sud_runtime_config cfg;
+    sud_runtime_config_clear(&cfg);
+    cfg.remap_rules[0] = spec;
+    cfg.remap_rule_count = 1;
+    sud_runtime_config_test_install(&cfg);
     sud_overlay_reset_for_testing();
     sud_overlay_init();
 }
@@ -538,13 +549,17 @@ static void test_multi_rule_parsing(void)
     /* Use /tmp paths for the second rule too, since rules with non-
      * existent paths are still parsed and counted; we only assert the
      * count and that resolution finds the right rule. */
-    char env[PATH_MAX * 8];
-    snprintf(env, sizeof(env),
-             "%s=%s+%s+%s:/aux=%s",
-             g_merged, g_upper, g_lower1, g_lower2,
-             g_lower1);
-    setenv("SUD_OVERLAY", env, 1);
-    unsetenv("SUD_REMAP");
+    char spec1[PATH_MAX * 4], spec2[PATH_MAX * 4];
+    snprintf(spec1, sizeof(spec1),
+             "overlay:%s=%s+%s+%s",
+             g_merged, g_upper, g_lower1, g_lower2);
+    snprintf(spec2, sizeof(spec2), "overlay:/aux=%s", g_lower1);
+    struct sud_runtime_config cfg;
+    sud_runtime_config_clear(&cfg);
+    cfg.remap_rules[0] = spec1;
+    cfg.remap_rules[1] = spec2;
+    cfg.remap_rule_count = 2;
+    sud_runtime_config_test_install(&cfg);
     sud_overlay_reset_for_testing();
     sud_overlay_init();
     TASSERT_EQ(sud_overlay_rule_count(), 2, "two rules parsed");

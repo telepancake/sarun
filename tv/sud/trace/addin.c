@@ -32,13 +32,10 @@ static void trace_wrapper_init(void)
     if (fstat(SUD_OUTPUT_FD, (struct stat *)&stbuf) == 0) {
         g_out_fd = SUD_OUTPUT_FD;
     } else {
-        /* Preferred: --trace-outfile flag from the runtime config.
-         * Fallback: legacy SUDTRACE_OUTFILE env var (transitional). */
+        /* --trace-outfile flag from the runtime config. */
         const char *out_path = NULL;
         if (g_sud_runtime_config_present)
             out_path = g_sud_runtime_config.trace_outfile;
-        if (!out_path || !out_path[0])
-            out_path = getenv(SUDTRACE_OUTFILE_ENV);
         if (out_path && out_path[0]) {
             int ofd = open(out_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
             g_out_fd = ofd >= 0 ? ofd : STDOUT_FILENO;

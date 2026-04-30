@@ -24,6 +24,7 @@
 #include "libc-fs/fmt.h"
 #include "sud/addin.h"
 #include "sud/raw.h"
+#include "sud/runtime_config.h"
 
 #if defined(SUD_ADDIN_PATH_REMAP)
 #include "sud/path_remap/overlay.h"
@@ -269,20 +270,27 @@ static void fixture_teardown(void)
 #ifdef SUD_ADDIN_PATH_REMAP
 static void install_overlay(void)
 {
-    char env[PATH_MAX * 4];
-    snprintf(env, sizeof(env), "%s=%s+%s", g_merged, g_upper, g_lower);
-    setenv("SUD_OVERLAY", env, 1);
-    unsetenv("SUD_REMAP");
+    char spec[PATH_MAX * 4];
+    snprintf(spec, sizeof(spec), "overlay:%s=%s+%s",
+             g_merged, g_upper, g_lower);
+    struct sud_runtime_config cfg;
+    sud_runtime_config_clear(&cfg);
+    cfg.remap_rules[0] = spec;
+    cfg.remap_rule_count = 1;
+    sud_runtime_config_test_install(&cfg);
     sud_overlay_reset_for_testing();
     sud_overlay_init();
 }
 
 static void install_readonly_overlay(void)
 {
-    char env[PATH_MAX * 4];
-    snprintf(env, sizeof(env), "%s=+%s", g_merged, g_lower);
-    setenv("SUD_OVERLAY", env, 1);
-    unsetenv("SUD_REMAP");
+    char spec[PATH_MAX * 4];
+    snprintf(spec, sizeof(spec), "overlay:%s=+%s", g_merged, g_lower);
+    struct sud_runtime_config cfg;
+    sud_runtime_config_clear(&cfg);
+    cfg.remap_rules[0] = spec;
+    cfg.remap_rule_count = 1;
+    sud_runtime_config_test_install(&cfg);
     sud_overlay_reset_for_testing();
     sud_overlay_init();
 }
@@ -292,19 +300,21 @@ static void install_unrelated_overlay(void)
     /* An overlay rule that targets a virtual mount point under
      * /tmp which is unrelated to anything we'll query, so any path
      * outside this rule passes through untouched. */
-    char env[PATH_MAX * 4];
-    snprintf(env, sizeof(env),
-             "%s/_unrelated=+%s", g_tmp, g_lower);
-    setenv("SUD_OVERLAY", env, 1);
-    unsetenv("SUD_REMAP");
+    char spec[PATH_MAX * 4];
+    snprintf(spec, sizeof(spec),
+             "overlay:%s/_unrelated=+%s", g_tmp, g_lower);
+    struct sud_runtime_config cfg;
+    sud_runtime_config_clear(&cfg);
+    cfg.remap_rules[0] = spec;
+    cfg.remap_rule_count = 1;
+    sud_runtime_config_test_install(&cfg);
     sud_overlay_reset_for_testing();
     sud_overlay_init();
 }
 
 static void install_no_overlay(void)
 {
-    unsetenv("SUD_OVERLAY");
-    unsetenv("SUD_REMAP");
+    sud_runtime_config_test_clear();
     sud_overlay_reset_for_testing();
     sud_overlay_init();
 }

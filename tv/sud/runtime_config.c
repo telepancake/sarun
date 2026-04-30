@@ -221,3 +221,19 @@ void sud_runtime_config_intern(struct sud_runtime_config *cfg)
             cfg->remap_rules[i] = rc_strdup(cfg->remap_rules[i]);
     }
 }
+
+void sud_runtime_config_test_install(const struct sud_runtime_config *src)
+{
+    sud_runtime_config_clear(&g_sud_runtime_config);
+    if (src) {
+        g_sud_runtime_config = *src;
+        sud_runtime_config_intern(&g_sud_runtime_config);
+    }
+    g_sud_runtime_config_present = 1;
+}
+
+void sud_runtime_config_test_clear(void)
+{
+    sud_runtime_config_clear(&g_sud_runtime_config);
+    g_sud_runtime_config_present = 0;
+}
