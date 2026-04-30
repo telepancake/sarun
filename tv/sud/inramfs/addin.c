@@ -3,17 +3,31 @@
  *
  * Acts as the syscall-dispatch front-end for the inramfs core
  * (super.c, vfs.c).  For every path-bearing syscall we:
- *   1. Compute an absolute path from (dirfd, path).
- *   2. Check whether that path is under the configured inramfs mount.
- *   3. If yes, run the in-process op, set ctx->ret to the result,
+ *   1. Ask path_remap to compute an absolute path from (dirfd, path)
+ *      and check whether that path lies under the configured inramfs
+ *      mount  (sud_pr_resolve_at_inramfs).
+ *   2. If yes, run the in-process op, set ctx->ret to the result,
  *      and return 1 to short-circuit the kernel call.
- *   4. If no, return 0 so the next addin (path_remap) gets a turn.
+ *   3. If no, return 0 so the next addin (path_remap) gets a turn.
  *
  * For fd-bearing syscalls (read/write/lseek/ftruncate/fstat/...) we
  * check sud_inramfs_owns_fd() — fds returned by inramfs are real
  * memfd fds that the kernel knows about (so close/dup/poll work
  * naturally), but read/write/seek/etc. against those fds must be
  * intercepted to read from inramfs's own data extents.
+ *
+ * After the Part-1 re-layering (PLAN.md), inramfs holds NO path /
+ * cwd / dirfd state of its own.  All such state is owned by
+ * sud/path_remap/path.{c,h}, which inramfs queries via the
+ * sud_pr_* API.  In particular:
+ *   - The inramfs mount prefix is owned by path_remap (parsed from
+ *     --remap-rule inramfs:<path>).
+ *   - The logical-CWD shadow (chdir/getcwd/fchdir bookkeeping) is
+ *     owned by path_remap.  This file no longer hooks chdir, fchdir
+ *     or getcwd.
+ *   - The dirfd → absolute-path map is owned by path_remap.  This
+ *     file registers an entry whenever sud_inramfs_op_open returns
+ *     a fd for a directory inode.
  *
  * The fd table is process-local (file descriptors don't survive
  * exec across the wrapper boundary in the initial implementation —
@@ -22,6 +36,7 @@
 
 #include "sud/inramfs/inramfs.h"
 #include "sud/inramfs/internal.h"
+#include "sud/path_remap/path.h"
 #include "sud/addin.h"
 #include "sud/raw.h"
 #include "sud/runtime_config.h"
@@ -47,14 +62,12 @@ struct sud_ir_open_file {
     /* Directory-iteration cookie: byte offset into the dirblock chain
      * at which the next getdents64 call resumes. */
     uint32_t dir_cookie;
-    /* Absolute path under the mount used to open this fd, populated
-     * when the inode is a directory.  Used for *at(dirfd, relpath)
-     * resolution in absolutise().  Empty (path[0]==0) means "not
-     * a directory fd, or path-not-tracked" — relative resolution
-     * via this fd will fail with -EXDEV (caller falls through to
-     * the kernel which sees the underlying memfd, fails ENOTDIR,
-     * and propagates the right errno). */
-    char     dir_path[512];
+    /* For directory fds: the absolute path used to open the fd is
+     * registered with path_remap's dirfd table (sud_pr_dirfd_register)
+     * in sud_inramfs_op_open and forgotten in sud_inramfs_op_close.
+     * That single shared table is consulted by sud_pr_absolutise()
+     * for any subsequent (dirfd, relpath) syscall, so this struct
+     * carries no path itself. */
 };
 
 static struct sud_ir_open_file g_fdtab[SUD_IR_FD_TABLE_SIZE];
@@ -89,7 +102,6 @@ static struct sud_ir_open_file *fdtab_alloc(int kfd, uint32_t inode_idx,
             g_fdtab[i].pos        = 0;
             g_fdtab[i].flags      = flags;
             g_fdtab[i].dir_cookie = 0;
-            g_fdtab[i].dir_path[0] = '\0';
             return &g_fdtab[i];
         }
     }
@@ -100,6 +112,8 @@ static void fdtab_release(int fd)
 {
     struct sud_ir_open_file *of = fdtab_lookup(fd);
     if (of) of->kfd = -1;
+    /* Drop any path_remap dirfd entry; harmless no-op for non-dirs. */
+    sud_pr_dirfd_forget(fd);
 }
 
 static int try_adopt_inherited_fd(int fd);   /* defined below */
@@ -202,160 +216,30 @@ static void fdtab_forget(int fd)
 {
     struct sud_ir_open_file *of = fdtab_lookup(fd);
     if (of) of->kfd = -1;
+    sud_pr_dirfd_forget(fd);
 }
 
 /* ================================================================
- * Path resolution helper (dirfd, relative path) → absolute path
+ * Path resolution — delegated to path_remap.
+ *
+ * The CWD shadow, dirfd→logical-path table, absolutise() and the
+ * inramfs mount-prefix knowledge that used to live here have all
+ * moved to sud/path_remap/path.c (see PLAN.md Part 1).  The two
+ * functions below are thin compat shims kept in inramfs.h purely so
+ * existing callers (sud/loader.c, sud/elf.c) don't need to learn the
+ * new API yet — they delegate to path_remap.
  * ================================================================ */
 
-/* ================================================================
- * Logical CWD (chdir/getcwd/fchdir into inramfs)
- *
- * The kernel only knows about real filesystem paths, so a kernel
- * chdir(/inramfs/...) returns ENOENT.  We maintain our own logical
- * CWD: when chdir lands on an inramfs path we stash it here and
- * point the kernel CWD at "/" (somewhere innocuous so /proc/self/cwd
- * doesn't claim a path the kernel can't resolve).  Subsequent
- * AT_FDCWD-relative path resolution in absolutise() consults
- * g_logical_cwd before falling back to /proc/self/cwd.  Subsequent
- * getcwd(2) returns g_logical_cwd verbatim.
- *
- * Empty string means "logical CWD not active" — kernel CWD is
- * authoritative as before.
- *
- * Inheritance across exec: we keep g_sud_runtime_config.cwd in
- * lock-step with g_logical_cwd, and sud/elf.c::build_exec_argv re-
- * emits "--cwd <abs>" on every child wrapper invocation as part of
- * the standard runtime-config flag block.  Children parse the flag
- * in their wrapper.c::main, populate their own
- * g_sud_runtime_config.cwd, and our cwd_seed_from_runtime_config()
- * picks it up on the first chdir-related access.  No env-var hop;
- * no envp rewriting in execve.
- * ================================================================ */
-
-static char g_logical_cwd[PATH_MAX];
-static int  g_cwd_seeded;     /* one-shot seed from runtime config */
-
-/* Read g_sud_runtime_config.cwd once into g_logical_cwd if it
- * carries a usable absolute path.  Called lazily — we don't want to
- * do this on every syscall, only the first time path resolution
- * happens.  After an execve the child wrapper's main() repopulates
- * g_sud_runtime_config.cwd from its --cwd argv flag, so the child's
- * first call here observes the inherited value. */
-static void cwd_seed_from_runtime_config(void)
+int sud_inramfs_path_under_mount(const char *abs_path)
 {
-    if (g_cwd_seeded) return;
-    g_cwd_seeded = 1;
-
-    if (!g_sud_runtime_config_present) return;
-    const char *v = g_sud_runtime_config.cwd;
-    if (!v || v[0] != '/') return;
-    size_t vl = strlen(v);
-    if (vl >= sizeof(g_logical_cwd)) return;
-    memcpy(g_logical_cwd, v, vl + 1);
+    return sud_pr_inramfs_path_under_mount(abs_path);
 }
 
-/* Update g_sud_runtime_config.cwd so that the next execve interception
- * (sud/elf.c::build_exec_argv) re-emits the new "--cwd <abs>" flag
- * naturally.  Pass NULL/empty to clear. */
-static void cwd_publish_to_runtime_config(const char *new_val)
-{
-    if (!g_sud_runtime_config_present) return;
-    sud_runtime_config_set_cwd(&g_sud_runtime_config, new_val);
-}
-
-/* Read /proc/self/cwd via raw syscall.  Used to absolute-ify
- * AT_FDCWD relative paths.  Returns 0 / -errno. */
-static long read_cwd_abs(char *out, size_t out_sz)
-{
-    long n = raw_syscall6(SYS_readlinkat, AT_FDCWD,
-                          (long)"/proc/self/cwd",
-                          (long)out, (long)out_sz - 1, 0, 0);
-    if (n < 0) return n;
-    out[n] = '\0';
-    return 0;
-}
-
-/* Compose abs from (dirfd, path).  Returns 0 / -errno.  When dirfd
- * names an inramfs directory fd, we resolve it back to the inode and
- * walk up to root via the directory tree (we don't store parent
- * pointers, so for now we only support AT_FDCWD and absolute paths;
- * inramfs dirfds are documented as not yet usable as base for
- * relative *at-syscalls).  This matches ramfs semantics for
- * common workloads (build tools use absolute paths). */
-static int absolutise(int dirfd, const char *path, char *out, size_t out_sz)
-{
-    if (!path) return -EFAULT;
-    if (path[0] == '/') {
-        size_t n = strlen(path);
-        if (n + 1 > out_sz) return -ENAMETOOLONG;
-        memcpy(out, path, n + 1);
-        return 0;
-    }
-    if (dirfd != AT_FDCWD) {
-        struct sud_ir_open_file *of = fdtab_lookup(dirfd);
-        if (of && of->dir_path[0]) {
-            /* inramfs dirfd with a known absolute path: resolve
-             * `path` relative to it.  Same join logic as the
-             * AT_FDCWD branch below.  Path components like ".."
-             * and symlinks are normalised by the inramfs walker
-             * downstream — we just hand it the joined string. */
-            size_t cl = strlen(of->dir_path);
-            size_t pl = strlen(path);
-            if (cl + 1 + pl + 1 > out_sz) return -ENAMETOOLONG;
-            memcpy(out, of->dir_path, cl);
-            out[cl] = '/';
-            memcpy(out + cl + 1, path, pl + 1);
-            return 0;
-        }
-        if (of) {
-            /* inramfs fd but we have no recorded path (e.g. fd was
-             * adopted from an inherited memfd: only the inode is
-             * known, not the original path).  Fall through so the
-             * kernel takes the call — it'll fail sensibly with the
-             * memfd's own errno. */
-            return -EXDEV;
-        }
-        /* Real kernel fd we don't own; let it pass through. */
-        return -EXDEV;
-    }
-    /* AT_FDCWD: prepend cwd.  Logical CWD (set by an earlier
-     * chdir into inramfs) wins over the kernel CWD — without
-     * this, after `chdir(/ir/proj)` a relative `open("foo")`
-     * would resolve via /proc/self/cwd ("/" since we point the
-     * kernel at root during inramfs-chdir) and miss the mount. */
-    cwd_seed_from_runtime_config();
-    char cwd[PATH_MAX];
-    size_t cl;
-    if (g_logical_cwd[0]) {
-        cl = strlen(g_logical_cwd);
-        if (cl >= sizeof(cwd)) return -ENAMETOOLONG;
-        memcpy(cwd, g_logical_cwd, cl + 1);
-    } else {
-        long rc = read_cwd_abs(cwd, sizeof(cwd));
-        if (rc < 0) return (int)rc;
-        cl = strlen(cwd);
-    }
-    size_t pl = strlen(path);
-    if (cl + 1 + pl + 1 > out_sz) return -ENAMETOOLONG;
-    memcpy(out, cwd, cl);
-    out[cl] = '/';
-    memcpy(out + cl + 1, path, pl + 1);
-    return 0;
-}
-
-/* Public: try to resolve (dirfd, path) into an inramfs-mount-relative
- * absolute path.  Returns 0 on success; -1 if path is NOT under the
- * mount; or -errno on a hard failure.  On success `out` is NUL-
- * terminated and starts with the mount prefix. */
 int sud_inramfs_resolve_at(int dirfd, const char *path,
                            char *out, size_t out_sz)
 {
     if (!sud_inramfs_active()) return -1;
-    int rc = absolutise(dirfd, path, out, out_sz);
-    if (rc < 0) return rc;
-    if (!sud_inramfs_path_under_mount(out)) return -1;
-    return 0;
+    return sud_pr_resolve_at_inramfs(dirfd, path, out, out_sz);
 }
 
 /* ================================================================
@@ -453,17 +337,14 @@ long sud_inramfs_op_open(const char *abs_path, int flags, int mode)
         raw_close(kfd);
         return -EMFILE;
     }
-    /* For directory fds, remember the absolute path so subsequent
-     * *at(dirfd, relpath) syscalls can resolve via this fd.  Skip
-     * for non-directories (saves the copy for the common case). */
+    /* For directory fds, register the absolute path with path_remap's
+     * shared dirfd table so subsequent *at(dirfd, relpath) syscalls
+     * (in any addin) resolve correctly via this fd.  Non-dir opens
+     * skip the registration — they're not valid base dirs anyway and
+     * a dirfd lookup on them would surface -EXDEV → kernel pass-
+     * through, which the kernel turns into a sensible -ENOTDIR. */
     if (ino->type == SUD_IR_T_DIR) {
-        size_t pl = strlen(abs_path);
-        if (pl < sizeof(of->dir_path)) {
-            memcpy(of->dir_path, abs_path, pl + 1);
-        }
-        /* If the path is too long, dir_path stays empty — relative
-         * resolution via this fd will fall back to the kernel.
-         * That's a graceful degradation, not a correctness bug. */
+        sud_pr_dirfd_register(kfd, abs_path);
     }
     /* O_APPEND is honoured at write time via flags. */
     return kfd;
@@ -914,6 +795,7 @@ static long fdtab_register_dup(struct sud_ir_open_file *src, int newkfd)
     {
         struct sud_ir_open_file *stale = fdtab_lookup(newkfd);
         if (stale) stale->kfd = -1;
+        sud_pr_dirfd_forget(newkfd);
     }
     for (int i = 0; i < SUD_IR_FD_TABLE_SIZE; i++) {
         if (g_fdtab[i].kfd == -1) {
@@ -928,9 +810,11 @@ static long fdtab_register_dup(struct sud_ir_open_file *src, int newkfd)
              * minted by fdopendir, which is what `rm -rf` and many
              * ftw-style traversals use) would lose their path and
              * cause subsequent unlinkat/openat-relative ops on the
-             * dup to fail with EXDEV from absolutise(). */
-            memcpy(g_fdtab[i].dir_path, src->dir_path,
-                   sizeof(g_fdtab[i].dir_path));
+             * dup to fail with EXDEV from sud_pr_absolutise().  The
+             * dirfd table is owned by path_remap; mirror the entry
+             * there. */
+            const char *src_path = sud_pr_dirfd_lookup(src->kfd);
+            if (src_path) sud_pr_dirfd_register(newkfd, src_path);
             return newkfd;
         }
     }
@@ -1247,128 +1131,13 @@ static long h_utimensat(struct sud_syscall_ctx *c, const char *abs)
         (const struct timespec *)c->args[2], follow);
 }
 
-/* ---- chdir / getcwd / fchdir -----------------------------------
- *
- * chdir(path):
- *   - Resolve `path` relative to the current logical CWD (already
- *     handled by absolutise's seed).
- *   - If the absolute path is under our mount, validate it's a
- *     directory via sud_inramfs_op_chdir, then store it as the new
- *     logical CWD and point the kernel CWD at "/" so /proc/self/cwd
- *     reports something the kernel can resolve (rather than an
- *     inramfs path it doesn't know about).  Update the env var so
- *     the next execve naturally inherits the new logical CWD.
- *   - If the absolute path is *outside* our mount, it's a transition
- *     OUT of inramfs.  Clear the logical CWD, scrub the env var, and
- *     fall through to the kernel which performs the real chdir.
- *
- * getcwd(buf, size):
- *   - If logical CWD is active, copy it (incl. trailing NUL) into
- *     the user buffer and return strlen+1, matching getcwd(2)'s
- *     return-on-success contract.
- *   - Else, fall through.
- *
- * fchdir(fd):
- *   - inramfs dirfds are real memfds (not directories), so the
- *     kernel would EBADF/ENOTDIR them anyway.  We don't support
- *     fchdir-to-inramfs in this iteration (would require carrying
- *     the dir's path on each open fd).
- *   - For host fds we conservatively clear the logical CWD before
- *     letting the kernel fchdir — once the user has fchdir'd to a
- *     host directory they have left inramfs.
- */
-static long h_chdir(struct sud_syscall_ctx *c)
-{
-    const char *path = (const char *)c->args[0];
-    if (!path) return -EFAULT;
-
-    char abs[PATH_MAX];
-    int rc = absolutise(AT_FDCWD, path, abs, sizeof(abs));
-    if (rc < 0) return rc;
-
-    if (!sud_inramfs_path_under_mount(abs)) {
-        /* Leaving inramfs.  Clear our state and let the kernel
-         * perform the actual chdir (return 0 from this handler =
-         * "not handled, continue to kernel"). */
-        if (g_logical_cwd[0]) {
-            g_logical_cwd[0] = '\0';
-            cwd_publish_to_runtime_config(0);
-        }
-        return 1;   /* sentinel: fall through to kernel */
-    }
-
-    long r = sud_inramfs_op_chdir(abs);
-    if (r < 0) return r;
-
-    /* Park the kernel CWD at "/" so /proc/self/cwd doesn't lie
-     * about a path the kernel can't resolve.  Best-effort — if
-     * even chdir("/") fails we still set our logical state; the
-     * worst that happens is /proc/self/cwd reports a stale
-     * (kernel-visible) directory, which is harmless for our own
-     * absolutise (it consults g_logical_cwd first). */
-    raw_syscall6(SYS_chdir, (long)"/", 0, 0, 0, 0, 0);
-
-    size_t l = strlen(abs);
-    if (l >= sizeof(g_logical_cwd)) return -ENAMETOOLONG;
-    memcpy(g_logical_cwd, abs, l + 1);
-    cwd_publish_to_runtime_config(g_logical_cwd);
-    return 0;
-}
-
-static long h_getcwd(struct sud_syscall_ctx *c)
-{
-    cwd_seed_from_runtime_config();
-    if (!g_logical_cwd[0]) return 1;   /* not active — fall through */
-
-    char *buf = (char *)c->args[0];
-    size_t size = (size_t)c->args[1];
-    if (!buf) return -EFAULT;
-    size_t l = strlen(g_logical_cwd);
-    if (l + 1 > size) return -ERANGE;
-    memcpy(buf, g_logical_cwd, l + 1);
-    /* Linux getcwd(2) returns the buffer length including NUL on
-     * success.  Glibc/musl wrap this and return the buffer pointer;
-     * raw syscall semantics are what we have to honour here. */
-    return (long)(l + 1);
-}
-
-static long h_fchdir(struct sud_syscall_ctx *c)
-{
-    int fd = (int)c->args[0];
-    struct sud_ir_open_file *of = fdtab_lookup(fd);
-    if (!of && sud_inramfs_owns_fd(fd))
-        of = fdtab_lookup(fd);          /* adopted just now */
-    if (of) {
-        /* Inramfs fd.  Only directory fds with a recorded path can
-         * become the logical CWD; without dir_path we can't name
-         * the destination.  Surface ENOTDIR for non-directory
-         * inramfs fds (memfds), and EXDEV-style fallback isn't
-         * applicable for chdir. */
-        struct sud_ir_inode *ino = sud_ir_inode_get(of->inode_idx);
-        if (!ino || ino->type != SUD_IR_T_DIR) return -ENOTDIR;
-        if (!of->dir_path[0])           return -EBADF;
-        size_t pl = strlen(of->dir_path);
-        if (pl >= sizeof(g_logical_cwd)) return -ENAMETOOLONG;
-        memcpy(g_logical_cwd, of->dir_path, pl + 1);
-        cwd_publish_to_runtime_config(g_logical_cwd);
-        /* Park the kernel CWD at "/" so /proc/self/cwd doesn't
-         * claim a path the kernel can't resolve.  Mirrors
-         * h_chdir's behaviour for absolute inramfs paths. */
-        raw_syscall6(SYS_chdir, (long)"/", 0, 0, 0, 0, 0);
-        return 0;
-    }
-    /* Host fd: a successful fchdir lands the process outside inramfs.
-     * Clear logical state pre-emptively; if the kernel call fails
-     * (EBADF/ENOTDIR/...) the worst case is we've forgotten an
-     * inramfs CWD, but the next chdir resets it.  This trade is
-     * preferred over allowing a stale logical CWD to silently mis-
-     * route relative paths after a successful host-side fchdir. */
-    if (g_logical_cwd[0]) {
-        g_logical_cwd[0] = '\0';
-        cwd_publish_to_runtime_config(0);
-    }
-    return 1;   /* fall through to kernel */
-}
+/* chdir / getcwd / fchdir interception lives in path_remap now —
+ * see sud_pr_chdir_pre_syscall in sud/path_remap/addin.c.  These
+ * syscalls need cross-layer knowledge (path_remap owns the CWD
+ * shadow + dirfd table; inramfs supplies "is this a directory?"
+ * validation via sud_inramfs_op_chdir + sud_inramfs_owns_fd) and
+ * keeping them on the path_remap side avoids splitting the logical
+ * CWD invariant across two files. */
 
 /* Two-path handlers. */
 static long h_rename(struct sud_syscall_ctx *c, const char *src, const char *dst)
@@ -1735,33 +1504,10 @@ static int inramfs_pre_syscall(struct sud_syscall_ctx *ctx)
     }
 #endif
 
-    /* chdir / fchdir / getcwd: all three need addin-side logical-CWD
-     * bookkeeping even when the call is "going outside inramfs"
-     * (we must clear the stored logical CWD).  Handlers return 1
-     * to signal "state updated, please fall through to the kernel"
-     * (used when the user is leaving inramfs and the kernel
-     * actually owns the operation). */
-#ifdef SYS_chdir
-    if (nr == SYS_chdir) {
-        long r = h_chdir(ctx);
-        if (r == 1) return 0;          /* leaving inramfs: kernel handles */
-        return short_circuit(ctx, r);
-    }
-#endif
-#ifdef SYS_fchdir
-    if (nr == SYS_fchdir) {
-        long r = h_fchdir(ctx);
-        if (r == 1) return 0;
-        return short_circuit(ctx, r);
-    }
-#endif
-#ifdef SYS_getcwd
-    if (nr == SYS_getcwd) {
-        long r = h_getcwd(ctx);
-        if (r == 1) return 0;
-        return short_circuit(ctx, r);
-    }
-#endif
+    /* chdir / fchdir / getcwd are intercepted by path_remap (it owns
+     * the logical-CWD shadow and the dirfd → path table; see
+     * sud/path_remap/addin.c::pre_syscall).  No bookkeeping needed
+     * here. */
 
     /* execve: nothing to do here.  The logical CWD is propagated to
      * the child wrapper via the runtime-config "--cwd" argv flag,

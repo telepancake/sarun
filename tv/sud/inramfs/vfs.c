@@ -279,18 +279,9 @@ static const char *strip_mount(const char *abs)
     return abs + mlen + 1;
 }
 
-int sud_inramfs_path_under_mount(const char *abs)
-{
-    if (!abs || abs[0] != '/') return 0;
-    if (!sud_inramfs_active()) return 0;
-    const char *m = sud_ir_mount_path();
-    size_t mlen = sud_ir_mount_len();
-    if (!m) return 0;
-    if (mlen == 1 && m[0] == '/') return 1;
-    if (memcmp(abs, m, mlen) != 0) return 0;
-    if (abs[mlen] == '\0' || abs[mlen] == '/') return 1;
-    return 0;
-}
+int sud_inramfs_path_under_mount(const char *abs);
+/* (Implementation lives in sud/inramfs/addin.c — it delegates to
+ * sud/path_remap/path.c, which owns the inramfs mount prefix.) */
 
 /* Walk one path component starting at `dir_idx` and return the
  * child idx.  `name`/`len` is the component slice.  Handles "."

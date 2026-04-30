@@ -86,7 +86,7 @@ SUD_SRCS    += sud/trace/event.c sud/trace/addin.c
 endif
 ifneq ($(filter sud/path_remap,$(SUD_ADDINS)),)
 SUD_CFLAGS  += -DSUD_ADDIN_PATH_REMAP
-SUD_SRCS    += sud/path_remap/addin.c sud/path_remap/overlay.c
+SUD_SRCS    += sud/path_remap/addin.c sud/path_remap/overlay.c sud/path_remap/path.c
 endif
 ifneq ($(filter sud/inramfs,$(SUD_ADDINS)),)
 SUD_CFLAGS  += -DSUD_ADDIN_INRAMFS
@@ -185,9 +185,11 @@ libc-fs-test:
 # is caught in CI before the wrapper goes near a traced program.
 PATH_REMAP_TEST_SRCS := sud/path_remap/tests/test_overlay.c \
                         sud/path_remap/overlay.c \
+                        sud/path_remap/path.c \
                         sud/runtime_config.c \
                         libc-fs/libc.c libc-fs/deps/printf/printf.c
 PATH_REMAP_TEST_HDRS := sud/path_remap/overlay.h \
+                        sud/path_remap/path.h \
                         sud/runtime_config.h \
                         libc-fs/libc.h libc-fs/fmt.h
 .PHONY: path-remap-test
@@ -220,8 +222,8 @@ DISPATCH_TEST_COMMON_SRCS := sud/path_remap/tests/test_dispatcher.c \
                              sud/addin.c \
                              sud/runtime_config.c \
                              libc-fs/libc.c libc-fs/deps/printf/printf.c
-DISPATCH_TEST_PATHREMAP_SRCS := sud/path_remap/addin.c sud/path_remap/overlay.c
-DISPATCH_TEST_HDRS := sud/addin.h sud/path_remap/overlay.h \
+DISPATCH_TEST_PATHREMAP_SRCS := sud/path_remap/addin.c sud/path_remap/overlay.c sud/path_remap/path.c
+DISPATCH_TEST_HDRS := sud/addin.h sud/path_remap/overlay.h sud/path_remap/path.h \
                       sud/runtime_config.h \
                       libc-fs/libc.h libc-fs/fmt.h
 
@@ -295,9 +297,11 @@ wire-test: tv
 # /dev/shm as the backing region; CI must allow writes there.
 INRAMFS_TEST_SRCS := sud/inramfs/tests/test_inramfs.c \
                      sud/inramfs/super.c sud/inramfs/vfs.c sud/inramfs/addin.c \
+                     sud/path_remap/path.c \
                      sud/runtime_config.c \
                      libc-fs/libc.c libc-fs/deps/printf/printf.c
 INRAMFS_TEST_HDRS := sud/inramfs/inramfs.h sud/inramfs/internal.h \
+                     sud/path_remap/path.h \
                      sud/addin.h sud/runtime_config.h \
                      libc-fs/libc.h libc-fs/fmt.h
 .PHONY: inramfs-test inramfs-test-e2e inramfs-test-sqlite

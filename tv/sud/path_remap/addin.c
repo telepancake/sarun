@@ -25,6 +25,10 @@
 #include "sud/addin.h"
 #include "sud/raw.h"
 #include "sud/path_remap/overlay.h"
+#include "sud/path_remap/path.h"
+#ifdef SUD_ADDIN_INRAMFS
+#include "sud/inramfs/inramfs.h"
+#endif
 
 /* Each path-bearing syscall is dispatched under `#ifdef SYS_xxx`; the
  * alias may be absent on architectures that lack the underlying
@@ -161,15 +165,141 @@ static int handle_delete(struct sud_syscall_ctx *ctx, int dirfd_idx,
 static void path_remap_init(void)
 {
     sud_overlay_init();
+    sud_pr_path_init();
+}
+
+/* ---- chdir / getcwd / fchdir interception -----------------------
+ *
+ * The kernel only knows about real filesystem paths.  When the
+ * traced program chdirs into a remapped or inramfs path the kernel
+ * would return ENOENT; we shadow the user-visible CWD in path.c
+ * (g_logical_cwd) and park the kernel CWD at "/" so /proc/self/cwd
+ * is at least resolvable.  Subsequent AT_FDCWD-relative path
+ * resolution (sud_pr_absolutise) consults the shadow first.
+ *
+ * For inramfs paths we additionally validate that the destination is
+ * a real inramfs directory via sud_inramfs_op_chdir.  The validation
+ * is gated on SUD_ADDIN_INRAMFS so path_remap can be built and
+ * tested standalone.
+ *
+ * Handlers return:
+ *   1 — short-circuited; ctx->ret holds the syscall result.
+ *   0 — not handled; let the kernel run the call.
+ */
+
+#ifdef SUD_ADDIN_INRAMFS
+static long inramfs_chdir_validate(const char *abs)
+{
+    return sud_inramfs_op_chdir(abs);
+}
+#else
+static long inramfs_chdir_validate(const char *abs) { (void)abs; return 0; }
+#endif
+
+static int handle_chdir(struct sud_syscall_ctx *ctx)
+{
+    const char *path = (const char *)ctx->args[0];
+    if (!path) return short_circuit(ctx, -EFAULT);
+
+    /* Step 1: classify against the inramfs mount.  inramfs paths are
+     * not visible to the kernel (the addin's data lives in memfds),
+     * so we must intercept and shadow them here. */
+    if (sud_pr_inramfs_mount_path()) {
+        char abs[PATH_MAX];
+        int rc = sud_pr_absolutise(AT_FDCWD, path, abs, sizeof(abs));
+        if (rc == 0 && sud_pr_inramfs_path_under_mount(abs)) {
+            long r = inramfs_chdir_validate(abs);
+            if (r < 0) return short_circuit(ctx, r);
+            /* Park the kernel CWD at "/" so /proc/self/cwd doesn't
+             * claim a path the kernel can't resolve. */
+            raw_syscall6(SYS_chdir, (long)"/", 0, 0, 0, 0, 0);
+            sud_pr_cwd_set(abs);
+            return short_circuit(ctx, 0);
+        }
+        /* Hard error from absolutise (e.g. -ENAMETOOLONG): surface. */
+        if (rc < 0 && rc != -EXDEV) return short_circuit(ctx, rc);
+    }
+
+    /* Step 2: the destination is on the host FS.  Drop any stale
+     * shadow (the kernel CWD is about to become authoritative again),
+     * then fall through with the path arg overlay-resolved when an
+     * overlay rule applies. */
+    sud_pr_cwd_set(0);
+
+    if (sud_overlay_rule_count() == 0) return 0;
+    int rc = remap_path_arg(ctx, 0, 0);
+    return handle_overlay_result(ctx, rc);
+}
+
+static int handle_getcwd(struct sud_syscall_ctx *ctx)
+{
+    const char *lcwd = sud_pr_cwd_get();
+    if (!lcwd) return 0;            /* fall through to kernel */
+
+    char *buf = (char *)ctx->args[0];
+    size_t size = (size_t)ctx->args[1];
+    if (!buf) return short_circuit(ctx, -EFAULT);
+    size_t l = strlen(lcwd);
+    if (l + 1 > size) return short_circuit(ctx, -ERANGE);
+    memcpy(buf, lcwd, l + 1);
+    /* Linux getcwd(2) returns the buffer length including NUL on
+     * success.  Glibc/musl wrap this and return the buffer pointer;
+     * raw syscall semantics are what we honour here. */
+    return short_circuit(ctx, (long)(l + 1));
+}
+
+static int handle_fchdir(struct sud_syscall_ctx *ctx)
+{
+    int fd = (int)ctx->args[0];
+    /* If fd was opened against an inramfs (or overlay synthetic)
+     * directory we know its absolute path via the shared dirfd
+     * table.  Validate and shadow. */
+    const char *base = sud_pr_dirfd_lookup(fd);
+    if (base) {
+        if (sud_pr_inramfs_path_under_mount(base)) {
+            long r = inramfs_chdir_validate(base);
+            if (r < 0) return short_circuit(ctx, r);
+            raw_syscall6(SYS_chdir, (long)"/", 0, 0, 0, 0, 0);
+            sud_pr_cwd_set(base);
+            return short_circuit(ctx, 0);
+        }
+        /* Fall through with the shadow updated to the (host) base
+         * path: the kernel will validate the fd and our shadow
+         * matches what /proc/self/cwd will report after success. */
+        sud_pr_cwd_set(base);
+        return 0;
+    }
+    /* Unknown / host fd: a successful fchdir takes us outside any
+     * shadowed directory.  Clear shadow pre-emptively (if the
+     * kernel call subsequently fails the next chdir resets it,
+     * which is a strictly better outcome than a stale shadow
+     * silently mis-routing relative paths). */
+    sud_pr_cwd_set(0);
+    return 0;
 }
 
 /* ---- pre_syscall dispatcher -------------------------------------- */
 
 static int path_remap_pre_syscall(struct sud_syscall_ctx *ctx)
 {
-    if (sud_overlay_rule_count() == 0) return 0;
-
     long nr = ctx->nr;
+
+    /* chdir/getcwd/fchdir are intercepted unconditionally — they
+     * keep the logical-CWD shadow consistent across remap, overlay,
+     * and inramfs.  No early-out on rule_count because inramfs
+     * (which keeps its own runtime-config slot) may be active even
+     * when no overlay rule is configured. */
+#ifdef SYS_chdir
+    if (nr == SYS_chdir)  return handle_chdir(ctx);
+#endif
+#ifdef SYS_fchdir
+    if (nr == SYS_fchdir) return handle_fchdir(ctx);
+#endif
+#ifdef SYS_getcwd
+    if (nr == SYS_getcwd) return handle_getcwd(ctx);
+#endif
+
+    if (sud_overlay_rule_count() == 0) return 0;
 
     /* ---- open / openat ------------------------------------------- */
 #ifdef SYS_open

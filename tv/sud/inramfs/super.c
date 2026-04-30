@@ -11,6 +11,7 @@
 
 #include "sud/inramfs/inramfs.h"
 #include "sud/inramfs/internal.h"
+#include "sud/path_remap/path.h"
 #include "sud/raw.h"
 #include "sud/runtime_config.h"
 
@@ -29,9 +30,12 @@ volatile char *sud_ir_base;          /* base of the metadata mapping */
 volatile char *sud_ir_data_base;     /* base of the small-file shm mapping
                                       * (NULL on 32-bit — never mapped) */
 
-/* Mount config (parsed once from SUD_INRAMFS). */
-static char   g_mount_path[PATH_MAX];
-static size_t g_mount_len;
+/* Mount config: the inramfs mount prefix is OWNED by path_remap
+ * (parsed from --remap-rule inramfs:<path>).  super.c keeps no
+ * copy; sud_ir_mount_path/len delegate to path_remap.  This file
+ * still parses --inramfs-meta-mb and --inramfs-key (both are
+ * inramfs-internal: they affect the data-store backing region,
+ * not pathnames). */
 static size_t g_meta_size;           /* metadata region bytes (user-sized) */
 static int    g_init_done;
 static int    g_active;              /* 1 once attach succeeded */
@@ -49,8 +53,8 @@ static int    g_small_fd = -1;       /* small-file shm fd; kept open
  * Public accessors
  * ================================================================ */
 
-const char *sud_ir_mount_path(void) { return g_mount_len ? g_mount_path : 0; }
-size_t      sud_ir_mount_len (void) { return g_mount_len; }
+const char *sud_ir_mount_path(void) { return sud_pr_inramfs_mount_path(); }
+size_t      sud_ir_mount_len (void) { return sud_pr_inramfs_mount_len();  }
 int         sud_inramfs_active(void) { return g_active; }
 size_t      sud_ir_meta_size (void) { return g_meta_size; }
 size_t      sud_ir_small_size(void)
@@ -886,53 +890,24 @@ static void wait_for_init(volatile uint32_t *init_state)
      * disables itself in that case. */
 }
 
-/* Populate g_mount_path / g_mount_len / g_meta_size from the runtime
- * config (preferred) or, if no config is present, from the legacy
- * SUD_INRAMFS env var (transitional, used only by tests that have
- * not yet migrated).  Returns 1 if a mount was configured, 0 if not.
- *
- * The mount path is sourced from a "--remap-rule inramfs:<path>"
- * entry — once Part 1 of the layered split lands, only path_remap
- * will read this rule, but for now inramfs continues to consult it
- * directly so it knows which prefix it owns.  The metadata size
- * comes from --inramfs-meta-mb. */
-static int parse_env(void)
+/* Read --inramfs-meta-mb from the runtime config and ask path_remap
+ * whether an inramfs mount has been registered (parsed from
+ * --remap-rule inramfs:<path>).  Returns 1 if a mount is configured,
+ * 0 if not.  After Part-1 of the layered split, super.c does NOT
+ * parse the --remap-rule list itself — that is path_remap's job. */
+static int parse_runtime_config(void)
 {
-    const char *path = NULL;
-    size_t      plen = 0;
-    uint64_t    size_mb = 16;       /* default */
+    uint64_t size_mb = 16;       /* default */
 
     if (!g_sud_runtime_config_present) return 0;
 
-    for (int i = 0; i < g_sud_runtime_config.remap_rule_count; i++) {
-        const char *r = g_sud_runtime_config.remap_rules[i];
-        if (!r) continue;
-        /* Only the first inramfs rule is honoured.  Match
-         * "inramfs:" prefix, then take the rest as the path. */
-        const char tag[] = "inramfs:";
-        const size_t tlen = sizeof(tag) - 1;
-        int match = 1;
-        for (size_t k = 0; k < tlen; k++)
-            if (r[k] != tag[k]) { match = 0; break; }
-        if (!match) continue;
-        const char *p = r + tlen;
-        const char *end = p;
-        while (*end && *end != ':') end++;
-        path = p;
-        plen = (size_t)(end - p);
-        break;
-    }
+    /* Make sure path_remap has parsed the inramfs:<path> rule.  This
+     * is idempotent and safe even if path_remap's own init runs first. */
+    sud_pr_inramfs_init_from_runtime_config();
+    if (!sud_pr_inramfs_mount_path()) return 0;
+
     if (g_sud_runtime_config.inramfs_meta_mb > 0)
         size_mb = (uint64_t)g_sud_runtime_config.inramfs_meta_mb;
-
-    if (!path) return 0;
-    if (plen == 0 || plen >= sizeof(g_mount_path)) return 0;
-    if (path[0] != '/') return 0;            /* must be absolute */
-    /* Strip trailing slashes (but not the root). */
-    while (plen > 1 && path[plen - 1] == '/') plen--;
-    memcpy(g_mount_path, path, plen);
-    g_mount_path[plen] = '\0';
-    g_mount_len = plen;
 
     g_meta_size = (size_t)(size_mb * 1024ull * 1024ull);
     return 1;
@@ -1009,7 +984,7 @@ void sud_inramfs_init(void)
     if (g_init_done) return;
     g_init_done = 1;
 
-    if (!parse_env()) return;            /* no mount configured */
+    if (!parse_runtime_config()) return; /* no mount configured */
 
     /* Round the user's request up to the floor — it must be at
      * least big enough to hold the inode table + small-file bitmap
@@ -1022,7 +997,11 @@ void sud_inramfs_init(void)
     const char *key = NULL;
     if (g_sud_runtime_config_present)
         key = g_sud_runtime_config.inramfs_key;
-    compose_shm_paths(key, g_mount_path,
+    /* The mount path is owned by path_remap; consult it for the
+     * default-key hash (only used when no explicit --inramfs-key
+     * was given). */
+    const char *mount_for_key = sud_pr_inramfs_mount_path();
+    compose_shm_paths(key, mount_for_key ? mount_for_key : "/",
                       g_meta_shm_path,  sizeof(g_meta_shm_path),
                       g_small_shm_path, sizeof(g_small_shm_path),
                       g_shm_key,        sizeof(g_shm_key));
@@ -1140,8 +1119,6 @@ void sud_inramfs_reset_for_testing(void)
     g_small_fd        = -1;
     g_active          = 0;
     g_init_done       = 0;
-    g_mount_len       = 0;
-    g_mount_path[0]   = '\0';
     g_meta_size       = 0;
     g_meta_shm_path[0]  = '\0';
     g_small_shm_path[0] = '\0';
