@@ -193,6 +193,13 @@ static long inramfs_chdir_validate(const char *abs)
     return sud_inramfs_op_chdir(abs);
 }
 #else
+/* Stub used when the inramfs addin is compiled out (e.g. dispatcher
+ * test-only builds).  Unreachable in practice: without inramfs there
+ * is no `--remap-rule inramfs:` parser, so `sud_pr_inramfs_mount_path()`
+ * always returns NULL and the chdir handler's pre-check short-
+ * circuits before this stub is called.  Asserting via -ENOSYS would
+ * be a behaviour change in dispatcher-test builds, so we return 0
+ * (the path_remap rewrite path runs afterwards regardless). */
 static long inramfs_chdir_validate(const char *abs) { (void)abs; return 0; }
 #endif
 
