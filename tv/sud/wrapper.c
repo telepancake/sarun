@@ -184,6 +184,15 @@ int main(int argc, char **argv)
         raw_write(2, msg, sizeof(msg) - 1);
         _exit(2);
     }
+    /* The parser aliases argv[] entries directly.  Below we will
+     * call rewrite_cmdline(), which overwrites the original argv
+     * memory with the visible argv so /proc/self/cmdline reflects
+     * the target program.  That clobber would invalidate every
+     * string in g_sud_runtime_config (trace_outfile, inramfs_key,
+     * remap_rules, cwd) — the next build_exec_argv() would then
+     * re-emit garbage flag values to child wrappers.  Deep-copy
+     * the strings now so the live config owns its own storage. */
+    sud_runtime_config_intern(&g_sud_runtime_config);
     g_sud_runtime_config_present = 1;
     g_trace_exec_env = !g_sud_runtime_config.no_env;
     int drop_count   = g_sud_runtime_config.drop_count;

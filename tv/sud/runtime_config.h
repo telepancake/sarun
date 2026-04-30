@@ -108,6 +108,15 @@ int sud_runtime_config_emit(const struct sud_runtime_config *cfg,
                             const char **out, int max,
                             char *int_scratch, int int_scratch_size);
 
+/* Replace every string field in *cfg with a heap-allocated copy
+ * (via the libc strdup, which uses mmap in the freestanding wrapper
+ * and malloc in the libc-linked launcher).  Required when the
+ * caller-provided strings (typically argv[] entries) are about to
+ * be overwritten or freed.  Strings already NULL or empty are left
+ * unchanged.  No deduplication; on allocation failure the affected
+ * field is set to NULL. */
+void sud_runtime_config_intern(struct sud_runtime_config *cfg);
+
 /* The live runtime config populated by sud/wrapper.c::main before
  * sud_addins_wrapper_init() runs.  Each addin's wrapper_init reads
  * its slice of the configuration from here.  When the wrapper has

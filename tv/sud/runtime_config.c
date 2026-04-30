@@ -14,6 +14,13 @@
 
 #include "sud/runtime_config.h"
 
+/* Forward-declare the few libc symbols we need.  Both build
+ * environments (the freestanding wrapper linked against libc-fs and
+ * the libc-linked sudtrace launcher) provide these — but we must
+ * avoid pulling in <stdlib.h>/<string.h> directly because the
+ * freestanding side cannot tolerate those headers. */
+extern void *malloc(size_t);
+
 /* ---- Global slot ------------------------------------------------- */
 
 struct sud_runtime_config g_sud_runtime_config;
@@ -182,4 +189,35 @@ int sud_runtime_config_emit(const struct sud_runtime_config *cfg,
     #undef EMIT1
     #undef EMIT2
     return n;
+}
+
+/* ---- Interning --------------------------------------------------- */
+
+static char *rc_strdup(const char *s)
+{
+    if (!s) return 0;
+    size_t n = 0;
+    while (s[n]) n++;
+    char *p = (char *)malloc(n + 1);
+    if (!p) return 0;
+    for (size_t i = 0; i < n; i++) p[i] = s[i];
+    p[n] = '\0';
+    return p;
+}
+
+void sud_runtime_config_intern(struct sud_runtime_config *cfg)
+{
+    if (!cfg) return;
+    if (cfg->cwd && cfg->cwd[0])
+        cfg->cwd = rc_strdup(cfg->cwd);
+    if (cfg->trace_outfile && cfg->trace_outfile[0])
+        cfg->trace_outfile = rc_strdup(cfg->trace_outfile);
+    if (cfg->inramfs_key && cfg->inramfs_key[0])
+        cfg->inramfs_key = rc_strdup(cfg->inramfs_key);
+    int rcount = cfg->remap_rule_count;
+    if (rcount > SUD_RC_MAX_REMAP_RULES) rcount = SUD_RC_MAX_REMAP_RULES;
+    for (int i = 0; i < rcount; i++) {
+        if (cfg->remap_rules[i] && cfg->remap_rules[i][0])
+            cfg->remap_rules[i] = rc_strdup(cfg->remap_rules[i]);
+    }
 }

@@ -953,23 +953,6 @@ static int parse_env(void)
     g_mount_len = plen;
 
     g_meta_size = (size_t)(size_mb * 1024ull * 1024ull);
-    /* DEBUG */
-    {
-        char buf[256];
-        char *p = buf;
-        const char *m = "[ir parse_env] mount=";
-        while (*m) *p++ = *m++;
-        for (size_t i = 0; i < plen; i++) *p++ = path[i];
-        *p++ = ' '; *p++ = 'm'; *p++ = 'b'; *p++ = '=';
-        unsigned long v = (unsigned long)size_mb;
-        char tmp[16]; int k = 0;
-        do { tmp[k++] = '0' + (v % 10); v /= 10; } while (v);
-        while (k--) *p++ = tmp[k];
-        *p++ = ' '; *p++ = 'r'; *p++ = 'c'; *p++ = '=';
-        *p++ = g_sud_runtime_config_present ? '1' : '0';
-        *p++ = '\n';
-        raw_write(2, buf, (size_t)(p - buf));
-    }
     return 1;
 }
 
