@@ -119,6 +119,10 @@ int sud_pr_inramfs_path_under_mount(const char *abs_path);
  *    0 — success and inside inramfs (out is the absolute path)
  *   -1 — outside inramfs (caller should pass through / use overlay)
  *   <0 — hard error -errno
+ *
+ * For the inode-indexed ticket form (preferred for the inramfs
+ * dispatcher), see sud_pr_resolve_at_inramfs_ticket() in
+ * sud/path_remap/inramfs_glue.h.
  */
 int sud_pr_resolve_at_inramfs(int dirfd, const char *path,
                               char *out, size_t out_sz);

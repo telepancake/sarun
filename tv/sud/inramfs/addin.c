@@ -252,58 +252,17 @@ static int alloc_kfd(uint32_t inode_idx)
 #endif
 }
 
-long sud_inramfs_op_open(const char *abs_path, int flags, int mode)
+/* Open a known-existing inode and return a fresh kfd.  Performs the
+ * type/access checks and O_TRUNC, allocates a memfd for the kfd,
+ * registers the fd in the local table, and (for directories)
+ * publishes the abs_path to the shared dirfd registry so subsequent
+ * *at(dirfd, relpath) syscalls resolve back into inramfs.  abs_path
+ * may be NULL when the caller doesn't have one (no dirfd
+ * registration is performed in that case). */
+long sud_inramfs_op_open_inode(uint32_t inode_idx, int flags,
+                               const char *abs_path)
 {
-    int err = 0;
-    uint32_t idx = sud_ir_walk(abs_path,
-                               (flags & O_NOFOLLOW) ? 0 : 1, &err);
-
-    if (!idx && err != -ENOENT) return err;
-    if (!idx && !(flags & O_CREAT)) return -ENOENT;
-
-    /* O_EXCL semantics: if the file already exists, fail. */
-    if (idx && (flags & O_CREAT) && (flags & O_EXCL)) return -EEXIST;
-
-    if (!idx) {
-        /* Create regular file using the namespace lock + helpers. */
-        uint32_t pidx;
-        const char *base;
-        size_t blen;
-        int rc = sud_ir_walk_parent(abs_path, &pidx, &base, &blen);
-        if (rc) return rc;
-        if (blen == 0 || blen > 63) return -ENAMETOOLONG;
-        struct sud_ir_super *sb = sud_ir_sb();
-        sud_ir_lock(&sb->lock);
-        uint32_t exists;
-        if (sud_ir_dir_lookup(pidx, base, blen, &exists) == 0) {
-            /* Race: another opener won.  Use the existing inode. */
-            idx = exists;
-        } else {
-            uint32_t uid = 0, gid = 0;
-#ifdef SYS_getuid
-            uid = (uint32_t)raw_syscall6(SYS_getuid, 0, 0, 0, 0, 0, 0);
-#endif
-#ifdef SYS_getgid
-            gid = (uint32_t)raw_syscall6(SYS_getgid, 0, 0, 0, 0, 0, 0);
-#endif
-            uint32_t ni = sud_ir_inode_alloc(SUD_IR_T_REG,
-                                             (uint32_t)(mode & 07777),
-                                             uid, gid);
-            if (!ni) { sud_ir_unlock(&sb->lock); return -ENOSPC; }
-            struct sud_ir_inode *new_ino = sud_ir_inode_get(ni);
-            new_ino->nlink = 1;
-            int lrc = sud_ir_dir_link(pidx, base, blen, ni, DT_REG);
-            if (lrc) {
-                sud_ir_inode_free(ni);
-                sud_ir_unlock(&sb->lock);
-                return lrc;
-            }
-            idx = ni;
-        }
-        sud_ir_unlock(&sb->lock);
-    }
-
-    struct sud_ir_inode *ino = sud_ir_inode_get(idx);
+    struct sud_ir_inode *ino = sud_ir_inode_get(inode_idx);
     if (!ino) return -ENOENT;
 
     /* O_DIRECTORY enforcement. */
@@ -319,9 +278,9 @@ long sud_inramfs_op_open(const char *abs_path, int flags, int mode)
         sud_ir_file_truncate(ino, 0);
     }
 
-    int kfd = alloc_kfd(idx);
+    int kfd = alloc_kfd(inode_idx);
     if (kfd < 0) return kfd;
-    struct sud_ir_open_file *of = fdtab_alloc(kfd, idx, flags);
+    struct sud_ir_open_file *of = fdtab_alloc(kfd, inode_idx, flags);
     if (!of) {
         raw_close(kfd);
         return -EMFILE;
@@ -332,11 +291,85 @@ long sud_inramfs_op_open(const char *abs_path, int flags, int mode)
      * skip the registration — they're not valid base dirs anyway and
      * a dirfd lookup on them would surface -EXDEV → kernel pass-
      * through, which the kernel turns into a sensible -ENOTDIR. */
-    if (ino->type == SUD_IR_T_DIR) {
+    if (ino->type == SUD_IR_T_DIR && abs_path) {
         sud_pr_dirfd_register(kfd, abs_path);
     }
     /* O_APPEND is honoured at write time via flags. */
     return kfd;
+}
+
+/* Create a regular file under the given parent dir and open it.
+ * Mirrors the O_CREAT half of open(2): if the entry already exists
+ * (race with another opener) we use it (subject to O_EXCL).
+ * abs_path is for dirfd registration only (NULL skips it). */
+long sud_inramfs_op_create_open_inode(uint32_t parent_idx,
+                                      const char *name, size_t name_len,
+                                      int flags, int mode,
+                                      const char *abs_path)
+{
+    if (name_len == 0 || name_len > 63) return -ENAMETOOLONG;
+    uint32_t idx = 0;
+    struct sud_ir_super *sb = sud_ir_sb();
+    sud_ir_lock(&sb->lock);
+    uint32_t exists;
+    if (sud_ir_dir_lookup(parent_idx, name, name_len, &exists) == 0) {
+        /* Race: another opener won.  O_EXCL means caller required
+         * creation, so refuse. */
+        if (flags & O_EXCL) {
+            sud_ir_unlock(&sb->lock);
+            return -EEXIST;
+        }
+        idx = exists;
+    } else {
+        uint32_t uid = 0, gid = 0;
+#ifdef SYS_getuid
+        uid = (uint32_t)raw_syscall6(SYS_getuid, 0, 0, 0, 0, 0, 0);
+#endif
+#ifdef SYS_getgid
+        gid = (uint32_t)raw_syscall6(SYS_getgid, 0, 0, 0, 0, 0, 0);
+#endif
+        uint32_t ni = sud_ir_inode_alloc(SUD_IR_T_REG,
+                                         (uint32_t)(mode & 07777),
+                                         uid, gid);
+        if (!ni) { sud_ir_unlock(&sb->lock); return -ENOSPC; }
+        struct sud_ir_inode *new_ino = sud_ir_inode_get(ni);
+        new_ino->nlink = 1;
+        int lrc = sud_ir_dir_link(parent_idx, name, name_len, ni, DT_REG);
+        if (lrc) {
+            sud_ir_inode_free(ni);
+            sud_ir_unlock(&sb->lock);
+            return lrc;
+        }
+        idx = ni;
+    }
+    sud_ir_unlock(&sb->lock);
+    return sud_inramfs_op_open_inode(idx, flags, abs_path);
+}
+
+long sud_inramfs_op_open(const char *abs_path, int flags, int mode)
+{
+    int err = 0;
+    uint32_t idx = sud_ir_walk(abs_path,
+                               (flags & O_NOFOLLOW) ? 0 : 1, &err);
+
+    if (!idx && err != -ENOENT) return err;
+    if (!idx && !(flags & O_CREAT)) return -ENOENT;
+
+    /* O_EXCL semantics: if the file already exists, fail. */
+    if (idx && (flags & O_CREAT) && (flags & O_EXCL)) return -EEXIST;
+
+    if (!idx) {
+        /* Create regular file via the parent + basename helper. */
+        uint32_t pidx;
+        const char *base;
+        size_t blen;
+        int rc = sud_ir_walk_parent(abs_path, &pidx, &base, &blen);
+        if (rc) return rc;
+        return sud_inramfs_op_create_open_inode(pidx, base, blen,
+                                                flags, mode, abs_path);
+    }
+
+    return sud_inramfs_op_open_inode(idx, flags, abs_path);
 }
 
 long sud_inramfs_op_close(int fd)
@@ -716,14 +749,11 @@ void sud_inramfs_fill_stat(void *st_buf, uint32_t idx,
  * so we always populate those bits regardless of the caller's mask
  * (kernel statx is allowed to over-fill).  Newer fields (btime,
  * mnt_id, dio align) are zeroed. */
-long sud_inramfs_op_statx_fill(const char *abs_path, int follow,
-                               unsigned int mask, void *statx_buf)
+long sud_inramfs_op_statx_fill_inode(uint32_t inode_idx,
+                                     unsigned int mask, void *statx_buf)
 {
     (void)mask;
-    int err = 0;
-    uint32_t idx = sud_ir_walk(abs_path, follow ? 1 : 0, &err);
-    if (!idx) return err ? err : -ENOENT;
-    struct sud_ir_inode *ino = sud_ir_inode_get(idx);
+    struct sud_ir_inode *ino = sud_ir_inode_get(inode_idx);
     if (!ino) return -ENOENT;
 
     struct statx *stx = (struct statx *)statx_buf;
@@ -739,7 +769,7 @@ long sud_inramfs_op_statx_fill(const char *abs_path, int follow,
                        :                              S_IFREG)
                        | (ino->mode & 07777);
     stx->stx_mode    = (uint16_t)mode_bits;
-    stx->stx_ino     = idx;
+    stx->stx_ino     = inode_idx;
     stx->stx_size    = ino->size;
     stx->stx_blocks  = (ino->size + 511) / 512;
     stx->stx_atime.tv_sec  = (int64_t)(ino->atime_ns / 1000000000ull);
@@ -750,6 +780,15 @@ long sud_inramfs_op_statx_fill(const char *abs_path, int follow,
     stx->stx_ctime.tv_nsec = (uint32_t)(ino->ctime_ns % 1000000000ull);
     /* No btime (creation time tracking) yet; mask bit stays clear. */
     return 0;
+}
+
+long sud_inramfs_op_statx_fill(const char *abs_path, int follow,
+                               unsigned int mask, void *statx_buf)
+{
+    int err = 0;
+    uint32_t idx = sud_ir_walk(abs_path, follow ? 1 : 0, &err);
+    if (!idx) return err ? err : -ENOENT;
+    return sud_inramfs_op_statx_fill_inode(idx, mask, statx_buf);
 }
 
 /* ================================================================

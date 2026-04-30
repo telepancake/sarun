@@ -963,14 +963,79 @@ static void fill_stat(struct sud_ir_kstat *st, uint32_t idx,
 #endif
 }
 
+long sud_inramfs_op_stat_inode(uint32_t inode_idx, void *st_buf)
+{
+    struct sud_ir_inode *ino = sud_ir_inode_get(inode_idx);
+    if (!ino) return -ENOENT;
+    fill_stat((struct sud_ir_kstat *)st_buf, inode_idx, ino);
+    return 0;
+}
+
 long sud_inramfs_op_stat(const char *abs_path, void *st_buf, int follow)
 {
     int err = 0;
     uint32_t idx = sud_ir_walk(abs_path, follow, &err);
     if (!idx) return err;
-    struct sud_ir_inode *ino = sud_ir_inode_get(idx);
-    if (!ino) return -ENOENT;
-    fill_stat((struct sud_ir_kstat *)st_buf, idx, ino);
+    return sud_inramfs_op_stat_inode(idx, st_buf);
+}
+
+/* Public ticket-resolver primitive — used by sud/path_remap/inramfs_glue.c
+ * to drive the inode-indexed op API.  Encapsulates `sud_ir_walk` and
+ * `sud_ir_walk_parent` (both internal to inramfs) so the cross-layer
+ * glue doesn't have to include sud/inramfs/internal.h. */
+long sud_inramfs_resolve_inode(const char *abs_path, int follow,
+                               int want_parent,
+                               uint32_t *leaf_idx_out,
+                               uint32_t *parent_idx_out,
+                               const char **basename_out,
+                               size_t *basename_len_out)
+{
+    if (leaf_idx_out)     *leaf_idx_out = 0;
+    if (parent_idx_out)   *parent_idx_out = 0;
+    if (basename_out)     *basename_out = 0;
+    if (basename_len_out) *basename_len_out = 0;
+
+    if (want_parent) {
+        /* Walk to the parent first.  Failure (e.g. parent missing,
+         * or path doesn't lie under the mount) propagates as -errno. */
+        uint32_t pidx;
+        const char *base;
+        size_t blen;
+        int rc = sud_ir_walk_parent(abs_path, &pidx, &base, &blen);
+        if (rc) return rc;
+        if (parent_idx_out)   *parent_idx_out = pidx;
+        if (basename_out)     *basename_out = base;
+        if (basename_len_out) *basename_len_out = blen;
+
+        /* Look up the leaf within the parent directly (avoids a
+         * second top-of-tree walk and works when the leaf is a
+         * dangling entry).  Missing leaf is reflected by leaf=0. */
+        struct sud_ir_super *sb = sud_ir_sb();
+        sud_ir_lock(&sb->lock);
+        uint32_t leaf;
+        int lrc = sud_ir_dir_lookup(pidx, base, blen, &leaf);
+        sud_ir_unlock(&sb->lock);
+        if (lrc == 0) {
+            if (follow) {
+                /* Re-walk from root to honour symlink following on
+                 * the leaf.  Most mutators (mkdir/unlink/rename)
+                 * pass follow=0; this branch exists for symmetry. */
+                int err = 0;
+                uint32_t fidx = sud_ir_walk(abs_path, 1, &err);
+                if (fidx && leaf_idx_out) *leaf_idx_out = fidx;
+                else if (leaf_idx_out)    *leaf_idx_out = leaf;
+            } else {
+                if (leaf_idx_out) *leaf_idx_out = leaf;
+            }
+        }
+        return 0;
+    }
+
+    /* Leaf-only mode: walk and surface ENOENT directly. */
+    int err = 0;
+    uint32_t idx = sud_ir_walk(abs_path, follow, &err);
+    if (!idx) return err ? err : -ENOENT;
+    if (leaf_idx_out) *leaf_idx_out = idx;
     return 0;
 }
 
@@ -978,14 +1043,14 @@ long sud_inramfs_op_stat(const char *abs_path, void *st_buf, int follow)
  * Public op: namespace mutators
  * ================================================================ */
 
-static long create_at(const char *abs_path, uint32_t type, uint32_t mode,
-                      const char *symlink_target, uint32_t *out_idx)
+/* Create an entry under `pidx` named `(base, blen)` of the given
+ * type/mode (and, for symlinks, target).  Caller has already
+ * resolved the parent inode and basename.  Returns 0 / -errno;
+ * on success *out_idx receives the new child inode index. */
+static long create_at_inode(uint32_t pidx, const char *base, size_t blen,
+                            uint32_t type, uint32_t mode,
+                            const char *symlink_target, uint32_t *out_idx)
 {
-    uint32_t pidx;
-    const char *base;
-    size_t blen;
-    int rc = sud_ir_walk_parent(abs_path, &pidx, &base, &blen);
-    if (rc) return rc;
     if (blen == 0 || blen > 63) return -ENAMETOOLONG;
     /* Refuse special component names. */
     if (blen == 1 && base[0] == '.') return -EEXIST;
@@ -1038,7 +1103,7 @@ static long create_at(const char *abs_path, uint32_t type, uint32_t mode,
     uint8_t dt = (type == SUD_IR_T_DIR) ? DT_DIR
                 : (type == SUD_IR_T_LNK) ? DT_LNK
                 : DT_REG;
-    rc = sud_ir_dir_link(pidx, base, blen, new_idx, dt);
+    int rc = sud_ir_dir_link(pidx, base, blen, new_idx, dt);
     if (rc) {
         sud_ir_inode_free(new_idx);
         sud_ir_unlock(&sb->lock);
@@ -1047,6 +1112,20 @@ static long create_at(const char *abs_path, uint32_t type, uint32_t mode,
     if (out_idx) *out_idx = new_idx;
     sud_ir_unlock(&sb->lock);
     return 0;
+}
+
+/* Path-based create: walk to parent + basename, then call
+ * create_at_inode. */
+static long create_at(const char *abs_path, uint32_t type, uint32_t mode,
+                      const char *symlink_target, uint32_t *out_idx)
+{
+    uint32_t pidx;
+    const char *base;
+    size_t blen;
+    int rc = sud_ir_walk_parent(abs_path, &pidx, &base, &blen);
+    if (rc) return rc;
+    return create_at_inode(pidx, base, blen, type, mode,
+                           symlink_target, out_idx);
 }
 
 /* Returns 1 if abs_path is exactly the mount root (after stripping
@@ -1066,10 +1145,27 @@ static int is_mount_root(const char *abs_path)
     return L == mlen && memcmp(abs_path, m, mlen) == 0;
 }
 
+long sud_inramfs_op_mkdir_at_inode(uint32_t parent_idx,
+                                   const char *name, size_t name_len,
+                                   int mode)
+{
+    return create_at_inode(parent_idx, name, name_len, SUD_IR_T_DIR,
+                           (uint32_t)(mode & 07777), 0, 0);
+}
+
 long sud_inramfs_op_mkdir(const char *abs_path, int mode)
 {
     if (is_mount_root(abs_path)) return -EEXIST;
     return create_at(abs_path, SUD_IR_T_DIR, (uint32_t)(mode & 07777), 0, 0);
+}
+
+long sud_inramfs_op_symlink_at_inode(const char *target,
+                                     uint32_t parent_idx,
+                                     const char *name, size_t name_len)
+{
+    if (!target) return -EINVAL;
+    return create_at_inode(parent_idx, name, name_len, SUD_IR_T_LNK,
+                           0777, target, 0);
 }
 
 long sud_inramfs_op_symlink(const char *target, const char *abs_linkpath)
@@ -1078,12 +1174,10 @@ long sud_inramfs_op_symlink(const char *target, const char *abs_linkpath)
     return create_at(abs_linkpath, SUD_IR_T_LNK, 0777, target, 0);
 }
 
-long sud_inramfs_op_readlink(const char *abs_path, char *buf, size_t bufsz)
+long sud_inramfs_op_readlink_inode(uint32_t inode_idx,
+                                   char *buf, size_t bufsz)
 {
-    int err = 0;
-    uint32_t idx = sud_ir_walk(abs_path, 0 /*don't follow last*/, &err);
-    if (!idx) return err;
-    struct sud_ir_inode *ino = sud_ir_inode_get(idx);
+    struct sud_ir_inode *ino = sud_ir_inode_get(inode_idx);
     if (!ino) return -ENOENT;
     if (ino->type != SUD_IR_T_LNK) return -EINVAL;
     const char *tgt = (const char *)sud_ir_ptr(ino->u.lnk.target_block_offset);
@@ -1094,6 +1188,64 @@ long sud_inramfs_op_readlink(const char *abs_path, char *buf, size_t bufsz)
     return (long)tlen;
 }
 
+long sud_inramfs_op_readlink(const char *abs_path, char *buf, size_t bufsz)
+{
+    int err = 0;
+    uint32_t idx = sud_ir_walk(abs_path, 0 /*don't follow last*/, &err);
+    if (!idx) return err;
+    return sud_inramfs_op_readlink_inode(idx, buf, bufsz);
+}
+
+/* Common body for unlink_at_inode (file/symlink only) and
+ * rmdir_at_inode (directory only).  `is_dir` selects the type
+ * check + emptiness check + nlink handling. */
+static long unlink_at_inode_internal(uint32_t parent_idx,
+                                     const char *name, size_t name_len,
+                                     int is_dir)
+{
+    /* Refuse "." and ".." for rmdir; for unlink they would have
+     * resolved to the parent inode and never get here, but bail
+     * defensively too. */
+    if ((name_len == 1 && name[0] == '.')
+        || (name_len == 2 && name[0] == '.' && name[1] == '.'))
+        return is_dir ? -EINVAL : -EISDIR;
+    struct sud_ir_super *sb = sud_ir_sb();
+    sud_ir_lock(&sb->lock);
+    uint32_t cidx;
+    int rc = sud_ir_dir_lookup(parent_idx, name, name_len, &cidx);
+    if (rc) { sud_ir_unlock(&sb->lock); return rc; }
+    struct sud_ir_inode *child = sud_ir_inode_get(cidx);
+    if (!child) { sud_ir_unlock(&sb->lock); return -ENOENT; }
+    if (is_dir) {
+        if (child->type != SUD_IR_T_DIR) {
+            sud_ir_unlock(&sb->lock); return -ENOTDIR;
+        }
+        if (!sud_ir_dir_is_empty(cidx)) {
+            sud_ir_unlock(&sb->lock); return -ENOTEMPTY;
+        }
+    } else {
+        if (child->type == SUD_IR_T_DIR) {
+            sud_ir_unlock(&sb->lock); return -EISDIR;
+        }
+    }
+    rc = sud_ir_dir_unlink(parent_idx, name, name_len, &cidx);
+    if (rc) { sud_ir_unlock(&sb->lock); return rc; }
+    if (is_dir) {
+        sud_ir_inode_free(cidx);
+    } else {
+        if (child->nlink) child->nlink--;
+        if (child->nlink == 0) sud_ir_inode_free(cidx);
+    }
+    sud_ir_unlock(&sb->lock);
+    return 0;
+}
+
+long sud_inramfs_op_unlink_at_inode(uint32_t parent_idx,
+                                    const char *name, size_t name_len)
+{
+    return unlink_at_inode_internal(parent_idx, name, name_len, 0);
+}
+
 long sud_inramfs_op_unlink(const char *abs_path)
 {
     if (is_mount_root(abs_path)) return -EISDIR;
@@ -1102,23 +1254,13 @@ long sud_inramfs_op_unlink(const char *abs_path)
     size_t blen;
     int rc = sud_ir_walk_parent(abs_path, &pidx, &base, &blen);
     if (rc) return rc;
-    struct sud_ir_super *sb = sud_ir_sb();
-    sud_ir_lock(&sb->lock);
-    uint32_t cidx;
-    rc = sud_ir_dir_lookup(pidx, base, blen, &cidx);
-    if (rc) { sud_ir_unlock(&sb->lock); return rc; }
-    struct sud_ir_inode *child = sud_ir_inode_get(cidx);
-    if (!child) { sud_ir_unlock(&sb->lock); return -ENOENT; }
-    if (child->type == SUD_IR_T_DIR) {
-        sud_ir_unlock(&sb->lock);
-        return -EISDIR;
-    }
-    rc = sud_ir_dir_unlink(pidx, base, blen, &cidx);
-    if (rc) { sud_ir_unlock(&sb->lock); return rc; }
-    if (child->nlink) child->nlink--;
-    if (child->nlink == 0) sud_ir_inode_free(cidx);
-    sud_ir_unlock(&sb->lock);
-    return 0;
+    return sud_inramfs_op_unlink_at_inode(pidx, base, blen);
+}
+
+long sud_inramfs_op_rmdir_at_inode(uint32_t parent_idx,
+                                   const char *name, size_t name_len)
+{
+    return unlink_at_inode_internal(parent_idx, name, name_len, 1);
 }
 
 long sud_inramfs_op_rmdir(const char *abs_path)
@@ -1129,25 +1271,30 @@ long sud_inramfs_op_rmdir(const char *abs_path)
     size_t blen;
     int rc = sud_ir_walk_parent(abs_path, &pidx, &base, &blen);
     if (rc) return rc;
-    /* Refuse "." and "..". */
-    if ((blen == 1 && base[0] == '.')
-        || (blen == 2 && base[0] == '.' && base[1] == '.'))
-        return -EINVAL;
+    return sud_inramfs_op_rmdir_at_inode(pidx, base, blen);
+}
+
+long sud_inramfs_op_link_at_inode(uint32_t src_inode_idx,
+                                  uint32_t dst_parent_idx,
+                                  const char *dst_name, size_t dst_name_len)
+{
+    struct sud_ir_inode *src_ino = sud_ir_inode_get(src_inode_idx);
+    if (!src_ino) return -ENOENT;
+    if (src_ino->type == SUD_IR_T_DIR) return -EPERM;
+
     struct sud_ir_super *sb = sud_ir_sb();
     sud_ir_lock(&sb->lock);
-    uint32_t cidx;
-    rc = sud_ir_dir_lookup(pidx, base, blen, &cidx);
-    if (rc) { sud_ir_unlock(&sb->lock); return rc; }
-    struct sud_ir_inode *child = sud_ir_inode_get(cidx);
-    if (!child || child->type != SUD_IR_T_DIR) {
-        sud_ir_unlock(&sb->lock); return -ENOTDIR;
+    uint32_t exists;
+    if (sud_ir_dir_lookup(dst_parent_idx, dst_name, dst_name_len, &exists) == 0) {
+        sud_ir_unlock(&sb->lock);
+        return -EEXIST;
     }
-    if (!sud_ir_dir_is_empty(cidx)) {
-        sud_ir_unlock(&sb->lock); return -ENOTEMPTY;
-    }
-    rc = sud_ir_dir_unlink(pidx, base, blen, &cidx);
+    uint8_t dt = (src_ino->type == SUD_IR_T_LNK) ? DT_LNK : DT_REG;
+    int rc = sud_ir_dir_link(dst_parent_idx, dst_name, dst_name_len,
+                             src_inode_idx, dt);
     if (rc) { sud_ir_unlock(&sb->lock); return rc; }
-    sud_ir_inode_free(cidx);
+    src_ino->nlink++;
+    src_ino->ctime_ns = sud_ir_now_ns();
     sud_ir_unlock(&sb->lock);
     return 0;
 }
@@ -1157,52 +1304,29 @@ long sud_inramfs_op_link(const char *abs_oldpath, const char *abs_newpath)
     int err = 0;
     uint32_t src = sud_ir_walk(abs_oldpath, 0, &err);
     if (!src) return err;
-    struct sud_ir_inode *src_ino = sud_ir_inode_get(src);
-    if (!src_ino) return -ENOENT;
-    if (src_ino->type == SUD_IR_T_DIR) return -EPERM;
-
     uint32_t pidx;
     const char *base;
     size_t blen;
     int rc = sud_ir_walk_parent(abs_newpath, &pidx, &base, &blen);
     if (rc) return rc;
-    struct sud_ir_super *sb = sud_ir_sb();
-    sud_ir_lock(&sb->lock);
-    uint32_t exists;
-    if (sud_ir_dir_lookup(pidx, base, blen, &exists) == 0) {
-        sud_ir_unlock(&sb->lock);
-        return -EEXIST;
-    }
-    uint8_t dt = (src_ino->type == SUD_IR_T_LNK) ? DT_LNK : DT_REG;
-    rc = sud_ir_dir_link(pidx, base, blen, src, dt);
-    if (rc) { sud_ir_unlock(&sb->lock); return rc; }
-    src_ino->nlink++;
-    src_ino->ctime_ns = sud_ir_now_ns();
-    sud_ir_unlock(&sb->lock);
-    return 0;
+    return sud_inramfs_op_link_at_inode(src, pidx, base, blen);
 }
 
-long sud_inramfs_op_rename(const char *abs_oldpath,
-                           const char *abs_newpath, unsigned int flags)
+long sud_inramfs_op_rename_at_inode(uint32_t old_par,
+                                    const char *old_base, size_t old_blen,
+                                    uint32_t new_par,
+                                    const char *new_base, size_t new_blen,
+                                    unsigned int flags)
 {
     /* Only support flags == 0 in the initial cut (no RENAME_EXCHANGE,
      * no RENAME_NOREPLACE).  Flag-zero matches plain rename(2). */
     if (flags) return -EINVAL;
 
-    uint32_t old_par, new_par;
-    const char *old_base, *new_base;
-    size_t old_blen, new_blen;
-    int rc;
-    rc = sud_ir_walk_parent(abs_oldpath, &old_par, &old_base, &old_blen);
-    if (rc) return rc;
-    rc = sud_ir_walk_parent(abs_newpath, &new_par, &new_base, &new_blen);
-    if (rc) return rc;
-
     struct sud_ir_super *sb = sud_ir_sb();
     sud_ir_lock(&sb->lock);
 
     uint32_t src;
-    rc = sud_ir_dir_lookup(old_par, old_base, old_blen, &src);
+    int rc = sud_ir_dir_lookup(old_par, old_base, old_blen, &src);
     if (rc) { sud_ir_unlock(&sb->lock); return rc; }
     struct sud_ir_inode *src_ino = sud_ir_inode_get(src);
     if (!src_ino) { sud_ir_unlock(&sb->lock); return -ENOENT; }
@@ -1255,16 +1379,46 @@ long sud_inramfs_op_rename(const char *abs_oldpath,
     return 0;
 }
 
+long sud_inramfs_op_rename(const char *abs_oldpath,
+                           const char *abs_newpath, unsigned int flags)
+{
+    uint32_t old_par, new_par;
+    const char *old_base, *new_base;
+    size_t old_blen, new_blen;
+    int rc;
+    rc = sud_ir_walk_parent(abs_oldpath, &old_par, &old_base, &old_blen);
+    if (rc) return rc;
+    rc = sud_ir_walk_parent(abs_newpath, &new_par, &new_base, &new_blen);
+    if (rc) return rc;
+    return sud_inramfs_op_rename_at_inode(old_par, old_base, old_blen,
+                                          new_par, new_base, new_blen,
+                                          flags);
+}
+
+long sud_inramfs_op_truncate_inode(uint32_t inode_idx, off_t length)
+{
+    struct sud_ir_inode *ino = sud_ir_inode_get(inode_idx);
+    if (!ino) return -ENOENT;
+    if (ino->type == SUD_IR_T_DIR) return -EISDIR;
+    if (ino->type != SUD_IR_T_REG) return -EINVAL;
+    return sud_ir_file_truncate(ino, length);
+}
+
 long sud_inramfs_op_truncate(const char *abs_path, off_t length)
 {
     int err = 0;
     uint32_t idx = sud_ir_walk(abs_path, 1, &err);
     if (!idx) return err;
-    struct sud_ir_inode *ino = sud_ir_inode_get(idx);
+    return sud_inramfs_op_truncate_inode(idx, length);
+}
+
+long sud_inramfs_op_chmod_inode(uint32_t inode_idx, int mode)
+{
+    struct sud_ir_inode *ino = sud_ir_inode_get(inode_idx);
     if (!ino) return -ENOENT;
-    if (ino->type == SUD_IR_T_DIR) return -EISDIR;
-    if (ino->type != SUD_IR_T_REG) return -EINVAL;
-    return sud_ir_file_truncate(ino, length);
+    ino->mode = (uint32_t)(mode & 07777);
+    ino->ctime_ns = sud_ir_now_ns();
+    return 0;
 }
 
 long sud_inramfs_op_chmod(const char *abs_path, int mode)
@@ -1272,9 +1426,15 @@ long sud_inramfs_op_chmod(const char *abs_path, int mode)
     int err = 0;
     uint32_t idx = sud_ir_walk(abs_path, 1, &err);
     if (!idx) return err;
-    struct sud_ir_inode *ino = sud_ir_inode_get(idx);
+    return sud_inramfs_op_chmod_inode(idx, mode);
+}
+
+long sud_inramfs_op_chown_inode(uint32_t inode_idx, int uid, int gid)
+{
+    struct sud_ir_inode *ino = sud_ir_inode_get(inode_idx);
     if (!ino) return -ENOENT;
-    ino->mode = (uint32_t)(mode & 07777);
+    if (uid != -1) ino->uid = (uint32_t)uid;
+    if (gid != -1) ino->gid = (uint32_t)gid;
     ino->ctime_ns = sud_ir_now_ns();
     return 0;
 }
@@ -1284,21 +1444,13 @@ long sud_inramfs_op_chown(const char *abs_path, int uid, int gid, int follow)
     int err = 0;
     uint32_t idx = sud_ir_walk(abs_path, follow, &err);
     if (!idx) return err;
-    struct sud_ir_inode *ino = sud_ir_inode_get(idx);
-    if (!ino) return -ENOENT;
-    if (uid != -1) ino->uid = (uint32_t)uid;
-    if (gid != -1) ino->gid = (uint32_t)gid;
-    ino->ctime_ns = sud_ir_now_ns();
-    return 0;
+    return sud_inramfs_op_chown_inode(idx, uid, gid);
 }
 
-long sud_inramfs_op_utimensat(const char *abs_path,
-                              const struct timespec ts[2], int follow)
+long sud_inramfs_op_utimens_inode(uint32_t inode_idx,
+                                  const struct timespec ts[2])
 {
-    int err = 0;
-    uint32_t idx = sud_ir_walk(abs_path, follow, &err);
-    if (!idx) return err;
-    struct sud_ir_inode *ino = sud_ir_inode_get(idx);
+    struct sud_ir_inode *ino = sud_ir_inode_get(inode_idx);
     if (!ino) return -ENOENT;
     uint64_t now = sud_ir_now_ns();
     if (!ts) {
@@ -1316,13 +1468,29 @@ long sud_inramfs_op_utimensat(const char *abs_path,
     return 0;
 }
 
-long sud_inramfs_op_access(const char *abs_path, int mode)
+long sud_inramfs_op_utimensat(const char *abs_path,
+                              const struct timespec ts[2], int follow)
+{
+    int err = 0;
+    uint32_t idx = sud_ir_walk(abs_path, follow, &err);
+    if (!idx) return err;
+    return sud_inramfs_op_utimens_inode(idx, ts);
+}
+
+long sud_inramfs_op_access_inode(uint32_t inode_idx, int mode)
 {
     (void)mode;     /* we don't enforce permissions in initial cut */
+    struct sud_ir_inode *ino = sud_ir_inode_get(inode_idx);
+    if (!ino) return -ENOENT;
+    return 0;
+}
+
+long sud_inramfs_op_access(const char *abs_path, int mode)
+{
     int err = 0;
     uint32_t idx = sud_ir_walk(abs_path, 1, &err);
     if (!idx) return err;
-    return 0;
+    return sud_inramfs_op_access_inode(idx, mode);
 }
 
 /* chdir(2) validation: confirm `abs_path` exists in the inramfs and
@@ -1340,19 +1508,9 @@ long sud_inramfs_op_chdir(const char *abs_path)
     return 0;
 }
 
-/* Return a real kernel fd backing the file at `abs_path`.  Used by
- * the ELF loader (sud/loader.c) and any other consumer that needs to
- * hand the kernel a real fd it can pread/mmap from for an inramfs
- * file.  SMALL files don't have an individual kernel fd (they live as
- * runs in the shared smalldata shm), so promote them to LARGE first.
- * The caller owns the returned fd (open it fresh — sud_ir_large_open
- * caches its fd internally and would conflict on close). */
-long sud_inramfs_op_get_kfd(const char *abs_path)
+long sud_inramfs_op_get_kfd_inode(uint32_t inode_idx)
 {
-    int err = 0;
-    uint32_t idx = sud_ir_walk(abs_path, 1, &err);
-    if (!idx) return err;
-    struct sud_ir_inode *ino = sud_ir_inode_get(idx);
+    struct sud_ir_inode *ino = sud_ir_inode_get(inode_idx);
     if (!ino) return -ENOENT;
     if (ino->type != SUD_IR_T_REG) return -EISDIR;
 
@@ -1368,4 +1526,19 @@ long sud_inramfs_op_get_kfd(const char *abs_path)
     long fd = raw_syscall6(SYS_openat, AT_FDCWD, (long)p,
                            O_RDONLY | O_CLOEXEC, 0, 0, 0);
     return fd;
+}
+
+/* Return a real kernel fd backing the file at `abs_path`.  Used by
+ * the ELF loader (sud/loader.c) and any other consumer that needs to
+ * hand the kernel a real fd it can pread/mmap from for an inramfs
+ * file.  SMALL files don't have an individual kernel fd (they live as
+ * runs in the shared smalldata shm), so promote them to LARGE first.
+ * The caller owns the returned fd (open it fresh — sud_ir_large_open
+ * caches its fd internally and would conflict on close). */
+long sud_inramfs_op_get_kfd(const char *abs_path)
+{
+    int err = 0;
+    uint32_t idx = sud_ir_walk(abs_path, 1, &err);
+    if (!idx) return err;
+    return sud_inramfs_op_get_kfd_inode(idx);
 }

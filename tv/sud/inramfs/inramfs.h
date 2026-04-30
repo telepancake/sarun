@@ -11,25 +11,29 @@
  * (parents, fork()'d children, exec()'d children that re-run the
  * wrapper) see the same files.
  *
- * Configuration (environment):
+ * Configuration (cmdline flags on sud32/sud64; see sud/wrapper.c
+ * and sud/runtime_config.h):
  *
- *   SUD_INRAMFS=<path>[:<size_mb>]
- *       Mount point and (optional) backing-region size in MiB.  The
- *       mount point is the absolute path under which programs see
- *       the in-RAM tree; size defaults to 256 MiB.
+ *   --remap-rule inramfs:<path>:<key>
+ *       Mount point (consumed by path_remap, which routes prefix
+ *       matches to inramfs's inode ops); the inramfs layer never
+ *       sees the path.
  *
- *   SUD_INRAMFS_KEY=<key>
- *       Optional override for the /dev/shm filename used as the
- *       backing object.  Defaults to a hash of the mount path.
+ *   --inramfs-key <key>
+ *       Backing /dev/shm filename used by inramfs (defaults to a
+ *       hash of the mount path, set by sudtrace).
+ *
+ *   --inramfs-meta-mb <N>
+ *       Metadata region size in MiB (defaults to 64).
  *
  * Dispatch order (see sud/addin.c):
  *   1. trace      — observer; sees program's original args.
- *   2. inramfs    — first mutator; if path is under the mount it
- *                   handles the syscall in-process and short-circuits.
- *   3. path_remap — only sees passthrough syscalls (paths NOT under
- *                   inramfs).  In-RAM fds returned by inramfs are
- *                   real kernel fds (from memfd_create) that
- *                   path_remap leaves untouched.
+ *   2. path_remap — owns all path resolution; for paths under an
+ *                   inramfs prefix, drives this addin's inode-level
+ *                   ops directly via sud/path_remap/inramfs_glue.c.
+ *   3. inramfs    — only its fd-bearing pre_syscall hooks run here
+ *                   (read/write/lseek/close/dup/fcntl/mmap/...);
+ *                   path-bearing dispatch is gone (lives in glue).
  *
  * Things this initial implementation deliberately omits:
  *   - extended attributes / ACLs / SELinux
@@ -92,15 +96,100 @@ extern const struct sud_addin sud_inramfs_addin;
  * dispatch function).  All return either a non-negative result or a
  * negative -errno value, in the kernel-syscall convention.
  *
- * Note: path resolution (dirfd + relpath + cwd → absolute path) and
- * mount-prefix testing have moved to sud/path_remap/path.h.  Use
- * sud_pr_resolve_at_inramfs() / sud_pr_inramfs_path_under_mount()
- * directly from there if you need them. */
+ * The API has two flavours:
+ *
+ *   - **Inode-indexed** (`*_inode` / `*_at_inode`): the primary, hot-
+ *     path API.  Callers (path_remap's inramfs_glue) resolve
+ *     (dirfd, path) → inode_idx via `sud_pr_resolve_at_inramfs_ticket`
+ *     once per syscall and then call these forms; the inramfs layer
+ *     never re-walks the path.  Mutating ops that need parent +
+ *     basename take those as arguments (`*_at_inode`).
+ *
+ *   - **Path-based** (legacy abs_path forms): thin wrappers that walk
+ *     the absolute path and dispatch to the inode form.  Retained
+ *     for `sud/loader.c` and `sud/elf.c` (which only call them on
+ *     the rare exec lookup path) and for the inramfs unit tests
+ *     (which exercise the data store directly).  Path resolution
+ *     itself lives in `sud/path_remap/path.h`.
+ */
 
-/* The high-level operations.  Each takes an *absolute* path that
- * lives under the mount (callers should have validated this with
- * sud_pr_inramfs_path_under_mount).  Returns 0 / fd / nbytes on
- * success and -errno on failure, matching kernel syscall semantics. */
+/* ---- Public ticket-resolver primitive ----
+ *
+ * Walk an absolute path under the mount and return the inode
+ * index/indexes needed by the inode-indexed op API.  Used by
+ * sud/path_remap/inramfs_glue.c (where the cross-layer ticket
+ * abstraction lives) so the glue doesn't have to include
+ * sud/inramfs/internal.h.
+ *
+ *   - `follow`: 1 to follow trailing symlinks on the leaf.
+ *   - `want_parent`: 1 to also resolve parent + basename (for
+ *     namespace mutators); 0 for read-side leaf ops.
+ *
+ * On success returns 0:
+ *   - When `want_parent == 0`: *leaf_idx_out is the leaf inode
+ *     (>= 1; missing leaf surfaces as -ENOENT).
+ *   - When `want_parent == 1`: *parent_idx_out, *basename_out,
+ *     *basename_len_out are populated.  *leaf_idx_out is the
+ *     leaf inode if it exists, or 0 if it doesn't (caller is
+ *     about to create it).  basename_out points into abs_path.
+ *
+ * On failure returns -errno (parent missing, ENOTDIR mid-walk,
+ * ENOENT on want_parent==0, etc.).  Output pointers may be NULL
+ * to skip; out-params are zero-initialised on entry. */
+long sud_inramfs_resolve_inode(const char *abs_path, int follow,
+                               int want_parent,
+                               uint32_t *leaf_idx_out,
+                               uint32_t *parent_idx_out,
+                               const char **basename_out,
+                               size_t *basename_len_out);
+
+/* ---- Inode-indexed read-side ops (leaf inode known) ---- */
+long sud_inramfs_op_open_inode(uint32_t inode_idx, int flags,
+                               const char *abs_path);
+long sud_inramfs_op_create_open_inode(uint32_t parent_idx,
+                                      const char *name, size_t name_len,
+                                      int flags, int mode,
+                                      const char *abs_path);
+long sud_inramfs_op_stat_inode(uint32_t inode_idx, void *st_buf);
+long sud_inramfs_op_chmod_inode(uint32_t inode_idx, int mode);
+long sud_inramfs_op_chown_inode(uint32_t inode_idx, int uid, int gid);
+long sud_inramfs_op_truncate_inode(uint32_t inode_idx, off_t length);
+long sud_inramfs_op_utimens_inode(uint32_t inode_idx,
+                                  const struct timespec ts[2]);
+long sud_inramfs_op_access_inode(uint32_t inode_idx, int mode);
+long sud_inramfs_op_readlink_inode(uint32_t inode_idx,
+                                   char *buf, size_t bufsz);
+long sud_inramfs_op_get_kfd_inode(uint32_t inode_idx);
+long sud_inramfs_op_statx_fill_inode(uint32_t inode_idx,
+                                     unsigned int mask, void *statx_buf);
+
+/* ---- Inode-indexed namespace mutators (parent + basename) ---- */
+long sud_inramfs_op_mkdir_at_inode(uint32_t parent_idx,
+                                   const char *name, size_t name_len,
+                                   int mode);
+long sud_inramfs_op_rmdir_at_inode(uint32_t parent_idx,
+                                   const char *name, size_t name_len);
+long sud_inramfs_op_unlink_at_inode(uint32_t parent_idx,
+                                    const char *name, size_t name_len);
+long sud_inramfs_op_symlink_at_inode(const char *target,
+                                     uint32_t parent_idx,
+                                     const char *name, size_t name_len);
+long sud_inramfs_op_link_at_inode(uint32_t src_inode_idx,
+                                  uint32_t dst_parent_idx,
+                                  const char *dst_name, size_t dst_name_len);
+long sud_inramfs_op_rename_at_inode(uint32_t old_par,
+                                    const char *old_base, size_t old_blen,
+                                    uint32_t new_par,
+                                    const char *new_base, size_t new_blen,
+                                    unsigned int flags);
+
+/* ---- Legacy path-based wrappers (walk + dispatch) ----
+ *
+ * Each takes an *absolute* path under the mount and walks it via
+ * `sud_ir_walk` / `sud_ir_walk_parent` before calling the inode
+ * form.  Behaviourally equivalent; kept so that callers that
+ * legitimately have only an absolute path (the ELF loader, the
+ * inramfs unit tests) don't have to re-implement the walk. */
 long sud_inramfs_op_open(const char *abs_path, int flags, int mode);
 long sud_inramfs_op_close(int fd);
 long sud_inramfs_op_read(int fd, void *buf, size_t count);

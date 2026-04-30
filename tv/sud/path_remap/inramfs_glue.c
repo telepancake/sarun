@@ -54,167 +54,338 @@ static int short_circuit(struct sud_syscall_ctx *ctx, long ret)
     return 1;
 }
 
-/* Resolve (dirfd, path) into ctx->scratch as a NUL-terminated path
- * known to lie under the inramfs mount.  Returns:
- *    0 → success, *abs_out points into ctx->scratch
- *   -1 → not under inramfs, fall through to caller (overlay/kernel)
- *  <0 → hard error -errno (caller should short-circuit)
+/* Implementation of the ticket resolver declared in inramfs_glue.h.
+ * Two-step: (1) absolutise (dirfd, path) via path_remap and reject
+ * paths outside the mount; (2) hand the absolute path to inramfs's
+ * walker via the public sud_inramfs_resolve_inode primitive.  The
+ * ticket borrows abs_path from the caller-provided abs_buf. */
+int sud_pr_resolve_at_inramfs_ticket(int dirfd, const char *path,
+                                     int follow, int want_parent,
+                                     char *abs_buf, size_t abs_buf_sz,
+                                     struct sud_pr_inramfs_ticket *out)
+{
+    if (!out) return -EFAULT;
+    out->abs_path      = 0;
+    out->leaf_idx      = 0;
+    out->parent_idx    = 0;
+    out->basename      = 0;
+    out->basename_len  = 0;
+    out->is_mount_root = 0;
+
+    int rc = sud_pr_resolve_at_inramfs(dirfd, path, abs_buf, abs_buf_sz);
+    if (rc < 0) return rc;     /* -1 (not under mount) or -errno */
+    out->abs_path = abs_buf;
+
+    /* Detect "is this exactly the mount root?".  Strip any trailing
+     * slashes and compare to the mount path.  Used by callers that
+     * need to surface EEXIST/EBUSY/EISDIR for ops on the root
+     * itself (mkdir/rmdir/unlink). */
+    {
+        const char *m = sud_pr_inramfs_mount_path();
+        size_t mlen = sud_pr_inramfs_mount_len();
+        size_t L = strlen(abs_buf);
+        while (L > 1 && abs_buf[L - 1] == '/') L--;
+        if (m && L == mlen && memcmp(abs_buf, m, mlen) == 0)
+            out->is_mount_root = 1;
+    }
+
+    long lrc = sud_inramfs_resolve_inode(abs_buf, follow, want_parent,
+                                         &out->leaf_idx,
+                                         &out->parent_idx,
+                                         &out->basename,
+                                         &out->basename_len);
+    if (lrc < 0) return (int)lrc;
+    return 0;
+}
+
+/* Resolve (dirfd, path) into a full ticket using ctx->scratch as the
+ * abs-path buffer.  Returns:
+ *    0 → success, *out populated (borrows from ctx->scratch).
+ *   -1 → not under inramfs, fall through to caller (overlay/kernel).
+ *  <0 → hard error -errno (caller should short-circuit).
  *
  * The scratch buffer must be at least PATH_MAX bytes.  All path-
  * bearing syscalls under sud carry that guarantee via
  * sud_handler_alloc_scratch.
  */
-static int resolve_path(struct sud_syscall_ctx *ctx,
-                        int dirfd, const char *path,
-                        const char **abs_out)
+static int resolve_ticket(struct sud_syscall_ctx *ctx,
+                          int dirfd, const char *path,
+                          int follow, int want_parent,
+                          struct sud_pr_inramfs_ticket *out)
 {
     if (!ctx->scratch || ctx->scratch_size < PATH_MAX) return -1;
-    int rc = sud_pr_resolve_at_inramfs(dirfd, path,
-                                       ctx->scratch, ctx->scratch_size);
-    if (rc < 0) return rc;
-    *abs_out = ctx->scratch;
-    return 0;
+    return sud_pr_resolve_at_inramfs_ticket(dirfd, path, follow,
+                                            want_parent,
+                                            ctx->scratch,
+                                            ctx->scratch_size, out);
 }
 
-/* Resolve a (src, dst) pair for rename/link.  The source is copied
- * into the caller-provided `src_save` buffer so that the destination
- * resolve can reuse ctx->scratch.  Cross-FS link/rename — i.e. one
- * side under the mount and the other not — is rejected with -EXDEV,
- * matching kernel semantics.  Returns the same {0, -1, -errno}
- * convention as resolve_path.
- */
-static int resolve_two_paths(struct sud_syscall_ctx *ctx,
-                             int src_dirfd, const char *src_path,
-                             int dst_dirfd, const char *dst_path,
-                             char *src_save, size_t src_save_sz,
-                             const char **src_out, const char **dst_out)
+/* Resolve a (src, dst) pair for rename/link.  Both must lie under
+ * the inramfs mount; mixed (one in, one out) is rejected with
+ * -EXDEV, matching kernel cross-FS link/rename semantics.
+ * `src_save` is a caller-owned PATH_MAX buffer that holds the src
+ * absolute path while ctx->scratch is reused for the dst. */
+static int resolve_two_tickets(struct sud_syscall_ctx *ctx,
+                               int src_dirfd, const char *src_path,
+                               int dst_dirfd, const char *dst_path,
+                               char *src_save, size_t src_save_sz,
+                               struct sud_pr_inramfs_ticket *src_t,
+                               struct sud_pr_inramfs_ticket *dst_t)
 {
-    const char *first;
-    int r = resolve_path(ctx, src_dirfd, src_path, &first);
+    /* Resolve src first using ctx->scratch, then copy abs_path into
+     * src_save and re-point the ticket at the copy.  After that
+     * ctx->scratch is free for the dst resolve. */
+    int r = resolve_ticket(ctx, src_dirfd, src_path,
+                           0 /*follow=0 for link/rename*/,
+                           1 /*want_parent*/, src_t);
     if (r < 0) return r;
-    size_t l = strlen(first);
+    size_t l = strlen(src_t->abs_path);
     if (l + 1 > src_save_sz) return -ENAMETOOLONG;
-    memcpy(src_save, first, l + 1);
-    *src_out = src_save;
-    r = sud_pr_resolve_at_inramfs(dst_dirfd, dst_path,
-                                  ctx->scratch, ctx->scratch_size);
+    /* Re-point basename into the src_save buffer so it survives
+     * ctx->scratch being overwritten by the dst resolve. */
+    size_t bn_off = (size_t)(src_t->basename - src_t->abs_path);
+    memcpy(src_save, src_t->abs_path, l + 1);
+    src_t->abs_path = src_save;
+    src_t->basename = src_save + bn_off;
+
+    r = sud_pr_resolve_at_inramfs_ticket(dst_dirfd, dst_path,
+                                         0 /*follow=0*/, 1 /*want_parent*/,
+                                         ctx->scratch, ctx->scratch_size,
+                                         dst_t);
     /* Source under mount, destination not → cross-FS. */
     if (r < 0) return -EXDEV;
-    *dst_out = ctx->scratch;
     return 0;
 }
 
 /* ================================================================
  * Per-syscall handlers.  One tiny function per syscall, each
  * extracting the call's own (mode/flags/buf/...) arguments from
- * ctx->args and forwarding to the matching sud_inramfs_op_* op
- * with the pre-resolved absolute path.
+ * ctx->args and forwarding to the matching sud_inramfs_op_*_inode
+ * op with the pre-resolved inode index(es) from the ticket.
  * ================================================================ */
 
-typedef long (*ir_path_handler)(struct sud_syscall_ctx *ctx,
-                                const char *abs);
-typedef long (*ir_two_path_handler)(struct sud_syscall_ctx *ctx,
-                                    const char *src, const char *dst);
+/* Single-path, leaf-only handler signature: leaf_idx is non-zero
+ * (resolve_ticket already surfaced -ENOENT for missing leaves on
+ * want_parent==0 calls).  ctx supplies the syscall args. */
+typedef long (*ir_leaf_handler)(struct sud_syscall_ctx *ctx,
+                                const struct sud_pr_inramfs_ticket *t);
 
-static long h_open_creat(struct sud_syscall_ctx *c, const char *abs)
+/* Two-path handler signature: both tickets are want_parent=1; src
+ * is for link's src inode + rename's src parent+basename. */
+typedef long (*ir_two_path_handler)(struct sud_syscall_ctx *ctx,
+                                    const struct sud_pr_inramfs_ticket *src,
+                                    const struct sud_pr_inramfs_ticket *dst);
+
+/* ---- open / openat ----
+ * These are the only single-path handlers that take want_parent=1
+ * (because of O_CREAT semantics).  The dispatch table below marks
+ * them with .want_parent=1; everything else uses want_parent=0. */
+static long h_open_creat(struct sud_syscall_ctx *c,
+                         const struct sud_pr_inramfs_ticket *t)
 {
     /* open(path, flags, mode) — flags @[1], mode @[2]. */
-    return sud_inramfs_op_open(abs, (int)c->args[1], (int)c->args[2]);
+    int flags = (int)c->args[1];
+    int mode  = (int)c->args[2];
+    if (t->leaf_idx) {
+        if ((flags & O_CREAT) && (flags & O_EXCL)) return -EEXIST;
+        return sud_inramfs_op_open_inode(t->leaf_idx, flags, t->abs_path);
+    }
+    if (!(flags & O_CREAT)) return -ENOENT;
+    return sud_inramfs_op_create_open_inode(t->parent_idx,
+                                            t->basename, t->basename_len,
+                                            flags, mode, t->abs_path);
 }
-static long h_openat_creat(struct sud_syscall_ctx *c, const char *abs)
+static long h_openat_creat(struct sud_syscall_ctx *c,
+                           const struct sud_pr_inramfs_ticket *t)
 {
     /* openat(dirfd, path, flags, mode) — flags @[2], mode @[3]. */
-    return sud_inramfs_op_open(abs, (int)c->args[2], (int)c->args[3]);
+    int flags = (int)c->args[2];
+    int mode  = (int)c->args[3];
+    if (t->leaf_idx) {
+        if ((flags & O_CREAT) && (flags & O_EXCL)) return -EEXIST;
+        return sud_inramfs_op_open_inode(t->leaf_idx, flags, t->abs_path);
+    }
+    if (!(flags & O_CREAT)) return -ENOENT;
+    return sud_inramfs_op_create_open_inode(t->parent_idx,
+                                            t->basename, t->basename_len,
+                                            flags, mode, t->abs_path);
 }
 
-static long h_stat_follow  (struct sud_syscall_ctx *c, const char *abs)
-{ return sud_inramfs_op_stat(abs, (void *)c->args[1], 1); }
-static long h_stat_nofollow(struct sud_syscall_ctx *c, const char *abs)
-{ return sud_inramfs_op_stat(abs, (void *)c->args[1], 0); }
-static long h_fstatat(struct sud_syscall_ctx *c, const char *abs)
+/* ---- stat family ---- */
+static long h_stat(struct sud_syscall_ctx *c,
+                   const struct sud_pr_inramfs_ticket *t)
+{ return sud_inramfs_op_stat_inode(t->leaf_idx, (void *)c->args[1]); }
+static long h_fstatat(struct sud_syscall_ctx *c,
+                      const struct sud_pr_inramfs_ticket *t)
+{ return sud_inramfs_op_stat_inode(t->leaf_idx, (void *)c->args[2]); }
+static long h_statx(struct sud_syscall_ctx *c,
+                    const struct sud_pr_inramfs_ticket *t)
+{ return sud_inramfs_op_statx_fill_inode(t->leaf_idx,
+                                         (unsigned int)c->args[3],
+                                         (void *)c->args[4]); }
+
+/* ---- access ---- */
+static long h_access_a1(struct sud_syscall_ctx *c,
+                        const struct sud_pr_inramfs_ticket *t)
+{ return sud_inramfs_op_access_inode(t->leaf_idx, (int)c->args[1]); }
+static long h_access_a2(struct sud_syscall_ctx *c,
+                        const struct sud_pr_inramfs_ticket *t)
+{ return sud_inramfs_op_access_inode(t->leaf_idx, (int)c->args[2]); }
+
+/* ---- mkdir / rmdir / unlink ----
+ * These take parent + basename, so the dispatch row sets
+ * want_parent=1.  Mount-root special-cases match Linux semantics. */
+static long h_mkdir_a1(struct sud_syscall_ctx *c,
+                       const struct sud_pr_inramfs_ticket *t)
 {
-    int follow = ((int)c->args[3] & AT_SYMLINK_NOFOLLOW) ? 0 : 1;
-    return sud_inramfs_op_stat(abs, (void *)c->args[2], follow);
+    if (t->is_mount_root) return -EEXIST;
+    if (t->leaf_idx) return -EEXIST;
+    return sud_inramfs_op_mkdir_at_inode(t->parent_idx,
+                                         t->basename, t->basename_len,
+                                         (int)c->args[1]);
 }
-
-static long h_statx(struct sud_syscall_ctx *c, const char *abs)
+static long h_mkdir_a2(struct sud_syscall_ctx *c,
+                       const struct sud_pr_inramfs_ticket *t)
 {
-    int follow = ((int)c->args[2] & AT_SYMLINK_NOFOLLOW) ? 0 : 1;
-    return sud_inramfs_op_statx_fill(abs, follow,
-                                     (unsigned int)c->args[3],
-                                     (void *)c->args[4]);
+    if (t->is_mount_root) return -EEXIST;
+    if (t->leaf_idx) return -EEXIST;
+    return sud_inramfs_op_mkdir_at_inode(t->parent_idx,
+                                         t->basename, t->basename_len,
+                                         (int)c->args[2]);
 }
-
-static long h_access_a1(struct sud_syscall_ctx *c, const char *abs)
-{ return sud_inramfs_op_access(abs, (int)c->args[1]); }
-static long h_access_a2(struct sud_syscall_ctx *c, const char *abs)
-{ return sud_inramfs_op_access(abs, (int)c->args[2]); }
-
-static long h_mkdir_a1 (struct sud_syscall_ctx *c, const char *abs)
-{ return sud_inramfs_op_mkdir(abs, (int)c->args[1]); }
-static long h_mkdir_a2 (struct sud_syscall_ctx *c, const char *abs)
-{ return sud_inramfs_op_mkdir(abs, (int)c->args[2]); }
-static long h_rmdir    (struct sud_syscall_ctx *c, const char *abs)
-{ (void)c; return sud_inramfs_op_rmdir(abs); }
-static long h_unlink   (struct sud_syscall_ctx *c, const char *abs)
-{ (void)c; return sud_inramfs_op_unlink(abs); }
-static long h_unlinkat (struct sud_syscall_ctx *c, const char *abs)
+static long h_rmdir(struct sud_syscall_ctx *c,
+                    const struct sud_pr_inramfs_ticket *t)
 {
-    return ((int)c->args[2] & AT_REMOVEDIR)
-        ? sud_inramfs_op_rmdir(abs)
-        : sud_inramfs_op_unlink(abs);
+    (void)c;
+    if (t->is_mount_root) return -EBUSY;
+    return sud_inramfs_op_rmdir_at_inode(t->parent_idx,
+                                         t->basename, t->basename_len);
 }
-
-static long h_symlink_a0(struct sud_syscall_ctx *c, const char *abs)
-{ return sud_inramfs_op_symlink((const char *)c->args[0], abs); }
-
-static long h_readlink_a1(struct sud_syscall_ctx *c, const char *abs)
-{ return sud_inramfs_op_readlink(abs, (char *)c->args[1], (size_t)c->args[2]); }
-static long h_readlink_a2(struct sud_syscall_ctx *c, const char *abs)
-{ return sud_inramfs_op_readlink(abs, (char *)c->args[2], (size_t)c->args[3]); }
-
-static long h_chmod_a1 (struct sud_syscall_ctx *c, const char *abs)
-{ return sud_inramfs_op_chmod(abs, (int)c->args[1]); }
-static long h_chmod_a2 (struct sud_syscall_ctx *c, const char *abs)
-{ return sud_inramfs_op_chmod(abs, (int)c->args[2]); }
-static long h_chown    (struct sud_syscall_ctx *c, const char *abs)
-{ return sud_inramfs_op_chown(abs, (int)c->args[1], (int)c->args[2], 1); }
-static long h_lchown   (struct sud_syscall_ctx *c, const char *abs)
-{ return sud_inramfs_op_chown(abs, (int)c->args[1], (int)c->args[2], 0); }
-static long h_fchownat (struct sud_syscall_ctx *c, const char *abs)
+static long h_unlink(struct sud_syscall_ctx *c,
+                     const struct sud_pr_inramfs_ticket *t)
 {
-    int follow = ((int)c->args[4] & AT_SYMLINK_NOFOLLOW) ? 0 : 1;
-    return sud_inramfs_op_chown(abs, (int)c->args[2], (int)c->args[3], follow);
+    (void)c;
+    if (t->is_mount_root) return -EISDIR;
+    return sud_inramfs_op_unlink_at_inode(t->parent_idx,
+                                          t->basename, t->basename_len);
 }
-
-static long h_truncate (struct sud_syscall_ctx *c, const char *abs)
-{ return sud_inramfs_op_truncate(abs, (off_t)c->args[1]); }
-
-static long h_utimensat(struct sud_syscall_ctx *c, const char *abs)
+static long h_unlinkat(struct sud_syscall_ctx *c,
+                       const struct sud_pr_inramfs_ticket *t)
 {
-    int follow = ((int)c->args[3] & AT_SYMLINK_NOFOLLOW) ? 0 : 1;
-    return sud_inramfs_op_utimensat(abs,
-        (const struct timespec *)c->args[2], follow);
+    if ((int)c->args[2] & AT_REMOVEDIR) {
+        if (t->is_mount_root) return -EBUSY;
+        return sud_inramfs_op_rmdir_at_inode(t->parent_idx,
+                                             t->basename, t->basename_len);
+    }
+    if (t->is_mount_root) return -EISDIR;
+    return sud_inramfs_op_unlink_at_inode(t->parent_idx,
+                                          t->basename, t->basename_len);
 }
 
-static long h_rename(struct sud_syscall_ctx *c, const char *src, const char *dst)
-{ (void)c; return sud_inramfs_op_rename(src, dst, 0); }
-static long h_renameat2(struct sud_syscall_ctx *c, const char *src, const char *dst)
-{ return sud_inramfs_op_rename(src, dst, (unsigned int)c->args[4]); }
-static long h_link(struct sud_syscall_ctx *c, const char *src, const char *dst)
-{ (void)c; return sud_inramfs_op_link(src, dst); }
+/* ---- symlink (target is opaque text; the *new name* is the path
+ *               that fs lookup applies to). */
+static long h_symlink_a0(struct sud_syscall_ctx *c,
+                         const struct sud_pr_inramfs_ticket *t)
+{
+    if (t->is_mount_root) return -EEXIST;
+    if (t->leaf_idx) return -EEXIST;
+    return sud_inramfs_op_symlink_at_inode((const char *)c->args[0],
+                                           t->parent_idx,
+                                           t->basename, t->basename_len);
+}
+
+/* ---- readlink ---- */
+static long h_readlink_a1(struct sud_syscall_ctx *c,
+                          const struct sud_pr_inramfs_ticket *t)
+{ return sud_inramfs_op_readlink_inode(t->leaf_idx,
+                                       (char *)c->args[1],
+                                       (size_t)c->args[2]); }
+static long h_readlink_a2(struct sud_syscall_ctx *c,
+                          const struct sud_pr_inramfs_ticket *t)
+{ return sud_inramfs_op_readlink_inode(t->leaf_idx,
+                                       (char *)c->args[2],
+                                       (size_t)c->args[3]); }
+
+/* ---- chmod / chown ---- */
+static long h_chmod_a1(struct sud_syscall_ctx *c,
+                       const struct sud_pr_inramfs_ticket *t)
+{ return sud_inramfs_op_chmod_inode(t->leaf_idx, (int)c->args[1]); }
+static long h_chmod_a2(struct sud_syscall_ctx *c,
+                       const struct sud_pr_inramfs_ticket *t)
+{ return sud_inramfs_op_chmod_inode(t->leaf_idx, (int)c->args[2]); }
+static long h_chown(struct sud_syscall_ctx *c,
+                    const struct sud_pr_inramfs_ticket *t)
+{ return sud_inramfs_op_chown_inode(t->leaf_idx,
+                                    (int)c->args[1], (int)c->args[2]); }
+static long h_chown_at2(struct sud_syscall_ctx *c,
+                        const struct sud_pr_inramfs_ticket *t)
+{ return sud_inramfs_op_chown_inode(t->leaf_idx,
+                                    (int)c->args[2], (int)c->args[3]); }
+
+/* ---- truncate ---- */
+static long h_truncate(struct sud_syscall_ctx *c,
+                       const struct sud_pr_inramfs_ticket *t)
+{ return sud_inramfs_op_truncate_inode(t->leaf_idx, (off_t)c->args[1]); }
+
+/* ---- utimensat ---- */
+static long h_utimensat(struct sud_syscall_ctx *c,
+                        const struct sud_pr_inramfs_ticket *t)
+{ return sud_inramfs_op_utimens_inode(t->leaf_idx,
+                                      (const struct timespec *)c->args[2]); }
+
+/* ---- rename / link (two-path) ---- */
+static long h_rename(struct sud_syscall_ctx *c,
+                     const struct sud_pr_inramfs_ticket *src,
+                     const struct sud_pr_inramfs_ticket *dst)
+{
+    (void)c;
+    return sud_inramfs_op_rename_at_inode(src->parent_idx,
+                                          src->basename, src->basename_len,
+                                          dst->parent_idx,
+                                          dst->basename, dst->basename_len,
+                                          0);
+}
+static long h_renameat2(struct sud_syscall_ctx *c,
+                        const struct sud_pr_inramfs_ticket *src,
+                        const struct sud_pr_inramfs_ticket *dst)
+{
+    return sud_inramfs_op_rename_at_inode(src->parent_idx,
+                                          src->basename, src->basename_len,
+                                          dst->parent_idx,
+                                          dst->basename, dst->basename_len,
+                                          (unsigned int)c->args[4]);
+}
+static long h_link(struct sud_syscall_ctx *c,
+                   const struct sud_pr_inramfs_ticket *src,
+                   const struct sud_pr_inramfs_ticket *dst)
+{
+    (void)c;
+    if (!src->leaf_idx) return -ENOENT;
+    return sud_inramfs_op_link_at_inode(src->leaf_idx,
+                                        dst->parent_idx,
+                                        dst->basename, dst->basename_len);
+}
 
 /* ================================================================
  * Path-bearing dispatch table.
  *
  * Encoding:
- *   .nr        — syscall number we match.  Rows are skipped at build
- *                time (via #ifdef SYS_xxx) on architectures that lack
- *                the underlying __NR_xxx.
- *   .dirfd_idx — args[] index of the dirfd to combine with the
- *                pathname.  -1 means "use AT_FDCWD".
- *   .path_idx  — args[] index of the pathname.
- *   .path_h    — handler function called once the path is resolved.
+ *   .nr           — syscall number we match.  Rows are skipped at
+ *                   build time (via #ifdef SYS_xxx) on architectures
+ *                   that lack the underlying __NR_xxx.
+ *   .dirfd_idx    — args[] index of the dirfd to combine with the
+ *                   pathname.  -1 means "use AT_FDCWD".
+ *   .path_idx     — args[] index of the pathname.
+ *   .follow       — 1 to follow trailing symlinks, 0 to leave them.
+ *   .want_parent  — 1 for handlers that need parent + basename
+ *                   (mkdir/unlink/rmdir/symlink/openat-with-CREAT);
+ *                   0 for read-side leaf ops.  The dispatcher
+ *                   forwards both modes by always populating both
+ *                   leaf and (when requested) parent fields of the
+ *                   ticket, so leaf-only handlers can simply read
+ *                   `t->leaf_idx`.
+ *   .h            — handler function, called once the ticket is
+ *                   resolved.
  *
  * Two-path syscalls (rename/link/renameat/linkat/renameat2) live in
  * a separate dispatch arm below because their resolve step is a
@@ -224,111 +395,104 @@ struct ir_path_row {
     long             nr;
     signed char      dirfd_idx;
     signed char      path_idx;
-    ir_path_handler  path_h;
+    signed char      follow;
+    signed char      want_parent;
+    ir_leaf_handler  h;
 };
 
-#define ROW(SYSNR, DIRFDIDX, PATHIDX, H) \
-    { SYSNR, (DIRFDIDX), (PATHIDX), (H) }
+#define ROW(SYSNR, DIRFDIDX, PATHIDX, FOLLOW, WANT_PARENT, H) \
+    { SYSNR, (DIRFDIDX), (PATHIDX), (FOLLOW), (WANT_PARENT), (H) }
 
 static const struct ir_path_row ir_path_dispatch[] = {
-    /* open / openat — open's dirfd is implicit AT_FDCWD. */
+    /* open / openat — open's dirfd is implicit AT_FDCWD.
+     * want_parent=1 because O_CREAT may need parent + basename. */
 #ifdef SYS_open
-    ROW(SYS_open,    -1, 0, h_open_creat),
+    ROW(SYS_open,    -1, 0, 1, 1, h_open_creat),
 #endif
 #ifdef SYS_openat
-    ROW(SYS_openat,   0, 1, h_openat_creat),
+    ROW(SYS_openat,   0, 1, 1, 1, h_openat_creat),
 #endif
 
-    /* stat family */
+    /* stat family — leaf only.  Per-row follow flag is constant for
+     * stat/lstat; fstatat/statx parse AT_SYMLINK_NOFOLLOW per call,
+     * so they're handled separately below. */
 #ifdef SYS_stat
-    ROW(SYS_stat,    -1, 0, h_stat_follow),
+    ROW(SYS_stat,    -1, 0, 1, 0, h_stat),
 #endif
 #ifdef SYS_lstat
-    ROW(SYS_lstat,   -1, 0, h_stat_nofollow),
+    ROW(SYS_lstat,   -1, 0, 0, 0, h_stat),
 #endif
 #ifdef SYS_stat64
-    ROW(SYS_stat64,  -1, 0, h_stat_follow),
+    ROW(SYS_stat64,  -1, 0, 1, 0, h_stat),
 #endif
 #ifdef SYS_lstat64
-    ROW(SYS_lstat64, -1, 0, h_stat_nofollow),
-#endif
-#ifdef SYS_newfstatat
-    ROW(SYS_newfstatat, 0, 1, h_fstatat),
-#endif
-#ifdef SYS_fstatat64
-    ROW(SYS_fstatat64,  0, 1, h_fstatat),
-#endif
-#ifdef SYS_statx
-    ROW(SYS_statx,      0, 1, h_statx),
+    ROW(SYS_lstat64, -1, 0, 0, 0, h_stat),
 #endif
 
     /* access family */
 #ifdef SYS_access
-    ROW(SYS_access,     -1, 0, h_access_a1),
+    ROW(SYS_access,     -1, 0, 1, 0, h_access_a1),
 #endif
 #ifdef SYS_faccessat
-    ROW(SYS_faccessat,   0, 1, h_access_a2),
+    ROW(SYS_faccessat,   0, 1, 1, 0, h_access_a2),
 #endif
 #ifdef SYS_faccessat2
-    ROW(SYS_faccessat2,  0, 1, h_access_a2),
+    ROW(SYS_faccessat2,  0, 1, 1, 0, h_access_a2),
 #endif
 
-    /* directory ops */
+    /* directory ops — want_parent=1. */
 #ifdef SYS_mkdir
-    ROW(SYS_mkdir,    -1, 0, h_mkdir_a1),
+    ROW(SYS_mkdir,    -1, 0, 0, 1, h_mkdir_a1),
 #endif
 #ifdef SYS_mkdirat
-    ROW(SYS_mkdirat,   0, 1, h_mkdir_a2),
+    ROW(SYS_mkdirat,   0, 1, 0, 1, h_mkdir_a2),
 #endif
 #ifdef SYS_rmdir
-    ROW(SYS_rmdir,    -1, 0, h_rmdir),
+    ROW(SYS_rmdir,    -1, 0, 0, 1, h_rmdir),
 #endif
 #ifdef SYS_unlink
-    ROW(SYS_unlink,   -1, 0, h_unlink),
+    ROW(SYS_unlink,   -1, 0, 0, 1, h_unlink),
 #endif
 #ifdef SYS_unlinkat
-    ROW(SYS_unlinkat,  0, 1, h_unlinkat),
+    ROW(SYS_unlinkat,  0, 1, 0, 1, h_unlinkat),
 #endif
 
-    /* symlink/readlink — for symlink the *new name* is the path that
-     * fs lookup applies to (args[1] for symlink, args[2] for
-     * symlinkat); the target string is opaque text. */
+    /* symlink — for symlink the *new name* is the path arg
+     * (args[1] for symlink, args[2] for symlinkat); the target
+     * string is opaque text. */
 #ifdef SYS_symlink
-    ROW(SYS_symlink,   -1, 1, h_symlink_a0),
+    ROW(SYS_symlink,   -1, 1, 0, 1, h_symlink_a0),
 #endif
 #ifdef SYS_symlinkat
-    ROW(SYS_symlinkat,  1, 2, h_symlink_a0),
+    ROW(SYS_symlinkat,  1, 2, 0, 1, h_symlink_a0),
 #endif
 #ifdef SYS_readlink
-    ROW(SYS_readlink,  -1, 0, h_readlink_a1),
+    ROW(SYS_readlink,  -1, 0, 0, 0, h_readlink_a1),
 #endif
 #ifdef SYS_readlinkat
-    ROW(SYS_readlinkat, 0, 1, h_readlink_a2),
+    ROW(SYS_readlinkat, 0, 1, 0, 0, h_readlink_a2),
 #endif
 
-    /* chmod / chown */
+    /* chmod / chown — leaf only. */
 #ifdef SYS_chmod
-    ROW(SYS_chmod,    -1, 0, h_chmod_a1),
+    ROW(SYS_chmod,    -1, 0, 1, 0, h_chmod_a1),
 #endif
 #ifdef SYS_fchmodat
-    ROW(SYS_fchmodat,  0, 1, h_chmod_a2),
+    ROW(SYS_fchmodat,  0, 1, 1, 0, h_chmod_a2),
 #endif
 #ifdef SYS_chown
-    ROW(SYS_chown,    -1, 0, h_chown),
+    ROW(SYS_chown,    -1, 0, 1, 0, h_chown),
 #endif
 #ifdef SYS_lchown
-    ROW(SYS_lchown,   -1, 0, h_lchown),
-#endif
-#ifdef SYS_fchownat
-    ROW(SYS_fchownat,  0, 1, h_fchownat),
+    ROW(SYS_lchown,   -1, 0, 0, 0, h_chown),
 #endif
 
     /* truncate */
 #ifdef SYS_truncate
-    ROW(SYS_truncate,   -1, 0, h_truncate),
+    ROW(SYS_truncate,   -1, 0, 1, 0, h_truncate),
 #endif
 #ifdef SYS_truncate64
-    ROW(SYS_truncate64, -1, 0, h_truncate),
+    ROW(SYS_truncate64, -1, 0, 1, 0, h_truncate),
 #endif
 };
 
@@ -343,12 +507,13 @@ static int dispatch_single_path(struct sud_syscall_ctx *ctx)
         if (row->nr != nr) continue;
         int dirfd = (row->dirfd_idx < 0) ? AT_FDCWD
                                          : (int)ctx->args[row->dirfd_idx];
-        const char *abs;
-        int r = resolve_path(ctx, dirfd,
-                             (const char *)ctx->args[row->path_idx], &abs);
+        struct sud_pr_inramfs_ticket t;
+        int r = resolve_ticket(ctx, dirfd,
+                               (const char *)ctx->args[row->path_idx],
+                               row->follow, row->want_parent, &t);
         if (r == -1) return 0;          /* not under mount */
         if (r < 0)   return short_circuit(ctx, r);
-        return short_circuit(ctx, row->path_h(ctx, abs));
+        return short_circuit(ctx, row->h(ctx, &t));
     }
     return 0;
 }
@@ -364,14 +529,14 @@ static int dispatch_two_path(struct sud_syscall_ctx *ctx,
                                         : (int)ctx->args[src_dirfd_idx];
     int dst_dirfd = (dst_dirfd_idx < 0) ? AT_FDCWD
                                         : (int)ctx->args[dst_dirfd_idx];
-    const char *src, *dst;
-    int r = resolve_two_paths(ctx,
-                              src_dirfd, (const char *)ctx->args[src_path_idx],
-                              dst_dirfd, (const char *)ctx->args[dst_path_idx],
-                              src_save, sizeof(src_save), &src, &dst);
+    struct sud_pr_inramfs_ticket src_t, dst_t;
+    int r = resolve_two_tickets(ctx,
+                                src_dirfd, (const char *)ctx->args[src_path_idx],
+                                dst_dirfd, (const char *)ctx->args[dst_path_idx],
+                                src_save, sizeof(src_save), &src_t, &dst_t);
     if (r == -1) return 0;
     if (r < 0)   return short_circuit(ctx, r);
-    return short_circuit(ctx, h(ctx, src, dst));
+    return short_circuit(ctx, h(ctx, &src_t, &dst_t));
 }
 
 /* ================================================================
@@ -411,19 +576,69 @@ int sud_pr_inramfs_route_pre_syscall(struct sud_syscall_ctx *ctx)
         return dispatch_two_path(ctx,  0, 1,  2, 3, h_link);
 #endif
 
+    /* fstatat / statx parse AT_SYMLINK_NOFOLLOW from per-call flags,
+     * so we resolve with the runtime-derived `follow` rather than
+     * a constant on a dispatch row. */
+#ifdef SYS_newfstatat
+    if (nr == SYS_newfstatat) {
+        int follow = ((int)ctx->args[3] & AT_SYMLINK_NOFOLLOW) ? 0 : 1;
+        struct sud_pr_inramfs_ticket t;
+        int r = resolve_ticket(ctx, (int)ctx->args[0],
+                               (const char *)ctx->args[1], follow, 0, &t);
+        if (r == -1) return 0;
+        if (r < 0)   return short_circuit(ctx, r);
+        return short_circuit(ctx, h_fstatat(ctx, &t));
+    }
+#endif
+#ifdef SYS_fstatat64
+    if (nr == SYS_fstatat64) {
+        int follow = ((int)ctx->args[3] & AT_SYMLINK_NOFOLLOW) ? 0 : 1;
+        struct sud_pr_inramfs_ticket t;
+        int r = resolve_ticket(ctx, (int)ctx->args[0],
+                               (const char *)ctx->args[1], follow, 0, &t);
+        if (r == -1) return 0;
+        if (r < 0)   return short_circuit(ctx, r);
+        return short_circuit(ctx, h_fstatat(ctx, &t));
+    }
+#endif
+#ifdef SYS_statx
+    if (nr == SYS_statx) {
+        int follow = ((int)ctx->args[2] & AT_SYMLINK_NOFOLLOW) ? 0 : 1;
+        struct sud_pr_inramfs_ticket t;
+        int r = resolve_ticket(ctx, (int)ctx->args[0],
+                               (const char *)ctx->args[1], follow, 0, &t);
+        if (r == -1) return 0;
+        if (r < 0)   return short_circuit(ctx, r);
+        return short_circuit(ctx, h_statx(ctx, &t));
+    }
+#endif
+#ifdef SYS_fchownat
+    if (nr == SYS_fchownat) {
+        int follow = ((int)ctx->args[4] & AT_SYMLINK_NOFOLLOW) ? 0 : 1;
+        struct sud_pr_inramfs_ticket t;
+        int r = resolve_ticket(ctx, (int)ctx->args[0],
+                               (const char *)ctx->args[1], follow, 0, &t);
+        if (r == -1) return 0;
+        if (r < 0)   return short_circuit(ctx, r);
+        return short_circuit(ctx, h_chown_at2(ctx, &t));
+    }
+#endif
+
     /* utimensat: a NULL path means "operate on dirfd as if it were
      * an open fd" (futimens semantics).  That case is handled by
      * inramfs's fd-bearing dispatch (sud_inramfs_op_futimens), so
-     * we only claim the path-bearing form here. */
+     * we only claim the path-bearing form here.  Per-call follow
+     * flag matches fstatat. */
 #ifdef SYS_utimensat
     if (nr == SYS_utimensat) {
         const char *p = (const char *)ctx->args[1];
         if (!p) return 0;
-        const char *abs;
-        int r = resolve_path(ctx, (int)ctx->args[0], p, &abs);
+        int follow = ((int)ctx->args[3] & AT_SYMLINK_NOFOLLOW) ? 0 : 1;
+        struct sud_pr_inramfs_ticket t;
+        int r = resolve_ticket(ctx, (int)ctx->args[0], p, follow, 0, &t);
         if (r == -1) return 0;
         if (r < 0)   return short_circuit(ctx, r);
-        return short_circuit(ctx, h_utimensat(ctx, abs));
+        return short_circuit(ctx, h_utimensat(ctx, &t));
     }
 #endif
 
