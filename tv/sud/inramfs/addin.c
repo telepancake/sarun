@@ -220,27 +220,16 @@ static void fdtab_forget(int fd)
 }
 
 /* ================================================================
- * Path resolution — delegated to path_remap.
+ * Path resolution lives in sud/path_remap/path.{c,h} now.
  *
  * The CWD shadow, dirfd→logical-path table, absolutise() and the
  * inramfs mount-prefix knowledge that used to live here have all
- * moved to sud/path_remap/path.c (see PLAN.md Part 1).  The two
- * functions below are thin compat shims kept in inramfs.h purely so
- * existing callers (sud/loader.c, sud/elf.c) don't need to learn the
- * new API yet — they delegate to path_remap.
+ * moved to sud/path_remap/path.c (see PLAN.md Part 1).  Callers that
+ * need to resolve a (dirfd, path) into an absolute path under the
+ * inramfs mount, or test whether a path is under the mount, call
+ * sud_pr_resolve_at_inramfs() / sud_pr_inramfs_path_under_mount()
+ * directly.  No shim is provided here.
  * ================================================================ */
-
-int sud_inramfs_path_under_mount(const char *abs_path)
-{
-    return sud_pr_inramfs_path_under_mount(abs_path);
-}
-
-int sud_inramfs_resolve_at(int dirfd, const char *path,
-                           char *out, size_t out_sz)
-{
-    if (!sud_inramfs_active()) return -1;
-    return sud_pr_resolve_at_inramfs(dirfd, path, out, out_sz);
-}
 
 /* ================================================================
  * Public open: walks the path, allocates a real fd via memfd_create,
@@ -904,70 +893,31 @@ long sud_inramfs_op_fcntl_setfl(int fd, int flags)
 }
 
 /* ================================================================
- * Pre-syscall dispatch
+ * Pre-syscall dispatch — fd-bearing syscalls only.
  *
- * Each path-bearing or fd-bearing syscall is handled by a single
- * row in the dispatch table.  A row binds a syscall number to:
+ * After PLAN.md Part 1, all PATH-bearing dispatch
+ * (open/stat/mkdir/unlink/symlink/readlink/chmod/chown/utimensat/
+ * truncate/rename/link/...) lives in sud/path_remap/inramfs_glue.c
+ * and is driven by path_remap before this addin is consulted.
  *
- *   - a "match" predicate (does inramfs claim this call?), and
- *   - a "do" function that performs the in-process op and writes
- *     the result into ctx->ret.
+ * What remains here:
  *
- * The match step uses argument indices stored in the row to find
- * either the fd or the (dirfd, path) pair to test against the
- * mount.  The do step receives those same arguments pre-resolved.
- *
- * Splitting match from do keeps the table dense (most rows are one
- * line) and lets non-matching syscalls fall through to the next
- * addin without paying for path resolution.
+ *   - The fd-bearing syscall table (read/write/lseek/ftruncate/
+ *     fstat/fchmod/fchown/getdents64/mmap/fsync/close), each row
+ *     gated on sud_inramfs_owns_fd(fd).
+ *   - dup family (dup/dup2/dup3) — special destination-scrub
+ *     semantics that path_remap can't express.
+ *   - fcntl subcommand demux (F_DUPFD, F_DUPFD_CLOEXEC, F_GETFL, F_SETFL).
+ *   - munmap of our shared shm regions (must be a no-op so the
+ *     addin keeps working after the traced program "unmaps" them).
+ *   - copy_file_range/sendfile/splice refusal (force userland
+ *     fallback on inramfs fds; their backing memfds are empty).
  * ================================================================ */
 
 static int short_circuit(struct sud_syscall_ctx *ctx, long ret)
 {
     ctx->ret = ret;
     return 1;
-}
-
-/* Resolve (dirfd, path) into ctx->scratch as a NUL-terminated path
- * known to be under the inramfs mount.  Returns 0 / -1 / -errno;
- * on -1 the caller falls through to the next addin. */
-static int resolve_path(struct sud_syscall_ctx *ctx,
-                        int dirfd, const char *path,
-                        const char **abs_out)
-{
-    if (!ctx->scratch || ctx->scratch_size < PATH_MAX) return -1;
-    int rc = sud_inramfs_resolve_at(dirfd, path,
-                                    ctx->scratch, ctx->scratch_size);
-    if (rc < 0) return rc;
-    *abs_out = ctx->scratch;
-    return 0;
-}
-
-/* Resolve two paths.  Used by rename/link.  src_dirfd/src_path
- * yields `*src_out`, copied into the small `src_save` buffer so
- * the second resolve can reuse ctx->scratch for the destination.
- * Returns 0 / -1 / -errno using the same convention as resolve_path. */
-static int resolve_two_paths(struct sud_syscall_ctx *ctx,
-                             int src_dirfd, const char *src_path,
-                             int dst_dirfd, const char *dst_path,
-                             char *src_save, size_t src_save_sz,
-                             const char **src_out, const char **dst_out)
-{
-    const char *first;
-    int r = resolve_path(ctx, src_dirfd, src_path, &first);
-    if (r < 0) return r;
-    size_t l = strlen(first);
-    if (l + 1 > src_save_sz) return -ENAMETOOLONG;
-    memcpy(src_save, first, l + 1);
-    *src_out = src_save;
-    r = sud_inramfs_resolve_at(dst_dirfd, dst_path,
-                               ctx->scratch, ctx->scratch_size);
-    /* If the destination is on the host FS, this is a cross-FS
-     * link/rename and we must refuse it (the source is on inramfs
-     * and the destination is not). */
-    if (r < 0) return -EXDEV;
-    *dst_out = ctx->scratch;
-    return 0;
 }
 
 /* off_t pieces in pread64/pwrite64 are ABI-split on 32-bit.  On
@@ -982,18 +932,9 @@ static off_t pread_offset(const long *args)
 #endif
 }
 
-/* ---- handler types --------------------------------------------- */
+/* ---- fd handlers — one per syscall ----------------------------- */
 
-/* All handlers receive the syscall ctx (for ret + raw args) plus a
- * pre-extracted artefact (resolved path, or fd value).  Returning
- * the handler's value is what gets short-circuited. */
 typedef long (*ir_fd_handler)(struct sud_syscall_ctx *ctx, int fd);
-typedef long (*ir_path_handler)(struct sud_syscall_ctx *ctx,
-                                const char *abs);
-typedef long (*ir_two_path_handler)(struct sud_syscall_ctx *ctx,
-                                    const char *src, const char *dst);
-
-/* ---- per-syscall handlers (one tiny function per syscall) ----- */
 
 static long h_read   (struct sud_syscall_ctx *c, int fd)
 { return sud_inramfs_op_read (fd, (void *)c->args[1], (size_t)c->args[2]); }
@@ -1045,140 +986,17 @@ static long h_mmap2(struct sud_syscall_ctx *c, int fd)
 }
 #endif
 
-/* Path handlers.  The dispatch table tells us where in args[] the
- * path lives and which dirfd to use; by the time we're called the
- * path has already been resolved and verified to be under mount.
- * We just need to pull any remaining mode/flags from ctx->args. */
+/* ---- fd dispatch table ----------------------------------------- */
 
-static long h_open_creat(struct sud_syscall_ctx *c, const char *abs)
-{
-    /* open(path, flags, mode) — flags @[1], mode @[2]. */
-    return sud_inramfs_op_open(abs, (int)c->args[1], (int)c->args[2]);
-}
-static long h_openat_creat(struct sud_syscall_ctx *c, const char *abs)
-{
-    /* openat(dirfd, path, flags, mode) — flags @[2], mode @[3]. */
-    return sud_inramfs_op_open(abs, (int)c->args[2], (int)c->args[3]);
-}
-
-static long h_stat_follow  (struct sud_syscall_ctx *c, const char *abs)
-{ return sud_inramfs_op_stat(abs, (void *)c->args[1], 1); }
-static long h_stat_nofollow(struct sud_syscall_ctx *c, const char *abs)
-{ return sud_inramfs_op_stat(abs, (void *)c->args[1], 0); }
-static long h_fstatat(struct sud_syscall_ctx *c, const char *abs)
-{
-    int follow = ((int)c->args[3] & AT_SYMLINK_NOFOLLOW) ? 0 : 1;
-    return sud_inramfs_op_stat(abs, (void *)c->args[2], follow);
-}
-
-static long h_statx(struct sud_syscall_ctx *c, const char *abs)
-{
-    int follow = ((int)c->args[2] & AT_SYMLINK_NOFOLLOW) ? 0 : 1;
-    return sud_inramfs_op_statx_fill(abs, follow,
-                                     (unsigned int)c->args[3],
-                                     (void *)c->args[4]);
-}
-
-static long h_access_a1(struct sud_syscall_ctx *c, const char *abs)
-{ return sud_inramfs_op_access(abs, (int)c->args[1]); }
-static long h_access_a2(struct sud_syscall_ctx *c, const char *abs)
-{ return sud_inramfs_op_access(abs, (int)c->args[2]); }
-
-static long h_mkdir_a1 (struct sud_syscall_ctx *c, const char *abs)
-{ return sud_inramfs_op_mkdir(abs, (int)c->args[1]); }
-static long h_mkdir_a2 (struct sud_syscall_ctx *c, const char *abs)
-{ return sud_inramfs_op_mkdir(abs, (int)c->args[2]); }
-static long h_rmdir    (struct sud_syscall_ctx *c, const char *abs)
-{ (void)c; return sud_inramfs_op_rmdir(abs); }
-static long h_unlink   (struct sud_syscall_ctx *c, const char *abs)
-{ (void)c; return sud_inramfs_op_unlink(abs); }
-static long h_unlinkat (struct sud_syscall_ctx *c, const char *abs)
-{
-    return ((int)c->args[2] & AT_REMOVEDIR)
-        ? sud_inramfs_op_rmdir(abs)
-        : sud_inramfs_op_unlink(abs);
-}
-
-static long h_symlink_a0(struct sud_syscall_ctx *c, const char *abs)
-{ return sud_inramfs_op_symlink((const char *)c->args[0], abs); }
-
-static long h_readlink_a1(struct sud_syscall_ctx *c, const char *abs)
-{ return sud_inramfs_op_readlink(abs, (char *)c->args[1], (size_t)c->args[2]); }
-static long h_readlink_a2(struct sud_syscall_ctx *c, const char *abs)
-{ return sud_inramfs_op_readlink(abs, (char *)c->args[2], (size_t)c->args[3]); }
-
-static long h_chmod_a1 (struct sud_syscall_ctx *c, const char *abs)
-{ return sud_inramfs_op_chmod(abs, (int)c->args[1]); }
-static long h_chmod_a2 (struct sud_syscall_ctx *c, const char *abs)
-{ return sud_inramfs_op_chmod(abs, (int)c->args[2]); }
-static long h_chown    (struct sud_syscall_ctx *c, const char *abs)
-{ return sud_inramfs_op_chown(abs, (int)c->args[1], (int)c->args[2], 1); }
-static long h_lchown   (struct sud_syscall_ctx *c, const char *abs)
-{ return sud_inramfs_op_chown(abs, (int)c->args[1], (int)c->args[2], 0); }
-static long h_fchownat (struct sud_syscall_ctx *c, const char *abs)
-{
-    int follow = ((int)c->args[4] & AT_SYMLINK_NOFOLLOW) ? 0 : 1;
-    return sud_inramfs_op_chown(abs, (int)c->args[2], (int)c->args[3], follow);
-}
-
-static long h_truncate (struct sud_syscall_ctx *c, const char *abs)
-{ return sud_inramfs_op_truncate(abs, (off_t)c->args[1]); }
-
-static long h_utimensat(struct sud_syscall_ctx *c, const char *abs)
-{
-    int follow = ((int)c->args[3] & AT_SYMLINK_NOFOLLOW) ? 0 : 1;
-    return sud_inramfs_op_utimensat(abs,
-        (const struct timespec *)c->args[2], follow);
-}
-
-/* chdir / getcwd / fchdir interception lives in path_remap now —
- * see sud_pr_chdir_pre_syscall in sud/path_remap/addin.c.  These
- * syscalls need cross-layer knowledge (path_remap owns the CWD
- * shadow + dirfd table; inramfs supplies "is this a directory?"
- * validation via sud_inramfs_op_chdir + sud_inramfs_owns_fd) and
- * keeping them on the path_remap side avoids splitting the logical
- * CWD invariant across two files. */
-
-/* Two-path handlers. */
-static long h_rename(struct sud_syscall_ctx *c, const char *src, const char *dst)
-{ (void)c; return sud_inramfs_op_rename(src, dst, 0); }
-static long h_renameat2(struct sud_syscall_ctx *c, const char *src, const char *dst)
-{ return sud_inramfs_op_rename(src, dst, (unsigned int)c->args[4]); }
-static long h_link(struct sud_syscall_ctx *c, const char *src, const char *dst)
-{ (void)c; return sud_inramfs_op_link(src, dst); }
-
-/* ---- dispatch table -------------------------------------------- */
-
-/* Encoding:
- *   .nr           — syscall number we match.  Rows are skipped at
- *                   build time when SYS_xxx is undefined for the
- *                   running arch.
- *   .fd_idx       — args[] index of the fd to test for inramfs
- *                   ownership.  -1 means "this is a path syscall".
- *   .dirfd_idx    — args[] index of the dirfd to combine with the
- *                   path.  -1 means "use AT_FDCWD".  Only meaningful
- *                   when path_idx >= 0.
- *   .path_idx     — args[] index of the pathname.  -1 means "this is
- *                   an fd syscall".
- *   .fd_h/path_h  — handler function.  Exactly one of fd_h/path_h
- *                   is set per row.
- */
-struct ir_dispatch_row {
-    long             nr;
-    signed char      fd_idx;
-    signed char      dirfd_idx;
-    signed char      path_idx;
-    ir_fd_handler    fd_h;
-    ir_path_handler  path_h;
+struct ir_fd_row {
+    long           nr;
+    signed char    fd_idx;
+    ir_fd_handler  fd_h;
 };
 
-#define ROW_FD(SYSNR, FDIDX, H)  \
-    { SYSNR, (FDIDX), -1, -1, (H), 0 }
-#define ROW_PATH(SYSNR, DIRFDIDX, PATHIDX, H) \
-    { SYSNR, -1, (DIRFDIDX), (PATHIDX), 0, (H) }
+#define ROW_FD(SYSNR, FDIDX, H)  { SYSNR, (FDIDX), (H) }
 
-static const struct ir_dispatch_row ir_dispatch[] = {
-    /* fd ops */
+static const struct ir_fd_row ir_fd_dispatch[] = {
 #ifdef SYS_read
     ROW_FD(SYS_read,        0, h_read),
 #endif
@@ -1233,156 +1051,22 @@ static const struct ir_dispatch_row ir_dispatch[] = {
 #ifdef SYS_sync_file_range
     ROW_FD(SYS_sync_file_range, 0, h_fsync_noop),
 #endif
-
-    /* open / openat — DIRFDIDX of -1 means AT_FDCWD; openat is +1. */
-#ifdef SYS_open
-    ROW_PATH(SYS_open,    -1, 0, h_open_creat),
-#endif
-#ifdef SYS_openat
-    ROW_PATH(SYS_openat,   0, 1, h_openat_creat),
-#endif
-
-    /* stat family */
-#ifdef SYS_stat
-    ROW_PATH(SYS_stat,    -1, 0, h_stat_follow),
-#endif
-#ifdef SYS_lstat
-    ROW_PATH(SYS_lstat,   -1, 0, h_stat_nofollow),
-#endif
-#ifdef SYS_stat64
-    ROW_PATH(SYS_stat64,  -1, 0, h_stat_follow),
-#endif
-#ifdef SYS_lstat64
-    ROW_PATH(SYS_lstat64, -1, 0, h_stat_nofollow),
-#endif
-#ifdef SYS_newfstatat
-    ROW_PATH(SYS_newfstatat, 0, 1, h_fstatat),
-#endif
-#ifdef SYS_fstatat64
-    ROW_PATH(SYS_fstatat64,  0, 1, h_fstatat),
-#endif
-#ifdef SYS_statx
-    ROW_PATH(SYS_statx,      0, 1, h_statx),
-#endif
-
-    /* access family */
-#ifdef SYS_access
-    ROW_PATH(SYS_access,     -1, 0, h_access_a1),
-#endif
-#ifdef SYS_faccessat
-    ROW_PATH(SYS_faccessat,   0, 1, h_access_a2),
-#endif
-#ifdef SYS_faccessat2
-    ROW_PATH(SYS_faccessat2,  0, 1, h_access_a2),
-#endif
-
-    /* directory ops */
-#ifdef SYS_mkdir
-    ROW_PATH(SYS_mkdir,    -1, 0, h_mkdir_a1),
-#endif
-#ifdef SYS_mkdirat
-    ROW_PATH(SYS_mkdirat,   0, 1, h_mkdir_a2),
-#endif
-#ifdef SYS_rmdir
-    ROW_PATH(SYS_rmdir,    -1, 0, h_rmdir),
-#endif
-#ifdef SYS_unlink
-    ROW_PATH(SYS_unlink,   -1, 0, h_unlink),
-#endif
-#ifdef SYS_unlinkat
-    ROW_PATH(SYS_unlinkat,  0, 1, h_unlinkat),
-#endif
-
-    /* symlink/readlink — symlink path is the *new* name (args[1] for
-     * symlink, args[2] for symlinkat).  The target text is opaque to
-     * the path-resolution machinery; the handler reads it from args[0]. */
-#ifdef SYS_symlink
-    ROW_PATH(SYS_symlink,   -1, 1, h_symlink_a0),
-#endif
-#ifdef SYS_symlinkat
-    ROW_PATH(SYS_symlinkat,  1, 2, h_symlink_a0),
-#endif
-#ifdef SYS_readlink
-    ROW_PATH(SYS_readlink,  -1, 0, h_readlink_a1),
-#endif
-#ifdef SYS_readlinkat
-    ROW_PATH(SYS_readlinkat, 0, 1, h_readlink_a2),
-#endif
-
-    /* chmod / chown */
-#ifdef SYS_chmod
-    ROW_PATH(SYS_chmod,    -1, 0, h_chmod_a1),
-#endif
-#ifdef SYS_fchmodat
-    ROW_PATH(SYS_fchmodat,  0, 1, h_chmod_a2),
-#endif
-#ifdef SYS_chown
-    ROW_PATH(SYS_chown,    -1, 0, h_chown),
-#endif
-#ifdef SYS_lchown
-    ROW_PATH(SYS_lchown,   -1, 0, h_lchown),
-#endif
-#ifdef SYS_fchownat
-    ROW_PATH(SYS_fchownat,  0, 1, h_fchownat),
-#endif
-
-    /* truncate / utimensat */
-#ifdef SYS_truncate
-    ROW_PATH(SYS_truncate,   -1, 0, h_truncate),
-#endif
-#ifdef SYS_truncate64
-    ROW_PATH(SYS_truncate64, -1, 0, h_truncate),
-#endif
 };
 
-#define IR_DISPATCH_LEN ((int)(sizeof(ir_dispatch)/sizeof(ir_dispatch[0])))
+#define IR_FD_DISPATCH_LEN \
+    ((int)(sizeof(ir_fd_dispatch)/sizeof(ir_fd_dispatch[0])))
 
-static int dispatch_table(struct sud_syscall_ctx *ctx)
+static int dispatch_fd_table(struct sud_syscall_ctx *ctx)
 {
     long nr = ctx->nr;
-    for (int i = 0; i < IR_DISPATCH_LEN; i++) {
-        const struct ir_dispatch_row *row = &ir_dispatch[i];
+    for (int i = 0; i < IR_FD_DISPATCH_LEN; i++) {
+        const struct ir_fd_row *row = &ir_fd_dispatch[i];
         if (row->nr != nr) continue;
-
-        if (row->fd_idx >= 0) {
-            int fd = (int)ctx->args[row->fd_idx];
-            if (!sud_inramfs_owns_fd(fd)) return 0;
-            return short_circuit(ctx, row->fd_h(ctx, fd));
-        }
-        /* path row */
-        int dirfd = (row->dirfd_idx < 0) ? AT_FDCWD
-                                         : (int)ctx->args[row->dirfd_idx];
-        const char *abs;
-        int r = resolve_path(ctx, dirfd,
-                             (const char *)ctx->args[row->path_idx], &abs);
-        if (r == -1) return 0;
-        if (r < 0)   return short_circuit(ctx, r);
-        return short_circuit(ctx, row->path_h(ctx, abs));
+        int fd = (int)ctx->args[row->fd_idx];
+        if (!sud_inramfs_owns_fd(fd)) return 0;
+        return short_circuit(ctx, row->fd_h(ctx, fd));
     }
     return 0;
-}
-
-/* Two-path syscalls (rename / link family).  Pulled out of the main
- * table because they need a second resolve and the cross-FS error
- * shape is uniform. */
-static int dispatch_two_path(struct sud_syscall_ctx *ctx,
-                             int src_dirfd_idx, int src_path_idx,
-                             int dst_dirfd_idx, int dst_path_idx,
-                             ir_two_path_handler h)
-{
-    char src_save[PATH_MAX];
-    int src_dirfd = (src_dirfd_idx < 0) ? AT_FDCWD
-                                        : (int)ctx->args[src_dirfd_idx];
-    int dst_dirfd = (dst_dirfd_idx < 0) ? AT_FDCWD
-                                        : (int)ctx->args[dst_dirfd_idx];
-    const char *src, *dst;
-    int r = resolve_two_paths(ctx,
-                              src_dirfd, (const char *)ctx->args[src_path_idx],
-                              dst_dirfd, (const char *)ctx->args[dst_path_idx],
-                              src_save, sizeof(src_save), &src, &dst);
-    if (r == -1) return 0;
-    if (r < 0)   return short_circuit(ctx, r);
-    return short_circuit(ctx, h(ctx, src, dst));
 }
 
 /* dup family.  We hijack only when the SOURCE fd is inramfs-owned;
@@ -1466,55 +1150,6 @@ static int inramfs_pre_syscall(struct sud_syscall_ctx *ctx)
 #ifdef SYS_fcntl64
     if (nr == SYS_fcntl64) return dispatch_fcntl(ctx);
 #endif
-
-    /* Two-path ops (rename/link family). */
-#ifdef SYS_rename
-    if (nr == SYS_rename)
-        return dispatch_two_path(ctx, -1, 0, -1, 1, h_rename);
-#endif
-#ifdef SYS_renameat
-    if (nr == SYS_renameat)
-        return dispatch_two_path(ctx,  0, 1,  2, 3, h_rename);
-#endif
-#ifdef SYS_renameat2
-    if (nr == SYS_renameat2)
-        return dispatch_two_path(ctx,  0, 1,  2, 3, h_renameat2);
-#endif
-#ifdef SYS_link
-    if (nr == SYS_link)
-        return dispatch_two_path(ctx, -1, 0, -1, 1, h_link);
-#endif
-#ifdef SYS_linkat
-    if (nr == SYS_linkat)
-        return dispatch_two_path(ctx,  0, 1,  2, 3, h_link);
-#endif
-
-    /* utimensat: a NULL path means "operate on dirfd as if it were
-     * an open fd" (futimens semantics), which we don't yet support
-     * — fall through.  Otherwise dispatch via the normal path lane. */
-#ifdef SYS_utimensat
-    if (nr == SYS_utimensat) {
-        const char *p = (const char *)ctx->args[1];
-        if (!p) return 0;
-        const char *abs;
-        int r = resolve_path(ctx, (int)ctx->args[0], p, &abs);
-        if (r == -1) return 0;
-        if (r < 0)   return short_circuit(ctx, r);
-        return short_circuit(ctx, h_utimensat(ctx, abs));
-    }
-#endif
-
-    /* chdir / fchdir / getcwd are intercepted by path_remap (it owns
-     * the logical-CWD shadow and the dirfd → path table; see
-     * sud/path_remap/addin.c::pre_syscall).  No bookkeeping needed
-     * here. */
-
-    /* execve: nothing to do here.  The logical CWD is propagated to
-     * the child wrapper via the runtime-config "--cwd" argv flag,
-     * which sud/elf.c::build_exec_argv re-emits as part of the
-     * standard wrapper-flag block.  envp is passed through to the
-     * kernel byte-for-byte (the child program sees exactly the env
-     * the traced program supplied to execve). */
 
     /* munmap interception.
      *
@@ -1600,8 +1235,11 @@ static int inramfs_pre_syscall(struct sud_syscall_ctx *ctx)
     }
 #endif
 
-    /* Everything else (most fd + path syscalls) is in the table. */
-    return dispatch_table(ctx);
+    /* Path-bearing dispatch (open/stat/mkdir/unlink/rename/...) is
+     * driven by path_remap before this hook runs (see
+     * sud/path_remap/inramfs_glue.c).  Everything left is a
+     * fd-bearing op handled by the table below. */
+    return dispatch_fd_table(ctx);
 }
 
 /* ---- addin lifecycle hooks --------------------------------------- */

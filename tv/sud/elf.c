@@ -15,6 +15,7 @@
 #include "sud/runtime_config.h"
 #ifdef SUD_ADDIN_INRAMFS
 #include "sud/inramfs/inramfs.h"
+#include "sud/path_remap/path.h"
 #endif
 
 /* ELF ident helpers not provided by our minimal libc.h */
@@ -63,7 +64,7 @@ static int ir_path_is_inramfs(const char *path)
 {
     return path && path[0] == '/'
         && sud_inramfs_active()
-        && sud_inramfs_path_under_mount(path);
+        && sud_pr_inramfs_path_under_mount(path);
 }
 
 /* Mark inramfs-owned fds with this bit so we can dispatch close
@@ -288,7 +289,9 @@ int resolve_path(const char *cmd, char *out, int out_sz)
 #ifdef SUD_ADDIN_INRAMFS
     if (cmd[0] == '.' || strchr(cmd, '/')) {
         char abs[PATH_MAX];
-        int rc = sud_inramfs_resolve_at(AT_FDCWD, cmd, abs, sizeof(abs));
+        int rc = sud_inramfs_active()
+               ? sud_pr_resolve_at_inramfs(AT_FDCWD, cmd, abs, sizeof(abs))
+               : -1;
         if (rc == 0) {
             size_t clen = strlen(abs);
             if (clen >= (size_t)out_sz) clen = (size_t)out_sz - 1;

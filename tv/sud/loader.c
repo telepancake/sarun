@@ -15,6 +15,7 @@
 #include "sud/state.h"
 #ifdef SUD_ADDIN_INRAMFS
 #include "sud/inramfs/inramfs.h"
+#include "sud/path_remap/path.h"
 #endif
 
 /* Open a target ELF, transparently handling inramfs paths.  For paths
@@ -26,7 +27,7 @@ static int loader_open_elf(const char *path)
 {
 #ifdef SUD_ADDIN_INRAMFS
     if (sud_inramfs_active() && path && path[0] == '/'
-        && sud_inramfs_path_under_mount(path)) {
+        && sud_pr_inramfs_path_under_mount(path)) {
         long r = sud_inramfs_op_get_kfd(path);
         if (r >= 0) return (int)r;
         /* Path is under the mount but lookup failed — fall through

@@ -91,6 +91,12 @@ endif
 ifneq ($(filter sud/inramfs,$(SUD_ADDINS)),)
 SUD_CFLAGS  += -DSUD_ADDIN_INRAMFS
 SUD_SRCS    += sud/inramfs/addin.c sud/inramfs/super.c sud/inramfs/vfs.c
+# inramfs_glue.c lives under path_remap/ but is the path-bearing
+# dispatch table for inramfs.  It only makes sense when both addins
+# are configured (path_remap drives, inramfs serves).
+ifneq ($(filter sud/path_remap,$(SUD_ADDINS)),)
+SUD_SRCS    += sud/path_remap/inramfs_glue.c
+endif
 endif
 SUD_NATIVE  := $(if $(filter x86_64,$(shell uname -m)),sud64,sud32)
 

@@ -16,6 +16,7 @@
 #include "libc-fs/fmt.h"
 #include "sud/inramfs/inramfs.h"
 #include "sud/inramfs/internal.h"
+#include "sud/path_remap/path.h"
 #include "sud/raw.h"
 #include "sud/runtime_config.h"
 
@@ -82,11 +83,11 @@ static void test_init_and_root(void)
     g_curtest = "init_and_root";
     setup_mount("/inramfs", 4, "test_init");
     TASSERT(sud_inramfs_active(), "active after init");
-    TASSERT(sud_inramfs_path_under_mount("/inramfs"),
+    TASSERT(sud_pr_inramfs_path_under_mount("/inramfs"),
             "mount root is under mount");
-    TASSERT(sud_inramfs_path_under_mount("/inramfs/foo"),
+    TASSERT(sud_pr_inramfs_path_under_mount("/inramfs/foo"),
             "subpath is under mount");
-    TASSERT(!sud_inramfs_path_under_mount("/tmp/x"),
+    TASSERT(!sud_pr_inramfs_path_under_mount("/tmp/x"),
             "/tmp is not under mount");
     /* Root inode should be present, type DIR, mode 0755. */
     struct sud_ir_inode *root = sud_ir_inode_get(1);
@@ -350,8 +351,8 @@ static void test_root_mount(void)
     g_curtest = "root_mount";
     /* "/" as the mount: every absolute path is under it. */
     setup_mount("/", 4, "test_root");
-    TASSERT(sud_inramfs_path_under_mount("/foo"), "/foo under root mount");
-    TASSERT(sud_inramfs_path_under_mount("/"), "/ under root mount");
+    TASSERT(sud_pr_inramfs_path_under_mount("/foo"), "/foo under root mount");
+    TASSERT(sud_pr_inramfs_path_under_mount("/"), "/ under root mount");
     int fd = (int)sud_inramfs_op_open("/file", O_WRONLY | O_CREAT, 0644);
     TASSERT(fd >= 0, "open /file");
     sud_inramfs_op_write(fd, "x", 1);

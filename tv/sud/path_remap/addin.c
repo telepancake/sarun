@@ -28,6 +28,7 @@
 #include "sud/path_remap/path.h"
 #ifdef SUD_ADDIN_INRAMFS
 #include "sud/inramfs/inramfs.h"
+#include "sud/path_remap/inramfs_glue.h"
 #endif
 
 /* Each path-bearing syscall is dispatched under `#ifdef SYS_xxx`; the
@@ -304,6 +305,16 @@ static int path_remap_pre_syscall(struct sud_syscall_ctx *ctx)
 #endif
 #ifdef SYS_getcwd
     if (nr == SYS_getcwd) return handle_getcwd(ctx);
+#endif
+
+    /* Route inramfs-mounted paths to the inramfs data store BEFORE
+     * consulting the overlay rule table.  inramfs_glue handles
+     * open/stat/mkdir/unlink/symlink/readlink/chmod/chown/utimensat/
+     * truncate/rename/link via sud_inramfs_op_*; the kernel never
+     * sees the path arg.  Returns 0 if the syscall isn't path-
+     * bearing or the path isn't under the inramfs mount. */
+#ifdef SUD_ADDIN_INRAMFS
+    if (sud_pr_inramfs_route_pre_syscall(ctx)) return 1;
 #endif
 
     if (sud_overlay_rule_count() == 0) return 0;

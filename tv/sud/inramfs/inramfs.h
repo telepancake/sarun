@@ -90,26 +90,16 @@ extern const struct sud_addin sud_inramfs_addin;
 /* Public, addin-internal entry points (broken out so addin.c can
  * dispatch syscalls into them without depending on a single huge
  * dispatch function).  All return either a non-negative result or a
- * negative -errno value, in the kernel-syscall convention. */
-
-/* Returns the resolved absolute path that `(dirfd, path)` denotes,
- * provided that resolution stays inside the inramfs mount.  Writes a
- * NUL-terminated path into `out` and returns 0 on success.  Returns
- * -1 if the path is NOT under the mount (caller should pass through
- * to the kernel) or -errno if it IS under the mount but the
- * resolution failed (e.g. ENAMETOOLONG, ENOENT for a missing dirfd
- * mapping).  Symlinks are NOT resolved here — only path-syntactic
- * normalisation (".", ".." and double slashes) is applied. */
-int sud_inramfs_resolve_at(int dirfd, const char *path,
-                           char *out, size_t out_sz);
-
-/* True if `abs_path` (must be absolute, NUL-terminated) lies inside
- * the configured inramfs mount on a path-component boundary. */
-int sud_inramfs_path_under_mount(const char *abs_path);
+ * negative -errno value, in the kernel-syscall convention.
+ *
+ * Note: path resolution (dirfd + relpath + cwd → absolute path) and
+ * mount-prefix testing have moved to sud/path_remap/path.h.  Use
+ * sud_pr_resolve_at_inramfs() / sud_pr_inramfs_path_under_mount()
+ * directly from there if you need them. */
 
 /* The high-level operations.  Each takes an *absolute* path that
  * lives under the mount (callers should have validated this with
- * sud_inramfs_path_under_mount).  Returns 0 / fd / nbytes on
+ * sud_pr_inramfs_path_under_mount).  Returns 0 / fd / nbytes on
  * success and -errno on failure, matching kernel syscall semantics. */
 long sud_inramfs_op_open(const char *abs_path, int flags, int mode);
 long sud_inramfs_op_close(int fd);
