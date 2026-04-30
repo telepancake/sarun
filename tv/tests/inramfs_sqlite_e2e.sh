@@ -3,7 +3,7 @@
 # inramfs add-in.
 #
 # Runs an entire sqlite-from-source workflow under ./sudtrace with
-# SUD_INRAMFS+SUD_REMAP routing all I/O into the in-RAM filesystem:
+# --inramfs routing all I/O into the in-RAM filesystem:
 #
 #   1.  git clone (small) sqlite amalgamation repo into /ir/work
 #   2.  compile sqlite3 (gcc shell.c sqlite3.c -o sqlite3)
@@ -15,7 +15,7 @@
 #   - every step exits 0 (no crashes, no hangs)
 #   - the trace shows no host-disk write outside the working dir
 #     (we don't enforce this strictly here; the read-only-on-host
-#     property is what SUD_REMAP / SUD_INRAMFS together provide)
+#     property is what --inramfs provides)
 #   - after the launcher exits, /dev/shm/sud-inramfs.* contains no
 #     leftover backing files (the launcher owns the shm lifetime)
 #
@@ -72,11 +72,10 @@ fail() {
 #
 # The script runs INSIDE one sudtrace invocation so that all four
 # phases (clone, build, run-1, run-2) share the same inramfs.  The
-# launcher mints the SUD_INRAMFS_KEY itself and unlinks both shm
+# launcher mints the inramfs key itself and unlinks both shm
 # files on exit, so after the script we can grep /dev/shm to
 # confirm no orphans were left behind.
-SUD_INRAMFS="${MOUNT}:64" \
-    "$SUDTRACE" -o /dev/null -- /bin/bash -c '
+"$SUDTRACE" --inramfs "${MOUNT}:64" -o /dev/null -- /bin/bash -c '
 set -e
 MOUNT="'"$MOUNT"'"
 

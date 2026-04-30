@@ -1,7 +1,7 @@
 #!/bin/bash
 # tests/inramfs_e2e.sh — end-to-end test for the inramfs add-in.
 #
-# Runs ./sudtrace with SUD_INRAMFS=<MOUNT> over a tiny shell workload,
+# Runs ./sudtrace --inramfs <MOUNT> over a tiny shell workload,
 # under strace -f -e trace=%file, and asserts:
 #
 #   1. The workload itself succeeded (expected stdout).
@@ -71,9 +71,9 @@ run_e2e() {
     # only file syscalls strace sees are those that actually
     # reached the kernel.  Any /inramfs_e2e/* in the captured
     # output is therefore a leak.
-    if ! SUD_INRAMFS="$MOUNT:8" SUD_INRAMFS_KEY="$KEY" \
-         strace -f -e trace=%file -o "$strace_log" \
-         "$SUDTRACE" -o "$trace_out" -- /bin/sh -c "$cmd" \
+    if ! strace -f -e trace=%file -o "$strace_log" \
+         "$SUDTRACE" --inramfs "$MOUNT:8" --inramfs-key "$KEY" \
+         -o "$trace_out" -- /bin/sh -c "$cmd" \
          > "$stdout_log" 2>"$TMPDIR/stderr.$name"; then
         echo "FAIL [$name] sudtrace exit non-zero"
         echo "  stderr:" && sed 's/^/    /' "$TMPDIR/stderr.$name"
@@ -153,7 +153,8 @@ run_e2e "exec-redir-builtins" "got: BB" \
 # walking through user-created directories survives to a child
 # process.  Now uses `mkdir -p` (which chdir's into each component
 # via chdir(2)) — chdir into inramfs is supported in the addin via
-# a logical-CWD layer that propagates across exec via SUD_INRAMFS_CWD.
+# a logical-CWD layer that propagates across exec via the --cwd flag
+# re-emitted on every child wrapper invocation.
 run_e2e "mkdir-and-nested" "deep:hello" \
     "mkdir -p $MOUNT/a/b/c &&
      echo hello > $MOUNT/a/b/c/f &&
@@ -163,7 +164,7 @@ run_e2e "mkdir-and-nested" "deep:hello" \
 # After `cd $MOUNT/d`, `pwd`, `ls`, and `cat foo` (relative path)
 # must all see the inramfs view, both in the parent shell (chdir
 # tracked locally) and in exec'd children (logical CWD inherited
-# via SUD_INRAMFS_CWD env var).
+# via the --cwd flag re-emitted on every child wrapper invocation).
 run_e2e "chdir-and-relative" "/inramfs_e2e/d
 hello
 hello" \

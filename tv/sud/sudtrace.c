@@ -53,11 +53,26 @@
 static void usage(const char *prog)
 {
     fprintf(stderr,
-        "Usage: %s [-o FILE] [--no-env] -- command [args...]\n"
+        "Usage: %s [options] -- command [args...]\n"
         "\n"
         "Syscall User Dispatch (SUD) based process tracer.\n"
         "Produces a binary trace (see trace/trace.h).\n"
-        "Decode with: tv dump FILE\n",
+        "Decode with: tv dump FILE\n"
+        "\n"
+        "Options:\n"
+        "  -o FILE                       write trace to FILE (default: stdout)\n"
+        "  --no-env                      strip envp passed to the target program\n"
+        "  --inramfs <mount>[:<mb>]      serve <mount> from an in-RAM inode store\n"
+        "                                of <mb> megabytes (default 64)\n"
+        "  --inramfs-key <key>           share an existing inramfs store across\n"
+        "                                sudtrace invocations (default: mint a\n"
+        "                                fresh key and unlink the backing shm on\n"
+        "                                exit)\n"
+        "  --overlay <merged>=<upper>+<lower>[+<lower>...]\n"
+        "                                overlayfs-style merged view (repeatable;\n"
+        "                                empty <upper> = read-only)\n"
+        "  --remap <src>=<dst>           rewrite <src> → <dst> on every path\n"
+        "                                argument (repeatable)\n",
         prog);
     exit(1);
 }
@@ -106,11 +121,12 @@ static void init_wrapper_paths(const char *argv0)
 /* ================================================================
  * inramfs shm lifetime
  *
- * If the user gives us SUD_INRAMFS but no SUD_INRAMFS_KEY, we mint a
- * unique key, publish it via the env var (so the addin in the traced
- * children attaches to the same shm files), and remember to unlink
- * the backing files on launcher exit.  Net effect: a sudtrace
- * invocation owns its own backing shm and never leaves
+ * If the user gives us --inramfs but no --inramfs-key, we mint a
+ * unique key, stash it on the runtime-config struct (so the addin
+ * in the traced children attaches to the same shm files via the
+ * --inramfs-key flag re-emitted on the wrapper argv), and remember
+ * to unlink the backing files on launcher exit.  Net effect: a
+ * sudtrace invocation owns its own backing shm and never leaves
  * `/dev/shm/sud-inramfs.*` clutter behind, while the explicit-key
  * workflow (multiple sudtrace invocations sharing the same mount)
  * still works for users who supply their own key.
@@ -187,8 +203,8 @@ static void ir_signal_cleanup(int sig)
 /* If the user wants inramfs but didn't pin a key, mint one and
  * register cleanup hooks.  Called once from main() before fork.
  * On return, *out_minted_key holds either NULL (if a key was already
- * pinned by the caller via SUD_INRAMFS_KEY env or --inramfs-key) or
- * a malloc'd key string the caller should put into cfg->inramfs_key. */
+ * pinned by the caller via --inramfs-key) or a malloc'd key string
+ * the caller should put into cfg->inramfs_key. */
 static char *ir_setup_owned_shm(const char *mount_path,
                                 const char *existing_key)
 {
@@ -589,10 +605,20 @@ int main(int argc, char **argv)
 {
     init_wrapper_paths(argv[0]);
 
-    /* Parse options */
+    /* Parse options.  All configuration enters via flags here —
+     * sudtrace no longer reads any SUD_* environment variable.
+     * (The PATH lookup in build_wrapper_argv is the only remaining
+     * getenv in this file and is for resolving the user's command,
+     * not sud configuration.) */
     const char *outfile = NULL;
     int cmd_start = -1;
     int no_env = 0;
+    const char *cli_inramfs = NULL;       /* "<mount>" or "<mount>:<mb>" */
+    const char *cli_inramfs_key = NULL;
+    const char *cli_overlay[SUD_RC_MAX_REMAP_RULES];
+    int         cli_overlay_n = 0;
+    const char *cli_remap[SUD_RC_MAX_REMAP_RULES];
+    int         cli_remap_n = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--") == 0) {
@@ -603,8 +629,29 @@ int main(int argc, char **argv)
             outfile = argv[++i];
         } else if (strcmp(argv[i], "--no-env") == 0) {
             no_env = 1;
+        } else if (strcmp(argv[i], "--inramfs") == 0 && i + 1 < argc) {
+            cli_inramfs = argv[++i];
+        } else if (strcmp(argv[i], "--inramfs-key") == 0 && i + 1 < argc) {
+            cli_inramfs_key = argv[++i];
+        } else if (strcmp(argv[i], "--overlay") == 0 && i + 1 < argc) {
+            if (cli_overlay_n >= SUD_RC_MAX_REMAP_RULES) {
+                fprintf(stderr, "sudtrace: too many --overlay rules "
+                                "(max %d)\n", SUD_RC_MAX_REMAP_RULES);
+                exit(1);
+            }
+            cli_overlay[cli_overlay_n++] = argv[++i];
+        } else if (strcmp(argv[i], "--remap") == 0 && i + 1 < argc) {
+            if (cli_remap_n >= SUD_RC_MAX_REMAP_RULES) {
+                fprintf(stderr, "sudtrace: too many --remap rules "
+                                "(max %d)\n", SUD_RC_MAX_REMAP_RULES);
+                exit(1);
+            }
+            cli_remap[cli_remap_n++] = argv[++i];
         } else if (strcmp(argv[i], "-h") == 0 ||
                    strcmp(argv[i], "--help") == 0) {
+            usage(argv[0]);
+        } else if (argv[i][0] == '-' && argv[i][1] != '\0') {
+            fprintf(stderr, "sudtrace: unknown option '%s'\n", argv[i]);
             usage(argv[0]);
         } else {
             cmd_start = i;
@@ -615,88 +662,68 @@ int main(int argc, char **argv)
     if (cmd_start < 0 || cmd_start >= argc)
         usage(argv[0]);
 
-    /* Build the runtime config we'll hand to the wrapper.  We
-     * translate any pre-existing SUD_* environment variables (which
-     * the user may still set as a UX shortcut) into the new flag
-     * surface.  Nothing in the child's argv depends on env after
-     * this point — sudtrace never calls setenv/unsetenv on SUD_*. */
+    /* Build the runtime config we'll hand to the wrapper.  Every
+     * value comes from a flag we just parsed; sudtrace never calls
+     * getenv/setenv/unsetenv on SUD_* (PLAN.md Part 2 invariant). */
     struct sud_runtime_config cfg;
     sud_runtime_config_clear(&cfg);
     cfg.no_env = no_env;
 
-    /* SUD_INRAMFS=<mount>[:<size_mb>] -> "--remap-rule inramfs:<mount>"
-     * + "--inramfs-meta-mb <N>" if a size was specified. */
+    /* --inramfs <mount>[:<mb>]  →  "--remap-rule inramfs:<mount>"
+     * (+ "--inramfs-meta-mb <N>" if a size was given).  The mount
+     * spec is forwarded verbatim so the wrapper-side path_remap
+     * parser sees exactly the user's text. */
     char *inramfs_mount = NULL;
-    {
-        const char *e = getenv("SUD_INRAMFS");
-        if (e && e[0]) {
-            const char *colon = strchr(e, ':');
-            size_t plen = colon ? (size_t)(colon - e) : strlen(e);
-            inramfs_mount = strndup(e, plen);
-            char *rule = malloc(plen + sizeof("inramfs:") + 1);
-            if (!rule) { fprintf(stderr, "sudtrace: oom\n"); exit(1); }
-            memcpy(rule, "inramfs:", sizeof("inramfs:") - 1);
-            memcpy(rule + sizeof("inramfs:") - 1, e, plen);
-            rule[sizeof("inramfs:") - 1 + plen] = '\0';
-            if (cfg.remap_rule_count < SUD_RC_MAX_REMAP_RULES)
-                cfg.remap_rules[cfg.remap_rule_count++] = rule;
+    if (cli_inramfs && cli_inramfs[0]) {
+        const char *e = cli_inramfs;
+        const char *colon = strchr(e, ':');
+        size_t plen = colon ? (size_t)(colon - e) : strlen(e);
+        inramfs_mount = strndup(e, plen);
+        char *rule = malloc(plen + sizeof("inramfs:") + 1);
+        if (!rule) { fprintf(stderr, "sudtrace: oom\n"); exit(1); }
+        memcpy(rule, "inramfs:", sizeof("inramfs:") - 1);
+        memcpy(rule + sizeof("inramfs:") - 1, e, plen);
+        rule[sizeof("inramfs:") - 1 + plen] = '\0';
+        if (cfg.remap_rule_count < SUD_RC_MAX_REMAP_RULES)
+            cfg.remap_rules[cfg.remap_rule_count++] = rule;
 
-            if (colon && colon[1]) {
-                int mb = atoi(colon + 1);
-                if (mb > 0) cfg.inramfs_meta_mb = mb;
-            }
+        if (colon && colon[1]) {
+            int mb = atoi(colon + 1);
+            if (mb > 0) cfg.inramfs_meta_mb = mb;
         }
     }
 
-    /* SUD_INRAMFS_KEY -> --inramfs-key.  If the user did not pin a
-     * key, ir_setup_owned_shm() mints one for us. */
-    {
-        const char *user_key = getenv("SUD_INRAMFS_KEY");
-        if (user_key && user_key[0]) cfg.inramfs_key = strdup(user_key);
-    }
+    /* --inramfs-key.  If the user did not pin a key, ir_setup_owned_shm()
+     * mints one for us (and registers cleanup of the backing shms). */
+    if (cli_inramfs_key && cli_inramfs_key[0])
+        cfg.inramfs_key = strdup(cli_inramfs_key);
     char *minted_key = ir_setup_owned_shm(inramfs_mount, cfg.inramfs_key);
     if (minted_key) cfg.inramfs_key = minted_key;
 
-    /* SUD_OVERLAY=<merged>=<upper>+<lower>...:<more>...
-     * Each colon-separated segment becomes one
-     * "--remap-rule overlay:<segment>" entry. */
-    {
-        const char *e = getenv("SUD_OVERLAY");
-        while (e && *e) {
-            const char *seg = e;
-            while (*e && *e != ':') e++;
-            size_t slen = (size_t)(e - seg);
-            if (slen > 0 &&
-                cfg.remap_rule_count < SUD_RC_MAX_REMAP_RULES) {
-                char *rule = malloc(slen + sizeof("overlay:") + 1);
-                if (!rule) { fprintf(stderr, "sudtrace: oom\n"); exit(1); }
-                memcpy(rule, "overlay:", sizeof("overlay:") - 1);
-                memcpy(rule + sizeof("overlay:") - 1, seg, slen);
-                rule[sizeof("overlay:") - 1 + slen] = '\0';
-                cfg.remap_rules[cfg.remap_rule_count++] = rule;
-            }
-            if (*e == ':') e++;
-        }
+    /* --overlay <spec>  (repeatable)  →  "--remap-rule overlay:<spec>". */
+    for (int i = 0; i < cli_overlay_n; i++) {
+        const char *spec = cli_overlay[i];
+        size_t slen = strlen(spec);
+        if (slen == 0 ||
+            cfg.remap_rule_count >= SUD_RC_MAX_REMAP_RULES) continue;
+        char *rule = malloc(slen + sizeof("overlay:") + 1);
+        if (!rule) { fprintf(stderr, "sudtrace: oom\n"); exit(1); }
+        memcpy(rule, "overlay:", sizeof("overlay:") - 1);
+        memcpy(rule + sizeof("overlay:") - 1, spec, slen + 1);
+        cfg.remap_rules[cfg.remap_rule_count++] = rule;
     }
 
-    /* SUD_REMAP=<src>=<dst>:<more>... -> repeated --remap-rule remap:.. */
-    {
-        const char *e = getenv("SUD_REMAP");
-        while (e && *e) {
-            const char *seg = e;
-            while (*e && *e != ':') e++;
-            size_t slen = (size_t)(e - seg);
-            if (slen > 0 &&
-                cfg.remap_rule_count < SUD_RC_MAX_REMAP_RULES) {
-                char *rule = malloc(slen + sizeof("remap:") + 1);
-                if (!rule) { fprintf(stderr, "sudtrace: oom\n"); exit(1); }
-                memcpy(rule, "remap:", sizeof("remap:") - 1);
-                memcpy(rule + sizeof("remap:") - 1, seg, slen);
-                rule[sizeof("remap:") - 1 + slen] = '\0';
-                cfg.remap_rules[cfg.remap_rule_count++] = rule;
-            }
-            if (*e == ':') e++;
-        }
+    /* --remap <src>=<dst>  (repeatable)  →  "--remap-rule remap:<spec>". */
+    for (int i = 0; i < cli_remap_n; i++) {
+        const char *spec = cli_remap[i];
+        size_t slen = strlen(spec);
+        if (slen == 0 ||
+            cfg.remap_rule_count >= SUD_RC_MAX_REMAP_RULES) continue;
+        char *rule = malloc(slen + sizeof("remap:") + 1);
+        if (!rule) { fprintf(stderr, "sudtrace: oom\n"); exit(1); }
+        memcpy(rule, "remap:", sizeof("remap:") - 1);
+        memcpy(rule + sizeof("remap:") - 1, spec, slen + 1);
+        cfg.remap_rules[cfg.remap_rule_count++] = rule;
     }
 
     /* Setup output */
