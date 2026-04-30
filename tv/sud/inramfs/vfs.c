@@ -24,7 +24,9 @@
  */
 
 #include "sud/inramfs/inramfs.h"
+#include "sud/inramfs/path_ops.h"
 #include "sud/inramfs/internal.h"
+#include "sud/path_remap/path.h"
 #include "sud/raw.h"
 
 #ifndef EIO
@@ -268,8 +270,8 @@ int sud_ir_dir_is_empty(uint32_t dir_idx)
 
 static const char *strip_mount(const char *abs)
 {
-    const char *m = sud_ir_mount_path();
-    size_t mlen = sud_ir_mount_len();
+    const char *m = sud_pr_inramfs_mount_path();
+    size_t mlen = sud_pr_inramfs_mount_len();
     if (!m) return 0;
     /* Trivial root mount ("/"): everything is under it. */
     if (mlen == 1 && m[0] == '/') return abs + 1;
@@ -1137,8 +1139,8 @@ static long create_at(const char *abs_path, uint32_t type, uint32_t mode,
 static int is_mount_root(const char *abs_path)
 {
     if (!abs_path) return 0;
-    const char *m = sud_ir_mount_path();
-    size_t mlen = sud_ir_mount_len();
+    const char *m = sud_pr_inramfs_mount_path();
+    size_t mlen = sud_pr_inramfs_mount_len();
     if (!m) return 0;
     size_t L = strlen(abs_path);
     while (L > 1 && abs_path[L - 1] == '/') L--;

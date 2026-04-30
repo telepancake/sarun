@@ -32,8 +32,9 @@ volatile char *sud_ir_data_base;     /* base of the small-file shm mapping
 
 /* Mount config: the inramfs mount prefix is OWNED by path_remap
  * (parsed from --remap-rule inramfs:<path>).  super.c keeps no
- * copy; sud_ir_mount_path/len delegate to path_remap.  This file
- * still parses --inramfs-meta-mb and --inramfs-key (both are
+ * copy and exposes no shim; vfs.c calls
+ * `sud_pr_inramfs_mount_path/len()` directly.  This file still
+ * parses --inramfs-meta-mb and --inramfs-key (both are
  * inramfs-internal: they affect the data-store backing region,
  * not pathnames). */
 static size_t g_meta_size;           /* metadata region bytes (user-sized) */
@@ -53,8 +54,6 @@ static int    g_small_fd = -1;       /* small-file shm fd; kept open
  * Public accessors
  * ================================================================ */
 
-const char *sud_ir_mount_path(void) { return sud_pr_inramfs_mount_path(); }
-size_t      sud_ir_mount_len (void) { return sud_pr_inramfs_mount_len();  }
 int         sud_inramfs_active(void) { return g_active; }
 size_t      sud_ir_meta_size (void) { return g_meta_size; }
 size_t      sud_ir_small_size(void)

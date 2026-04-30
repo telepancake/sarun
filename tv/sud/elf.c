@@ -15,6 +15,7 @@
 #include "sud/runtime_config.h"
 #ifdef SUD_ADDIN_INRAMFS
 #include "sud/inramfs/inramfs.h"
+#include "sud/inramfs/path_ops.h"
 #include "sud/path_remap/path.h"
 #endif
 

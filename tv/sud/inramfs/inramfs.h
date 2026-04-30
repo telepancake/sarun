@@ -191,12 +191,17 @@ long sud_inramfs_op_rename_at_inode(uint32_t old_par,
 
 /* ---- Legacy path-based wrappers (walk + dispatch) ----
  *
- * Each takes an *absolute* path under the mount and walks it via
- * `sud_ir_walk` / `sud_ir_walk_parent` before calling the inode
- * form.  Behaviourally equivalent; kept so that callers that
- * legitimately have only an absolute path (the ELF loader, the
- * inramfs unit tests) don't have to re-implement the walk. */
-long sud_inramfs_op_open(const char *abs_path, int flags, int mode);
+ * Path-based forms (`sud_inramfs_op_open(abs_path,...)`,
+ * `..._stat`, `..._mkdir`, ...) live in
+ * `sud/inramfs/path_ops.h`, kept out of this header so that
+ * `inramfs.h` exposes only the data primitives per PLAN.md.
+ *
+ * The fd-bearing forms (`..._read`, `..._write`, `..._lseek`,
+ * `..._close`, `..._fstat`, `..._fchmod`, `..._fchown`,
+ * `..._futimens`, `..._ftruncate`, `..._getdents64`) are pure
+ * data primitives and remain below. */
+
+/* ---- fd-bearing data primitives (no path argument) ---- */
 long sud_inramfs_op_close(int fd);
 long sud_inramfs_op_read(int fd, void *buf, size_t count);
 long sud_inramfs_op_write(int fd, const void *buf, size_t count);
@@ -204,39 +209,12 @@ long sud_inramfs_op_pread(int fd, void *buf, size_t count, off_t off);
 long sud_inramfs_op_pwrite(int fd, const void *buf, size_t count, off_t off);
 long sud_inramfs_op_lseek(int fd, off_t off, int whence);
 long sud_inramfs_op_ftruncate(int fd, off_t length);
-long sud_inramfs_op_truncate(const char *abs_path, off_t length);
 long sud_inramfs_op_fstat(int fd, void *st_buf);          /* writes a struct stat for the running ABI */
-long sud_inramfs_op_stat(const char *abs_path, void *st_buf, int follow);
-long sud_inramfs_op_mkdir(const char *abs_path, int mode);
-long sud_inramfs_op_rmdir(const char *abs_path);
-long sud_inramfs_op_unlink(const char *abs_path);
-long sud_inramfs_op_rename(const char *abs_oldpath,
-                           const char *abs_newpath, unsigned int flags);
-long sud_inramfs_op_symlink(const char *target, const char *abs_linkpath);
-long sud_inramfs_op_readlink(const char *abs_path, char *buf, size_t bufsz);
-long sud_inramfs_op_link(const char *abs_oldpath, const char *abs_newpath);
-long sud_inramfs_op_chmod(const char *abs_path, int mode);
 long sud_inramfs_op_fchmod(int fd, int mode);
-long sud_inramfs_op_chown(const char *abs_path, int uid, int gid, int follow);
 long sud_inramfs_op_fchown(int fd, int uid, int gid);
-long sud_inramfs_op_utimensat(const char *abs_path,
-                              const struct timespec ts[2], int follow);
 long sud_inramfs_op_futimens(int fd, const struct timespec ts[2]);
-long sud_inramfs_op_access(const char *abs_path, int mode);
-/* Validate that `abs_path` (under the mount) names an existing
- * directory.  Returns 0 on success, -errno otherwise.  The addin
- * stores the path itself; this op is the only inramfs-side check. */
-long sud_inramfs_op_chdir(const char *abs_path);
 long sud_inramfs_op_getdents64(int fd, void *buf, size_t count);
 
-/* Return a real *kernel* fd for `abs_path` (must be under the mount),
- * suitable for the kernel's own pread/mmap (e.g. the ELF loader in
- * sud/loader.c).  If the file is currently SMALL, it is promoted to
- * LARGE first (since SMALL files have no individual kernel fd — they
- * live as runs in the shared smalldata shm).  The returned fd is
- * O_CLOEXEC-flagged and owned by the caller (close with raw_close).
- * Returns -errno on failure. */
-long sud_inramfs_op_get_kfd(const char *abs_path);
 /* Returns the (addr, length) for a successful mmap, or MAP_FAILED on
  * failure with errno-value in *err.  Maps the fd's underlying shm
  * extent into the caller's address space.  Only PROT_READ/WRITE and
@@ -275,11 +253,5 @@ long sud_inramfs_op_fcntl_getfl(int fd);
  * O_APPEND/O_NONBLOCK can be changed (per fcntl(F_SETFL) semantics);
  * the access mode is preserved.  Mirrors fcntl(F_SETFL). */
 long sud_inramfs_op_fcntl_setfl(int fd, int flags);
-
-/* Fill a `struct statx` (kernel ABI) for the given path.  `mask` is
- * the caller's STATX_* mask; we always return the basic fields
- * regardless.  `follow` controls trailing-symlink resolution. */
-long sud_inramfs_op_statx_fill(const char *abs_path, int follow,
-                               unsigned int mask, void *statx_buf);
 
 #endif /* SUD_INRAMFS_INRAMFS_H */

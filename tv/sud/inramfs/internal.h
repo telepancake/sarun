@@ -408,9 +408,8 @@ void     sud_ir_inode_free(uint32_t index);
  * range/free indices. */
 struct sud_ir_inode *sud_ir_inode_get(uint32_t index);
 
-/* Mount-prefix accessors (set by sud_inramfs_init from SUD_INRAMFS). */
-const char *sud_ir_mount_path(void);
-size_t      sud_ir_mount_len(void);
+/* (mount-prefix accessors removed: vfs.c now calls
+ * sud_pr_inramfs_mount_path/len() directly.) */
 
 /* Sizes of the metadata mapping and the small-file shm, in bytes.
  * Used by the addin's munmap interceptor to decide whether a user

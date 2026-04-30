@@ -35,6 +35,7 @@
  */
 
 #include "sud/inramfs/inramfs.h"
+#include "sud/inramfs/path_ops.h"
 #include "sud/inramfs/internal.h"
 #include "sud/path_remap/path.h"
 #include "sud/addin.h"
