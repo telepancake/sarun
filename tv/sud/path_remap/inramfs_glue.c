@@ -179,7 +179,13 @@ typedef long (*ir_two_path_handler)(struct sud_syscall_ctx *ctx,
 /* ---- open / openat ----
  * These are the only single-path handlers that take want_parent=1
  * (because of O_CREAT semantics).  The dispatch table below marks
- * them with .want_parent=1; everything else uses want_parent=0. */
+ * them with .want_parent=1; everything else uses want_parent=0.
+ *
+ * After a successful open of a directory inode, register the
+ * resulting kfd in path_remap's shared dirfd table so subsequent
+ * *at(dirfd, relpath) syscalls from any addin resolve back into
+ * inramfs.  inramfs's open op is a pure inode→kfd primitive (it
+ * has no path knowledge); the dirfd table is owned here. */
 static long h_open_creat(struct sud_syscall_ctx *c,
                          const struct sud_pr_inramfs_ticket *t)
 {
@@ -188,12 +194,16 @@ static long h_open_creat(struct sud_syscall_ctx *c,
     int mode  = (int)c->args[2];
     if (t->leaf_idx) {
         if ((flags & O_CREAT) && (flags & O_EXCL)) return -EEXIST;
-        return sud_inramfs_op_open_inode(t->leaf_idx, flags, t->abs_path);
+        long fd = sud_inramfs_op_open_inode(t->leaf_idx, flags);
+        if (fd >= 0 && sud_inramfs_inode_is_dir(t->leaf_idx))
+            sud_pr_dirfd_register((int)fd, t->abs_path);
+        return fd;
     }
     if (!(flags & O_CREAT)) return -ENOENT;
+    /* Created entry is always a regular file — no dirfd reg needed. */
     return sud_inramfs_op_create_open_inode(t->parent_idx,
                                             t->basename, t->basename_len,
-                                            flags, mode, t->abs_path);
+                                            flags, mode);
 }
 static long h_openat_creat(struct sud_syscall_ctx *c,
                            const struct sud_pr_inramfs_ticket *t)
@@ -203,12 +213,16 @@ static long h_openat_creat(struct sud_syscall_ctx *c,
     int mode  = (int)c->args[3];
     if (t->leaf_idx) {
         if ((flags & O_CREAT) && (flags & O_EXCL)) return -EEXIST;
-        return sud_inramfs_op_open_inode(t->leaf_idx, flags, t->abs_path);
+        long fd = sud_inramfs_op_open_inode(t->leaf_idx, flags);
+        if (fd >= 0 && sud_inramfs_inode_is_dir(t->leaf_idx))
+            sud_pr_dirfd_register((int)fd, t->abs_path);
+        return fd;
     }
     if (!(flags & O_CREAT)) return -ENOENT;
+    /* Created entry is always a regular file — no dirfd reg needed. */
     return sud_inramfs_op_create_open_inode(t->parent_idx,
                                             t->basename, t->basename_len,
-                                            flags, mode, t->abs_path);
+                                            flags, mode);
 }
 
 /* ---- stat family ---- */

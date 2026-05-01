@@ -739,8 +739,7 @@ static void test_data_store_no_mount(void)
 
     /* Create-and-open a file under d1 via the inode-indexed creator. */
     long fdl = sud_inramfs_op_create_open_inode(d1_idx, "f", 1,
-                                                O_WRONLY | O_CREAT, 0644,
-                                                /*abs_path*/0);
+                                                O_WRONLY | O_CREAT, 0644);
     TASSERT(fdl >= 0, "create_open_inode");
     int fd = (int)fdl;
     TASSERT_EQ(sud_inramfs_op_write(fd, "hi", 2), 2, "write 2");
@@ -752,7 +751,7 @@ static void test_data_store_no_mount(void)
     lrc = sud_ir_dir_lookup(d1_idx, "f", 1, &f_idx);
     sud_ir_unlock(&sb->lock);
     TASSERT_EQ(lrc, 0, "lookup f");
-    long rfd = sud_inramfs_op_open_inode(f_idx, O_RDONLY, /*abs_path*/0);
+    long rfd = sud_inramfs_op_open_inode(f_idx, O_RDONLY);
     TASSERT(rfd >= 0, "open_inode RDONLY");
     char buf[8] = {0};
     long n = sud_inramfs_op_read((int)rfd, buf, sizeof(buf));

@@ -254,14 +254,18 @@ static int alloc_kfd(uint32_t inode_idx)
 }
 
 /* Open a known-existing inode and return a fresh kfd.  Performs the
- * type/access checks and O_TRUNC, allocates a memfd for the kfd,
- * registers the fd in the local table, and (for directories)
- * publishes the abs_path to the shared dirfd registry so subsequent
- * *at(dirfd, relpath) syscalls resolve back into inramfs.  abs_path
- * may be NULL when the caller doesn't have one (no dirfd
- * registration is performed in that case). */
-long sud_inramfs_op_open_inode(uint32_t inode_idx, int flags,
-                               const char *abs_path)
+ * type/access checks and O_TRUNC, allocates a memfd for the kfd, and
+ * registers the fd in the local table.  Pure inode→kfd primitive: no
+ * path argument, no path_remap dirfd registration.  Callers that
+ * need a directory fd registered with path_remap's shared dirfd
+ * table (so subsequent *at(dirfd, relpath) syscalls resolve into
+ * inramfs) must do that themselves after this call returns, e.g.:
+ *
+ *     long fd = sud_inramfs_op_open_inode(idx, flags);
+ *     if (fd >= 0 && sud_inramfs_inode_is_dir(idx))
+ *         sud_pr_dirfd_register((int)fd, abs_path);
+ */
+long sud_inramfs_op_open_inode(uint32_t inode_idx, int flags)
 {
     struct sud_ir_inode *ino = sud_ir_inode_get(inode_idx);
     if (!ino) return -ENOENT;
@@ -286,27 +290,25 @@ long sud_inramfs_op_open_inode(uint32_t inode_idx, int flags,
         raw_close(kfd);
         return -EMFILE;
     }
-    /* For directory fds, register the absolute path with path_remap's
-     * shared dirfd table so subsequent *at(dirfd, relpath) syscalls
-     * (in any addin) resolve correctly via this fd.  Non-dir opens
-     * skip the registration — they're not valid base dirs anyway and
-     * a dirfd lookup on them would surface -EXDEV → kernel pass-
-     * through, which the kernel turns into a sensible -ENOTDIR. */
-    if (ino->type == SUD_IR_T_DIR && abs_path) {
-        sud_pr_dirfd_register(kfd, abs_path);
-    }
     /* O_APPEND is honoured at write time via flags. */
     return kfd;
 }
 
+int sud_inramfs_inode_is_dir(uint32_t inode_idx)
+{
+    struct sud_ir_inode *ino = sud_ir_inode_get(inode_idx);
+    return ino && ino->type == SUD_IR_T_DIR;
+}
+
 /* Create a regular file under the given parent dir and open it.
  * Mirrors the O_CREAT half of open(2): if the entry already exists
- * (race with another opener) we use it (subject to O_EXCL).
- * abs_path is for dirfd registration only (NULL skips it). */
+ * (race with another opener) we use it (subject to O_EXCL).  Like
+ * sud_inramfs_op_open_inode, this is a pure inode-data primitive
+ * with no path argument; the freshly-created entry is always a
+ * regular file so no dirfd registration ever applies. */
 long sud_inramfs_op_create_open_inode(uint32_t parent_idx,
                                       const char *name, size_t name_len,
-                                      int flags, int mode,
-                                      const char *abs_path)
+                                      int flags, int mode)
 {
     if (name_len == 0 || name_len > 63) return -ENAMETOOLONG;
     uint32_t idx = 0;
@@ -344,7 +346,9 @@ long sud_inramfs_op_create_open_inode(uint32_t parent_idx,
         idx = ni;
     }
     sud_ir_unlock(&sb->lock);
-    return sud_inramfs_op_open_inode(idx, flags, abs_path);
+    /* Freshly-created inode is always a regular file — no dirfd
+     * registration is ever appropriate. */
+    return sud_inramfs_op_open_inode(idx, flags);
 }
 
 long sud_inramfs_op_open(const char *abs_path, int flags, int mode)
@@ -367,10 +371,16 @@ long sud_inramfs_op_open(const char *abs_path, int flags, int mode)
         int rc = sud_ir_walk_parent(abs_path, &pidx, &base, &blen);
         if (rc) return rc;
         return sud_inramfs_op_create_open_inode(pidx, base, blen,
-                                                flags, mode, abs_path);
+                                                flags, mode);
     }
 
-    return sud_inramfs_op_open_inode(idx, flags, abs_path);
+    long fd = sud_inramfs_op_open_inode(idx, flags);
+    /* Path-based wrapper: mirror what path_remap's inramfs_glue does
+     * for ticket-driven opens — register the dirfd so subsequent
+     * *at(dirfd, relpath) lookups resolve under this mount. */
+    if (fd >= 0 && sud_inramfs_inode_is_dir(idx))
+        sud_pr_dirfd_register((int)fd, abs_path);
+    return fd;
 }
 
 long sud_inramfs_op_close(int fd)

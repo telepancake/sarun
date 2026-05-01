@@ -149,13 +149,24 @@ long sud_inramfs_resolve_inode(const char *abs_path, int follow,
                                const char **basename_out,
                                size_t *basename_len_out);
 
-/* ---- Inode-indexed read-side ops (leaf inode known) ---- */
-long sud_inramfs_op_open_inode(uint32_t inode_idx, int flags,
-                               const char *abs_path);
+/* ---- Inode-indexed read-side ops (leaf inode known) ----
+ *
+ * The open ops return a kfd on success.  They do NOT register the
+ * resulting fd with path_remap's dirfd table even when the inode is
+ * a directory; that registration is path_remap's responsibility, and
+ * the caller (which holds the abs_path) does it explicitly after
+ * checking `sud_inramfs_inode_is_dir(inode_idx)`.  This keeps
+ * inramfs's public API free of any string path arguments — see
+ * PLAN.md "Net result". */
+long sud_inramfs_op_open_inode(uint32_t inode_idx, int flags);
 long sud_inramfs_op_create_open_inode(uint32_t parent_idx,
                                       const char *name, size_t name_len,
-                                      int flags, int mode,
-                                      const char *abs_path);
+                                      int flags, int mode);
+/* Returns 1 if `inode_idx` names a directory in the inramfs, 0
+ * otherwise (including missing or non-directory inodes).  Cheap
+ * O(1) lookup, used by callers of `sud_inramfs_op_open_inode` to
+ * decide whether to register the freshly-opened kfd as a dirfd. */
+int  sud_inramfs_inode_is_dir(uint32_t inode_idx);
 long sud_inramfs_op_stat_inode(uint32_t inode_idx, void *st_buf);
 long sud_inramfs_op_chmod_inode(uint32_t inode_idx, int mode);
 long sud_inramfs_op_chown_inode(uint32_t inode_idx, int uid, int gid);
