@@ -84,25 +84,49 @@ static inline long sud_ov_lstat(const char *path,
 #define SUD_OVERLAY_MAX_RULES   16
 #define SUD_OVERLAY_MAX_LOWERS  16
 
+/* Rule kinds — one of:
+ *   SUD_OR_OVERLAY      copy-up overlay with whiteouts (today's SUD_OVERLAY)
+ *   SUD_OR_REMAP        simple 1:1 path rewrite (today's SUD_REMAP)
+ *   SUD_OR_PASSTHROUGH  explicit "leave the syscall untouched" — used
+ *                       to carve a sub-prefix out of a wider overlay
+ *                       or remap rule.  Has no upper/lowers, only
+ *                       `merged` + `merged_len`.
+ *
+ * PLAN.md (line 47-58) calls for a unified rule registry tagged with
+ * a kind; this `kind` field is that tag.  The legacy `simple` flag
+ * is preserved as a fast-path bool for the hot REMAP arm of
+ * sud_overlay_resolve(); it is set iff kind == SUD_OR_REMAP. */
+enum sud_overlay_kind {
+    SUD_OR_OVERLAY     = 0,   /* default — keeps zero-init semantics */
+    SUD_OR_REMAP       = 1,
+    SUD_OR_PASSTHROUGH = 2,
+};
+
 struct sud_overlay_rule {
     /* Merged mount point ("/merged"). */
     const char *merged;
     size_t      merged_len;
 
-    /* Upper (writable) layer; NULL or empty if read-only overlay. */
+    /* Upper (writable) layer; NULL or empty if read-only overlay.
+     * Always NULL for SUD_OR_PASSTHROUGH. */
     const char *upper;
     size_t      upper_len;
 
-    /* Lower layers in priority order. */
+    /* Lower layers in priority order.  Empty for SUD_OR_PASSTHROUGH. */
     const char *lowers[SUD_OVERLAY_MAX_LOWERS];
     size_t      lower_lens[SUD_OVERLAY_MAX_LOWERS];
     int         lower_count;
 
-    /* When set, this rule was created from SUD_REMAP, not SUD_OVERLAY:
-     * `upper` and the single `lowers[0]` are the same path, no whiteout
-     * semantics are applied, and read/write resolve identically to the
-     * legacy 1:1 remap behaviour. */
+    /* When set, this rule was created from "remap:<src>=<dst>", not
+     * "overlay:...":  `upper` and the single `lowers[0]` are the same
+     * path, no whiteout semantics are applied, and read/write resolve
+     * identically to the legacy 1:1 remap behaviour.  Equivalent to
+     * (kind == SUD_OR_REMAP); kept as a fast-path bool because the
+     * resolve loop branches on it once per syscall. */
     int         simple;
+
+    /* Rule-kind tag.  See enum sud_overlay_kind above. */
+    int         kind;
 };
 
 static struct sud_overlay_rule g_rules[SUD_OVERLAY_MAX_RULES];
@@ -172,6 +196,7 @@ static void parse_overlay_segment(const char *seg, size_t len)
 
     struct sud_overlay_rule *r = &g_rules[g_rule_count];
     r->merged = 0; r->upper = 0; r->lower_count = 0; r->simple = 0;
+    r->kind = SUD_OR_OVERLAY;
 
     if (merged_len == 0) return;
     r->merged = dup_range(merged, merged_len);
@@ -231,7 +256,29 @@ static void parse_remap_segment(const char *seg, size_t len)
     r->lower_lens[0] = r->upper_len;
     r->lower_count = 1;
     r->simple = 1;
+    r->kind = SUD_OR_REMAP;
     if (r->merged && r->upper) g_rule_count++;
+}
+
+/* Parse one passthrough segment "<prefix>".  Stores a kind-tagged rule
+ * with no upper / no lowers; sud_overlay_resolve() short-circuits to
+ * SUD_OVERLAY_PASSTHROUGH on a match.  See PLAN.md line 49. */
+static void parse_passthrough_segment(const char *seg, size_t len)
+{
+    if (g_rule_count >= SUD_OVERLAY_MAX_RULES) return;
+    /* Strip trailing slashes (except a bare "/"). */
+    while (len > 1 && seg[len - 1] == '/') len--;
+    if (len == 0 || seg[0] != '/') return;
+
+    struct sud_overlay_rule *r = &g_rules[g_rule_count];
+    r->merged = dup_range(seg, len);
+    if (!r->merged) return;
+    r->merged_len = len;
+    r->upper = 0; r->upper_len = 0;
+    r->lower_count = 0;
+    r->simple = 0;
+    r->kind = SUD_OR_PASSTHROUGH;
+    g_rule_count++;
 }
 
 void sud_overlay_init(void)
@@ -260,10 +307,14 @@ void sud_overlay_init(void)
         else if (klen == 5 && r[0]=='r' && r[1]=='e' && r[2]=='m' &&
                  r[3]=='a' && r[4]=='p')
             parse_remap_segment(spec, slen);
-        /* "inramfs" / "passthrough" / "fakeroot": not yet
-         * implemented in path_remap; ignored here.  The inramfs
-         * addin reads the inramfs rule from runtime_config
-         * directly. */
+        else if (klen == 11 && r[0]=='p' && r[1]=='a' && r[2]=='s' &&
+                 r[3]=='s' && r[4]=='t' && r[5]=='h' && r[6]=='r' &&
+                 r[7]=='o' && r[8]=='u' && r[9]=='g' && r[10]=='h')
+            parse_passthrough_segment(spec, slen);
+        /* "inramfs" / "fakeroot": inramfs is owned by the inramfs
+         * addin (which reads its rule from runtime_config directly);
+         * fakeroot is PLAN-line-57 future work.  Both are silently
+         * ignored here. */
     }
 }
 
@@ -403,6 +454,14 @@ int sud_overlay_resolve(const char *path, int for_write,
     const char *tail;
     const struct sud_overlay_rule *r = find_rule(path, &tail);
     if (!r) return SUD_OVERLAY_PASSTHROUGH;
+
+    /* Explicit passthrough rule: leave the syscall arg untouched.
+     * The caller (sud/path_remap/addin.c) treats SUD_OVERLAY_PASSTHROUGH
+     * as "no rewrite, no short-circuit"; that is exactly the desired
+     * semantics for a "carve-out" rule that pins a sub-prefix of a
+     * wider overlay/remap to native kernel behaviour.  See PLAN.md
+     * line 49.  Direction-agnostic: read and write both pass through. */
+    if (r->kind == SUD_OR_PASSTHROUGH) return SUD_OVERLAY_PASSTHROUGH;
 
     /* Simple SUD_REMAP rule: pass through to the single mapping. */
     if (r->simple) {
@@ -578,6 +637,7 @@ int sud_overlay_create_whiteout(const char *path)
     const char *tail;
     const struct sud_overlay_rule *r = find_rule(path, &tail);
     if (!r) return 0;            /* not under overlay — nothing to do */
+    if (r->kind == SUD_OR_PASSTHROUGH) return 0;  /* explicit carve-out */
     if (r->simple) return 0;     /* simple remap has no whiteouts */
     if (!r->upper) return -EROFS;
 
@@ -821,6 +881,11 @@ int sud_overlay_open_dir(const char *path, int flags, int mode)
     const char *tail;
     const struct sud_overlay_rule *r = find_rule(path, &tail);
     if (!r) return SUD_OVERLAY_NO_DIR;
+    /* Passthrough rules carve a sub-prefix out of any wider overlay;
+     * directory opens on them must hit the kernel directly so the
+     * caller (path_remap addin) returns NO_DIR → falls back to the
+     * standard openat code path. */
+    if (r->kind == SUD_OR_PASSTHROUGH) return SUD_OVERLAY_NO_DIR;
     if (r->simple) {
         /* Simple remap: just open the mapped path directly. */
         char buf[PATH_MAX];

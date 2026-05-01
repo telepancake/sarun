@@ -571,6 +571,100 @@ static void test_multi_rule_parsing(void)
     fixture_teardown();
 }
 
+/* PLAN.md line 49 — passthrough rule kind.  Three properties:
+ *
+ *   1. A bare passthrough rule matches the prefix and reports
+ *      PASSTHROUGH (no rewrite, regardless of for_write).
+ *   2. A passthrough rule listed BEFORE a wider overlay rule wins
+ *      for paths inside its sub-prefix — this is the "carve-out"
+ *      idiom users will reach for in practice.
+ *   3. Passthrough is honoured by the *at-syscall resolver too, and
+ *      by the directory-open special case (no synthetic merged dir
+ *      is built — the kernel sees the raw open). */
+static void test_passthrough_rule(void)
+{
+    g_curtest = "passthrough_rule";
+    fixture_setup();
+
+    /* (1) Bare passthrough: just the rule, no overlay/remap. */
+    char spec[PATH_MAX * 2];
+    snprintf(spec, sizeof(spec), "passthrough:%s", g_merged);
+    struct sud_runtime_config cfg;
+    sud_runtime_config_clear(&cfg);
+    cfg.remap_rules[0] = spec;
+    cfg.remap_rule_count = 1;
+    sud_runtime_config_test_install(&cfg);
+    sud_overlay_reset_for_testing();
+    sud_overlay_init();
+    TASSERT_EQ(sud_overlay_rule_count(), 1, "passthrough rule parsed");
+
+    char path[PATH_MAX], out[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/anything", g_merged);
+    int rc = sud_overlay_resolve(path, 0, out, sizeof(out));
+    TASSERT_EQ(rc, SUD_OVERLAY_PASSTHROUGH, "read passes through");
+    rc = sud_overlay_resolve(path, 1, out, sizeof(out));
+    TASSERT_EQ(rc, SUD_OVERLAY_PASSTHROUGH, "write passes through");
+
+    /* Boundary: must match on a path-component boundary (no
+     * "/mergedfoo" matching "/merged"). */
+    char neighbour[PATH_MAX];
+    snprintf(neighbour, sizeof(neighbour), "%s_neighbour/x", g_merged);
+    rc = sud_overlay_resolve(neighbour, 0, out, sizeof(out));
+    TASSERT_EQ(rc, SUD_OVERLAY_PASSTHROUGH, "non-boundary not matched");
+
+    /* (2) Carve-out: passthrough rule listed first wins for its
+     * sub-prefix even though a wider overlay rule covers the parent.
+     * Use an inner subdir of the existing merged tree as the carve. */
+    char carve[PATH_MAX], carve_path[PATH_MAX];
+    char overlay_spec[PATH_MAX * 4], passthrough_spec[PATH_MAX * 2];
+    snprintf(carve, sizeof(carve), "%s/dev", g_merged);
+    snprintf(carve_path, sizeof(carve_path), "%s/null", carve);
+    snprintf(passthrough_spec, sizeof(passthrough_spec),
+             "passthrough:%s", carve);
+    snprintf(overlay_spec, sizeof(overlay_spec),
+             "overlay:%s=%s+%s+%s",
+             g_merged, g_upper, g_lower1, g_lower2);
+    sud_runtime_config_clear(&cfg);
+    /* Order matters: passthrough must come before the overlay rule it
+     * carves out of, since find_rule() returns the first match. */
+    cfg.remap_rules[0] = passthrough_spec;
+    cfg.remap_rules[1] = overlay_spec;
+    cfg.remap_rule_count = 2;
+    sud_runtime_config_test_install(&cfg);
+    sud_overlay_reset_for_testing();
+    sud_overlay_init();
+    TASSERT_EQ(sud_overlay_rule_count(), 2, "carve-out: 2 rules");
+
+    rc = sud_overlay_resolve(carve_path, 0, out, sizeof(out));
+    TASSERT_EQ(rc, SUD_OVERLAY_PASSTHROUGH, "carve-out wins for sub-prefix");
+
+    /* The wider overlay rule still applies to siblings of the carve. */
+    char sibling[PATH_MAX];
+    snprintf(sibling, sizeof(sibling), "%s/etc", g_merged);
+    /* Make sure the upper exists so the resolve path picks an upper
+     * answer (test fixture creates upper as a real dir). */
+    rc = sud_overlay_resolve(sibling, 1, out, sizeof(out));
+    TASSERT_EQ(rc, SUD_OVERLAY_RESOLVED, "overlay still owns siblings");
+
+    /* (3) The *at-form delegates to sud_overlay_resolve; spot-check
+     * that passthrough propagates through it for an absolute path. */
+    rc = sud_overlay_resolve_at(AT_FDCWD, carve_path, 0, out, sizeof(out));
+    TASSERT_EQ(rc, SUD_OVERLAY_PASSTHROUGH, "_at honours passthrough");
+
+    /* Directory open on a passthrough prefix must report NO_DIR so
+     * the caller falls back to a raw kernel openat (no synthetic
+     * merged dir is materialised). */
+    int dfd = sud_overlay_open_dir(carve, O_RDONLY | O_DIRECTORY, 0);
+    TASSERT_EQ(dfd, SUD_OVERLAY_NO_DIR, "open_dir on passthrough = NO_DIR");
+
+    /* create_whiteout on a passthrough prefix is a no-op (returns 0)
+     * — passthrough has no upper layer to mark. */
+    int wo = sud_overlay_create_whiteout(carve_path);
+    TASSERT_EQ(wo, 0, "create_whiteout on passthrough is a no-op");
+
+    fixture_teardown();
+}
+
 /* ---- Driver -------------------------------------------------------- */
 
 int main(int argc, char **argv)
@@ -588,6 +682,7 @@ int main(int argc, char **argv)
     test_merged_directory_listing();
     test_resolve_at_with_dirfd();
     test_multi_rule_parsing();
+    test_passthrough_rule();
 
     if (g_failures) {
         char buf[64];

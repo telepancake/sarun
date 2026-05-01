@@ -72,7 +72,12 @@ static void usage(const char *prog)
         "                                overlayfs-style merged view (repeatable;\n"
         "                                empty <upper> = read-only)\n"
         "  --remap <src>=<dst>           rewrite <src> → <dst> on every path\n"
-        "                                argument (repeatable)\n",
+        "                                argument (repeatable)\n"
+        "  --passthrough <prefix>        carve <prefix> out of any wider\n"
+        "                                --overlay/--remap rule: paths under\n"
+        "                                <prefix> hit the kernel directly\n"
+        "                                (repeatable; list before the wider\n"
+        "                                rule it carves out of)\n",
         prog);
     exit(1);
 }
@@ -619,6 +624,8 @@ int main(int argc, char **argv)
     int         cli_overlay_n = 0;
     const char *cli_remap[SUD_RC_MAX_REMAP_RULES];
     int         cli_remap_n = 0;
+    const char *cli_passthrough[SUD_RC_MAX_REMAP_RULES];
+    int         cli_passthrough_n = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--") == 0) {
@@ -647,6 +654,13 @@ int main(int argc, char **argv)
                 exit(1);
             }
             cli_remap[cli_remap_n++] = argv[++i];
+        } else if (strcmp(argv[i], "--passthrough") == 0 && i + 1 < argc) {
+            if (cli_passthrough_n >= SUD_RC_MAX_REMAP_RULES) {
+                fprintf(stderr, "sudtrace: too many --passthrough rules "
+                                "(max %d)\n", SUD_RC_MAX_REMAP_RULES);
+                exit(1);
+            }
+            cli_passthrough[cli_passthrough_n++] = argv[++i];
         } else if (strcmp(argv[i], "-h") == 0 ||
                    strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
@@ -699,6 +713,22 @@ int main(int argc, char **argv)
         cfg.inramfs_key = strdup(cli_inramfs_key);
     char *minted_key = ir_setup_owned_shm(inramfs_mount, cfg.inramfs_key);
     if (minted_key) cfg.inramfs_key = minted_key;
+
+    /* --passthrough <prefix>  (repeatable)  →  "--remap-rule passthrough:<prefix>".
+     * Emitted BEFORE --overlay / --remap so find_rule()'s first-match-wins
+     * loop picks the passthrough rule when a path lies in a sub-prefix
+     * carved out of a wider overlay/remap. */
+    for (int i = 0; i < cli_passthrough_n; i++) {
+        const char *spec = cli_passthrough[i];
+        size_t slen = strlen(spec);
+        if (slen == 0 ||
+            cfg.remap_rule_count >= SUD_RC_MAX_REMAP_RULES) continue;
+        char *rule = malloc(slen + sizeof("passthrough:") + 1);
+        if (!rule) { fprintf(stderr, "sudtrace: oom\n"); exit(1); }
+        memcpy(rule, "passthrough:", sizeof("passthrough:") - 1);
+        memcpy(rule + sizeof("passthrough:") - 1, spec, slen + 1);
+        cfg.remap_rules[cfg.remap_rule_count++] = rule;
+    }
 
     /* --overlay <spec>  (repeatable)  →  "--remap-rule overlay:<spec>". */
     for (int i = 0; i < cli_overlay_n; i++) {

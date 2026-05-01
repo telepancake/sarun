@@ -13,19 +13,28 @@
  *     marker overlayfs uses) in upper hide the corresponding name in
  *     all lower layers.
  *
- * Configuration via environment variables:
+ * Configuration via wrapper CLI flags (parsed by sud/wrapper.c into
+ * g_sud_runtime_config; --remap-rule may be repeated):
  *
- *   SUD_OVERLAY=<merged>=<upper>+<lower1>[+<lower2>...][:<rule2>...]
+ *   --remap-rule overlay:<merged>=<upper>+<lower1>[+<lower2>...]
  *       Full overlay rule.  The first path after `=` is the upper
  *       (writable) layer.  Each `+`-separated path that follows is a
  *       lower (read-only) layer, in priority order.  An empty upper
- *       (`<merged>=+<lower1>+<lower2>`) makes the rule read-only:
- *       writes return -EROFS.
+ *       (`overlay:<merged>=+<lower1>+<lower2>`) makes the rule
+ *       read-only: writes return -EROFS.
  *
- *   SUD_REMAP=<src>=<dst>[:<rule2>...]
- *       Backwards-compatible single-layer remap (treated as a degenerate
- *       overlay rule with `dst` as both upper and the only lower —
- *       i.e. simple bidirectional path rewriting).
+ *   --remap-rule remap:<src>=<dst>
+ *       Single-layer remap (treated as a degenerate overlay rule with
+ *       `dst` as both upper and the only lower — i.e. simple
+ *       bidirectional path rewriting).
+ *
+ *   --remap-rule passthrough:<prefix>
+ *       Explicit "leave the syscall arg untouched" rule for any path
+ *       under <prefix>.  Useful as an escape hatch for sub-prefixes
+ *       of a wider overlay/remap rule: list the passthrough rule
+ *       BEFORE the wider rule so find_rule()'s first-match-wins loop
+ *       picks it.  Has no upper/lowers; for_write is irrelevant
+ *       (read and write both pass through identically).
  *
  * All overlay rule paths must be absolute and contain no trailing
  * slash; the merged prefix is matched on a path-component boundary so
