@@ -86,7 +86,7 @@ SUD_SRCS    += sud/trace/event.c sud/trace/addin.c
 endif
 ifneq ($(filter sud/path_remap,$(SUD_ADDINS)),)
 SUD_CFLAGS  += -DSUD_ADDIN_PATH_REMAP
-SUD_SRCS    += sud/path_remap/addin.c sud/path_remap/overlay.c sud/path_remap/path.c
+SUD_SRCS    += sud/path_remap/addin.c sud/path_remap/overlay.c sud/path_remap/path.c sud/path_remap/fakeroot.c
 endif
 ifneq ($(filter sud/inramfs,$(SUD_ADDINS)),)
 SUD_CFLAGS  += -DSUD_ADDIN_INRAMFS
@@ -190,12 +190,15 @@ libc-fs-test:
 # specific bug in path resolution / stat layout / syscall numbering
 # is caught in CI before the wrapper goes near a traced program.
 PATH_REMAP_TEST_SRCS := sud/path_remap/tests/test_overlay.c \
+                        sud/path_remap/tests/test_fakeroot.c \
                         sud/path_remap/overlay.c \
                         sud/path_remap/path.c \
+                        sud/path_remap/fakeroot.c \
                         sud/runtime_config.c \
                         libc-fs/libc.c libc-fs/deps/printf/printf.c
 PATH_REMAP_TEST_HDRS := sud/path_remap/overlay.h \
                         sud/path_remap/path.h \
+                        sud/path_remap/fakeroot.h \
                         sud/runtime_config.h \
                         libc-fs/libc.h libc-fs/fmt.h
 .PHONY: path-remap-test
@@ -228,8 +231,9 @@ DISPATCH_TEST_COMMON_SRCS := sud/path_remap/tests/test_dispatcher.c \
                              sud/addin.c \
                              sud/runtime_config.c \
                              libc-fs/libc.c libc-fs/deps/printf/printf.c
-DISPATCH_TEST_PATHREMAP_SRCS := sud/path_remap/addin.c sud/path_remap/overlay.c sud/path_remap/path.c
+DISPATCH_TEST_PATHREMAP_SRCS := sud/path_remap/addin.c sud/path_remap/overlay.c sud/path_remap/path.c sud/path_remap/fakeroot.c
 DISPATCH_TEST_HDRS := sud/addin.h sud/path_remap/overlay.h sud/path_remap/path.h \
+                      sud/path_remap/fakeroot.h \
                       sud/runtime_config.h \
                       libc-fs/libc.h libc-fs/fmt.h
 

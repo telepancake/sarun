@@ -77,7 +77,13 @@ static void usage(const char *prog)
         "                                --overlay/--remap rule: paths under\n"
         "                                <prefix> hit the kernel directly\n"
         "                                (repeatable; list before the wider\n"
-        "                                rule it carves out of)\n",
+        "                                rule it carves out of)\n"
+        "  --fakeroot <prefix>           pretend the traced process is uid 0\n"
+        "                                under <prefix>: chown/chmod succeed\n"
+        "                                without touching the kernel, stat\n"
+        "                                returns the recorded uid/gid/mode,\n"
+        "                                geteuid()/getuid()/&c return 0\n"
+        "                                process-wide (repeatable)\n",
         prog);
     exit(1);
 }
@@ -626,6 +632,8 @@ int main(int argc, char **argv)
     int         cli_remap_n = 0;
     const char *cli_passthrough[SUD_RC_MAX_REMAP_RULES];
     int         cli_passthrough_n = 0;
+    const char *cli_fakeroot[SUD_RC_MAX_REMAP_RULES];
+    int         cli_fakeroot_n = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--") == 0) {
@@ -661,6 +669,13 @@ int main(int argc, char **argv)
                 exit(1);
             }
             cli_passthrough[cli_passthrough_n++] = argv[++i];
+        } else if (strcmp(argv[i], "--fakeroot") == 0 && i + 1 < argc) {
+            if (cli_fakeroot_n >= SUD_RC_MAX_REMAP_RULES) {
+                fprintf(stderr, "sudtrace: too many --fakeroot rules "
+                                "(max %d)\n", SUD_RC_MAX_REMAP_RULES);
+                exit(1);
+            }
+            cli_fakeroot[cli_fakeroot_n++] = argv[++i];
         } else if (strcmp(argv[i], "-h") == 0 ||
                    strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
@@ -740,6 +755,24 @@ int main(int argc, char **argv)
         if (!rule) { fprintf(stderr, "sudtrace: oom\n"); exit(1); }
         memcpy(rule, "overlay:", sizeof("overlay:") - 1);
         memcpy(rule + sizeof("overlay:") - 1, spec, slen + 1);
+        cfg.remap_rules[cfg.remap_rule_count++] = rule;
+    }
+
+    /* --fakeroot <prefix>  (repeatable)  →  "--remap-rule fakeroot:<prefix>".
+     * Path resolution under fakeroot is pure passthrough; what changes is
+     * metadata (chown/chmod recorded, stat patched, geteuid/&c forced to 0).
+     * Emitted ahead of --remap so a path that lives under both a fakeroot
+     * prefix and a remap rule still sees the remap (the addins consume
+     * fakeroot rules independently of overlay's first-match-wins loop). */
+    for (int i = 0; i < cli_fakeroot_n; i++) {
+        const char *spec = cli_fakeroot[i];
+        size_t slen = strlen(spec);
+        if (slen == 0 ||
+            cfg.remap_rule_count >= SUD_RC_MAX_REMAP_RULES) continue;
+        char *rule = malloc(slen + sizeof("fakeroot:") + 1);
+        if (!rule) { fprintf(stderr, "sudtrace: oom\n"); exit(1); }
+        memcpy(rule, "fakeroot:", sizeof("fakeroot:") - 1);
+        memcpy(rule + sizeof("fakeroot:") - 1, spec, slen + 1);
         cfg.remap_rules[cfg.remap_rule_count++] = rule;
     }
 

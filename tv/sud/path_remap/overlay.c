@@ -311,10 +311,12 @@ void sud_overlay_init(void)
                  r[3]=='s' && r[4]=='t' && r[5]=='h' && r[6]=='r' &&
                  r[7]=='o' && r[8]=='u' && r[9]=='g' && r[10]=='h')
             parse_passthrough_segment(spec, slen);
-        /* "inramfs" / "fakeroot": inramfs is owned by the inramfs
-         * addin (which reads its rule from runtime_config directly);
-         * fakeroot is PLAN-line-57 future work.  Both are silently
-         * ignored here. */
+        /* "inramfs" / "fakeroot": each is owned by a separate layer
+         * that reads its slice of the runtime config independently
+         * (sud/inramfs/super.c for inramfs; sud/path_remap/fakeroot.c
+         * for fakeroot — see PLAN.md line 57).  Both are silently
+         * ignored here so overlay.c stays focused on path-rewriting
+         * rule kinds. */
     }
 }
 

@@ -26,6 +26,7 @@
 #include "sud/raw.h"
 #include "sud/path_remap/overlay.h"
 #include "sud/path_remap/path.h"
+#include "sud/path_remap/fakeroot.h"
 #ifdef SUD_ADDIN_INRAMFS
 #include "sud/inramfs/inramfs.h"
 #include "sud/inramfs/path_ops.h"
@@ -168,6 +169,371 @@ static void path_remap_init(void)
 {
     sud_overlay_init();
     sud_pr_path_init();
+    sud_fakeroot_init();
+}
+
+/* ---- fakeroot helpers --------------------------------------------
+ *
+ * fakeroot is "passthrough for path resolution but tags the ticket
+ * with uid/gid override metadata that the dispatcher applies to stat/
+ * chown short-circuits" (PLAN.md line 57).  In practice that means:
+ *
+ *   - chown / lchown / fchownat under a fakeroot prefix → record the
+ *     intended uid/gid (keyed by the file's dev+ino) and short-
+ *     circuit the syscall with success.  The on-disk metadata is not
+ *     touched (the real user typically can't chmod files they don't
+ *     own); the override is replayed on every subsequent stat.
+ *   - chmod / fchmodat similarly record permission bits.
+ *   - stat / lstat / fstat / newfstatat / fstatat64 in post_syscall
+ *     re-read dev/ino from the kernel-filled buffer and patch
+ *     uid/gid/mode in place if an override exists.
+ *   - getuid / geteuid / getgid / getegid / getresuid / getresgid
+ *     return 0 unconditionally while fakeroot is active, so that
+ *     ownership-gating code paths (`if (geteuid() == 0) chown(...)`)
+ *     take the root-only branch.
+ *   - setuid / seteuid / setgid / setegid / setresuid / setresgid
+ *     return 0 (success) without invoking the kernel; real-fakeroot
+ *     similarly no-ops these so that suid-changing helpers don't
+ *     abort when running as a non-root user.
+ *
+ * fchown/fchmod (fd-based, no path) are not intercepted in this first
+ * cut: there is no path to test against the prefix.  Documented
+ * limitation; can be lifted by piping the call through
+ * sud_pr_dirfd_lookup() once the dirfd table grows to cover plain
+ * file fds (today it's directory-only).
+ */
+
+/* Stat the path identified by (dirfd, path) and write dev/ino into
+ * the out-parameters.  Honours AT_SYMLINK_NOFOLLOW (we always pass it
+ * — chown/chmod operate on the link itself when LINK is set).  All
+ * filesystem ops go through raw_syscall6 because we run inside the
+ * SIGSYS handler.  Returns 0 / -errno.
+ *
+ * The returned dev/ino are the kernel's identification of the file —
+ * the same values it will later write into a stat buffer that
+ * fakeroot_patch_kernel_stat consumes — so overrides keyed here will
+ * be found there. */
+static long fr_stat_devino(int dirfd, const char *path, int follow,
+                           unsigned long long *dev_out,
+                           unsigned long long *ino_out)
+{
+#if defined(__x86_64__)
+    struct {
+        unsigned long long dev;
+        unsigned long long ino;
+        unsigned long long _pad[20];
+    } st = {0, 0, {0}};
+#  ifdef SYS_newfstatat
+    long rc = raw_syscall6(SYS_newfstatat, dirfd, (long)path, (long)&st,
+                           follow ? 0 : AT_SYMLINK_NOFOLLOW, 0, 0);
+#  else
+    long rc = -ENOSYS;
+#  endif
+    if (rc < 0) return rc;
+    *dev_out = st.dev;
+    *ino_out = st.ino;
+    return 0;
+#else
+    /* i386: use fstatat64 with the stat64 layout — st_dev is at off 0
+     * and the 64-bit st_ino sits at offset 64 (the trailing field
+     * after the legacy 32-bit __st_ino padding). */
+    unsigned long long buf[24];
+    for (int i = 0; i < 24; i++) buf[i] = 0;
+#  ifdef SYS_fstatat64
+    long rc = raw_syscall6(SYS_fstatat64, dirfd, (long)path, (long)buf,
+                           follow ? 0 : AT_SYMLINK_NOFOLLOW, 0, 0);
+#  else
+    long rc = -ENOSYS;
+#  endif
+    if (rc < 0) return rc;
+    *dev_out = buf[0];
+    *ino_out = buf[8];        /* offset 64 / 8 = 8 (in 8-byte units) */
+    return 0;
+#endif
+}
+
+/* Run the fakeroot pre_syscall path for chown/chmod/getuid&c.  If we
+ * decide to short-circuit, we set ctx->ret and return 1; otherwise we
+ * return 0 and let the rest of the dispatcher run.
+ *
+ * Args are inspected from ctx->args[].  The path resolution to
+ * absolute form (for the prefix check) goes through sud_pr_absolutise
+ * so that AT_FDCWD / dirfd-relative chowns map to the same logical
+ * path the rest of the dispatcher uses. */
+static int fr_handle_chown(struct sud_syscall_ctx *ctx, int dirfd,
+                           const char *path, int uid, int gid, int follow)
+{
+    if (!path || !path[0]) return short_circuit(ctx, -EFAULT);
+    char abs[PATH_MAX];
+    int rc = sud_pr_absolutise(dirfd, path, abs, sizeof(abs));
+    if (rc < 0) return 0;     /* let the kernel deal with bad paths */
+    if (!sud_fakeroot_match(abs)) return 0;
+    unsigned long long dev = 0, ino = 0;
+    long sr = fr_stat_devino(dirfd, path, follow, &dev, &ino);
+    if (sr < 0) return short_circuit(ctx, sr);
+    sud_fakeroot_record_chown(dev, ino, uid, gid);
+    return short_circuit(ctx, 0);
+}
+
+static int fr_handle_chmod(struct sud_syscall_ctx *ctx, int dirfd,
+                           const char *path, unsigned int mode, int follow)
+{
+    if (!path || !path[0]) return short_circuit(ctx, -EFAULT);
+    char abs[PATH_MAX];
+    int rc = sud_pr_absolutise(dirfd, path, abs, sizeof(abs));
+    if (rc < 0) return 0;
+    if (!sud_fakeroot_match(abs)) return 0;
+    unsigned long long dev = 0, ino = 0;
+    long sr = fr_stat_devino(dirfd, path, follow, &dev, &ino);
+    if (sr < 0) return short_circuit(ctx, sr);
+    sud_fakeroot_record_chmod(dev, ino, mode);
+    return short_circuit(ctx, 0);
+}
+
+/* fakeroot pre_syscall dispatcher — invoked unconditionally before
+ * the overlay-rule fast-path so it works in a fakeroot-only build
+ * (no overlay rules registered).  Returns 1 on short-circuit. */
+static int fakeroot_pre_syscall(struct sud_syscall_ctx *ctx)
+{
+    if (!sud_fakeroot_active()) return 0;
+    long nr = ctx->nr;
+
+    /* uid / gid getters — return 0 process-wide while fakeroot is on.
+     * The single getter syscalls (getuid/geteuid/getgid/getegid) take
+     * no args; getresuid/getresgid take three uid_t* out-params and
+     * we have to write all three.  Writing them as 0 makes the
+     * "running as root" illusion consistent. */
+#ifdef __NR_getuid
+    if (nr == __NR_getuid)  return short_circuit(ctx, 0);
+#endif
+#ifdef __NR_geteuid
+    if (nr == __NR_geteuid) return short_circuit(ctx, 0);
+#endif
+#ifdef __NR_getgid
+    if (nr == __NR_getgid)  return short_circuit(ctx, 0);
+#endif
+#ifdef __NR_getegid
+    if (nr == __NR_getegid) return short_circuit(ctx, 0);
+#endif
+#ifdef __NR_getuid32
+    if (nr == __NR_getuid32)  return short_circuit(ctx, 0);
+#endif
+#ifdef __NR_geteuid32
+    if (nr == __NR_geteuid32) return short_circuit(ctx, 0);
+#endif
+#ifdef __NR_getgid32
+    if (nr == __NR_getgid32)  return short_circuit(ctx, 0);
+#endif
+#ifdef __NR_getegid32
+    if (nr == __NR_getegid32) return short_circuit(ctx, 0);
+#endif
+#ifdef __NR_getresuid
+    if (nr == __NR_getresuid) {
+        unsigned int *r = (unsigned int *)ctx->args[0];
+        unsigned int *e = (unsigned int *)ctx->args[1];
+        unsigned int *s = (unsigned int *)ctx->args[2];
+        if (r) *r = 0;
+        if (e) *e = 0;
+        if (s) *s = 0;
+        return short_circuit(ctx, 0);
+    }
+#endif
+#ifdef __NR_getresgid
+    if (nr == __NR_getresgid) {
+        unsigned int *r = (unsigned int *)ctx->args[0];
+        unsigned int *e = (unsigned int *)ctx->args[1];
+        unsigned int *s = (unsigned int *)ctx->args[2];
+        if (r) *r = 0;
+        if (e) *e = 0;
+        if (s) *s = 0;
+        return short_circuit(ctx, 0);
+    }
+#endif
+#ifdef __NR_getresuid32
+    if (nr == __NR_getresuid32) {
+        unsigned int *r = (unsigned int *)ctx->args[0];
+        unsigned int *e = (unsigned int *)ctx->args[1];
+        unsigned int *s = (unsigned int *)ctx->args[2];
+        if (r) *r = 0;
+        if (e) *e = 0;
+        if (s) *s = 0;
+        return short_circuit(ctx, 0);
+    }
+#endif
+#ifdef __NR_getresgid32
+    if (nr == __NR_getresgid32) {
+        unsigned int *r = (unsigned int *)ctx->args[0];
+        unsigned int *e = (unsigned int *)ctx->args[1];
+        unsigned int *s = (unsigned int *)ctx->args[2];
+        if (r) *r = 0;
+        if (e) *e = 0;
+        if (s) *s = 0;
+        return short_circuit(ctx, 0);
+    }
+#endif
+
+    /* uid / gid setters — accept any value and report success without
+     * touching the kernel.  Real fakeroot does the same (a non-root
+     * process can't actually setuid; pretending success keeps suid-
+     * aware build steps from aborting). */
+#ifdef __NR_setuid
+    if (nr == __NR_setuid)   return short_circuit(ctx, 0);
+#endif
+#ifdef __NR_seteuid
+    if (nr == __NR_seteuid)  return short_circuit(ctx, 0);
+#endif
+#ifdef __NR_setgid
+    if (nr == __NR_setgid)   return short_circuit(ctx, 0);
+#endif
+#ifdef __NR_setegid
+    if (nr == __NR_setegid)  return short_circuit(ctx, 0);
+#endif
+#ifdef __NR_setresuid
+    if (nr == __NR_setresuid) return short_circuit(ctx, 0);
+#endif
+#ifdef __NR_setresgid
+    if (nr == __NR_setresgid) return short_circuit(ctx, 0);
+#endif
+#ifdef __NR_setreuid
+    if (nr == __NR_setreuid)  return short_circuit(ctx, 0);
+#endif
+#ifdef __NR_setregid
+    if (nr == __NR_setregid)  return short_circuit(ctx, 0);
+#endif
+#ifdef __NR_setuid32
+    if (nr == __NR_setuid32)   return short_circuit(ctx, 0);
+#endif
+#ifdef __NR_seteuid32
+    if (nr == __NR_seteuid32)  return short_circuit(ctx, 0);
+#endif
+#ifdef __NR_setgid32
+    if (nr == __NR_setgid32)   return short_circuit(ctx, 0);
+#endif
+#ifdef __NR_setegid32
+    if (nr == __NR_setegid32)  return short_circuit(ctx, 0);
+#endif
+#ifdef __NR_setresuid32
+    if (nr == __NR_setresuid32) return short_circuit(ctx, 0);
+#endif
+#ifdef __NR_setresgid32
+    if (nr == __NR_setresgid32) return short_circuit(ctx, 0);
+#endif
+
+    /* chown family.  We need (path, dirfd, uid, gid, follow_links). */
+#ifdef __NR_chown
+    if (nr == __NR_chown)
+        return fr_handle_chown(ctx, AT_FDCWD,
+                               (const char *)ctx->args[0],
+                               (int)ctx->args[1], (int)ctx->args[2], 1);
+#endif
+#ifdef __NR_lchown
+    if (nr == __NR_lchown)
+        return fr_handle_chown(ctx, AT_FDCWD,
+                               (const char *)ctx->args[0],
+                               (int)ctx->args[1], (int)ctx->args[2], 0);
+#endif
+#ifdef __NR_chown32
+    if (nr == __NR_chown32)
+        return fr_handle_chown(ctx, AT_FDCWD,
+                               (const char *)ctx->args[0],
+                               (int)ctx->args[1], (int)ctx->args[2], 1);
+#endif
+#ifdef __NR_lchown32
+    if (nr == __NR_lchown32)
+        return fr_handle_chown(ctx, AT_FDCWD,
+                               (const char *)ctx->args[0],
+                               (int)ctx->args[1], (int)ctx->args[2], 0);
+#endif
+#ifdef __NR_fchownat
+    if (nr == __NR_fchownat) {
+        int flags  = (int)ctx->args[4];
+        int follow = (flags & AT_SYMLINK_NOFOLLOW) ? 0 : 1;
+        return fr_handle_chown(ctx, (int)ctx->args[0],
+                               (const char *)ctx->args[1],
+                               (int)ctx->args[2], (int)ctx->args[3], follow);
+    }
+#endif
+
+    /* chmod family. */
+#ifdef __NR_chmod
+    if (nr == __NR_chmod)
+        return fr_handle_chmod(ctx, AT_FDCWD,
+                               (const char *)ctx->args[0],
+                               (unsigned int)ctx->args[1], 1);
+#endif
+#ifdef __NR_fchmodat
+    if (nr == __NR_fchmodat) {
+        /* fchmodat's flags arg is largely ignored by the kernel
+         * (AT_SYMLINK_NOFOLLOW is unsupported and returns ENOTSUP);
+         * we treat it as follow=1 to match kernel behaviour. */
+        return fr_handle_chmod(ctx, (int)ctx->args[0],
+                               (const char *)ctx->args[1],
+                               (unsigned int)ctx->args[2], 1);
+    }
+#endif
+
+    return 0;
+}
+
+/* fakeroot post_syscall — patch stat-family results in place using
+ * the override table.  Runs after the kernel call (or after a
+ * passthrough short-circuit by another addin) so the user buffer is
+ * already populated.  No-op when the call failed (ctx->ret < 0) or
+ * when there's no matching override. */
+static void fakeroot_post_syscall(const struct sud_syscall_ctx *ctx)
+{
+    if (!sud_fakeroot_active()) return;
+    if (ctx->ret < 0) return;
+    long nr = ctx->nr;
+
+#ifdef SYS_newfstatat
+    if (nr == SYS_newfstatat) {
+        sud_fakeroot_patch_kernel_stat((void *)ctx->args[2]);
+        return;
+    }
+#endif
+#ifdef __NR_stat
+    if (nr == __NR_stat) {
+        sud_fakeroot_patch_kernel_stat((void *)ctx->args[1]);
+        return;
+    }
+#endif
+#ifdef __NR_lstat
+    if (nr == __NR_lstat) {
+        sud_fakeroot_patch_kernel_stat((void *)ctx->args[1]);
+        return;
+    }
+#endif
+#ifdef __NR_fstat
+    if (nr == __NR_fstat) {
+        sud_fakeroot_patch_kernel_stat((void *)ctx->args[1]);
+        return;
+    }
+#endif
+#ifdef __NR_fstatat64
+    if (nr == __NR_fstatat64) {
+        sud_fakeroot_patch_kernel_stat64((void *)ctx->args[2]);
+        return;
+    }
+#endif
+#ifdef __NR_stat64
+    if (nr == __NR_stat64) {
+        sud_fakeroot_patch_kernel_stat64((void *)ctx->args[1]);
+        return;
+    }
+#endif
+#ifdef __NR_lstat64
+    if (nr == __NR_lstat64) {
+        sud_fakeroot_patch_kernel_stat64((void *)ctx->args[1]);
+        return;
+    }
+#endif
+#ifdef __NR_fstat64
+    if (nr == __NR_fstat64) {
+        sud_fakeroot_patch_kernel_stat64((void *)ctx->args[1]);
+        return;
+    }
+#endif
 }
 
 /* ---- chdir / getcwd / fchdir interception -----------------------
@@ -317,6 +683,12 @@ static int path_remap_pre_syscall(struct sud_syscall_ctx *ctx)
 #ifdef SUD_ADDIN_INRAMFS
     if (sud_pr_inramfs_route_pre_syscall(ctx)) return 1;
 #endif
+
+    /* fakeroot pre_syscall — intercept chown/chmod under a fakeroot
+     * prefix and the global geteuid/setuid family.  Runs ahead of the
+     * overlay-rule fast-path so a fakeroot-only configuration (no
+     * overlay rules) still gets its hooks. */
+    if (fakeroot_pre_syscall(ctx)) return 1;
 
     if (sud_overlay_rule_count() == 0) return 0;
 
@@ -701,5 +1073,5 @@ const struct sud_addin sud_path_remap_addin = {
     0,
     0,
     path_remap_pre_syscall,
-    0,
+    fakeroot_post_syscall,
 };

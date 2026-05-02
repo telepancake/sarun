@@ -667,6 +667,11 @@ static void test_passthrough_rule(void)
 
 /* ---- Driver -------------------------------------------------------- */
 
+/* Exposed by sud/path_remap/tests/test_fakeroot.c — linked into the
+ * same binary so a single test invocation covers the full path_remap
+ * surface. */
+extern int run_fakeroot_tests(void);
+
 int main(int argc, char **argv)
 {
     (void)argc; (void)argv;
@@ -684,10 +689,12 @@ int main(int argc, char **argv)
     test_multi_rule_parsing();
     test_passthrough_rule();
 
-    if (g_failures) {
+    int fr_fail = run_fakeroot_tests();
+
+    if (g_failures || fr_fail) {
         char buf[64];
         snprintf(buf, sizeof(buf),
-                 "overlay test: %d failure(s)\n", g_failures);
+                 "overlay test: %d failure(s)\n", g_failures + fr_fail);
         test_log(buf);
         return 1;
     }
