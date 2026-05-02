@@ -54,6 +54,7 @@ void sud_addins_post_syscall(const struct sud_syscall_ctx *ctx);
 
 extern const struct sud_addin sud_trace_addin;
 extern const struct sud_addin sud_path_remap_addin;
+extern const struct sud_addin sud_fake_exec_addin;
 extern const struct sud_addin sud_inramfs_addin;
 
 #endif /* SUD_ADDIN_H */

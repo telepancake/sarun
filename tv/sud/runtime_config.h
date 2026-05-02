@@ -14,6 +14,8 @@
  *              [--trace-outfile <abs>]
  *              [--inramfs-key <key>] [--inramfs-meta-mb <N>]
  *              [--remap-rule <kind>:<spec>]   (repeatable)
+ *              [--fake-exec off]
+ *              [--fake-exec-deny <basename>]  (repeatable)
  *              /path/to/binary [args...]
  *
  * Parsing terminates at the first non-flag argument (the target
@@ -51,12 +53,15 @@
 
 #include <stddef.h>
 
-#define SUD_RC_MAX_REMAP_RULES 64
+#define SUD_RC_MAX_REMAP_RULES     64
+#define SUD_RC_MAX_FAKE_EXEC_DENY  32
 
 /* Upper bound on the number of argv slots a fully-loaded config can
  * emit (used by callers to size buffers).  Each remap rule consumes
- * 2 slots ("--remap-rule" + spec); other flags consume at most 12. */
-#define SUD_RC_MAX_EMIT_ARGS  (12 + SUD_RC_MAX_REMAP_RULES * 2)
+ * 2 slots ("--remap-rule" + spec); each fake-exec-deny consumes 2
+ * slots; other flags consume at most 14. */
+#define SUD_RC_MAX_EMIT_ARGS  (14 + SUD_RC_MAX_REMAP_RULES * 2 \
+                                  + SUD_RC_MAX_FAKE_EXEC_DENY * 2)
 
 struct sud_runtime_config {
     int         no_env;             /* 1 if --no-env present          */
@@ -73,6 +78,15 @@ struct sud_runtime_config {
      * Pointers refer to argv (parser) or to the caller's storage
      * (snapshot).  No ownership is transferred. */
     const char *remap_rules[SUD_RC_MAX_REMAP_RULES];
+
+    /* fake-exec addin: skip executing trivial child processes.
+     *   fake_exec_off       1 if "--fake-exec off" present (disable addin)
+     *   fake_exec_deny[]    list of builtin basenames to skip emulating
+     *                       (e.g. "true", "echo"); each entry from
+     *                       a "--fake-exec-deny <basename>" pair. */
+    int         fake_exec_off;
+    int         fake_exec_deny_count;
+    const char *fake_exec_deny[SUD_RC_MAX_FAKE_EXEC_DENY];
 };
 
 /* Reset cfg to all-zero defaults. */

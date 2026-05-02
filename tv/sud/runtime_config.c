@@ -64,6 +64,10 @@ void sud_runtime_config_clear(struct sud_runtime_config *cfg)
     cfg->remap_rule_count   = 0;
     for (int i = 0; i < SUD_RC_MAX_REMAP_RULES; i++)
         cfg->remap_rules[i] = 0;
+    cfg->fake_exec_off       = 0;
+    cfg->fake_exec_deny_count = 0;
+    for (int i = 0; i < SUD_RC_MAX_FAKE_EXEC_DENY; i++)
+        cfg->fake_exec_deny[i] = 0;
 }
 
 int sud_runtime_config_parse(int argc, char **argv, int *argi,
@@ -116,6 +120,25 @@ int sud_runtime_config_parse(int argc, char **argv, int *argi,
             if (i + 1 >= argc || !argv[i + 1]) return -1;
             if (cfg->remap_rule_count >= SUD_RC_MAX_REMAP_RULES) return -1;
             cfg->remap_rules[cfg->remap_rule_count++] = argv[i + 1];
+            i += 2;
+            continue;
+        }
+        if (rc_streq(a, "--fake-exec")) {
+            if (i + 1 >= argc || !argv[i + 1]) return -1;
+            /* Only "off" is recognised; future values may turn the
+             * addin back on with specific tuning. */
+            if (rc_streq(argv[i + 1], "off"))
+                cfg->fake_exec_off = 1;
+            else
+                cfg->fake_exec_off = 0;
+            i += 2;
+            continue;
+        }
+        if (rc_streq(a, "--fake-exec-deny")) {
+            if (i + 1 >= argc || !argv[i + 1]) return -1;
+            if (cfg->fake_exec_deny_count >= SUD_RC_MAX_FAKE_EXEC_DENY)
+                return -1;
+            cfg->fake_exec_deny[cfg->fake_exec_deny_count++] = argv[i + 1];
             i += 2;
             continue;
         }
@@ -186,6 +209,16 @@ int sud_runtime_config_emit(const struct sud_runtime_config *cfg,
         EMIT2("--remap-rule", cfg->remap_rules[i]);
     }
 
+    if (cfg->fake_exec_off)
+        EMIT2("--fake-exec", "off");
+
+    int dcount = cfg->fake_exec_deny_count;
+    if (dcount > SUD_RC_MAX_FAKE_EXEC_DENY) dcount = SUD_RC_MAX_FAKE_EXEC_DENY;
+    for (int i = 0; i < dcount; i++) {
+        if (!cfg->fake_exec_deny[i] || !cfg->fake_exec_deny[i][0]) continue;
+        EMIT2("--fake-exec-deny", cfg->fake_exec_deny[i]);
+    }
+
     #undef EMIT1
     #undef EMIT2
     return n;
@@ -219,6 +252,12 @@ void sud_runtime_config_intern(struct sud_runtime_config *cfg)
     for (int i = 0; i < rcount; i++) {
         if (cfg->remap_rules[i] && cfg->remap_rules[i][0])
             cfg->remap_rules[i] = rc_strdup(cfg->remap_rules[i]);
+    }
+    int dcount = cfg->fake_exec_deny_count;
+    if (dcount > SUD_RC_MAX_FAKE_EXEC_DENY) dcount = SUD_RC_MAX_FAKE_EXEC_DENY;
+    for (int i = 0; i < dcount; i++) {
+        if (cfg->fake_exec_deny[i] && cfg->fake_exec_deny[i][0])
+            cfg->fake_exec_deny[i] = rc_strdup(cfg->fake_exec_deny[i]);
     }
 }
 

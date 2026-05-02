@@ -8,7 +8,7 @@ MOK_CER ?= $(PWD)/MOK.der
 all: tv sudtrace upttrace sud-bins mod-bins
 
 .PHONY: sud-bins mod-bins
-sud-bins: path-remap-test dispatcher-test inramfs-test
+sud-bins: path-remap-test dispatcher-test inramfs-test fake-exec-test
 	$(MAKE) $(SUD_NATIVE)
 
 mod-bins:
@@ -46,6 +46,7 @@ clean:
 	rm -f build/dispatcher_test_pathremap32 build/dispatcher_test_pathremap64
 	rm -f build/dispatcher_test_trace32 build/dispatcher_test_trace64
 	rm -f build/inramfs_test32 build/inramfs_test64
+	rm -f build/fake_exec_test32 build/fake_exec_test64
 
 install:
 	$(MAKE) -C $(MOD_DIR) install
@@ -87,6 +88,10 @@ endif
 ifneq ($(filter sud/path_remap,$(SUD_ADDINS)),)
 SUD_CFLAGS  += -DSUD_ADDIN_PATH_REMAP
 SUD_SRCS    += sud/path_remap/addin.c sud/path_remap/overlay.c sud/path_remap/path.c sud/path_remap/fakeroot.c
+endif
+ifneq ($(filter sud/fake-exec,$(SUD_ADDINS)),)
+SUD_CFLAGS  += -DSUD_ADDIN_FAKE_EXEC
+SUD_SRCS    += sud/fake-exec/addin.c sud/fake-exec/builtins.c sud/fake-exec/detect.c
 endif
 ifneq ($(filter sud/inramfs,$(SUD_ADDINS)),)
 SUD_CFLAGS  += -DSUD_ADDIN_INRAMFS
@@ -358,6 +363,27 @@ build/inramfs_test32: $(INRAMFS_TEST_SRCS) $(INRAMFS_TEST_HDRS)
 	@mkdir -p build
 	$(CC) -m32 $(SUD_CFLAGS) -DSUD_ADDIN_INRAMFS $(SUD_LDFLAGS) \
 	    -o $@ $(INRAMFS_TEST_SRCS) -lgcc
+
+# fake-exec addin self-tests.  Pure-function tests over the classifier
+# and the builtin registry; the SYS_exit-emitting addin path is exercised
+# end-to-end by tests/sudtrace_test.sh, not here.
+FAKE_EXEC_TEST_SRCS := sud/fake-exec/tests/test_fake_exec.c \
+                       sud/fake-exec/detect.c \
+                       sud/fake-exec/builtins.c \
+                       sud/runtime_config.c \
+                       libc-fs/libc.c libc-fs/deps/printf/printf.c
+FAKE_EXEC_TEST_HDRS := sud/fake-exec/fake_exec.h sud/fake-exec/builtins.h \
+                       sud/addin.h sud/runtime_config.h \
+                       libc-fs/libc.h libc-fs/fmt.h
+.PHONY: fake-exec-test
+fake-exec-test: build/fake_exec_test64
+	@echo '--- running 64-bit fake-exec tests ---'
+	./build/fake_exec_test64
+
+build/fake_exec_test64: $(FAKE_EXEC_TEST_SRCS) $(FAKE_EXEC_TEST_HDRS)
+	@mkdir -p build
+	$(CC) -m64 $(SUD_CFLAGS) -DSUD_ADDIN_FAKE_EXEC $(SUD_LDFLAGS) \
+	    -o $@ $(FAKE_EXEC_TEST_SRCS) -lgcc
 
 .PHONY: all keygen sign load unload clean clean-bins install test
 test: tv libc-fs-test
