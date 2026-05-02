@@ -184,3 +184,197 @@ sud/inramfs/ is a self-contained inode/data store, ~30% smaller, with no string 
 sud/path_remap/ becomes the universal path layer; its rule model is general enough to express simple remap, overlay (CoW + whiteouts), inramfs placement, and a clean seam for fakeroot semantics.
 
 sud32/sud64 have a single, documented CLI; configuration is fully reproducible from /proc/<pid>/cmdline of any wrapper process; no SUD_* environment variable is read or written anywhere in sud/.
+
+
+
+Part 3 — Grow sud/fake-exec/ from MVP into the full elision layer
+
+Status (after commit 5f9b2e5)
+
+The skeleton has shipped:
+
+sud/fake-exec/ exists, registers between path_remap and inramfs, and elides SYS_execve / SYS_execveat for /usr/bin/{true,false,:} (+ /bin/ aliases) by issuing a per-task SYS_exit from inside the SIGSYS handler.  Vfork-safe (raw syscalls only, no heap, no globals).  Trace fidelity preserved — trace addin runs first and records EXEC/EXIT from the program's view.  Wrapper CLI flags --fake-exec off and --fake-exec-deny <basename> propagate through sud_runtime_config_emit so every child wrapper inherits the same behaviour without touching envp.  Verified end-to-end: 200× /usr/bin/true under sudtrace runs in 120 ms vs 232 ms for untraced real true (we skip the helper's ELF load + libc init each iteration).
+
+What is intentionally NOT in the MVP, listed in the order Part 3 should land:
+
+
+Step A — Track B: full posix_spawn fork-skip with synthetic-child waitpid
+
+Goal: unlock builtins that need richer semantics than the vfork-safe envelope (heap, libc-fs ops, multi-syscall I/O) by faking the clone(CLONE_VM|CLONE_VFORK) itself, not just the child's execve.
+
+Inside a vfork child the only safe operations are raw syscalls and reads of immutable state.  That makes anything beyond write-then-exit impossible there.  The rest of the elision frontier therefore requires returning to the parent's normal handler context, which means synthesising the spawn's wait result.
+
+Concrete plan:
+
+
+sud/fake-exec/spawn.{c,h}, new files.  Process-wide table keyed by parent tid, with a single per-thread "in-vfork-spawn" slot:
+
+```c
+struct fake_exec_thread_state {
+    int       in_vfork_spawn;      /* set in parent's clone pre_syscall */
+    pid_t     pending_child_tid;   /* tid the kernel returned           */
+    int       have_synth_result;   /* set by child rollback             */
+    int       synth_status;        /* exit-status word for waitpid      */
+    const struct sud_fake_exec_builtin *synth_builtin;
+    char     *synth_argv_storage;  /* arena copy; freed on wait reap    */
+};
+```
+
+Lookup is O(N) over a small fixed-size array indexed by tid; size matches the "in-flight posix_spawns per parent" upper bound (16 is plenty in practice).
+
+Hook points in sud/fake-exec/addin.c::pre_syscall:
+
+
+SYS_clone / SYS_clone3 with CLONE_VM|CLONE_VFORK in the parent.  Set in_vfork_spawn = 1 on this thread and pass through.  We do NOT skip the kernel clone in this step — see Step F.
+
+SYS_execve in a task whose parent has in_vfork_spawn set (we test this by reading the parent's slot via shared VM, since CLONE_VM means the table is shared).  Two sub-cases:
+
+
+Builtin is FAKE_EXEC_VFORK_SAFE: existing behaviour, write-then-SYS_exit inline.
+
+Builtin is FAKE_EXEC_RICH (new flag, defined in builtins.h next to FAKE_EXEC_VFORK_SAFE): copy argv into the parent-visible synth slot via a small bump arena that lives in shared VM, mark have_synth_result = 0 and synth_builtin = b, then SYS_exit(0) the empty child immediately.  The kernel's clone return wakes the parent.
+
+SYS_wait4 / SYS_waitid in the parent.  If the wait targets a tid that matches a synth slot whose builtin is RICH and have_synth_result is 0:
+
+
+Run b->run_rich(argc, argv, envp, &fd_view) in the parent's handler context.  Full address-space isolation here: the emulator may allocate, call libc-fs primitives, do multi-syscall I/O.
+
+Pack the returned status into a struct __wait_status word (WIFEXITED | (status<<8)) and store on the synth slot.  Set have_synth_result = 1.
+
+Set ctx->ret = pending_child_tid, write the status word into the user buffer at args[1], and return 1 to short-circuit the kernel wait.  The kernel-side child has already exited via SYS_exit(0) from the rollback point, so its zombie is already reaped by the time we synthesise — no orphan, no SIGCHLD races.
+
+
+Test scaffolding: sud/fake-exec/tests/test_fake_exec_spawn.c drives the harness with a mocked clone+vfork sequence (the kernel calls themselves are real; we just verify the state-machine transitions and that the parent's wait sees the synthesised status without the kernel entering execve).  e2e: a tiny posix_spawn driver in tests/ that spawns /usr/bin/true 10000× and asserts no zombies and a measurable speedup over --fake-exec off.
+
+Re-emit through sud_runtime_config_emit: the per-thread state is process-local so nothing changes in the wrapper-flag block.  But add a new --fake-exec-no-rollback escape hatch (parsed and emitted alongside --fake-exec) to disable Step A's Track-B path while keeping Track-A; useful for bisecting trace-fidelity regressions.
+
+
+Step B — Vfork-safe write-then-exit for echo / printf
+
+Goal: cover the second-most-frequent pure helper in shell scripts without paying for Step A.
+
+Both echo and printf (no %-conversion) are pure functions of argv that emit a single bounded string to stdout and exit 0.  Implementation in sud/fake-exec/builtins.c:
+
+
+run_inline composes argv joined with single spaces + trailing '\n' into ctx->scratch (PATH_MAX*2 bytes, plenty for any sane invocation; classifier rejects anything larger).
+
+After composition, addin.c emits raw_syscall6(SYS_write, fd, buf, len) once, then raw_syscall6(SYS_exit, 0).  Both calls bypass the SUD handler — and that's a problem for trace fidelity, since the real /usr/bin/echo's write would have hit the trace addin.
+
+Trace-fidelity fix: the addin synthesises the WRITE event itself by calling a small new sud_trace_emit_synthetic_write(fd, buf, len) helper added to sud/trace/addin.h.  The helper takes the same path as a normal post_syscall observation but with caller-supplied args.  The addin emits the synthetic event before the raw write so a reader that snapshots mid-handler still sees consistent ordering.  Test: diff the trace produced by /usr/bin/echo run normally (with --fake-exec off) against the elided run; only timestamps differ.
+
+Classifier additions: in sud/fake-exec/detect.c, accept echo and printf only when
+
+
+argv has no embedded NUL or non-UTF-8 bytes (ctx->scratch holds a bounded buffer);
+
+stdout is not O_NONBLOCK (we'd have to handle EAGAIN, which means looping in the handler — out of scope);
+
+for printf, the format string has no %-conversion at all (the conservative subset).
+
+
+Step C — /bin/sh -c <single trivial command>
+
+Goal: catch GNU make's hot path.  make spawns each recipe line as /bin/sh -c <recipe>; a large fraction of recipes are a single command with no shell metacharacters, e.g. /bin/sh -c "true" or /bin/sh -c "/usr/bin/echo done".
+
+Implementation in detect.c:
+
+
+When path is /bin/sh or /bin/bash and argv == [..., "-c", "<cmd>", ...], run a tiny single-command shell-grammar check on <cmd>: reject anything containing |, &, ;, <, >, $, `, \, *, ?, [, ], (, ), {, }, =, ', ", or whitespace runs that aren't a single SP.  On accept, tokenise into argv and recurse the classifier on the inner command.
+
+If the inner classifier returns INLINE_VFORK_SAFE, replace the outer execve's argv conceptually with the inner one and emit accordingly.  Emit the synthetic EXEC event for the inner binary too (otherwise the trace would show /bin/sh -c "true" and an EXIT, but no EXEC for true — readers expect both).
+
+Test: tests/fake_exec_sh_e2e.sh drives sudtrace -- make -j8 over a fixed autotools project; assert the trace produced with --fake-exec on diffs only on timestamps from a baseline produced with --fake-exec off; assert wall-clock improvement.
+
+
+Step D — Track-B builtins: test/[, cat, dirname, basename, expr, pwd
+
+Goal: cover the rest of POSIX trivia, all of which need richer semantics than Step B's envelope (file lookups, allocation, multi-syscall I/O).  All ride Step A's Track B.
+
+Per-builtin notes:
+
+
+test / [ — full POSIX subset (-n / -z / -e / -f / -d / -r / -w / -x / -s / numeric and string comparisons / parenthesised ! / -a / -o).  File-test predicates use sud_overlay_resolve_at + a stat that goes through path_remap so inramfs files and overlay rules are honoured.
+
+cat <single small file> — only when the file resolves into inramfs (sud_inramfs_op_open_inode / sud_inramfs_op_pread) or to a path_remap target whose size is below a threshold (1 MiB; classifier rejects larger).  Larger files go through the kernel because the in-handler memcpy then dominates and we lose the win.
+
+dirname, basename, pwd — pure string ops; trivial.
+
+expr — integer subset (+ - * / % comparisons), no GNU extensions.
+
+
+Step E — Defaulting fake-exec into the standard SUD_ADDINS list
+
+Once Steps A–C have soaked through tests/sudtrace_test.sh and a clean make -j8 build of an autotools project produces a byte-identical trace under --fake-exec on vs off, flip the Makefile default:
+
+```make
+SUD_ADDINS ?= sud/trace sud/path_remap sud/fake-exec sud/inramfs
+```
+
+(In the same patch: extend tests/sudtrace_test.sh's matrix to run with fake-exec compiled in by default; remove the explicit SUD_ADDINS=... wrapper from the existing inramfs e2e harness and let it fall through to the new default.)
+
+Add sudtrace user-facing flags so users don't need to know about the wrapper-level CLI:
+
+
+--no-fake-exec → translates to --fake-exec off on the wrapper argv.
+
+--fake-exec-deny <basename> → forwards verbatim (repeatable).
+
+Update the usage block in sud/sudtrace.c::usage().
+
+
+Step F — Skip the kernel clone(CLONE_VFORK) too (stretch)
+
+Goal: remove even the vfork itself from the syscall stream when the spawn is provably trivial.
+
+This needs information sud doesn't have at the clone site — the child's execve hasn't happened yet, so we don't know what it's about to run.  Two avenues:
+
+
+Hook glibc's posix_spawn symbol (intercept at the libc-level rather than at the syscall level).  glibc's __spawni stages the binary path / argv / file_actions on the parent's stack before clone; we read them, classify, and on hit synthesise the wait result without entering clone at all.  This is outside the SUD model — it requires loading a small interposer .so (or intercepting via the dynamic linker's PLT) and is a bigger architectural change than Steps A–E combined.
+
+Speculative clone-elision: skip the clone, run the child code as a userspace coroutine on the parent's alt-stack until we observe the execve, then commit (synthesise wait) or roll back (actually issue the kernel clone and replay).  Rollback is hard to make watertight — most non-trivial child code mutates state — so this only ever works for an even smaller, pre-classified set of spawn helpers.
+
+Both are deferred indefinitely.  The combined Steps A–E already capture the big-O win (we never pay for the helper's ELF load + libc init); Step F is at most a constant-factor improvement on top.
+
+
+Step G — Performance harness + regression gate
+
+Goal: make sure the gains don't silently regress.
+
+Add tests/fake_exec_perf.sh:
+
+
+Builds a small fixture (5 000 sh -c true loop, plus the autotools fixture from Step C).
+
+Runs each fixture three times each with --fake-exec on and --fake-exec off, records median wall-clock.
+
+Asserts the on/off ratio stays below a checked-in threshold (initially 0.6; tighten once Step A lands).
+
+Skipped automatically when /proc/sys/kernel/sched_autogroup_enabled or other timing-fragile knobs differ from CI's reference.
+
+
+Test inventory after Part 3
+
+
+sud/fake-exec/tests/test_fake_exec.c — classifier + builtin registry (already shipped, 12 cases).
+
+sud/fake-exec/tests/test_fake_exec_spawn.c — Track-B state machine + waitpid synthesis (Step A).
+
+sud/fake-exec/tests/test_fake_exec_builtins.c — per-builtin parity vs the real binary, table-driven, one row per builtin (Steps B + D).
+
+sud/fake-exec/tests/test_fake_exec_sh_grammar.c — single-command shell-grammar check (Step C).
+
+tests/fake_exec_e2e.sh — sudtrace + tv dump assertions: trace fidelity (every elided invocation produces the same EXEC/EXIT events as a real run) (Steps A + B + C).
+
+tests/fake_exec_perf.sh — perf regression gate (Step G).
+
+
+Net result after Part 3
+
+
+Every "trivial" exec in a typical autotools / make workload is elided in userspace.  ELF load + libc init + the helper's own runtime are gone for true / false / : / echo / printf / dirname / basename / pwd / expr / test / [ / small cat / single-token /bin/sh -c.
+
+posix_spawn is still observed by the kernel (we issue the clone) but the child never enters the kernel's exec path — the entire helper invocation costs one clone + one exit.
+
+Trace bytes are byte-identical to the unoptimised run (timestamps aside), so every existing tv panel, every SQL query, every downstream consumer keeps working without modification.
+
+Wrapper CLI surface remains tiny: --fake-exec off, --fake-exec-deny <basename>, --fake-exec-no-rollback (Step A).  Configuration round-trips through sud_runtime_config_emit so children inherit it from /proc/<pid>/cmdline alone — no envp dumping ground, matching Part 2's invariant.
