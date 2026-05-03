@@ -83,7 +83,14 @@ static void usage(const char *prog)
         "                                without touching the kernel, stat\n"
         "                                returns the recorded uid/gid/mode,\n"
         "                                geteuid()/getuid()/&c return 0\n"
-        "                                process-wide (repeatable)\n",
+        "                                process-wide (repeatable)\n"
+        "  --no-fake-exec                disable the fake-exec addin (run\n"
+        "                                trivial helpers like true/false/\n"
+        "                                echo/printf/sh -c <trivial> through\n"
+        "                                the kernel instead of eliding them)\n"
+        "  --fake-exec-deny <basename>   keep fake-exec on but exclude one\n"
+        "                                builtin from elision, e.g. 'echo'\n"
+        "                                (repeatable)\n",
         prog);
     exit(1);
 }
@@ -634,6 +641,9 @@ int main(int argc, char **argv)
     int         cli_passthrough_n = 0;
     const char *cli_fakeroot[SUD_RC_MAX_REMAP_RULES];
     int         cli_fakeroot_n = 0;
+    int         cli_no_fake_exec = 0;
+    const char *cli_fake_exec_deny[SUD_RC_MAX_FAKE_EXEC_DENY];
+    int         cli_fake_exec_deny_n = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--") == 0) {
@@ -676,6 +686,15 @@ int main(int argc, char **argv)
                 exit(1);
             }
             cli_fakeroot[cli_fakeroot_n++] = argv[++i];
+        } else if (strcmp(argv[i], "--no-fake-exec") == 0) {
+            cli_no_fake_exec = 1;
+        } else if (strcmp(argv[i], "--fake-exec-deny") == 0 && i + 1 < argc) {
+            if (cli_fake_exec_deny_n >= SUD_RC_MAX_FAKE_EXEC_DENY) {
+                fprintf(stderr, "sudtrace: too many --fake-exec-deny rules "
+                                "(max %d)\n", SUD_RC_MAX_FAKE_EXEC_DENY);
+                exit(1);
+            }
+            cli_fake_exec_deny[cli_fake_exec_deny_n++] = argv[++i];
         } else if (strcmp(argv[i], "-h") == 0 ||
                    strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
@@ -787,6 +806,19 @@ int main(int argc, char **argv)
         memcpy(rule, "remap:", sizeof("remap:") - 1);
         memcpy(rule + sizeof("remap:") - 1, spec, slen + 1);
         cfg.remap_rules[cfg.remap_rule_count++] = rule;
+    }
+
+    /* --no-fake-exec  →  "--fake-exec off" on the wrapper argv.
+     * --fake-exec-deny <basename>  (repeatable)  →  forwarded verbatim.
+     * Both flags only matter when the fake-exec addin is compiled into
+     * the wrapper; the parser ignores unknown values harmlessly when
+     * it isn't.  The default (fake_exec_off = 0) leaves the addin
+     * active. */
+    cfg.fake_exec_off = cli_no_fake_exec;
+    for (int i = 0; i < cli_fake_exec_deny_n; i++) {
+        if (cfg.fake_exec_deny_count >= SUD_RC_MAX_FAKE_EXEC_DENY) break;
+        cfg.fake_exec_deny[cfg.fake_exec_deny_count++] =
+            strdup(cli_fake_exec_deny[i]);
     }
 
     /* Setup output */

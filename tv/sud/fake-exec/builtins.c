@@ -1,28 +1,22 @@
 /*
  * sud/fake-exec/builtins.c — Trivial vfork-safe emulators.
  *
- * The MVP set is the three pure-status builtins that GNU make and
- * autoconf scripts call most frequently and whose entire observable
- * effect is the exit code:
+ * Pure-status family (true / false / :): exit code is the only
+ * observable effect.
  *
- *   /usr/bin/true   → exit 0    /bin/true   alias
- *   /usr/bin/false  → exit 1    /bin/false  alias
- *   /usr/bin/:      → exit 0   (POSIX shell `:` builtin; some
- *                                 distributions ship a binary too)
+ * Bounded-stdout family (echo / printf): compose a single bounded
+ * string into the caller's scratch buffer; the addin emits a
+ * synthetic STDOUT trace event then issues raw write+exit, all from
+ * inside the SIGSYS handler.
  *
- * Each emulator is a pure function of argv: no environment reads, no
- * I/O, no allocation, no syscalls.  They are therefore safe to fire
- * from inside a child of clone(CLONE_VM|CLONE_VFORK) without faking
- * the vfork — the only kernel call that ever happens is the
- * SYS_exit issued by the addin after run_inline returns.
- *
- * Future builtins that need to emit output (echo, printf) require
- * either a vfork-safe write-via-raw_syscall6 path here, or a
- * Track-B run_rich path that runs in the parent's handler context
- * after the vfork child has exited.  Neither is wired in the MVP.
+ * Every emulator is a pure function of argv: no environment reads,
+ * no syscalls, no allocation, no global mutation.  Safe to fire from
+ * inside a child of clone(CLONE_VM|CLONE_VFORK).
  */
 
 #include "sud/fake-exec/builtins.h"
+
+/* ---- Pure-status family ----------------------------------------- */
 
 static int builtin_true(int argc, char *const *argv)
 {
@@ -44,20 +38,138 @@ static int builtin_colon(int argc, char *const *argv)
     return 0;
 }
 
+/* ---- Bounded-stdout family -------------------------------------- */
+
+/* Append `src` to *dst (advancing *dst, never past `end`).  Returns
+ * the number of bytes that *would* have been written even if it
+ * truncates — caller compares against the remaining capacity to
+ * detect overflow. */
+static int append_str(char **dst, char *end, const char *src)
+{
+    int n = 0;
+    while (*src) {
+        if (*dst < end) *(*dst)++ = *src;
+        src++; n++;
+    }
+    return n;
+}
+
+static int append_char(char **dst, char *end, char c)
+{
+    if (*dst < end) *(*dst)++ = c;
+    return 1;
+}
+
+/* echo argv[1..argc-1] joined by single spaces, terminated by '\n'.
+ *
+ * We deliberately do NOT honour `-n` / `-e` / `-E` flags — the GNU
+ * echo binary behaves differently across releases and the cost of a
+ * misclassification is "we output an extra newline / lose the -e
+ * escapes" which is observable.  The classifier (detect.c) rejects
+ * any argv that starts with a `-`, so we only ever see the plain
+ * "echo arg1 arg2 ..." form here. */
+static int compose_echo(int argc, char *const *argv,
+                        char *scratch, int scratch_size)
+{
+    if (!scratch || scratch_size <= 0) return -1;
+    /* Real echo treats argv[1] as a flag word when it starts with `-`
+     * (`-n` suppresses newline, `-e` enables backslash escapes, `-E`
+     * disables them).  GNU and BSD differ on which flags exist and
+     * what `--` does.  Refuse the moment we see a leading `-` so the
+     * kernel can run the real binary's distro-specific behaviour. */
+    if (argc >= 2 && argv[1] && argv[1][0] == '-') return -1;
+    char *p   = scratch;
+    char *end = scratch + scratch_size;
+    int   need = 0;
+    for (int i = 1; i < argc; i++) {
+        if (i > 1) need += append_char(&p, end, ' ');
+        if (argv[i]) need += append_str(&p, end, argv[i]);
+    }
+    need += append_char(&p, end, '\n');
+    if (need > scratch_size) return -1;
+    return (int)(p - scratch);
+}
+
+/* printf with no %-conversions: the format string is the only output
+ * (extra args are ignored, matching POSIX printf when the format
+ * has no conversions and no extra newline is appended).
+ *
+ * The classifier rejects any format containing `%` (the conservative
+ * subset).  Backslash escapes are NOT interpreted — coreutils printf
+ * does interpret \n / \t / \\, but the cost of getting that wrong
+ * (output diverges from real binary) is higher than the cost of a
+ * passthrough.  Callers that want escapes will see the format string
+ * forwarded literally to the kernel's exec.
+ *
+ * Result: only an absolutely-literal printf "hello world\n" form is
+ * accepted, where the format already contains the literal newline as
+ * a single byte (e.g. shell `printf "hi\n"` after the shell has
+ * already substituted the escape).  The detect.c classifier catches
+ * the `%` and `\` cases and routes around us. */
+static int compose_printf(int argc, char *const *argv,
+                          char *scratch, int scratch_size)
+{
+    if (argc < 2 || !argv[1]) return -1;
+    if (!scratch || scratch_size <= 0) return -1;
+    /* coreutils printf:
+     *   • leading `-` may be a flag (`--help`, `--version`)
+     *   • any `%` introduces a conversion (we don't emulate them)
+     *   • any `\` introduces an escape (we don't emulate them either)
+     * Refuse any of those — the kernel runs the real binary. */
+    if (argv[1][0] == '-') return -1;
+    for (const char *q = argv[1]; *q; q++) {
+        if (*q == '%' || *q == '\\') return -1;
+    }
+    char *p   = scratch;
+    char *end = scratch + scratch_size;
+    int   need = append_str(&p, end, argv[1]);
+    if (need > scratch_size) return -1;
+    return (int)(p - scratch);
+}
+
+static int run_zero(int argc, char *const *argv)
+{
+    (void)argc; (void)argv;
+    return 0;
+}
+
+/* ---- Registry --------------------------------------------------- */
+
 static const struct sud_fake_exec_builtin g_builtin_true = {
-    "/usr/bin/true", "true", FAKE_EXEC_VFORK_SAFE, builtin_true,
+    "/usr/bin/true", "true", FAKE_EXEC_VFORK_SAFE, builtin_true, 0,
 };
 static const struct sud_fake_exec_builtin g_builtin_true_alt = {
-    "/bin/true", "true", FAKE_EXEC_VFORK_SAFE, builtin_true,
+    "/bin/true", "true", FAKE_EXEC_VFORK_SAFE, builtin_true, 0,
 };
 static const struct sud_fake_exec_builtin g_builtin_false = {
-    "/usr/bin/false", "false", FAKE_EXEC_VFORK_SAFE, builtin_false,
+    "/usr/bin/false", "false", FAKE_EXEC_VFORK_SAFE, builtin_false, 0,
 };
 static const struct sud_fake_exec_builtin g_builtin_false_alt = {
-    "/bin/false", "false", FAKE_EXEC_VFORK_SAFE, builtin_false,
+    "/bin/false", "false", FAKE_EXEC_VFORK_SAFE, builtin_false, 0,
 };
 static const struct sud_fake_exec_builtin g_builtin_colon = {
-    "/usr/bin/:", ":", FAKE_EXEC_VFORK_SAFE, builtin_colon,
+    "/usr/bin/:", ":", FAKE_EXEC_VFORK_SAFE, builtin_colon, 0,
+};
+
+static const struct sud_fake_exec_builtin g_builtin_echo = {
+    "/usr/bin/echo", "echo",
+    FAKE_EXEC_VFORK_SAFE | FAKE_EXEC_HAS_INLINE_OUTPUT,
+    run_zero, compose_echo,
+};
+static const struct sud_fake_exec_builtin g_builtin_echo_alt = {
+    "/bin/echo", "echo",
+    FAKE_EXEC_VFORK_SAFE | FAKE_EXEC_HAS_INLINE_OUTPUT,
+    run_zero, compose_echo,
+};
+static const struct sud_fake_exec_builtin g_builtin_printf = {
+    "/usr/bin/printf", "printf",
+    FAKE_EXEC_VFORK_SAFE | FAKE_EXEC_HAS_INLINE_OUTPUT,
+    run_zero, compose_printf,
+};
+static const struct sud_fake_exec_builtin g_builtin_printf_alt = {
+    "/bin/printf", "printf",
+    FAKE_EXEC_VFORK_SAFE | FAKE_EXEC_HAS_INLINE_OUTPUT,
+    run_zero, compose_printf,
 };
 
 static const struct sud_fake_exec_builtin *const g_builtins[] = {
@@ -66,6 +178,10 @@ static const struct sud_fake_exec_builtin *const g_builtins[] = {
     &g_builtin_false,
     &g_builtin_false_alt,
     &g_builtin_colon,
+    &g_builtin_echo,
+    &g_builtin_echo_alt,
+    &g_builtin_printf,
+    &g_builtin_printf_alt,
     0,
 };
 

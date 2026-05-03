@@ -1,6 +1,7 @@
 #include "sud/addin.h"
 #include "sud/raw.h"
 #include "sud/trace/event.h"
+#include "sud/trace/trace_addin.h"
 #include "sud/elf.h"
 #include "sud/state.h"
 #include "sud/runtime_config.h"
@@ -150,6 +151,28 @@ static void trace_post_syscall(const struct sud_syscall_ctx *ctx)
         }
     }
 #endif
+}
+
+/* See sud/trace/trace_addin.h.  Routes the synthetic event through
+ * the same emit_write_event path that trace's own post_syscall hook
+ * uses for SYS_write — same delta encoding, same wire shape, same
+ * fd 1/2 STDOUT/STDERR classification — so a consumer cannot tell a
+ * synthetic write apart from a real one beyond the timestamp.
+ *
+ * fds outside {1, 2} are dropped to mirror the post_syscall(SYS_write)
+ * classifier, which only records writes to the inherited stdout/
+ * stderr.  Callers (currently fake-exec for echo/printf) only emit
+ * stdout writes, so this restriction is invisible in practice. */
+void sud_trace_emit_synthetic_write(pid_t tid, int fd,
+                                    const void *buf, size_t len)
+{
+    if (!buf || len == 0) return;
+    if (fd == 1) {
+        if (!fd1_is_creator_stdout(tid)) return;
+        emit_write_event(tid, "STDOUT", buf, len);
+    } else if (fd == 2) {
+        emit_write_event(tid, "STDERR", buf, len);
+    }
 }
 
 const struct sud_addin sud_trace_addin = {

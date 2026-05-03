@@ -385,6 +385,16 @@ build/fake_exec_test64: $(FAKE_EXEC_TEST_SRCS) $(FAKE_EXEC_TEST_HDRS)
 	$(CC) -m64 $(SUD_CFLAGS) -DSUD_ADDIN_FAKE_EXEC $(SUD_LDFLAGS) \
 	    -o $@ $(FAKE_EXEC_TEST_SRCS) -lgcc
 
+# fake-exec performance regression gate.  Runs sudtrace over a
+# fixture loop with --no-fake-exec vs the default and asserts the
+# on/off wall-clock ratio stays under FAKE_EXEC_PERF_RATIO (default
+# 95%).  Needs sud64 + sudtrace built with the fake-exec addin.
+.PHONY: fake-exec-perf
+fake-exec-perf: tests/fake_exec_perf.sh
+	@SUD_ADDINS="sud/trace sud/path_remap sud/fake-exec" \
+	    $(MAKE) -s sud64 sudtrace
+	./tests/fake_exec_perf.sh
+
 .PHONY: all keygen sign load unload clean clean-bins install test
 test: tv libc-fs-test
 	./tv test
