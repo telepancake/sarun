@@ -8,7 +8,7 @@ MOK_CER ?= $(PWD)/MOK.der
 all: tv sudtrace upttrace sud-bins mod-bins
 
 .PHONY: sud-bins mod-bins
-sud-bins: path-remap-test dispatcher-test inramfs-test fake-exec-test
+sud-bins: path-remap-test dispatcher-test inramfs-test fake-exec-test cmd-rewrite-test
 	$(MAKE) $(SUD_NATIVE)
 
 mod-bins:
@@ -47,6 +47,7 @@ clean:
 	rm -f build/dispatcher_test_trace32 build/dispatcher_test_trace64
 	rm -f build/inramfs_test32 build/inramfs_test64
 	rm -f build/fake_exec_test32 build/fake_exec_test64
+	rm -f build/cmd_rewrite_test64
 
 install:
 	$(MAKE) -C $(MOD_DIR) install
@@ -88,6 +89,10 @@ endif
 ifneq ($(filter sud/path_remap,$(SUD_ADDINS)),)
 SUD_CFLAGS  += -DSUD_ADDIN_PATH_REMAP
 SUD_SRCS    += sud/path_remap/addin.c sud/path_remap/overlay.c sud/path_remap/path.c sud/path_remap/fakeroot.c
+endif
+ifneq ($(filter sud/cmd-rewrite,$(SUD_ADDINS)),)
+SUD_CFLAGS  += -DSUD_ADDIN_CMD_REWRITE
+SUD_SRCS    += sud/cmd-rewrite/addin.c sud/cmd-rewrite/rules.c
 endif
 ifneq ($(filter sud/fake-exec,$(SUD_ADDINS)),)
 SUD_CFLAGS  += -DSUD_ADDIN_FAKE_EXEC
@@ -384,6 +389,27 @@ build/fake_exec_test64: $(FAKE_EXEC_TEST_SRCS) $(FAKE_EXEC_TEST_HDRS)
 	@mkdir -p build
 	$(CC) -m64 $(SUD_CFLAGS) -DSUD_ADDIN_FAKE_EXEC $(SUD_LDFLAGS) \
 	    -o $@ $(FAKE_EXEC_TEST_SRCS) -lgcc
+
+# cmd-rewrite addin self-tests.  Pure-function tests over the rule
+# parser, pattern matchers (basename/glob/path), and apply paths;
+# the SIGSYS interception is exercised end-to-end by sudtrace_test.sh.
+CMD_REWRITE_TEST_SRCS := sud/cmd-rewrite/tests/test_cmd_rewrite.c \
+                         sud/cmd-rewrite/rules.c \
+                         sud/runtime_config.c \
+                         libc-fs/libc.c libc-fs/deps/printf/printf.c
+CMD_REWRITE_TEST_HDRS := sud/cmd-rewrite/cmd_rewrite.h \
+                         sud/cmd-rewrite/rules.h \
+                         sud/addin.h sud/runtime_config.h \
+                         libc-fs/libc.h libc-fs/fmt.h
+.PHONY: cmd-rewrite-test
+cmd-rewrite-test: build/cmd_rewrite_test64
+	@echo '--- running 64-bit cmd-rewrite tests ---'
+	./build/cmd_rewrite_test64
+
+build/cmd_rewrite_test64: $(CMD_REWRITE_TEST_SRCS) $(CMD_REWRITE_TEST_HDRS)
+	@mkdir -p build
+	$(CC) -m64 $(SUD_CFLAGS) -DSUD_ADDIN_CMD_REWRITE $(SUD_LDFLAGS) \
+	    -o $@ $(CMD_REWRITE_TEST_SRCS) -lgcc
 
 # fake-exec performance regression gate.  Runs sudtrace over a
 # fixture loop with --no-fake-exec vs the default and asserts the

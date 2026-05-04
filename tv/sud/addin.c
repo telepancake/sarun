@@ -28,18 +28,28 @@
  *      circuited (with -errno or a synthetic fd) or had its path
  *      arg rewritten to the resolved kernel path.
  *
- *   3. sud_fake_exec_addin runs THIRD.  It intercepts execve/execveat
- *      and, for a small registry of trivial helper binaries
- *      (true/false/:), replaces the kernel exec with a per-task
- *      SYS_exit emitting the synthesised status.  Slotted after
- *      path_remap so the path it sees is already resolved to a
- *      kernel-canonical absolute path; slotted before inramfs so we
- *      never need an inramfs-served binary to back a builtin we are
- *      about to elide.  Trace fidelity is preserved because the
- *      trace addin (above) records the EXEC event from the original
- *      args before we run.
+ *   3. sud_cmd_rewrite_addin runs THIRD.  It rewrites execve args:
+ *      compiler-wrap prepends ccache, exec-strip drops sudo /
+ *      fakeroot-ng / env wrappers, exec-as bumps the runtime
+ *      config's pretend-uid/gid for the rewritten exec subtree.
+ *      Slotted after path_remap so paths are resolved before we
+ *      pattern-match on them, and before fake-exec so any further
+ *      elision (true/false/echo) can fire on the rewritten argv —
+ *      "sudo /usr/bin/true" becomes /usr/bin/true via exec-strip
+ *      and then fake-exec elides it.
  *
- *   4. sud_inramfs_addin runs LAST.  After the Part-1 re-layering
+ *   4. sud_fake_exec_addin runs FOURTH.  It intercepts execve/execveat
+ *      and, for a small registry of trivial helper binaries
+ *      (true/false/:/echo/printf), replaces the kernel exec with a
+ *      per-task SYS_exit emitting the synthesised status (and any
+ *      synthetic stdout bytes).  Slotted after cmd-rewrite so the
+ *      argv it sees is already canonicalised; slotted before inramfs
+ *      so we never need an inramfs-served binary to back a builtin
+ *      we are about to elide.  Trace fidelity is preserved because
+ *      the trace addin (above) records the EXEC event from the
+ *      original args before we run.
+ *
+ *   5. sud_inramfs_addin runs LAST.  After the Part-1 re-layering
  *      it sees only fd-bearing syscalls (read/write/lseek/dup/
  *      fcntl/mmap/munmap/copy_file_range/...): path_remap already
  *      handled all path-bearing dispatch into the inramfs data
@@ -60,6 +70,9 @@ static const struct sud_addin *const g_addins[] = {
 #endif
 #ifdef SUD_ADDIN_PATH_REMAP
     &sud_path_remap_addin,
+#endif
+#ifdef SUD_ADDIN_CMD_REWRITE
+    &sud_cmd_rewrite_addin,
 #endif
 #ifdef SUD_ADDIN_FAKE_EXEC
     &sud_fake_exec_addin,

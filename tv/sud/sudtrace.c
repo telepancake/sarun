@@ -90,6 +90,49 @@ static void usage(const char *prog)
         "                                the kernel instead of eliding them)\n"
         "  --fake-exec-deny <basename>   keep fake-exec on but exclude one\n"
         "                                builtin from elision, e.g. 'echo'\n"
+        "                                (repeatable)\n"
+        "  --ccache <tool>               prepend <tool> (typically /usr/bin/\n"
+        "                                ccache) to argv on every exec of a\n"
+        "                                compiler.  Matches gcc/g++/cc/c++/\n"
+        "                                clang/clang++ basenames plus the\n"
+        "                                common cross-compiler globs (*-gcc,\n"
+        "                                *-gcc-[0-9]*, etc.) for free.\n"
+        "                                Auto-suppresses recursion: ccache\n"
+        "                                exec'ing the real compiler does NOT\n"
+        "                                re-trigger the wrap.\n"
+        "  --ccache-also <pattern>       attach an extra glob pattern to\n"
+        "                                --ccache's tool — for vendor blobs\n"
+        "                                that don't follow the gcc naming\n"
+        "                                convention.  <pattern> may be a\n"
+        "                                bare glob ('ti-cgt-cl*') or a full\n"
+        "                                'match-kind:pattern' (repeatable)\n"
+        "  --exec-strip <pattern>        drop the matched wrapper command\n"
+        "                                (sudo, fakeroot-ng, env, ...) and\n"
+        "                                run its inner program directly.\n"
+        "                                <pattern> defaults to a basename\n"
+        "                                match; built-in flag-skip tables\n"
+        "                                cover sudo / fakeroot-ng / env.\n"
+        "                                (repeatable)\n"
+        "  --exec-as <pat>:<uid>[:<gid>] when the matched program execs,\n"
+        "                                propagate <uid>/<gid> as the new\n"
+        "                                pretend uid/gid for the exec\n"
+        "                                subtree.  Equivalent to running\n"
+        "                                that command (and its descendants)\n"
+        "                                under fakeroot.  (repeatable)\n"
+        "  --pretend-uid <uid>           force getuid()/geteuid() to return\n"
+        "                                <uid> process-wide (the existing\n"
+        "                                fakeroot uid-getter short-circuit).\n"
+        "                                Implies fakeroot active.\n"
+        "  --pretend-gid <gid>           same, for getgid()/getegid().\n"
+        "  --cmd-rule <kind>:<spec>      raw cmd-rewrite rule, repeatable.\n"
+        "                                Kinds: compiler-wrap, exec-strip,\n"
+        "                                exec-as.  See --ccache /\n"
+        "                                --exec-strip / --exec-as for the\n"
+        "                                friendlier shorthand forms.\n"
+        "  --suppress-rule <name>        prevent the named cmd-rewrite rule\n"
+        "                                from firing in this subtree.  Rule\n"
+        "                                names are <kind>:<match>:<pattern>,\n"
+        "                                e.g. 'compiler-wrap:basename:gcc'.\n"
         "                                (repeatable)\n",
         prog);
     exit(1);
@@ -644,6 +687,20 @@ int main(int argc, char **argv)
     int         cli_no_fake_exec = 0;
     const char *cli_fake_exec_deny[SUD_RC_MAX_FAKE_EXEC_DENY];
     int         cli_fake_exec_deny_n = 0;
+    /* cmd-rewrite addin flags. */
+    const char *cli_cmd_rule[SUD_RC_MAX_CMD_RULES];
+    int         cli_cmd_rule_n = 0;
+    const char *cli_suppress[SUD_RC_MAX_SUPPRESS];
+    int         cli_suppress_n = 0;
+    const char *cli_ccache_tool = NULL;            /* --ccache <tool> */
+    const char *cli_ccache_extra[SUD_RC_MAX_CMD_RULES];
+    int         cli_ccache_extra_n = 0;
+    const char *cli_exec_strip[SUD_RC_MAX_CMD_RULES];
+    int         cli_exec_strip_n = 0;
+    const char *cli_exec_as[SUD_RC_MAX_CMD_RULES];
+    int         cli_exec_as_n = 0;
+    int         cli_pretend_uid = -1;
+    int         cli_pretend_gid = -1;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--") == 0) {
@@ -695,6 +752,47 @@ int main(int argc, char **argv)
                 exit(1);
             }
             cli_fake_exec_deny[cli_fake_exec_deny_n++] = argv[++i];
+        } else if (strcmp(argv[i], "--cmd-rule") == 0 && i + 1 < argc) {
+            if (cli_cmd_rule_n >= SUD_RC_MAX_CMD_RULES) {
+                fprintf(stderr, "sudtrace: too many --cmd-rule rules "
+                                "(max %d)\n", SUD_RC_MAX_CMD_RULES);
+                exit(1);
+            }
+            cli_cmd_rule[cli_cmd_rule_n++] = argv[++i];
+        } else if (strcmp(argv[i], "--suppress-rule") == 0 && i + 1 < argc) {
+            if (cli_suppress_n >= SUD_RC_MAX_SUPPRESS) {
+                fprintf(stderr, "sudtrace: too many --suppress-rule entries "
+                                "(max %d)\n", SUD_RC_MAX_SUPPRESS);
+                exit(1);
+            }
+            cli_suppress[cli_suppress_n++] = argv[++i];
+        } else if (strcmp(argv[i], "--ccache") == 0 && i + 1 < argc) {
+            cli_ccache_tool = argv[++i];
+        } else if (strcmp(argv[i], "--ccache-also") == 0 && i + 1 < argc) {
+            if (cli_ccache_extra_n >= SUD_RC_MAX_CMD_RULES) {
+                fprintf(stderr, "sudtrace: too many --ccache-also patterns "
+                                "(max %d)\n", SUD_RC_MAX_CMD_RULES);
+                exit(1);
+            }
+            cli_ccache_extra[cli_ccache_extra_n++] = argv[++i];
+        } else if (strcmp(argv[i], "--exec-strip") == 0 && i + 1 < argc) {
+            if (cli_exec_strip_n >= SUD_RC_MAX_CMD_RULES) {
+                fprintf(stderr, "sudtrace: too many --exec-strip rules "
+                                "(max %d)\n", SUD_RC_MAX_CMD_RULES);
+                exit(1);
+            }
+            cli_exec_strip[cli_exec_strip_n++] = argv[++i];
+        } else if (strcmp(argv[i], "--exec-as") == 0 && i + 1 < argc) {
+            if (cli_exec_as_n >= SUD_RC_MAX_CMD_RULES) {
+                fprintf(stderr, "sudtrace: too many --exec-as rules "
+                                "(max %d)\n", SUD_RC_MAX_CMD_RULES);
+                exit(1);
+            }
+            cli_exec_as[cli_exec_as_n++] = argv[++i];
+        } else if (strcmp(argv[i], "--pretend-uid") == 0 && i + 1 < argc) {
+            cli_pretend_uid = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--pretend-gid") == 0 && i + 1 < argc) {
+            cli_pretend_gid = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-h") == 0 ||
                    strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
@@ -820,6 +918,136 @@ int main(int argc, char **argv)
         cfg.fake_exec_deny[cfg.fake_exec_deny_count++] =
             strdup(cli_fake_exec_deny[i]);
     }
+
+    /* cmd-rewrite addin wiring.  --cmd-rule passes through verbatim;
+     * --suppress-rule too.  --ccache, --exec-strip, --exec-as expand
+     * into one or more --cmd-rule strings each.
+     *
+     * --ccache <tool>    → compiler-wrap rules for the canonical
+     *                      compiler basenames (gcc/g++/cc/c++/clang/
+     *                      clang++) plus their version-suffix and
+     *                      cross-target variants via globs
+     *                      (*-gcc, *-gcc-[0-9]*, etc).  Covers the
+     *                      vendor-cross-compiler case without
+     *                      needing per-toolchain configuration.
+     * --ccache-also <pat> attaches one extra glob pattern to the
+     *                      same tool (e.g. "ti-cgt-cl*" for vendors
+     *                      that don't follow the gcc naming
+     *                      convention). */
+    static const char *const ccache_default_globs[] = {
+        "basename:gcc",  "basename:g++",  "basename:cc",  "basename:c++",
+        "basename:clang", "basename:clang++",
+        "glob:*-gcc",     "glob:*-g++",
+        "glob:*-gcc-[0-9]*",  "glob:*-g++-[0-9]*",
+        "glob:gcc-[0-9]*",    "glob:g++-[0-9]*",
+        "glob:*-cc",          "glob:*-clang",
+    };
+    if (cli_ccache_tool) {
+        for (size_t i = 0;
+             i < sizeof(ccache_default_globs)/sizeof(ccache_default_globs[0]);
+             i++) {
+            if (cfg.cmd_rule_count >= SUD_RC_MAX_CMD_RULES) break;
+            const char *m = ccache_default_globs[i];
+            size_t mlen = strlen(m), tlen = strlen(cli_ccache_tool);
+            char *r = malloc(sizeof("compiler-wrap:") - 1 + mlen + 1 + tlen + 1);
+            if (!r) { fprintf(stderr, "sudtrace: oom\n"); exit(1); }
+            char *p = r;
+            memcpy(p, "compiler-wrap:", sizeof("compiler-wrap:") - 1);
+            p += sizeof("compiler-wrap:") - 1;
+            memcpy(p, m, mlen); p += mlen;
+            *p++ = ':';
+            memcpy(p, cli_ccache_tool, tlen + 1);
+            cfg.cmd_rules[cfg.cmd_rule_count++] = r;
+        }
+        for (int i = 0; i < cli_ccache_extra_n; i++) {
+            if (cfg.cmd_rule_count >= SUD_RC_MAX_CMD_RULES) break;
+            const char *spec = cli_ccache_extra[i];
+            /* When the spec's leading token isn't a match-kind keyword,
+             * default to glob (the most useful for cross-compilers). */
+            const char *colon2 = strchr(spec, ':');
+            size_t klen2 = colon2 ? (size_t)(colon2 - spec) : 0;
+            int long_form = colon2 && (
+                (klen2 == 8 && strncmp(spec, "basename", 8) == 0) ||
+                (klen2 == 4 && strncmp(spec, "glob",     4) == 0) ||
+                (klen2 == 4 && strncmp(spec, "path",     4) == 0));
+            const char *prefix = long_form ? "compiler-wrap:" : "compiler-wrap:glob:";
+            size_t plen = strlen(prefix);
+            size_t slen = strlen(spec);
+            size_t tlen = strlen(cli_ccache_tool);
+            char *r = malloc(plen + slen + 1 + tlen + 1);
+            if (!r) { fprintf(stderr, "sudtrace: oom\n"); exit(1); }
+            char *p = r;
+            memcpy(p, prefix, plen); p += plen;
+            memcpy(p, spec, slen); p += slen;
+            *p++ = ':';
+            memcpy(p, cli_ccache_tool, tlen + 1);
+            cfg.cmd_rules[cfg.cmd_rule_count++] = r;
+        }
+    }
+
+    /* --exec-strip <pattern> shorthand: when the spec's leading
+     * token (up to first ':') isn't a match-kind keyword, prepend
+     * "exec-strip:basename:".  So `--exec-strip sudo` →
+     * "exec-strip:basename:sudo", but
+     * `--exec-strip glob:fakeroot-*` → "exec-strip:glob:fakeroot-*". */
+    for (int i = 0; i < cli_exec_strip_n; i++) {
+        if (cfg.cmd_rule_count >= SUD_RC_MAX_CMD_RULES) break;
+        const char *spec = cli_exec_strip[i];
+        const char *colon = strchr(spec, ':');
+        size_t klen = colon ? (size_t)(colon - spec) : 0;
+        int long_form = colon && (
+            (klen == 8 && strncmp(spec, "basename", 8) == 0) ||
+            (klen == 4 && strncmp(spec, "glob",     4) == 0) ||
+            (klen == 4 && strncmp(spec, "path",     4) == 0));
+        const char *prefix = long_form ? "exec-strip:" : "exec-strip:basename:";
+        size_t plen = strlen(prefix), slen = strlen(spec);
+        char *r = malloc(plen + slen + 1);
+        if (!r) { fprintf(stderr, "sudtrace: oom\n"); exit(1); }
+        char *p = r;
+        memcpy(p, prefix, plen); p += plen;
+        memcpy(p, spec, slen + 1);
+        cfg.cmd_rules[cfg.cmd_rule_count++] = r;
+    }
+
+    /* --exec-as <pattern>:<uid>[:<gid>] (shorthand) or
+     * --exec-as <match-kind>:<pattern>:<uid>[:<gid>] (long form).
+     *
+     * We treat the spec as long-form iff the first token (up to the
+     * first `:`) is exactly "basename", "glob" or "path"; otherwise
+     * it's the shorthand and we prepend "exec-as:basename:". */
+    for (int i = 0; i < cli_exec_as_n; i++) {
+        if (cfg.cmd_rule_count >= SUD_RC_MAX_CMD_RULES) break;
+        const char *spec = cli_exec_as[i];
+        const char *colon = strchr(spec, ':');
+        size_t klen = colon ? (size_t)(colon - spec) : 0;
+        int long_form = colon && (
+            (klen == 8 && strncmp(spec, "basename", 8) == 0) ||
+            (klen == 4 && strncmp(spec, "glob",     4) == 0) ||
+            (klen == 4 && strncmp(spec, "path",     4) == 0));
+        const char *prefix = long_form ? "exec-as:" : "exec-as:basename:";
+        size_t plen = strlen(prefix), slen = strlen(spec);
+        char *r = malloc(plen + slen + 1);
+        if (!r) { fprintf(stderr, "sudtrace: oom\n"); exit(1); }
+        char *p = r;
+        memcpy(p, prefix, plen); p += plen;
+        memcpy(p, spec, slen + 1);
+        cfg.cmd_rules[cfg.cmd_rule_count++] = r;
+    }
+
+    /* --cmd-rule entries (verbatim). */
+    for (int i = 0; i < cli_cmd_rule_n; i++) {
+        if (cfg.cmd_rule_count >= SUD_RC_MAX_CMD_RULES) break;
+        cfg.cmd_rules[cfg.cmd_rule_count++] = strdup(cli_cmd_rule[i]);
+    }
+
+    /* --suppress-rule entries (verbatim). */
+    for (int i = 0; i < cli_suppress_n; i++) {
+        if (cfg.suppress_count >= SUD_RC_MAX_SUPPRESS) break;
+        cfg.suppressed[cfg.suppress_count++] = strdup(cli_suppress[i]);
+    }
+
+    cfg.pretend_uid = cli_pretend_uid;
+    cfg.pretend_gid = cli_pretend_gid;
 
     /* Setup output */
     char abs_out[PATH_MAX];

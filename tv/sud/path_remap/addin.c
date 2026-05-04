@@ -298,43 +298,47 @@ static int fakeroot_pre_syscall(struct sud_syscall_ctx *ctx)
     if (!sud_fakeroot_active()) return 0;
     long nr = ctx->nr;
 
-    /* uid / gid getters — return 0 process-wide while fakeroot is on.
-     * The single getter syscalls (getuid/geteuid/getgid/getegid) take
-     * no args; getresuid/getresgid take three uid_t* out-params and
-     * we have to write all three.  Writing them as 0 makes the
-     * "running as root" illusion consistent. */
+    /* uid / gid getters — return the configured pretend uid/gid
+     * process-wide while fakeroot is on.  Defaults to 0 (the
+     * historical behaviour) when no explicit pretend-uid is set;
+     * the cmd-rewrite addin's exec-as rule and the wrapper's
+     * --pretend-uid flag both feed into the same value.  The single
+     * getter syscalls take no args; getresuid/getresgid take three
+     * uid_t* out-params and we have to write all three. */
+    int p_uid = sud_fakeroot_pretend_uid();
+    int p_gid = sud_fakeroot_pretend_gid();
 #ifdef __NR_getuid
-    if (nr == __NR_getuid)  return short_circuit(ctx, 0);
+    if (nr == __NR_getuid)  return short_circuit(ctx, p_uid);
 #endif
 #ifdef __NR_geteuid
-    if (nr == __NR_geteuid) return short_circuit(ctx, 0);
+    if (nr == __NR_geteuid) return short_circuit(ctx, p_uid);
 #endif
 #ifdef __NR_getgid
-    if (nr == __NR_getgid)  return short_circuit(ctx, 0);
+    if (nr == __NR_getgid)  return short_circuit(ctx, p_gid);
 #endif
 #ifdef __NR_getegid
-    if (nr == __NR_getegid) return short_circuit(ctx, 0);
+    if (nr == __NR_getegid) return short_circuit(ctx, p_gid);
 #endif
 #ifdef __NR_getuid32
-    if (nr == __NR_getuid32)  return short_circuit(ctx, 0);
+    if (nr == __NR_getuid32)  return short_circuit(ctx, p_uid);
 #endif
 #ifdef __NR_geteuid32
-    if (nr == __NR_geteuid32) return short_circuit(ctx, 0);
+    if (nr == __NR_geteuid32) return short_circuit(ctx, p_uid);
 #endif
 #ifdef __NR_getgid32
-    if (nr == __NR_getgid32)  return short_circuit(ctx, 0);
+    if (nr == __NR_getgid32)  return short_circuit(ctx, p_gid);
 #endif
 #ifdef __NR_getegid32
-    if (nr == __NR_getegid32) return short_circuit(ctx, 0);
+    if (nr == __NR_getegid32) return short_circuit(ctx, p_gid);
 #endif
 #ifdef __NR_getresuid
     if (nr == __NR_getresuid) {
         unsigned int *r = (unsigned int *)ctx->args[0];
         unsigned int *e = (unsigned int *)ctx->args[1];
         unsigned int *s = (unsigned int *)ctx->args[2];
-        if (r) *r = 0;
-        if (e) *e = 0;
-        if (s) *s = 0;
+        if (r) *r = (unsigned int)p_uid;
+        if (e) *e = (unsigned int)p_uid;
+        if (s) *s = (unsigned int)p_uid;
         return short_circuit(ctx, 0);
     }
 #endif
@@ -343,9 +347,9 @@ static int fakeroot_pre_syscall(struct sud_syscall_ctx *ctx)
         unsigned int *r = (unsigned int *)ctx->args[0];
         unsigned int *e = (unsigned int *)ctx->args[1];
         unsigned int *s = (unsigned int *)ctx->args[2];
-        if (r) *r = 0;
-        if (e) *e = 0;
-        if (s) *s = 0;
+        if (r) *r = (unsigned int)p_gid;
+        if (e) *e = (unsigned int)p_gid;
+        if (s) *s = (unsigned int)p_gid;
         return short_circuit(ctx, 0);
     }
 #endif
@@ -354,9 +358,9 @@ static int fakeroot_pre_syscall(struct sud_syscall_ctx *ctx)
         unsigned int *r = (unsigned int *)ctx->args[0];
         unsigned int *e = (unsigned int *)ctx->args[1];
         unsigned int *s = (unsigned int *)ctx->args[2];
-        if (r) *r = 0;
-        if (e) *e = 0;
-        if (s) *s = 0;
+        if (r) *r = (unsigned int)p_uid;
+        if (e) *e = (unsigned int)p_uid;
+        if (s) *s = (unsigned int)p_uid;
         return short_circuit(ctx, 0);
     }
 #endif
@@ -365,9 +369,9 @@ static int fakeroot_pre_syscall(struct sud_syscall_ctx *ctx)
         unsigned int *r = (unsigned int *)ctx->args[0];
         unsigned int *e = (unsigned int *)ctx->args[1];
         unsigned int *s = (unsigned int *)ctx->args[2];
-        if (r) *r = 0;
-        if (e) *e = 0;
-        if (s) *s = 0;
+        if (r) *r = (unsigned int)p_gid;
+        if (e) *e = (unsigned int)p_gid;
+        if (s) *s = (unsigned int)p_gid;
         return short_circuit(ctx, 0);
     }
 #endif

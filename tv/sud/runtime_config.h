@@ -55,13 +55,18 @@
 
 #define SUD_RC_MAX_REMAP_RULES     64
 #define SUD_RC_MAX_FAKE_EXEC_DENY  32
+#define SUD_RC_MAX_CMD_RULES       32
+#define SUD_RC_MAX_SUPPRESS        32
 
 /* Upper bound on the number of argv slots a fully-loaded config can
  * emit (used by callers to size buffers).  Each remap rule consumes
  * 2 slots ("--remap-rule" + spec); each fake-exec-deny consumes 2
- * slots; other flags consume at most 14. */
-#define SUD_RC_MAX_EMIT_ARGS  (14 + SUD_RC_MAX_REMAP_RULES * 2 \
-                                  + SUD_RC_MAX_FAKE_EXEC_DENY * 2)
+ * slots; each cmd-rule and suppress entry consumes 2 slots; other
+ * flags consume at most 18. */
+#define SUD_RC_MAX_EMIT_ARGS  (18 + SUD_RC_MAX_REMAP_RULES * 2 \
+                                  + SUD_RC_MAX_FAKE_EXEC_DENY * 2 \
+                                  + SUD_RC_MAX_CMD_RULES * 2 \
+                                  + SUD_RC_MAX_SUPPRESS * 2)
 
 struct sud_runtime_config {
     int         no_env;             /* 1 if --no-env present          */
@@ -87,6 +92,53 @@ struct sud_runtime_config {
     int         fake_exec_off;
     int         fake_exec_deny_count;
     const char *fake_exec_deny[SUD_RC_MAX_FAKE_EXEC_DENY];
+
+    /* cmd-rewrite addin: rewrite execve args at the SIGSYS layer
+     * before the wrapper-rewrite path picks them up.  Each rule is
+     * a "<kind>:<spec>" string; the addin parses them lazily in its
+     * wrapper_init (mirrors path_remap's remap-rule pattern).
+     *
+     *   compiler-wrap:<match-kind>:<pattern>:<tool>
+     *      prepend <tool> to argv on a match, e.g.
+     *      "compiler-wrap:basename:gcc:/usr/bin/ccache"
+     *
+     *   exec-strip:<match-kind>:<pattern>[:<flag-spec>]
+     *      drop the matched program and any of its own flags from
+     *      argv, then run argv[N] with argv[N..end].  Default flag
+     *      specs are baked in for "sudo" and "fakeroot-ng".
+     *
+     *   exec-as:<match-kind>:<pattern>:<uid>[:<gid>]
+     *      on a match, propagate <uid>/<gid> as the new pretend-uid/
+     *      pretend-gid for the rewritten exec and every descendant
+     *      (consumed by fakeroot's getuid/geteuid short-circuit).
+     *
+     * <match-kind> ∈ {basename, glob, path}.
+     * <pattern>    is the basename / fnmatch glob / abs path,
+     *              respectively. */
+    int         cmd_rule_count;
+    const char *cmd_rules[SUD_RC_MAX_CMD_RULES];
+
+    /* Generic per-rule suppression: when a cmd-rewrite rule fires
+     * once, the addin appends the rule's implicit name (kind + match
+     * pattern, e.g. "compiler-wrap:basename:gcc") to this list before
+     * the wrapper-rewrite emits the child argv.  The child wrapper
+     * inherits the suppression and never re-fires that rule, killing
+     * the recursion that would otherwise happen when ccache execs
+     * gcc which would re-match `compiler-wrap:basename:gcc`.
+     *
+     * Users can also seed this list explicitly with --suppress-rule
+     * <name> (repeatable) at sudtrace launch time. */
+    int         suppress_count;
+    const char *suppressed[SUD_RC_MAX_SUPPRESS];
+
+    /* Pretend uid/gid for the fakeroot uid-getter short-circuit and
+     * for the exec-as rule kind in cmd-rewrite.  -1 means unset:
+     * fakeroot falls back to its historical hardcoded "report 0",
+     * and cmd-rewrite's exec-as rule does nothing.  Set explicitly
+     * via --pretend-uid / --pretend-gid on the wrapper, or implicitly
+     * by an exec-as rule on the way to the rewritten exec. */
+    int         pretend_uid;
+    int         pretend_gid;
 };
 
 /* Reset cfg to all-zero defaults. */

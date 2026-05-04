@@ -138,7 +138,37 @@ void sud_fakeroot_init(void)
 
 int sud_fakeroot_active(void)
 {
-    return g_prefix_count > 0;
+    /* Active when either at least one prefix rule is registered (the
+     * historical condition) OR a pretend-uid/gid is set on the
+     * runtime config.  The latter lets the cmd-rewrite addin's
+     * exec-as rule turn on uid-spoofing for a process subtree
+     * without forcing the user to also configure a fakeroot prefix. */
+    if (g_prefix_count > 0) return 1;
+    if (g_sud_runtime_config_present &&
+        (g_sud_runtime_config.pretend_uid >= 0 ||
+         g_sud_runtime_config.pretend_gid >= 0))
+        return 1;
+    return 0;
+}
+
+/* Returns the configured pretend-uid for getuid/geteuid short-
+ * circuits.  Defaults to 0 (the historical hardcoded value) when
+ * fakeroot is active but no explicit pretend-uid is set, matching
+ * the previous behaviour exactly. */
+int sud_fakeroot_pretend_uid(void)
+{
+    if (g_sud_runtime_config_present &&
+        g_sud_runtime_config.pretend_uid >= 0)
+        return g_sud_runtime_config.pretend_uid;
+    return 0;
+}
+
+int sud_fakeroot_pretend_gid(void)
+{
+    if (g_sud_runtime_config_present &&
+        g_sud_runtime_config.pretend_gid >= 0)
+        return g_sud_runtime_config.pretend_gid;
+    return 0;
 }
 
 int sud_fakeroot_match(const char *abs_path)

@@ -50,10 +50,23 @@
  * time from sud_pr_path_init(). */
 void sud_fakeroot_init(void);
 
-/* True iff at least one fakeroot prefix is registered.  When 0 the
- * dispatcher must skip every fakeroot hook — including the global
- * geteuid/getuid override — to keep a fakeroot-free build a no-op. */
+/* True when the fakeroot layer should run any of its hooks.
+ * Equivalent to "at least one fakeroot prefix is registered, OR a
+ * pretend-uid/gid is set on the runtime config" — the latter
+ * branch is what the cmd-rewrite addin's exec-as rule activates
+ * when it doesn't want to register a path prefix.  When this
+ * returns 0 the dispatcher skips every fakeroot hook, keeping a
+ * fakeroot-free build a no-op. */
 int  sud_fakeroot_active(void);
+
+/* Pretend uid / gid for the getuid / geteuid / getresuid family of
+ * short-circuits in path_remap/addin.c.  Returns the value
+ * configured via --pretend-uid / --pretend-gid (set explicitly on
+ * the wrapper or implicitly by a cmd-rewrite exec-as rule), falling
+ * back to 0 when fakeroot is active but no explicit override is
+ * configured. */
+int  sud_fakeroot_pretend_uid(void);
+int  sud_fakeroot_pretend_gid(void);
 
 /* True iff abs_path lies at or under any registered fakeroot prefix
  * on a path-component boundary.  abs_path must be absolute and
