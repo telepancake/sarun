@@ -88,7 +88,7 @@ SUD_SRCS    += sud/trace/event.c sud/trace/addin.c
 endif
 ifneq ($(filter sud/path_remap,$(SUD_ADDINS)),)
 SUD_CFLAGS  += -DSUD_ADDIN_PATH_REMAP
-SUD_SRCS    += sud/path_remap/addin.c sud/path_remap/overlay.c sud/path_remap/path.c sud/path_remap/fakeroot.c
+SUD_SRCS    += sud/path_remap/addin.c sud/path_remap/overlay.c sud/path_remap/path.c sud/path_remap/fakeroot.c sud/path_remap/rules.c
 endif
 ifneq ($(filter sud/cmd-rewrite,$(SUD_ADDINS)),)
 SUD_CFLAGS  += -DSUD_ADDIN_CMD_REWRITE
@@ -161,9 +161,12 @@ tv: $(TV_CXX_SRCS) $(TV_C_OBJS) $(TV_HDRS) $(ZSTD_LIB) $(DUCKDB_OBJ)
 
 # Standalone sudtrace launcher (the tracer binary itself; calls into
 # sud32/sud64 wrappers to drive the traced process). See sud/sudtrace.c
-# for the design notes.
-sudtrace: sud/sudtrace.c sud/runtime_config.c sud/runtime_config.h wire/wire.h trace/trace.h
-	$(CC) $(CFLAGS) -o $@ sud/sudtrace.c sud/runtime_config.c
+# for the design notes.  Links the shared --remap/--overlay rule
+# parser (sud/path_remap/rules.c) so the launcher applies the exact
+# same rule set as the wrapper-side path_remap addin when probing
+# script shebangs and interpreter binaries before forking the wrapper.
+sudtrace: sud/sudtrace.c sud/runtime_config.c sud/runtime_config.h sud/path_remap/rules.c sud/path_remap/rules.h wire/wire.h trace/trace.h
+	$(CC) $(CFLAGS) -o $@ sud/sudtrace.c sud/runtime_config.c sud/path_remap/rules.c
 
 # Standalone upttrace (ptrace-based userspace tracer, works anywhere).
 UPTTRACE_HDRS := wire/wire.h trace/trace.h
@@ -204,11 +207,13 @@ PATH_REMAP_TEST_SRCS := sud/path_remap/tests/test_overlay.c \
                         sud/path_remap/overlay.c \
                         sud/path_remap/path.c \
                         sud/path_remap/fakeroot.c \
+                        sud/path_remap/rules.c \
                         sud/runtime_config.c \
                         libc-fs/libc.c libc-fs/deps/printf/printf.c
 PATH_REMAP_TEST_HDRS := sud/path_remap/overlay.h \
                         sud/path_remap/path.h \
                         sud/path_remap/fakeroot.h \
+                        sud/path_remap/rules.h \
                         sud/runtime_config.h \
                         libc-fs/libc.h libc-fs/fmt.h
 .PHONY: path-remap-test
@@ -241,9 +246,10 @@ DISPATCH_TEST_COMMON_SRCS := sud/path_remap/tests/test_dispatcher.c \
                              sud/addin.c \
                              sud/runtime_config.c \
                              libc-fs/libc.c libc-fs/deps/printf/printf.c
-DISPATCH_TEST_PATHREMAP_SRCS := sud/path_remap/addin.c sud/path_remap/overlay.c sud/path_remap/path.c sud/path_remap/fakeroot.c
+DISPATCH_TEST_PATHREMAP_SRCS := sud/path_remap/addin.c sud/path_remap/overlay.c sud/path_remap/path.c sud/path_remap/fakeroot.c sud/path_remap/rules.c
 DISPATCH_TEST_HDRS := sud/addin.h sud/path_remap/overlay.h sud/path_remap/path.h \
                       sud/path_remap/fakeroot.h \
+                      sud/path_remap/rules.h \
                       sud/runtime_config.h \
                       libc-fs/libc.h libc-fs/fmt.h
 

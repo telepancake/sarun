@@ -18,6 +18,9 @@
 #include "sud/inramfs/path_ops.h"
 #include "sud/path_remap/path.h"
 #endif
+#ifdef SUD_ADDIN_PATH_REMAP
+#include "sud/path_remap/overlay.h"
+#endif
 
 /* ELF ident helpers not provided by our minimal libc.h */
 #ifndef SELFMAG
@@ -273,6 +276,25 @@ int resolve_path(const char *cmd, char *out, int out_sz)
         if (clen >= (size_t)out_sz) clen = (size_t)out_sz - 1;
         memcpy(out, cmd, clen);
         out[clen] = '\0';
+#ifdef SUD_ADDIN_PATH_REMAP
+        /* Apply --remap / --overlay rules before checking accessibility:
+         * the wrapper has to load the *real* binary off disk (the kernel
+         * will then exec it with /proc/self/exe pointing at the real
+         * path, and the SIGSYS layer rewrites future syscall args back
+         * onto the virtual layout).  Without this, a script whose
+         * shebang names an interpreter under a remapped prefix
+         * (e.g. `#!/usr/bin/python3` with --remap /usr/bin=/host/usr/bin)
+         * fails here with "sud: cannot find …" because the literal
+         * virtual path doesn't exist on disk. */
+        char rewritten[PATH_MAX];
+        int rc = sud_overlay_resolve(out, 0, rewritten, sizeof(rewritten));
+        if (rc == SUD_OVERLAY_RESOLVED) {
+            size_t rlen = strlen(rewritten);
+            if (rlen >= (size_t)out_sz) rlen = (size_t)out_sz - 1;
+            memcpy(out, rewritten, rlen);
+            out[rlen] = '\0';
+        }
+#endif
         return (ir_access(out, X_OK) == 0);
     }
 
@@ -324,6 +346,19 @@ int resolve_path(const char *cmd, char *out, int out_sz)
             out[dlen] = '/';
             memcpy(out + dlen + 1, cmd, clen);
             out[dlen + 1 + clen] = '\0';
+#ifdef SUD_ADDIN_PATH_REMAP
+            /* Same rationale as the absolute-path arm: a $PATH dir may
+             * itself be remapped (e.g. --remap /usr/bin=/host/usr/bin).
+             * Translate before testing executability. */
+            char rewritten[PATH_MAX];
+            int rc = sud_overlay_resolve(out, 0, rewritten, sizeof(rewritten));
+            if (rc == SUD_OVERLAY_RESOLVED) {
+                size_t rlen = strlen(rewritten);
+                if (rlen >= (size_t)out_sz) rlen = (size_t)out_sz - 1;
+                memcpy(out, rewritten, rlen);
+                out[rlen] = '\0';
+            }
+#endif
             if (ir_access(out, X_OK) == 0)
                 return 1;
         }

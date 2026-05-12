@@ -16,6 +16,7 @@
  */
 
 #include "sud/path_remap/overlay.h"
+#include "sud/path_remap/rules.h"
 #include "sud/raw.h"
 #include "sud/runtime_config.h"
 
@@ -84,261 +85,90 @@ static inline long sud_ov_lstat(const char *path,
 #define SUD_OVERLAY_MAX_RULES   16
 #define SUD_OVERLAY_MAX_LOWERS  16
 
-/* Rule kinds — one of:
- *   SUD_OR_OVERLAY      copy-up overlay with whiteouts (today's SUD_OVERLAY)
- *   SUD_OR_REMAP        simple 1:1 path rewrite (today's SUD_REMAP)
- *   SUD_OR_PASSTHROUGH  explicit "leave the syscall untouched" — used
- *                       to carve a sub-prefix out of a wider overlay
- *                       or remap rule.  Has no upper/lowers, only
- *                       `merged` + `merged_len`.
- *
- * PLAN.md (line 47-58) calls for a unified rule registry tagged with
- * a kind; this `kind` field is that tag.  The legacy `simple` flag
- * is preserved as a fast-path bool for the hot REMAP arm of
- * sud_overlay_resolve(); it is set iff kind == SUD_OR_REMAP. */
-enum sud_overlay_kind {
-    SUD_OR_OVERLAY     = 0,   /* default — keeps zero-init semantics */
-    SUD_OR_REMAP       = 1,
-    SUD_OR_PASSTHROUGH = 2,
-};
+/* Path-rewriting rule kinds we care about (the rest are owned by
+ * other layers).  Used as a kind-mask when calling sud_rules_find_
+ * filtered() so that --fakeroot / --inramfs entries appearing earlier
+ * in the rule list don't shadow a later --remap or --overlay match. */
+#define OVERLAY_PATH_KIND_MASK \
+    ((1u << SUD_RULE_KIND_PASSTHROUGH) | \
+     (1u << SUD_RULE_KIND_REMAP)       | \
+     (1u << SUD_RULE_KIND_OVERLAY))
 
-struct sud_overlay_rule {
-    /* Merged mount point ("/merged"). */
-    const char *merged;
-    size_t      merged_len;
+/* Convenience accessors over struct sud_rule.  Naming preserves the
+ * old upper/lower terminology so the rest of this TU still reads as
+ * "overlay code"; in the unified rule struct, layers[0] is the upper
+ * (may be empty for a read-only overlay) and layers[1..] are the
+ * lowers in priority order.  For SUD_RULE_KIND_REMAP there is exactly
+ * one layer (the dst); we route both upper-side and lower-side
+ * accessors at it so the simple-remap arms stay one-line. */
+static const char *rule_upper(const struct sud_rule *r)
+{
+    if (r->kind == SUD_RULE_KIND_REMAP) return r->layers[0];
+    if (r->layer_count > 0 && r->layer_lens[0] > 0) return r->layers[0];
+    return 0;
+}
+static size_t rule_upper_len(const struct sud_rule *r)
+{
+    if (r->kind == SUD_RULE_KIND_REMAP) return r->layer_lens[0];
+    if (r->layer_count > 0) return r->layer_lens[0];
+    return 0;
+}
+static int rule_lower_count(const struct sud_rule *r)
+{
+    if (r->kind == SUD_RULE_KIND_REMAP) return 1;
+    return r->layer_count > 1 ? r->layer_count - 1 : 0;
+}
+static const char *rule_lower(const struct sud_rule *r, int i)
+{
+    if (r->kind == SUD_RULE_KIND_REMAP) return r->layers[0];
+    return r->layers[i + 1];
+}
+static size_t rule_lower_len(const struct sud_rule *r, int i)
+{
+    if (r->kind == SUD_RULE_KIND_REMAP) return r->layer_lens[0];
+    return r->layer_lens[i + 1];
+}
 
-    /* Upper (writable) layer; NULL or empty if read-only overlay.
-     * Always NULL for SUD_OR_PASSTHROUGH. */
-    const char *upper;
-    size_t      upper_len;
-
-    /* Lower layers in priority order.  Empty for SUD_OR_PASSTHROUGH. */
-    const char *lowers[SUD_OVERLAY_MAX_LOWERS];
-    size_t      lower_lens[SUD_OVERLAY_MAX_LOWERS];
-    int         lower_count;
-
-    /* When set, this rule was created from "remap:<src>=<dst>", not
-     * "overlay:...":  `upper` and the single `lowers[0]` are the same
-     * path, no whiteout semantics are applied, and read/write resolve
-     * identically to the legacy 1:1 remap behaviour.  Equivalent to
-     * (kind == SUD_OR_REMAP); kept as a fast-path bool because the
-     * resolve loop branches on it once per syscall. */
-    int         simple;
-
-    /* Rule-kind tag.  See enum sud_overlay_kind above. */
-    int         kind;
-};
-
-static struct sud_overlay_rule g_rules[SUD_OVERLAY_MAX_RULES];
+static struct sud_rule g_rules[SUD_OVERLAY_MAX_RULES];
 static int g_rule_count;
 static int g_init_done;
 
 /* ----------------------------------------------------------------
- *  Tiny utility helpers (kept local: libc-fs has strlen/memcpy/etc.
- *  but a few tasks below want bounded/explicit behaviour).
- * ---------------------------------------------------------------- */
-static int is_path_boundary(char c)
-{
-    return c == '\0' || c == '/';
-}
-
-static char *dup_range(const char *start, size_t n)
-{
-    char *p = (char *)malloc(n + 1);
-    if (!p) return 0;
-    for (size_t i = 0; i < n; i++) p[i] = start[i];
-    p[n] = '\0';
-    return p;
-}
-
-/* Append `tail` to `head` into out[0..out_sz).  `head` is `head_len`
- * bytes (no NUL); `tail` is NUL-terminated.  Returns 0 on success,
- * -1 on overflow. */
-static int compose(char *out, size_t out_sz,
-                   const char *head, size_t head_len,
-                   const char *tail)
-{
-    size_t tail_len = strlen(tail);
-    if (head_len + tail_len + 1 > out_sz) return -1;
-    memcpy(out, head, head_len);
-    memcpy(out + head_len, tail, tail_len + 1);
-    return 0;
-}
-
-/* Test whether `path` lies at or under `prefix` on a path-component
- * boundary.  Returns the relative tail (pointing into `path`, may be
- * "" or starting with '/') on match, or NULL otherwise. */
-static const char *path_under(const char *path, const char *prefix,
-                              size_t prefix_len)
-{
-    if (strncmp(path, prefix, prefix_len) != 0) return 0;
-    if (!is_path_boundary(path[prefix_len])) return 0;
-    return path + prefix_len;
-}
-
-/* ----------------------------------------------------------------
  *  Configuration parsing.
- * ---------------------------------------------------------------- */
-/* Parse one overlay segment "<merged>=<upper>+<lower>+...".  Length
- * passed explicitly so the same function works on both NUL-terminated
- * config values and views into a colon-delimited env value. */
-static void parse_overlay_segment(const char *seg, size_t len)
-{
-    if (g_rule_count >= SUD_OVERLAY_MAX_RULES) return;
-    const char *env = seg;
-    const char *end = seg + len;
-    /* Read merged path until '='. */
-    const char *merged = env;
-    while (env < end && *env != '=') env++;
-    if (env >= end) return;
-    size_t merged_len = (size_t)(env - merged);
-    env++;  /* skip '=' */
-
-    struct sud_overlay_rule *r = &g_rules[g_rule_count];
-    r->merged = 0; r->upper = 0; r->lower_count = 0; r->simple = 0;
-    r->kind = SUD_OR_OVERLAY;
-
-    if (merged_len == 0) return;
-    r->merged = dup_range(merged, merged_len);
-    r->merged_len = merged_len;
-    if (!r->merged) return;
-
-    /* Upper (may be empty: "+lower1+lower2"). */
-    const char *upper = env;
-    while (env < end && *env != '+') env++;
-    size_t upper_len = (size_t)(env - upper);
-    if (upper_len > 0) {
-        r->upper = dup_range(upper, upper_len);
-        r->upper_len = upper_len;
-        if (!r->upper) return;
-    }
-
-    /* Lowers: each '+'-separated path. */
-    while (env < end && *env == '+' &&
-           r->lower_count < SUD_OVERLAY_MAX_LOWERS) {
-        env++;
-        const char *low = env;
-        while (env < end && *env != '+') env++;
-        size_t low_len = (size_t)(env - low);
-        if (low_len == 0) continue;
-        char *p = dup_range(low, low_len);
-        if (!p) return;
-        r->lowers[r->lower_count] = p;
-        r->lower_lens[r->lower_count] = low_len;
-        r->lower_count++;
-    }
-
-    /* A rule must have at least an upper or one lower to be usable. */
-    if (r->upper || r->lower_count > 0) g_rule_count++;
-}
-
-/* Parse one simple remap segment "<src>=<dst>". */
-static void parse_remap_segment(const char *seg, size_t len)
-{
-    if (g_rule_count >= SUD_OVERLAY_MAX_RULES) return;
-    const char *env = seg;
-    const char *end = seg + len;
-    const char *src = env;
-    while (env < end && *env != '=') env++;
-    if (env >= end) return;
-    size_t src_len = (size_t)(env - src);
-    env++;
-    const char *dst = env;
-    size_t dst_len = (size_t)(end - dst);
-    if (src_len == 0 || dst_len == 0) return;
-
-    struct sud_overlay_rule *r = &g_rules[g_rule_count];
-    r->merged = dup_range(src, src_len);
-    r->merged_len = src_len;
-    r->upper = dup_range(dst, dst_len);
-    r->upper_len = dst_len;
-    r->lowers[0] = r->upper;
-    r->lower_lens[0] = r->upper_len;
-    r->lower_count = 1;
-    r->simple = 1;
-    r->kind = SUD_OR_REMAP;
-    if (r->merged && r->upper) g_rule_count++;
-}
-
-/* Parse one passthrough segment "<prefix>".  Stores a kind-tagged rule
- * with no upper / no lowers; sud_overlay_resolve() short-circuits to
- * SUD_OVERLAY_PASSTHROUGH on a match.  See PLAN.md line 49. */
-static void parse_passthrough_segment(const char *seg, size_t len)
-{
-    if (g_rule_count >= SUD_OVERLAY_MAX_RULES) return;
-    /* Strip trailing slashes (except a bare "/"). */
-    while (len > 1 && seg[len - 1] == '/') len--;
-    if (len == 0 || seg[0] != '/') return;
-
-    struct sud_overlay_rule *r = &g_rules[g_rule_count];
-    r->merged = dup_range(seg, len);
-    if (!r->merged) return;
-    r->merged_len = len;
-    r->upper = 0; r->upper_len = 0;
-    r->lower_count = 0;
-    r->simple = 0;
-    r->kind = SUD_OR_PASSTHROUGH;
-    g_rule_count++;
-}
-
+ * ----------------------------------------------------------------
+ * Done by the shared parser in sud/path_remap/rules.c so the launcher
+ * (sud/sudtrace.c) and the wrapper-side overlay layer here see the
+ * same rule set parsed the same way.  The strings inside `g_rules`
+ * alias `g_sud_runtime_config.remap_rules` entries directly — those
+ * are interned in sud/wrapper.c::main via sud_runtime_config_intern()
+ * before the addins start running, so the aliasing is process-lifetime
+ * stable. */
 void sud_overlay_init(void)
 {
     if (g_init_done) return;
     g_init_done = 1;
-
-    /* Read rules from the runtime config populated by sud/wrapper.c.
-     * Each "--remap-rule <kind>:<spec>" entry becomes one rule.
-     * Inramfs rules are skipped here — they are owned by the inramfs
-     * addin (and, eventually, the path_remap inramfs glue). */
     if (!g_sud_runtime_config_present) return;
-    for (int i = 0; i < g_sud_runtime_config.remap_rule_count; i++) {
-        const char *r = g_sud_runtime_config.remap_rules[i];
-        if (!r || !r[0]) continue;
-        const char *colon = r;
-        while (*colon && *colon != ':') colon++;
-        if (*colon != ':') continue;
-        size_t klen = (size_t)(colon - r);
-        const char *spec = colon + 1;
-        size_t slen = 0;
-        while (spec[slen]) slen++;
-        if (klen == 7 && r[0]=='o' && r[1]=='v' && r[2]=='e' &&
-            r[3]=='r' && r[4]=='l' && r[5]=='a' && r[6]=='y')
-            parse_overlay_segment(spec, slen);
-        else if (klen == 5 && r[0]=='r' && r[1]=='e' && r[2]=='m' &&
-                 r[3]=='a' && r[4]=='p')
-            parse_remap_segment(spec, slen);
-        else if (klen == 11 && r[0]=='p' && r[1]=='a' && r[2]=='s' &&
-                 r[3]=='s' && r[4]=='t' && r[5]=='h' && r[6]=='r' &&
-                 r[7]=='o' && r[8]=='u' && r[9]=='g' && r[10]=='h')
-            parse_passthrough_segment(spec, slen);
-        /* "inramfs" / "fakeroot": each is owned by a separate layer
-         * that reads its slice of the runtime config independently
-         * (sud/inramfs/super.c for inramfs; sud/path_remap/fakeroot.c
-         * for fakeroot — see PLAN.md line 57).  Both are silently
-         * ignored here so overlay.c stays focused on path-rewriting
-         * rule kinds. */
-    }
+    g_rule_count = sud_rules_parse(&g_sud_runtime_config,
+                                   g_rules, SUD_OVERLAY_MAX_RULES);
 }
 
 int sud_overlay_rule_count(void)
 {
-    return g_rule_count;
+    /* Count only the kinds this layer actually rewrites — fakeroot
+     * and inramfs entries live in g_rules too (the parser is shared)
+     * but they don't contribute to overlay's resolution loop. */
+    int n = 0;
+    for (int i = 0; i < g_rule_count; i++) {
+        unsigned k = (unsigned)g_rules[i].kind;
+        if (OVERLAY_PATH_KIND_MASK & (1u << k)) n++;
+    }
+    return n;
 }
 
 void sud_overlay_reset_for_testing(void)
 {
-    /* Free is not strictly necessary (process-lifetime) but tests run
-     * reset between sub-tests; the leaked dup_range strings are tiny
-     * and bounded by the number of rules tested. */
-    for (int i = 0; i < g_rule_count; i++) {
-        struct sud_overlay_rule *r = &g_rules[i];
-        if (r->merged) free((void *)r->merged);
-        if (r->upper) free((void *)r->upper);
-        for (int j = 0; j < r->lower_count; j++) {
-            if (r->simple) break;  /* lowers[0] aliases upper */
-            if (r->lowers[j]) free((void *)r->lowers[j]);
-        }
-    }
+    /* Strings inside g_rules alias the runtime config (no malloc here),
+     * so just zero the table. */
     memset(g_rules, 0, sizeof(g_rules));
     g_rule_count = 0;
     g_init_done = 0;
@@ -348,22 +178,21 @@ void sud_overlay_reset_for_testing(void)
  *  Overlay lookup primitives.
  * ---------------------------------------------------------------- */
 
-/* Find the rule whose merged prefix `path` lies under.  Returns the
- * rule and writes `*tail_out` to point at the trailing relative path
- * (may be "" or "/..."), or NULL if no match. */
-static const struct sud_overlay_rule *
+static int compose(char *out, size_t out_sz,
+                   const char *head, size_t head_len,
+                   const char *tail)
+{
+    return sud_rules_compose(out, out_sz, head, head_len, tail) ? 0 : -1;
+}
+
+/* Find the first rule whose merged prefix `path` lies under, ignoring
+ * --fakeroot and --inramfs entries (those don't rewrite paths and
+ * sit in the rule list to preserve user-visible CLI ordering). */
+static const struct sud_rule *
 find_rule(const char *path, const char **tail_out)
 {
-    if (!path || path[0] != '/') return 0;
-    for (int i = 0; i < g_rule_count; i++) {
-        const struct sud_overlay_rule *r = &g_rules[i];
-        const char *tail = path_under(path, r->merged, r->merged_len);
-        if (tail) {
-            *tail_out = tail;
-            return r;
-        }
-    }
-    return 0;
+    return sud_rules_find_filtered(g_rules, g_rule_count, path,
+                                   OVERLAY_PATH_KIND_MASK, tail_out);
 }
 
 /* Stat `path` (no follow).  Returns kernel-style return code:
@@ -454,7 +283,7 @@ int sud_overlay_resolve(const char *path, int for_write,
     if (!path || path[0] != '/') return SUD_OVERLAY_PASSTHROUGH;
 
     const char *tail;
-    const struct sud_overlay_rule *r = find_rule(path, &tail);
+    const struct sud_rule *r = find_rule(path, &tail);
     if (!r) return SUD_OVERLAY_PASSTHROUGH;
 
     /* Explicit passthrough rule: leave the syscall arg untouched.
@@ -463,23 +292,25 @@ int sud_overlay_resolve(const char *path, int for_write,
      * semantics for a "carve-out" rule that pins a sub-prefix of a
      * wider overlay/remap to native kernel behaviour.  See PLAN.md
      * line 49.  Direction-agnostic: read and write both pass through. */
-    if (r->kind == SUD_OR_PASSTHROUGH) return SUD_OVERLAY_PASSTHROUGH;
+    if (r->kind == SUD_RULE_KIND_PASSTHROUGH) return SUD_OVERLAY_PASSTHROUGH;
 
-    /* Simple SUD_REMAP rule: pass through to the single mapping. */
-    if (r->simple) {
-        if (compose_layer(out, out_sz, r->upper, r->upper_len, tail) < 0)
+    /* Simple --remap rule: pass through to the single mapping. */
+    if (r->kind == SUD_RULE_KIND_REMAP) {
+        if (compose_layer(out, out_sz,
+                          rule_upper(r), rule_upper_len(r), tail) < 0)
             return SUD_OVERLAY_PASSTHROUGH;
         return SUD_OVERLAY_RESOLVED;
     }
 
     /* Check upper first (always needed: for whiteout detection on read
      * paths, and as the destination for writes). */
+    const char *upper     = rule_upper(r);
+    size_t      upper_len = rule_upper_len(r);
     char upath[PATH_MAX];
     int upper_state = 0;  /* 0=absent, 1=whiteout, 2=present */
     struct sud_overlay_stat st;
-    if (r->upper) {
-        if (compose_layer(upath, sizeof(upath),
-                          r->upper, r->upper_len, tail) < 0)
+    if (upper) {
+        if (compose_layer(upath, sizeof(upath), upper, upper_len, tail) < 0)
             return SUD_OVERLAY_PASSTHROUGH;
         if (stat_one(upath, &st) == 0) {
             upper_state = is_whiteout_st(&st) ? 1 : 2;
@@ -487,8 +318,8 @@ int sud_overlay_resolve(const char *path, int for_write,
     }
 
     if (for_write) {
-        if (!r->upper) return SUD_OVERLAY_READONLY;
-        ensure_parent_in_upper(r->upper, r->upper_len, tail);
+        if (!upper) return SUD_OVERLAY_READONLY;
+        ensure_parent_in_upper(upper, upper_len, tail);
         return copy_resolved(out, out_sz, upath);
     }
 
@@ -496,10 +327,11 @@ int sud_overlay_resolve(const char *path, int for_write,
     if (upper_state == 1) return SUD_OVERLAY_WHITEOUT;
     if (upper_state == 2) return copy_resolved(out, out_sz, upath);
     /* Walk lowers. */
-    for (int i = 0; i < r->lower_count; i++) {
+    int lc = rule_lower_count(r);
+    for (int i = 0; i < lc; i++) {
         char buf[PATH_MAX];
         if (compose_layer(buf, sizeof(buf),
-                          r->lowers[i], r->lower_lens[i], tail) < 0)
+                          rule_lower(r, i), rule_lower_len(r, i), tail) < 0)
             continue;
         if (stat_one(buf, &st) == 0)
             return copy_resolved(out, out_sz, buf);
@@ -507,10 +339,10 @@ int sud_overlay_resolve(const char *path, int for_write,
     /* Not found in any layer.  Return the upper path so the syscall
      * itself produces -ENOENT against a meaningful location.  If no
      * upper is configured, return the first lower. */
-    if (r->upper) return copy_resolved(out, out_sz, upath);
-    if (r->lower_count > 0) {
+    if (upper) return copy_resolved(out, out_sz, upath);
+    if (lc > 0) {
         if (compose_layer(out, out_sz,
-                          r->lowers[0], r->lower_lens[0], tail) < 0)
+                          rule_lower(r, 0), rule_lower_len(r, 0), tail) < 0)
             return SUD_OVERLAY_PASSTHROUGH;
         return SUD_OVERLAY_RESOLVED;
     }
@@ -637,29 +469,31 @@ int sud_overlay_create_whiteout(const char *path)
 {
     if (!path || path[0] != '/') return -EINVAL;
     const char *tail;
-    const struct sud_overlay_rule *r = find_rule(path, &tail);
+    const struct sud_rule *r = find_rule(path, &tail);
     if (!r) return 0;            /* not under overlay — nothing to do */
-    if (r->kind == SUD_OR_PASSTHROUGH) return 0;  /* explicit carve-out */
-    if (r->simple) return 0;     /* simple remap has no whiteouts */
-    if (!r->upper) return -EROFS;
+    if (r->kind == SUD_RULE_KIND_PASSTHROUGH) return 0;
+    if (r->kind == SUD_RULE_KIND_REMAP) return 0;  /* no whiteouts */
+    const char *upper     = rule_upper(r);
+    size_t      upper_len = rule_upper_len(r);
+    if (!upper) return -EROFS;
 
     /* If the entry doesn't exist in any lower, no whiteout is needed. */
     int needed = 0;
+    int lc = rule_lower_count(r);
     struct sud_overlay_stat st;
-    for (int i = 0; i < r->lower_count; i++) {
+    for (int i = 0; i < lc; i++) {
         char buf[PATH_MAX];
         if (compose_layer(buf, sizeof(buf),
-                          r->lowers[i], r->lower_lens[i], tail) < 0)
+                          rule_lower(r, i), rule_lower_len(r, i), tail) < 0)
             continue;
         if (stat_one(buf, &st) == 0) { needed = 1; break; }
     }
     if (!needed) return 0;
 
     char upath[PATH_MAX];
-    if (compose_layer(upath, sizeof(upath),
-                      r->upper, r->upper_len, tail) < 0)
+    if (compose_layer(upath, sizeof(upath), upper, upper_len, tail) < 0)
         return -ENAMETOOLONG;
-    ensure_parent_in_upper(r->upper, r->upper_len, tail);
+    ensure_parent_in_upper(upper, upper_len, tail);
 
     /* If something already exists at the upper location, remove it
      * first.  This is the case after a write-then-delete cycle: the
@@ -881,18 +715,18 @@ int sud_overlay_open_dir(const char *path, int flags, int mode)
     if (!g_rule_count) return SUD_OVERLAY_NO_DIR;
     if (!path || path[0] != '/') return SUD_OVERLAY_NO_DIR;
     const char *tail;
-    const struct sud_overlay_rule *r = find_rule(path, &tail);
+    const struct sud_rule *r = find_rule(path, &tail);
     if (!r) return SUD_OVERLAY_NO_DIR;
     /* Passthrough rules carve a sub-prefix out of any wider overlay;
      * directory opens on them must hit the kernel directly so the
      * caller (path_remap addin) returns NO_DIR → falls back to the
      * standard openat code path. */
-    if (r->kind == SUD_OR_PASSTHROUGH) return SUD_OVERLAY_NO_DIR;
-    if (r->simple) {
+    if (r->kind == SUD_RULE_KIND_PASSTHROUGH) return SUD_OVERLAY_NO_DIR;
+    if (r->kind == SUD_RULE_KIND_REMAP) {
         /* Simple remap: just open the mapped path directly. */
         char buf[PATH_MAX];
         if (compose_layer(buf, sizeof(buf),
-                          r->upper, r->upper_len, tail) < 0)
+                          rule_upper(r), rule_upper_len(r), tail) < 0)
             return -ENAMETOOLONG;
         long fd = raw_syscall6(SYS_openat, AT_FDCWD, (long)buf,
                                flags, mode, 0, 0);
@@ -930,12 +764,17 @@ int sud_overlay_open_dir(const char *path, int flags, int mode)
     struct name_set seen     = { seen_buf,  65536, 0, 0 };
     struct name_set whiteouts= { white_buf, 16384, 0, 0 };
 
-    if (r->upper)
-        merge_layer(r->upper, r->upper_len, tail,
-                    synth, synth_len, &seen, &whiteouts, 1);
-    for (int i = 0; i < r->lower_count; i++)
-        merge_layer(r->lowers[i], r->lower_lens[i], tail,
-                    synth, synth_len, &seen, &whiteouts, 0);
+    {
+        const char *upper     = rule_upper(r);
+        size_t      upper_len = rule_upper_len(r);
+        if (upper)
+            merge_layer(upper, upper_len, tail,
+                        synth, synth_len, &seen, &whiteouts, 1);
+        int lc = rule_lower_count(r);
+        for (int i = 0; i < lc; i++)
+            merge_layer(rule_lower(r, i), rule_lower_len(r, i), tail,
+                        synth, synth_len, &seen, &whiteouts, 0);
+    }
 
     free(seen_buf);
     free(white_buf);

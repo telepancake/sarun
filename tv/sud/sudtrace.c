@@ -33,6 +33,7 @@
 #include "wire/wire.h"
 #include "trace/trace.h"
 #include "sud/runtime_config.h"
+#include "sud/path_remap/rules.h"
 
 #ifndef __WALL
 #define __WALL 0x40000000
@@ -68,22 +69,43 @@ static void usage(const char *prog)
         "                                sudtrace invocations (default: mint a\n"
         "                                fresh key and unlink the backing shm on\n"
         "                                exit)\n"
-        "  --overlay <merged>=<upper>+<lower>[+<lower>...]\n"
-        "                                overlayfs-style merged view (repeatable;\n"
-        "                                empty <upper> = read-only)\n"
-        "  --remap <src>=<dst>           rewrite <src> → <dst> on every path\n"
-        "                                argument (repeatable)\n"
-        "  --passthrough <prefix>        carve <prefix> out of any wider\n"
+        "\n"
+        "  Path rewriting.  In every rule below the LHS of '=' is what the\n"
+        "  TRACED PROGRAM SEES (the path it passes to syscalls); the RHS is\n"
+        "  what is ACTUALLY ON DISK (what the kernel sees once we rewrite\n"
+        "  the syscall).  Rules are scanned in CLI order and the first one\n"
+        "  whose LHS prefix matches wins, so list narrower rules before the\n"
+        "  wider ones they carve out of.\n"
+        "\n"
+        "  --overlay <visible>=<upper>+<lower>[+<lower>...]\n"
+        "                                overlayfs-style merged view: at\n"
+        "                                <visible> the program sees <upper>\n"
+        "                                (writable) stacked over each <lower>\n"
+        "                                (read-only) in priority order.\n"
+        "                                Writes land in <upper>; reads walk\n"
+        "                                upper, then each lower.  An empty\n"
+        "                                <upper> (\"=+<lower>...\") makes the\n"
+        "                                rule read-only (writes get -EROFS).\n"
+        "                                (repeatable)\n"
+        "  --remap <visible>=<real>      whenever the program touches a path\n"
+        "                                under <visible>, rewrite the\n"
+        "                                <visible> prefix to <real> before\n"
+        "                                handing the syscall to the kernel.\n"
+        "                                (repeatable)\n"
+        "  --passthrough <visible>       carve <visible> out of any wider\n"
         "                                --overlay/--remap rule: paths under\n"
-        "                                <prefix> hit the kernel directly\n"
-        "                                (repeatable; list before the wider\n"
-        "                                rule it carves out of)\n"
-        "  --fakeroot <prefix>           pretend the traced process is uid 0\n"
-        "                                under <prefix>: chown/chmod succeed\n"
+        "                                <visible> hit the kernel verbatim,\n"
+        "                                with no rewriting.  List BEFORE the\n"
+        "                                wider rule it carves out of.\n"
+        "                                (repeatable)\n"
+        "  --fakeroot <visible>          pretend the traced process is uid 0\n"
+        "                                under <visible>: chown/chmod succeed\n"
         "                                without touching the kernel, stat\n"
         "                                returns the recorded uid/gid/mode,\n"
         "                                geteuid()/getuid()/&c return 0\n"
-        "                                process-wide (repeatable)\n"
+        "                                process-wide.  Path resolution is\n"
+        "                                pure passthrough; only metadata is\n"
+        "                                faked.  (repeatable)\n"
         "  --no-fake-exec                disable the fake-exec addin (run\n"
         "                                trivial helpers like true/false/\n"
         "                                echo/printf/sh -c <trivial> through\n"
@@ -358,6 +380,109 @@ static int detect_target_class(const char *path)
 }
 
 /* ================================================================
+ * Launcher-side path-rule resolver
+ *
+ * The traced process gets path remapping for free: the path_remap addin
+ * inside the wrapper rewrites every syscall arg.  But the launcher
+ * itself ALSO has to read a couple of paths off the disk before the
+ * wrapper is even spawned — namely the script the user pointed us at
+ * (so we can read its #! line) and the shebang interpreter (so we can
+ * pick the right wrapper bitness).  Without applying the same rules
+ * the addin would, those reads fail whenever the user's interpreter
+ * lives under a --remap or --overlay prefix, even though the path
+ * exists perfectly well on disk under the rewritten location.
+ *
+ * The actual rule parser and prefix lookup live in
+ * sud/path_remap/rules.{c,h} and are shared with the wrapper-side
+ * sud/path_remap/overlay.c.  Here we just enumerate candidate on-disk
+ * paths and pick the first one that exists.
+ * ================================================================ */
+
+/* Translate a virtual path through the shared rule resolver.  Returns:
+ *    1  — `out` holds the on-disk path the wrapper would reach.
+ *    0  — no rule matched, or matched a passthrough/fakeroot rule
+ *         (path is its own real location).
+ *   -1  — path falls under --inramfs and isn't readable from the
+ *         launcher.  Caller should give up and let the wrapper handle
+ *         the read inside the inramfs store. */
+static int resolve_via_cli_rules(const struct sud_runtime_config *cfg,
+                                 const char *path,
+                                 char *out, size_t out_sz)
+{
+    if (!cfg || !path) return 0;
+
+    struct sud_rule rules[SUD_RULES_MAX_RULES];
+    int rule_count = sud_rules_parse(cfg, rules, SUD_RULES_MAX_RULES);
+    if (rule_count == 0) return 0;
+
+    const char *tail = NULL;
+    const struct sud_rule *r = sud_rules_find(rules, rule_count, path, &tail);
+    if (!r) return 0;
+    if (r->kind == SUD_RULE_KIND_PASSTHROUGH ||
+        r->kind == SUD_RULE_KIND_FAKEROOT) return 0;
+    if (r->kind == SUD_RULE_KIND_INRAMFS) return -1;
+
+    /* For overlay/remap, walk the layers in priority order and stop on
+     * the first one that exists on disk.  Mirrors overlay.c's
+     * sud_overlay_resolve(for_write=0). */
+    int have_first = 0;
+    char first_real[PATH_MAX];
+    for (int i = 0; i < r->layer_count; i++) {
+        char cand[PATH_MAX];
+        if (!sud_rules_compose(cand, sizeof(cand),
+                               r->layers[i], r->layer_lens[i], tail))
+            continue;
+        if (!have_first) {
+            size_t n = strlen(cand);
+            if (n + 1 <= sizeof(first_real)) {
+                memcpy(first_real, cand, n + 1);
+                have_first = 1;
+            }
+        }
+        struct stat st;
+        if (stat(cand, &st) == 0) {
+            size_t n = strlen(cand);
+            if (n + 1 > out_sz) return 0;
+            memcpy(out, cand, n + 1);
+            return 1;
+        }
+    }
+    /* Nothing existed; fall back to the first non-empty layer so the
+     * caller gets a meaningful -ENOENT against a real on-disk name. */
+    if (have_first) {
+        size_t n = strlen(first_real);
+        if (n + 1 > out_sz) return 0;
+        memcpy(out, first_real, n + 1);
+        return 1;
+    }
+    return 0;
+}
+
+/* Open `path` for reading, applying CLI rules first so we look at the
+ * file the wrapper would.  Returns the fd, or -1 on failure or when
+ * the path lives under inramfs (unreadable from the launcher). */
+static int open_via_cli_rules(const struct sud_runtime_config *cfg,
+                              const char *path, int flags)
+{
+    char real[PATH_MAX];
+    int rc = resolve_via_cli_rules(cfg, path, real, sizeof(real));
+    if (rc < 0) return -1;
+    return open(rc == 1 ? real : path, flags);
+}
+
+/* Same direction-aware wrapper around detect_target_class().  Falls
+ * back to the input path (and ultimately the built-in 64-bit default)
+ * when the rule resolver doesn't have an answer. */
+static int detect_target_class_via_rules(const struct sud_runtime_config *cfg,
+                                         const char *path)
+{
+    char real[PATH_MAX];
+    int rc = resolve_via_cli_rules(cfg, path, real, sizeof(real));
+    if (rc == 1) return detect_target_class(real);
+    return detect_target_class(path);
+}
+
+/* ================================================================
  * Wire-format event emission.
  *
  * The launcher is itself a wire producer: it writes the version atom
@@ -535,12 +660,15 @@ static char **build_wrapper_argv(int cmd_argc, char **cmd_argv,
         snprintf(resolved, sizeof(resolved), "%s", target);
     }
 
-    /* Check for shebang */
+    /* Check for shebang.  The user-supplied script may itself live under
+     * a remap/overlay rule; route the read through the same resolver
+     * the addin would use so we read the on-disk file rather than
+     * stat'ing into thin air. */
     char shebang_interp[PATH_MAX] = "";
     char shebang_arg[PATH_MAX] = "";
     {
         char buf[512];
-        int fd = open(resolved, O_RDONLY);
+        int fd = open_via_cli_rules(cfg, resolved, O_RDONLY);
         if (fd >= 0) {
             ssize_t n = read(fd, buf, sizeof(buf) - 1);
             close(fd);
@@ -589,7 +717,7 @@ static char **build_wrapper_argv(int cmd_argc, char **cmd_argv,
     } else {
         /* ELF binary — check if dynamic */
         int elf_class = 0;
-        int fd = open(resolved, O_RDONLY);
+        int fd = open_via_cli_rules(cfg, resolved, O_RDONLY);
         if (fd >= 0) {
             unsigned char ehdr[64];
             ssize_t n = read(fd, ehdr, sizeof(ehdr));
@@ -608,8 +736,13 @@ static char **build_wrapper_argv(int cmd_argc, char **cmd_argv,
         elf_path = resolved;
     }
 
-    /* Determine the target ELF class */
-    int target_class = detect_target_class(elf_path);
+    /* Determine the target ELF class.  When the interpreter (or, for a
+     * non-script target, the binary itself) lives under a --remap or
+     * --overlay rule, the resolver translates the virtual path to the
+     * on-disk one before opening it; otherwise the probe would fail
+     * and we'd silently fall back to 64-bit, picking the wrong wrapper
+     * for genuinely 32-bit interpreters under such rules. */
+    int target_class = detect_target_class_via_rules(cfg, elf_path);
     const char *wrapper = (target_class == 1) ? g_wrapper_32 : g_wrapper_64;
 
     /* Build argv:
