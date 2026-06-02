@@ -1,1 +1,12 @@
 # sarun
+
+super easy controlled execution for linux. this is not containers. this is for running normal programs directly, but not really.
+two parts - "ui"/"server", and "sandbox"/"client". both are exact same command. 'sarun' with just options starts ui, 'sarun <cmd>' runs cmd under sandbox.
+sandbox uses bwrap to run command in an overlayfs covering the whole filesystem, so that all file modifications by the program get captured by the overlayfs upper layer. (except of course /proc, /dev and such that make no sense whatsoever to cover with overlay, and they instead are mounted by bwrap)
+sandbox removes direct network connectivity and uses mitmproxy to provide network access, with all requests either being approved or rejected by the matching rule from the ruleset, or, if no rule matches, by user action (hence need for server and ui. sandboxes cannot directly ask user. what if sandbox runs from a script? but that ui can. so sandbox connects to that ui on startup), that can accept or reject or create a rule for duration of session, or permanently (that is added to ~/.config/sarun/netrul.txt).
+to make life of mitmproxy easier, sandbox creates another lower dir with modified certificate stores that include mitmproxy certificate as trusted, and mounts that below the upper, so that the overlayfs is host, then cert stores, then upper rw dir.
+each sandbox runs it's own instance of mitmproxy, in the sandbox net filesystem.
+sandbox, by virtue of how bwrap works, prevents program from messing with system by running sudo, writing to all kinds of sockets, or messing with other privileged actions.
+the "upper" that captures output lives in ~/.cache/sarun/upper/* and is visible and browsable in the UI that lists all sessions. upon completion (or a crash) of a sandbox session the ui provides visual hint that this upper is safe to inspect and merge into host filesystem as is, or edit before merging, or merge just some bits, or delete. this is facilitated by the interactive nature of the ui, support for overlayfs whiteouts, automatic diff view for textual files and easy to use "smalltalk-like" file browser with file/diff information in the large bottom area, and folder path in the string of navigation panes above.
+while sandbox has not terminated, UI lets inspect it's process tree (similar to how htop does) and intervene by poking the processes. it is also possible to destroy whole sandbox session.
+all sandbox processes run as the user that started the sandbox. again, this is not a container.
