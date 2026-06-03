@@ -63,18 +63,22 @@ from typing import Any
 #  Paths
 # ════════════════════════════════════════════════════════════════════════════
 
+# These are pure path helpers: they must NOT create anything at import time. The
+# in-sandbox `--inner` process imports this module too, and any directory it
+# touched (under the sandboxed HOME) would be captured by the overlay and show up
+# as a bogus "change". Real directory creation is deferred to ensure_dirs(),
+# called only by the UI and the runner.
 def data_home() -> Path:
     base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
-    p = Path(base) / "sandbox"; p.mkdir(parents=True, exist_ok=True); return p
+    return Path(base) / "sandbox"
 
 def config_home() -> Path:
     base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
-    p = Path(base) / "sandbox"; p.mkdir(parents=True, exist_ok=True); return p
+    return Path(base) / "sandbox"
 
 def runtime_home() -> Path:
     base = os.environ.get("XDG_RUNTIME_DIR")
-    p = Path(base) / "sandbox" if base else data_home()
-    p.mkdir(parents=True, exist_ok=True); return p
+    return Path(base) / "sandbox" if base else data_home()
 
 SHM_ROOT       = Path("/dev/shm")
 SHM_PREFIX     = "sandbox."
@@ -82,8 +86,15 @@ SOCK_PATH      = str(runtime_home() / "ui.sock")        # control + FD channel
 MITM_CONFDIR   = data_home() / "mitmproxy"              # CA, generated once
 CA_CERT        = MITM_CONFDIR / "mitmproxy-ca-cert.pem"
 RULES_FILE     = config_home() / "rules"
-MITM_CONFDIR.mkdir(parents=True, exist_ok=True)
-RULES_FILE.touch(exist_ok=True)
+
+def ensure_dirs() -> None:
+    """Create our host-side config/data/runtime directories. Called by the UI and
+    the runner — never by the in-sandbox --inner process."""
+    for p in (data_home(), config_home(), runtime_home(), MITM_CONFDIR):
+        try: p.mkdir(parents=True, exist_ok=True)
+        except OSError: pass
+    try: RULES_FILE.touch(exist_ok=True)
+    except OSError: pass
 
 INNER_PROXY_PORT = 8080   # forwarder's listen port inside the sandbox
 
@@ -216,9 +227,12 @@ class Rules:
     def __init__(self, path: Path):
         self.path = path; self.entries: set = set(); self.load()
     def load(self) -> None:
-        self.entries = {ln.strip() for ln in self.path.read_text().splitlines()
+        try: text = self.path.read_text()
+        except OSError: text = ""
+        self.entries = {ln.strip() for ln in text.splitlines()
                         if ln.strip() and not ln.startswith("#")}
     def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text("\n".join(sorted(self.entries)) + "\n")
     @staticmethod
     def _match(host: str, port: int, pat: str) -> bool:
@@ -240,6 +254,20 @@ class Rules:
 # ════════════════════════════════════════════════════════════════════════════
 #  Session model + discovery + robust removal
 # ════════════════════════════════════════════════════════════════════════════
+
+def _is_overlay_marker(name: str) -> bool:
+    """fuse-overlayfs / aufs opaque-directory and bookkeeping markers. These are
+    internal to the overlay and are not user-visible changes, so we never list,
+    apply, or count them."""
+    return name == ".wh..opq" or name.startswith(".wh..wh.")
+
+def upper_has_changes(up: Path) -> bool:
+    """True if the overlay upper holds any real change (a created/modified file or
+    a whiteout deletion), ignoring the overlay's own opaque markers."""
+    for root, _dirs, files in os.walk(up, onerror=lambda _e: None):
+        if any(not _is_overlay_marker(nm) for nm in files):
+            return True
+    return False
 
 def _pid_alive(pid: int) -> bool:
     if not pid: return False
@@ -424,6 +452,11 @@ class Supervisor:
         s.exit_code = msg.get("exit_code")
         self._emit(type="session_updated", session=s.to_dict())
 
+    def drop(self, msg: dict) -> None:
+        # Runner reports the session left nothing to review; remove it outright.
+        if self.sessions.pop(msg["session_id"], None) is not None:
+            self._emit(type="session_removed", session_id=msg["session_id"])
+
     async def approval_request(self, sid, host, port, scheme) -> dict:
         s = self.sessions.get(sid)
         if not s:
@@ -491,26 +524,72 @@ class Supervisor:
             st = p.stat(); return stat_mod.S_ISCHR(st.st_mode) and st.st_rdev == 0
         except OSError: return False
 
+    # Surfacing deletions caused by an opaque directory can in principle touch a
+    # large lower tree; cap it so the review list can't be flooded.
+    _OPAQUE_DELETE_CAP = 500
+
     def overlay_entries(self, sid) -> list:
         s = self.sessions.get(sid)
         if not s: return []
-        upper = Path(s.upper); out = []
-        if not upper.exists(): return out
-        for ap in sorted(upper.rglob("*")):
-            if ap.is_dir() and not self._is_whiteout(ap): continue
+        upper = Path(s.upper)
+        if not upper.exists(): return []
+        # Walk by hand so an unreadable subtree can't abort the whole listing.
+        paths = []
+        opaque_dirs = set()           # upper dirs the overlay marked opaque
+        for root, dirs, files in os.walk(upper, onerror=lambda _e: None):
+            rootp = Path(root)
+            for nm in dirs + files:
+                paths.append(rootp / nm)
+
+        entries: dict = {}            # rel -> entry (so opacity can't duplicate)
+        for ap in sorted(paths):
+            name = ap.name
+            if _is_overlay_marker(name):
+                opaque_dirs.add(ap.parent)     # this dir fully shadows the lower
+                continue
+            if name.startswith(".wh.") and not name.startswith(".wh..wh."):
+                # aufs-style whiteout file: a deletion of the un-prefixed name
+                rel = str((ap.parent / name[len(".wh."):]).relative_to(upper))
+                entries[rel] = dict(path=rel, kind="deleted", size=0, is_text=False)
+                continue
+            try:
+                whiteout = self._is_whiteout(ap); is_dir = ap.is_dir()
+            except OSError:
+                continue
+            if is_dir and not whiteout: continue
             rel = str(ap.relative_to(upper)); real = Path("/") / rel
-            if self._is_whiteout(ap):
-                out.append(dict(path=rel, kind="deleted", size=0, is_text=False))
+            if whiteout:
+                entries[rel] = dict(path=rel, kind="deleted", size=0, is_text=False)
             else:
-                size = ap.stat().st_size if ap.is_file() else 0
+                try: size = ap.stat().st_size if ap.is_file() else 0
+                except OSError: size = 0
                 is_text = False
-                if ap.is_file() and size < (10 << 20):
+                if size and size < (10 << 20):
                     try: ap.read_bytes()[:512].decode(); is_text = True
                     except (UnicodeDecodeError, OSError): pass
-                out.append(dict(path=rel,
-                                kind="modified" if real.exists() else "created",
-                                size=size, is_text=is_text))
-        return out
+                entries[rel] = dict(path=rel,
+                                    kind="modified" if real.exists() else "created",
+                                    size=size, is_text=is_text)
+
+        # An opaque upper directory hides everything the lower had there. If the
+        # lower really had files, those are effectively deleted — show them so,
+        # unless the upper resurrected them with the same path.
+        added = 0
+        for d in opaque_dirs:
+            if added >= self._OPAQUE_DELETE_CAP: break
+            drel = d.relative_to(upper)
+            lower = Path("/").joinpath(*drel.parts)
+            if not lower.is_dir(): continue        # nothing existed below -> new dir
+            for lroot, ldirs, lfiles in os.walk(lower, onerror=lambda _e: None):
+                for nm in ldirs + lfiles:
+                    rel = os.path.relpath(os.path.join(lroot, nm), "/")
+                    if rel in entries: continue    # kept/recreated in the upper
+                    entries[rel] = dict(path=rel, kind="deleted",
+                                        size=0, is_text=False)
+                    added += 1
+                    if added >= self._OPAQUE_DELETE_CAP: break
+                if added >= self._OPAQUE_DELETE_CAP: break
+        return [entries[k] for k in sorted(entries)]
 
     def overlay_diff(self, sid, rel) -> dict:
         import difflib
@@ -518,6 +597,9 @@ class Supervisor:
         if not s: return dict(kind="error", error="no session")
         rel = rel.lstrip("/"); up = Path(s.upper) / rel; lo = Path("/") / rel
         if self._is_whiteout(up): return dict(kind="deleted", diff=None, raw=None, content=None)
+        if not up.exists():
+            # deletion implied by an opaque parent directory (no upper artifact)
+            return dict(kind="deleted", diff=None, raw=None, content=None)
         if not up.is_file(): return dict(kind="directory", diff=None, raw=None, content=None)
         try:
             ut = up.read_text(errors="replace")
@@ -540,14 +622,17 @@ class Supervisor:
         s = self.sessions.get(sid)
         if not s: return dict(applied=[], errors=[{"error": "no session"}])
         upper = Path(s.upper)
-        paths = paths or [e["path"] for e in self.overlay_entries(sid)]
+        kinds = {e["path"]: e["kind"] for e in self.overlay_entries(sid)}
+        paths = paths or list(kinds)
         applied, errors = [], []
         for rel in paths:
             src, dst = upper / rel, Path("/") / rel
             try:
-                if self._is_whiteout(src):
-                    if dst.is_dir(): shutil.rmtree(dst)
-                    elif dst.exists(): dst.unlink()
+                # A deletion may come from a whiteout *or* from an opaque parent
+                # directory (which leaves no per-file artifact in the upper).
+                if kinds.get(rel) == "deleted" or self._is_whiteout(src):
+                    if dst.is_dir() and not dst.is_symlink(): shutil.rmtree(dst)
+                    elif dst.exists() or dst.is_symlink(): dst.unlink()
                 elif src.is_dir(): dst.mkdir(parents=True, exist_ok=True)
                 elif src.is_file():
                     dst.parent.mkdir(parents=True, exist_ok=True)
@@ -799,6 +884,7 @@ class ChannelServer:
         t = msg.get("type")
         if t == "register": self.sup.register(msg)
         elif t == "unregister": self.sup.unregister(msg)
+        elif t == "remove": self.sup.drop(msg)
 
     async def stop(self) -> None:
         if getattr(self, "_task", None):
@@ -913,7 +999,6 @@ def cmd_run(cmd, label, no_net, session_whitelist, chdir) -> int:
 
         args = ["bwrap",
                 "--bind", str(merged), "/",
-                "--ro-bind", str(up), "/upper",
                 "--proc", "/proc", "--dev", "/dev",
                 "--ro-bind-try", "/sys", "/sys",
                 "--tmpfs", "/tmp", "--tmpfs", "/run",
@@ -981,14 +1066,12 @@ def cmd_run(cmd, label, no_net, session_whitelist, chdir) -> int:
                       status="finished", exit_code=1)
         return 1
 
-    # If nothing was written, don't leave an empty session behind.
-    has_changes = any(True for _ in up.rglob("*"))
-    if not has_changes:
+    # If nothing real was written, don't leave an empty session behind: drop the
+    # overlay and ask the UI to remove the session outright (nothing to review).
+    if not upper_has_changes(up):
         rm_rf(shm_dir)
         if have_ui:
-            sync_send(SOCK_PATH, type="unregister", session_id=sid,
-                      status="finished", exit_code=code or 0)
-        # also tell UI to drop it (no changes to review)
+            sync_send(SOCK_PATH, type="remove", session_id=sid)
         print(f"sandbox: {label} exited ({code}); no changes.", file=sys.stderr)
         return code or 0
 
@@ -1124,7 +1207,7 @@ def run_ui() -> int:
                 with TabPane("Sandboxes [1]", id="t-sb"):
                     with Horizontal(id="sb-top"):
                         with Vertical(id="s-pane"):
-                            yield Static("● SANDBOXES", classes="pt")
+                            yield Static("● SANDBOXES   [dim]flags: R running · F finished · K killed[/]", classes="pt")
                             yield DataTable(id="s-tab", cursor_type="row")
                         with Vertical(id="l-pane"):
                             yield Static("▤ CONNECTIONS", classes="pt")
@@ -1154,7 +1237,7 @@ def run_ui() -> int:
 
         async def on_mount(self):
             self.query_one("#s-tab",DataTable).add_columns(
-                "Label","St","PID","Cmd","✓","✗","↑","↓","Age")
+                "F","Label","PID","Cmd","✓","✗","↑","↓","Age")
             self.query_one("#cf-tab",DataTable).add_columns("","Path","Size")
             ensure_ca_cert()
             loop=asyncio.get_event_loop()
@@ -1218,7 +1301,8 @@ def run_ui() -> int:
             for sid,s in sorted(self.sessions.items(),
                                 key=lambda x:x[1]["started"], reverse=True):
                 c=sty(s["status"])
-                t.add_row(f"[{c}]{s['label']}[/]", f"[{c}]{s['status'][:4]}[/]",
+                flag={"running":"R","finished":"F","killed":"K"}.get(s["status"],"?")
+                t.add_row(f"[{c}]{flag}[/]", f"[{c}]{s['label']}[/]",
                           str(s["pid"]), " ".join(s["cmd"])[:24],
                           f"[green]{s['conn_allowed']}[/]", f"[red]{s['conn_denied']}[/]",
                           fmt_bytes(s["bytes_up"]), fmt_bytes(s["bytes_down"]),
@@ -1404,6 +1488,7 @@ def run_ui() -> int:
                 if content is not None: self.sup.overlay_edit(sid,p,content)
             self.push_screen(Editor(p, d.get("raw") or ""), done)
 
+    ensure_dirs()
     UI().run()
     return 0
 
