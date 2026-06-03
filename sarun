@@ -7,19 +7,19 @@
 # ]
 # ///
 """
-sandbox — run an untrusted process in an unprivileged bwrap sandbox.
+slopbox — run an untrusted process in an unprivileged bwrap slopbox.
 
-    sandbox                 start the UI (network approval + change review)
-    sandbox CMD [ARGS...]   run CMD sandboxed
+    slopbox                 start the UI (network approval + change review)
+    slopbox CMD [ARGS...]   run CMD slopboxed
 
-Network model: the sandbox has NO real network — only loopback. A tiny
-forwarder inside the sandbox listens on 127.0.0.1:8080 (the proxy the program
+Network model: the slopbox has NO real network — only loopback. A tiny
+forwarder inside the slopbox listens on 127.0.0.1:8080 (the proxy the program
 is told to use) and hands each accepted connection's FD out to the UI over a
 Unix socket (SCM_RIGHTS). The UI feeds that socket to an in-process mitmproxy,
 which gates it against the rules / asks you, and performs the real upstream
 fetch in the UI's own network context. No slirp, no host ports reachable from
-the sandbox, no proxy listening anywhere the sandbox could abuse. If no UI is
-running, the forwarder has nowhere to hand connections, so the sandbox simply
+the slopbox, no proxy listening anywhere the slopbox could abuse. If no UI is
+running, the forwarder has nowhere to hand connections, so the slopbox simply
 has no network — it never blocks waiting on an absent human.
 
 Filesystem: writes are captured by fuse-overlayfs (upper on tmpfs, squashed to
@@ -28,11 +28,11 @@ review in the UI's Changes tab; sessions with no changes are cleaned up.
 
 Isolation: own PID/IPC/UTS/net namespaces, all caps dropped, runs as you.
 
-Options (sandbox CMD ...):
+Options (slopbox CMD ...):
   -l NAME    session label (default: timestamp)
   -w HOST    pre-allow HOST for this session (repeatable)
   -n         no network at all (forwarder not started)
-  -C DIR     working directory inside the sandbox (default: cwd)
+  -C DIR     working directory inside the slopbox (default: cwd)
 """
 
 from __future__ import annotations
@@ -64,24 +64,24 @@ from typing import Any
 # ════════════════════════════════════════════════════════════════════════════
 
 # These are pure path helpers: they must NOT create anything at import time. The
-# in-sandbox `--inner` process imports this module too, and any directory it
-# touched (under the sandboxed HOME) would be captured by the overlay and show up
+# in-slopbox `--inner` process imports this module too, and any directory it
+# touched (under the slopboxed HOME) would be captured by the overlay and show up
 # as a bogus "change". Real directory creation is deferred to ensure_dirs(),
 # called only by the UI and the runner.
 def data_home() -> Path:
     base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
-    return Path(base) / "sandbox"
+    return Path(base) / "slopbox"
 
 def config_home() -> Path:
     base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
-    return Path(base) / "sandbox"
+    return Path(base) / "slopbox"
 
 def runtime_home() -> Path:
     base = os.environ.get("XDG_RUNTIME_DIR")
-    return Path(base) / "sandbox" if base else data_home()
+    return Path(base) / "slopbox" if base else data_home()
 
 SHM_ROOT       = Path("/dev/shm")
-SHM_PREFIX     = "sandbox."
+SHM_PREFIX     = "slopbox."
 SOCK_PATH      = str(runtime_home() / "ui.sock")        # control + FD channel
 MITM_CONFDIR   = data_home() / "mitmproxy"              # CA, generated once
 CA_CERT        = MITM_CONFDIR / "mitmproxy-ca-cert.pem"
@@ -89,14 +89,14 @@ RULES_FILE     = config_home() / "rules"
 
 def ensure_dirs() -> None:
     """Create our host-side config/data/runtime directories. Called by the UI and
-    the runner — never by the in-sandbox --inner process."""
+    the runner — never by the in-slopbox --inner process."""
     for p in (data_home(), config_home(), runtime_home(), MITM_CONFDIR):
         try: p.mkdir(parents=True, exist_ok=True)
         except OSError: pass
     try: RULES_FILE.touch(exist_ok=True)
     except OSError: pass
 
-INNER_PROXY_PORT = 8080   # forwarder's listen port inside the sandbox
+INNER_PROXY_PORT = 8080   # forwarder's listen port inside the slopbox
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -130,12 +130,12 @@ def ui_is_running(sock_path: str) -> bool:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  Inner forwarder — `sandbox --inner` (runs as pid-1-ish inside the sandbox)
+#  Inner forwarder — `slopbox --inner` (runs as pid-1-ish inside the slopbox)
 # ════════════════════════════════════════════════════════════════════════════
 #
 # Listens on 127.0.0.1:INNER_PROXY_PORT. For each accepted connection, sends the
 # connection's FD plus the session id to the UI's FD channel over a Unix socket
-# that was bind-mounted into the sandbox. Then execs the real command. The
+# that was bind-mounted into the slopbox. Then execs the real command. The
 # forwarder holds no bytes; the UI drives the proxied conversation.
 
 def run_inner(channel_path: str, session_id: str, cmd: list) -> int:
@@ -163,7 +163,7 @@ def run_inner(channel_path: str, session_id: str, cmd: list) -> int:
             srv.bind(("127.0.0.1", INNER_PROXY_PORT))
             srv.listen(64)
         except OSError as e:
-            print(f"sandbox(inner): cannot listen: {e}", file=sys.stderr)
+            print(f"slopbox(inner): cannot listen: {e}", file=sys.stderr)
             return
         srv.settimeout(0.5)
         while not stop.is_set():
@@ -194,7 +194,7 @@ def run_inner(channel_path: str, session_id: str, cmd: list) -> int:
     try:
         proc = subprocess.Popen(cmd, preexec_fn=os.setpgrp)
     except FileNotFoundError:
-        print(f"sandbox(inner): command not found: {cmd[0]}", file=sys.stderr)
+        print(f"slopbox(inner): command not found: {cmd[0]}", file=sys.stderr)
         return 127
     try: os.setpgid(proc.pid, proc.pid)
     except OSError: pass
@@ -678,7 +678,7 @@ class Supervisor:
 # into the child tasks mitmproxy spawns, so each connection's hooks see their own
 # session id even when many run concurrently.
 _CURRENT_SID: "contextvars.ContextVar[str]" = contextvars.ContextVar(
-    "sandbox_session_id", default="")
+    "slopbox_session_id", default="")
 
 
 class _GatingAddon:
@@ -695,7 +695,7 @@ class _GatingAddon:
             _CURRENT_SID.get(), flow.request.host, flow.request.port, scheme)
         if res.get("action") != "allow":
             flow.response = http.Response.make(
-                403, b"sandbox: denied\n", {"Content-Type": "text/plain"})
+                403, b"slopbox: denied\n", {"Content-Type": "text/plain"})
 
     async def http_connect(self, flow):        # https: gate at CONNECT time
         await self._gate(flow, "https")
@@ -707,7 +707,7 @@ class _GatingAddon:
     def response(self, flow):
         req, resp = flow.request, flow.response
         denied = bool(resp and resp.status_code == 403
-                      and b"sandbox: denied" in (resp.content or b""))
+                      and b"slopbox: denied" in (resp.content or b""))
         self.sup.note_traffic(
             _CURRENT_SID.get(), req.host, req.port, req.scheme,
             "deny" if denied else "allow",
@@ -718,12 +718,12 @@ class _GatingAddon:
 
 class ProxyEngine:
     """
-    For each client FD handed over by a sandbox, we build an asyncio stream and run
+    For each client FD handed over by a slopbox, we build an asyncio stream and run
     a real mitmproxy connection handler against an in-process mitmproxy Master. The
     Master carries mitmproxy's default addons (NextLayer, TlsConfig, …) so http and
     https are handled exactly as mitmproxy would, plus our _GatingAddon which asks
     the Supervisor to allow/deny each host. The upstream fetch happens here, in the
-    UI's own network context; the sandbox itself has no route to the internet.
+    UI's own network context; the slopbox itself has no route to the internet.
     """
     def __init__(self, sup: "Supervisor", loop: asyncio.AbstractEventLoop,
                  schedule):
@@ -753,7 +753,7 @@ class ProxyEngine:
             self._mode = mode_specs.ProxyMode.parse("regular")
             self._ready = True
         except Exception as e:
-            print(f"sandbox(ui): mitmproxy unavailable: {e}", file=sys.stderr)
+            print(f"slopbox(ui): mitmproxy unavailable: {e}", file=sys.stderr)
 
     @property
     def ready(self) -> bool:
@@ -923,7 +923,7 @@ def ensure_ca_cert() -> Path:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  Runner — `sandbox CMD [ARGS...]`
+#  Runner — `slopbox CMD [ARGS...]`
 # ════════════════════════════════════════════════════════════════════════════
 
 def find_self() -> str: return os.path.abspath(sys.argv[0])
@@ -942,7 +942,7 @@ def bwrap_supports(flag: str) -> bool:
 
 def cmd_run(cmd, label, no_net, session_whitelist, chdir) -> int:
     if not cmd:
-        print("sandbox: no command given", file=sys.stderr); return 2
+        print("slopbox: no command given", file=sys.stderr); return 2
 
     label = label or time.strftime("%Y%m%d-%H%M%S")
     sid = str(uuid.uuid4())
@@ -958,12 +958,12 @@ def cmd_run(cmd, label, no_net, session_whitelist, chdir) -> int:
     # Diagnostics go to stderr (never stdout) and only ever before/after the
     # child runs, so the wrapped command's stdout stays clean and an interactive
     # screen never gets garbled mid-run.
-    print(f"sandbox: {label}  ({'net' if net else 'no-net'}, "
+    print(f"slopbox: {label}  ({'net' if net else 'no-net'}, "
           f"UI {'connected' if have_ui else 'absent'}"
           f"{'' if can_net else ' → no network'})", file=sys.stderr)
     print(f"  overlay upper: {up}", file=sys.stderr)
 
-    # The sandbox runs as a foreground job so interactive programs can read the
+    # The slopbox runs as a foreground job so interactive programs can read the
     # keyboard. The actual terminal hand-off happens *inside* the namespace (see
     # run_inner) where process-group ids are namespace-local; out here we only
     # remember the original foreground group as a safety net to restore on exit,
@@ -988,7 +988,7 @@ def cmd_run(cmd, label, no_net, session_whitelist, chdir) -> int:
              "-o", f"squash_to_gid={os.getgid()}", str(merged)],
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         if fr.returncode != 0 or not os.path.ismount(merged):
-            print("sandbox: fuse-overlayfs failed:",
+            print("slopbox: fuse-overlayfs failed:",
                   fr.stderr.decode(errors='replace').strip(), file=sys.stderr)
             rm_rf(shm_dir); return 1
         fuse_mounted = True
@@ -1021,7 +1021,7 @@ def cmd_run(cmd, label, no_net, session_whitelist, chdir) -> int:
         args += ["--", sys.executable, find_self(), "--inner",
                  "--channel", chan, "--sid", sid, "--", *cmd]
 
-        # Launch the sandbox in its own process group so it (and everything it
+        # Launch the slopbox in its own process group so it (and everything it
         # spawns) can be foregrounded and killed as a unit. preexec_fn runs in the
         # child between fork and exec; we also set it from the parent to close the
         # race, then hand the terminal's foreground to that group.
@@ -1072,19 +1072,19 @@ def cmd_run(cmd, label, no_net, session_whitelist, chdir) -> int:
         rm_rf(shm_dir)
         if have_ui:
             sync_send(SOCK_PATH, type="remove", session_id=sid)
-        print(f"sandbox: {label} exited ({code}); no changes.", file=sys.stderr)
+        print(f"slopbox: {label} exited ({code}); no changes.", file=sys.stderr)
         return code or 0
 
     if have_ui:
         sync_send(SOCK_PATH, type="unregister", session_id=sid,
                   status="finished", exit_code=code or 0)
-    print(f"sandbox: {label} exited ({code}). Review changes in the UI, "
+    print(f"slopbox: {label} exited ({code}). Review changes in the UI, "
           f"or: {up}", file=sys.stderr)
     return code or 0
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  UI — `sandbox`
+#  UI — `slopbox`
 # ════════════════════════════════════════════════════════════════════════════
 
 def run_ui() -> int:
@@ -1144,7 +1144,7 @@ def run_ui() -> int:
                         f"  [dim]{a['session_id'][:8]} · {fmt_age(a['ts'])}[/]")
 
     class UI(App):
-        TITLE="sandbox"
+        TITLE="slopbox"
         CSS="""
         Screen { layout: vertical; }
         .pt  { height:1; padding:0 1; text-style:bold; background:$primary; color:$text; }
@@ -1171,7 +1171,7 @@ def run_ui() -> int:
         ModalScreen { align:center middle; }
         """
         BINDINGS=[
-            Binding("1","tab('t-sb')","Sandboxes"),
+            Binding("1","tab('t-sb')","Slopboxes"),
             Binding("2","tab('t-ch')","Changes"),
             Binding("3","tab('t-tr')","Traffic"),
             Binding("k","kill","Kill"), Binding("d","delete","Delete"),
@@ -1204,10 +1204,10 @@ def run_ui() -> int:
         def compose(self) -> ComposeResult:
             yield Header()
             with TabbedContent(id="tabs", initial="t-sb"):
-                with TabPane("Sandboxes [1]", id="t-sb"):
+                with TabPane("Slopboxes [1]", id="t-sb"):
                     with Horizontal(id="sb-top"):
                         with Vertical(id="s-pane"):
-                            yield Static("● SANDBOXES   [dim]flags: R running · F finished · K killed[/]", classes="pt")
+                            yield Static("● SLOPBOXES   [dim]flags: R running · F finished · K killed[/]", classes="pt")
                             yield DataTable(id="s-tab", cursor_type="row")
                         with Vertical(id="l-pane"):
                             yield Static("▤ CONNECTIONS", classes="pt")
@@ -1500,9 +1500,9 @@ def run_ui() -> int:
 def main() -> int:
     argv = sys.argv[1:]
 
-    # inner mode: sandbox --inner --channel PATH --sid SID -- CMD...
+    # inner mode: slopbox --inner --channel PATH --sid SID -- CMD...
     if argv and argv[0] == "--inner":
-        ap = argparse.ArgumentParser(prog="sandbox --inner")
+        ap = argparse.ArgumentParser(prog="slopbox --inner")
         ap.add_argument("--channel", default="")
         ap.add_argument("--sid", required=True)
         ap.add_argument("cmd", nargs=argparse.REMAINDER)
@@ -1515,9 +1515,9 @@ def main() -> int:
         return run_ui()
 
     ap = argparse.ArgumentParser(
-        prog="sandbox",
-        usage="sandbox            (start UI)\n"
-              "       sandbox [-l NAME] [-w HOST]... [-n] [-C DIR] CMD [ARGS...]")
+        prog="slopbox",
+        usage="slopbox            (start UI)\n"
+              "       slopbox [-l NAME] [-w HOST]... [-n] [-C DIR] CMD [ARGS...]")
     ap.add_argument("-l", dest="label", default=None)
     ap.add_argument("-w", dest="whitelist", action="append", default=[], metavar="HOST")
     ap.add_argument("-n", dest="no_net", action="store_true")
