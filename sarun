@@ -1299,8 +1299,11 @@ def run_ui() -> int:
                 yield Label(f"[dim]cname[/] {cnames}")
                 yield Label(f"[dim]url[/]   {url}")
                 yield Input(value=f"host:{a['host']}", id="rule-input")
-                yield Label("[dim]kinds: host:NAME · host:NAME:PORT · ip:ADDR|CIDR "
-                            "· cname:NAME · url:PREFIX  (NAME allows *.domain)[/]")
+                yield Label("[dim]kinds:  host:NAME[:PORT]  ·  ip:ADDR|CIDR  ·  "
+                            "cname:NAME  ·  url:PREFIX[/]")
+                yield Label("[dim]host & cname take [b]*[/b] wildcards — "
+                            "[b]*.example.com[/b] matches example.com and any "
+                            "subdomain; [b]*[/b] alone matches anything[/]")
                 yield Checkbox("insert at top (checked first)", id="rule-top")
                 with Horizontal(id="rule-btns"):
                     yield Button("This session [↵]", id="rb-sess", variant="primary")
@@ -1342,6 +1345,7 @@ def run_ui() -> int:
             if self.index is not None: self.app._rule_move(self.index,+1)
 
     class UI(App):
+        ENABLE_COMMAND_PALETTE=False   # free Ctrl+P (and drop the unused palette)
         TITLE="slopbox"
         CSS="""
         Screen { layout: vertical; }
