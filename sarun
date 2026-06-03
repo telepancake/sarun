@@ -1156,9 +1156,9 @@ def run_ui() -> int:
         #sb-top { height:1fr; } #sb-bot { height:13; }
         #s-pane { width:2fr; border:solid $primary; }
         #l-pane { width:3fr; border:solid $primary; }
-        #a-pane { width:2fr; border:solid $warning; }
+        #a-pane { width:3fr; border:solid $warning; }
         #a-pane.pending { border:tall $error; }
-        #w-pane { width:3fr; border:solid $success; }
+        #w-pane { width:2fr; border:solid $success; }
         #c-top { height:1fr; }
         #cf-pane { width:2fr; border:solid $primary; }
         #cd-pane { width:3fr; border:solid $primary; }
@@ -1221,7 +1221,7 @@ def run_ui() -> int:
                             yield RichLog(id="c-log", markup=True, wrap=False)
                     with Horizontal(id="sb-bot"):
                         with Vertical(id="a-pane"):
-                            yield Static("⚡ APPROVALS  [dim]y/Y/P allow · n/N deny[/]", classes="pw")
+                            yield Static("⚡ APPROVALS  [dim]allow [b]y[/] once · [b]Y[/] session · [b]P[/] forever    deny [b]n[/] once · [b]N[/] session[/]", classes="pw")
                             yield ListView(id="a-list")
                         with Vertical(id="w-pane"):
                             yield Static("✓ RULES", classes="pok")
