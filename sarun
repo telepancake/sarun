@@ -1326,6 +1326,22 @@ def run_ui() -> int:
         @on(Button.Pressed,"#rb-cancel")
         def _c(self): self.dismiss(None)
 
+    class RuleLineModal(ModalScreen):
+        # Edit one existing rule as a full line. Returns the new line or None.
+        BINDINGS=[("escape","cancel","")]
+        def __init__(self, line): super().__init__(); self.line=line
+        def compose(self):
+            with Vertical(id="rule-box"):
+                yield Label(" Edit rule", id="rule-title")
+                yield Input(value=self.line, id="rule-input")
+                yield Label("[dim]<allow|deny> <kind>:<pattern>   "
+                            "(host/cname take [b]*[/b] wildcards) · Enter save · "
+                            "Esc cancel[/]")
+        def on_mount(self): self.query_one("#rule-input",Input).focus()
+        def action_cancel(self): self.dismiss(None)
+        @on(Input.Submitted,"#rule-input")
+        def _save(self): self.dismiss(self.query_one("#rule-input",Input).value.strip())
+
     class ApprovalItem(ListItem):
         def __init__(self,a): super().__init__(); self.a=a
         def compose(self):
@@ -1334,9 +1350,13 @@ def run_ui() -> int:
                         f"  [dim]{a['session_id'][:8]} · {fmt_age(a['ts'])}[/]")
 
     class RulesList(ListView):
-        # Rule-pane keys, active only while this list is focused (so they don't
-        # clash with the global ones): Delete removes, Ctrl+↑/↓ reorder.
-        BINDINGS=[("delete","del",""),("ctrl+up","up",""),("ctrl+down","down","")]
+        # Rule-pane keys, active only while this list is focused (so 'd' here means
+        # "remove this rule", consistent with 'd' = delete elsewhere): Enter/e edit,
+        # d/Delete remove, Ctrl+↑/↓ reorder.
+        BINDINGS=[("e","edit",""),("d","del",""),("delete","del",""),
+                  ("ctrl+up","up",""),("ctrl+down","down","")]
+        def action_edit(self):
+            if self.index is not None: self.app._rule_edit_at(self.index)
         def action_del(self):
             if self.index is not None: self.app._rule_del(self.index)
         def action_up(self):
@@ -1425,7 +1445,7 @@ def run_ui() -> int:
                             yield Static("⚡ APPROVALS  [dim][b]y[/] allow once · [b]n[/] deny once · [b]Y[/]/[b]N[/] allow/deny rule…[/]", classes="pw")
                             yield ListView(id="a-list")
                         with Vertical(id="w-pane"):
-                            yield Static("✓ RULES  [dim]top→bottom, first match wins · Del remove · ^↑/^↓ move[/]", classes="pok")
+                            yield Static("✓ RULES  [dim]top→bottom, first match wins · Enter/e edit · d remove · ^↑/^↓ move[/]", classes="pok")
                             yield RulesList(id="w-list")
                 with TabPane("Changes [2]", id="t-ch"):
                     with Horizontal(id="c-top"):
@@ -1578,6 +1598,21 @@ def run_ui() -> int:
             j=self.rules_store.move(i, d); self._refresh_rules()
             try: self.query_one("#w-list",ListView).index=j
             except Exception: pass
+        def _rule_edit_at(self, i):
+            rules=self.rules_store.rules
+            if i is None or not (0<=i<len(rules)): return
+            def done(line):
+                if line is None: return
+                r=Rule.parse(line)
+                if not r: self._status("invalid rule — keeping the old one"); return
+                rules[i]=r; self.rules_store.save(); self._refresh_rules()
+                try: self.query_one("#w-list",ListView).index=i
+                except Exception: pass
+            self.push_screen(RuleLineModal(rules[i].to_line()), done)
+
+        @on(ListView.Selected, "#w-list")
+        def _rule_activated(self, ev):
+            self._rule_edit_at(self.query_one("#w-list",ListView).index)
 
         def _rebuild_ch(self, preserve=False):
             rows=[(e["path"], [ICON.get(e["kind"],"?"), e["path"],
