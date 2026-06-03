@@ -1349,12 +1349,44 @@ def run_ui() -> int:
             yield Label(f"[bold]{a['scheme']}[/] [cyan]{a['host']}[/]:{a['port']}"
                         f"  [dim]{a['session_id'][:8]} · {fmt_age(a['ts'])}[/]")
 
+    # Each interactive pane carries its own key bindings (with labels), delegating
+    # to the app's actions. Textual's Footer then shows exactly the keys usable in
+    # whatever pane is focused — pico/pine style — instead of one fixed list.
+    class SessionTable(DataTable):
+        BINDINGS=[Binding("k","kill","kill"), Binding("d","delete","delete"),
+                  Binding("f","filt","filter")]
+        def action_kill(self): self.app.action_kill()
+        def action_delete(self): self.app.action_delete()
+        def action_filt(self): self.app.action_filt()
+
+    class ChangesTable(DataTable):
+        BINDINGS=[Binding("a","apply","apply"), Binding("A","apply_all","apply all"),
+                  Binding("x","discard","discard"),
+                  Binding("X","discard_all","discard all"),
+                  Binding("e","edit","edit"), Binding("r","refresh","refresh")]
+        def action_apply(self): self.app.action_apply_one()
+        def action_apply_all(self): self.app.action_apply_all()
+        def action_discard(self): self.app.action_discard_one()
+        def action_discard_all(self): self.app.action_discard_all()
+        def action_edit(self): self.app.action_edit()
+        def action_refresh(self): self.app.action_refresh()
+
+    class ApprovalsList(ListView):
+        BINDINGS=[Binding("y","allow_once","allow once"),
+                  Binding("n","deny_once","deny once"),
+                  Binding("Y","allow_rule","allow rule…"),
+                  Binding("N","deny_rule","deny rule…")]
+        def action_allow_once(self): self.app.action_ap_once("allow")
+        def action_deny_once(self): self.app.action_ap_once("deny")
+        def action_allow_rule(self): self.app.action_ap_rule("allow")
+        def action_deny_rule(self): self.app.action_ap_rule("deny")
+
     class RulesList(ListView):
-        # Rule-pane keys, active only while this list is focused (so 'd' here means
-        # "remove this rule", consistent with 'd' = delete elsewhere): Enter/e edit,
-        # d/Delete remove, Ctrl+↑/↓ reorder.
-        BINDINGS=[("e","edit",""),("d","del",""),("delete","del",""),
-                  ("ctrl+up","up",""),("ctrl+down","down","")]
+        # 'd' here removes the focused rule (consistent with 'd' = delete elsewhere).
+        BINDINGS=[Binding("e","edit","edit"), Binding("d","del","remove"),
+                  Binding("delete","del","remove", show=False),
+                  Binding("ctrl+up","up","move up"),
+                  Binding("ctrl+down","down","move down")]
         def action_edit(self):
             if self.index is not None: self.app._rule_edit_at(self.index)
         def action_del(self):
@@ -1399,15 +1431,8 @@ def run_ui() -> int:
             Binding("1","tab('t-sb')","Slopboxes"),
             Binding("2","tab('t-ch')","Changes"),
             Binding("3","tab('t-tr')","Traffic"),
-            Binding("k","kill","Kill"), Binding("d","delete","Delete"),
-            Binding("f","filt","Filter"), Binding("r","refresh","Refresh"),
-            Binding("a","apply_one","Apply"), Binding("A","apply_all","Apply all"),
-            Binding("x","discard_one","Discard"), Binding("X","discard_all","Discard all"),
-            Binding("e","edit","Edit"),
-            Binding("y","ap_once('allow')","",show=False),
-            Binding("n","ap_once('deny')","",show=False),
-            Binding("Y","ap_rule('allow')","",show=False),
-            Binding("N","ap_rule('deny')","",show=False),
+            Binding("tab","focus_next","",show=False),
+            Binding("shift+tab","focus_previous","",show=False),
             Binding("q","quit","Quit")]
         sessions=reactive({}, layout=True)
         pending=reactive({}, layout=True)
@@ -1436,26 +1461,26 @@ def run_ui() -> int:
                     with Horizontal(id="sb-top"):
                         with Vertical(id="s-pane"):
                             yield Static("● SLOPBOXES   [dim]flags: R running · F finished · K killed[/]", classes="pt")
-                            yield DataTable(id="s-tab", cursor_type="row")
+                            yield SessionTable(id="s-tab", cursor_type="row")
                         with Vertical(id="l-pane"):
                             yield Static("▤ CONNECTIONS", classes="pt")
                             yield RichLog(id="c-log", markup=True, wrap=False)
                     with Horizontal(id="sb-bot"):
                         with Vertical(id="a-pane"):
-                            yield Static("⚡ APPROVALS  [dim][b]y[/] allow once · [b]n[/] deny once · [b]Y[/]/[b]N[/] allow/deny rule…[/]", classes="pw")
-                            yield ListView(id="a-list")
+                            yield Static("⚡ APPROVALS", classes="pw")
+                            yield ApprovalsList(id="a-list")
                         with Vertical(id="w-pane"):
-                            yield Static("✓ RULES  [dim]top→bottom, first match wins · Enter/e edit · d remove · ^↑/^↓ move[/]", classes="pok")
+                            yield Static("✓ RULES   [dim]top → bottom, first match wins[/]", classes="pok")
                             yield RulesList(id="w-list")
                 with TabPane("Changes [2]", id="t-ch"):
                     with Horizontal(id="c-top"):
                         with Vertical(id="cf-pane"):
                             yield Static("📁 FILES", classes="pt")
-                            yield DataTable(id="cf-tab", cursor_type="row")
+                            yield ChangesTable(id="cf-tab", cursor_type="row")
                         with Vertical(id="cd-pane"):
                             yield Static("≡ DIFF", classes="pt")
                             yield RichLog(id="cd-log", markup=True, wrap=False)
-                    yield Static("  r refresh · a/A apply · x/X discard · e edit", id="c-bar")
+                    yield Static("", id="c-bar")
                 with TabPane("Traffic [3]", id="t-tr"):
                     with Vertical(id="t-pane"):
                         yield Static("▤ ALL TRAFFIC", classes="pt")
@@ -1482,6 +1507,8 @@ def run_ui() -> int:
                 self.sessions={**self.sessions, s.session_id:s.to_dict()}
             self._rebuild_sessions()
             self.set_interval(3, self._tick)
+            try: self.query_one("#s-tab",DataTable).focus()
+            except Exception: pass
 
         async def on_unmount(self):
             if self.server: await self.server.stop()
@@ -1503,6 +1530,15 @@ def run_ui() -> int:
             elif t=="approval_pending":
                 a=ev["approval"]; self.pending={**self.pending,a["request_id"]:a}
                 self._rebuild_approvals(preserve=True); self.bell()
+                # Surface the approval keys: focus the approvals list (unless a
+                # modal is open or the user is on another tab).
+                try:
+                    if (len(self.screen_stack)==1 and
+                            self.query_one("#tabs",TabbedContent).active=="t-sb"):
+                        lv=self.query_one("#a-list",ListView)
+                        if lv.index is None and self.pending: lv.index=0
+                        lv.focus()
+                except Exception: pass
             elif t=="approval_resolved":
                 rid=ev["request_id"]
                 self.pending={k:v for k,v in self.pending.items() if k!=rid}
@@ -1664,8 +1700,7 @@ def run_ui() -> int:
             try: self.query_one("#status",Static).update(t)
             except Exception: pass
         def _cbar(self, extra):
-            try: self.query_one("#c-bar",Static).update(
-                f"  r refresh · a/A apply · x/X discard · e edit   [dim]{extra}[/]")
+            try: self.query_one("#c-bar",Static).update(f"  [dim]{extra}[/]")
             except Exception: pass
 
         def _sel_session(self):
@@ -1711,6 +1746,11 @@ def run_ui() -> int:
         def action_tab(self, t):
             self.query_one("#tabs",TabbedContent).active=t
             if t=="t-ch" and self._ch_sid: self._load_changes(self._ch_sid, force=True)
+            # Move focus into the tab's primary pane so the footer shows its keys.
+            focus={"t-sb":"#s-tab","t-ch":"#cf-tab","t-tr":"#t-log"}.get(t)
+            if focus:
+                try: self.query_one(focus).focus()
+                except Exception: pass
 
         def action_kill(self):
             s=self._sel_session()
