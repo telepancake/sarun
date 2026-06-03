@@ -1,0 +1,1450 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#   "textual>=0.60",
+#   "mitmproxy>=11",
+# ]
+# ///
+"""
+sandbox — run an untrusted process in an unprivileged bwrap sandbox.
+
+    sandbox                 start the UI (network approval + change review)
+    sandbox CMD [ARGS...]   run CMD sandboxed
+
+Network model: the sandbox has NO real network — only loopback. A tiny
+forwarder inside the sandbox listens on 127.0.0.1:8080 (the proxy the program
+is told to use) and hands each accepted connection's FD out to the UI over a
+Unix socket (SCM_RIGHTS). The UI feeds that socket to an in-process mitmproxy,
+which gates it against the rules / asks you, and performs the real upstream
+fetch in the UI's own network context. No slirp, no host ports reachable from
+the sandbox, no proxy listening anywhere the sandbox could abuse. If no UI is
+running, the forwarder has nowhere to hand connections, so the sandbox simply
+has no network — it never blocks waiting on an absent human.
+
+Filesystem: writes are captured by fuse-overlayfs (upper on tmpfs, squashed to
+your uid so the program can write anywhere). After exit the upper is kept for
+review in the UI's Changes tab; sessions with no changes are cleaned up.
+
+Isolation: own PID/IPC/UTS/net namespaces, all caps dropped, runs as you.
+
+Options (sandbox CMD ...):
+  -l NAME    session label (default: timestamp)
+  -w HOST    pre-allow HOST for this session (repeatable)
+  -n         no network at all (forwarder not started)
+  -C DIR     working directory inside the sandbox (default: cwd)
+"""
+
+from __future__ import annotations
+
+import argparse
+import array
+import asyncio
+import base64
+import contextvars
+import json
+import os
+import shutil
+import signal
+import socket
+import stat as stat_mod
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import uuid
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+from typing import Any
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Paths
+# ════════════════════════════════════════════════════════════════════════════
+
+def data_home() -> Path:
+    base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    p = Path(base) / "sandbox"; p.mkdir(parents=True, exist_ok=True); return p
+
+def config_home() -> Path:
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    p = Path(base) / "sandbox"; p.mkdir(parents=True, exist_ok=True); return p
+
+def runtime_home() -> Path:
+    base = os.environ.get("XDG_RUNTIME_DIR")
+    p = Path(base) / "sandbox" if base else data_home()
+    p.mkdir(parents=True, exist_ok=True); return p
+
+SHM_ROOT       = Path("/dev/shm")
+SHM_PREFIX     = "sandbox."
+SOCK_PATH      = str(runtime_home() / "ui.sock")        # control + FD channel
+MITM_CONFDIR   = data_home() / "mitmproxy"              # CA, generated once
+CA_CERT        = MITM_CONFDIR / "mitmproxy-ca-cert.pem"
+RULES_FILE     = config_home() / "rules"
+MITM_CONFDIR.mkdir(parents=True, exist_ok=True)
+RULES_FILE.touch(exist_ok=True)
+
+INNER_PROXY_PORT = 8080   # forwarder's listen port inside the sandbox
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Wire protocol (control messages: newline JSON; FD messages: SCM_RIGHTS)
+# ════════════════════════════════════════════════════════════════════════════
+
+async def aw_send(writer: asyncio.StreamWriter, **msg: Any) -> None:
+    writer.write((json.dumps(msg) + "\n").encode()); await writer.drain()
+
+async def aw_recv(reader: asyncio.StreamReader) -> "dict | None":
+    try:
+        line = await reader.readline()
+        return json.loads(line.decode()) if line else None
+    except (json.JSONDecodeError, asyncio.IncompleteReadError, OSError):
+        return None
+
+def sync_send(sock_path: str, timeout: float = 5.0, **msg: Any) -> None:
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout); s.connect(sock_path)
+            s.sendall((json.dumps(msg) + "\n").encode())
+    except OSError:
+        pass
+
+def ui_is_running(sock_path: str) -> bool:
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(1.0); s.connect(sock_path); return True
+    except OSError:
+        return False
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Inner forwarder — `sandbox --inner` (runs as pid-1-ish inside the sandbox)
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Listens on 127.0.0.1:INNER_PROXY_PORT. For each accepted connection, sends the
+# connection's FD plus the session id to the UI's FD channel over a Unix socket
+# that was bind-mounted into the sandbox. Then execs the real command. The
+# forwarder holds no bytes; the UI drives the proxied conversation.
+
+def run_inner(channel_path: str, session_id: str, cmd: list) -> int:
+    stop = threading.Event()
+
+    def forward_one(conn: socket.socket) -> None:
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as ch:
+                ch.connect(channel_path)
+                ch.sendmsg(
+                    [json.dumps({"session_id": session_id}).encode()],
+                    [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
+                      array.array("i", [conn.fileno()]).tobytes())],
+                )
+            # The UI now owns a dup of the FD; we can close ours.
+        except OSError:
+            pass
+        finally:
+            conn.close()
+
+    def listener() -> None:
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            srv.bind(("127.0.0.1", INNER_PROXY_PORT))
+            srv.listen(64)
+        except OSError as e:
+            print(f"sandbox(inner): cannot listen: {e}", file=sys.stderr)
+            return
+        srv.settimeout(0.5)
+        while not stop.is_set():
+            try:
+                conn, _ = srv.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            threading.Thread(target=forward_one, args=(conn,), daemon=True).start()
+        srv.close()
+
+    # Only run the forwarder if a channel exists (i.e. networked + UI present).
+    if channel_path and os.path.exists(os.path.dirname(channel_path) or "/"):
+        threading.Thread(target=listener, daemon=True).start()
+
+    # Run the real command as a foreground job *inside* this PID namespace. We are
+    # PID 1 here, so the process-group ids we put on the controlling terminal are
+    # namespace-local — which is what lets an interactive job-control shell
+    # (bash/dash) save and restore the terminal's foreground group without hitting
+    # "Cannot set tty process group (No such process)". The command gets its own
+    # process group and the terminal handed to it; restored when it exits.
+    tty_fd = next((fd for fd in (0, 1, 2) if os.isatty(fd)), None)
+    old_fg = None
+    if tty_fd is not None:
+        try: old_fg = os.tcgetpgrp(tty_fd)
+        except OSError: old_fg = None
+    try:
+        proc = subprocess.Popen(cmd, preexec_fn=os.setpgrp)
+    except FileNotFoundError:
+        print(f"sandbox(inner): command not found: {cmd[0]}", file=sys.stderr)
+        return 127
+    try: os.setpgid(proc.pid, proc.pid)
+    except OSError: pass
+    old_ttou = None
+    if tty_fd is not None:
+        old_ttou = signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+        try: os.tcsetpgrp(tty_fd, proc.pid)
+        except OSError: pass
+    try:
+        code = proc.wait()
+    except KeyboardInterrupt:
+        proc.terminate()
+        code = proc.wait()
+    if tty_fd is not None:
+        if old_fg is not None:
+            try: os.tcsetpgrp(tty_fd, old_fg)
+            except OSError: pass
+        if old_ttou is not None:
+            try: signal.signal(signal.SIGTTOU, old_ttou)
+            except (OSError, ValueError): pass
+    stop.set()
+    return code or 0
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Rules
+# ════════════════════════════════════════════════════════════════════════════
+
+class Rules:
+    def __init__(self, path: Path):
+        self.path = path; self.entries: set = set(); self.load()
+    def load(self) -> None:
+        self.entries = {ln.strip() for ln in self.path.read_text().splitlines()
+                        if ln.strip() and not ln.startswith("#")}
+    def save(self) -> None:
+        self.path.write_text("\n".join(sorted(self.entries)) + "\n")
+    @staticmethod
+    def _match(host: str, port: int, pat: str) -> bool:
+        p = pat.lstrip("!")
+        if p in (host, f"{host}:{port}"): return True
+        if p.startswith("*.") and (host.endswith(p[1:]) or host == p[2:]): return True
+        return False
+    def decide(self, host: str, port: int) -> "str | None":
+        for pat in self.entries:
+            if self._match(host, port, pat):
+                return "deny" if pat.startswith("!") else "allow"
+        return None
+    def add(self, host: str, allow: bool) -> None:
+        self.entries.add(host if allow else f"!{host}"); self.save()
+    def remove(self, entry: str) -> None:
+        self.entries.discard(entry); self.save()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Session model + discovery + robust removal
+# ════════════════════════════════════════════════════════════════════════════
+
+def _pid_alive(pid: int) -> bool:
+    if not pid: return False
+    try:
+        os.kill(pid, 0); return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+def rm_rf(path) -> None:
+    """Remove a tree, fixing perms (fuse-overlayfs workdir can be unwritable)."""
+    path = str(path)
+    if not os.path.exists(path) and not os.path.islink(path):
+        return
+    def _fix_and_retry(func, p, _exc):
+        try:
+            os.chmod(p, 0o700)
+            par = os.path.dirname(p)
+            if par: os.chmod(par, 0o700)
+        except OSError:
+            pass
+        try: func(p)
+        except OSError: pass
+    try:
+        shutil.rmtree(path, onexc=_fix_and_retry)
+    except TypeError:
+        shutil.rmtree(path, onerror=_fix_and_retry)
+    if os.path.exists(path):
+        for root, dirs, files in os.walk(path, topdown=False):
+            for nm in files + dirs:
+                fp = os.path.join(root, nm)
+                try: os.chmod(fp, 0o700)
+                except OSError: pass
+                try: (os.rmdir if os.path.isdir(fp) and not os.path.islink(fp)
+                      else os.unlink)(fp)
+                except OSError: pass
+        try: os.chmod(path, 0o700); os.rmdir(path)
+        except OSError: pass
+
+def fuse_unmount(merged: str) -> None:
+    if not os.path.ismount(merged):
+        return
+    for tool in ("fusermount3", "fusermount"):
+        try:
+            subprocess.run([tool, "-u", merged], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=10)
+            if not os.path.ismount(merged):
+                return
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+
+
+@dataclass
+class Session:
+    session_id: str
+    label: str
+    cmd: list
+    pid: int
+    shm_dir: str
+    started: float
+    status: str = "running"
+    exit_code: "int | None" = None
+    conn_allowed: int = 0
+    conn_denied: int = 0
+    bytes_up: int = 0
+    bytes_down: int = 0
+    sess_allow: set = field(default_factory=set)
+    sess_deny: set = field(default_factory=set)
+    live: bool = False
+    @property
+    def upper(self) -> str: return str(Path(self.shm_dir) / "up")
+    @property
+    def merged(self) -> str: return str(Path(self.shm_dir) / "merged")
+    def to_dict(self) -> dict:
+        d = asdict(self)
+        d["sess_allow"] = list(self.sess_allow)
+        d["sess_deny"] = list(self.sess_deny)
+        d["upper"] = self.upper
+        return d
+
+
+def write_meta(shm_dir: Path, session_id, label, cmd, pid, started) -> None:
+    (shm_dir / "meta.json").write_text(json.dumps(
+        dict(session_id=session_id, label=label, cmd=cmd, pid=pid, started=started)))
+
+def discover_sessions() -> dict:
+    out = {}
+    if not SHM_ROOT.exists(): return out
+    for d in SHM_ROOT.glob(SHM_PREFIX + "*"):
+        mf = d / "meta.json"
+        if not mf.is_file(): continue
+        try: m = json.loads(mf.read_text())
+        except (json.JSONDecodeError, OSError): continue
+        sid = m.get("session_id") or d.name
+        pid = m.get("pid", 0)
+        out[sid] = Session(
+            session_id=sid, label=m.get("label", d.name), cmd=m.get("cmd", []),
+            pid=pid, shm_dir=str(d), started=m.get("started", d.stat().st_mtime),
+            status="running" if _pid_alive(pid) else "finished", live=False)
+    return out
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Supervisor (in-process inside the UI)
+# ════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class Pending:
+    request_id: str; session_id: str; host: str; port: int
+    scheme: str; ts: float; future: Any
+
+class Supervisor:
+    def __init__(self, rules: Rules):
+        self.rules = rules
+        self.sessions: dict = {}
+        self.pending: dict = {}
+        self.traffic: list = []
+        self.MAX_TRAFFIC = 5000
+        self._counter = 0
+        self.on_event = lambda ev: None
+        self.sessions.update(discover_sessions())
+
+    def _emit(self, **ev: Any) -> None: self.on_event(ev)
+
+    def rescan(self) -> None:
+        disk = discover_sessions()
+        for sid, s in disk.items():
+            cur = self.sessions.get(sid)
+            if cur is None:
+                self.sessions[sid] = s
+                self._emit(type="session_added", session=s.to_dict())
+            elif not cur.live:
+                ns = "running" if _pid_alive(cur.pid) else (
+                    cur.status if cur.status == "killed" else "finished")
+                if ns != cur.status:
+                    cur.status = ns
+                    self._emit(type="session_updated", session=cur.to_dict())
+        for sid in list(self.sessions):
+            s = self.sessions[sid]
+            if not s.live and not Path(s.shm_dir).exists():
+                del self.sessions[sid]
+                self._emit(type="session_removed", session_id=sid)
+
+    def _decide(self, s: Session, host: str, port: int) -> "str | None":
+        r = self.rules.decide(host, port)
+        if r: return r
+        for pat in s.sess_allow:
+            if Rules._match(host, port, pat): return "allow"
+        for pat in s.sess_deny:
+            if Rules._match(host, port, pat): return "deny"
+        return None
+
+    def _record_traffic(self, s, host, port, scheme, action,
+                        bytes_up=0, bytes_down=0, status=0) -> None:
+        ev = dict(ts=time.time(), session_id=s.session_id, host=host, port=port,
+                  scheme=scheme, action=action, bytes_up=bytes_up,
+                  bytes_down=bytes_down, status=status)
+        if action == "allow": s.conn_allowed += 1
+        else: s.conn_denied += 1
+        s.bytes_up += bytes_up; s.bytes_down += bytes_down
+        self.traffic.append(ev)
+        if len(self.traffic) > self.MAX_TRAFFIC:
+            self.traffic = self.traffic[-self.MAX_TRAFFIC:]
+        self._emit(type="traffic", event=ev, session=s.to_dict())
+
+    def register(self, msg: dict) -> None:
+        sid = msg["session_id"]
+        s = Session(session_id=sid, label=msg["label"], cmd=msg["cmd"],
+                    pid=msg["pid"], shm_dir=msg["shm_dir"],
+                    started=msg.get("started", time.time()),
+                    status="running", live=True)
+        for h in msg.get("session_whitelist", []): s.sess_allow.add(h)
+        self.sessions[sid] = s
+        self._emit(type="session_added", session=s.to_dict())
+
+    def unregister(self, msg: dict) -> None:
+        s = self.sessions.get(msg["session_id"])
+        if not s: return
+        s.live = False
+        if s.status == "running": s.status = msg.get("status", "finished")
+        s.exit_code = msg.get("exit_code")
+        self._emit(type="session_updated", session=s.to_dict())
+
+    async def approval_request(self, sid, host, port, scheme) -> dict:
+        s = self.sessions.get(sid)
+        if not s:
+            return {"action": "deny", "scope": "once"}
+        decided = self._decide(s, host, port)
+        if decided:
+            self._record_traffic(s, host, port, scheme, decided)
+            return {"action": decided, "scope": "rule"}
+        self._counter += 1
+        rid = f"{sid[:8]}-{self._counter}"
+        fut = asyncio.get_event_loop().create_future()
+        self.pending[rid] = Pending(rid, sid, host, port, scheme, time.time(), fut)
+        self._emit(type="approval_pending", approval=self._pending_dict(rid))
+        try:
+            result = await asyncio.wait_for(asyncio.shield(fut), timeout=300)
+        except asyncio.TimeoutError:
+            result = {"action": "deny", "scope": "once"}
+        self.pending.pop(rid, None)
+        action, scope = result["action"], result["scope"]
+        if scope == "session":
+            (s.sess_allow if action == "allow" else s.sess_deny).add(host)
+        elif scope == "permanent":
+            self.rules.add(host, allow=(action == "allow"))
+            self._emit(type="rules_updated")
+        self._record_traffic(s, host, port, scheme, action)
+        self._emit(type="approval_resolved", request_id=rid)
+        return {"action": action, "scope": scope}
+
+    def resolve(self, rid, action, scope) -> None:
+        p = self.pending.get(rid)
+        if p and not p.future.done():
+            p.future.set_result({"action": action, "scope": scope})
+
+    def note_traffic(self, sid, host, port, scheme, action, bu, bd, status) -> None:
+        s = self.sessions.get(sid)
+        if s: self._record_traffic(s, host, port, scheme, action, bu, bd, status)
+
+    def _pending_dict(self, rid) -> dict:
+        p = self.pending[rid]
+        return dict(request_id=p.request_id, session_id=p.session_id,
+                    host=p.host, port=p.port, scheme=p.scheme, ts=p.ts)
+
+    def kill(self, sid) -> None:
+        s = self.sessions.get(sid)
+        if not s or not _pid_alive(s.pid): return
+        try: os.killpg(s.pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            try: os.kill(s.pid, signal.SIGTERM)
+            except ProcessLookupError: pass
+        s.status = "killed"
+        self._emit(type="session_updated", session=s.to_dict())
+
+    def delete(self, sid) -> None:
+        s = self.sessions.get(sid)
+        if not s: return
+        if _pid_alive(s.pid) and s.live: return
+        fuse_unmount(s.merged)
+        rm_rf(s.shm_dir)
+        del self.sessions[sid]
+        self._emit(type="session_removed", session_id=sid)
+
+    @staticmethod
+    def _is_whiteout(p: Path) -> bool:
+        try:
+            st = p.stat(); return stat_mod.S_ISCHR(st.st_mode) and st.st_rdev == 0
+        except OSError: return False
+
+    def overlay_entries(self, sid) -> list:
+        s = self.sessions.get(sid)
+        if not s: return []
+        upper = Path(s.upper); out = []
+        if not upper.exists(): return out
+        for ap in sorted(upper.rglob("*")):
+            if ap.is_dir() and not self._is_whiteout(ap): continue
+            rel = str(ap.relative_to(upper)); real = Path("/") / rel
+            if self._is_whiteout(ap):
+                out.append(dict(path=rel, kind="deleted", size=0, is_text=False))
+            else:
+                size = ap.stat().st_size if ap.is_file() else 0
+                is_text = False
+                if ap.is_file() and size < (10 << 20):
+                    try: ap.read_bytes()[:512].decode(); is_text = True
+                    except (UnicodeDecodeError, OSError): pass
+                out.append(dict(path=rel,
+                                kind="modified" if real.exists() else "created",
+                                size=size, is_text=is_text))
+        return out
+
+    def overlay_diff(self, sid, rel) -> dict:
+        import difflib
+        s = self.sessions.get(sid)
+        if not s: return dict(kind="error", error="no session")
+        rel = rel.lstrip("/"); up = Path(s.upper) / rel; lo = Path("/") / rel
+        if self._is_whiteout(up): return dict(kind="deleted", diff=None, raw=None, content=None)
+        if not up.is_file(): return dict(kind="directory", diff=None, raw=None, content=None)
+        try:
+            ut = up.read_text(errors="replace")
+            lt = lo.read_text(errors="replace") if lo.exists() else ""
+            diff = "".join(difflib.unified_diff(
+                lt.splitlines(keepends=True), ut.splitlines(keepends=True),
+                fromfile=f"a/{rel}", tofile=f"b/{rel}", lineterm=""))
+            return dict(kind="modified" if lo.exists() else "created",
+                        diff=diff, raw=ut, content=None, is_text=True)
+        except (UnicodeDecodeError, OSError):
+            try:
+                raw = up.read_bytes()
+                return dict(kind="modified" if lo.exists() else "created",
+                            diff=None, raw=None,
+                            content=base64.b64encode(raw).decode(), is_text=False)
+            except OSError as e:
+                return dict(kind="error", error=str(e))
+
+    def overlay_apply(self, sid, paths) -> dict:
+        s = self.sessions.get(sid)
+        if not s: return dict(applied=[], errors=[{"error": "no session"}])
+        upper = Path(s.upper)
+        paths = paths or [e["path"] for e in self.overlay_entries(sid)]
+        applied, errors = [], []
+        for rel in paths:
+            src, dst = upper / rel, Path("/") / rel
+            try:
+                if self._is_whiteout(src):
+                    if dst.is_dir(): shutil.rmtree(dst)
+                    elif dst.exists(): dst.unlink()
+                elif src.is_dir(): dst.mkdir(parents=True, exist_ok=True)
+                elif src.is_file():
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src, dst)
+                applied.append(rel)
+            except OSError as e:
+                errors.append({"path": rel, "error": str(e)})
+        return dict(applied=applied, errors=errors)
+
+    def overlay_discard(self, sid, paths) -> dict:
+        s = self.sessions.get(sid)
+        if not s: return dict(discarded=[], errors=[{"error": "no session"}])
+        upper = Path(s.upper)
+        paths = paths or [e["path"] for e in self.overlay_entries(sid)]
+        discarded, errors = [], []
+        for rel in paths:
+            p = upper / rel
+            try:
+                if p.is_dir() and not self._is_whiteout(p): shutil.rmtree(p)
+                elif p.exists() or self._is_whiteout(p): p.unlink()
+                discarded.append(rel)
+            except OSError as e:
+                errors.append({"path": rel, "error": str(e)})
+        return dict(discarded=discarded, errors=errors)
+
+    def overlay_edit(self, sid, rel, content) -> dict:
+        s = self.sessions.get(sid)
+        if not s: return dict(ok=False, error="no session")
+        p = Path(s.upper) / rel.lstrip("/")
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True); p.write_text(content)
+            return dict(ok=True)
+        except OSError as e:
+            return dict(ok=False, error=str(e))
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  In-process mitmproxy: drive one connection per passed FD
+# ════════════════════════════════════════════════════════════════════════════
+
+# A per-connection session id, read by the gating addon's hooks. It is set in
+# handle_fd before the mitmproxy handler runs; asyncio copies the current context
+# into the child tasks mitmproxy spawns, so each connection's hooks see their own
+# session id even when many run concurrently.
+_CURRENT_SID: "contextvars.ContextVar[str]" = contextvars.ContextVar(
+    "sandbox_session_id", default="")
+
+
+class _GatingAddon:
+    """A mitmproxy addon that gates each http(s) connection through the Supervisor
+    and logs completed traffic. It runs inside the UI's addon chain next to
+    mitmproxy's own NextLayer / TlsConfig addons, which do the real protocol and
+    TLS work — so this only has to make the allow/deny decision."""
+    def __init__(self, sup: "Supervisor"):
+        self.sup = sup
+
+    async def _gate(self, flow, scheme: str) -> None:
+        from mitmproxy import http
+        res = await self.sup.approval_request(
+            _CURRENT_SID.get(), flow.request.host, flow.request.port, scheme)
+        if res.get("action") != "allow":
+            flow.response = http.Response.make(
+                403, b"sandbox: denied\n", {"Content-Type": "text/plain"})
+
+    async def http_connect(self, flow):        # https: gate at CONNECT time
+        await self._gate(flow, "https")
+
+    async def request(self, flow):              # http: gate the plain request
+        if flow.request.scheme == "http":
+            await self._gate(flow, "http")
+
+    def response(self, flow):
+        req, resp = flow.request, flow.response
+        denied = bool(resp and resp.status_code == 403
+                      and b"sandbox: denied" in (resp.content or b""))
+        self.sup.note_traffic(
+            _CURRENT_SID.get(), req.host, req.port, req.scheme,
+            "deny" if denied else "allow",
+            len(req.content or b""),
+            len(resp.content or b"") if resp else 0,
+            resp.status_code if resp else 0)
+
+
+class ProxyEngine:
+    """
+    For each client FD handed over by a sandbox, we build an asyncio stream and run
+    a real mitmproxy connection handler against an in-process mitmproxy Master. The
+    Master carries mitmproxy's default addons (NextLayer, TlsConfig, …) so http and
+    https are handled exactly as mitmproxy would, plus our _GatingAddon which asks
+    the Supervisor to allow/deny each host. The upstream fetch happens here, in the
+    UI's own network context; the sandbox itself has no route to the internet.
+    """
+    def __init__(self, sup: "Supervisor", loop: asyncio.AbstractEventLoop,
+                 schedule):
+        self.sup = sup
+        self.loop = loop
+        self.schedule = schedule       # call(coro) -> schedules Supervisor coro
+        self._master = None
+        self._opts = None
+        self._mode = None
+        self._ready = False
+        try:
+            from mitmproxy import options as moptions, addons, hooks as mhooks
+            from mitmproxy.master import Master
+            from mitmproxy.proxy import mode_specs
+            opts = moptions.Options()
+            master = Master(opts, event_loop=loop)
+            master.addons.add(*addons.default_addons())
+            master.addons.add(_GatingAddon(sup))
+            # Point mitmproxy at our generated CA and keep it from starting any
+            # listening server of its own (we feed it connections by hand).
+            # Updating options fires ConfigureHook synchronously; we also trigger a
+            # full configure so addons like TlsConfig build their cert store now.
+            opts.update(confdir=str(MITM_CONFDIR), server=False)
+            master.addons.trigger(mhooks.ConfigureHook(set(opts.keys())))
+            self._master = master
+            self._opts = opts
+            self._mode = mode_specs.ProxyMode.parse("regular")
+            self._ready = True
+        except Exception as e:
+            print(f"sandbox(ui): mitmproxy unavailable: {e}", file=sys.stderr)
+
+    @property
+    def ready(self) -> bool:
+        return self._ready
+
+    async def handle_fd(self, fd: int, session_id: str) -> None:
+        if not self._ready:
+            try: os.close(fd)
+            except OSError: pass
+            return
+        from mitmproxy.proxy.mode_servers import ProxyConnectionHandler
+        from mitmproxy.proxy import layers
+
+        sock = socket.socket(fileno=fd)
+        sock.setblocking(False)
+        try:
+            reader, writer = await asyncio.open_connection(sock=sock)
+        except OSError:
+            try: sock.close()
+            except OSError: pass
+            return
+
+        _CURRENT_SID.set(session_id)
+        handler = ProxyConnectionHandler(
+            self._master, reader, writer, self._opts, self._mode)
+        # Seed the regular-proxy top layer exactly as mitmproxy's RegularInstance
+        # does; without it the NextLayer addon has no layer stack to reason about.
+        handler.layer = layers.modes.HttpProxy(handler.layer.context)
+        try:
+            await handler.handle_client()
+        except Exception:
+            pass
+        finally:
+            try: writer.close()
+            except Exception: pass
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Control + FD-channel socket server (inside the UI)
+# ════════════════════════════════════════════════════════════════════════════
+
+class ChannelServer:
+    """
+    One Unix socket carries two kinds of client:
+      - control clients (runner register/unregister/etc.): newline JSON, no FDs
+      - FD clients (inner forwarder): a single sendmsg with {session_id} + 1 FD
+    We disambiguate by inspecting the first message's ancillary data.
+    """
+    def __init__(self, sup: Supervisor, engine: "ProxyEngine", sock_path: str):
+        self.sup = sup; self.engine = engine; self.sock_path = sock_path
+        self._srv = None
+
+    async def start(self) -> None:
+        try: os.unlink(self.sock_path)
+        except FileNotFoundError: pass
+        # We need ancillary-data (FD) reception, which asyncio streams don't do.
+        # So we run a raw socket accept loop in a thread, dispatching to the loop.
+        self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._sock.bind(self.sock_path)
+        os.chmod(self.sock_path, 0o600)
+        self._sock.listen(128)
+        self._sock.setblocking(False)
+        self._loop = asyncio.get_event_loop()
+        self._task = asyncio.ensure_future(self._accept_loop())
+
+    async def _accept_loop(self) -> None:
+        while True:
+            try:
+                conn, _ = await self._loop.sock_accept(self._sock)
+            except (OSError, asyncio.CancelledError):
+                break
+            asyncio.ensure_future(self._handle(conn))
+
+    async def _handle(self, conn: socket.socket) -> None:
+        conn.setblocking(False)
+        try:
+            # Peek the first message WITH ancillary space to detect an FD.
+            msg, anc, _flags, _addr = await self._loop.run_in_executor(
+                None, self._recvmsg_blocking, conn)
+            fds = []
+            for lvl, typ, data in anc:
+                if lvl == socket.SOL_SOCKET and typ == socket.SCM_RIGHTS:
+                    a = array.array("i"); a.frombytes(data); fds.extend(a.tolist())
+            if fds:
+                # FD client: forwarder handed us a connection.
+                try:
+                    meta = json.loads(msg.decode() or "{}")
+                except json.JSONDecodeError:
+                    meta = {}
+                sid = meta.get("session_id", "")
+                # hand the first FD to the proxy engine; close any extras
+                for extra in fds[1:]:
+                    try: os.close(extra)
+                    except OSError: pass
+                conn.close()
+                await self.engine.handle_fd(fds[0], sid)
+                return
+            # Control client: first line is JSON; keep reading lines.
+            buf = msg
+            while True:
+                if b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    if line.strip():
+                        self._dispatch_control(line)
+                    continue
+                more = await self._loop.sock_recv(conn, 4096)
+                if not more:
+                    if buf.strip():
+                        self._dispatch_control(buf)
+                    break
+                buf += more
+        except (OSError, asyncio.CancelledError):
+            pass
+        finally:
+            try: conn.close()
+            except OSError: pass
+
+    def _recvmsg_blocking(self, conn):
+        conn.setblocking(True)
+        try:
+            return conn.recvmsg(65536, socket.CMSG_SPACE(4 * 16))
+        finally:
+            conn.setblocking(False)
+
+    def _dispatch_control(self, line: bytes) -> None:
+        try: msg = json.loads(line.decode())
+        except json.JSONDecodeError: return
+        t = msg.get("type")
+        if t == "register": self.sup.register(msg)
+        elif t == "unregister": self.sup.unregister(msg)
+
+    async def stop(self) -> None:
+        if getattr(self, "_task", None):
+            self._task.cancel()
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+        try: os.unlink(self.sock_path)
+        except FileNotFoundError: pass
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  CA generation
+# ════════════════════════════════════════════════════════════════════════════
+
+def ensure_ca_cert() -> Path:
+    if CA_CERT.exists(): return CA_CERT
+    try:
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0)); tmp_port = s.getsockname()[1]
+        proc = subprocess.Popen(
+            ["mitmdump", "-q", "--listen-host", "127.0.0.1",
+             "--listen-port", str(tmp_port), "--set", f"confdir={MITM_CONFDIR}"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL)
+        for _ in range(50):
+            if CA_CERT.exists(): break
+            time.sleep(0.1)
+        proc.terminate()
+        try: proc.wait(timeout=3)
+        except Exception: proc.kill()
+    except FileNotFoundError:
+        pass
+    return CA_CERT
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Runner — `sandbox CMD [ARGS...]`
+# ════════════════════════════════════════════════════════════════════════════
+
+def find_self() -> str: return os.path.abspath(sys.argv[0])
+
+_BWRAP_HELP = None
+def bwrap_supports(flag: str) -> bool:
+    global _BWRAP_HELP
+    if _BWRAP_HELP is None:
+        try:
+            r = subprocess.run(["bwrap", "--help"], capture_output=True,
+                               text=True, timeout=5)
+            _BWRAP_HELP = r.stdout + r.stderr
+        except Exception:
+            _BWRAP_HELP = ""
+    return flag in _BWRAP_HELP
+
+def cmd_run(cmd, label, no_net, session_whitelist, chdir) -> int:
+    if not cmd:
+        print("sandbox: no command given", file=sys.stderr); return 2
+
+    label = label or time.strftime("%Y%m%d-%H%M%S")
+    sid = str(uuid.uuid4())
+    started_at = time.time()
+    shm_dir = Path(tempfile.mkdtemp(prefix=f"{SHM_PREFIX}{label}.", dir=SHM_ROOT))
+    up = shm_dir / "up"; work = shm_dir / "work"; merged = shm_dir / "merged"
+    for d in (up, work, merged): d.mkdir()
+
+    have_ui = ui_is_running(SOCK_PATH)
+    net = not no_net
+    can_net = net and have_ui and CA_CERT.exists()
+
+    # Diagnostics go to stderr (never stdout) and only ever before/after the
+    # child runs, so the wrapped command's stdout stays clean and an interactive
+    # screen never gets garbled mid-run.
+    print(f"sandbox: {label}  ({'net' if net else 'no-net'}, "
+          f"UI {'connected' if have_ui else 'absent'}"
+          f"{'' if can_net else ' → no network'})", file=sys.stderr)
+    print(f"  overlay upper: {up}", file=sys.stderr)
+
+    # The sandbox runs as a foreground job so interactive programs can read the
+    # keyboard. The actual terminal hand-off happens *inside* the namespace (see
+    # run_inner) where process-group ids are namespace-local; out here we only
+    # remember the original foreground group as a safety net to restore on exit,
+    # and ignore SIGTTOU so that restore can't stop us once we've been backgrounded.
+    tty_fd = next((fd for fd in (0, 1, 2) if os.isatty(fd)), None)
+    old_fg_pgrp = None
+    old_ttou = None
+    if tty_fd is not None:
+        try: old_fg_pgrp = os.tcgetpgrp(tty_fd)
+        except OSError: old_fg_pgrp = None
+        old_ttou = signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+
+    fuse_mounted = False
+    launched = False
+    code = 1
+
+    try:
+        # fuse-overlayfs root
+        fr = subprocess.run(
+            ["fuse-overlayfs", "-o", "lowerdir=/", "-o", f"upperdir={up}",
+             "-o", f"workdir={work}", "-o", f"squash_to_uid={os.getuid()}",
+             "-o", f"squash_to_gid={os.getgid()}", str(merged)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        if fr.returncode != 0 or not os.path.ismount(merged):
+            print("sandbox: fuse-overlayfs failed:",
+                  fr.stderr.decode(errors='replace').strip(), file=sys.stderr)
+            rm_rf(shm_dir); return 1
+        fuse_mounted = True
+
+        # the inner forwarder needs the channel socket bound in; the channel is
+        # the UI socket. We bind its directory in so connect() works.
+        chan = SOCK_PATH if can_net else ""
+
+        args = ["bwrap",
+                "--bind", str(merged), "/",
+                "--ro-bind", str(up), "/upper",
+                "--proc", "/proc", "--dev", "/dev",
+                "--ro-bind-try", "/sys", "/sys",
+                "--tmpfs", "/tmp", "--tmpfs", "/run",
+                "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--unshare-net",
+                "--cap-drop", "ALL", "--die-with-parent",
+                "--chdir", chdir or os.getcwd()]
+        if bwrap_supports("--as-pid-1"):
+            args += ["--as-pid-1"]
+        if can_net:
+            # bind the UI socket in (its dir) so the forwarder can reach it
+            args += ["--bind", os.path.dirname(SOCK_PATH), os.path.dirname(SOCK_PATH)]
+            args += ["--ro-bind", str(CA_CERT), str(CA_CERT)]
+            proxy = f"http://127.0.0.1:{INNER_PROXY_PORT}"
+            for var in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
+                args += ["--setenv", var, proxy]
+            for var in ("REQUESTS_CA_BUNDLE", "SSL_CERT_FILE",
+                        "CURL_CA_BUNDLE", "NODE_EXTRA_CA_CERTS"):
+                args += ["--setenv", var, str(CA_CERT)]
+        # run our own --inner, which starts the forwarder then execs cmd
+        args += ["--", sys.executable, find_self(), "--inner",
+                 "--channel", chan, "--sid", sid, "--", *cmd]
+
+        # Launch the sandbox in its own process group so it (and everything it
+        # spawns) can be foregrounded and killed as a unit. preexec_fn runs in the
+        # child between fork and exec; we also set it from the parent to close the
+        # race, then hand the terminal's foreground to that group.
+        proc = subprocess.Popen(args, preexec_fn=os.setpgrp)
+        launched = True
+        try: os.setpgid(proc.pid, proc.pid)
+        except OSError: pass
+
+        # Track the session by the bwrap pid (its process-group leader) so the UI
+        # can check liveness and killpg the whole tree.
+        write_meta(shm_dir, sid, label, list(cmd), proc.pid, started_at)
+        if have_ui:
+            sync_send(SOCK_PATH, type="register", session_id=sid, label=label,
+                      cmd=list(cmd), pid=proc.pid, shm_dir=str(shm_dir),
+                      started=started_at, session_whitelist=session_whitelist)
+
+        def _sig(_s, _f):
+            try: os.killpg(proc.pid, signal.SIGTERM)
+            except OSError:
+                try: proc.terminate()
+                except OSError: pass
+        signal.signal(signal.SIGTERM, _sig)
+        signal.signal(signal.SIGINT, _sig)
+
+        code = proc.wait()
+    finally:
+        # Restore terminal foreground before we print anything else, so our own
+        # output never races the child's or trips SIGTTOU.
+        if tty_fd is not None and old_fg_pgrp is not None:
+            try: os.tcsetpgrp(tty_fd, old_fg_pgrp)
+            except OSError: pass
+        if old_ttou is not None:
+            try: signal.signal(signal.SIGTTOU, old_ttou)
+            except (OSError, ValueError): pass
+        if fuse_mounted:
+            fuse_unmount(str(merged))
+
+    if not launched:
+        rm_rf(shm_dir)
+        if have_ui:
+            sync_send(SOCK_PATH, type="unregister", session_id=sid,
+                      status="finished", exit_code=1)
+        return 1
+
+    # If nothing was written, don't leave an empty session behind.
+    has_changes = any(True for _ in up.rglob("*"))
+    if not has_changes:
+        rm_rf(shm_dir)
+        if have_ui:
+            sync_send(SOCK_PATH, type="unregister", session_id=sid,
+                      status="finished", exit_code=code or 0)
+        # also tell UI to drop it (no changes to review)
+        print(f"sandbox: {label} exited ({code}); no changes.", file=sys.stderr)
+        return code or 0
+
+    if have_ui:
+        sync_send(SOCK_PATH, type="unregister", session_id=sid,
+                  status="finished", exit_code=code or 0)
+    print(f"sandbox: {label} exited ({code}). Review changes in the UI, "
+          f"or: {up}", file=sys.stderr)
+    return code or 0
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  UI — `sandbox`
+# ════════════════════════════════════════════════════════════════════════════
+
+def run_ui() -> int:
+    from textual import on
+    from textual.app import App, ComposeResult
+    from textual.binding import Binding
+    from textual.containers import Horizontal, Vertical, Container
+    from textual.reactive import reactive
+    from textual.screen import ModalScreen
+    from textual.widgets import (
+        Button, DataTable, Footer, Header, Label,
+        ListItem, ListView, RichLog, Static, TabbedContent, TabPane, TextArea)
+
+    def fmt_bytes(n):
+        for u, d in (("G",1<<30),("M",1<<20),("K",1<<10)):
+            if n >= d: return f"{n/d:.1f}{u}"
+        return f"{n}B"
+    def fmt_age(ts):
+        s = int(time.time()-ts)
+        if s<60: return f"{s}s"
+        if s<3600: return f"{s//60}m{s%60:02d}s"
+        return f"{s//3600}h{(s%3600)//60:02d}m"
+    sty = lambda st: {"running":"green","finished":"dim","killed":"red"}.get(st,"")
+    ICON = {"created":"[green]+[/]","modified":"[yellow]~[/]","deleted":"[red]-[/]"}
+
+    class Confirm(ModalScreen):
+        BINDINGS=[("y","yes",""),("n","no",""),("escape","no","")]
+        def __init__(self,m): super().__init__(); self.m=m
+        def compose(self):
+            with Container(id="confirm-box"):
+                yield Label(self.m, id="confirm-msg")
+                with Horizontal(id="confirm-btns"):
+                    yield Button("Yes [y]", variant="error", id="cy")
+                    yield Button("No [n]", id="cn")
+        def action_yes(self): self.dismiss(True)
+        def action_no(self): self.dismiss(False)
+        @on(Button.Pressed,"#cy")
+        def _y(self): self.dismiss(True)
+        @on(Button.Pressed,"#cn")
+        def _n(self): self.dismiss(False)
+
+    class Editor(ModalScreen):
+        BINDINGS=[("ctrl+s","save",""),("escape","cancel","")]
+        def __init__(self,path,content): super().__init__(); self.p=path; self.c=content
+        def compose(self):
+            with Vertical(id="edit-box"):
+                yield Label(f" {self.p}  [dim]Ctrl+S save · Esc cancel[/]", id="edit-title")
+                yield TextArea(self.c, id="edit-area")
+        def action_save(self): self.dismiss(self.query_one("#edit-area",TextArea).text)
+        def action_cancel(self): self.dismiss(None)
+
+    class ApprovalItem(ListItem):
+        def __init__(self,a): super().__init__(); self.a=a
+        def compose(self):
+            a=self.a
+            yield Label(f"[bold]{a['scheme']}[/] [cyan]{a['host']}[/]:{a['port']}"
+                        f"  [dim]{a['session_id'][:8]} · {fmt_age(a['ts'])}[/]")
+
+    class UI(App):
+        TITLE="sandbox"
+        CSS="""
+        Screen { layout: vertical; }
+        .pt  { height:1; padding:0 1; text-style:bold; background:$primary; color:$text; }
+        .pw  { height:1; padding:0 1; text-style:bold; background:$warning; color:$text; }
+        .pok { height:1; padding:0 1; text-style:bold; background:$success; color:$text; }
+        #sb-top { height:1fr; } #sb-bot { height:13; }
+        #s-pane { width:2fr; border:solid $primary; }
+        #l-pane { width:3fr; border:solid $primary; }
+        #a-pane { width:2fr; border:solid $warning; }
+        #a-pane.pending { border:tall $error; }
+        #w-pane { width:3fr; border:solid $success; }
+        #c-top { height:1fr; }
+        #cf-pane { width:2fr; border:solid $primary; }
+        #cd-pane { width:3fr; border:solid $primary; }
+        #c-bar { height:1; background:$surface; color:$text-muted; padding:0 1; }
+        #t-pane { border:solid $primary; height:1fr; }
+        #status { height:1; background:$surface; color:$text-muted; padding:0 1; }
+        DataTable { height:1fr; } RichLog { height:1fr; } ListView { height:1fr; }
+        #confirm-box { width:64; height:auto; padding:1 2; background:$surface; border:tall $error; }
+        #confirm-msg { margin-bottom:1; } #confirm-btns { height:3; }
+        #edit-box { width:100%; height:100%; background:$surface; border:tall $primary; }
+        #edit-title { height:1; background:$primary; color:$text; padding:0 1; }
+        #edit-area { height:1fr; }
+        ModalScreen { align:center middle; }
+        """
+        BINDINGS=[
+            Binding("1","tab('t-sb')","Sandboxes"),
+            Binding("2","tab('t-ch')","Changes"),
+            Binding("3","tab('t-tr')","Traffic"),
+            Binding("k","kill","Kill"), Binding("d","delete","Delete"),
+            Binding("f","filt","Filter"), Binding("r","refresh","Refresh"),
+            Binding("a","apply_one","Apply"), Binding("A","apply_all","Apply all"),
+            Binding("x","discard_one","Discard"), Binding("X","discard_all","Discard all"),
+            Binding("e","edit","Edit"),
+            Binding("y","ap('allow','once')","",show=False),
+            Binding("Y","ap('allow','session')","",show=False),
+            Binding("P","ap('allow','permanent')","",show=False),
+            Binding("n","ap('deny','once')","",show=False),
+            Binding("N","ap('deny','session')","",show=False),
+            Binding("q","quit","Quit")]
+        sessions=reactive({}, layout=True)
+        pending=reactive({}, layout=True)
+        log_filter=reactive(None)
+
+        def __init__(self):
+            super().__init__()
+            self.rules_store=Rules(RULES_FILE)
+            self.sup=Supervisor(self.rules_store)
+            self.sup.on_event=self._on_evt
+            self.engine=None
+            self.server=None
+            self._all_traffic=[]
+            self._ch_sid=None
+            self._ch_entries=[]
+            self._last_loaded_sid=None  # guard against reload on re-highlight
+
+        def compose(self) -> ComposeResult:
+            yield Header()
+            with TabbedContent(id="tabs", initial="t-sb"):
+                with TabPane("Sandboxes [1]", id="t-sb"):
+                    with Horizontal(id="sb-top"):
+                        with Vertical(id="s-pane"):
+                            yield Static("● SANDBOXES", classes="pt")
+                            yield DataTable(id="s-tab", cursor_type="row")
+                        with Vertical(id="l-pane"):
+                            yield Static("▤ CONNECTIONS", classes="pt")
+                            yield RichLog(id="c-log", markup=True, wrap=False)
+                    with Horizontal(id="sb-bot"):
+                        with Vertical(id="a-pane"):
+                            yield Static("⚡ APPROVALS  [dim]y/Y/P allow · n/N deny[/]", classes="pw")
+                            yield ListView(id="a-list")
+                        with Vertical(id="w-pane"):
+                            yield Static("✓ RULES", classes="pok")
+                            yield ListView(id="w-list")
+                with TabPane("Changes [2]", id="t-ch"):
+                    with Horizontal(id="c-top"):
+                        with Vertical(id="cf-pane"):
+                            yield Static("📁 FILES", classes="pt")
+                            yield DataTable(id="cf-tab", cursor_type="row")
+                        with Vertical(id="cd-pane"):
+                            yield Static("≡ DIFF", classes="pt")
+                            yield RichLog(id="cd-log", markup=True, wrap=False)
+                    yield Static("  r refresh · a/A apply · x/X discard · e edit", id="c-bar")
+                with TabPane("Traffic [3]", id="t-tr"):
+                    with Vertical(id="t-pane"):
+                        yield Static("▤ ALL TRAFFIC", classes="pt")
+                        yield RichLog(id="t-log", markup=True, wrap=False)
+            yield Static("", id="status")
+            yield Footer()
+
+        async def on_mount(self):
+            self.query_one("#s-tab",DataTable).add_columns(
+                "Label","St","PID","Cmd","✓","✗","↑","↓","Age")
+            self.query_one("#cf-tab",DataTable).add_columns("","Path","Size")
+            ensure_ca_cert()
+            loop=asyncio.get_event_loop()
+            self.engine=ProxyEngine(self.sup, loop,
+                                    lambda coro: asyncio.ensure_future(coro))
+            self.server=ChannelServer(self.sup, self.engine, SOCK_PATH)
+            await self.server.start()
+            msg = f"listening · {SOCK_PATH}"
+            if not self.engine.ready:
+                msg += "  [red](mitmproxy unavailable — no gating)[/]"
+            self._status(msg)
+            self._refresh_rules()
+            for s in self.sup.sessions.values():
+                self.sessions={**self.sessions, s.session_id:s.to_dict()}
+            self._rebuild_sessions()
+            self.set_interval(3, self._tick)
+
+        async def on_unmount(self):
+            if self.server: await self.server.stop()
+
+        def _on_evt(self, ev): self.call_later(self._apply_evt, ev)
+
+        def _apply_evt(self, ev):
+            t=ev["type"]
+            if t in ("session_added","session_updated"):
+                s=ev["session"]; self.sessions={**self.sessions,s["session_id"]:s}
+                self._rebuild_sessions(preserve=True)
+            elif t=="session_removed":
+                sid=ev["session_id"]
+                self.sessions={k:v for k,v in self.sessions.items() if k!=sid}
+                self._rebuild_sessions(preserve=True)
+                if self._ch_sid==sid:
+                    self._ch_sid=None; self._last_loaded_sid=None
+                    self._ch_entries=[]; self._rebuild_ch()
+            elif t=="approval_pending":
+                a=ev["approval"]; self.pending={**self.pending,a["request_id"]:a}
+                self._rebuild_approvals(preserve=True); self.bell()
+            elif t=="approval_resolved":
+                rid=ev["request_id"]
+                self.pending={k:v for k,v in self.pending.items() if k!=rid}
+                self._rebuild_approvals(preserve=True)
+            elif t=="traffic":
+                self._ingest(ev["event"]); s=ev["session"]
+                self.sessions={**self.sessions,s["session_id"]:s}
+                self._rebuild_sessions(preserve=True)
+            elif t=="rules_updated":
+                self._refresh_rules()
+
+        def _tick(self):
+            self.sup.rescan()
+            self._rebuild_sessions(preserve=True)
+            self._rebuild_approvals(preserve=True)
+
+        def _rebuild_sessions(self, preserve=False):
+            t=self.query_one("#s-tab",DataTable)
+            saved=None
+            if preserve and t.row_count:
+                try: saved=t.coordinate_to_cell_key((t.cursor_row,0)).row_key.value
+                except Exception: saved=None
+            t.clear()
+            for sid,s in sorted(self.sessions.items(),
+                                key=lambda x:x[1]["started"], reverse=True):
+                c=sty(s["status"])
+                t.add_row(f"[{c}]{s['label']}[/]", f"[{c}]{s['status'][:4]}[/]",
+                          str(s["pid"]), " ".join(s["cmd"])[:24],
+                          f"[green]{s['conn_allowed']}[/]", f"[red]{s['conn_denied']}[/]",
+                          fmt_bytes(s["bytes_up"]), fmt_bytes(s["bytes_down"]),
+                          fmt_age(s["started"]), key=sid)
+            if saved is not None:
+                try: t.move_cursor(row=t.get_row_index(saved), animate=False)
+                except Exception: pass
+
+        def _rebuild_approvals(self, preserve=False):
+            lv=self.query_one("#a-list",ListView)
+            saved=lv.index if preserve else None
+            lv.clear()
+            self.query_one("#a-pane").set_class(bool(self.pending),"pending")
+            for a in self.pending.values(): lv.append(ApprovalItem(a))
+            if saved is not None and 0<=saved<len(self.pending):
+                lv.index=saved
+
+        def _refresh_rules(self):
+            lv=self.query_one("#w-list",ListView); lv.clear()
+            for e in sorted(self.rules_store.entries):
+                col="red" if e.startswith("!") else "green"
+                lv.append(ListItem(Label(f"[{col}]{e}[/]")))
+
+        def _rebuild_ch(self):
+            t=self.query_one("#cf-tab",DataTable); t.clear()
+            for e in self._ch_entries:
+                t.add_row(ICON.get(e["kind"],"?"), e["path"],
+                          fmt_bytes(e["size"]) if e["size"] else "", key=e["path"])
+
+        def _ingest(self, ev):
+            self._all_traffic.append(ev)
+            self._write(self.query_one("#t-log",RichLog), ev, True)
+            if not self.log_filter or self.log_filter==ev.get("session_id"):
+                self._write(self.query_one("#c-log",RichLog), ev, not bool(self.log_filter))
+
+        def _write(self, w, ev, sid):
+            act=ev.get("action","?"); col="green" if act=="allow" else "red"
+            ts=time.strftime("%H:%M:%S", time.localtime(ev.get("ts",time.time())))
+            st=f" [{ev['status']}]" if ev.get("status") else ""
+            bu,bd=ev.get("bytes_up",0),ev.get("bytes_down",0)
+            bt=f" [dim]↑{fmt_bytes(bu)} ↓{fmt_bytes(bd)}[/]" if (bu or bd) else ""
+            sd=f" [dim cyan]{ev.get('session_id','')[:8]}[/]" if sid else ""
+            w.write(f"[dim]{ts}[/]{sd} [{col}]{'✓' if act=='allow' else '✗'}[/] "
+                    f"[bold]{ev.get('scheme','?')}[/] "
+                    f"[cyan]{ev.get('host','?')}[/]:{ev.get('port','?')}{st}{bt}")
+
+        def _show_diff(self, d):
+            log=self.query_one("#cd-log",RichLog); log.clear()
+            k=d.get("kind")
+            if k=="deleted": log.write("[red bold]DELETED[/]"); return
+            if k=="directory": log.write("[cyan]DIRECTORY[/]"); return
+            if k=="error": log.write(f"[red]{d.get('error')}[/]"); return
+            diff=d.get("diff")
+            if diff is not None:
+                for ln in diff.splitlines():
+                    if ln.startswith(("+++","---")): log.write(f"[bold]{ln}[/]")
+                    elif ln.startswith("+"): log.write(f"[green]{ln}[/]")
+                    elif ln.startswith("-"): log.write(f"[red]{ln}[/]")
+                    elif ln.startswith("@@"): log.write(f"[cyan]{ln}[/]")
+                    else: log.write(ln)
+                if not diff.strip(): log.write("[dim](no textual diff)[/]")
+            else:
+                raw=base64.b64decode(d.get("content") or b"")
+                log.write(f"[dim]binary · {fmt_bytes(len(raw))}[/]")
+                for i in range(0,min(len(raw),256),16):
+                    ch=raw[i:i+16]; h=" ".join(f"{b:02x}" for b in ch)
+                    a="".join(chr(b) if 0x20<=b<0x7f else "." for b in ch)
+                    log.write(f"[dim]{i:04x}[/]  {h:<48}  {a}")
+
+        def _status(self, t):
+            try: self.query_one("#status",Static).update(t)
+            except Exception: pass
+        def _cbar(self, extra):
+            try: self.query_one("#c-bar",Static).update(
+                f"  r refresh · a/A apply · x/X discard · e edit   [dim]{extra}[/]")
+            except Exception: pass
+
+        def _sel_session(self):
+            t=self.query_one("#s-tab",DataTable)
+            if not t.row_count: return None
+            try: return self.sessions.get(
+                t.coordinate_to_cell_key((t.cursor_row,0)).row_key.value)
+            except Exception: return None
+        def _sel_approval(self):
+            it=self.query_one("#a-list",ListView).highlighted_child
+            return it.a if isinstance(it,ApprovalItem) else None
+        def _sel_path(self):
+            t=self.query_one("#cf-tab",DataTable)
+            if not t.row_count: return None
+            try: return t.coordinate_to_cell_key((t.cursor_row,0)).row_key.value
+            except Exception: return None
+
+        def _load_changes(self, sid):
+            self._ch_entries=self.sup.overlay_entries(sid)
+            self._rebuild_ch()
+            self._cbar(f"{len(self._ch_entries)} change(s)")
+
+        @on(DataTable.RowHighlighted, "#s-tab")
+        def _sc(self, ev):
+            if ev.row_key and ev.row_key.value:
+                sid=ev.row_key.value
+                self._ch_sid=sid
+                # only reload the changes list when the SELECTED SESSION changes,
+                # so the periodic refresh / cursor restore never reloads & blinks
+                if sid!=self._last_loaded_sid:
+                    self._last_loaded_sid=sid
+                    self._load_changes(sid)
+
+        @on(DataTable.RowHighlighted, "#cf-tab")
+        def _cc(self, ev):
+            if ev.row_key and ev.row_key.value and self._ch_sid:
+                self._show_diff(self.sup.overlay_diff(self._ch_sid, ev.row_key.value))
+
+        def action_tab(self, t): self.query_one("#tabs",TabbedContent).active=t
+
+        def action_kill(self):
+            s=self._sel_session()
+            if not s or s["status"]!="running":
+                self._status("no running session selected"); return
+            def done(ok):
+                if ok: self.sup.kill(s["session_id"])
+            self.push_screen(Confirm(f"Kill [bold]{s['label']}[/]?"), done)
+
+        def action_delete(self):
+            s=self._sel_session()
+            if not s: return
+            if s["status"]=="running": self._status("kill it first"); return
+            def done(ok):
+                if ok: self.sup.delete(s["session_id"])
+            self.push_screen(Confirm(f"Delete [bold]{s['label']}[/] and its overlay?"), done)
+
+        def action_filt(self):
+            s=self._sel_session()
+            self.log_filter=None if self.log_filter else (s["session_id"] if s else None)
+            self._status("log: all" if not self.log_filter else f"log: {s['label']}")
+            cl=self.query_one("#c-log",RichLog); cl.clear()
+            for ev in self._all_traffic:
+                if not self.log_filter or self.log_filter==ev.get("session_id"):
+                    self._write(cl, ev, not bool(self.log_filter))
+
+        def action_ap(self, action, scope):
+            a=self._sel_approval()
+            if not a: self._status("no approval selected"); return
+            self.sup.resolve(a["request_id"], action, scope)
+
+        def action_refresh(self):
+            if self._ch_sid: self._load_changes(self._ch_sid)
+
+        def action_apply_one(self):
+            p,sid=self._sel_path(),self._ch_sid
+            if p and sid:
+                r=self.sup.overlay_apply(sid,[p]); self._cbar(f"applied {len(r['applied'])}")
+
+        def action_apply_all(self):
+            sid=self._ch_sid
+            if not sid: return
+            s=self.sessions.get(sid,{})
+            warn="\n[yellow]still running[/]" if s.get("status")=="running" else ""
+            def done(ok):
+                if ok:
+                    r=self.sup.overlay_apply(sid,None); self._cbar(f"applied {len(r['applied'])}")
+            self.push_screen(Confirm(f"Apply all {len(self._ch_entries)} changes?{warn}"), done)
+
+        def action_discard_one(self):
+            p,sid=self._sel_path(),self._ch_sid
+            if p and sid:
+                self.sup.overlay_discard(sid,[p]); self._load_changes(sid)
+
+        def action_discard_all(self):
+            sid=self._ch_sid
+            if not sid: return
+            def done(ok):
+                if ok: self.sup.overlay_discard(sid,None); self._load_changes(sid)
+            self.push_screen(Confirm(f"Discard ALL {len(self._ch_entries)} changes?"), done)
+
+        def action_edit(self):
+            p,sid=self._sel_path(),self._ch_sid
+            if not p or not sid: return
+            d=self.sup.overlay_diff(sid,p)
+            if d.get("kind")=="deleted": self._status("can't edit a deletion"); return
+            if not d.get("is_text"): self._status("binary — can't edit"); return
+            def done(content):
+                if content is not None: self.sup.overlay_edit(sid,p,content)
+            self.push_screen(Editor(p, d.get("raw") or ""), done)
+
+    UI().run()
+    return 0
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Entry
+# ════════════════════════════════════════════════════════════════════════════
+
+def main() -> int:
+    argv = sys.argv[1:]
+
+    # inner mode: sandbox --inner --channel PATH --sid SID -- CMD...
+    if argv and argv[0] == "--inner":
+        ap = argparse.ArgumentParser(prog="sandbox --inner")
+        ap.add_argument("--channel", default="")
+        ap.add_argument("--sid", required=True)
+        ap.add_argument("cmd", nargs=argparse.REMAINDER)
+        ns = ap.parse_args(argv[1:])
+        cmd = ns.cmd
+        if cmd and cmd[0] == "--": cmd = cmd[1:]
+        return run_inner(ns.channel, ns.sid, cmd)
+
+    if not argv:
+        return run_ui()
+
+    ap = argparse.ArgumentParser(
+        prog="sandbox",
+        usage="sandbox            (start UI)\n"
+              "       sandbox [-l NAME] [-w HOST]... [-n] [-C DIR] CMD [ARGS...]")
+    ap.add_argument("-l", dest="label", default=None)
+    ap.add_argument("-w", dest="whitelist", action="append", default=[], metavar="HOST")
+    ap.add_argument("-n", dest="no_net", action="store_true")
+    ap.add_argument("-C", dest="chdir", default=None)
+    ap.add_argument("cmd", nargs=argparse.REMAINDER)
+    if argv[0] in ("-h","--help"):
+        ap.print_help(); return 0
+    ns = ap.parse_args(argv)
+    cmd = ns.cmd
+    if cmd and cmd[0] == "--": cmd = cmd[1:]
+    return cmd_run(cmd, ns.label, ns.no_net, ns.whitelist, ns.chdir)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
