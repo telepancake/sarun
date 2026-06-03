@@ -1290,32 +1290,67 @@ def run_ui() -> int:
             self.sup.rescan()
             self._rebuild_sessions(preserve=True)
             self._rebuild_approvals(preserve=True)
+            # Keep the Changes pane live for the selected session (its overlay can
+            # keep growing while the process runs). Falls back to the highlighted
+            # row if no selection has been recorded yet.
+            if self._ch_sid is None:
+                s=self._sel_session()
+                if s: self._ch_sid=self._last_loaded_sid=s["session_id"]
+            if self._ch_sid:
+                self._load_changes(self._ch_sid)
+
+        def _sync_table(self, table, rows):
+            # Reconcile a DataTable against the desired (key, cells) rows IN PLACE.
+            # When the set+order of rows is unchanged we only rewrite changed cells,
+            # so the cursor, scroll and selection are never disturbed by a refresh.
+            # Only a structural change (row added/removed/reordered) rebuilds, and
+            # even then the cursor is restored by key.
+            cur=[rk.value for rk in table.rows]
+            new=[k for k,_ in rows]
+            if cur==new:
+                cols=list(table.columns)
+                for key,cells in rows:
+                    for ck,val in zip(cols,cells):
+                        try:
+                            if table.get_cell(key,ck)!=val:
+                                table.update_cell(key,ck,val,update_width=False)
+                        except Exception: pass
+                return
+            saved=None
+            if table.row_count:
+                try: saved=table.coordinate_to_cell_key((table.cursor_row,0)).row_key.value
+                except Exception: saved=None
+            table.clear()
+            for key,cells in rows:
+                table.add_row(*cells,key=key)
+            if saved is not None:
+                try: table.move_cursor(row=table.get_row_index(saved),animate=False)
+                except Exception: pass
 
         def _rebuild_sessions(self, preserve=False):
-            t=self.query_one("#s-tab",DataTable)
-            saved=None
-            if preserve and t.row_count:
-                try: saved=t.coordinate_to_cell_key((t.cursor_row,0)).row_key.value
-                except Exception: saved=None
-            t.clear()
+            rows=[]
             for sid,s in sorted(self.sessions.items(),
                                 key=lambda x:x[1]["started"], reverse=True):
                 c=sty(s["status"])
                 flag={"running":"R","finished":"F","killed":"K"}.get(s["status"],"?")
-                t.add_row(f"[{c}]{flag}[/]", f"[{c}]{s['label']}[/]",
-                          str(s["pid"]), " ".join(s["cmd"])[:24],
-                          f"[green]{s['conn_allowed']}[/]", f"[red]{s['conn_denied']}[/]",
-                          fmt_bytes(s["bytes_up"]), fmt_bytes(s["bytes_down"]),
-                          fmt_age(s["started"]), key=sid)
-            if saved is not None:
-                try: t.move_cursor(row=t.get_row_index(saved), animate=False)
-                except Exception: pass
+                rows.append((sid,[
+                    f"[{c}]{flag}[/]", f"[{c}]{s['label']}[/]",
+                    str(s["pid"]), " ".join(s["cmd"])[:24],
+                    f"[green]{s['conn_allowed']}[/]", f"[red]{s['conn_denied']}[/]",
+                    fmt_bytes(s["bytes_up"]), fmt_bytes(s["bytes_down"]),
+                    fmt_age(s["started"])]))
+            self._sync_table(self.query_one("#s-tab",DataTable), rows)
 
         def _rebuild_approvals(self, preserve=False):
             lv=self.query_one("#a-list",ListView)
-            saved=lv.index if preserve else None
-            lv.clear()
             self.query_one("#a-pane").set_class(bool(self.pending),"pending")
+            new_ids=list(self.pending.keys())
+            cur_ids=[c.a.get("request_id") for c in lv.children
+                     if isinstance(c,ApprovalItem)]
+            if cur_ids==new_ids:
+                return                       # nothing added/removed: leave it alone
+            saved=lv.index
+            lv.clear()
             for a in self.pending.values(): lv.append(ApprovalItem(a))
             if saved is not None and 0<=saved<len(self.pending):
                 lv.index=saved
@@ -1326,11 +1361,11 @@ def run_ui() -> int:
                 col="red" if e.startswith("!") else "green"
                 lv.append(ListItem(Label(f"[{col}]{e}[/]")))
 
-        def _rebuild_ch(self):
-            t=self.query_one("#cf-tab",DataTable); t.clear()
-            for e in self._ch_entries:
-                t.add_row(ICON.get(e["kind"],"?"), e["path"],
-                          fmt_bytes(e["size"]) if e["size"] else "", key=e["path"])
+        def _rebuild_ch(self, preserve=False):
+            rows=[(e["path"], [ICON.get(e["kind"],"?"), e["path"],
+                               fmt_bytes(e["size"]) if e["size"] else ""])
+                  for e in self._ch_entries]
+            self._sync_table(self.query_one("#cf-tab",DataTable), rows)
 
         def _ingest(self, ev):
             self._all_traffic.append(ev)
@@ -1395,9 +1430,15 @@ def run_ui() -> int:
             try: return t.coordinate_to_cell_key((t.cursor_row,0)).row_key.value
             except Exception: return None
 
-        def _load_changes(self, sid):
-            self._ch_entries=self.sup.overlay_entries(sid)
-            self._rebuild_ch()
+        def _load_changes(self, sid, force=False):
+            entries=self.sup.overlay_entries(sid)
+            # Only touch the table when the set of changes actually differs, so the
+            # periodic refresh keeps the pane live without blinking or losing the
+            # cursor while nothing is changing.
+            if not force and entries==self._ch_entries:
+                return
+            self._ch_entries=entries
+            self._rebuild_ch(preserve=True)
             self._cbar(f"{len(self._ch_entries)} change(s)")
 
         @on(DataTable.RowHighlighted, "#s-tab")
@@ -1405,18 +1446,18 @@ def run_ui() -> int:
             if ev.row_key and ev.row_key.value:
                 sid=ev.row_key.value
                 self._ch_sid=sid
-                # only reload the changes list when the SELECTED SESSION changes,
-                # so the periodic refresh / cursor restore never reloads & blinks
                 if sid!=self._last_loaded_sid:
                     self._last_loaded_sid=sid
-                    self._load_changes(sid)
+                    self._load_changes(sid, force=True)
 
         @on(DataTable.RowHighlighted, "#cf-tab")
         def _cc(self, ev):
             if ev.row_key and ev.row_key.value and self._ch_sid:
                 self._show_diff(self.sup.overlay_diff(self._ch_sid, ev.row_key.value))
 
-        def action_tab(self, t): self.query_one("#tabs",TabbedContent).active=t
+        def action_tab(self, t):
+            self.query_one("#tabs",TabbedContent).active=t
+            if t=="t-ch" and self._ch_sid: self._load_changes(self._ch_sid, force=True)
 
         def action_kill(self):
             s=self._sel_session()
