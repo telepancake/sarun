@@ -604,8 +604,11 @@ class Supervisor:
         try:
             ut = up.read_text(errors="replace")
             lt = lo.read_text(errors="replace") if lo.exists() else ""
-            diff = "".join(difflib.unified_diff(
-                lt.splitlines(keepends=True), ut.splitlines(keepends=True),
+            # Split WITHOUT keepends and join with "\n": mixing keepends with
+            # lineterm="" leaves the ---/+++/@@ headers without terminators, so
+            # they run into the first change ("…@@+line") and hide it.
+            diff = "\n".join(difflib.unified_diff(
+                lt.splitlines(), ut.splitlines(),
                 fromfile=f"a/{rel}", tofile=f"b/{rel}", lineterm=""))
             return dict(kind="modified" if lo.exists() else "created",
                         diff=diff, raw=ut, content=None, is_text=True)
@@ -1191,6 +1194,10 @@ def run_ui() -> int:
 
         def __init__(self):
             super().__init__()
+            # Snappy, not dial-up: disable smooth-scroll/other animation so
+            # PgUp/PgDn jump a page instantly instead of re-compositing the whole
+            # screen frame-by-frame.
+            self.animation_level="none"
             self.rules_store=Rules(RULES_FILE)
             self.sup=Supervisor(self.rules_store)
             self.sup.on_event=self._on_evt
