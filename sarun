@@ -42,6 +42,8 @@ import array
 import asyncio
 import base64
 import contextvars
+import fnmatch
+import ipaddress
 import json
 import os
 import shutil
@@ -223,32 +225,109 @@ def run_inner(channel_path: str, session_id: str, cmd: list) -> int:
 #  Rules
 # ════════════════════════════════════════════════════════════════════════════
 
+RULE_KINDS = ("host", "ip", "cname", "url")
+
+
+def _host_glob(pat: str, name: str) -> bool:
+    """Wildcard hostname match. `*.example.com` matches example.com and any
+    subdomain; otherwise standard glob (`*`, `?`)."""
+    name = (name or "").rstrip(".").lower(); pat = pat.rstrip(".").lower()
+    if pat.startswith("*.") and name == pat[2:]: return True
+    return fnmatch.fnmatch(name, pat)
+
+
+def _ip_match(pat: str, ip: str) -> bool:
+    """Match an IP (v4/v6) against an address or CIDR network."""
+    try:
+        addr = ipaddress.ip_address(ip)
+        if "/" in pat:
+            return addr in ipaddress.ip_network(pat, strict=False)
+        return addr == ipaddress.ip_address(pat)
+    except ValueError:
+        return False
+
+
+@dataclass
+class Rule:
+    action: str            # "allow" | "deny"
+    kind: str              # one of RULE_KINDS
+    pattern: str
+
+    def matches(self, host, port, url, ips, cnames) -> bool:
+        k, p = self.kind, self.pattern
+        if k == "host":
+            # optional :port suffix (but not for bare IPv6 literals)
+            if ":" in p and p.rpartition(":")[2].isdigit() and not p.startswith("["):
+                h, _, pp = p.rpartition(":")
+                return _host_glob(h, host) and int(pp) == port
+            return _host_glob(p, host)
+        if k == "ip":
+            return any(_ip_match(p, ip) for ip in ips)
+        if k == "cname":
+            return any(_host_glob(p, c) for c in cnames)
+        if k == "url":
+            return bool(url) and (url == p or url.startswith(p))
+        return False
+
+    def to_line(self) -> str:
+        return f"{self.action} {self.kind}:{self.pattern}"
+
+    def label(self) -> str:
+        col = "green" if self.action == "allow" else "red"
+        sign = "+" if self.action == "allow" else "−"
+        return f"[{col}]{sign} {self.kind}:{self.pattern}[/]"
+
+    @staticmethod
+    def parse(line: str) -> "Rule | None":
+        s = line.strip()
+        if not s or s.startswith("#"):
+            return None
+        action = "allow"
+        # explicit verb, or legacy "!" deny prefix
+        low = s.lower()
+        if low.startswith("allow ") or low.startswith("deny "):
+            verb, _, rest = s.partition(" ")
+            action = verb.lower(); s = rest.strip()
+        elif s.startswith("!"):
+            action = "deny"; s = s[1:].strip()
+        kind = "host"
+        if ":" in s:
+            maybe, _, rest = s.partition(":")
+            if maybe.lower() in RULE_KINDS:
+                kind = maybe.lower(); s = rest.strip()
+        if not s:
+            return None
+        return Rule(action=action, kind=kind, pattern=s)
+
+
 class Rules:
+    """An ordered rule list, evaluated top-to-bottom — first match wins."""
     def __init__(self, path: Path):
-        self.path = path; self.entries: set = set(); self.load()
+        self.path = path; self.rules: list = []; self.load()
     def load(self) -> None:
         try: text = self.path.read_text()
         except OSError: text = ""
-        self.entries = {ln.strip() for ln in text.splitlines()
-                        if ln.strip() and not ln.startswith("#")}
+        self.rules = [r for r in (Rule.parse(ln) for ln in text.splitlines()) if r]
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text("\n".join(sorted(self.entries)) + "\n")
-    @staticmethod
-    def _match(host: str, port: int, pat: str) -> bool:
-        p = pat.lstrip("!")
-        if p in (host, f"{host}:{port}"): return True
-        if p.startswith("*.") and (host.endswith(p[1:]) or host == p[2:]): return True
-        return False
-    def decide(self, host: str, port: int) -> "str | None":
-        for pat in self.entries:
-            if self._match(host, port, pat):
-                return "deny" if pat.startswith("!") else "allow"
+        self.path.write_text("".join(r.to_line() + "\n" for r in self.rules))
+    def needs_dns(self) -> bool:
+        return any(r.kind in ("ip", "cname") for r in self.rules)
+    def decide(self, host, port, url=None, ips=(), cnames=()) -> "str | None":
+        for r in self.rules:
+            if r.matches(host, port, url, ips, cnames):
+                return r.action
         return None
-    def add(self, host: str, allow: bool) -> None:
-        self.entries.add(host if allow else f"!{host}"); self.save()
-    def remove(self, entry: str) -> None:
-        self.entries.discard(entry); self.save()
+    def insert(self, rule: Rule, at_top: bool = False) -> None:
+        self.rules.insert(0 if at_top else len(self.rules), rule); self.save()
+    def remove_at(self, i: int) -> None:
+        if 0 <= i < len(self.rules): del self.rules[i]; self.save()
+    def move(self, i: int, delta: int) -> int:
+        j = i + delta
+        if 0 <= i < len(self.rules) and 0 <= j < len(self.rules):
+            self.rules[i], self.rules[j] = self.rules[j], self.rules[i]
+            self.save(); return j
+        return i
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -335,17 +414,15 @@ class Session:
     conn_denied: int = 0
     bytes_up: int = 0
     bytes_down: int = 0
-    sess_allow: set = field(default_factory=set)
-    sess_deny: set = field(default_factory=set)
+    sess_rules: list = field(default_factory=list)   # ordered, session-only Rules
     live: bool = False
     @property
     def upper(self) -> str: return str(Path(self.shm_dir) / "up")
     @property
     def merged(self) -> str: return str(Path(self.shm_dir) / "merged")
     def to_dict(self) -> dict:
-        d = asdict(self)
-        d["sess_allow"] = list(self.sess_allow)
-        d["sess_deny"] = list(self.sess_deny)
+        d = {k: v for k, v in asdict(self).items() if k != "sess_rules"}
+        d["sess_rules"] = [r.to_line() for r in self.sess_rules]
         d["upper"] = self.upper
         return d
 
@@ -379,12 +456,15 @@ def discover_sessions() -> dict:
 class Pending:
     request_id: str; session_id: str; host: str; port: int
     scheme: str; ts: float; future: Any
+    url: str = ""; ips: list = field(default_factory=list)
+    cnames: list = field(default_factory=list)
 
 class Supervisor:
     def __init__(self, rules: Rules):
         self.rules = rules
         self.sessions: dict = {}
         self.pending: dict = {}
+        self._dns_cache: dict = {}
         self.traffic: list = []
         self.MAX_TRAFFIC = 5000
         self._counter = 0
@@ -412,14 +492,47 @@ class Supervisor:
                 del self.sessions[sid]
                 self._emit(type="session_removed", session_id=sid)
 
-    def _decide(self, s: Session, host: str, port: int) -> "str | None":
-        r = self.rules.decide(host, port)
-        if r: return r
-        for pat in s.sess_allow:
-            if Rules._match(host, port, pat): return "allow"
-        for pat in s.sess_deny:
-            if Rules._match(host, port, pat): return "deny"
-        return None
+    def _resolve(self, host: str) -> tuple:
+        """Best-effort DNS: (ips, cnames). Cached for the UI's lifetime. Uses
+        gethostbyname_ex for the IPv4 + CNAME/alias chain and getaddrinfo for
+        IPv6 (and IPv4). All best-effort — failures just yield empty lists."""
+        cached = self._dns_cache.get(host)
+        if cached is not None:
+            return cached
+        ips, cnames = set(), set()
+        try:
+            canon, aliases, addrs = socket.gethostbyname_ex(host)
+            ips.update(addrs)
+            if canon and canon.rstrip(".").lower() != host.lower():
+                cnames.add(canon.rstrip(".").lower())
+            cnames.update(a.rstrip(".").lower() for a in aliases)
+        except OSError:
+            pass
+        try:
+            for *_, sa in socket.getaddrinfo(host, None):
+                ips.add(sa[0])
+        except OSError:
+            pass
+        res = (sorted(ips), sorted(cnames)); self._dns_cache[host] = res
+        return res
+
+    def _decide(self, s: Session, host: str, port: int,
+                url: str = None) -> "str | None":
+        need_dns = self.rules.needs_dns() or any(
+            r.kind in ("ip", "cname") for r in s.sess_rules)
+        ips, cnames = self._resolve(host) if need_dns else ((), ())
+        # session rules first (temporary overrides), then the permanent ruleset;
+        # each evaluated top-to-bottom, first match wins.
+        for r in s.sess_rules:
+            if r.matches(host, port, url, ips, cnames):
+                return r.action
+        return self.rules.decide(host, port, url, ips, cnames)
+
+    def precheck(self, sid, host, port, url=None) -> "str | None":
+        """Rule-only decision (no prompting) for the given request."""
+        s = self.sessions.get(sid)
+        if not s: return "deny"
+        return self._decide(s, host, port, url)
 
     def _record_traffic(self, s, host, port, scheme, action,
                         bytes_up=0, bytes_down=0, status=0) -> None:
@@ -440,7 +553,8 @@ class Supervisor:
                     pid=msg["pid"], shm_dir=msg["shm_dir"],
                     started=msg.get("started", time.time()),
                     status="running", live=True)
-        for h in msg.get("session_whitelist", []): s.sess_allow.add(h)
+        for h in msg.get("session_whitelist", []):
+            s.sess_rules.append(Rule("allow", "host", h))
         self.sessions[sid] = s
         self._emit(type="session_added", session=s.to_dict())
 
@@ -457,18 +571,21 @@ class Supervisor:
         if self.sessions.pop(msg["session_id"], None) is not None:
             self._emit(type="session_removed", session_id=msg["session_id"])
 
-    async def approval_request(self, sid, host, port, scheme) -> dict:
+    async def approval_request(self, sid, host, port, scheme, url="") -> dict:
         s = self.sessions.get(sid)
         if not s:
             return {"action": "deny", "scope": "once"}
-        decided = self._decide(s, host, port)
+        decided = self._decide(s, host, port, url)
         if decided:
             self._record_traffic(s, host, port, scheme, decided)
             return {"action": decided, "scope": "rule"}
         self._counter += 1
         rid = f"{sid[:8]}-{self._counter}"
         fut = asyncio.get_event_loop().create_future()
-        self.pending[rid] = Pending(rid, sid, host, port, scheme, time.time(), fut)
+        # Resolve now so the approval UI can offer IP / CNAME matches to the user.
+        ips, cnames = self._resolve(host)
+        self.pending[rid] = Pending(rid, sid, host, port, scheme, time.time(), fut,
+                                    url=url, ips=ips, cnames=cnames)
         self._emit(type="approval_pending", approval=self._pending_dict(rid))
         try:
             result = await asyncio.wait_for(asyncio.shield(fut), timeout=300)
@@ -476,19 +593,27 @@ class Supervisor:
             result = {"action": "deny", "scope": "once"}
         self.pending.pop(rid, None)
         action, scope = result["action"], result["scope"]
-        if scope == "session":
-            (s.sess_allow if action == "allow" else s.sess_deny).add(host)
-        elif scope == "permanent":
-            self.rules.add(host, allow=(action == "allow"))
-            self._emit(type="rules_updated")
+        # The UI hands back the exact rule it wants ("kind:pattern") and where to
+        # put it; we only synthesise a host rule if it didn't supply one.
+        spec = result.get("spec") or f"host:{host}"
+        at_top = result.get("at_top", False)
+        if scope in ("session", "permanent"):
+            rule = Rule.parse(f"{action} {spec}")
+            if rule:
+                if scope == "session":
+                    s.sess_rules.insert(0 if at_top else len(s.sess_rules), rule)
+                else:
+                    self.rules.insert(rule, at_top=at_top)
+                    self._emit(type="rules_updated")
         self._record_traffic(s, host, port, scheme, action)
         self._emit(type="approval_resolved", request_id=rid)
         return {"action": action, "scope": scope}
 
-    def resolve(self, rid, action, scope) -> None:
+    def resolve(self, rid, action, scope, spec=None, at_top=False) -> None:
         p = self.pending.get(rid)
         if p and not p.future.done():
-            p.future.set_result({"action": action, "scope": scope})
+            p.future.set_result({"action": action, "scope": scope,
+                                 "spec": spec, "at_top": at_top})
 
     def note_traffic(self, sid, host, port, scheme, action, bu, bd, status) -> None:
         s = self.sessions.get(sid)
@@ -497,7 +622,8 @@ class Supervisor:
     def _pending_dict(self, rid) -> dict:
         p = self.pending[rid]
         return dict(request_id=p.request_id, session_id=p.session_id,
-                    host=p.host, port=p.port, scheme=p.scheme, ts=p.ts)
+                    host=p.host, port=p.port, scheme=p.scheme, ts=p.ts,
+                    url=p.url, ips=p.ips, cnames=p.cnames)
 
     def kill(self, sid) -> None:
         s = self.sessions.get(sid)
@@ -692,20 +818,32 @@ class _GatingAddon:
     def __init__(self, sup: "Supervisor"):
         self.sup = sup
 
-    async def _gate(self, flow, scheme: str) -> None:
+    def _deny(self, flow):
         from mitmproxy import http
-        res = await self.sup.approval_request(
-            _CURRENT_SID.get(), flow.request.host, flow.request.port, scheme)
-        if res.get("action") != "allow":
-            flow.response = http.Response.make(
-                403, b"slopbox: denied\n", {"Content-Type": "text/plain"})
+        flow.response = http.Response.make(
+            403, b"slopbox: denied\n", {"Content-Type": "text/plain"})
 
-    async def http_connect(self, flow):        # https: gate at CONNECT time
+    async def _gate(self, flow, scheme: str, url: str = "") -> None:
+        res = await self.sup.approval_request(
+            _CURRENT_SID.get(), flow.request.host, flow.request.port, scheme, url)
+        if res.get("action") != "allow":
+            self._deny(flow)
+
+    async def http_connect(self, flow):
+        # https: gate the tunnel by host/ip/cname (the URL isn't visible yet).
         await self._gate(flow, "https")
 
-    async def request(self, flow):              # http: gate the plain request
+    async def request(self, flow):
+        url = flow.request.pretty_url
         if flow.request.scheme == "http":
-            await self._gate(flow, "http")
+            # http has no CONNECT: this is the one place we gate it (URL known).
+            await self._gate(flow, "http", url)
+        else:
+            # https was already gated at CONNECT; here we only enforce a URL-level
+            # deny rule, so we don't prompt twice for the same connection.
+            if self.sup.precheck(_CURRENT_SID.get(), flow.request.host,
+                                 flow.request.port, url) == "deny":
+                self._deny(flow)
 
     def response(self, flow):
         req, resp = flow.request, flow.response
@@ -1098,7 +1236,7 @@ def run_ui() -> int:
     from textual.reactive import reactive
     from textual.screen import ModalScreen
     from textual.widgets import (
-        Button, DataTable, Footer, Header, Label,
+        Button, Checkbox, DataTable, Footer, Header, Input, Label,
         ListItem, ListView, RichLog, Static, TabbedContent, TabPane, TextArea)
 
     def fmt_bytes(n):
@@ -1139,12 +1277,69 @@ def run_ui() -> int:
         def action_save(self): self.dismiss(self.query_one("#edit-area",TextArea).text)
         def action_cancel(self): self.dismiss(None)
 
+    class RuleModal(ModalScreen):
+        # Let the user write the exact rule (kind:pattern) and choose where it goes,
+        # instead of the program guessing. It shows what this request can be matched
+        # on — host, resolved IPs, CNAME chain, URL — so those are easy to copy.
+        # Returns (scope, spec, at_top) or None.
+        BINDINGS=[("escape","cancel",""),("ctrl+p","perm","")]
+        def __init__(self, action, appr):
+            super().__init__(); self.action=action; self.a=appr
+        def compose(self):
+            a=self.a
+            verb="ALLOW" if self.action=="allow" else "DENY"
+            col="success" if self.action=="allow" else "error"
+            ips=", ".join(a.get("ips") or []) or "—"
+            cnames=", ".join(a.get("cnames") or []) or "—"
+            url=a.get("url") or "—"
+            with Vertical(id="rule-box"):
+                yield Label(f" [{col}]{verb}[/] rule", id="rule-title")
+                yield Label(f"[dim]host[/]  [cyan]{a['host']}[/]:{a['port']}")
+                yield Label(f"[dim]ip[/]    {ips}")
+                yield Label(f"[dim]cname[/] {cnames}")
+                yield Label(f"[dim]url[/]   {url}")
+                yield Input(value=f"host:{a['host']}", id="rule-input")
+                yield Label("[dim]kinds: host:NAME · host:NAME:PORT · ip:ADDR|CIDR "
+                            "· cname:NAME · url:PREFIX  (NAME allows *.domain)[/]")
+                yield Checkbox("insert at top (checked first)", id="rule-top")
+                with Horizontal(id="rule-btns"):
+                    yield Button("This session [↵]", id="rb-sess", variant="primary")
+                    yield Button("Permanent [^p]", id="rb-perm", variant="warning")
+                    yield Button("Cancel [esc]", id="rb-cancel")
+        def on_mount(self): self.query_one("#rule-input",Input).focus()
+        def _spec(self): return self.query_one("#rule-input",Input).value.strip()
+        def _top(self): return self.query_one("#rule-top",Checkbox).value
+        def _go(self, scope):
+            s=self._spec()
+            if s: self.dismiss((scope, s, self._top()))
+        def action_perm(self): self._go("permanent")
+        def action_cancel(self): self.dismiss(None)
+        @on(Input.Submitted,"#rule-input")
+        def _submit(self): self._go("session")
+        @on(Button.Pressed,"#rb-sess")
+        def _s(self): self._go("session")
+        @on(Button.Pressed,"#rb-perm")
+        def _p(self): self._go("permanent")
+        @on(Button.Pressed,"#rb-cancel")
+        def _c(self): self.dismiss(None)
+
     class ApprovalItem(ListItem):
         def __init__(self,a): super().__init__(); self.a=a
         def compose(self):
             a=self.a
             yield Label(f"[bold]{a['scheme']}[/] [cyan]{a['host']}[/]:{a['port']}"
                         f"  [dim]{a['session_id'][:8]} · {fmt_age(a['ts'])}[/]")
+
+    class RulesList(ListView):
+        # Rule-pane keys, active only while this list is focused (so they don't
+        # clash with the global ones): Delete removes, Ctrl+↑/↓ reorder.
+        BINDINGS=[("delete","del",""),("ctrl+up","up",""),("ctrl+down","down","")]
+        def action_del(self):
+            if self.index is not None: self.app._rule_del(self.index)
+        def action_up(self):
+            if self.index is not None: self.app._rule_move(self.index,-1)
+        def action_down(self):
+            if self.index is not None: self.app._rule_move(self.index,+1)
 
     class UI(App):
         TITLE="slopbox"
@@ -1171,6 +1366,9 @@ def run_ui() -> int:
         #edit-box { width:100%; height:100%; background:$surface; border:tall $primary; }
         #edit-title { height:1; background:$primary; color:$text; padding:0 1; }
         #edit-area { height:1fr; }
+        #rule-box { width:72; height:auto; padding:1 2; background:$surface; border:tall $warning; }
+        #rule-title { margin-bottom:1; } #rule-input { margin-bottom:1; }
+        #rule-btns { height:3; margin-top:1; }
         ModalScreen { align:center middle; }
         """
         BINDINGS=[
@@ -1182,11 +1380,10 @@ def run_ui() -> int:
             Binding("a","apply_one","Apply"), Binding("A","apply_all","Apply all"),
             Binding("x","discard_one","Discard"), Binding("X","discard_all","Discard all"),
             Binding("e","edit","Edit"),
-            Binding("y","ap('allow','once')","",show=False),
-            Binding("Y","ap('allow','session')","",show=False),
-            Binding("P","ap('allow','permanent')","",show=False),
-            Binding("n","ap('deny','once')","",show=False),
-            Binding("N","ap('deny','session')","",show=False),
+            Binding("y","ap_once('allow')","",show=False),
+            Binding("n","ap_once('deny')","",show=False),
+            Binding("Y","ap_rule('allow')","",show=False),
+            Binding("N","ap_rule('deny')","",show=False),
             Binding("q","quit","Quit")]
         sessions=reactive({}, layout=True)
         pending=reactive({}, layout=True)
@@ -1221,11 +1418,11 @@ def run_ui() -> int:
                             yield RichLog(id="c-log", markup=True, wrap=False)
                     with Horizontal(id="sb-bot"):
                         with Vertical(id="a-pane"):
-                            yield Static("⚡ APPROVALS  [dim]allow [b]y[/] once · [b]Y[/] session · [b]P[/] forever    deny [b]n[/] once · [b]N[/] session[/]", classes="pw")
+                            yield Static("⚡ APPROVALS  [dim][b]y[/] allow once · [b]n[/] deny once · [b]Y[/]/[b]N[/] allow/deny rule…[/]", classes="pw")
                             yield ListView(id="a-list")
                         with Vertical(id="w-pane"):
-                            yield Static("✓ RULES", classes="pok")
-                            yield ListView(id="w-list")
+                            yield Static("✓ RULES  [dim]top→bottom, first match wins · Del remove · ^↑/^↓ move[/]", classes="pok")
+                            yield RulesList(id="w-list")
                 with TabPane("Changes [2]", id="t-ch"):
                     with Horizontal(id="c-top"):
                         with Vertical(id="cf-pane"):
@@ -1363,10 +1560,20 @@ def run_ui() -> int:
                 lv.index=saved
 
         def _refresh_rules(self):
-            lv=self.query_one("#w-list",ListView); lv.clear()
-            for e in sorted(self.rules_store.entries):
-                col="red" if e.startswith("!") else "green"
-                lv.append(ListItem(Label(f"[{col}]{e}[/]")))
+            lv=self.query_one("#w-list",ListView)
+            idx=lv.index
+            lv.clear()
+            for r in self.rules_store.rules:
+                lv.append(ListItem(Label(r.label())))
+            n=len(self.rules_store.rules)
+            if idx is not None and n: lv.index=min(idx, n-1)
+
+        def _rule_del(self, i):
+            self.rules_store.remove_at(i); self._refresh_rules()
+        def _rule_move(self, i, d):
+            j=self.rules_store.move(i, d); self._refresh_rules()
+            try: self.query_one("#w-list",ListView).index=j
+            except Exception: pass
 
         def _rebuild_ch(self, preserve=False):
             rows=[(e["path"], [ICON.get(e["kind"],"?"), e["path"],
@@ -1491,10 +1698,20 @@ def run_ui() -> int:
                 if not self.log_filter or self.log_filter==ev.get("session_id"):
                     self._write(cl, ev, not bool(self.log_filter))
 
-        def action_ap(self, action, scope):
+        def action_ap_once(self, action):
             a=self._sel_approval()
             if not a: self._status("no approval selected"); return
-            self.sup.resolve(a["request_id"], action, scope)
+            self.sup.resolve(a["request_id"], action, "once")
+
+        def action_ap_rule(self, action):
+            a=self._sel_approval()
+            if not a: self._status("no approval selected"); return
+            rid=a["request_id"]
+            def done(res):
+                if res:
+                    scope,spec,at_top=res
+                    self.sup.resolve(rid, action, scope, spec, at_top)
+            self.push_screen(RuleModal(action, a), done)
 
         def action_refresh(self):
             if self._ch_sid: self._load_changes(self._ch_sid)
