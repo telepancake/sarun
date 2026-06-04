@@ -30,10 +30,13 @@ review in the UI's Changes tab; sessions with no changes are cleaned up.
 Isolation: own PID/IPC/UTS/net namespaces, all caps dropped, runs as you.
 
 Options (slopbox CMD ...):
-  -l NAME    session label (default: timestamp)
   -w HOST    pre-allow HOST for this session (repeatable)
   -n         no network at all (forwarder not started)
   -C DIR     working directory inside the slopbox (default: cwd)
+
+A session is named by the time it started and the runner's pid
+(YYYYmmdd-HHMMSS_PID); that name is the overlay dir and the patch filename, and
+the only thing stored besides the captured changes is the command itself.
 """
 
 from __future__ import annotations
@@ -54,7 +57,6 @@ import socket
 import stat as stat_mod
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import uuid
@@ -445,8 +447,9 @@ def ut_split(data: bytes) -> list:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  Patch codec — a byte-exact unified diff (multi-file), XZ-compressed at rest,
-#  meta.json kept in the file's user.slopbox.meta xattr.
+#  Patch codec — a byte-exact unified diff (multi-file), XZ-compressed at rest.
+#  The only metadata is the original command, kept NUL-separated in the file's
+#  user.slopbox.cmd xattr (no JSON, no keyed fields).
 # ════════════════════════════════════════════════════════════════════════════
 
 def state_home() -> Path:
@@ -455,6 +458,45 @@ def state_home() -> Path:
 
 def patch_path(session_id: str) -> Path:
     return state_home() / (session_id + ".patch.xz")
+
+# A session's whole identity is its name: "YYYYmmdd-HHMMSS_PID". The timestamp
+# (1-second resolution) and the runner's pid can't collide — a live pid is unique,
+# and two runs in the same second have different runner pids — so we need nothing
+# else. Start time, pid and a display label are all read back out of the name; the
+# name is the slopbox dir suffix (slopbox.<name>) and the patch basename
+# (<name>.patch.xz). Nothing else is stored but the command.
+_SID_FMT = "%Y%m%d-%H%M%S"
+
+def make_sid() -> str:
+    return time.strftime(_SID_FMT) + "_" + str(os.getpid())
+
+def parse_sid(sid: str) -> tuple:
+    """(started_epoch, pid) from a "YYYYmmdd-HHMMSS_PID" name; zeros if malformed."""
+    stamp, _, pids = sid.rpartition("_")
+    try: started = time.mktime(time.strptime(stamp, _SID_FMT))
+    except (ValueError, OverflowError): started = 0.0
+    try: pid = int(pids)
+    except ValueError: pid = 0
+    return started, pid
+
+CMD_XATTR = "user.slopbox.cmd"
+
+def _cmd_pack(cmd: list) -> bytes:
+    # argv joined by NUL, exactly like /proc/<pid>/cmdline — order preserved,
+    # byte-exact, no quoting ambiguity, and not JSON.
+    return b"\x00".join(c.encode("utf-8", "surrogateescape") for c in cmd)
+
+def _cmd_unpack(data: bytes) -> list:
+    if not data: return []
+    return [p.decode("utf-8", "surrogateescape") for p in data.split(b"\x00")]
+
+def set_cmd_xattr(path, cmd: list) -> None:
+    try: os.setxattr(path, CMD_XATTR, _cmd_pack(cmd))
+    except OSError: pass
+
+def get_cmd_xattr(path) -> list:
+    try: return _cmd_unpack(os.getxattr(path, CMD_XATTR))
+    except OSError: return []
 
 _NO_NL = b"\\ No newline at end of file\n"   # standard "no newline at EOF" marker
 
@@ -580,20 +622,15 @@ def apply_one_hunk(base_lines: list, hunk: dict) -> tuple:
     al = hunk_a_lines(hunk)
     return base_lines[:pos] + hunk_b_lines(hunk) + base_lines[pos + len(al):], pos - hunk["a1"]
 
-def write_patch_file(path: Path, data: bytes, meta: dict) -> None:
+def write_patch_file(path: Path, data: bytes, cmd: list) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_bytes(lzma.compress(data, preset=6))
-    try: os.setxattr(tmp, "user.slopbox.meta", json.dumps(meta).encode())
-    except OSError: pass
+    set_cmd_xattr(tmp, cmd)            # NUL-separated argv, nothing else
     os.replace(tmp, path)
 
-def read_patch_file(path: Path) -> tuple:
-    """Return (data_bytes, meta_dict). meta is {} if the xattr is missing."""
-    data = lzma.decompress(path.read_bytes())
-    try: meta = json.loads(os.getxattr(path, "user.slopbox.meta").decode())
-    except (OSError, json.JSONDecodeError): meta = {}
-    return data, meta
+def read_patch_file(path: Path) -> bytes:
+    return lzma.decompress(path.read_bytes())
 
 
 def upper_has_changes(up: Path) -> bool:
@@ -660,7 +697,7 @@ def _apply_overlay_entry(upper: Path, ap: Path, rel: str) -> None:
         return
     remove_upper_entry(ap)
 
-def consolidate(shm_dir, session_id: str, meta: dict) -> None:
+def consolidate(shm_dir, session_id: str, cmd: list) -> None:
     """Move every overlay change that a patch can represent *exactly and entirely*
     into the session's patch file, then prune emptied dirs. Per file it is all or
     nothing: binary files, or anything that doesn't round-trip, stay in the overlay.
@@ -677,7 +714,7 @@ def consolidate(shm_dir, session_id: str, meta: dict) -> None:
     pp = patch_path(session_id)
     files = {}
     if pp.exists():
-        try: files = parse_patch(read_patch_file(pp)[0])
+        try: files = parse_patch(read_patch_file(pp))
         except Exception: files = {}
     moved = []
     paths = []
@@ -719,7 +756,7 @@ def consolidate(shm_dir, session_id: str, meta: dict) -> None:
             continue
         files[rel] = fp; moved.append(ap)
     if files:
-        write_patch_file(pp, serialize_patch(files), meta)
+        write_patch_file(pp, serialize_patch(files), cmd)
     elif pp.exists():
         pp.unlink()
     for ap in moved:
@@ -779,12 +816,9 @@ def fuse_unmount(merged: str) -> None:
 
 @dataclass
 class Session:
-    session_id: str
-    label: str
+    session_id: str                # "YYYYmmdd-HHMMSS_PID" — the whole identity
     cmd: list
-    pid: int
-    shm_dir: str
-    started: float
+    shm_dir: str = ""
     status: str = "running"
     exit_code: "int | None" = None
     conn_allowed: int = 0
@@ -794,6 +828,13 @@ class Session:
     sess_rules: list = field(default_factory=list)   # ordered, session-only Rules
     live: bool = False
     has_patch: bool = False                           # a consolidated patch exists
+    # started time and pid are not stored — they are read back out of the name.
+    @property
+    def started(self) -> float: return parse_sid(self.session_id)[0]
+    @property
+    def pid(self) -> int: return parse_sid(self.session_id)[1]
+    @property
+    def stamp(self) -> str: return self.session_id.partition("_")[0]
     @property
     def upper(self) -> str: return str(Path(self.shm_dir) / "up")
     @property
@@ -802,32 +843,22 @@ class Session:
         d = {k: v for k, v in asdict(self).items() if k != "sess_rules"}
         d["sess_rules"] = [r.to_line() for r in self.sess_rules]
         d["upper"] = self.upper
+        d["started"] = self.started; d["pid"] = self.pid; d["stamp"] = self.stamp
         return d
 
 
-def write_meta(shm_dir: Path, session_id, label, cmd, pid, started) -> None:
-    (shm_dir / "meta.json").write_text(json.dumps(
-        dict(session_id=session_id, label=label, cmd=cmd, pid=pid, started=started)))
-
-def read_patch_meta(path: Path) -> dict:
-    """Meta from the xattr only — no need to decompress the patch."""
-    try: return json.loads(os.getxattr(path, "user.slopbox.meta").decode())
-    except (OSError, json.JSONDecodeError): return {}
-
 def discover_sessions() -> dict:
+    """Find sessions purely from filesystem names: slopbox.<sid> overlay dirs and
+    <sid>.patch.xz patches. Everything but the command is encoded in <sid>."""
     out = {}
     if SHM_ROOT.exists():
         for d in SHM_ROOT.glob(SHM_PREFIX + "*"):
-            mf = d / "meta.json"
-            if not mf.is_file(): continue
-            try: m = json.loads(mf.read_text())
-            except (json.JSONDecodeError, OSError): continue
-            sid = m.get("session_id") or d.name
-            pid = m.get("pid", 0)
+            if not (d / "up").is_dir(): continue          # not a slopbox overlay
+            sid = d.name[len(SHM_PREFIX):]
             out[sid] = Session(
-                session_id=sid, label=m.get("label", d.name), cmd=m.get("cmd", []),
-                pid=pid, shm_dir=str(d), started=m.get("started", d.stat().st_mtime),
-                status="running" if _pid_alive(pid) else "finished", live=False)
+                session_id=sid, cmd=get_cmd_xattr(d), shm_dir=str(d),
+                status="running" if _pid_alive(parse_sid(sid)[1]) else "finished",
+                live=False)
     sd = state_home()
     if sd.exists():
         for pf in sd.glob("*.patch.xz"):
@@ -835,11 +866,9 @@ def discover_sessions() -> dict:
             if sid in out:
                 out[sid].has_patch = True
                 continue
-            m = read_patch_meta(pf)
             out[sid] = Session(
-                session_id=m.get("session_id", sid), label=m.get("label", sid),
-                cmd=m.get("cmd", []), pid=m.get("pid", 0),
-                shm_dir=m.get("shm_dir", ""), started=m.get("started", pf.stat().st_mtime),
+                session_id=sid, cmd=get_cmd_xattr(pf),
+                shm_dir=str(SHM_ROOT / (SHM_PREFIX + sid)),
                 status="finished", live=False, has_patch=True)
     return out
 
@@ -947,9 +976,7 @@ class Supervisor:
 
     def register(self, msg: dict) -> None:
         sid = msg["session_id"]
-        s = Session(session_id=sid, label=msg["label"], cmd=msg["cmd"],
-                    pid=msg["pid"], shm_dir=msg["shm_dir"],
-                    started=msg.get("started", time.time()),
+        s = Session(session_id=sid, cmd=msg["cmd"], shm_dir=msg["shm_dir"],
                     status="running", live=True)
         for h in msg.get("session_whitelist", []):
             s.sess_rules.append(Rule("allow", "host", h))
@@ -1029,12 +1056,14 @@ class Supervisor:
                     url=p.url, ips=p.ips, cnames=p.cnames)
 
     def kill(self, sid) -> None:
+        # s.pid is the runner ("slopbox CMD") process, derived from the session id.
+        # SIGTERM to it trips the runner's handler, which tears down the bwrap group
+        # and unmounts; we must NOT killpg here — the runner shares the launching
+        # shell's process group.
         s = self.sessions.get(sid)
         if not s or not _pid_alive(s.pid): return
-        try: os.killpg(s.pid, signal.SIGTERM)
-        except (ProcessLookupError, PermissionError):
-            try: os.kill(s.pid, signal.SIGTERM)
-            except ProcessLookupError: pass
+        try: os.kill(s.pid, signal.SIGTERM)
+        except ProcessLookupError: pass
         s.status = "killed"
         self._emit(type="session_updated", session=s.to_dict())
 
@@ -1324,10 +1353,9 @@ class Supervisor:
         return dict(discarded=discarded, errors=errors)
 
     # ─── consolidated patch layer (host ← overlay ← patch) ──────────────────
-    @staticmethod
-    def _session_meta(s) -> dict:
-        return dict(session_id=s.session_id, label=s.label, cmd=s.cmd, pid=s.pid,
-                    started=s.started, shm_dir=s.shm_dir)
+    def _cmd_of(self, sid) -> list:
+        s = self.sessions.get(sid)
+        return list(s.cmd) if s else []
 
     @staticmethod
     def _host_lines(rel) -> list:
@@ -1356,7 +1384,7 @@ class Supervisor:
         if p is None:
             files = {}
             if st is not None:
-                try: files = parse_patch(read_patch_file(patch_path(sid))[0])
+                try: files = parse_patch(read_patch_file(patch_path(sid)))
                 except Exception: files = {}
             p = self.patches[sid] = dict(files=files, dirty=False,
                                          touched=time.time(), mtime=st)
@@ -1370,9 +1398,7 @@ class Supervisor:
         if p is None: return
         pf = patch_path(sid)
         if p["files"]:
-            s = self.sessions.get(sid)
-            write_patch_file(pf, serialize_patch(p["files"]),
-                             self._session_meta(s) if s else {})
+            write_patch_file(pf, serialize_patch(p["files"]), self._cmd_of(sid))
             s = self.sessions.get(sid)
             if s: s.has_patch = True
         else:
@@ -1408,7 +1434,7 @@ class Supervisor:
         self._consolidated.add(sid)
         if not (s.shm_dir and Path(s.shm_dir).exists()): return
         try:
-            consolidate(s.shm_dir, sid, self._session_meta(s))
+            consolidate(s.shm_dir, sid, s.cmd)
         except Exception:
             return
         self.patches.pop(sid, None)        # force a reload of the freshly-written patch
@@ -1846,16 +1872,23 @@ def bwrap_supports(flag: str) -> bool:
             _BWRAP_HELP = ""
     return flag in _BWRAP_HELP
 
-def cmd_run(cmd, label, no_net, session_whitelist, chdir) -> int:
+def cmd_run(cmd, no_net, session_whitelist, chdir) -> int:
     if not cmd:
         print("slopbox: no command given", file=sys.stderr); return 2
 
-    label = label or time.strftime("%Y%m%d-%H%M%S")
-    sid = str(uuid.uuid4())
-    started_at = time.time()
-    shm_dir = Path(tempfile.mkdtemp(prefix=f"{SHM_PREFIX}{label}.", dir=SHM_ROOT))
+    # The session id is the whole identity: timestamp + our pid. It names the
+    # overlay dir (slopbox.<sid>) and, later, the patch (<sid>.patch.xz). The only
+    # other thing kept is the command, in the dir's user.slopbox.cmd xattr.
+    sid = make_sid()
+    shm_dir = SHM_ROOT / (SHM_PREFIX + sid)
+    try:
+        shm_dir.mkdir()
+    except FileExistsError:
+        sid = sid + "." + uuid.uuid4().hex[:6]   # absurdly unlikely; stay unique
+        shm_dir = SHM_ROOT / (SHM_PREFIX + sid); shm_dir.mkdir()
     up = shm_dir / "up"; work = shm_dir / "work"; merged = shm_dir / "merged"
     for d in (up, work, merged): d.mkdir()
+    set_cmd_xattr(shm_dir, list(cmd))
 
     have_ui = ui_is_running(SOCK_PATH)
     net = not no_net
@@ -1864,7 +1897,7 @@ def cmd_run(cmd, label, no_net, session_whitelist, chdir) -> int:
     # Diagnostics go to stderr (never stdout) and only ever before/after the
     # child runs, so the wrapped command's stdout stays clean and an interactive
     # screen never gets garbled mid-run.
-    print(f"slopbox: {label}  ({'net' if net else 'no-net'}, "
+    print(f"slopbox: {sid}  ({'net' if net else 'no-net'}, "
           f"UI {'connected' if have_ui else 'absent'}"
           f"{'' if can_net else ' → no network'})", file=sys.stderr)
     print(f"  overlay upper: {up}", file=sys.stderr)
@@ -1951,13 +1984,12 @@ def cmd_run(cmd, label, no_net, session_whitelist, chdir) -> int:
         try: os.setpgid(proc.pid, proc.pid)
         except OSError: pass
 
-        # Track the session by the bwrap pid (its process-group leader) so the UI
-        # can check liveness and killpg the whole tree.
-        write_meta(shm_dir, sid, label, list(cmd), proc.pid, started_at)
+        # The command is already on the overlay dir's xattr; the UI keys the session
+        # by <sid>, deriving start time and our pid from it for liveness/kill.
         if have_ui:
-            sync_send(SOCK_PATH, type="register", session_id=sid, label=label,
-                      cmd=list(cmd), pid=proc.pid, shm_dir=str(shm_dir),
-                      started=started_at, session_whitelist=session_whitelist)
+            sync_send(SOCK_PATH, type="register", session_id=sid,
+                      cmd=list(cmd), shm_dir=str(shm_dir),
+                      session_whitelist=session_whitelist)
 
         def _sig(_s, _f):
             try: os.killpg(proc.pid, signal.SIGTERM)
@@ -1990,10 +2022,8 @@ def cmd_run(cmd, label, no_net, session_whitelist, chdir) -> int:
     # Consolidate every exactly-representable change out of the overlay into a
     # single patch (host <- overlay <- patch); binary/non-representable changes
     # stay in the overlay.
-    meta = dict(session_id=sid, label=label, cmd=list(cmd), pid=proc.pid,
-                started=started_at, shm_dir=str(shm_dir))
     try:
-        consolidate(str(shm_dir), sid, meta)
+        consolidate(str(shm_dir), sid, list(cmd))
     except Exception as e:
         print(f"slopbox: patch consolidation failed: {e}", file=sys.stderr)
 
@@ -2003,7 +2033,7 @@ def cmd_run(cmd, label, no_net, session_whitelist, chdir) -> int:
         rm_rf(shm_dir)
         if have_ui:
             sync_send(SOCK_PATH, type="remove", session_id=sid)
-        print(f"slopbox: {label} exited ({code}); no changes.", file=sys.stderr)
+        print(f"slopbox: {sid} exited ({code}); no changes.", file=sys.stderr)
         return code or 0
 
     if not has_overlay:
@@ -2012,7 +2042,7 @@ def cmd_run(cmd, label, no_net, session_whitelist, chdir) -> int:
         sync_send(SOCK_PATH, type="unregister", session_id=sid,
                   status="finished", exit_code=code or 0)
     where = patch_path(sid) if not has_overlay else up
-    print(f"slopbox: {label} exited ({code}). Review changes in the UI, "
+    print(f"slopbox: {sid} exited ({code}). Review changes in the UI, "
           f"or: {where}", file=sys.stderr)
     return code or 0
 
@@ -2327,7 +2357,7 @@ def run_ui() -> int:
 
         async def on_mount(self):
             self.query_one("#s-tab",DataTable).add_columns(
-                "F","Label","PID","Cmd","✓","✗","↑","↓","Age")
+                "F","Started","PID","Cmd","✓","✗","↑","↓","Age")
             self.query_one("#cf-tab",DataTable).add_columns("","S","Path","Size")
             ensure_ca_cert()
             loop=asyncio.get_event_loop()
@@ -2539,7 +2569,7 @@ def run_ui() -> int:
                 c=sty(s["status"])
                 flag={"running":"R","finished":"F","killed":"K"}.get(s["status"],"?")
                 rows.append((sid,[
-                    Text(flag, style=c), Text(s["label"], style=c),
+                    Text(flag, style=c), Text(s["stamp"], style=c),
                     str(s["pid"]), Text(" ".join(s["cmd"])[:24]),
                     Text(str(s["conn_allowed"]), style="green"),
                     Text(str(s["conn_denied"]), style="red"),
@@ -2554,7 +2584,7 @@ def run_ui() -> int:
                 d.update(Text("(no slopbox selected)", style="dim")); return
             sid=s["session_id"]
             t=Text()
-            t.append(s["label"]+"\n", style="bold "+(sty(s["status"]) or ""))
+            t.append(s["session_id"]+"\n", style="bold "+(sty(s["status"]) or ""))
             t.append("status  ", style="dim"); t.append(s["status"]+"\n", style=sty(s["status"]))
             t.append("cmd     ", style="dim"); t.append(" ".join(s["cmd"])+"\n")
             t.append("pid     ", style="dim")
@@ -2861,7 +2891,7 @@ def run_ui() -> int:
                 self._status("no running session selected"); return
             def done(ok):
                 if ok: self.sup.kill(s["session_id"])
-            self.push_screen(Confirm(styled("Kill ", (s['label'],"bold"), "?")), done)
+            self.push_screen(Confirm(styled("Kill ", (s['stamp'],"bold"), "?")), done)
 
         def action_delete(self):
             s=self._sel_session()
@@ -2869,7 +2899,7 @@ def run_ui() -> int:
             if s["status"]=="running": self._status("kill it first"); return
             def done(ok):
                 if ok: self.sup.delete(s["session_id"])
-            self.push_screen(Confirm(styled("Delete ", (s['label'],"bold"), " and its overlay?")), done)
+            self.push_screen(Confirm(styled("Delete ", (s['stamp'],"bold"), " and its overlay?")), done)
 
         def action_ap_allow(self): self._ap_once("allow")
         def action_ap_deny(self): self._ap_once("deny")
@@ -2963,8 +2993,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(
         prog="slopbox",
         usage="slopbox            (start UI)\n"
-              "       slopbox [-l NAME] [-w HOST]... [-n] [-C DIR] CMD [ARGS...]")
-    ap.add_argument("-l", dest="label", default=None)
+              "       slopbox [-w HOST]... [-n] [-C DIR] CMD [ARGS...]")
     ap.add_argument("-w", dest="whitelist", action="append", default=[], metavar="HOST")
     ap.add_argument("-n", dest="no_net", action="store_true")
     ap.add_argument("-C", dest="chdir", default=None)
@@ -2974,7 +3003,7 @@ def main() -> int:
     ns = ap.parse_args(argv)
     cmd = ns.cmd
     if cmd and cmd[0] == "--": cmd = cmd[1:]
-    return cmd_run(cmd, ns.label, ns.no_net, ns.whitelist, ns.chdir)
+    return cmd_run(cmd, ns.no_net, ns.whitelist, ns.chdir)
 
 
 if __name__ == "__main__":
