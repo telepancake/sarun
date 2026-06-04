@@ -397,8 +397,9 @@ def make_patch(files: list) -> bytes:
 
 def parse_patch(data: bytes) -> dict:
     """Parse unified-diff bytes into an ordered {rel: filepatch} where filepatch is
-    dict(rel, created, deleted, hunks=[dict(a1, a_lines, b_lines)]). a_lines are the
-    original-side byte-lines (context+removed), b_lines the new-side (context+added)."""
+    dict(rel, created, deleted, hunks=[dict(a1, b1, lines)]) and lines is the ordered
+    [(op, byteline)] with op in ' '/'-'/'+'. Ordered lines let us re-serialize and
+    edit hunks losslessly."""
     import re
     files = {}; cur = None; phys = ut_split(data); i = 0
     while i < len(phys):
@@ -411,16 +412,37 @@ def parse_patch(data: bytes) -> dict:
             rel = relb.decode("utf-8","surrogateescape")
             cur = files[rel] = dict(rel=rel, created=created, deleted=deleted, hunks=[])
         elif line.startswith(b"@@") and cur is not None:
-            m = re.search(rb"-(\d+)", line)
-            cur["hunks"].append(dict(a1=int(m.group(1)) - 1, a_lines=[], b_lines=[]))
+            m = re.search(rb"-(\d+)(?:,\d+)? \+(\d+)", line)
+            cur["hunks"].append(dict(a1=int(m.group(1)) - 1,
+                                     b1=int(m.group(2)) - 1, lines=[]))
         elif cur and cur["hunks"] and line[:1] in (b" ", b"-", b"+"):
             prefix = line[:1]; content = line[1:]
             if i < len(phys) and phys[i] == _NO_NL:
                 i += 1; content = content[:-1]      # drop the terminator we added
-            h = cur["hunks"][-1]
-            if prefix in (b" ", b"-"): h["a_lines"].append(content)
-            if prefix in (b" ", b"+"): h["b_lines"].append(content)
+            cur["hunks"][-1]["lines"].append((prefix.decode(), content))
     return files
+
+def hunk_a_lines(h): return [bl for op, bl in h["lines"] if op != "+"]
+def hunk_b_lines(h): return [bl for op, bl in h["lines"] if op != "-"]
+
+def serialize_patch(files: dict) -> bytes:
+    """Inverse of parse_patch: render an ordered {rel: filepatch} back to bytes."""
+    out = []
+    for fp in files.values():
+        a = b"/dev/null" if fp["created"] else b"a/" + fp["rel"].encode("utf-8","surrogateescape")
+        b = b"/dev/null" if fp["deleted"] else b"b/" + fp["rel"].encode("utf-8","surrogateescape")
+        out.append(b"--- " + a + b"\n"); out.append(b"+++ " + b + b"\n")
+        for h in fp["hunks"]:
+            na, nb = len(hunk_a_lines(h)), len(hunk_b_lines(h))
+            out.append(f"@@ -{h['a1']+1},{na} +{h['b1']+1},{nb} @@\n".encode())
+            for op, line in h["lines"]:
+                _emit(out, op.encode(), line)
+    return b"".join(out)
+
+def build_file_patch(rel, lower, upper, created, deleted) -> dict:
+    """Parsed filepatch for one file from its lower/upper byte-line lists."""
+    return parse_patch(make_patch([dict(rel=rel, lower=lower, upper=upper,
+                                        created=created, deleted=deleted)]))[rel]
 
 def apply_hunks(base_lines: list, hunks: list) -> list:
     """Apply hunks forward onto base_lines (a byte-line list). Each hunk's recorded
@@ -428,21 +450,20 @@ def apply_hunks(base_lines: list, hunks: list) -> list:
     round-trip verification where the base is unchanged. Returns new byte-line list."""
     out = []; pos = 0
     for h in hunks:
-        a1 = h["a1"]; al = h["a_lines"]
+        a1 = h["a1"]; al = hunk_a_lines(h)
         if base_lines[a1:a1 + len(al)] != al:
             raise PatchConflict(f"context mismatch at line {a1+1}")
         if a1 < pos:
             raise PatchConflict("overlapping hunks")
-        out.extend(base_lines[pos:a1]); out.extend(h["b_lines"]); pos = a1 + len(al)
+        out.extend(base_lines[pos:a1]); out.extend(hunk_b_lines(h)); pos = a1 + len(al)
     out.extend(base_lines[pos:])
     return out
 
 def locate_hunk(base_lines: list, hunk: dict) -> "int | None":
-    """patch(1)-style: find where a hunk's original side (a_lines) occurs in
-    base_lines, preferring the recorded position then searching outward. Returns the
-    index, or None if the context isn't found. A pure-insert hunk (no a_lines) goes
-    at the recorded position (clamped)."""
-    al = hunk["a_lines"]; a1 = hunk["a1"]; n = len(base_lines)
+    """patch(1)-style: find where a hunk's original side occurs in base_lines,
+    preferring the recorded position then searching outward. None if not found. A
+    pure-insert hunk (no original lines) goes at the recorded position (clamped)."""
+    al = hunk_a_lines(hunk); a1 = hunk["a1"]; n = len(base_lines)
     if not al:
         return max(0, min(a1, n))
     if base_lines[a1:a1 + len(al)] == al:
@@ -460,8 +481,8 @@ def apply_one_hunk(base_lines: list, hunk: dict) -> tuple:
     pos = locate_hunk(base_lines, hunk)
     if pos is None:
         raise PatchConflict("hunk does not apply")
-    al = hunk["a_lines"]
-    return base_lines[:pos] + hunk["b_lines"] + base_lines[pos + len(al):], pos - hunk["a1"]
+    al = hunk_a_lines(hunk)
+    return base_lines[:pos] + hunk_b_lines(hunk) + base_lines[pos + len(al):], pos - hunk["a1"]
 
 def write_patch_file(path: Path, data: bytes, meta: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -486,6 +507,95 @@ def upper_has_changes(up: Path) -> bool:
         if any(not _is_overlay_marker(nm) for nm in files):
             return True
     return False
+
+def is_whiteout(p: Path) -> bool:
+    try:
+        st = p.stat(); return stat_mod.S_ISCHR(st.st_mode) and st.st_rdev == 0
+    except OSError: return False
+
+def remove_upper_entry(p: Path) -> None:
+    """Remove one upper artifact: a file, a directory tree, or a char-device
+    whiteout. No-op if nothing is there (e.g. an opacity-only deletion)."""
+    try:
+        if p.is_dir() and not p.is_symlink() and not is_whiteout(p):
+            shutil.rmtree(p)
+        elif p.exists() or p.is_symlink() or is_whiteout(p):
+            p.unlink()
+    except FileNotFoundError:
+        pass
+
+def cleanup_dirs(upper: Path, start: Path) -> None:
+    """Walk up from `start` toward `upper`, removing directories that hold no real
+    change. A dir with only opaque markers is removed only when the lower has
+    nothing there (a freshly-created dir); otherwise the markers record deletions
+    and the dir is kept. Dirs with files/whiteouts stop the walk."""
+    d = start
+    while d != upper and upper in d.parents:
+        try: children = list(d.iterdir())
+        except OSError: break
+        if any(not _is_overlay_marker(c.name) for c in children):
+            break
+        if children:
+            rel = d.relative_to(upper)
+            if Path("/").joinpath(*rel.parts).is_dir():
+                break
+        parent = d.parent
+        try: shutil.rmtree(d)
+        except OSError: break
+        d = parent
+
+def consolidate(shm_dir, session_id: str, meta: dict) -> None:
+    """Move every overlay change that a patch can represent *exactly and entirely*
+    into the session's patch file, then prune emptied dirs. Per file it is all or
+    nothing: binary files, or anything that doesn't round-trip, stay in the overlay.
+    Idempotent and additive — re-running just folds in any newly representable
+    overlay change (a file is never in both the overlay and the patch)."""
+    upper = Path(shm_dir) / "up"
+    if not upper.is_dir(): return
+    pp = patch_path(session_id)
+    files = {}
+    if pp.exists():
+        try: files = parse_patch(read_patch_file(pp)[0])
+        except Exception: files = {}
+    moved = []
+    paths = []
+    for root, _dirs, names in os.walk(upper, onerror=lambda _e: None):
+        for nm in names:
+            if not _is_overlay_marker(nm): paths.append(Path(root) / nm)
+    for ap in sorted(paths):
+        rel = str(ap.relative_to(upper))
+        if rel in files: continue                       # already in the patch
+        host = Path("/") / rel
+        try:
+            if is_whiteout(ap):                          # deletion
+                if not host.exists() or host.is_dir(): continue
+                lo = host.read_bytes()
+                if b"\x00" in lo: continue
+                lower, upperl, created, deleted = ut_split(lo), [], False, True
+            elif ap.is_file() and not ap.is_symlink():
+                ub = ap.read_bytes()
+                if b"\x00" in ub: continue
+                lob = host.read_bytes() if (host.exists() and not host.is_dir()) else b""
+                if b"\x00" in lob: continue
+                lower, upperl = ut_split(lob), ut_split(ub)
+                created, deleted = not host.exists(), False
+            else:
+                continue
+        except OSError:
+            continue
+        fp = build_file_patch(rel, lower, upperl, created, deleted)
+        try:
+            if b"".join(apply_hunks(lower, fp["hunks"])) != b"".join(upperl):
+                continue                                # not exactly representable
+        except PatchConflict:
+            continue
+        files[rel] = fp; moved.append(ap)
+    if files:
+        write_patch_file(pp, serialize_patch(files), meta)
+    elif pp.exists():
+        pp.unlink()
+    for ap in moved:
+        remove_upper_entry(ap); cleanup_dirs(upper, ap.parent)
 
 def _pid_alive(pid: int) -> bool:
     if not pid: return False
@@ -785,9 +895,7 @@ class Supervisor:
 
     @staticmethod
     def _is_whiteout(p: Path) -> bool:
-        try:
-            st = p.stat(); return stat_mod.S_ISCHR(st.st_mode) and st.st_rdev == 0
-        except OSError: return False
+        return is_whiteout(p)
 
     # Surfacing deletions caused by an opaque directory can in principle touch a
     # large lower tree; cap it so the review list can't be flooded.
@@ -994,37 +1102,10 @@ class Supervisor:
         return dict(ok=True)
 
     def _remove_upper_entry(self, p: Path) -> None:
-        """Remove a single upper artifact: a file, a directory tree, or a
-        char-device whiteout. No-op if nothing is there (e.g. an opacity-only
-        deletion, which has no per-file artifact)."""
-        try:
-            if p.is_dir() and not p.is_symlink() and not self._is_whiteout(p):
-                shutil.rmtree(p)
-            elif p.exists() or p.is_symlink() or self._is_whiteout(p):
-                p.unlink()
-        except FileNotFoundError:
-            pass
+        remove_upper_entry(p)
 
     def _cleanup_dirs(self, upper: Path, start: Path) -> None:
-        """Walk up from `start` toward `upper`, removing directories that hold no
-        real change. A dir with only opaque markers is removed only when the lower
-        has nothing there (a freshly-created dir); if the lower exists, the markers
-        record real deletions and the dir is kept. Dirs with files/whiteouts stop
-        the walk."""
-        d = start
-        while d != upper and upper in d.parents:
-            try: children = list(d.iterdir())
-            except OSError: break
-            if any(not _is_overlay_marker(c.name) for c in children):
-                break                              # real content remains; stop
-            if children:                            # only opaque markers present
-                rel = d.relative_to(upper)
-                if Path("/").joinpath(*rel.parts).is_dir():
-                    break                           # markers = deletions of lower
-            parent = d.parent
-            try: shutil.rmtree(d)
-            except OSError: break
-            d = parent
+        cleanup_dirs(upper, start)
 
     def _maybe_remove_empty(self, sid) -> None:
         """A finished session whose overlay has emptied out can just disappear."""
