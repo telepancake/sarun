@@ -5,6 +5,8 @@
 #   "textual>=0.60",
 #   "mitmproxy>=11",
 #   "wcmatch>=8.4",
+#   "pyfuse3>=3.2",
+#   "trio>=0.22",
 # ]
 # ///
 """
@@ -23,11 +25,26 @@ the slopbox, no proxy listening anywhere the slopbox could abuse. If no UI is
 running, the forwarder has nowhere to hand connections, so the slopbox simply
 has no network — it never blocks waiting on an absent human.
 
-Filesystem: writes are captured by fuse-overlayfs (upper on tmpfs, squashed to
-your uid so the program can write anywhere). After exit the upper is kept for
-review in the UI's Changes tab; sessions with no changes are cleaned up.
+Filesystem model: the UI owns ONE pyfuse3 overlay mount, served from a
+dedicated trio thread and created the ordinary way (`pyfuse3.init` via the
+setuid `fusermount3` helper — no root, no user namespace, no fd-passing, no
+mount(2)/pivot_root anywhere). That single mount is *multiplexed*: its synthetic
+root lists one subfolder per live slopbox, `<mnt>/<sid>`, each presenting a
+copy-on-write overlay of lower=`/` plus that session's private upper (on disk
+under `live/<sid>/up` + `live/<sid>/index.db`). A slopbox writing to
+`<mnt>/<sid>/etc/hostname` reads through to the host file unless it wrote there.
 
-Isolation: own PID/IPC/UTS/net namespaces, all caps dropped, runs as you.
+Because the UI serves every filesystem op, it sits in the I/O path exactly like
+it already does for network requests: the Changes view updates live as writes
+happen, and a per-write policy hook (policy_check) is the obvious place where a
+deny/prompt would attach. Provenance (pid/exe/argv of the writer) is captured
+synchronously and recorded in index.db. Since the UI is now the mount provider,
+`slopbox CMD` REQUIRES a running UI and fails fast otherwise.
+
+Isolation is UNCHANGED: the runner still does `bwrap --bind <mnt>/<sid> / …`
+with the same flags (own PID/IPC/UTS/net namespaces, all caps dropped, runs as
+you). The bind-as-root confines the box to its own subfolder; it cannot reach
+`<mnt>/` or another session's `<sid>`. Same uid as the UI, so no allow_other.
 
 Options (slopbox CMD ...):
   -w HOST    pre-allow HOST for this session (repeatable)
@@ -35,8 +52,9 @@ Options (slopbox CMD ...):
   -C DIR     working directory inside the slopbox (default: cwd)
 
 A session is named by the time it started and the runner's pid
-(YYYYmmdd-HHMMSS_PID); that name is the overlay dir and the patch filename, and
-the only thing stored besides the captured changes is the command itself.
+(YYYYmmdd-HHMMSS_PID); that name is the live/ subfolder, the mount subfolder
+and the patch filename, and the only thing stored besides the captured changes
+is the command itself.
 """
 
 from __future__ import annotations
@@ -46,11 +64,14 @@ import array
 import asyncio
 import base64
 import contextvars
+import errno
+import fcntl
 import fnmatch
 import ipaddress
 import json
 import lzma
 import os
+import queue
 import shutil
 import signal
 import socket
@@ -90,6 +111,20 @@ def runtime_home() -> Path:
 
 SHM_ROOT       = Path("/dev/shm")
 SHM_PREFIX     = "slopbox."
+
+def live_home() -> Path:
+    """Per-session overlay backing: live/<sid>/{up,index.db}. Holds provenance, so
+    it is created mode 0700. Replaces the old /dev/shm/slopbox.<sid> overlay dirs."""
+    return runtime_home() / "live"
+
+def live_dir(session_id: str) -> Path:
+    return live_home() / session_id
+
+def mnt_point() -> Path:
+    """The single pyfuse3 mountpoint the UI owns; box subfolders live under it as
+    <mnt>/<sid>. Empty at rest."""
+    return runtime_home() / "mnt"
+
 SOCK_PATH      = str(runtime_home() / "ui.sock")        # control + FD channel
 MITM_CONFDIR   = data_home() / "mitmproxy"              # CA, generated once
 CA_CERT        = MITM_CONFDIR / "mitmproxy-ca-cert.pem"
@@ -102,6 +137,13 @@ def ensure_dirs() -> None:
     for p in (data_home(), config_home(), runtime_home(), MITM_CONFDIR, state_home()):
         try: p.mkdir(parents=True, exist_ok=True)
         except OSError: pass
+    # live/ holds provenance (pid/exe/argv of writers) — restrict it (R8).
+    try: live_home().mkdir(parents=True, mode=0o700, exist_ok=True)
+    except OSError: pass
+    try: os.chmod(live_home(), 0o700)
+    except OSError: pass
+    try: mnt_point().mkdir(parents=True, exist_ok=True)
+    except OSError: pass
     # migrate the old single "rules" file to its new name "netrules"
     old_rules = config_home() / "rules"
     if old_rules.exists() and not RULES_FILE.exists():
@@ -790,6 +832,1361 @@ def flows_get(path, fid) -> "dict | None":
         return None
     finally:
         conn.close()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Overlay engine — pyfuse3 copy-on-write overlay, multiplexed per session.
+#
+#  The UI owns ONE pyfuse3 mount (see OverlayMount). Its synthetic root lists one
+#  subfolder <sid> per live session; <mnt>/<sid>/… is a merged overlay of
+#  lower=/ + that session's upper (live/<sid>/up) with whiteouts/opacity tracked
+#  in live/<sid>/index.db. Inode numbers span the whole mount; each inode carries
+#  its (sid, rel) so one Operations object serves every box.
+#
+#  Implements OVERLAY-SPEC.md §3–§14. Sections 1–2 (userns/fd-passing/inner-mount)
+#  are DELIBERATELY not implemented — this design has none of that: the mount is
+#  made the ordinary way via fusermount3 and bwrap binds the subfolder as root.
+# ════════════════════════════════════════════════════════════════════════════
+
+# Selected env keys captured per writer (provenance), per spec §3.
+_PROV_ENV_KEYS = ("USER", "PWD", "SSH_CONNECTION", "TERM", "_")
+
+FICLONE = 0x40049409   # _IOW(0x94, 9, int) — btrfs/xfs reflink ioctl
+
+
+def read_provenance(pid: int) -> dict:
+    """Best-effort writer provenance from host /proc/<pid>. Read SYNCHRONOUSLY from
+    the write handler while the caller is still blocked (and thus still in /proc).
+    Every field is best-effort — a vanished pid yields zeros/empties, never raises
+    (spec §3, §8: /proc reads are the one place best-effort OSError is acceptable)."""
+    info = dict(pid=int(pid), ppid=0, exe="", argv=[], env={})
+    base = f"/proc/{pid}"
+    try:
+        with open(f"{base}/cmdline", "rb") as f:
+            raw = f.read()
+        info["argv"] = [p.decode("utf-8", "surrogateescape")
+                        for p in raw.split(b"\x00") if p]
+    except OSError: pass
+    try: info["exe"] = os.readlink(f"{base}/exe")
+    except OSError: pass
+    try:
+        with open(f"{base}/stat", "rb") as f:
+            st = f.read()
+        # comm is parenthesized and may contain spaces/parens; split after the last ')'
+        rp = st.rfind(b")")
+        rest = st[rp + 2:].split() if rp >= 0 else []
+        # fields after comm: state(0) ppid(1)
+        if len(rest) >= 2: info["ppid"] = int(rest[1])
+    except (OSError, ValueError): pass
+    try:
+        with open(f"{base}/environ", "rb") as f:
+            env_raw = f.read()
+        env = {}
+        for kv in env_raw.split(b"\x00"):
+            if b"=" not in kv: continue
+            k, _, v = kv.partition(b"=")
+            ks = k.decode("utf-8", "surrogateescape")
+            if ks in _PROV_ENV_KEYS:
+                env[ks] = v.decode("utf-8", "surrogateescape")
+        info["env"] = env
+    except OSError: pass
+    return info
+
+
+def policy_check(sid: str, prov: dict, path: str, op: str) -> str:
+    """THE policy hook. Called once per mutating overlay op (create/write/unlink/
+    rename/setattr/…) with the session id, the writer's provenance (pid/exe/argv),
+    the overlay-relative path, and the operation name. Returns "allow" or "deny".
+
+    For v1 this always allows (no behaviour change vs the old fuse-overlayfs path).
+    It exists as the single, obvious seam where per-write policy — a file-rules
+    check, or an interactive UI prompt exactly like the network-approval flow —
+    would attach. It runs ON the trio serving thread while the writer is blocked,
+    so a future prompt would hand off to the UI thread and await, just like
+    Supervisor.approval_request does for connections."""
+    return "allow"
+
+
+def reflink_or_copy(src_fd: int, dst_fd: int) -> str:
+    """Clone src into dst. Tries FICLONE (O(1) on btrfs/xfs/bcachefs); on any of the
+    not-supported errnos falls back to copy_file_range, then to a 1 MiB read/write
+    loop (always correct). Returns 'reflink' or 'copy'. Never silently no-ops — a
+    failure to materialize content is a correctness bug (spec §6, R5)."""
+    try:
+        fcntl.ioctl(dst_fd, FICLONE, src_fd)
+        return "reflink"
+    except OSError as e:
+        if e.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP, errno.EXDEV,
+                           errno.EINVAL, errno.EPERM):
+            raise
+    # plain copy
+    os.lseek(src_fd, 0, os.SEEK_SET); os.lseek(dst_fd, 0, os.SEEK_SET)
+    try:
+        st = os.fstat(src_fd); remaining = st.st_size
+        while remaining > 0:
+            n = os.copy_file_range(src_fd, dst_fd, remaining)
+            if n == 0: break
+            remaining -= n
+        if remaining == 0:
+            os.lseek(dst_fd, 0, os.SEEK_SET); os.lseek(src_fd, 0, os.SEEK_SET)
+            return "copy"
+    except (OSError, AttributeError):
+        pass
+    os.lseek(src_fd, 0, os.SEEK_SET); os.lseek(dst_fd, 0, os.SEEK_SET)
+    os.ftruncate(dst_fd, 0)
+    while True:
+        chunk = os.read(src_fd, 1 << 20)
+        if not chunk: break
+        off = 0
+        while off < len(chunk):
+            off += os.write(dst_fd, chunk[off:])
+    os.lseek(dst_fd, 0, os.SEEK_SET); os.lseek(src_fd, 0, os.SEEK_SET)
+    return "copy"
+
+
+class Index:
+    """Per-session overlay index (live/<sid>/index.db) + write-through RAM mirror.
+
+    The hot read paths (lookup/getattr/readdir) touch ONLY the RAM mirror; SQLite is
+    written on mutation and read only for provenance / consolidate. Created mode 0700
+    (R8): it holds writer provenance. Opened check_same_thread=False — the serve loop
+    owns the write connection; the UI thread reads it only after the loop stops
+    (lifecycle-serialized; spec §11)."""
+
+    def __init__(self, backing: Path):
+        self.backing = Path(backing)
+        self.db_path = self.backing / "index.db"
+        # restrict before SQLite creates the file (R8)
+        old = os.umask(0o077)
+        try:
+            self._db = sqlite3.connect(str(self.db_path), check_same_thread=False)
+        finally:
+            os.umask(old)
+        try: os.chmod(self.db_path, 0o700)
+        except OSError: pass
+        self._db.execute("PRAGMA journal_mode=WAL")
+        self._db.execute("PRAGMA synchronous=NORMAL")
+        self._db.executescript(
+            "CREATE TABLE IF NOT EXISTS writers("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT, pid INT, ppid INT,"
+            " exe TEXT, argv TEXT, env TEXT, captured_at REAL);"
+            "CREATE TABLE IF NOT EXISTS entries("
+            " path TEXT PRIMARY KEY, kind TEXT, mode INT, mtime REAL,"
+            " writer_id INT, first_seen REAL, opaque INT DEFAULT 0);"
+            "CREATE TABLE IF NOT EXISTS oplog("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, op TEXT, path TEXT,"
+            " writer_id INT, detail TEXT);")
+        self._db.commit()
+        self._writer_cache: dict = {}     # host pid -> writers.id (this process only)
+        self._whiteouts: set = set()
+        self._kinds: dict = {}
+        self._opaque: set = set()
+        self._lock = threading.Lock()     # serialize SQLite + mirror mutations
+        self._load_mirror()
+
+    def _load_mirror(self) -> None:
+        for path, kind, opaque in self._db.execute(
+                "SELECT path, kind, opaque FROM entries"):
+            if kind == "whiteout":
+                self._whiteouts.add(path)
+            else:
+                self._kinds[path] = kind
+            if opaque:
+                self._opaque.add(path)
+
+    # ── fast RAM accessors (hot path) ───────────────────────────────────────
+    def has_overlay_state(self) -> bool:
+        return bool(self._whiteouts or self._kinds or self._opaque)
+
+    def kind_of(self, rel: str) -> "str | None":
+        if rel in self._whiteouts: return "whiteout"
+        return self._kinds.get(rel)
+
+    def is_opaque(self, rel: str) -> bool:
+        return rel in self._opaque
+
+    def hidden_by_opaque(self, rel: str) -> bool:
+        if not self._opaque: return False
+        parts = rel.split("/") if rel else []
+        for i in range(len(parts)):
+            anc = "/".join(parts[:i])
+            if anc in self._opaque: return True
+        return False
+
+    # ── provenance ──────────────────────────────────────────────────────────
+    def writer_for(self, pid: int) -> int:
+        """Provenance capture (spec §3). Synchronous; caller is blocked. The writer
+        row is ALWAYS inserted, even if /proc/<pid> is gone (R5/R7)."""
+        cached = self._writer_cache.get(pid)
+        if cached is not None: return cached
+        prov = read_provenance(pid)
+        with self._lock:
+            cur = self._db.execute(
+                "INSERT INTO writers(pid,ppid,exe,argv,env,captured_at)"
+                " VALUES(?,?,?,?,?,?)",
+                (prov["pid"], prov["ppid"], prov["exe"],
+                 json.dumps(prov["argv"]), json.dumps(prov["env"]), time.time()))
+            self._db.commit()
+            wid = cur.lastrowid
+        self._writer_cache[pid] = wid
+        return wid
+
+    def provenance_of(self, pid: int) -> dict:
+        return read_provenance(pid)
+
+    # ── mutations (write-through) ───────────────────────────────────────────
+    def set_entry(self, path, kind, mode, writer_id, op,
+                  detail: str = "", opaque=None) -> None:
+        now = time.time()
+        with self._lock:
+            row = self._db.execute(
+                "SELECT path, opaque FROM entries WHERE path=?", (path,)).fetchone()
+            if row is None:
+                op_q = int(opaque) if opaque is not None else 0
+                self._db.execute(
+                    "INSERT INTO entries(path,kind,mode,mtime,writer_id,first_seen,opaque)"
+                    " VALUES(?,?,?,?,?,?,?)",
+                    (path, kind, int(mode), now, writer_id, now, op_q))
+            else:
+                if opaque is None:
+                    self._db.execute(
+                        "UPDATE entries SET kind=?, mode=?, mtime=? WHERE path=?",
+                        (kind, int(mode), now, path))
+                else:
+                    self._db.execute(
+                        "UPDATE entries SET kind=?, mode=?, mtime=?, opaque=? WHERE path=?",
+                        (kind, int(mode), now, int(opaque), path))
+            self._db.execute(
+                "INSERT INTO oplog(ts,op,path,writer_id,detail) VALUES(?,?,?,?,?)",
+                (now, op, path, writer_id, detail))
+            self._db.commit()
+        # RAM mirror
+        if kind == "whiteout":
+            self._whiteouts.add(path); self._kinds.pop(path, None)
+        else:
+            self._kinds[path] = kind; self._whiteouts.discard(path)
+        if opaque is not None:
+            if opaque: self._opaque.add(path)
+            else: self._opaque.discard(path)
+
+    def del_entry(self, path, op: str = "del", writer_id=None) -> None:
+        now = time.time()
+        with self._lock:
+            self._db.execute("DELETE FROM entries WHERE path=?", (path,))
+            self._db.execute(
+                "INSERT INTO oplog(ts,op,path,writer_id,detail) VALUES(?,?,?,?,?)",
+                (now, op, path, writer_id, ""))
+            self._db.commit()
+        self._whiteouts.discard(path); self._kinds.pop(path, None)
+        self._opaque.discard(path)
+
+    def prune_subtree(self, prefix: str) -> None:
+        """Drop all rows under prefix + '/' (after an rmdir whose children were
+        whiteouts/entries). Mirror updated to match."""
+        pref = prefix + "/"
+        with self._lock:
+            self._db.execute("DELETE FROM entries WHERE path LIKE ?", (pref + "%",))
+            self._db.commit()
+        for s in (self._whiteouts, self._opaque):
+            for p in [p for p in s if p.startswith(pref)]: s.discard(p)
+        for p in [p for p in self._kinds if p.startswith(pref)]:
+            self._kinds.pop(p, None)
+
+    def reparent(self, old: str, new: str, writer_id) -> None:
+        """Rewrite all descendant rows old/… → new/… (dir rename). Mirror rebuilt
+        for the affected subtree."""
+        oldp = old + "/"; newp = new + "/"
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT path, kind, mode, opaque FROM entries WHERE path LIKE ?",
+                (oldp + "%",)).fetchall()
+            for path, kind, mode, opaque in rows:
+                np = newp + path[len(oldp):]
+                self._db.execute("DELETE FROM entries WHERE path=?", (path,))
+                self._db.execute(
+                    "INSERT OR REPLACE INTO entries"
+                    "(path,kind,mode,mtime,writer_id,first_seen,opaque)"
+                    " VALUES(?,?,?,?,?,?,?)",
+                    (np, kind, mode, time.time(), writer_id, time.time(), opaque))
+            self._db.commit()
+        for path, kind, mode, opaque in rows:
+            np = newp + path[len(oldp):]
+            self._whiteouts.discard(path); self._kinds.pop(path, None); self._opaque.discard(path)
+            if kind == "whiteout": self._whiteouts.add(np)
+            else: self._kinds[np] = kind
+            if opaque: self._opaque.add(np)
+
+    # ── consolidate accessors (spec §11) ────────────────────────────────────
+    def deletions(self) -> list:
+        return sorted(self._whiteouts)
+
+    def opaque_dirs(self) -> list:
+        return sorted(self._opaque)
+
+    def writer_provenance(self, path: str) -> "dict | None":
+        cur = self._db.execute(
+            "SELECT writer_id FROM entries WHERE path=?", (path,)).fetchone()
+        if not cur or cur[0] is None: return None
+        w = self._db.execute(
+            "SELECT pid,ppid,exe,argv FROM writers WHERE id=?", (cur[0],)).fetchone()
+        if not w: return None
+        try: argv = json.loads(w[3]) if w[3] else []
+        except (ValueError, TypeError): argv = []
+        return dict(pid=w[0], ppid=w[1], exe=w[2], argv=argv)
+
+    def close(self) -> None:
+        try: self._db.close()
+        except sqlite3.Error: pass
+
+
+def _build_overlay_ops():
+    """Build the MultiplexOverlayFs class. Imports pyfuse3 lazily so that importing
+    this module (e.g. the --inner forwarder, or offline tests) does not require
+    pyfuse3/trio. Returns the class."""
+    import pyfuse3
+
+    ATTR_TIMEOUT = 300.0
+    ENTRY_TIMEOUT = 300.0
+    NEG_TIMEOUT = 5.0
+
+    class MultiplexOverlayFs(pyfuse3.Operations):
+        """One pyfuse3 Operations object serving every box. The synthetic root ('')
+        lists one child per live <sid>; below that, <sid>/<rel> is the per-session
+        overlay (lower=/, upper=live/<sid>/up, index=live/<sid>/index.db).
+
+        Inodes span the whole mount: ROOT_INODE is the synthetic root, and every
+        other inode maps to a key "<sid>/<rel>" (rel may be empty for a session
+        root). Sessions are added/removed by the OverlayMount as boxes come and go."""
+
+        enable_writeback_cache = False
+
+        def __init__(self, lower: str, on_event=None):
+            super().__init__()
+            self.lower_root = lower.rstrip("/") or "/"
+            self.squash_uid = os.getuid()
+            self.squash_gid = os.getgid()
+            self.on_event = on_event or (lambda **ev: None)
+            # session registry: sid -> dict(up=Path, index=Index, virtual={rel:bytes})
+            self.sessions: dict = {}
+            # inode maps. key for a path inside a session is (sid, rel).
+            self._ino_to_key: dict = {pyfuse3.ROOT_INODE: None}   # None = synth root
+            self._key_to_ino: dict = {}
+            self._next_ino = pyfuse3.ROOT_INODE + 1
+            self._lookup_count: dict = {}
+            self._fd_table: dict = {}     # fh -> open fd (regular files)
+            self._vfh: dict = {}          # fh -> (sid, rel, bytes) for virtual reads
+            self._dir_snaps: dict = {}    # dh -> sorted [(name, key_or_None, attrs)]
+            self._next_fh = 1
+            # watchdog (spec §9): written only by this (single) trio thread
+            self._req_started = None
+            self._req_label = ""
+            self._req_seq = 0
+            self._lock = threading.Lock()   # guards inode/fh allocation vs UI thread
+
+        # ── session registry ────────────────────────────────────────────────
+        def add_session(self, sid: str, up: Path, index: "Index") -> None:
+            with self._lock:
+                self.sessions[sid] = dict(up=Path(up), index=index, virtual={})
+
+        def remove_session(self, sid: str) -> None:
+            with self._lock:
+                self.sessions.pop(sid, None)
+                dead = [ino for ino, key in self._ino_to_key.items()
+                        if key and key[0] == sid]
+                for ino in dead:
+                    self._ino_to_key.pop(ino, None)
+                    self._lookup_count.pop(ino, None)
+                self._key_to_ino = {k: i for k, i in self._key_to_ino.items()
+                                    if k[0] != sid}
+
+        def add_virtual(self, sid: str, rel: str, content: bytes) -> None:
+            s = self.sessions.get(sid)
+            if s is not None: s["virtual"][rel.lstrip("/")] = content
+
+        # ── inode bookkeeping ───────────────────────────────────────────────
+        def _ino_for(self, sid: str, rel: str) -> int:
+            key = (sid, rel)
+            with self._lock:
+                ino = self._key_to_ino.get(key)
+                if ino is None:
+                    ino = self._next_ino; self._next_ino += 1
+                    self._key_to_ino[key] = ino
+                    self._ino_to_key[ino] = key
+                return ino
+
+        def _key(self, inode: int):
+            return self._ino_to_key.get(inode)
+
+        # ── path helpers ─────────────────────────────────────────────────────
+        def _lower_path(self, rel: str) -> str:
+            return os.path.join(self.lower_root, rel) if rel else self.lower_root
+
+        def _upper_path(self, sid: str, rel: str) -> str:
+            up = self.sessions[sid]["up"]
+            return str(up / rel) if rel else str(up)
+
+        def _index(self, sid: str) -> "Index":
+            return self.sessions[sid]["index"]
+
+        # ── layer resolution (spec §4) ───────────────────────────────────────
+        def _resolve_st(self, sid: str, rel: str):
+            idx = self._index(sid)
+            if not idx.has_overlay_state():
+                try: return ("lower", self._lower_path(rel), os.lstat(self._lower_path(rel)))
+                except OSError: return ("absent", None, None)
+            k = idx.kind_of(rel)
+            if k == "whiteout":
+                return ("whiteout", None, None)
+            if k is not None:
+                up = self._upper_path(sid, rel)
+                try: return ("upper", up, os.lstat(up))
+                except OSError: pass
+            if idx.hidden_by_opaque(rel):
+                return ("absent", None, None)
+            try: return ("lower", self._lower_path(rel), os.lstat(self._lower_path(rel)))
+            except OSError: return ("absent", None, None)
+
+        def _resolve(self, sid: str, rel: str) -> str:
+            return self._resolve_st(sid, rel)[0]
+
+        def _is_virtual(self, sid: str, rel: str) -> bool:
+            s = self.sessions.get(sid)
+            if not s: return False
+            return rel in s["virtual"] and self._index(sid).kind_of(rel) is None
+
+        # ── attr construction ────────────────────────────────────────────────
+        def _entry(self, ino: int, st) -> "pyfuse3.EntryAttributes":
+            a = pyfuse3.EntryAttributes()
+            a.st_ino = ino
+            a.st_mode = st.st_mode
+            a.st_nlink = st.st_nlink
+            a.st_uid = self.squash_uid
+            a.st_gid = self.squash_gid
+            a.st_rdev = getattr(st, "st_rdev", 0)
+            a.st_size = st.st_size
+            a.st_blksize = 512
+            a.st_blocks = (st.st_size + 511) // 512
+            a.st_atime_ns = int(getattr(st, "st_atime", 0) * 1e9)
+            a.st_mtime_ns = int(getattr(st, "st_mtime", 0) * 1e9)
+            a.st_ctime_ns = int(getattr(st, "st_ctime", 0) * 1e9)
+            a.attr_timeout = ATTR_TIMEOUT
+            a.entry_timeout = ENTRY_TIMEOUT
+            return a
+
+        def _synth_dir_attrs(self, ino: int) -> "pyfuse3.EntryAttributes":
+            a = pyfuse3.EntryAttributes()
+            a.st_ino = ino
+            a.st_mode = stat_mod.S_IFDIR | 0o755
+            a.st_nlink = 2
+            a.st_uid = self.squash_uid
+            a.st_gid = self.squash_gid
+            a.st_size = 0
+            a.st_blksize = 512
+            a.st_blocks = 0
+            now = int(time.time() * 1e9)
+            a.st_atime_ns = a.st_mtime_ns = a.st_ctime_ns = now
+            a.attr_timeout = ATTR_TIMEOUT
+            a.entry_timeout = ENTRY_TIMEOUT
+            return a
+
+        def _virtual_attrs(self, sid: str, rel: str, ino: int) -> "pyfuse3.EntryAttributes":
+            content = self.sessions[sid]["virtual"][rel]
+            a = pyfuse3.EntryAttributes()
+            a.st_ino = ino
+            a.st_mode = stat_mod.S_IFREG | 0o644
+            a.st_nlink = 1
+            a.st_uid = self.squash_uid
+            a.st_gid = self.squash_gid
+            a.st_size = len(content)
+            a.st_blksize = 512
+            a.st_blocks = (len(content) + 511) // 512
+            try: lst = os.lstat(self._lower_path(rel)); ts = int(lst.st_mtime * 1e9)
+            except OSError: ts = int(time.time() * 1e9)
+            a.st_atime_ns = a.st_mtime_ns = a.st_ctime_ns = ts
+            a.attr_timeout = ATTR_TIMEOUT
+            a.entry_timeout = ENTRY_TIMEOUT
+            return a
+
+        def _neg_entry(self) -> "pyfuse3.EntryAttributes":
+            a = pyfuse3.EntryAttributes()
+            a.st_ino = 0
+            a.entry_timeout = NEG_TIMEOUT
+            a.attr_timeout = NEG_TIMEOUT
+            return a
+
+        # ── watchdog (spec §9) ───────────────────────────────────────────────
+        def _req_enter(self, label: str) -> None:
+            self._req_started = time.monotonic(); self._req_label = label
+            self._req_seq += 1
+
+        def _req_exit(self) -> None:
+            self._req_started = None
+
+        def inflight_age(self):
+            t = self._req_started
+            return (time.monotonic() - t) if t is not None else None
+
+        # ── child-path utility for synthetic root vs session paths ───────────
+        def _child_key(self, parent_key, name: str):
+            """Return (sid, rel) for a child `name` under parent_key (None = synth
+            root, where children are session ids)."""
+            if parent_key is None:
+                return (name, "")                      # a session root
+            sid, rel = parent_key
+            child = (rel + "/" + name) if rel else name
+            return (sid, child)
+
+        def _parent_key(self, parent_key):
+            if parent_key is None: return None
+            sid, rel = parent_key
+            if not rel: return None                    # session root's parent = synth
+            up = rel.rsplit("/", 1)[0] if "/" in rel else ""
+            return (sid, up)
+
+        # ── FUSE: lookup ─────────────────────────────────────────────────────
+        async def lookup(self, parent_inode, name, ctx=None):
+            name = os.fsdecode(name)
+            pkey = self._key(parent_inode)
+            if name == ".":
+                ckey = pkey
+            elif name == "..":
+                ckey = self._parent_key(pkey)
+            else:
+                ckey = self._child_key(pkey, name)
+            if ckey is None:                            # synth root itself
+                return self._synth_dir_attrs(pyfuse3.ROOT_INODE)
+            sid, rel = ckey
+            if pkey is None:                            # child of synth root = a session
+                if sid not in self.sessions:
+                    return self._neg_entry()
+                ino = self._ino_for(sid, "")
+                self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
+                return self._synth_dir_attrs(ino)
+            if sid not in self.sessions:
+                return self._neg_entry()
+            if self._is_virtual(sid, rel):
+                ino = self._ino_for(sid, rel)
+                self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
+                return self._virtual_attrs(sid, rel, ino)
+            layer, _ap, st = self._resolve_st(sid, rel)
+            if layer in ("absent", "whiteout"):
+                return self._neg_entry()
+            ino = self._ino_for(sid, rel)
+            self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
+            return self._entry(ino, st)
+
+        async def getattr(self, inode, ctx=None):
+            key = self._key(inode)
+            if key is None:
+                return self._synth_dir_attrs(pyfuse3.ROOT_INODE)
+            sid, rel = key
+            if sid not in self.sessions:
+                raise pyfuse3.FUSEError(errno.ENOENT)
+            if not rel:                                 # a session root
+                return self._synth_dir_attrs(inode)
+            if self._is_virtual(sid, rel):
+                return self._virtual_attrs(sid, rel, inode)
+            layer, _ap, st = self._resolve_st(sid, rel)
+            if layer in ("absent", "whiteout"):
+                raise pyfuse3.FUSEError(errno.ENOENT)
+            return self._entry(inode, st)
+
+        async def forget(self, inode_list):
+            for inode, nlookup in inode_list:
+                c = self._lookup_count.get(inode, 0) - nlookup
+                if c <= 0:
+                    self._lookup_count.pop(inode, None)
+                else:
+                    self._lookup_count[inode] = c
+
+        async def setxattr(self, inode, name, value, ctx):
+            raise pyfuse3.FUSEError(errno.ENOSYS)
+
+        async def getxattr(self, inode, name, ctx):
+            raise pyfuse3.FUSEError(pyfuse3.ENOATTR)
+
+        # ── readdir ──────────────────────────────────────────────────────────
+        def _scan_dir(self, sid: str, rel: str) -> list:
+            """Merged listing of <sid>/<rel>: [(name, (sid, childrel) or None, attrs)].
+            None key marks a virtual/synthetic-only entry where attrs are supplied."""
+            idx = self._index(sid)
+            names: dict = {}     # name -> (abspath_or_None, layer)
+            if not idx.is_opaque(rel):
+                try:
+                    with os.scandir(self._lower_path(rel)) as it:
+                        for de in it:
+                            names[de.name] = "lower"
+                except OSError: pass
+            if idx.has_overlay_state():
+                try:
+                    with os.scandir(self._upper_path(sid, rel)) as it:
+                        for de in it:
+                            names[de.name] = "upper"
+                except OSError: pass
+                # apply index children: whiteouts remove, others ensure present
+                prefix = (rel + "/") if rel else ""
+                for wp in list(idx._whiteouts):
+                    if wp.startswith(prefix) and "/" not in wp[len(prefix):]:
+                        names.pop(wp[len(prefix):], None)
+                for kp in list(idx._kinds):
+                    if kp.startswith(prefix) and kp != rel and "/" not in kp[len(prefix):]:
+                        names.setdefault(kp[len(prefix):], "upper")
+            # virtual files in this dir
+            for vp in self.sessions[sid]["virtual"]:
+                pfx = (rel + "/") if rel else ""
+                if vp.startswith(pfx) and "/" not in vp[len(pfx):]:
+                    names.setdefault(vp[len(pfx):], "virtual")
+            out = []
+            for name in sorted(names):
+                childrel = (rel + "/" + name) if rel else name
+                if self._is_virtual(sid, childrel):
+                    ino = self._ino_for(sid, childrel)
+                    out.append((name, (sid, childrel),
+                                self._virtual_attrs(sid, childrel, ino)))
+                    continue
+                layer, _ap, st = self._resolve_st(sid, childrel)
+                if layer in ("absent", "whiteout"): continue
+                ino = self._ino_for(sid, childrel)
+                out.append((name, (sid, childrel), self._entry(ino, st)))
+            return out
+
+        async def opendir(self, inode, ctx):
+            with self._lock:
+                dh = self._next_fh; self._next_fh += 1
+            self._dir_snaps[dh] = None
+            self._dir_snaps[(dh, "inode")] = inode
+            return dh
+
+        async def readdir(self, fh, start_id, token):
+            snap = self._dir_snaps.get(fh)
+            if snap is None:
+                inode = self._dir_snaps.get((fh, "inode"))
+                key = self._key(inode)
+                if key is None:
+                    # synthetic root: list live sessions
+                    snap = []
+                    for sid in sorted(self.sessions):
+                        ino = self._ino_for(sid, "")
+                        snap.append((sid, self._synth_dir_attrs(ino)))
+                else:
+                    sid, rel = key
+                    if sid in self.sessions:
+                        snap = [(name, attrs)
+                                for name, _k, attrs in self._scan_dir(sid, rel)]
+                    else:
+                        snap = []
+                self._dir_snaps[fh] = snap
+            for i in range(start_id, len(snap)):
+                name, attrs = snap[i]
+                if not pyfuse3.readdir_reply(
+                        token, os.fsencode(name), attrs, i + 1):
+                    break
+
+        async def releasedir(self, fh):
+            self._dir_snaps.pop(fh, None)
+            self._dir_snaps.pop((fh, "inode"), None)
+
+        async def readlink(self, inode, ctx):
+            key = self._key(inode)
+            if key is None: raise pyfuse3.FUSEError(errno.EINVAL)
+            sid, rel = key
+            layer, ap, _st = self._resolve_st(sid, rel)
+            if layer in ("absent", "whiteout"): raise pyfuse3.FUSEError(errno.ENOENT)
+            try: return os.fsencode(os.readlink(ap))
+            except OSError as e: raise pyfuse3.FUSEError(e.errno or errno.EIO)
+
+        # ── parent-dir materialization ───────────────────────────────────────
+        def _ensure_parent_dirs(self, sid: str, rel: str, wid) -> None:
+            """Materialize the chain of parent dirs of rel into the upper. Each level
+            is a single mkdir; opacity is recorded if it shadows a lower dir."""
+            parent = rel.rsplit("/", 1)[0] if "/" in rel else ""
+            if not parent: return
+            idx = self._index(sid)
+            parts = parent.split("/")
+            cur = ""
+            for p in parts:
+                cur = (cur + "/" + p) if cur else p
+                upath = self._upper_path(sid, cur)
+                if os.path.isdir(upath):
+                    continue
+                self._ensure_parent_dirs(sid, cur, wid)
+                try:
+                    os.mkdir(upath, 0o755)
+                except FileExistsError:
+                    pass
+                except OSError as e:
+                    raise pyfuse3.FUSEError(e.errno or errno.EIO)
+                opaque = 0
+                try:
+                    if stat_mod.S_ISDIR(os.lstat(self._lower_path(cur)).st_mode):
+                        # a real lower dir still showing through -> not opaque
+                        opaque = 0
+                except OSError:
+                    pass
+                idx.set_entry(cur, "dir", stat_mod.S_IFDIR | 0o755, wid,
+                              "mkdir_parent", opaque=opaque)
+
+        # ── copy-up (spec §5/§6) ─────────────────────────────────────────────
+        def _ensure_copyup(self, sid: str, rel: str, flags: int, ctx) -> int:
+            """Materialize a lower (or absent) file into the upper; return an O_RDWR
+            fd on it. Fail-closed: any copy error propagates (R5)."""
+            wid = self._index(sid).writer_for(ctx.pid)
+            self._ensure_parent_dirs(sid, rel, wid)
+            upath = self._upper_path(sid, rel)
+            if os.path.lexists(upath):
+                # O_NOFOLLOW: if the upper artifact is itself a symlink (planted by
+                # the sandbox to point at a host file), this raises ELOOP rather than
+                # opening the target — fail closed, never dereference (R1/§8).
+                try:
+                    return os.open(upath, os.O_RDWR | os.O_NOFOLLOW)
+                except OSError as e:
+                    raise pyfuse3.FUSEError(e.errno or errno.EIO)
+            layer, ap, st = self._resolve_st(sid, rel)
+            idx = self._index(sid)
+            if layer == "lower":
+                mode = stat_mod.S_IMODE(st.st_mode)
+                src = os.open(ap, os.O_RDONLY)
+                try:
+                    dst = os.open(upath, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, mode)
+                    try:
+                        method = reflink_or_copy(src, dst)
+                    except OSError as e:
+                        os.close(dst)
+                        try: os.unlink(upath)
+                        except OSError: pass
+                        raise pyfuse3.FUSEError(e.errno or errno.EIO)
+                finally:
+                    os.close(src)
+                idx.set_entry(rel, "file", st.st_mode, wid, "copyup", detail=method)
+                return dst
+            else:
+                # absent (or whiteout cleared) -> brand new upper file
+                fd = os.open(upath, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o644)
+                idx.set_entry(rel, "file", stat_mod.S_IFREG | 0o644, wid, "create")
+                return fd
+
+        # ── open / read / write / release ───────────────────────────────────
+        async def open(self, inode, flags, ctx):
+            key = self._key(inode)
+            if key is None: raise pyfuse3.FUSEError(errno.EISDIR)
+            sid, rel = key
+            writable = (flags & (os.O_WRONLY | os.O_RDWR)) != 0
+            if self._is_virtual(sid, rel) and not writable:
+                content = self.sessions[sid]["virtual"][rel]
+                with self._lock:
+                    fh = self._next_fh; self._next_fh += 1
+                self._vfh[fh] = (sid, rel, content)
+                return pyfuse3.FileInfo(fh=fh, direct_io=False, keep_cache=False)
+            self._req_enter(f"open {sid}/{rel}")
+            try:
+                if not writable:
+                    layer, ap, _st = self._resolve_st(sid, rel)
+                    if layer in ("absent", "whiteout"):
+                        raise pyfuse3.FUSEError(errno.ENOENT)
+                    try:
+                        fd = os.open(ap, os.O_RDONLY)
+                    except OSError as e:
+                        raise pyfuse3.FUSEError(e.errno or errno.EIO)
+                else:
+                    if policy_check(sid, self._index(sid).provenance_of(ctx.pid),
+                                    rel, "open_write") == "deny":
+                        raise pyfuse3.FUSEError(errno.EACCES)
+                    fd = self._ensure_copyup(sid, rel, flags, ctx)
+                    self._notify(sid)
+                with self._lock:
+                    fh = self._next_fh; self._next_fh += 1
+                self._fd_table[fh] = fd
+                return pyfuse3.FileInfo(fh=fh, direct_io=False, keep_cache=False)
+            finally:
+                self._req_exit()
+
+        async def read(self, fh, off, size):
+            if fh in self._vfh:
+                _sid, _rel, content = self._vfh[fh]
+                return content[off:off + size]
+            fd = self._fd_table.get(fh)
+            if fd is None: raise pyfuse3.FUSEError(errno.EBADF)
+            self._req_enter("read")
+            try:
+                return os.pread(fd, size, off)
+            except OSError as e:
+                raise pyfuse3.FUSEError(e.errno or errno.EIO)
+            finally:
+                self._req_exit()
+
+        async def write(self, fh, off, buf):
+            fd = self._fd_table.get(fh)
+            if fd is None: raise pyfuse3.FUSEError(errno.EBADF)
+            self._req_enter("write")
+            try:
+                return os.pwrite(fd, buf, off)
+            except OSError as e:
+                raise pyfuse3.FUSEError(e.errno or errno.EIO)
+            finally:
+                self._req_exit()
+
+        async def fsync(self, fh, datasync):
+            fd = self._fd_table.get(fh)
+            if fd is None: return
+            try:
+                if datasync: os.fdatasync(fd)
+                else: os.fsync(fd)
+            except OSError as e:
+                raise pyfuse3.FUSEError(e.errno or errno.EIO)
+
+        async def flush(self, fh):
+            return
+
+        async def release(self, fh):
+            if fh in self._vfh:
+                self._vfh.pop(fh, None); return
+            fd = self._fd_table.pop(fh, None)
+            if fd is not None:
+                try: os.close(fd)
+                except OSError: pass
+
+        # ── create / mkdir / symlink ─────────────────────────────────────────
+        async def create(self, parent_inode, name, mode, flags, ctx):
+            name = os.fsdecode(name)
+            pkey = self._key(parent_inode)
+            if pkey is None: raise pyfuse3.FUSEError(errno.EACCES)
+            sid, _rel = self._child_key(pkey, name)
+            rel = self._child_key(pkey, name)[1]
+            if sid not in self.sessions: raise pyfuse3.FUSEError(errno.ENOENT)
+            wid = self._index(sid).writer_for(ctx.pid)
+            if policy_check(sid, self._index(sid).provenance_of(ctx.pid),
+                            rel, "create") == "deny":
+                raise pyfuse3.FUSEError(errno.EACCES)
+            self._req_enter(f"create {sid}/{rel}")
+            try:
+                self._ensure_parent_dirs(sid, rel, wid)
+                upath = self._upper_path(sid, rel)
+                try:
+                    fd = os.open(upath, flags | os.O_CREAT | os.O_NOFOLLOW,
+                                 mode & 0o7777)
+                except OSError as e:
+                    raise pyfuse3.FUSEError(e.errno or errno.EIO)
+                idx = self._index(sid)
+                if idx.kind_of(rel) == "whiteout":
+                    idx.del_entry(rel)
+                idx.set_entry(rel, "file", stat_mod.S_IFREG | (mode & 0o7777),
+                              wid, "create")
+                st = os.fstat(fd)
+                ino = self._ino_for(sid, rel)
+                self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
+                with self._lock:
+                    nfh = self._next_fh; self._next_fh += 1
+                self._fd_table[nfh] = fd
+                self._notify(sid)
+                return (pyfuse3.FileInfo(fh=nfh, direct_io=False, keep_cache=False),
+                        self._entry(ino, st))
+            finally:
+                self._req_exit()
+
+        async def mkdir(self, parent_inode, name, mode, ctx):
+            name = os.fsdecode(name)
+            pkey = self._key(parent_inode)
+            if pkey is None: raise pyfuse3.FUSEError(errno.EACCES)
+            sid, rel = self._child_key(pkey, name)
+            if sid not in self.sessions: raise pyfuse3.FUSEError(errno.ENOENT)
+            wid = self._index(sid).writer_for(ctx.pid)
+            if policy_check(sid, self._index(sid).provenance_of(ctx.pid),
+                            rel, "mkdir") == "deny":
+                raise pyfuse3.FUSEError(errno.EACCES)
+            self._ensure_parent_dirs(sid, rel, wid)
+            upath = self._upper_path(sid, rel)
+            try:
+                os.mkdir(upath, mode & 0o7777)
+            except OSError as e:
+                raise pyfuse3.FUSEError(e.errno or errno.EIO)
+            idx = self._index(sid)
+            if idx.kind_of(rel) == "whiteout":
+                idx.del_entry(rel)
+            opaque = 0
+            try:
+                if stat_mod.S_ISDIR(os.lstat(self._lower_path(rel)).st_mode):
+                    opaque = 1            # rm-rf'd then recreated over a lower dir
+            except OSError:
+                opaque = 0
+            idx.set_entry(rel, "dir", stat_mod.S_IFDIR | (mode & 0o7777), wid,
+                          "mkdir", opaque=opaque)
+            ino = self._ino_for(sid, rel)
+            self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
+            st = os.lstat(upath)
+            self._notify(sid)
+            return self._entry(ino, st)
+
+        async def symlink(self, parent_inode, name, target, ctx):
+            name = os.fsdecode(name); target = os.fsdecode(target)
+            pkey = self._key(parent_inode)
+            if pkey is None: raise pyfuse3.FUSEError(errno.EACCES)
+            sid, rel = self._child_key(pkey, name)
+            if sid not in self.sessions: raise pyfuse3.FUSEError(errno.ENOENT)
+            wid = self._index(sid).writer_for(ctx.pid)
+            if policy_check(sid, self._index(sid).provenance_of(ctx.pid),
+                            rel, "symlink") == "deny":
+                raise pyfuse3.FUSEError(errno.EACCES)
+            self._ensure_parent_dirs(sid, rel, wid)
+            upath = self._upper_path(sid, rel)
+            # remove a stale upper artifact (no-follow safe: unlink/rmtree by lstat)
+            try:
+                lst = os.lstat(upath)
+                if stat_mod.S_ISDIR(lst.st_mode): shutil.rmtree(upath)
+                else: os.unlink(upath)
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                raise pyfuse3.FUSEError(e.errno or errno.EIO)
+            try:
+                os.symlink(target, upath)
+            except OSError as e:
+                raise pyfuse3.FUSEError(e.errno or errno.EIO)
+            idx = self._index(sid)
+            if idx.kind_of(rel) == "whiteout":
+                idx.del_entry(rel)
+            idx.set_entry(rel, "symlink", stat_mod.S_IFLNK | 0o777, wid, "symlink")
+            ino = self._ino_for(sid, rel)
+            self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
+            st = os.lstat(upath)
+            self._notify(sid)
+            return self._entry(ino, st)
+
+        # ── unlink / rmdir ───────────────────────────────────────────────────
+        def _merged_children(self, sid: str, rel: str) -> list:
+            return [n for n, _k, _a in self._scan_dir(sid, rel)]
+
+        async def unlink(self, parent_inode, name, ctx):
+            name = os.fsdecode(name)
+            pkey = self._key(parent_inode)
+            if pkey is None: raise pyfuse3.FUSEError(errno.EACCES)
+            sid, rel = self._child_key(pkey, name)
+            if sid not in self.sessions: raise pyfuse3.FUSEError(errno.ENOENT)
+            wid = self._index(sid).writer_for(ctx.pid)
+            if policy_check(sid, self._index(sid).provenance_of(ctx.pid),
+                            rel, "unlink") == "deny":
+                raise pyfuse3.FUSEError(errno.EACCES)
+            idx = self._index(sid)
+            upath = self._upper_path(sid, rel)
+            if os.path.lexists(upath):
+                try: os.unlink(upath)
+                except OSError as e: raise pyfuse3.FUSEError(e.errno or errno.EIO)
+            lower_exists = False
+            if not idx.hidden_by_opaque(rel):
+                try: lower_exists = os.path.lexists(self._lower_path(rel))
+                except OSError: lower_exists = False
+            if lower_exists:
+                idx.set_entry(rel, "whiteout", 0, wid, "unlink")
+            else:
+                idx.del_entry(rel, op="unlink", writer_id=wid)
+            self._notify(sid)
+
+        async def rmdir(self, parent_inode, name, ctx):
+            name = os.fsdecode(name)
+            pkey = self._key(parent_inode)
+            if pkey is None: raise pyfuse3.FUSEError(errno.EACCES)
+            sid, rel = self._child_key(pkey, name)
+            if sid not in self.sessions: raise pyfuse3.FUSEError(errno.ENOENT)
+            wid = self._index(sid).writer_for(ctx.pid)
+            if policy_check(sid, self._index(sid).provenance_of(ctx.pid),
+                            rel, "rmdir") == "deny":
+                raise pyfuse3.FUSEError(errno.EACCES)
+            if self._merged_children(sid, rel):
+                raise pyfuse3.FUSEError(errno.ENOTEMPTY)
+            idx = self._index(sid)
+            upath = self._upper_path(sid, rel)
+            if os.path.isdir(upath) and not os.path.islink(upath):
+                try: os.rmdir(upath)
+                except OSError as e: raise pyfuse3.FUSEError(e.errno or errno.EIO)
+            idx.prune_subtree(rel)
+            lower_is_dir = False
+            if not idx.hidden_by_opaque(rel):
+                try:
+                    lower_is_dir = stat_mod.S_ISDIR(
+                        os.lstat(self._lower_path(rel)).st_mode)
+                except OSError: lower_is_dir = False
+            if lower_is_dir:
+                idx.set_entry(rel, "whiteout", 0, wid, "rmdir")
+            else:
+                idx.del_entry(rel, op="rmdir", writer_id=wid)
+            self._notify(sid)
+
+        # ── setattr ──────────────────────────────────────────────────────────
+        async def setattr(self, inode, attr, fields, fh, ctx):
+            key = self._key(inode)
+            if key is None: raise pyfuse3.FUSEError(errno.EPERM)
+            sid, rel = key
+            if sid not in self.sessions: raise pyfuse3.FUSEError(errno.ENOENT)
+            if policy_check(sid, self._index(sid).provenance_of(ctx.pid),
+                            rel, "setattr") == "deny":
+                raise pyfuse3.FUSEError(errno.EACCES)
+            idx = self._index(sid)
+            self._req_enter(f"setattr {sid}/{rel}")
+            try:
+                layer = self._resolve(sid, rel)
+                if layer in ("absent", "whiteout"):
+                    raise pyfuse3.FUSEError(errno.ENOENT)
+                if layer == "lower":
+                    fd = self._ensure_copyup(sid, rel, os.O_RDWR, ctx)
+                    os.close(fd)
+                upath = self._upper_path(sid, rel)
+                wid = idx.writer_for(ctx.pid)
+                is_link = stat_mod.S_ISLNK(os.lstat(upath).st_mode)
+                try:
+                    # size/mode operate on file content/inode: open ONE O_NOFOLLOW fd
+                    # and use fchmod/ftruncate (R3/R4). O_NOFOLLOW makes the open of a
+                    # symlink upper-artifact raise ELOOP → we never touch its target.
+                    if (fields.update_size or fields.update_mode) and not is_link:
+                        fd = os.open(upath, os.O_RDWR | os.O_NOFOLLOW)
+                        try:
+                            if fields.update_size: os.ftruncate(fd, attr.st_size)
+                            if fields.update_mode:
+                                os.fchmod(fd, stat_mod.S_IMODE(attr.st_mode))
+                        finally:
+                            os.close(fd)
+                    # chown/utime have real no-follow variants (lchown / utimensat
+                    # AT_SYMLINK_NOFOLLOW): they act on the link itself, never target.
+                    if fields.update_uid or fields.update_gid:
+                        uid = attr.st_uid if fields.update_uid else -1
+                        gid = attr.st_gid if fields.update_gid else -1
+                        os.chown(upath, uid, gid, follow_symlinks=False)
+                    if fields.update_mtime or fields.update_atime:
+                        st0 = os.lstat(upath)
+                        atime = (attr.st_atime_ns / 1e9 if fields.update_atime
+                                 else st0.st_atime)
+                        mtime = (attr.st_mtime_ns / 1e9 if fields.update_mtime
+                                 else st0.st_mtime)
+                        os.utime(upath, (atime, mtime), follow_symlinks=False)
+                except OSError as e:
+                    raise pyfuse3.FUSEError(e.errno or errno.EIO)
+                st = os.lstat(upath)
+                if stat_mod.S_ISDIR(st.st_mode): kind = "dir"
+                elif stat_mod.S_ISLNK(st.st_mode): kind = "symlink"
+                else: kind = "file"
+                idx.set_entry(rel, kind, st.st_mode, wid, "setattr")
+                self._notify(sid)
+                return self._entry(inode, st)
+            finally:
+                self._req_exit()
+
+        async def statfs(self, ctx):
+            s = pyfuse3.StatvfsData()
+            try:
+                vfs = os.statvfs(str(live_home()))
+                s.f_bsize = vfs.f_bsize; s.f_frsize = vfs.f_frsize
+                s.f_blocks = vfs.f_blocks; s.f_bfree = vfs.f_bfree
+                s.f_bavail = vfs.f_bavail; s.f_files = vfs.f_files
+                s.f_ffree = vfs.f_ffree; s.f_favail = vfs.f_favail
+            except OSError:
+                s.f_bsize = s.f_frsize = 4096
+                s.f_blocks = s.f_bfree = s.f_bavail = 1 << 20
+                s.f_files = s.f_ffree = s.f_favail = 1 << 16
+            s.f_namemax = 255
+            return s
+
+        # ── copy-up of one entry (for rename/link materialization) ───────────
+        def _copyup_one(self, sid: str, rel: str, wid) -> None:
+            upath = self._upper_path(sid, rel)
+            if os.path.lexists(upath): return
+            self._ensure_parent_dirs(sid, rel, wid)
+            layer, ap, st = self._resolve_st(sid, rel)
+            idx = self._index(sid)
+            if layer == "lower":
+                if stat_mod.S_ISLNK(st.st_mode):
+                    os.symlink(os.readlink(ap), upath)
+                    idx.set_entry(rel, "symlink", stat_mod.S_IFLNK | 0o777, wid,
+                                  "copyup_symlink")
+                elif stat_mod.S_ISDIR(st.st_mode):
+                    os.mkdir(upath, stat_mod.S_IMODE(st.st_mode))
+                    idx.set_entry(rel, "dir", st.st_mode, wid, "copyup_dir")
+                else:
+                    src = os.open(ap, os.O_RDONLY)
+                    try:
+                        dst = os.open(upath, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
+                                      stat_mod.S_IMODE(st.st_mode))
+                        try: reflink_or_copy(src, dst)
+                        finally: os.close(dst)
+                    finally:
+                        os.close(src)
+                    idx.set_entry(rel, "file", st.st_mode, wid, "copyup")
+
+        def _materialize_tree(self, sid: str, rel: str, wid) -> None:
+            """Walk the merged view of rel and copy every entry into the upper."""
+            self._copyup_one(sid, rel, wid)
+            for name, _k, _a in self._scan_dir(sid, rel):
+                child = (rel + "/" + name) if rel else name
+                layer, _ap, st = self._resolve_st(sid, child)
+                if layer in ("absent", "whiteout"): continue
+                if stat_mod.S_ISDIR(st.st_mode):
+                    self._materialize_tree(sid, child, wid)
+                else:
+                    self._copyup_one(sid, child, wid)
+
+        async def rename(self, parent_old, name_old, parent_new, name_new,
+                         flags, ctx):
+            if flags & getattr(pyfuse3, "RENAME_EXCHANGE", 2):
+                raise pyfuse3.FUSEError(errno.ENOSYS)
+            name_old = os.fsdecode(name_old); name_new = os.fsdecode(name_new)
+            pko = self._key(parent_old); pkn = self._key(parent_new)
+            if pko is None or pkn is None: raise pyfuse3.FUSEError(errno.EACCES)
+            sid_o, rel_o = self._child_key(pko, name_old)
+            sid_n, rel_n = self._child_key(pkn, name_new)
+            if sid_o != sid_n or sid_o not in self.sessions:
+                raise pyfuse3.FUSEError(errno.EXDEV)
+            sid = sid_o
+            if policy_check(sid, self._index(sid).provenance_of(ctx.pid),
+                            rel_o, "rename") == "deny":
+                raise pyfuse3.FUSEError(errno.EACCES)
+            idx = self._index(sid)
+            layer_o, _ap_o, st_o = self._resolve_st(sid, rel_o)
+            if layer_o in ("absent", "whiteout"):
+                raise pyfuse3.FUSEError(errno.ENOENT)
+            layer_n = self._resolve(sid, rel_n)
+            if flags & getattr(pyfuse3, "RENAME_NOREPLACE", 1):
+                if layer_n not in ("absent", "whiteout"):
+                    raise pyfuse3.FUSEError(errno.EEXIST)
+            wid = idx.writer_for(ctx.pid)
+            self._req_enter(f"rename {sid}/{rel_o}->{rel_n}")
+            try:
+                dst_shadows_lower = False
+                try:
+                    dst_shadows_lower = (not idx.hidden_by_opaque(rel_n)
+                        and stat_mod.S_ISDIR(os.lstat(self._lower_path(rel_n)).st_mode))
+                except OSError:
+                    dst_shadows_lower = False
+                is_dir = stat_mod.S_ISDIR(st_o.st_mode)
+                if is_dir:
+                    self._materialize_tree(sid, rel_o, wid)
+                else:
+                    self._copyup_one(sid, rel_o, wid)
+                upo = self._upper_path(sid, rel_o); upn = self._upper_path(sid, rel_n)
+                # remove existing destination upper artifact
+                try:
+                    lst = os.lstat(upn)
+                    if stat_mod.S_ISDIR(lst.st_mode) and not stat_mod.S_ISLNK(lst.st_mode):
+                        shutil.rmtree(upn)
+                    else:
+                        os.unlink(upn)
+                except FileNotFoundError:
+                    pass
+                self._ensure_parent_dirs(sid, rel_n, wid)
+                try:
+                    os.rename(upo, upn)
+                except OSError as e:
+                    raise pyfuse3.FUSEError(e.errno or errno.EIO)
+                # index update
+                src_shadowed_lower = False
+                try:
+                    src_shadowed_lower = (not idx.hidden_by_opaque(rel_o)
+                        and os.path.lexists(self._lower_path(rel_o)))
+                except OSError:
+                    src_shadowed_lower = False
+                if is_dir:
+                    idx.reparent(rel_o, rel_n, wid)
+                    idx.set_entry(rel_n, "dir", st_o.st_mode, wid, "rename_to",
+                                  opaque=1 if dst_shadows_lower else None)
+                else:
+                    knd = ("symlink" if stat_mod.S_ISLNK(st_o.st_mode) else "file")
+                    idx.set_entry(rel_n, knd, st_o.st_mode, wid, "rename_to",
+                                  opaque=1 if dst_shadows_lower else None)
+                if src_shadowed_lower:
+                    idx.set_entry(rel_o, "whiteout", 0, wid, "rename_from")
+                else:
+                    idx.del_entry(rel_o, op="rename_from", writer_id=wid)
+                self._remap_inode_subtree(sid, rel_o, rel_n)
+                self._notify(sid)
+            finally:
+                self._req_exit()
+
+        def _remap_inode_subtree(self, sid: str, rel_o: str, rel_n: str) -> None:
+            with self._lock:
+                oldp = rel_o + "/"; newp = rel_n + "/"
+                remap = []
+                for (ksid, krel), ino in list(self._key_to_ino.items()):
+                    if ksid != sid: continue
+                    if krel == rel_o:
+                        remap.append(((ksid, krel), (ksid, rel_n), ino))
+                    elif krel.startswith(oldp):
+                        remap.append(((ksid, krel), (ksid, newp + krel[len(oldp):]), ino))
+                for oldkey, newkey, ino in remap:
+                    self._key_to_ino.pop(oldkey, None)
+                    self._key_to_ino[newkey] = ino
+                    self._ino_to_key[ino] = newkey
+
+        async def link(self, inode, new_parent, new_name, ctx):
+            new_name = os.fsdecode(new_name)
+            key = self._key(inode); pkn = self._key(new_parent)
+            if key is None or pkn is None: raise pyfuse3.FUSEError(errno.EPERM)
+            sid, rel_src = key
+            sid_n, rel_n = self._child_key(pkn, new_name)
+            if sid != sid_n or sid not in self.sessions:
+                raise pyfuse3.FUSEError(errno.EXDEV)
+            layer, _ap, st = self._resolve_st(sid, rel_src)
+            if layer in ("absent", "whiteout"): raise pyfuse3.FUSEError(errno.ENOENT)
+            if stat_mod.S_ISDIR(st.st_mode): raise pyfuse3.FUSEError(errno.EPERM)
+            wid = self._index(sid).writer_for(ctx.pid)
+            if policy_check(sid, self._index(sid).provenance_of(ctx.pid),
+                            rel_n, "link") == "deny":
+                raise pyfuse3.FUSEError(errno.EACCES)
+            self._copyup_one(sid, rel_src, wid)
+            self._ensure_parent_dirs(sid, rel_n, wid)
+            ups = self._upper_path(sid, rel_src); upn = self._upper_path(sid, rel_n)
+            idx = self._index(sid)
+            try:
+                if stat_mod.S_ISLNK(st.st_mode):
+                    os.symlink(os.readlink(ups), upn)
+                    idx.set_entry(rel_n, "symlink", stat_mod.S_IFLNK | 0o777, wid,
+                                  "link_as_copy", detail=rel_src)
+                else:
+                    src = os.open(ups, os.O_RDONLY)
+                    try:
+                        dst = os.open(upn, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
+                                      stat_mod.S_IMODE(st.st_mode))
+                        try: reflink_or_copy(src, dst)
+                        finally: os.close(dst)
+                    finally:
+                        os.close(src)
+                    idx.set_entry(rel_n, "file", st.st_mode, wid, "link_as_copy",
+                                  detail=rel_src)
+            except OSError as e:
+                raise pyfuse3.FUSEError(e.errno or errno.EIO)
+            ino = self._ino_for(sid, rel_n)
+            self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
+            self._notify(sid)
+            return self._entry(ino, os.lstat(upn))
+
+        def _notify(self, sid: str) -> None:
+            """Live-feedback seam: tell the UI a box's overlay changed so the Changes
+            view refreshes event-driven (NOT by polling). Called from the mutating
+            handlers; the handoff itself is thread-safe (see OverlayMount)."""
+            try: self.on_event(type="overlay_changed", sid=sid)
+            except Exception: pass
+
+    return MultiplexOverlayFs
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Overlay mount manager — owns the single pyfuse3 mount on a trio thread.
+#
+#  The pyfuse3 serve loop runs on trio in a dedicated background thread of the UI
+#  process; the Textual UI + mitmproxy run on asyncio in the main thread. The two
+#  loops cannot share a thread, so the serving thread does all FUSE I/O and hands
+#  events to the UI thread-safely (a thread-safe queue drained via an asyncio
+#  callback). Index/RAM mutations are single-writer on the serving thread.
+# ════════════════════════════════════════════════════════════════════════════
+
+class OverlayMount:
+    def __init__(self, mountpoint: Path, lower: str = "/"):
+        self.mountpoint = Path(mountpoint)
+        self.lower = lower
+        self.ops = None
+        self._thread = None
+        self._started = threading.Event()
+        self._start_error = None
+        self._stop_trio = None       # set to a trio Event from inside the loop
+        self._trio_token = None
+        self.event_q: "queue.Queue" = queue.Queue()
+
+    def _on_ops_event(self, **ev) -> None:
+        # called from the trio serving thread; hand off to the UI thread-safely
+        self.event_q.put(ev)
+
+    def start(self) -> bool:
+        """Mount the single overlay and start serving. Blocks until the serve loop is
+        actually up (or failed). Returns True on success. Fail-closed (R5): a mount
+        failure is reported, never swallowed."""
+        try:
+            self.mountpoint.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            self._start_error = e; return False
+        make_ops = _build_overlay_ops()
+        self.ops = make_ops(self.lower, on_event=self._on_ops_event)
+        self._thread = threading.Thread(target=self._run, name="overlay-fuse",
+                                        daemon=True)
+        self._thread.start()
+        self._started.wait(timeout=30)
+        if self._start_error is not None:
+            return False
+        return self._started.is_set()
+
+    def _run(self) -> None:
+        import pyfuse3, trio
+        fuse_options = set(pyfuse3.default_options)
+        fuse_options.add("fsname=slopbox")
+        # same uid as the mounter -> no allow_other needed; do NOT set
+        # default_permissions (we report squash ownership ourselves).
+        try:
+            pyfuse3.init(self.ops, str(self.mountpoint), fuse_options)
+        except Exception as e:
+            self._start_error = e
+            self._started.set()
+            return
+
+        async def _main():
+            self._trio_token = trio.lowlevel.current_trio_token()
+            self._stop_trio = trio.Event()
+            async with trio.open_nursery() as nursery:
+                nursery.start_soon(pyfuse3.main)
+                # R6-analogue: signal "serving" only after the loop is running.
+                self._started.set()
+                await self._stop_trio.wait()
+                # tear down: unmount so pyfuse3.main returns
+                pyfuse3.close(unmount=True)
+        try:
+            trio.run(_main)
+        except Exception as e:
+            if self._start_error is None:
+                self._start_error = e
+            self._started.set()
+        finally:
+            try: pyfuse3.close(unmount=True)
+            except Exception: pass
+
+    def add_session(self, sid: str, up: Path, index: "Index") -> None:
+        if self.ops is not None:
+            self.ops.add_session(sid, up, index)
+
+    def remove_session(self, sid: str) -> None:
+        if self.ops is not None:
+            self.ops.remove_session(sid)
+
+    def add_ca_spoof(self, sid: str, ca_bytes: bytes, bundle_paths) -> None:
+        """Register the CA-augmented trust bundle as virtual files for this session
+        (spec §7): the box sees system_ca + our mitmproxy CA at every bundle path,
+        but the augmented bytes are invisible to consolidate (no on-disk artifact)."""
+        if self.ops is None: return
+        for p in bundle_paths:
+            lp = Path(p)
+            try:
+                if not lp.is_file(): continue
+                base = lp.read_bytes()
+            except OSError:
+                continue
+            sep = b"" if base.endswith(b"\n") else b"\n"
+            self.ops.add_virtual(sid, p.lstrip("/"), base + sep + b"\n" + ca_bytes)
+
+    def inflight_age(self):
+        return self.ops.inflight_age() if self.ops else None
+
+    def stop(self) -> None:
+        """Stop serving and unmount. Lazy-unmount as a fallback so the mount table is
+        clean even if the loop is wedged (spec §9 watchdog)."""
+        ev = self._stop_trio; token = self._trio_token
+        if ev is not None and token is not None:
+            try:
+                import trio
+                trio.from_thread.run_sync(ev.set, trio_token=token)
+            except Exception:
+                pass
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+        # lazy-unmount fallback (recovers the mount table even if wedged)
+        try:
+            if os.path.ismount(str(self.mountpoint)):
+                subprocess.run(["fusermount3", "-uz", str(self.mountpoint)],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               timeout=10)
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
 
 
 def upper_has_changes(up: Path) -> bool:
