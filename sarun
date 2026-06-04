@@ -109,9 +109,6 @@ def runtime_home() -> Path:
     base = os.environ.get("XDG_RUNTIME_DIR")
     return Path(base) / "slopbox" if base else data_home()
 
-SHM_ROOT       = Path("/dev/shm")
-SHM_PREFIX     = "slopbox."
-
 def live_home() -> Path:
     """Per-session overlay backing: live/<sid>/{up,index.db}. Holds provenance, so
     it is created mode 0700. Replaces the old /dev/shm/slopbox.<sid> overlay dirs."""
@@ -177,6 +174,24 @@ def sync_send(sock_path: str, timeout: float = 5.0, **msg: Any) -> None:
             s.sendall((json.dumps(msg) + "\n").encode())
     except OSError:
         pass
+
+def sync_request(sock_path: str, timeout: float = 30.0, **msg: Any) -> "dict | None":
+    """Send one control message and wait for a single newline-JSON reply. Used by the
+    runner to register a session and block until the UI has created live/<sid> and
+    exposed <mnt>/<sid> (so the bwrap bind target exists). None on any failure."""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout); s.connect(sock_path)
+            s.sendall((json.dumps(msg) + "\n").encode())
+            buf = b""
+            while b"\n" not in buf:
+                chunk = s.recv(4096)
+                if not chunk: break
+                buf += chunk
+            line = buf.split(b"\n", 1)[0]
+            return json.loads(line.decode()) if line.strip() else None
+    except (OSError, json.JSONDecodeError):
+        return None
 
 def ui_is_running(sock_path: str) -> bool:
     try:
@@ -701,6 +716,15 @@ def _sqlar_put_file(conn, name, content: bytes, mode, mtime) -> None:
     data, sz = (comp, len(content)) if len(comp) < len(content) else (content, len(content))
     conn.execute("INSERT OR REPLACE INTO sqlar VALUES(?,?,?,?,?)",
                  (name, int(mode), int(mtime), sz, sqlite3.Binary(data)))
+
+def _sqlar_put_provenance(conn, name, prov: dict) -> None:
+    """Record who wrote a change (spec §11) in a side `provenance` table — invisible
+    to standard sqlar tooling, the headline capability fuse-overlayfs can't provide."""
+    conn.execute("CREATE TABLE IF NOT EXISTS provenance"
+                 "(path TEXT PRIMARY KEY, pid INT, ppid INT, exe TEXT, argv TEXT)")
+    conn.execute("INSERT OR REPLACE INTO provenance VALUES(?,?,?,?,?)",
+                 (name, int(prov.get("pid") or 0), int(prov.get("ppid") or 0),
+                  prov.get("exe") or "", json.dumps(prov.get("argv") or [])))
 
 def _sqlar_put_symlink(conn, name, target: bytes, mtime) -> None:
     conn.execute("INSERT OR REPLACE INTO sqlar VALUES(?,?,?,?,?)",
@@ -2276,19 +2300,29 @@ def _try_fold_patch(rel, ap, host, files) -> bool:
     files[rel] = fp
     return True
 
-def consolidate(shm_dir, session_id: str, cmd: list) -> None:
-    """Empty the /dev/shm overlay into on-disk state: text create/modify folds into
-    the patch (<sid>.patch.xz), everything else a patch can't hold — binary files,
-    symlinks and deletions/tombstones — goes into the sqlar archive (<sid>.sqlar)
-    next to it. Afterwards the overlay holds nothing reviewable, so the caller can
-    free the /dev/shm tree. Idempotent and additive; a file lands in exactly one of
-    overlay / patch / sqlar.
+def _open_index_ro(shm_dir) -> "Index | None":
+    """Open the session's index.db read-only-ish for consolidate. None if absent."""
+    db = Path(shm_dir) / "index.db"
+    if not db.exists(): return None
+    try: return Index(Path(shm_dir))
+    except sqlite3.Error: return None
+
+def consolidate(shm_dir, session_id: str, cmd: list, index: "Index | None" = None) -> None:
+    """Empty a finished session's overlay (live/<sid>) into on-disk state: text
+    create/modify folds into the patch (<sid>.patch.xz); binary files and symlinks go
+    into the sqlar archive (<sid>.sqlar). Deletions and opaque-dir expansions come
+    from index.db (NOT from char-device whiteouts / .wh..opq scanning — those never
+    exist in this overlay; R13/R14). Writer provenance per path is carried into the
+    sqlar `provenance` table (spec §11). Afterwards the upper holds nothing
+    reviewable, so the caller can free the backing tree. Idempotent and additive.
 
     File rules are consulted first, top-to-bottom: a matching 'apply' writes the
     change to the host and drops it, a matching 'discard' just drops it — either way
     it reaches neither store."""
     upper = Path(shm_dir) / "up"
     if not upper.is_dir(): return
+    own_index = index is None
+    idx = index if index is not None else _open_index_ro(shm_dir)
     frules = load_file_rules()
     pp = patch_path(session_id)
     files = {}
@@ -2300,12 +2334,22 @@ def consolidate(shm_dir, session_id: str, cmd: list) -> None:
         nonlocal sq
         if sq is None: sq = _sqlar_open(sqlar_path(session_id))
         return sq
+    def _prov(rel):
+        return idx.writer_provenance(rel) if idx is not None else None
     moved = []
+    # 1) created/modified files + symlinks in the upper (dirs are structural).
     paths = []
     for root, _dirs, names in os.walk(upper, onerror=lambda _e: None):
         for nm in names:
-            if not _is_overlay_marker(nm): paths.append(Path(root) / nm)
-    for ap in sorted(paths):
+            paths.append(Path(root) / nm)
+        # symlinks-to-dirs show up in _dirs from os.walk? No — os.walk lists symlinks
+        # to dirs under dirs and does not descend; capture them explicitly.
+    # also catch symlinks that point at directories (os.walk would list them as dirs)
+    for root, dirs, _names in os.walk(upper, onerror=lambda _e: None):
+        for d in dirs:
+            p = Path(root) / d
+            if p.is_symlink(): paths.append(p)
+    for ap in sorted(set(paths)):
         rel = str(ap.relative_to(upper))
         act = frules.decide(rel)                         # apply / discard / None
         if act == "discard":
@@ -2316,23 +2360,50 @@ def consolidate(shm_dir, session_id: str, cmd: list) -> None:
         if rel in files: continue                        # already in the patch
         host = Path("/") / rel
         try:
-            if is_whiteout(ap):                          # deletion → sqlar tombstone
-                if host.exists() or host.is_symlink():
-                    _sqlar_put_tombstone(_sq(), rel)
-                # a whiteout over nothing is a no-op; just drop it
-            elif ap.is_symlink():
+            if ap.is_symlink():
                 _sqlar_put_symlink(_sq(), rel,
                                    os.readlink(ap).encode("utf-8", "surrogateescape"),
                                    ap.lstat().st_mtime)
+                p = _prov(rel)
+                if p: _sqlar_put_provenance(_sq(), rel, p)
             elif ap.is_file():
                 if not _try_fold_patch(rel, ap, host, files):   # not clean text
                     st = ap.stat()
                     _sqlar_put_file(_sq(), rel, ap.read_bytes(), st.st_mode, st.st_mtime)
+                    p = _prov(rel)
+                    if p: _sqlar_put_provenance(_sq(), rel, p)
             else:
                 continue                                 # dirs handled by cleanup
         except OSError:
             continue
         moved.append(ap)
+    # 2) deletions (whiteouts) from the index -> sqlar tombstones.
+    if idx is not None:
+        for rel in idx.deletions():
+            if frules.decide(rel) == "discard": continue
+            host = Path("/") / rel
+            if frules.decide(rel) == "apply":
+                try:
+                    if host.is_dir() and not host.is_symlink(): shutil.rmtree(host)
+                    elif host.exists() or host.is_symlink(): host.unlink()
+                except OSError: pass
+                continue
+            if host.exists() or host.is_symlink():
+                _sqlar_put_tombstone(_sq(), rel)
+                p = _prov(rel)
+                if p: _sqlar_put_provenance(_sq(), rel, p)
+        # 3) opaque dirs: expand into per-lower-child tombstones for children not
+        #    re-materialized in the upper (spec §11/§12).
+        for drel in idx.opaque_dirs():
+            lower = Path("/") / drel
+            if not lower.is_dir(): continue
+            for lroot, ldirs, lfiles in os.walk(lower, onerror=lambda _e: None):
+                for nm in ldirs + lfiles:
+                    crel = os.path.relpath(os.path.join(lroot, nm), "/")
+                    if (upper / crel).exists() or (upper / crel).is_symlink():
+                        continue                          # re-materialized in upper
+                    if frules.decide(crel) in ("apply", "discard"): continue
+                    _sqlar_put_tombstone(_sq(), crel)
     if files:
         write_patch_file(pp, serialize_patch(files), cmd)
     elif pp.exists():
@@ -2341,6 +2412,8 @@ def consolidate(shm_dir, session_id: str, cmd: list) -> None:
         sq.commit(); sq.close(); set_cmd_xattr(sqlar_path(session_id), cmd)
     for ap in moved:
         remove_upper_entry(ap); cleanup_dirs(upper, ap.parent)
+    if own_index and idx is not None:
+        idx.close()
 
 def _pid_alive(pid: int) -> bool:
     if not pid: return False
@@ -2381,24 +2454,13 @@ def rm_rf(path) -> None:
         try: os.chmod(path, 0o700); os.rmdir(path)
         except OSError: pass
 
-def fuse_unmount(merged: str) -> None:
-    if not os.path.ismount(merged):
-        return
-    for tool in ("fusermount3", "fusermount"):
-        try:
-            subprocess.run([tool, "-u", merged], stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL, timeout=10)
-            if not os.path.ismount(merged):
-                return
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            continue
 
 
 @dataclass
 class Session:
     session_id: str                # "YYYYmmdd-HHMMSS_PID" — the whole identity
     cmd: list
-    shm_dir: str = ""
+    shm_dir: str = ""              # the session backing dir: live/<sid> (up + index.db)
     status: str = "running"
     exit_code: "int | None" = None
     conn_allowed: int = 0
@@ -2420,7 +2482,7 @@ class Session:
     @property
     def upper(self) -> str: return str(Path(self.shm_dir) / "up")
     @property
-    def merged(self) -> str: return str(Path(self.shm_dir) / "merged")
+    def index_db(self) -> str: return str(Path(self.shm_dir) / "index.db")
     def to_dict(self) -> dict:
         d = {k: v for k, v in asdict(self).items() if k != "sess_rules"}
         d["sess_rules"] = [r.to_line() for r in self.sess_rules]
@@ -2430,13 +2492,15 @@ class Session:
 
 
 def discover_sessions() -> dict:
-    """Find sessions purely from filesystem names: slopbox.<sid> overlay dirs plus
-    <sid>.patch.xz and <sid>.sqlar under state_home. All but the command is in <sid>."""
+    """Find sessions purely from filesystem names: live/<sid> backing dirs (an
+    un-consolidated/orphaned overlay) plus <sid>.patch.xz / <sid>.sqlar / <sid>.flows
+    under state_home. All but the command is in <sid>."""
     out = {}
-    if SHM_ROOT.exists():
-        for d in SHM_ROOT.glob(SHM_PREFIX + "*"):
-            if not (d / "up").is_dir(): continue          # not a slopbox overlay
-            sid = d.name[len(SHM_PREFIX):]
+    lh = live_home()
+    if lh.exists():
+        for d in lh.iterdir():
+            if not (d / "up").is_dir(): continue          # not a slopbox backing dir
+            sid = d.name
             out[sid] = Session(
                 session_id=sid, cmd=get_cmd_xattr(d), shm_dir=str(d),
                 status="running" if _pid_alive(parse_sid(sid)[1]) else "finished",
@@ -2448,7 +2512,7 @@ def discover_sessions() -> dict:
             if s is None:
                 s = out[sid] = Session(
                     session_id=sid, cmd=get_cmd_xattr(src),
-                    shm_dir=str(SHM_ROOT / (SHM_PREFIX + sid)),
+                    shm_dir=str(live_dir(sid)),
                     status="finished", live=False)
             return s
         for pf in sd.glob("*.patch.xz"):
@@ -2472,8 +2536,10 @@ class Pending:
     cnames: list = field(default_factory=list)
 
 class Supervisor:
-    def __init__(self, rules: Rules):
+    def __init__(self, rules: Rules, mount: "OverlayMount | None" = None):
         self.rules = rules
+        self.mount = mount               # the single pyfuse3 OverlayMount (UI-owned)
+        self.indexes: dict = {}          # sid -> live Index (for running sessions)
         self.sessions: dict = {}
         self.pending: dict = {}
         self.patches: dict = {}          # sid -> {files, dirty, touched, mtime}
@@ -2484,6 +2550,28 @@ class Supervisor:
         self.sessions.update(discover_sessions())
 
     def _emit(self, **ev: Any) -> None: self.on_event(ev)
+
+    def sweep_orphans(self) -> None:
+        """At UI startup, consolidate-or-leave each orphaned live/<sid> from a prior
+        crash: its runner is gone, so fold its overlay into patch/sqlar (deletions
+        and opacity come from its index.db) and remove the spent backing tree. Leaves
+        live/ empty at rest for any session that had no reviewable changes."""
+        lh = live_home()
+        if not lh.exists(): return
+        for d in sorted(lh.iterdir()):
+            if not (d / "up").is_dir(): continue
+            sid = d.name
+            if _pid_alive(parse_sid(sid)[1]): continue   # a running runner owns it
+            try:
+                consolidate(str(d), sid, get_cmd_xattr(d))
+            except Exception as e:
+                print(f"slopbox(ui): sweep of {sid} failed: {e}", file=sys.stderr)
+                continue
+            try:
+                if not upper_has_changes(d / "up"):
+                    rm_rf(d)
+            except OSError:
+                pass
 
     def rescan(self) -> None:
         disk = discover_sessions()
@@ -2565,28 +2653,93 @@ class Supervisor:
         s.bytes_up += bytes_up; s.bytes_down += bytes_down
         self._emit(type="session_updated", session=s.to_dict())
 
-    def register(self, msg: dict) -> None:
+    def register(self, msg: dict) -> dict:
+        """Set up a box's overlay and expose it as a mount subfolder. Returns the ack
+        dict the ChannelServer sends back to the runner: the absolute <mnt>/<sid>
+        bind target, so the runner can bwrap onto it. Fail-closed: any setup error is
+        reported in the ack, never swallowed (R5)."""
         sid = msg["session_id"]
-        s = Session(session_id=sid, cmd=msg["cmd"], shm_dir=msg["shm_dir"],
+        cmd = msg.get("cmd", [])
+        if self.mount is None or self.mount.ops is None:
+            return dict(ok=False, error="overlay mount is not available")
+        backing = live_dir(sid)
+        up = backing / "up"
+        try:
+            # 0700: live/<sid> holds provenance (R8).
+            old = os.umask(0o077)
+            try:
+                backing.mkdir(parents=True, exist_ok=True)
+                up.mkdir(parents=True, exist_ok=True)
+            finally:
+                os.umask(old)
+            os.chmod(backing, 0o700)
+            set_cmd_xattr(backing, list(cmd))
+            index = Index(backing)
+        except (OSError, sqlite3.Error) as e:
+            return dict(ok=False, error=f"overlay setup failed: {e}")
+        self.indexes[sid] = index
+        self.mount.add_session(sid, up, index)
+        # CA-augmented trust bundle as virtual files (spec §7), if networked.
+        net = bool(msg.get("want_net"))
+        if net:
+            try:
+                ca = CA_CERT.read_bytes() if CA_CERT.exists() else b""
+            except OSError:
+                ca = b""
+            if ca.strip():
+                self.mount.add_ca_spoof(sid, ca, SYSTEM_CA_FILES)
+        box_root = str(mnt_point() / sid)
+        s = Session(session_id=sid, cmd=cmd, shm_dir=str(backing),
                     status="running", live=True)
         for h in msg.get("session_whitelist", []):
             s.sess_rules.append(Rule("allow", "host", h))
         self.sessions[sid] = s
+        self._consolidated.discard(sid)
         self._emit(type="session_added", session=s.to_dict())
+        return dict(ok=True, mount=box_root, shm_dir=str(backing), net=net)
 
     def unregister(self, msg: dict) -> None:
-        s = self.sessions.get(msg["session_id"])
-        if not s: return
+        sid = msg["session_id"]
+        s = self.sessions.get(sid)
+        # Teardown: remove the box from the live mount set, consolidate its overlay
+        # (deletions/opacity from index.db, provenance into the sqlar), then drop the
+        # backing tree. live/ + the synthetic root are empty at rest. Fail-closed on
+        # the security-critical teardown — log, don't silently pass.
+        if self.mount is not None:
+            self.mount.remove_session(sid)
+        index = self.indexes.pop(sid, None)
+        backing = live_dir(sid)
+        if backing.exists():
+            try:
+                consolidate(str(backing), sid, list(s.cmd) if s else get_cmd_xattr(backing),
+                            index=index)
+            except Exception as e:
+                print(f"slopbox(ui): consolidate {sid} failed: {e}", file=sys.stderr)
+        if index is not None:
+            index.close()
+        try:
+            if not (backing.exists() and upper_has_changes(backing / "up")):
+                rm_rf(backing)
+        except OSError:
+            pass
+        if not s:
+            return
         s.live = False
         if s.status == "running": s.status = msg.get("status", "finished")
         s.exit_code = msg.get("exit_code")
-        # The runner consolidated on the way out; pick up the patch it just wrote
-        # (and mark this session as already-consolidated so we don't redo it).
-        self.patches.pop(s.session_id, None)
-        s.has_patch = patch_path(s.session_id).exists()
-        s.has_sqlar = sqlar_path(s.session_id).exists()
-        self._consolidated.add(s.session_id)
-        self._emit(type="session_updated", session=s.to_dict())
+        self.patches.pop(sid, None)
+        s.has_patch = patch_path(sid).exists()
+        s.has_sqlar = sqlar_path(sid).exists()
+        s.has_flows = flows_path(sid).exists()
+        self._consolidated.add(sid)
+        # nothing reviewable at all -> drop the entry entirely
+        if not (s.has_patch or s.has_sqlar or s.has_flows
+                or (backing.exists() and upper_has_changes(backing / "up"))):
+            self.sessions.pop(sid, None)
+            self._emit(type="session_removed", session_id=sid)
+        else:
+            s.shm_dir = str(backing)
+            self._emit(type="session_updated", session=s.to_dict())
 
     def drop(self, msg: dict) -> None:
         # Runner reports the session left nothing to review; remove it outright.
@@ -2680,8 +2833,15 @@ class Supervisor:
         s = self.sessions.get(sid)
         if not s: return
         if _pid_alive(s.pid) and s.live: return
+        # detach from the live mount if it was somehow still attached, close the
+        # index, and remove the backing tree + all on-disk stores.
+        if self.mount is not None:
+            self.mount.remove_session(sid)
+        idx = self.indexes.pop(sid, None)
+        if idx is not None:
+            try: idx.close()
+            except Exception: pass
         if s.shm_dir:
-            fuse_unmount(s.merged)
             rm_rf(s.shm_dir)
         for f in (patch_path(sid), sqlar_path(sid), flows_path(sid)):
             if f.exists():
@@ -2699,75 +2859,74 @@ class Supervisor:
     # large lower tree; cap it so the review list can't be flooded.
     _OPAQUE_DELETE_CAP = 500
 
+    def _index_for(self, sid) -> "Index | None":
+        """The session's overlay index: the live one for a running box, else one
+        opened on its backing dir. The live-change listing reads the box's upper
+        plus this index (deletions/opacity), per the spec — not whiteout scanning."""
+        idx = self.indexes.get(sid)
+        if idx is not None: return idx
+        s = self.sessions.get(sid)
+        if s and s.shm_dir:
+            db = Path(s.shm_dir) / "index.db"
+            if db.exists():
+                try: return Index(Path(s.shm_dir))
+                except sqlite3.Error: return None
+        return None
+
     def overlay_entries(self, sid) -> list:
         s = self.sessions.get(sid)
         if not s: return []
         upper = Path(s.upper)
         if not upper.exists(): return []
-        # Walk by hand so an unreadable subtree can't abort the whole listing.
+        idx = self.indexes.get(sid)        # only the live in-RAM index (no reopen)
+        entries: dict = {}            # rel -> entry
+        # 1) created/modified files + symlinks present in the upper.
         paths = []
-        opaque_dirs = set()           # upper dirs the overlay marked opaque
         for root, dirs, files in os.walk(upper, onerror=lambda _e: None):
             rootp = Path(root)
-            for nm in dirs + files:
-                paths.append(rootp / nm)
-
-        entries: dict = {}            # rel -> entry (so opacity can't duplicate)
-        for ap in sorted(paths):
-            name = ap.name
-            if _is_overlay_marker(name):
-                opaque_dirs.add(ap.parent)     # this dir fully shadows the lower
-                continue
-            if name.startswith(".wh.") and not name.startswith(".wh..wh."):
-                # aufs-style whiteout file: a deletion of the un-prefixed name
-                rel = str((ap.parent / name[len(".wh."):]).relative_to(upper))
-                entries[rel] = dict(path=rel, kind="deleted", size=0, is_text=False)
-                continue
+            for nm in files: paths.append(rootp / nm)
+            for nm in dirs:
+                p = rootp / nm
+                if p.is_symlink(): paths.append(p)
+        for ap in sorted(set(paths)):
             try:
-                whiteout = self._is_whiteout(ap); is_dir = ap.is_dir()
+                if ap.is_dir() and not ap.is_symlink(): continue
             except OSError:
                 continue
-            if is_dir and not whiteout: continue
             rel = str(ap.relative_to(upper)); real = Path("/") / rel
-            if whiteout:
+            try: size = ap.stat().st_size if (ap.is_file() and not ap.is_symlink()) else 0
+            except OSError: size = 0
+            is_text = False
+            if size and size < (10 << 20):
+                try: ap.read_bytes()[:512].decode(); is_text = True
+                except (UnicodeDecodeError, OSError): pass
+            stale = False
+            exists = real.exists() or real.is_symlink()
+            if exists:
+                try: stale = real.lstat().st_mtime > ap.lstat().st_mtime
+                except OSError: stale = False
+            entries[rel] = dict(path=rel,
+                                kind="modified" if exists else "created",
+                                size=size, is_text=is_text, stale=stale)
+        # 2) deletions (whiteouts) + opaque-dir expansion from the index.
+        if idx is not None:
+            for rel in idx.deletions():
                 entries[rel] = dict(path=rel, kind="deleted", size=0,
                                     is_text=False, stale=False)
-            else:
-                try: size = ap.stat().st_size if ap.is_file() else 0
-                except OSError: size = 0
-                is_text = False
-                if size and size < (10 << 20):
-                    try: ap.read_bytes()[:512].decode(); is_text = True
-                    except (UnicodeDecodeError, OSError): pass
-                # "stale" = the host file is newer than our captured copy, so
-                # applying would overwrite newer host data with an older version.
-                stale = False
-                exists = real.exists()
-                if exists:
-                    try: stale = real.stat().st_mtime > ap.stat().st_mtime
-                    except OSError: stale = False
-                entries[rel] = dict(path=rel,
-                                    kind="modified" if exists else "created",
-                                    size=size, is_text=is_text, stale=stale)
-
-        # An opaque upper directory hides everything the lower had there. If the
-        # lower really had files, those are effectively deleted — show them so,
-        # unless the upper resurrected them with the same path.
-        added = 0
-        for d in opaque_dirs:
-            if added >= self._OPAQUE_DELETE_CAP: break
-            drel = d.relative_to(upper)
-            lower = Path("/").joinpath(*drel.parts)
-            if not lower.is_dir(): continue        # nothing existed below -> new dir
-            for lroot, ldirs, lfiles in os.walk(lower, onerror=lambda _e: None):
-                for nm in ldirs + lfiles:
-                    rel = os.path.relpath(os.path.join(lroot, nm), "/")
-                    if rel in entries: continue    # kept/recreated in the upper
-                    entries[rel] = dict(path=rel, kind="deleted",
-                                        size=0, is_text=False)
-                    added += 1
-                    if added >= self._OPAQUE_DELETE_CAP: break
+            added = 0
+            for drel in idx.opaque_dirs():
                 if added >= self._OPAQUE_DELETE_CAP: break
+                lower = Path("/") / drel
+                if not lower.is_dir(): continue
+                for lroot, ldirs, lfiles in os.walk(lower, onerror=lambda _e: None):
+                    for nm in ldirs + lfiles:
+                        rel = os.path.relpath(os.path.join(lroot, nm), "/")
+                        if rel in entries: continue
+                        entries[rel] = dict(path=rel, kind="deleted",
+                                            size=0, is_text=False)
+                        added += 1
+                        if added >= self._OPAQUE_DELETE_CAP: break
+                    if added >= self._OPAQUE_DELETE_CAP: break
         return [entries[k] for k in sorted(entries)]
 
     def overlay_diff(self, sid, rel) -> dict:
@@ -2952,11 +3111,16 @@ class Supervisor:
         s = self.sessions.get(sid)
         if not s: return dict(discarded=[], errors=[{"error": "no session"}])
         upper = Path(s.upper)
+        idx = self.indexes.get(sid)        # live index (deletions live here, not upper)
         paths = paths or [e["path"] for e in self.overlay_entries(sid)]
         discarded, errors = [], []
         for rel in paths:
-            p = upper / rel
+            r = rel.lstrip("/")
+            p = upper / r
             try:
+                # drop an index-recorded whiteout (a deletion the box made)
+                if idx is not None and idx.kind_of(r) == "whiteout":
+                    idx.del_entry(r, op="discard_whiteout")
                 self._remove_upper_entry(p)
                 self._cleanup_dirs(upper, p.parent)
                 discarded.append(rel)
@@ -3038,14 +3202,20 @@ class Supervisor:
 
     def _ensure_consolidated(self, sid) -> None:
         """Fold a finished session's overlay into its patch the first time we look
-        at it — the same consolidation the runner does, but for sessions that were
-        already sitting on disk (or whose runner never got to it). Never touches a
-        live/running session (its overlay is still moving)."""
+        at it — the same consolidation unregister does, but for orphaned sessions
+        sitting on disk (e.g. a crashed runner). Never touches a live/running session
+        (its overlay is still moving and its index is owned by the serve loop)."""
         if sid in self._consolidated: return
         s = self.sessions.get(sid)
         if not s or s.live or _pid_alive(s.pid): return
         self._consolidated.add(sid)
         if not (s.shm_dir and Path(s.shm_dir).exists()): return
+        # a leftover live index handle (shouldn't exist for a non-live session) —
+        # close it so consolidate opens a clean one.
+        idx = self.indexes.pop(sid, None)
+        if idx is not None:
+            try: idx.close()
+            except Exception: pass
         try:
             consolidate(s.shm_dir, sid, s.cmd)
         except Exception:
@@ -3054,11 +3224,11 @@ class Supervisor:
         s.has_patch = patch_path(sid).exists()
         s.has_sqlar = sqlar_path(sid).exists()
         # consolidate() empties the overlay (text → patch, the rest → sqlar), so the
-        # /dev/shm tree is now spent — free it; the on-disk stores are the record.
+        # backing tree is now spent — free it; the on-disk stores are the record.
         try: empty = not upper_has_changes(Path(s.upper))
         except OSError: empty = False
         if empty:
-            fuse_unmount(s.merged); rm_rf(s.shm_dir)
+            rm_rf(s.shm_dir)
 
     # ─── sqlar layer (binary files, symlinks, deletions a patch can't hold) ──
     def _sqlar_entries(self, sid) -> list:
@@ -3464,18 +3634,32 @@ class ChannelServer:
                 conn.close()
                 await self.engine.handle_fd(fds[0], sid)
                 return
-            # Control client: first line is JSON; keep reading lines.
+            # Control client: first line is JSON; keep reading lines. A control
+            # message may produce a reply (register acks with the mount path); we
+            # write it back on the same connection so the runner can block on it.
             buf = msg
             while True:
                 if b"\n" in buf:
                     line, buf = buf.split(b"\n", 1)
                     if line.strip():
-                        self._dispatch_control(line)
+                        reply = self._dispatch_control(line)
+                        if reply is not None:
+                            try:
+                                await self._loop.sock_sendall(
+                                    conn, (json.dumps(reply) + "\n").encode())
+                            except OSError:
+                                pass
                     continue
                 more = await self._loop.sock_recv(conn, 4096)
                 if not more:
                     if buf.strip():
-                        self._dispatch_control(buf)
+                        reply = self._dispatch_control(buf)
+                        if reply is not None:
+                            try:
+                                await self._loop.sock_sendall(
+                                    conn, (json.dumps(reply) + "\n").encode())
+                            except OSError:
+                                pass
                     break
                 buf += more
         except (OSError, asyncio.CancelledError):
@@ -3491,13 +3675,18 @@ class ChannelServer:
         finally:
             conn.setblocking(False)
 
-    def _dispatch_control(self, line: bytes) -> None:
+    def _dispatch_control(self, line: bytes) -> "dict | None":
         try: msg = json.loads(line.decode())
-        except json.JSONDecodeError: return
+        except json.JSONDecodeError: return None
         t = msg.get("type")
-        if t == "register": self.sup.register(msg)
+        if t == "register":
+            try:
+                return self.sup.register(msg)          # acks with the mount path
+            except Exception as e:
+                return dict(ok=False, error=str(e))
         elif t == "unregister": self.sup.unregister(msg)
         elif t == "remove": self.sup.drop(msg)
+        return None
 
     async def stop(self) -> None:
         if getattr(self, "_task", None):
@@ -3550,36 +3739,11 @@ def primary_ca_path() -> "str | None":
         if Path(f).is_file(): return f
     return None
 
-def build_cert_layer(dest: Path, ca_cert: Path) -> "str | None":
-    """Build an overlay *lower* layer that appends our mitmproxy CA to every system
-    trust bundle present on the host. Used as an extra read-only lowerdir under the
-    slopbox root, so TLS verification succeeds for everything that reads the system
-    store (git, curl, openssl, wget, python's ssl, …) — git in particular ignores
-    CURL_CA_BUNDLE and only trusts its compiled-in bundle, which this patches.
-
-    It is a lower layer on purpose: the modified bundles never appear in the review
-    upper, so they are not mistaken for changes the program made. Returns the layer
-    dir (to put first in lowerdir=…:/) or None if there was nothing to add."""
-    try: ca = ca_cert.read_bytes()
-    except OSError: return None
-    if not ca.strip(): return None
-    made = False
-    for sysf in SYSTEM_CA_FILES:
-        src = Path(sysf)
-        try:
-            if not src.is_file(): continue          # follows symlinks to the real file
-            base = src.read_bytes()
-        except OSError:
-            continue
-        out = dest / sysf.lstrip("/")
-        try:
-            out.parent.mkdir(parents=True, exist_ok=True)
-            sep = b"" if base.endswith(b"\n") else b"\n"
-            out.write_bytes(base + sep + b"\n" + ca)
-            made = True
-        except OSError:
-            continue
-    return str(dest) if made else None
+# The CA-augmented trust bundle is no longer a lower overlay layer. The overlay
+# engine synthesizes it as a *virtual file* at each system bundle path (see
+# OverlayMount.add_ca_spoof / MultiplexOverlayFs virtual files, spec §7): the box
+# sees system CA + our mitmproxy CA there, but the augmented bytes have no on-disk
+# artifact in either layer, so they stay invisible to change review.
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -3604,37 +3768,53 @@ def cmd_run(cmd, no_net, session_whitelist, chdir) -> int:
     if not cmd:
         print("slopbox: no command given", file=sys.stderr); return 2
 
-    # The session id is the whole identity: timestamp + our pid. It names the
-    # overlay dir (slopbox.<sid>) and, later, the patch (<sid>.patch.xz). The only
-    # other thing kept is the command, in the dir's user.slopbox.cmd xattr.
-    sid = make_sid()
-    shm_dir = SHM_ROOT / (SHM_PREFIX + sid)
-    try:
-        shm_dir.mkdir()
-    except FileExistsError:
-        sid = sid + "." + uuid.uuid4().hex[:6]   # absurdly unlikely; stay unique
-        shm_dir = SHM_ROOT / (SHM_PREFIX + sid); shm_dir.mkdir()
-    up = shm_dir / "up"; work = shm_dir / "work"; merged = shm_dir / "merged"
-    for d in (up, work, merged): d.mkdir()
-    set_cmd_xattr(shm_dir, list(cmd))
+    # The UI is now the mount provider: it owns the single pyfuse3 overlay and
+    # exposes this box as a subfolder under it. So the UI MUST be running — fail
+    # fast and clearly otherwise. (We deliberately trade no-UI operation for live
+    # feedback + per-write policy; there is no run-without-UI path.)
+    if not ui_is_running(SOCK_PATH):
+        print("slopbox: the UI is not running.\n"
+              "  The UI owns the overlay mount that the slopbox binds as its root,\n"
+              "  so a slopbox cannot run without it. Start the UI first:\n"
+              "      slopbox            # (in another terminal)\n"
+              f"  (expected control socket: {SOCK_PATH})", file=sys.stderr)
+        return 3
 
-    have_ui = ui_is_running(SOCK_PATH)
     net = not no_net
-    can_net = net and have_ui and CA_CERT.exists()
+
+    # The session id is the whole identity: timestamp + our pid. It names the
+    # live/<sid> backing dir, the <mnt>/<sid> mount subfolder, and the patch
+    # (<sid>.patch.xz). The only other thing kept is the command (xattr).
+    sid = make_sid()
+
+    # Register with the UI and BLOCK until it has created live/<sid>, built the
+    # index, added the session to the mount, and exposed <mnt>/<sid> — only then
+    # does the bwrap bind target exist. The ack carries the absolute mount path.
+    ack = sync_request(SOCK_PATH, type="register", session_id=sid,
+                       cmd=list(cmd), session_whitelist=session_whitelist,
+                       want_net=net)
+    if not ack or not ack.get("ok") or not ack.get("mount"):
+        # collision on sid (same second + pid is impossible, but be safe) or the
+        # UI failed to set up the overlay — retry once with a unique suffix.
+        sid = sid + "." + uuid.uuid4().hex[:6]
+        ack = sync_request(SOCK_PATH, type="register", session_id=sid,
+                           cmd=list(cmd), session_whitelist=session_whitelist,
+                           want_net=net)
+        if not ack or not ack.get("ok") or not ack.get("mount"):
+            print("slopbox: the UI could not set up the overlay for this session"
+                  f"{(' — ' + ack['error']) if ack and ack.get('error') else ''}.",
+                  file=sys.stderr)
+            return 1
+    box_root = ack["mount"]                      # <mnt>/<sid>
+    shm_dir = ack.get("shm_dir", str(live_dir(sid)))
+    can_net = net and bool(ack.get("net")) and CA_CERT.exists()
 
     # Diagnostics go to stderr (never stdout) and only ever before/after the
-    # child runs, so the wrapped command's stdout stays clean and an interactive
-    # screen never gets garbled mid-run.
-    print(f"slopbox: {sid}  ({'net' if net else 'no-net'}, "
-          f"UI {'connected' if have_ui else 'absent'}"
+    # child runs, so the wrapped command's stdout stays clean.
+    print(f"slopbox: {sid}  ({'net' if net else 'no-net'}, UI connected"
           f"{'' if can_net else ' → no network'})", file=sys.stderr)
-    print(f"  overlay upper: {up}", file=sys.stderr)
+    print(f"  overlay root: {box_root}", file=sys.stderr)
 
-    # The slopbox runs as a foreground job so interactive programs can read the
-    # keyboard. The actual terminal hand-off happens *inside* the namespace (see
-    # run_inner) where process-group ids are namespace-local; out here we only
-    # remember the original foreground group as a safety net to restore on exit,
-    # and ignore SIGTTOU so that restore can't stop us once we've been backgrounded.
     tty_fd = next((fd for fd in (0, 1, 2) if os.isatty(fd)), None)
     old_fg_pgrp = None
     old_ttou = None
@@ -3643,36 +3823,22 @@ def cmd_run(cmd, no_net, session_whitelist, chdir) -> int:
         except OSError: old_fg_pgrp = None
         old_ttou = signal.signal(signal.SIGTTOU, signal.SIG_IGN)
 
-    fuse_mounted = False
     launched = False
     code = 1
 
     try:
-        # An extra read-only lower layer that teaches the slopbox's system trust
-        # store about our mitmproxy CA (so git/curl/openssl verify upstream that
-        # mitmproxy re-signed). It sits *below* the review upper, so the patched
-        # bundles are invisible to change review.
-        cert_layer = build_cert_layer(shm_dir / "certlow", CA_CERT) if can_net else None
-        lower = f"{cert_layer}:/" if cert_layer else "/"
-
-        # fuse-overlayfs root
-        fr = subprocess.run(
-            ["fuse-overlayfs", "-o", f"lowerdir={lower}", "-o", f"upperdir={up}",
-             "-o", f"workdir={work}", "-o", f"squash_to_uid={os.getuid()}",
-             "-o", f"squash_to_gid={os.getgid()}", str(merged)],
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-        if fr.returncode != 0 or not os.path.ismount(merged):
-            print("slopbox: fuse-overlayfs failed:",
-                  fr.stderr.decode(errors='replace').strip(), file=sys.stderr)
-            rm_rf(shm_dir); return 1
-        fuse_mounted = True
-
         # the inner forwarder needs the channel socket bound in; the channel is
         # the UI socket. We bind its directory in so connect() works.
         chan = SOCK_PATH if can_net else ""
 
+        # UNCHANGED bwrap security boundary: the ONLY difference from the old
+        # fuse-overlayfs path is the bind source — this box's mount subfolder
+        # instead of a per-box fuse-overlayfs `merged`. Every other flag is
+        # identical (own pid/ipc/uts/net ns, all caps dropped, runs as you). The
+        # bind-as-root confines the box to its subfolder; it cannot reach <mnt>/
+        # or another session's <sid>. No userns, no fd-passing, no inner mount.
         args = ["bwrap",
-                "--bind", str(merged), "/",
+                "--bind", str(box_root), "/",
                 "--proc", "/proc", "--dev", "/dev",
                 "--ro-bind-try", "/sys", "/sys",
                 "--tmpfs", "/tmp", "--tmpfs", "/run",
@@ -3688,11 +3854,12 @@ def cmd_run(cmd, no_net, session_whitelist, chdir) -> int:
             proxy = f"http://127.0.0.1:{INNER_PROXY_PORT}"
             for var in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
                 args += ["--setenv", var, proxy]
-            # The overlay already folded our CA into the system bundle, so point the
-            # bundle-based tools at that combined file (which holds the normal roots
-            # *and* ours). Fall back to the bare CA if no system bundle was found.
+            # The overlay synthesizes a CA-augmented trust bundle as a *virtual*
+            # file at each system bundle path (invisible to review), so point the
+            # bundle-based tools at the in-overlay system bundle path; fall back to
+            # the bare CA if no system bundle was found.
             primary = primary_ca_path()
-            cafile = primary if (cert_layer and primary) else str(CA_CERT)
+            cafile = primary if primary else str(CA_CERT)
             for var in ("REQUESTS_CA_BUNDLE", "SSL_CERT_FILE",
                         "CURL_CA_BUNDLE", "GIT_SSL_CAINFO"):
                 args += ["--setenv", var, cafile]
@@ -3703,21 +3870,10 @@ def cmd_run(cmd, no_net, session_whitelist, chdir) -> int:
         args += ["--", sys.executable, find_self(), "--inner",
                  "--channel", chan, "--sid", sid, "--", *cmd]
 
-        # Launch the slopbox in its own process group so it (and everything it
-        # spawns) can be foregrounded and killed as a unit. preexec_fn runs in the
-        # child between fork and exec; we also set it from the parent to close the
-        # race, then hand the terminal's foreground to that group.
         proc = subprocess.Popen(args, preexec_fn=os.setpgrp)
         launched = True
         try: os.setpgid(proc.pid, proc.pid)
         except OSError: pass
-
-        # The command is already on the overlay dir's xattr; the UI keys the session
-        # by <sid>, deriving start time and our pid from it for liveness/kill.
-        if have_ui:
-            sync_send(SOCK_PATH, type="register", session_id=sid,
-                      cmd=list(cmd), shm_dir=str(shm_dir),
-                      session_whitelist=session_whitelist)
 
         def _sig(_s, _f):
             try: os.killpg(proc.pid, signal.SIGTERM)
@@ -3737,45 +3893,16 @@ def cmd_run(cmd, no_net, session_whitelist, chdir) -> int:
         if old_ttou is not None:
             try: signal.signal(signal.SIGTTOU, old_ttou)
             except (OSError, ValueError): pass
-        if fuse_mounted:
-            fuse_unmount(str(merged))
 
-    if not launched:
-        rm_rf(shm_dir)
-        if have_ui:
-            sync_send(SOCK_PATH, type="unregister", session_id=sid,
-                      status="finished", exit_code=1)
-        return 1
-
-    # Empty the overlay into on-disk state: text → <sid>.patch.xz, the rest (binary,
-    # symlinks, deletions) → <sid>.sqlar. Afterwards the /dev/shm tree is spent.
-    try:
-        consolidate(str(shm_dir), sid, list(cmd))
-    except Exception as e:
-        print(f"slopbox: consolidation failed: {e}", file=sys.stderr)
-
-    has_overlay = upper_has_changes(up)
-    has_patch = patch_path(sid).exists()
-    has_sqlar = sqlar_path(sid).exists()
-    # The UI's proxy may have written a network log for this session; keep the
-    # entry if so, even when nothing touched the filesystem.
-    has_flows = flows_path(sid).exists()
-    if not has_overlay and not has_patch and not has_sqlar and not has_flows:
-        rm_rf(shm_dir)
-        if have_ui:
-            sync_send(SOCK_PATH, type="remove", session_id=sid)
-        print(f"slopbox: {sid} exited ({code}); no changes.", file=sys.stderr)
-        return code or 0
-
-    if not has_overlay:
-        rm_rf(shm_dir)          # consolidated: overlay emptied into patch + sqlar
-    if have_ui:
-        sync_send(SOCK_PATH, type="unregister", session_id=sid,
-                  status="finished", exit_code=code or 0)
-    where = (state_home() if not has_overlay else up)
-    print(f"slopbox: {sid} exited ({code}). Review changes in the UI, "
-          f"or: {where}", file=sys.stderr)
-    return code or 0
+    # Tell the UI we exited. The UI runs consolidate() on live/<sid>, removes
+    # <mnt>/<sid> from the live set, and deletes live/<sid>. (The runner does NOT
+    # consolidate: the UI owns the index/mount and the only live index handle.)
+    sync_send(SOCK_PATH, type="unregister", session_id=sid,
+              status="finished" if launched else "finished",
+              exit_code=(code or 0) if launched else 1)
+    print(f"slopbox: {sid} exited ({code if launched else 1}). "
+          f"Review changes in the UI.", file=sys.stderr)
+    return (code or 0) if launched else 1
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -4067,7 +4194,10 @@ def run_ui() -> int:
             self.view="boxes"
             self.rules_store=Rules(RULES_FILE)
             self.frules_store=FileRules(FILE_RULES_FILE)
-            self.sup=Supervisor(self.rules_store)
+            # The UI owns the single pyfuse3 overlay mount (started in on_mount on a
+            # dedicated trio thread). The Supervisor drives it as boxes come and go.
+            self.mount=OverlayMount(mnt_point(), lower="/")
+            self.sup=Supervisor(self.rules_store, mount=self.mount)
             self.sup.on_event=self._on_evt
             self.engine=None
             self.server=None
@@ -4107,11 +4237,22 @@ def run_ui() -> int:
             self.query_one("#cf-tab",DataTable).add_columns("","S","Path","Size")
             ensure_ca_cert()
             loop=asyncio.get_event_loop()
+            # Start the single pyfuse3 overlay mount on its dedicated trio thread.
+            # Until it is up, no slopbox can run (it has nowhere to bind its root).
+            mount_ok=self.mount.start()
+            # A prior crash may have left orphaned live/<sid> backings: fold them.
+            try: self.sup.sweep_orphans()
+            except Exception: pass
             self.engine=ProxyEngine(self.sup, loop,
                                     lambda coro: asyncio.ensure_future(coro))
             self.server=ChannelServer(self.sup, self.engine, SOCK_PATH)
             await self.server.start()
             msg = f"listening · {SOCK_PATH}"
+            if mount_ok:
+                msg += f"  ·  overlay {mnt_point()}"
+            else:
+                err=getattr(self.mount,"_start_error",None)
+                msg += f"  [red](overlay mount FAILED: {err} — slopboxes cannot run)[/]"
             if not self.engine.ready:
                 msg += "  [red](mitmproxy unavailable — no gating)[/]"
             self._status(msg)
@@ -4122,10 +4263,34 @@ def run_ui() -> int:
             self._rebuild_sessions()
             self._set_view("boxes")           # shows only the slopbox list + detail
             self.set_interval(3, self._tick)
+            # Live feedback: drain the overlay's thread-safe event queue often so the
+            # Changes view updates as the box writes (event-driven, NOT by polling
+            # /dev/shm). The serving thread enqueues; we apply on the UI thread.
+            self.set_interval(0.3, self._drain_overlay_events)
+
+        def _drain_overlay_events(self):
+            changed=set()
+            try:
+                while True:
+                    ev=self.mount.event_q.get_nowait()
+                    if ev.get("type")=="overlay_changed" and ev.get("sid"):
+                        changed.add(ev["sid"])
+            except queue.Empty:
+                pass
+            if not changed: return
+            # refresh the live change listing for the affected box if it's on screen
+            if self.view=="changes" and self._ch_sid in changed:
+                self._load_changes(self._ch_sid, force=True)
+            if self.view=="boxes" and self._ch_sid in changed:
+                self._update_box_detail()
 
         async def on_unmount(self):
             self._save_all_patches()
             if self.server: await self.server.stop()
+            # Tear down the single overlay mount; lazy-unmount fallback keeps the
+            # mount table clean even if a handler is wedged.
+            try: self.mount.stop()
+            except Exception: pass
 
         def _save_all_patches(self):
             for sid, p in list(self.sup.patches.items()):
