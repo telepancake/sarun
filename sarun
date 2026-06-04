@@ -719,6 +719,79 @@ def sqlar_remove(path, name) -> int:
     return left
 
 
+# ════════════════════════════════════════════════════════════════════════════
+#  Network log — every gated request/response for a session, written live by the
+#  in-process mitmproxy to a sibling SQLite db <sid>.flows. No overlay involved,
+#  so it goes straight to state_home. Same user.slopbox.cmd xattr as the others.
+# ════════════════════════════════════════════════════════════════════════════
+
+def flows_path(session_id: str) -> Path:
+    return state_home() / (session_id + ".flows")
+
+_FLOW_BODY_CAP = 1 << 20    # store at most 1 MiB of each body (but record true size)
+
+def _flows_open(path) -> "sqlite3.Connection":
+    path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path))
+    conn.execute("PRAGMA busy_timeout=3000")
+    conn.execute("CREATE TABLE IF NOT EXISTS flows("
+                 "id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, action TEXT,"
+                 "method TEXT, scheme TEXT, host TEXT, port INT, url TEXT, status INT,"
+                 "req_headers TEXT, req_len INT, req_body BLOB,"
+                 "resp_headers TEXT, resp_len INT, resp_body BLOB)")
+    return conn
+
+def _hdr_text(items) -> str:
+    out = []
+    for k, v in (items or []):
+        if isinstance(k, bytes): k = k.decode("latin-1", "replace")
+        if isinstance(v, bytes): v = v.decode("latin-1", "replace")
+        out.append(f"{k}: {v}")
+    return "\n".join(out)
+
+def flows_add(path, fl: dict) -> None:
+    rb = fl.get("req_body") or b""; pb = fl.get("resp_body") or b""
+    conn = _flows_open(path)
+    try:
+        conn.execute(
+            "INSERT INTO flows(ts,action,method,scheme,host,port,url,status,"
+            "req_headers,req_len,req_body,resp_headers,resp_len,resp_body)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (fl.get("ts", time.time()), fl.get("action", ""), fl.get("method", ""),
+             fl.get("scheme", ""), fl.get("host", ""), fl.get("port", 0),
+             fl.get("url", ""), fl.get("status", 0),
+             _hdr_text(fl.get("req_headers")), len(rb), sqlite3.Binary(rb[:_FLOW_BODY_CAP]),
+             _hdr_text(fl.get("resp_headers")), len(pb), sqlite3.Binary(pb[:_FLOW_BODY_CAP])))
+        conn.commit()
+    finally:
+        conn.close()
+
+def flows_list(path) -> list:
+    path = Path(path)
+    if not path.exists(): return []
+    conn = _flows_open(path); conn.row_factory = sqlite3.Row
+    try:
+        return [dict(r) for r in conn.execute(
+            "SELECT id,ts,action,method,host,port,url,status,req_len,resp_len"
+            " FROM flows ORDER BY id").fetchall()]
+    except sqlite3.Error:
+        return []
+    finally:
+        conn.close()
+
+def flows_get(path, fid) -> "dict | None":
+    path = Path(path)
+    if not path.exists(): return None
+    conn = _flows_open(path); conn.row_factory = sqlite3.Row
+    try:
+        r = conn.execute("SELECT * FROM flows WHERE id=?", (fid,)).fetchone()
+        return dict(r) if r else None
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+
+
 def upper_has_changes(up: Path) -> bool:
     """True if the overlay upper holds any real change (a created/modified file or
     a whiteout deletion), ignoring the overlay's own opaque markers."""
@@ -939,6 +1012,7 @@ class Session:
     live: bool = False
     has_patch: bool = False                           # a consolidated patch exists
     has_sqlar: bool = False                           # a consolidated sqlar exists
+    has_flows: bool = False                           # a network log exists
     # started time and pid are not stored — they are read back out of the name.
     @property
     def started(self) -> float: return parse_sid(self.session_id)[0]
@@ -984,6 +1058,8 @@ def discover_sessions() -> dict:
             _store(pf.name[:-len(".patch.xz")], pf).has_patch = True
         for af in sd.glob("*.sqlar"):
             _store(af.name[:-len(".sqlar")], af).has_sqlar = True
+        for ff in sd.glob("*.flows"):
+            _store(ff.name[:-len(".flows")], ff).has_flows = True
     return out
 
 
@@ -1023,8 +1099,9 @@ class Supervisor:
                 ns = "running" if _pid_alive(cur.pid) else (
                     cur.status if cur.status == "killed" else "finished")
                 changed = (ns != cur.status or cur.has_patch != s.has_patch
-                           or cur.has_sqlar != s.has_sqlar)
-                cur.status = ns; cur.has_patch = s.has_patch; cur.has_sqlar = s.has_sqlar
+                           or cur.has_sqlar != s.has_sqlar or cur.has_flows != s.has_flows)
+                cur.status = ns; cur.has_patch = s.has_patch
+                cur.has_sqlar = s.has_sqlar; cur.has_flows = s.has_flows
                 if changed:
                     self._emit(type="session_updated", session=cur.to_dict())
         for sid in list(self.sessions):
@@ -1034,7 +1111,8 @@ class Supervisor:
             inmem = self.patches.get(sid)
             patch_gone = not patch_path(sid).exists() and not (inmem and inmem["files"])
             sqlar_gone = not sqlar_path(sid).exists()
-            if shm_gone and patch_gone and sqlar_gone:
+            flows_gone = not flows_path(sid).exists()
+            if shm_gone and patch_gone and sqlar_gone and flows_gone:
                 del self.sessions[sid]
                 self._emit(type="session_removed", session_id=sid)
 
@@ -1166,6 +1244,23 @@ class Supervisor:
         s = self.sessions.get(sid)
         if s: self._record_traffic(s, host, port, scheme, action, bu, bd, status)
 
+    def log_flow(self, sid, fl: dict) -> None:
+        """Persist one completed request/response into the session's <sid>.flows db."""
+        try: flows_add(flows_path(sid), fl)
+        except Exception: return
+        s = self.sessions.get(sid)
+        try: set_cmd_xattr(flows_path(sid), list(s.cmd) if s else [])
+        except Exception: pass
+        if s and not s.has_flows:
+            s.has_flows = True
+            self._emit(type="session_updated", session=s.to_dict())
+
+    def flows(self, sid) -> list:
+        return flows_list(flows_path(sid))
+
+    def flow_detail(self, sid, fid) -> "dict | None":
+        return flows_get(flows_path(sid), fid)
+
     def _pending_dict(self, rid) -> dict:
         p = self.pending[rid]
         return dict(request_id=p.request_id, session_id=p.session_id,
@@ -1191,7 +1286,7 @@ class Supervisor:
         if s.shm_dir:
             fuse_unmount(s.merged)
             rm_rf(s.shm_dir)
-        for f in (patch_path(sid), sqlar_path(sid)):
+        for f in (patch_path(sid), sqlar_path(sid), flows_path(sid)):
             if f.exists():
                 try: f.unlink()
                 except OSError: pass
@@ -1414,14 +1509,17 @@ class Supervisor:
         cleanup_dirs(upper, start)
 
     def _maybe_remove_empty(self, sid) -> None:
-        """A finished session with no overlay change, no patch and no sqlar vanishes."""
+        """A finished session vanishes only when it holds nothing at all — no overlay
+        change, no patch, no sqlar, and no network log. The connection log alone is
+        reason enough to keep the entry around."""
         s = self.sessions.get(sid)
         if not s or s.live or _pid_alive(s.pid): return
         try: overlay = upper_has_changes(Path(s.upper))
         except OSError: overlay = False
         patch = bool(self._patch(sid)["files"]) or patch_path(sid).exists()
         sqlar = sqlar_path(sid).exists()
-        if not overlay and not patch and not sqlar:
+        flows = flows_path(sid).exists()
+        if not overlay and not patch and not sqlar and not flows:
             self.delete(sid)
 
     def overlay_apply(self, sid, paths) -> dict:
@@ -1800,12 +1898,23 @@ class _GatingAddon:
         req, resp = flow.request, flow.response
         denied = bool(resp and resp.status_code == 403
                       and b"slopbox: denied" in (resp.content or b""))
+        sid = _CURRENT_SID.get(); action = "deny" if denied else "allow"
         self.sup.note_traffic(
-            _CURRENT_SID.get(), req.host, req.port, req.scheme,
-            "deny" if denied else "allow",
+            sid, req.host, req.port, req.scheme, action,
             len(req.content or b""),
             len(resp.content or b"") if resp else 0,
             resp.status_code if resp else 0)
+        # Persist the whole exchange for after-the-fact review.
+        try: req_body = bytes(req.content or b"")
+        except Exception: req_body = b""
+        try: resp_body = bytes(resp.content or b"") if resp else b""
+        except Exception: resp_body = b""
+        self.sup.log_flow(sid, dict(
+            ts=time.time(), action=action, method=req.method, scheme=req.scheme,
+            host=req.host, port=req.port, url=req.pretty_url,
+            status=resp.status_code if resp else 0,
+            req_headers=list(req.headers.items()), req_body=req_body,
+            resp_headers=list(resp.headers.items()) if resp else [], resp_body=resp_body))
 
 
 class ProxyEngine:
@@ -2236,7 +2345,10 @@ def cmd_run(cmd, no_net, session_whitelist, chdir) -> int:
     has_overlay = upper_has_changes(up)
     has_patch = patch_path(sid).exists()
     has_sqlar = sqlar_path(sid).exists()
-    if not has_overlay and not has_patch and not has_sqlar:
+    # The UI's proxy may have written a network log for this session; keep the
+    # entry if so, even when nothing touched the filesystem.
+    has_flows = flows_path(sid).exists()
+    if not has_overlay and not has_patch and not has_sqlar and not has_flows:
         rm_rf(shm_dir)
         if have_ui:
             sync_send(SOCK_PATH, type="remove", session_id=sid)
@@ -2262,7 +2374,7 @@ def run_ui() -> int:
     from textual import on
     from textual.app import App, ComposeResult
     from textual.binding import Binding
-    from textual.containers import Horizontal, Vertical, Container
+    from textual.containers import Horizontal, Vertical, Container, VerticalScroll
     from textual.reactive import reactive
     from textual.screen import ModalScreen
     from textual.widgets import (
@@ -2398,6 +2510,10 @@ def run_ui() -> int:
         def action_kill(self): self.app.action_kill()
         def action_delete(self): self.app.action_delete()
 
+    class NetTable(DataTable):
+        # Read-only: the network log is a record, nothing to accept or reject.
+        pass
+
     class ChangesTable(DataTable):
         BINDINGS=[Binding("a","apply","apply"), Binding("A","apply_all","apply all"),
                   Binding("x","discard","discard"),
@@ -2491,6 +2607,7 @@ def run_ui() -> int:
         #c-bar { height:1; background:$surface; color:$text-muted; padding:0 1; }
         #status { height:1; background:$surface; color:$text-muted; padding:0 1; }
         DataTable { height:1fr; } ListView { height:1fr; }
+        #flow-wrap { height:1fr; } #flow-detail { height:auto; padding:0 1; }
         #confirm-box { width:64; height:auto; padding:1 2; background:$surface; border:tall $error; }
         #confirm-msg { margin-bottom:1; } #confirm-btns { height:3; }
         #rule-box { width:72; height:auto; padding:1 2; background:$surface; border:tall $warning; }
@@ -2501,18 +2618,20 @@ def run_ui() -> int:
         # The single left-hand list cycles through these sources; the right pane
         # shows the matching detail. Approvals are not a view — they arrive as a
         # transient top banner with global keys, so they never steal the cursor.
-        VIEWS=("boxes","changes","net","file")
-        VIEW_TITLE={"boxes":"Slopboxes","changes":"Changes",
+        VIEWS=("boxes","changes","netlog","net","file")
+        VIEW_TITLE={"boxes":"Slopboxes","changes":"Changes","netlog":"Network",
                     "net":"Net rules","file":"File rules"}
-        LEFT={"boxes":"#s-tab","changes":"#cf-tab","net":"#w-list","file":"#r-list"}
-        RIGHT={"boxes":"#box-detail","changes":"#cd-log",
+        LEFT={"boxes":"#s-tab","changes":"#cf-tab","netlog":"#nf-tab",
+              "net":"#w-list","file":"#r-list"}
+        RIGHT={"boxes":"#box-detail","changes":"#cd-log","netlog":"#flow-wrap",
                "net":"#rule-detail","file":"#rule-detail"}
         # One direct key per list (shown — and highlighted for the current one — in
         # the bottom key bar). No tab strip: the active view is the lit-up key.
-        VIEW_KEY={"boxes":"b","changes":"c","net":"w","file":"f"}
+        VIEW_KEY={"boxes":"b","changes":"c","netlog":"t","net":"w","file":"f"}
         BINDINGS=[
             Binding("b","view_boxes","boxes"),
             Binding("c","view_changes","changes"),
+            Binding("t","view_netlog","network"),
             Binding("w","view_net","net rules"),
             Binding("f","view_file","file rules"),
             Binding("escape","back","back"),
@@ -2541,6 +2660,7 @@ def run_ui() -> int:
             self.server=None
             self._ch_sid=None
             self._ch_entries=[]
+            self._nf_flows=[]
             self._last_loaded_sid=None  # guard against reload on re-highlight
 
         def compose(self) -> ComposeResult:
@@ -2551,12 +2671,15 @@ def run_ui() -> int:
                     yield Static("", id="left-title", classes="pt")
                     yield SessionTable(id="s-tab", cursor_type="row")
                     yield ChangesTable(id="cf-tab", cursor_type="row")
+                    yield NetTable(id="nf-tab", cursor_type="row")
                     yield RulesList(id="w-list")
                     yield FileRulesList(id="r-list")
                 with Vertical(id="right"):
                     yield Static("", id="right-title", classes="pt")
                     yield Static("", id="box-detail")
                     yield DiffView(id="cd-log")
+                    with VerticalScroll(id="flow-wrap"):
+                        yield Static("", id="flow-detail")
                     yield Static("", id="rule-detail")
             yield Static("", id="c-bar")
             yield Static("", id="status")
@@ -2565,6 +2688,8 @@ def run_ui() -> int:
         async def on_mount(self):
             self.query_one("#s-tab",DataTable).add_columns(
                 "F","Started","PID","Cmd","✓","✗","↑","↓","Age")
+            self.query_one("#nf-tab",DataTable).add_columns(
+                "Time","","Method","Host","St","↑","↓")
             self.query_one("#cf-tab",DataTable).add_columns("","S","Path","Size")
             ensure_ca_cert()
             loop=asyncio.get_event_loop()
@@ -2640,6 +2765,8 @@ def run_ui() -> int:
                 if s: self._ch_sid=self._last_loaded_sid=s["session_id"]
             if self.view=="changes" and self._ch_sid:
                 self._load_changes(self._ch_sid)
+            if self.view=="netlog" and self._ch_sid:
+                self._load_flows(self._ch_sid)
             if self.view=="boxes":
                 self._update_box_detail()
             self._cbar()    # keep the dirty/count indicator current
@@ -2653,18 +2780,21 @@ def run_ui() -> int:
                 try: self.query_one(sel).display=(k==v)
                 except Exception: pass
             rsel=self.RIGHT[v]
-            for sel in ("#box-detail","#cd-log","#rule-detail"):
+            for sel in ("#box-detail","#cd-log","#flow-wrap","#rule-detail"):
                 try: self.query_one(sel).display=(sel==rsel)
                 except Exception: pass
             self._titles()
             if v=="changes" and self._ch_sid:
                 self._load_changes(self._ch_sid, force=True)
+            if v=="netlog" and self._ch_sid:
+                self._load_flows(self._ch_sid, force=True)
             self._update_right()
             try: self.query_one(self.LEFT[v]).focus()
             except Exception: pass
 
         def action_view_boxes(self): self._set_view("boxes")
         def action_view_changes(self): self._set_view("changes")
+        def action_view_netlog(self): self._set_view("netlog")
         def action_view_net(self): self._set_view("net")
         def action_view_file(self): self._set_view("file")
 
@@ -2673,15 +2803,17 @@ def run_ui() -> int:
         _LEFT_HDR={
             "boxes":"● SLOPBOXES   [dim]R run · F fin · K kill · ✓/✗ conns[/]",
             "changes":"📁 FILES   [dim]+ new · ~ mod · - del · [/][reverse red]![/][dim] stale · [/][blue]P[/][dim] patch · [/][magenta]A[/][dim] archive · O overlay[/]",
+            "netlog":"🌐 CONNECTIONS   [dim]✓ allowed · ✗ denied · ↑ req · ↓ resp[/]",
             "net":"✓ NETWORK RULES   [dim]top → bottom, first match wins[/]",
             "file":"✓ FILE RULES   [dim]top → bottom, first match wins[/]"}
         _RIGHT_HDR={
-            "boxes":"≣ DETAIL","changes":"≡ DIFF",
+            "boxes":"≣ DETAIL","changes":"≡ DIFF","netlog":"≡ REQUEST · RESPONSE",
             "net":"⛁ WHAT IT MATCHES","file":"⛁ WHAT IT MATCHES"}
         _ACTS={
             "boxes":[("↵","review"),("k","kill"),("d","delete")],
             "changes":[("↵","diff"),("a","apply"),("x","discard"),
                        ("X","disc all"),("s","save")],
+            "netlog":[("↑/↓","browse")],
             "net":[("↵/e","edit"),("d","remove"),("^↑/^↓","move")],
             "file":[("a","add"),("↵/e","edit"),("d","remove"),("^↑/^↓","move")]}
 
@@ -2710,6 +2842,7 @@ def run_ui() -> int:
 
         def _update_right(self):
             if self.view=="boxes": self._update_box_detail()
+            elif self.view=="netlog": self._update_flow_detail()
             elif self.view in ("net","file"): self._update_rule_detail()
 
         def _notify(self, title, body):
@@ -2800,6 +2933,10 @@ def run_ui() -> int:
             t.append(f"{s['conn_allowed']} ✓ ", style="green")
             t.append(f"{s['conn_denied']} ✗", style="red")
             t.append(f"    ↑{fmt_bytes(s['bytes_up'])} ↓{fmt_bytes(s['bytes_down'])}\n", style="dim")
+            if s.get("has_flows"):
+                t.append("network ", style="dim")
+                t.append(f"{len(self.sup.flows(sid))} connection(s)   ")
+                t.append("[t for log]\n", style="dim")
             try: entries=self.sup.session_changes(sid)
             except Exception: entries=[]
             t.append("changes ", style="dim")
@@ -3044,6 +3181,63 @@ def run_ui() -> int:
             self._rebuild_ch(preserve=True)
             self._cbar()
 
+        def _load_flows(self, sid, force=False):
+            flows=self.sup.flows(sid)
+            if not force and flows==self._nf_flows:
+                return
+            self._nf_flows=flows
+            def row(f):
+                act="✓" if f["action"]=="allow" else "✗"
+                col="green" if f["action"]=="allow" else "red"
+                hp=f"{f['host']}:{f['port']}" if f["port"] not in (80,443) else f["host"]
+                stc="green" if 200<=f["status"]<400 else ("red" if f["status"]>=400 else "")
+                return (f["id"], [
+                    Text(time.strftime("%H:%M:%S", time.localtime(f["ts"]))),
+                    Text(act, style=col), Text(f["method"]),
+                    Text(hp, style="cyan"),
+                    Text(str(f["status"] or ""), style=stc),
+                    fmt_bytes(f["req_len"]), fmt_bytes(f["resp_len"])])
+            self._sync_table(self.query_one("#nf-tab",DataTable), [row(f) for f in flows])
+            self._update_flow_detail()
+
+        def _update_flow_detail(self):
+            d=self.query_one("#flow-detail",Static)
+            sid=self._ch_sid; fid=self._sel_flow()
+            if not sid or fid is None:
+                d.update(Text("(no connection selected)", style="dim")); return
+            f=self.sup.flow_detail(sid, fid)
+            if not f:
+                d.update(Text("(gone)", style="dim")); return
+            def body(blob, n):
+                if not blob: return Text("  (empty)\n", style="dim")
+                raw=bytes(blob)
+                try:
+                    txt=raw.decode("utf-8")
+                    t=Text(txt[:8000])
+                    if len(txt)>8000 or n>len(raw): t.append(f"\n  … {fmt_bytes(n)} total\n", style="dim")
+                    else: t.append("\n")
+                    return t
+                except UnicodeDecodeError:
+                    return Text(f"  binary · {fmt_bytes(n)}\n", style="dim")
+            t=Text()
+            t.append(f["action"].upper()+"  ", style="green bold" if f["action"]=="allow" else "red bold")
+            t.append(f["method"]+" ", style="bold")
+            t.append(f["url"], style="cyan"); t.append("\n\n")
+            t.append("── request headers ──\n", style="dim")
+            t.append((f["req_headers"] or "").rstrip()+"\n", style="")
+            t.append("── request body ──\n", style="dim"); t.append(body(f["req_body"], f["req_len"]))
+            t.append("\n")
+            t.append(f"── response  [{f['status']}] ──\n", style="dim")
+            t.append((f["resp_headers"] or "").rstrip()+"\n", style="")
+            t.append("── response body ──\n", style="dim"); t.append(body(f["resp_body"], f["resp_len"]))
+            d.update(t)
+
+        def _sel_flow(self):
+            t=self.query_one("#nf-tab",DataTable)
+            if not t.row_count: return None
+            try: return t.coordinate_to_cell_key((t.cursor_row,0)).row_key.value
+            except Exception: return None
+
         @on(DataTable.RowHighlighted, "#s-tab")
         def _sc(self, ev):
             if ev.row_key and ev.row_key.value:
@@ -3065,6 +3259,10 @@ def run_ui() -> int:
         def _cc(self, ev):
             if ev.row_key and ev.row_key.value and self._ch_sid:
                 self._load_diff(self._ch_sid, ev.row_key.value)
+
+        @on(DataTable.RowHighlighted, "#nf-tab")
+        def _nc(self, ev):
+            if self.view=="netlog": self._update_flow_detail()
 
         @on(DataTable.RowSelected, "#cf-tab")
         def _f_open(self, ev):
