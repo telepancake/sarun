@@ -1736,6 +1736,21 @@ class Supervisor:
         for e in ov: e["source"] = "overlay"
         return ov + self._patch_entries(sid) + self._sqlar_entries(sid)
 
+    def change_mode(self, sid, rel, source) -> "int | None":
+        """st_mode for a changed file (for the path/mode header): the overlay copy,
+        the sqlar entry, or the host file behind a patch — None if unavailable."""
+        rel = rel.lstrip("/")
+        if source == "sqlar":
+            return sqlar_mode(sqlar_path(sid), rel)
+        if source == "overlay":
+            s = self.sessions.get(sid)
+            if s:
+                try: return (Path(s.upper) / rel).lstat().st_mode
+                except OSError: return None
+        host = Path("/") / rel
+        try: return host.lstat().st_mode if (host.exists() or host.is_symlink()) else None
+        except OSError: return None
+
     def _in_patch(self, sid, rel) -> bool:
         return rel.lstrip("/") in self._patch(sid)["files"]
 
@@ -2608,6 +2623,7 @@ def run_ui() -> int:
         #status { height:1; background:$surface; color:$text-muted; padding:0 1; }
         DataTable { height:1fr; } ListView { height:1fr; }
         #flow-wrap { height:1fr; } #flow-detail { height:auto; padding:0 1; }
+        #cd-info { height:auto; padding:0 1; background:$panel; }
         #confirm-box { width:64; height:auto; padding:1 2; background:$surface; border:tall $error; }
         #confirm-msg { margin-bottom:1; } #confirm-btns { height:3; }
         #rule-box { width:72; height:auto; padding:1 2; background:$surface; border:tall $warning; }
@@ -2676,6 +2692,7 @@ def run_ui() -> int:
                     yield FileRulesList(id="r-list")
                 with Vertical(id="right"):
                     yield Static("", id="right-title", classes="pt")
+                    yield Static("", id="cd-info")
                     yield Static("", id="box-detail")
                     yield DiffView(id="cd-log")
                     with VerticalScroll(id="flow-wrap"):
@@ -2783,9 +2800,12 @@ def run_ui() -> int:
             for sel in ("#box-detail","#cd-log","#flow-wrap","#rule-detail"):
                 try: self.query_one(sel).display=(sel==rsel)
                 except Exception: pass
+            try: self.query_one("#cd-info").display=(v=="changes")   # full-path header
+            except Exception: pass
             self._titles()
             if v=="changes" and self._ch_sid:
                 self._load_changes(self._ch_sid, force=True)
+                self._update_cd_info()
             if v=="netlog" and self._ch_sid:
                 self._load_flows(self._ch_sid, force=True)
             self._update_right()
@@ -3083,8 +3103,12 @@ def run_ui() -> int:
                 if s=="patch": return Text("P", style="blue")
                 if s=="sqlar": return Text("A", style="magenta")
                 return Text("O", style="dim")
+            def short(p, n=44):
+                # Truncate from the *start* so the basename stays visible; the full
+                # path lives above the diff.
+                return p if len(p)<=n else "…"+p[-(n-1):]
             rows=[(e["path"], [flag(e), src(e),
-                               Text(e["path"], style="red" if e.get("stale") else ""),
+                               Text(short(e["path"]), style="red" if e.get("stale") else ""),
                                fmt_bytes(e["size"]) if e["size"] else ""])
                   for e in self._ch_entries]
             self._sync_table(self.query_one("#cf-tab",DataTable), rows)
@@ -3111,6 +3135,28 @@ def run_ui() -> int:
                     a="".join(chr(b) if 0x20<=b<0x7f else "." for b in ch)
                     out.append(Text(f"{i:04x}  {h:<48}  {a}", style="dim"))
             return out
+
+        def _update_cd_info(self, rel=None):
+            # Full path + kind/source/size/mode shown above the diff, since the file
+            # list truncates the path to keep the basename readable.
+            info=self.query_one("#cd-info",Static)
+            rel = rel if rel is not None else self._sel_path()
+            ent = next((e for e in self._ch_entries if e["path"]==rel), None) if rel else None
+            if not ent:
+                info.update(Text("")); return
+            mode = self.sup.change_mode(self._ch_sid, ent["path"], ent.get("source"))
+            srcname = {"overlay":"overlay","patch":"patch","sqlar":"archive"}.get(
+                ent.get("source"), ent.get("source") or "")
+            t=Text()
+            t.append("/"+ent["path"], style="bold")
+            t.append("\n")
+            t.append(f"{ent['kind']} · {srcname}", style="dim")
+            if ent.get("size"): t.append(f" · {fmt_bytes(ent['size'])}", style="dim")
+            if mode is not None:
+                t.append(f" · {stat_mod.filemode(mode)} {oct(stat_mod.S_IMODE(mode))}", style="dim")
+            if ent.get("stale"):
+                t.append("  ⚠ host changed since capture", style="reverse red")
+            info.update(t)
 
         def _load_diff(self, sid, rel, keep_pos=False):
             dv=self.query_one("#cd-log",DiffView)
@@ -3258,6 +3304,7 @@ def run_ui() -> int:
         @on(DataTable.RowHighlighted, "#cf-tab")
         def _cc(self, ev):
             if ev.row_key and ev.row_key.value and self._ch_sid:
+                self._update_cd_info(ev.row_key.value)
                 self._load_diff(self._ch_sid, ev.row_key.value)
 
         @on(DataTable.RowHighlighted, "#nf-tab")
