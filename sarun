@@ -45,6 +45,7 @@ import contextvars
 import fnmatch
 import ipaddress
 import json
+import lzma
 import os
 import shutil
 import signal
@@ -92,7 +93,7 @@ RULES_FILE     = config_home() / "rules"
 def ensure_dirs() -> None:
     """Create our host-side config/data/runtime directories. Called by the UI and
     the runner — never by the in-slopbox --inner process."""
-    for p in (data_home(), config_home(), runtime_home(), MITM_CONFDIR):
+    for p in (data_home(), config_home(), runtime_home(), MITM_CONFDIR, state_home()):
         try: p.mkdir(parents=True, exist_ok=True)
         except OSError: pass
     try: RULES_FILE.touch(exist_ok=True)
@@ -345,6 +346,138 @@ def ut_split(data: bytes) -> list:
     if parts[-1]:
         lines.append(parts[-1])
     return lines
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Patch codec — a byte-exact unified diff (multi-file), XZ-compressed at rest,
+#  meta.json kept in the file's user.slopbox.meta xattr.
+# ════════════════════════════════════════════════════════════════════════════
+
+def state_home() -> Path:
+    base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    return Path(base) / "slopbox"
+
+def patch_path(session_id: str) -> Path:
+    return state_home() / (session_id + ".patch.xz")
+
+_NO_NL = b"\\ No newline at end of file\n"   # standard "no newline at EOF" marker
+
+class PatchConflict(Exception):
+    """A hunk's recorded context no longer matches the file it applies to."""
+
+def _emit(out: list, prefix: bytes, line: bytes) -> None:
+    # Each physical patch line ends in \n; a content line lacking its own newline
+    # gets one (as terminator) plus the NO_NL marker, so parsing is unambiguous and
+    # \r (CRLF) is preserved as content.
+    if line.endswith(b"\n"):
+        out.append(prefix + line)
+    else:
+        out.append(prefix + line + b"\n"); out.append(_NO_NL)
+
+def make_patch(files: list) -> bytes:
+    """files: list of dict(rel, lower, upper, created, deleted) with lower/upper as
+    byte-line lists (from ut_split). Returns the unified-diff bytes."""
+    import difflib
+    out = []
+    for f in files:
+        a = b"/dev/null" if f["created"] else b"a/" + f["rel"].encode("utf-8","surrogateescape")
+        b = b"/dev/null" if f["deleted"] else b"b/" + f["rel"].encode("utf-8","surrogateescape")
+        out.append(b"--- " + a + b"\n"); out.append(b"+++ " + b + b"\n")
+        ll, ul = f["lower"], f["upper"]
+        for g in difflib.SequenceMatcher(None, ll, ul).get_grouped_opcodes(3):
+            a1, a2, b1, b2 = g[0][1], g[-1][2], g[0][3], g[-1][4]
+            out.append(f"@@ -{a1+1},{a2-a1} +{b1+1},{b2-b1} @@\n".encode())
+            for tag, i1, i2, j1, j2 in g:
+                if tag == "equal":
+                    for ln in ll[i1:i2]: _emit(out, b" ", ln)
+                else:
+                    for ln in ll[i1:i2]: _emit(out, b"-", ln)
+                    for ln in ul[j1:j2]: _emit(out, b"+", ln)
+    return b"".join(out)
+
+def parse_patch(data: bytes) -> dict:
+    """Parse unified-diff bytes into an ordered {rel: filepatch} where filepatch is
+    dict(rel, created, deleted, hunks=[dict(a1, a_lines, b_lines)]). a_lines are the
+    original-side byte-lines (context+removed), b_lines the new-side (context+added)."""
+    import re
+    files = {}; cur = None; phys = ut_split(data); i = 0
+    while i < len(phys):
+        line = phys[i]; i += 1
+        if line.startswith(b"--- "):
+            aside = line[4:].rstrip(b"\n")
+            bside = phys[i][4:].rstrip(b"\n") if i < len(phys) else b""; i += 1
+            created = aside == b"/dev/null"; deleted = bside == b"/dev/null"
+            relb = (aside if deleted else bside)[2:]   # strip "a/" or "b/"
+            rel = relb.decode("utf-8","surrogateescape")
+            cur = files[rel] = dict(rel=rel, created=created, deleted=deleted, hunks=[])
+        elif line.startswith(b"@@") and cur is not None:
+            m = re.search(rb"-(\d+)", line)
+            cur["hunks"].append(dict(a1=int(m.group(1)) - 1, a_lines=[], b_lines=[]))
+        elif cur and cur["hunks"] and line[:1] in (b" ", b"-", b"+"):
+            prefix = line[:1]; content = line[1:]
+            if i < len(phys) and phys[i] == _NO_NL:
+                i += 1; content = content[:-1]      # drop the terminator we added
+            h = cur["hunks"][-1]
+            if prefix in (b" ", b"-"): h["a_lines"].append(content)
+            if prefix in (b" ", b"+"): h["b_lines"].append(content)
+    return files
+
+def apply_hunks(base_lines: list, hunks: list) -> list:
+    """Apply hunks forward onto base_lines (a byte-line list). Each hunk's recorded
+    context must match exactly at its position, else PatchConflict. Used for
+    round-trip verification where the base is unchanged. Returns new byte-line list."""
+    out = []; pos = 0
+    for h in hunks:
+        a1 = h["a1"]; al = h["a_lines"]
+        if base_lines[a1:a1 + len(al)] != al:
+            raise PatchConflict(f"context mismatch at line {a1+1}")
+        if a1 < pos:
+            raise PatchConflict("overlapping hunks")
+        out.extend(base_lines[pos:a1]); out.extend(h["b_lines"]); pos = a1 + len(al)
+    out.extend(base_lines[pos:])
+    return out
+
+def locate_hunk(base_lines: list, hunk: dict) -> "int | None":
+    """patch(1)-style: find where a hunk's original side (a_lines) occurs in
+    base_lines, preferring the recorded position then searching outward. Returns the
+    index, or None if the context isn't found. A pure-insert hunk (no a_lines) goes
+    at the recorded position (clamped)."""
+    al = hunk["a_lines"]; a1 = hunk["a1"]; n = len(base_lines)
+    if not al:
+        return max(0, min(a1, n))
+    if base_lines[a1:a1 + len(al)] == al:
+        return a1
+    for off in range(1, n + 1):
+        for pos in (a1 - off, a1 + off):
+            if 0 <= pos <= n - len(al) and base_lines[pos:pos + len(al)] == al:
+                return pos
+    return None
+
+def apply_one_hunk(base_lines: list, hunk: dict) -> tuple:
+    """Apply a single hunk with offset search. Returns (new_lines, offset) where
+    offset is how far from the recorded position it landed (0 = exact). Raises
+    PatchConflict if the context can't be found — caller leaves the file untouched."""
+    pos = locate_hunk(base_lines, hunk)
+    if pos is None:
+        raise PatchConflict("hunk does not apply")
+    al = hunk["a_lines"]
+    return base_lines[:pos] + hunk["b_lines"] + base_lines[pos + len(al):], pos - hunk["a1"]
+
+def write_patch_file(path: Path, data: bytes, meta: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_bytes(lzma.compress(data, preset=6))
+    try: os.setxattr(tmp, "user.slopbox.meta", json.dumps(meta).encode())
+    except OSError: pass
+    os.replace(tmp, path)
+
+def read_patch_file(path: Path) -> tuple:
+    """Return (data_bytes, meta_dict). meta is {} if the xattr is missing."""
+    data = lzma.decompress(path.read_bytes())
+    try: meta = json.loads(os.getxattr(path, "user.slopbox.meta").decode())
+    except (OSError, json.JSONDecodeError): meta = {}
+    return data, meta
+
 
 def upper_has_changes(up: Path) -> bool:
     """True if the overlay upper holds any real change (a created/modified file or
