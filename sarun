@@ -54,12 +54,14 @@ import os
 import shutil
 import signal
 import socket
+import sqlite3
 import stat as stat_mod
 import subprocess
 import sys
 import threading
 import time
 import uuid
+import zlib
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any
@@ -633,6 +635,90 @@ def read_patch_file(path: Path) -> bytes:
     return lzma.decompress(path.read_bytes())
 
 
+# ════════════════════════════════════════════════════════════════════════════
+#  SQLite Archive (sqlar) — everything a patch can't hold (binary files,
+#  symlinks, deletions) lands here next to the patch as <sid>.sqlar, so once
+#  consolidate() runs the /dev/shm overlay is empty and all unreviewed changes
+#  live on disk under state_home. Standard sqlar schema; one extra convention:
+#  a NULL blob with a char-device mode is a deletion tombstone (an overlay
+#  whiteout). Blobs are zlib-deflated when that's smaller (len(data) != sz).
+# ════════════════════════════════════════════════════════════════════════════
+
+def sqlar_path(session_id: str) -> Path:
+    return state_home() / (session_id + ".sqlar")
+
+def _sqlar_open(path) -> "sqlite3.Connection":
+    path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path))
+    conn.execute("CREATE TABLE IF NOT EXISTS sqlar"
+                 "(name TEXT PRIMARY KEY, mode INT, mtime INT, sz INT, data BLOB)")
+    return conn
+
+def _sqlar_put_file(conn, name, content: bytes, mode, mtime) -> None:
+    comp = zlib.compress(content, 6)
+    data, sz = (comp, len(content)) if len(comp) < len(content) else (content, len(content))
+    conn.execute("INSERT OR REPLACE INTO sqlar VALUES(?,?,?,?,?)",
+                 (name, int(mode), int(mtime), sz, sqlite3.Binary(data)))
+
+def _sqlar_put_symlink(conn, name, target: bytes, mtime) -> None:
+    conn.execute("INSERT OR REPLACE INTO sqlar VALUES(?,?,?,?,?)",
+                 (name, stat_mod.S_IFLNK | 0o777, int(mtime), len(target),
+                  sqlite3.Binary(target)))
+
+def _sqlar_put_tombstone(conn, name) -> None:
+    conn.execute("INSERT OR REPLACE INTO sqlar VALUES(?,?,?,?,?)",
+                 (name, stat_mod.S_IFCHR, 0, 0, None))
+
+def sqlar_list(path) -> list:
+    """[(name, mode, mtime, sz)] sorted by name; [] if there is no archive."""
+    path = Path(path)
+    if not path.exists(): return []
+    conn = _sqlar_open(path)
+    try: return conn.execute("SELECT name,mode,mtime,sz FROM sqlar "
+                             "ORDER BY name").fetchall()
+    except sqlite3.Error: return []
+    finally: conn.close()
+
+def sqlar_mode(path, name) -> "int | None":
+    path = Path(path)
+    if not path.exists(): return None
+    conn = _sqlar_open(path)
+    try:
+        row = conn.execute("SELECT mode FROM sqlar WHERE name=?", (name,)).fetchone()
+    except sqlite3.Error: row = None
+    finally: conn.close()
+    return row[0] if row else None
+
+def sqlar_content(path, name) -> "bytes | None":
+    """Decompressed bytes for one entry (the symlink target for a symlink); None if
+    missing or a tombstone."""
+    path = Path(path)
+    if not path.exists(): return None
+    conn = _sqlar_open(path)
+    try:
+        row = conn.execute("SELECT sz,data FROM sqlar WHERE name=?", (name,)).fetchone()
+    except sqlite3.Error: row = None
+    finally: conn.close()
+    if not row or row[1] is None: return None
+    sz, data = row[0], bytes(row[1])
+    return data if len(data) == sz else zlib.decompress(data)
+
+def sqlar_remove(path, name) -> int:
+    """Drop one entry; unlink the archive when it empties. Returns entries left."""
+    path = Path(path)
+    if not path.exists(): return 0
+    conn = _sqlar_open(path)
+    try:
+        conn.execute("DELETE FROM sqlar WHERE name=?", (name,)); conn.commit()
+        left = conn.execute("SELECT COUNT(*) FROM sqlar").fetchone()[0]
+    except sqlite3.Error: left = 1
+    finally: conn.close()
+    if left == 0:
+        try: path.unlink()
+        except OSError: pass
+    return left
+
+
 def upper_has_changes(up: Path) -> bool:
     """True if the overlay upper holds any real change (a created/modified file or
     a whiteout deletion), ignoring the overlay's own opaque markers."""
@@ -697,17 +783,40 @@ def _apply_overlay_entry(upper: Path, ap: Path, rel: str) -> None:
         return
     remove_upper_entry(ap)
 
+def _try_fold_patch(rel, ap, host, files) -> bool:
+    """Fold a text create/modify into the patch dict; True if it went in. Deletions
+    and anything that isn't a clean line-diff of UTF-bytes are left for the sqlar."""
+    try:
+        ub = ap.read_bytes()
+    except OSError:
+        return False
+    if b"\x00" in ub: return False
+    try:
+        lob = host.read_bytes() if (host.exists() and not host.is_dir()) else b""
+    except OSError:
+        return False
+    if b"\x00" in lob: return False
+    lower, upperl = ut_split(lob), ut_split(ub)
+    fp = build_file_patch(rel, lower, upperl, not host.exists(), False)
+    try:
+        if b"".join(apply_hunks(lower, fp["hunks"])) != b"".join(upperl):
+            return False
+    except PatchConflict:
+        return False
+    files[rel] = fp
+    return True
+
 def consolidate(shm_dir, session_id: str, cmd: list) -> None:
-    """Move every overlay change that a patch can represent *exactly and entirely*
-    into the session's patch file, then prune emptied dirs. Per file it is all or
-    nothing: binary files, or anything that doesn't round-trip, stay in the overlay.
-    Idempotent and additive — re-running just folds in any newly representable
-    overlay change (a file is never in both the overlay and the patch).
+    """Empty the /dev/shm overlay into on-disk state: text create/modify folds into
+    the patch (<sid>.patch.xz), everything else a patch can't hold — binary files,
+    symlinks and deletions/tombstones — goes into the sqlar archive (<sid>.sqlar)
+    next to it. Afterwards the overlay holds nothing reviewable, so the caller can
+    free the /dev/shm tree. Idempotent and additive; a file lands in exactly one of
+    overlay / patch / sqlar.
 
     File rules are consulted first, top-to-bottom: a matching 'apply' writes the
-    change to the host and drops it from the overlay, a matching 'discard' just
-    drops it — either way it never reaches the patch. Unmatched changes fall
-    through to the patch-folding above."""
+    change to the host and drops it, a matching 'discard' just drops it — either way
+    it reaches neither store."""
     upper = Path(shm_dir) / "up"
     if not upper.is_dir(): return
     frules = load_file_rules()
@@ -716,6 +825,11 @@ def consolidate(shm_dir, session_id: str, cmd: list) -> None:
     if pp.exists():
         try: files = parse_patch(read_patch_file(pp))
         except Exception: files = {}
+    sq = None                                            # lazy sqlar connection
+    def _sq():
+        nonlocal sq
+        if sq is None: sq = _sqlar_open(sqlar_path(session_id))
+        return sq
     moved = []
     paths = []
     for root, _dirs, names in os.walk(upper, onerror=lambda _e: None):
@@ -732,33 +846,29 @@ def consolidate(shm_dir, session_id: str, cmd: list) -> None:
         if rel in files: continue                        # already in the patch
         host = Path("/") / rel
         try:
-            if is_whiteout(ap):                          # deletion
-                if not host.exists() or host.is_dir(): continue
-                lo = host.read_bytes()
-                if b"\x00" in lo: continue
-                lower, upperl, created, deleted = ut_split(lo), [], False, True
-            elif ap.is_file() and not ap.is_symlink():
-                ub = ap.read_bytes()
-                if b"\x00" in ub: continue
-                lob = host.read_bytes() if (host.exists() and not host.is_dir()) else b""
-                if b"\x00" in lob: continue
-                lower, upperl = ut_split(lob), ut_split(ub)
-                created, deleted = not host.exists(), False
+            if is_whiteout(ap):                          # deletion → sqlar tombstone
+                if host.exists() or host.is_symlink():
+                    _sqlar_put_tombstone(_sq(), rel)
+                # a whiteout over nothing is a no-op; just drop it
+            elif ap.is_symlink():
+                _sqlar_put_symlink(_sq(), rel,
+                                   os.readlink(ap).encode("utf-8", "surrogateescape"),
+                                   ap.lstat().st_mtime)
+            elif ap.is_file():
+                if not _try_fold_patch(rel, ap, host, files):   # not clean text
+                    st = ap.stat()
+                    _sqlar_put_file(_sq(), rel, ap.read_bytes(), st.st_mode, st.st_mtime)
             else:
-                continue
+                continue                                 # dirs handled by cleanup
         except OSError:
             continue
-        fp = build_file_patch(rel, lower, upperl, created, deleted)
-        try:
-            if b"".join(apply_hunks(lower, fp["hunks"])) != b"".join(upperl):
-                continue                                # not exactly representable
-        except PatchConflict:
-            continue
-        files[rel] = fp; moved.append(ap)
+        moved.append(ap)
     if files:
         write_patch_file(pp, serialize_patch(files), cmd)
     elif pp.exists():
         pp.unlink()
+    if sq is not None:
+        sq.commit(); sq.close(); set_cmd_xattr(sqlar_path(session_id), cmd)
     for ap in moved:
         remove_upper_entry(ap); cleanup_dirs(upper, ap.parent)
 
@@ -828,6 +938,7 @@ class Session:
     sess_rules: list = field(default_factory=list)   # ordered, session-only Rules
     live: bool = False
     has_patch: bool = False                           # a consolidated patch exists
+    has_sqlar: bool = False                           # a consolidated sqlar exists
     # started time and pid are not stored — they are read back out of the name.
     @property
     def started(self) -> float: return parse_sid(self.session_id)[0]
@@ -848,8 +959,8 @@ class Session:
 
 
 def discover_sessions() -> dict:
-    """Find sessions purely from filesystem names: slopbox.<sid> overlay dirs and
-    <sid>.patch.xz patches. Everything but the command is encoded in <sid>."""
+    """Find sessions purely from filesystem names: slopbox.<sid> overlay dirs plus
+    <sid>.patch.xz and <sid>.sqlar under state_home. All but the command is in <sid>."""
     out = {}
     if SHM_ROOT.exists():
         for d in SHM_ROOT.glob(SHM_PREFIX + "*"):
@@ -861,15 +972,18 @@ def discover_sessions() -> dict:
                 live=False)
     sd = state_home()
     if sd.exists():
+        def _store(sid, src):
+            s = out.get(sid)
+            if s is None:
+                s = out[sid] = Session(
+                    session_id=sid, cmd=get_cmd_xattr(src),
+                    shm_dir=str(SHM_ROOT / (SHM_PREFIX + sid)),
+                    status="finished", live=False)
+            return s
         for pf in sd.glob("*.patch.xz"):
-            sid = pf.name[:-len(".patch.xz")]
-            if sid in out:
-                out[sid].has_patch = True
-                continue
-            out[sid] = Session(
-                session_id=sid, cmd=get_cmd_xattr(pf),
-                shm_dir=str(SHM_ROOT / (SHM_PREFIX + sid)),
-                status="finished", live=False, has_patch=True)
+            _store(pf.name[:-len(".patch.xz")], pf).has_patch = True
+        for af in sd.glob("*.sqlar"):
+            _store(af.name[:-len(".sqlar")], af).has_sqlar = True
     return out
 
 
@@ -908,8 +1022,9 @@ class Supervisor:
             elif not cur.live:
                 ns = "running" if _pid_alive(cur.pid) else (
                     cur.status if cur.status == "killed" else "finished")
-                changed = ns != cur.status or cur.has_patch != s.has_patch
-                cur.status = ns; cur.has_patch = s.has_patch
+                changed = (ns != cur.status or cur.has_patch != s.has_patch
+                           or cur.has_sqlar != s.has_sqlar)
+                cur.status = ns; cur.has_patch = s.has_patch; cur.has_sqlar = s.has_sqlar
                 if changed:
                     self._emit(type="session_updated", session=cur.to_dict())
         for sid in list(self.sessions):
@@ -918,7 +1033,8 @@ class Supervisor:
             shm_gone = not (s.shm_dir and Path(s.shm_dir).exists())
             inmem = self.patches.get(sid)
             patch_gone = not patch_path(sid).exists() and not (inmem and inmem["files"])
-            if shm_gone and patch_gone:
+            sqlar_gone = not sqlar_path(sid).exists()
+            if shm_gone and patch_gone and sqlar_gone:
                 del self.sessions[sid]
                 self._emit(type="session_removed", session_id=sid)
 
@@ -993,6 +1109,7 @@ class Supervisor:
         # (and mark this session as already-consolidated so we don't redo it).
         self.patches.pop(s.session_id, None)
         s.has_patch = patch_path(s.session_id).exists()
+        s.has_sqlar = sqlar_path(s.session_id).exists()
         self._consolidated.add(s.session_id)
         self._emit(type="session_updated", session=s.to_dict())
 
@@ -1074,10 +1191,10 @@ class Supervisor:
         if s.shm_dir:
             fuse_unmount(s.merged)
             rm_rf(s.shm_dir)
-        pf = patch_path(sid)
-        if pf.exists():
-            try: pf.unlink()
-            except OSError: pass
+        for f in (patch_path(sid), sqlar_path(sid)):
+            if f.exists():
+                try: f.unlink()
+                except OSError: pass
         self.patches.pop(sid, None)
         del self.sessions[sid]
         self._emit(type="session_removed", session_id=sid)
@@ -1297,13 +1414,14 @@ class Supervisor:
         cleanup_dirs(upper, start)
 
     def _maybe_remove_empty(self, sid) -> None:
-        """A finished session with neither overlay changes nor a patch disappears."""
+        """A finished session with no overlay change, no patch and no sqlar vanishes."""
         s = self.sessions.get(sid)
         if not s or s.live or _pid_alive(s.pid): return
         try: overlay = upper_has_changes(Path(s.upper))
         except OSError: overlay = False
         patch = bool(self._patch(sid)["files"]) or patch_path(sid).exists()
-        if not overlay and not patch:
+        sqlar = sqlar_path(sid).exists()
+        if not overlay and not patch and not sqlar:
             self.delete(sid)
 
     def overlay_apply(self, sid, paths) -> dict:
@@ -1439,20 +1557,86 @@ class Supervisor:
             return
         self.patches.pop(sid, None)        # force a reload of the freshly-written patch
         s.has_patch = patch_path(sid).exists()
-        # A text-only session has had its whole overlay folded away; drop the now
-        # empty /dev/shm tree (the patch is the only remaining record).
+        s.has_sqlar = sqlar_path(sid).exists()
+        # consolidate() empties the overlay (text → patch, the rest → sqlar), so the
+        # /dev/shm tree is now spent — free it; the on-disk stores are the record.
         try: empty = not upper_has_changes(Path(s.upper))
         except OSError: empty = False
         if empty:
             fuse_unmount(s.merged); rm_rf(s.shm_dir)
 
+    # ─── sqlar layer (binary files, symlinks, deletions a patch can't hold) ──
+    def _sqlar_entries(self, sid) -> list:
+        out = []
+        for name, mode, mtime, sz in sqlar_list(sqlar_path(sid)):
+            host = Path("/") / name
+            if stat_mod.S_ISCHR(mode):
+                kind, stale = "deleted", False
+            else:
+                exists = host.exists() or host.is_symlink()
+                kind = "modified" if exists else "created"
+                stale = False
+                if exists:
+                    try: stale = host.lstat().st_mtime > mtime
+                    except OSError: stale = False
+            out.append(dict(path=name, kind=kind, size=sz, is_text=False,
+                            stale=stale, source="sqlar"))
+        return out
+
+    def _in_sqlar(self, sid, rel) -> bool:
+        return sqlar_mode(sqlar_path(sid), rel.lstrip("/")) is not None
+
+    def _sqlar_display(self, sid, rel) -> dict:
+        sp = sqlar_path(sid); rel = rel.lstrip("/")
+        mode = sqlar_mode(sp, rel)
+        if mode is None: return dict(is_text=False, hunks=[], diff=dict(kind="error", error="gone"))
+        host = Path("/") / rel
+        if stat_mod.S_ISCHR(mode):
+            return dict(is_text=False, hunks=[], diff=dict(kind="deleted"))
+        if stat_mod.S_ISLNK(mode):
+            tgt = sqlar_content(sp, rel) or b""
+            d = dict(kind="modified" if host.is_symlink() else "created",
+                     diff="symlink → " + tgt.decode("utf-8", "replace"))
+            return dict(is_text=False, hunks=[], diff=d)
+        raw = sqlar_content(sp, rel) or b""
+        return dict(is_text=False, hunks=[],
+                    diff=dict(kind="modified" if host.exists() else "created",
+                              content=base64.b64encode(raw).decode()))
+
+    def _sqlar_apply(self, sid, rel) -> dict:
+        sp = sqlar_path(sid); rel = rel.lstrip("/")
+        mode = sqlar_mode(sp, rel)
+        if mode is None: return dict(ok=False, error="not in archive")
+        host = Path("/") / rel
+        try:
+            if stat_mod.S_ISCHR(mode):                      # tombstone → delete
+                if host.is_dir() and not host.is_symlink(): shutil.rmtree(host)
+                elif host.exists() or host.is_symlink(): host.unlink()
+            elif stat_mod.S_ISLNK(mode):
+                tgt = (sqlar_content(sp, rel) or b"").decode("utf-8", "surrogateescape")
+                if host.exists() or host.is_symlink(): host.unlink()
+                host.parent.mkdir(parents=True, exist_ok=True); os.symlink(tgt, host)
+            else:
+                host.parent.mkdir(parents=True, exist_ok=True)
+                host.write_bytes(sqlar_content(sp, rel) or b"")
+                try: os.chmod(host, stat_mod.S_IMODE(mode))
+                except OSError: pass
+        except OSError as e:
+            return dict(ok=False, error=str(e))
+        sqlar_remove(sp, rel)
+        return dict(ok=True)
+
+    def _sqlar_discard(self, sid, rel) -> dict:
+        sqlar_remove(sqlar_path(sid), rel.lstrip("/"))
+        return dict(ok=True)
+
     def session_changes(self, sid) -> list:
-        """All changes for a session, from the overlay and the patch, each tagged
-        with its source. (A file is never in both.)"""
+        """All changes for a session — overlay, patch and sqlar — each tagged with
+        its source. (A file is in exactly one of the three.)"""
         self._ensure_consolidated(sid)
         ov = self.overlay_entries(sid)
         for e in ov: e["source"] = "overlay"
-        return ov + self._patch_entries(sid)
+        return ov + self._patch_entries(sid) + self._sqlar_entries(sid)
 
     def _in_patch(self, sid, rel) -> bool:
         return rel.lstrip("/") in self._patch(sid)["files"]
@@ -1460,6 +1644,7 @@ class Supervisor:
     def hunks(self, sid, rel) -> dict:
         rel2 = rel.lstrip("/")
         if self._in_patch(sid, rel2): return self._patch_hunks_display(sid, rel2)
+        if self._in_sqlar(sid, rel2): return self._sqlar_display(sid, rel2)
         return self.overlay_hunks(sid, rel)
 
     def _patch_hunks_display(self, sid, rel) -> dict:
@@ -1479,11 +1664,13 @@ class Supervisor:
     def apply_hunk(self, sid, rel, index) -> dict:
         rel2 = rel.lstrip("/")
         if self._in_patch(sid, rel2): return self._patch_apply_hunk(sid, rel2, index)
+        if self._in_sqlar(sid, rel2): return dict(ok=False, error="binary — apply whole file")
         return self.overlay_apply_hunk(sid, rel, index)
 
     def discard_hunk(self, sid, rel, index) -> dict:
         rel2 = rel.lstrip("/")
         if self._in_patch(sid, rel2): return self._patch_discard_hunk(sid, rel2, index)
+        if self._in_sqlar(sid, rel2): return dict(ok=False, error="binary — discard whole file")
         return self.overlay_discard_hunk(sid, rel, index)
 
     def _drop_patch_file(self, sid, rel) -> None:
@@ -1518,26 +1705,46 @@ class Supervisor:
         return dict(ok=True)
 
     def apply(self, sid, paths) -> dict:
-        pf = self._patch(sid)["files"]
+        # Route each path to its store: patch (apply every hunk), sqlar (write the
+        # blob / delete for a tombstone), or the live overlay.
         if paths is None: paths = [e["path"] for e in self.session_changes(sid)]
-        ov = [p for p in paths if p.lstrip("/") not in pf]
-        res = self.overlay_apply(sid, ov) if ov else dict(applied=[], errors=[])
-        for rel in [p for p in paths if p.lstrip("/") in pf]:
-            rel2 = rel.lstrip("/"); ok = True
-            while pf.get(rel2, {}).get("hunks"):
-                if not self._patch_apply_hunk(sid, rel2, 0).get("ok"): ok = False; break
-            (res["applied"] if ok else res["errors"]).append(
-                rel if ok else {"path": rel, "error": "some hunks did not apply"})
+        pf = self._patch(sid)["files"]
+        res = dict(applied=[], errors=[]); ov = []
+        for rel in paths:
+            r = rel.lstrip("/")
+            if r in pf:
+                ok = True
+                while pf.get(r, {}).get("hunks"):
+                    if not self._patch_apply_hunk(sid, r, 0).get("ok"): ok = False; break
+                (res["applied"] if ok else res["errors"]).append(
+                    rel if ok else {"path": rel, "error": "some hunks did not apply"})
+            elif self._in_sqlar(sid, r):
+                rr = self._sqlar_apply(sid, r)
+                (res["applied"] if rr.get("ok") else res["errors"]).append(
+                    rel if rr.get("ok") else {"path": rel, "error": rr.get("error")})
+            else:
+                ov.append(rel)
+        if ov:
+            o = self.overlay_apply(sid, ov)
+            res["applied"] += o["applied"]; res["errors"] += o["errors"]
         self._maybe_remove_empty(sid)
         return res
 
     def discard(self, sid, paths) -> dict:
-        pf = self._patch(sid)["files"]
         if paths is None: paths = [e["path"] for e in self.session_changes(sid)]
-        ov = [p for p in paths if p.lstrip("/") not in pf]
-        res = self.overlay_discard(sid, ov) if ov else dict(discarded=[], errors=[])
-        for rel in [p for p in paths if p.lstrip("/") in pf]:
-            self._drop_patch_file(sid, rel.lstrip("/")); res["discarded"].append(rel)
+        pf = self._patch(sid)["files"]
+        res = dict(discarded=[], errors=[]); ov = []
+        for rel in paths:
+            r = rel.lstrip("/")
+            if r in pf:
+                self._drop_patch_file(sid, r); res["discarded"].append(rel)
+            elif self._in_sqlar(sid, r):
+                self._sqlar_discard(sid, r); res["discarded"].append(rel)
+            else:
+                ov.append(rel)
+        if ov:
+            o = self.overlay_discard(sid, ov)
+            res["discarded"] += o["discarded"]; res["errors"] += o["errors"]
         self._maybe_remove_empty(sid)
         return res
 
@@ -2019,17 +2226,17 @@ def cmd_run(cmd, no_net, session_whitelist, chdir) -> int:
                       status="finished", exit_code=1)
         return 1
 
-    # Consolidate every exactly-representable change out of the overlay into a
-    # single patch (host <- overlay <- patch); binary/non-representable changes
-    # stay in the overlay.
+    # Empty the overlay into on-disk state: text → <sid>.patch.xz, the rest (binary,
+    # symlinks, deletions) → <sid>.sqlar. Afterwards the /dev/shm tree is spent.
     try:
         consolidate(str(shm_dir), sid, list(cmd))
     except Exception as e:
-        print(f"slopbox: patch consolidation failed: {e}", file=sys.stderr)
+        print(f"slopbox: consolidation failed: {e}", file=sys.stderr)
 
     has_overlay = upper_has_changes(up)
     has_patch = patch_path(sid).exists()
-    if not has_overlay and not has_patch:
+    has_sqlar = sqlar_path(sid).exists()
+    if not has_overlay and not has_patch and not has_sqlar:
         rm_rf(shm_dir)
         if have_ui:
             sync_send(SOCK_PATH, type="remove", session_id=sid)
@@ -2037,11 +2244,11 @@ def cmd_run(cmd, no_net, session_whitelist, chdir) -> int:
         return code or 0
 
     if not has_overlay:
-        rm_rf(shm_dir)          # text-only: overlay emptied into the patch
+        rm_rf(shm_dir)          # consolidated: overlay emptied into patch + sqlar
     if have_ui:
         sync_send(SOCK_PATH, type="unregister", session_id=sid,
                   status="finished", exit_code=code or 0)
-    where = patch_path(sid) if not has_overlay else up
+    where = (state_home() if not has_overlay else up)
     print(f"slopbox: {sid} exited ({code}). Review changes in the UI, "
           f"or: {where}", file=sys.stderr)
     return code or 0
@@ -2465,7 +2672,7 @@ def run_ui() -> int:
         # action keys advertised in the bottom bar for that view.
         _LEFT_HDR={
             "boxes":"● SLOPBOXES   [dim]R run · F fin · K kill · ✓/✗ conns[/]",
-            "changes":"📁 FILES   [dim]+ new · ~ mod · - del · [/][reverse red]![/][dim] stale · [/][blue]P[/][dim] patch · O overlay[/]",
+            "changes":"📁 FILES   [dim]+ new · ~ mod · - del · [/][reverse red]![/][dim] stale · [/][blue]P[/][dim] patch · [/][magenta]A[/][dim] archive · O overlay[/]",
             "net":"✓ NETWORK RULES   [dim]top → bottom, first match wins[/]",
             "file":"✓ FILE RULES   [dim]top → bottom, first match wins[/]"}
         _RIGHT_HDR={
@@ -2733,9 +2940,11 @@ def run_ui() -> int:
                 if e.get("stale"): t.append("!", style="reverse red")  # host is newer
                 return t
             def src(e):
-                # where this change currently lives: P = consolidated patch (on
-                # disk / in memory), O = raw overlay on /dev/shm.
-                if e.get("source")=="patch": return Text("P", style="blue")
+                # where this change lives: P = patch (text), A = sqlar archive
+                # (binary/symlink/deletion), O = raw overlay still on /dev/shm.
+                s=e.get("source")
+                if s=="patch": return Text("P", style="blue")
+                if s=="sqlar": return Text("A", style="magenta")
                 return Text("O", style="dim")
             rows=[(e["path"], [flag(e), src(e),
                                Text(e["path"], style="red" if e.get("stale") else ""),
