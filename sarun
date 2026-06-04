@@ -2029,8 +2029,8 @@ def run_ui() -> int:
     from textual.reactive import reactive
     from textual.screen import ModalScreen
     from textual.widgets import (
-        Button, Checkbox, DataTable, Footer, Header, Input, Label,
-        ListItem, ListView, Static, TabbedContent, TabPane)
+        Button, Checkbox, DataTable, Header, Input, Label,
+        ListItem, ListView, Static)
     from rich.text import Text
 
     # Build a styled line as data: each fragment is (text, style); the text is
@@ -2154,17 +2154,8 @@ def run_ui() -> int:
         @on(Input.Submitted,"#rule-input")
         def _save(self): self.dismiss(self.query_one("#rule-input",Input).value.strip())
 
-    class ApprovalItem(ListItem):
-        def __init__(self,a): super().__init__(); self.a=a
-        def compose(self):
-            a=self.a
-            yield Label(styled((a['scheme'],"bold"), " ", (a['host'],"cyan"),
-                               f":{a['port']}  ",
-                               (f"{a['session_id'][:8]} · {fmt_age(a['ts'])}","dim")))
-
-    # Each interactive pane carries its own key bindings (with labels), delegating
-    # to the app's actions. Textual's Footer then shows exactly the keys usable in
-    # whatever pane is focused — pico/pine style — instead of one fixed list.
+    # Each list carries its own key bindings, delegating to the app's actions. The
+    # bottom key bar advertises them per view (and lights up the current list's key).
     class SessionTable(DataTable):
         BINDINGS=[Binding("k","kill","kill"), Binding("d","delete","delete")]
         def action_kill(self): self.app.action_kill()
@@ -2181,16 +2172,6 @@ def run_ui() -> int:
         def action_discard_all(self): self.app.action_discard_all()
         def action_save(self): self.app.action_save_patch()
         def action_refresh(self): self.app.action_refresh()
-
-    class ApprovalsList(ListView):
-        BINDINGS=[Binding("y","allow_once","allow once"),
-                  Binding("n","deny_once","deny once"),
-                  Binding("Y","allow_rule","allow rule…"),
-                  Binding("N","deny_rule","deny rule…")]
-        def action_allow_once(self): self.app.action_ap_once("allow")
-        def action_deny_once(self): self.app.action_ap_once("deny")
-        def action_allow_rule(self): self.app.action_ap_rule("allow")
-        def action_deny_rule(self): self.app.action_ap_rule("deny")
 
     class RulesList(ListView):
         # 'd' here removes the focused rule (consistent with 'd' = delete elsewhere).
@@ -2262,18 +2243,15 @@ def run_ui() -> int:
         CSS="""
         Screen { layout: vertical; }
         .pt  { height:1; padding:0 1; text-style:bold; background:$primary; color:$text; }
-        .pw  { height:1; padding:0 1; text-style:bold; background:$warning; color:$text; }
-        .pok { height:1; padding:0 1; text-style:bold; background:$success; color:$text; }
-        #s-pane { height:1fr; border:solid $primary; }
-        #sb-bot { height:1fr; }
-        #a-pane { width:3fr; border:solid $warning; }
-        #a-pane.pending { border:tall $error; }
-        #w-pane { width:2fr; border:solid $success; }
-        #c-top { height:1fr; }
-        #cf-pane { width:2fr; border:solid $primary; }
-        #cd-pane { width:3fr; border:solid $primary; }
+        #keybar { height:auto; padding:0 1; background:$surface; color:$text; }
+        #appr-bar { height:auto; display:none; padding:0 1;
+                    background:$warning; color:$text; text-style:bold; }
+        #appr-bar.show { display:block; }
+        #main { height:1fr; }
+        #left  { width:2fr; border:solid $primary; }
+        #right { width:3fr; border:solid $primary; }
+        #box-detail, #rule-detail { height:1fr; padding:0 1; }
         #c-bar { height:1; background:$surface; color:$text-muted; padding:0 1; }
-        #fr-pane { border:solid $success; height:1fr; }
         #status { height:1; background:$surface; color:$text-muted; padding:0 1; }
         DataTable { height:1fr; } ListView { height:1fr; }
         #confirm-box { width:64; height:auto; padding:1 2; background:$surface; border:tall $error; }
@@ -2283,12 +2261,31 @@ def run_ui() -> int:
         #rule-btns { height:3; margin-top:1; }
         ModalScreen { align:center middle; }
         """
+        # The single left-hand list cycles through these sources; the right pane
+        # shows the matching detail. Approvals are not a view — they arrive as a
+        # transient top banner with global keys, so they never steal the cursor.
+        VIEWS=("boxes","changes","net","file")
+        VIEW_TITLE={"boxes":"Slopboxes","changes":"Changes",
+                    "net":"Net rules","file":"File rules"}
+        LEFT={"boxes":"#s-tab","changes":"#cf-tab","net":"#w-list","file":"#r-list"}
+        RIGHT={"boxes":"#box-detail","changes":"#cd-log",
+               "net":"#rule-detail","file":"#rule-detail"}
+        # One direct key per list (shown — and highlighted for the current one — in
+        # the bottom key bar). No tab strip: the active view is the lit-up key.
+        VIEW_KEY={"boxes":"b","changes":"c","net":"w","file":"f"}
         BINDINGS=[
-            Binding("escape","back","Back"),
-            Binding("r","rules","File rules"),
-            Binding("tab","focus_next","",show=False),
-            Binding("shift+tab","focus_previous","",show=False),
-            Binding("q","quit","Quit")]
+            Binding("b","view_boxes","boxes"),
+            Binding("c","view_changes","changes"),
+            Binding("w","view_net","net rules"),
+            Binding("f","view_file","file rules"),
+            Binding("escape","back","back"),
+            Binding("q","quit","quit"),
+            # Approval keys act on the oldest pending request from anywhere, without
+            # moving focus. The banner shows them in place.
+            Binding("y","ap_allow","",show=False),
+            Binding("n","ap_deny","",show=False),
+            Binding("Y","ap_allow_rule","",show=False),
+            Binding("N","ap_deny_rule","",show=False)]
         sessions=reactive({}, layout=True)
         pending=reactive({}, layout=True)
 
@@ -2298,6 +2295,7 @@ def run_ui() -> int:
             # PgUp/PgDn jump a page instantly instead of re-compositing the whole
             # screen frame-by-frame.
             self.animation_level="none"
+            self.view="boxes"
             self.rules_store=Rules(RULES_FILE)
             self.frules_store=FileRules(FILE_RULES_FILE)
             self.sup=Supervisor(self.rules_store)
@@ -2310,34 +2308,22 @@ def run_ui() -> int:
 
         def compose(self) -> ComposeResult:
             yield Header()
-            with TabbedContent(id="tabs", initial="t-sb"):
-                with TabPane("Slopboxes", id="t-sb"):
-                    with Vertical(id="s-pane"):
-                        yield Static("● SLOPBOXES   [dim]R run · F fin · K kill · ✓/✗ allowed/denied conns · ↵ changes[/]", classes="pt")
-                        yield SessionTable(id="s-tab", cursor_type="row")
-                    with Horizontal(id="sb-bot"):
-                        with Vertical(id="a-pane"):
-                            yield Static("⚡ APPROVALS   [dim]y allow once · n deny once · Y/N …as a rule[/]", classes="pw")
-                            yield ApprovalsList(id="a-list")
-                        with Vertical(id="w-pane"):
-                            yield Static("✓ NETWORK RULES   [dim]top → bottom, first match wins[/]", classes="pok")
-                            yield RulesList(id="w-list")
-                with TabPane("Changes", id="t-ch"):
-                    with Horizontal(id="c-top"):
-                        with Vertical(id="cf-pane"):
-                            yield Static("📁 FILES   [dim]+ new · ~ mod · - del ·[/] [reverse red]![/] [dim]host changed ·[/] [blue]P[/][dim] patch ·[/] [dim]O overlay[/]", classes="pt")
-                            yield ChangesTable(id="cf-tab", cursor_type="row")
-                        with Vertical(id="cd-pane"):
-                            yield Static("≡ DIFF   [dim]↵ focus · ↑/↓ hunk · a apply · x discard · esc back[/]", classes="pt")
-                            yield DiffView(id="cd-log")
-                    yield Static("", id="c-bar")
-                with TabPane("File Rules", id="t-fr"):
-                    with Vertical(id="fr-pane"):
-                        yield Static("✓ FILE RULES   [dim]top → bottom, first match wins · "
-                                     "apply / discard during capture · a add · e edit · d remove[/]", classes="pok")
-                        yield FileRulesList(id="r-list")
+            yield Static("", id="appr-bar")       # transient approval banner
+            with Horizontal(id="main"):
+                with Vertical(id="left"):
+                    yield Static("", id="left-title", classes="pt")
+                    yield SessionTable(id="s-tab", cursor_type="row")
+                    yield ChangesTable(id="cf-tab", cursor_type="row")
+                    yield RulesList(id="w-list")
+                    yield FileRulesList(id="r-list")
+                with Vertical(id="right"):
+                    yield Static("", id="right-title", classes="pt")
+                    yield Static("", id="box-detail")
+                    yield DiffView(id="cd-log")
+                    yield Static("", id="rule-detail")
+            yield Static("", id="c-bar")
             yield Static("", id="status")
-            yield Footer()
+            yield Static("", id="keybar")         # global keys; active list lit up
 
         async def on_mount(self):
             self.query_one("#s-tab",DataTable).add_columns(
@@ -2358,9 +2344,8 @@ def run_ui() -> int:
             for s in self.sup.sessions.values():
                 self.sessions={**self.sessions, s.session_id:s.to_dict()}
             self._rebuild_sessions()
+            self._set_view("boxes")           # shows only the slopbox list + detail
             self.set_interval(3, self._tick)
-            try: self.query_one("#s-tab",DataTable).focus()
-            except Exception: pass
 
         async def on_unmount(self):
             self._save_all_patches()
@@ -2379,6 +2364,7 @@ def run_ui() -> int:
             if t in ("session_added","session_updated"):
                 s=ev["session"]; self.sessions={**self.sessions,s["session_id"]:s}
                 self._rebuild_sessions(preserve=True)
+                if self.view=="boxes": self._update_box_detail()
             elif t=="session_removed":
                 sid=ev["session_id"]
                 self.sessions={k:v for k,v in self.sessions.items() if k!=sid}
@@ -2386,29 +2372,26 @@ def run_ui() -> int:
                 if self._ch_sid==sid:
                     self._ch_sid=None; self._last_loaded_sid=None
                     self._ch_entries=[]; self._rebuild_ch()
+                if self.view=="boxes": self._update_box_detail()
             elif t=="approval_pending":
                 a=ev["approval"]; self.pending={**self.pending,a["request_id"]:a}
-                self._rebuild_approvals(preserve=True); self.bell()
-                # Surface the approval keys: focus the approvals list (unless a
-                # modal is open or the user is on another tab).
-                try:
-                    if (len(self.screen_stack)==1 and
-                            self.query_one("#tabs",TabbedContent).active=="t-sb"):
-                        lv=self.query_one("#a-list",ListView)
-                        if lv.index is None and self.pending: lv.index=0
-                        lv.focus()
-                except Exception: pass
+                # No focus stealing: just raise the banner, beep, and (if available)
+                # fire a desktop notification. The keys work from wherever you are.
+                self._render_appr(); self.bell()
+                self._notify("slopbox: approve connection?",
+                             f"{a['scheme']} {a['host']}:{a['port']}")
             elif t=="approval_resolved":
                 rid=ev["request_id"]
                 self.pending={k:v for k,v in self.pending.items() if k!=rid}
-                self._rebuild_approvals(preserve=True)
+                self._render_appr()
             elif t=="rules_updated":
                 self._refresh_rules()
+                if self.view=="net": self._update_rule_detail()
 
         def _tick(self):
             self.sup.rescan()
             self._rebuild_sessions(preserve=True)
-            self._rebuild_approvals(preserve=True)
+            self._render_appr()
             # Autosave any in-memory patch that's been dirty and idle for 60s, to
             # avoid thrashing the compressed file on every edit.
             now=time.time()
@@ -2418,9 +2401,108 @@ def run_ui() -> int:
             if self._ch_sid is None:
                 s=self._sel_session()
                 if s: self._ch_sid=self._last_loaded_sid=s["session_id"]
-            if self._ch_sid:
+            if self.view=="changes" and self._ch_sid:
                 self._load_changes(self._ch_sid)
+            if self.view=="boxes":
+                self._update_box_detail()
             self._cbar()    # keep the dirty/count indicator current
+
+        # ── view machinery: one left list at a time + its right-pane detail ────
+        def _set_view(self, v):
+            if self.view=="changes" and v!="changes":
+                self._save_all_patches()      # leaving changes autosaves the patch
+            self.view=v
+            for k,sel in self.LEFT.items():
+                try: self.query_one(sel).display=(k==v)
+                except Exception: pass
+            rsel=self.RIGHT[v]
+            for sel in ("#box-detail","#cd-log","#rule-detail"):
+                try: self.query_one(sel).display=(sel==rsel)
+                except Exception: pass
+            self._titles()
+            if v=="changes" and self._ch_sid:
+                self._load_changes(self._ch_sid, force=True)
+            self._update_right()
+            try: self.query_one(self.LEFT[v]).focus()
+            except Exception: pass
+
+        def action_view_boxes(self): self._set_view("boxes")
+        def action_view_changes(self): self._set_view("changes")
+        def action_view_net(self): self._set_view("net")
+        def action_view_file(self): self._set_view("file")
+
+        # Per-view pane headers (left = the list, right = its detail) and the set of
+        # action keys advertised in the bottom bar for that view.
+        _LEFT_HDR={
+            "boxes":"● SLOPBOXES   [dim]R run · F fin · K kill · ✓/✗ conns[/]",
+            "changes":"📁 FILES   [dim]+ new · ~ mod · - del · [/][reverse red]![/][dim] stale · [/][blue]P[/][dim] patch · O overlay[/]",
+            "net":"✓ NETWORK RULES   [dim]top → bottom, first match wins[/]",
+            "file":"✓ FILE RULES   [dim]top → bottom, first match wins[/]"}
+        _RIGHT_HDR={
+            "boxes":"≣ DETAIL","changes":"≡ DIFF",
+            "net":"⛁ WHAT IT MATCHES","file":"⛁ WHAT IT MATCHES"}
+        _ACTS={
+            "boxes":[("↵","review"),("k","kill"),("d","delete")],
+            "changes":[("↵","diff"),("a","apply"),("x","discard"),
+                       ("X","disc all"),("s","save")],
+            "net":[("↵/e","edit"),("d","remove"),("^↑/^↓","move")],
+            "file":[("a","add"),("↵/e","edit"),("d","remove"),("^↑/^↓","move")]}
+
+        def _titles(self):
+            try: self.query_one("#left-title",Static).update(self._LEFT_HDR[self.view])
+            except Exception: pass
+            try: self.query_one("#right-title",Static).update(self._RIGHT_HDR[self.view])
+            except Exception: pass
+            self._keybar()
+
+        def _keybar(self):
+            t=Text()
+            # the four list keys; the current view is lit up (its key reversed and
+            # its name in bright bold, the others dim) so "which list" is obvious.
+            for v in self.VIEWS:
+                k=self.VIEW_KEY[v]; on=(v==self.view)
+                t.append(f" {k} ", style="reverse bold" if on else "bold")
+                t.append(self.VIEW_TITLE[v]+"  ",
+                         style="bold yellow" if on else "dim")
+            t.append(" │  ", style="dim")
+            for k,lab in self._ACTS[self.view]:
+                t.append(k, style="bold"); t.append(f" {lab}  ", style="dim")
+            t.append(" esc back  q quit", style="dim")
+            try: self.query_one("#keybar",Static).update(t)
+            except Exception: pass
+
+        def _update_right(self):
+            if self.view=="boxes": self._update_box_detail()
+            elif self.view in ("net","file"): self._update_rule_detail()
+
+        def _notify(self, title, body):
+            exe=shutil.which("notify-send")
+            if not exe: return
+            try:
+                subprocess.Popen([exe,"-a","slopbox","-u","critical",title,body],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception: pass
+
+        def _first_pending(self):
+            return next(iter(self.pending.values()), None)
+
+        def _render_appr(self):
+            bar=self.query_one("#appr-bar",Static)
+            if not self.pending:
+                bar.set_class(False,"show"); bar.update(""); return
+            a=self._first_pending(); n=len(self.pending)
+            t=Text()
+            t.append("⚡ ALLOW? ", style="bold")
+            t.append(a["scheme"]+" ", style="bold")
+            t.append(a["host"], style="cyan"); t.append(f":{a['port']}")
+            t.append(f"  [{a['session_id'][:8]}]", style="dim")
+            if n>1: t.append(f"  (+{n-1} more)", style="dim")
+            t.append("      ")
+            t.append("y", style="reverse"); t.append(" allow  ")
+            t.append("n", style="reverse"); t.append(" deny  ")
+            t.append("Y", style="reverse"); t.append(" allow rule…  ")
+            t.append("N", style="reverse"); t.append(" deny rule…")
+            bar.update(t); bar.set_class(True,"show")
 
         def _sync_table(self, table, rows):
             # Reconcile a DataTable against the desired (key, cells) rows IN PLACE.
@@ -2465,19 +2547,70 @@ def run_ui() -> int:
                     fmt_age(s["started"])]))
             self._sync_table(self.query_one("#s-tab",DataTable), rows)
 
-        def _rebuild_approvals(self, preserve=False):
-            lv=self.query_one("#a-list",ListView)
-            self.query_one("#a-pane").set_class(bool(self.pending),"pending")
-            new_ids=list(self.pending.keys())
-            cur_ids=[c.a.get("request_id") for c in lv.children
-                     if isinstance(c,ApprovalItem)]
-            if cur_ids==new_ids:
-                return                       # nothing added/removed: leave it alone
-            saved=lv.index
-            lv.clear()
-            for a in self.pending.values(): lv.append(ApprovalItem(a))
-            if saved is not None and 0<=saved<len(self.pending):
-                lv.index=saved
+        def _update_box_detail(self):
+            d=self.query_one("#box-detail",Static)
+            s=self._sel_session()
+            if not s:
+                d.update(Text("(no slopbox selected)", style="dim")); return
+            sid=s["session_id"]
+            t=Text()
+            t.append(s["label"]+"\n", style="bold "+(sty(s["status"]) or ""))
+            t.append("status  ", style="dim"); t.append(s["status"]+"\n", style=sty(s["status"]))
+            t.append("cmd     ", style="dim"); t.append(" ".join(s["cmd"])+"\n")
+            t.append("pid     ", style="dim")
+            t.append(f"{s['pid']}    age {fmt_age(s['started'])}\n")
+            t.append("conns   ", style="dim")
+            t.append(f"{s['conn_allowed']} ✓ ", style="green")
+            t.append(f"{s['conn_denied']} ✗", style="red")
+            t.append(f"    ↑{fmt_bytes(s['bytes_up'])} ↓{fmt_bytes(s['bytes_down'])}\n", style="dim")
+            try: entries=self.sup.session_changes(sid)
+            except Exception: entries=[]
+            t.append("changes ", style="dim")
+            t.append(f"{len(entries)} file(s)   ")
+            t.append("[↵ to review]\n\n", style="dim")
+            sig={"created":("+","green"),"modified":("~","yellow"),"deleted":("-","red")}
+            for e in entries[:200]:
+                sym,col=sig.get(e["kind"],("?",""))
+                t.append("  "); t.append(sym+" ", style=col)
+                t.append(e["path"]+"\n",
+                         style="red" if e.get("stale") else "")
+            d.update(t)
+
+        def _update_rule_detail(self):
+            d=self.query_one("#rule-detail",Static)
+            if self.view=="net":
+                rules=self.rules_store.rules
+                i=self.query_one("#w-list",ListView).index
+                if i is None or not (0<=i<len(rules)):
+                    d.update(Text("(no rule — connections fall through to a prompt)", style="dim")); return
+                r=rules[i]; t=Text()
+                t.append(("ALLOW" if r.action=="allow" else "DENY")+"\n",
+                         style="green bold" if r.action=="allow" else "red bold")
+                t.append("kind     ", style="dim"); t.append(r.kind+"\n")
+                t.append("pattern  ", style="dim"); t.append(r.pattern+"\n\n")
+                help={"host":"Match the request's hostname. * and ? wildcards; "
+                              "*.example.com also matches example.com. Optional :PORT.",
+                      "ip":"Match a resolved IP — a literal address or a CIDR network "
+                           "(e.g. 10.0.0.0/8, ::1).",
+                      "cname":"Match any name in the DNS CNAME/alias chain (wildcards ok).",
+                      "url":"Match http(s) URLs by exact value or prefix."}.get(r.kind,"")
+                t.append(help, style="dim"); d.update(t)
+            else:
+                rules=self.frules_store.rules
+                i=self.query_one("#r-list",ListView).index
+                if i is None or not (0<=i<len(rules)):
+                    d.update(Text("(no rule — changes are kept for review)", style="dim")); return
+                r=rules[i]; t=Text()
+                t.append(r.action.upper()+"\n",
+                         style="green bold" if r.action=="apply" else "red bold")
+                t.append("glob     ", style="dim"); t.append(r.pattern+"\n\n")
+                t.append("apply"if r.action=="apply" else "discard", style="bold")
+                t.append((" writes the change to the host during capture."
+                          if r.action=="apply" else
+                          " drops the change during capture.")+"\n", style="dim")
+                t.append("* in a segment · ** across dirs · @(a|b) !(x) {a,b} · "
+                         "bare name = any depth · leading / = anchored", style="dim")
+                d.update(t)
 
         def _refresh_rules(self):
             lv=self.query_one("#w-list",ListView)
@@ -2619,6 +2752,7 @@ def run_ui() -> int:
                     dv.append(ListItem(Label(line)))
             n=len(dv.children)
             if keep is not None and n: dv.index=min(keep, n-1)
+            elif n: dv.index=0   # highlight a hunk so a/x act without an extra step
 
         def _hunk_op(self, index, discard):
             sid=self._ch_sid; p=self._sel_path()
@@ -2654,9 +2788,6 @@ def run_ui() -> int:
             try: return self.sessions.get(
                 t.coordinate_to_cell_key((t.cursor_row,0)).row_key.value)
             except Exception: return None
-        def _sel_approval(self):
-            it=self.query_one("#a-list",ListView).highlighted_child
-            return it.a if isinstance(it,ApprovalItem) else None
         def _sel_path(self):
             t=self.query_one("#cf-tab",DataTable)
             if not t.row_count: return None
@@ -2682,12 +2813,14 @@ def run_ui() -> int:
                 if sid!=self._last_loaded_sid:
                     self._last_loaded_sid=sid
                     self._load_changes(sid, force=True)
+                if self.view=="boxes": self._update_box_detail()
 
         @on(DataTable.RowSelected, "#s-tab")
         def _s_open(self, ev):
-            # Enter on a slopbox drills into its Changes view.
+            # Enter on a slopbox → review its changes.
             if ev.row_key and ev.row_key.value:
-                self._open_changes(ev.row_key.value)
+                self._ch_sid=ev.row_key.value; self._last_loaded_sid=ev.row_key.value
+                self._set_view("changes")
 
         @on(DataTable.RowHighlighted, "#cf-tab")
         def _cc(self, ev):
@@ -2702,40 +2835,25 @@ def run_ui() -> int:
                 try: self.query_one("#cd-log",DiffView).focus()
                 except Exception: pass
 
-        def _goto(self, t):
-            # Leaving the content view autosaves any dirty patch.
-            if self.query_one("#tabs",TabbedContent).active=="t-ch" and t!="t-ch":
-                self._save_all_patches()
-            self.query_one("#tabs",TabbedContent).active=t
-            if t=="t-ch" and self._ch_sid: self._load_changes(self._ch_sid, force=True)
-            # Move focus into the tab's primary pane so the footer shows its keys.
-            focus={"t-sb":"#s-tab","t-ch":"#cf-tab","t-fr":"#r-list"}.get(t)
-            if focus:
-                try: self.query_one(focus).focus()
-                except Exception: pass
+        @on(ListView.Highlighted, "#w-list")
+        def _net_hl(self, ev):
+            if self.view=="net": self._update_rule_detail()
 
-        # ── drill-down navigation: Enter goes in, Esc comes back ──────────────
-        #   Slopboxes ──enter──▶ Changes (this slopbox) ──enter──▶ Diff
-        #             ◀──esc─────          ◀──esc──────
-        def _open_changes(self, sid):
-            self._ch_sid=sid; self._last_loaded_sid=sid
-            self._goto("t-ch")
+        @on(ListView.Highlighted, "#r-list")
+        def _file_hl(self, ev):
+            if self.view=="file": self._update_rule_detail()
 
         def action_back(self):
-            """Step back out: Diff → files → Slopboxes; File Rules → Slopboxes."""
-            active=self.query_one("#tabs",TabbedContent).active
-            if active=="t-ch":
+            """Esc steps back: diff → file list; any other list → slopboxes."""
+            if self.view=="changes":
                 try: in_diff=self.focused is self.query_one("#cd-log",DiffView)
                 except Exception: in_diff=False
                 if in_diff:
                     try: self.query_one("#cf-tab",DataTable).focus()
                     except Exception: pass
-                else:
-                    self._goto("t-sb")
-            elif active=="t-fr":
-                self._goto("t-sb")
-
-        def action_rules(self): self._goto("t-fr")
+                    return
+            if self.view!="boxes":
+                self._set_view("boxes")
 
         def action_kill(self):
             s=self._sel_session()
@@ -2753,14 +2871,17 @@ def run_ui() -> int:
                 if ok: self.sup.delete(s["session_id"])
             self.push_screen(Confirm(styled("Delete ", (s['label'],"bold"), " and its overlay?")), done)
 
-        def action_ap_once(self, action):
-            a=self._sel_approval()
-            if not a: self._status("no approval selected"); return
-            self.sup.resolve(a["request_id"], action, "once")
+        def action_ap_allow(self): self._ap_once("allow")
+        def action_ap_deny(self): self._ap_once("deny")
+        def _ap_once(self, action):
+            a=self._first_pending()
+            if a: self.sup.resolve(a["request_id"], action, "once")
 
-        def action_ap_rule(self, action):
-            a=self._sel_approval()
-            if not a: self._status("no approval selected"); return
+        def action_ap_allow_rule(self): self._ap_rule("allow")
+        def action_ap_deny_rule(self): self._ap_rule("deny")
+        def _ap_rule(self, action):
+            a=self._first_pending()
+            if not a: return
             rid=a["request_id"]
             def done(res):
                 if res:
