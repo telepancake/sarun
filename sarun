@@ -272,11 +272,6 @@ class Rule:
     def to_line(self) -> str:
         return f"{self.action} {self.kind}:{self.pattern}"
 
-    def label(self) -> str:
-        col = "green" if self.action == "allow" else "red"
-        sign = "+" if self.action == "allow" else "−"
-        return f"[{col}]{sign} {self.kind}:{self.pattern}[/]"
-
     @staticmethod
     def parse(line: str) -> "Rule | None":
         s = line.strip()
@@ -1386,7 +1381,17 @@ def run_ui() -> int:
     from textual.widgets import (
         Button, Checkbox, DataTable, Footer, Header, Input, Label,
         ListItem, ListView, RichLog, Static, TabbedContent, TabPane, TextArea)
-    from rich.markup import escape as _esc
+    from rich.text import Text
+
+    # Build a styled line as data: each fragment is (text, style); the text is
+    # stored verbatim and never parsed for markup, so file contents / filenames /
+    # hostnames can't inject styling. Use this for anything program-derived.
+    def styled(*frags) -> Text:
+        t=Text()
+        for frag in frags:
+            if isinstance(frag, tuple): t.append(frag[0], style=frag[1])
+            else: t.append(frag)
+        return t
 
     def fmt_bytes(n):
         for u, d in (("G",1<<30),("M",1<<20),("K",1<<10)):
@@ -1398,7 +1403,6 @@ def run_ui() -> int:
         if s<3600: return f"{s//60}m{s%60:02d}s"
         return f"{s//3600}h{(s%3600)//60:02d}m"
     sty = lambda st: {"running":"green","finished":"dim","killed":"red"}.get(st,"")
-    ICON = {"created":"[green]+[/]","modified":"[yellow]~[/]","deleted":"[red]-[/]"}
 
     class Confirm(ModalScreen):
         BINDINGS=[("y","yes",""),("n","no",""),("escape","no","")]
@@ -1421,7 +1425,7 @@ def run_ui() -> int:
         def __init__(self,path,content): super().__init__(); self.p=path; self.c=content
         def compose(self):
             with Vertical(id="edit-box"):
-                yield Label(f" {self.p}  [dim]Ctrl+S save · Esc cancel[/]", id="edit-title")
+                yield Label(styled(" ", (self.p,""), "  ", ("Ctrl+S save · Esc cancel","dim")), id="edit-title")
                 yield TextArea(self.c, id="edit-area")
         def action_save(self): self.dismiss(self.query_one("#edit-area",TextArea).text)
         def action_cancel(self): self.dismiss(None)
@@ -1443,10 +1447,10 @@ def run_ui() -> int:
             url=a.get("url") or "—"
             with Vertical(id="rule-box"):
                 yield Label(f" [{col}]{verb}[/] rule", id="rule-title")
-                yield Label(f"[dim]host[/]  [cyan]{a['host']}[/]:{a['port']}")
-                yield Label(f"[dim]ip[/]    {ips}")
-                yield Label(f"[dim]cname[/] {cnames}")
-                yield Label(f"[dim]url[/]   {url}")
+                yield Label(styled(("host  ","dim"), (a['host'],"cyan"), f":{a['port']}"))
+                yield Label(styled(("ip    ","dim"), ips))
+                yield Label(styled(("cname ","dim"), cnames))
+                yield Label(styled(("url   ","dim"), url))
                 yield Input(value=f"host:{a['host']}", id="rule-input")
                 yield Label("[dim]kinds:  host:NAME[:PORT]  ·  ip:ADDR|CIDR  ·  "
                             "cname:NAME  ·  url:PREFIX[/]")
@@ -1495,8 +1499,9 @@ def run_ui() -> int:
         def __init__(self,a): super().__init__(); self.a=a
         def compose(self):
             a=self.a
-            yield Label(f"[bold]{a['scheme']}[/] [cyan]{a['host']}[/]:{a['port']}"
-                        f"  [dim]{a['session_id'][:8]} · {fmt_age(a['ts'])}[/]")
+            yield Label(styled((a['scheme'],"bold"), " ", (a['host'],"cyan"),
+                               f":{a['port']}  ",
+                               (f"{a['session_id'][:8]} · {fmt_age(a['ts'])}","dim")))
 
     # Each interactive pane carries its own key bindings (with labels), delegating
     # to the app's actions. Textual's Footer then shows exactly the keys usable in
@@ -1549,14 +1554,14 @@ def run_ui() -> int:
         def __init__(self, index, lines):
             super().__init__(); self.hunk_index=index; self._lines=lines
         def compose(self):
-            out=[]
-            for tag,txt in self._lines:
-                t=_esc(txt)
-                if tag=="hdr": out.append(f"[cyan]{t}[/]")
-                elif tag=="+": out.append(f"[green]+{t}[/]")
-                elif tag=="-": out.append(f"[red]-{t}[/]")
-                else: out.append(f"[dim] {t}[/]")
-            yield Label("\n".join(out))
+            t=Text()
+            for i,(tag,txt) in enumerate(self._lines):
+                if i: t.append("\n")
+                if tag=="hdr": t.append(txt, style="cyan")
+                elif tag=="+": t.append("+"+txt, style="green")
+                elif tag=="-": t.append("-"+txt, style="red")
+                else: t.append(" "+txt, style="dim")
+            yield Label(t)
 
     class DiffView(ListView):
         # Per-hunk staging when focused: a apply this hunk to the host, x/d discard
@@ -1776,9 +1781,10 @@ def run_ui() -> int:
                 c=sty(s["status"])
                 flag={"running":"R","finished":"F","killed":"K"}.get(s["status"],"?")
                 rows.append((sid,[
-                    f"[{c}]{flag}[/]", f"[{c}]{s['label']}[/]",
-                    str(s["pid"]), " ".join(s["cmd"])[:24],
-                    f"[green]{s['conn_allowed']}[/]", f"[red]{s['conn_denied']}[/]",
+                    Text(flag, style=c), Text(s["label"], style=c),
+                    str(s["pid"]), Text(" ".join(s["cmd"])[:24]),
+                    Text(str(s["conn_allowed"]), style="green"),
+                    Text(str(s["conn_denied"]), style="red"),
                     fmt_bytes(s["bytes_up"]), fmt_bytes(s["bytes_down"]),
                     fmt_age(s["started"])]))
             self._sync_table(self.query_one("#s-tab",DataTable), rows)
@@ -1802,7 +1808,9 @@ def run_ui() -> int:
             idx=lv.index
             lv.clear()
             for r in self.rules_store.rules:
-                lv.append(ListItem(Label(r.label())))
+                col="red" if r.action=="deny" else "green"
+                sign="−" if r.action=="deny" else "+"
+                lv.append(ListItem(Label(Text(f"{sign} {r.kind}:{r.pattern}", style=col))))
             n=len(self.rules_store.rules)
             if idx is not None and n: lv.index=min(idx, n-1)
 
@@ -1829,12 +1837,14 @@ def run_ui() -> int:
             self._rule_edit_at(self.query_one("#w-list",ListView).index)
 
         def _rebuild_ch(self, preserve=False):
+            sigs={"created":("+","green"),"modified":("~","yellow"),"deleted":("-","red")}
             def flag(e):
-                f=ICON.get(e["kind"],"?")
-                if e.get("stale"): f+="[reverse red]![/]"   # host newer than overlay
-                return f
+                sym,col=sigs.get(e["kind"],("?",""))
+                t=Text(sym, style=col)
+                if e.get("stale"): t.append("!", style="reverse red")  # host is newer
+                return t
             rows=[(e["path"], [flag(e),
-                               f"[red]{e['path']}[/]" if e.get("stale") else e["path"],
+                               Text(e["path"], style="red" if e.get("stale") else ""),
                                fmt_bytes(e["size"]) if e["size"] else ""])
                   for e in self._ch_entries]
             self._sync_table(self.query_one("#cf-tab",DataTable), rows)
@@ -1848,36 +1858,39 @@ def run_ui() -> int:
         def _write(self, w, ev, sid):
             act=ev.get("action","?"); col="green" if act=="allow" else "red"
             ts=time.strftime("%H:%M:%S", time.localtime(ev.get("ts",time.time())))
-            st=f" [{ev['status']}]" if ev.get("status") else ""
+            t=Text()
+            t.append(ts+" ", style="dim")
+            if sid: t.append(str(ev.get("session_id",""))[:8]+" ", style="dim cyan")
+            t.append(("✓" if act=="allow" else "✗")+" ", style=col)
+            t.append(str(ev.get("scheme","?"))+" ", style="bold")
+            t.append(str(ev.get("host","?")), style="cyan")
+            t.append(":"+str(ev.get("port","?")))
+            if ev.get("status"): t.append(f" [{ev['status']}]")
             bu,bd=ev.get("bytes_up",0),ev.get("bytes_down",0)
-            bt=f" [dim]↑{fmt_bytes(bu)} ↓{fmt_bytes(bd)}[/]" if (bu or bd) else ""
-            sd=f" [dim cyan]{ev.get('session_id','')[:8]}[/]" if sid else ""
-            w.write(f"[dim]{ts}[/]{sd} [{col}]{'✓' if act=='allow' else '✗'}[/] "
-                    f"[bold]{ev.get('scheme','?')}[/] "
-                    f"[cyan]{ev.get('host','?')}[/]:{ev.get('port','?')}{st}{bt}")
+            if bu or bd: t.append(f" ↑{fmt_bytes(bu)} ↓{fmt_bytes(bd)}", style="dim")
+            w.write(t)
 
         def _diff_info_lines(self, d):
             k=d.get("kind")
-            if k=="deleted": return ["[red bold]DELETED[/]"]
-            if k=="directory": return ["[cyan]DIRECTORY[/]"]
-            if k=="error": return [f"[red]{_esc(str(d.get('error')))}[/]"]
+            if k=="deleted": return [Text("DELETED", style="red bold")]
+            if k=="directory": return [Text("DIRECTORY", style="cyan")]
+            if k=="error": return [Text(str(d.get("error")), style="red")]
             diff=d.get("diff"); out=[]
             if diff is not None:
                 for ln in diff.splitlines():
-                    t=_esc(ln)
-                    if ln.startswith(("+++","---")): out.append(f"[bold]{t}[/]")
-                    elif ln.startswith("+"): out.append(f"[green]{t}[/]")
-                    elif ln.startswith("-"): out.append(f"[red]{t}[/]")
-                    elif ln.startswith("@@"): out.append(f"[cyan]{t}[/]")
-                    else: out.append(f"[dim]{t}[/]")
-                if not diff.strip(): out.append("[dim](no textual diff)[/]")
+                    if ln.startswith(("+++","---")): out.append(Text(ln, style="bold"))
+                    elif ln.startswith("+"): out.append(Text(ln, style="green"))
+                    elif ln.startswith("-"): out.append(Text(ln, style="red"))
+                    elif ln.startswith("@@"): out.append(Text(ln, style="cyan"))
+                    else: out.append(Text(ln, style="dim"))
+                if not diff.strip(): out.append(Text("(no textual diff)", style="dim"))
             else:
                 raw=base64.b64decode(d.get("content") or b"")
-                out.append(f"[dim]binary · {fmt_bytes(len(raw))}[/]")
+                out.append(Text(f"binary · {fmt_bytes(len(raw))}", style="dim"))
                 for i in range(0,min(len(raw),256),16):
                     ch=raw[i:i+16]; h=" ".join(f"{b:02x}" for b in ch)
                     a="".join(chr(b) if 0x20<=b<0x7f else "." for b in ch)
-                    out.append(f"[dim]{i:04x}  {h:<48}  {_esc(a)}[/]")
+                    out.append(Text(f"{i:04x}  {h:<48}  {a}", style="dim"))
             return out
 
         def _load_diff(self, sid, rel, keep_pos=False):
@@ -1888,7 +1901,7 @@ def run_ui() -> int:
             if res.get("is_text"):
                 hunks=res.get("hunks") or []
                 if not hunks:
-                    dv.append(ListItem(Label("[dim](no textual differences)[/]")))
+                    dv.append(ListItem(Label(Text("(no textual differences)", style="dim"))))
                 for h in hunks:
                     dv.append(HunkItem(h["index"], h["lines"]))
             else:
@@ -1902,7 +1915,7 @@ def run_ui() -> int:
             if not sid or p is None: return
             r=(self.sup.overlay_discard_hunk if discard
                else self.sup.overlay_apply_hunk)(sid, p, index)
-            if not r.get("ok"): self._status(r.get("error","hunk op failed")); return
+            if not r.get("ok"): self._status(Text(r.get("error") or "hunk op failed")); return
             self._load_changes(sid)
             if any(e["path"]==p for e in self._ch_entries):
                 self._load_diff(sid, p, keep_pos=True)
@@ -1975,7 +1988,7 @@ def run_ui() -> int:
                 self._status("no running session selected"); return
             def done(ok):
                 if ok: self.sup.kill(s["session_id"])
-            self.push_screen(Confirm(f"Kill [bold]{s['label']}[/]?"), done)
+            self.push_screen(Confirm(styled("Kill ", (s['label'],"bold"), "?")), done)
 
         def action_delete(self):
             s=self._sel_session()
@@ -1983,12 +1996,12 @@ def run_ui() -> int:
             if s["status"]=="running": self._status("kill it first"); return
             def done(ok):
                 if ok: self.sup.delete(s["session_id"])
-            self.push_screen(Confirm(f"Delete [bold]{s['label']}[/] and its overlay?"), done)
+            self.push_screen(Confirm(styled("Delete ", (s['label'],"bold"), " and its overlay?")), done)
 
         def action_filt(self):
             s=self._sel_session()
             self.log_filter=None if self.log_filter else (s["session_id"] if s else None)
-            self._status("log: all" if not self.log_filter else f"log: {s['label']}")
+            self._status("log: all" if not self.log_filter else styled("log: ", (s['label'],"")))
             cl=self.query_one("#c-log",RichLog); cl.clear()
             for ev in self._all_traffic:
                 if not self.log_filter or self.log_filter==ev.get("session_id"):
