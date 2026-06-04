@@ -335,6 +335,17 @@ def _is_overlay_marker(name: str) -> bool:
     apply, or count them."""
     return name == ".wh..opq" or name.startswith(".wh..wh.")
 
+def ut_split(data: bytes) -> list:
+    """Split bytes into lines on \\n, keeping the terminator on each line (the last
+    line keeps whatever it had). b"".join(result) == data exactly, so splicing
+    these line-pieces and writing the bytes back is lossless — CR/CRLF, encoding,
+    BOM and a missing final newline are all preserved."""
+    parts = data.split(b"\n")
+    lines = [p + b"\n" for p in parts[:-1]]
+    if parts[-1]:
+        lines.append(parts[-1])
+    return lines
+
 def upper_has_changes(up: Path) -> bool:
     """True if the overlay upper holds any real change (a created/modified file or
     a whiteout deletion), ignoring the overlay's own opaque markers."""
@@ -751,30 +762,35 @@ class Supervisor:
                 return dict(kind="error", error=str(e))
 
     def _file_hunks(self, sid, rel):
-        """For a text file change, return (lower_lines, upper_lines, groups) where
-        groups are difflib grouped opcodes (each = one hunk with context). None if
-        the file isn't a text change we can splice (binary / deleted / directory)."""
+        """For a text file change return (lower_lines, upper_lines, groups) where
+        the line lists are **bytes** (split on \\n, terminators kept) so splicing is
+        byte-exact, and groups are difflib grouped opcodes (one hunk + context each).
+        None if it isn't a line-splittable change (binary / deleted / directory)."""
         s = self.sessions.get(sid)
         if not s: return None
         rel = rel.lstrip("/")
         src = Path(s.upper) / rel; dst = Path("/") / rel
         if not src.is_file() or self._is_whiteout(src): return None
         try:
-            ut = src.read_text(); lt = dst.read_text() if dst.exists() else ""
-        except (UnicodeDecodeError, OSError):
+            ut = src.read_bytes(); lt = dst.read_bytes() if dst.exists() else b""
+        except OSError:
+            return None
+        if b"\x00" in ut or b"\x00" in lt:        # NUL byte -> treat as binary
             return None
         import difflib
-        ll = lt.splitlines(keepends=True); ul = ut.splitlines(keepends=True)
+        ll = ut_split(lt); ul = ut_split(ut)
         groups = list(difflib.SequenceMatcher(None, ll, ul).get_grouped_opcodes(3))
         return (ll, ul, groups)
 
     def overlay_hunks(self, sid, rel) -> dict:
         """Text changes are returned as a list of hunks for per-hunk apply/discard;
-        anything else falls back to the whole-file diff for display only."""
+        anything else falls back to the whole-file diff for display only. Hunk line
+        text is decoded only for *display* — the splice operates on the raw bytes."""
         info = self._file_hunks(sid, rel)
         if info is None:
             return dict(is_text=False, hunks=[], diff=self.overlay_diff(sid, rel))
         ll, ul, groups = info
+        def disp(b): return b.decode("utf-8", "replace").rstrip("\r\n")
         hunks = []
         for gi, group in enumerate(groups):
             a1, a2 = group[0][1], group[-1][2]
@@ -782,10 +798,10 @@ class Supervisor:
             lines = [("hdr", f"@@ -{a1+1},{a2-a1} +{b1+1},{b2-b1} @@")]
             for tag, i1, i2, j1, j2 in group:
                 if tag == "equal":
-                    for ln in ll[i1:i2]: lines.append((" ", ln.rstrip("\n")))
+                    for ln in ll[i1:i2]: lines.append((" ", disp(ln)))
                 else:
-                    for ln in ll[i1:i2]: lines.append(("-", ln.rstrip("\n")))
-                    for ln in ul[j1:j2]: lines.append(("+", ln.rstrip("\n")))
+                    for ln in ll[i1:i2]: lines.append(("-", disp(ln)))
+                    for ln in ul[j1:j2]: lines.append(("+", disp(ln)))
             hunks.append(dict(index=gi, lines=lines))
         return dict(is_text=True, hunks=hunks)
 
@@ -809,7 +825,8 @@ class Supervisor:
 
     def overlay_apply_hunk(self, sid, rel, index) -> dict:
         # Apply one hunk forward onto the host file; the overlay already has it, so
-        # that hunk simply stops being a difference.
+        # that hunk simply stops being a difference. Byte-exact: we splice raw
+        # byte-lines and write bytes (line endings / encoding preserved verbatim).
         info = self._file_hunks(sid, rel)
         if info is None: return dict(ok=False, error="not a text change")
         ll, ul, groups = info
@@ -820,14 +837,14 @@ class Supervisor:
         dst = Path("/") / rel.lstrip("/")
         try:
             dst.parent.mkdir(parents=True, exist_ok=True)
-            dst.write_text("".join(new_lower))
+            dst.write_bytes(b"".join(new_lower))
         except OSError as e:
             return dict(ok=False, error=str(e))
         self._settle_file(sid, rel)
         return dict(ok=True)
 
     def overlay_discard_hunk(self, sid, rel, index) -> dict:
-        # Revert one hunk in the overlay file (back to the host's version there).
+        # Revert one hunk in the overlay file (back to the host's bytes there).
         info = self._file_hunks(sid, rel)
         if info is None: return dict(ok=False, error="not a text change")
         ll, ul, groups = info
@@ -837,7 +854,7 @@ class Supervisor:
         new_upper = ul[:b1] + ll[a1:a2] + ul[b2:]
         src = Path(self.sessions[sid].upper) / rel.lstrip("/")
         try:
-            src.write_text("".join(new_upper))
+            src.write_bytes(b"".join(new_upper))
         except OSError as e:
             return dict(ok=False, error=str(e))
         self._settle_file(sid, rel)
@@ -929,16 +946,6 @@ class Supervisor:
                 errors.append({"path": rel, "error": str(e)})
         self._maybe_remove_empty(sid)
         return dict(discarded=discarded, errors=errors)
-
-    def overlay_edit(self, sid, rel, content) -> dict:
-        s = self.sessions.get(sid)
-        if not s: return dict(ok=False, error="no session")
-        p = Path(s.upper) / rel.lstrip("/")
-        try:
-            p.parent.mkdir(parents=True, exist_ok=True); p.write_text(content)
-            return dict(ok=True)
-        except OSError as e:
-            return dict(ok=False, error=str(e))
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1380,7 +1387,7 @@ def run_ui() -> int:
     from textual.screen import ModalScreen
     from textual.widgets import (
         Button, Checkbox, DataTable, Footer, Header, Input, Label,
-        ListItem, ListView, RichLog, Static, TabbedContent, TabPane, TextArea)
+        ListItem, ListView, RichLog, Static, TabbedContent, TabPane)
     from rich.text import Text
 
     # Build a styled line as data: each fragment is (text, style); the text is
@@ -1419,16 +1426,6 @@ def run_ui() -> int:
         def _y(self): self.dismiss(True)
         @on(Button.Pressed,"#cn")
         def _n(self): self.dismiss(False)
-
-    class Editor(ModalScreen):
-        BINDINGS=[("ctrl+s","save",""),("escape","cancel","")]
-        def __init__(self,path,content): super().__init__(); self.p=path; self.c=content
-        def compose(self):
-            with Vertical(id="edit-box"):
-                yield Label(styled(" ", (self.p,""), "  ", ("Ctrl+S save · Esc cancel","dim")), id="edit-title")
-                yield TextArea(self.c, id="edit-area")
-        def action_save(self): self.dismiss(self.query_one("#edit-area",TextArea).text)
-        def action_cancel(self): self.dismiss(None)
 
     class RuleModal(ModalScreen):
         # Let the user write the exact rule (kind:pattern) and choose where it goes,
@@ -1517,12 +1514,11 @@ def run_ui() -> int:
         BINDINGS=[Binding("a","apply","apply"), Binding("A","apply_all","apply all"),
                   Binding("x","discard","discard"),
                   Binding("X","discard_all","discard all"),
-                  Binding("e","edit","edit"), Binding("r","refresh","refresh")]
+                  Binding("r","refresh","refresh")]
         def action_apply(self): self.app.action_apply_one()
         def action_apply_all(self): self.app.action_apply_all()
         def action_discard(self): self.app.action_discard_one()
         def action_discard_all(self): self.app.action_discard_all()
-        def action_edit(self): self.app.action_edit()
         def action_refresh(self): self.app.action_refresh()
 
     class ApprovalsList(ListView):
@@ -1602,9 +1598,6 @@ def run_ui() -> int:
         DataTable { height:1fr; } RichLog { height:1fr; } ListView { height:1fr; }
         #confirm-box { width:64; height:auto; padding:1 2; background:$surface; border:tall $error; }
         #confirm-msg { margin-bottom:1; } #confirm-btns { height:3; }
-        #edit-box { width:100%; height:100%; background:$surface; border:tall $primary; }
-        #edit-title { height:1; background:$primary; color:$text; padding:0 1; }
-        #edit-area { height:1fr; }
         #rule-box { width:72; height:auto; padding:1 2; background:$surface; border:tall $warning; }
         #rule-title { margin-bottom:1; } #rule-input { margin-bottom:1; }
         #rule-btns { height:3; margin-top:1; }
@@ -2051,16 +2044,6 @@ def run_ui() -> int:
             def done(ok):
                 if ok: self.sup.overlay_discard(sid,None); self._load_changes(sid)
             self.push_screen(Confirm(f"Discard ALL {len(self._ch_entries)} changes?"), done)
-
-        def action_edit(self):
-            p,sid=self._sel_path(),self._ch_sid
-            if not p or not sid: return
-            d=self.sup.overlay_diff(sid,p)
-            if d.get("kind")=="deleted": self._status("can't edit a deletion"); return
-            if not d.get("is_text"): self._status("binary — can't edit"); return
-            def done(content):
-                if content is not None: self.sup.overlay_edit(sid,p,content)
-            self.push_screen(Editor(p, d.get("raw") or ""), done)
 
     ensure_dirs()
     UI().run()
