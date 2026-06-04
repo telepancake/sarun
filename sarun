@@ -4,6 +4,7 @@
 # dependencies = [
 #   "textual>=0.60",
 #   "mitmproxy>=11",
+#   "wcmatch>=8.4",
 # ]
 # ///
 """
@@ -88,7 +89,8 @@ SHM_PREFIX     = "slopbox."
 SOCK_PATH      = str(runtime_home() / "ui.sock")        # control + FD channel
 MITM_CONFDIR   = data_home() / "mitmproxy"              # CA, generated once
 CA_CERT        = MITM_CONFDIR / "mitmproxy-ca-cert.pem"
-RULES_FILE     = config_home() / "rules"
+RULES_FILE     = config_home() / "netrules"             # allow/deny network rules
+FILE_RULES_FILE = config_home() / "filerules"           # apply/discard by path glob
 
 def ensure_dirs() -> None:
     """Create our host-side config/data/runtime directories. Called by the UI and
@@ -96,8 +98,14 @@ def ensure_dirs() -> None:
     for p in (data_home(), config_home(), runtime_home(), MITM_CONFDIR, state_home()):
         try: p.mkdir(parents=True, exist_ok=True)
         except OSError: pass
-    try: RULES_FILE.touch(exist_ok=True)
-    except OSError: pass
+    # migrate the old single "rules" file to its new name "netrules"
+    old_rules = config_home() / "rules"
+    if old_rules.exists() and not RULES_FILE.exists():
+        try: old_rules.rename(RULES_FILE)
+        except OSError: pass
+    for f in (RULES_FILE, FILE_RULES_FILE):
+        try: f.touch(exist_ok=True)
+        except OSError: pass
 
 INNER_PROXY_PORT = 8080   # forwarder's listen port inside the slopbox
 
@@ -327,6 +335,94 @@ class Rules:
 
 
 # ════════════════════════════════════════════════════════════════════════════
+#  File rules — apply / discard a change by path glob (first match wins)
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Patterns are extended shell globs (bash-style) over the change's absolute path,
+# via wcmatch with GLOBSTAR + EXTGLOB + BRACE:
+#   *            any run of non-/ characters (stays within one path segment)
+#   ?            one non-/ character
+#   **           crosses /, so **/ = any depth, /var/**/*.log = under /var
+#   @(a|b) !(x) +(…) *(…) ?(…)   extglob groups;  {a,b}  brace alternation
+# A pattern with no slash, or no leading /, matches at any depth (so *.txt, .~*,
+# a, dir/**/*.txt). A leading / anchors at the filesystem root.
+
+_GLOB_FLAGS = None
+
+def _path_match(pat: str, rel: str) -> bool:
+    global _GLOB_FLAGS
+    pat = pat.strip()
+    if not pat: return False
+    # Lazy import: keeps a bare `import slopbox` (the in-slopbox --inner path)
+    # stdlib-only — only the runner/UI that actually matches files needs wcmatch.
+    from wcmatch import glob as _wg
+    if _GLOB_FLAGS is None:
+        _GLOB_FLAGS = _wg.GLOBSTAR | _wg.EXTGLOB | _wg.BRACE | _wg.DOTGLOB
+    s = "/" + rel.lstrip("/")                    # the change's absolute path
+    if "/" not in pat or not pat.startswith("/"):
+        pat = "**/" + pat                        # bare name / relative → any depth
+    try:
+        return bool(_wg.globmatch(s, pat, flags=_GLOB_FLAGS))
+    except ValueError:
+        return False
+
+
+@dataclass
+class FileRule:
+    action: str            # "apply" | "discard"
+    pattern: str
+
+    def matches(self, rel: str) -> bool:
+        return _path_match(self.pattern, rel)
+
+    def to_line(self) -> str:
+        return f"{self.action} {self.pattern}"
+
+    @staticmethod
+    def parse(line: str) -> "FileRule | None":
+        s = line.strip()
+        if not s or s.startswith("#"):
+            return None
+        verb, _, rest = s.partition(" ")
+        action = verb.lower(); pat = rest.strip()
+        if action not in ("apply", "discard") or not pat:
+            return None
+        return FileRule(action=action, pattern=pat)
+
+
+class FileRules:
+    """An ordered apply/discard rule list, evaluated top-to-bottom — first match
+    wins. Same shape as the network Rules, so the UI edits both the same way."""
+    def __init__(self, path: Path):
+        self.path = path; self.rules: list = []; self.load()
+    def load(self) -> None:
+        try: text = self.path.read_text()
+        except OSError: text = ""
+        self.rules = [r for r in (FileRule.parse(ln) for ln in text.splitlines()) if r]
+    def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text("".join(r.to_line() + "\n" for r in self.rules))
+    def decide(self, rel: str) -> "str | None":
+        for r in self.rules:
+            if r.matches(rel):
+                return r.action
+        return None
+    def insert(self, rule: FileRule, at_top: bool = False) -> None:
+        self.rules.insert(0 if at_top else len(self.rules), rule); self.save()
+    def remove_at(self, i: int) -> None:
+        if 0 <= i < len(self.rules): del self.rules[i]; self.save()
+    def move(self, i: int, delta: int) -> int:
+        j = i + delta
+        if 0 <= i < len(self.rules) and 0 <= j < len(self.rules):
+            self.rules[i], self.rules[j] = self.rules[j], self.rules[i]
+            self.save(); return j
+        return i
+
+def load_file_rules() -> FileRules:
+    return FileRules(FILE_RULES_FILE)
+
+
+# ════════════════════════════════════════════════════════════════════════════
 #  Session model + discovery + robust removal
 # ════════════════════════════════════════════════════════════════════════════
 
@@ -544,14 +640,40 @@ def cleanup_dirs(upper: Path, start: Path) -> None:
         except OSError: break
         d = parent
 
+def _apply_overlay_entry(upper: Path, ap: Path, rel: str) -> None:
+    """Write one overlay change onto the host (the same effect as the UI's Apply),
+    then drop it from the overlay. A whiteout deletes; a file/symlink is copied."""
+    host = Path("/") / rel
+    try:
+        if is_whiteout(ap):
+            if host.is_dir() and not host.is_symlink(): shutil.rmtree(host)
+            elif host.exists() or host.is_symlink(): host.unlink()
+        elif ap.is_symlink():
+            tgt = os.readlink(ap)
+            if host.exists() or host.is_symlink(): host.unlink()
+            host.parent.mkdir(parents=True, exist_ok=True); os.symlink(tgt, host)
+        elif ap.is_file():
+            host.parent.mkdir(parents=True, exist_ok=True); shutil.copy2(ap, host)
+        else:
+            return                                       # unknown type: leave it
+    except OSError:
+        return
+    remove_upper_entry(ap)
+
 def consolidate(shm_dir, session_id: str, meta: dict) -> None:
     """Move every overlay change that a patch can represent *exactly and entirely*
     into the session's patch file, then prune emptied dirs. Per file it is all or
     nothing: binary files, or anything that doesn't round-trip, stay in the overlay.
     Idempotent and additive — re-running just folds in any newly representable
-    overlay change (a file is never in both the overlay and the patch)."""
+    overlay change (a file is never in both the overlay and the patch).
+
+    File rules are consulted first, top-to-bottom: a matching 'apply' writes the
+    change to the host and drops it from the overlay, a matching 'discard' just
+    drops it — either way it never reaches the patch. Unmatched changes fall
+    through to the patch-folding above."""
     upper = Path(shm_dir) / "up"
     if not upper.is_dir(): return
+    frules = load_file_rules()
     pp = patch_path(session_id)
     files = {}
     if pp.exists():
@@ -564,7 +686,13 @@ def consolidate(shm_dir, session_id: str, meta: dict) -> None:
             if not _is_overlay_marker(nm): paths.append(Path(root) / nm)
     for ap in sorted(paths):
         rel = str(ap.relative_to(upper))
-        if rel in files: continue                       # already in the patch
+        act = frules.decide(rel)                         # apply / discard / None
+        if act == "discard":
+            remove_upper_entry(ap); cleanup_dirs(upper, ap.parent); continue
+        if act == "apply":
+            _apply_overlay_entry(upper, ap, rel); cleanup_dirs(upper, ap.parent)
+            files.pop(rel, None); continue
+        if rel in files: continue                        # already in the patch
         host = Path("/") / rel
         try:
             if is_whiteout(ap):                          # deletion
@@ -1950,6 +2078,25 @@ def run_ui() -> int:
         @on(Input.Submitted,"#rule-input")
         def _save(self): self.dismiss(self.query_one("#rule-input",Input).value.strip())
 
+    class FileRuleLineModal(ModalScreen):
+        # Add or edit one file rule as a full line. Returns the new line or None.
+        BINDINGS=[("escape","cancel","")]
+        def __init__(self, line): super().__init__(); self.line=line
+        def compose(self):
+            with Vertical(id="rule-box"):
+                yield Label(" File rule", id="rule-title")
+                yield Input(value=self.line, id="rule-input")
+                yield Label("[dim]<apply|discard> <path-glob>   e.g. "
+                            "[b]discard *.log[/b] · [b]apply src/**/*.py[/b] · "
+                            "[b]discard .~*[/b] · [b]apply /etc/**[/b]\n"
+                            "[b]*[/b] stays in one path segment · [b]**[/b] crosses "
+                            "dirs · a bare name matches at any depth · leading "
+                            "[b]/[/b] anchors at root · Enter save · Esc cancel[/]")
+        def on_mount(self): self.query_one("#rule-input",Input).focus()
+        def action_cancel(self): self.dismiss(None)
+        @on(Input.Submitted,"#rule-input")
+        def _save(self): self.dismiss(self.query_one("#rule-input",Input).value.strip())
+
     class ApprovalItem(ListItem):
         def __init__(self,a): super().__init__(); self.a=a
         def compose(self):
@@ -2005,6 +2152,24 @@ def run_ui() -> int:
         def action_down(self):
             if self.index is not None: self.app._rule_move(self.index,+1)
 
+    class FileRulesList(ListView):
+        # An ordered apply/discard list, edited like the network rules — plus 'a'
+        # to add one (file rules have no approval flow to seed them).
+        BINDINGS=[Binding("a","add","add"), Binding("e","edit","edit"),
+                  Binding("d","del","remove"),
+                  Binding("delete","del","remove", show=False),
+                  Binding("ctrl+up","up","move up"),
+                  Binding("ctrl+down","down","move down")]
+        def action_add(self): self.app._file_rule_add()
+        def action_edit(self):
+            if self.index is not None: self.app._file_rule_edit_at(self.index)
+        def action_del(self):
+            if self.index is not None: self.app._file_rule_del(self.index)
+        def action_up(self):
+            if self.index is not None: self.app._file_rule_move(self.index,-1)
+        def action_down(self):
+            if self.index is not None: self.app._file_rule_move(self.index,+1)
+
     class HunkItem(ListItem):
         def __init__(self, index, lines):
             super().__init__(); self.hunk_index=index; self._lines=lines
@@ -2055,6 +2220,7 @@ def run_ui() -> int:
         #cd-pane { width:3fr; border:solid $primary; }
         #c-bar { height:1; background:$surface; color:$text-muted; padding:0 1; }
         #t-pane { border:solid $primary; height:1fr; }
+        #fr-pane { border:solid $success; height:1fr; }
         #status { height:1; background:$surface; color:$text-muted; padding:0 1; }
         DataTable { height:1fr; } RichLog { height:1fr; } ListView { height:1fr; }
         #confirm-box { width:64; height:auto; padding:1 2; background:$surface; border:tall $error; }
@@ -2066,6 +2232,7 @@ def run_ui() -> int:
         """
         BINDINGS=[
             Binding("escape","back","Back"),
+            Binding("r","rules","File rules"),
             Binding("t","traffic","Traffic"),
             Binding("tab","focus_next","",show=False),
             Binding("shift+tab","focus_previous","",show=False),
@@ -2081,6 +2248,7 @@ def run_ui() -> int:
             # screen frame-by-frame.
             self.animation_level="none"
             self.rules_store=Rules(RULES_FILE)
+            self.frules_store=FileRules(FILE_RULES_FILE)
             self.sup=Supervisor(self.rules_store)
             self.sup.on_event=self._on_evt
             self.engine=None
@@ -2117,6 +2285,11 @@ def run_ui() -> int:
                             yield Static("≡ DIFF   [dim]↵ focus · ↑/↓ hunk · a apply · x discard · esc back[/]", classes="pt")
                             yield DiffView(id="cd-log")
                     yield Static("", id="c-bar")
+                with TabPane("File Rules", id="t-fr"):
+                    with Vertical(id="fr-pane"):
+                        yield Static("✓ FILE RULES   [dim]top → bottom, first match wins · "
+                                     "apply / discard during capture · a add · e edit · d remove[/]", classes="pok")
+                        yield FileRulesList(id="r-list")
                 with TabPane("Traffic", id="t-tr"):
                     with Vertical(id="t-pane"):
                         yield Static("▤ ALL TRAFFIC", classes="pt")
@@ -2139,6 +2312,7 @@ def run_ui() -> int:
                 msg += "  [red](mitmproxy unavailable — no gating)[/]"
             self._status(msg)
             self._refresh_rules()
+            self._refresh_file_rules()
             for s in self.sup.sessions.values():
                 self.sessions={**self.sessions, s.session_id:s.to_dict()}
             self._rebuild_sessions()
@@ -2299,6 +2473,56 @@ def run_ui() -> int:
         @on(ListView.Selected, "#w-list")
         def _rule_activated(self, ev):
             self._rule_edit_at(self.query_one("#w-list",ListView).index)
+
+        def _refresh_file_rules(self):
+            lv=self.query_one("#r-list",ListView)
+            idx=lv.index; lv.clear()
+            for r in self.frules_store.rules:
+                col="red" if r.action=="discard" else "green"
+                sign="−" if r.action=="discard" else "+"
+                lv.append(ListItem(Label(Text(f"{sign} {r.action} {r.pattern}", style=col))))
+            n=len(self.frules_store.rules)
+            if idx is not None and n: lv.index=min(idx, n-1)
+
+        def _file_rules_changed(self):
+            # A new/changed rule should get a chance to act on whatever is still in
+            # the overlays, so let those sessions consolidate again on next view.
+            self.sup._consolidated.clear()
+            self._refresh_file_rules()
+
+        def _file_rule_add(self):
+            def done(line):
+                if not line: return
+                r=FileRule.parse(line)
+                if not r:
+                    self._status("invalid file rule — use: apply|discard <glob>"); return
+                self.frules_store.insert(r); self._file_rules_changed()
+                try: self.query_one("#r-list",ListView).index=len(self.frules_store.rules)-1
+                except Exception: pass
+            self.push_screen(FileRuleLineModal("discard "), done)
+
+        def _file_rule_edit_at(self, i):
+            rules=self.frules_store.rules
+            if i is None or not (0<=i<len(rules)): return
+            def done(line):
+                if line is None: return
+                r=FileRule.parse(line)
+                if not r: self._status("invalid file rule — keeping the old one"); return
+                rules[i]=r; self.frules_store.save(); self._file_rules_changed()
+                try: self.query_one("#r-list",ListView).index=i
+                except Exception: pass
+            self.push_screen(FileRuleLineModal(rules[i].to_line()), done)
+
+        def _file_rule_del(self, i):
+            self.frules_store.remove_at(i); self._file_rules_changed()
+        def _file_rule_move(self, i, d):
+            j=self.frules_store.move(i, d); self._file_rules_changed()
+            try: self.query_one("#r-list",ListView).index=j
+            except Exception: pass
+
+        @on(ListView.Selected, "#r-list")
+        def _file_rule_activated(self, ev):
+            self._file_rule_edit_at(self.query_one("#r-list",ListView).index)
 
         def _rebuild_ch(self, preserve=False):
             sigs={"created":("+","green"),"modified":("~","yellow"),"deleted":("-","red")}
@@ -2468,7 +2692,8 @@ def run_ui() -> int:
             self.query_one("#tabs",TabbedContent).active=t
             if t=="t-ch" and self._ch_sid: self._load_changes(self._ch_sid, force=True)
             # Move focus into the tab's primary pane so the footer shows its keys.
-            focus={"t-sb":"#s-tab","t-ch":"#cf-tab","t-tr":"#t-log"}.get(t)
+            focus={"t-sb":"#s-tab","t-ch":"#cf-tab","t-fr":"#r-list",
+                   "t-tr":"#t-log"}.get(t)
             if focus:
                 try: self.query_one(focus).focus()
                 except Exception: pass
@@ -2491,10 +2716,11 @@ def run_ui() -> int:
                     except Exception: pass
                 else:
                     self._goto("t-sb")
-            elif active=="t-tr":
+            elif active in ("t-tr","t-fr"):
                 self._goto("t-sb")
 
         def action_traffic(self): self._goto("t-tr")
+        def action_rules(self): self._goto("t-fr")
 
         def action_kill(self):
             s=self._sel_session()
