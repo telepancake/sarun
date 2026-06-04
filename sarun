@@ -2210,6 +2210,32 @@ class OverlayMount:
     def inflight_age(self):
         return self.ops.inflight_age() if self.ops else None
 
+    # A handler wedged longer than this is treated as hung (spec §9 watchdog).
+    WATCHDOG_HANG_S = 30.0
+
+    def watchdog_recover(self) -> bool:
+        """Supervisor-owned recovery (R12): if a FUSE handler has been in-flight too
+        long, the single trio serve loop is frozen and any client parked in that
+        request is in D-state. Lazy-unmount aborts the FUSE connection — that frees
+        the parked clients (~tens of ms) and recovers the mount table. Returns True
+        if a recovery was triggered.
+
+        Note: a fuller recovery would also close the raw /dev/fuse fd to end the
+        serve loop deterministically; pyfuse3 doesn't surface that fd, so the
+        lazy-unmount (which the kernel turns into an ENODEV on the wedged loop) is the
+        v1 mechanism. Offloading slow blocking syscalls to a thread pool to avoid
+        wedging in the first place is the known later upgrade."""
+        age = self.inflight_age()
+        if age is None or age < self.WATCHDOG_HANG_S:
+            return False
+        try:
+            subprocess.run(["fusermount3", "-uz", str(self.mountpoint)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=10)
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+        return True
+
     def stop(self) -> None:
         """Stop serving and unmount. Lazy-unmount as a fallback so the mount table is
         clean even if the loop is wedged (spec §9 watchdog)."""
@@ -4352,6 +4378,13 @@ def _make_ui_app():
                 if self.view=="net": self._update_rule_detail()
 
         def _tick(self):
+            # Watchdog (R12): if a FUSE handler has wedged the single serve loop,
+            # lazy-unmount to abort the connection and free parked clients.
+            try:
+                if self.overlay_mount.watchdog_recover():
+                    self._status("[red]overlay handler hung — recovered "
+                                 "(lazy-unmounted)[/]")
+            except Exception: pass
             self.sup.rescan()
             self._rebuild_sessions(preserve=True)
             self._render_appr()

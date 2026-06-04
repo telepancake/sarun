@@ -90,7 +90,9 @@ def run_with_ui(tmp):
         script = (
             "set -e; "
             "echo hello-overlay > /root_newfile.txt; "      # created text
-            "mkdir -p /newdir && head -c 300 /dev/urandom > /newdir/blob.bin; "  # binary
+            # binary: deterministic NUL-containing bytes so it is unambiguously
+            # non-text (random bytes occasionally lack a NUL and would fold as text).
+            "mkdir -p /newdir && printf 'BIN\\x00\\x01\\x02\\xff\\xfe' > /newdir/blob.bin; "
             "ln -s /target /newlink; "                      # symlink
             f"rm -f /{victim}; "                            # delete a host file (overlay)
             "true")
@@ -105,11 +107,14 @@ def run_with_ui(tmp):
         check(host_after == host_before and host_after is not None,
               "host file the box 'deleted' is untouched on the real host")
 
-        # give the UI a moment to consolidate (unregister -> consolidate)
-        time.sleep(2.0)
-
-        # find the consolidated stores
+        # the UI consolidates on unregister; poll for the stores rather than racing
+        # a fixed sleep (consolidation can lag on a loaded machine).
         state = Path(e["XDG_STATE_HOME"]) / "slopbox"
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            if list(state.glob("*.patch.xz")) and list(state.glob("*.sqlar")):
+                break
+            time.sleep(0.3)
         patches = list(state.glob("*.patch.xz"))
         sqlars = list(state.glob("*.sqlar"))
         check(len(patches) == 1, f"exactly one patch.xz produced (got {len(patches)})")
@@ -138,9 +143,17 @@ def run_with_ui(tmp):
             if prov:
                 check(all(int(p[1]) > 0 for p in prov), "every provenance row has a pid")
 
-        # backing live/<sid> is gone (consolidated + cleaned)
+        # backing live/<sid> is gone (consolidated + cleaned). Poll: the unregister
+        # handler removes the backing right AFTER writing the stores, so the stores
+        # can momentarily exist before the dir is gone.
         live = Path(e["XDG_RUNTIME_DIR"]) / "slopbox" / "live"
-        leftover = [d for d in (live.iterdir() if live.exists() else []) if (d/"up").is_dir()]
+        deadline = time.time() + 15
+        leftover = ["x"]
+        while time.time() < deadline:
+            leftover = [d for d in (live.iterdir() if live.exists() else [])
+                        if (d/"up").is_dir()]
+            if not leftover: break
+            time.sleep(0.3)
         check(not leftover, "live/ is empty at rest after teardown")
 
         # the mount is still up (UI alive) but the synthetic root is empty again
