@@ -685,7 +685,8 @@ class Supervisor:
             if is_dir and not whiteout: continue
             rel = str(ap.relative_to(upper)); real = Path("/") / rel
             if whiteout:
-                entries[rel] = dict(path=rel, kind="deleted", size=0, is_text=False)
+                entries[rel] = dict(path=rel, kind="deleted", size=0,
+                                    is_text=False, stale=False)
             else:
                 try: size = ap.stat().st_size if ap.is_file() else 0
                 except OSError: size = 0
@@ -693,9 +694,16 @@ class Supervisor:
                 if size and size < (10 << 20):
                     try: ap.read_bytes()[:512].decode(); is_text = True
                     except (UnicodeDecodeError, OSError): pass
+                # "stale" = the host file is newer than our captured copy, so
+                # applying would overwrite newer host data with an older version.
+                stale = False
+                exists = real.exists()
+                if exists:
+                    try: stale = real.stat().st_mtime > ap.stat().st_mtime
+                    except OSError: stale = False
                 entries[rel] = dict(path=rel,
-                                    kind="modified" if real.exists() else "created",
-                                    size=size, is_text=is_text)
+                                    kind="modified" if exists else "created",
+                                    size=size, is_text=is_text, stale=stale)
 
         # An opaque upper directory hides everything the lower had there. If the
         # lower really had files, those are effectively deleted — show them so,
@@ -747,7 +755,50 @@ class Supervisor:
             except OSError as e:
                 return dict(kind="error", error=str(e))
 
+    def _remove_upper_entry(self, p: Path) -> None:
+        """Remove a single upper artifact: a file, a directory tree, or a
+        char-device whiteout. No-op if nothing is there (e.g. an opacity-only
+        deletion, which has no per-file artifact)."""
+        try:
+            if p.is_dir() and not p.is_symlink() and not self._is_whiteout(p):
+                shutil.rmtree(p)
+            elif p.exists() or p.is_symlink() or self._is_whiteout(p):
+                p.unlink()
+        except FileNotFoundError:
+            pass
+
+    def _cleanup_dirs(self, upper: Path, start: Path) -> None:
+        """Walk up from `start` toward `upper`, removing directories that hold no
+        real change. A dir with only opaque markers is removed only when the lower
+        has nothing there (a freshly-created dir); if the lower exists, the markers
+        record real deletions and the dir is kept. Dirs with files/whiteouts stop
+        the walk."""
+        d = start
+        while d != upper and upper in d.parents:
+            try: children = list(d.iterdir())
+            except OSError: break
+            if any(not _is_overlay_marker(c.name) for c in children):
+                break                              # real content remains; stop
+            if children:                            # only opaque markers present
+                rel = d.relative_to(upper)
+                if Path("/").joinpath(*rel.parts).is_dir():
+                    break                           # markers = deletions of lower
+            parent = d.parent
+            try: shutil.rmtree(d)
+            except OSError: break
+            d = parent
+
+    def _maybe_remove_empty(self, sid) -> None:
+        """A finished session whose overlay has emptied out can just disappear."""
+        s = self.sessions.get(sid)
+        if not s or s.live or _pid_alive(s.pid): return
+        try:
+            if not upper_has_changes(Path(s.upper)): self.delete(sid)
+        except OSError: pass
+
     def overlay_apply(self, sid, paths) -> dict:
+        # Apply == write the change onto the host, then discard it from the
+        # overlay (so the overlay shrinks and can vanish once empty).
         s = self.sessions.get(sid)
         if not s: return dict(applied=[], errors=[{"error": "no session"}])
         upper = Path(s.upper)
@@ -766,9 +817,12 @@ class Supervisor:
                 elif src.is_file():
                     dst.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(src, dst)
+                self._remove_upper_entry(src)       # discard from the overlay
+                self._cleanup_dirs(upper, src.parent)
                 applied.append(rel)
             except OSError as e:
                 errors.append({"path": rel, "error": str(e)})
+        self._maybe_remove_empty(sid)
         return dict(applied=applied, errors=errors)
 
     def overlay_discard(self, sid, paths) -> dict:
@@ -780,11 +834,12 @@ class Supervisor:
         for rel in paths:
             p = upper / rel
             try:
-                if p.is_dir() and not self._is_whiteout(p): shutil.rmtree(p)
-                elif p.exists() or self._is_whiteout(p): p.unlink()
+                self._remove_upper_entry(p)
+                self._cleanup_dirs(upper, p.parent)
                 discarded.append(rel)
             except OSError as e:
                 errors.append({"path": rel, "error": str(e)})
+        self._maybe_remove_empty(sid)
         return dict(discarded=discarded, errors=errors)
 
     def overlay_edit(self, sid, rel, content) -> dict:
@@ -1475,7 +1530,7 @@ def run_ui() -> int:
                 with TabPane("Changes [2]", id="t-ch"):
                     with Horizontal(id="c-top"):
                         with Vertical(id="cf-pane"):
-                            yield Static("📁 FILES", classes="pt")
+                            yield Static("📁 FILES   [dim]+ new · ~ mod · - del ·[/] [reverse red]![/] [dim]host is NEWER than overlay — applying may lose host changes[/]", classes="pt")
                             yield ChangesTable(id="cf-tab", cursor_type="row")
                         with Vertical(id="cd-pane"):
                             yield Static("≡ DIFF", classes="pt")
@@ -1651,7 +1706,12 @@ def run_ui() -> int:
             self._rule_edit_at(self.query_one("#w-list",ListView).index)
 
         def _rebuild_ch(self, preserve=False):
-            rows=[(e["path"], [ICON.get(e["kind"],"?"), e["path"],
+            def flag(e):
+                f=ICON.get(e["kind"],"?")
+                if e.get("stale"): f+="[reverse red]![/]"   # host newer than overlay
+                return f
+            rows=[(e["path"], [flag(e),
+                               f"[red]{e['path']}[/]" if e.get("stale") else e["path"],
                                fmt_bytes(e["size"]) if e["size"] else ""])
                   for e in self._ch_entries]
             self._sync_table(self.query_one("#cf-tab",DataTable), rows)
