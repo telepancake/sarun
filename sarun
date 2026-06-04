@@ -3909,7 +3909,9 @@ def cmd_run(cmd, no_net, session_whitelist, chdir) -> int:
 #  UI — `slopbox`
 # ════════════════════════════════════════════════════════════════════════════
 
-def run_ui() -> int:
+def _make_ui_app():
+    """Build and return the Textual UI App class. Factored out of run_ui() so tests
+    can construct it under app.run_test() without entering the blocking run loop."""
     from textual import on
     from textual.app import App, ComposeResult
     from textual.binding import Binding
@@ -4196,8 +4198,9 @@ def run_ui() -> int:
             self.frules_store=FileRules(FILE_RULES_FILE)
             # The UI owns the single pyfuse3 overlay mount (started in on_mount on a
             # dedicated trio thread). The Supervisor drives it as boxes come and go.
-            self.mount=OverlayMount(mnt_point(), lower="/")
-            self.sup=Supervisor(self.rules_store, mount=self.mount)
+            # NB: not `self.mount` — that would shadow textual App.mount().
+            self.overlay_mount=OverlayMount(mnt_point(), lower="/")
+            self.sup=Supervisor(self.rules_store, mount=self.overlay_mount)
             self.sup.on_event=self._on_evt
             self.engine=None
             self.server=None
@@ -4239,7 +4242,7 @@ def run_ui() -> int:
             loop=asyncio.get_event_loop()
             # Start the single pyfuse3 overlay mount on its dedicated trio thread.
             # Until it is up, no slopbox can run (it has nowhere to bind its root).
-            mount_ok=self.mount.start()
+            mount_ok=self.overlay_mount.start()
             # A prior crash may have left orphaned live/<sid> backings: fold them.
             try: self.sup.sweep_orphans()
             except Exception: pass
@@ -4251,7 +4254,7 @@ def run_ui() -> int:
             if mount_ok:
                 msg += f"  ·  overlay {mnt_point()}"
             else:
-                err=getattr(self.mount,"_start_error",None)
+                err=getattr(self.overlay_mount,"_start_error",None)
                 msg += f"  [red](overlay mount FAILED: {err} — slopboxes cannot run)[/]"
             if not self.engine.ready:
                 msg += "  [red](mitmproxy unavailable — no gating)[/]"
@@ -4272,7 +4275,7 @@ def run_ui() -> int:
             changed=set()
             try:
                 while True:
-                    ev=self.mount.event_q.get_nowait()
+                    ev=self.overlay_mount.event_q.get_nowait()
                     if ev.get("type")=="overlay_changed" and ev.get("sid"):
                         changed.add(ev["sid"])
             except queue.Empty:
@@ -4289,7 +4292,7 @@ def run_ui() -> int:
             if self.server: await self.server.stop()
             # Tear down the single overlay mount; lazy-unmount fallback keeps the
             # mount table clean even if a handler is wedged.
-            try: self.mount.stop()
+            try: self.overlay_mount.stop()
             except Exception: pass
 
         def _save_all_patches(self):
@@ -4980,8 +4983,12 @@ def run_ui() -> int:
                 if ok: self.sup.discard(sid,None); self._refresh_after(sid, None)
             self.push_screen(Confirm(f"Discard ALL {len(self._ch_entries)} changes?"), done)
 
+    return UI
+
+
+def run_ui() -> int:
     ensure_dirs()
-    UI().run()
+    _make_ui_app()().run()
     return 0
 
 
