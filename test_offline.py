@@ -124,7 +124,8 @@ def test_consolidate_opaque_expands_tombstones():
 
 def test_supervisor_no_mount_register_fails_closed():
     sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=None)
-    ack = sup.register(dict(session_id="x_1", cmd=["true"]))
+    # a VALID sid so we exercise the mount-fail-closed path (not the sid rejection)
+    ack = sup.register(dict(session_id="20260604-000000_111", cmd=["true"]))
     check(ack.get("ok") is False, "register without a mount fails closed (no ok)")
     check("error" in ack, "register failure carries an error message")
 

@@ -72,6 +72,7 @@ import json
 import lzma
 import os
 import queue
+import re
 import shutil
 import signal
 import socket
@@ -116,6 +117,24 @@ def live_home() -> Path:
 
 def live_dir(session_id: str) -> Path:
     return live_home() / session_id
+
+# A box's session_id is its whole on-disk identity (it names live/<sid>, <mnt>/<sid>,
+# the patch/sqlar, and the per-session relay socket dir). It is consumed as a path
+# component, so any sid that arrives in a message MUST be validated against the one
+# legitimate shape before it is used — never trust a sid a box could influence.
+SID_RE = re.compile(r"\d{8}-\d{6}_\d+(\.[0-9a-f]{6})?\Z")
+
+def valid_sid(sid: "str | None") -> bool:
+    return bool(isinstance(sid, str) and SID_RE.match(sid))
+
+def relay_dir(session_id: str) -> Path:
+    """The per-session directory that holds ONLY this box's relay socket. Bound into
+    exactly this box (and no other), so an FD arriving on its relay socket is always
+    gated as this sid — the box cannot choose another session's rules."""
+    return live_dir(session_id) / "chan"
+
+def relay_sock_path(session_id: str) -> str:
+    return str(relay_dir(session_id) / "relay.sock")
 
 def mnt_point() -> Path:
     """The single pyfuse3 mountpoint the UI owns; box subfolders live under it as
@@ -217,8 +236,12 @@ def run_inner(channel_path: str, session_id: str, cmd: list) -> int:
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as ch:
                 ch.connect(channel_path)
+                # The relay socket is per-session and bound into ONLY this box, so the
+                # UI derives the session from which socket the FD arrived on. We send a
+                # one-byte payload (sendmsg needs a non-empty iov) and NO session_id:
+                # the UI never trusts a sid from inside a box.
                 ch.sendmsg(
-                    [json.dumps({"session_id": session_id}).encode()],
+                    [b"\x00"],
                     [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
                       array.array("i", [conn.fileno()]).tobytes())],
                 )
@@ -878,12 +901,26 @@ _PROV_ENV_KEYS = ("USER", "PWD", "SSH_CONNECTION", "TERM", "_")
 FICLONE = 0x40049409   # _IOW(0x94, 9, int) — btrfs/xfs reflink ioctl
 
 
+def _proc_start_time(pid: int) -> int:
+    """The process's start time (field 22 of /proc/<pid>/stat, jiffies since boot).
+    0 if unreadable. Cheap and stable for a live process; used to detect PID reuse so
+    a provenance cache entry is not reused across two different processes (LOW-1)."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            st = f.read()
+        rp = st.rfind(b")")
+        rest = st[rp + 2:].split() if rp >= 0 else []
+        return int(rest[19]) if len(rest) >= 20 else 0
+    except (OSError, ValueError):
+        return 0
+
+
 def read_provenance(pid: int) -> dict:
     """Best-effort writer provenance from host /proc/<pid>. Read SYNCHRONOUSLY from
     the write handler while the caller is still blocked (and thus still in /proc).
     Every field is best-effort — a vanished pid yields zeros/empties, never raises
     (spec §3, §8: /proc reads are the one place best-effort OSError is acceptable)."""
-    info = dict(pid=int(pid), ppid=0, exe="", argv=[], env={})
+    info = dict(pid=int(pid), ppid=0, exe="", argv=[], env={}, start_time=0)
     base = f"/proc/{pid}"
     try:
         with open(f"{base}/cmdline", "rb") as f:
@@ -899,8 +936,10 @@ def read_provenance(pid: int) -> dict:
         # comm is parenthesized and may contain spaces/parens; split after the last ')'
         rp = st.rfind(b")")
         rest = st[rp + 2:].split() if rp >= 0 else []
-        # fields after comm: state(0) ppid(1)
+        # fields after comm: state(0) ppid(1) ... starttime(19) (jiffies since boot).
+        # starttime distinguishes a reused pid from the original process (LOW-1).
         if len(rest) >= 2: info["ppid"] = int(rest[1])
+        if len(rest) >= 20: info["start_time"] = int(rest[19])
     except (OSError, ValueError): pass
     try:
         with open(f"{base}/environ", "rb") as f:
@@ -1039,10 +1078,17 @@ class Index:
         return False
 
     # ── provenance ──────────────────────────────────────────────────────────
+    def _prov_key(self, pid: int) -> tuple:
+        """Cache key that survives PID reuse: (pid, /proc start_time). If the kernel
+        reuses a pid for a new process, its start_time differs, so the stale cache
+        entry is missed and we re-capture (LOW-1)."""
+        return (pid, _proc_start_time(pid))
+
     def writer_for(self, pid: int) -> int:
         """Provenance capture (spec §3). Synchronous; caller is blocked. The writer
         row is ALWAYS inserted, even if /proc/<pid> is gone (R5/R7)."""
-        cached = self._writer_cache.get(pid)
+        key = self._prov_key(pid)
+        cached = self._writer_cache.get(key)
         if cached is not None: return cached
         prov = self.provenance_of(pid)
         with self._lock:
@@ -1053,17 +1099,19 @@ class Index:
                  json.dumps(prov["argv"]), json.dumps(prov["env"]), time.time()))
             self._db.commit()
             wid = cur.lastrowid
-        self._writer_cache[pid] = wid
+        self._writer_cache[key] = wid
         return wid
 
     def provenance_of(self, pid: int) -> dict:
-        """Provenance for a pid, cached per pid for this process. policy_check calls
-        this once per mutating op, so caching avoids re-reading /proc/<pid>/* on the
-        write hot path (a long-lived writer is read once)."""
-        cached = self._prov_cache.get(pid)
+        """Provenance for a pid, cached per (pid, start_time) for this process. The
+        start_time component means a reused pid is not served a previous process's
+        provenance (LOW-1). policy_check calls this once per mutating op, so caching
+        still avoids re-reading /proc/<pid>/* for a long-lived writer."""
+        key = self._prov_key(pid)
+        cached = self._prov_cache.get(key)
         if cached is not None: return cached
         prov = read_provenance(pid)
-        self._prov_cache[pid] = prov
+        self._prov_cache[key] = prov
         return prov
 
     # ── mutations (write-through) ───────────────────────────────────────────
@@ -1092,14 +1140,15 @@ class Index:
                 "INSERT INTO oplog(ts,op,path,writer_id,detail) VALUES(?,?,?,?,?)",
                 (now, op, path, writer_id, detail))
             self._db.commit()
-        # RAM mirror
-        if kind == "whiteout":
-            self._whiteouts.add(path); self._kinds.pop(path, None)
-        else:
-            self._kinds[path] = kind; self._whiteouts.discard(path)
-        if opaque is not None:
-            if opaque: self._opaque.add(path)
-            else: self._opaque.discard(path)
+            # RAM mirror — mutate under the SAME lock so a UI-thread snapshot of
+            # _whiteouts/_opaque can never observe a set mid-resize (M3).
+            if kind == "whiteout":
+                self._whiteouts.add(path); self._kinds.pop(path, None)
+            else:
+                self._kinds[path] = kind; self._whiteouts.discard(path)
+            if opaque is not None:
+                if opaque: self._opaque.add(path)
+                else: self._opaque.discard(path)
 
     def del_entry(self, path, op: str = "del", writer_id=None) -> None:
         now = time.time()
@@ -1109,8 +1158,8 @@ class Index:
                 "INSERT INTO oplog(ts,op,path,writer_id,detail) VALUES(?,?,?,?,?)",
                 (now, op, path, writer_id, ""))
             self._db.commit()
-        self._whiteouts.discard(path); self._kinds.pop(path, None)
-        self._opaque.discard(path)
+            self._whiteouts.discard(path); self._kinds.pop(path, None)
+            self._opaque.discard(path)
 
     def prune_subtree(self, prefix: str) -> None:
         """Drop all rows under prefix + '/' (after an rmdir whose children were
@@ -1119,10 +1168,10 @@ class Index:
         with self._lock:
             self._db.execute("DELETE FROM entries WHERE path LIKE ?", (pref + "%",))
             self._db.commit()
-        for s in (self._whiteouts, self._opaque):
-            for p in [p for p in s if p.startswith(pref)]: s.discard(p)
-        for p in [p for p in self._kinds if p.startswith(pref)]:
-            self._kinds.pop(p, None)
+            for s in (self._whiteouts, self._opaque):
+                for p in [p for p in s if p.startswith(pref)]: s.discard(p)
+            for p in [p for p in self._kinds if p.startswith(pref)]:
+                self._kinds.pop(p, None)
 
     def reparent(self, old: str, new: str, writer_id) -> None:
         """Rewrite all descendant rows old/… → new/… (dir rename). Mirror rebuilt
@@ -1141,19 +1190,27 @@ class Index:
                     " VALUES(?,?,?,?,?,?,?)",
                     (np, kind, mode, time.time(), writer_id, time.time(), opaque))
             self._db.commit()
-        for path, kind, mode, opaque in rows:
-            np = newp + path[len(oldp):]
-            self._whiteouts.discard(path); self._kinds.pop(path, None); self._opaque.discard(path)
-            if kind == "whiteout": self._whiteouts.add(np)
-            else: self._kinds[np] = kind
-            if opaque: self._opaque.add(np)
+            for path, kind, mode, opaque in rows:
+                np = newp + path[len(oldp):]
+                self._whiteouts.discard(path); self._kinds.pop(path, None); self._opaque.discard(path)
+                if kind == "whiteout": self._whiteouts.add(np)
+                else: self._kinds[np] = kind
+                if opaque: self._opaque.add(np)
 
     # ── consolidate accessors (spec §11) ────────────────────────────────────
     def deletions(self) -> list:
-        return sorted(self._whiteouts)
+        # Snapshot under the lock: the serve thread can mutate _whiteouts concurrently
+        # (set_entry/del_entry update the RAM mirror outside the lock), so copy the set
+        # while holding _lock before sorting — otherwise the UI thread's sorted() can
+        # hit "set changed size during iteration" (M3).
+        with self._lock:
+            snap = list(self._whiteouts)
+        return sorted(snap)
 
     def opaque_dirs(self) -> list:
-        return sorted(self._opaque)
+        with self._lock:
+            snap = list(self._opaque)
+        return sorted(snap)
 
     def writer_provenance(self, path: str) -> "dict | None":
         cur = self._db.execute(
@@ -1177,9 +1234,13 @@ def _build_overlay_ops():
     pyfuse3/trio. Returns the class."""
     import pyfuse3
 
-    ATTR_TIMEOUT = 300.0
-    ENTRY_TIMEOUT = 300.0
-    NEG_TIMEOUT = 5.0
+    # Short timeouts for an untrusted, mutating mount: a box can change the merged
+    # view at any moment (copy-up, whiteout, opaque), so the kernel must not cache
+    # attrs/entries for long or it will serve stale (and potentially cross-state)
+    # metadata. 5xx-second caching here was a correctness/safety hazard (M5).
+    ATTR_TIMEOUT = 1.0
+    ENTRY_TIMEOUT = 1.0
+    NEG_TIMEOUT = 1.0
 
     class MultiplexOverlayFs(pyfuse3.Operations):
         """One pyfuse3 Operations object serving every box. The synthetic root ('')
@@ -1206,6 +1267,7 @@ def _build_overlay_ops():
             self._next_ino = pyfuse3.ROOT_INODE + 1
             self._lookup_count: dict = {}
             self._fd_table: dict = {}     # fh -> open fd (regular files)
+            self._fh_sid: dict = {}       # fh -> sid (so teardown can close a box's fds)
             self._vfh: dict = {}          # fh -> (sid, rel, bytes) for virtual reads
             self._dir_snaps: dict = {}    # dh -> sorted [(name, key_or_None, attrs)]
             self._next_fh = 1
@@ -1230,6 +1292,17 @@ def _build_overlay_ops():
                     self._lookup_count.pop(ino, None)
                 self._key_to_ino = {k: i for k, i in self._key_to_ino.items()
                                     if k[0] != sid}
+                # Close any still-open fds that belong to this box so its backing
+                # tree can be removed without leaking descriptors (M4). A client that
+                # had the file open will get EBADF on its next read/write — the box is
+                # being torn down anyway.
+                dead_fhs = [fh for fh, s in self._fh_sid.items() if s == sid]
+                for fh in dead_fhs:
+                    self._fh_sid.pop(fh, None)
+                    fd = self._fd_table.pop(fh, None)
+                    if fd is not None:
+                        try: os.close(fd)
+                        except OSError: pass
 
         def add_virtual(self, sid: str, rel: str, content: bytes) -> None:
             s = self.sessions.get(sid)
@@ -1410,7 +1483,13 @@ def _build_overlay_ops():
         async def getattr(self, inode, ctx=None):
             key = self._key(inode)
             if key is None:
-                return self._synth_dir_attrs(pyfuse3.ROOT_INODE)
+                # Only the synthetic root legitimately maps to a None key. A None for
+                # any other inode means it was forgotten/removed (e.g. its session was
+                # torn down) — a stale inode must ENOENT, never resolve to the root's
+                # attributes (M5).
+                if inode == pyfuse3.ROOT_INODE:
+                    return self._synth_dir_attrs(pyfuse3.ROOT_INODE)
+                raise pyfuse3.FUSEError(errno.ENOENT)
             sid, rel = key
             if sid not in self.sessions:
                 raise pyfuse3.FUSEError(errno.ENOENT)
@@ -1539,8 +1618,14 @@ def _build_overlay_ops():
             for p in parts:
                 cur = (cur + "/" + p) if cur else p
                 upath = self._upper_path(sid, cur)
-                if os.path.isdir(upath):
-                    continue
+                # os.path.isdir follows symlinks: a symlink in the upper pointing at a
+                # host directory would be treated as "already a dir" and writes would
+                # land through it onto the host. Require a real directory (M2).
+                try:
+                    if stat_mod.S_ISDIR(os.lstat(upath).st_mode):
+                        continue
+                except OSError:
+                    pass
                 self._ensure_parent_dirs(sid, cur, wid)
                 try:
                     os.mkdir(upath, 0o755)
@@ -1589,7 +1674,7 @@ def _build_overlay_ops():
                     except OSError as e:
                         raise pyfuse3.FUSEError(e.errno or errno.EIO)
                 mode = stat_mod.S_IMODE(st.st_mode)
-                src = os.open(ap, os.O_RDONLY)
+                src = os.open(ap, os.O_RDONLY | os.O_NOFOLLOW)
                 try:
                     dst = os.open(upath, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, mode)
                     try:
@@ -1628,7 +1713,10 @@ def _build_overlay_ops():
                     if layer in ("absent", "whiteout"):
                         raise pyfuse3.FUSEError(errno.ENOENT)
                     try:
-                        fd = os.open(ap, os.O_RDONLY)
+                        # O_NOFOLLOW: never dereference a symlink at the final path
+                        # component on the read path either — defensive even where the
+                        # resolved layer is host-owned (M1, §8).
+                        fd = os.open(ap, os.O_RDONLY | os.O_NOFOLLOW)
                     except OSError as e:
                         raise pyfuse3.FUSEError(e.errno or errno.EIO)
                 else:
@@ -1639,7 +1727,8 @@ def _build_overlay_ops():
                     self._notify(sid)
                 with self._lock:
                     fh = self._next_fh; self._next_fh += 1
-                self._fd_table[fh] = fd
+                    self._fd_table[fh] = fd
+                    self._fh_sid[fh] = sid
                 return pyfuse3.FileInfo(fh=fh, direct_io=False, keep_cache=False)
             finally:
                 self._req_exit()
@@ -1684,6 +1773,7 @@ def _build_overlay_ops():
         async def release(self, fh):
             if fh in self._vfh:
                 self._vfh.pop(fh, None); return
+            self._fh_sid.pop(fh, None)
             fd = self._fd_table.pop(fh, None)
             if fd is not None:
                 try: os.close(fd)
@@ -1719,7 +1809,8 @@ def _build_overlay_ops():
                 self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
                 with self._lock:
                     nfh = self._next_fh; self._next_fh += 1
-                self._fd_table[nfh] = fd
+                    self._fd_table[nfh] = fd
+                    self._fh_sid[nfh] = sid
                 self._notify(sid)
                 return (pyfuse3.FileInfo(fh=nfh, direct_io=False, keep_cache=False),
                         self._entry(ino, st))
@@ -1942,7 +2033,7 @@ def _build_overlay_ops():
                     os.mkdir(upath, stat_mod.S_IMODE(st.st_mode))
                     idx.set_entry(rel, "dir", st.st_mode, wid, "copyup_dir")
                 else:
-                    src = os.open(ap, os.O_RDONLY)
+                    src = os.open(ap, os.O_RDONLY | os.O_NOFOLLOW)
                     try:
                         dst = os.open(upath, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
                                       stat_mod.S_IMODE(st.st_mode))
@@ -2080,7 +2171,7 @@ def _build_overlay_ops():
                     idx.set_entry(rel_n, "symlink", stat_mod.S_IFLNK | 0o777, wid,
                                   "link_as_copy", detail=rel_src)
                 else:
-                    src = os.open(ups, os.O_RDONLY)
+                    src = os.open(ups, os.O_RDONLY | os.O_NOFOLLOW)
                     try:
                         dst = os.open(upn, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
                                       stat_mod.S_IMODE(st.st_mode))
@@ -2244,8 +2335,15 @@ class OverlayMount:
             try:
                 import trio
                 trio.from_thread.run_sync(ev.set, trio_token=token)
-            except Exception:
-                pass
+            except trio.RunFinishedError:
+                # The serve loop already finished (e.g. unmounted/crashed); the
+                # lazy-unmount fallback below still cleans the mount table. Log rather
+                # than swallow so a premature exit is visible (LOW-4).
+                print("slopbox(ui): overlay serve loop already finished at stop()",
+                      file=sys.stderr)
+            except Exception as e:
+                print(f"slopbox(ui): overlay stop signalling failed: {e}",
+                      file=sys.stderr)
         if self._thread is not None:
             self._thread.join(timeout=5)
         # lazy-unmount fallback (recovers the mount table even if wedged)
@@ -2270,6 +2368,14 @@ def is_whiteout(p: Path) -> bool:
     try:
         st = p.stat(); return stat_mod.S_ISCHR(st.st_mode) and st.st_rdev == 0
     except OSError: return False
+
+def _is_symlink(p: Path) -> bool:
+    """True if p is itself a symlink (lstat, never follows). Used to refuse writing
+    THROUGH a symlink onto the host / into the upper from the UI thread (LOW-3)."""
+    try:
+        return stat_mod.S_ISLNK(os.lstat(p).st_mode)
+    except OSError:
+        return False
 
 def remove_upper_entry(p: Path) -> None:
     """Remove one upper artifact: a file, a directory tree, or a char-device
@@ -2425,9 +2531,10 @@ def consolidate(shm_dir, session_id: str, cmd: list, index: "Index | None" = Non
     # 2) deletions (whiteouts) from the index -> sqlar tombstones.
     if idx is not None:
         for rel in idx.deletions():
-            if frules.decide(rel) == "discard": continue
+            act = frules.decide(rel)
+            if act == "discard": continue
             host = Path("/") / rel
-            if frules.decide(rel) == "apply":
+            if act == "apply":
                 try:
                     if host.is_dir() and not host.is_symlink(): shutil.rmtree(host)
                     elif host.exists() or host.is_symlink(): host.unlink()
@@ -2592,7 +2699,46 @@ class Supervisor:
         self._dns_cache: dict = {}
         self._counter = 0
         self.on_event = lambda ev: None
+        # HIGH-1: per-session owner tokens + relay sockets. A box can reach only its
+        # own relay socket and never the control socket, so it cannot register/unregister
+        # any session, nor gate its traffic as another sid.
+        self._owner_tokens: dict = {}     # sid -> random token (kept OUTSIDE the box)
+        self._relays: dict = {}           # sid -> RelayServer
+        self._relay_loop = None           # asyncio loop the relays run on
+        self._relay_engine = None         # ProxyEngine relays hand FDs to
         self.sessions.update(discover_sessions())
+
+    def attach_relay_factory(self, loop, engine) -> None:
+        """Called by the ChannelServer once its asyncio loop is up; lets register()
+        spin up a per-session RelayServer for each networked box."""
+        self._relay_loop = loop
+        self._relay_engine = engine
+
+    def _start_relay(self, sid: str) -> "str | None":
+        """Create + start this box's own relay socket; return its path (to bind into
+        only that box). None if no relay machinery is attached (e.g. offline tests)."""
+        if self._relay_loop is None or self._relay_engine is None:
+            return None
+        self._stop_relay(sid)
+        path = relay_sock_path(sid)
+        rs = RelayServer(self._relay_engine, sid, path, self._relay_loop)
+        try:
+            rs.start()
+        except OSError as e:
+            print(f"slopbox(ui): relay socket for {sid} failed: {e}", file=sys.stderr)
+            return None
+        self._relays[sid] = rs
+        return path
+
+    def _stop_relay(self, sid: str) -> None:
+        rs = self._relays.pop(sid, None)
+        if rs is not None:
+            try: rs.stop()
+            except Exception: pass
+
+    def stop_all_relays(self) -> None:
+        for sid in list(self._relays):
+            self._stop_relay(sid)
 
     def _emit(self, **ev: Any) -> None: self.on_event(ev)
 
@@ -2703,7 +2849,12 @@ class Supervisor:
         dict the ChannelServer sends back to the runner: the absolute <mnt>/<sid>
         bind target, so the runner can bwrap onto it. Fail-closed: any setup error is
         reported in the ack, never swallowed (R5)."""
-        sid = msg["session_id"]
+        sid = msg.get("session_id")
+        # HIGH-2: sid is used as a path component (live/<sid>, <mnt>/<sid>, the relay
+        # dir, the patch/sqlar). Reject anything that isn't the one legitimate shape
+        # BEFORE any mkdir — a traversal sid (".." / a slash) must create nothing.
+        if not valid_sid(sid):
+            return dict(ok=False, error="invalid session_id")
         cmd = msg.get("cmd", [])
         if self.mount is None or self.mount.ops is None:
             return dict(ok=False, error="overlay mount is not available")
@@ -2740,11 +2891,40 @@ class Supervisor:
             s.sess_rules.append(Rule("allow", "host", h))
         self.sessions[sid] = s
         self._consolidated.discard(sid)
+        # HIGH-1: mint an owner token kept OUTSIDE the box (returned to the runner
+        # only). unregister/drop must present it, so no box can tear down a session.
+        token = uuid.uuid4().hex
+        self._owner_tokens[sid] = token
+        # HIGH-1: a networked box gets its OWN relay socket, bound into only that box.
+        relay = self._start_relay(sid) if net else None
         self._emit(type="session_added", session=s.to_dict())
-        return dict(ok=True, mount=box_root, shm_dir=str(backing), net=net)
+        ack = dict(ok=True, mount=box_root, shm_dir=str(backing), net=net,
+                   owner_token=token)
+        if relay is not None:
+            ack["relay"] = relay
+        return ack
+
+    def _owns(self, msg: dict, sid: str) -> bool:
+        """A teardown control op is honoured only if it presents the session's owner
+        token. The token never enters the box, so in-box code cannot forge it."""
+        want = self._owner_tokens.get(sid)
+        if want is None:
+            # No token on record (e.g. a session discovered from disk at startup, never
+            # registered this run). Such sessions were never live this process, so any
+            # teardown is a local bookkeeping op, not a cross-session attack surface.
+            return True
+        return msg.get("owner_token") == want
 
     def unregister(self, msg: dict) -> None:
-        sid = msg["session_id"]
+        sid = msg.get("session_id")
+        if not valid_sid(sid):
+            return
+        if not self._owns(msg, sid):
+            print(f"slopbox(ui): rejected unregister of {sid} (bad owner token)",
+                  file=sys.stderr)
+            return
+        self._stop_relay(sid)
+        self._owner_tokens.pop(sid, None)
         s = self.sessions.get(sid)
         # Teardown: remove the box from the live mount set, consolidate its overlay
         # (deletions/opacity from index.db, provenance into the sqlar), then drop the
@@ -2788,8 +2968,17 @@ class Supervisor:
 
     def drop(self, msg: dict) -> None:
         # Runner reports the session left nothing to review; remove it outright.
-        if self.sessions.pop(msg["session_id"], None) is not None:
-            self._emit(type="session_removed", session_id=msg["session_id"])
+        sid = msg.get("session_id")
+        if not valid_sid(sid):
+            return
+        if not self._owns(msg, sid):
+            print(f"slopbox(ui): rejected remove of {sid} (bad owner token)",
+                  file=sys.stderr)
+            return
+        self._stop_relay(sid)
+        self._owner_tokens.pop(sid, None)
+        if self.sessions.pop(sid, None) is not None:
+            self._emit(type="session_removed", session_id=sid)
 
     async def approval_request(self, sid, host, port, scheme, url="") -> dict:
         s = self.sessions.get(sid)
@@ -3078,6 +3267,10 @@ class Supervisor:
         a1, a2, b1, b2 = g[0][1], g[-1][2], g[0][3], g[-1][4]
         new_lower = ll[:a1] + ul[b1:b2] + ll[a2:]
         dst = Path("/") / rel.lstrip("/")
+        # LOW-3: never write THROUGH a symlink onto the host. If the target path is a
+        # symlink, refuse rather than follow it.
+        if _is_symlink(dst):
+            return dict(ok=False, error="refusing to write through a symlink")
         try:
             dst.parent.mkdir(parents=True, exist_ok=True)
             dst.write_bytes(b"".join(new_lower))
@@ -3096,6 +3289,9 @@ class Supervisor:
         a1, a2, b1, b2 = g[0][1], g[-1][2], g[0][3], g[-1][4]
         new_upper = ul[:b1] + ll[a1:a2] + ul[b2:]
         src = Path(self.sessions[sid].upper) / rel.lstrip("/")
+        # LOW-3: refuse to write through a symlink planted in the upper.
+        if _is_symlink(src):
+            return dict(ok=False, error="refusing to write through a symlink")
         try:
             src.write_bytes(b"".join(new_upper))
         except OSError as e:
@@ -3142,6 +3338,11 @@ class Supervisor:
                     elif dst.exists() or dst.is_symlink(): dst.unlink()
                 elif src.is_dir(): dst.mkdir(parents=True, exist_ok=True)
                 elif src.is_file():
+                    # LOW-3: refuse to copy through a symlink at the host target.
+                    if _is_symlink(dst):
+                        errors.append({"path": rel,
+                                       "error": "refusing to write through a symlink"})
+                        continue
                     dst.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(src, dst)
                 self._remove_upper_entry(src)       # discard from the overlay
@@ -3623,28 +3824,30 @@ class ProxyEngine:
 #  Control + FD-channel socket server (inside the UI)
 # ════════════════════════════════════════════════════════════════════════════
 
-class ChannelServer:
-    """
-    One Unix socket carries two kinds of client:
-      - control clients (runner register/unregister/etc.): newline JSON, no FDs
-      - FD clients (inner forwarder): a single sendmsg with {session_id} + 1 FD
-    We disambiguate by inspecting the first message's ancillary data.
-    """
-    def __init__(self, sup: Supervisor, engine: "ProxyEngine", sock_path: str):
-        self.sup = sup; self.engine = engine; self.sock_path = sock_path
-        self._srv = None
+class RelayServer:
+    """A per-session FD relay. One of these is created by the Supervisor for each
+    networked box; it listens on that box's OWN relay socket (relay_sock_path(sid),
+    bound into only that box). Every FD that arrives here is gated as `sid` — the
+    sender cannot choose another session's rules, because there is no sid in the
+    message and this loop is hard-bound to one sid. This socket carries FD messages
+    ONLY: it never accepts a register/unregister/control message, so untrusted in-box
+    code that can reach it can do nothing but hand us its own connections."""
+    def __init__(self, engine: "ProxyEngine", sid: str, sock_path: str,
+                 loop: asyncio.AbstractEventLoop):
+        self.engine = engine; self.sid = sid; self.sock_path = sock_path
+        self._loop = loop; self._sock = None; self._task = None
 
-    async def start(self) -> None:
+    def start(self) -> None:
+        try: os.makedirs(os.path.dirname(self.sock_path), mode=0o700, exist_ok=True)
+        except OSError: pass
         try: os.unlink(self.sock_path)
         except FileNotFoundError: pass
-        # We need ancillary-data (FD) reception, which asyncio streams don't do.
-        # So we run a raw socket accept loop in a thread, dispatching to the loop.
         self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._sock.bind(self.sock_path)
-        os.chmod(self.sock_path, 0o600)
-        self._sock.listen(128)
+        try: os.chmod(self.sock_path, 0o600)
+        except OSError: pass
+        self._sock.listen(64)
         self._sock.setblocking(False)
-        self._loop = asyncio.get_event_loop()
         self._task = asyncio.ensure_future(self._accept_loop())
 
     async def _accept_loop(self) -> None:
@@ -3658,31 +3861,84 @@ class ChannelServer:
     async def _handle(self, conn: socket.socket) -> None:
         conn.setblocking(False)
         try:
-            # Peek the first message WITH ancillary space to detect an FD.
-            msg, anc, _flags, _addr = await self._loop.run_in_executor(
-                None, self._recvmsg_blocking, conn)
+            _msg, anc, _flags, _addr = await self._loop.run_in_executor(
+                None, _recvmsg_blocking, conn)
             fds = []
             for lvl, typ, data in anc:
                 if lvl == socket.SOL_SOCKET and typ == socket.SCM_RIGHTS:
                     a = array.array("i"); a.frombytes(data); fds.extend(a.tolist())
+            for extra in fds[1:]:
+                try: os.close(extra)
+                except OSError: pass
+            conn.close()
             if fds:
-                # FD client: forwarder handed us a connection.
-                try:
-                    meta = json.loads(msg.decode() or "{}")
-                except json.JSONDecodeError:
-                    meta = {}
-                sid = meta.get("session_id", "")
-                # hand the first FD to the proxy engine; close any extras
-                for extra in fds[1:]:
-                    try: os.close(extra)
-                    except OSError: pass
-                conn.close()
-                await self.engine.handle_fd(fds[0], sid)
-                return
-            # Control client: first line is JSON; keep reading lines. A control
-            # message may produce a reply (register acks with the mount path); we
-            # write it back on the same connection so the runner can block on it.
-            buf = msg
+                # gated as THIS relay's sid, regardless of any message content
+                await self.engine.handle_fd(fds[0], self.sid)
+        except (OSError, asyncio.CancelledError):
+            try: conn.close()
+            except OSError: pass
+
+    def stop(self) -> None:
+        if self._task is not None:
+            self._task.cancel()
+        try:
+            if self._sock is not None: self._sock.close()
+        except OSError:
+            pass
+        try: os.unlink(self.sock_path)
+        except FileNotFoundError: pass
+
+
+def _recvmsg_blocking(conn):
+    conn.setblocking(True)
+    try:
+        return conn.recvmsg(65536, socket.CMSG_SPACE(4 * 16))
+    finally:
+        conn.setblocking(False)
+
+
+class ChannelServer:
+    """
+    The UI control socket (ui.sock). It carries control messages ONLY (register /
+    unregister / remove): newline JSON, no FDs. This socket is NEVER bind-mounted
+    into a sandbox, so untrusted in-box code cannot reach it. FD relay for networked
+    boxes happens on per-session RelayServer sockets instead (see RelayServer).
+    """
+    def __init__(self, sup: Supervisor, engine: "ProxyEngine", sock_path: str):
+        self.sup = sup; self.engine = engine; self.sock_path = sock_path
+        self._srv = None
+
+    async def start(self) -> None:
+        try: os.unlink(self.sock_path)
+        except FileNotFoundError: pass
+        self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._sock.bind(self.sock_path)
+        os.chmod(self.sock_path, 0o600)
+        self._sock.listen(128)
+        self._sock.setblocking(False)
+        self._loop = asyncio.get_event_loop()
+        # The Supervisor needs the loop + engine to spin up per-session relay sockets
+        # (one per networked box) when it handles a register; hand them over now.
+        self.sup.attach_relay_factory(self._loop, self.engine)
+        self._task = asyncio.ensure_future(self._accept_loop())
+
+    async def _accept_loop(self) -> None:
+        while True:
+            try:
+                conn, _ = await self._loop.sock_accept(self._sock)
+            except (OSError, asyncio.CancelledError):
+                break
+            asyncio.ensure_future(self._handle(conn))
+
+    async def _handle(self, conn: socket.socket) -> None:
+        conn.setblocking(False)
+        try:
+            # Control client: each line is JSON. Any ancillary FDs on this socket are
+            # rejected (closed): the control socket never carries connection FDs — that
+            # is the per-session RelayServer's job. A register message produces a reply
+            # (the mount path + owner token) written back on the same connection so the
+            # runner can block on it.
+            buf = b""
             while True:
                 if b"\n" in buf:
                     line, buf = buf.split(b"\n", 1)
@@ -3713,13 +3969,6 @@ class ChannelServer:
             try: conn.close()
             except OSError: pass
 
-    def _recvmsg_blocking(self, conn):
-        conn.setblocking(True)
-        try:
-            return conn.recvmsg(65536, socket.CMSG_SPACE(4 * 16))
-        finally:
-            conn.setblocking(False)
-
     def _dispatch_control(self, line: bytes) -> "dict | None":
         try: msg = json.loads(line.decode())
         except json.JSONDecodeError: return None
@@ -3736,6 +3985,10 @@ class ChannelServer:
     async def stop(self) -> None:
         if getattr(self, "_task", None):
             self._task.cancel()
+        try:
+            self.sup.stop_all_relays()
+        except Exception:
+            pass
         try:
             self._sock.close()
         except OSError:
@@ -3853,6 +4106,10 @@ def cmd_run(cmd, no_net, session_whitelist, chdir) -> int:
     box_root = ack["mount"]                      # <mnt>/<sid>
     shm_dir = ack.get("shm_dir", str(live_dir(sid)))
     can_net = net and bool(ack.get("net")) and CA_CERT.exists()
+    # The owner token is held HERE, in the runner (outside the box). Only we can
+    # unregister this session; in-box code never sees it.
+    owner_token = ack.get("owner_token", "")
+    relay_path = ack.get("relay", "")            # this box's own FD relay socket
 
     # Diagnostics go to stderr (never stdout) and only ever before/after the
     # child runs, so the wrapped command's stdout stays clean.
@@ -3872,9 +4129,10 @@ def cmd_run(cmd, no_net, session_whitelist, chdir) -> int:
     code = 1
 
     try:
-        # the inner forwarder needs the channel socket bound in; the channel is
-        # the UI socket. We bind its directory in so connect() works.
-        chan = SOCK_PATH if can_net else ""
+        # The inner forwarder needs this box's OWN relay socket bound in (never the
+        # UI control socket). We bind only the relay socket's dedicated directory, so
+        # the box can reach nothing but its own per-session FD relay.
+        chan = relay_path if (can_net and relay_path) else ""
 
         # UNCHANGED bwrap security boundary: the ONLY difference from the old
         # fuse-overlayfs path is the bind source — this box's mount subfolder
@@ -3892,9 +4150,13 @@ def cmd_run(cmd, no_net, session_whitelist, chdir) -> int:
                 "--chdir", chdir or os.getcwd()]
         if bwrap_supports("--as-pid-1"):
             args += ["--as-pid-1"]
-        if can_net:
-            # bind the UI socket in (its dir) so the forwarder can reach it
-            args += ["--bind", os.path.dirname(SOCK_PATH), os.path.dirname(SOCK_PATH)]
+        if can_net and chan:
+            # bind ONLY this box's relay-socket directory in (holds nothing but the
+            # per-session relay.sock) so the forwarder can reach its own relay — and
+            # nothing else under the runtime dir (not the control socket, not live/,
+            # not <mnt>/).
+            chan_dir = os.path.dirname(chan)
+            args += ["--bind", chan_dir, chan_dir]
             args += ["--ro-bind", str(CA_CERT), str(CA_CERT)]
             proxy = f"http://127.0.0.1:{INNER_PROXY_PORT}"
             for var in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
@@ -3942,7 +4204,7 @@ def cmd_run(cmd, no_net, session_whitelist, chdir) -> int:
     # Tell the UI we exited. The UI runs consolidate() on live/<sid>, removes
     # <mnt>/<sid> from the live set, and deletes live/<sid>. (The runner does NOT
     # consolidate: the UI owns the index/mount and the only live index handle.)
-    sync_send(SOCK_PATH, type="unregister", session_id=sid,
+    sync_send(SOCK_PATH, type="unregister", session_id=sid, owner_token=owner_token,
               status="finished" if launched else "finished",
               exit_code=(code or 0) if launched else 1)
     print(f"slopbox: {sid} exited ({code if launched else 1}). "
