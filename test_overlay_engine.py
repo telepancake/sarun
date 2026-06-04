@@ -194,10 +194,41 @@ def test_rename():
         fx.stop()
 
 
+def test_lower_symlink_copyup_preserves_type():
+    """A lower (host) symlink that gets copied up (e.g. setattr on it) must remain a
+    symlink in the upper, NOT be materialized as its target's bytes."""
+    fx = MountFixture()
+    try:
+        fx.start()
+        # find a host symlink to exercise (many exist under /usr/lib, /etc/...)
+        host_link = None
+        for cand in ("/etc/mtab", "/etc/os-release"):
+            if Path(cand).is_symlink(): host_link = cand; break
+        if host_link is None:
+            # fall back: create one on the lower? can't write host. scan /usr/bin.
+            import glob as _g
+            for p in _g.glob("/usr/bin/*")[:2000]:
+                if os.path.islink(p): host_link = p; break
+        if host_link is None:
+            check(True, "lower-symlink: no host symlink found (skipped)"); return
+        rel = host_link.lstrip("/")
+        # touch -h sets mtime on the link itself (setattr utime, follow=False)
+        r = fx.sh(f"touch -h -d '2001-01-01' {rel} 2>&1; echo rc=$?")
+        # the upper artifact (if materialized) must be a symlink, not a file
+        up_art = fx.up / rel
+        if up_art.exists() or up_art.is_symlink():
+            check(up_art.is_symlink(),
+                  "copied-up lower symlink stays a symlink (not target bytes)")
+        else:
+            check(True, "lower symlink not materialized (no copy-up needed) — ok")
+    finally:
+        fx.stop()
+
+
 if __name__ == "__main__":
     for t in (test_readthrough_and_create, test_copyup_modify, test_delete_whiteout,
               test_symlink_and_readlink, test_provenance_recorded, test_opaque_dir,
-              test_rename):
+              test_rename, test_lower_symlink_copyup_preserves_type):
         print(f"\n== {t.__name__} ==")
         try:
             t()

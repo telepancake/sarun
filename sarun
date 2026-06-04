@@ -1002,6 +1002,7 @@ class Index:
             " writer_id INT, detail TEXT);")
         self._db.commit()
         self._writer_cache: dict = {}     # host pid -> writers.id (this process only)
+        self._prov_cache: dict = {}       # host pid -> provenance dict (hot-path cache)
         self._whiteouts: set = set()
         self._kinds: dict = {}
         self._opaque: set = set()
@@ -1043,7 +1044,7 @@ class Index:
         row is ALWAYS inserted, even if /proc/<pid> is gone (R5/R7)."""
         cached = self._writer_cache.get(pid)
         if cached is not None: return cached
-        prov = read_provenance(pid)
+        prov = self.provenance_of(pid)
         with self._lock:
             cur = self._db.execute(
                 "INSERT INTO writers(pid,ppid,exe,argv,env,captured_at)"
@@ -1056,7 +1057,14 @@ class Index:
         return wid
 
     def provenance_of(self, pid: int) -> dict:
-        return read_provenance(pid)
+        """Provenance for a pid, cached per pid for this process. policy_check calls
+        this once per mutating op, so caching avoids re-reading /proc/<pid>/* on the
+        write hot path (a long-lived writer is read once)."""
+        cached = self._prov_cache.get(pid)
+        if cached is not None: return cached
+        prov = read_provenance(pid)
+        self._prov_cache[pid] = prov
+        return prov
 
     # ── mutations (write-through) ───────────────────────────────────────────
     def set_entry(self, path, kind, mode, writer_id, op,
@@ -1568,6 +1576,18 @@ def _build_overlay_ops():
             layer, ap, st = self._resolve_st(sid, rel)
             idx = self._index(sid)
             if layer == "lower":
+                # A lower symlink/dir must copy up preserving its type — never open
+                # it O_RDONLY (that would follow a symlink onto its target and
+                # materialize the target's bytes as a regular file). _copyup_one does
+                # the type-correct copy (symlink→symlink, dir→dir); then re-open the
+                # upper artifact O_NOFOLLOW. (A symlink open-for-write is unusual; the
+                # caller gets an fd on the preserved artifact.)
+                if not stat_mod.S_ISREG(st.st_mode):
+                    self._copyup_one(sid, rel, wid)
+                    try:
+                        return os.open(upath, os.O_RDWR | os.O_NOFOLLOW)
+                    except OSError as e:
+                        raise pyfuse3.FUSEError(e.errno or errno.EIO)
                 mode = stat_mod.S_IMODE(st.st_mode)
                 src = os.open(ap, os.O_RDONLY)
                 try:
@@ -1674,8 +1694,7 @@ def _build_overlay_ops():
             name = os.fsdecode(name)
             pkey = self._key(parent_inode)
             if pkey is None: raise pyfuse3.FUSEError(errno.EACCES)
-            sid, _rel = self._child_key(pkey, name)
-            rel = self._child_key(pkey, name)[1]
+            sid, rel = self._child_key(pkey, name)
             if sid not in self.sessions: raise pyfuse3.FUSEError(errno.ENOENT)
             wid = self._index(sid).writer_for(ctx.pid)
             if policy_check(sid, self._index(sid).provenance_of(ctx.pid),
