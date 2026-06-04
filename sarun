@@ -755,6 +755,99 @@ class Supervisor:
             except OSError as e:
                 return dict(kind="error", error=str(e))
 
+    def _file_hunks(self, sid, rel):
+        """For a text file change, return (lower_lines, upper_lines, groups) where
+        groups are difflib grouped opcodes (each = one hunk with context). None if
+        the file isn't a text change we can splice (binary / deleted / directory)."""
+        s = self.sessions.get(sid)
+        if not s: return None
+        rel = rel.lstrip("/")
+        src = Path(s.upper) / rel; dst = Path("/") / rel
+        if not src.is_file() or self._is_whiteout(src): return None
+        try:
+            ut = src.read_text(); lt = dst.read_text() if dst.exists() else ""
+        except (UnicodeDecodeError, OSError):
+            return None
+        import difflib
+        ll = lt.splitlines(keepends=True); ul = ut.splitlines(keepends=True)
+        groups = list(difflib.SequenceMatcher(None, ll, ul).get_grouped_opcodes(3))
+        return (ll, ul, groups)
+
+    def overlay_hunks(self, sid, rel) -> dict:
+        """Text changes are returned as a list of hunks for per-hunk apply/discard;
+        anything else falls back to the whole-file diff for display only."""
+        info = self._file_hunks(sid, rel)
+        if info is None:
+            return dict(is_text=False, hunks=[], diff=self.overlay_diff(sid, rel))
+        ll, ul, groups = info
+        hunks = []
+        for gi, group in enumerate(groups):
+            a1, a2 = group[0][1], group[-1][2]
+            b1, b2 = group[0][3], group[-1][4]
+            lines = [("hdr", f"@@ -{a1+1},{a2-a1} +{b1+1},{b2-b1} @@")]
+            for tag, i1, i2, j1, j2 in group:
+                if tag == "equal":
+                    for ln in ll[i1:i2]: lines.append((" ", ln.rstrip("\n")))
+                else:
+                    for ln in ll[i1:i2]: lines.append(("-", ln.rstrip("\n")))
+                    for ln in ul[j1:j2]: lines.append(("+", ln.rstrip("\n")))
+            hunks.append(dict(index=gi, lines=lines))
+        return dict(is_text=True, hunks=hunks)
+
+    def _settle_file(self, sid, rel) -> None:
+        """After a hunk op, if the overlay copy no longer differs from the host (or
+        a created file has been emptied), drop it from the overlay and clean up."""
+        s = self.sessions.get(sid)
+        if not s: return
+        rel = rel.lstrip("/")
+        upper = Path(s.upper); src = upper / rel; dst = Path("/") / rel
+        if not src.is_file(): return
+        try:
+            up = src.read_bytes()
+            settled = (up == dst.read_bytes()) if dst.exists() else (len(up) == 0)
+        except OSError:
+            return
+        if settled:
+            self._remove_upper_entry(src)
+            self._cleanup_dirs(upper, src.parent)
+            self._maybe_remove_empty(sid)
+
+    def overlay_apply_hunk(self, sid, rel, index) -> dict:
+        # Apply one hunk forward onto the host file; the overlay already has it, so
+        # that hunk simply stops being a difference.
+        info = self._file_hunks(sid, rel)
+        if info is None: return dict(ok=False, error="not a text change")
+        ll, ul, groups = info
+        if not (0 <= index < len(groups)): return dict(ok=False, error="stale hunk")
+        g = groups[index]
+        a1, a2, b1, b2 = g[0][1], g[-1][2], g[0][3], g[-1][4]
+        new_lower = ll[:a1] + ul[b1:b2] + ll[a2:]
+        dst = Path("/") / rel.lstrip("/")
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_text("".join(new_lower))
+        except OSError as e:
+            return dict(ok=False, error=str(e))
+        self._settle_file(sid, rel)
+        return dict(ok=True)
+
+    def overlay_discard_hunk(self, sid, rel, index) -> dict:
+        # Revert one hunk in the overlay file (back to the host's version there).
+        info = self._file_hunks(sid, rel)
+        if info is None: return dict(ok=False, error="not a text change")
+        ll, ul, groups = info
+        if not (0 <= index < len(groups)): return dict(ok=False, error="stale hunk")
+        g = groups[index]
+        a1, a2, b1, b2 = g[0][1], g[-1][2], g[0][3], g[-1][4]
+        new_upper = ul[:b1] + ll[a1:a2] + ul[b2:]
+        src = Path(self.sessions[sid].upper) / rel.lstrip("/")
+        try:
+            src.write_text("".join(new_upper))
+        except OSError as e:
+            return dict(ok=False, error=str(e))
+        self._settle_file(sid, rel)
+        return dict(ok=True)
+
     def _remove_upper_entry(self, p: Path) -> None:
         """Remove a single upper artifact: a file, a directory tree, or a
         char-device whiteout. No-op if nothing is there (e.g. an opacity-only
@@ -1293,6 +1386,7 @@ def run_ui() -> int:
     from textual.widgets import (
         Button, Checkbox, DataTable, Footer, Header, Input, Label,
         ListItem, ListView, RichLog, Static, TabbedContent, TabPane, TextArea)
+    from rich.markup import escape as _esc
 
     def fmt_bytes(n):
         for u, d in (("G",1<<30),("M",1<<20),("K",1<<10)):
@@ -1451,6 +1545,35 @@ def run_ui() -> int:
         def action_down(self):
             if self.index is not None: self.app._rule_move(self.index,+1)
 
+    class HunkItem(ListItem):
+        def __init__(self, index, lines):
+            super().__init__(); self.hunk_index=index; self._lines=lines
+        def compose(self):
+            out=[]
+            for tag,txt in self._lines:
+                t=_esc(txt)
+                if tag=="hdr": out.append(f"[cyan]{t}[/]")
+                elif tag=="+": out.append(f"[green]+{t}[/]")
+                elif tag=="-": out.append(f"[red]-{t}[/]")
+                else: out.append(f"[dim] {t}[/]")
+            yield Label("\n".join(out))
+
+    class DiffView(ListView):
+        # Per-hunk staging when focused: a apply this hunk to the host, x/d discard
+        # it from the overlay; ↑/↓ move between hunks.
+        BINDINGS=[Binding("a","apply","apply hunk"),
+                  Binding("x","discard","discard hunk"),
+                  Binding("d","discard","",show=False)]
+        def _idx(self):
+            it=self.highlighted_child
+            return it.hunk_index if isinstance(it,HunkItem) else None
+        def action_apply(self):
+            i=self._idx()
+            if i is not None: self.app._hunk_apply(i)
+        def action_discard(self):
+            i=self._idx()
+            if i is not None: self.app._hunk_discard(i)
+
     class UI(App):
         ENABLE_COMMAND_PALETTE=False   # free Ctrl+P (and drop the unused palette)
         TITLE="slopbox"
@@ -1533,8 +1656,8 @@ def run_ui() -> int:
                             yield Static("📁 FILES   [dim]+ new · ~ mod · - del ·[/] [reverse red]![/] [dim]host is NEWER than overlay — applying may lose host changes[/]", classes="pt")
                             yield ChangesTable(id="cf-tab", cursor_type="row")
                         with Vertical(id="cd-pane"):
-                            yield Static("≡ DIFF", classes="pt")
-                            yield RichLog(id="cd-log", markup=True, wrap=False)
+                            yield Static("≡ DIFF   [dim]focus & ↑/↓ pick hunk · a apply hunk · x discard hunk[/]", classes="pt")
+                            yield DiffView(id="cd-log")
                     yield Static("", id="c-bar")
                 with TabPane("Traffic [3]", id="t-tr"):
                     with Vertical(id="t-pane"):
@@ -1733,28 +1856,62 @@ def run_ui() -> int:
                     f"[bold]{ev.get('scheme','?')}[/] "
                     f"[cyan]{ev.get('host','?')}[/]:{ev.get('port','?')}{st}{bt}")
 
-        def _show_diff(self, d):
-            log=self.query_one("#cd-log",RichLog); log.clear()
+        def _diff_info_lines(self, d):
             k=d.get("kind")
-            if k=="deleted": log.write("[red bold]DELETED[/]"); return
-            if k=="directory": log.write("[cyan]DIRECTORY[/]"); return
-            if k=="error": log.write(f"[red]{d.get('error')}[/]"); return
-            diff=d.get("diff")
+            if k=="deleted": return ["[red bold]DELETED[/]"]
+            if k=="directory": return ["[cyan]DIRECTORY[/]"]
+            if k=="error": return [f"[red]{_esc(str(d.get('error')))}[/]"]
+            diff=d.get("diff"); out=[]
             if diff is not None:
                 for ln in diff.splitlines():
-                    if ln.startswith(("+++","---")): log.write(f"[bold]{ln}[/]")
-                    elif ln.startswith("+"): log.write(f"[green]{ln}[/]")
-                    elif ln.startswith("-"): log.write(f"[red]{ln}[/]")
-                    elif ln.startswith("@@"): log.write(f"[cyan]{ln}[/]")
-                    else: log.write(ln)
-                if not diff.strip(): log.write("[dim](no textual diff)[/]")
+                    t=_esc(ln)
+                    if ln.startswith(("+++","---")): out.append(f"[bold]{t}[/]")
+                    elif ln.startswith("+"): out.append(f"[green]{t}[/]")
+                    elif ln.startswith("-"): out.append(f"[red]{t}[/]")
+                    elif ln.startswith("@@"): out.append(f"[cyan]{t}[/]")
+                    else: out.append(f"[dim]{t}[/]")
+                if not diff.strip(): out.append("[dim](no textual diff)[/]")
             else:
                 raw=base64.b64decode(d.get("content") or b"")
-                log.write(f"[dim]binary · {fmt_bytes(len(raw))}[/]")
+                out.append(f"[dim]binary · {fmt_bytes(len(raw))}[/]")
                 for i in range(0,min(len(raw),256),16):
                     ch=raw[i:i+16]; h=" ".join(f"{b:02x}" for b in ch)
                     a="".join(chr(b) if 0x20<=b<0x7f else "." for b in ch)
-                    log.write(f"[dim]{i:04x}[/]  {h:<48}  {a}")
+                    out.append(f"[dim]{i:04x}  {h:<48}  {_esc(a)}[/]")
+            return out
+
+        def _load_diff(self, sid, rel, keep_pos=False):
+            dv=self.query_one("#cd-log",DiffView)
+            keep=dv.index if keep_pos else None
+            res=self.sup.overlay_hunks(sid, rel)
+            dv.clear()
+            if res.get("is_text"):
+                hunks=res.get("hunks") or []
+                if not hunks:
+                    dv.append(ListItem(Label("[dim](no textual differences)[/]")))
+                for h in hunks:
+                    dv.append(HunkItem(h["index"], h["lines"]))
+            else:
+                for line in self._diff_info_lines(res.get("diff") or {}):
+                    dv.append(ListItem(Label(line)))
+            n=len(dv.children)
+            if keep is not None and n: dv.index=min(keep, n-1)
+
+        def _hunk_op(self, index, discard):
+            sid=self._ch_sid; p=self._sel_path()
+            if not sid or p is None: return
+            r=(self.sup.overlay_discard_hunk if discard
+               else self.sup.overlay_apply_hunk)(sid, p, index)
+            if not r.get("ok"): self._status(r.get("error","hunk op failed")); return
+            self._load_changes(sid)
+            if any(e["path"]==p for e in self._ch_entries):
+                self._load_diff(sid, p, keep_pos=True)
+            else:
+                try: self.query_one("#cd-log",DiffView).clear()
+                except Exception: pass
+            self._cbar("hunk " + ("discarded" if discard else "applied"))
+        def _hunk_apply(self, index): self._hunk_op(index, discard=False)
+        def _hunk_discard(self, index): self._hunk_op(index, discard=True)
 
         def _status(self, t):
             try: self.query_one("#status",Static).update(t)
@@ -1801,7 +1958,7 @@ def run_ui() -> int:
         @on(DataTable.RowHighlighted, "#cf-tab")
         def _cc(self, ev):
             if ev.row_key and ev.row_key.value and self._ch_sid:
-                self._show_diff(self.sup.overlay_diff(self._ch_sid, ev.row_key.value))
+                self._load_diff(self._ch_sid, ev.row_key.value)
 
         def action_tab(self, t):
             self.query_one("#tabs",TabbedContent).active=t
