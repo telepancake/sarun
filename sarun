@@ -1786,6 +1786,53 @@ def ensure_ca_cert() -> Path:
     return CA_CERT
 
 
+# Where the various distros keep the system CA bundle that OpenSSL/curl/git read
+# by default. We add our mitmproxy CA to every one that exists.
+SYSTEM_CA_FILES = (
+    "/etc/ssl/certs/ca-certificates.crt",                   # Debian/Ubuntu/Arch
+    "/etc/pki/tls/certs/ca-bundle.crt",                     # Fedora/RHEL (symlink)
+    "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",   # Fedora/RHEL (real)
+    "/etc/ssl/cert.pem",                                    # Alpine/LibreSSL/BSD
+    "/etc/ssl/ca-bundle.pem",                               # openSUSE
+)
+
+def primary_ca_path() -> "str | None":
+    for f in SYSTEM_CA_FILES:
+        if Path(f).is_file(): return f
+    return None
+
+def build_cert_layer(dest: Path, ca_cert: Path) -> "str | None":
+    """Build an overlay *lower* layer that appends our mitmproxy CA to every system
+    trust bundle present on the host. Used as an extra read-only lowerdir under the
+    slopbox root, so TLS verification succeeds for everything that reads the system
+    store (git, curl, openssl, wget, python's ssl, …) — git in particular ignores
+    CURL_CA_BUNDLE and only trusts its compiled-in bundle, which this patches.
+
+    It is a lower layer on purpose: the modified bundles never appear in the review
+    upper, so they are not mistaken for changes the program made. Returns the layer
+    dir (to put first in lowerdir=…:/) or None if there was nothing to add."""
+    try: ca = ca_cert.read_bytes()
+    except OSError: return None
+    if not ca.strip(): return None
+    made = False
+    for sysf in SYSTEM_CA_FILES:
+        src = Path(sysf)
+        try:
+            if not src.is_file(): continue          # follows symlinks to the real file
+            base = src.read_bytes()
+        except OSError:
+            continue
+        out = dest / sysf.lstrip("/")
+        try:
+            out.parent.mkdir(parents=True, exist_ok=True)
+            sep = b"" if base.endswith(b"\n") else b"\n"
+            out.write_bytes(base + sep + b"\n" + ca)
+            made = True
+        except OSError:
+            continue
+    return str(dest) if made else None
+
+
 # ════════════════════════════════════════════════════════════════════════════
 #  Runner — `slopbox CMD [ARGS...]`
 # ════════════════════════════════════════════════════════════════════════════
@@ -1845,9 +1892,16 @@ def cmd_run(cmd, label, no_net, session_whitelist, chdir) -> int:
     code = 1
 
     try:
+        # An extra read-only lower layer that teaches the slopbox's system trust
+        # store about our mitmproxy CA (so git/curl/openssl verify upstream that
+        # mitmproxy re-signed). It sits *below* the review upper, so the patched
+        # bundles are invisible to change review.
+        cert_layer = build_cert_layer(shm_dir / "certlow", CA_CERT) if can_net else None
+        lower = f"{cert_layer}:/" if cert_layer else "/"
+
         # fuse-overlayfs root
         fr = subprocess.run(
-            ["fuse-overlayfs", "-o", "lowerdir=/", "-o", f"upperdir={up}",
+            ["fuse-overlayfs", "-o", f"lowerdir={lower}", "-o", f"upperdir={up}",
              "-o", f"workdir={work}", "-o", f"squash_to_uid={os.getuid()}",
              "-o", f"squash_to_gid={os.getgid()}", str(merged)],
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -1878,9 +1932,17 @@ def cmd_run(cmd, label, no_net, session_whitelist, chdir) -> int:
             proxy = f"http://127.0.0.1:{INNER_PROXY_PORT}"
             for var in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
                 args += ["--setenv", var, proxy]
+            # The overlay already folded our CA into the system bundle, so point the
+            # bundle-based tools at that combined file (which holds the normal roots
+            # *and* ours). Fall back to the bare CA if no system bundle was found.
+            primary = primary_ca_path()
+            cafile = primary if (cert_layer and primary) else str(CA_CERT)
             for var in ("REQUESTS_CA_BUNDLE", "SSL_CERT_FILE",
-                        "CURL_CA_BUNDLE", "NODE_EXTRA_CA_CERTS"):
-                args += ["--setenv", var, str(CA_CERT)]
+                        "CURL_CA_BUNDLE", "GIT_SSL_CAINFO"):
+                args += ["--setenv", var, cafile]
+            # node merges NODE_EXTRA_CA_CERTS with its built-in roots, so it only
+            # needs the addition, not the whole bundle.
+            args += ["--setenv", "NODE_EXTRA_CA_CERTS", str(CA_CERT)]
         # run our own --inner, which starts the forwarder then execs cmd
         args += ["--", sys.executable, find_self(), "--inner",
                  "--channel", chan, "--sid", sid, "--", *cmd]
