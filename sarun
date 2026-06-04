@@ -732,7 +732,8 @@ class Supervisor:
         self.rules = rules
         self.sessions: dict = {}
         self.pending: dict = {}
-        self.patches: dict = {}          # sid -> {files, dirty, touched}
+        self.patches: dict = {}          # sid -> {files, dirty, touched, mtime}
+        self._consolidated: set = set()  # sids whose overlay we've folded to a patch
         self._dns_cache: dict = {}
         self.traffic: list = []
         self.MAX_TRAFFIC = 5000
@@ -838,6 +839,11 @@ class Supervisor:
         s.live = False
         if s.status == "running": s.status = msg.get("status", "finished")
         s.exit_code = msg.get("exit_code")
+        # The runner consolidated on the way out; pick up the patch it just wrote
+        # (and mark this session as already-consolidated so we don't redo it).
+        self.patches.pop(s.session_id, None)
+        s.has_patch = patch_path(s.session_id).exists()
+        self._consolidated.add(s.session_id)
         self._emit(type="session_updated", session=s.to_dict())
 
     def drop(self, msg: dict) -> None:
@@ -1208,15 +1214,29 @@ class Supervisor:
         except OSError: pass
         return []
 
+    @staticmethod
+    def _patch_mtime(sid):
+        pf = patch_path(sid)
+        try: return pf.stat().st_mtime_ns if pf.exists() else None
+        except OSError: return None
+
     def _patch(self, sid) -> dict:
-        """Lazily load the session's patch into memory: {files, dirty, touched}."""
+        """Lazily load the session's patch into memory: {files, dirty, touched, mtime}.
+        The patch file can be (re)written behind our back — by the runner when a
+        subprocess finishes, or by consolidate() — so when we hold no unsaved edits
+        and the on-disk file has changed (appeared / updated / removed) we reload it.
+        A dirty in-memory patch is authoritative and never clobbered by a reload."""
         p = self.patches.get(sid)
+        st = self._patch_mtime(sid)
+        if p is not None and not p["dirty"] and p.get("mtime") != st:
+            p = None
         if p is None:
-            pf = patch_path(sid); files = {}
-            if pf.exists():
-                try: files = parse_patch(read_patch_file(pf)[0])
+            files = {}
+            if st is not None:
+                try: files = parse_patch(read_patch_file(patch_path(sid))[0])
                 except Exception: files = {}
-            p = self.patches[sid] = dict(files=files, dirty=False, touched=time.time())
+            p = self.patches[sid] = dict(files=files, dirty=False,
+                                         touched=time.time(), mtime=st)
         return p
 
     def patch_dirty(self, sid) -> bool:
@@ -1230,6 +1250,8 @@ class Supervisor:
             s = self.sessions.get(sid)
             write_patch_file(pf, serialize_patch(p["files"]),
                              self._session_meta(s) if s else {})
+            s = self.sessions.get(sid)
+            if s: s.has_patch = True
         else:
             if pf.exists():
                 try: pf.unlink()
@@ -1237,6 +1259,7 @@ class Supervisor:
             s = self.sessions.get(sid)
             if s: s.has_patch = False
         p["dirty"] = False
+        p["mtime"] = self._patch_mtime(sid)
         self._maybe_remove_empty(sid)
 
     def _patch_warn(self, rel, fp) -> bool:
@@ -1251,9 +1274,33 @@ class Supervisor:
                             stale=self._patch_warn(rel, fp), source="patch"))
         return out
 
+    def _ensure_consolidated(self, sid) -> None:
+        """Fold a finished session's overlay into its patch the first time we look
+        at it — the same consolidation the runner does, but for sessions that were
+        already sitting on disk (or whose runner never got to it). Never touches a
+        live/running session (its overlay is still moving)."""
+        if sid in self._consolidated: return
+        s = self.sessions.get(sid)
+        if not s or s.live or _pid_alive(s.pid): return
+        self._consolidated.add(sid)
+        if not (s.shm_dir and Path(s.shm_dir).exists()): return
+        try:
+            consolidate(s.shm_dir, sid, self._session_meta(s))
+        except Exception:
+            return
+        self.patches.pop(sid, None)        # force a reload of the freshly-written patch
+        s.has_patch = patch_path(sid).exists()
+        # A text-only session has had its whole overlay folded away; drop the now
+        # empty /dev/shm tree (the patch is the only remaining record).
+        try: empty = not upper_has_changes(Path(s.upper))
+        except OSError: empty = False
+        if empty:
+            fuse_unmount(s.merged); rm_rf(s.shm_dir)
+
     def session_changes(self, sid) -> list:
         """All changes for a session, from the overlay and the patch, each tagged
         with its source. (A file is never in both.)"""
+        self._ensure_consolidated(sid)
         ov = self.overlay_entries(sid)
         for e in ov: e["source"] = "overlay"
         return ov + self._patch_entries(sid)
@@ -2018,9 +2065,8 @@ def run_ui() -> int:
         ModalScreen { align:center middle; }
         """
         BINDINGS=[
-            Binding("1","tab('t-sb')","Slopboxes"),
-            Binding("2","tab('t-ch')","Changes"),
-            Binding("3","tab('t-tr')","Traffic"),
+            Binding("escape","back","Back"),
+            Binding("t","traffic","Traffic"),
             Binding("tab","focus_next","",show=False),
             Binding("shift+tab","focus_previous","",show=False),
             Binding("q","quit","Quit")]
@@ -2047,10 +2093,10 @@ def run_ui() -> int:
         def compose(self) -> ComposeResult:
             yield Header()
             with TabbedContent(id="tabs", initial="t-sb"):
-                with TabPane("Slopboxes [1]", id="t-sb"):
+                with TabPane("Slopboxes", id="t-sb"):
                     with Horizontal(id="sb-top"):
                         with Vertical(id="s-pane"):
-                            yield Static("● SLOPBOXES   [dim]flags: R running · F finished · K killed[/]", classes="pt")
+                            yield Static("● SLOPBOXES   [dim]R run · F fin · K kill · ↵ changes[/]", classes="pt")
                             yield SessionTable(id="s-tab", cursor_type="row")
                         with Vertical(id="l-pane"):
                             yield Static("▤ CONNECTIONS", classes="pt")
@@ -2062,16 +2108,16 @@ def run_ui() -> int:
                         with Vertical(id="w-pane"):
                             yield Static("✓ RULES   [dim]top → bottom, first match wins[/]", classes="pok")
                             yield RulesList(id="w-list")
-                with TabPane("Changes [2]", id="t-ch"):
+                with TabPane("Changes", id="t-ch"):
                     with Horizontal(id="c-top"):
                         with Vertical(id="cf-pane"):
-                            yield Static("📁 FILES   [dim]+ new · ~ mod · - del ·[/] [reverse red]![/] [dim]host changed since capture — review hunks before applying[/]", classes="pt")
+                            yield Static("📁 FILES   [dim]+ new · ~ mod · - del ·[/] [reverse red]![/] [dim]host changed ·[/] [blue]P[/][dim] patch ·[/] [dim]O overlay[/]", classes="pt")
                             yield ChangesTable(id="cf-tab", cursor_type="row")
                         with Vertical(id="cd-pane"):
-                            yield Static("≡ DIFF   [dim]focus & ↑/↓ pick hunk · a apply hunk · x discard hunk[/]", classes="pt")
+                            yield Static("≡ DIFF   [dim]↵ focus · ↑/↓ hunk · a apply · x discard · esc back[/]", classes="pt")
                             yield DiffView(id="cd-log")
                     yield Static("", id="c-bar")
-                with TabPane("Traffic [3]", id="t-tr"):
+                with TabPane("Traffic", id="t-tr"):
                     with Vertical(id="t-pane"):
                         yield Static("▤ ALL TRAFFIC", classes="pt")
                         yield RichLog(id="t-log", markup=True, wrap=False)
@@ -2081,7 +2127,7 @@ def run_ui() -> int:
         async def on_mount(self):
             self.query_one("#s-tab",DataTable).add_columns(
                 "F","Label","PID","Cmd","✓","✗","↑","↓","Age")
-            self.query_one("#cf-tab",DataTable).add_columns("","Path","Size")
+            self.query_one("#cf-tab",DataTable).add_columns("","S","Path","Size")
             ensure_ca_cert()
             loop=asyncio.get_event_loop()
             self.engine=ProxyEngine(self.sup, loop,
@@ -2261,7 +2307,12 @@ def run_ui() -> int:
                 t=Text(sym, style=col)
                 if e.get("stale"): t.append("!", style="reverse red")  # host is newer
                 return t
-            rows=[(e["path"], [flag(e),
+            def src(e):
+                # where this change currently lives: P = consolidated patch (on
+                # disk / in memory), O = raw overlay on /dev/shm.
+                if e.get("source")=="patch": return Text("P", style="blue")
+                return Text("O", style="dim")
+            rows=[(e["path"], [flag(e), src(e),
                                Text(e["path"], style="red" if e.get("stale") else ""),
                                fmt_bytes(e["size"]) if e["size"] else ""])
                   for e in self._ch_entries]
@@ -2391,12 +2442,26 @@ def run_ui() -> int:
                     self._last_loaded_sid=sid
                     self._load_changes(sid, force=True)
 
+        @on(DataTable.RowSelected, "#s-tab")
+        def _s_open(self, ev):
+            # Enter on a slopbox drills into its Changes view.
+            if ev.row_key and ev.row_key.value:
+                self._open_changes(ev.row_key.value)
+
         @on(DataTable.RowHighlighted, "#cf-tab")
         def _cc(self, ev):
             if ev.row_key and ev.row_key.value and self._ch_sid:
                 self._load_diff(self._ch_sid, ev.row_key.value)
 
-        def action_tab(self, t):
+        @on(DataTable.RowSelected, "#cf-tab")
+        def _f_open(self, ev):
+            # Enter on a file focuses the diff/hunk pane for it.
+            if ev.row_key and ev.row_key.value and self._ch_sid:
+                self._load_diff(self._ch_sid, ev.row_key.value)
+                try: self.query_one("#cd-log",DiffView).focus()
+                except Exception: pass
+
+        def _goto(self, t):
             # Leaving the content view autosaves any dirty patch.
             if self.query_one("#tabs",TabbedContent).active=="t-ch" and t!="t-ch":
                 self._save_all_patches()
@@ -2407,6 +2472,29 @@ def run_ui() -> int:
             if focus:
                 try: self.query_one(focus).focus()
                 except Exception: pass
+
+        # ── drill-down navigation: Enter goes in, Esc comes back ──────────────
+        #   Slopboxes ──enter──▶ Changes (this slopbox) ──enter──▶ Diff
+        #             ◀──esc─────          ◀──esc──────
+        def _open_changes(self, sid):
+            self._ch_sid=sid; self._last_loaded_sid=sid
+            self._goto("t-ch")
+
+        def action_back(self):
+            """Step back out: Diff → files → Slopboxes; Traffic → Slopboxes."""
+            active=self.query_one("#tabs",TabbedContent).active
+            if active=="t-ch":
+                try: in_diff=self.focused is self.query_one("#cd-log",DiffView)
+                except Exception: in_diff=False
+                if in_diff:
+                    try: self.query_one("#cf-tab",DataTable).focus()
+                    except Exception: pass
+                else:
+                    self._goto("t-sb")
+            elif active=="t-tr":
+                self._goto("t-sb")
+
+        def action_traffic(self): self._goto("t-tr")
 
         def action_kill(self):
             s=self._sel_session()
