@@ -863,8 +863,6 @@ class Supervisor:
         self.patches: dict = {}          # sid -> {files, dirty, touched, mtime}
         self._consolidated: set = set()  # sids whose overlay we've folded to a patch
         self._dns_cache: dict = {}
-        self.traffic: list = []
-        self.MAX_TRAFFIC = 5000
         self._counter = 0
         self.on_event = lambda ev: None
         self.sessions.update(discover_sessions())
@@ -939,16 +937,13 @@ class Supervisor:
 
     def _record_traffic(self, s, host, port, scheme, action,
                         bytes_up=0, bytes_down=0, status=0) -> None:
-        ev = dict(ts=time.time(), session_id=s.session_id, host=host, port=port,
-                  scheme=scheme, action=action, bytes_up=bytes_up,
-                  bytes_down=bytes_down, status=status)
+        # Keep the compact per-session tallies shown in the Slopboxes table; we no
+        # longer keep a connection-by-connection log (the Approvals panel is the
+        # live view, and the upstream fetch isn't ours to journal).
         if action == "allow": s.conn_allowed += 1
         else: s.conn_denied += 1
         s.bytes_up += bytes_up; s.bytes_down += bytes_down
-        self.traffic.append(ev)
-        if len(self.traffic) > self.MAX_TRAFFIC:
-            self.traffic = self.traffic[-self.MAX_TRAFFIC:]
-        self._emit(type="traffic", event=ev, session=s.to_dict())
+        self._emit(type="session_updated", session=s.to_dict())
 
     def register(self, msg: dict) -> None:
         sid = msg["session_id"]
@@ -2035,7 +2030,7 @@ def run_ui() -> int:
     from textual.screen import ModalScreen
     from textual.widgets import (
         Button, Checkbox, DataTable, Footer, Header, Input, Label,
-        ListItem, ListView, RichLog, Static, TabbedContent, TabPane)
+        ListItem, ListView, Static, TabbedContent, TabPane)
     from rich.text import Text
 
     # Build a styled line as data: each fragment is (text, style); the text is
@@ -2171,11 +2166,9 @@ def run_ui() -> int:
     # to the app's actions. Textual's Footer then shows exactly the keys usable in
     # whatever pane is focused — pico/pine style — instead of one fixed list.
     class SessionTable(DataTable):
-        BINDINGS=[Binding("k","kill","kill"), Binding("d","delete","delete"),
-                  Binding("f","filt","filter")]
+        BINDINGS=[Binding("k","kill","kill"), Binding("d","delete","delete")]
         def action_kill(self): self.app.action_kill()
         def action_delete(self): self.app.action_delete()
-        def action_filt(self): self.app.action_filt()
 
     class ChangesTable(DataTable):
         BINDINGS=[Binding("a","apply","apply"), Binding("A","apply_all","apply all"),
@@ -2271,9 +2264,8 @@ def run_ui() -> int:
         .pt  { height:1; padding:0 1; text-style:bold; background:$primary; color:$text; }
         .pw  { height:1; padding:0 1; text-style:bold; background:$warning; color:$text; }
         .pok { height:1; padding:0 1; text-style:bold; background:$success; color:$text; }
-        #sb-top { height:1fr; } #sb-bot { height:13; }
-        #s-pane { width:2fr; border:solid $primary; }
-        #l-pane { width:3fr; border:solid $primary; }
+        #s-pane { height:1fr; border:solid $primary; }
+        #sb-bot { height:1fr; }
         #a-pane { width:3fr; border:solid $warning; }
         #a-pane.pending { border:tall $error; }
         #w-pane { width:2fr; border:solid $success; }
@@ -2281,10 +2273,9 @@ def run_ui() -> int:
         #cf-pane { width:2fr; border:solid $primary; }
         #cd-pane { width:3fr; border:solid $primary; }
         #c-bar { height:1; background:$surface; color:$text-muted; padding:0 1; }
-        #t-pane { border:solid $primary; height:1fr; }
         #fr-pane { border:solid $success; height:1fr; }
         #status { height:1; background:$surface; color:$text-muted; padding:0 1; }
-        DataTable { height:1fr; } RichLog { height:1fr; } ListView { height:1fr; }
+        DataTable { height:1fr; } ListView { height:1fr; }
         #confirm-box { width:64; height:auto; padding:1 2; background:$surface; border:tall $error; }
         #confirm-msg { margin-bottom:1; } #confirm-btns { height:3; }
         #rule-box { width:72; height:auto; padding:1 2; background:$surface; border:tall $warning; }
@@ -2295,13 +2286,11 @@ def run_ui() -> int:
         BINDINGS=[
             Binding("escape","back","Back"),
             Binding("r","rules","File rules"),
-            Binding("t","traffic","Traffic"),
             Binding("tab","focus_next","",show=False),
             Binding("shift+tab","focus_previous","",show=False),
             Binding("q","quit","Quit")]
         sessions=reactive({}, layout=True)
         pending=reactive({}, layout=True)
-        log_filter=reactive(None)
 
         def __init__(self):
             super().__init__()
@@ -2315,7 +2304,6 @@ def run_ui() -> int:
             self.sup.on_event=self._on_evt
             self.engine=None
             self.server=None
-            self._all_traffic=[]
             self._ch_sid=None
             self._ch_entries=[]
             self._last_loaded_sid=None  # guard against reload on re-highlight
@@ -2324,19 +2312,15 @@ def run_ui() -> int:
             yield Header()
             with TabbedContent(id="tabs", initial="t-sb"):
                 with TabPane("Slopboxes", id="t-sb"):
-                    with Horizontal(id="sb-top"):
-                        with Vertical(id="s-pane"):
-                            yield Static("● SLOPBOXES   [dim]R run · F fin · K kill · ↵ changes[/]", classes="pt")
-                            yield SessionTable(id="s-tab", cursor_type="row")
-                        with Vertical(id="l-pane"):
-                            yield Static("▤ CONNECTIONS", classes="pt")
-                            yield RichLog(id="c-log", markup=True, wrap=False)
+                    with Vertical(id="s-pane"):
+                        yield Static("● SLOPBOXES   [dim]R run · F fin · K kill · ✓/✗ allowed/denied conns · ↵ changes[/]", classes="pt")
+                        yield SessionTable(id="s-tab", cursor_type="row")
                     with Horizontal(id="sb-bot"):
                         with Vertical(id="a-pane"):
-                            yield Static("⚡ APPROVALS", classes="pw")
+                            yield Static("⚡ APPROVALS   [dim]y allow once · n deny once · Y/N …as a rule[/]", classes="pw")
                             yield ApprovalsList(id="a-list")
                         with Vertical(id="w-pane"):
-                            yield Static("✓ RULES   [dim]top → bottom, first match wins[/]", classes="pok")
+                            yield Static("✓ NETWORK RULES   [dim]top → bottom, first match wins[/]", classes="pok")
                             yield RulesList(id="w-list")
                 with TabPane("Changes", id="t-ch"):
                     with Horizontal(id="c-top"):
@@ -2352,10 +2336,6 @@ def run_ui() -> int:
                         yield Static("✓ FILE RULES   [dim]top → bottom, first match wins · "
                                      "apply / discard during capture · a add · e edit · d remove[/]", classes="pok")
                         yield FileRulesList(id="r-list")
-                with TabPane("Traffic", id="t-tr"):
-                    with Vertical(id="t-pane"):
-                        yield Static("▤ ALL TRAFFIC", classes="pt")
-                        yield RichLog(id="t-log", markup=True, wrap=False)
             yield Static("", id="status")
             yield Footer()
 
@@ -2422,10 +2402,6 @@ def run_ui() -> int:
                 rid=ev["request_id"]
                 self.pending={k:v for k,v in self.pending.items() if k!=rid}
                 self._rebuild_approvals(preserve=True)
-            elif t=="traffic":
-                self._ingest(ev["event"]); s=ev["session"]
-                self.sessions={**self.sessions,s["session_id"]:s}
-                self._rebuild_sessions(preserve=True)
             elif t=="rules_updated":
                 self._refresh_rules()
 
@@ -2604,27 +2580,6 @@ def run_ui() -> int:
                   for e in self._ch_entries]
             self._sync_table(self.query_one("#cf-tab",DataTable), rows)
 
-        def _ingest(self, ev):
-            self._all_traffic.append(ev)
-            self._write(self.query_one("#t-log",RichLog), ev, True)
-            if not self.log_filter or self.log_filter==ev.get("session_id"):
-                self._write(self.query_one("#c-log",RichLog), ev, not bool(self.log_filter))
-
-        def _write(self, w, ev, sid):
-            act=ev.get("action","?"); col="green" if act=="allow" else "red"
-            ts=time.strftime("%H:%M:%S", time.localtime(ev.get("ts",time.time())))
-            t=Text()
-            t.append(ts+" ", style="dim")
-            if sid: t.append(str(ev.get("session_id",""))[:8]+" ", style="dim cyan")
-            t.append(("✓" if act=="allow" else "✗")+" ", style=col)
-            t.append(str(ev.get("scheme","?"))+" ", style="bold")
-            t.append(str(ev.get("host","?")), style="cyan")
-            t.append(":"+str(ev.get("port","?")))
-            if ev.get("status"): t.append(f" [{ev['status']}]")
-            bu,bd=ev.get("bytes_up",0),ev.get("bytes_down",0)
-            if bu or bd: t.append(f" ↑{fmt_bytes(bu)} ↓{fmt_bytes(bd)}", style="dim")
-            w.write(t)
-
         def _diff_info_lines(self, d):
             k=d.get("kind")
             if k=="deleted": return [Text("DELETED", style="red bold")]
@@ -2754,8 +2709,7 @@ def run_ui() -> int:
             self.query_one("#tabs",TabbedContent).active=t
             if t=="t-ch" and self._ch_sid: self._load_changes(self._ch_sid, force=True)
             # Move focus into the tab's primary pane so the footer shows its keys.
-            focus={"t-sb":"#s-tab","t-ch":"#cf-tab","t-fr":"#r-list",
-                   "t-tr":"#t-log"}.get(t)
+            focus={"t-sb":"#s-tab","t-ch":"#cf-tab","t-fr":"#r-list"}.get(t)
             if focus:
                 try: self.query_one(focus).focus()
                 except Exception: pass
@@ -2768,7 +2722,7 @@ def run_ui() -> int:
             self._goto("t-ch")
 
         def action_back(self):
-            """Step back out: Diff → files → Slopboxes; Traffic → Slopboxes."""
+            """Step back out: Diff → files → Slopboxes; File Rules → Slopboxes."""
             active=self.query_one("#tabs",TabbedContent).active
             if active=="t-ch":
                 try: in_diff=self.focused is self.query_one("#cd-log",DiffView)
@@ -2778,10 +2732,9 @@ def run_ui() -> int:
                     except Exception: pass
                 else:
                     self._goto("t-sb")
-            elif active in ("t-tr","t-fr"):
+            elif active=="t-fr":
                 self._goto("t-sb")
 
-        def action_traffic(self): self._goto("t-tr")
         def action_rules(self): self._goto("t-fr")
 
         def action_kill(self):
@@ -2799,15 +2752,6 @@ def run_ui() -> int:
             def done(ok):
                 if ok: self.sup.delete(s["session_id"])
             self.push_screen(Confirm(styled("Delete ", (s['label'],"bold"), " and its overlay?")), done)
-
-        def action_filt(self):
-            s=self._sel_session()
-            self.log_filter=None if self.log_filter else (s["session_id"] if s else None)
-            self._status("log: all" if not self.log_filter else styled("log: ", (s['label'],"")))
-            cl=self.query_one("#c-log",RichLog); cl.clear()
-            for ev in self._all_traffic:
-                if not self.log_filter or self.log_filter==ev.get("session_id"):
-                    self._write(cl, ev, not bool(self.log_filter))
 
         def action_ap_once(self, action):
             a=self._sel_approval()
