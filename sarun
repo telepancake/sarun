@@ -7,6 +7,7 @@
 #   "wcmatch>=8.4",
 #   "pyfuse3>=3.2",
 #   "trio>=0.22",
+#   "python-magic>=0.4",
 # ]
 # ///
 """
@@ -78,6 +79,7 @@ import json
 import os
 import queue
 import re
+import resource
 import shutil
 import signal
 import socket
@@ -86,6 +88,7 @@ import struct
 import stat as stat_mod
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -93,6 +96,14 @@ import zlib
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any
+
+# libmagic is built to handle hostile input, so the in-process type sniff is fine;
+# guarded so a missing python-magic / libmagic degrades (no type line, no
+# structural diff) instead of breaking the program.
+try:
+    import magic
+except Exception:
+    magic = None
 
 # Sections: grep -n "^# ═" sarun | awk 'NR%2==0' lists each closing bar (18 sections);
 # the title is the line just above each.
@@ -3215,6 +3226,53 @@ def _build_hunks_display(ll: list, ul: list, groups: list) -> list:
         hunks.append(dict(index=gi, lines=lines))
     return hunks
 
+# ── structural-diff differ registry (binary detail pane) ───────────────────
+# Given the libmagic type string + a sniff of the leading bytes, pick the argv
+# template (with a "{in}" placeholder) that dumps a recognized binary into a
+# textual, diffable form — or None. The argv runs ONLY through run_on_untrusted.
+_STRUCT_MAX = 4 * 1024 * 1024   # skip structural diff above this; parsers are heavy
+
+def _pem_marker(data: bytes):
+    head = data[:8192]
+    if b"-----BEGIN " not in head: return None
+    if b"BEGIN CERTIFICATE REQUEST" in head:
+        return ["openssl", "req", "-in", "{in}", "-noout", "-text"]
+    if b"BEGIN X509 CRL" in head:
+        return ["openssl", "crl", "-in", "{in}", "-noout", "-text"]
+    if b"BEGIN PKCS7" in head:
+        return ["openssl", "pkcs7", "-in", "{in}", "-print_certs", "-text", "-noout"]
+    if b"BEGIN CERTIFICATE" in head or b"BEGIN TRUSTED CERTIFICATE" in head:
+        return ["openssl", "x509", "-in", "{in}", "-noout", "-text"]
+    if b"PRIVATE KEY" in head or b"BEGIN EC PARAMETERS" in head:
+        return ["openssl", "pkey", "-in", "{in}", "-noout", "-text"]
+    if b"-----BEGIN " in head:   # other PEM blob — best-effort structure dump
+        return ["openssl", "asn1parse", "-in", "{in}"]
+    return None
+
+def differ_for(mtype: str, data: bytes):
+    """Return (argv_template, label) for a recognized binary, else None.
+    `mtype` is `magic.from_buffer(data)`; `data` the leading bytes (for sniffing)."""
+    if not data: return None
+    mt = (mtype or "").lower()
+    if "elf" in mt:
+        return (["readelf", "-Wa", "{in}"], "ELF (readelf -Wa)")
+    pem = _pem_marker(data)
+    if pem is not None:
+        return (pem, "PEM (openssl)")
+    if data[:1] == b"\x30":   # DER SEQUENCE — ASN.1 (cert/key/etc.)
+        if "certificate" in mt:
+            return (["openssl", "x509", "-inform", "DER", "-in", "{in}",
+                     "-noout", "-text"], "DER cert (openssl x509)")
+        return (["openssl", "asn1parse", "-inform", "DER", "-in", "{in}"],
+                "DER ASN.1 (openssl asn1parse)")
+    if "current ar archive" in mt or mt.startswith("ar archive") or "ar archive" in mt:
+        return (["ar", "t", "{in}"], "ar archive (ar t)")
+    if "zip archive" in mt or data[:2] == b"PK":
+        return (["unzip", "-l", "{in}"], "zip (unzip -l)")
+    if "tar archive" in mt or "gzip compressed" in mt or "bzip2" in mt or "xz compressed" in mt:
+        return (["tar", "-tvf", "{in}"], "tar (tar -tvf)")
+    return None
+
 # ════════════════════════════════════════════════════════════════════════════
 #  ChangeSource: the one abstraction barrier over a box's change substrate
 # ════════════════════════════════════════════════════════════════════════════
@@ -3488,6 +3546,10 @@ class ChangeReview:
         # not-yet-complete change set. Mutated ONLY on the UI loop (start/finish), so
         # it stays single-thread-confined like _consolidated.
         self._consolidating: set = set()
+        # Rendered structural-diff text per (sid, rel) for the binary detail pane
+        # (lazy: only filled when that single entry's detail is shown). Invalidated
+        # wherever the other change caches are.
+        self._struct_cache: dict = {}
 
     def _entries(self, sid) -> list:
         """All changed entries for a session — enumeration is delegated to the box's
@@ -3589,6 +3651,7 @@ class ChangeReview:
         """Forget which sessions were already consolidated this run, so each gets
         a fresh consolidate pass on next view (e.g. after a file-rule change)."""
         self._consolidated.clear()
+        self._struct_cache.clear()
 
     # ─── source-agnostic change interface ──────────────────────────────────
     def session_changes(self, sid) -> list:
@@ -3678,6 +3741,89 @@ class ChangeReview:
 
     def hunks(self, sid, rel) -> dict:
         return self._hunks_display(self._source(sid), rel)
+
+    def structural_diff(self, sid, rel) -> "dict | None":
+        """READ-ONLY, informational insight for a single binary entry: the libmagic
+        type line(s) on top, then (for a recognized type) a unified diff of a
+        structural dump of base vs current bytes — readelf for ELF, openssl for
+        certs/keys, ar/unzip/tar for archives. The heavyweight parsers run only via
+        the hardened run_on_untrusted sandbox; the magic sniff runs in-process
+        (libmagic handles hostile input). Lazy + cached per (sid, rel); NOT an
+        applyable hunk. Returns dict(lines=[(style, text), ...]) or None when magic
+        is unavailable. Never raises."""
+        rel = rel.lstrip("/")
+        key = (sid, rel)
+        if key in self._struct_cache: return self._struct_cache[key]
+        if magic is None:
+            self._struct_cache[key] = None
+            return None
+        try:
+            res = self._structural_diff(sid, rel)
+        except Exception as e:
+            res = dict(lines=[("err", f"structural diff failed: {e}")])
+        self._struct_cache[key] = res
+        return res
+
+    def _struct_type(self, data: bytes) -> str:
+        try: return magic.from_buffer(data[:65536]) or "data"
+        except Exception: return "data"
+
+    def _structural_diff(self, sid, rel) -> dict:
+        src = self._source(sid)
+        base = self._lower_bytes(rel) or b""
+        cur = src.current_bytes(rel) or b""
+        lines = []
+        if base and cur:
+            bt, ct = self._struct_type(base), self._struct_type(cur)
+            lines.append(("type", f"type (base): {bt}"))
+            lines.append(("type", f"type (current): {ct}"))
+        else:
+            d = cur or base
+            lines.append(("type", f"type: {self._struct_type(d)}"))
+        # Pick the differ off the present side (prefer current).
+        sniff = cur or base
+        st = self._struct_type(sniff)
+        diff = differ_for(st, sniff)
+        if diff is None:
+            return dict(lines=lines)
+        argv, label = diff
+        lines.append(("hdr", f"── structural diff · {label} ──"))
+        if (base and len(base) > _STRUCT_MAX) or (cur and len(cur) > _STRUCT_MAX):
+            lines.append(("dim", f"(skipped: file exceeds {fmt_bytes(_STRUCT_MAX)})"))
+            return dict(lines=lines)
+        def dump(data):
+            if not data: return (None, "")
+            ok, out, err = run_on_untrusted(argv, {"in": data})
+            return (ok, out if ok else f"<parser error: {err}>")
+        if base and cur:
+            _, bd = dump(base); _, cd = dump(cur)
+            ud = difflib.unified_diff(bd.splitlines(), cd.splitlines(),
+                                      "base", "current", lineterm="")
+            any_line = False
+            for ln in ud:
+                any_line = True
+                if ln.startswith(("+++", "---")): lines.append(("hdr", ln))
+                elif ln.startswith("+"): lines.append(("+", ln))
+                elif ln.startswith("-"): lines.append(("-", ln))
+                elif ln.startswith("@@"): lines.append(("@", ln))
+                else: lines.append((" ", ln))
+            if not any_line:
+                lines.append(("dim", "(structural dumps identical)"))
+        else:
+            _, d = dump(cur or base)
+            side = "current" if cur else "base"
+            lines.append(("dim", f"({side} only)"))
+            for ln in d.splitlines():
+                lines.append((" ", ln))
+        return dict(lines=lines)
+
+    def invalidate_struct(self, sid=None) -> None:
+        """Drop cached structural diffs (all, or just one sid). Called wherever the
+        other change caches are invalidated."""
+        if sid is None: self._struct_cache.clear()
+        else:
+            for k in [k for k in self._struct_cache if k[0] == sid]:
+                self._struct_cache.pop(k, None)
 
     def apply_hunk(self, sid, rel, index) -> dict:
         # Apply one hunk onto the host; the change already contains it, so that hunk
@@ -4851,6 +4997,76 @@ def bwrap_supports(flag: str) -> bool:
             _BWRAP_HELP = ""
     return flag in _BWRAP_HELP
 
+# ── hardened runner for UNTRUSTED parsers ──────────────────────────────────
+# The ONLY place we spawn a parser (readelf/openssl/objdump/…) over bytes that
+# came out of a box. General primitive: "run this argv over these untrusted
+# bytes, fully sandboxed" — not diff-specific, so a future caller (e.g. rendering
+# a network-flow body) can reuse it unchanged. Defence in depth: no namespaces
+# (--unshare-all → no net), no caps, read-only root, rlimited, wall-clock timed,
+# process group killed on expiry. Never raises into the caller.
+_SANDBOX_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+def _untrusted_rlimits(timeout, out_cap):
+    cpu = max(1, int(timeout) + 1)
+    def _set():
+        os.setpgrp()
+        resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu))
+        AS = 512 * 1024 * 1024
+        resource.setrlimit(resource.RLIMIT_AS, (AS, AS))
+        fsz = max(out_cap, 1024 * 1024)
+        resource.setrlimit(resource.RLIMIT_FSIZE, (fsz, fsz))
+    return _set
+
+def run_on_untrusted(argv, files, timeout=10, out_cap=256 * 1024):
+    """Run `argv` over untrusted `files` (name->bytes) inside a throwaway bwrap.
+    `files` are written to a fresh temp dir, ro-bound read-only into the sandbox;
+    `argv` placeholders like "{in}" resolve to the path INSIDE the sandbox.
+    Returns (ok, output_text, err): ok False + a clean error string on
+    timeout / oom / missing tool / nonzero exit. Never raises."""
+    if shutil.which("bwrap") is None:
+        return (False, "", "bwrap unavailable")
+    try:
+        with tempfile.TemporaryDirectory(prefix="ut-") as td:
+            inside = "/tmp/ut"
+            sub = {}
+            for name, data in (files or {}).items():
+                p = os.path.join(td, name)
+                with open(p, "wb") as f: f.write(data)
+                sub[name] = inside + "/" + name
+            real = [sub.get(a.strip("{}"), a) if (a.startswith("{") and a.endswith("}"))
+                    else a for a in argv]
+            bw = ["bwrap", "--unshare-all", "--die-with-parent", "--new-session",
+                  "--cap-drop", "ALL", "--ro-bind", "/", "/",
+                  "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
+                  "--ro-bind", td, inside, "--chdir", inside,
+                  "--clearenv", "--setenv", "PATH", _SANDBOX_PATH, "--"] + real
+            try:
+                proc = subprocess.Popen(
+                    bw, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, preexec_fn=_untrusted_rlimits(timeout, out_cap))
+            except Exception as e:
+                return (False, "", f"spawn failed: {e}")
+            try:
+                out, err = proc.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                try: os.killpg(proc.pid, signal.SIGKILL)
+                except Exception:
+                    try: proc.kill()
+                    except Exception: pass
+                try: proc.communicate(timeout=2)
+                except Exception: pass
+                return (False, "", f"timed out after {timeout}s")
+            out_t = out[:out_cap].decode("utf-8", "replace")
+            if proc.returncode != 0:
+                msg = (err or b"").decode("utf-8", "replace").strip()[:2000]
+                if proc.returncode < 0:
+                    return (False, out_t, f"killed by signal {-proc.returncode}"
+                            + (f": {msg}" if msg else " (rlimit?)"))
+                return (False, out_t, msg or f"exit {proc.returncode}")
+            return (True, out_t, "")
+    except Exception as e:
+        return (False, "", f"sandbox error: {e}")
+
 def cmd_run(cmd, net, trace, direct, session_whitelist, chdir) -> int:
     if not cmd:
         print("slopbox: no command given", file=sys.stderr); return 2
@@ -5561,6 +5777,7 @@ def _make_ui_app():
             self._fin_changes.pop(sid, None)
             self._live_changes.pop(sid, None)
             self._ch_decor.pop(sid, None)
+            self.sup.review.invalidate_struct(sid)
 
         def _drain_overlay_events(self):
             # Live proc retirement runs on THIS reliable 0.3s cadence (not the 3s
@@ -6209,6 +6426,17 @@ def _make_ui_app():
                     out.append(Text(f"{i:04x}  {h:<48}  {a}", style="dim"))
             return out
 
+        _STRUCT_STYLE={"type":"yellow","hdr":"bold cyan","+":"green","-":"red",
+                       "@":"cyan","err":"red"," ":"dim","dim":"dim"}
+        def _struct_lines(self, sid, rel):
+            try: res=self.sup.review.structural_diff(sid, rel)
+            except Exception: res=None
+            if not res: return []
+            out=[Text("")]
+            for style, txt in res.get("lines", []):
+                out.append(Text(txt, style=self._STRUCT_STYLE.get(style, "")))
+            return out
+
         def _update_cd_info(self, rel=None):
             # Full path + kind/size/mode shown above the diff, since the file
             # list truncates the path to keep the basename readable.
@@ -6251,6 +6479,11 @@ def _make_ui_app():
                     dv.append(HunkItem(h["index"], h["lines"]))
             else:
                 for line in self._diff_info_lines(res.get("diff") or {}):
+                    dv.append(ListItem(Label(line)))
+                # Read-only binary insight: libmagic type + (for recognized types)
+                # a structural diff via the sandboxed runner. Lazy + cached; NOT an
+                # applyable hunk, so it lives in the info path, not HunkItem.
+                for line in self._struct_lines(sid, rel):
                     dv.append(ListItem(Label(line)))
             n=len(dv.children)
             if keep is not None and n: dv.index=min(keep, n-1)
