@@ -3030,6 +3030,254 @@ def _build_hunks_display(ll: list, ul: list, groups: list) -> list:
         hunks.append(dict(index=gi, lines=lines))
     return hunks
 
+# ════════════════════════════════════════════════════════════════════════════
+#  ChangeSource: the one abstraction barrier over a box's change substrate
+# ════════════════════════════════════════════════════════════════════════════
+class ChangeSource:
+    """The single abstraction barrier over the two concrete representations of a
+    box's change set — {live overlay upper + in-RAM Index} vs {the box's one
+    sqlar archive}. Every change-review operation talks only to this interface;
+    `Supervisor._source(sid)` is the SOLE place that branches live-vs-consolidated.
+    Implementors: LiveUpper, SqlarArchive."""
+
+    def current_bytes(self, rel) -> "bytes | None":
+        """Bytes for a changed entry in the current state, or None for whiteouts,
+        directories, or missing entries."""
+        raise NotImplementedError
+
+    def current_mode(self, rel) -> "int | None":
+        """st_mode for the changed entry, or None on any error / missing entry."""
+        raise NotImplementedError
+
+    def entries(self) -> list:
+        """Decorated change records [{path,kind,size,is_text,stale}, ...]."""
+        raise NotImplementedError
+
+    def remove(self, rel) -> None:
+        """Drop/forget a change after a whole-file apply or discard."""
+        raise NotImplementedError
+
+    def settle(self, rel) -> None:
+        """Post-hunk-op cleanup: forget the change if it no longer differs."""
+        raise NotImplementedError
+
+    def write_current(self, rel, data: bytes) -> "dict | None":
+        """Revert bytes back into the current state (for discard_hunk). Returns a
+        dict(ok=False, error=...) to abort, or None on success."""
+        raise NotImplementedError
+
+    def apply_plan(self, rel) -> "dict | None":
+        """How to materialise this change onto the host: dict(kind=...) where kind
+        is 'delete' | 'symlink' (target=) | 'dir' | 'file' (data=, mode=). None if
+        the entry is not in this source."""
+        raise NotImplementedError
+
+
+class LiveUpper(ChangeSource):
+    """Change substrate for a running box: the overlay upper dir plus the session's
+    live in-RAM Index (deletions / opaque-dir expansion)."""
+    _OPAQUE_DELETE_CAP = 500
+
+    def __init__(self, sup, sid):
+        self.sup, self.sid = sup, sid
+        self.s = sup.sessions.get(sid)
+        self.upper = Path(self.s.upper) if self.s else None
+        self.idx = sup.indexes.get(sid)    # only the live in-RAM index (no reopen)
+
+    def current_bytes(self, rel):
+        rel = rel.lstrip("/")
+        p = self.upper / rel
+        if p.is_file() and not is_whiteout(p):
+            try: return p.read_bytes()
+            except OSError: return None
+        return None
+
+    def current_mode(self, rel):
+        rel = rel.lstrip("/")
+        try: return (self.upper / rel).lstat().st_mode
+        except OSError: return None
+
+    def entries(self):
+        if not self.s or not self.upper.exists(): return []
+        upper, idx = self.upper, self.idx
+        entries: dict = {}
+        paths = []
+        for root, dirs, files in os.walk(upper, onerror=lambda _e: None):
+            rootp = Path(root)
+            for nm in files: paths.append(rootp / nm)
+            for nm in dirs:
+                p = rootp / nm
+                if p.is_symlink(): paths.append(p)
+        for ap in sorted(set(paths)):
+            try:
+                if ap.is_dir() and not ap.is_symlink(): continue
+            except OSError:
+                continue
+            rel = str(ap.relative_to(upper)); real = Path("/") / rel
+            try: size = ap.stat().st_size if (ap.is_file() and not ap.is_symlink()) else 0
+            except OSError: size = 0
+            is_text = self.sup._is_text_change(self, rel)
+            stale = False
+            exists = real.exists() or real.is_symlink()
+            if exists:
+                try: stale = real.lstat().st_mtime > ap.lstat().st_mtime
+                except OSError: stale = False
+            entries[rel] = dict(path=rel,
+                                kind="modified" if exists else "created",
+                                size=size, is_text=is_text, stale=stale)
+        if idx is not None:
+            for rel in idx.deletions():
+                entries[rel] = dict(path=rel, kind="deleted", size=0,
+                                    is_text=False, stale=False)
+            added = 0
+            for drel in idx.opaque_dirs():
+                if added >= self._OPAQUE_DELETE_CAP: break
+                lower = Path("/") / drel
+                if not lower.is_dir(): continue
+                for lroot, ldirs, lfiles in os.walk(lower, onerror=lambda _e: None):
+                    for nm in ldirs + lfiles:
+                        rel = os.path.relpath(os.path.join(lroot, nm), "/")
+                        if rel in entries: continue
+                        entries[rel] = dict(path=rel, kind="deleted",
+                                            size=0, is_text=False)
+                        added += 1
+                        if added >= self._OPAQUE_DELETE_CAP: break
+                    if added >= self._OPAQUE_DELETE_CAP: break
+        return [entries[k] for k in sorted(entries)]
+
+    def remove(self, rel):
+        rel = rel.lstrip("/")
+        p = self.upper / rel
+        remove_upper_entry(p)
+        cleanup_dirs(self.upper, p.parent)
+
+    def discard(self, rel):
+        """Drop a change without writing the host (handles whiteouts in the Index)."""
+        rel = rel.lstrip("/")
+        p = self.upper / rel
+        if self.idx is not None and self.idx.kind_of(rel) == "whiteout":
+            self.idx.del_entry(rel, op="discard_whiteout")
+        remove_upper_entry(p)
+        cleanup_dirs(self.upper, p.parent)
+
+    def settle(self, rel):
+        """If the overlay copy no longer differs from the host (or a created file has
+        been emptied), drop it from the overlay and clean up."""
+        rel = rel.lstrip("/")
+        src = self.upper / rel; dst = Path("/") / rel
+        if not src.is_file(): return
+        try:
+            up = src.read_bytes()
+            settled = (up == dst.read_bytes()) if dst.exists() else (len(up) == 0)
+        except OSError:
+            return
+        if settled:
+            remove_upper_entry(src)
+            cleanup_dirs(self.upper, src.parent)
+            self.sup._maybe_remove_empty(self.sid)
+
+    def write_current(self, rel, data):
+        rel = rel.lstrip("/")
+        src = self.upper / rel
+        # LOW-3: refuse to write through a symlink planted in the upper.
+        if _is_symlink(src):
+            return dict(ok=False, error="refusing to write through a symlink")
+        try:
+            src.write_bytes(data)
+        except OSError as e:
+            return dict(ok=False, error=str(e))
+        return None
+
+    def apply_plan(self, rel):
+        rel = rel.lstrip("/")
+        src = self.upper / rel
+        # A deletion may come from a whiteout or an opaque parent dir.
+        if self._kinds.get(rel) == "deleted" or is_whiteout(src):
+            return dict(kind="delete")
+        if src.is_symlink():
+            return dict(kind="symlink", target=os.readlink(src))
+        if src.is_dir():
+            return dict(kind="dir")
+        if src.is_file():
+            return dict(kind="file", copy_from=src)    # copy2: preserves mode+mtime
+        return dict(kind="noop")
+
+    @property
+    def _kinds(self):
+        k = getattr(self, "_kinds_cache", None)
+        if k is None:
+            k = {e["path"]: e["kind"] for e in self.entries()}
+            self._kinds_cache = k
+        return k
+
+
+class SqlarArchive(ChangeSource):
+    """Change substrate for a finished box: its single sqlar archive. CHAR-mode rows
+    are tombstones (deletions)."""
+
+    def __init__(self, sup, sid):
+        self.sup, self.sid = sup, sid
+        self.path = sqlar_path(sid)
+
+    def current_bytes(self, rel):
+        return sqlar_content(self.path, rel.lstrip("/"))
+
+    def current_mode(self, rel):
+        return sqlar_mode(self.path, rel.lstrip("/"))
+
+    def entries(self):
+        out = []
+        for name, mode, mtime, sz in sqlar_list(self.path):
+            host = Path("/") / name
+            if stat_mod.S_ISCHR(mode):
+                kind, stale, is_text = "deleted", False, False
+            else:
+                exists = host.exists() or host.is_symlink()
+                kind = "modified" if exists else "created"
+                stale = False
+                if exists:
+                    try: stale = host.lstat().st_mtime > mtime
+                    except OSError: stale = False
+                is_text = self.sup._is_text_change(self, name)
+            out.append(dict(path=name, kind=kind, size=sz, is_text=is_text, stale=stale))
+        return out
+
+    def remove(self, rel):
+        sqlar_remove(self.path, rel.lstrip("/"))
+
+    def discard(self, rel):
+        sqlar_remove(self.path, rel.lstrip("/"))
+
+    def settle(self, rel):
+        # After a hunk op the diff is gone exactly when the stored current bytes
+        # equal the host's bytes; drop the row then.
+        rel = rel.lstrip("/")
+        if (self.current_bytes(rel) or b"") == Supervisor._lower_bytes(rel):
+            sqlar_remove(self.path, rel)
+
+    def write_current(self, rel, data):
+        rel = rel.lstrip("/")
+        conn = _sqlar_open(self.path)
+        try:
+            blob, sz = _sqlar_deflate(data)
+            conn.execute("UPDATE sqlar SET sz=?, data=? WHERE name=?",
+                         (sz, sqlite3.Binary(blob), rel)); conn.commit()
+        finally: conn.close()
+        return None
+
+    def apply_plan(self, rel):
+        rel = rel.lstrip("/")
+        mode = sqlar_mode(self.path, rel)
+        if mode is None: return None
+        if stat_mod.S_ISCHR(mode):               # tombstone → delete
+            return dict(kind="delete")
+        if stat_mod.S_ISLNK(mode):
+            tgt = (sqlar_content(self.path, rel) or b"").decode("utf-8", "surrogateescape")
+            return dict(kind="symlink", target=tgt)
+        return dict(kind="file", data=sqlar_content(self.path, rel) or b"",
+                    chmod=stat_mod.S_IMODE(mode))
+
+
 class Supervisor:
     """Owns the live session set and drives consolidation. Concurrency contract
     (single-thread-confined, like Index's): EVERY method here runs on the UI
@@ -3485,10 +3733,6 @@ class Supervisor:
         del self.sessions[sid]
         self._emit(type="session_removed", session_id=sid)
 
-    # Surfacing deletions caused by an opaque directory can in principle touch a
-    # large lower tree; cap it so the review list can't be flooded.
-    _OPAQUE_DELETE_CAP = 500
-
     def _index_for(self, sid) -> "Index | None":
         """The session's overlay index: the live one for a running box, else one
         opened on its backing dir. The live-change listing reads the box's upper
@@ -3502,140 +3746,56 @@ class Supervisor:
         return None
 
     def _entries(self, sid) -> list:
-        """All changed entries for a session.  ONE if self._live branch for data
-        gathering; everything else (stale/is_text/kind) is computed uniformly."""
-        if self._live(sid):
-            s = self.sessions.get(sid)
-            if not s: return []
-            upper = Path(s.upper)
-            if not upper.exists(): return []
-            idx = self.indexes.get(sid)    # only the live in-RAM index (no reopen)
-            entries: dict = {}
-            paths = []
-            for root, dirs, files in os.walk(upper, onerror=lambda _e: None):
-                rootp = Path(root)
-                for nm in files: paths.append(rootp / nm)
-                for nm in dirs:
-                    p = rootp / nm
-                    if p.is_symlink(): paths.append(p)
-            for ap in sorted(set(paths)):
-                try:
-                    if ap.is_dir() and not ap.is_symlink(): continue
-                except OSError:
-                    continue
-                rel = str(ap.relative_to(upper)); real = Path("/") / rel
-                try: size = ap.stat().st_size if (ap.is_file() and not ap.is_symlink()) else 0
-                except OSError: size = 0
-                is_text = self._is_text_change(sid, rel)
-                stale = False
-                exists = real.exists() or real.is_symlink()
-                if exists:
-                    try: stale = real.lstat().st_mtime > ap.lstat().st_mtime
-                    except OSError: stale = False
-                entries[rel] = dict(path=rel,
-                                    kind="modified" if exists else "created",
-                                    size=size, is_text=is_text, stale=stale)
-            if idx is not None:
-                for rel in idx.deletions():
-                    entries[rel] = dict(path=rel, kind="deleted", size=0,
-                                        is_text=False, stale=False)
-                added = 0
-                for drel in idx.opaque_dirs():
-                    if added >= self._OPAQUE_DELETE_CAP: break
-                    lower = Path("/") / drel
-                    if not lower.is_dir(): continue
-                    for lroot, ldirs, lfiles in os.walk(lower, onerror=lambda _e: None):
-                        for nm in ldirs + lfiles:
-                            rel = os.path.relpath(os.path.join(lroot, nm), "/")
-                            if rel in entries: continue
-                            entries[rel] = dict(path=rel, kind="deleted",
-                                                size=0, is_text=False)
-                            added += 1
-                            if added >= self._OPAQUE_DELETE_CAP: break
-                        if added >= self._OPAQUE_DELETE_CAP: break
-            return [entries[k] for k in sorted(entries)]
-        else:
-            out = []
-            for name, mode, mtime, sz in sqlar_list(sqlar_path(sid)):
-                host = Path("/") / name
-                if stat_mod.S_ISCHR(mode):
-                    kind, stale, is_text = "deleted", False, False
-                else:
-                    exists = host.exists() or host.is_symlink()
-                    kind = "modified" if exists else "created"
-                    stale = False
-                    if exists:
-                        try: stale = host.lstat().st_mtime > mtime
-                        except OSError: stale = False
-                    is_text = self._is_text_change(sid, name)
-                out.append(dict(path=name, kind=kind, size=sz, is_text=is_text, stale=stale))
-            return out
+        """All changed entries for a session — enumeration is delegated to the box's
+        ChangeSource; stale/is_text/kind decoration lives inside it."""
+        return self._source(sid).entries()
 
-    def _is_text_change(self, sid, rel) -> bool:
+    def _is_text_change(self, src, rel) -> bool:
         """Whether the (base, current) pair is a *text* change — i.e. a line-based
         unified diff applied with patch(1) would reproduce the current bytes exactly.
         Conservative approximation of that: both sides must be NUL-free (a NUL is
         what breaks patch byte-exactness); tombstones, symlinks and directories are
         never text.  Examines BOTH files of the pair, not just the current one."""
         rel = rel.lstrip("/")
-        mode = self._current_mode(sid, rel)
+        mode = src.current_mode(rel)
         if mode is None or stat_mod.S_ISCHR(mode) or stat_mod.S_ISLNK(mode):
             return False
-        cur = self._current_bytes(sid, rel)
+        cur = src.current_bytes(rel)
         if cur is None or b"\x00" in cur: return False
         return b"\x00" not in self._lower_bytes(rel)
 
-    def _hunks(self, sid, rel):
-        """Unified (lower_lines, upper_lines, groups) for any session state, or None
-        for a non-text change.  The only live/consolidated branch is inside the
-        _current_bytes/_lower_bytes accessors."""
+    def _hunks(self, src, rel):
+        """Unified (lower_lines, upper_lines, groups) from `src`, or None for a
+        non-text change.  Source-agnostic: reads via the ChangeSource only."""
         rel = rel.lstrip("/")
-        if not self._is_text_change(sid, rel): return None
-        ll = ut_split(self._lower_bytes(rel)); ul = ut_split(self._current_bytes(sid, rel))
+        if not self._is_text_change(src, rel): return None
+        ll = ut_split(self._lower_bytes(rel)); ul = ut_split(src.current_bytes(rel))
         groups = list(difflib.SequenceMatcher(None, ll, ul).get_grouped_opcodes(3))
         return (ll, ul, groups)
 
-    def _hunks_display(self, sid, rel) -> dict:
+    def _hunks_display(self, src, rel) -> dict:
         """Build the hunks display dict via _hunks (source-agnostic)."""
         rel = rel.lstrip("/")
-        info = self._hunks(sid, rel)
+        info = self._hunks(src, rel)
         if info is not None:
             ll, ul, groups = info
             return dict(is_text=True, hunks=_build_hunks_display(ll, ul, groups))
         # non-text / deleted / symlink / binary: build a display-only diff summary.
-        mode = self._current_mode(sid, rel)
+        mode = src.current_mode(rel)
         host = Path("/") / rel
         if mode is None:
             return dict(is_text=False, hunks=[], diff=dict(kind="error", error="gone"))
         if stat_mod.S_ISCHR(mode):
             return dict(is_text=False, hunks=[], diff=dict(kind="deleted"))
         if stat_mod.S_ISLNK(mode):
-            tgt = self._current_bytes(sid, rel) or b""
+            tgt = src.current_bytes(rel) or b""
             d = dict(kind="modified" if host.is_symlink() else "created",
                      diff="symlink → " + tgt.decode("utf-8", "replace"))
             return dict(is_text=False, hunks=[], diff=d)
-        raw = self._current_bytes(sid, rel) or b""
+        raw = src.current_bytes(rel) or b""
         return dict(is_text=False, hunks=[],
                     diff=dict(kind="modified" if host.exists() else "created",
                               content=base64.b64encode(raw).decode()))
-
-    def _settle_file(self, sid, rel) -> None:
-        """After a hunk op, if the overlay copy no longer differs from the host (or
-        a created file has been emptied), drop it from the overlay and clean up."""
-        s = self.sessions.get(sid)
-        if not s: return
-        rel = rel.lstrip("/")
-        upper = Path(s.upper); src = upper / rel; dst = Path("/") / rel
-        if not src.is_file(): return
-        try:
-            up = src.read_bytes()
-            settled = (up == dst.read_bytes()) if dst.exists() else (len(up) == 0)
-        except OSError:
-            return
-        if settled:
-            remove_upper_entry(src)
-            cleanup_dirs(upper, src.parent)
-            self._maybe_remove_empty(sid)
 
     def _maybe_remove_empty(self, sid) -> None:
         """A finished session vanishes only when it holds nothing at all — no overlay
@@ -3694,28 +3854,10 @@ class Supervisor:
         s = self.sessions.get(sid)
         return bool(s and (s.live or _pid_alive(s.pid)) and Path(s.upper).exists())
 
-    def _current_bytes(self, sid, rel) -> "bytes | None":
-        """Bytes for a changed file in the current state: upper file for live, sqlar
-        blob for consolidated.  None for whiteouts, directories, or missing entries."""
-        rel = rel.lstrip("/")
-        if self._live(sid):
-            s = self.sessions.get(sid)
-            p = Path(s.upper) / rel
-            if p.is_file() and not is_whiteout(p):
-                try: return p.read_bytes()
-                except OSError: return None
-            return None
-        return sqlar_content(sqlar_path(sid), rel)
-
-    def _current_mode(self, sid, rel) -> "int | None":
-        """st_mode for the changed entry: lstat of upper for live, sqlar mode for
-        consolidated.  None on any error / missing entry."""
-        rel = rel.lstrip("/")
-        if self._live(sid):
-            s = self.sessions.get(sid)
-            try: return (Path(s.upper) / rel).lstat().st_mode
-            except OSError: return None
-        return sqlar_mode(sqlar_path(sid), rel)
+    def _source(self, sid) -> ChangeSource:
+        """THE sole live-vs-consolidated branch in the change-review code: a live box
+        reads/writes its overlay upper + in-RAM Index, a finished one its sqlar."""
+        return LiveUpper(self, sid) if self._live(sid) else SqlarArchive(self, sid)
 
     @staticmethod
     def _lower_bytes(rel) -> bytes:
@@ -3727,17 +3869,45 @@ class Supervisor:
         except OSError: pass
         return b""
 
+    @staticmethod
+    def _write_host_change(host: Path, plan: dict) -> "dict | None":
+        """Materialise one change onto the host per `plan` (a ChangeSource.apply_plan
+        result). Source-agnostic; dispatches on plan kind, never on live-vs-sqlar.
+        Returns dict(ok=False, error=...) to abort, or None on success."""
+        kind = plan["kind"]
+        if kind == "delete":
+            if host.is_dir() and not host.is_symlink(): shutil.rmtree(host)
+            elif host.exists() or host.is_symlink(): host.unlink()
+        elif kind == "symlink":
+            if host.exists() or host.is_symlink(): host.unlink()
+            host.parent.mkdir(parents=True, exist_ok=True); os.symlink(plan["target"], host)
+        elif kind == "dir":
+            host.mkdir(parents=True, exist_ok=True)
+        elif kind == "file":
+            if _is_symlink(host):
+                return dict(error="refusing to write through a symlink")
+            host.parent.mkdir(parents=True, exist_ok=True)
+            if "copy_from" in plan:
+                shutil.copy2(plan["copy_from"], host)
+            else:
+                host.write_bytes(plan["data"])
+                if plan.get("chmod") is not None:
+                    try: os.chmod(host, plan["chmod"])
+                    except OSError: pass
+        return None
+
     def change_mode(self, sid, rel, source=None) -> "int | None":
         """st_mode for a changed file (for the path/mode header). None if N/A."""
-        return self._current_mode(sid, rel)
+        return self._source(sid).current_mode(rel)
 
     def hunks(self, sid, rel) -> dict:
-        return self._hunks_display(sid, rel)
+        return self._hunks_display(self._source(sid), rel)
 
     def apply_hunk(self, sid, rel, index) -> dict:
         # Apply one hunk onto the host; the change already contains it, so that hunk
         # simply stops being a difference.  Byte-exact splice on raw byte-lines.
-        info = self._hunks(sid, rel)
+        src = self._source(sid)
+        info = self._hunks(src, rel)
         if info is None: return dict(ok=False, error="not a text change")
         ll, ul, groups = info
         if not (0 <= index < len(groups)): return dict(ok=False, error="stale hunk")
@@ -3746,53 +3916,32 @@ class Supervisor:
         new_lower = ll[:a1] + ul[b1:b2] + ll[a2:]
         result = _write_host_hunk(Path("/") / rel.lstrip("/"), new_lower)
         if not result["ok"]: return result
-        if self._live(sid):
-            self._settle_file(sid, rel)
-        else:
-            if b"".join(new_lower) == b"".join(ul):
-                sqlar_remove(sqlar_path(sid), rel.lstrip("/"))
+        src.settle(rel)
         return dict(ok=True)
 
     def discard_hunk(self, sid, rel, index) -> dict:
         # Revert one hunk in the change (back to the host's bytes at that range).
-        info = self._hunks(sid, rel)
+        src = self._source(sid)
+        info = self._hunks(src, rel)
         if info is None: return dict(ok=False, error="not a text change")
         ll, ul, groups = info
         if not (0 <= index < len(groups)): return dict(ok=False, error="stale hunk")
         g = groups[index]
         a1, a2, b1, b2 = g[0][1], g[-1][2], g[0][3], g[-1][4]
         new_upper = ul[:b1] + ll[a1:a2] + ul[b2:]
-        if self._live(sid):
-            src = Path(self.sessions[sid].upper) / rel.lstrip("/")
-            # LOW-3: refuse to write through a symlink planted in the upper.
-            if _is_symlink(src):
-                return dict(ok=False, error="refusing to write through a symlink")
-            try:
-                src.write_bytes(b"".join(new_upper))
-            except OSError as e:
-                return dict(ok=False, error=str(e))
-            self._settle_file(sid, rel)
-        else:
-            rel = rel.lstrip("/")
-            body = b"".join(new_upper)
-            if body == b"".join(ll):
-                sqlar_remove(sqlar_path(sid), rel)    # back to host: no change
-            else:
-                conn = _sqlar_open(sqlar_path(sid))
-                try:
-                    data, sz = _sqlar_deflate(body)
-                    conn.execute("UPDATE sqlar SET sz=?, data=? WHERE name=?",
-                                 (sz, sqlite3.Binary(data), rel)); conn.commit()
-                finally: conn.close()
+        err = src.write_current(rel, b"".join(new_upper))
+        if err is not None: return err
+        src.settle(rel)
         return dict(ok=True)
 
     def patch_text(self, sid) -> bytes:
         """The unified patch for a box, computed ON DEMAND.  Symlinks, binaries, and
         deletions are summarised as comment lines (a patch can't carry them)."""
+        src = self._source(sid)
         out = []
         for e in self.session_changes(sid):
             rel = e["path"]
-            info = self._hunks(sid, rel)
+            info = self._hunks(src, rel)
             if e["kind"] == "deleted":
                 out.append(f"# deleted: {rel}\n".encode()); continue
             if info is not None:
@@ -3807,57 +3956,17 @@ class Supervisor:
     def apply(self, sid, paths) -> dict:
         # Apply == write each change onto the host, then drop it from the change set.
         if paths is None: paths = [e["path"] for e in self.session_changes(sid)]
-        live = self._live(sid)
-        s = self.sessions.get(sid)
+        src = self._source(sid)
         applied, errors = [], []
-        if live:
-            if not s: return dict(applied=[], errors=[{"error": "no session"}])
-            upper = Path(s.upper)
-            kinds = {e["path"]: e["kind"] for e in self._entries(sid)}
         for rel in paths:
-            r = rel.lstrip("/"); host = Path("/") / r
+            host = Path("/") / rel.lstrip("/")
             try:
-                if live:
-                    src = upper / r
-                    # A deletion may come from a whiteout or an opaque parent dir.
-                    if kinds.get(rel) == "deleted" or is_whiteout(src):
-                        if host.is_dir() and not host.is_symlink(): shutil.rmtree(host)
-                        elif host.exists() or host.is_symlink(): host.unlink()
-                    elif src.is_symlink():
-                        tgt = os.readlink(src)
-                        if host.exists() or host.is_symlink(): host.unlink()
-                        host.parent.mkdir(parents=True, exist_ok=True); os.symlink(tgt, host)
-                    elif src.is_dir(): host.mkdir(parents=True, exist_ok=True)
-                    elif src.is_file():
-                        if _is_symlink(host):
-                            errors.append({"path": rel,
-                                           "error": "refusing to write through a symlink"})
-                            continue
-                        host.parent.mkdir(parents=True, exist_ok=True)
-                        shutil.copy2(src, host)
-                    remove_upper_entry(src)
-                    cleanup_dirs(upper, src.parent)
-                else:
-                    sp = sqlar_path(sid)
-                    mode = sqlar_mode(sp, r)
-                    if mode is None: errors.append({"path": rel, "error": "not in archive"}); continue
-                    if stat_mod.S_ISCHR(mode):               # tombstone → delete
-                        if host.is_dir() and not host.is_symlink(): shutil.rmtree(host)
-                        elif host.exists() or host.is_symlink(): host.unlink()
-                    elif stat_mod.S_ISLNK(mode):
-                        tgt = (sqlar_content(sp, r) or b"").decode("utf-8", "surrogateescape")
-                        if host.exists() or host.is_symlink(): host.unlink()
-                        host.parent.mkdir(parents=True, exist_ok=True); os.symlink(tgt, host)
-                    else:
-                        if _is_symlink(host):
-                            errors.append({"path": rel,
-                                           "error": "refusing to write through a symlink"})
-                            continue
-                        host.parent.mkdir(parents=True, exist_ok=True)
-                        host.write_bytes(sqlar_content(sp, r) or b"")
-                        try: os.chmod(host, stat_mod.S_IMODE(mode))
-                        except OSError: pass
-                    sqlar_remove(sp, r)
+                plan = src.apply_plan(rel)
+                if plan is None:
+                    errors.append({"path": rel, "error": "not in archive"}); continue
+                err = self._write_host_change(host, plan)
+                if err is not None: errors.append({"path": rel, **err}); continue
+                src.remove(rel)
                 applied.append(rel)
             except OSError as e:
                 errors.append({"path": rel, "error": str(e)})
@@ -3867,24 +3976,11 @@ class Supervisor:
     def discard(self, sid, paths) -> dict:
         # Drop each change from the change set without writing anything to the host.
         if paths is None: paths = [e["path"] for e in self.session_changes(sid)]
-        live = self._live(sid)
-        s = self.sessions.get(sid)
+        src = self._source(sid)
         discarded, errors = [], []
-        if live:
-            if not s: return dict(discarded=[], errors=[{"error": "no session"}])
-            upper = Path(s.upper)
-            idx = self.indexes.get(sid)    # live index (whiteouts live here, not upper)
         for rel in paths:
-            r = rel.lstrip("/")
             try:
-                if live:
-                    p = upper / r
-                    if idx is not None and idx.kind_of(r) == "whiteout":
-                        idx.del_entry(r, op="discard_whiteout")
-                    remove_upper_entry(p)
-                    cleanup_dirs(upper, p.parent)
-                else:
-                    sqlar_remove(sqlar_path(sid), r)
+                src.discard(rel)
                 discarded.append(rel)
             except OSError as e:
                 errors.append({"path": rel, "error": str(e)})
