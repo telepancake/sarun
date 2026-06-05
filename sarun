@@ -3037,7 +3037,7 @@ class ChangeSource:
     """The single abstraction barrier over the two concrete representations of a
     box's change set — {live overlay upper + in-RAM Index} vs {the box's one
     sqlar archive}. Every change-review operation talks only to this interface;
-    `Supervisor._source(sid)` is the SOLE place that branches live-vs-consolidated.
+    `ChangeReview._source(sid)` is the SOLE place that branches live-vs-consolidated.
     Implementors: LiveUpper, SqlarArchive."""
 
     def current_bytes(self, rel) -> "bytes | None":
@@ -3078,11 +3078,11 @@ class LiveUpper(ChangeSource):
     live in-RAM Index (deletions / opaque-dir expansion)."""
     _OPAQUE_DELETE_CAP = 500
 
-    def __init__(self, sup, sid):
-        self.sup, self.sid = sup, sid
-        self.s = sup.sessions.get(sid)
+    def __init__(self, review, sid):
+        self.review, self.sid = review, sid
+        self.s = review.reg.sessions.get(sid)
         self.upper = Path(self.s.upper) if self.s else None
-        self.idx = sup.indexes.get(sid)    # only the live in-RAM index (no reopen)
+        self.idx = review.reg.indexes.get(sid)    # only the live in-RAM index (no reopen)
 
     def current_bytes(self, rel):
         rel = rel.lstrip("/")
@@ -3116,7 +3116,7 @@ class LiveUpper(ChangeSource):
             rel = str(ap.relative_to(upper)); real = Path("/") / rel
             try: size = ap.stat().st_size if (ap.is_file() and not ap.is_symlink()) else 0
             except OSError: size = 0
-            is_text = self.sup._is_text_change(self, rel)
+            is_text = self.review._is_text_change(self, rel)
             stale = False
             exists = real.exists() or real.is_symlink()
             if exists:
@@ -3174,7 +3174,7 @@ class LiveUpper(ChangeSource):
         if settled:
             remove_upper_entry(src)
             cleanup_dirs(self.upper, src.parent)
-            self.sup._maybe_remove_empty(self.sid)
+            self.review.reg._maybe_remove_empty(self.sid)
 
     def write_current(self, rel, data):
         rel = rel.lstrip("/")
@@ -3215,8 +3215,8 @@ class SqlarArchive(ChangeSource):
     """Change substrate for a finished box: its single sqlar archive. CHAR-mode rows
     are tombstones (deletions)."""
 
-    def __init__(self, sup, sid):
-        self.sup, self.sid = sup, sid
+    def __init__(self, review, sid):
+        self.review, self.sid = review, sid
         self.path = sqlar_path(sid)
 
     def current_bytes(self, rel):
@@ -3238,7 +3238,7 @@ class SqlarArchive(ChangeSource):
                 if exists:
                     try: stale = host.lstat().st_mtime > mtime
                     except OSError: stale = False
-                is_text = self.sup._is_text_change(self, name)
+                is_text = self.review._is_text_change(self, name)
             out.append(dict(path=name, kind=kind, size=sz, is_text=is_text, stale=stale))
         return out
 
@@ -3252,7 +3252,7 @@ class SqlarArchive(ChangeSource):
         # After a hunk op the diff is gone exactly when the stored current bytes
         # equal the host's bytes; drop the row then.
         rel = rel.lstrip("/")
-        if (self.current_bytes(rel) or b"") == Supervisor._lower_bytes(rel):
+        if (self.current_bytes(rel) or b"") == ChangeReview._lower_bytes(rel):
             sqlar_remove(self.path, rel)
 
     def write_current(self, rel, data):
@@ -3276,6 +3276,246 @@ class SqlarArchive(ChangeSource):
             return dict(kind="symlink", target=tgt)
         return dict(kind="file", data=sqlar_content(self.path, rel) or b"",
                     chmod=stat_mod.S_IMODE(mode))
+
+
+class ChangeReview:
+    """The box-change review model over the ChangeSource barrier. Lists, diffs,
+    applies, and discards a box's changes (whole-file and per-hunk) and computes
+    its on-demand patch; routes every operation through the one ChangeSource that
+    `_source(sid)` selects (live overlay upper + in-RAM Index vs the box's sqlar).
+    Holds one back-reference `self.reg` to the owning Supervisor registry, for the
+    session set (`reg.sessions`/`reg.indexes`) and registry callbacks
+    (`reg._maybe_remove_empty`/`reg._emit`/`reg.delete`). Owns the per-run
+    consolidation memo (`_consolidated`)."""
+
+    def __init__(self, reg: "Supervisor"):
+        self.reg = reg
+        self._consolidated: set = set()   # sids already consolidated this run
+
+    def _entries(self, sid) -> list:
+        """All changed entries for a session — enumeration is delegated to the box's
+        ChangeSource; stale/is_text/kind decoration lives inside it."""
+        return self._source(sid).entries()
+
+    def _is_text_change(self, src, rel) -> bool:
+        """Whether the (base, current) pair is a *text* change — i.e. a line-based
+        unified diff applied with patch(1) would reproduce the current bytes exactly.
+        Conservative approximation of that: both sides must be NUL-free (a NUL is
+        what breaks patch byte-exactness); tombstones, symlinks and directories are
+        never text.  Examines BOTH files of the pair, not just the current one."""
+        rel = rel.lstrip("/")
+        mode = src.current_mode(rel)
+        if mode is None or stat_mod.S_ISCHR(mode) or stat_mod.S_ISLNK(mode):
+            return False
+        cur = src.current_bytes(rel)
+        if cur is None or b"\x00" in cur: return False
+        return b"\x00" not in self._lower_bytes(rel)
+
+    def _hunks(self, src, rel):
+        """Unified (lower_lines, upper_lines, groups) from `src`, or None for a
+        non-text change.  Source-agnostic: reads via the ChangeSource only."""
+        rel = rel.lstrip("/")
+        if not self._is_text_change(src, rel): return None
+        ll = ut_split(self._lower_bytes(rel)); ul = ut_split(src.current_bytes(rel))
+        groups = list(difflib.SequenceMatcher(None, ll, ul).get_grouped_opcodes(3))
+        return (ll, ul, groups)
+
+    def _hunks_display(self, src, rel) -> dict:
+        """Build the hunks display dict via _hunks (source-agnostic)."""
+        rel = rel.lstrip("/")
+        info = self._hunks(src, rel)
+        if info is not None:
+            ll, ul, groups = info
+            return dict(is_text=True, hunks=_build_hunks_display(ll, ul, groups))
+        # non-text / deleted / symlink / binary: build a display-only diff summary.
+        mode = src.current_mode(rel)
+        host = Path("/") / rel
+        if mode is None:
+            return dict(is_text=False, hunks=[], diff=dict(kind="error", error="gone"))
+        if stat_mod.S_ISCHR(mode):
+            return dict(is_text=False, hunks=[], diff=dict(kind="deleted"))
+        if stat_mod.S_ISLNK(mode):
+            tgt = src.current_bytes(rel) or b""
+            d = dict(kind="modified" if host.is_symlink() else "created",
+                     diff="symlink → " + tgt.decode("utf-8", "replace"))
+            return dict(is_text=False, hunks=[], diff=d)
+        raw = src.current_bytes(rel) or b""
+        return dict(is_text=False, hunks=[],
+                    diff=dict(kind="modified" if host.exists() else "created",
+                              content=base64.b64encode(raw).decode()))
+
+    def _ensure_consolidated(self, sid) -> None:
+        """Consolidate a finished session's overlay into its single sqlar the first
+        time we look at it (for orphaned sessions left on disk by a crashed runner).
+        Never touches a live/running session."""
+        if sid in self._consolidated: return
+        s = self.reg.sessions.get(sid)
+        if not s or s.live or _pid_alive(s.pid): return
+        self._consolidated.add(sid)
+        if not (s.shm_dir and Path(s.shm_dir).exists()): return
+        idx = self.reg.indexes.pop(sid, None)
+        if idx is not None:
+            try: idx.close()
+            except Exception: pass
+        try:
+            consolidate(s.shm_dir, sid, s.cmd)
+        except Exception:
+            return
+        s.has_sqlar = bool(sqlar_list(sqlar_path(sid)))
+        try: empty = not upper_has_changes(Path(s.upper))
+        except OSError: empty = False
+        if empty:
+            rm_rf(s.shm_dir)
+
+    def invalidate_consolidation(self) -> None:
+        """Forget which sessions were already consolidated this run, so each gets
+        a fresh consolidate pass on next view (e.g. after a file-rule change)."""
+        self._consolidated.clear()
+
+    # ─── source-agnostic change interface ──────────────────────────────────
+    def session_changes(self, sid) -> list:
+        """All changes for a session. Everything comes from the one sqlar (when
+        consolidated) plus the live overlay upper (while running) — there is no
+        separate patch source."""
+        self._ensure_consolidated(sid)
+        return self._entries(sid)
+
+    def _live(self, sid) -> bool:
+        s = self.reg.sessions.get(sid)
+        return bool(s and (s.live or _pid_alive(s.pid)) and Path(s.upper).exists())
+
+    def _source(self, sid) -> ChangeSource:
+        """THE sole live-vs-consolidated branch in the change-review code: a live box
+        reads/writes its overlay upper + in-RAM Index, a finished one its sqlar."""
+        return LiveUpper(self, sid) if self._live(sid) else SqlarArchive(self, sid)
+
+    @staticmethod
+    def _lower_bytes(rel) -> bytes:
+        """Original host content for /<rel> as bytes; b'' if missing or a directory.
+        This is the diff base, identical for both live and consolidated states."""
+        host = Path("/") / rel.lstrip("/")
+        try:
+            if host.exists() and not host.is_dir(): return host.read_bytes()
+        except OSError: pass
+        return b""
+
+    @staticmethod
+    def _write_host_change(host: Path, plan: dict) -> "dict | None":
+        """Materialise one change onto the host per `plan` (a ChangeSource.apply_plan
+        result). Source-agnostic; dispatches on plan kind, never on live-vs-sqlar.
+        Returns dict(ok=False, error=...) to abort, or None on success."""
+        kind = plan["kind"]
+        if kind == "delete":
+            if host.is_dir() and not host.is_symlink(): shutil.rmtree(host)
+            elif host.exists() or host.is_symlink(): host.unlink()
+        elif kind == "symlink":
+            if host.exists() or host.is_symlink(): host.unlink()
+            host.parent.mkdir(parents=True, exist_ok=True); os.symlink(plan["target"], host)
+        elif kind == "dir":
+            host.mkdir(parents=True, exist_ok=True)
+        elif kind == "file":
+            if _is_symlink(host):
+                return dict(error="refusing to write through a symlink")
+            host.parent.mkdir(parents=True, exist_ok=True)
+            if "copy_from" in plan:
+                shutil.copy2(plan["copy_from"], host)
+            else:
+                host.write_bytes(plan["data"])
+                if plan.get("chmod") is not None:
+                    try: os.chmod(host, plan["chmod"])
+                    except OSError: pass
+        return None
+
+    def change_mode(self, sid, rel, source=None) -> "int | None":
+        """st_mode for a changed file (for the path/mode header). None if N/A."""
+        return self._source(sid).current_mode(rel)
+
+    def hunks(self, sid, rel) -> dict:
+        return self._hunks_display(self._source(sid), rel)
+
+    def apply_hunk(self, sid, rel, index) -> dict:
+        # Apply one hunk onto the host; the change already contains it, so that hunk
+        # simply stops being a difference.  Byte-exact splice on raw byte-lines.
+        src = self._source(sid)
+        info = self._hunks(src, rel)
+        if info is None: return dict(ok=False, error="not a text change")
+        ll, ul, groups = info
+        if not (0 <= index < len(groups)): return dict(ok=False, error="stale hunk")
+        g = groups[index]
+        a1, a2, b1, b2 = g[0][1], g[-1][2], g[0][3], g[-1][4]
+        new_lower = ll[:a1] + ul[b1:b2] + ll[a2:]
+        result = _write_host_hunk(Path("/") / rel.lstrip("/"), new_lower)
+        if not result["ok"]: return result
+        src.settle(rel)
+        return dict(ok=True)
+
+    def discard_hunk(self, sid, rel, index) -> dict:
+        # Revert one hunk in the change (back to the host's bytes at that range).
+        src = self._source(sid)
+        info = self._hunks(src, rel)
+        if info is None: return dict(ok=False, error="not a text change")
+        ll, ul, groups = info
+        if not (0 <= index < len(groups)): return dict(ok=False, error="stale hunk")
+        g = groups[index]
+        a1, a2, b1, b2 = g[0][1], g[-1][2], g[0][3], g[-1][4]
+        new_upper = ul[:b1] + ll[a1:a2] + ul[b2:]
+        err = src.write_current(rel, b"".join(new_upper))
+        if err is not None: return err
+        src.settle(rel)
+        return dict(ok=True)
+
+    def patch_text(self, sid) -> bytes:
+        """The unified patch for a box, computed ON DEMAND.  Symlinks, binaries, and
+        deletions are summarised as comment lines (a patch can't carry them)."""
+        src = self._source(sid)
+        out = []
+        for e in self.session_changes(sid):
+            rel = e["path"]
+            info = self._hunks(src, rel)
+            if e["kind"] == "deleted":
+                out.append(f"# deleted: {rel}\n".encode()); continue
+            if info is not None:
+                ll, ul, groups = info
+                created = not (Path("/") / rel).exists()
+                fp = build_file_patch(rel, ll, ul, created, False)
+                out.append(serialize_patch({rel: fp}))
+            else:
+                out.append(f"# binary or symlink change: {rel}\n".encode())
+        return b"".join(out)
+
+    def apply(self, sid, paths) -> dict:
+        # Apply == write each change onto the host, then drop it from the change set.
+        if paths is None: paths = [e["path"] for e in self.session_changes(sid)]
+        src = self._source(sid)
+        applied, errors = [], []
+        for rel in paths:
+            host = Path("/") / rel.lstrip("/")
+            try:
+                plan = src.apply_plan(rel)
+                if plan is None:
+                    errors.append({"path": rel, "error": "not in archive"}); continue
+                err = self._write_host_change(host, plan)
+                if err is not None: errors.append({"path": rel, **err}); continue
+                src.remove(rel)
+                applied.append(rel)
+            except OSError as e:
+                errors.append({"path": rel, "error": str(e)})
+        self.reg._maybe_remove_empty(sid)
+        return dict(applied=applied, errors=errors)
+
+    def discard(self, sid, paths) -> dict:
+        # Drop each change from the change set without writing anything to the host.
+        if paths is None: paths = [e["path"] for e in self.session_changes(sid)]
+        src = self._source(sid)
+        discarded, errors = [], []
+        for rel in paths:
+            try:
+                src.discard(rel)
+                discarded.append(rel)
+            except OSError as e:
+                errors.append({"path": rel, "error": str(e)})
+        self.reg._maybe_remove_empty(sid)
+        return dict(discarded=discarded, errors=errors)
 
 
 class NetworkPolicy:
@@ -3391,10 +3631,11 @@ class NetworkPolicy:
 
 
 class Supervisor:
-    """Owns the live session set and drives consolidation. Concurrency contract
-    (single-thread-confined, like Index's): EVERY method here runs on the UI
-    process's one asyncio main-loop thread. Two callers reach it, both on that
-    loop:
+    """The session registry: owns the live session set (lifecycle, relay plumbing,
+    flow recording) and composes `self.policy` (a NetworkPolicy) and `self.review`
+    (a ChangeReview). Concurrency contract (single-thread-confined, like Index's):
+    EVERY method here runs on the UI process's one asyncio main-loop thread. Two
+    callers reach it, both on that loop:
 
       • the mitmproxy/relay path — the _GatingAddon coroutines and RelayServer
         await `self.policy.approval_request`/`self.policy.precheck` and call
@@ -3403,23 +3644,27 @@ class Supervisor:
         ChannelServer/ProxyEngine/relays run on;
       • the control plane — `register`/`unregister`/`drop`/`patch` via
         ChannelServer._dispatch_control, again on that same loop;
-      • the Textual UI handlers — `kill`/`delete`/`apply`/`discard`/
-        `apply_hunk`/`discard_hunk`/`session_changes`/`hunks`/
-        `invalidate_consolidation`/etc. — Textual runs on the SAME asyncio loop.
+      • the Textual UI handlers — `kill`/`delete` here, change review via
+        `self.review` (`apply`/`discard`/`apply_hunk`/`discard_hunk`/
+        `session_changes`/`hunks`/`invalidate_consolidation`/…) — Textual runs on
+        the SAME asyncio loop.
 
     Network decisioning (the ruleset, DNS memo, and pending approvals) lives on
     `self.policy` (a NetworkPolicy); `self.pending` aliases `self.policy.pending`.
+    Change-review state (the live-vs-sqlar ChangeSource selection and the
+    consolidation memo `self.review._consolidated`) lives on `self.review`.
 
     Because the control server, the proxy/relays, and the Textual app share one
     loop and one thread, there is no cross-thread access here: `self.sessions`,
-    `self.policy.pending`, and `self._consolidated` are single-thread-confined to
-    that loop and mutated ONLY from it, so they need no lock.
+    `self.policy.pending`, and `self.review._consolidated` are
+    single-thread-confined to that loop and mutated ONLY from it, so they need no
+    lock.
 
     The FUSE serve thread (a separate trio thread, see OverlayMount) never
     touches Supervisor state directly. It interacts only through the per-session
     `Index` (the single writer, under Index._lock) and the OverlayMount event
     queue (drained back on the asyncio loop). Keep it that way: any new path
-    that would read/write sessions/pending/_consolidated must run on the asyncio
+    that would read/write sessions/pending/review state must run on the asyncio
     loop, never on the serve thread."""
 
     def __init__(self, rules: Rules, mount: "OverlayMount | None" = None):
@@ -3430,7 +3675,7 @@ class Supervisor:
             rules, resolve_session=self.sessions.get,
             record=self._record_traffic, emit=self._emit)
         self.selected_sid = None         # the UI's current box (target of `patch`)
-        self._consolidated: set = set()  # sids already consolidated this run
+        self.review = ChangeReview(self) # change-review model (owns consolidation memo)
         self.on_event = lambda ev: None
         # HIGH-1: per-session owner tokens + relay sockets. A box can reach only its
         # own relay socket and never the control socket, so it cannot register/unregister
@@ -3592,7 +3837,7 @@ class Supervisor:
         for h in msg.get("session_whitelist", []):
             s.sess_rules.append(Rule("allow", "host", h))
         self.sessions[sid] = s
-        self._consolidated.discard(sid)
+        self.review._consolidated.discard(sid)
         # HIGH-1: mint an owner token kept OUTSIDE the box (returned to the runner
         # only). unregister/drop must present it, so no box can tear down a session.
         token = uuid.uuid4().hex
@@ -3659,7 +3904,7 @@ class Supervisor:
         s.exit_code = msg.get("exit_code")
         s.has_sqlar = bool(sqlar_list(sqlar_path(sid)))
         s.has_flows = has_flows(sqlar_path(sid))
-        self._consolidated.add(sid)
+        self.review._consolidated.add(sid)
         # nothing reviewable at all -> drop the entry entirely
         if not (s.has_sqlar or s.has_flows
                 or (backing.exists() and upper_has_changes(backing / "up"))):
@@ -3774,58 +4019,6 @@ class Supervisor:
             except sqlite3.Error: return None
         return None
 
-    def _entries(self, sid) -> list:
-        """All changed entries for a session — enumeration is delegated to the box's
-        ChangeSource; stale/is_text/kind decoration lives inside it."""
-        return self._source(sid).entries()
-
-    def _is_text_change(self, src, rel) -> bool:
-        """Whether the (base, current) pair is a *text* change — i.e. a line-based
-        unified diff applied with patch(1) would reproduce the current bytes exactly.
-        Conservative approximation of that: both sides must be NUL-free (a NUL is
-        what breaks patch byte-exactness); tombstones, symlinks and directories are
-        never text.  Examines BOTH files of the pair, not just the current one."""
-        rel = rel.lstrip("/")
-        mode = src.current_mode(rel)
-        if mode is None or stat_mod.S_ISCHR(mode) or stat_mod.S_ISLNK(mode):
-            return False
-        cur = src.current_bytes(rel)
-        if cur is None or b"\x00" in cur: return False
-        return b"\x00" not in self._lower_bytes(rel)
-
-    def _hunks(self, src, rel):
-        """Unified (lower_lines, upper_lines, groups) from `src`, or None for a
-        non-text change.  Source-agnostic: reads via the ChangeSource only."""
-        rel = rel.lstrip("/")
-        if not self._is_text_change(src, rel): return None
-        ll = ut_split(self._lower_bytes(rel)); ul = ut_split(src.current_bytes(rel))
-        groups = list(difflib.SequenceMatcher(None, ll, ul).get_grouped_opcodes(3))
-        return (ll, ul, groups)
-
-    def _hunks_display(self, src, rel) -> dict:
-        """Build the hunks display dict via _hunks (source-agnostic)."""
-        rel = rel.lstrip("/")
-        info = self._hunks(src, rel)
-        if info is not None:
-            ll, ul, groups = info
-            return dict(is_text=True, hunks=_build_hunks_display(ll, ul, groups))
-        # non-text / deleted / symlink / binary: build a display-only diff summary.
-        mode = src.current_mode(rel)
-        host = Path("/") / rel
-        if mode is None:
-            return dict(is_text=False, hunks=[], diff=dict(kind="error", error="gone"))
-        if stat_mod.S_ISCHR(mode):
-            return dict(is_text=False, hunks=[], diff=dict(kind="deleted"))
-        if stat_mod.S_ISLNK(mode):
-            tgt = src.current_bytes(rel) or b""
-            d = dict(kind="modified" if host.is_symlink() else "created",
-                     diff="symlink → " + tgt.decode("utf-8", "replace"))
-            return dict(is_text=False, hunks=[], diff=d)
-        raw = src.current_bytes(rel) or b""
-        return dict(is_text=False, hunks=[],
-                    diff=dict(kind="modified" if host.exists() else "created",
-                              content=base64.b64encode(raw).decode()))
-
     def _maybe_remove_empty(self, sid) -> None:
         """A finished session vanishes only when it holds nothing at all — no overlay
         change, no sqlar entry, and no network log. The connection log alone is
@@ -3842,179 +4035,6 @@ class Supervisor:
     def _cmd_of(self, sid) -> list:
         s = self.sessions.get(sid)
         return list(s.cmd) if s else []
-
-    def _ensure_consolidated(self, sid) -> None:
-        """Consolidate a finished session's overlay into its single sqlar the first
-        time we look at it (for orphaned sessions left on disk by a crashed runner).
-        Never touches a live/running session."""
-        if sid in self._consolidated: return
-        s = self.sessions.get(sid)
-        if not s or s.live or _pid_alive(s.pid): return
-        self._consolidated.add(sid)
-        if not (s.shm_dir and Path(s.shm_dir).exists()): return
-        idx = self.indexes.pop(sid, None)
-        if idx is not None:
-            try: idx.close()
-            except Exception: pass
-        try:
-            consolidate(s.shm_dir, sid, s.cmd)
-        except Exception:
-            return
-        s.has_sqlar = bool(sqlar_list(sqlar_path(sid)))
-        try: empty = not upper_has_changes(Path(s.upper))
-        except OSError: empty = False
-        if empty:
-            rm_rf(s.shm_dir)
-
-    def invalidate_consolidation(self) -> None:
-        """Forget which sessions were already consolidated this run, so each gets
-        a fresh consolidate pass on next view (e.g. after a file-rule change)."""
-        self._consolidated.clear()
-
-    # ─── source-agnostic change interface ──────────────────────────────────
-    def session_changes(self, sid) -> list:
-        """All changes for a session. Everything comes from the one sqlar (when
-        consolidated) plus the live overlay upper (while running) — there is no
-        separate patch source."""
-        self._ensure_consolidated(sid)
-        return self._entries(sid)
-
-    def _live(self, sid) -> bool:
-        s = self.sessions.get(sid)
-        return bool(s and (s.live or _pid_alive(s.pid)) and Path(s.upper).exists())
-
-    def _source(self, sid) -> ChangeSource:
-        """THE sole live-vs-consolidated branch in the change-review code: a live box
-        reads/writes its overlay upper + in-RAM Index, a finished one its sqlar."""
-        return LiveUpper(self, sid) if self._live(sid) else SqlarArchive(self, sid)
-
-    @staticmethod
-    def _lower_bytes(rel) -> bytes:
-        """Original host content for /<rel> as bytes; b'' if missing or a directory.
-        This is the diff base, identical for both live and consolidated states."""
-        host = Path("/") / rel.lstrip("/")
-        try:
-            if host.exists() and not host.is_dir(): return host.read_bytes()
-        except OSError: pass
-        return b""
-
-    @staticmethod
-    def _write_host_change(host: Path, plan: dict) -> "dict | None":
-        """Materialise one change onto the host per `plan` (a ChangeSource.apply_plan
-        result). Source-agnostic; dispatches on plan kind, never on live-vs-sqlar.
-        Returns dict(ok=False, error=...) to abort, or None on success."""
-        kind = plan["kind"]
-        if kind == "delete":
-            if host.is_dir() and not host.is_symlink(): shutil.rmtree(host)
-            elif host.exists() or host.is_symlink(): host.unlink()
-        elif kind == "symlink":
-            if host.exists() or host.is_symlink(): host.unlink()
-            host.parent.mkdir(parents=True, exist_ok=True); os.symlink(plan["target"], host)
-        elif kind == "dir":
-            host.mkdir(parents=True, exist_ok=True)
-        elif kind == "file":
-            if _is_symlink(host):
-                return dict(error="refusing to write through a symlink")
-            host.parent.mkdir(parents=True, exist_ok=True)
-            if "copy_from" in plan:
-                shutil.copy2(plan["copy_from"], host)
-            else:
-                host.write_bytes(plan["data"])
-                if plan.get("chmod") is not None:
-                    try: os.chmod(host, plan["chmod"])
-                    except OSError: pass
-        return None
-
-    def change_mode(self, sid, rel, source=None) -> "int | None":
-        """st_mode for a changed file (for the path/mode header). None if N/A."""
-        return self._source(sid).current_mode(rel)
-
-    def hunks(self, sid, rel) -> dict:
-        return self._hunks_display(self._source(sid), rel)
-
-    def apply_hunk(self, sid, rel, index) -> dict:
-        # Apply one hunk onto the host; the change already contains it, so that hunk
-        # simply stops being a difference.  Byte-exact splice on raw byte-lines.
-        src = self._source(sid)
-        info = self._hunks(src, rel)
-        if info is None: return dict(ok=False, error="not a text change")
-        ll, ul, groups = info
-        if not (0 <= index < len(groups)): return dict(ok=False, error="stale hunk")
-        g = groups[index]
-        a1, a2, b1, b2 = g[0][1], g[-1][2], g[0][3], g[-1][4]
-        new_lower = ll[:a1] + ul[b1:b2] + ll[a2:]
-        result = _write_host_hunk(Path("/") / rel.lstrip("/"), new_lower)
-        if not result["ok"]: return result
-        src.settle(rel)
-        return dict(ok=True)
-
-    def discard_hunk(self, sid, rel, index) -> dict:
-        # Revert one hunk in the change (back to the host's bytes at that range).
-        src = self._source(sid)
-        info = self._hunks(src, rel)
-        if info is None: return dict(ok=False, error="not a text change")
-        ll, ul, groups = info
-        if not (0 <= index < len(groups)): return dict(ok=False, error="stale hunk")
-        g = groups[index]
-        a1, a2, b1, b2 = g[0][1], g[-1][2], g[0][3], g[-1][4]
-        new_upper = ul[:b1] + ll[a1:a2] + ul[b2:]
-        err = src.write_current(rel, b"".join(new_upper))
-        if err is not None: return err
-        src.settle(rel)
-        return dict(ok=True)
-
-    def patch_text(self, sid) -> bytes:
-        """The unified patch for a box, computed ON DEMAND.  Symlinks, binaries, and
-        deletions are summarised as comment lines (a patch can't carry them)."""
-        src = self._source(sid)
-        out = []
-        for e in self.session_changes(sid):
-            rel = e["path"]
-            info = self._hunks(src, rel)
-            if e["kind"] == "deleted":
-                out.append(f"# deleted: {rel}\n".encode()); continue
-            if info is not None:
-                ll, ul, groups = info
-                created = not (Path("/") / rel).exists()
-                fp = build_file_patch(rel, ll, ul, created, False)
-                out.append(serialize_patch({rel: fp}))
-            else:
-                out.append(f"# binary or symlink change: {rel}\n".encode())
-        return b"".join(out)
-
-    def apply(self, sid, paths) -> dict:
-        # Apply == write each change onto the host, then drop it from the change set.
-        if paths is None: paths = [e["path"] for e in self.session_changes(sid)]
-        src = self._source(sid)
-        applied, errors = [], []
-        for rel in paths:
-            host = Path("/") / rel.lstrip("/")
-            try:
-                plan = src.apply_plan(rel)
-                if plan is None:
-                    errors.append({"path": rel, "error": "not in archive"}); continue
-                err = self._write_host_change(host, plan)
-                if err is not None: errors.append({"path": rel, **err}); continue
-                src.remove(rel)
-                applied.append(rel)
-            except OSError as e:
-                errors.append({"path": rel, "error": str(e)})
-        self._maybe_remove_empty(sid)
-        return dict(applied=applied, errors=errors)
-
-    def discard(self, sid, paths) -> dict:
-        # Drop each change from the change set without writing anything to the host.
-        if paths is None: paths = [e["path"] for e in self.session_changes(sid)]
-        src = self._source(sid)
-        discarded, errors = [], []
-        for rel in paths:
-            try:
-                src.discard(rel)
-                discarded.append(rel)
-            except OSError as e:
-                errors.append({"path": rel, "error": str(e)})
-        self._maybe_remove_empty(sid)
-        return dict(discarded=discarded, errors=errors)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -4376,7 +4396,7 @@ class ChannelServer:
                 sid = self.sup.selected_sid
                 if not sid:
                     return dict(ok=False, error="no slopbox selected in the UI")
-                data = self.sup.patch_text(sid)
+                data = self.sup.review.patch_text(sid)
                 return dict(ok=True, patch=base64.b64encode(data).decode())
             except Exception as e:
                 return dict(ok=False, error=str(e))
@@ -5274,7 +5294,7 @@ def _make_ui_app():
                 t.append("network ", style="dim")
                 t.append(f"{len(self.sup.flows(sid))} connection(s)   ")
                 t.append("[t for log]\n", style="dim")
-            try: entries=self.sup.session_changes(sid)
+            try: entries=self.sup.review.session_changes(sid)
             except Exception: entries=[]
             t.append("changes ", style="dim")
             t.append(f"{len(entries)} file(s)   ")
@@ -5373,7 +5393,7 @@ def _make_ui_app():
         def _file_rules_changed(self):
             # A new/changed rule should get a chance to act on whatever is still in
             # the overlays, so let those sessions consolidate again on next view.
-            self.sup.invalidate_consolidation()
+            self.sup.review.invalidate_consolidation()
             self._refresh_file_rules()
 
         def _file_rule_add(self):
@@ -5458,7 +5478,7 @@ def _make_ui_app():
             ent = next((e for e in self._ch_entries if e["path"]==rel), None) if rel else None
             if not ent:
                 info.update(Text("")); return
-            mode = self.sup.change_mode(self._ch_sid, ent["path"])
+            mode = self.sup.review.change_mode(self._ch_sid, ent["path"])
             t=Text()
             t.append("/"+ent["path"], style="bold")
             t.append("\n")
@@ -5473,7 +5493,7 @@ def _make_ui_app():
         def _load_diff(self, sid, rel, keep_pos=False):
             dv=self.query_one("#cd-log",DiffView)
             keep=dv.index if keep_pos else None
-            res=self.sup.hunks(sid, rel)
+            res=self.sup.review.hunks(sid, rel)
             dv.clear()
             if res.get("is_text"):
                 hunks=res.get("hunks") or []
@@ -5491,8 +5511,8 @@ def _make_ui_app():
         def _hunk_op(self, index, discard):
             sid=self._ch_sid; p=self._sel_path()
             if not sid or p is None: return
-            r=(self.sup.discard_hunk if discard
-               else self.sup.apply_hunk)(sid, p, index)
+            r=(self.sup.review.discard_hunk if discard
+               else self.sup.review.apply_hunk)(sid, p, index)
             if not r.get("ok"): self._status(Text(r.get("error") or "hunk op failed")); return
             self._load_changes(sid)
             if any(e["path"]==p for e in self._ch_entries):
@@ -5526,7 +5546,7 @@ def _make_ui_app():
             except Exception: return None
 
         def _load_changes(self, sid, force=False):
-            entries=self.sup.session_changes(sid)
+            entries=self.sup.review.session_changes(sid)
             # Only touch the table when the set of changes actually differs, so the
             # periodic refresh keeps the pane live without blinking or losing the
             # cursor while nothing is changing.
@@ -5742,7 +5762,7 @@ def _make_ui_app():
         def action_apply_one(self):
             p,sid=self._sel_path(),self._ch_sid
             if p and sid:
-                r=self.sup.apply(sid,[p]); self._cbar(f"applied {len(r['applied'])}")
+                r=self.sup.review.apply(sid,[p]); self._cbar(f"applied {len(r['applied'])}")
                 self._refresh_after(sid, p)
 
         def action_apply_all(self):
@@ -5752,20 +5772,20 @@ def _make_ui_app():
             warn="\n[yellow]still running[/]" if s.get("status")=="running" else ""
             def done(ok):
                 if ok:
-                    r=self.sup.apply(sid,None); self._cbar(f"applied {len(r['applied'])}")
+                    r=self.sup.review.apply(sid,None); self._cbar(f"applied {len(r['applied'])}")
                     self._refresh_after(sid, None)
             self.push_screen(Confirm(f"Apply all {len(self._ch_entries)} changes?{warn}"), done)
 
         def action_discard_one(self):
             p,sid=self._sel_path(),self._ch_sid
             if p and sid:
-                self.sup.discard(sid,[p]); self._refresh_after(sid, p)
+                self.sup.review.discard(sid,[p]); self._refresh_after(sid, p)
 
         def action_discard_all(self):
             sid=self._ch_sid
             if not sid: return
             def done(ok):
-                if ok: self.sup.discard(sid,None); self._refresh_after(sid, None)
+                if ok: self.sup.review.discard(sid,None); self._refresh_after(sid, None)
             self.push_screen(Confirm(f"Discard ALL {len(self._ch_entries)} changes?"), done)
 
     return UI
