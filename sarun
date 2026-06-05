@@ -1174,6 +1174,22 @@ class Index:
             if anc in self._opaque: return True
         return False
 
+    def children_of(self, rel: str) -> tuple:
+        """Index entries that are DIRECT children of dir `rel`, for the merged
+        readdir scan: (whiteouts, present). `whiteouts` is the set of child names
+        that whiteout a lower entry (remove from the listing); `present` is the
+        set of child names that have an index kind (ensure present in the
+        listing). Names only — caller resolves each via kind_of/_resolve_st."""
+        prefix = (rel + "/") if rel else ""
+        whiteouts, present = set(), set()
+        for wp in self._whiteouts:
+            if wp.startswith(prefix) and "/" not in wp[len(prefix):]:
+                whiteouts.add(wp[len(prefix):])
+        for kp in self._kinds:
+            if kp.startswith(prefix) and kp != rel and "/" not in kp[len(prefix):]:
+                present.add(kp[len(prefix):])
+        return whiteouts, present
+
     # ── provenance / process table ──────────────────────────────────────────
     def _prov_key(self, pid: int) -> tuple:
         """Cache key that survives PID reuse: (pid, /proc start_time)."""
@@ -1391,6 +1407,14 @@ class Index:
         except (sqlite3.Error, AttributeError): pass
 
 
+@dataclass
+class DirHandle:
+    """Per-open directory handle state for readdir: the lazily-built listing
+    snapshot and the directory inode it was opened on."""
+    inode: int
+    snapshot: "list | None" = None
+
+
 def _build_overlay_ops():
     """Build the MultiplexOverlayFs class. Imports pyfuse3 lazily so that importing
     this module (e.g. the --inner forwarder, or offline tests) does not require
@@ -1432,7 +1456,7 @@ def _build_overlay_ops():
             self._fd_table: dict = {}     # fh -> open fd (regular files)
             self._fh_sid: dict = {}       # fh -> sid (so teardown can close a box's fds)
             self._vfh: dict = {}          # fh -> (sid, rel, bytes) for virtual reads
-            self._dir_snaps: dict = {}    # dh -> sorted [(name, key_or_None, attrs)]
+            self._dir_snaps: dict = {}    # fh -> DirHandle(inode, snapshot)
             self._next_fh = 1
             # watchdog: written only by this (single) trio thread
             self._req_started = None
@@ -1729,13 +1753,11 @@ def _build_overlay_ops():
                             names[de.name] = "upper"
                 except OSError: pass
                 # apply index children: whiteouts remove, others ensure present
-                prefix = (rel + "/") if rel else ""
-                for wp in list(idx._whiteouts):
-                    if wp.startswith(prefix) and "/" not in wp[len(prefix):]:
-                        names.pop(wp[len(prefix):], None)
-                for kp in list(idx._kinds):
-                    if kp.startswith(prefix) and kp != rel and "/" not in kp[len(prefix):]:
-                        names.setdefault(kp[len(prefix):], "upper")
+                whiteouts, present = idx.children_of(rel)
+                for name in whiteouts:
+                    names.pop(name, None)
+                for name in present:
+                    names.setdefault(name, "upper")
             # virtual files in this dir
             for vp in self.sessions[sid]["virtual"]:
                 pfx = (rel + "/") if rel else ""
@@ -1758,14 +1780,14 @@ def _build_overlay_ops():
         async def opendir(self, inode, ctx):
             with self._lock:
                 dh = self._next_fh; self._next_fh += 1
-            self._dir_snaps[dh] = None
-            self._dir_snaps[(dh, "inode")] = inode
+            self._dir_snaps[dh] = DirHandle(inode=inode)
             return dh
 
         async def readdir(self, fh, start_id, token):
-            snap = self._dir_snaps.get(fh)
+            dh = self._dir_snaps.get(fh)
+            snap = dh.snapshot if dh is not None else None
             if snap is None:
-                inode = self._dir_snaps.get((fh, "inode"))
+                inode = dh.inode if dh is not None else None
                 key = self._key(inode)
                 if key is None:
                     # synthetic root: list live sessions
@@ -1780,7 +1802,9 @@ def _build_overlay_ops():
                                 for name, _k, attrs in self._scan_dir(sid, rel)]
                     else:
                         snap = []
-                self._dir_snaps[fh] = snap
+                if dh is None:
+                    dh = DirHandle(inode=inode); self._dir_snaps[fh] = dh
+                dh.snapshot = snap
             for i in range(start_id, len(snap)):
                 name, attrs = snap[i]
                 if not pyfuse3.readdir_reply(
@@ -1789,7 +1813,6 @@ def _build_overlay_ops():
 
         async def releasedir(self, fh):
             self._dir_snaps.pop(fh, None)
-            self._dir_snaps.pop((fh, "inode"), None)
 
         async def readlink(self, inode, ctx):
             key = self._key(inode)
@@ -3008,6 +3031,33 @@ def _build_hunks_display(ll: list, ul: list, groups: list) -> list:
     return hunks
 
 class Supervisor:
+    """Owns the live session set and drives consolidation. Concurrency contract
+    (single-thread-confined, like Index's): EVERY method here runs on the UI
+    process's one asyncio main-loop thread. Two callers reach it, both on that
+    loop:
+
+      • the mitmproxy/relay path — the _GatingAddon coroutines and RelayServer
+        await `approval_request`/`precheck` and call `note_traffic`/`log_flow`
+        (and the per-connection relay handlers feed the ProxyEngine) — all from
+        the asyncio loop the ChannelServer/ProxyEngine/relays run on;
+      • the control plane — `register`/`unregister`/`drop`/`patch` via
+        ChannelServer._dispatch_control, again on that same loop;
+      • the Textual UI handlers — `kill`/`delete`/`apply`/`discard`/
+        `apply_hunk`/`discard_hunk`/`session_changes`/`hunks`/`resolve`/
+        `invalidate_consolidation`/etc. — Textual runs on the SAME asyncio loop.
+
+    Because the control server, the proxy/relays, and the Textual app share one
+    loop and one thread, there is no cross-thread access here: `self.sessions`,
+    `self.pending`, and `self._consolidated` are single-thread-confined to that
+    loop and mutated ONLY from it, so they need no lock.
+
+    The FUSE serve thread (a separate trio thread, see OverlayMount) never
+    touches Supervisor state directly. It interacts only through the per-session
+    `Index` (the single writer, under Index._lock) and the OverlayMount event
+    queue (drained back on the asyncio loop). Keep it that way: any new path
+    that would read/write sessions/pending/_consolidated must run on the asyncio
+    loop, never on the serve thread."""
+
     def __init__(self, rules: Rules, mount: "OverlayMount | None" = None):
         self.rules = rules
         self.mount = mount               # the single pyfuse3 OverlayMount (UI-owned)
@@ -3583,15 +3633,9 @@ class Supervisor:
         except OSError:
             return
         if settled:
-            self._remove_upper_entry(src)
-            self._cleanup_dirs(upper, src.parent)
+            remove_upper_entry(src)
+            cleanup_dirs(upper, src.parent)
             self._maybe_remove_empty(sid)
-
-    def _remove_upper_entry(self, p: Path) -> None:
-        remove_upper_entry(p)
-
-    def _cleanup_dirs(self, upper: Path, start: Path) -> None:
-        cleanup_dirs(upper, start)
 
     def _maybe_remove_empty(self, sid) -> None:
         """A finished session vanishes only when it holds nothing at all — no overlay
@@ -3632,6 +3676,11 @@ class Supervisor:
         except OSError: empty = False
         if empty:
             rm_rf(s.shm_dir)
+
+    def invalidate_consolidation(self) -> None:
+        """Forget which sessions were already consolidated this run, so each gets
+        a fresh consolidate pass on next view (e.g. after a file-rule change)."""
+        self._consolidated.clear()
 
     # ─── source-agnostic change interface ──────────────────────────────────
     def session_changes(self, sid) -> list:
@@ -3786,8 +3835,8 @@ class Supervisor:
                             continue
                         host.parent.mkdir(parents=True, exist_ok=True)
                         shutil.copy2(src, host)
-                    self._remove_upper_entry(src)
-                    self._cleanup_dirs(upper, src.parent)
+                    remove_upper_entry(src)
+                    cleanup_dirs(upper, src.parent)
                 else:
                     sp = sqlar_path(sid)
                     mode = sqlar_mode(sp, r)
@@ -3832,8 +3881,8 @@ class Supervisor:
                     p = upper / r
                     if idx is not None and idx.kind_of(r) == "whiteout":
                         idx.del_entry(r, op="discard_whiteout")
-                    self._remove_upper_entry(p)
-                    self._cleanup_dirs(upper, p.parent)
+                    remove_upper_entry(p)
+                    cleanup_dirs(upper, p.parent)
                 else:
                     sqlar_remove(sqlar_path(sid), r)
                 discarded.append(rel)
@@ -5199,7 +5248,7 @@ def _make_ui_app():
         def _file_rules_changed(self):
             # A new/changed rule should get a chance to act on whatever is still in
             # the overlays, so let those sessions consolidate again on next view.
-            self.sup._consolidated.clear()
+            self.sup.invalidate_consolidation()
             self._refresh_file_rules()
 
         def _file_rule_add(self):
