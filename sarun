@@ -795,6 +795,16 @@ def sqlar_mode(path, name) -> "int | None":
     finally: conn.close()
     return row[0] if row else None
 
+def sqlar_mtime(path, name) -> "float | None":
+    path = Path(path)
+    if not path.exists(): return None
+    conn = _sqlar_open(path)
+    try:
+        row = conn.execute("SELECT mtime FROM sqlar WHERE name=?", (name,)).fetchone()
+    except sqlite3.Error: row = None
+    finally: conn.close()
+    return row[0] if row else None
+
 def sqlar_content(path, name) -> "bytes | None":
     """Decompressed bytes for one entry (the symlink target for a symlink); None if
     missing, a tombstone, or content not yet consolidated (NULL blob)."""
@@ -3075,8 +3085,15 @@ class ChangeSource:
         """st_mode for the changed entry, or None on any error / missing entry."""
         raise NotImplementedError
 
+    def current_mtime(self, rel) -> "float | None":
+        """Stored-side mtime for the changed entry (the diff-base for the stale check),
+        or None if unavailable."""
+        raise NotImplementedError
+
     def entries(self) -> list:
-        """Decorated change records [{path,kind,size,is_text,stale}, ...]."""
+        """Cheap change records [{path,kind,size}, ...] — NO per-entry host I/O.
+        kind is the host-I/O-free class (deleted/symlink/changed); is_text/stale/
+        precise created-vs-modified are decorated lazily per visible row by the UI."""
         raise NotImplementedError
 
     def remove(self, rel) -> None:
@@ -3123,6 +3140,11 @@ class LiveUpper(ChangeSource):
         try: return (self.upper / rel).lstat().st_mode
         except OSError: return None
 
+    def current_mtime(self, rel):
+        rel = rel.lstrip("/")
+        try: return (self.upper / rel).lstat().st_mtime
+        except OSError: return None
+
     def entries(self):
         if not self.s or not self.upper.exists(): return []
         upper, idx = self.upper, self.idx
@@ -3139,22 +3161,19 @@ class LiveUpper(ChangeSource):
                 if ap.is_dir() and not ap.is_symlink(): continue
             except OSError:
                 continue
-            rel = str(ap.relative_to(upper)); real = Path("/") / rel
-            try: size = ap.stat().st_size if (ap.is_file() and not ap.is_symlink()) else 0
-            except OSError: size = 0
-            is_text = self.review._is_text_change(self, rel)
-            stale = False
-            exists = real.exists() or real.is_symlink()
-            if exists:
-                try: stale = real.lstat().st_mtime > ap.lstat().st_mtime
-                except OSError: stale = False
+            rel = str(ap.relative_to(upper))
+            # Cheap backbone: size + a host-I/O-free kind. is_text / stale / precise
+            # created-vs-modified are decorated lazily per visible row.
+            try:
+                is_lnk = ap.is_symlink()
+                size = ap.stat().st_size if (ap.is_file() and not is_lnk) else 0
+            except OSError:
+                is_lnk = False; size = 0
             entries[rel] = dict(path=rel,
-                                kind="modified" if exists else "created",
-                                size=size, is_text=is_text, stale=stale)
+                                kind="symlink" if is_lnk else "changed", size=size)
         if idx is not None:
             for rel in idx.deletions():
-                entries[rel] = dict(path=rel, kind="deleted", size=0,
-                                    is_text=False, stale=False)
+                entries[rel] = dict(path=rel, kind="deleted", size=0)
             added = 0
             for drel in idx.opaque_dirs():
                 if added >= self._OPAQUE_DELETE_CAP: break
@@ -3251,21 +3270,19 @@ class SqlarArchive(ChangeSource):
     def current_mode(self, rel):
         return sqlar_mode(self.path, rel.lstrip("/"))
 
+    def current_mtime(self, rel):
+        return sqlar_mtime(self.path, rel.lstrip("/"))
+
     def entries(self):
+        # Cheap O(n) backbone: rows straight from sqlar_list, kind from the stored
+        # mode alone — NO host I/O (no exists/lstat, no _is_text_change). is_text /
+        # stale / precise created-vs-modified are decorated lazily per visible row.
         out = []
         for name, mode, mtime, sz in sqlar_list(self.path):
-            host = Path("/") / name
-            if stat_mod.S_ISCHR(mode):
-                kind, stale, is_text = "deleted", False, False
-            else:
-                exists = host.exists() or host.is_symlink()
-                kind = "modified" if exists else "created"
-                stale = False
-                if exists:
-                    try: stale = host.lstat().st_mtime > mtime
-                    except OSError: stale = False
-                is_text = self.review._is_text_change(self, name)
-            out.append(dict(path=name, kind=kind, size=sz, is_text=is_text, stale=stale))
+            if stat_mod.S_ISCHR(mode): kind = "deleted"
+            elif stat_mod.S_ISLNK(mode): kind = "symlink"
+            else: kind = "changed"
+            out.append(dict(path=name, kind=kind, size=sz))
         return out
 
     def remove(self, rel):
@@ -3455,6 +3472,30 @@ class ChangeReview:
     def change_mode(self, sid, rel, source=None) -> "int | None":
         """st_mode for a changed file (for the path/mode header). None if N/A."""
         return self._source(sid).current_mode(rel)
+
+    def decorate(self, sid, rel, source=None) -> dict:
+        """The per-row lazy decoration for ONE changed entry — the host-touching work
+        kept out of the cheap entries() backbone, scoped to a single rel: is_text (NUL
+        pair-wise rule), stale (host-vs-stored mtime), and kind refined to created vs
+        modified via a single host stat. Pass `source` to reuse one ChangeSource across
+        a visible window. Cheap (a couple of syscalls + one file pair)."""
+        rel = rel.lstrip("/")
+        src = source if source is not None else self._source(sid)
+        mode = src.current_mode(rel)
+        if mode is None:
+            return dict(is_text=False, stale=False, kind="changed")
+        host = Path("/") / rel
+        if stat_mod.S_ISCHR(mode):
+            return dict(is_text=False, stale=False, kind="deleted")
+        is_text = self._is_text_change(src, rel)
+        try: hstat = host.lstat(); exists = True
+        except OSError: hstat = None; exists = False
+        kind = "modified" if exists else "created"
+        stale = False
+        if exists and hstat is not None:
+            cm = src.current_mtime(rel)
+            if cm is not None: stale = hstat.st_mtime > cm
+        return dict(is_text=is_text, stale=stale, kind=kind)
 
     def hunks(self, sid, rel) -> dict:
         return self._hunks_display(self._source(sid), rel)
@@ -4837,6 +4878,11 @@ def _make_ui_app():
         def action_discard(self): self.app.action_discard_one()
         def action_discard_all(self): self.app.action_discard_all()
         def action_refresh(self): self.app.action_refresh()
+        def watch_scroll_y(self, old, new):
+            # Decorate rows as they scroll into view (viewport-scoped, cached).
+            super().watch_scroll_y(old, new)
+            try: self.app._decorate_visible()
+            except Exception: pass
 
     class RulesList(ListView):
         # 'd' here removes the focused rule (consistent with 'd' = delete elsewhere).
@@ -4985,6 +5031,10 @@ def _make_ui_app():
             # is computed once and cached here, invalidated only on a real edit.
             self._live_changes={}     # sid -> {rel -> record}
             self._fin_changes={}      # sid -> [entry,...]  (cached finished set)
+            # Viewport-lazy per-row decoration: is_text/stale/precise-kind computed
+            # ONLY for rows scrolled into view, cached per (sid -> {rel -> decor})
+            # so a row is decorated at most once until its sid cache is invalidated.
+            self._ch_decor={}         # sid -> {rel -> {is_text,stale,kind}}
             # Proc pane: a finished box's full process table is immutable, so compute
             # it ONCE and cache it here (like _fin_changes); a live box is served from
             # its Index's bounded active set every tick (O(active set), no full query).
@@ -5093,6 +5143,9 @@ def _make_ui_app():
             upsert with kind 'modified' if the host path exists else 'created'."""
             if rel is None or sid not in self._live_changes: return
             m=self._live_changes[sid]; rel=rel.lstrip("/")
+            # The row's content moved: drop its cached decoration so it's recomputed
+            # lazily the next time it's visible.
+            self._ch_decor.get(sid, {}).pop(rel, None)
             if op=="deleted":
                 host=Path("/")/rel
                 # A create-then-delete of a host-absent path leaves no change.
@@ -5110,6 +5163,7 @@ def _make_ui_app():
             discard, or a file-rule change): drop the cache so the next view recomputes."""
             self._fin_changes.pop(sid, None)
             self._live_changes.pop(sid, None)
+            self._ch_decor.pop(sid, None)
 
         def _drain_overlay_events(self):
             changed=set()
@@ -5171,6 +5225,7 @@ def _make_ui_app():
                 # session_changes pass into the finished cache. Self-heals any drift.
                 if sid in self._live_changes and not self.sup.review._live(sid):
                     self._live_changes.pop(sid, None)
+                    self._ch_decor.pop(sid, None)   # live decor may differ from sqlar
                     try: self._fin_changes[sid]=self.sup.review.session_changes(sid)
                     except Exception: self._fin_changes[sid]=[]
                     if self.view=="changes" and self._ch_sid==sid:
@@ -5179,6 +5234,7 @@ def _make_ui_app():
             elif t=="session_removed":
                 sid=ev["session_id"]
                 self._live_changes.pop(sid, None); self._fin_changes.pop(sid, None)
+                self._ch_decor.pop(sid, None)
                 self.sessions={k:v for k,v in self.sessions.items() if k!=sid}
                 self._rebuild_sessions(preserve=True)
                 if self._ch_sid==sid:
@@ -5412,12 +5468,17 @@ def _make_ui_app():
             t.append("changes ", style="dim")
             t.append(f"{len(entries)} file(s)   ")
             t.append("[↵ to review]\n\n", style="dim")
-            sig={"created":("+","green"),"modified":("~","yellow"),"deleted":("-","red")}
+            # Preview only (not a scrollable table): use cached decoration where it
+            # exists, else the cheap kind with a neutral glyph — never stat all files.
+            sig={"created":("+","green"),"modified":("~","yellow"),"deleted":("-","red"),
+                 "changed":("·","dim"),"symlink":("·","dim")}
             for e in entries[:200]:
-                sym,col=sig.get(e["kind"],("?",""))
+                dd=self._decor_of(sid, e["path"])
+                kind=dd["kind"] if dd else e["kind"]
+                stale=bool(dd and dd.get("stale"))
+                sym,col=sig.get(kind,("·","dim"))
                 t.append("  "); t.append(sym+" ", style=col)
-                t.append(e["path"]+"\n",
-                         style="red" if e.get("stale") else "")
+                t.append(e["path"]+"\n", style="red" if stale else "")
             d.update(t)
 
         def _update_rule_detail(self):
@@ -5508,6 +5569,7 @@ def _make_ui_app():
             # the overlays, so let those sessions consolidate again on next view.
             self.sup.review.invalidate_consolidation()
             self._fin_changes.clear(); self._live_changes.clear()
+            self._ch_decor.clear()
             self._refresh_file_rules()
 
         def _file_rule_add(self):
@@ -5544,22 +5606,65 @@ def _make_ui_app():
         def _file_rule_activated(self, ev):
             self._file_rule_edit_at(self.query_one("#r-list",ListView).index)
 
-        def _rebuild_ch(self, preserve=False):
+        def _decor_of(self, sid, rel):
+            """Cached per-row decoration for (sid, rel), or None if not yet computed."""
+            return self._ch_decor.get(sid, {}).get(rel)
+
+        def _ch_cells(self, e):
+            # One change row's cells from the cheap backbone + its (maybe-absent) lazy
+            # decoration. An undecorated changed/symlink row renders with a neutral '…'
+            # placeholder rather than a guessed kind; deleted is known from the backbone.
             sigs={"created":("+","green"),"modified":("~","yellow"),"deleted":("-","red")}
-            def flag(e):
-                sym,col=sigs.get(e["kind"],("?",""))
-                t=Text(sym, style=col)
-                if e.get("stale"): t.append("!", style="reverse red")  # host is newer
-                return t
+            d=self._decor_of(self._ch_sid, e["path"])
+            kind=d["kind"] if d else e["kind"]
+            stale=bool(d and d.get("stale"))
+            sym,col=sigs.get(kind,("…","dim"))
+            t=Text(sym, style=col)
+            if stale: t.append("!", style="reverse red")  # host is newer
             def short(p, n=46):
                 # Truncate from the *start* so the basename stays visible; the full
                 # path lives above the diff.
                 return p if len(p)<=n else "…"+p[-(n-1):]
-            rows=[(e["path"], [flag(e),
-                               Text(short(e["path"]), style="red" if e.get("stale") else ""),
-                               fmt_bytes(e["size"]) if e["size"] else ""])
-                  for e in self._ch_entries]
+            return [t, Text(short(e["path"]), style="red" if stale else ""),
+                    fmt_bytes(e["size"]) if e["size"] else ""]
+
+        def _rebuild_ch(self, preserve=False):
+            rows=[(e["path"], self._ch_cells(e)) for e in self._ch_entries]
             self._sync_table(self.query_one("#cf-tab",DataTable), rows)
+            self._decorate_visible()
+
+        def _decorate_visible(self):
+            # Viewport-scoped lazy decoration: compute is_text/stale/precise-kind ONLY
+            # for the rows currently scrolled into view (DataTable renders only those),
+            # cache per (sid,rel), then repaint just those cells. Never iterates all n.
+            sid=self._ch_sid
+            if sid is None or self.view!="changes": return
+            try: tbl=self.query_one("#cf-tab",DataTable)
+            except Exception: return
+            n=len(self._ch_entries)
+            if not n: return
+            top=max(0, int(tbl.scroll_offset.y))
+            # Before first layout size.height is 0 — fall back to a small window, NEVER
+            # n, so a huge box is never fully decorated at first paint.
+            h=tbl.size.height or 40
+            lo=max(0, top-2); hi=min(n, top+h+2)   # small over-scan for smoothness
+            cache=self._ch_decor.setdefault(sid, {})
+            cols=list(tbl.columns); src=None
+            for i in range(lo, hi):
+                e=self._ch_entries[i]; rel=e["path"]
+                if rel in cache: continue
+                if e["kind"]=="deleted":
+                    cache[rel]=dict(is_text=False, stale=False, kind="deleted")
+                else:
+                    if src is None: src=self.sup.review._source(sid)
+                    try: cache[rel]=self.sup.review.decorate(sid, rel, source=src)
+                    except Exception: cache[rel]=dict(is_text=False, stale=False, kind=e["kind"])
+                cells=self._ch_cells(e)
+                for ck,val in zip(cols, cells):
+                    try:
+                        if tbl.get_cell(rel,ck)!=val:
+                            tbl.update_cell(rel,ck,val,update_width=False)
+                    except Exception: pass
 
         def _diff_info_lines(self, d):
             k=d.get("kind")
@@ -5593,14 +5698,23 @@ def _make_ui_app():
             if not ent:
                 info.update(Text("")); return
             mode = self.sup.review.change_mode(self._ch_sid, ent["path"])
+            # The selected row is visible → use its lazy decoration for the precise
+            # kind/stale (decorate on the spot if it hasn't been seen yet).
+            d=self._decor_of(self._ch_sid, ent["path"])
+            if d is None and ent["kind"]!="deleted":
+                try: d=self._ch_decor.setdefault(self._ch_sid, {}).setdefault(
+                    ent["path"], self.sup.review.decorate(self._ch_sid, ent["path"]))
+                except Exception: d=None
+            kind=d["kind"] if d else ent["kind"]
+            stale=bool(d and d.get("stale"))
             t=Text()
             t.append("/"+ent["path"], style="bold")
             t.append("\n")
-            t.append(f"{ent['kind']}", style="dim")
+            t.append(f"{kind}", style="dim")
             if ent.get("size"): t.append(f" · {fmt_bytes(ent['size'])}", style="dim")
             if mode is not None:
                 t.append(f" · {stat_mod.filemode(mode)} {oct(stat_mod.S_IMODE(mode))}", style="dim")
-            if ent.get("stale"):
+            if stale:
                 t.append("  ⚠ host changed since capture", style="reverse red")
             info.update(t)
 
@@ -5811,6 +5925,7 @@ def _make_ui_app():
         @on(DataTable.RowHighlighted, "#cf-tab")
         def _cc(self, ev):
             if ev.row_key and ev.row_key.value and self._ch_sid:
+                self._decorate_visible()
                 self._update_cd_info(ev.row_key.value)
                 self._load_diff(self._ch_sid, ev.row_key.value)
 
