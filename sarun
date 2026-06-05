@@ -602,14 +602,44 @@ def parse_sid(sid: str) -> tuple:
 
 _PROC_TREE_DEPTH = 64   # defensive cap on a root→self walk (cycles / runaway chains)
 
+def build_path_tree(members, payload_of):
+    """Generic stateless TREE core shared by the proc and file panes. `members` maps
+    key -> path-tuple for the REAL rows. Every ancestor PREFIX of a member's path that
+    isn't itself a member is unioned in as a structural CONNECTOR, so the tree is fully
+    connected; sorting all rows by their path tuple yields DFS order (a parent/prefix
+    immediately precedes its subtree, siblings ordered by the tuple). `payload_of(path)`
+    resolves the per-row payload for any node (member or connector) — the caller keys it
+    however it likes (proc: last tuple element = tgid; file: the joined path).
+
+    Returns [(key, payload, depth, connector)] in DFS order, where depth=len(path)-1 and
+    `connector`=True for a purely-structural prefix added by the union. Order-independent:
+    output is a pure function of the member set + payload_of."""
+    paths = {}                                # path-tuple -> key  (member or connector)
+    is_member = {}                            # path-tuple -> bool
+    for key, path in members.items():
+        path = tuple(path)
+        paths[path] = key; is_member[path] = True
+        for i in range(1, len(path)):         # union in every ancestor prefix
+            pre = path[:i]
+            if pre not in paths:
+                paths.setdefault(pre, pre); is_member.setdefault(pre, False)
+    for path in list(paths):
+        is_member.setdefault(path, False)
+    rows = []
+    for path in sorted(paths):                # lexicographic path → DFS order
+        connector = not is_member[path]
+        rows.append((paths[path], payload_of(path), len(path) - 1, connector))
+    return rows
+
 def build_proc_tree(procs, root_pid, lookup):
     """Stateless process-TREE assembly: turn a flat viewing list into DFS-ordered,
     depth-indented rows that stay correct under any scroll/paging with NO global tree
     state. For each member compute its root→self pid path by walking the ppid chain up
     to `root_pid` (defensive: visited-guard, stop at root / ppid<=1 / a missing
     ancestor, cap depth). UNION in every ancestor met while walking — even ones not in
-    `procs` — so the tree is fully connected; sorting all rows by their path tuple then
-    yields DFS order (parent immediately before its subtree, siblings by pid).
+    `procs` — so the tree is fully connected; the generic core (build_path_tree) then
+    sorts by path tuple to yield DFS order (parent immediately before its subtree,
+    siblings by pid).
 
     `procs` is [(id, tgid, ppid, exe, argv-list)]; `lookup(tgid)->(ppid,exe,argv)|None`
     resolves connector ancestors not present in `procs` (same builder for live/finished).
@@ -647,21 +677,18 @@ def build_proc_tree(procs, root_pid, lookup):
         path.reverse()
         return tuple(path)
 
-    paths = {tgid: path_of(tgid) for tgid in list(members)}
-    # path_of unions ancestors into `nodes`; give every unioned ancestor a path too.
-    for tgid in list(nodes):
-        if tgid not in paths: paths[tgid] = path_of(tgid)
+    member_paths = {tgid: path_of(tgid) for tgid in list(members)}
 
-    rows = []
-    for tgid in nodes:
-        path = paths[tgid]
-        ppid, exe, argv = nodes[tgid]
+    def payload_of(path):
+        tgid = path[-1]                       # last pid-path element identifies the proc
+        ppid, exe, argv = nodes.get(tgid) or (info(tgid) or (0, "", []))
         connector = tgid not in members
         pid = members[tgid][0] if not connector else tgid
-        rows.append((path, pid, tgid, ppid, exe, argv, connector))
-    rows.sort(key=lambda r: r[0])             # lexicographic path → DFS order
-    return [(pid, tgid, ppid, exe, argv, len(path) - 1, connector)
-            for (path, pid, tgid, ppid, exe, argv, connector) in rows]
+        return pid, tgid, ppid, exe, argv
+
+    rows = build_path_tree(member_paths, payload_of)
+    return [(pid, tgid, ppid, exe, argv, depth, connector)
+            for (_tgid, (pid, tgid, ppid, exe, argv), depth, connector) in rows]
 
 _NO_NL = b"\\ No newline at end of file\n"   # standard "no newline at EOF" marker
 
@@ -5148,6 +5175,11 @@ def _make_ui_app():
             self.server=None
             self._ch_sid=None
             self._ch_entries=[]
+            # Changes pane is a directory TREE (same scheme as procs): _ch_rows is the
+            # DFS-ordered render list [(key, name, depth, connector)], built from
+            # _ch_entries only when the change set actually changes (so the 0.3s tick
+            # never re-sorts). _ch_conn = connector row keys the cursor skips.
+            self._ch_rows=[]; self._ch_conn=set()
             self._nf_flows=[]
             self._last_loaded_sid=None  # guard against reload on re-highlight
             # Live boxes: per-sid incremental change map {rel -> {path,kind,size}},
@@ -5773,10 +5805,16 @@ def _make_ui_app():
             """Cached per-row decoration for (sid, rel), or None if not yet computed."""
             return self._ch_decor.get(sid, {}).get(rel)
 
-        def _ch_cells(self, e):
-            # One change row's cells from the cheap backbone + its (maybe-absent) lazy
-            # decoration. An undecorated changed/symlink row renders with a neutral '…'
-            # placeholder rather than a guessed kind; deleted is known from the backbone.
+        def _ch_indent(self, depth):
+            # Same indent glyph/scheme as the proc pane, for visual consistency.
+            return "  "*depth + ("└ " if depth else "")
+
+        def _ch_cells(self, e, depth):
+            # One REAL change row's cells from the cheap backbone + its (maybe-absent)
+            # lazy decoration. The NAME column shows only the basename, indented by tree
+            # depth (the full path lives in the cd-info header above the diff). An
+            # undecorated changed/symlink row renders with a neutral '…' placeholder
+            # rather than a guessed kind; deleted is known from the backbone.
             sigs={"created":("+","green"),"modified":("~","yellow"),"deleted":("-","red")}
             d=self._decor_of(self._ch_sid, e["path"])
             kind=d["kind"] if d else e["kind"]
@@ -5784,37 +5822,85 @@ def _make_ui_app():
             sym,col=sigs.get(kind,("…","dim"))
             t=Text(sym, style=col)
             if stale: t.append("!", style="reverse red")  # host is newer
-            def short(p, n=46):
-                # Truncate from the *start* so the basename stays visible; the full
-                # path lives above the diff.
-                return p if len(p)<=n else "…"+p[-(n-1):]
-            return [t, Text(short(e["path"]), style="red" if stale else ""),
+            name=e["path"].rsplit("/",1)[-1]
+            return [t, Text(self._ch_indent(depth)+name, style="red" if stale else ""),
                     fmt_bytes(e["size"]) if e["size"] else ""]
 
+        def _conn_cells(self, name, depth):
+            # A structural directory row (a prefix that isn't itself a change): dimmed,
+            # basename + "/", cursor-skipped — display-only, never an apply target.
+            return [Text(""), Text(self._ch_indent(depth)+name+"/", style="dim"), ""]
+
+        def _build_ch_tree(self):
+            # Build the change set into a DFS-ordered directory tree via the shared
+            # generic core. Members keyed by full path, path tuple = path components.
+            # Connector dir prefixes (not themselves changes) come back as tuple keys;
+            # give them a stable "d/<joined>" string row key so the cursor can skip them.
+            members={e["path"]:tuple(e["path"].split("/")) for e in self._ch_entries}
+            rows=[]; conn=set()
+            for key, joined, depth, connector in build_path_tree(members, lambda p:"/".join(p)):
+                if connector:
+                    rk="d/"+joined; conn.add(rk)
+                    rows.append((rk, joined.rsplit("/",1)[-1], depth, True))
+                else:
+                    rows.append((key, joined.rsplit("/",1)[-1], depth, False))
+            self._ch_rows=rows; self._ch_conn=conn
+
         def _rebuild_ch(self, preserve=False):
-            rows=[(e["path"], self._ch_cells(e)) for e in self._ch_entries]
+            # Rebuild the cached tree (set/order/labels) then feed it to _sync_table;
+            # only runs when _ch_entries actually changed, so the 0.3s tick never sorts.
+            self._build_ch_tree()
+            ent={e["path"]:e for e in self._ch_entries}
+            rows=[]
+            for rk, name, depth, connector in self._ch_rows:
+                if connector: rows.append((rk, self._conn_cells(name, depth)))
+                else: rows.append((rk, self._ch_cells(ent[rk], depth)))
             self._sync_table(self.query_one("#cf-tab",DataTable), rows)
+            self._skip_conn_ch()
             self._decorate_visible()
+
+        def _skip_conn_ch(self):
+            # Keep the cursor off dimmed connector dir rows: nudge to the next real entry.
+            conn=self._ch_conn
+            if not conn: return
+            t=self.query_one("#cf-tab",DataTable)
+            if not t.row_count: return
+            try: ck=t.coordinate_to_cell_key((t.cursor_row,0)).row_key.value
+            except Exception: return
+            if ck not in conn: return
+            keys=[rk.value for rk in t.rows]
+            i=t.cursor_row
+            nxt=next((j for j in range(i+1,len(keys)) if keys[j] not in conn),
+                     next((j for j in range(i-1,-1,-1) if keys[j] not in conn), None))
+            if nxt is not None:
+                try: t.move_cursor(row=nxt, animate=False)
+                except Exception: pass
 
         def _decorate_visible(self):
             # Viewport-scoped lazy decoration: compute is_text/stale/precise-kind ONLY
-            # for the rows currently scrolled into view (DataTable renders only those),
-            # cache per (sid,rel), then repaint just those cells. Never iterates all n.
+            # for the REAL rows currently scrolled into view (DataTable renders only
+            # those), cache per (sid,rel), then repaint just those cells. Connector dir
+            # rows need no decoration. Never iterates all n.
             sid=self._ch_sid
             if sid is None or self.view!="changes": return
             try: tbl=self.query_one("#cf-tab",DataTable)
             except Exception: return
-            n=len(self._ch_entries)
+            n=len(self._ch_rows)
             if not n: return
             top=max(0, int(tbl.scroll_offset.y))
             # Before first layout size.height is 0 — fall back to a small window, NEVER
             # n, so a huge box is never fully decorated at first paint.
             h=tbl.size.height or 40
             lo=max(0, top-2); hi=min(n, top+h+2)   # small over-scan for smoothness
+            ent={e["path"]:e for e in self._ch_entries}
             cache=self._ch_decor.setdefault(sid, {})
             cols=list(tbl.columns); src=None
             for i in range(lo, hi):
-                e=self._ch_entries[i]; rel=e["path"]
+                rk, name, depth, connector = self._ch_rows[i]
+                if connector: continue            # structural dir row: no decoration
+                e=ent.get(rk)
+                if e is None: continue
+                rel=e["path"]
                 if rel in cache: continue
                 if e["kind"]=="deleted":
                     cache[rel]=dict(is_text=False, stale=False, kind="deleted")
@@ -5822,7 +5908,7 @@ def _make_ui_app():
                     if src is None: src=self.sup.review._source(sid)
                     try: cache[rel]=self.sup.review.decorate(sid, rel, source=src)
                     except Exception: cache[rel]=dict(is_text=False, stale=False, kind=e["kind"])
-                cells=self._ch_cells(e)
+                cells=self._ch_cells(e, depth)
                 for ck,val in zip(cols, cells):
                     try:
                         if tbl.get_cell(rel,ck)!=val:
@@ -5932,10 +6018,14 @@ def _make_ui_app():
                 t.coordinate_to_cell_key((t.cursor_row,0)).row_key.value)
             except Exception: return None
         def _sel_path(self):
+            # The selected REAL change's full path. Connector dir rows are display-only:
+            # the cursor skips them, but guard here too so apply/discard/p-jump never act
+            # on a structural row.
             t=self.query_one("#cf-tab",DataTable)
             if not t.row_count: return None
-            try: return t.coordinate_to_cell_key((t.cursor_row,0)).row_key.value
+            try: k=t.coordinate_to_cell_key((t.cursor_row,0)).row_key.value
             except Exception: return None
+            return None if k in self._ch_conn else k
 
         def _load_changes(self, sid, force=False):
             entries=self._changes_for(sid)
@@ -6124,6 +6214,8 @@ def _make_ui_app():
 
         @on(DataTable.RowHighlighted, "#cf-tab")
         def _cc(self, ev):
+            if ev.row_key and ev.row_key.value in self._ch_conn:
+                self._skip_conn_ch(); return       # nudge off the dimmed dir row
             if ev.row_key and ev.row_key.value and self._ch_sid:
                 self._decorate_visible()
                 self._update_cd_info(ev.row_key.value)
@@ -6135,8 +6227,9 @@ def _make_ui_app():
 
         @on(DataTable.RowSelected, "#cf-tab")
         def _f_open(self, ev):
-            # Enter on a file focuses the diff/hunk pane for it.
-            if ev.row_key and ev.row_key.value and self._ch_sid:
+            # Enter on a real file focuses the diff/hunk pane for it; dir rows are inert.
+            if ev.row_key and ev.row_key.value and ev.row_key.value not in self._ch_conn \
+               and self._ch_sid:
                 self._load_diff(self._ch_sid, ev.row_key.value)
                 try: self.query_one("#cd-log",DiffView).focus()
                 except Exception: pass
