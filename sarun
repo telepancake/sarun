@@ -3476,10 +3476,7 @@ class Supervisor:
                 rel = str(ap.relative_to(upper)); real = Path("/") / rel
                 try: size = ap.stat().st_size if (ap.is_file() and not ap.is_symlink()) else 0
                 except OSError: size = 0
-                is_text = False
-                if size and size < (10 << 20):
-                    try: ap.read_bytes()[:512].decode(); is_text = True
-                    except (UnicodeDecodeError, OSError): pass
+                is_text = self._is_text_change(sid, rel)
                 stale = False
                 exists = real.exists() or real.is_symlink()
                 if exists:
@@ -3520,28 +3517,31 @@ class Supervisor:
                     if exists:
                         try: stale = host.lstat().st_mtime > mtime
                         except OSError: stale = False
-                    if stat_mod.S_ISLNK(mode) or stat_mod.S_ISDIR(mode):
-                        is_text = False
-                    else:
-                        raw = sqlar_content(sqlar_path(sid), name)
-                        is_text = raw is not None and b"\x00" not in raw
+                    is_text = self._is_text_change(sid, name)
                 out.append(dict(path=name, kind=kind, size=sz, is_text=is_text, stale=stale))
             return out
 
-    def _hunks(self, sid, rel):
-        """Unified (lower_lines, upper_lines, groups) for any session state.
-        Uses _current_bytes/_current_mode (the only live/consolidated branch) and
-        _lower_bytes as the diff base.  Returns None for non-text / deleted /
-        directory / whiteout changes."""
+    def _is_text_change(self, sid, rel) -> bool:
+        """Whether the (base, current) pair is a *text* change — i.e. a line-based
+        unified diff applied with patch(1) would reproduce the current bytes exactly.
+        Conservative approximation of that: both sides must be NUL-free (a NUL is
+        what breaks patch byte-exactness); tombstones, symlinks and directories are
+        never text.  Examines BOTH files of the pair, not just the current one."""
         rel = rel.lstrip("/")
         mode = self._current_mode(sid, rel)
-        if mode is None: return None
-        if stat_mod.S_ISCHR(mode) or stat_mod.S_ISLNK(mode): return None
-        raw = self._current_bytes(sid, rel)
-        if raw is None or b"\x00" in raw: return None
-        lo = self._lower_bytes(rel)
-        if b"\x00" in lo: return None
-        ll = ut_split(lo); ul = ut_split(raw)
+        if mode is None or stat_mod.S_ISCHR(mode) or stat_mod.S_ISLNK(mode):
+            return False
+        cur = self._current_bytes(sid, rel)
+        if cur is None or b"\x00" in cur: return False
+        return b"\x00" not in self._lower_bytes(rel)
+
+    def _hunks(self, sid, rel):
+        """Unified (lower_lines, upper_lines, groups) for any session state, or None
+        for a non-text change.  The only live/consolidated branch is inside the
+        _current_bytes/_lower_bytes accessors."""
+        rel = rel.lstrip("/")
+        if not self._is_text_change(sid, rel): return None
+        ll = ut_split(self._lower_bytes(rel)); ul = ut_split(self._current_bytes(sid, rel))
         groups = list(difflib.SequenceMatcher(None, ll, ul).get_grouped_opcodes(3))
         return (ll, ul, groups)
 
