@@ -1945,7 +1945,7 @@ def _build_overlay_ops():
                         fd = self._passthrough_open(rel, flags)
                     else:
                         fd = self._ensure_copyup(sid, rel, flags, ctx)
-                        self._notify(sid)
+                        self._notify(sid, rel, "modified")
                 with self._lock:
                     fh = self._next_fh; self._next_fh += 1
                     self._fd_table[fh] = fd
@@ -2023,7 +2023,7 @@ def _build_overlay_ops():
                 idx = self._index(sid)
                 upath = self._upper_path(sid, rel)
                 res = upper_op(sid, rel, upath, wid, idx)
-                self._notify(sid)
+                self._notify(sid, rel, "created")
                 return res
             finally:
                 self._req_exit()
@@ -2166,7 +2166,7 @@ def _build_overlay_ops():
                     idx.set_entry(rel, "whiteout", 0, wid, "unlink")
                 else:
                     idx.del_entry(rel, op="unlink", writer_id=wid)
-                self._notify(sid)
+                self._notify(sid, rel, "deleted")
             finally:
                 self._req_exit()
 
@@ -2207,7 +2207,7 @@ def _build_overlay_ops():
                     idx.set_entry(rel, "whiteout", 0, wid, "rmdir")
                 else:
                     idx.del_entry(rel, op="rmdir", writer_id=wid)
-                self._notify(sid)
+                self._notify(sid, rel, "deleted")
             finally:
                 self._req_exit()
 
@@ -2273,7 +2273,7 @@ def _build_overlay_ops():
                 elif stat_mod.S_ISLNK(st.st_mode): kind = "symlink"
                 else: kind = "file"
                 idx.set_entry(rel, kind, st.st_mode, wid, "setattr")
-                self._notify(sid)
+                self._notify(sid, rel, "modified")
                 return self._entry(inode, st)
             finally:
                 self._req_exit()
@@ -2420,7 +2420,9 @@ def _build_overlay_ops():
                 else:
                     idx.del_entry(rel_o, op="rename_from", writer_id=wid)
                 self._remap_inode_subtree(sid, rel_o, rel_n)
-                self._notify(sid)
+                # rename = remove-old + add-new for the live map.
+                self._notify(sid, rel_o, "deleted")
+                self._notify(sid, rel_n, "created")
             finally:
                 self._req_exit()
 
@@ -2498,11 +2500,13 @@ def _build_overlay_ops():
             finally:
                 self._req_exit()
 
-        def _notify(self, sid: str) -> None:
+        def _notify(self, sid: str, rel: str = None, op: str = None) -> None:
             """Live-feedback seam: tell the UI a box's overlay changed so the Changes
-            view refreshes event-driven (NOT by polling). Called from the mutating
-            handlers; the handoff itself is thread-safe (see OverlayMount)."""
-            try: self.on_event(type="overlay_changed", sid=sid)
+            view refreshes event-driven (NOT by polling). Carries the affected `rel`
+            and an `op` ("created"/"modified"/"deleted") so the UI folds the change
+            into its live map in O(1) — no re-walk. Called from the mutating handlers;
+            the handoff itself is thread-safe (see OverlayMount)."""
+            try: self.on_event(type="overlay_changed", sid=sid, rel=rel, op=op)
             except Exception: pass
 
     return MultiplexOverlayFs
@@ -4923,6 +4927,12 @@ def _make_ui_app():
             self._ch_entries=[]
             self._nf_flows=[]
             self._last_loaded_sid=None  # guard against reload on re-highlight
+            # Live boxes: per-sid incremental change map {rel -> {path,kind,size}},
+            # seeded once then folded from the enriched FUSE event stream — never
+            # re-walked on the hot path. Finished boxes: their immutable change list
+            # is computed once and cached here, invalidated only on a real edit.
+            self._live_changes={}     # sid -> {rel -> record}
+            self._fin_changes={}      # sid -> [entry,...]  (cached finished set)
 
         def compose(self) -> ComposeResult:
             yield Header()
@@ -4991,19 +5001,76 @@ def _make_ui_app():
             # The serving thread enqueues; we apply on the UI thread.
             self.set_interval(0.3, self._drain_overlay_events)
 
+        # ── change-set cache: live (incremental) vs finished (static) ──────────
+        def _changes_for(self, sid):
+            """The change-entry list for a box, cheap on the hot path. A live box is
+            served from its incremental map (seeded once); a finished box from a
+            cache computed once and invalidated only on a real edit."""
+            if sid is None: return []
+            if self.sup.review._live(sid):
+                self._fin_changes.pop(sid, None)
+                return self._live_list(sid)
+            self._live_changes.pop(sid, None)
+            if sid not in self._fin_changes:
+                try: self._fin_changes[sid]=self.sup.review.session_changes(sid)
+                except Exception: self._fin_changes[sid]=[]
+            return self._fin_changes[sid]
+
+        def _live_list(self, sid):
+            """Sorted entry list for a live box from its incremental map, seeding it
+            with ONE full pass the first time the box is shown."""
+            m=self._live_changes.get(sid)
+            if m is None:
+                m={}
+                try:
+                    for e in self.sup.review.session_changes(sid):
+                        m[e["path"]]=dict(path=e["path"], kind=e["kind"],
+                                          size=e.get("size",0))
+                except Exception: pass
+                self._live_changes[sid]=m
+            return [m[k] for k in sorted(m)]
+
+        def _fold_event(self, sid, rel, op):
+            """Fold one enriched FUSE event into the live map in O(1). Converges to the
+            same SET the full walk produces: deletions mark 'deleted'; creates/mods
+            upsert with kind 'modified' if the host path exists else 'created'."""
+            if rel is None or sid not in self._live_changes: return
+            m=self._live_changes[sid]; rel=rel.lstrip("/")
+            if op=="deleted":
+                host=Path("/")/rel
+                # A create-then-delete of a host-absent path leaves no change.
+                if host.exists() or host.is_symlink():
+                    m[rel]=dict(path=rel, kind="deleted", size=0)
+                else:
+                    m.pop(rel, None)
+            else:
+                host=Path("/")/rel
+                kind="modified" if (host.exists() or host.is_symlink()) else "created"
+                m[rel]=dict(path=rel, kind=kind, size=0)
+
+        def _invalidate_changes(self, sid):
+            """A real edit happened to a box's change set (hunk/whole-file apply or
+            discard, or a file-rule change): drop the cache so the next view recomputes."""
+            self._fin_changes.pop(sid, None)
+            self._live_changes.pop(sid, None)
+
         def _drain_overlay_events(self):
             changed=set()
             try:
                 while True:
                     ev=self.overlay_mount.event_q.get_nowait()
                     if ev.get("type")=="overlay_changed" and ev.get("sid"):
-                        changed.add(ev["sid"])
+                        sid=ev["sid"]; changed.add(sid)
+                        # Fold into the live map in O(1) — no walk on this 0.3s path.
+                        self._fold_event(sid, ev.get("rel"), ev.get("op"))
             except queue.Empty:
                 pass
             if not changed: return
-            # refresh the live change listing for the affected box if it's on screen
+            # refresh the live change listing for the affected box if it's on screen.
+            # No force: _load_changes reads the cheap in-RAM map and the table diffs
+            # in place — the 0.3s drain never re-walks the overlay.
             if self.view=="changes" and self._ch_sid in changed:
-                self._load_changes(self._ch_sid, force=True)
+                self._load_changes(self._ch_sid)
             if self.view=="boxes" and self._ch_sid in changed:
                 self._update_box_detail()
 
@@ -5040,11 +5107,21 @@ def _make_ui_app():
                 self._select_sid(s["session_id"])
                 if self.view=="boxes": self._update_box_detail()
             elif t=="session_updated":
-                s=ev["session"]; self.sessions={**self.sessions,s["session_id"]:s}
+                s=ev["session"]; sid=s["session_id"]
+                self.sessions={**self.sessions,sid:s}
                 self._rebuild_sessions(preserve=True)
+                # live→stopped: drop the incremental map and do ONE authoritative
+                # session_changes pass into the finished cache. Self-heals any drift.
+                if sid in self._live_changes and not self.sup.review._live(sid):
+                    self._live_changes.pop(sid, None)
+                    try: self._fin_changes[sid]=self.sup.review.session_changes(sid)
+                    except Exception: self._fin_changes[sid]=[]
+                    if self.view=="changes" and self._ch_sid==sid:
+                        self._load_changes(sid, force=True)
                 if self.view=="boxes": self._update_box_detail()
             elif t=="session_removed":
                 sid=ev["session_id"]
+                self._live_changes.pop(sid, None); self._fin_changes.pop(sid, None)
                 self.sessions={k:v for k,v in self.sessions.items() if k!=sid}
                 self._rebuild_sessions(preserve=True)
                 if self._ch_sid==sid:
@@ -5273,7 +5350,7 @@ def _make_ui_app():
                 t.append("network ", style="dim")
                 t.append(f"{len(self.sup.flows(sid))} connection(s)   ")
                 t.append("[t for log]\n", style="dim")
-            try: entries=self.sup.review.session_changes(sid)
+            try: entries=self._changes_for(sid)
             except Exception: entries=[]
             t.append("changes ", style="dim")
             t.append(f"{len(entries)} file(s)   ")
@@ -5373,6 +5450,7 @@ def _make_ui_app():
             # A new/changed rule should get a chance to act on whatever is still in
             # the overlays, so let those sessions consolidate again on next view.
             self.sup.review.invalidate_consolidation()
+            self._fin_changes.clear(); self._live_changes.clear()
             self._refresh_file_rules()
 
         def _file_rule_add(self):
@@ -5493,6 +5571,7 @@ def _make_ui_app():
             r=(self.sup.review.discard_hunk if discard
                else self.sup.review.apply_hunk)(sid, p, index)
             if not r.get("ok"): self._status(Text(r.get("error") or "hunk op failed")); return
+            self._invalidate_changes(sid)   # a real edit changed the set
             self._load_changes(sid)
             if any(e["path"]==p for e in self._ch_entries):
                 self._load_diff(sid, p, keep_pos=True)
@@ -5525,7 +5604,7 @@ def _make_ui_app():
             except Exception: return None
 
         def _load_changes(self, sid, force=False):
-            entries=self.sup.review.session_changes(sid)
+            entries=self._changes_for(sid)
             # Only touch the table when the set of changes actually differs, so the
             # periodic refresh keeps the pane live without blinking or losing the
             # cursor while nothing is changing.
@@ -5731,6 +5810,7 @@ def _make_ui_app():
             if self._ch_sid: self._load_changes(self._ch_sid)
 
         def _refresh_after(self, sid, p):
+            self._invalidate_changes(sid)   # a real edit changed the set
             self._load_changes(sid)
             if p is not None and any(e["path"]==p for e in self._ch_entries):
                 self._load_diff(sid, p, keep_pos=True)
