@@ -702,6 +702,18 @@ def build_proc_tree(procs, root_pid, lookup):
     return [(pid, tgid, ppid, exe, argv, depth, connector)
             for (_tgid, (pid, tgid, ppid, exe, argv), depth, connector) in rows]
 
+def nearest_surviving_row(vanished_tgid, ppid_of, present):
+    """When the cursored proc `vanished_tgid` is gone, find the row key of its NEAREST
+    surviving ANCESTOR: walk ppid_of (tgid->ppid, covering prior+new rows incl
+    connectors) up from its parent to the first tgid present in `present` (tgid->row
+    key). None if no ancestor survives (caller falls back to the root). O(depth)."""
+    seen = set(); cur = ppid_of.get(vanished_tgid)
+    for _ in range(_PROC_TREE_DEPTH):
+        if cur is None or cur in seen: break
+        if cur in present: return present[cur]
+        seen.add(cur); cur = ppid_of.get(cur)
+    return None
+
 _NO_NL = b"\\ No newline at end of file\n"   # standard "no newline at EOF" marker
 
 class PatchConflict(Exception):
@@ -6708,9 +6720,27 @@ def _make_ui_app():
                 key=procs; dead=set()
             cur=getattr(self,"_pr_key",None)
             if not force and key==cur: return
+            # BUG2: before the rebuild, note the cursored proc's tgid (real row key is
+            # str(pid)->tgid via the prior snapshot; connector key is "c<tgid>"); if it
+            # vanishes we relocate the cursor to its nearest surviving ancestor below.
+            pt=self.query_one("#pr-tab",DataTable)
+            cur_tg=None
+            try: ck=pt.coordinate_to_cell_key((pt.cursor_row,0)).row_key.value
+            except Exception: ck=None
+            if ck is not None:
+                if isinstance(ck,str) and ck.startswith("c"):
+                    try: cur_tg=int(ck[1:])
+                    except ValueError: cur_tg=None
+                else:
+                    cur_tg=next((tg for (p,tg,_pp,_ex,_av) in (self._pr_procs or [])
+                                 if str(p)==ck), None)
+            prev_pp=getattr(self,"_pr_pp",{})
             self._pr_key=key
             self._pr_procs=[(p,tg,pp,ex,av) for (p,tg,pp,ex,av,_d,c) in tree if not c]
             self._pr_conn={("c"+str(tg)) for (_p,tg,_pp,_ex,_av,_d,c) in tree if c}
+            # New-tree maps for the ancestor walk: tgid->row key (present) and tgid->ppid
+            # (combined with the prior snapshot so a multi-level vanish still resolves).
+            present={}; new_pp={}
             rows=[]
             for pid, tgid, ppid, exe, argv, depth, conn in tree:
                 indent="  "*depth + ("└ " if depth else "")
@@ -6726,9 +6756,26 @@ def _make_ui_app():
                     nm.stylize("red"); ar.stylize("red")
                 else:
                     rk=str(pid); tg=str(tgid); pp=str(ppid)
+                present[tgid]=rk; new_pp[tgid]=ppid
                 rows.append((rk, [tg, pp, nm, ar]))
-            self._sync_table(self.query_one("#pr-tab",DataTable), rows)
+            ppid_of=dict(prev_pp); ppid_of.update(new_pp)
+            self._pr_pp=new_pp
+            # BUG1: capture the user's vertical scroll so a scrolled-down tree view
+            # survives the rebuild (clear()+re-add resets scroll_y to 0).
+            scroll_y=pt.scroll_offset.y
+            self._sync_table(pt, rows)
+            # BUG2: cursored proc vanished -> move to its nearest surviving ancestor
+            # (root only if the whole chain is gone). _sync_table left the cursor at row
+            # 0 since the key was absent; relocate before connector-skip.
+            if cur_tg is not None and cur_tg not in present:
+                rk=nearest_surviving_row(cur_tg, ppid_of, present)
+                if rk is not None:
+                    try: pt.move_cursor(row=pt.get_row_index(rk), animate=False)
+                    except Exception: pass
             self._skip_conn_proc()
+            # BUG1: restore scroll after rows/cursor settle, clamped to new content.
+            try: pt.scroll_to(y=min(scroll_y, max(0, pt.virtual_size.height-pt.scrollable_content_region.height)), animate=False)
+            except Exception: pass
             self._update_proc_detail()
 
         def _skip_conn_proc(self):
