@@ -644,22 +644,24 @@ def build_path_tree(members, payload_of):
         rows.append((paths[path], payload_of(path), len(path) - 1, connector))
     return rows
 
-def build_proc_tree(procs, root_pid, lookup):
+def build_proc_tree(procs, roots, lookup):
     """Stateless process-TREE assembly: turn a flat viewing list into DFS-ordered,
     depth-indented rows that stay correct under any scroll/paging with NO global tree
     state. For each member compute its root→self pid path by walking the ppid chain up
-    to `root_pid` (defensive: visited-guard, stop at root / ppid<=1 / a missing
-    ancestor, cap depth). UNION in every ancestor met while walking — even ones not in
-    `procs` — so the tree is fully connected; the generic core (build_path_tree) then
-    sorts by path tuple to yield DFS order (parent immediately before its subtree,
-    siblings by pid).
+    until it reaches a member of `roots` (the box's hierarchy roots — a re-run box has
+    several, so the result is a FOREST; defensive: visited-guard, stop at a root /
+    ppid<=1 / a missing ancestor, cap depth). UNION in every ancestor met while walking
+    — even ones not in `procs` — so the tree is fully connected; the generic core
+    (build_path_tree) then sorts by path tuple to yield DFS order (parent immediately
+    before its subtree, siblings by pid).
 
-    `procs` is [(id, tgid, ppid, exe, argv-list)]; `lookup(tgid)->(ppid,exe,argv)|None`
-    resolves connector ancestors not present in `procs` (same builder for live/finished).
-    Returns [(id, tgid, ppid, exe, argv, depth, connector)] in DFS order, where
-    depth=len(path)-1 and `connector`=True for a purely-structural ancestor (added by
-    the union, not a member of `procs`). Order-independent: output is a pure function of
-    the (root_pid, lookup, set-of-procs)."""
+    `procs` is [(id, tgid, ppid, exe, argv-list)]; `roots` is a set of root tgids;
+    `lookup(tgid)->(ppid,exe,argv)|None` resolves connector ancestors not present in
+    `procs` (same builder for live/finished). Returns [(id, tgid, ppid, exe, argv,
+    depth, connector)] in DFS order, where depth=len(path)-1 and `connector`=True for a
+    purely-structural ancestor (added by the union, not a member of `procs`).
+    Order-independent: output is a pure function of the (roots, lookup, set-of-procs)."""
+    roots = set(roots or ())
     members = {}                              # tgid -> (id, ppid, exe, argv)
     for pid, tgid, ppid, exe, argv in procs:
         members[tgid] = (pid, ppid, exe or "", list(argv))
@@ -680,7 +682,7 @@ def build_proc_tree(procs, root_pid, lookup):
         for _ in range(_PROC_TREE_DEPTH):
             if cur in seen: break             # cycle guard
             seen.add(cur); path.append(cur)
-            if cur == root_pid: break         # reached the box root
+            if cur in roots: break            # reached a box root
             got = info(cur)
             if got is None: break             # missing ancestor: stop, link what we have
             ppid = got[0]
@@ -804,20 +806,27 @@ def build_file_patch(rel, lower, upper, created, deleted) -> dict:
 #  live index (consulted on every FUSE op, mirrored in RAM for the hot path) AND
 #  the at-rest archive. It holds ALL state in one schema:
 #
-#    sqlar(name, mode, mtime, sz, data, opaque, writer)
+#    sqlar(name, mode, mtime, sz, data, opaque, writer, last_writer)
 #        every file/dir/symlink/whiteout entry with its metadata. `mtime` is the
 #        modification time as integer NANOSECONDS (st_mtime_ns), stored exactly so
 #        sub-second mtime ordering survives consolidate→sqlar→apply→host. `data` is the
 #        zlib-deflated file content (NULL until consolidate() fills it from the
 #        overlay upper). A char-device mode with NULL data is a deletion
-#        tombstone (whiteout). `opaque`=1 marks an opaque directory. `writer` is
-#        the process-table id (FK to process.id) that produced/last-modified it.
+#        tombstone (whiteout). `opaque`=1 marks an opaque directory. `writer` is the
+#        process-table id (FK to process.id) of the FIRST process to produce the
+#        entry; `last_writer` is the id of the MOST RECENT process to modify it (the
+#        two differ when a path is rewritten by a later process, e.g. a re-run).
 #    provenance(path, pid, ppid, exe, argv)
 #        per-path writer provenance (pid/exe/argv).
-#    process(id, tgid, ppid, exe, argv, env_id)
+#    process(id, tgid, ppid, exe, argv, env_id, root)
 #        the box's process table (one row per traced tgid); env_id -> env.id.
+#        `root`=1 marks a hierarchy root — the process a `slopbox -- cmd` launch
+#        recorded. A box re-run (`slopbox NAME -- cmd`) adds another root, so the
+#        table is a FOREST; PPid bubbling stops at any root, not at the sid's pid.
 #    env(id, hash, env)
 #        unique environment json, deduped by hash and referenced by env_id.
+#    meta(key, value)
+#        small per-box key/value strings (e.g. the box's display `name`).
 #    flows(...)
 #        every gated request/response for the box.
 #
@@ -848,20 +857,35 @@ def _sqlar_open(path) -> "sqlite3.Connection":
     conn.executescript(
         "CREATE TABLE IF NOT EXISTS sqlar"
         "(name TEXT PRIMARY KEY, mode INT, mtime INT, sz INT, data BLOB,"
-        " opaque INT DEFAULT 0, writer INT);"
+        " opaque INT DEFAULT 0, writer INT, last_writer INT);"
         "CREATE TABLE IF NOT EXISTS provenance"
         "(path TEXT PRIMARY KEY, pid INT, ppid INT, exe TEXT, argv TEXT);"
         "CREATE TABLE IF NOT EXISTS env"
         "(id INTEGER PRIMARY KEY AUTOINCREMENT, hash TEXT UNIQUE, env TEXT);"
         "CREATE TABLE IF NOT EXISTS process"
         "(id INTEGER PRIMARY KEY AUTOINCREMENT, tgid INT UNIQUE, ppid INT,"
-        " exe TEXT, argv TEXT, env_id INT);"
+        " exe TEXT, argv TEXT, env_id INT, root INT DEFAULT 0);"
+        "CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);"
         "CREATE TABLE IF NOT EXISTS flows("
         " id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, action TEXT,"
         " method TEXT, scheme TEXT, host TEXT, port INT, url TEXT, status INT,"
         " process_id INT, req_headers TEXT, req_len INT, req_body BLOB,"
         " resp_headers TEXT, resp_len INT, resp_body BLOB);")
+    # Migrate boxes created by an older schema: add columns introduced later. The
+    # one DDL above is authoritative for fresh DBs; these top up existing files.
+    _ensure_columns(conn, "sqlar", {"last_writer": "INT"})
+    _ensure_columns(conn, "process", {"root": "INT DEFAULT 0"})
+    conn.commit()
     return conn
+
+def _ensure_columns(conn, table: str, cols: dict) -> None:
+    """Add any missing `cols` (name -> SQL decl) to `table` in place. CREATE TABLE
+    IF NOT EXISTS never alters an existing table, so a db written by an older schema
+    keeps its old column set until this tops it up."""
+    have = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+    for name, decl in cols.items():
+        if name not in have:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
 
 def _sqlar_deflate(content: bytes):
     comp = zlib.compress(content, 6)
@@ -1047,14 +1071,26 @@ def process_list(path) -> list:
         out.append((pid, tgid, ppid, exe or "", av))
     return out
 
+def process_roots(path) -> set:
+    """The box's hierarchy-root tgids (process.root=1) read from a sqlar on disk —
+    the finished-box counterpart to Index.roots()."""
+    path = Path(path)
+    if not path.exists(): return set()
+    conn = _sqlar_open(path)
+    try:
+        return {r[0] for r in conn.execute("SELECT tgid FROM process WHERE root=1")}
+    except sqlite3.Error: return set()
+    finally: conn.close()
+
 def sqlar_writer_id(path, rel) -> "int | None":
-    """The process-table row id that wrote `rel` (the sqlar `writer` tag), or None.
-    Finished-box path: read straight from the consolidated single sqlar."""
+    """The process-table row id that LAST wrote `rel` (the sqlar `last_writer` tag),
+    or None. Finished-box path: read straight from the consolidated single sqlar."""
     path = Path(path)
     if not path.exists(): return None
     conn = _sqlar_open(path)
     try:
-        row = conn.execute("SELECT writer FROM sqlar WHERE name=?", (rel,)).fetchone()
+        row = conn.execute("SELECT last_writer FROM sqlar WHERE name=?",
+                            (rel,)).fetchone()
     except sqlite3.Error: row = None
     finally: conn.close()
     return row[0] if row and row[0] is not None else None
@@ -1075,14 +1111,21 @@ def process_env(path, proc_id) -> dict:
     except (ValueError, TypeError): return {}
 
 def root_cmd(sid: str) -> list:
-    """The box's command: argv of the ROOT process row in <sid>.sqlar, keyed by the
-    host pid embedded in the sid. [] if the sid is malformed or no such row exists.
-    The persisted single source of truth, surviving after the runner exits."""
-    root_pid = parse_sid(sid)[1]
-    if not root_pid: return []
-    for _id, tgid, _ppid, _exe, argv in process_list(sqlar_path(sid)):
-        if tgid == root_pid: return list(argv)
-    return []
+    """The box's command: argv of its FIRST root process row (process.root=1, lowest
+    id) in <sid>.sqlar. [] if no such row exists. The persisted single source of truth,
+    surviving after the runner exits; a re-run box has several roots — this is the
+    original launch's command."""
+    path = sqlar_path(sid)
+    if not path.exists(): return []
+    conn = _sqlar_open(path)
+    try:
+        row = conn.execute("SELECT argv FROM process WHERE root=1"
+                           " ORDER BY id LIMIT 1").fetchone()
+    except sqlite3.Error: row = None
+    finally: conn.close()
+    if not row or not row[0]: return []
+    try: return list(json.loads(row[0]))
+    except (ValueError, TypeError): return []
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1276,11 +1319,12 @@ class Index:
         self._active: dict = {}           # tgid -> last-seen monotonic
         self._dead_since: dict = {}       # tgid -> first monotonic kill(0) saw it dead
         self._tracing = False             # -t: record the process table
-        # The box's root process: the host pid embedded in the sid. Newly-inserted
-        # process rows bubble up their PPid chain until they reach it (3c records its
-        # row at register), so the table stays one connected tree. 0 if the sid is
-        # malformed — bubbling then simply doesn't run.
-        self._root_pid = parse_sid(self.backing.name)[1]
+        # The box's hierarchy ROOTS: the tgids of every `slopbox -- cmd` launch (one
+        # per run; a re-run adds another). Newly-inserted process rows bubble up their
+        # PPid chain until they reach a root, so the table stays one connected FOREST.
+        # Authoritative source is the `process.root` column (loaded here, kept in sync
+        # by process_from_prov); the sid's pid is no longer consulted as the boundary.
+        self._roots: set = set()
         self._whiteouts: set = set()
         self._kinds: dict = {}
         self._opaque: set = set()
@@ -1300,6 +1344,10 @@ class Index:
                 self._kinds[path] = kind
             if opaque:
                 self._opaque.add(path)
+        # Hierarchy roots recorded by earlier runs (PPid-bubbling boundary).
+        for (tgid,) in self._db.execute(
+                "SELECT tgid FROM process WHERE root=1"):
+            self._roots.add(tgid)
 
     @staticmethod
     def _row_mode(kind, mode) -> int:
@@ -1378,16 +1426,24 @@ class Index:
                                            exe=prov["exe"], argv=prov["argv"],
                                            env=prov.get("env") or {})) or tgid
 
-    def process_from_prov(self, prov: dict) -> "int | None":
+    def process_from_prov(self, prov: dict, root: bool = False) -> "int | None":
         """Insert/dedup a process row from a provenance dict (tgid/ppid/exe/argv/env,
         all HOST-namespace — resolved by RelayServer from the --inner pidfd via host
         /proc, consistent with the FUSE path) and return its row id. Returns None if no
-        tgid was supplied. Same process-table + env-crc32 dedup as writer_for."""
+        tgid was supplied. Same process-table + env-crc32 dedup as writer_for. `root`
+        marks this tgid as a hierarchy root (a `slopbox -- cmd` launch) — the PPid
+        bubbling boundary; it is also remembered in the RAM `_roots` mirror."""
         tgid = int(prov.get("tgid") or 0)
         if not tgid: return None
         self._touch_active(tgid)                  # active-set: re-stamp on every sight
+        if root: self._roots.add(tgid)
         cached = self._proc_cache.get(tgid)
-        if cached is not None: return cached
+        if cached is not None:
+            if root:                              # promote an already-recorded row
+                with self._lock:
+                    self._db.execute("UPDATE process SET root=1 WHERE tgid=?", (tgid,))
+                    self._db.commit()
+            return cached
         ppid_tgid = int(prov.get("ppid") or 0)
         exe = prov.get("exe") or ""
         argv = prov.get("argv") or []
@@ -1402,16 +1458,17 @@ class Index:
                 eid = self._db.execute("SELECT id FROM env WHERE hash=?",
                                        (env_hash,)).fetchone()[0]
             cur = self._db.execute(
-                "INSERT OR IGNORE INTO process(tgid,ppid,exe,argv,env_id)"
-                " VALUES(?,?,?,?,?)",
-                (tgid, ppid_tgid, exe, json.dumps(argv), eid))
+                "INSERT OR IGNORE INTO process(tgid,ppid,exe,argv,env_id,root)"
+                " VALUES(?,?,?,?,?,?)",
+                (tgid, ppid_tgid, exe, json.dumps(argv), eid, 1 if root else 0))
             inserted = cur.rowcount > 0   # newly recorded vs. already present
             pid_row = self._db.execute("SELECT id FROM process WHERE tgid=?",
                                        (tgid,)).fetchone()[0]
             self._db.commit()
         self._proc_cache[tgid] = pid_row
         self._prov_by_proc[pid_row] = dict(pid=tgid, ppid=ppid_tgid, exe=exe, argv=argv)
-        if inserted: self._bubble_parent(tgid, ppid_tgid)
+        # A root is its own boundary; never bubble above it into the runner's ancestry.
+        if inserted and not root: self._bubble_parent(tgid, ppid_tgid)
         return pid_row
 
     def _bubble_parent(self, tgid: int, ppid: int) -> None:
@@ -1421,12 +1478,12 @@ class Index:
         the recursion at the first ancestor already present (the root row, recorded
         at register, is always present), guaranteeing termination. Best-effort: a
         failed ancestor /proc read links a minimal row and stops, never raises.
-        STOPS at: the root tgid (boundary — never walk above it into the runner's
-        own host ancestry), ppid<=1 (init), or any already-recorded parent."""
-        if not self._root_pid: return            # malformed sid: don't bubble
-        if tgid == self._root_pid: return        # the root row is the boundary
+        STOPS at: a root tgid (boundary — never walk above a `slopbox -- cmd` launch
+        into the runner's own host ancestry), ppid<=1 (init), or any already-recorded
+        parent."""
+        if tgid in self._roots: return           # a root row is the boundary
         if ppid <= 1: return                     # reached init; no system procs
-        if ppid in self._proc_cache: return      # parent already linked
+        if ppid in self._proc_cache: return      # parent already linked (roots always are)
         try:
             pprov = read_provenance(ppid, full_env=self._tracing)
         except OSError:
@@ -1449,6 +1506,11 @@ class Index:
         prov = self._prov_by_proc.get(pid_row) if pid_row is not None else None
         if prov is None: return None
         return prov["ppid"], prov["exe"] or "", list(prov["argv"])
+
+    def roots(self) -> set:
+        """The box's hierarchy-root tgids (the PPid-bubbling / tree-walk boundary).
+        GIL-atomic read of the RAM mirror (Index threading contract)."""
+        return set(self._roots)
 
     def live_processes(self) -> list:
         """htop-style live view of the box's ACTIVE SET: the recently-seen tgids only,
@@ -1515,21 +1577,25 @@ class Index:
     # ── mutations (write-through; upsert into the single sqlar) ──────────────
     def _upsert(self, path, mode, writer_id, opaque) -> None:
         """Upsert one entry row with data=NULL (filled at consolidate). opaque None
-        means leave as-is on update; writer_id None means leave as-is on update."""
+        means leave as-is on update; writer_id None means leave as-is on update.
+        `writer` records the FIRST process to touch the path (set once); `last_writer`
+        records the MOST RECENT (advanced on every named write)."""
         row = self._db.execute(
-            "SELECT opaque, writer FROM sqlar WHERE name=?", (path,)).fetchone()
+            "SELECT opaque, writer, last_writer FROM sqlar WHERE name=?",
+            (path,)).fetchone()
         if row is None:
             self._db.execute(
-                "INSERT INTO sqlar(name,mode,mtime,sz,data,opaque,writer)"
-                " VALUES(?,?,?,?,?,?,?)",
+                "INSERT INTO sqlar(name,mode,mtime,sz,data,opaque,writer,last_writer)"
+                " VALUES(?,?,?,?,?,?,?,?)",
                 (path, int(mode), 0, 0, None,
-                 int(opaque) if opaque is not None else 0, writer_id))
+                 int(opaque) if opaque is not None else 0, writer_id, writer_id))
         else:
             op_q = int(opaque) if opaque is not None else row[0]
-            wr = writer_id if writer_id is not None else row[1]
+            first = row[1] if row[1] is not None else writer_id   # FIRST: fill once
+            last = writer_id if writer_id is not None else row[2]  # LAST: advance
             self._db.execute(
-                "UPDATE sqlar SET mode=?, opaque=?, writer=? WHERE name=?",
-                (int(mode), op_q, wr, path))
+                "UPDATE sqlar SET mode=?, opaque=?, writer=?, last_writer=? WHERE name=?",
+                (int(mode), op_q, first, last, path))
 
     def set_entry(self, path, kind, mode, writer_id, op,
                   detail: str = "", opaque=None) -> None:
@@ -1567,18 +1633,19 @@ class Index:
         oldp = old + "/"; newp = new + "/"
         with self._lock:
             rows = self._db.execute(
-                "SELECT name, mode, opaque, writer FROM sqlar WHERE name LIKE ? ESCAPE '\\'",
+                "SELECT name, mode, opaque, writer, last_writer FROM sqlar"
+                " WHERE name LIKE ? ESCAPE '\\'",
                 (_like_escape(oldp) + "%",)).fetchall()
-            for path, mode, opaque, writer in rows:
+            for path, mode, opaque, writer, last_writer in rows:
                 np = newp + path[len(oldp):]
                 self._db.execute("DELETE FROM sqlar WHERE name=?", (path,))
                 self._db.execute(
                     "INSERT OR REPLACE INTO sqlar"
-                    "(name,mode,mtime,sz,data,opaque,writer)"
-                    " VALUES(?,?,?,?,?,?,?)",
-                    (np, mode, 0, 0, None, opaque, writer))
+                    "(name,mode,mtime,sz,data,opaque,writer,last_writer)"
+                    " VALUES(?,?,?,?,?,?,?,?)",
+                    (np, mode, 0, 0, None, opaque, writer, last_writer))
             self._db.commit()
-            for path, mode, opaque, writer in rows:
+            for path, mode, opaque, writer, last_writer in rows:
                 np = newp + path[len(oldp):]
                 kind = _kind_of_mode(mode)
                 self._whiteouts.discard(path); self._kinds.pop(path, None); self._opaque.discard(path)
@@ -1598,14 +1665,14 @@ class Index:
         return sorted(snap)
 
     def writer_id_for(self, path: str) -> "int | None":
-        """The process-table row id that last wrote `path` (the sqlar `writer` tag),
-        or None. Keys the proc pane → used to focus the writer when jumping to procs.
-        UI-thread read of the single sqlar handle: take _lock so it never races the
-        serve thread's writes on the shared connection (Index threading contract)."""
+        """The process-table row id that LAST wrote `path` (the sqlar `last_writer`
+        tag), or None. Keys the proc pane → used to focus the writer when jumping to
+        procs. UI-thread read of the single sqlar handle: take _lock so it never races
+        the serve thread's writes on the shared connection (Index threading contract)."""
         try:
             with self._lock:
                 row = self._db.execute(
-                    "SELECT writer FROM sqlar WHERE name=?", (path,)).fetchone()
+                    "SELECT last_writer FROM sqlar WHERE name=?", (path,)).fetchone()
         except sqlite3.Error: return None
         return row[0] if row and row[0] is not None else None
 
@@ -1613,7 +1680,7 @@ class Index:
         # No lock: consolidate-only precondition — called post-teardown with the box
         # dead and the serve thread stopped, so there is no concurrent writer.
         cur = self._db.execute(
-            "SELECT writer FROM sqlar WHERE name=?", (path,)).fetchone()
+            "SELECT last_writer FROM sqlar WHERE name=?", (path,)).fetchone()
         if not cur or cur[0] is None: return None
         cached = self._prov_by_proc.get(cur[0])
         if cached is not None: return dict(cached)
@@ -4282,9 +4349,12 @@ class Supervisor:
         # provenance at register). Persisted now via the one process-table insert
         # path, so an empty box still shows its command and survives the runner exit.
         root_prov = dict(msg.get("prov") or {})
-        root_prov["tgid"] = parse_sid(sid)[1]
+        # The runner's own host pid is the box root. It equals the sid's pid suffix on a
+        # first run; a re-run reuses an existing sid (different pid), so trust the
+        # runner-reported tgid and fall back to the sid only if absent.
+        root_prov["tgid"] = int(msg.get("root_tgid") or 0) or parse_sid(sid)[1]
         root_prov["argv"] = list(cmd)
-        index.process_from_prov(root_prov)
+        index.process_from_prov(root_prov, root=True)
         self.indexes[sid] = index
         self.mount.add_session(sid, up, index, passthrough=direct)
         # CA-augmented trust bundle as virtual files, if networked.
@@ -4522,6 +4592,13 @@ class Supervisor:
         finished box (its cached full table is self-contained)."""
         idx = self.indexes.get(sid)
         return idx.proc_info(tgid) if idx is not None else None
+
+    def proc_roots(self, sid) -> set:
+        """The box's hierarchy-root tgids (the proc-tree walk boundary). Live box → its
+        in-RAM Index; finished/discovered → the sqlar's process.root column."""
+        idx = self.indexes.get(sid)
+        if idx is not None: return idx.roots()
+        return process_roots(sqlar_path(sid))
 
     def process_env(self, sid, proc_id) -> dict:
         return process_env(sqlar_path(sid), proc_id)
@@ -5172,7 +5249,7 @@ def cmd_run(cmd, net, trace, direct, session_whitelist, chdir) -> int:
     # index, added the session to the mount, and exposed <mnt>/<sid> — only then
     # does the bwrap bind target exist. The ack carries the absolute mount path.
     ack = sync_request(SOCK_PATH, type="register", session_id=sid,
-                       cmd=list(cmd), prov=self_prov,
+                       cmd=list(cmd), prov=self_prov, root_tgid=os.getpid(),
                        session_whitelist=session_whitelist,
                        want_net=net, want_trace=trace, want_direct=direct)
     if not ack or not ack.get("ok") or not ack.get("mount"):
@@ -5180,7 +5257,7 @@ def cmd_run(cmd, net, trace, direct, session_whitelist, chdir) -> int:
         # UI failed to set up the overlay — retry once with a unique suffix.
         sid = sid + "." + uuid.uuid4().hex[:6]
         ack = sync_request(SOCK_PATH, type="register", session_id=sid,
-                           cmd=list(cmd), prov=self_prov,
+                           cmd=list(cmd), prov=self_prov, root_tgid=os.getpid(),
                            session_whitelist=session_whitelist,
                            want_net=net, want_trace=trace, want_direct=direct)
         if not ack or not ack.get("ok") or not ack.get("mount"):
@@ -6734,7 +6811,7 @@ def _make_ui_app():
                 self._pr_key=None
                 self._update_proc_detail()
                 return
-            root=parse_sid(sid)[1]
+            root=self.sup.proc_roots(sid)
             live=self.sup.processes_live(sid)
             if live is not None:
                 self._fin_procs.pop(sid, None)
