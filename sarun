@@ -3278,6 +3278,118 @@ class SqlarArchive(ChangeSource):
                     chmod=stat_mod.S_IMODE(mode))
 
 
+class NetworkPolicy:
+    """Owns the network decisioning: the permanent ruleset, the DNS resolve memo,
+    and the pending-approval bookkeeping. Holds NO session/index registry state —
+    every method that needs a box's per-session rules takes the `Session` object
+    (or resolves it through the injected `resolve_session` callback); recording a
+    decision against a Session and emitting UI events go through the injected
+    `record`/`emit` callbacks. Single-thread-confined to the UI asyncio loop, like
+    its owning Supervisor."""
+
+    def __init__(self, rules: Rules, resolve_session=None,
+                 record=None, emit=None):
+        self.rules = rules
+        self.pending: dict = {}
+        self._dns_cache: dict = {}
+        self._counter = 0
+        self._resolve_session = resolve_session or (lambda sid: None)
+        self._record = record or (lambda *a, **k: None)
+        self._emit = emit or (lambda **ev: None)
+
+    def _resolve(self, host: str) -> tuple:
+        """Best-effort DNS: (ips, cnames). Cached for the UI's lifetime. Uses
+        gethostbyname_ex for the IPv4 + CNAME/alias chain and getaddrinfo for
+        IPv6 (and IPv4). All best-effort — failures just yield empty lists."""
+        cached = self._dns_cache.get(host)
+        if cached is not None:
+            return cached
+        ips, cnames = set(), set()
+        try:
+            canon, aliases, addrs = socket.gethostbyname_ex(host)
+            ips.update(addrs)
+            if canon and canon.rstrip(".").lower() != host.lower():
+                cnames.add(canon.rstrip(".").lower())
+            cnames.update(a.rstrip(".").lower() for a in aliases)
+        except OSError:
+            pass
+        try:
+            for *_, sa in socket.getaddrinfo(host, None):
+                ips.add(sa[0])
+        except OSError:
+            pass
+        res = (sorted(ips), sorted(cnames)); self._dns_cache[host] = res
+        return res
+
+    def decide(self, s: Session, host: str, port: int,
+               url: str = None) -> "str | None":
+        need_dns = self.rules.needs_dns() or any(
+            r.kind in ("ip", "cname") for r in s.sess_rules)
+        ips, cnames = self._resolve(host) if need_dns else ((), ())
+        # session rules first (temporary overrides), then the permanent ruleset;
+        # each evaluated top-to-bottom, first match wins.
+        for r in s.sess_rules:
+            if r.matches(host, port, url, ips, cnames):
+                return r.action
+        return self.rules.decide(host, port, url, ips, cnames)
+
+    def precheck(self, sid, host, port, url=None) -> "str | None":
+        """Rule-only decision (no prompting) for the given request."""
+        s = self._resolve_session(sid)
+        if not s: return "deny"
+        return self.decide(s, host, port, url)
+
+    async def approval_request(self, sid, host, port, scheme, url="") -> dict:
+        s = self._resolve_session(sid)
+        if not s:
+            return {"action": "deny", "scope": "once"}
+        decided = self.decide(s, host, port, url)
+        if decided:
+            self._record(s, host, port, scheme, decided)
+            return {"action": decided, "scope": "rule"}
+        self._counter += 1
+        rid = f"{sid[:8]}-{self._counter}"
+        fut = asyncio.get_event_loop().create_future()
+        # Resolve now so the approval UI can offer IP / CNAME matches to the user.
+        ips, cnames = self._resolve(host)
+        self.pending[rid] = Pending(rid, sid, host, port, scheme, time.time(), fut,
+                                    url=url, ips=ips, cnames=cnames)
+        self._emit(type="approval_pending", approval=self._pending_dict(rid))
+        try:
+            result = await asyncio.wait_for(asyncio.shield(fut), timeout=300)
+        except asyncio.TimeoutError:
+            result = {"action": "deny", "scope": "once"}
+        self.pending.pop(rid, None)
+        action, scope = result["action"], result["scope"]
+        # The UI hands back the exact rule it wants ("kind:pattern") and where to
+        # put it; we only synthesise a host rule if it didn't supply one.
+        spec = result.get("spec") or f"host:{host}"
+        at_top = result.get("at_top", False)
+        if scope in ("session", "permanent"):
+            rule = Rule.parse(f"{action} {spec}")
+            if rule:
+                if scope == "session":
+                    s.sess_rules.insert(0 if at_top else len(s.sess_rules), rule)
+                else:
+                    self.rules.insert(rule, at_top=at_top)
+                    self._emit(type="rules_updated")
+        self._record(s, host, port, scheme, action)
+        self._emit(type="approval_resolved", request_id=rid)
+        return {"action": action, "scope": scope}
+
+    def resolve(self, rid, action, scope, spec=None, at_top=False) -> None:
+        p = self.pending.get(rid)
+        if p and not p.future.done():
+            p.future.set_result({"action": action, "scope": scope,
+                                 "spec": spec, "at_top": at_top})
+
+    def _pending_dict(self, rid) -> dict:
+        p = self.pending[rid]
+        return dict(request_id=p.request_id, session_id=p.session_id,
+                    host=p.host, port=p.port, scheme=p.scheme, ts=p.ts,
+                    url=p.url, ips=p.ips, cnames=p.cnames)
+
+
 class Supervisor:
     """Owns the live session set and drives consolidation. Concurrency contract
     (single-thread-confined, like Index's): EVERY method here runs on the UI
@@ -3285,19 +3397,23 @@ class Supervisor:
     loop:
 
       • the mitmproxy/relay path — the _GatingAddon coroutines and RelayServer
-        await `approval_request`/`precheck` and call `note_traffic`/`log_flow`
-        (and the per-connection relay handlers feed the ProxyEngine) — all from
-        the asyncio loop the ChannelServer/ProxyEngine/relays run on;
+        await `self.policy.approval_request`/`self.policy.precheck` and call
+        `note_traffic`/`log_flow` (and the per-connection relay handlers feed the
+        ProxyEngine) — all from the asyncio loop the
+        ChannelServer/ProxyEngine/relays run on;
       • the control plane — `register`/`unregister`/`drop`/`patch` via
         ChannelServer._dispatch_control, again on that same loop;
       • the Textual UI handlers — `kill`/`delete`/`apply`/`discard`/
-        `apply_hunk`/`discard_hunk`/`session_changes`/`hunks`/`resolve`/
+        `apply_hunk`/`discard_hunk`/`session_changes`/`hunks`/
         `invalidate_consolidation`/etc. — Textual runs on the SAME asyncio loop.
+
+    Network decisioning (the ruleset, DNS memo, and pending approvals) lives on
+    `self.policy` (a NetworkPolicy); `self.pending` aliases `self.policy.pending`.
 
     Because the control server, the proxy/relays, and the Textual app share one
     loop and one thread, there is no cross-thread access here: `self.sessions`,
-    `self.pending`, and `self._consolidated` are single-thread-confined to that
-    loop and mutated ONLY from it, so they need no lock.
+    `self.policy.pending`, and `self._consolidated` are single-thread-confined to
+    that loop and mutated ONLY from it, so they need no lock.
 
     The FUSE serve thread (a separate trio thread, see OverlayMount) never
     touches Supervisor state directly. It interacts only through the per-session
@@ -3307,15 +3423,14 @@ class Supervisor:
     loop, never on the serve thread."""
 
     def __init__(self, rules: Rules, mount: "OverlayMount | None" = None):
-        self.rules = rules
         self.mount = mount               # the single pyfuse3 OverlayMount (UI-owned)
         self.indexes: dict = {}          # sid -> live Index (for running sessions)
         self.sessions: dict = {}
-        self.pending: dict = {}
+        self.policy = NetworkPolicy(
+            rules, resolve_session=self.sessions.get,
+            record=self._record_traffic, emit=self._emit)
         self.selected_sid = None         # the UI's current box (target of `patch`)
         self._consolidated: set = set()  # sids already consolidated this run
-        self._dns_cache: dict = {}
-        self._counter = 0
         self.on_event = lambda ev: None
         # HIGH-1: per-session owner tokens + relay sockets. A box can reach only its
         # own relay socket and never the control socket, so it cannot register/unregister
@@ -3408,47 +3523,11 @@ class Supervisor:
                 del self.sessions[sid]
                 self._emit(type="session_removed", session_id=sid)
 
-    def _resolve(self, host: str) -> tuple:
-        """Best-effort DNS: (ips, cnames). Cached for the UI's lifetime. Uses
-        gethostbyname_ex for the IPv4 + CNAME/alias chain and getaddrinfo for
-        IPv6 (and IPv4). All best-effort — failures just yield empty lists."""
-        cached = self._dns_cache.get(host)
-        if cached is not None:
-            return cached
-        ips, cnames = set(), set()
-        try:
-            canon, aliases, addrs = socket.gethostbyname_ex(host)
-            ips.update(addrs)
-            if canon and canon.rstrip(".").lower() != host.lower():
-                cnames.add(canon.rstrip(".").lower())
-            cnames.update(a.rstrip(".").lower() for a in aliases)
-        except OSError:
-            pass
-        try:
-            for *_, sa in socket.getaddrinfo(host, None):
-                ips.add(sa[0])
-        except OSError:
-            pass
-        res = (sorted(ips), sorted(cnames)); self._dns_cache[host] = res
-        return res
-
-    def _decide(self, s: Session, host: str, port: int,
-                url: str = None) -> "str | None":
-        need_dns = self.rules.needs_dns() or any(
-            r.kind in ("ip", "cname") for r in s.sess_rules)
-        ips, cnames = self._resolve(host) if need_dns else ((), ())
-        # session rules first (temporary overrides), then the permanent ruleset;
-        # each evaluated top-to-bottom, first match wins.
-        for r in s.sess_rules:
-            if r.matches(host, port, url, ips, cnames):
-                return r.action
-        return self.rules.decide(host, port, url, ips, cnames)
-
-    def precheck(self, sid, host, port, url=None) -> "str | None":
-        """Rule-only decision (no prompting) for the given request."""
-        s = self.sessions.get(sid)
-        if not s: return "deny"
-        return self._decide(s, host, port, url)
+    @property
+    def pending(self) -> dict:
+        """Network-approval bookkeeping lives on the policy; aliased here because
+        the external surface exposes `Supervisor.pending`."""
+        return self.policy.pending
 
     def _record_traffic(self, s, host, port, scheme, action,
                         bytes_up=0, bytes_down=0, status=0) -> None:
@@ -3604,50 +3683,6 @@ class Supervisor:
         if self.sessions.pop(sid, None) is not None:
             self._emit(type="session_removed", session_id=sid)
 
-    async def approval_request(self, sid, host, port, scheme, url="") -> dict:
-        s = self.sessions.get(sid)
-        if not s:
-            return {"action": "deny", "scope": "once"}
-        decided = self._decide(s, host, port, url)
-        if decided:
-            self._record_traffic(s, host, port, scheme, decided)
-            return {"action": decided, "scope": "rule"}
-        self._counter += 1
-        rid = f"{sid[:8]}-{self._counter}"
-        fut = asyncio.get_event_loop().create_future()
-        # Resolve now so the approval UI can offer IP / CNAME matches to the user.
-        ips, cnames = self._resolve(host)
-        self.pending[rid] = Pending(rid, sid, host, port, scheme, time.time(), fut,
-                                    url=url, ips=ips, cnames=cnames)
-        self._emit(type="approval_pending", approval=self._pending_dict(rid))
-        try:
-            result = await asyncio.wait_for(asyncio.shield(fut), timeout=300)
-        except asyncio.TimeoutError:
-            result = {"action": "deny", "scope": "once"}
-        self.pending.pop(rid, None)
-        action, scope = result["action"], result["scope"]
-        # The UI hands back the exact rule it wants ("kind:pattern") and where to
-        # put it; we only synthesise a host rule if it didn't supply one.
-        spec = result.get("spec") or f"host:{host}"
-        at_top = result.get("at_top", False)
-        if scope in ("session", "permanent"):
-            rule = Rule.parse(f"{action} {spec}")
-            if rule:
-                if scope == "session":
-                    s.sess_rules.insert(0 if at_top else len(s.sess_rules), rule)
-                else:
-                    self.rules.insert(rule, at_top=at_top)
-                    self._emit(type="rules_updated")
-        self._record_traffic(s, host, port, scheme, action)
-        self._emit(type="approval_resolved", request_id=rid)
-        return {"action": action, "scope": scope}
-
-    def resolve(self, rid, action, scope, spec=None, at_top=False) -> None:
-        p = self.pending.get(rid)
-        if p and not p.future.done():
-            p.future.set_result({"action": action, "scope": scope,
-                                 "spec": spec, "at_top": at_top})
-
     def note_traffic(self, sid, host, port, scheme, action, bu, bd, status) -> None:
         s = self.sessions.get(sid)
         if s: self._record_traffic(s, host, port, scheme, action, bu, bd, status)
@@ -3693,12 +3728,6 @@ class Supervisor:
 
     def process_env(self, sid, proc_id) -> dict:
         return process_env(sqlar_path(sid), proc_id)
-
-    def _pending_dict(self, rid) -> dict:
-        p = self.pending[rid]
-        return dict(request_id=p.request_id, session_id=p.session_id,
-                    host=p.host, port=p.port, scheme=p.scheme, ts=p.ts,
-                    url=p.url, ips=p.ips, cnames=p.cnames)
 
     def kill(self, sid) -> None:
         # s.pid is the runner ("slopbox CMD") process, derived from the session id.
@@ -4021,7 +4050,7 @@ class _GatingAddon:
             403, b"slopbox: denied\n", {"Content-Type": "text/plain"})
 
     async def _gate(self, flow, scheme: str, url: str = "") -> None:
-        res = await self.sup.approval_request(
+        res = await self.sup.policy.approval_request(
             _CURRENT_SID.get(), flow.request.host, flow.request.port, scheme, url)
         if res.get("action") != "allow":
             self._deny(flow)
@@ -4038,8 +4067,8 @@ class _GatingAddon:
         else:
             # https was already gated at CONNECT; here we only enforce a URL-level
             # deny rule, so we don't prompt twice for the same connection.
-            if self.sup.precheck(_CURRENT_SID.get(), flow.request.host,
-                                 flow.request.port, url) == "deny":
+            if self.sup.policy.precheck(_CURRENT_SID.get(), flow.request.host,
+                                        flow.request.port, url) == "deny":
                 self._deny(flow)
 
     def response(self, flow):
@@ -5685,7 +5714,7 @@ def _make_ui_app():
         def action_ap_deny(self): self._ap_once("deny")
         def _ap_once(self, action):
             a=self._first_pending()
-            if a: self.sup.resolve(a["request_id"], action, "once")
+            if a: self.sup.policy.resolve(a["request_id"], action, "once")
 
         def action_ap_allow_rule(self): self._ap_rule("allow")
         def action_ap_deny_rule(self): self._ap_rule("deny")
@@ -5696,7 +5725,7 @@ def _make_ui_app():
             def done(res):
                 if res:
                     scope,spec,at_top=res
-                    self.sup.resolve(rid, action, scope, spec, at_top)
+                    self.sup.policy.resolve(rid, action, scope, spec, at_top)
             self.push_screen(RuleModal(action, a), done)
 
         def action_refresh(self):
