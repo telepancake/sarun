@@ -4669,6 +4669,8 @@ class Supervisor:
             return dict(ok=True, sid=sid, old=sid)
         if self.review._live(sid):
             return dict(ok=False, error="can't rename a running slopbox")
+        if sid in self.review._consolidating:
+            return dict(ok=False, error="slopbox is consolidating; try again in a moment")
         if self._box_exists(new_name):
             return dict(ok=False, error=f"name '{new_name}' is already in use")
         old_sqlar, new_sqlar = sqlar_path(sid), sqlar_path(new_name)
