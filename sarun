@@ -3956,76 +3956,93 @@ class ChangeReview:
         """READ-ONLY, informational insight for a single binary entry: the libmagic
         type line(s) on top, then (for a recognized type) a unified diff of a
         structural dump of base vs current bytes — readelf for ELF, openssl for
-        certs/keys, ar/unzip/tar for archives. The heavyweight parsers run only via
-        the hardened run_on_untrusted sandbox; the magic sniff runs in-process
-        (libmagic handles hostile input). Lazy + cached per (sid, rel); NOT an
-        applyable hunk. Returns dict(lines=[(style, text), ...]) or None when magic
-        is unavailable. Never raises."""
-        rel = rel.lstrip("/")
-        key = (sid, rel)
-        if key in self._struct_cache: return self._struct_cache[key]
-        if magic is None:
-            self._struct_cache[key] = None
-            return None
-        try:
-            res = self._structural_diff(sid, rel)
-        except Exception as e:
-            res = dict(lines=[("err", f"structural diff failed: {e}")])
-        self._struct_cache[key] = res
-        return res
+        certs/keys, ar/unzip/tar for archives. SYNCHRONOUS (runs the sandboxed parsers
+        inline); the interactive UI uses the quick/finish split below so it never
+        blocks. Returns dict(lines=...) or None when magic is unavailable."""
+        lines, job = self.structural_diff_quick(sid, rel)
+        if job is not None:
+            return self.structural_diff_finish(job)
+        return self._struct_cache.get((sid, rel.lstrip("/")))
 
     def _struct_type(self, data: bytes) -> str:
         try: return magic.from_buffer(data[:65536]) or "data"
         except Exception: return "data"
 
-    def _structural_diff(self, sid, rel) -> dict:
-        src = self._source(sid)
-        base = self._lower_bytes(rel) or b""
-        cur = src.current_bytes(rel) or b""
+    def structural_diff_quick(self, sid, rel) -> tuple:
+        """FAST in-process half: libmagic type line(s) + differ selection — no
+        sandboxed parser runs here. Returns (lines, job): when `job` is None the lines
+        are the COMPLETE result (already cached: a hit, an unrecognized type, or a file
+        over the size cap); when `job` is a dict it describes the heavyweight dump for
+        structural_diff_finish to run off the UI loop. `lines` is the partial result to
+        show immediately (type + the structural-diff header). Never raises."""
+        rel = rel.lstrip("/")
+        key = (sid, rel)
+        if key in self._struct_cache:
+            res = self._struct_cache[key]
+            return ((res.get("lines", []) if res else []), None)
+        if magic is None:
+            self._struct_cache[key] = None
+            return ([], None)
+        try:
+            src = self._source(sid)
+            base = self._lower_bytes(rel) or b""
+            cur = src.current_bytes(rel) or b""
+        except Exception as e:
+            res = dict(lines=[("err", f"structural diff failed: {e}")])
+            self._struct_cache[key] = res
+            return (res["lines"], None)
         lines = []
         if base and cur:
-            bt, ct = self._struct_type(base), self._struct_type(cur)
-            lines.append(("type", f"type (base): {bt}"))
-            lines.append(("type", f"type (current): {ct}"))
+            lines.append(("type", f"type (base): {self._struct_type(base)}"))
+            lines.append(("type", f"type (current): {self._struct_type(cur)}"))
         else:
-            d = cur or base
-            lines.append(("type", f"type: {self._struct_type(d)}"))
-        # Pick the differ off the present side (prefer current).
+            lines.append(("type", f"type: {self._struct_type(cur or base)}"))
         sniff = cur or base
-        st = self._struct_type(sniff)
-        diff = differ_for(st, sniff)
-        if diff is None:
-            return dict(lines=lines)
+        diff = differ_for(self._struct_type(sniff), sniff)
+        if diff is None:                                  # nothing heavy to run
+            self._struct_cache[key] = dict(lines=lines)
+            return (lines, None)
         argv, label = diff
         lines.append(("hdr", f"── structural diff · {label} ──"))
         if (base and len(base) > _STRUCT_MAX) or (cur and len(cur) > _STRUCT_MAX):
             lines.append(("dim", f"(skipped: file exceeds {fmt_bytes(_STRUCT_MAX)})"))
-            return dict(lines=lines)
-        def dump(data):
-            if not data: return (None, "")
-            ok, out, err = run_on_untrusted(argv, {"in": data})
-            return (ok, out if ok else f"<parser error: {err}>")
-        if base and cur:
-            _, bd = dump(base); _, cd = dump(cur)
-            ud = difflib.unified_diff(bd.splitlines(), cd.splitlines(),
-                                      "base", "current", lineterm="")
-            any_line = False
-            for ln in ud:
-                any_line = True
-                if ln.startswith(("+++", "---")): lines.append(("hdr", ln))
-                elif ln.startswith("+"): lines.append(("+", ln))
-                elif ln.startswith("-"): lines.append(("-", ln))
-                elif ln.startswith("@@"): lines.append(("@", ln))
-                else: lines.append((" ", ln))
-            if not any_line:
-                lines.append(("dim", "(structural dumps identical)"))
-        else:
-            _, d = dump(cur or base)
-            side = "current" if cur else "base"
-            lines.append(("dim", f"({side} only)"))
-            for ln in d.splitlines():
-                lines.append((" ", ln))
-        return dict(lines=lines)
+            self._struct_cache[key] = dict(lines=lines)
+            return (lines, None)
+        return (lines, dict(key=key, argv=argv, base=base, cur=cur, head=list(lines)))
+
+    def structural_diff_finish(self, job, on_spawn=None) -> dict:
+        """SLOW half: run the sandboxed dump(s) for `job` (from structural_diff_quick)
+        and build the unified structural diff. Meant to run OFF the UI loop. Each bwrap
+        Popen is handed to `on_spawn(proc)` (if given) so the caller can kill it to
+        cancel. Caches and returns the final dict(lines=...). Never raises."""
+        lines = list(job["head"]); base, cur, argv = job["base"], job["cur"], job["argv"]
+        try:
+            def dump(data):
+                if not data: return ""
+                ok, out, err = run_on_untrusted(argv, {"in": data}, on_spawn=on_spawn)
+                return out if ok else f"<parser error: {err}>"
+            if base and cur:
+                bd, cd = dump(base), dump(cur)
+                any_line = False
+                for ln in difflib.unified_diff(bd.splitlines(), cd.splitlines(),
+                                               "base", "current", lineterm=""):
+                    any_line = True
+                    if ln.startswith(("+++", "---")): lines.append(("hdr", ln))
+                    elif ln.startswith("+"): lines.append(("+", ln))
+                    elif ln.startswith("-"): lines.append(("-", ln))
+                    elif ln.startswith("@@"): lines.append(("@", ln))
+                    else: lines.append((" ", ln))
+                if not any_line:
+                    lines.append(("dim", "(structural dumps identical)"))
+            else:
+                lines.append(("dim", f"({'current' if cur else 'base'} only)"))
+                for ln in dump(cur or base).splitlines():
+                    lines.append((" ", ln))
+        except Exception as e:
+            lines.append(("err", f"structural diff failed: {e}"))
+        res = dict(lines=lines)
+        self._struct_cache[job["key"]] = res
+        return res
 
     def invalidate_struct(self, sid=None) -> None:
         """Drop cached structural diffs (all, or just one sid). Called wherever the
@@ -5350,12 +5367,15 @@ def _untrusted_rlimits(timeout, out_cap):
         resource.setrlimit(resource.RLIMIT_FSIZE, (fsz, fsz))
     return _set
 
-def run_on_untrusted(argv, files, timeout=10, out_cap=256 * 1024):
+def run_on_untrusted(argv, files, timeout=10, out_cap=256 * 1024, on_spawn=None):
     """Run `argv` over untrusted `files` (name->bytes) inside a throwaway bwrap.
     `files` are written to a fresh temp dir, ro-bound read-only into the sandbox;
     `argv` placeholders like "{in}" resolve to the path INSIDE the sandbox.
-    Returns (ok, output_text, err): ok False + a clean error string on
-    timeout / oom / missing tool / nonzero exit. Never raises."""
+    `on_spawn(proc)`, if given, receives the bwrap Popen right after launch so a
+    caller on another thread can kill it (the box runs under --die-with-parent in its
+    own pid namespace, so a SIGKILL to the group tears the whole tree down — no
+    zombies). Returns (ok, output_text, err): ok False + a clean error string on
+    timeout / oom / missing tool / nonzero exit / external kill. Never raises."""
     if shutil.which("bwrap") is None:
         return (False, "", "bwrap unavailable")
     try:
@@ -5379,6 +5399,9 @@ def run_on_untrusted(argv, files, timeout=10, out_cap=256 * 1024):
                     stderr=subprocess.PIPE, preexec_fn=_untrusted_rlimits(timeout, out_cap))
             except Exception as e:
                 return (False, "", f"spawn failed: {e}")
+            if on_spawn is not None:
+                try: on_spawn(proc)
+                except Exception: pass
             try:
                 out, err = proc.communicate(timeout=timeout)
             except subprocess.TimeoutExpired:
@@ -5918,6 +5941,17 @@ def _make_ui_app():
             # the latest fraction to render. Both are mutated on the UI thread only —
             # the worker marshals updates via call_from_thread.
             self._cons_progress={}
+            # Off-loop structural (binary) diff. The heavy readelf/openssl/… parsers
+            # run in a worker thread under bwrap, so the UI never blocks decompiling a
+            # big binary. Started after a 0.1s debounce (so fast navigation doesn't even
+            # spawn them), animated while running, and killed if the selection moves
+            # away before it finishes.
+            self._struct_gen=0        # bumped on cancel/supersede; stale workers ignored
+            self._struct_proc=None    # the live bwrap Popen (killed on navigate-away)
+            self._struct_lock=threading.Lock()
+            self._struct_timer=None   # 0.1s debounce handle
+            self._struct_spin_timer=None; self._struct_spin_item=None; self._struct_spin_i=0
+            self._struct_job=None
 
         def compose(self) -> ComposeResult:
             yield Header()
@@ -6184,6 +6218,8 @@ def _make_ui_app():
                 self._update_box_detail()
 
         async def on_unmount(self):
+            try: self._cancel_struct()    # kill any in-flight structural parser
+            except Exception: pass
             if self.server: await self.server.stop()
             # Tear down the single overlay mount; lazy-unmount fallback keeps the
             # mount table clean even if a handler is wedged.
@@ -6328,6 +6364,9 @@ def _make_ui_app():
 
         # ── view machinery: one left list at a time + its right-pane detail ────
         def _set_view(self, v):
+            # Leaving the diff pane: kill any structural parser still running for it.
+            if self.view=="changes" and v!="changes":
+                self._cancel_struct()
             self.view=v
             for k,sel in self.LEFT.items():
                 try: self.query_one(sel).display=(k==v)
@@ -6823,14 +6862,93 @@ def _make_ui_app():
 
         _STRUCT_STYLE={"type":"yellow","hdr":"bold cyan","+":"green","-":"red",
                        "@":"cyan","err":"red"," ":"dim","dim":"dim"}
-        def _struct_lines(self, sid, rel):
-            try: res=self.sup.review.structural_diff(sid, rel)
-            except Exception: res=None
-            if not res: return []
-            out=[Text("")]
-            for style, txt in res.get("lines", []):
-                out.append(Text(txt, style=self._STRUCT_STYLE.get(style, "")))
-            return out
+        def _struct_text(self, style, txt):
+            return Text(txt, style=self._STRUCT_STYLE.get(style, ""))
+
+        # ── off-loop structural (binary) diff: debounce + spinner + cancel ──────
+        def _cancel_struct(self):
+            """Supersede any in-flight structural diff: stop the debounce, stop the
+            spinner, and KILL the running bwrap parser (don't keep decompiling a 100MB
+            binary the user has navigated away from). Bumping the generation makes any
+            worker already past the kill point discard its result."""
+            self._struct_gen += 1
+            if self._struct_timer is not None:
+                try: self._struct_timer.stop()
+                except Exception: pass
+                self._struct_timer=None
+            self._stop_struct_spin()
+            with self._struct_lock:
+                proc=self._struct_proc; self._struct_proc=None
+            if proc is not None:
+                try: os.killpg(proc.pid, signal.SIGKILL)
+                except Exception:
+                    try: proc.kill()
+                    except Exception: pass
+            self._struct_job=None
+
+        def _stop_struct_spin(self):
+            if self._struct_spin_timer is not None:
+                try: self._struct_spin_timer.stop()
+                except Exception: pass
+                self._struct_spin_timer=None
+            self._struct_spin_item=None
+
+        def _struct_spin_tick(self):
+            frames="⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+            self._struct_spin_i=(self._struct_spin_i+1)%len(frames)
+            if self._struct_spin_item is not None:
+                try: self._struct_spin_item.update(Text(
+                    f"  {frames[self._struct_spin_i]} analyzing structure…  "
+                    "(navigate away to cancel)", style="dim"))
+                except Exception: pass
+
+        def _begin_struct(self, sid, rel, job, dv):
+            """A heavyweight structural diff is pending for (sid,rel): show an animated
+            indicator now and start the sandboxed parser after a 0.1s debounce, so
+            scrolling through rows stays smooth and only the row you settle on runs."""
+            self._struct_job=job
+            self._struct_spin_i=0
+            self._struct_spin_item=Label(Text("  ⠋ analyzing structure…  "
+                                              "(navigate away to cancel)", style="dim"))
+            dv.append(ListItem(self._struct_spin_item))
+            self._struct_spin_timer=self.set_interval(0.12, self._struct_spin_tick)
+            gen=self._struct_gen
+            self._struct_timer=self.set_timer(
+                0.1, lambda: self._run_struct(gen, sid, rel, job))
+
+        def _run_struct(self, gen, sid, rel, job):
+            if gen != self._struct_gen: return        # superseded during the debounce
+            self._struct_timer=None
+            self.run_worker(lambda: self._struct_worker(gen, sid, rel, job),
+                            thread=True, exclusive=False, name="structdiff")
+
+        def _struct_worker(self, gen, sid, rel, job):
+            """Worker THREAD: run the sandboxed parser(s). on_spawn registers the bwrap
+            Popen so _cancel_struct can kill it; a generation bump makes us discard a
+            late result. Result is cached by structural_diff_finish; the loop just
+            re-renders from cache."""
+            def on_spawn(proc):
+                with self._struct_lock:
+                    if gen == self._struct_gen: self._struct_proc=proc
+                    else:
+                        try: os.killpg(proc.pid, signal.SIGKILL)
+                        except Exception:
+                            try: proc.kill()
+                            except Exception: pass
+            try:
+                self.sup.review.structural_diff_finish(job, on_spawn=on_spawn)
+            finally:
+                with self._struct_lock: self._struct_proc=None
+            self.call_from_thread(self._struct_done, gen, sid, rel)
+
+        def _struct_done(self, gen, sid, rel):
+            if gen != self._struct_gen: return        # superseded: ignore
+            self._stop_struct_spin()
+            # The result is now cached; re-render the diff in place (quick() returns the
+            # full cached lines, no job, so no new worker is kicked).
+            if (self.view=="changes" and self._ch_sid==sid
+                    and self._sel_path()==rel):
+                self._load_diff(sid, rel, keep_pos=True)
 
         def _update_cd_info(self, rel=None):
             # Full path + kind/size/mode shown above the diff, since the file
@@ -6864,6 +6982,9 @@ def _make_ui_app():
         def _load_diff(self, sid, rel, keep_pos=False):
             dv=self.query_one("#cd-log",DiffView)
             keep=dv.index if keep_pos else None
+            # Supersede any structural diff in flight for a previous row: stop its
+            # spinner and KILL its bwrap parser so navigation never blocks or lingers.
+            self._cancel_struct()
             res=self.sup.review.hunks(sid, rel)
             dv.clear()
             if res.get("is_text"):
@@ -6875,11 +6996,17 @@ def _make_ui_app():
             else:
                 for line in self._diff_info_lines(res.get("diff") or {}):
                     dv.append(ListItem(Label(line)))
-                # Read-only binary insight: libmagic type + (for recognized types)
-                # a structural diff via the sandboxed runner. Lazy + cached; NOT an
-                # applyable hunk, so it lives in the info path, not HunkItem.
-                for line in self._struct_lines(sid, rel):
-                    dv.append(ListItem(Label(line)))
+                # Read-only binary insight: libmagic type + (for recognized types) a
+                # structural diff. The FAST half (type + differ pick) renders now; the
+                # heavy sandboxed parser runs off-loop, debounced 0.1s, animated, and
+                # cancellable — so a big binary never locks the UI.
+                try: head, job = self.sup.review.structural_diff_quick(sid, rel)
+                except Exception: head, job = [], None
+                if head: dv.append(ListItem(Label(Text(""))))
+                for style, txt in head:
+                    dv.append(ListItem(Label(self._struct_text(style, txt))))
+                if job is not None:
+                    self._begin_struct(sid, rel, job, dv)
             n=len(dv.children)
             if keep is not None and n: dv.index=min(keep, n-1)
             elif n: dv.index=0   # highlight a hunk so a/x act without an extra step
