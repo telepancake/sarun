@@ -1792,9 +1792,9 @@ def _build_overlay_ops():
             a.st_size = st.st_size
             a.st_blksize = 512
             a.st_blocks = (st.st_size + 511) // 512
-            a.st_atime_ns = int(getattr(st, "st_atime", 0) * 1e9)
-            a.st_mtime_ns = int(getattr(st, "st_mtime", 0) * 1e9)
-            a.st_ctime_ns = int(getattr(st, "st_ctime", 0) * 1e9)
+            a.st_atime_ns = getattr(st, "st_atime_ns", 0)
+            a.st_mtime_ns = getattr(st, "st_mtime_ns", 0)
+            a.st_ctime_ns = getattr(st, "st_ctime_ns", 0)
             a.attr_timeout = ATTR_TIMEOUT
             a.entry_timeout = ENTRY_TIMEOUT
             return a
@@ -1809,7 +1809,7 @@ def _build_overlay_ops():
             a.st_size = 0
             a.st_blksize = 512
             a.st_blocks = 0
-            now = int(time.time() * 1e9)
+            now = time.time_ns()
             a.st_atime_ns = a.st_mtime_ns = a.st_ctime_ns = now
             a.attr_timeout = ATTR_TIMEOUT
             a.entry_timeout = ENTRY_TIMEOUT
@@ -1826,8 +1826,8 @@ def _build_overlay_ops():
             a.st_size = len(content)
             a.st_blksize = 512
             a.st_blocks = (len(content) + 511) // 512
-            try: lst = os.lstat(self._lower_path(rel)); ts = int(lst.st_mtime * 1e9)
-            except OSError: ts = int(time.time() * 1e9)
+            try: lst = os.lstat(self._lower_path(rel)); ts = lst.st_mtime_ns
+            except OSError: ts = time.time_ns()
             a.st_atime_ns = a.st_mtime_ns = a.st_ctime_ns = ts
             a.attr_timeout = ATTR_TIMEOUT
             a.entry_timeout = ENTRY_TIMEOUT
@@ -2462,11 +2462,11 @@ def _build_overlay_ops():
                         os.chown(upath, uid, gid, follow_symlinks=False)
                     if fields.update_mtime or fields.update_atime:
                         st0 = os.lstat(upath)
-                        atime = (attr.st_atime_ns / 1e9 if fields.update_atime
-                                 else st0.st_atime)
-                        mtime = (attr.st_mtime_ns / 1e9 if fields.update_mtime
-                                 else st0.st_mtime)
-                        os.utime(upath, (atime, mtime), follow_symlinks=False)
+                        atime_ns = (attr.st_atime_ns if fields.update_atime
+                                    else st0.st_atime_ns)
+                        mtime_ns = (attr.st_mtime_ns if fields.update_mtime
+                                    else st0.st_mtime_ns)
+                        os.utime(upath, ns=(atime_ns, mtime_ns), follow_symlinks=False)
                 except OSError as e:
                     raise pyfuse3.FUSEError(e.errno or errno.EIO)
                 st = os.lstat(upath)
