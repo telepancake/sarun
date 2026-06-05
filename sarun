@@ -72,6 +72,7 @@ import difflib
 import errno
 import fcntl
 import fnmatch
+import functools
 import ipaddress
 import json
 import os
@@ -4128,33 +4129,104 @@ class Supervisor:
         return msg.get("owner_token") == want
 
     def unregister(self, msg: dict) -> None:
+        """Synchronous teardown: the fold runs inline on the CALLING thread. Used by
+        non-UI callers (control-plane tests, a relay-loop caller) where blocking that
+        thread is fine. The interactive UI must NOT use this — `_dispatch_control`
+        calls unregister_async, which folds OFF the loop (awaited) so the UI never
+        freezes. Both share the same prep/fold/post helpers, so the resulting sqlar is
+        identical; only WHERE the fold runs differs."""
+        ctx = self._teardown_prep(msg)
+        if ctx is None: return
+        sid, s, index, backing, reported_status = ctx
+        self._teardown_fold(sid, s, index, backing, reported_status, executor=None)
+        self._teardown_post(msg, sid, s, index, backing, reported_status)
+
+    async def unregister_async(self, msg: dict, loop) -> None:
+        """Loop-side teardown: identical to unregister() but the slow deflate fold runs
+        in the executor, AWAITED — the UI loop stays free during the minute-long fold
+        while the box is fully consolidated by the time this returns, so programmatic
+        observers (test_e2e / test_control_plane / `slopbox patch`) that read results
+        right after a box reports finished see the consolidated result with no race."""
+        ctx = self._teardown_prep(msg)
+        if ctx is None: return
+        sid, s, index, backing, reported_status = ctx
+        aw = self._teardown_fold(sid, s, index, backing, reported_status,
+                                 executor=loop)
+        if aw is not None:
+            await aw
+        self._teardown_post(msg, sid, s, index, backing, reported_status)
+
+    def _teardown_prep(self, msg: dict):
+        """Loop/thread-side teardown setup, shared by sync + async unregister: validate,
+        check the owner token, stop the relay, then remove the box from the live mount
+        set (this DETACHES it from the FUSE serve thread, so its live Index becomes
+        QUIESCENT — the single writer is done with it) and pop the Index handle. Returns
+        (sid, s, index, backing, reported_status) or None to abort."""
         sid = msg.get("session_id")
         if not valid_sid(sid):
-            return
+            return None
         if not self._owns(msg, sid):
             print(f"slopbox(ui): rejected unregister of {sid} (bad owner token)",
                   file=sys.stderr)
-            return
+            return None
         self._stop_relay(sid)
         self._owner_tokens.pop(sid, None)
         s = self.sessions.get(sid)
         reported_status = msg.get("status", "finished")
-        # Teardown: remove the box from the live mount set, consolidate its overlay
-        # (fill the single sqlar's NULL blobs from the upper, provenance into the
-        # same db), then drop the backing tree. live/ + the synthetic root are empty
-        # at rest. Fail-closed on the security-critical teardown — log, don't pass.
-        # If bwrap never launched (status="error"), skip consolidate — the upper was
-        # never written by the box, so there is nothing to surface as a change set.
         if self.mount is not None:
             self.mount.remove_session(sid)
         index = self.indexes.pop(sid, None)
-        backing = live_dir(sid)
-        if backing.exists() and reported_status != "error":
+        return sid, s, index, live_dir(sid), reported_status
+
+    def _teardown_fold(self, sid, s, index, backing, reported_status, executor):
+        """Consolidate the box's overlay into its single sqlar (fill NULL blobs + record
+        provenance). If `executor` (the event loop) is given, run the fold there and
+        return an awaitable; otherwise fold inline and return None. The Index is passed
+        through: remove_session() in _teardown_prep already detached it from the serve
+        thread, so it is quiescent (consolidate only READS deletions()/opaque_dirs() —
+        GIL-atomic — and WRITES the sqlar over its own conn). It is close()d AFTER the
+        fold (in _teardown_post). Show the placeholder + #cons-bar via _consolidating
+        (loop-confined, set/cleared here) and progress events (post_message is thread-
+        safe, so an executor-thread progress callback marshals fine). Fail-closed on a
+        consolidate error: log and continue teardown. If bwrap never launched
+        (status="error"), skip the fold — the upper holds nothing the box wrote.
+
+        Returns an awaitable when `executor` is set, else None — unregister_async awaits
+        it, the sync path ignores it."""
+        if not (backing.exists() and reported_status != "error"):
+            return None
+        cmd = list(s.cmd) if s else root_cmd(sid)
+        self.review._consolidating.add(sid)
+        self._emit(type="consolidate_started", session_id=sid)
+        def _prog(done, total):
+            self._emit(type="consolidate_progress", session_id=sid,
+                       done=done, total=total)
+        def _done(err):
+            if err is not None:
+                print(f"slopbox(ui): consolidate {sid} failed: {err}", file=sys.stderr)
+            self.review._consolidating.discard(sid)
+            self._emit(type="consolidate_finished", session_id=sid)
+        if executor is None:
             try:
-                consolidate(str(backing), sid, list(s.cmd) if s else root_cmd(sid),
-                            index=index)
+                consolidate(str(backing), sid, cmd, index=index, progress=_prog)
+                _done(None)
             except Exception as e:
-                print(f"slopbox(ui): consolidate {sid} failed: {e}", file=sys.stderr)
+                _done(e)
+            return None
+        async def _run():
+            try:
+                await executor.run_in_executor(
+                    None, functools.partial(consolidate, str(backing), sid, cmd,
+                                            index=index, progress=_prog))
+                _done(None)
+            except Exception as e:
+                _done(e)
+        return _run()
+
+    def _teardown_post(self, msg, sid, s, index, backing, reported_status):
+        """Loop/thread-side teardown finish, shared by sync + async unregister: close the
+        Index AFTER the fold, drop the spent backing tree, then update session
+        status/has_sqlar/has_flows. live/ + the synthetic root are empty at rest."""
         if index is not None:
             index.close()
         try:
@@ -4676,7 +4748,7 @@ class ChannelServer:
                 return self.sup.register(msg)          # acks with the mount path
             except Exception as e:
                 return dict(ok=False, error=str(e))
-        elif t == "unregister": self.sup.unregister(msg)
+        elif t == "unregister": await self.sup.unregister_async(msg, self._loop)
         elif t == "remove": self.sup.drop(msg)
         elif t == "patch":
             # On-demand patch for the UI's currently-selected box. The patch needs the
@@ -5598,6 +5670,31 @@ def _make_ui_app():
             elif t=="rules_updated":
                 self._refresh_rules()
                 if self.view=="net": self._update_rule_detail()
+            elif t=="consolidate_started":
+                # unregister's teardown fold runs off-loop; show the #cons-bar +
+                # placeholder (it already added the sid to review._consolidating on
+                # the loop). Reuses the same progress machinery as the interactive
+                # off-loop worker.
+                self._cons_progress[ev["session_id"]]=(0,0)
+                self._render_cons_bar()
+            elif t=="consolidate_progress":
+                sid=ev["session_id"]
+                if sid in self.sup.review._consolidating:
+                    self._cons_progress[sid]=(ev["done"],ev["total"])
+                    self._render_cons_bar()
+            elif t=="consolidate_finished":
+                # unregister already discarded the sid from _consolidating + closed the
+                # Index on the loop; drop the fraction, invalidate the now-folded box's
+                # caches, repaint, and refresh whatever pane is showing it (a following
+                # session_updated/removed event handles the registry-level redraw).
+                sid=ev["session_id"]
+                self._cons_progress.pop(sid, None)
+                self._fin_changes.pop(sid, None); self._ch_decor.pop(sid, None)
+                self._render_cons_bar()
+                if self._ch_sid==sid:
+                    if self.view=="changes": self._load_changes(sid, force=True)
+                    elif self.view=="boxes": self._update_box_detail()
+                    elif self.view=="procs": self._load_procs(sid, force=True)
 
         def _tick(self):
             # Watchdog: if a FUSE handler has wedged the single serve loop,
