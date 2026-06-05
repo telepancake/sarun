@@ -836,6 +836,7 @@ def sqlar_remove(path, name) -> int:
 # ════════════════════════════════════════════════════════════════════════════
 
 _FLOW_BODY_CAP = 1 << 20    # store at most 1 MiB of each body (but record true size)
+_PROC_RETIRE_S = 4.0        # live proc pane: keep a dead tgid (highlighted) this long
 
 def _hdr_text(items) -> str:
     out = []
@@ -1124,6 +1125,12 @@ class Index:
         self._proc_cache: dict = {}       # (tgid) -> process.id (this process only)
         self._prov_cache: dict = {}       # host pid -> provenance dict (hot-path cache)
         self._prov_by_proc: dict = {}     # process.id -> provenance dict
+        # Live "active set": tgid -> last-seen monotonic, stamped every time the FUSE
+        # serve thread or the relay path records/sees a tgid (in-memory only, NOT
+        # persisted — the persistent `process` table keeps the full history). Reads
+        # come from the UI thread; the dict is GIL-atomic like the other RAM mirrors.
+        self._active: dict = {}           # tgid -> last-seen monotonic
+        self._dead_since: dict = {}       # tgid -> first monotonic kill(0) saw it dead
         self._tracing = False             # -t: record the process table
         # The box's root process: the host pid embedded in the sid. Newly-inserted
         # process rows bubble up their PPid chain until they reach it (3c records its
@@ -1200,6 +1207,7 @@ class Index:
         process-table row id, inserting it (and its deduped env) on first sight.
         Always returns an id even if /proc is gone. The id tags the file entry."""
         tgid = tgid_of(pid)
+        self._active[tgid] = time.monotonic()    # active-set: re-stamp on every sight
         cached = self._proc_cache.get(tgid)
         if cached is not None: return cached
         # When tracing, capture the FULL environment for the process table; the
@@ -1220,6 +1228,7 @@ class Index:
         tgid was supplied. Same process-table + env-crc32 dedup as writer_for."""
         tgid = int(prov.get("tgid") or 0)
         if not tgid: return None
+        self._active[tgid] = time.monotonic()    # active-set: re-stamp on every sight
         cached = self._proc_cache.get(tgid)
         if cached is not None: return cached
         ppid_tgid = int(prov.get("ppid") or 0)
@@ -1273,6 +1282,40 @@ class Index:
                       exe=pprov.get("exe") or "", argv=pprov.get("argv") or [],
                       env=pprov.get("env") or {})
         self.process_from_prov(parent)           # recurses up; dedup ends the walk
+
+    def live_processes(self) -> list:
+        """htop-style live view of the box's ACTIVE SET: the recently-seen tgids only,
+        decorated from the in-memory caches (NO full-table scan, cost O(active set)).
+        Returns [(id, tgid, ppid, exe, argv-list, alive, dead)] where `alive` is a
+        kill(0) liveness probe over just the active set and `dead` flags a row that
+        kill(0) reports gone but is still inside its retirement grace window. A tgid
+        first seen dead is stamped and kept (highlighted) for _PROC_RETIRE_S, then
+        pruned from the active set — the persistent `process` table is untouched.
+        UI-thread read of the GIL-atomic active-set/cache dicts (Index contract)."""
+        now = time.monotonic()
+        out = []
+        for tgid in list(self._active):
+            alive = _pid_alive(tgid)
+            if alive:
+                self._dead_since.pop(tgid, None)
+            else:
+                first = self._dead_since.get(tgid)
+                if first is None:
+                    self._dead_since[tgid] = first = now
+                if now - first >= _PROC_RETIRE_S:    # retire: drop from the live pane
+                    self._active.pop(tgid, None)
+                    self._dead_since.pop(tgid, None)
+                    continue
+            pid_row = self._proc_cache.get(tgid)
+            prov = self._prov_by_proc.get(pid_row) if pid_row is not None else None
+            if prov is not None:
+                ppid, exe, argv = prov["ppid"], prov["exe"], prov["argv"]
+            else:
+                ppid, exe, argv = 0, "", []
+            out.append((pid_row if pid_row is not None else tgid, tgid, ppid,
+                        exe or "", list(argv), alive, not alive))
+        out.sort(key=lambda r: r[1])
+        return out
 
     def add_flow(self, fl: dict) -> None:
         """Append one completed flow to the box's single sqlar via THIS handle — the
@@ -3954,6 +3997,15 @@ class Supervisor:
         """The box's process table: [(id, tgid, ppid, exe, argv-list)]."""
         return process_list(sqlar_path(sid))
 
+    def processes_live(self, sid) -> "list | None":
+        """The live, bounded ACTIVE SET for a running box (htop-style), decorated by
+        the live Index from its in-memory caches — O(active set), no full-table query.
+        None if the box has no live Index (finished/discovered): the UI then renders
+        the cached full `processes(sid)` history instead."""
+        idx = self.indexes.get(sid)
+        if idx is None: return None
+        return idx.live_processes()
+
     def process_env(self, sid, proc_id) -> dict:
         return process_env(sqlar_path(sid), proc_id)
 
@@ -4933,6 +4985,11 @@ def _make_ui_app():
             # is computed once and cached here, invalidated only on a real edit.
             self._live_changes={}     # sid -> {rel -> record}
             self._fin_changes={}      # sid -> [entry,...]  (cached finished set)
+            # Proc pane: a finished box's full process table is immutable, so compute
+            # it ONCE and cache it here (like _fin_changes); a live box is served from
+            # its Index's bounded active set every tick (O(active set), no full query).
+            self._fin_procs={}        # sid -> [(id,tgid,ppid,exe,argv)]  (cached)
+            self._pr_procs=[]; self._pr_key=None   # current proc-pane rows + repaint key
 
         def compose(self) -> ComposeResult:
             yield Header()
@@ -5673,16 +5730,33 @@ def _make_ui_app():
 
         # ── processes pane (the selected box's process table) ────────────────
         def _load_procs(self, sid, force=False):
-            procs=self.sup.processes(sid)
-            cur=getattr(self,"_pr_procs",None)
-            if not force and procs==cur: return
-            self._pr_procs=procs
+            # LIVE box: the Index's bounded active set (htop-style), O(active set), no
+            # full-table query — dead-but-not-yet-retired rows are highlighted. FINISHED
+            # box: the full immutable process history, computed once and cached.
+            live=self.sup.processes_live(sid)
+            if live is not None:
+                self._fin_procs.pop(sid, None)
+                key=live
+                procs=[(p, tg, pp, ex, av) for (p, tg, pp, ex, av, _al, _dd) in live]
+                dead={tg for (_p, tg, _pp, _ex, _av, _al, dd) in live if dd}
+            else:
+                if sid not in self._fin_procs:
+                    self._fin_procs[sid]=self.sup.processes(sid)
+                procs=self._fin_procs[sid]
+                key=procs; dead=set()
+            cur=getattr(self,"_pr_key",None)
+            if not force and key==cur: return
+            self._pr_key=key; self._pr_procs=procs
             rows=[]
             for pid, tgid, ppid, exe, argv in procs:
-                rows.append((str(pid), [
-                    str(tgid), str(ppid),
-                    Text((exe.rsplit("/",1)[-1] or exe)[:18], style="cyan"),
-                    Text(" ".join(argv)[:40], style="dim")]))
+                nm=Text((exe.rsplit("/",1)[-1] or exe)[:18], style="cyan")
+                ar=Text(" ".join(argv)[:40], style="dim")
+                if tgid in dead:                  # htop-style: process exited, flashing out
+                    tg=Text(str(tgid), style="red"); pp=Text(str(ppid), style="red")
+                    nm.stylize("red"); ar.stylize("red")
+                else:
+                    tg=str(tgid); pp=str(ppid)
+                rows.append((str(pid), [tg, pp, nm, ar]))
             self._sync_table(self.query_one("#pr-tab",DataTable), rows)
             self._update_proc_detail()
 
