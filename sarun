@@ -3857,22 +3857,40 @@ class ChangeReview:
         return dict(ok=True)
 
     def patch_text(self, sid) -> bytes:
-        """The unified patch for a box, computed ON DEMAND.  Symlinks, binaries, and
-        deletions are summarised as comment lines (a patch can't carry them)."""
+        """The unified patch for a box, computed ON DEMAND.  Text changes become real
+        unified hunks; binary changes get a `Binary files … differ` line (visible +
+        counted by diffstat); symlinks stay a comment line (a patch can't carry them)."""
         src = self._source(sid)
         out = []
         for e in self.session_changes(sid):
             rel = e["path"]
+            if e["kind"] == "symlink":
+                out.append(f"# symlink change: {rel}\n".encode()); continue
             info = self._hunks(src, rel)
-            if e["kind"] == "deleted":
-                out.append(f"# deleted: {rel}\n".encode()); continue
             if info is not None:
                 ll, ul, groups = info
                 created = not (Path("/") / rel).exists()
                 fp = build_file_patch(rel, ll, ul, created, False)
                 out.append(serialize_patch({rel: fp}))
+            elif e["kind"] == "deleted":
+                # A deletion has no current bytes (so _hunks is None); classify by the
+                # *base* being removed: a text file gets a real removal hunk, a binary
+                # file the diff-style "Binary files … differ" line.
+                base = self._lower_bytes(rel)
+                if b"\x00" in base:
+                    eb = rel.encode("utf-8", "surrogateescape")
+                    out.append(b"Binary files a/" + eb + b" and /dev/null differ\n")
+                else:
+                    fp = build_file_patch(rel, ut_split(base), [], False, True)
+                    out.append(serialize_patch({rel: fp}))
             else:
-                out.append(f"# binary or symlink change: {rel}\n".encode())
+                # Binary create/modify: standard diff-style line where hunks would go.
+                eb = rel.encode("utf-8", "surrogateescape")
+                if not (Path("/") / rel.lstrip("/")).exists():
+                    a, b = b"/dev/null", b"b/" + eb
+                else:
+                    a, b = b"a/" + eb, b"b/" + eb
+                out.append(b"Binary files " + a + b" and " + b + b" differ\n")
         return b"".join(out)
 
     def apply(self, sid, paths) -> dict:
@@ -4908,6 +4926,28 @@ class ChannelServer:
                 await self.sup.consolidate_in_executor(self._loop, sid)
                 data = self.sup.review.patch_text(sid)
                 return dict(ok=True, patch=base64.b64encode(data).decode())
+            except Exception as e:
+                return dict(ok=False, error=str(e))
+        elif t in ("apply", "discard"):
+            # CLI apply/discard for the UI's currently-selected box. Consolidate
+            # off-loop (as `patch` does), act on the ENTIRE change set, then
+            # force-delete the box — unlike the UI we delete unconditionally, even
+            # with network-flow rows, so the CLI op is predictable (box consumed).
+            try:
+                sid = self.sup.selected_sid
+                if not sid:
+                    return dict(ok=False, error="no slopbox selected in the UI")
+                await self.sup.consolidate_in_executor(self._loop, sid)
+                paths = [e["path"] for e in self.sup.review.session_changes(sid)]
+                if t == "apply":
+                    res = self.sup.review.apply(sid, paths)
+                    n = len(res.get("applied", []))
+                else:
+                    res = self.sup.review.discard(sid, paths)
+                    n = len(res.get("discarded", []))
+                self.sup.delete(sid)          # force: removes sqlar + backing + flows
+                self.sup.selected_sid = None
+                return dict(ok=True, count=n, sid=sid, errors=res.get("errors", []))
             except Exception as e:
                 return dict(ok=False, error=str(e))
         return None
@@ -6886,8 +6926,34 @@ def cmd_patch() -> int:
     return 0
 
 
+def _cmd_review(verb: str, done: str) -> int:
+    """Shared body for apply/discard: act on the UI's selected box over the control
+    socket, then print the summary. The box is consumed (force-deleted) by the UI."""
+    if not ui_is_running(SOCK_PATH):
+        print("slopbox: the UI is not running.", file=sys.stderr); return 3
+    rep = sync_request(SOCK_PATH, type=verb)
+    if not rep or not rep.get("ok"):
+        print("slopbox: " + ((rep or {}).get("error") or f"nothing to {verb}"),
+              file=sys.stderr)
+        return 1
+    print(f"{done} {rep.get('count', 0)} changes, slopbox {rep.get('sid')} removed")
+    return 0
+
+
+def cmd_apply() -> int:
+    """Apply the UI's selected box's entire change set to the host, then remove it."""
+    return _cmd_review("apply", "applied")
+
+
+def cmd_discard() -> int:
+    """Discard the UI's selected box's entire change set, then remove it."""
+    return _cmd_review("discard", "discarded")
+
+
 _USAGE = ("slopbox                         start the UI\n"
           "       slopbox patch                   print selected box's patch (stdout)\n"
+          "       slopbox apply                   apply selected box's changes, remove it\n"
+          "       slopbox discard                 discard selected box's changes, remove it\n"
           "       slopbox [-n] [-t] [-d] [-w HOST]... [-C DIR] -- CMD [ARGS...]\n"
           "         -n  networking via mitmproxy   -t  process tracing\n"
           "         -d  direct host access (no capture)")
@@ -6919,6 +6985,12 @@ def main() -> int:
 
     if argv[0] == "patch":
         return cmd_patch()
+
+    if argv[0] == "apply":
+        return cmd_apply()
+
+    if argv[0] == "discard":
+        return cmd_discard()
 
     # The command MUST come after `--`. Flags come before it.
     if "--" not in argv:
