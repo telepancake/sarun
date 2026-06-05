@@ -1789,10 +1789,16 @@ def _build_overlay_ops():
 
         # ── session registry ────────────────────────────────────────────────
         def add_session(self, sid: str, up: Path, index: "Index",
-                        passthrough: bool = False) -> None:
+                        passthrough: bool = False, parent: "str | None" = None) -> None:
+            # `parent`: the sid of the box this one was launched INSIDE (nested
+            # `./slopbox`). When set, everything beneath this box's own upper is not the
+            # real host but the parent box's merged view (see _lower_resolve) — reads,
+            # listings, copy-up sources, and opacity all chain through the parent, down
+            # to the real host at the root box.
             with self._lock:
                 self.sessions[sid] = dict(up=Path(up), index=index, virtual={},
                                           passthrough=bool(passthrough),
+                                          parent=parent or None,
                                           frules=load_file_rules())
 
         def remove_session(self, sid: str) -> None:
@@ -1846,6 +1852,51 @@ def _build_overlay_ops():
         def _index(self, sid: str) -> "Index":
             return self.sessions[sid]["index"]
 
+        # ── base layer (the real host, or — nested — the parent box's view) ──
+        # A box launched inside another box declares its parent sid (add_session).
+        # The layer BENEATH this box's own upper is then the parent box's merged
+        # overlay view rather than the real host: reads, directory listings, copy-up
+        # sources and opacity/existence checks all resolve through the parent, which
+        # layers over its own parent, recursively, until the root box bottoms out on
+        # the real host. The recursion is finite (each hop is a distinct live sid).
+        def _parent(self, sid: str) -> "str | None":
+            s = self.sessions.get(sid)
+            p = s.get("parent") if s else None
+            return p if (p and p in self.sessions) else None
+
+        def _lower_resolve(self, sid: str, rel: str):
+            """(layer, abspath, st) for the layer beneath this box's own upper — the
+            parent box's merged view if nested, else the real host. The returned path
+            is a real on-disk file (host file, or a file in some ancestor's upper), so
+            callers can lstat/open/copy it directly."""
+            p = self._parent(sid)
+            if p is not None:
+                return self._resolve_st(p, rel)
+            host = self._lower_path(rel)
+            try: return ("lower", host, os.lstat(host))
+            except OSError: return ("absent", None, None)
+
+        def _lower_exists(self, sid: str, rel: str) -> bool:
+            return self._lower_resolve(sid, rel)[0] not in ("absent", "whiteout")
+
+        def _lower_is_dir(self, sid: str, rel: str) -> bool:
+            _l, _ap, st = self._lower_resolve(sid, rel)
+            return bool(st and stat_mod.S_ISDIR(st.st_mode))
+
+        def _lower_names(self, sid: str, rel: str) -> dict:
+            """{name: 'lower'} for the entries the layer beneath this box's own upper
+            shows under dir `rel`: the parent box's merged listing if nested, else the
+            real host directory."""
+            p = self._parent(sid)
+            if p is not None:
+                return {n: "lower" for n, _k, _a in self._scan_dir(p, rel)}
+            out = {}
+            try:
+                with os.scandir(self._lower_path(rel)) as it:
+                    for de in it: out[de.name] = "lower"
+            except OSError: pass
+            return out
+
         # ── passthrough (direct host action, nothing captured) ───────────────
         def _passthrough(self, sid: str, rel: str) -> bool:
             """True when this op should act on the REAL host fs and record nothing in
@@ -1878,8 +1929,7 @@ def _build_overlay_ops():
         def _resolve_st(self, sid: str, rel: str):
             idx = self._index(sid)
             if not idx.has_overlay_state():
-                try: return ("lower", self._lower_path(rel), os.lstat(self._lower_path(rel)))
-                except OSError: return ("absent", None, None)
+                return self._lower_resolve(sid, rel)
             k = idx.kind_of(rel)
             if k == "whiteout":
                 return ("whiteout", None, None)
@@ -1889,8 +1939,7 @@ def _build_overlay_ops():
                 except OSError: pass
             if idx.hidden_by_opaque(rel):
                 return ("absent", None, None)
-            try: return ("lower", self._lower_path(rel), os.lstat(self._lower_path(rel)))
-            except OSError: return ("absent", None, None)
+            return self._lower_resolve(sid, rel)
 
         def _resolve(self, sid: str, rel: str) -> str:
             return self._resolve_st(sid, rel)[0]
@@ -2064,11 +2113,8 @@ def _build_overlay_ops():
             idx = self._index(sid)
             names: dict = {}     # name -> (abspath_or_None, layer)
             if not idx.is_opaque(rel):
-                try:
-                    with os.scandir(self._lower_path(rel)) as it:
-                        for de in it:
-                            names[de.name] = "lower"
-                except OSError: pass
+                for nm in self._lower_names(sid, rel):
+                    names[nm] = "lower"
             if idx.has_overlay_state():
                 try:
                     with os.scandir(self._upper_path(sid, rel)) as it:
@@ -2200,7 +2246,10 @@ def _build_overlay_ops():
                     raise pyfuse3.FUSEError(e.errno or errno.EIO)
             layer, ap, st = self._resolve_st(sid, rel)
             idx = self._index(sid)
-            if layer == "lower":
+            if layer in ("lower", "upper"):
+                # The source is the layer beneath this box's own upper: a host file, or
+                # (nested) a file in an ancestor's upper. Either way `ap` is a real
+                # on-disk path we copy from.
                 # A lower symlink/dir must copy up preserving its type — never open
                 # it O_RDONLY (that would follow a symlink onto its target and
                 # materialize the target's bytes as a regular file). _copyup_one does
@@ -2417,12 +2466,7 @@ def _build_overlay_ops():
                     raise pyfuse3.FUSEError(e.errno or errno.EIO)
                 if idx.kind_of(rel) == "whiteout":
                     idx.del_entry(rel)
-                opaque = 0
-                try:
-                    if stat_mod.S_ISDIR(os.lstat(self._lower_path(rel)).st_mode):
-                        opaque = 1            # rm-rf'd then recreated over a lower dir
-                except OSError:
-                    opaque = 0
+                opaque = 1 if self._lower_is_dir(sid, rel) else 0   # recreated over lower dir
                 idx.set_entry(rel, "dir", stat_mod.S_IFDIR | (mode & 0o7777), wid,
                               "mkdir", opaque=opaque)
                 ino = self._ino_for(sid, rel)
@@ -2492,10 +2536,8 @@ def _build_overlay_ops():
                 if os.path.lexists(upath):
                     try: os.unlink(upath)
                     except OSError as e: raise pyfuse3.FUSEError(e.errno or errno.EIO)
-                lower_exists = False
-                if not idx.hidden_by_opaque(rel):
-                    try: lower_exists = os.path.lexists(self._lower_path(rel))
-                    except OSError: lower_exists = False
+                lower_exists = (not idx.hidden_by_opaque(rel)
+                                and self._lower_exists(sid, rel))
                 if lower_exists:
                     idx.set_entry(rel, "whiteout", 0, wid, "unlink")
                 else:
@@ -2531,12 +2573,8 @@ def _build_overlay_ops():
                     try: os.rmdir(upath)
                     except OSError as e: raise pyfuse3.FUSEError(e.errno or errno.EIO)
                 idx.prune_subtree(rel)
-                lower_is_dir = False
-                if not idx.hidden_by_opaque(rel):
-                    try:
-                        lower_is_dir = stat_mod.S_ISDIR(
-                            os.lstat(self._lower_path(rel)).st_mode)
-                    except OSError: lower_is_dir = False
+                lower_is_dir = (not idx.hidden_by_opaque(rel)
+                                and self._lower_is_dir(sid, rel))
                 if lower_is_dir:
                     idx.set_entry(rel, "whiteout", 0, wid, "rmdir")
                 else:
@@ -2634,7 +2672,7 @@ def _build_overlay_ops():
             self._ensure_parent_dirs(sid, rel, wid)
             layer, ap, st = self._resolve_st(sid, rel)
             idx = self._index(sid)
-            if layer == "lower":
+            if layer in ("lower", "upper"):     # host, or (nested) an ancestor's upper
                 if stat_mod.S_ISLNK(st.st_mode):
                     os.symlink(os.readlink(ap), upath)
                     idx.set_entry(rel, "symlink", stat_mod.S_IFLNK | 0o777, wid,
@@ -2708,12 +2746,8 @@ def _build_overlay_ops():
                     raise pyfuse3.FUSEError(errno.EEXIST)
             self._req_enter(f"rename {sid}/{rel_o}->{rel_n}")
             try:
-                dst_shadows_lower = False
-                try:
-                    dst_shadows_lower = (not idx.hidden_by_opaque(rel_n)
-                        and stat_mod.S_ISDIR(os.lstat(self._lower_path(rel_n)).st_mode))
-                except OSError:
-                    dst_shadows_lower = False
+                dst_shadows_lower = (not idx.hidden_by_opaque(rel_n)
+                                     and self._lower_is_dir(sid, rel_n))
                 is_dir = stat_mod.S_ISDIR(st_o.st_mode)
                 if is_dir:
                     self._materialize_tree(sid, rel_o, wid)
@@ -2735,12 +2769,8 @@ def _build_overlay_ops():
                 except OSError as e:
                     raise pyfuse3.FUSEError(e.errno or errno.EIO)
                 # index update
-                src_shadowed_lower = False
-                try:
-                    src_shadowed_lower = (not idx.hidden_by_opaque(rel_o)
-                        and os.path.lexists(self._lower_path(rel_o)))
-                except OSError:
-                    src_shadowed_lower = False
+                src_shadowed_lower = (not idx.hidden_by_opaque(rel_o)
+                                      and self._lower_exists(sid, rel_o))
                 if is_dir:
                     idx.reparent(rel_o, rel_n, wid)
                     idx.set_entry(rel_n, "dir", st_o.st_mode, wid, "rename_to",
@@ -2923,9 +2953,10 @@ class OverlayMount:
             except Exception: pass
 
     def add_session(self, sid: str, up: Path, index: "Index",
-                    passthrough: bool = False) -> None:
+                    passthrough: bool = False, parent: "str | None" = None) -> None:
         if self.ops is not None:
-            self.ops.add_session(sid, up, index, passthrough=passthrough)
+            self.ops.add_session(sid, up, index, passthrough=passthrough,
+                                 parent=parent)
 
     def remove_session(self, sid: str) -> None:
         if self.ops is not None:

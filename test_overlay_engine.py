@@ -280,12 +280,77 @@ def test_passthrough_acts_on_host_records_nothing():
         shutil.rmtree(host_lower, ignore_errors=True)
 
 
+def test_nested_lower_chaining():
+    """A box launched inside another box (parent= set) reads the layer beneath its own
+    upper from the PARENT box's merged overlay view, not the real host: parent-created
+    files show through, a parent whiteout hides a host file, and a child write copies up
+    from the parent's upper into the child's own upper while the parent stays untouched."""
+    tmp = Path(tempfile.mkdtemp(prefix="ovl-nest-"))
+    os.environ["XDG_STATE_HOME"] = str(tmp / "state")
+    mnt = tmp / "mnt"; live = tmp / "live"
+    psid = "20260604-000000_1"; csid = "20260604-000000_2"
+    pbk = live / psid; cbk = live / csid
+    (pbk / "up").mkdir(parents=True); (cbk / "up").mkdir(parents=True)
+    pidx = m.Index(pbk); cidx = m.Index(cbk)
+    mount = m.OverlayMount(mnt, lower="/")
+
+    def sh(root, script, timeout=15):
+        return subprocess.run(["timeout", str(timeout), "bash", "-c", script],
+                              cwd=str(root), capture_output=True, text=True)
+    try:
+        if not mount.start():
+            raise RuntimeError(f"mount failed: {mount._start_error}")
+        mount.add_session(psid, pbk / "up", pidx)
+        mount.add_session(csid, cbk / "up", cidx, parent=psid)
+        proot = mnt / psid; croot = mnt / csid
+        # (1) parent creates a file; the child reads it through the lower chain — and it
+        #     never touches the real host.
+        sh(proot, "echo from-parent > pfile.txt")
+        r = sh(croot, "cat pfile.txt")
+        check(r.returncode == 0 and r.stdout == "from-parent\n",
+              "child reads a parent-created file through the lower chain")
+        check(not Path("/pfile.txt").exists(), "parent-created file is NOT on the host")
+        # (2) child appends -> copy-up from the parent's upper into the child's own
+        #     upper; the parent's upper is untouched.
+        r = sh(croot, "echo from-child >> pfile.txt && cat pfile.txt")
+        check(r.stdout == "from-parent\nfrom-child\n",
+              "child copies up the parent file and appends to its own copy")
+        check(cidx.kind_of("pfile.txt") == "file", "child upper captured the file")
+        check((pbk / "up" / "pfile.txt").read_text() == "from-parent\n",
+              "parent's upper is untouched by the child's write")
+        # (3) a parent whiteout of a host file hides it from the child too.
+        if Path("/etc/hostname").exists():
+            sh(proot, "rm etc/hostname")
+            r = sh(croot, "cat etc/hostname 2>&1; echo rc=$?")
+            check("rc=1" in r.stdout or "No such file" in r.stdout,
+                  "parent whiteout of a host file hides it from the child")
+            check(Path("/etc/hostname").exists(), "host /etc/hostname still present")
+        # (4) child readdir merges parent-created entries.
+        sh(proot, "mkdir pdir && echo a > pdir/x")
+        r = sh(croot, "ls pdir")
+        check(r.stdout.strip() == "x", "child lists a parent-created dir's contents")
+    finally:
+        try:
+            mount.stop()
+        finally:
+            try:
+                if os.path.ismount(str(mnt)):
+                    subprocess.run(["fusermount3", "-uz", str(mnt)],
+                                   stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL, timeout=10)
+            except Exception: pass
+            try: pidx.close(); cidx.close()
+            except Exception: pass
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     for t in (test_readthrough_and_create, test_copyup_modify,
               test_otrunc_rewrite_shorter, test_delete_whiteout,
               test_symlink_and_readlink, test_provenance_recorded, test_opaque_dir,
               test_rename, test_lower_symlink_copyup_preserves_type,
-              test_passthrough_acts_on_host_records_nothing):
+              test_passthrough_acts_on_host_records_nothing,
+              test_nested_lower_chaining):
         print(f"\n== {t.__name__} ==")
         try:
             t()
