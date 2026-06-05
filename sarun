@@ -600,6 +600,69 @@ def parse_sid(sid: str) -> tuple:
     except ValueError: pid = 0
     return started, pid
 
+_PROC_TREE_DEPTH = 64   # defensive cap on a root→self walk (cycles / runaway chains)
+
+def build_proc_tree(procs, root_pid, lookup):
+    """Stateless process-TREE assembly: turn a flat viewing list into DFS-ordered,
+    depth-indented rows that stay correct under any scroll/paging with NO global tree
+    state. For each member compute its root→self pid path by walking the ppid chain up
+    to `root_pid` (defensive: visited-guard, stop at root / ppid<=1 / a missing
+    ancestor, cap depth). UNION in every ancestor met while walking — even ones not in
+    `procs` — so the tree is fully connected; sorting all rows by their path tuple then
+    yields DFS order (parent immediately before its subtree, siblings by pid).
+
+    `procs` is [(id, tgid, ppid, exe, argv-list)]; `lookup(tgid)->(ppid,exe,argv)|None`
+    resolves connector ancestors not present in `procs` (same builder for live/finished).
+    Returns [(id, tgid, ppid, exe, argv, depth, connector)] in DFS order, where
+    depth=len(path)-1 and `connector`=True for a purely-structural ancestor (added by
+    the union, not a member of `procs`). Order-independent: output is a pure function of
+    the (root_pid, lookup, set-of-procs)."""
+    members = {}                              # tgid -> (id, ppid, exe, argv)
+    for pid, tgid, ppid, exe, argv in procs:
+        members[tgid] = (pid, ppid, exe or "", list(argv))
+    nodes = {}                                # tgid -> (ppid, exe, argv)
+    for tgid, (_id, ppid, exe, argv) in members.items():
+        nodes[tgid] = (ppid, exe, argv)
+
+    def info(tgid):
+        if tgid in nodes: return nodes[tgid]
+        m = members.get(tgid)
+        if m is not None: return m[1], m[2], m[3]
+        got = lookup(tgid) if lookup else None
+        return got                            # (ppid,exe,argv) or None
+
+    def path_of(tgid):
+        path = []; seen = set()
+        cur = tgid
+        for _ in range(_PROC_TREE_DEPTH):
+            if cur in seen: break             # cycle guard
+            seen.add(cur); path.append(cur)
+            if cur == root_pid: break         # reached the box root
+            got = info(cur)
+            if got is None: break             # missing ancestor: stop, link what we have
+            ppid = got[0]
+            if ppid <= 1: break               # init / unknown parent
+            nodes.setdefault(ppid, info(ppid) or (0, "", []))
+            cur = ppid
+        path.reverse()
+        return tuple(path)
+
+    paths = {tgid: path_of(tgid) for tgid in list(members)}
+    # path_of unions ancestors into `nodes`; give every unioned ancestor a path too.
+    for tgid in list(nodes):
+        if tgid not in paths: paths[tgid] = path_of(tgid)
+
+    rows = []
+    for tgid in nodes:
+        path = paths[tgid]
+        ppid, exe, argv = nodes[tgid]
+        connector = tgid not in members
+        pid = members[tgid][0] if not connector else tgid
+        rows.append((path, pid, tgid, ppid, exe, argv, connector))
+    rows.sort(key=lambda r: r[0])             # lexicographic path → DFS order
+    return [(pid, tgid, ppid, exe, argv, len(path) - 1, connector)
+            for (path, pid, tgid, ppid, exe, argv, connector) in rows]
+
 _NO_NL = b"\\ No newline at end of file\n"   # standard "no newline at EOF" marker
 
 class PatchConflict(Exception):
@@ -1318,6 +1381,16 @@ class Index:
                       exe=pprov.get("exe") or "", argv=pprov.get("argv") or [],
                       env=pprov.get("env") or {})
         self.process_from_prov(parent)           # recurses up; dedup ends the walk
+
+    def proc_info(self, tgid: int) -> "tuple | None":
+        """(ppid, exe, argv-list) for ANY recorded tgid, in or out of the active set —
+        the tree builder uses it to resolve connector ancestors. RAM-only read of the
+        GIL-atomic caches (Index threading contract): _proc_cache maps tgid→row id and
+        _prov_by_proc maps row id→provenance. None if the tgid was never recorded."""
+        pid_row = self._proc_cache.get(tgid)
+        prov = self._prov_by_proc.get(pid_row) if pid_row is not None else None
+        if prov is None: return None
+        return prov["ppid"], prov["exe"] or "", list(prov["argv"])
 
     def live_processes(self) -> list:
         """htop-style live view of the box's ACTIVE SET: the recently-seen tgids only,
@@ -4085,6 +4158,13 @@ class Supervisor:
         if idx is None: return None
         return idx.live_processes()
 
+    def proc_info(self, sid, tgid) -> "tuple | None":
+        """(ppid, exe, argv) for any tgid the live box's Index ever recorded, so the
+        tree builder can resolve connector ancestors outside the active set. None for a
+        finished box (its cached full table is self-contained)."""
+        idx = self.indexes.get(sid)
+        return idx.proc_info(tgid) if idx is not None else None
+
     def process_env(self, sid, proc_id) -> dict:
         return process_env(sqlar_path(sid), proc_id)
 
@@ -5083,7 +5163,8 @@ def _make_ui_app():
             # Proc pane: a finished box's full process table is immutable, so compute
             # it ONCE and cache it here (like _fin_changes); a live box is served from
             # its Index's bounded active set every tick (O(active set), no full query).
-            self._fin_procs={}        # sid -> [(id,tgid,ppid,exe,argv)]  (cached)
+            self._fin_procs={}        # sid -> (procs, tree)  (built once, cached)
+            self._pr_conn=set()       # connector-only proc row keys (cursor skips)
             self._pr_procs=[]; self._pr_key=None   # current proc-pane rows + repaint key
 
         def compose(self) -> ComposeResult:
@@ -5928,33 +6009,67 @@ def _make_ui_app():
         def _load_procs(self, sid, force=False):
             # LIVE box: the Index's bounded active set (htop-style), O(active set), no
             # full-table query — dead-but-not-yet-retired rows are highlighted. FINISHED
-            # box: the full immutable process history, computed once and cached.
+            # box: the full immutable process history, tree-built once and cached.
+            # Both render as a process TREE: build_proc_tree gives DFS-ordered rows,
+            # depth-indented; connector-only ancestors (added to connect the tree) are
+            # dimmed and the cursor skips them. The live lookup resolves ancestors
+            # outside the active set; the finished full table is self-contained.
+            root=parse_sid(sid)[1]
             live=self.sup.processes_live(sid)
             if live is not None:
                 self._fin_procs.pop(sid, None)
                 key=live
                 procs=[(p, tg, pp, ex, av) for (p, tg, pp, ex, av, _al, _dd) in live]
                 dead={tg for (_p, tg, _pp, _ex, _av, _al, dd) in live if dd}
+                tree=build_proc_tree(procs, root,
+                                     lambda tg: self.sup.proc_info(sid, tg))
             else:
                 if sid not in self._fin_procs:
-                    self._fin_procs[sid]=self.sup.processes(sid)
-                procs=self._fin_procs[sid]
+                    procs=self.sup.processes(sid)
+                    self._fin_procs[sid]=(procs, build_proc_tree(procs, root, None))
+                procs,tree=self._fin_procs[sid]
                 key=procs; dead=set()
             cur=getattr(self,"_pr_key",None)
             if not force and key==cur: return
-            self._pr_key=key; self._pr_procs=procs
+            self._pr_key=key
+            self._pr_procs=[(p,tg,pp,ex,av) for (p,tg,pp,ex,av,_d,c) in tree if not c]
+            self._pr_conn={("c"+str(tg)) for (_p,tg,_pp,_ex,_av,_d,c) in tree if c}
             rows=[]
-            for pid, tgid, ppid, exe, argv in procs:
-                nm=Text((exe.rsplit("/",1)[-1] or exe)[:18], style="cyan")
+            for pid, tgid, ppid, exe, argv, depth, conn in tree:
+                indent="  "*depth + ("└ " if depth else "")
+                nm=Text(indent+(exe.rsplit("/",1)[-1] or exe or "?")[:18], style="cyan")
                 ar=Text(" ".join(argv)[:40], style="dim")
-                if tgid in dead:                  # htop-style: process exited, flashing out
+                if conn:                          # structural-only ancestor: dimmed
+                    rk="c"+str(tgid)
+                    tg=Text(str(tgid), style="dim"); pp=Text(str(ppid), style="dim")
+                    nm.stylize("dim"); ar.stylize("dim")
+                elif tgid in dead:                # htop-style: process exited, flashing out
+                    rk=str(pid)
                     tg=Text(str(tgid), style="red"); pp=Text(str(ppid), style="red")
                     nm.stylize("red"); ar.stylize("red")
                 else:
-                    tg=str(tgid); pp=str(ppid)
-                rows.append((str(pid), [tg, pp, nm, ar]))
+                    rk=str(pid); tg=str(tgid); pp=str(ppid)
+                rows.append((rk, [tg, pp, nm, ar]))
             self._sync_table(self.query_one("#pr-tab",DataTable), rows)
+            self._skip_conn_proc()
             self._update_proc_detail()
+
+        def _skip_conn_proc(self):
+            # Keep the cursor off dimmed connector rows: nudge to the next real member.
+            conn=getattr(self,"_pr_conn",None)
+            if not conn: return
+            t=self.query_one("#pr-tab",DataTable)
+            if not t.row_count: return
+            try: ck=t.coordinate_to_cell_key((t.cursor_row,0)).row_key.value
+            except Exception: return
+            if ck not in conn: return
+            keys=[rk.value for rk in t.rows]
+            i=t.cursor_row
+            nxt=next((j for j in range(i+1,len(keys)) if keys[j] not in conn),
+                     next((j for j in range(i-1,-1,-1) if keys[j] not in conn), None))
+            if nxt is not None:
+                try: t.move_cursor(row=nxt, animate=False)
+                except Exception: pass
 
         def _sel_proc(self):
             t=self.query_one("#pr-tab",DataTable)
@@ -5985,7 +6100,10 @@ def _make_ui_app():
 
         @on(DataTable.RowHighlighted, "#pr-tab")
         def _ph(self, ev):
-            if self.view=="procs": self._update_proc_detail()
+            if self.view!="procs": return
+            if ev.row_key and ev.row_key.value in getattr(self,"_pr_conn",()):
+                self._skip_conn_proc()
+            self._update_proc_detail()
 
         @on(DataTable.RowHighlighted, "#s-tab")
         def _sc(self, ev):
