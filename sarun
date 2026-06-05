@@ -2001,7 +2001,11 @@ def _build_overlay_ops():
                 except OSError: pass
 
         # ── create / mkdir / symlink ─────────────────────────────────────────
-        async def create(self, parent_inode, name, mode, flags, ctx):
+        def _mutate(self, parent_inode, name, ctx, op, host_op, upper_op):
+            # THE single checked entry point for node-creating mutating handlers:
+            # the security preamble (decode/key/ENOENT/writer/policy_check/EACCES/
+            # _req_enter) and the passthrough-vs-overlay fork live here exactly once,
+            # so no handler can skip a check. host_op/upper_op create only THIS node.
             name = os.fsdecode(name)
             pkey = self._key(parent_inode)
             if pkey is None: raise pyfuse3.FUSEError(errno.EACCES)
@@ -2009,36 +2013,44 @@ def _build_overlay_ops():
             if sid not in self.sessions: raise pyfuse3.FUSEError(errno.ENOENT)
             wid = self._index(sid).writer_for(ctx.pid)
             if policy_check(sid, self._index(sid).provenance_of(ctx.pid),
-                            rel, "create") == "deny":
+                            rel, op) == "deny":
                 raise pyfuse3.FUSEError(errno.EACCES)
-            self._req_enter(f"create {sid}/{rel}")
+            self._req_enter(f"{op} {sid}/{rel}")
             try:
                 if self._passthrough(sid, rel):
-                    # direct host create, nothing captured
-                    host = self._host_path(rel)
-                    try:
-                        os.makedirs(os.path.dirname(host) or "/", exist_ok=True)
-                        fd = os.open(host, flags | os.O_CREAT | os.O_NOFOLLOW,
-                                     mode & 0o7777)
-                    except OSError as e:
-                        raise pyfuse3.FUSEError(e.errno or errno.EIO)
-                    st = os.fstat(fd)
-                    ino = self._ino_for(sid, rel)
-                    self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
-                    with self._lock:
-                        nfh = self._next_fh; self._next_fh += 1
-                        self._fd_table[nfh] = fd
-                        self._fh_sid[nfh] = sid
-                    return (pyfuse3.FileInfo(fh=nfh, direct_io=False, keep_cache=False),
-                            self._entry(ino, st))
+                    return host_op(sid, rel, self._host_path(rel))
                 self._ensure_parent_dirs(sid, rel, wid)
+                idx = self._index(sid)
                 upath = self._upper_path(sid, rel)
+                res = upper_op(sid, rel, upath, wid, idx)
+                self._notify(sid)
+                return res
+            finally:
+                self._req_exit()
+
+        async def create(self, parent_inode, name, mode, flags, ctx):
+            def host_op(sid, rel, host):
+                try:
+                    os.makedirs(os.path.dirname(host) or "/", exist_ok=True)
+                    fd = os.open(host, flags | os.O_CREAT | os.O_NOFOLLOW,
+                                 mode & 0o7777)
+                except OSError as e:
+                    raise pyfuse3.FUSEError(e.errno or errno.EIO)
+                st = os.fstat(fd)
+                ino = self._ino_for(sid, rel)
+                self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
+                with self._lock:
+                    nfh = self._next_fh; self._next_fh += 1
+                    self._fd_table[nfh] = fd
+                    self._fh_sid[nfh] = sid
+                return (pyfuse3.FileInfo(fh=nfh, direct_io=False, keep_cache=False),
+                        self._entry(ino, st))
+            def upper_op(sid, rel, upath, wid, idx):
                 try:
                     fd = os.open(upath, flags | os.O_CREAT | os.O_NOFOLLOW,
                                  mode & 0o7777)
                 except OSError as e:
                     raise pyfuse3.FUSEError(e.errno or errno.EIO)
-                idx = self._index(sid)
                 if idx.kind_of(rel) == "whiteout":
                     idx.del_entry(rel)
                 idx.set_entry(rel, "file", stat_mod.S_IFREG | (mode & 0o7777),
@@ -2050,41 +2062,25 @@ def _build_overlay_ops():
                     nfh = self._next_fh; self._next_fh += 1
                     self._fd_table[nfh] = fd
                     self._fh_sid[nfh] = sid
-                self._notify(sid)
                 return (pyfuse3.FileInfo(fh=nfh, direct_io=False, keep_cache=False),
                         self._entry(ino, st))
-            finally:
-                self._req_exit()
+            return self._mutate(parent_inode, name, ctx, "create", host_op, upper_op)
 
         async def mkdir(self, parent_inode, name, mode, ctx):
-            name = os.fsdecode(name)
-            pkey = self._key(parent_inode)
-            if pkey is None: raise pyfuse3.FUSEError(errno.EACCES)
-            sid, rel = self._child_key(pkey, name)
-            if sid not in self.sessions: raise pyfuse3.FUSEError(errno.ENOENT)
-            wid = self._index(sid).writer_for(ctx.pid)
-            if policy_check(sid, self._index(sid).provenance_of(ctx.pid),
-                            rel, "mkdir") == "deny":
-                raise pyfuse3.FUSEError(errno.EACCES)
-            self._req_enter(f"mkdir {sid}/{rel}")
-            try:
-                if self._passthrough(sid, rel):
-                    host = self._host_path(rel)
-                    try:
-                        os.makedirs(os.path.dirname(host) or "/", exist_ok=True)
-                        os.mkdir(host, mode & 0o7777)
-                    except OSError as e:
-                        raise pyfuse3.FUSEError(e.errno or errno.EIO)
-                    ino = self._ino_for(sid, rel)
-                    self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
-                    return self._entry(ino, os.lstat(host))
-                self._ensure_parent_dirs(sid, rel, wid)
-                upath = self._upper_path(sid, rel)
+            def host_op(sid, rel, host):
+                try:
+                    os.makedirs(os.path.dirname(host) or "/", exist_ok=True)
+                    os.mkdir(host, mode & 0o7777)
+                except OSError as e:
+                    raise pyfuse3.FUSEError(e.errno or errno.EIO)
+                ino = self._ino_for(sid, rel)
+                self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
+                return self._entry(ino, os.lstat(host))
+            def upper_op(sid, rel, upath, wid, idx):
                 try:
                     os.mkdir(upath, mode & 0o7777)
                 except OSError as e:
                     raise pyfuse3.FUSEError(e.errno or errno.EIO)
-                idx = self._index(sid)
                 if idx.kind_of(rel) == "whiteout":
                     idx.del_entry(rel)
                 opaque = 0
@@ -2098,35 +2094,21 @@ def _build_overlay_ops():
                 ino = self._ino_for(sid, rel)
                 self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
                 st = os.lstat(upath)
-                self._notify(sid)
                 return self._entry(ino, st)
-            finally:
-                self._req_exit()
+            return self._mutate(parent_inode, name, ctx, "mkdir", host_op, upper_op)
 
         async def symlink(self, parent_inode, name, target, ctx):
-            name = os.fsdecode(name); target = os.fsdecode(target)
-            pkey = self._key(parent_inode)
-            if pkey is None: raise pyfuse3.FUSEError(errno.EACCES)
-            sid, rel = self._child_key(pkey, name)
-            if sid not in self.sessions: raise pyfuse3.FUSEError(errno.ENOENT)
-            wid = self._index(sid).writer_for(ctx.pid)
-            if policy_check(sid, self._index(sid).provenance_of(ctx.pid),
-                            rel, "symlink") == "deny":
-                raise pyfuse3.FUSEError(errno.EACCES)
-            self._req_enter(f"symlink {sid}/{rel}")
-            try:
-                if self._passthrough(sid, rel):
-                    host = self._host_path(rel)
-                    try:
-                        os.makedirs(os.path.dirname(host) or "/", exist_ok=True)
-                        os.symlink(target, host)
-                    except OSError as e:
-                        raise pyfuse3.FUSEError(e.errno or errno.EIO)
-                    ino = self._ino_for(sid, rel)
-                    self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
-                    return self._entry(ino, os.lstat(host))
-                self._ensure_parent_dirs(sid, rel, wid)
-                upath = self._upper_path(sid, rel)
+            target = os.fsdecode(target)
+            def host_op(sid, rel, host):
+                try:
+                    os.makedirs(os.path.dirname(host) or "/", exist_ok=True)
+                    os.symlink(target, host)
+                except OSError as e:
+                    raise pyfuse3.FUSEError(e.errno or errno.EIO)
+                ino = self._ino_for(sid, rel)
+                self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
+                return self._entry(ino, os.lstat(host))
+            def upper_op(sid, rel, upath, wid, idx):
                 # remove a stale upper artifact (no-follow safe: unlink/rmtree by lstat)
                 try:
                     lst = os.lstat(upath)
@@ -2140,17 +2122,14 @@ def _build_overlay_ops():
                     os.symlink(target, upath)
                 except OSError as e:
                     raise pyfuse3.FUSEError(e.errno or errno.EIO)
-                idx = self._index(sid)
                 if idx.kind_of(rel) == "whiteout":
                     idx.del_entry(rel)
                 idx.set_entry(rel, "symlink", stat_mod.S_IFLNK | 0o777, wid, "symlink")
                 ino = self._ino_for(sid, rel)
                 self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
                 st = os.lstat(upath)
-                self._notify(sid)
                 return self._entry(ino, st)
-            finally:
-                self._req_exit()
+            return self._mutate(parent_inode, name, ctx, "symlink", host_op, upper_op)
 
         # ── unlink / rmdir ───────────────────────────────────────────────────
         def _merged_children(self, sid: str, rel: str) -> list:
