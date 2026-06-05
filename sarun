@@ -792,7 +792,9 @@ def build_file_patch(rel, lower, upper, created, deleted) -> dict:
 #  the at-rest archive. It holds ALL state in one schema:
 #
 #    sqlar(name, mode, mtime, sz, data, opaque, writer)
-#        every file/dir/symlink/whiteout entry with its metadata. `data` is the
+#        every file/dir/symlink/whiteout entry with its metadata. `mtime` is the
+#        modification time as integer NANOSECONDS (st_mtime_ns), stored exactly so
+#        sub-second mtime ordering survives consolidate→sqlar→apply→host. `data` is the
 #        zlib-deflated file content (NULL until consolidate() fills it from the
 #        overlay upper). A char-device mode with NULL data is a deletion
 #        tombstone (whiteout). `opaque`=1 marks an opaque directory. `writer` is
@@ -852,23 +854,25 @@ def _sqlar_deflate(content: bytes):
     comp = zlib.compress(content, 6)
     return (comp, len(content)) if len(comp) < len(content) else (content, len(content))
 
-def _sqlar_put_file(conn, name, content: bytes, mode, mtime) -> None:
+def _sqlar_put_file(conn, name, content: bytes, mode, mtime_ns) -> None:
+    """`mtime_ns` is integer nanoseconds (st_mtime_ns); stored as-is."""
     data, sz = _sqlar_deflate(content)
     conn.execute("INSERT INTO sqlar(name,mode,mtime,sz,data) VALUES(?,?,?,?,?)"
                  " ON CONFLICT(name) DO UPDATE SET mode=excluded.mode,"
                  " mtime=excluded.mtime, sz=excluded.sz, data=excluded.data",
-                 (name, int(mode), int(mtime), sz, sqlite3.Binary(data)))
+                 (name, int(mode), int(mtime_ns), sz, sqlite3.Binary(data)))
 
 def _sqlar_put_provenance(conn, name, prov: dict) -> None:
     conn.execute("INSERT OR REPLACE INTO provenance VALUES(?,?,?,?,?)",
                  (name, int(prov.get("pid") or 0), int(prov.get("ppid") or 0),
                   prov.get("exe") or "", json.dumps(prov.get("argv") or [])))
 
-def _sqlar_put_symlink(conn, name, target: bytes, mtime) -> None:
+def _sqlar_put_symlink(conn, name, target: bytes, mtime_ns) -> None:
+    """`mtime_ns` is integer nanoseconds (st_mtime_ns); stored as-is."""
     conn.execute("INSERT INTO sqlar(name,mode,mtime,sz,data) VALUES(?,?,?,?,?)"
                  " ON CONFLICT(name) DO UPDATE SET mode=excluded.mode,"
                  " mtime=excluded.mtime, sz=excluded.sz, data=excluded.data",
-                 (name, stat_mod.S_IFLNK | 0o777, int(mtime), len(target),
+                 (name, stat_mod.S_IFLNK | 0o777, int(mtime_ns), len(target),
                   sqlite3.Binary(target)))
 
 def _sqlar_put_tombstone(conn, name) -> None:
@@ -878,7 +882,8 @@ def _sqlar_put_tombstone(conn, name) -> None:
                  (name, stat_mod.S_IFCHR, 0, 0, None))
 
 def sqlar_list(path) -> list:
-    """[(name, mode, mtime, sz)] sorted by name; [] if there is no archive."""
+    """[(name, mode, mtime, sz)] sorted by name; [] if there is no archive.
+    mtime is integer NANOSECONDS (st_mtime_ns)."""
     path = Path(path)
     if not path.exists(): return []
     conn = _sqlar_open(path)
@@ -897,7 +902,8 @@ def sqlar_mode(path, name) -> "int | None":
     finally: conn.close()
     return row[0] if row else None
 
-def sqlar_mtime(path, name) -> "float | None":
+def sqlar_mtime(path, name) -> "int | None":
+    """Stored mtime as integer NANOSECONDS (st_mtime_ns), or None if missing."""
     path = Path(path)
     if not path.exists(): return None
     conn = _sqlar_open(path)
@@ -2904,6 +2910,17 @@ def _is_symlink(p: Path) -> bool:
     except OSError:
         return False
 
+def _restore_host_mtime_ns(host, mtime_ns, is_symlink: bool) -> None:
+    """Set host's mtime to exactly `mtime_ns` integer nanoseconds (atime too). For a
+    symlink, utime the link itself (follow_symlinks=False). Best-effort/no-op if
+    mtime_ns is None or the platform can't utime a symlink."""
+    if mtime_ns is None: return
+    n = int(mtime_ns)
+    try:
+        os.utime(host, ns=(n, n), follow_symlinks=not is_symlink)
+    except (OSError, NotImplementedError):
+        pass
+
 def remove_upper_entry(p: Path) -> None:
     """Remove one upper artifact: a file, a directory tree, or a char-device
     whiteout. No-op if nothing is there (e.g. an opacity-only deletion)."""
@@ -2990,13 +3007,13 @@ def consolidate(shm_dir, session_id: str, cmd: list, index: "Index | None" = Non
     frules = load_file_rules()
     sp = sqlar_path(session_id)
     sq = _sqlar_open(sp)
-    def _set_blob(rel, content: bytes, mode, mtime) -> None:
+    def _set_blob(rel, content: bytes, mode, mtime_ns) -> None:
         data, sz = _sqlar_deflate(content)
         sq.execute("UPDATE sqlar SET mode=?, mtime=?, sz=?, data=? WHERE name=?",
-                   (int(mode), int(mtime), sz, sqlite3.Binary(data), rel))
+                   (int(mode), int(mtime_ns), sz, sqlite3.Binary(data), rel))
         if sq.execute("SELECT changes()").fetchone()[0] == 0:
             # No pre-existing row (orphaned overlay with no live index): create it.
-            _sqlar_put_file(sq, rel, content, mode, mtime)
+            _sqlar_put_file(sq, rel, content, mode, mtime_ns)
     def _prov(rel):
         return idx.writer_provenance(rel) if idx is not None else None
     def _sq_remove(rel):
@@ -3029,15 +3046,15 @@ def consolidate(shm_dir, session_id: str, cmd: list, index: "Index | None" = Non
                 tgt = os.readlink(ap).encode("utf-8", "surrogateescape")
                 data, sz = _sqlar_deflate(tgt)
                 sq.execute("UPDATE sqlar SET mode=?, mtime=?, sz=?, data=? WHERE name=?",
-                           (stat_mod.S_IFLNK | 0o777, int(lst.st_mtime),
+                           (stat_mod.S_IFLNK | 0o777, int(lst.st_mtime_ns),
                             len(tgt), sqlite3.Binary(data), rel))
                 if sq.execute("SELECT changes()").fetchone()[0] == 0:
-                    _sqlar_put_symlink(sq, rel, tgt, lst.st_mtime)
+                    _sqlar_put_symlink(sq, rel, tgt, lst.st_mtime_ns)
                 p = _prov(rel)
                 if p: _sqlar_put_provenance(sq, rel, p)
             elif ap.is_file():
                 st = ap.stat()
-                _set_blob(rel, ap.read_bytes(), st.st_mode, st.st_mtime)
+                _set_blob(rel, ap.read_bytes(), st.st_mode, st.st_mtime_ns)
                 p = _prov(rel)
                 if p: _sqlar_put_provenance(sq, rel, p)
             else:
@@ -3292,9 +3309,9 @@ class ChangeSource:
         """st_mode for the changed entry, or None on any error / missing entry."""
         raise NotImplementedError
 
-    def current_mtime(self, rel) -> "float | None":
-        """Stored-side mtime for the changed entry (the diff-base for the stale check),
-        or None if unavailable."""
+    def current_mtime(self, rel) -> "int | None":
+        """Stored-side mtime as integer NANOSECONDS (st_mtime_ns) for the changed entry
+        (the diff-base for the stale check), or None if unavailable."""
         raise NotImplementedError
 
     def entries(self) -> list:
@@ -3349,7 +3366,7 @@ class LiveUpper(ChangeSource):
 
     def current_mtime(self, rel):
         rel = rel.lstrip("/")
-        try: return (self.upper / rel).lstat().st_mtime
+        try: return (self.upper / rel).lstat().st_mtime_ns
         except OSError: return None
 
     def entries(self):
@@ -3447,7 +3464,9 @@ class LiveUpper(ChangeSource):
         if self._kinds.get(rel) == "deleted" or is_whiteout(src):
             return dict(kind="delete")
         if src.is_symlink():
-            return dict(kind="symlink", target=os.readlink(src))
+            try: m = src.lstat().st_mtime_ns
+            except OSError: m = None
+            return dict(kind="symlink", target=os.readlink(src), mtime_ns=m)
         if src.is_dir():
             return dict(kind="dir")
         if src.is_file():
@@ -3521,11 +3540,12 @@ class SqlarArchive(ChangeSource):
         if mode is None: return None
         if stat_mod.S_ISCHR(mode):               # tombstone → delete
             return dict(kind="delete")
+        mtime_ns = sqlar_mtime(self.path, rel)   # stored integer ns; restored on host
         if stat_mod.S_ISLNK(mode):
             tgt = (sqlar_content(self.path, rel) or b"").decode("utf-8", "surrogateescape")
-            return dict(kind="symlink", target=tgt)
+            return dict(kind="symlink", target=tgt, mtime_ns=mtime_ns)
         return dict(kind="file", data=sqlar_content(self.path, rel) or b"",
-                    chmod=stat_mod.S_IMODE(mode))
+                    chmod=stat_mod.S_IMODE(mode), mtime_ns=mtime_ns)
 
 
 class ChangeReview:
@@ -3696,6 +3716,7 @@ class ChangeReview:
         elif kind == "symlink":
             if host.exists() or host.is_symlink(): host.unlink()
             host.parent.mkdir(parents=True, exist_ok=True); os.symlink(plan["target"], host)
+            _restore_host_mtime_ns(host, plan.get("mtime_ns"), is_symlink=True)
         elif kind == "dir":
             host.mkdir(parents=True, exist_ok=True)
         elif kind == "file":
@@ -3703,12 +3724,13 @@ class ChangeReview:
                 return dict(error="refusing to write through a symlink")
             host.parent.mkdir(parents=True, exist_ok=True)
             if "copy_from" in plan:
-                shutil.copy2(plan["copy_from"], host)
+                shutil.copy2(plan["copy_from"], host)   # carries ns mtime from the upper
             else:
                 host.write_bytes(plan["data"])
                 if plan.get("chmod") is not None:
                     try: os.chmod(host, plan["chmod"])
                     except OSError: pass
+                _restore_host_mtime_ns(host, plan.get("mtime_ns"), is_symlink=False)
         return None
 
     def change_mode(self, sid, rel, source=None) -> "int | None":
@@ -3735,8 +3757,8 @@ class ChangeReview:
         kind = "modified" if exists else "created"
         stale = False
         if exists and hstat is not None:
-            cm = src.current_mtime(rel)
-            if cm is not None: stale = hstat.st_mtime > cm
+            cm = src.current_mtime(rel)              # integer ns (st_mtime_ns)
+            if cm is not None: stale = hstat.st_mtime_ns > cm
         return dict(is_text=is_text, stale=stale, kind=kind)
 
     def hunks(self, sid, rel) -> dict:
