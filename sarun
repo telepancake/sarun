@@ -75,6 +75,7 @@ import fcntl
 import fnmatch
 import functools
 import ipaddress
+import itertools
 import json
 import os
 import queue
@@ -5810,9 +5811,11 @@ def _make_ui_app():
                 except Exception: self._fin_changes[sid]=[]
             return self._fin_changes[sid]
 
-        def _live_list(self, sid):
-            """Sorted entry list for a live box from its incremental map, seeding it
-            with ONE full pass the first time the box is shown."""
+        def _live_map(self, sid):
+            """The live change set as a {rel->record} dict, seeded with ONE full pass
+            the first time the box is shown and kept current incrementally by
+            _fold_event thereafter. _fold_event moves each touched key to the end, so
+            iteration order is recency (oldest first), newest last."""
             m=self._live_changes.get(sid)
             if m is None:
                 m={}
@@ -5822,7 +5825,21 @@ def _make_ui_app():
                                           size=e.get("size",0))
                 except Exception: pass
                 self._live_changes[sid]=m
+            return m
+
+        def _live_list(self, sid):
+            """Sorted entry list for a live box — for the interactive review table,
+            which needs a stable order to scroll/select against."""
+            m=self._live_map(sid)
             return [m[k] for k in sorted(m)]
+
+        def _live_recent(self, sid, n):
+            """The n most-recently-changed entries for a live box, newest first,
+            straight from the notify-stream order — no sort. O(n) regardless of how
+            many files the box has touched. Returns (total_count, entries)."""
+            m=self._live_map(sid)
+            keys=list(itertools.islice(reversed(m), n))   # O(n), newest first
+            return len(m), [m[k] for k in keys]
 
         def _fold_event(self, sid, rel, op):
             """Fold one enriched FUSE event into the live map in O(1). Converges to the
@@ -5833,13 +5850,14 @@ def _make_ui_app():
             # The row's content moved: drop its cached decoration so it's recomputed
             # lazily the next time it's visible.
             self._ch_decor.get(sid, {}).pop(rel, None)
+            # pop-then-(maybe)-reinsert moves the touched key to the END of the dict,
+            # so iteration order tracks recency for the live tail preview.
+            m.pop(rel, None)
             if op=="deleted":
                 host=Path("/")/rel
                 # A create-then-delete of a host-absent path leaves no change.
                 if host.exists() or host.is_symlink():
                     m[rel]=dict(path=rel, kind="deleted", size=0)
-                else:
-                    m.pop(rel, None)
             else:
                 host=Path("/")/rel
                 kind="modified" if (host.exists() or host.is_symlink()) else "created"
@@ -6216,20 +6234,33 @@ def _make_ui_app():
                 t.append("network ", style="dim")
                 t.append(f"{len(self.sup.flows(sid))} connection(s)   ")
                 t.append("[t for log]\n", style="dim")
-            try: entries=self._changes_for(sid)   # kicks the off-loop fold if needed
-            except Exception: entries=[]
-            if self._is_consolidating(sid):
-                t.append("changes ", style="dim")
-                t.append("consolidating…\n", style="bold")
-                d.update(t); return
+            live=False
+            try: live=self.sup.review._live(sid)
+            except Exception: pass
+            if live:
+                # LIVE: show the notify-stream TAIL — the files that just changed,
+                # newest first. O(200), never sorts the (possibly millions-large) set,
+                # and it's the meaningful thing to watch while the box runs.
+                self._fin_changes.pop(sid, None)
+                total, entries = self._live_recent(sid, 200)
+                label = "recently changed"
+            else:
+                try: entries=self._changes_for(sid)   # kicks the off-loop fold if needed
+                except Exception: entries=[]
+                if self._is_consolidating(sid):
+                    t.append("changes ", style="dim")
+                    t.append("consolidating…\n", style="bold")
+                    d.update(t); return
+                total=len(entries); entries=entries[:200]
+                label = "↵ to review"
             t.append("changes ", style="dim")
-            t.append(f"{len(entries)} file(s)   ")
-            t.append("[↵ to review]\n\n", style="dim")
+            t.append(f"{total} file(s)   ")
+            t.append(f"[{label}]\n\n", style="dim")
             # Preview only (not a scrollable table): use cached decoration where it
             # exists, else the cheap kind with a neutral glyph — never stat all files.
             sig={"created":("+","green"),"modified":("~","yellow"),"deleted":("-","red"),
                  "changed":("·","dim"),"symlink":("·","dim")}
-            for e in entries[:200]:
+            for e in entries:
                 dd=self._decor_of(sid, e["path"])
                 kind=dd["kind"] if dd else e["kind"]
                 stale=bool(dd and dd.get("stale"))
