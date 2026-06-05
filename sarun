@@ -148,9 +148,18 @@ def state_home() -> Path:
 # component, so any sid that arrives in a message MUST be validated against the one
 # legitimate shape before it is used — never trust a sid a box could influence.
 SID_RE = re.compile(r"\d{8}-\d{6}_\d+(\.[0-9a-f]{6})?\Z")
+# A user-assigned box name: CAPITALS / digits / '-', starts with a letter, never ends
+# with a '-'. Uppercase so it can never collide with a lowercase subcommand verb
+# (patch/apply/discard/rename) on the command line, and it is a traversal-safe path
+# component (no '/', no '.', no '..') usable directly as the box's <name>.sqlar identity.
+NAME_RE = re.compile(r"[A-Z]([A-Z0-9-]*[A-Z0-9])?\Z")
+
+def valid_name(name: "str | None") -> bool:
+    return bool(isinstance(name, str) and NAME_RE.match(name))
 
 def valid_sid(sid: "str | None") -> bool:
-    return bool(isinstance(sid, str) and SID_RE.match(sid))
+    # A box identity is either an auto sid (timestamp_pid) or a renamed box's NAME.
+    return bool(isinstance(sid, str) and (SID_RE.match(sid) or NAME_RE.match(sid)))
 
 def relay_dir(session_id: str) -> Path:
     """The per-session directory that holds ONLY this box's relay socket. Bound into
@@ -1070,6 +1079,27 @@ def process_list(path) -> list:
         except (ValueError, TypeError): av = []
         out.append((pid, tgid, ppid, exe or "", av))
     return out
+
+def sqlar_meta_get(path, key: str) -> "str | None":
+    """Read one small per-box meta string (e.g. the renamed box's birth sid) from a
+    sqlar on disk. None if absent."""
+    path = Path(path)
+    if not path.exists(): return None
+    conn = _sqlar_open(path)
+    try:
+        row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    except sqlite3.Error: row = None
+    finally: conn.close()
+    return row[0] if row else None
+
+def sqlar_meta_set(path, key: str, value: str) -> None:
+    conn = _sqlar_open(path)
+    try:
+        conn.execute("INSERT INTO meta(key,value) VALUES(?,?)"
+                     " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                     (key, str(value)))
+        conn.commit()
+    finally: conn.close()
 
 def process_roots(path) -> set:
     """The box's hierarchy-root tgids (process.root=1) read from a sqlar on disk —
@@ -3181,6 +3211,59 @@ def consolidate(shm_dir, session_id: str, cmd: list, index: "Index | None" = Non
     if own_index and idx is not None:
         idx.close()
 
+def unconsolidate(shm_dir, session_id: str) -> None:
+    """The inverse of consolidate(): re-materialize a finished box's sqlar back into a
+    live overlay upper so a re-run (`slopbox NAME -- cmd`) sees its accumulated state.
+    For every non-whiteout row, recreate the entry under up/<rel> — a directory, a
+    symlink, or a file whose bytes are inflated from the blob — carrying its mode and
+    exact ns mtime, then NULL the row's blob. That restores the live invariant (bytes
+    live in the upper; the sqlar row's data is NULL until the next consolidate fills
+    it again). Whiteouts and opacity need no upper artifact: the fresh Index loads them
+    straight from these same rows. Idempotent — an already-live (NULL-blob) file row is
+    left as-is."""
+    upper = Path(shm_dir) / "up"
+    upper.mkdir(parents=True, exist_ok=True)
+    sp = sqlar_path(session_id)
+    if not sp.exists(): return
+    sq = _sqlar_open(sp)
+    try:
+        # ORDER BY name puts a directory immediately before its children, so parents
+        # exist before we write into them (we also mkdir parents defensively).
+        rows = sq.execute("SELECT name, mode, sz, data, mtime FROM sqlar"
+                          " ORDER BY name").fetchall()
+        cleared = []
+        for name, mode, sz, data, mtime in rows:
+            kind = _kind_of_mode(mode)
+            if kind == "whiteout": continue
+            dst = upper / name
+            try:
+                if kind == "dir":
+                    dst.mkdir(parents=True, exist_ok=True)
+                    try: os.chmod(dst, stat_mod.S_IMODE(mode))
+                    except OSError: pass
+                    continue                       # dirs carry no blob to clear
+                if data is None: continue          # already live (NULL blob): leave it
+                blob = bytes(data)
+                content = blob if len(blob) == sz else zlib.decompress(blob)
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                if dst.is_symlink() or dst.exists(): remove_upper_entry(dst)
+                if kind == "symlink":
+                    os.symlink(os.fsdecode(content), dst)
+                    _restore_host_mtime_ns(dst, mtime, is_symlink=True)
+                else:
+                    dst.write_bytes(content)
+                    try: os.chmod(dst, stat_mod.S_IMODE(mode))
+                    except OSError: pass
+                    _restore_host_mtime_ns(dst, mtime, is_symlink=False)
+                cleared.append(name)
+            except OSError:
+                continue
+        for name in cleared:                       # restore the live NULL-blob invariant
+            sq.execute("UPDATE sqlar SET data=NULL, sz=0 WHERE name=?", (name,))
+        sq.commit()
+    finally:
+        sq.close()
+
 def _pid_alive(pid: int) -> bool:
     if not pid: return False
     try:
@@ -3238,13 +3321,23 @@ class Session:
     live: bool = False
     has_sqlar: bool = False                           # the single db has entries
     has_flows: bool = False                           # the single db has flows
-    # started time and pid are not stored — they are read back out of the name.
+    born: str = ""                # original auto-sid if renamed (age/stamp source)
+    run_pid: int = 0              # the live runner's host pid (set at register)
+    # started time and pid are read out of the name; a renamed box (sid is a NAME, no
+    # timestamp) falls back to `born`, the auto-sid it was launched under.
     @property
-    def started(self) -> float: return parse_sid(self.session_id)[0]
+    def started(self) -> float:
+        s = parse_sid(self.session_id)[0]
+        return s if s else parse_sid(self.born)[0]
     @property
-    def pid(self) -> int: return parse_sid(self.session_id)[1]
+    def pid(self) -> int:
+        # The live run's actual runner pid when known (a re-run reuses an sid whose pid
+        # suffix is a stale/dead pid), else the sid's pid suffix.
+        return self.run_pid or parse_sid(self.session_id)[1]
     @property
-    def stamp(self) -> str: return self.session_id.partition("_")[0]
+    def stamp(self) -> str:
+        base = self.session_id if "_" in self.session_id else self.born
+        return base.partition("_")[0]
     @property
     def upper(self) -> str: return str(Path(self.shm_dir) / "up")
     def to_dict(self) -> dict:
@@ -3280,6 +3373,10 @@ def discover_sessions() -> dict:
                     shm_dir=str(live_dir(sid)), status="finished", live=False)
             s.has_sqlar = bool(sqlar_list(af))
             s.has_flows = has_flows(af)
+            # A renamed box (sid is a NAME, not an auto sid) remembers its birth sid so
+            # its age/timestamp display survives the rename.
+            if not SID_RE.match(sid):
+                s.born = sqlar_meta_get(af, "born") or ""
     return out
 
 
@@ -4327,6 +4424,13 @@ class Supervisor:
         cmd = msg.get("cmd", [])
         if self.mount is None or not self.mount.is_healthy():
             return dict(ok=False, error="overlay mount is not available")
+        # Re-run (`slopbox NAME -- cmd`): the sid is an existing finished box. Refuse if
+        # it is already live, then un-consolidate its sqlar back into a fresh upper so
+        # the new command sees the box's accumulated state.
+        rerun = bool(msg.get("want_rerun"))
+        if rerun and (sid in self.indexes
+                      or (self.sessions.get(sid) and self.sessions[sid].live)):
+            return dict(ok=False, error="slopbox is already running")
         backing = live_dir(sid)
         up = backing / "up"
         try:
@@ -4338,6 +4442,8 @@ class Supervisor:
             finally:
                 os.umask(old)
             os.chmod(backing, 0o700)
+            if rerun and sqlar_path(sid).exists():
+                unconsolidate(backing, sid)        # materialize prior state into up/
             index = Index(backing)
         except (OSError, sqlite3.Error) as e:
             return dict(ok=False, error=f"overlay setup failed: {e}")
@@ -4368,7 +4474,8 @@ class Supervisor:
                 self.mount.add_ca_spoof(sid, ca, SYSTEM_CA_FILES)
         box_root = str(mnt_point() / sid)
         s = Session(session_id=sid, cmd=cmd, shm_dir=str(backing),
-                    status="running", live=True)
+                    status="running", live=True, run_pid=root_prov["tgid"],
+                    born=sqlar_meta_get(sqlar_path(sid), "born") or "")
         for h in msg.get("session_whitelist", []):
             s.sess_rules.append(Rule("allow", "host", h))
         self.sessions[sid] = s
@@ -4533,6 +4640,58 @@ class Supervisor:
         self._owner_tokens.pop(sid, None)
         if self.sessions.pop(sid, None) is not None:
             self._emit(type="session_removed", session_id=sid)
+
+    def _box_exists(self, sid) -> bool:
+        return bool(sid and (sid in self.sessions or sqlar_path(sid).exists()
+                             or live_dir(sid).exists()))
+
+    def select(self, sid) -> dict:
+        """Resolve a box identity (an sid or a renamed box's NAME) and make it the UI's
+        selected box (the target of bare `slopbox patch`/`apply`/`discard`/`rename`).
+        Error if no such box."""
+        if not self._box_exists(sid):
+            return dict(ok=False, error=f"no slopbox '{sid}'")
+        self.selected_sid = sid
+        self._emit(type="select_box", session_id=sid)   # move the UI cursor too
+        return dict(ok=True, sid=sid)
+
+    def rename(self, sid, new_name) -> dict:
+        """Rename a FINISHED box to `new_name`, moving its on-disk identity with it:
+        <sid>.sqlar (+ wal/shm) and any live/<sid> backing become <new_name>.* . The
+        box's birth sid is preserved in meta so its age/timestamp display survives.
+        A running box can't be renamed (its mount/relay/bwrap are keyed by the sid)."""
+        if not valid_name(new_name):
+            return dict(ok=False, error="invalid name: CAPS, digits and '-', "
+                        "start with a letter, no trailing '-'")
+        if not self._box_exists(sid):
+            return dict(ok=False, error="no slopbox selected")
+        if new_name == sid:
+            return dict(ok=True, sid=sid, old=sid)
+        if self.review._live(sid):
+            return dict(ok=False, error="can't rename a running slopbox")
+        if self._box_exists(new_name):
+            return dict(ok=False, error=f"name '{new_name}' is already in use")
+        old_sqlar, new_sqlar = sqlar_path(sid), sqlar_path(new_name)
+        try:
+            for suf in ("", "-wal", "-shm"):
+                p = Path(str(old_sqlar) + suf)
+                if p.exists(): p.rename(Path(str(new_sqlar) + suf))
+            old_back, new_back = live_dir(sid), live_dir(new_name)
+            if old_back.exists() and not new_back.exists():
+                old_back.rename(new_back)
+        except OSError as e:
+            return dict(ok=False, error=f"rename failed: {e}")
+        born = sqlar_meta_get(new_sqlar, "born") or (sid if SID_RE.match(sid) else "")
+        if born:
+            try: sqlar_meta_set(new_sqlar, "born", born)
+            except sqlite3.Error: pass
+        self.sessions.pop(sid, None)
+        self._owner_tokens.pop(sid, None)
+        self.review._consolidated.discard(sid)
+        if self.selected_sid == sid: self.selected_sid = new_name
+        self._emit(type="session_removed", session_id=sid)
+        self.rescan()        # discovers <new_name>.sqlar; its session_added auto-selects
+        return dict(ok=True, sid=new_name, old=sid)
 
     def note_traffic(self, sid, host, port, scheme, action, bu, bd, status) -> None:
         s = self.sessions.get(sid)
@@ -5026,29 +5185,38 @@ class ChannelServer:
                 return dict(ok=False, error=str(e))
         elif t == "unregister": await self.sup.unregister_async(msg, self._loop)
         elif t == "remove": self.sup.drop(msg)
+        elif t == "select":
+            # `slopbox NAME …`: select a box by sid/NAME (and move the UI cursor).
+            return self.sup.select(msg.get("sid"))
+        elif t == "rename":
+            # `slopbox [NAME] rename NEW`: rename the targeted (or selected) box.
+            sid = msg.get("sid") or self.sup.selected_sid
+            return self.sup.rename(sid, msg.get("name") or "")
         elif t == "patch":
-            # On-demand patch for the UI's currently-selected box. The patch needs the
-            # box consolidated; for a finished box that is the slow deflate pass, so run
-            # it in the executor (awaited — the CLI is blocked on this reply) instead of
-            # inline, keeping the loop free for the UI/proxy while it runs.
+            # On-demand patch for a target box (explicit sid, else the UI's selection).
+            # The patch needs the box consolidated; for a finished box that is the slow
+            # deflate pass, so run it in the executor (awaited — the CLI is blocked on
+            # this reply) instead of inline, keeping the loop free for the UI/proxy.
             try:
-                sid = self.sup.selected_sid
+                sid = msg.get("sid") or self.sup.selected_sid
                 if not sid:
                     return dict(ok=False, error="no slopbox selected in the UI")
+                if msg.get("sid"): self.sup.select(sid)
                 await self.sup.consolidate_in_executor(self._loop, sid)
                 data = self.sup.review.patch_text(sid)
                 return dict(ok=True, patch=base64.b64encode(data).decode())
             except Exception as e:
                 return dict(ok=False, error=str(e))
         elif t in ("apply", "discard"):
-            # CLI apply/discard for the UI's currently-selected box. Consolidate
-            # off-loop (as `patch` does), act on the ENTIRE change set, then
-            # force-delete the box — unlike the UI we delete unconditionally, even
-            # with network-flow rows, so the CLI op is predictable (box consumed).
+            # CLI apply/discard for a target box (explicit sid, else the UI's selection).
+            # Consolidate off-loop (as `patch` does), act on the ENTIRE change set, then
+            # force-delete the box — unlike the UI we delete unconditionally, even with
+            # network-flow rows, so the CLI op is predictable (box consumed).
             try:
-                sid = self.sup.selected_sid
+                sid = msg.get("sid") or self.sup.selected_sid
                 if not sid:
                     return dict(ok=False, error="no slopbox selected in the UI")
+                if msg.get("sid"): self.sup.select(sid)
                 await self.sup.consolidate_in_executor(self._loop, sid)
                 paths = [e["path"] for e in self.sup.review.session_changes(sid)]
                 if t == "apply":
@@ -5219,7 +5387,7 @@ def run_on_untrusted(argv, files, timeout=10, out_cap=256 * 1024):
     except Exception as e:
         return (False, "", f"sandbox error: {e}")
 
-def cmd_run(cmd, net, trace, direct, session_whitelist, chdir) -> int:
+def cmd_run(cmd, net, trace, direct, session_whitelist, chdir, reuse_sid=None) -> int:
     if not cmd:
         print("slopbox: no command given", file=sys.stderr); return 2
 
@@ -5235,14 +5403,16 @@ def cmd_run(cmd, net, trace, direct, session_whitelist, chdir) -> int:
               f"  (expected control socket: {SOCK_PATH})", file=sys.stderr)
         return 3
 
-    # The session id is the whole identity: timestamp + our pid. It names the
-    # live/<sid> backing dir, the <mnt>/<sid> mount subfolder, and the single db
-    # (<sid>.sqlar). The command is the box's root process row in that db.
-    sid = make_sid()
+    # The session id is the whole identity: it names the live/<sid> backing dir, the
+    # <mnt>/<sid> mount subfolder, and the single db (<sid>.sqlar). A re-run reuses an
+    # existing box's identity (`reuse_sid`); a fresh run mints timestamp + our pid.
+    rerun = reuse_sid is not None
+    sid = reuse_sid if rerun else make_sid()
 
-    # Our own HOST-namespace provenance: the sid's pid suffix is this runner's pid,
-    # so this is the box's root process. The UI persists it as the root process row
-    # (tgid == sid pid, argv == cmd). full_env so a traced box has the root env too.
+    # Our own HOST-namespace provenance: this runner is the box's root process for this
+    # run. The UI persists it as a root process row (tgid == our pid, argv == cmd); a
+    # re-run adds another root to the box's process forest. full_env so a traced box
+    # has the root env too.
     self_prov = read_provenance(os.getpid(), full_env=True)
 
     # Register with the UI and BLOCK until it has created live/<sid>, built the
@@ -5250,15 +5420,21 @@ def cmd_run(cmd, net, trace, direct, session_whitelist, chdir) -> int:
     # does the bwrap bind target exist. The ack carries the absolute mount path.
     ack = sync_request(SOCK_PATH, type="register", session_id=sid,
                        cmd=list(cmd), prov=self_prov, root_tgid=os.getpid(),
-                       session_whitelist=session_whitelist,
+                       session_whitelist=session_whitelist, want_rerun=rerun,
                        want_net=net, want_trace=trace, want_direct=direct)
     if not ack or not ack.get("ok") or not ack.get("mount"):
+        if rerun:
+            # A re-run can't relocate to a fresh sid — the identity IS the target box.
+            print("slopbox: could not re-run this slopbox"
+                  f"{(' — ' + ack['error']) if ack and ack.get('error') else ''}.",
+                  file=sys.stderr)
+            return 1
         # collision on sid (same second + pid is impossible, but be safe) or the
         # UI failed to set up the overlay — retry once with a unique suffix.
         sid = sid + "." + uuid.uuid4().hex[:6]
         ack = sync_request(SOCK_PATH, type="register", session_id=sid,
                            cmd=list(cmd), prov=self_prov, root_tgid=os.getpid(),
-                           session_whitelist=session_whitelist,
+                           session_whitelist=session_whitelist, want_rerun=False,
                            want_net=net, want_trace=trace, want_direct=direct)
         if not ack or not ack.get("ok") or not ack.get("mount"):
             print("slopbox: the UI could not set up the overlay for this session"
@@ -5513,12 +5689,30 @@ def _make_ui_app():
         @on(Input.Submitted,"#rule-input")
         def _save(self): self.dismiss(self.query_one("#rule-input",Input).value.strip())
 
+    class RenameModal(ModalScreen):
+        # Rename the selected box. Returns the new NAME or None.
+        BINDINGS=[("escape","cancel","")]
+        def __init__(self, cur): super().__init__(); self.cur=cur
+        def compose(self):
+            with Vertical(id="rule-box"):
+                yield Label(f" Rename {self.cur}", id="rule-title")
+                yield Input(value="", id="rule-input")
+                yield Label("[dim]CAPITALS, digits and [b]-[/b] · start with a letter · "
+                            "no trailing [b]-[/b]   e.g. [b]BOB5-24-YES[/b] · "
+                            "Enter save · Esc cancel[/]")
+        def on_mount(self): self.query_one("#rule-input",Input).focus()
+        def action_cancel(self): self.dismiss(None)
+        @on(Input.Submitted,"#rule-input")
+        def _save(self): self.dismiss(self.query_one("#rule-input",Input).value.strip())
+
     # Each list carries its own key bindings, delegating to the app's actions. The
     # bottom key bar advertises them per view (and lights up the current list's key).
     class SessionTable(DataTable):
-        BINDINGS=[Binding("k","kill","kill"), Binding("d","delete","delete")]
+        BINDINGS=[Binding("k","kill","kill"), Binding("d","delete","delete"),
+                  Binding("n","rename","rename")]
         def action_kill(self): self.app.action_kill()
         def action_delete(self): self.app.action_delete()
+        def action_rename(self): self.app.action_rename()
 
     class NetTable(DataTable):
         # Read-only: the network log is a record, nothing to accept or reject.
@@ -6042,6 +6236,12 @@ def _make_ui_app():
                         self.sup.selected_sid=None
                     self._ch_entries=[]; self._rebuild_ch()
                 if self.view=="boxes": self._update_box_detail()
+            elif t=="select_box":
+                # A CLI `slopbox NAME …` selected this box: move the cursor to it.
+                sid=ev["session_id"]
+                if sid in self.sessions:
+                    self._select_sid(sid)
+                    if self.view=="boxes": self._update_box_detail()
             elif t=="approval_pending":
                 a=ev["approval"]; self.pending={**self.pending,a["request_id"]:a}
                 # No focus stealing: just raise the banner, beep, and (if available)
@@ -7012,6 +7212,18 @@ def _make_ui_app():
                 if ok: self.sup.delete(s["session_id"])
             self.push_screen(Confirm(styled("Delete ", (s['stamp'],"bold"), " and its overlay?")), done)
 
+        def action_rename(self):
+            s=self._sel_session()
+            if not s: return
+            if s["status"]=="running": self._status("can't rename a running slopbox"); return
+            sid=s["session_id"]
+            def done(name):
+                if not name: return
+                rep=self.sup.rename(sid, name)
+                if not rep.get("ok"): self._status(rep.get("error") or "rename failed")
+                else: self._status(f"renamed → {rep['sid']}")
+            self.push_screen(RenameModal(s.get("stamp") or sid), done)
+
         def action_ap_allow(self): self._ap_once("allow")
         def action_ap_deny(self): self._ap_once("deny")
         def _ap_once(self, action):
@@ -7088,12 +7300,13 @@ def run_ui() -> int:
     return 0
 
 
-def cmd_patch() -> int:
-    """Print the unified patch for the UI's currently-selected slopbox to stdout,
-    by asking the running UI over the control socket."""
+def cmd_patch(target=None) -> int:
+    """Print the unified patch for a slopbox to stdout, by asking the running UI over
+    the control socket. `target` (an sid/NAME) selects the box; None = the UI's
+    currently-selected box."""
     if not ui_is_running(SOCK_PATH):
         print("slopbox: the UI is not running.", file=sys.stderr); return 3
-    rep = sync_request(SOCK_PATH, type="patch")
+    rep = sync_request(SOCK_PATH, type="patch", sid=target)
     if not rep or not rep.get("ok"):
         print("slopbox: " + ((rep or {}).get("error") or "no patch available"),
               file=sys.stderr)
@@ -7103,12 +7316,13 @@ def cmd_patch() -> int:
     return 0
 
 
-def _cmd_review(verb: str, done: str) -> int:
-    """Shared body for apply/discard: act on the UI's selected box over the control
-    socket, then print the summary. The box is consumed (force-deleted) by the UI."""
+def _cmd_review(verb: str, done: str, target=None) -> int:
+    """Shared body for apply/discard: act on a box (`target` sid/NAME, else the UI's
+    selection) over the control socket, then print the summary. The box is consumed
+    (force-deleted) by the UI."""
     if not ui_is_running(SOCK_PATH):
         print("slopbox: the UI is not running.", file=sys.stderr); return 3
-    rep = sync_request(SOCK_PATH, type=verb)
+    rep = sync_request(SOCK_PATH, type=verb, sid=target)
     if not rep or not rep.get("ok"):
         print("slopbox: " + ((rep or {}).get("error") or f"nothing to {verb}"),
               file=sys.stderr)
@@ -7117,23 +7331,47 @@ def _cmd_review(verb: str, done: str) -> int:
     return 0
 
 
-def cmd_apply() -> int:
-    """Apply the UI's selected box's entire change set to the host, then remove it."""
-    return _cmd_review("apply", "applied")
+def cmd_apply(target=None) -> int:
+    """Apply a box's entire change set to the host, then remove it."""
+    return _cmd_review("apply", "applied", target)
 
 
-def cmd_discard() -> int:
-    """Discard the UI's selected box's entire change set, then remove it."""
-    return _cmd_review("discard", "discarded")
+def cmd_discard(target=None) -> int:
+    """Discard a box's entire change set, then remove it."""
+    return _cmd_review("discard", "discarded", target)
+
+
+def cmd_rename(target, new_name) -> int:
+    """Rename a slopbox (`target` sid/NAME, else the UI's selection) to NEW_NAME."""
+    if not new_name:
+        print("slopbox: usage: slopbox [NAME] rename NEWNAME", file=sys.stderr)
+        return 2
+    if not valid_name(new_name):
+        print("slopbox: invalid name — CAPS, digits and '-', start with a letter, "
+              "no trailing '-' (e.g. BOB5-24-YES).", file=sys.stderr)
+        return 2
+    if not ui_is_running(SOCK_PATH):
+        print("slopbox: the UI is not running.", file=sys.stderr); return 3
+    rep = sync_request(SOCK_PATH, type="rename", sid=target, name=new_name)
+    if not rep or not rep.get("ok"):
+        print("slopbox: " + ((rep or {}).get("error") or "rename failed"),
+              file=sys.stderr)
+        return 1
+    print(f"renamed {rep.get('old')} → {rep.get('sid')}")
+    return 0
 
 
 _USAGE = ("slopbox                         start the UI\n"
           "       slopbox patch                   print selected box's patch (stdout)\n"
           "       slopbox apply                   apply selected box's changes, remove it\n"
           "       slopbox discard                 discard selected box's changes, remove it\n"
-          "       slopbox [-n] [-t] [-d] [-w HOST]... [-C DIR] -- CMD [ARGS...]\n"
+          "       slopbox rename NEWNAME          rename the selected box\n"
+          "       slopbox NAME [SUBCOMMAND]       select box NAME, then run SUBCOMMAND\n"
+          "                                       (e.g. slopbox BOB patch · slopbox BOB -- ls)\n"
+          "       slopbox [NAME] [-n] [-t] [-d] [-w HOST]... [-C DIR] -- CMD [ARGS...]\n"
           "         -n  networking via mitmproxy   -t  process tracing\n"
-          "         -d  direct host access (no capture)")
+          "         -d  direct host access (no capture)\n"
+          "         a NAME is CAPS/digits/'-', starts with a letter, no trailing '-'")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -7160,14 +7398,34 @@ def main() -> int:
     if argv[0] in ("-h", "--help"):
         print("usage: " + _USAGE); return 0
 
-    if argv[0] == "patch":
-        return cmd_patch()
+    # An optional leading box NAME (CAPS) selects that box; the rest of the line then
+    # applies to it. `slopbox BOB patch`, `slopbox BOB rename NEW`, `slopbox BOB -- ls`,
+    # or bare `slopbox BOB` (just select). A missing box is an error.
+    target = None
+    if valid_name(argv[0]):
+        target = argv[0]; argv = argv[1:]
+        if ui_is_running(SOCK_PATH):
+            rep = sync_request(SOCK_PATH, type="select", sid=target)
+            if not rep or not rep.get("ok"):
+                print("slopbox: " + ((rep or {}).get("error")
+                                     or f"no slopbox '{target}'"), file=sys.stderr)
+                return 1
+        elif not (sqlar_path(target).exists() or live_dir(target).exists()):
+            print(f"slopbox: no slopbox '{target}'", file=sys.stderr); return 1
+        if not argv:
+            return 0                          # bare `slopbox NAME` just selects
 
-    if argv[0] == "apply":
-        return cmd_apply()
+    if argv and argv[0] == "patch":
+        return cmd_patch(target)
 
-    if argv[0] == "discard":
-        return cmd_discard()
+    if argv and argv[0] == "apply":
+        return cmd_apply(target)
+
+    if argv and argv[0] == "discard":
+        return cmd_discard(target)
+
+    if argv and argv[0] == "rename":
+        return cmd_rename(target, argv[1] if len(argv) > 1 else "")
 
     # The command MUST come after `--`. Flags come before it.
     if "--" not in argv:
@@ -7195,7 +7453,8 @@ def main() -> int:
         return 2
     if not cmd:
         print("slopbox: no command after `--`.", file=sys.stderr); return 2
-    return cmd_run(cmd, ns.net, ns.trace, ns.direct, ns.whitelist, ns.chdir)
+    return cmd_run(cmd, ns.net, ns.trace, ns.direct, ns.whitelist, ns.chdir,
+                   reuse_sid=target)
 
 
 if __name__ == "__main__":

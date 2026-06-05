@@ -386,8 +386,9 @@ def _run_main(argv, **patches):
 
 def test_dash_dash_required_and_flag_parsing():
     seen = {}
-    def fake_run(cmd, net, trace, direct, wl, chdir):
-        seen.update(cmd=cmd, net=net, trace=trace, direct=direct, wl=wl, chdir=chdir)
+    def fake_run(cmd, net, trace, direct, wl, chdir, reuse_sid=None):
+        seen.update(cmd=cmd, net=net, trace=trace, direct=direct, wl=wl, chdir=chdir,
+                    reuse_sid=reuse_sid)
         return 0
 
     # missing `--` is refused with a clear, fixable message.
