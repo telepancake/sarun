@@ -2261,9 +2261,20 @@ def _build_overlay_ops():
                         raise pyfuse3.FUSEError(errno.EACCES)
                     self._index(sid).writer_for(ctx.pid)   # tracing/provenance
                     if self._passthrough(sid, rel):
-                        fd = self._passthrough_open(rel, flags)
+                        fd = self._passthrough_open(rel, flags)   # flags carry O_TRUNC
                     else:
                         fd = self._ensure_copyup(sid, rel, flags, ctx)
+                        # Honor O_TRUNC on the overlay path. With FUSE atomic_o_trunc the
+                        # kernel passes O_TRUNC to open() (and sends NO separate
+                        # setattr(size=0)), so the handler must truncate itself — else a
+                        # rewrite-shorter (e.g. `>` over an existing upper file, as
+                        # config.status does when it reuses a sed fragment) keeps the old
+                        # tail bytes past the new length and the file reads back corrupt.
+                        if flags & os.O_TRUNC:
+                            try: os.ftruncate(fd, 0)
+                            except OSError as e:
+                                os.close(fd)
+                                raise pyfuse3.FUSEError(e.errno or errno.EIO)
                         self._notify(sid, rel, "modified")
                 with self._lock:
                     fh = self._next_fh; self._next_fh += 1

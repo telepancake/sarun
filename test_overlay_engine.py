@@ -108,6 +108,31 @@ def test_copyup_modify():
         fx.stop()
 
 
+def test_otrunc_rewrite_shorter():
+    # Regression: O_TRUNC on the overlay (copy-up) open path must truncate. With FUSE
+    # atomic_o_trunc the kernel passes O_TRUNC to open() and sends no separate
+    # setattr(size=0), so a `>`-rewrite with SHORTER content must not leave the old
+    # tail behind. This is the config.status `subs-N.sed` busyloop bug.
+    fx = MountFixture()
+    try:
+        fx.start()
+        # (a) an upper (created) file rewritten shorter: exact new bytes, no stale tail
+        r = fx.sh("printf 'LOOOOOOOOONG original content\\n' > a; printf 'short\\n' > a; cat a")
+        check(r.stdout == "short\n",
+              "upper O_TRUNC rewrite-shorter truncates (no stale tail)")
+        r = fx.sh("wc -c < a")
+        check(r.stdout.strip() == "6", "upper O_TRUNC rewrite leaves exactly the new length")
+        # (b) a lower-backed file rewritten shorter (copy-up + O_TRUNC together)
+        r = fx.sh("printf 'tiny\\n' > etc/hostname; "
+                  "printf 'len=%s' \"$(wc -c < etc/hostname)\"")
+        check(r.stdout == "len=5", "lower copy-up + O_TRUNC truncates to new length")
+        # (c) truncate to empty
+        r = fx.sh("printf 'data\\n' > e; : > e; wc -c < e")
+        check(r.stdout.strip() == "0", "O_TRUNC to empty yields a 0-byte file")
+    finally:
+        fx.stop()
+
+
 def test_delete_whiteout():
     fx = MountFixture()
     try:
@@ -256,7 +281,8 @@ def test_passthrough_acts_on_host_records_nothing():
 
 
 if __name__ == "__main__":
-    for t in (test_readthrough_and_create, test_copyup_modify, test_delete_whiteout,
+    for t in (test_readthrough_and_create, test_copyup_modify,
+              test_otrunc_rewrite_shorter, test_delete_whiteout,
               test_symlink_and_readlink, test_provenance_recorded, test_opaque_dir,
               test_rename, test_lower_symlink_copyup_preserves_type,
               test_passthrough_acts_on_host_records_nothing):
