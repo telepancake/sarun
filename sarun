@@ -143,6 +143,27 @@ def live_home() -> Path:
 def live_dir(session_id: str) -> Path:
     return live_home() / session_id
 
+# ── content pool ────────────────────────────────────────────────────────────
+# A box's regular-file BYTES live in a flat pool, addressed not by host path but
+# by <box_id>/<shard>/<row_id>: the box's stable id (filename-independent, so a
+# box rename never moves its bytes) and the sqlar entry's row id (stable across
+# renames once we update the name in place). This decouples the on-disk layout
+# from the logical tree — no mirrored directories, no symlink-escape surface on a
+# planted upper, and a box's whole working set drops as a unit when its <box_id>
+# dir is removed. The shard level keeps any one directory from collecting the
+# millions of inodes a large box can produce.
+POOL_SHARDS = 1024
+
+def pool_home() -> Path:
+    return live_home() / "blob"
+
+def box_pool_dir(box_id: int) -> Path:
+    return pool_home() / str(int(box_id))
+
+def blob_path(box_id: int, row_id: int) -> Path:
+    rid = int(row_id)
+    return box_pool_dir(box_id) / f"{rid % POOL_SHARDS:03x}" / str(rid)
+
 def state_home() -> Path:
     base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
     return Path(base) / "slopbox"
@@ -1104,6 +1125,49 @@ def sqlar_meta_set(path, key: str, value: str) -> None:
                      (key, str(value)))
         conn.commit()
     finally: conn.close()
+
+def _all_box_ids() -> dict:
+    """{box_id: sid} for every <sid>.sqlar that has been assigned a pool id. Boxes
+    not yet assigned one are simply absent (the pool id is minted lazily, the first
+    time a box needs to back bytes)."""
+    out = {}
+    sh = state_home()
+    if not sh.exists(): return out
+    for p in sh.glob("*.sqlar"):
+        v = sqlar_meta_get(p, "box_id")
+        if v is None: continue
+        try: out[int(v)] = p.stem
+        except ValueError: pass
+    return out
+
+def ensure_box_id(sid: str) -> int:
+    """The box's STABLE pool id (meta 'box_id'): read it if present, else assign
+    max(existing)+1 and persist it inside the box's own sqlar. Living in the sqlar
+    (not derived from the filename) is what lets a box be renamed without moving or
+    losing its pooled bytes. Single-process (the UI) mints ids, so the scan-then-
+    assign needs no cross-process lock."""
+    sp = sqlar_path(sid)
+    v = sqlar_meta_get(sp, "box_id")
+    if v is not None:
+        try: return int(v)
+        except ValueError: pass
+    nid = max(_all_box_ids(), default=0) + 1
+    sqlar_meta_set(sp, "box_id", str(nid))
+    return nid
+
+def sweep_orphan_pools() -> None:
+    """Drop pool dirs whose box is gone: any blob/<box_id> with no surviving sqlar
+    claiming that id (the box's sqlar was deleted/applied). Runs at UI startup beside
+    the overlay-orphan sweep; cheap when the pool is empty."""
+    root = pool_home()
+    if not root.exists(): return
+    live = set(_all_box_ids())
+    for d in root.iterdir():
+        if not d.is_dir(): continue
+        try: bid = int(d.name)
+        except ValueError: continue
+        if bid not in live:
+            rm_rf(d)
 
 def process_roots(path) -> set:
     """The box's hierarchy-root tgids (process.root=1) read from a sqlar on disk —
@@ -4400,6 +4464,7 @@ class Supervisor:
         live/ empty at rest for any session that had no reviewable changes. Each fold
         is the slow deflate pass; run it OFF the loop (executor, awaited) so the UI
         comes up responsive instead of frozen behind a big orphan."""
+        sweep_orphan_pools()
         lh = live_home()
         if not lh.exists(): return
         loop = loop or asyncio.get_event_loop()

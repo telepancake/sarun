@@ -245,13 +245,50 @@ def test_supervisor_no_mount_register_fails_closed():
     check("error" in ack, "register failure carries an error message")
 
 
+def test_box_id_and_pool_layout():
+    """The box's stable pool id is minted once, unique per box, persisted in the
+    sqlar's own meta (so it survives the sqlar being renamed), and the blob path is
+    addressed by <box_id>/<shard>/<row_id> — never by host path."""
+    tmp = Path(tempfile.mkdtemp(prefix="pool-"))
+    _redirect_state(tmp)
+    try:
+        a = "20260604-000000_1"; b = "20260604-000000_2"
+        # mint sqlars (touch a meta entry so the files exist)
+        m.sqlar_meta_set(m.sqlar_path(a), "born", a)
+        m.sqlar_meta_set(m.sqlar_path(b), "born", b)
+        ida = m.ensure_box_id(a); idb = m.ensure_box_id(b)
+        check(isinstance(ida, int) and isinstance(idb, int), "box ids are ints")
+        check(ida != idb, "distinct boxes get distinct pool ids")
+        check(m.ensure_box_id(a) == ida, "box id is stable across calls (minted once)")
+        # rename the sqlar file: the id travels with it (lives in meta, not the name)
+        renamed = m.sqlar_path("RENAMED")
+        m.sqlar_path(a).rename(renamed)
+        check(m.ensure_box_id("RENAMED") == ida,
+              "box id survives a sqlar rename (stored in meta, not the filename)")
+        # blob path layout: <pool>/<box_id>/<shard>/<row_id>, shard = row % SHARDS
+        bp = m.blob_path(ida, 1234)
+        check(bp.parent.parent == m.box_pool_dir(ida),
+              "blob path is rooted at the box's pool dir")
+        check(bp.name == "1234" and bp.parent.name == f"{1234 % m.POOL_SHARDS:03x}",
+              "blob path is <box_id>/<shard>/<row_id>")
+        # orphan sweep: a pool dir with no surviving sqlar id is removed; a live one stays
+        m.box_pool_dir(idb).mkdir(parents=True, exist_ok=True)
+        ghost = m.box_pool_dir(999999); ghost.mkdir(parents=True, exist_ok=True)
+        m.sweep_orphan_pools()
+        check(m.box_pool_dir(idb).exists(), "pool dir of a live box is kept")
+        check(not ghost.exists(), "pool dir with no surviving box is swept")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     for t in (test_one_db_only_and_blob_lifecycle,
               test_process_and_env_tables_dedup_and_tag,
               test_tracing_off_keeps_env_empty,
               test_consolidate_opaque_expands_tombstones,
               test_process_table_is_one_connected_tree,
-              test_supervisor_no_mount_register_fails_closed):
+              test_supervisor_no_mount_register_fails_closed,
+              test_box_id_and_pool_layout):
         print(f"\n== {t.__name__} ==")
         try:
             t()
