@@ -68,6 +68,7 @@ import array
 import asyncio
 import base64
 import contextvars
+import difflib
 import errno
 import fcntl
 import fnmatch
@@ -92,6 +93,8 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any
 
+# Sections: grep -n "^# ═" sarun | awk 'NR%2==0' lists each closing bar (18 sections);
+# the title is the line just above each.
 
 # ════════════════════════════════════════════════════════════════════════════
 #  Paths
@@ -122,6 +125,10 @@ def live_home() -> Path:
 
 def live_dir(session_id: str) -> Path:
     return live_home() / session_id
+
+def state_home() -> Path:
+    base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    return Path(base) / "slopbox"
 
 # A box's session_id is its whole on-disk identity (it names live/<sid>, <mnt>/<sid>,
 # the patch/sqlar, and the per-session relay socket dir). It is consumed as a path
@@ -235,9 +242,7 @@ def ui_is_running(sock_path: str) -> bool:
 # forwarder holds no bytes; the UI drives the proxied conversation.
 
 def run_inner(channel_path: str, _session_id: str, cmd: list) -> int:
-    # Session identity is NOT taken from _session_id — the UI derives the session
-    # from which relay socket the FD arrives on (channel_path). A box cannot inject
-    # a session id; the parameter is kept only to match the call-site invocation.
+    # _session_id unused: the UI derives the session from which relay socket the FD arrives on.
     stop = threading.Event()
 
     def _peer_pidfd(conn: socket.socket) -> int:
@@ -554,13 +559,13 @@ def load_file_rules() -> FileRules:
 #  Session model + discovery + robust removal
 # ════════════════════════════════════════════════════════════════════════════
 
-def _is_overlay_marker(name: str) -> bool:
-    """Guard against legacy char-device whiteout / opaque-directory marker names
-    (.wh..opq, .wh..wh.*) appearing in the upper. These are never created by this
-    overlay model (deletions and opacity are recorded in <sid>.sqlar, not as on-disk
-    markers), so this function is always False in practice — it is kept as a
-    defensive filter in upper_has_changes and cleanup_dirs."""
-    return name == ".wh..opq" or name.startswith(".wh..wh.")
+# ════════════════════════════════════════════════════════════════════════════
+#  Patch codec — a byte-exact unified diff (multi-file), computed ON DEMAND from
+#  the single sqlar (there is no patch file at rest). Used to render text diffs in
+#  the Changes view, to apply/discard an individual hunk, and to print a box's
+#  whole patch over the control socket (`slopbox patch`). The original command is
+#  the box's ROOT process row in the same sqlar (tgid == the sid's pid).
+# ════════════════════════════════════════════════════════════════════════════
 
 def ut_split(data: bytes) -> list:
     """Split bytes into lines on \\n, keeping the terminator on each line (the last
@@ -572,19 +577,6 @@ def ut_split(data: bytes) -> list:
     if parts[-1]:
         lines.append(parts[-1])
     return lines
-
-
-# ════════════════════════════════════════════════════════════════════════════
-#  Patch codec — a byte-exact unified diff (multi-file), computed ON DEMAND from
-#  the single sqlar (there is no patch file at rest). Used to render text diffs in
-#  the Changes view, to apply/discard an individual hunk, and to print a box's
-#  whole patch over the control socket (`slopbox patch`). The original command is
-#  the box's ROOT process row in the same sqlar (tgid == the sid's pid).
-# ════════════════════════════════════════════════════════════════════════════
-
-def state_home() -> Path:
-    base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
-    return Path(base) / "slopbox"
 
 # A session's whole identity is its name: "YYYYmmdd-HHMMSS_PID". The timestamp
 # (1-second resolution) and the runner's pid can't collide — a live pid is unique,
@@ -625,7 +617,6 @@ def _emit(out: list, prefix: bytes, line: bytes) -> None:
 def make_patch(files: list) -> bytes:
     """files: list of dict(rel, lower, upper, created, deleted) with lower/upper as
     byte-line lists (from ut_split). Returns the unified-diff bytes."""
-    import difflib
     out = []
     for f in files:
         a = b"/dev/null" if f["created"] else b"a/" + f["rel"].encode("utf-8","surrogateescape")
@@ -648,7 +639,6 @@ def parse_patch(data: bytes) -> dict:
     dict(rel, created, deleted, hunks=[dict(a1, b1, lines)]) and lines is the ordered
     [(op, byteline)] with op in ' '/'-'/'+'. Ordered lines let us re-serialize and
     edit hunks losslessly."""
-    import re
     files = {}; cur = None; phys = ut_split(data); i = 0
     while i < len(phys):
         line = phys[i]; i += 1
@@ -692,46 +682,6 @@ def build_file_patch(rel, lower, upper, created, deleted) -> dict:
     return parse_patch(make_patch([dict(rel=rel, lower=lower, upper=upper,
                                         created=created, deleted=deleted)]))[rel]
 
-def apply_hunks(base_lines: list, hunks: list) -> list:
-    """Apply hunks forward onto base_lines (a byte-line list). Each hunk's recorded
-    context must match exactly at its position, else PatchConflict. Used for
-    round-trip verification where the base is unchanged. Returns new byte-line list."""
-    out = []; pos = 0
-    for h in hunks:
-        a1 = h["a1"]; al = hunk_a_lines(h)
-        if base_lines[a1:a1 + len(al)] != al:
-            raise PatchConflict(f"context mismatch at line {a1+1}")
-        if a1 < pos:
-            raise PatchConflict("overlapping hunks")
-        out.extend(base_lines[pos:a1]); out.extend(hunk_b_lines(h)); pos = a1 + len(al)
-    out.extend(base_lines[pos:])
-    return out
-
-def locate_hunk(base_lines: list, hunk: dict) -> "int | None":
-    """patch(1)-style: find where a hunk's original side occurs in base_lines,
-    preferring the recorded position then searching outward. None if not found. A
-    pure-insert hunk (no original lines) goes at the recorded position (clamped)."""
-    al = hunk_a_lines(hunk); a1 = hunk["a1"]; n = len(base_lines)
-    if not al:
-        return max(0, min(a1, n))
-    if base_lines[a1:a1 + len(al)] == al:
-        return a1
-    for off in range(1, n + 1):
-        for pos in (a1 - off, a1 + off):
-            if 0 <= pos <= n - len(al) and base_lines[pos:pos + len(al)] == al:
-                return pos
-    return None
-
-def apply_one_hunk(base_lines: list, hunk: dict) -> tuple:
-    """Apply a single hunk with offset search. Returns (new_lines, offset) where
-    offset is how far from the recorded position it landed (0 = exact). Raises
-    PatchConflict if the context can't be found — caller leaves the file untouched."""
-    pos = locate_hunk(base_lines, hunk)
-    if pos is None:
-        raise PatchConflict("hunk does not apply")
-    al = hunk_a_lines(hunk)
-    return base_lines[:pos] + hunk_b_lines(hunk) + base_lines[pos + len(al):], pos - hunk["a1"]
-
 # ════════════════════════════════════════════════════════════════════════════
 #  The single per-instance database — ONE sqlite file per slopbox (the sqlar).
 #
@@ -759,6 +709,10 @@ def apply_one_hunk(base_lines: list, hunk: dict) -> tuple:
 #  bytes and UPDATEs each already-existing sqlar row's NULL `data` in place, then
 #  tears the upper down — the sqlar is then self-contained.
 # ════════════════════════════════════════════════════════════════════════════
+
+def _like_escape(s: str) -> str:
+    """Escape \\ % _ for use with LIKE ? ESCAPE '\\\\'."""
+    return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 def sqlar_path(session_id: str) -> Path:
     return state_home() / (session_id + ".sqlar")
@@ -1375,7 +1329,8 @@ class Index:
     def prune_subtree(self, prefix: str) -> None:
         pref = prefix + "/"
         with self._lock:
-            self._db.execute("DELETE FROM sqlar WHERE name LIKE ?", (pref + "%",))
+            self._db.execute("DELETE FROM sqlar WHERE name LIKE ? ESCAPE '\\'",
+                             (_like_escape(pref) + "%",))
             self._db.commit()
             for s in (self._whiteouts, self._opaque):
                 for p in [p for p in s if p.startswith(pref)]: s.discard(p)
@@ -1386,8 +1341,8 @@ class Index:
         oldp = old + "/"; newp = new + "/"
         with self._lock:
             rows = self._db.execute(
-                "SELECT name, mode, opaque, writer FROM sqlar WHERE name LIKE ?",
-                (oldp + "%",)).fetchall()
+                "SELECT name, mode, opaque, writer FROM sqlar WHERE name LIKE ? ESCAPE '\\'",
+                (_like_escape(oldp) + "%",)).fetchall()
             for path, mode, opaque, writer in rows:
                 np = newp + path[len(oldp):]
                 self._db.execute("DELETE FROM sqlar WHERE name=?", (path,))
@@ -2616,8 +2571,7 @@ class OverlayMount:
                 # signal "serving" only after the loop is running.
                 self._started.set()
                 await self._stop_trio.wait()
-                # tear down: unmount so pyfuse3.main returns
-                pyfuse3.close(unmount=True)
+                nursery.cancel_scope.cancel()
         try:
             trio.run(_main)
         except Exception as e:
@@ -2713,6 +2667,12 @@ class OverlayMount:
         except (FileNotFoundError, subprocess.TimeoutExpired):
             pass
 
+
+def _is_overlay_marker(name: str) -> bool:
+    """Guard against legacy char-device whiteout / opaque-directory marker names
+    (.wh..opq, .wh..wh.*) appearing in the upper. These are never created by this
+    overlay model — kept as a defensive filter in upper_has_changes and cleanup_dirs."""
+    return name == ".wh..opq" or name.startswith(".wh..wh.")
 
 def upper_has_changes(up: Path) -> bool:
     """True if the overlay upper holds any real change (a created/modified file or
@@ -2824,13 +2784,14 @@ def consolidate(shm_dir, session_id: str, cmd: list, index: "Index | None" = Non
             _sqlar_put_file(sq, rel, content, mode, mtime)
     def _prov(rel):
         return idx.writer_provenance(rel) if idx is not None else None
+    def _sq_remove(rel):
+        sq.execute("DELETE FROM sqlar WHERE name=?", (rel,))
+        sq.execute("DELETE FROM provenance WHERE path=?", (rel,))
     moved = []
     # 1) created/modified files + symlinks in the upper (dirs are structural).
     paths = []
-    for root, _dirs, names in os.walk(upper, onerror=lambda _e: None):
-        for nm in names:
-            paths.append(Path(root) / nm)
-    for root, dirs, _names in os.walk(upper, onerror=lambda _e: None):
+    for root, dirs, names in os.walk(upper, onerror=lambda _e: None):
+        for nm in names: paths.append(Path(root) / nm)
         for d in dirs:
             p = Path(root) / d
             if p.is_symlink(): paths.append(p)
@@ -2838,20 +2799,21 @@ def consolidate(shm_dir, session_id: str, cmd: list, index: "Index | None" = Non
         rel = str(ap.relative_to(upper))
         act = frules.decide(rel)                         # apply / discard / passthrough / None
         if act in ("discard", "passthrough"):
-            sqlar_remove(sp, rel)
+            _sq_remove(rel)
             remove_upper_entry(ap); cleanup_dirs(upper, ap.parent); continue
         if act == "apply":
             _apply_overlay_entry(upper, ap, rel, index=idx)
-            sqlar_remove(sp, rel); cleanup_dirs(upper, ap.parent); continue
+            _sq_remove(rel); cleanup_dirs(upper, ap.parent); continue
         try:
             if ap.is_symlink():
+                lst = ap.lstat()
                 tgt = os.readlink(ap).encode("utf-8", "surrogateescape")
                 data, sz = _sqlar_deflate(tgt)
                 sq.execute("UPDATE sqlar SET mode=?, mtime=?, sz=?, data=? WHERE name=?",
-                           (stat_mod.S_IFLNK | 0o777, int(ap.lstat().st_mtime),
+                           (stat_mod.S_IFLNK | 0o777, int(lst.st_mtime),
                             len(tgt), sqlite3.Binary(data), rel))
                 if sq.execute("SELECT changes()").fetchone()[0] == 0:
-                    _sqlar_put_symlink(sq, rel, tgt, ap.lstat().st_mtime)
+                    _sqlar_put_symlink(sq, rel, tgt, lst.st_mtime)
                 p = _prov(rel)
                 if p: _sqlar_put_provenance(sq, rel, p)
             elif ap.is_file():
@@ -2870,20 +2832,20 @@ def consolidate(shm_dir, session_id: str, cmd: list, index: "Index | None" = Non
         for rel in idx.deletions():
             act = frules.decide(rel)
             if act in ("discard", "passthrough"):
-                sqlar_remove(sp, rel); continue
+                _sq_remove(rel); continue
             host = Path("/") / rel
             if act == "apply":
                 try:
                     if host.is_dir() and not host.is_symlink(): shutil.rmtree(host)
                     elif host.exists() or host.is_symlink(): host.unlink()
                 except OSError: pass
-                sqlar_remove(sp, rel); continue
+                _sq_remove(rel); continue
             if host.exists() or host.is_symlink():
                 _sqlar_put_tombstone(sq, rel)
                 p = _prov(rel)
                 if p: _sqlar_put_provenance(sq, rel, p)
             else:
-                sqlar_remove(sp, rel)
+                _sq_remove(rel)
         # 3) opaque dirs: expand into per-lower-child tombstones for children not
         #    re-materialized in the upper.
         for drel in idx.opaque_dirs():
@@ -3015,6 +2977,35 @@ class Pending:
     scheme: str; ts: float; future: Any
     url: str = ""; ips: list = field(default_factory=list)
     cnames: list = field(default_factory=list)
+
+def _write_host_hunk(dst: Path, new_lower: list) -> dict:
+    """Write new_lower bytes to dst on the host, refusing to write through a symlink.
+    Returns dict(ok=True) on success, dict(ok=False, error=...) on failure."""
+    if _is_symlink(dst):
+        return dict(ok=False, error="refusing to write through a symlink")
+    try:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(b"".join(new_lower))
+    except OSError as e:
+        return dict(ok=False, error=str(e))
+    return dict(ok=True)
+
+def _build_hunks_display(ll: list, ul: list, groups: list) -> list:
+    """Build the hunk display list from lower/upper byte-line lists and diff groups."""
+    def disp(b): return b.decode("utf-8", "replace").rstrip("\r\n")
+    hunks = []
+    for gi, group in enumerate(groups):
+        a1, a2 = group[0][1], group[-1][2]
+        b1, b2 = group[0][3], group[-1][4]
+        lines = [("hdr", f"@@ -{a1+1},{a2-a1} +{b1+1},{b2-b1} @@")]
+        for tag, i1, i2, j1, j2 in group:
+            if tag == "equal":
+                for ln in ll[i1:i2]: lines.append((" ", disp(ln)))
+            else:
+                for ln in ll[i1:i2]: lines.append(("-", disp(ln)))
+                for ln in ul[j1:j2]: lines.append(("+", disp(ln)))
+        hunks.append(dict(index=gi, lines=lines))
+    return hunks
 
 class Supervisor:
     def __init__(self, rules: Rules, mount: "OverlayMount | None" = None):
@@ -3163,9 +3154,6 @@ class Supervisor:
 
     def _record_traffic(self, s, host, port, scheme, action,
                         bytes_up=0, bytes_down=0, status=0) -> None:
-        # Keep the compact per-session tallies shown in the Slopboxes table; we no
-        # longer keep a connection-by-connection log (the Approvals panel is the
-        # live view, and the upstream fetch isn't ours to journal).
         if action == "allow": s.conn_allowed += 1
         else: s.conn_denied += 1
         s.bytes_up += bytes_up; s.bytes_down += bytes_down
@@ -3447,10 +3435,6 @@ class Supervisor:
         del self.sessions[sid]
         self._emit(type="session_removed", session_id=sid)
 
-    @staticmethod
-    def _is_whiteout(p: Path) -> bool:
-        return is_whiteout(p)
-
     # Surfacing deletions caused by an opaque directory can in principle touch a
     # large lower tree; cap it so the review list can't be flooded.
     _OPAQUE_DELETE_CAP = 500
@@ -3524,11 +3508,10 @@ class Supervisor:
         return [entries[k] for k in sorted(entries)]
 
     def overlay_diff(self, sid, rel) -> dict:
-        import difflib
         s = self.sessions.get(sid)
         if not s: return dict(kind="error", error="no session")
         rel = rel.lstrip("/"); up = Path(s.upper) / rel; lo = Path("/") / rel
-        if self._is_whiteout(up): return dict(kind="deleted", diff=None, raw=None, content=None)
+        if is_whiteout(up): return dict(kind="deleted", diff=None, raw=None, content=None)
         if not up.exists():
             # deletion implied by an opaque parent directory (no upper artifact)
             return dict(kind="deleted", diff=None, raw=None, content=None)
@@ -3562,14 +3545,13 @@ class Supervisor:
         if not s: return None
         rel = rel.lstrip("/")
         src = Path(s.upper) / rel; dst = Path("/") / rel
-        if not src.is_file() or self._is_whiteout(src): return None
+        if not src.is_file() or is_whiteout(src): return None
         try:
             ut = src.read_bytes(); lt = dst.read_bytes() if dst.exists() else b""
         except OSError:
             return None
         if b"\x00" in ut or b"\x00" in lt:        # NUL byte -> treat as binary
             return None
-        import difflib
         ll = ut_split(lt); ul = ut_split(ut)
         groups = list(difflib.SequenceMatcher(None, ll, ul).get_grouped_opcodes(3))
         return (ll, ul, groups)
@@ -3582,20 +3564,7 @@ class Supervisor:
         if info is None:
             return dict(is_text=False, hunks=[], diff=self.overlay_diff(sid, rel))
         ll, ul, groups = info
-        def disp(b): return b.decode("utf-8", "replace").rstrip("\r\n")
-        hunks = []
-        for gi, group in enumerate(groups):
-            a1, a2 = group[0][1], group[-1][2]
-            b1, b2 = group[0][3], group[-1][4]
-            lines = [("hdr", f"@@ -{a1+1},{a2-a1} +{b1+1},{b2-b1} @@")]
-            for tag, i1, i2, j1, j2 in group:
-                if tag == "equal":
-                    for ln in ll[i1:i2]: lines.append((" ", disp(ln)))
-                else:
-                    for ln in ll[i1:i2]: lines.append(("-", disp(ln)))
-                    for ln in ul[j1:j2]: lines.append(("+", disp(ln)))
-            hunks.append(dict(index=gi, lines=lines))
-        return dict(is_text=True, hunks=hunks)
+        return dict(is_text=True, hunks=_build_hunks_display(ll, ul, groups))
 
     def _settle_file(self, sid, rel) -> None:
         """After a hunk op, if the overlay copy no longer differs from the host (or
@@ -3617,8 +3586,7 @@ class Supervisor:
 
     def overlay_apply_hunk(self, sid, rel, index) -> dict:
         # Apply one hunk forward onto the host file; the overlay already has it, so
-        # that hunk simply stops being a difference. Byte-exact: we splice raw
-        # byte-lines and write bytes (line endings / encoding preserved verbatim).
+        # that hunk simply stops being a difference. Byte-exact: splice raw byte-lines.
         info = self._file_hunks(sid, rel)
         if info is None: return dict(ok=False, error="not a text change")
         ll, ul, groups = info
@@ -3626,16 +3594,8 @@ class Supervisor:
         g = groups[index]
         a1, a2, b1, b2 = g[0][1], g[-1][2], g[0][3], g[-1][4]
         new_lower = ll[:a1] + ul[b1:b2] + ll[a2:]
-        dst = Path("/") / rel.lstrip("/")
-        # LOW-3: never write THROUGH a symlink onto the host. If the target path is a
-        # symlink, refuse rather than follow it.
-        if _is_symlink(dst):
-            return dict(ok=False, error="refusing to write through a symlink")
-        try:
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            dst.write_bytes(b"".join(new_lower))
-        except OSError as e:
-            return dict(ok=False, error=str(e))
+        result = _write_host_hunk(Path("/") / rel.lstrip("/"), new_lower)
+        if not result["ok"]: return result
         self._settle_file(sid, rel)
         return dict(ok=True)
 
@@ -3692,7 +3652,7 @@ class Supervisor:
             try:
                 # A deletion may come from a whiteout *or* from an opaque parent
                 # directory (which leaves no per-file artifact in the upper).
-                if kinds.get(rel) == "deleted" or self._is_whiteout(src):
+                if kinds.get(rel) == "deleted" or is_whiteout(src):
                     if dst.is_dir() and not dst.is_symlink(): shutil.rmtree(dst)
                     elif dst.exists() or dst.is_symlink(): dst.unlink()
                 elif src.is_dir(): dst.mkdir(parents=True, exist_ok=True)
@@ -3811,7 +3771,6 @@ class Supervisor:
         try: lo = host.read_bytes() if (host.exists() and not host.is_dir()) else b""
         except OSError: lo = b""
         if b"\x00" in lo: return None
-        import difflib
         ll = ut_split(lo); ul = ut_split(raw)
         groups = list(difflib.SequenceMatcher(None, ll, ul).get_grouped_opcodes(3))
         return (ll, ul, groups)
@@ -3831,20 +3790,7 @@ class Supervisor:
         info = self._sqlar_hunks(sid, rel)
         if info is not None:
             ll, ul, groups = info
-            def disp(b): return b.decode("utf-8", "replace").rstrip("\r\n")
-            hunks = []
-            for gi, group in enumerate(groups):
-                a1, a2 = group[0][1], group[-1][2]
-                b1, b2 = group[0][3], group[-1][4]
-                lines = [("hdr", f"@@ -{a1+1},{a2-a1} +{b1+1},{b2-b1} @@")]
-                for tag, i1, i2, j1, j2 in group:
-                    if tag == "equal":
-                        for ln in ll[i1:i2]: lines.append((" ", disp(ln)))
-                    else:
-                        for ln in ll[i1:i2]: lines.append(("-", disp(ln)))
-                        for ln in ul[j1:j2]: lines.append(("+", disp(ln)))
-                hunks.append(dict(index=gi, lines=lines))
-            return dict(is_text=True, hunks=hunks)
+            return dict(is_text=True, hunks=_build_hunks_display(ll, ul, groups))
         raw = sqlar_content(sp, rel) or b""
         return dict(is_text=False, hunks=[],
                     diff=dict(kind="modified" if host.exists() else "created",
@@ -3858,16 +3804,8 @@ class Supervisor:
         g = groups[index]
         a1, a2, b1, b2 = g[0][1], g[-1][2], g[0][3], g[-1][4]
         new_lower = ll[:a1] + ul[b1:b2] + ll[a2:]
-        dst = Path("/") / rel.lstrip("/")
-        if _is_symlink(dst):
-            return dict(ok=False, error="refusing to write through a symlink")
-        try:
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            dst.write_bytes(b"".join(new_lower))
-        except OSError as e:
-            return dict(ok=False, error=str(e))
-        # The hunk is now applied on the host; if the file matches the sqlar copy
-        # entirely, drop the entry.
+        result = _write_host_hunk(Path("/") / rel.lstrip("/"), new_lower)
+        if not result["ok"]: return result
         if b"".join(new_lower) == b"".join(ul):
             sqlar_remove(sqlar_path(sid), rel.lstrip("/"))
         return dict(ok=True)
@@ -4304,7 +4242,7 @@ class ChannelServer:
     """
     def __init__(self, sup: Supervisor, engine: "ProxyEngine", sock_path: str):
         self.sup = sup; self.engine = engine; self.sock_path = sock_path
-        self._srv = None
+        self._sock = None
 
     async def start(self) -> None:
         try: os.unlink(self.sock_path)
@@ -4315,8 +4253,6 @@ class ChannelServer:
         self._sock.listen(128)
         self._sock.setblocking(False)
         self._loop = asyncio.get_event_loop()
-        # The Supervisor needs the loop + engine to spin up per-session relay sockets
-        # (one per networked box) when it handles a register; hand them over now.
         self.sup.attach_relay_factory(self._loop, self.engine)
         self._task = asyncio.ensure_future(self._accept_loop())
 
@@ -4397,10 +4333,11 @@ class ChannelServer:
             self.sup.stop_all_relays()
         except Exception:
             pass
-        try:
-            self._sock.close()
-        except OSError:
-            pass
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
         try: os.unlink(self.sock_path)
         except FileNotFoundError: pass
 
@@ -4409,14 +4346,15 @@ class ChannelServer:
 #  CA generation
 # ════════════════════════════════════════════════════════════════════════════
 
-def ensure_ca_cert() -> Path:
+def ensure_ca_cert() -> "Path | None":
+    """Generate the mitmproxy CA cert if not already present. Returns CA_CERT on
+    success or None if mitmdump is unavailable or times out."""
     if CA_CERT.exists(): return CA_CERT
     try:
-        with socket.socket() as s:
-            s.bind(("127.0.0.1", 0)); tmp_port = s.getsockname()[1]
+        # Port 0: let mitmdump pick a free ephemeral port — no TOCTOU race.
         proc = subprocess.Popen(
             ["mitmdump", "-q", "--listen-host", "127.0.0.1",
-             "--listen-port", str(tmp_port), "--set", f"confdir={MITM_CONFDIR}"],
+             "--listen-port", "0", "--set", f"confdir={MITM_CONFDIR}"],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL)
         for _ in range(50):
@@ -4427,6 +4365,10 @@ def ensure_ca_cert() -> Path:
         except Exception: proc.kill()
     except FileNotFoundError:
         pass
+    if not CA_CERT.exists():
+        print("slopbox: ensure_ca_cert: mitmdump timed out; CA cert not generated",
+              file=sys.stderr)
+        return None
     return CA_CERT
 
 
