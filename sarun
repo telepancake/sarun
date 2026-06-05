@@ -131,10 +131,14 @@ def runtime_home() -> Path:
     return Path(base) / "slopbox" if base else data_home()
 
 def live_home() -> Path:
-    """Per-session overlay backing: live/<sid>/up only (overlay state and
-    provenance live in the per-box <sid>.sqlar). Created mode 0700. Replaces the
-    old /dev/shm/slopbox.<sid> overlay dirs."""
-    return runtime_home() / "live"
+    """Per-session overlay backing: live/<sid>/up (the box's working bytes) plus the
+    per-session relay socket dir. Sits next to the per-box <sid>.sqlar under
+    state_home — i.e. ON DISK, not the RAM-backed XDG_RUNTIME_DIR tmpfs. A box's
+    writes (every copy-up, every extracted file) land here, so its capacity must track
+    the disk, not a fraction of RAM; being on the same filesystem as the lower (/) also
+    lets copy-up reflink. (runtime_home keeps only the small ephemera: the control/
+    relay sockets and the FUSE mountpoint.) Created mode 0700."""
+    return state_home() / "live"
 
 def live_dir(session_id: str) -> Path:
     return live_home() / session_id

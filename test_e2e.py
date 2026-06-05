@@ -159,7 +159,7 @@ def run_with_ui(tmp):
         # backing live/<sid> is gone (consolidated + cleaned). Poll: the unregister
         # handler removes the backing right AFTER writing the stores, so the stores
         # can momentarily exist before the dir is gone.
-        live = Path(e["XDG_RUNTIME_DIR"]) / "slopbox" / "live"
+        live = Path(e["XDG_STATE_HOME"]) / "slopbox" / "live"
         deadline = time.time() + 15
         leftover = ["x"]
         while time.time() < deadline:
