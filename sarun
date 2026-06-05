@@ -847,6 +847,7 @@ def sqlar_remove(path, name) -> int:
 
 _FLOW_BODY_CAP = 1 << 20    # store at most 1 MiB of each body (but record true size)
 _PROC_RETIRE_S = 4.0        # live proc pane: keep a dead tgid (highlighted) this long
+_ACTIVE_CAP    = 4096       # active set hard cap (bounds RAM when the pane is unwatched)
 
 def _hdr_text(items) -> str:
     out = []
@@ -924,6 +925,18 @@ def process_list(path) -> list:
         except (ValueError, TypeError): av = []
         out.append((pid, tgid, ppid, exe or "", av))
     return out
+
+def sqlar_writer_id(path, rel) -> "int | None":
+    """The process-table row id that wrote `rel` (the sqlar `writer` tag), or None.
+    Finished-box path: read straight from the consolidated single sqlar."""
+    path = Path(path)
+    if not path.exists(): return None
+    conn = _sqlar_open(path)
+    try:
+        row = conn.execute("SELECT writer FROM sqlar WHERE name=?", (rel,)).fetchone()
+    except sqlite3.Error: row = None
+    finally: conn.close()
+    return row[0] if row and row[0] is not None else None
 
 def process_env(path, proc_id) -> dict:
     """The deduped environment for one process row (resolved via env_id)."""
@@ -1212,12 +1225,25 @@ class Index:
         """Cache key that survives PID reuse: (pid, /proc start_time)."""
         return (pid, _proc_start_time(pid))
 
+    def _touch_active(self, tgid: int) -> None:
+        """Re-stamp a tgid in the active set (last-seen monotonic) and keep the set
+        bounded: when it crosses the cap, drop the oldest-seen dead entries so RAM
+        stays bounded even if the proc pane is never opened to drive retirement.
+        Serve/relay-thread write; GIL-atomic dict ops (Index threading contract)."""
+        now = time.monotonic()
+        self._active[tgid] = now
+        if len(self._active) > _ACTIVE_CAP:
+            for t, _seen in sorted(self._active.items(), key=lambda kv: kv[1]):
+                if len(self._active) <= _ACTIVE_CAP: break
+                if t == tgid or _pid_alive(t): continue
+                self._active.pop(t, None); self._dead_since.pop(t, None)
+
     def writer_for(self, pid: int) -> int:
         """Resolve the FUSE ctx.pid (a TID) to its tgid and return that tgid's
         process-table row id, inserting it (and its deduped env) on first sight.
         Always returns an id even if /proc is gone. The id tags the file entry."""
         tgid = tgid_of(pid)
-        self._active[tgid] = time.monotonic()    # active-set: re-stamp on every sight
+        self._touch_active(tgid)                 # active-set: re-stamp on every sight
         cached = self._proc_cache.get(tgid)
         if cached is not None: return cached
         # When tracing, capture the FULL environment for the process table; the
@@ -1238,7 +1264,7 @@ class Index:
         tgid was supplied. Same process-table + env-crc32 dedup as writer_for."""
         tgid = int(prov.get("tgid") or 0)
         if not tgid: return None
-        self._active[tgid] = time.monotonic()    # active-set: re-stamp on every sight
+        self._touch_active(tgid)                  # active-set: re-stamp on every sight
         cached = self._proc_cache.get(tgid)
         if cached is not None: return cached
         ppid_tgid = int(prov.get("ppid") or 0)
@@ -1439,6 +1465,18 @@ class Index:
         with self._lock:
             snap = list(self._opaque)
         return sorted(snap)
+
+    def writer_id_for(self, path: str) -> "int | None":
+        """The process-table row id that last wrote `path` (the sqlar `writer` tag),
+        or None. Keys the proc pane → used to focus the writer when jumping to procs.
+        UI-thread read of the single sqlar handle: take _lock so it never races the
+        serve thread's writes on the shared connection (Index threading contract)."""
+        try:
+            with self._lock:
+                row = self._db.execute(
+                    "SELECT writer FROM sqlar WHERE name=?", (path,)).fetchone()
+        except sqlite3.Error: return None
+        return row[0] if row and row[0] is not None else None
 
     def writer_provenance(self, path: str) -> "dict | None":
         # No lock: consolidate-only precondition — called post-teardown with the box
@@ -4050,6 +4088,13 @@ class Supervisor:
     def process_env(self, sid, proc_id) -> dict:
         return process_env(sqlar_path(sid), proc_id)
 
+    def writer_id(self, sid, rel) -> "int | None":
+        """The process-table row id that wrote file `rel` in box `sid` (its proc-pane
+        key), for cross-pane jumps. Live box → its in-RAM Index; finished → the sqlar."""
+        idx = self.indexes.get(sid)
+        if idx is not None: return idx.writer_id_for(rel.lstrip("/"))
+        return sqlar_writer_id(sqlar_path(sid), rel.lstrip("/"))
+
     def kill(self, sid) -> None:
         # s.pid is the runner ("slopbox CMD") process, derived from the session id.
         # SIGTERM to it trips the runner's handler, which tears down the bwrap group
@@ -5166,6 +5211,14 @@ def _make_ui_app():
             self._ch_decor.pop(sid, None)
 
         def _drain_overlay_events(self):
+            # Live proc retirement runs on THIS reliable 0.3s cadence (not the 3s
+            # _tick, which can be starved): re-poll the active set every tick the
+            # proc pane is open so dead rows retire within _PROC_RETIRE_S even when
+            # no overlay events are arriving. _load_procs is a cheap O(active set)
+            # kill(0) probe and diffs the table in place (no blink, cursor kept).
+            if self.view=="procs" and self._ch_sid:
+                try: self._load_procs(self._ch_sid)
+                except Exception: pass
             changed=set()
             try:
                 while True:
@@ -5271,22 +5324,28 @@ def _make_ui_app():
                     self._status("[red]overlay handler hung — recovered "
                                  "(lazy-unmounted)[/]")
             except Exception: pass
-            self.sup.rescan()
-            self._rebuild_sessions(preserve=True)
-            self._render_appr()
+            # Section-guarded: a failure in any one section must NOT abort the rest
+            # (e.g. a rescan/render error used to starve the live proc refresh, so
+            # dead rows never retired). Each section is independent and best-effort.
+            def _g(fn):
+                try: fn()
+                except Exception: pass
+            _g(self.sup.rescan)
+            _g(lambda: self._rebuild_sessions(preserve=True))
+            _g(self._render_appr)
             if self._ch_sid is None:
                 s=self._sel_session()
                 if s: self._ch_sid=self._last_loaded_sid=s["session_id"]
             self.sup.selected_sid=self._ch_sid
             if self.view=="changes" and self._ch_sid:
-                self._load_changes(self._ch_sid)
+                _g(lambda: self._load_changes(self._ch_sid))
             if self.view=="netlog" and self._ch_sid:
-                self._load_flows(self._ch_sid)
+                _g(lambda: self._load_flows(self._ch_sid))
             if self.view=="procs" and self._ch_sid:
-                self._load_procs(self._ch_sid)
+                _g(lambda: self._load_procs(self._ch_sid))
             if self.view=="boxes":
-                self._update_box_detail()
-            self._cbar()    # keep the dirty/count indicator current
+                _g(self._update_box_detail)
+            _g(self._cbar)    # keep the dirty/count indicator current
 
         # ── view machinery: one left list at a time + its right-pane detail ────
         def _set_view(self, v):
@@ -5315,7 +5374,30 @@ def _make_ui_app():
 
         def action_view_boxes(self): self._set_view("boxes")
         def action_view_changes(self): self._set_view("changes")
-        def action_view_procs(self): self._set_view("procs")
+        def action_view_procs(self):
+            # Cross-pane jump: entering procs FROM a changes/netlog row focuses the
+            # process responsible — the file's writer (sqlar writer tag / live Index)
+            # or the flow's process_id. Resolve BEFORE switching; graceful if the
+            # process isn't in the displayed list (retired / none recorded): just show
+            # the pane (a finished box's full table still contains it).
+            target=None
+            try:
+                if self.view=="changes" and self._ch_sid:
+                    rel=self._sel_path()
+                    if rel: target=self.sup.writer_id(self._ch_sid, rel)
+                elif self.view=="netlog" and self._ch_sid:
+                    fid=self._sel_flow()
+                    if fid is not None:
+                        f=self.sup.flow_detail(self._ch_sid, fid)
+                        if f: target=f.get("process_id")
+            except Exception: target=None
+            self._set_view("procs")
+            if target is not None: self._focus_proc(target)
+        def _focus_proc(self, pid):
+            try:
+                t=self.query_one("#pr-tab",DataTable)
+                t.move_cursor(row=t.get_row_index(str(pid)), animate=False)
+            except Exception: pass   # not in the displayed active set — leave cursor
         def action_view_netlog(self): self._set_view("netlog")
         def action_view_net(self): self._set_view("net")
         def action_view_file(self): self._set_view("file")
