@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Adversarial test: prove the DAEMON never follows a sandbox-planted symlink onto
-its host target (OVERLAY-SPEC §8, R1–R4: O_NOFOLLOW / follow_symlinks=False on
-every upper-path open/stat/truncate/chmod/chown/utime).
+its host target (O_NOFOLLOW / follow_symlinks=False on every upper-path
+open/stat/truncate/chmod/chown/utime).
 
 Why drive the daemon directly: in production bwrap binds <mnt>/<sid> as `/`, so an
 *absolute* symlink target resolves INSIDE the sandbox overlay, and the kernel
 follows symlinks against the sandbox root — the host is unreachable to the child.
-The residual risk R1–R4 addresses is the *daemon itself* dereferencing a symlink
+The residual risk is the *daemon itself* dereferencing a symlink
 upper-artifact while servicing copy-up or setattr. We exercise exactly that: plant
 a symlink in the upper that points at a host file, then invoke the daemon's
 write-side handlers on that path and assert the host target is untouched.

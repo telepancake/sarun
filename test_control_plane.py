@@ -191,6 +191,7 @@ class _FakeOps:
 
 class _FakeMount:
     def __init__(self): self.ops = _FakeOps()
+    def is_healthy(self): return True
     def add_session(self, *a, **k): pass
     def remove_session(self, sid): self.ops.remove_session(sid)
     def add_ca_spoof(self, *a, **k): pass

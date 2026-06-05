@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Engine-level tests for the multiplexed pyfuse3 overlay (OVERLAY-SPEC §3–§14).
+"""Engine-level tests for the multiplexed pyfuse3 overlay.
 
 Run with the venv python (has pyfuse3+trio):
     /home/user/venv/bin/python test_overlay_engine.py
