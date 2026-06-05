@@ -2952,7 +2952,8 @@ def _open_index_ro(shm_dir) -> "Index | None":
     try: return Index(Path(shm_dir))
     except sqlite3.Error: return None
 
-def consolidate(shm_dir, session_id: str, cmd: list, index: "Index | None" = None) -> None:
+def consolidate(shm_dir, session_id: str, cmd: list, index: "Index | None" = None,
+                progress=None) -> None:
     """Finish a box: fill the NULL content blobs of its single sqlar from the overlay
     upper, then tear the upper down. consolidate does NOT copy rows or translate
     schemas — each entry row already exists (the FUSE layer upserted it on the
@@ -2964,7 +2965,12 @@ def consolidate(shm_dir, session_id: str, cmd: list, index: "Index | None" = Non
 
     File rules are consulted first, top-to-bottom: a matching 'apply' writes the
     change to the host and drops the row, a matching 'discard' just drops the row —
-    either way it reaches neither store."""
+    either way it reaches neither store.
+
+    `progress`, if given, is called as progress(done, total) after each upper entry
+    is folded — the per-file deflate loop is the slow part — so a UI can render a
+    fraction while consolidate runs off the loop. It is a plain callback; an off-loop
+    caller must marshal any UI touch back to its own thread (never draw from here)."""
     upper = Path(shm_dir) / "up"
     if not upper.is_dir(): return
     own_index = index is None
@@ -2992,9 +2998,13 @@ def consolidate(shm_dir, session_id: str, cmd: list, index: "Index | None" = Non
         for d in dirs:
             p = Path(root) / d
             if p.is_symlink(): paths.append(p)
-    for ap in sorted(set(paths)):
+    ordered = sorted(set(paths)); total = len(ordered)
+    for done, ap in enumerate(ordered, 1):
         rel = str(ap.relative_to(upper))
         act = frules.decide(rel)                         # apply / discard / passthrough / None
+        if progress is not None:
+            try: progress(done, total)
+            except Exception: pass
         if act in ("discard", "passthrough"):
             _sq_remove(rel)
             remove_upper_entry(ap); cleanup_dirs(upper, ap.parent); continue
@@ -3472,6 +3482,11 @@ class ChangeReview:
     def __init__(self, reg: "Supervisor"):
         self.reg = reg
         self._consolidated: set = set()   # sids already consolidated this run
+        # sids whose consolidate() is running OFF the loop in a worker thread. While a
+        # sid is here the UI shows a "Consolidating…" placeholder and never reads its
+        # not-yet-complete change set. Mutated ONLY on the UI loop (start/finish), so
+        # it stays single-thread-confined like _consolidated.
+        self._consolidating: set = set()
 
     def _entries(self, sid) -> list:
         """All changed entries for a session — enumeration is delegated to the box's
@@ -3525,28 +3540,49 @@ class ChangeReview:
                     diff=dict(kind="modified" if host.exists() else "created",
                               content=base64.b64encode(raw).decode()))
 
-    def _ensure_consolidated(self, sid) -> None:
-        """Consolidate a finished session's overlay into its single sqlar the first
-        time we look at it (for orphaned sessions left on disk by a crashed runner).
-        Never touches a live/running session."""
-        if sid in self._consolidated: return
+    def _consolidate_prep(self, sid) -> "dict | None":
+        """Loop-thread half of consolidation: decide whether `sid` (a finished,
+        not-yet-consolidated box) needs folding and, if so, mark it consolidated and
+        close + drop its live Index handle (a finished box has none live, but a stale
+        handle may linger). Returns the off-loop work args (shm_dir/cmd) or None when
+        there is nothing to do. Mutates registry state, so it MUST run on the UI loop;
+        the heavy consolidate() it enables runs OFF the loop (sync here, worker for
+        the UI)."""
+        if sid in self._consolidated: return None
         s = self.reg.sessions.get(sid)
-        if not s or s.live or _pid_alive(s.pid): return
+        if not s or s.live or _pid_alive(s.pid): return None
         self._consolidated.add(sid)
-        if not (s.shm_dir and Path(s.shm_dir).exists()): return
+        if not (s.shm_dir and Path(s.shm_dir).exists()): return None
         idx = self.reg.indexes.pop(sid, None)
         if idx is not None:
             try: idx.close()
             except Exception: pass
-        try:
-            consolidate(s.shm_dir, sid, s.cmd)
-        except Exception:
-            return
+        return dict(shm_dir=s.shm_dir, cmd=list(s.cmd))
+
+    def _consolidate_finish(self, sid) -> None:
+        """Loop-thread half: post-consolidate registry bookkeeping (has_sqlar refresh,
+        free a spent backing tree). MUST run on the UI loop. Idempotent."""
+        s = self.reg.sessions.get(sid)
+        if not s: return
         s.has_sqlar = bool(sqlar_list(sqlar_path(sid)))
         try: empty = not upper_has_changes(Path(s.upper))
         except OSError: empty = False
-        if empty:
+        if empty and s.shm_dir:
             rm_rf(s.shm_dir)
+
+    def _ensure_consolidated(self, sid) -> None:
+        """Consolidate a finished session's overlay into its single sqlar the first
+        time we look at it (for orphaned sessions left on disk by a crashed runner).
+        Never touches a live/running session. SYNCHRONOUS — for the control plane
+        (patch) and post-edit callers; the interactive UI uses the off-loop worker
+        path (UI._start_consolidate) so the loop never blocks."""
+        args = self._consolidate_prep(sid)
+        if args is None: return
+        try:
+            consolidate(args["shm_dir"], sid, args["cmd"])
+        except Exception:
+            return
+        self._consolidate_finish(sid)
 
     def invalidate_consolidation(self) -> None:
         """Forget which sessions were already consolidated this run, so each gets
@@ -3557,7 +3593,11 @@ class ChangeReview:
     def session_changes(self, sid) -> list:
         """All changes for a session. Everything comes from the one sqlar (when
         consolidated) plus the live overlay upper (while running) — there is no
-        separate patch source."""
+        separate patch source. SYNCHRONOUS consolidation; the interactive UI must NOT
+        call this for a finished box on the loop (it would block) — it triggers the
+        off-loop worker and reads only once the box is consolidated. While a box is
+        mid-consolidation its (partial) state is off-limits: refuse the read."""
+        if sid in self._consolidating: return []
         self._ensure_consolidated(sid)
         return self._entries(sid)
 
@@ -3925,20 +3965,26 @@ class Supervisor:
 
     def _emit(self, **ev: Any) -> None: self.on_event(ev)
 
-    def sweep_orphans(self) -> None:
+    async def sweep_orphans(self, loop=None) -> None:
         """At UI startup, consolidate-or-leave each orphaned live/<sid> from a prior
         crash: its runner is gone, so fold its overlay into the single <sid>.sqlar
         (deletions and opacity come from that sqlar) and remove the spent backing
         tree. Leaves
-        live/ empty at rest for any session that had no reviewable changes."""
+        live/ empty at rest for any session that had no reviewable changes. Each fold
+        is the slow deflate pass; run it OFF the loop (executor, awaited) so the UI
+        comes up responsive instead of frozen behind a big orphan."""
         lh = live_home()
         if not lh.exists(): return
+        loop = loop or asyncio.get_event_loop()
         for d in sorted(lh.iterdir()):
             if not (d / "up").is_dir(): continue
             sid = d.name
             if _pid_alive(parse_sid(sid)[1]): continue   # a running runner owns it
             try:
-                consolidate(str(d), sid, root_cmd(sid))
+                # No live Index for an orphan: consolidate opens its own sqlar conn over
+                # this box's own files, so running it in a thread is safe.
+                await loop.run_in_executor(
+                    None, consolidate, str(d), sid, root_cmd(sid))
             except Exception as e:
                 print(f"slopbox(ui): sweep of {sid} failed: {e}", file=sys.stderr)
                 continue
@@ -3947,6 +3993,20 @@ class Supervisor:
                     rm_rf(d)
             except OSError:
                 pass
+
+    async def consolidate_in_executor(self, loop, sid) -> None:
+        """Off-loop consolidation of one FINISHED box for a loop-side awaiter (the
+        `patch` control op). Prep + finish run on the loop (registry state); the heavy
+        deflate pass runs in the executor. No-op if `sid` needs no consolidation. Safe
+        off-loop: a finished box has no live Index — consolidate opens its own sqlar
+        conn over that box's own files."""
+        args = self.review._consolidate_prep(sid)
+        if args is None: return
+        try:
+            await loop.run_in_executor(
+                None, consolidate, args["shm_dir"], sid, args["cmd"])
+        finally:
+            self.review._consolidate_finish(sid)
 
     def rescan(self) -> None:
         disk = discover_sessions()
@@ -4581,7 +4641,7 @@ class ChannelServer:
                 if b"\n" in buf:
                     line, buf = buf.split(b"\n", 1)
                     if line.strip():
-                        reply = self._dispatch_control(line)
+                        reply = await self._dispatch_control(line)
                         if reply is not None:
                             try:
                                 await self._loop.sock_sendall(
@@ -4592,7 +4652,7 @@ class ChannelServer:
                 more = await self._loop.sock_recv(conn, 4096)
                 if not more:
                     if buf.strip():
-                        reply = self._dispatch_control(buf)
+                        reply = await self._dispatch_control(buf)
                         if reply is not None:
                             try:
                                 await self._loop.sock_sendall(
@@ -4607,7 +4667,7 @@ class ChannelServer:
             try: conn.close()
             except OSError: pass
 
-    def _dispatch_control(self, line: bytes) -> "dict | None":
+    async def _dispatch_control(self, line: bytes) -> "dict | None":
         try: msg = json.loads(line.decode())
         except json.JSONDecodeError: return None
         t = msg.get("type")
@@ -4619,11 +4679,15 @@ class ChannelServer:
         elif t == "unregister": self.sup.unregister(msg)
         elif t == "remove": self.sup.drop(msg)
         elif t == "patch":
-            # On-demand patch for the UI's currently-selected box.
+            # On-demand patch for the UI's currently-selected box. The patch needs the
+            # box consolidated; for a finished box that is the slow deflate pass, so run
+            # it in the executor (awaited — the CLI is blocked on this reply) instead of
+            # inline, keeping the loop free for the UI/proxy while it runs.
             try:
                 sid = self.sup.selected_sid
                 if not sid:
                     return dict(ok=False, error="no slopbox selected in the UI")
+                await self.sup.consolidate_in_executor(self._loop, sid)
                 data = self.sup.review.patch_text(sid)
                 return dict(ok=True, patch=base64.b64encode(data).decode())
             except Exception as e:
@@ -5108,6 +5172,9 @@ def _make_ui_app():
         #appr-bar { height:auto; display:none; padding:0 1;
                     background:$warning; color:$text; text-style:bold; }
         #appr-bar.show { display:block; }
+        #cons-bar { height:auto; display:none; padding:0 1;
+                    background:$accent; color:$text; text-style:bold; }
+        #cons-bar.show { display:block; }
         #main { height:1fr; }
         #left  { width:2fr; border:solid $primary; }
         #right { width:3fr; border:solid $primary; }
@@ -5198,9 +5265,16 @@ def _make_ui_app():
             self._fin_procs={}        # sid -> (procs, tree)  (built once, cached)
             self._pr_conn=set()       # connector-only proc row keys (cursor skips)
             self._pr_procs=[]; self._pr_key=None   # current proc-pane rows + repaint key
+            # Off-loop consolidation progress: sid -> (done, total) for the box(es)
+            # currently folding in a worker thread. The in-progress set itself lives on
+            # review._consolidating (consulted for placeholder gating); this only holds
+            # the latest fraction to render. Both are mutated on the UI thread only —
+            # the worker marshals updates via call_from_thread.
+            self._cons_progress={}
 
         def compose(self) -> ComposeResult:
             yield Header()
+            yield Static("", id="cons-bar")       # transient consolidation progress
             yield Static("", id="appr-bar")       # transient approval banner
             with Horizontal(id="main"):
                 with Vertical(id="left"):
@@ -5238,8 +5312,9 @@ def _make_ui_app():
             # Start the single pyfuse3 overlay mount on its dedicated trio thread.
             # Until it is up, no slopbox can run (it has nowhere to bind its root).
             mount_ok=self.overlay_mount.start()
-            # A prior crash may have left orphaned live/<sid> backings: fold them.
-            try: self.sup.sweep_orphans()
+            # A prior crash may have left orphaned live/<sid> backings: fold them
+            # off the loop so startup stays responsive behind a big orphan.
+            try: await self.sup.sweep_orphans(loop)
             except Exception: pass
             self.engine=ProxyEngine(self.sup, loop,
                                     lambda coro: asyncio.ensure_future(coro))
@@ -5266,16 +5341,108 @@ def _make_ui_app():
             # The serving thread enqueues; we apply on the UI thread.
             self.set_interval(0.3, self._drain_overlay_events)
 
+        # ── off-loop consolidation (folding a finished box's overlay → sqlar) ──
+        def _is_consolidating(self, sid):
+            return sid in self.sup.review._consolidating
+
+        def _maybe_start_consolidate(self, sid):
+            """If a FINISHED box still needs its overlay folded into the sqlar, kick the
+            fold off the UI loop in a worker thread and return True (so the caller shows
+            a placeholder instead of reading the not-yet-complete state). Returns False
+            when nothing to do (already consolidated, live, or no backing). Idempotent:
+            the prep marks the box + drops its stale Index, and _consolidating guards
+            against a second worker for the same sid."""
+            review=self.sup.review
+            if sid in review._consolidating: return True
+            args=review._consolidate_prep(sid)        # loop-thread: marks + drops Index
+            if args is None: return False             # nothing to fold
+            review._consolidating.add(sid)
+            self._cons_progress[sid]=(0,0)
+            self._render_cons_bar()
+            # @work thread worker: consolidate runs OFF the loop; a finished box has no
+            # live Index, and consolidate opens its own sqlar conn over this box's own
+            # files, so nothing else touches that box's sqlar while it runs.
+            self.run_worker(
+                lambda: self._consolidate_worker(sid, args["shm_dir"], args["cmd"]),
+                thread=True, exclusive=False, name=f"consolidate:{sid}")
+            return True
+
+        def _consolidate_worker(self, sid, shm_dir, cmd):
+            """Worker-THREAD body: the slow deflate pass. Touches only this box's files
+            via consolidate(); every UI/registry touch is marshaled back to the loop
+            with call_from_thread (progress + completion). Never draws from here."""
+            def _prog(done, total):
+                self.call_from_thread(self._cons_progress_update, sid, done, total)
+            try:
+                consolidate(shm_dir, sid, cmd, progress=_prog)
+            except Exception as e:
+                self.call_from_thread(self._consolidate_failed, sid, str(e)); return
+            self.call_from_thread(self._consolidate_done, sid)
+
+        def _cons_progress_update(self, sid, done, total):
+            # LOOP thread (marshaled): record the fraction and repaint the top bar.
+            if sid not in self.sup.review._consolidating: return
+            self._cons_progress[sid]=(done,total)
+            self._render_cons_bar()
+
+        def _consolidate_done(self, sid):
+            # LOOP thread (marshaled): finish registry bookkeeping, clear the in-progress
+            # flag, and refresh whatever pane is showing this box so the now-consolidated
+            # change set renders in place of the placeholder.
+            self.sup.review._consolidate_finish(sid)
+            self.sup.review._consolidating.discard(sid)
+            self._cons_progress.pop(sid, None)
+            self._fin_changes.pop(sid, None)   # force a fresh read of the folded sqlar
+            self._ch_decor.pop(sid, None)
+            self._render_cons_bar()
+            if self._ch_sid==sid:
+                if self.view=="changes": self._load_changes(sid, force=True)
+                elif self.view=="boxes": self._update_box_detail()
+                elif self.view=="procs": self._load_procs(sid, force=True)
+
+        def _consolidate_failed(self, sid, err):
+            # LOOP thread (marshaled): don't wedge the box forever — drop the flags and
+            # surface the error. (prep already added it to _consolidated; clearing that
+            # too lets a later view retry the fold.)
+            self.sup.review._consolidating.discard(sid)
+            self.sup.review._consolidated.discard(sid)
+            self._cons_progress.pop(sid, None)
+            self._render_cons_bar()
+            self._status(Text(f"consolidate {sid[:8]} failed: {err}", style="red"))
+
+        def _render_cons_bar(self):
+            bar=self.query_one("#cons-bar",Static)
+            cons=self.sup.review._consolidating
+            if not cons:
+                bar.set_class(False,"show"); bar.update(""); return
+            sid=self._ch_sid if self._ch_sid in cons else next(iter(cons))
+            done,total=self._cons_progress.get(sid,(0,0))
+            t=Text()
+            t.append("⟳ Consolidating ", style="bold")
+            t.append(sid[:8], style="bold")
+            if total:
+                pct=int(done*100/total); w=20; fill=int(w*done/total)
+                t.append("  ["); t.append("█"*fill, style="bold")
+                t.append("·"*(w-fill), style="dim"); t.append(f"] {done}/{total} ({pct}%)")
+            else:
+                t.append("…")
+            if len(cons)>1: t.append(f"  (+{len(cons)-1} more)", style="dim")
+            bar.update(t); bar.set_class(True,"show")
+
         # ── change-set cache: live (incremental) vs finished (static) ──────────
         def _changes_for(self, sid):
             """The change-entry list for a box, cheap on the hot path. A live box is
             served from its incremental map (seeded once); a finished box from a
-            cache computed once and invalidated only on a real edit."""
+            cache computed once and invalidated only on a real edit. A finished box
+            that still needs folding kicks the off-loop worker and reads as empty
+            (placeholder) until it completes."""
             if sid is None: return []
             if self.sup.review._live(sid):
                 self._fin_changes.pop(sid, None)
                 return self._live_list(sid)
             self._live_changes.pop(sid, None)
+            if self._maybe_start_consolidate(sid):
+                return []                              # mid-fold: placeholder, no read
             if sid not in self._fin_changes:
                 try: self._fin_changes[sid]=self.sup.review.session_changes(sid)
                 except Exception: self._fin_changes[sid]=[]
@@ -5387,13 +5554,16 @@ def _make_ui_app():
                 s=ev["session"]; sid=s["session_id"]
                 self.sessions={**self.sessions,sid:s}
                 self._rebuild_sessions(preserve=True)
-                # live→stopped: drop the incremental map and do ONE authoritative
-                # session_changes pass into the finished cache. Self-heals any drift.
+                # live→stopped: drop the incremental map and recompute the finished set
+                # via _changes_for, which folds OFF the loop when the box still needs it
+                # (it usually doesn't — unregister already consolidated on teardown).
+                # Self-heals any drift without blocking the loop on a big fold.
                 if sid in self._live_changes and not self.sup.review._live(sid):
                     self._live_changes.pop(sid, None)
                     self._ch_decor.pop(sid, None)   # live decor may differ from sqlar
-                    try: self._fin_changes[sid]=self.sup.review.session_changes(sid)
-                    except Exception: self._fin_changes[sid]=[]
+                    self._fin_changes.pop(sid, None)
+                    try: self._changes_for(sid)   # populates the cache or starts the fold
+                    except Exception: pass
                     if self.view=="changes" and self._ch_sid==sid:
                         self._load_changes(sid, force=True)
                 if self.view=="boxes": self._update_box_detail()
@@ -5658,8 +5828,12 @@ def _make_ui_app():
                 t.append("network ", style="dim")
                 t.append(f"{len(self.sup.flows(sid))} connection(s)   ")
                 t.append("[t for log]\n", style="dim")
-            try: entries=self._changes_for(sid)
+            try: entries=self._changes_for(sid)   # kicks the off-loop fold if needed
             except Exception: entries=[]
+            if self._is_consolidating(sid):
+                t.append("changes ", style="dim")
+                t.append("consolidating…\n", style="bold")
+                d.update(t); return
             t.append("changes ", style="dim")
             t.append(f"{len(entries)} file(s)   ")
             t.append("[↵ to review]\n\n", style="dim")
@@ -6028,7 +6202,18 @@ def _make_ui_app():
             return None if k in self._ch_conn else k
 
         def _load_changes(self, sid, force=False):
-            entries=self._changes_for(sid)
+            entries=self._changes_for(sid)   # kicks the off-loop fold if needed
+            # Mid-fold: show a placeholder row, never the partial state. _changes_for
+            # already started the worker; just render the wait.
+            if self._is_consolidating(sid):
+                self._ch_entries=[]
+                self._sync_table(self.query_one("#cf-tab",DataTable),
+                                 [("consolidating",
+                                   [Text(""), Text("consolidating…", style="dim"),
+                                    Text("")])])
+                self._ch_rows=[]; self._ch_conn=set()
+                self._cbar("consolidating…")
+                return
             # Only touch the table when the set of changes actually differs, so the
             # periodic refresh keeps the pane live without blinking or losing the
             # cursor while nothing is changing.
@@ -6104,6 +6289,16 @@ def _make_ui_app():
             # depth-indented; connector-only ancestors (added to connect the tree) are
             # dimmed and the cursor skips them. The live lookup resolves ancestors
             # outside the active set; the finished full table is self-contained.
+            # Mid-fold (finished box still consolidating): the sqlar this pane reads is
+            # being rewritten off the loop — show the placeholder, don't read it.
+            if not self.sup.review._live(sid) and self._maybe_start_consolidate(sid):
+                self._sync_table(self.query_one("#pr-tab",DataTable),
+                                 [("consolidating",
+                                   [Text("…"), Text(""),
+                                    Text("consolidating", style="dim"), Text("")])])
+                self._pr_key=None
+                self._update_proc_detail()
+                return
             root=parse_sid(sid)[1]
             live=self.sup.processes_live(sid)
             if live is not None:
