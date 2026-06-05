@@ -41,6 +41,7 @@ class Fields:
 def run():
     import pyfuse3
     tmp = Path(tempfile.mkdtemp(prefix="ovl-esc-"))
+    os.environ["XDG_STATE_HOME"] = str(tmp / "state")    # keep the single db local
     live = tmp / "live"; sid = "20260604-000000_2"
     backing = live / sid; up = backing / "up"; up.mkdir(parents=True)
     target = tmp / "HOST_SECRET"; target.write_text("ORIGINAL\n")

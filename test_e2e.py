@@ -48,11 +48,20 @@ def wait_socket(sock, timeout=30):
 
 def test_no_ui_fails_fast(tmp):
     e = env_for(tmp)
-    r = subprocess.run([PYBIN, SARUN, "true"], env=e,
+    r = subprocess.run([PYBIN, SARUN, "--", "true"], env=e,
                        capture_output=True, text=True, timeout=30)
     check(r.returncode != 0, "slopbox CMD with no UI exits non-zero")
     check("UI is not running" in r.stderr or "not running" in r.stderr.lower(),
           "no-UI run prints a clear 'UI not running' message")
+
+
+def test_dash_dash_required(tmp):
+    e = env_for(tmp)
+    r = subprocess.run([PYBIN, SARUN, "ls"], env=e,
+                       capture_output=True, text=True, timeout=30)
+    check(r.returncode != 0, "slopbox CMD without `--` exits non-zero")
+    check("--" in r.stderr and "command" in r.stderr.lower(),
+          "missing `--` prints a clear error suggesting `slopbox -- ls`")
 
 
 def run_with_ui(tmp):
@@ -97,7 +106,7 @@ def run_with_ui(tmp):
             f"rm -f /{victim}; "                            # delete a host file (overlay)
             "true")
         r = subprocess.run(
-            [PYBIN, SARUN, "-n", "bash", "-c", script],
+            [PYBIN, SARUN, "-n", "--", "bash", "-c", script],
             env=e, capture_output=True, text=True, timeout=120)
         check(r.returncode == 0, f"slopbox run exited 0 (got {r.returncode}: {r.stderr.strip()[-300:]})")
         check("UI connected" in r.stderr, "runner reports the UI connected")
@@ -107,41 +116,45 @@ def run_with_ui(tmp):
         check(host_after == host_before and host_after is not None,
               "host file the box 'deleted' is untouched on the real host")
 
-        # the UI consolidates on unregister; poll for the stores rather than racing
-        # a fixed sleep (consolidation can lag on a loaded machine).
+        # the UI consolidates on unregister into the ONE sqlar (text+binary+symlink+
+        # tombstone all in it); poll for it rather than racing a fixed sleep.
         state = Path(e["XDG_STATE_HOME"]) / "slopbox"
         deadline = time.time() + 30
         while time.time() < deadline:
-            if list(state.glob("*.patch.xz")) and list(state.glob("*.sqlar")):
+            if list(state.glob("*.sqlar")):
                 break
             time.sleep(0.3)
         patches = list(state.glob("*.patch.xz"))
         sqlars = list(state.glob("*.sqlar"))
-        check(len(patches) == 1, f"exactly one patch.xz produced (got {len(patches)})")
-        check(len(sqlars) == 1, f"exactly one sqlar produced (got {len(sqlars)})")
+        check(len(patches) == 0, f"no patch.xz at rest (got {len(patches)})")
+        check(len(sqlars) == 1, f"exactly one db file produced (got {len(sqlars)})")
 
-        if patches:
-            files = m.parse_patch(m.read_patch_file(patches[0]))
-            check("root_newfile.txt" in files, "created text file folded into the patch")
         if sqlars:
             sp = sqlars[0]
             names = {n for n, _md, _mt, _sz in m.sqlar_list(sp)}
-            check("newdir/blob.bin" in names, "binary file captured in the sqlar")
-            check("newlink" in names, "symlink captured in the sqlar")
+            check("root_newfile.txt" in names and
+                  m.sqlar_content(sp, "root_newfile.txt") == b"hello-overlay\n",
+                  "created text file captured (content filled) in the one db")
+            check("newdir/blob.bin" in names, "binary file captured in the one db")
+            check("newlink" in names, "symlink captured in the one db")
             check(victim in names and stat_mod.S_ISCHR(m.sqlar_mode(sp, victim) or 0),
-                  "host-file deletion captured as a tombstone (from index.db)")
-            # provenance present
+                  "host-file deletion captured as a tombstone in the one db")
+            # provenance present, in the SAME db
             conn = sqlite3.connect(str(sp))
             try:
                 prov = conn.execute(
                     "SELECT path,pid,exe,argv FROM provenance").fetchall()
+                tables = {r[0] for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'")}
             except sqlite3.Error:
-                prov = []
+                prov = []; tables = set()
             finally:
                 conn.close()
-            check(len(prov) >= 1, "provenance table populated in the sqlar")
+            check(len(prov) >= 1, "provenance table populated in the one db")
             if prov:
                 check(all(int(p[1]) > 0 for p in prov), "every provenance row has a pid")
+            check({"sqlar","provenance","process","env","flows"} <= tables,
+                  "the one db carries all concept tables (sqlar/provenance/process/env/flows)")
 
         # backing live/<sid> is gone (consolidated + cleaned). Poll: the unregister
         # handler removes the backing right AFTER writing the stores, so the stores
@@ -160,6 +173,20 @@ def run_with_ui(tmp):
         ls = subprocess.run(["timeout","10","ls",str(mnt)], capture_output=True, text=True)
         check(ls.returncode == 0 and ls.stdout.strip() == "",
               "overlay synthetic root empty again after the box exits")
+
+        # single-instance: a second `slopbox` (UI) must refuse while one is running.
+        r2 = subprocess.run([PYBIN, SARUN], env=e, capture_output=True, text=True,
+                            timeout=20)
+        check(r2.returncode != 0 and "already running" in r2.stderr.lower(),
+              "a second UI instance refuses to start")
+
+        # on-demand patch over the control socket: the finished box stayed selected,
+        # so `slopbox patch` returns its patch (the created text file shows up).
+        rp = subprocess.run([PYBIN, SARUN, "patch"], env=e, capture_output=True,
+                            timeout=20)
+        check(rp.returncode == 0, "slopbox patch exits 0 against the running UI")
+        check(b"root_newfile.txt" in rp.stdout and b"hello-overlay" in rp.stdout,
+              "slopbox patch prints the selected box's unified patch to stdout")
     finally:
         # shut the UI down
         try:
@@ -185,6 +212,8 @@ def main():
     try:
         print("== no-UI fail-fast ==")
         test_no_ui_fails_fast(tmp)
+        print("\n== `--` required ==")
+        test_dash_dash_required(tmp)
         print("\n== end-to-end with the UI ==")
         run_with_ui(tmp)
     except Exception as ex:

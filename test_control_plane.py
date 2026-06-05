@@ -311,13 +311,133 @@ def test_box_cannot_register_or_unregister_a_foreign_session():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+# ── command lives in the process table, not an xattr ────────────────────────
+
+def test_command_is_the_root_process_row():
+    """register() persists the box's command as the ROOT process row (tgid == the
+    sid's host pid, argv == cmd) in the single <sid>.sqlar — the sole home for the
+    command, with no xattr anywhere. The row is present even for an EMPTY box (no
+    file changes), and root_cmd() reads it straight from the persisted db, so it
+    survives after the runner (and its live Index) is gone."""
+    tmp = Path(tempfile.mkdtemp(prefix="cp-"))
+    _redirect_state(tmp)
+    try:
+        m.ensure_dirs()
+        # no command-recording xattr machinery remains
+        check(not hasattr(m, "set_cmd_xattr") and not hasattr(m, "get_cmd_xattr")
+              and not hasattr(m, "CMD_XATTR"),
+              "no set/get_cmd_xattr / CMD_XATTR symbols remain")
+
+        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
+        sid = "20260604-000000_4242"           # the suffix 4242 IS the root host pid
+        root_pid = m.parse_sid(sid)[1]
+        check(root_pid == 4242, "parse_sid recovers the host pid from the sid")
+        cmd = ["echo", "hello world"]
+        prov = dict(ppid=7, exe="/usr/bin/echo", env={"FOO": "bar"})
+        ack = sup.register(dict(session_id=sid, cmd=cmd, prov=prov, want_trace=True))
+        check(ack.get("ok") is True, "register ok")
+
+        # the live process table carries the root row keyed by the host pid
+        procs = sup.processes(sid)
+        root = next((p for p in procs if p[1] == root_pid), None)
+        check(root is not None, "a process row exists for the sid's root pid")
+        check(root and root[4] == cmd, "root row argv IS the command")
+        check(root and root[3] == "/usr/bin/echo", "root row carries the runner exe")
+        check(root and root[2] == 7, "root row carries the runner ppid")
+
+        # the command is retrievable via the lookup helper while live
+        check(m.root_cmd(sid) == cmd, "root_cmd(sid) returns the command")
+
+        # EMPTY box: no file changes were ever written, yet the root row persists.
+        # Drop the live Index to simulate the runner having exited, then read the
+        # command straight from the on-disk sqlar.
+        idx = sup.indexes.pop(sid, None)
+        if idx is not None: idx.close()
+        check(m.root_cmd(sid) == cmd,
+              "root_cmd(sid) reads the command from the persisted sqlar after exit")
+        check(m.discover_sessions()[sid].cmd == cmd,
+              "discover_sessions sources the command from the root process row")
+
+        # a malformed/unparsable sid yields an empty command, never a crash
+        check(m.root_cmd("not-a-sid") == [], "root_cmd of a malformed sid is []")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ── CLI: `--` required, -n/-t/-d flag parsing, single UI instance ────────────
+
+def _run_main(argv, **patches):
+    """Call m.main() with sys.argv set, capturing patched callables' results."""
+    import io, contextlib
+    saved = {k: getattr(m, k) for k in patches}
+    old_argv = sys.argv
+    sys.argv = ["slopbox"] + argv
+    captured = {}
+    for k, v in patches.items(): setattr(m, k, v)
+    err = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(err):
+            rc = m.main()
+    finally:
+        sys.argv = old_argv
+        for k, v in saved.items(): setattr(m, k, v)
+    return rc, err.getvalue()
+
+
+def test_dash_dash_required_and_flag_parsing():
+    seen = {}
+    def fake_run(cmd, net, trace, direct, wl, chdir):
+        seen.update(cmd=cmd, net=net, trace=trace, direct=direct, wl=wl, chdir=chdir)
+        return 0
+
+    # missing `--` is refused with a clear, fixable message.
+    rc, err = _run_main(["ls"], cmd_run=fake_run)
+    check(rc != 0 and "--" in err, "bare `slopbox ls` refused (needs `--`)")
+    check("ls" in err, "error suggests the corrected `slopbox -- ls`")
+    check(not seen, "cmd_run not called when `--` is missing")
+
+    # defaults: NOTHING enabled (no net, no trace, no direct).
+    seen.clear()
+    rc, _ = _run_main(["--", "echo", "hi"], cmd_run=fake_run)
+    check(seen.get("cmd") == ["echo", "hi"], "command parsed after `--`")
+    check(seen.get("net") is False and seen.get("trace") is False
+          and seen.get("direct") is False, "default run enables nothing")
+
+    # all three flags, combinable, before `--`.
+    seen.clear()
+    rc, _ = _run_main(["-n", "-t", "-d", "-w", "ex.com", "--", "ls", "-la"],
+                      cmd_run=fake_run)
+    check(seen.get("net") and seen.get("trace") and seen.get("direct"),
+          "-n/-t/-d are independent and combinable")
+    check(seen.get("cmd") == ["ls", "-la"], "flags before `--`, args (incl. -la) after")
+    check(seen.get("wl") == ["ex.com"], "-w whitelist parsed")
+
+
+def test_single_ui_instance_refused():
+    # run_ui refuses when a UI is already running (ui_is_running True).
+    started = {"n": 0}
+    def fake_app():
+        started["n"] += 1
+        class _A:
+            def run(self, *a, **k): pass
+        return lambda: _A()
+    rc, err = _run_main([], ui_is_running=lambda _p: True,
+                        _make_ui_app=fake_app)
+    check(rc != 0 and "already running" in err.lower(),
+          "second UI refuses with a clear error")
+    check(started["n"] == 0, "the app is never constructed when one is running")
+
+
 if __name__ == "__main__":
     for t in (test_sid_validation_rejects_traversal,
               test_relay_fd_gated_by_socket_not_message,
               test_relay_socket_does_not_dispatch_control,
               test_owner_token_required_for_teardown,
               test_register_net_wires_a_per_session_relay,
-              test_box_cannot_register_or_unregister_a_foreign_session):
+              test_box_cannot_register_or_unregister_a_foreign_session,
+              test_command_is_the_root_process_row,
+              test_dash_dash_required_and_flag_parsing,
+              test_single_ui_instance_refused):
         print(f"\n== {t.__name__} ==")
         try:
             t()

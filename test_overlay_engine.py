@@ -26,6 +26,9 @@ class MountFixture:
     a timeout-wrapped child (operating through the FUSE path), then tear down."""
     def __init__(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="ovl-test-"))
+        # The single db lives under state_home; keep it inside our temp tree so the
+        # real ~/.local/state is untouched.
+        os.environ["XDG_STATE_HOME"] = str(self.tmp / "state")
         self.mnt = self.tmp / "mnt"
         self.live = self.tmp / "live"
         self.sid = "20260604-000000_1"
@@ -35,13 +38,14 @@ class MountFixture:
         self.mount = None
         self.index = None
 
-    def start(self):
+    def start(self, lower=None, passthrough=False):
         self.index = m.Index(self.backing)
-        self.mount = m.OverlayMount(self.mnt, lower="/")
+        self.mount = m.OverlayMount(self.mnt, lower=lower or "/")
         ok = self.mount.start()
         if not ok:
             raise RuntimeError(f"mount failed: {self.mount._start_error}")
-        self.mount.add_session(self.sid, self.up, self.index)
+        self.mount.add_session(self.sid, self.up, self.index,
+                               passthrough=passthrough)
         self.root = self.mnt / self.sid
 
     def sh(self, script, timeout=15):
@@ -225,10 +229,37 @@ def test_lower_symlink_copyup_preserves_type():
         fx.stop()
 
 
+def test_passthrough_acts_on_host_records_nothing():
+    """With -d (blanket passthrough) the box's writes land on the REAL host fs (a
+    temp lower we own) and NOTHING is recorded in the overlay upper / the sqlar."""
+    fx = MountFixture()
+    host_lower = Path(tempfile.mkdtemp(prefix="ovl-pt-host-"))
+    try:
+        fx.start(lower=str(host_lower), passthrough=True)
+        r = fx.sh("mkdir -p d && echo hi > d/f.txt && cat d/f.txt && rm d/f.txt; "
+                  "echo rc=$?")
+        check("hi" in r.stdout and "rc=0" in r.stdout, "passthrough create/read/delete")
+        # the bytes went to the REAL host lower, NOT the overlay upper.
+        check(not (fx.up / "d").exists(), "nothing recorded in the overlay upper")
+        check(fx.index.kind_of("d") is None and fx.index.kind_of("d/f.txt") is None,
+              "nothing recorded in the single sqlar for passthrough paths")
+        # create one that survives, prove it's a real host file under the lower.
+        r2 = fx.sh("echo survive > kept.txt; echo rc=$?")
+        check("rc=0" in r2.stdout, "passthrough create succeeds")
+        check((host_lower / "kept.txt").read_text() == "survive\n",
+              "passthrough write landed on the real host lower")
+        check(not (fx.up / "kept.txt").exists(),
+              "passthrough write left no overlay artifact")
+    finally:
+        fx.stop()
+        shutil.rmtree(host_lower, ignore_errors=True)
+
+
 if __name__ == "__main__":
     for t in (test_readthrough_and_create, test_copyup_modify, test_delete_whiteout,
               test_symlink_and_readlink, test_provenance_recorded, test_opaque_dir,
-              test_rename, test_lower_symlink_copyup_preserves_type):
+              test_rename, test_lower_symlink_copyup_preserves_type,
+              test_passthrough_acts_on_host_records_nothing):
         print(f"\n== {t.__name__} ==")
         try:
             t()

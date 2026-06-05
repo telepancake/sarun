@@ -30,15 +30,17 @@ dedicated trio thread and created the ordinary way (`pyfuse3.init` via the
 setuid `fusermount3` helper — no root, no user namespace, no fd-passing, no
 mount(2)/pivot_root anywhere). That single mount is *multiplexed*: its synthetic
 root lists one subfolder per live slopbox, `<mnt>/<sid>`, each presenting a
-copy-on-write overlay of lower=`/` plus that session's private upper (on disk
-under `live/<sid>/up` + `live/<sid>/index.db`). A slopbox writing to
+copy-on-write overlay of lower=`/` plus that session's private upper (backing
+dir holds only `live/<sid>/up`; overlay state lives in the per-box
+`<sid>.sqlar`). A slopbox writing to
 `<mnt>/<sid>/etc/hostname` reads through to the host file unless it wrote there.
 
 Because the UI serves every filesystem op, it sits in the I/O path exactly like
 it already does for network requests: the Changes view updates live as writes
 happen, and a per-write policy hook (policy_check) is the obvious place where a
 deny/prompt would attach. Provenance (pid/exe/argv of the writer) is captured
-synchronously and recorded in index.db. Since the UI is now the mount provider,
+synchronously and recorded in the per-box `<sid>.sqlar`. Since the UI is now the
+mount provider,
 `slopbox CMD` REQUIRES a running UI and fails fast otherwise.
 
 Isolation is UNCHANGED: the runner still does `bwrap --bind <mnt>/<sid> / …`
@@ -46,15 +48,17 @@ with the same flags (own PID/IPC/UTS/net namespaces, all caps dropped, runs as
 you). The bind-as-root confines the box to its own subfolder; it cannot reach
 `<mnt>/` or another session's `<sid>`. Same uid as the UI, so no allow_other.
 
-Options (slopbox CMD ...):
+Options (slopbox [FLAGS] -- CMD ...; the command MUST follow `--`):
+  -n         enable networking via mitmproxy (default: off)
+  -t         enable process tracing (default: off)
+  -d         direct host access / no capture (default: off)
   -w HOST    pre-allow HOST for this session (repeatable)
-  -n         no network at all (forwarder not started)
   -C DIR     working directory inside the slopbox (default: cwd)
 
 A session is named by the time it started and the runner's pid
-(YYYYmmdd-HHMMSS_PID); that name is the live/ subfolder, the mount subfolder
-and the patch filename, and the only thing stored besides the captured changes
-is the command itself.
+(YYYYmmdd-HHMMSS_PID); that name is the live/ subfolder and the mount
+subfolder, and the only thing stored besides the captured changes is the
+command itself.
 """
 
 from __future__ import annotations
@@ -69,7 +73,6 @@ import fcntl
 import fnmatch
 import ipaddress
 import json
-import lzma
 import os
 import queue
 import re
@@ -77,6 +80,7 @@ import shutil
 import signal
 import socket
 import sqlite3
+import struct
 import stat as stat_mod
 import subprocess
 import sys
@@ -111,8 +115,9 @@ def runtime_home() -> Path:
     return Path(base) / "slopbox" if base else data_home()
 
 def live_home() -> Path:
-    """Per-session overlay backing: live/<sid>/{up,index.db}. Holds provenance, so
-    it is created mode 0700. Replaces the old /dev/shm/slopbox.<sid> overlay dirs."""
+    """Per-session overlay backing: live/<sid>/up only (overlay state and
+    provenance live in the per-box <sid>.sqlar). Created mode 0700. Replaces the
+    old /dev/shm/slopbox.<sid> overlay dirs."""
     return runtime_home() / "live"
 
 def live_dir(session_id: str) -> Path:
@@ -235,23 +240,57 @@ def run_inner(channel_path: str, _session_id: str, cmd: list) -> int:
     # a session id; the parameter is kept only to match the call-site invocation.
     stop = threading.Event()
 
+    def _peer_pidfd(conn: socket.socket) -> int:
+        """A pidfd for the connecting in-box workload process, or -1.
+
+        We are INSIDE the box PID namespace, so we must NOT read box /proc or ship
+        box-namespace pids — those are meaningless to the host-namespace UI and would
+        violate the host-pid invariant. Instead we resolve the peer's (box-namespace)
+        pid via SO_PEERCRED, use it ONLY as the pidfd_open() argument, and hand the
+        resulting pidfd to the UI. The UI then derives the HOST pid from the pidfd's
+        /proc/self/fdinfo (reported in the UI's namespace) and reads provenance there.
+        Returns -1 if the peer is gone, SO_PEERCRED fails, or pidfd_open is
+        unavailable (old kernel ENOSYS) — the UI then leaves the flow untagged."""
+        try:
+            creds = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
+                                    struct.calcsize("3i"))
+            pid, _uid, _gid = struct.unpack("3i", creds)
+        except OSError:
+            return -1
+        if pid <= 0:
+            return -1
+        try:
+            return os.pidfd_open(pid, 0)
+        except (OSError, AttributeError):
+            # AttributeError: Python < 3.9 (no os.pidfd_open).
+            # OSError (e.g. ENOSYS on old kernels, ESRCH if peer already reaped).
+            return -1
+
     def forward_one(conn: socket.socket) -> None:
+        pidfd = _peer_pidfd(conn)
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as ch:
                 ch.connect(channel_path)
                 # The relay socket is per-session and bound into ONLY this box, so the
-                # UI derives the session from which socket the FD arrived on. We send a
-                # one-byte payload (sendmsg needs a non-empty iov) and NO session_id:
-                # the UI never trusts a sid from inside a box.
+                # UI derives the session from which socket the FD arrived on. We send
+                # the request socket (index 0) and, if we could open one, a pidfd for
+                # the connecting workload process (index 1) over SCM_RIGHTS. No
+                # process fields travel in the payload — the pidfd IS the channel, and
+                # the UI resolves the HOST pid + provenance itself. No session_id is
+                # ever shipped (the UI never trusts a sid from inside a box).
+                fds = [conn.fileno()] if pidfd < 0 else [conn.fileno(), pidfd]
                 ch.sendmsg(
                     [b"\x00"],
                     [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
-                      array.array("i", [conn.fileno()]).tobytes())],
+                      array.array("i", fds).tobytes())],
                 )
-            # The UI now owns a dup of the FD; we can close ours.
+            # The UI now owns dups of the fds we sent; we can close ours.
         except OSError:
             pass
         finally:
+            if pidfd >= 0:
+                try: os.close(pidfd)
+                except OSError: pass
             conn.close()
 
     def listener() -> None:
@@ -454,9 +493,11 @@ def _path_match(pat: str, rel: str) -> bool:
         return False
 
 
+FILE_ACTIONS = ("apply", "discard", "passthrough")
+
 @dataclass
 class FileRule:
-    action: str            # "apply" | "discard"
+    action: str            # "apply" | "discard" | "passthrough"
     pattern: str
 
     def matches(self, rel: str) -> bool:
@@ -472,7 +513,7 @@ class FileRule:
             return None
         verb, _, rest = s.partition(" ")
         action = verb.lower(); pat = rest.strip()
-        if action not in ("apply", "discard") or not pat:
+        if action not in FILE_ACTIONS or not pat:
             return None
         return FileRule(action=action, pattern=pat)
 
@@ -516,7 +557,7 @@ def load_file_rules() -> FileRules:
 def _is_overlay_marker(name: str) -> bool:
     """Guard against legacy char-device whiteout / opaque-directory marker names
     (.wh..opq, .wh..wh.*) appearing in the upper. These are never created by this
-    overlay model (deletions and opacity are recorded in index.db, not as on-disk
+    overlay model (deletions and opacity are recorded in <sid>.sqlar, not as on-disk
     markers), so this function is always False in practice — it is kept as a
     defensive filter in upper_has_changes and cleanup_dirs."""
     return name == ".wh..opq" or name.startswith(".wh..wh.")
@@ -534,56 +575,38 @@ def ut_split(data: bytes) -> list:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  Patch codec — a byte-exact unified diff (multi-file), XZ-compressed at rest.
-#  The only metadata is the original command, kept NUL-separated in the file's
-#  user.slopbox.cmd xattr (no JSON, no keyed fields).
+#  Patch codec — a byte-exact unified diff (multi-file), computed ON DEMAND from
+#  the single sqlar (there is no patch file at rest). Used to render text diffs in
+#  the Changes view, to apply/discard an individual hunk, and to print a box's
+#  whole patch over the control socket (`slopbox patch`). The original command is
+#  the box's ROOT process row in the same sqlar (tgid == the sid's pid).
 # ════════════════════════════════════════════════════════════════════════════
 
 def state_home() -> Path:
     base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
     return Path(base) / "slopbox"
 
-def patch_path(session_id: str) -> Path:
-    return state_home() / (session_id + ".patch.xz")
-
 # A session's whole identity is its name: "YYYYmmdd-HHMMSS_PID". The timestamp
 # (1-second resolution) and the runner's pid can't collide — a live pid is unique,
 # and two runs in the same second have different runner pids — so we need nothing
 # else. Start time, pid and a display label are all read back out of the name; the
 # name is used as the live/<sid> backing dir, the <mnt>/<sid> mount subfolder, and
-# the patch basename (<sid>.patch.xz). Nothing else is stored but the command.
+# the single db basename (<sid>.sqlar). The command is the root process row in it.
 _SID_FMT = "%Y%m%d-%H%M%S"
 
 def make_sid() -> str:
     return time.strftime(_SID_FMT) + "_" + str(os.getpid())
 
 def parse_sid(sid: str) -> tuple:
-    """(started_epoch, pid) from a "YYYYmmdd-HHMMSS_PID" name; zeros if malformed."""
-    stamp, _, pids = sid.rpartition("_")
+    """(started_epoch, pid) from a "YYYYmmdd-HHMMSS_PID" name; zeros if malformed.
+    A rare ".<hex>" collision suffix is stripped before parsing the host pid."""
+    if not isinstance(sid, str): return 0.0, 0
+    stamp, _, pids = sid.partition(".")[0].rpartition("_")
     try: started = time.mktime(time.strptime(stamp, _SID_FMT))
     except (ValueError, OverflowError): started = 0.0
     try: pid = int(pids)
     except ValueError: pid = 0
     return started, pid
-
-CMD_XATTR = "user.slopbox.cmd"
-
-def _cmd_pack(cmd: list) -> bytes:
-    # argv joined by NUL, exactly like /proc/<pid>/cmdline — order preserved,
-    # byte-exact, no quoting ambiguity, and not JSON.
-    return b"\x00".join(c.encode("utf-8", "surrogateescape") for c in cmd)
-
-def _cmd_unpack(data: bytes) -> list:
-    if not data: return []
-    return [p.decode("utf-8", "surrogateescape") for p in data.split(b"\x00")]
-
-def set_cmd_xattr(path, cmd: list) -> None:
-    try: os.setxattr(path, CMD_XATTR, _cmd_pack(cmd))
-    except OSError: pass
-
-def get_cmd_xattr(path) -> list:
-    try: return _cmd_unpack(os.getxattr(path, CMD_XATTR))
-    except OSError: return []
 
 _NO_NL = b"\\ No newline at end of file\n"   # standard "no newline at EOF" marker
 
@@ -709,24 +732,32 @@ def apply_one_hunk(base_lines: list, hunk: dict) -> tuple:
     al = hunk_a_lines(hunk)
     return base_lines[:pos] + hunk_b_lines(hunk) + base_lines[pos + len(al):], pos - hunk["a1"]
 
-def write_patch_file(path: Path, data: bytes, cmd: list) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_bytes(lzma.compress(data, preset=6))
-    set_cmd_xattr(tmp, cmd)            # NUL-separated argv, nothing else
-    os.replace(tmp, path)
-
-def read_patch_file(path: Path) -> bytes:
-    return lzma.decompress(path.read_bytes())
-
-
 # ════════════════════════════════════════════════════════════════════════════
-#  SQLite Archive (sqlar) — everything a patch can't hold (binary files,
-#  symlinks, deletions) lands here next to the patch as <sid>.sqlar, so once
-#  consolidate() runs the /dev/shm overlay is empty and all unreviewed changes
-#  live on disk under state_home. Standard sqlar schema; one extra convention:
-#  a NULL blob with a char-device mode is a deletion tombstone (an overlay
-#  whiteout). Blobs are zlib-deflated when that's smaller (len(data) != sz).
+#  The single per-instance database — ONE sqlite file per slopbox (the sqlar).
+#
+#  There is exactly ONE database file per box, at sqlar_path(sid). It is BOTH the
+#  live index (consulted on every FUSE op, mirrored in RAM for the hot path) AND
+#  the at-rest archive. It holds ALL state in one schema:
+#
+#    sqlar(name, mode, mtime, sz, data, opaque, writer)
+#        every file/dir/symlink/whiteout entry with its metadata. `data` is the
+#        zlib-deflated file content (NULL until consolidate() fills it from the
+#        overlay upper). A char-device mode with NULL data is a deletion
+#        tombstone (whiteout). `opaque`=1 marks an opaque directory. `writer` is
+#        the process-table id (FK to process.id) that produced/last-modified it.
+#    provenance(path, pid, ppid, exe, argv)
+#        per-path writer provenance (pid/exe/argv).
+#    process(id, tgid, ppid, exe, argv, env_id)
+#        the box's process table (one row per traced tgid); env_id -> env.id.
+#    env(id, hash, env)
+#        unique environment json, deduped by hash and referenced by env_id.
+#    flows(...)
+#        every gated request/response for the box.
+#
+#  The overlay upper (live/<sid>/up) is a directory of real files where the box's
+#  bytes land fast during the run; it is NOT a database. consolidate() reads those
+#  bytes and UPDATEs each already-existing sqlar row's NULL `data` in place, then
+#  tears the upper down — the sqlar is then self-contained.
 # ════════════════════════════════════════════════════════════════════════════
 
 def sqlar_path(session_id: str) -> Path:
@@ -734,33 +765,60 @@ def sqlar_path(session_id: str) -> Path:
 
 def _sqlar_open(path) -> "sqlite3.Connection":
     path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(path))
-    conn.execute("CREATE TABLE IF NOT EXISTS sqlar"
-                 "(name TEXT PRIMARY KEY, mode INT, mtime INT, sz INT, data BLOB)")
+    # 0700: the single db holds writer provenance (pid/exe/argv/env).
+    old = os.umask(0o077)
+    try:
+        conn = sqlite3.connect(str(path))
+    finally:
+        os.umask(old)
+    try: os.chmod(str(path), 0o600)
+    except OSError: pass
+    conn.execute("PRAGMA busy_timeout=3000")
+    conn.executescript(
+        "CREATE TABLE IF NOT EXISTS sqlar"
+        "(name TEXT PRIMARY KEY, mode INT, mtime INT, sz INT, data BLOB,"
+        " opaque INT DEFAULT 0, writer INT);"
+        "CREATE TABLE IF NOT EXISTS provenance"
+        "(path TEXT PRIMARY KEY, pid INT, ppid INT, exe TEXT, argv TEXT);"
+        "CREATE TABLE IF NOT EXISTS env"
+        "(id INTEGER PRIMARY KEY AUTOINCREMENT, hash TEXT UNIQUE, env TEXT);"
+        "CREATE TABLE IF NOT EXISTS process"
+        "(id INTEGER PRIMARY KEY AUTOINCREMENT, tgid INT UNIQUE, ppid INT,"
+        " exe TEXT, argv TEXT, env_id INT);"
+        "CREATE TABLE IF NOT EXISTS flows("
+        " id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, action TEXT,"
+        " method TEXT, scheme TEXT, host TEXT, port INT, url TEXT, status INT,"
+        " process_id INT, req_headers TEXT, req_len INT, req_body BLOB,"
+        " resp_headers TEXT, resp_len INT, resp_body BLOB);")
     return conn
 
-def _sqlar_put_file(conn, name, content: bytes, mode, mtime) -> None:
+def _sqlar_deflate(content: bytes):
     comp = zlib.compress(content, 6)
-    data, sz = (comp, len(content)) if len(comp) < len(content) else (content, len(content))
-    conn.execute("INSERT OR REPLACE INTO sqlar VALUES(?,?,?,?,?)",
+    return (comp, len(content)) if len(comp) < len(content) else (content, len(content))
+
+def _sqlar_put_file(conn, name, content: bytes, mode, mtime) -> None:
+    data, sz = _sqlar_deflate(content)
+    conn.execute("INSERT INTO sqlar(name,mode,mtime,sz,data) VALUES(?,?,?,?,?)"
+                 " ON CONFLICT(name) DO UPDATE SET mode=excluded.mode,"
+                 " mtime=excluded.mtime, sz=excluded.sz, data=excluded.data",
                  (name, int(mode), int(mtime), sz, sqlite3.Binary(data)))
 
 def _sqlar_put_provenance(conn, name, prov: dict) -> None:
-    """Record who wrote a change in a side `provenance` table — invisible
-    to standard sqlar tooling."""
-    conn.execute("CREATE TABLE IF NOT EXISTS provenance"
-                 "(path TEXT PRIMARY KEY, pid INT, ppid INT, exe TEXT, argv TEXT)")
     conn.execute("INSERT OR REPLACE INTO provenance VALUES(?,?,?,?,?)",
                  (name, int(prov.get("pid") or 0), int(prov.get("ppid") or 0),
                   prov.get("exe") or "", json.dumps(prov.get("argv") or [])))
 
 def _sqlar_put_symlink(conn, name, target: bytes, mtime) -> None:
-    conn.execute("INSERT OR REPLACE INTO sqlar VALUES(?,?,?,?,?)",
+    conn.execute("INSERT INTO sqlar(name,mode,mtime,sz,data) VALUES(?,?,?,?,?)"
+                 " ON CONFLICT(name) DO UPDATE SET mode=excluded.mode,"
+                 " mtime=excluded.mtime, sz=excluded.sz, data=excluded.data",
                  (name, stat_mod.S_IFLNK | 0o777, int(mtime), len(target),
                   sqlite3.Binary(target)))
 
 def _sqlar_put_tombstone(conn, name) -> None:
-    conn.execute("INSERT OR REPLACE INTO sqlar VALUES(?,?,?,?,?)",
+    conn.execute("INSERT INTO sqlar(name,mode,mtime,sz,data) VALUES(?,?,?,?,?)"
+                 " ON CONFLICT(name) DO UPDATE SET mode=excluded.mode,"
+                 " mtime=excluded.mtime, sz=excluded.sz, data=excluded.data",
                  (name, stat_mod.S_IFCHR, 0, 0, None))
 
 def sqlar_list(path) -> list:
@@ -785,7 +843,7 @@ def sqlar_mode(path, name) -> "int | None":
 
 def sqlar_content(path, name) -> "bytes | None":
     """Decompressed bytes for one entry (the symlink target for a symlink); None if
-    missing or a tombstone."""
+    missing, a tombstone, or content not yet consolidated (NULL blob)."""
     path = Path(path)
     if not path.exists(): return None
     conn = _sqlar_open(path)
@@ -798,16 +856,19 @@ def sqlar_content(path, name) -> "bytes | None":
     return data if len(data) == sz else zlib.decompress(data)
 
 def sqlar_remove(path, name) -> int:
-    """Drop one entry; unlink the archive when it empties. Returns entries left."""
+    """Drop one entry; unlink the archive when it empties of entries. Returns
+    entries left."""
     path = Path(path)
     if not path.exists(): return 0
     conn = _sqlar_open(path)
     try:
-        conn.execute("DELETE FROM sqlar WHERE name=?", (name,)); conn.commit()
+        conn.execute("DELETE FROM sqlar WHERE name=?", (name,))
+        conn.execute("DELETE FROM provenance WHERE path=?", (name,)); conn.commit()
         left = conn.execute("SELECT COUNT(*) FROM sqlar").fetchone()[0]
-    except sqlite3.Error: left = 1
+        flows = conn.execute("SELECT COUNT(*) FROM flows").fetchone()[0]
+    except sqlite3.Error: left = 1; flows = 1
     finally: conn.close()
-    if left == 0:
+    if left == 0 and flows == 0:
         try: path.unlink()
         except OSError: pass
     return left
@@ -815,25 +876,12 @@ def sqlar_remove(path, name) -> int:
 
 # ════════════════════════════════════════════════════════════════════════════
 #  Network log — every gated request/response for a session, written live by the
-#  in-process mitmproxy to a sibling SQLite db <sid>.flows. No overlay involved,
-#  so it goes straight to state_home. Same user.slopbox.cmd xattr as the others.
+#  in-process mitmproxy into the `flows` table of the box's single sqlar db (the
+#  same file as the file index). No separate flows file. Each flow can carry the
+#  process-table id (process_id) of the in-box process that opened the connection.
 # ════════════════════════════════════════════════════════════════════════════
 
-def flows_path(session_id: str) -> Path:
-    return state_home() / (session_id + ".flows")
-
 _FLOW_BODY_CAP = 1 << 20    # store at most 1 MiB of each body (but record true size)
-
-def _flows_open(path) -> "sqlite3.Connection":
-    path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(path))
-    conn.execute("PRAGMA busy_timeout=3000")
-    conn.execute("CREATE TABLE IF NOT EXISTS flows("
-                 "id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, action TEXT,"
-                 "method TEXT, scheme TEXT, host TEXT, port INT, url TEXT, status INT,"
-                 "req_headers TEXT, req_len INT, req_body BLOB,"
-                 "resp_headers TEXT, resp_len INT, resp_body BLOB)")
-    return conn
 
 def _hdr_text(items) -> str:
     out = []
@@ -845,15 +893,15 @@ def _hdr_text(items) -> str:
 
 def flows_add(path, fl: dict) -> None:
     rb = fl.get("req_body") or b""; pb = fl.get("resp_body") or b""
-    conn = _flows_open(path)
+    conn = _sqlar_open(path)
     try:
         conn.execute(
-            "INSERT INTO flows(ts,action,method,scheme,host,port,url,status,"
+            "INSERT INTO flows(ts,action,method,scheme,host,port,url,status,process_id,"
             "req_headers,req_len,req_body,resp_headers,resp_len,resp_body)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (fl.get("ts", time.time()), fl.get("action", ""), fl.get("method", ""),
              fl.get("scheme", ""), fl.get("host", ""), fl.get("port", 0),
-             fl.get("url", ""), fl.get("status", 0),
+             fl.get("url", ""), fl.get("status", 0), fl.get("process_id"),
              _hdr_text(fl.get("req_headers")), len(rb), sqlite3.Binary(rb[:_FLOW_BODY_CAP]),
              _hdr_text(fl.get("resp_headers")), len(pb), sqlite3.Binary(pb[:_FLOW_BODY_CAP])))
         conn.commit()
@@ -863,10 +911,10 @@ def flows_add(path, fl: dict) -> None:
 def flows_list(path) -> list:
     path = Path(path)
     if not path.exists(): return []
-    conn = _flows_open(path); conn.row_factory = sqlite3.Row
+    conn = _sqlar_open(path); conn.row_factory = sqlite3.Row
     try:
         return [dict(r) for r in conn.execute(
-            "SELECT id,ts,action,method,host,port,url,status,req_len,resp_len"
+            "SELECT id,ts,action,method,host,port,url,status,process_id,req_len,resp_len"
             " FROM flows ORDER BY id").fetchall()]
     except sqlite3.Error:
         return []
@@ -876,7 +924,7 @@ def flows_list(path) -> list:
 def flows_get(path, fid) -> "dict | None":
     path = Path(path)
     if not path.exists(): return None
-    conn = _flows_open(path); conn.row_factory = sqlite3.Row
+    conn = _sqlar_open(path); conn.row_factory = sqlite3.Row
     try:
         r = conn.execute("SELECT * FROM flows WHERE id=?", (fid,)).fetchone()
         return dict(r) if r else None
@@ -886,13 +934,65 @@ def flows_get(path, fid) -> "dict | None":
         conn.close()
 
 
+def has_flows(path) -> bool:
+    path = Path(path)
+    if not path.exists(): return False
+    conn = _sqlar_open(path)
+    try: return conn.execute("SELECT COUNT(*) FROM flows").fetchone()[0] > 0
+    except sqlite3.Error: return False
+    finally: conn.close()
+
+
+def process_list(path) -> list:
+    """[(id, tgid, ppid, exe, argv-list)] for the box's process table."""
+    path = Path(path)
+    if not path.exists(): return []
+    conn = _sqlar_open(path)
+    try:
+        rows = conn.execute("SELECT id,tgid,ppid,exe,argv FROM process "
+                            "ORDER BY id").fetchall()
+    except sqlite3.Error: return []
+    finally: conn.close()
+    out = []
+    for pid, tgid, ppid, exe, argv in rows:
+        try: av = json.loads(argv) if argv else []
+        except (ValueError, TypeError): av = []
+        out.append((pid, tgid, ppid, exe or "", av))
+    return out
+
+def process_env(path, proc_id) -> dict:
+    """The deduped environment for one process row (resolved via env_id)."""
+    path = Path(path)
+    if not path.exists(): return {}
+    conn = _sqlar_open(path)
+    try:
+        row = conn.execute(
+            "SELECT env.env FROM process JOIN env ON process.env_id=env.id"
+            " WHERE process.id=?", (proc_id,)).fetchone()
+    except sqlite3.Error: row = None
+    finally: conn.close()
+    if not row or not row[0]: return {}
+    try: return json.loads(row[0])
+    except (ValueError, TypeError): return {}
+
+def root_cmd(sid: str) -> list:
+    """The box's command: argv of the ROOT process row in <sid>.sqlar, keyed by the
+    host pid embedded in the sid. [] if the sid is malformed or no such row exists.
+    The persisted single source of truth, surviving after the runner exits."""
+    root_pid = parse_sid(sid)[1]
+    if not root_pid: return []
+    for _id, tgid, _ppid, _exe, argv in process_list(sqlar_path(sid)):
+        if tgid == root_pid: return list(argv)
+    return []
+
+
 # ════════════════════════════════════════════════════════════════════════════
 #  Overlay engine — pyfuse3 copy-on-write overlay, multiplexed per session.
 #
 #  The UI owns ONE pyfuse3 mount (see OverlayMount). Its synthetic root lists one
 #  subfolder <sid> per live session; <mnt>/<sid>/… is a merged overlay of
 #  lower=/ + that session's upper (live/<sid>/up) with whiteouts/opacity tracked
-#  in live/<sid>/index.db. Inode numbers span the whole mount; each inode carries
+#  in the per-box <sid>.sqlar. Inode numbers span the whole mount; each inode carries
 #  its (sid, rel) so one Operations object serves every box.
 #
 #  This design has NO user namespaces, NO /dev/fuse fd-passing, and NO inner
@@ -905,6 +1005,24 @@ def flows_get(path, fid) -> "dict | None":
 _PROV_ENV_KEYS = ("USER", "PWD", "SSH_CONNECTION", "TERM", "_")
 
 FICLONE = 0x40049409   # _IOW(0x94, 9, int) — btrfs/xfs reflink ioctl
+
+
+def _proc_status_field(pid: int, field: str) -> "int | None":
+    """One integer field (e.g. Tgid, PPid) from /proc/<pid>/status. None if gone."""
+    try:
+        with open(f"/proc/{pid}/status", "rb") as f:
+            for ln in f:
+                if ln.startswith(field.encode() + b":"):
+                    return int(ln.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+def tgid_of(pid: int) -> int:
+    """Resolve a FUSE ctx.pid (a thread id) to its thread-group id via
+    /proc/<pid>/status Tgid; falls back to pid itself if unreadable."""
+    t = _proc_status_field(pid, "Tgid")
+    return t if t is not None else int(pid)
 
 
 def _proc_start_time(pid: int) -> int:
@@ -921,11 +1039,13 @@ def _proc_start_time(pid: int) -> int:
         return 0
 
 
-def read_provenance(pid: int) -> dict:
+def read_provenance(pid: int, full_env: bool = False) -> dict:
     """Best-effort writer provenance from host /proc/<pid>. Read SYNCHRONOUSLY from
     the write handler while the caller is still blocked (and thus still in /proc).
     Every field is best-effort — a vanished pid yields zeros/empties, never raises
-    (/proc reads are the one place best-effort OSError is acceptable)."""
+    (/proc reads are the one place best-effort OSError is acceptable). full_env
+    captures the whole environment (for the process table when tracing is on);
+    otherwise only the small _PROV_ENV_KEYS subset is kept."""
     info = dict(pid=int(pid), ppid=0, exe="", argv=[], env={}, start_time=0)
     base = f"/proc/{pid}"
     try:
@@ -955,7 +1075,7 @@ def read_provenance(pid: int) -> dict:
             if b"=" not in kv: continue
             k, _, v = kv.partition(b"=")
             ks = k.decode("utf-8", "surrogateescape")
-            if ks in _PROV_ENV_KEYS:
+            if full_env or ks in _PROV_ENV_KEYS:
                 env[ks] = v.decode("utf-8", "surrogateescape")
         info["env"] = env
     except OSError: pass
@@ -1012,58 +1132,74 @@ def reflink_or_copy(src_fd: int, dst_fd: int) -> str:
     return "copy"
 
 
-class Index:
-    """Per-session overlay index (live/<sid>/index.db) + write-through RAM mirror.
+def _kind_of_mode(mode: int) -> str:
+    if stat_mod.S_ISCHR(mode): return "whiteout"
+    if stat_mod.S_ISDIR(mode): return "dir"
+    if stat_mod.S_ISLNK(mode): return "symlink"
+    return "file"
 
-    The hot read paths (lookup/getattr/readdir) touch ONLY the RAM mirror; SQLite is
-    written on mutation and read only for provenance / consolidate. Created mode 0700:
-    it holds writer provenance. Opened check_same_thread=False — the serve loop
-    owns all mutations (under self._lock); the UI thread reads the live index
-    concurrently (kind_of/deletions/opaque_dirs via Supervisor.overlay_entries etc.)
-    and relies on the lock for SQLite safety and GIL-protected dict reads for the
-    RAM mirror."""
+
+class Index:
+    """The single per-instance database (sqlar_path(sid)) + a write-through RAM
+    mirror. There is exactly ONE sqlite file per box; this class is the set of
+    operations on it that the FUSE layer needs — there is no separate index.db.
+
+    On every mutating FUSE op the entry row is upserted into the `sqlar` table
+    right then (data = NULL for files: the bytes are in the overlay upper and the
+    NULL blob is filled in during consolidate()). The hot read paths
+    (lookup/getattr/readdir) touch ONLY the RAM mirror; the db is written on
+    mutation and read for provenance / process detail. Opened
+    check_same_thread=False — the serve loop owns all mutations (under
+    self._lock); the UI thread reads concurrently and relies on the lock for
+    SQLite safety and GIL-protected dict reads for the RAM mirror.
+
+    A box's process tracing (when -t is on) records each unique tgid into the
+    `process` table here, deduping its environment via the `env` table; the
+    process row id tags both modified file entries (the `writer` column) and
+    network flows."""
 
     def __init__(self, backing: Path):
         self.backing = Path(backing)
-        self.db_path = self.backing / "index.db"
-        # restrict before SQLite creates the file
-        old = os.umask(0o077)
-        try:
-            self._db = sqlite3.connect(str(self.db_path), check_same_thread=False)
-        finally:
-            os.umask(old)
-        try: os.chmod(self.db_path, 0o700)
-        except OSError: pass
+        # The single db: state_home/<sid>.sqlar. The sid is the backing dir name.
+        self.db_path = sqlar_path(self.backing.name)
+        # Create the parent dir + the one schema (the single source of the schema).
+        _sqlar_open(self.db_path).close()
+        self._db = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA synchronous=NORMAL")
-        self._db.executescript(
-            "CREATE TABLE IF NOT EXISTS writers("
-            " id INTEGER PRIMARY KEY AUTOINCREMENT, pid INT, ppid INT,"
-            " exe TEXT, argv TEXT, env TEXT, captured_at REAL);"
-            "CREATE TABLE IF NOT EXISTS entries("
-            " path TEXT PRIMARY KEY, kind TEXT, mode INT, mtime REAL,"
-            " writer_id INT, first_seen REAL, opaque INT DEFAULT 0);"
-            "CREATE TABLE IF NOT EXISTS oplog("
-            " id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, op TEXT, path TEXT,"
-            " writer_id INT, detail TEXT);")
-        self._db.commit()
-        self._writer_cache: dict = {}     # host pid -> writers.id (this process only)
+        self._proc_cache: dict = {}       # (tgid) -> process.id (this process only)
         self._prov_cache: dict = {}       # host pid -> provenance dict (hot-path cache)
+        self._prov_by_proc: dict = {}     # process.id -> provenance dict
+        self._tracing = False             # -t: record the process table
+        # The box's root process: the host pid embedded in the sid. Newly-inserted
+        # process rows bubble up their PPid chain until they reach it (3c records its
+        # row at register), so the table stays one connected tree. 0 if the sid is
+        # malformed — bubbling then simply doesn't run.
+        self._root_pid = parse_sid(self.backing.name)[1]
         self._whiteouts: set = set()
         self._kinds: dict = {}
         self._opaque: set = set()
         self._lock = threading.Lock()     # serialize SQLite + mirror mutations
         self._load_mirror()
 
+    def set_tracing(self, on: bool) -> None:
+        self._tracing = bool(on)
+
     def _load_mirror(self) -> None:
-        for path, kind, opaque in self._db.execute(
-                "SELECT path, kind, opaque FROM entries"):
+        for path, mode, opaque in self._db.execute(
+                "SELECT name, mode, opaque FROM sqlar"):
+            kind = _kind_of_mode(mode)
             if kind == "whiteout":
                 self._whiteouts.add(path)
             else:
                 self._kinds[path] = kind
             if opaque:
                 self._opaque.add(path)
+
+    @staticmethod
+    def _row_mode(kind, mode) -> int:
+        if kind == "whiteout": return stat_mod.S_IFCHR
+        return int(mode)
 
     # ── fast RAM accessors (hot path) ───────────────────────────────────────
     def has_overlay_state(self) -> bool:
@@ -1084,36 +1220,111 @@ class Index:
             if anc in self._opaque: return True
         return False
 
-    # ── provenance ──────────────────────────────────────────────────────────
+    # ── provenance / process table ──────────────────────────────────────────
     def _prov_key(self, pid: int) -> tuple:
-        """Cache key that survives PID reuse: (pid, /proc start_time). If the kernel
-        reuses a pid for a new process, its start_time differs, so the stale cache
-        entry is missed and we re-capture (LOW-1)."""
+        """Cache key that survives PID reuse: (pid, /proc start_time)."""
         return (pid, _proc_start_time(pid))
 
     def writer_for(self, pid: int) -> int:
-        """Provenance capture. Synchronous; caller is blocked. The writer
-        row is ALWAYS inserted, even if /proc/<pid> is gone."""
-        key = self._prov_key(pid)
-        cached = self._writer_cache.get(key)
+        """Resolve the FUSE ctx.pid (a TID) to its tgid and return that tgid's
+        process-table row id, inserting it (and its deduped env) on first sight.
+        Always returns an id even if /proc is gone. The id tags the file entry."""
+        tgid = tgid_of(pid)
+        cached = self._proc_cache.get(tgid)
         if cached is not None: return cached
-        prov = self.provenance_of(pid)
+        # When tracing, capture the FULL environment for the process table; the
+        # subset-cached provenance_of() is enough otherwise. Resolve the parent to
+        # its tgid and hand off to the single insert/dedup path (which also bubbles
+        # the PPid chain up to the box root so the table stays one connected tree).
+        prov = read_provenance(pid, full_env=True) if self._tracing \
+            else self.provenance_of(pid)
+        ppid_tgid = tgid_of(prov["ppid"]) if prov.get("ppid") else 0
+        return self.process_from_prov(dict(tgid=tgid, ppid=ppid_tgid,
+                                           exe=prov["exe"], argv=prov["argv"],
+                                           env=prov.get("env") or {})) or tgid
+
+    def process_from_prov(self, prov: dict) -> "int | None":
+        """Insert/dedup a process row from a provenance dict (tgid/ppid/exe/argv/env,
+        all HOST-namespace — resolved by RelayServer from the --inner pidfd via host
+        /proc, consistent with the FUSE path) and return its row id. Returns None if no
+        tgid was supplied. Same process-table + env-crc32 dedup as writer_for."""
+        tgid = int(prov.get("tgid") or 0)
+        if not tgid: return None
+        cached = self._proc_cache.get(tgid)
+        if cached is not None: return cached
+        ppid_tgid = int(prov.get("ppid") or 0)
+        exe = prov.get("exe") or ""
+        argv = prov.get("argv") or []
+        env = prov.get("env") or {}
         with self._lock:
+            eid = None
+            if self._tracing:
+                env_json = json.dumps(env, sort_keys=True)
+                env_hash = str(zlib.crc32(env_json.encode())) + ":" + str(len(env_json))
+                self._db.execute("INSERT OR IGNORE INTO env(hash,env) VALUES(?,?)",
+                                 (env_hash, env_json))
+                eid = self._db.execute("SELECT id FROM env WHERE hash=?",
+                                       (env_hash,)).fetchone()[0]
             cur = self._db.execute(
-                "INSERT INTO writers(pid,ppid,exe,argv,env,captured_at)"
-                " VALUES(?,?,?,?,?,?)",
-                (prov["pid"], prov["ppid"], prov["exe"],
-                 json.dumps(prov["argv"]), json.dumps(prov["env"]), time.time()))
+                "INSERT OR IGNORE INTO process(tgid,ppid,exe,argv,env_id)"
+                " VALUES(?,?,?,?,?)",
+                (tgid, ppid_tgid, exe, json.dumps(argv), eid))
+            inserted = cur.rowcount > 0   # newly recorded vs. already present
+            pid_row = self._db.execute("SELECT id FROM process WHERE tgid=?",
+                                       (tgid,)).fetchone()[0]
             self._db.commit()
-            wid = cur.lastrowid
-        self._writer_cache[key] = wid
-        return wid
+        self._proc_cache[tgid] = pid_row
+        self._prov_by_proc[pid_row] = dict(pid=tgid, ppid=ppid_tgid, exe=exe, argv=argv)
+        if inserted: self._bubble_parent(tgid, ppid_tgid)
+        return pid_row
+
+    def _bubble_parent(self, tgid: int, ppid: int) -> None:
+        """Record this row's parent (and so its whole PPid chain) so the per-box
+        process table forms ONE tree rooted at the sid's host pid. Runs only when a
+        row was genuinely new — the dedup short-circuit of process_from_prov stops
+        the recursion at the first ancestor already present (the root row, recorded
+        at register, is always present), guaranteeing termination. Best-effort: a
+        failed ancestor /proc read links a minimal row and stops, never raises.
+        STOPS at: the root tgid (boundary — never walk above it into the runner's
+        own host ancestry), ppid<=1 (init), or any already-recorded parent."""
+        if not self._root_pid: return            # malformed sid: don't bubble
+        if tgid == self._root_pid: return        # the root row is the boundary
+        if ppid <= 1: return                     # reached init; no system procs
+        if ppid in self._proc_cache: return      # parent already linked
+        try:
+            pprov = read_provenance(ppid, full_env=self._tracing)
+        except OSError:
+            pprov = dict(ppid=0, exe="", argv=[], env={})
+        # A live parent yields its own ppid (walk continues up); a vanished parent
+        # yields ppid 0 — a minimal row is still linked (tgid=ppid), then the next
+        # frame stops at ppid<=1 since the grandparent is unreachable.
+        parent = dict(tgid=tgid_of(ppid) or ppid,
+                      ppid=tgid_of(pprov.get("ppid")) if pprov.get("ppid") else 0,
+                      exe=pprov.get("exe") or "", argv=pprov.get("argv") or [],
+                      env=pprov.get("env") or {})
+        self.process_from_prov(parent)           # recurses up; dedup ends the walk
+
+    def add_flow(self, fl: dict) -> None:
+        """Append one completed flow to the box's single sqlar via THIS handle — the
+        one writer (under self._lock), so a flow write never opens a second handle to
+        the WAL db and never races the serve thread into SQLITE_BUSY."""
+        rb = fl.get("req_body") or b""; pb = fl.get("resp_body") or b""
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO flows(ts,action,method,scheme,host,port,url,status,process_id,"
+                "req_headers,req_len,req_body,resp_headers,resp_len,resp_body)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (fl.get("ts", time.time()), fl.get("action", ""), fl.get("method", ""),
+                 fl.get("scheme", ""), fl.get("host", ""), fl.get("port", 0),
+                 fl.get("url", ""), fl.get("status", 0), fl.get("process_id"),
+                 _hdr_text(fl.get("req_headers")), len(rb),
+                 sqlite3.Binary(rb[:_FLOW_BODY_CAP]),
+                 _hdr_text(fl.get("resp_headers")), len(pb),
+                 sqlite3.Binary(pb[:_FLOW_BODY_CAP])))
+            self._db.commit()
 
     def provenance_of(self, pid: int) -> dict:
-        """Provenance for a pid, cached per (pid, start_time) for this process. The
-        start_time component means a reused pid is not served a previous process's
-        provenance (LOW-1). policy_check calls this once per mutating op, so caching
-        still avoids re-reading /proc/<pid>/* for a long-lived writer."""
+        """Provenance for a pid, cached per (pid, start_time) for this process."""
         key = self._prov_key(pid)
         cached = self._prov_cache.get(key)
         if cached is not None: return cached
@@ -1121,34 +1332,31 @@ class Index:
         self._prov_cache[key] = prov
         return prov
 
-    # ── mutations (write-through) ───────────────────────────────────────────
+    # ── mutations (write-through; upsert into the single sqlar) ──────────────
+    def _upsert(self, path, mode, writer_id, opaque) -> None:
+        """Upsert one entry row with data=NULL (filled at consolidate). opaque None
+        means leave as-is on update; writer_id None means leave as-is on update."""
+        row = self._db.execute(
+            "SELECT opaque, writer FROM sqlar WHERE name=?", (path,)).fetchone()
+        if row is None:
+            self._db.execute(
+                "INSERT INTO sqlar(name,mode,mtime,sz,data,opaque,writer)"
+                " VALUES(?,?,?,?,?,?,?)",
+                (path, int(mode), 0, 0, None,
+                 int(opaque) if opaque is not None else 0, writer_id))
+        else:
+            op_q = int(opaque) if opaque is not None else row[0]
+            wr = writer_id if writer_id is not None else row[1]
+            self._db.execute(
+                "UPDATE sqlar SET mode=?, opaque=?, writer=? WHERE name=?",
+                (int(mode), op_q, wr, path))
+
     def set_entry(self, path, kind, mode, writer_id, op,
                   detail: str = "", opaque=None) -> None:
-        now = time.time()
         with self._lock:
-            row = self._db.execute(
-                "SELECT path, opaque FROM entries WHERE path=?", (path,)).fetchone()
-            if row is None:
-                op_q = int(opaque) if opaque is not None else 0
-                self._db.execute(
-                    "INSERT INTO entries(path,kind,mode,mtime,writer_id,first_seen,opaque)"
-                    " VALUES(?,?,?,?,?,?,?)",
-                    (path, kind, int(mode), now, writer_id, now, op_q))
-            else:
-                if opaque is None:
-                    self._db.execute(
-                        "UPDATE entries SET kind=?, mode=?, mtime=? WHERE path=?",
-                        (kind, int(mode), now, path))
-                else:
-                    self._db.execute(
-                        "UPDATE entries SET kind=?, mode=?, mtime=?, opaque=? WHERE path=?",
-                        (kind, int(mode), now, int(opaque), path))
-            self._db.execute(
-                "INSERT INTO oplog(ts,op,path,writer_id,detail) VALUES(?,?,?,?,?)",
-                (now, op, path, writer_id, detail))
+            self._upsert(path, self._row_mode(kind, mode), writer_id, opaque)
             self._db.commit()
-            # RAM mirror — mutate under the SAME lock so a UI-thread snapshot of
-            # _whiteouts/_opaque can never observe a set mid-resize.
+            # RAM mirror — mutate under the SAME lock.
             if kind == "whiteout":
                 self._whiteouts.add(path); self._kinds.pop(path, None)
             else:
@@ -1158,22 +1366,16 @@ class Index:
                 else: self._opaque.discard(path)
 
     def del_entry(self, path, op: str = "del", writer_id=None) -> None:
-        now = time.time()
         with self._lock:
-            self._db.execute("DELETE FROM entries WHERE path=?", (path,))
-            self._db.execute(
-                "INSERT INTO oplog(ts,op,path,writer_id,detail) VALUES(?,?,?,?,?)",
-                (now, op, path, writer_id, ""))
+            self._db.execute("DELETE FROM sqlar WHERE name=?", (path,))
             self._db.commit()
             self._whiteouts.discard(path); self._kinds.pop(path, None)
             self._opaque.discard(path)
 
     def prune_subtree(self, prefix: str) -> None:
-        """Drop all rows under prefix + '/' (after an rmdir whose children were
-        whiteouts/entries). Mirror updated to match."""
         pref = prefix + "/"
         with self._lock:
-            self._db.execute("DELETE FROM entries WHERE path LIKE ?", (pref + "%",))
+            self._db.execute("DELETE FROM sqlar WHERE name LIKE ?", (pref + "%",))
             self._db.commit()
             for s in (self._whiteouts, self._opaque):
                 for p in [p for p in s if p.startswith(pref)]: s.discard(p)
@@ -1181,24 +1383,23 @@ class Index:
                 self._kinds.pop(p, None)
 
     def reparent(self, old: str, new: str, writer_id) -> None:
-        """Rewrite all descendant rows old/… → new/… (dir rename). Mirror rebuilt
-        for the affected subtree."""
         oldp = old + "/"; newp = new + "/"
         with self._lock:
             rows = self._db.execute(
-                "SELECT path, kind, mode, opaque FROM entries WHERE path LIKE ?",
+                "SELECT name, mode, opaque, writer FROM sqlar WHERE name LIKE ?",
                 (oldp + "%",)).fetchall()
-            for path, kind, mode, opaque in rows:
+            for path, mode, opaque, writer in rows:
                 np = newp + path[len(oldp):]
-                self._db.execute("DELETE FROM entries WHERE path=?", (path,))
+                self._db.execute("DELETE FROM sqlar WHERE name=?", (path,))
                 self._db.execute(
-                    "INSERT OR REPLACE INTO entries"
-                    "(path,kind,mode,mtime,writer_id,first_seen,opaque)"
+                    "INSERT OR REPLACE INTO sqlar"
+                    "(name,mode,mtime,sz,data,opaque,writer)"
                     " VALUES(?,?,?,?,?,?,?)",
-                    (np, kind, mode, time.time(), writer_id, time.time(), opaque))
+                    (np, mode, 0, 0, None, opaque, writer))
             self._db.commit()
-            for path, kind, mode, opaque in rows:
+            for path, mode, opaque, writer in rows:
                 np = newp + path[len(oldp):]
+                kind = _kind_of_mode(mode)
                 self._whiteouts.discard(path); self._kinds.pop(path, None); self._opaque.discard(path)
                 if kind == "whiteout": self._whiteouts.add(np)
                 else: self._kinds[np] = kind
@@ -1206,10 +1407,6 @@ class Index:
 
     # ── consolidate accessors ────────────────────────────────────
     def deletions(self) -> list:
-        # Snapshot under the lock: the serve thread can mutate _whiteouts concurrently
-        # (set_entry/del_entry update the RAM mirror outside the lock), so copy the set
-        # while holding _lock before sorting — otherwise the UI thread's sorted() can
-        # hit "set changed size during iteration".
         with self._lock:
             snap = list(self._whiteouts)
         return sorted(snap)
@@ -1220,11 +1417,15 @@ class Index:
         return sorted(snap)
 
     def writer_provenance(self, path: str) -> "dict | None":
+        # No lock: consolidate-only precondition — called post-teardown with the box
+        # dead and the serve thread stopped, so there is no concurrent writer.
         cur = self._db.execute(
-            "SELECT writer_id FROM entries WHERE path=?", (path,)).fetchone()
+            "SELECT writer FROM sqlar WHERE name=?", (path,)).fetchone()
         if not cur or cur[0] is None: return None
+        cached = self._prov_by_proc.get(cur[0])
+        if cached is not None: return dict(cached)
         w = self._db.execute(
-            "SELECT pid,ppid,exe,argv FROM writers WHERE id=?", (cur[0],)).fetchone()
+            "SELECT tgid,ppid,exe,argv FROM process WHERE id=?", (cur[0],)).fetchone()
         if not w: return None
         try: argv = json.loads(w[3]) if w[3] else []
         except (ValueError, TypeError): argv = []
@@ -1232,7 +1433,7 @@ class Index:
 
     def close(self) -> None:
         try: self._db.close()
-        except sqlite3.Error: pass
+        except (sqlite3.Error, AttributeError): pass
 
 
 def _build_overlay_ops():
@@ -1252,7 +1453,7 @@ def _build_overlay_ops():
     class MultiplexOverlayFs(pyfuse3.Operations):
         """One pyfuse3 Operations object serving every box. The synthetic root ('')
         lists one child per live <sid>; below that, <sid>/<rel> is the per-session
-        overlay (lower=/, upper=live/<sid>/up, index=live/<sid>/index.db).
+        overlay (lower=/, upper=live/<sid>/up, index in the per-box <sid>.sqlar).
 
         Inodes span the whole mount: ROOT_INODE is the synthetic root, and every
         other inode maps to a key "<sid>/<rel>" (rel may be empty for a session
@@ -1285,9 +1486,12 @@ def _build_overlay_ops():
             self._lock = threading.Lock()   # guards inode/fh allocation vs UI thread
 
         # ── session registry ────────────────────────────────────────────────
-        def add_session(self, sid: str, up: Path, index: "Index") -> None:
+        def add_session(self, sid: str, up: Path, index: "Index",
+                        passthrough: bool = False) -> None:
             with self._lock:
-                self.sessions[sid] = dict(up=Path(up), index=index, virtual={})
+                self.sessions[sid] = dict(up=Path(up), index=index, virtual={},
+                                          passthrough=bool(passthrough),
+                                          frules=load_file_rules())
 
         def remove_session(self, sid: str) -> None:
             with self._lock:
@@ -1339,6 +1543,34 @@ def _build_overlay_ops():
 
         def _index(self, sid: str) -> "Index":
             return self.sessions[sid]["index"]
+
+        # ── passthrough (direct host action, nothing captured) ───────────────
+        def _passthrough(self, sid: str, rel: str) -> bool:
+            """True when this op should act on the REAL host fs and record nothing in
+            the overlay/sqlar — either the whole box is in direct mode (-d) or a
+            file-rule marks this path 'passthrough'."""
+            s = self.sessions.get(sid)
+            if not s: return False
+            if s.get("passthrough"): return True
+            fr = s.get("frules")
+            return bool(fr and fr.decide(rel) == "passthrough")
+
+        def _host_path(self, rel: str) -> str:
+            """The real host path for a passthrough op (lower root + rel)."""
+            return self._lower_path(rel)
+
+        def _passthrough_open(self, rel: str, flags: int) -> int:
+            """Open the REAL host file for a passthrough write. O_NOFOLLOW on the final
+            component: never dereference a box-planted symlink onto another host path."""
+            host = self._host_path(rel)
+            try:
+                os.makedirs(os.path.dirname(host) or "/", exist_ok=True)
+            except OSError:
+                pass
+            try:
+                return os.open(host, flags | os.O_NOFOLLOW)
+            except OSError as e:
+                raise pyfuse3.FUSEError(e.errno or errno.EIO)
 
         # ── layer resolution ───────────────────────────────────────
         def _resolve_st(self, sid: str, rel: str):
@@ -1730,8 +1962,12 @@ def _build_overlay_ops():
                     if policy_check(sid, self._index(sid).provenance_of(ctx.pid),
                                     rel, "open_write") == "deny":
                         raise pyfuse3.FUSEError(errno.EACCES)
-                    fd = self._ensure_copyup(sid, rel, flags, ctx)
-                    self._notify(sid)
+                    self._index(sid).writer_for(ctx.pid)   # tracing/provenance
+                    if self._passthrough(sid, rel):
+                        fd = self._passthrough_open(rel, flags)
+                    else:
+                        fd = self._ensure_copyup(sid, rel, flags, ctx)
+                        self._notify(sid)
                 with self._lock:
                     fh = self._next_fh; self._next_fh += 1
                     self._fd_table[fh] = fd
@@ -1799,6 +2035,24 @@ def _build_overlay_ops():
                 raise pyfuse3.FUSEError(errno.EACCES)
             self._req_enter(f"create {sid}/{rel}")
             try:
+                if self._passthrough(sid, rel):
+                    # direct host create, nothing captured
+                    host = self._host_path(rel)
+                    try:
+                        os.makedirs(os.path.dirname(host) or "/", exist_ok=True)
+                        fd = os.open(host, flags | os.O_CREAT | os.O_NOFOLLOW,
+                                     mode & 0o7777)
+                    except OSError as e:
+                        raise pyfuse3.FUSEError(e.errno or errno.EIO)
+                    st = os.fstat(fd)
+                    ino = self._ino_for(sid, rel)
+                    self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
+                    with self._lock:
+                        nfh = self._next_fh; self._next_fh += 1
+                        self._fd_table[nfh] = fd
+                        self._fh_sid[nfh] = sid
+                    return (pyfuse3.FileInfo(fh=nfh, direct_io=False, keep_cache=False),
+                            self._entry(ino, st))
                 self._ensure_parent_dirs(sid, rel, wid)
                 upath = self._upper_path(sid, rel)
                 try:
@@ -1836,6 +2090,16 @@ def _build_overlay_ops():
                 raise pyfuse3.FUSEError(errno.EACCES)
             self._req_enter(f"mkdir {sid}/{rel}")
             try:
+                if self._passthrough(sid, rel):
+                    host = self._host_path(rel)
+                    try:
+                        os.makedirs(os.path.dirname(host) or "/", exist_ok=True)
+                        os.mkdir(host, mode & 0o7777)
+                    except OSError as e:
+                        raise pyfuse3.FUSEError(e.errno or errno.EIO)
+                    ino = self._ino_for(sid, rel)
+                    self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
+                    return self._entry(ino, os.lstat(host))
                 self._ensure_parent_dirs(sid, rel, wid)
                 upath = self._upper_path(sid, rel)
                 try:
@@ -1873,6 +2137,16 @@ def _build_overlay_ops():
                 raise pyfuse3.FUSEError(errno.EACCES)
             self._req_enter(f"symlink {sid}/{rel}")
             try:
+                if self._passthrough(sid, rel):
+                    host = self._host_path(rel)
+                    try:
+                        os.makedirs(os.path.dirname(host) or "/", exist_ok=True)
+                        os.symlink(target, host)
+                    except OSError as e:
+                        raise pyfuse3.FUSEError(e.errno or errno.EIO)
+                    ino = self._ino_for(sid, rel)
+                    self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
+                    return self._entry(ino, os.lstat(host))
                 self._ensure_parent_dirs(sid, rel, wid)
                 upath = self._upper_path(sid, rel)
                 # remove a stale upper artifact (no-follow safe: unlink/rmtree by lstat)
@@ -1916,6 +2190,12 @@ def _build_overlay_ops():
                 raise pyfuse3.FUSEError(errno.EACCES)
             self._req_enter(f"unlink {sid}/{rel}")
             try:
+                if self._passthrough(sid, rel):
+                    host = self._host_path(rel)
+                    try: os.unlink(host)          # unlink never follows the final link
+                    except FileNotFoundError: raise pyfuse3.FUSEError(errno.ENOENT)
+                    except OSError as e: raise pyfuse3.FUSEError(e.errno or errno.EIO)
+                    return
                 idx = self._index(sid)
                 upath = self._upper_path(sid, rel)
                 if os.path.lexists(upath):
@@ -1945,6 +2225,13 @@ def _build_overlay_ops():
                 raise pyfuse3.FUSEError(errno.EACCES)
             self._req_enter(f"rmdir {sid}/{rel}")
             try:
+                if self._passthrough(sid, rel):
+                    host = self._host_path(rel)
+                    if os.path.islink(host): raise pyfuse3.FUSEError(errno.ENOTDIR)
+                    try: os.rmdir(host)
+                    except FileNotFoundError: raise pyfuse3.FUSEError(errno.ENOENT)
+                    except OSError as e: raise pyfuse3.FUSEError(e.errno or errno.EIO)
+                    return
                 if self._merged_children(sid, rel):
                     raise pyfuse3.FUSEError(errno.ENOTEMPTY)
                 idx = self._index(sid)
@@ -1979,14 +2266,21 @@ def _build_overlay_ops():
             idx = self._index(sid)
             self._req_enter(f"setattr {sid}/{rel}")
             try:
-                layer = self._resolve(sid, rel)
-                if layer in ("absent", "whiteout"):
-                    raise pyfuse3.FUSEError(errno.ENOENT)
-                if layer == "lower":
-                    fd = self._ensure_copyup(sid, rel, os.O_RDWR, ctx)
-                    os.close(fd)
-                upath = self._upper_path(sid, rel)
-                wid = idx.writer_for(ctx.pid)
+                passthrough = self._passthrough(sid, rel)
+                if passthrough:
+                    upath = self._host_path(rel)
+                    if not os.path.lexists(upath):
+                        raise pyfuse3.FUSEError(errno.ENOENT)
+                    wid = idx.writer_for(ctx.pid)
+                else:
+                    layer = self._resolve(sid, rel)
+                    if layer in ("absent", "whiteout"):
+                        raise pyfuse3.FUSEError(errno.ENOENT)
+                    if layer == "lower":
+                        fd = self._ensure_copyup(sid, rel, os.O_RDWR, ctx)
+                        os.close(fd)
+                    upath = self._upper_path(sid, rel)
+                    wid = idx.writer_for(ctx.pid)
                 is_link = stat_mod.S_ISLNK(os.lstat(upath).st_mode)
                 try:
                     # size/mode operate on file content/inode: open ONE O_NOFOLLOW fd
@@ -2016,6 +2310,8 @@ def _build_overlay_ops():
                 except OSError as e:
                     raise pyfuse3.FUSEError(e.errno or errno.EIO)
                 st = os.lstat(upath)
+                if passthrough:
+                    return self._entry(inode, st)
                 if stat_mod.S_ISDIR(st.st_mode): kind = "dir"
                 elif stat_mod.S_ISLNK(st.st_mode): kind = "symlink"
                 else: kind = "file"
@@ -2094,6 +2390,24 @@ def _build_overlay_ops():
                             rel_o, "rename") == "deny":
                 raise pyfuse3.FUSEError(errno.EACCES)
             idx = self._index(sid)
+            wid = idx.writer_for(ctx.pid)
+            # passthrough: both ends act on the real host. Both-ends-or-overlay:
+            # only when BOTH paths pass through do we touch the host; if either side
+            # is captured we fall through to overlay capture below. Symlink safety:
+            # rename(2) operates on the names, never dereferences the final components.
+            if self._passthrough(sid, rel_o) and self._passthrough(sid, rel_n):
+                self._req_enter(f"rename {sid}/{rel_o}->{rel_n}")
+                try:
+                    ho = self._host_path(rel_o); hn = self._host_path(rel_n)
+                    if not os.path.lexists(ho): raise pyfuse3.FUSEError(errno.ENOENT)
+                    try:
+                        os.makedirs(os.path.dirname(hn) or "/", exist_ok=True)
+                        os.rename(ho, hn)
+                    except OSError as e:
+                        raise pyfuse3.FUSEError(e.errno or errno.EIO)
+                    return
+                finally:
+                    self._req_exit()
             layer_o, _ap_o, st_o = self._resolve_st(sid, rel_o)
             if layer_o in ("absent", "whiteout"):
                 raise pyfuse3.FUSEError(errno.ENOENT)
@@ -2101,7 +2415,6 @@ def _build_overlay_ops():
             if flags & getattr(pyfuse3, "RENAME_NOREPLACE", 1):
                 if layer_n not in ("absent", "whiteout"):
                     raise pyfuse3.FUSEError(errno.EEXIST)
-            wid = idx.writer_for(ctx.pid)
             self._req_enter(f"rename {sid}/{rel_o}->{rel_n}")
             try:
                 dst_shadows_lower = False
@@ -2186,6 +2499,19 @@ def _build_overlay_ops():
                 raise pyfuse3.FUSEError(errno.EACCES)
             self._req_enter(f"link {sid}/{rel_src}->{rel_n}")
             try:
+                # Both-ends-or-overlay: hardlink on the host only when BOTH source and
+                # new name pass through; if either is captured, fall through to copy-up.
+                if self._passthrough(sid, rel_src) and self._passthrough(sid, rel_n):
+                    hs = self._host_path(rel_src); hn = self._host_path(rel_n)
+                    try:
+                        os.makedirs(os.path.dirname(hn) or "/", exist_ok=True)
+                        # follow_symlinks=False: hardlink the link itself, never target
+                        os.link(hs, hn, follow_symlinks=False)
+                    except OSError as e:
+                        raise pyfuse3.FUSEError(e.errno or errno.EIO)
+                    ino = self._ino_for(sid, rel_n)
+                    self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
+                    return self._entry(ino, os.lstat(hn))
                 self._copyup_one(sid, rel_src, wid)
                 self._ensure_parent_dirs(sid, rel_n, wid)
                 ups = self._upper_path(sid, rel_src); upn = self._upper_path(sid, rel_n)
@@ -2302,9 +2628,10 @@ class OverlayMount:
             try: pyfuse3.close(unmount=True)
             except Exception: pass
 
-    def add_session(self, sid: str, up: Path, index: "Index") -> None:
+    def add_session(self, sid: str, up: Path, index: "Index",
+                    passthrough: bool = False) -> None:
         if self.ops is not None:
-            self.ops.add_session(sid, up, index)
+            self.ops.add_session(sid, up, index, passthrough=passthrough)
 
     def remove_session(self, sid: str) -> None:
         if self.ops is not None:
@@ -2442,11 +2769,8 @@ def cleanup_dirs(upper: Path, start: Path) -> None:
 def _apply_overlay_entry(upper: Path, ap: Path, rel: str,
                          index: "Index | None" = None) -> None:
     """Write one overlay change onto the host (the same effect as the UI's Apply),
-    then drop it from the overlay. A whiteout (recorded in index.db as kind="whiteout")
-    deletes; a file/symlink is copied."""
+    then drop it from the overlay. A whiteout deletes; a file/symlink is copied."""
     host = Path("/") / rel
-    # Deletions are recorded in index.db as kind="whiteout", NOT as char-device
-    # whiteout files (those never exist in this overlay model). Check the index first.
     is_deletion = (index is not None and index.kind_of(rel) == "whiteout")
     try:
         if is_deletion:
@@ -2464,63 +2788,40 @@ def _apply_overlay_entry(upper: Path, ap: Path, rel: str,
         return
     remove_upper_entry(ap)
 
-def _try_fold_patch(rel, ap, host, files) -> bool:
-    """Fold a text create/modify into the patch dict; True if it went in. Deletions
-    and anything that isn't a clean line-diff of UTF-bytes are left for the sqlar."""
-    try:
-        ub = ap.read_bytes()
-    except OSError:
-        return False
-    if b"\x00" in ub: return False
-    try:
-        lob = host.read_bytes() if (host.exists() and not host.is_dir()) else b""
-    except OSError:
-        return False
-    if b"\x00" in lob: return False
-    lower, upperl = ut_split(lob), ut_split(ub)
-    fp = build_file_patch(rel, lower, upperl, not host.exists(), False)
-    try:
-        if b"".join(apply_hunks(lower, fp["hunks"])) != b"".join(upperl):
-            return False
-    except PatchConflict:
-        return False
-    files[rel] = fp
-    return True
-
 def _open_index_ro(shm_dir) -> "Index | None":
-    """Open the session's index.db read-only-ish for consolidate. None if absent."""
-    db = Path(shm_dir) / "index.db"
-    if not db.exists(): return None
+    """Open the session's single db for consolidate. None if absent."""
+    sp = sqlar_path(Path(shm_dir).name)
+    if not sp.exists(): return None
     try: return Index(Path(shm_dir))
     except sqlite3.Error: return None
 
 def consolidate(shm_dir, session_id: str, cmd: list, index: "Index | None" = None) -> None:
-    """Empty a finished session's overlay (live/<sid>) into on-disk state: text
-    create/modify folds into the patch (<sid>.patch.xz); binary files and symlinks go
-    into the sqlar archive (<sid>.sqlar). Deletions and opaque-dir expansions come
-    from index.db (NOT from char-device whiteouts / .wh..opq scanning — those never
-    exist in this overlay). Writer provenance per path is carried into the
-    sqlar `provenance` table. Afterwards the upper holds nothing
-    reviewable, so the caller can free the backing tree. Idempotent and additive.
+    """Finish a box: fill the NULL content blobs of its single sqlar from the overlay
+    upper, then tear the upper down. consolidate does NOT copy rows or translate
+    schemas — each entry row already exists (the FUSE layer upserted it on the
+    mutating op with data=NULL); for a file/symlink we just UPDATE that SAME row's
+    blob with the bytes the box wrote into the upper. Deletions/opacity are already
+    rows (tombstones); opaque dirs expand into per-lower-child tombstones. Writer
+    provenance per path is recorded into the `provenance` table. Afterwards the sqlar
+    is self-contained and the backing tree can be freed. Idempotent and additive.
 
     File rules are consulted first, top-to-bottom: a matching 'apply' writes the
-    change to the host and drops it, a matching 'discard' just drops it — either way
-    it reaches neither store."""
+    change to the host and drops the row, a matching 'discard' just drops the row —
+    either way it reaches neither store."""
     upper = Path(shm_dir) / "up"
     if not upper.is_dir(): return
     own_index = index is None
     idx = index if index is not None else _open_index_ro(shm_dir)
     frules = load_file_rules()
-    pp = patch_path(session_id)
-    files = {}
-    if pp.exists():
-        try: files = parse_patch(read_patch_file(pp))
-        except Exception: files = {}
-    sq = None                                            # lazy sqlar connection
-    def _sq():
-        nonlocal sq
-        if sq is None: sq = _sqlar_open(sqlar_path(session_id))
-        return sq
+    sp = sqlar_path(session_id)
+    sq = _sqlar_open(sp)
+    def _set_blob(rel, content: bytes, mode, mtime) -> None:
+        data, sz = _sqlar_deflate(content)
+        sq.execute("UPDATE sqlar SET mode=?, mtime=?, sz=?, data=? WHERE name=?",
+                   (int(mode), int(mtime), sz, sqlite3.Binary(data), rel))
+        if sq.execute("SELECT changes()").fetchone()[0] == 0:
+            # No pre-existing row (orphaned overlay with no live index): create it.
+            _sqlar_put_file(sq, rel, content, mode, mtime)
     def _prov(rel):
         return idx.writer_provenance(rel) if idx is not None else None
     moved = []
@@ -2529,57 +2830,60 @@ def consolidate(shm_dir, session_id: str, cmd: list, index: "Index | None" = Non
     for root, _dirs, names in os.walk(upper, onerror=lambda _e: None):
         for nm in names:
             paths.append(Path(root) / nm)
-        # symlinks-to-dirs show up in _dirs from os.walk? No — os.walk lists symlinks
-        # to dirs under dirs and does not descend; capture them explicitly.
-    # also catch symlinks that point at directories (os.walk would list them as dirs)
     for root, dirs, _names in os.walk(upper, onerror=lambda _e: None):
         for d in dirs:
             p = Path(root) / d
             if p.is_symlink(): paths.append(p)
     for ap in sorted(set(paths)):
         rel = str(ap.relative_to(upper))
-        act = frules.decide(rel)                         # apply / discard / None
-        if act == "discard":
+        act = frules.decide(rel)                         # apply / discard / passthrough / None
+        if act in ("discard", "passthrough"):
+            sqlar_remove(sp, rel)
             remove_upper_entry(ap); cleanup_dirs(upper, ap.parent); continue
         if act == "apply":
-            _apply_overlay_entry(upper, ap, rel, index=idx); cleanup_dirs(upper, ap.parent)
-            files.pop(rel, None); continue
-        if rel in files: continue                        # already in the patch
-        host = Path("/") / rel
+            _apply_overlay_entry(upper, ap, rel, index=idx)
+            sqlar_remove(sp, rel); cleanup_dirs(upper, ap.parent); continue
         try:
             if ap.is_symlink():
-                _sqlar_put_symlink(_sq(), rel,
-                                   os.readlink(ap).encode("utf-8", "surrogateescape"),
-                                   ap.lstat().st_mtime)
+                tgt = os.readlink(ap).encode("utf-8", "surrogateescape")
+                data, sz = _sqlar_deflate(tgt)
+                sq.execute("UPDATE sqlar SET mode=?, mtime=?, sz=?, data=? WHERE name=?",
+                           (stat_mod.S_IFLNK | 0o777, int(ap.lstat().st_mtime),
+                            len(tgt), sqlite3.Binary(data), rel))
+                if sq.execute("SELECT changes()").fetchone()[0] == 0:
+                    _sqlar_put_symlink(sq, rel, tgt, ap.lstat().st_mtime)
                 p = _prov(rel)
-                if p: _sqlar_put_provenance(_sq(), rel, p)
+                if p: _sqlar_put_provenance(sq, rel, p)
             elif ap.is_file():
-                if not _try_fold_patch(rel, ap, host, files):   # not clean text
-                    st = ap.stat()
-                    _sqlar_put_file(_sq(), rel, ap.read_bytes(), st.st_mode, st.st_mtime)
-                    p = _prov(rel)
-                    if p: _sqlar_put_provenance(_sq(), rel, p)
+                st = ap.stat()
+                _set_blob(rel, ap.read_bytes(), st.st_mode, st.st_mtime)
+                p = _prov(rel)
+                if p: _sqlar_put_provenance(sq, rel, p)
             else:
                 continue                                 # dirs handled by cleanup
         except OSError:
             continue
         moved.append(ap)
-    # 2) deletions (whiteouts) from the index -> sqlar tombstones.
+    # 2) deletions (whiteouts) from the index -> tombstone rows (already present, but
+    #    re-assert for the orphaned-overlay path) + provenance.
     if idx is not None:
         for rel in idx.deletions():
             act = frules.decide(rel)
-            if act == "discard": continue
+            if act in ("discard", "passthrough"):
+                sqlar_remove(sp, rel); continue
             host = Path("/") / rel
             if act == "apply":
                 try:
                     if host.is_dir() and not host.is_symlink(): shutil.rmtree(host)
                     elif host.exists() or host.is_symlink(): host.unlink()
                 except OSError: pass
-                continue
+                sqlar_remove(sp, rel); continue
             if host.exists() or host.is_symlink():
-                _sqlar_put_tombstone(_sq(), rel)
+                _sqlar_put_tombstone(sq, rel)
                 p = _prov(rel)
-                if p: _sqlar_put_provenance(_sq(), rel, p)
+                if p: _sqlar_put_provenance(sq, rel, p)
+            else:
+                sqlar_remove(sp, rel)
         # 3) opaque dirs: expand into per-lower-child tombstones for children not
         #    re-materialized in the upper.
         for drel in idx.opaque_dirs():
@@ -2590,14 +2894,10 @@ def consolidate(shm_dir, session_id: str, cmd: list, index: "Index | None" = Non
                     crel = os.path.relpath(os.path.join(lroot, nm), "/")
                     if (upper / crel).exists() or (upper / crel).is_symlink():
                         continue                          # re-materialized in upper
-                    if frules.decide(crel) in ("apply", "discard"): continue
-                    _sqlar_put_tombstone(_sq(), crel)
-    if files:
-        write_patch_file(pp, serialize_patch(files), cmd)
-    elif pp.exists():
-        pp.unlink()
-    if sq is not None:
-        sq.commit(); sq.close(); set_cmd_xattr(sqlar_path(session_id), cmd)
+                    if frules.decide(crel) in ("apply", "discard", "passthrough"):
+                        continue
+                    _sqlar_put_tombstone(sq, crel)
+    sq.commit(); sq.close()
     for ap in moved:
         remove_upper_entry(ap); cleanup_dirs(upper, ap.parent)
     if own_index and idx is not None:
@@ -2649,7 +2949,7 @@ def rm_rf(path) -> None:
 class Session:
     session_id: str                # "YYYYmmdd-HHMMSS_PID" — the whole identity
     cmd: list
-    shm_dir: str = ""              # the session backing dir: live/<sid> (up + index.db)
+    shm_dir: str = ""              # the session backing dir: live/<sid> (up only)
     status: str = "running"
     exit_code: "int | None" = None
     conn_allowed: int = 0
@@ -2658,9 +2958,8 @@ class Session:
     bytes_down: int = 0
     sess_rules: list = field(default_factory=list)   # ordered, session-only Rules
     live: bool = False
-    has_patch: bool = False                           # a consolidated patch exists
-    has_sqlar: bool = False                           # a consolidated sqlar exists
-    has_flows: bool = False                           # a network log exists
+    has_sqlar: bool = False                           # the single db has entries
+    has_flows: bool = False                           # the single db has flows
     # started time and pid are not stored — they are read back out of the name.
     @property
     def started(self) -> float: return parse_sid(self.session_id)[0]
@@ -2670,8 +2969,6 @@ class Session:
     def stamp(self) -> str: return self.session_id.partition("_")[0]
     @property
     def upper(self) -> str: return str(Path(self.shm_dir) / "up")
-    @property
-    def index_db(self) -> str: return str(Path(self.shm_dir) / "index.db")
     def to_dict(self) -> dict:
         d = {k: v for k, v in asdict(self).items() if k != "sess_rules"}
         d["sess_rules"] = [r.to_line() for r in self.sess_rules]
@@ -2682,8 +2979,8 @@ class Session:
 
 def discover_sessions() -> dict:
     """Find sessions purely from filesystem names: live/<sid> backing dirs (an
-    un-consolidated/orphaned overlay) plus <sid>.patch.xz / <sid>.sqlar / <sid>.flows
-    under state_home. All but the command is in <sid>."""
+    un-consolidated/orphaned overlay) plus the single <sid>.sqlar under state_home.
+    The command is the root process row in <sid>.sqlar (keyed by the sid's pid)."""
     out = {}
     lh = live_home()
     if lh.exists():
@@ -2691,25 +2988,20 @@ def discover_sessions() -> dict:
             if not (d / "up").is_dir(): continue          # not a slopbox backing dir
             sid = d.name
             out[sid] = Session(
-                session_id=sid, cmd=get_cmd_xattr(d), shm_dir=str(d),
+                session_id=sid, cmd=root_cmd(sid), shm_dir=str(d),
                 status="running" if _pid_alive(parse_sid(sid)[1]) else "finished",
                 live=False)
     sd = state_home()
     if sd.exists():
-        def _store(sid, src):
+        for af in sd.glob("*.sqlar"):
+            sid = af.name[:-len(".sqlar")]
             s = out.get(sid)
             if s is None:
                 s = out[sid] = Session(
-                    session_id=sid, cmd=get_cmd_xattr(src),
-                    shm_dir=str(live_dir(sid)),
-                    status="finished", live=False)
-            return s
-        for pf in sd.glob("*.patch.xz"):
-            _store(pf.name[:-len(".patch.xz")], pf).has_patch = True
-        for af in sd.glob("*.sqlar"):
-            _store(af.name[:-len(".sqlar")], af).has_sqlar = True
-        for ff in sd.glob("*.flows"):
-            _store(ff.name[:-len(".flows")], ff).has_flows = True
+                    session_id=sid, cmd=root_cmd(sid),
+                    shm_dir=str(live_dir(sid)), status="finished", live=False)
+            s.has_sqlar = bool(sqlar_list(af))
+            s.has_flows = has_flows(af)
     return out
 
 
@@ -2731,8 +3023,8 @@ class Supervisor:
         self.indexes: dict = {}          # sid -> live Index (for running sessions)
         self.sessions: dict = {}
         self.pending: dict = {}
-        self.patches: dict = {}          # sid -> {files, dirty, touched, mtime}
-        self._consolidated: set = set()  # sids whose overlay we've folded to a patch
+        self.selected_sid = None         # the UI's current box (target of `patch`)
+        self._consolidated: set = set()  # sids already consolidated this run
         self._dns_cache: dict = {}
         self._counter = 0
         self.on_event = lambda ev: None
@@ -2781,8 +3073,9 @@ class Supervisor:
 
     def sweep_orphans(self) -> None:
         """At UI startup, consolidate-or-leave each orphaned live/<sid> from a prior
-        crash: its runner is gone, so fold its overlay into patch/sqlar (deletions
-        and opacity come from its index.db) and remove the spent backing tree. Leaves
+        crash: its runner is gone, so fold its overlay into the single <sid>.sqlar
+        (deletions and opacity come from that sqlar) and remove the spent backing
+        tree. Leaves
         live/ empty at rest for any session that had no reviewable changes."""
         lh = live_home()
         if not lh.exists(): return
@@ -2791,7 +3084,7 @@ class Supervisor:
             sid = d.name
             if _pid_alive(parse_sid(sid)[1]): continue   # a running runner owns it
             try:
-                consolidate(str(d), sid, get_cmd_xattr(d))
+                consolidate(str(d), sid, root_cmd(sid))
             except Exception as e:
                 print(f"slopbox(ui): sweep of {sid} failed: {e}", file=sys.stderr)
                 continue
@@ -2811,9 +3104,9 @@ class Supervisor:
             elif not cur.live:
                 ns = "running" if _pid_alive(cur.pid) else (
                     cur.status if cur.status == "killed" else "finished")
-                changed = (ns != cur.status or cur.has_patch != s.has_patch
+                changed = (ns != cur.status
                            or cur.has_sqlar != s.has_sqlar or cur.has_flows != s.has_flows)
-                cur.status = ns; cur.has_patch = s.has_patch
+                cur.status = ns
                 cur.has_sqlar = s.has_sqlar; cur.has_flows = s.has_flows
                 if changed:
                     self._emit(type="session_updated", session=cur.to_dict())
@@ -2821,11 +3114,8 @@ class Supervisor:
             s = self.sessions[sid]
             if s.live: continue
             shm_gone = not (s.shm_dir and Path(s.shm_dir).exists())
-            inmem = self.patches.get(sid)
-            patch_gone = not patch_path(sid).exists() and not (inmem and inmem["files"])
             sqlar_gone = not sqlar_path(sid).exists()
-            flows_gone = not flows_path(sid).exists()
-            if shm_gone and patch_gone and sqlar_gone and flows_gone:
+            if shm_gone and sqlar_gone:
                 del self.sessions[sid]
                 self._emit(type="session_removed", session_id=sid)
 
@@ -2906,12 +3196,22 @@ class Supervisor:
             finally:
                 os.umask(old)
             os.chmod(backing, 0o700)
-            set_cmd_xattr(backing, list(cmd))
             index = Index(backing)
         except (OSError, sqlite3.Error) as e:
             return dict(ok=False, error=f"overlay setup failed: {e}")
+        trace = bool(msg.get("want_trace"))
+        direct = bool(msg.get("want_direct"))
+        index.set_tracing(trace)
+        # The box's ROOT process row: tgid == the sid's host pid, argv == the workload
+        # command. The cooperating runner self-reports ppid/exe/env (its own live
+        # provenance at register). Persisted now via the one process-table insert
+        # path, so an empty box still shows its command and survives the runner exit.
+        root_prov = dict(msg.get("prov") or {})
+        root_prov["tgid"] = parse_sid(sid)[1]
+        root_prov["argv"] = list(cmd)
+        index.process_from_prov(root_prov)
         self.indexes[sid] = index
-        self.mount.add_session(sid, up, index)
+        self.mount.add_session(sid, up, index, passthrough=direct)
         # CA-augmented trust bundle as virtual files, if networked.
         net = bool(msg.get("want_net"))
         if net:
@@ -2965,9 +3265,9 @@ class Supervisor:
         s = self.sessions.get(sid)
         reported_status = msg.get("status", "finished")
         # Teardown: remove the box from the live mount set, consolidate its overlay
-        # (deletions/opacity from index.db, provenance into the sqlar), then drop the
-        # backing tree. live/ + the synthetic root are empty at rest. Fail-closed on
-        # the security-critical teardown — log, don't silently pass.
+        # (fill the single sqlar's NULL blobs from the upper, provenance into the
+        # same db), then drop the backing tree. live/ + the synthetic root are empty
+        # at rest. Fail-closed on the security-critical teardown — log, don't pass.
         # If bwrap never launched (status="error"), skip consolidate — the upper was
         # never written by the box, so there is nothing to surface as a change set.
         if self.mount is not None:
@@ -2976,7 +3276,7 @@ class Supervisor:
         backing = live_dir(sid)
         if backing.exists() and reported_status != "error":
             try:
-                consolidate(str(backing), sid, list(s.cmd) if s else get_cmd_xattr(backing),
+                consolidate(str(backing), sid, list(s.cmd) if s else root_cmd(sid),
                             index=index)
             except Exception as e:
                 print(f"slopbox(ui): consolidate {sid} failed: {e}", file=sys.stderr)
@@ -2992,13 +3292,11 @@ class Supervisor:
         s.live = False
         if s.status == "running": s.status = reported_status
         s.exit_code = msg.get("exit_code")
-        self.patches.pop(sid, None)
-        s.has_patch = patch_path(sid).exists()
-        s.has_sqlar = sqlar_path(sid).exists()
-        s.has_flows = flows_path(sid).exists()
+        s.has_sqlar = bool(sqlar_list(sqlar_path(sid)))
+        s.has_flows = has_flows(sqlar_path(sid))
         self._consolidated.add(sid)
         # nothing reviewable at all -> drop the entry entirely
-        if not (s.has_patch or s.has_sqlar or s.has_flows
+        if not (s.has_sqlar or s.has_flows
                 or (backing.exists() and upper_has_changes(backing / "up"))):
             self.sessions.pop(sid, None)
             self._emit(type="session_removed", session_id=sid)
@@ -3069,21 +3367,46 @@ class Supervisor:
         if s: self._record_traffic(s, host, port, scheme, action, bu, bd, status)
 
     def log_flow(self, sid, fl: dict) -> None:
-        """Persist one completed request/response into the session's <sid>.flows db."""
-        try: flows_add(flows_path(sid), fl)
-        except Exception: return
+        """Persist one completed request/response into the box's single sqlar `flows`
+        table. fl['prov'] = {tgid,ppid,exe,argv,env} holds the originating workload
+        process's HOST-namespace provenance (resolved by RelayServer from the --inner
+        pidfd); tag the flow with that process's process-table id, inserting the
+        process+env row keyed by the host tgid.
+        Routes the write through the live Index (the single writer, under its lock) so
+        the flow never opens a second WAL handle and races the serve thread; falls back
+        to a direct write only when no live Index exists (session already torn down)."""
+        prov = fl.pop("prov", None) or {}
+        idx = self.indexes.get(sid)
+        if idx is not None:
+            if prov.get("tgid"):
+                try: fl["process_id"] = idx.process_from_prov(prov)
+                except Exception: pass
+            try: idx.add_flow(fl)
+            except Exception as e:
+                print(f"slopbox: dropped flow for {sid}: {e}", file=sys.stderr)
+                return
+        else:
+            try: flows_add(sqlar_path(sid), fl)
+            except Exception as e:
+                print(f"slopbox: dropped flow for {sid}: {e}", file=sys.stderr)
+                return
         s = self.sessions.get(sid)
-        try: set_cmd_xattr(flows_path(sid), list(s.cmd) if s else [])
-        except Exception: pass
         if s and not s.has_flows:
             s.has_flows = True
             self._emit(type="session_updated", session=s.to_dict())
 
     def flows(self, sid) -> list:
-        return flows_list(flows_path(sid))
+        return flows_list(sqlar_path(sid))
 
     def flow_detail(self, sid, fid) -> "dict | None":
-        return flows_get(flows_path(sid), fid)
+        return flows_get(sqlar_path(sid), fid)
+
+    def processes(self, sid) -> list:
+        """The box's process table: [(id, tgid, ppid, exe, argv-list)]."""
+        return process_list(sqlar_path(sid))
+
+    def process_env(self, sid, proc_id) -> dict:
+        return process_env(sqlar_path(sid), proc_id)
 
     def _pending_dict(self, rid) -> dict:
         p = self.pending[rid]
@@ -3117,11 +3440,10 @@ class Supervisor:
             except Exception: pass
         if s.shm_dir:
             rm_rf(s.shm_dir)
-        for f in (patch_path(sid), sqlar_path(sid), flows_path(sid)):
-            if f.exists():
-                try: f.unlink()
-                except OSError: pass
-        self.patches.pop(sid, None)
+        sp = sqlar_path(sid)
+        if sp.exists():
+            try: sp.unlink()
+            except OSError: pass
         del self.sessions[sid]
         self._emit(type="session_removed", session_id=sid)
 
@@ -3140,11 +3462,9 @@ class Supervisor:
         idx = self.indexes.get(sid)
         if idx is not None: return idx
         s = self.sessions.get(sid)
-        if s and s.shm_dir:
-            db = Path(s.shm_dir) / "index.db"
-            if db.exists():
-                try: return Index(Path(s.shm_dir))
-                except sqlite3.Error: return None
+        if s and s.shm_dir and sqlar_path(sid).exists():
+            try: return Index(Path(s.shm_dir))
+            except sqlite3.Error: return None
         return None
 
     def overlay_entries(self, sid) -> list:
@@ -3347,16 +3667,15 @@ class Supervisor:
 
     def _maybe_remove_empty(self, sid) -> None:
         """A finished session vanishes only when it holds nothing at all — no overlay
-        change, no patch, no sqlar, and no network log. The connection log alone is
+        change, no sqlar entry, and no network log. The connection log alone is
         reason enough to keep the entry around."""
         s = self.sessions.get(sid)
         if not s or s.live or _pid_alive(s.pid): return
         try: overlay = upper_has_changes(Path(s.upper))
         except OSError: overlay = False
-        patch = bool(self._patch(sid)["files"]) or patch_path(sid).exists()
-        sqlar = sqlar_path(sid).exists()
-        flows = flows_path(sid).exists()
-        if not overlay and not patch and not sqlar and not flows:
+        sqlar = bool(sqlar_list(sqlar_path(sid)))
+        flows = has_flows(sqlar_path(sid))
+        if not overlay and not sqlar and not flows:
             self.delete(sid)
 
     def overlay_apply(self, sid, paths) -> dict:
@@ -3415,7 +3734,7 @@ class Supervisor:
         self._maybe_remove_empty(sid)
         return dict(discarded=discarded, errors=errors)
 
-    # ─── consolidated patch layer (host ← overlay ← patch) ──────────────────
+    # ─── consolidated single-sqlar layer ───────────────────────────────────
     def _cmd_of(self, sid) -> list:
         s = self.sessions.get(sid)
         return list(s.cmd) if s else []
@@ -3428,76 +3747,15 @@ class Supervisor:
         except OSError: pass
         return []
 
-    @staticmethod
-    def _patch_mtime(sid):
-        pf = patch_path(sid)
-        try: return pf.stat().st_mtime_ns if pf.exists() else None
-        except OSError: return None
-
-    def _patch(self, sid) -> dict:
-        """Lazily load the session's patch into memory: {files, dirty, touched, mtime}.
-        The patch file can be (re)written behind our back — by the runner when a
-        subprocess finishes, or by consolidate() — so when we hold no unsaved edits
-        and the on-disk file has changed (appeared / updated / removed) we reload it.
-        A dirty in-memory patch is authoritative and never clobbered by a reload."""
-        p = self.patches.get(sid)
-        st = self._patch_mtime(sid)
-        if p is not None and not p["dirty"] and p.get("mtime") != st:
-            p = None
-        if p is None:
-            files = {}
-            if st is not None:
-                try: files = parse_patch(read_patch_file(patch_path(sid)))
-                except Exception: files = {}
-            p = self.patches[sid] = dict(files=files, dirty=False,
-                                         touched=time.time(), mtime=st)
-        return p
-
-    def patch_dirty(self, sid) -> bool:
-        return bool(self.patches.get(sid, {}).get("dirty"))
-
-    def save_patch(self, sid) -> None:
-        p = self.patches.get(sid)
-        if p is None: return
-        pf = patch_path(sid)
-        if p["files"]:
-            write_patch_file(pf, serialize_patch(p["files"]), self._cmd_of(sid))
-            s = self.sessions.get(sid)
-            if s: s.has_patch = True
-        else:
-            if pf.exists():
-                try: pf.unlink()
-                except OSError: pass
-            s = self.sessions.get(sid)
-            if s: s.has_patch = False
-        p["dirty"] = False
-        p["mtime"] = self._patch_mtime(sid)
-        self._maybe_remove_empty(sid)
-
-    def _patch_warn(self, rel, fp) -> bool:
-        base = self._host_lines(rel)
-        return any(locate_hunk(base, h) != h["a1"] for h in fp["hunks"])
-
-    def _patch_entries(self, sid) -> list:
-        out = []
-        for rel, fp in self._patch(sid)["files"].items():
-            kind = "deleted" if fp["deleted"] else ("created" if fp["created"] else "modified")
-            out.append(dict(path=rel, kind=kind, size=0, is_text=True,
-                            stale=self._patch_warn(rel, fp), source="patch"))
-        return out
-
     def _ensure_consolidated(self, sid) -> None:
-        """Fold a finished session's overlay into its patch the first time we look
-        at it — the same consolidation unregister does, but for orphaned sessions
-        sitting on disk (e.g. a crashed runner). Never touches a live/running session
-        (its overlay is still moving and its index is owned by the serve loop)."""
+        """Consolidate a finished session's overlay into its single sqlar the first
+        time we look at it (for orphaned sessions left on disk by a crashed runner).
+        Never touches a live/running session."""
         if sid in self._consolidated: return
         s = self.sessions.get(sid)
         if not s or s.live or _pid_alive(s.pid): return
         self._consolidated.add(sid)
         if not (s.shm_dir and Path(s.shm_dir).exists()): return
-        # a leftover live index handle (shouldn't exist for a non-live session) —
-        # close it so consolidate opens a clean one.
         idx = self.indexes.pop(sid, None)
         if idx is not None:
             try: idx.close()
@@ -3506,23 +3764,20 @@ class Supervisor:
             consolidate(s.shm_dir, sid, s.cmd)
         except Exception:
             return
-        self.patches.pop(sid, None)        # force a reload of the freshly-written patch
-        s.has_patch = patch_path(sid).exists()
-        s.has_sqlar = sqlar_path(sid).exists()
-        # consolidate() empties the overlay (text → patch, the rest → sqlar), so the
-        # backing tree is now spent — free it; the on-disk stores are the record.
+        s.has_sqlar = bool(sqlar_list(sqlar_path(sid)))
         try: empty = not upper_has_changes(Path(s.upper))
         except OSError: empty = False
         if empty:
             rm_rf(s.shm_dir)
 
-    # ─── sqlar layer (binary files, symlinks, deletions a patch can't hold) ──
+    # ─── sqlar entries (a finished/consolidated box) ────────────────────────
     def _sqlar_entries(self, sid) -> list:
         out = []
         for name, mode, mtime, sz in sqlar_list(sqlar_path(sid)):
             host = Path("/") / name
             if stat_mod.S_ISCHR(mode):
                 kind, stale = "deleted", False
+                is_text = False
             else:
                 exists = host.exists() or host.is_symlink()
                 kind = "modified" if exists else "created"
@@ -3530,12 +3785,36 @@ class Supervisor:
                 if exists:
                     try: stale = host.lstat().st_mtime > mtime
                     except OSError: stale = False
-            out.append(dict(path=name, kind=kind, size=sz, is_text=False,
-                            stale=stale, source="sqlar"))
+                is_text = self._sqlar_is_text(sid, name, mode)
+            out.append(dict(path=name, kind=kind, size=sz, is_text=is_text,
+                            stale=stale))
         return out
+
+    def _sqlar_is_text(self, sid, rel, mode) -> bool:
+        if stat_mod.S_ISLNK(mode) or stat_mod.S_ISDIR(mode): return False
+        raw = sqlar_content(sqlar_path(sid), rel)
+        return raw is not None and b"\x00" not in raw
 
     def _in_sqlar(self, sid, rel) -> bool:
         return sqlar_mode(sqlar_path(sid), rel.lstrip("/")) is not None
+
+    def _sqlar_hunks(self, sid, rel):
+        """(host_lines, sqlar_lines, grouped_opcodes) for a consolidated text file,
+        computed on demand from the single sqlar blob vs the host. None if not text."""
+        rel = rel.lstrip("/")
+        mode = sqlar_mode(sqlar_path(sid), rel)
+        if mode is None or stat_mod.S_ISCHR(mode) or stat_mod.S_ISLNK(mode):
+            return None
+        raw = sqlar_content(sqlar_path(sid), rel)
+        if raw is None or b"\x00" in raw: return None
+        host = Path("/") / rel
+        try: lo = host.read_bytes() if (host.exists() and not host.is_dir()) else b""
+        except OSError: lo = b""
+        if b"\x00" in lo: return None
+        import difflib
+        ll = ut_split(lo); ul = ut_split(raw)
+        groups = list(difflib.SequenceMatcher(None, ll, ul).get_grouped_opcodes(3))
+        return (ll, ul, groups)
 
     def _sqlar_display(self, sid, rel) -> dict:
         sp = sqlar_path(sid); rel = rel.lstrip("/")
@@ -3549,10 +3828,70 @@ class Supervisor:
             d = dict(kind="modified" if host.is_symlink() else "created",
                      diff="symlink → " + tgt.decode("utf-8", "replace"))
             return dict(is_text=False, hunks=[], diff=d)
+        info = self._sqlar_hunks(sid, rel)
+        if info is not None:
+            ll, ul, groups = info
+            def disp(b): return b.decode("utf-8", "replace").rstrip("\r\n")
+            hunks = []
+            for gi, group in enumerate(groups):
+                a1, a2 = group[0][1], group[-1][2]
+                b1, b2 = group[0][3], group[-1][4]
+                lines = [("hdr", f"@@ -{a1+1},{a2-a1} +{b1+1},{b2-b1} @@")]
+                for tag, i1, i2, j1, j2 in group:
+                    if tag == "equal":
+                        for ln in ll[i1:i2]: lines.append((" ", disp(ln)))
+                    else:
+                        for ln in ll[i1:i2]: lines.append(("-", disp(ln)))
+                        for ln in ul[j1:j2]: lines.append(("+", disp(ln)))
+                hunks.append(dict(index=gi, lines=lines))
+            return dict(is_text=True, hunks=hunks)
         raw = sqlar_content(sp, rel) or b""
         return dict(is_text=False, hunks=[],
                     diff=dict(kind="modified" if host.exists() else "created",
                               content=base64.b64encode(raw).decode()))
+
+    def _sqlar_apply_hunk(self, sid, rel, index) -> dict:
+        info = self._sqlar_hunks(sid, rel)
+        if info is None: return dict(ok=False, error="not a text change")
+        ll, ul, groups = info
+        if not (0 <= index < len(groups)): return dict(ok=False, error="stale hunk")
+        g = groups[index]
+        a1, a2, b1, b2 = g[0][1], g[-1][2], g[0][3], g[-1][4]
+        new_lower = ll[:a1] + ul[b1:b2] + ll[a2:]
+        dst = Path("/") / rel.lstrip("/")
+        if _is_symlink(dst):
+            return dict(ok=False, error="refusing to write through a symlink")
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_bytes(b"".join(new_lower))
+        except OSError as e:
+            return dict(ok=False, error=str(e))
+        # The hunk is now applied on the host; if the file matches the sqlar copy
+        # entirely, drop the entry.
+        if b"".join(new_lower) == b"".join(ul):
+            sqlar_remove(sqlar_path(sid), rel.lstrip("/"))
+        return dict(ok=True)
+
+    def _sqlar_discard_hunk(self, sid, rel, index) -> dict:
+        info = self._sqlar_hunks(sid, rel)
+        if info is None: return dict(ok=False, error="not a text change")
+        ll, ul, groups = info
+        if not (0 <= index < len(groups)): return dict(ok=False, error="stale hunk")
+        g = groups[index]
+        a1, a2, b1, b2 = g[0][1], g[-1][2], g[0][3], g[-1][4]
+        new_upper = ul[:b1] + ll[a1:a2] + ul[b2:]
+        rel = rel.lstrip("/")
+        body = b"".join(new_upper)
+        if body == b"".join(ll):
+            sqlar_remove(sqlar_path(sid), rel)            # back to host: no change
+        else:
+            conn = _sqlar_open(sqlar_path(sid))
+            try:
+                data, sz = _sqlar_deflate(body)
+                conn.execute("UPDATE sqlar SET sz=?, data=? WHERE name=?",
+                             (sz, sqlite3.Binary(data), rel)); conn.commit()
+            finally: conn.close()
+        return dict(ok=True)
 
     def _sqlar_apply(self, sid, rel) -> dict:
         sp = sqlar_path(sid); rel = rel.lstrip("/")
@@ -3568,6 +3907,8 @@ class Supervisor:
                 if host.exists() or host.is_symlink(): host.unlink()
                 host.parent.mkdir(parents=True, exist_ok=True); os.symlink(tgt, host)
             else:
+                if _is_symlink(host):
+                    return dict(ok=False, error="refusing to write through a symlink")
                 host.parent.mkdir(parents=True, exist_ok=True)
                 host.write_bytes(sqlar_content(sp, rel) or b"")
                 try: os.chmod(host, stat_mod.S_IMODE(mode))
@@ -3581,116 +3922,85 @@ class Supervisor:
         sqlar_remove(sqlar_path(sid), rel.lstrip("/"))
         return dict(ok=True)
 
+    # ─── unified change interface (live overlay OR consolidated sqlar) ──────
     def session_changes(self, sid) -> list:
-        """All changes for a session — overlay, patch and sqlar — each tagged with
-        its source. (A file is in exactly one of the three.)"""
+        """All changes for a session. Everything comes from the one sqlar (when
+        consolidated) plus the live overlay upper (while running) — there is no
+        separate patch source."""
         self._ensure_consolidated(sid)
-        ov = self.overlay_entries(sid)
-        for e in ov: e["source"] = "overlay"
-        return ov + self._patch_entries(sid) + self._sqlar_entries(sid)
+        s = self.sessions.get(sid)
+        if s and (s.live or _pid_alive(s.pid)):
+            return self.overlay_entries(sid)
+        return self._sqlar_entries(sid)
 
-    def change_mode(self, sid, rel, source) -> "int | None":
-        """st_mode for a changed file (for the path/mode header): the overlay copy,
-        the sqlar entry, or the host file behind a patch — None if unavailable."""
+    def _live(self, sid) -> bool:
+        s = self.sessions.get(sid)
+        return bool(s and (s.live or _pid_alive(s.pid)) and Path(s.upper).exists())
+
+    def change_mode(self, sid, rel, source=None) -> "int | None":
+        """st_mode for a changed file (for the path/mode header). None if N/A."""
         rel = rel.lstrip("/")
-        if source == "sqlar":
-            return sqlar_mode(sqlar_path(sid), rel)
-        if source == "overlay":
+        if self._live(sid):
             s = self.sessions.get(sid)
-            if s:
-                try: return (Path(s.upper) / rel).lstat().st_mode
-                except OSError: return None
+            try: return (Path(s.upper) / rel).lstat().st_mode
+            except OSError: return None
+        m = sqlar_mode(sqlar_path(sid), rel)
+        if m is not None: return m
         host = Path("/") / rel
         try: return host.lstat().st_mode if (host.exists() or host.is_symlink()) else None
         except OSError: return None
 
-    def _in_patch(self, sid, rel) -> bool:
-        return rel.lstrip("/") in self._patch(sid)["files"]
-
     def hunks(self, sid, rel) -> dict:
-        rel2 = rel.lstrip("/")
-        if self._in_patch(sid, rel2): return self._patch_hunks_display(sid, rel2)
-        if self._in_sqlar(sid, rel2): return self._sqlar_display(sid, rel2)
-        return self.overlay_hunks(sid, rel)
-
-    def _patch_hunks_display(self, sid, rel) -> dict:
-        fp = self._patch(sid)["files"].get(rel)
-        if not fp: return dict(is_text=True, hunks=[])
-        base = self._host_lines(rel); hunks = []
-        for gi, h in enumerate(fp["hunks"]):
-            pos = locate_hunk(base, h)
-            warn = ("  ⚠ won't apply" if pos is None else
-                    f"  ⚠ offset {pos - h['a1']:+d}" if pos != h["a1"] else "")
-            lines = [("hdr", f"@@ -{h['a1']+1} +{h['b1']+1} @@{warn}")]
-            for op, bl in h["lines"]:
-                lines.append((op, bl.decode("utf-8", "replace").rstrip("\r\n")))
-            hunks.append(dict(index=gi, lines=lines))
-        return dict(is_text=True, hunks=hunks)
+        if self._live(sid): return self.overlay_hunks(sid, rel)
+        return self._sqlar_display(sid, rel)
 
     def apply_hunk(self, sid, rel, index) -> dict:
-        rel2 = rel.lstrip("/")
-        if self._in_patch(sid, rel2): return self._patch_apply_hunk(sid, rel2, index)
-        if self._in_sqlar(sid, rel2): return dict(ok=False, error="binary — apply whole file")
-        return self.overlay_apply_hunk(sid, rel, index)
+        if self._live(sid): return self.overlay_apply_hunk(sid, rel, index)
+        return self._sqlar_apply_hunk(sid, rel, index)
 
     def discard_hunk(self, sid, rel, index) -> dict:
-        rel2 = rel.lstrip("/")
-        if self._in_patch(sid, rel2): return self._patch_discard_hunk(sid, rel2, index)
-        if self._in_sqlar(sid, rel2): return dict(ok=False, error="binary — discard whole file")
-        return self.overlay_discard_hunk(sid, rel, index)
+        if self._live(sid): return self.overlay_discard_hunk(sid, rel, index)
+        return self._sqlar_discard_hunk(sid, rel, index)
 
-    def _drop_patch_file(self, sid, rel) -> None:
-        p = self._patch(sid)
-        if rel in p["files"]:
-            del p["files"][rel]; p["dirty"] = True; p["touched"] = time.time()
-
-    def _patch_apply_hunk(self, sid, rel, index) -> dict:
-        p = self._patch(sid); fp = p["files"].get(rel)
-        if not fp or not (0 <= index < len(fp["hunks"])):
-            return dict(ok=False, error="stale hunk")
-        h = fp["hunks"][index]; host = Path("/") / rel
-        try: new, _off = apply_one_hunk(self._host_lines(rel), h)
-        except PatchConflict:
-            return dict(ok=False, error="hunk does not apply — file left unchanged")
-        try:
-            host.parent.mkdir(parents=True, exist_ok=True); host.write_bytes(b"".join(new))
-        except OSError as e:
-            return dict(ok=False, error=str(e))
-        del fp["hunks"][index]
-        if not fp["hunks"]: del p["files"][rel]
-        p["dirty"] = True; p["touched"] = time.time()
-        return dict(ok=True)
-
-    def _patch_discard_hunk(self, sid, rel, index) -> dict:
-        p = self._patch(sid); fp = p["files"].get(rel)
-        if not fp or not (0 <= index < len(fp["hunks"])):
-            return dict(ok=False, error="stale hunk")
-        del fp["hunks"][index]
-        if not fp["hunks"]: del p["files"][rel]
-        p["dirty"] = True; p["touched"] = time.time()
-        return dict(ok=True)
+    def patch_text(self, sid) -> bytes:
+        """The unified patch for a box, computed ON DEMAND. For a finished box it is
+        built from the single sqlar's text entries vs the host; symlinks/binaries/
+        deletions are summarised as comment lines (a patch can't carry them)."""
+        out = []
+        for e in self.session_changes(sid):
+            rel = e["path"]
+            if self._live(sid):
+                info = self._file_hunks(sid, rel)
+                d = self.overlay_diff(sid, rel)
+            else:
+                info = self._sqlar_hunks(sid, rel)
+                d = None
+            if e["kind"] == "deleted":
+                out.append(f"# deleted: {rel}\n".encode()); continue
+            if info is not None:
+                ll, ul, groups = info
+                created = not (Path("/") / rel).exists()
+                fp = build_file_patch(rel, ll, ul, created, False)
+                out.append(serialize_patch({rel: fp}))
+            elif self._live(sid) and d and d.get("is_text") and d.get("diff"):
+                out.append((d["diff"] + "\n").encode("utf-8", "surrogateescape"))
+            else:
+                out.append(f"# binary or symlink change: {rel}\n".encode())
+        return b"".join(out)
 
     def apply(self, sid, paths) -> dict:
-        # Route each path to its store: patch (apply every hunk), sqlar (write the
-        # blob / delete for a tombstone), or the live overlay.
         if paths is None: paths = [e["path"] for e in self.session_changes(sid)]
-        pf = self._patch(sid)["files"]
         res = dict(applied=[], errors=[]); ov = []
+        live = self._live(sid)
         for rel in paths:
             r = rel.lstrip("/")
-            if r in pf:
-                ok = True
-                while pf.get(r, {}).get("hunks"):
-                    if not self._patch_apply_hunk(sid, r, 0).get("ok"): ok = False; break
-                (res["applied"] if ok else res["errors"]).append(
-                    rel if ok else {"path": rel, "error": "some hunks did not apply"})
-            elif self._in_sqlar(sid, r):
+            if not live and self._in_sqlar(sid, r):
                 rr = self._sqlar_apply(sid, r)
                 (res["applied"] if rr.get("ok") else res["errors"]).append(
                     rel if rr.get("ok") else {"path": rel, "error": rr.get("error")})
             else:
                 ov.append(rel)
-        if ov:
+        if ov and live:
             o = self.overlay_apply(sid, ov)
             res["applied"] += o["applied"]; res["errors"] += o["errors"]
         self._maybe_remove_empty(sid)
@@ -3698,17 +4008,15 @@ class Supervisor:
 
     def discard(self, sid, paths) -> dict:
         if paths is None: paths = [e["path"] for e in self.session_changes(sid)]
-        pf = self._patch(sid)["files"]
         res = dict(discarded=[], errors=[]); ov = []
+        live = self._live(sid)
         for rel in paths:
             r = rel.lstrip("/")
-            if r in pf:
-                self._drop_patch_file(sid, r); res["discarded"].append(rel)
-            elif self._in_sqlar(sid, r):
+            if not live and self._in_sqlar(sid, r):
                 self._sqlar_discard(sid, r); res["discarded"].append(rel)
             else:
                 ov.append(rel)
-        if ov:
+        if ov and live:
             o = self.overlay_discard(sid, ov)
             res["discarded"] += o["discarded"]; res["errors"] += o["errors"]
         self._maybe_remove_empty(sid)
@@ -3725,6 +4033,13 @@ class Supervisor:
 # session id even when many run concurrently.
 _CURRENT_SID: "contextvars.ContextVar[str]" = contextvars.ContextVar(
     "slopbox_session_id", default="")
+# Per-connection originating workload-process provenance (set by RelayServer after
+# resolving the pidfd --inner sent to a HOST-namespace pid and reading host /proc).
+# Keys: tgid/ppid/exe/argv/env, all HOST-namespace — the same invariant the FUSE
+# file-op path holds. {"tgid":0} if unknown (no pidfd, or the peer was already gone).
+# A completed flow is tagged from this so its process row carries a host pid.
+_CURRENT_PROV: "contextvars.ContextVar[dict]" = contextvars.ContextVar(
+    "slopbox_prov", default={"tgid": 0})
 
 
 class _GatingAddon:
@@ -3780,7 +4095,7 @@ class _GatingAddon:
         self.sup.log_flow(sid, dict(
             ts=time.time(), action=action, method=req.method, scheme=req.scheme,
             host=req.host, port=req.port, url=req.pretty_url,
-            status=resp.status_code if resp else 0,
+            status=resp.status_code if resp else 0, prov=_CURRENT_PROV.get(),
             req_headers=list(req.headers.items()), req_body=req_body,
             resp_headers=list(resp.headers.items()) if resp else [], resp_body=resp_body))
 
@@ -3907,12 +4222,33 @@ class RelayServer:
             for lvl, typ, data in anc:
                 if lvl == socket.SOL_SOCKET and typ == socket.SCM_RIGHTS:
                     a = array.array("i"); a.frombytes(data); fds.extend(a.tolist())
-            for extra in fds[1:]:
+            conn.close()
+            # The ancillary fd array from --inner is [request_socket] or
+            # [request_socket, pidfd]: index 0 is always the connection socket the
+            # engine drives; index 1, if present, is a pidfd for the connecting in-box
+            # workload process. The payload carries no process fields — the pidfd is
+            # the channel. The sid is NEVER taken from the message; it is THIS relay's.
+            pidfd = fds[1] if len(fds) > 1 else -1
+            for extra in fds[2:]:
                 try: os.close(extra)
                 except OSError: pass
-            conn.close()
             if fds:
-                # gated as THIS relay's sid, regardless of any message content
+                # Derive the HOST-namespace pid from the pidfd (its fdinfo reports the
+                # pid in OUR — the UI's host — namespace), then read provenance with
+                # the same host-side read_provenance() the FUSE path uses. Every tgid
+                # we persist is thus a HOST pid; a dead/missing peer → untagged flow.
+                prov = {"tgid": 0}
+                if pidfd >= 0:
+                    host_pid = _host_pid_from_pidfd(pidfd)
+                    if host_pid > 0:
+                        info = read_provenance(host_pid, full_env=True)
+                        ppid_tgid = tgid_of(info["ppid"]) if info.get("ppid") else 0
+                        prov = {"tgid": tgid_of(host_pid), "ppid": ppid_tgid,
+                                "exe": info["exe"], "argv": info["argv"],
+                                "env": info["env"]}
+                    try: os.close(pidfd)
+                    except OSError: pass
+                _CURRENT_PROV.set(prov)
                 await self.engine.handle_fd(fds[0], self.sid)
         except (OSError, asyncio.CancelledError):
             try: conn.close()
@@ -3929,9 +4265,31 @@ class RelayServer:
         except FileNotFoundError: pass
 
 
+def _host_pid_from_pidfd(pidfd: int) -> int:
+    """Resolve a pidfd to a HOST-namespace pid by parsing /proc/self/fdinfo/<pidfd>.
+
+    A pidfd's fdinfo `Pid:` line reports the target's pid in the READER's pid
+    namespace — and the UI runs in the host namespace, so the value we read IS the
+    host pid (this is what makes the box→pidfd→UI chain yield a host-namespace pid
+    instead of the box-namespace pid SO_PEERCRED would give). A reaped/dead process
+    shows `Pid:\t-1` (or 0); the line may list several space-separated pids across
+    nested namespaces, and the first is the one in our namespace. Returns the host
+    pid, or 0 on a dead process / unparseable fdinfo (→ untagged flow)."""
+    try:
+        with open(f"/proc/self/fdinfo/{pidfd}", "rb") as f:
+            for line in f:
+                if line.startswith(b"Pid:"):
+                    rest = line.split(b":", 1)[1].split()
+                    return int(rest[0]) if rest else 0
+    except (OSError, ValueError, IndexError):
+        return 0
+    return 0
+
+
 def _recvmsg_blocking(conn):
     conn.setblocking(True)
     try:
+        # Up to 16 fds: --inner sends [request_socket] or [request_socket, pidfd].
         return conn.recvmsg(65536, socket.CMSG_SPACE(4 * 16))
     finally:
         conn.setblocking(False)
@@ -4020,6 +4378,16 @@ class ChannelServer:
                 return dict(ok=False, error=str(e))
         elif t == "unregister": self.sup.unregister(msg)
         elif t == "remove": self.sup.drop(msg)
+        elif t == "patch":
+            # On-demand patch for the UI's currently-selected box.
+            try:
+                sid = self.sup.selected_sid
+                if not sid:
+                    return dict(ok=False, error="no slopbox selected in the UI")
+                data = self.sup.patch_text(sid)
+                return dict(ok=True, patch=base64.b64encode(data).decode())
+            except Exception as e:
+                return dict(ok=False, error=str(e))
         return None
 
     async def stop(self) -> None:
@@ -4101,7 +4469,7 @@ def bwrap_supports(flag: str) -> bool:
             _BWRAP_HELP = ""
     return flag in _BWRAP_HELP
 
-def cmd_run(cmd, no_net, session_whitelist, chdir) -> int:
+def cmd_run(cmd, net, trace, direct, session_whitelist, chdir) -> int:
     if not cmd:
         print("slopbox: no command given", file=sys.stderr); return 2
 
@@ -4117,26 +4485,31 @@ def cmd_run(cmd, no_net, session_whitelist, chdir) -> int:
               f"  (expected control socket: {SOCK_PATH})", file=sys.stderr)
         return 3
 
-    net = not no_net
-
     # The session id is the whole identity: timestamp + our pid. It names the
-    # live/<sid> backing dir, the <mnt>/<sid> mount subfolder, and the patch
-    # (<sid>.patch.xz). The only other thing kept is the command (xattr).
+    # live/<sid> backing dir, the <mnt>/<sid> mount subfolder, and the single db
+    # (<sid>.sqlar). The command is the box's root process row in that db.
     sid = make_sid()
+
+    # Our own HOST-namespace provenance: the sid's pid suffix is this runner's pid,
+    # so this is the box's root process. The UI persists it as the root process row
+    # (tgid == sid pid, argv == cmd). full_env so a traced box has the root env too.
+    self_prov = read_provenance(os.getpid(), full_env=True)
 
     # Register with the UI and BLOCK until it has created live/<sid>, built the
     # index, added the session to the mount, and exposed <mnt>/<sid> — only then
     # does the bwrap bind target exist. The ack carries the absolute mount path.
     ack = sync_request(SOCK_PATH, type="register", session_id=sid,
-                       cmd=list(cmd), session_whitelist=session_whitelist,
-                       want_net=net)
+                       cmd=list(cmd), prov=self_prov,
+                       session_whitelist=session_whitelist,
+                       want_net=net, want_trace=trace, want_direct=direct)
     if not ack or not ack.get("ok") or not ack.get("mount"):
         # collision on sid (same second + pid is impossible, but be safe) or the
         # UI failed to set up the overlay — retry once with a unique suffix.
         sid = sid + "." + uuid.uuid4().hex[:6]
         ack = sync_request(SOCK_PATH, type="register", session_id=sid,
-                           cmd=list(cmd), session_whitelist=session_whitelist,
-                           want_net=net)
+                           cmd=list(cmd), prov=self_prov,
+                           session_whitelist=session_whitelist,
+                           want_net=net, want_trace=trace, want_direct=direct)
         if not ack or not ack.get("ok") or not ack.get("mount"):
             print("slopbox: the UI could not set up the overlay for this session"
                   f"{(' — ' + ack['error']) if ack and ack.get('error') else ''}.",
@@ -4152,7 +4525,9 @@ def cmd_run(cmd, no_net, session_whitelist, chdir) -> int:
 
     # Diagnostics go to stderr (never stdout) and only ever before/after the
     # child runs, so the wrapped command's stdout stays clean.
-    print(f"slopbox: {sid}  ({'net' if net else 'no-net'}, UI connected"
+    flags = ",".join(f for f, on in (("net", net), ("trace", trace),
+                                     ("direct", direct)) if on) or "isolated"
+    print(f"slopbox: {sid}  ({flags}, UI connected"
           f"{'' if can_net else ' → no network'})", file=sys.stderr)
     print(f"  overlay root: {box_root}", file=sys.stderr)
 
@@ -4403,12 +4778,11 @@ def _make_ui_app():
         BINDINGS=[Binding("a","apply","apply"), Binding("A","apply_all","apply all"),
                   Binding("x","discard","discard"),
                   Binding("X","discard_all","discard all"),
-                  Binding("s","save","save patch"), Binding("r","refresh","refresh")]
+                  Binding("r","refresh","refresh")]
         def action_apply(self): self.app.action_apply_one()
         def action_apply_all(self): self.app.action_apply_all()
         def action_discard(self): self.app.action_discard_one()
         def action_discard_all(self): self.app.action_discard_all()
-        def action_save(self): self.app.action_save_patch()
         def action_refresh(self): self.app.action_refresh()
 
     class RulesList(ListView):
@@ -4462,9 +4836,7 @@ def _make_ui_app():
         # it from the overlay; ↑/↓ move between hunks.
         BINDINGS=[Binding("a","apply","apply hunk"),
                   Binding("x","discard","discard hunk"),
-                  Binding("d","discard","",show=False),
-                  Binding("s","save","save patch")]
-        def action_save(self): self.app.action_save_patch()
+                  Binding("d","discard","",show=False)]
         def _idx(self):
             it=self.highlighted_child
             return it.hunk_index if isinstance(it,HunkItem) else None
@@ -4504,20 +4876,22 @@ def _make_ui_app():
         # The single left-hand list cycles through these sources; the right pane
         # shows the matching detail. Approvals are not a view — they arrive as a
         # transient top banner with global keys, so they never steal the cursor.
-        VIEWS=("boxes","changes","netlog","net","file")
+        VIEWS=("boxes","changes","netlog","procs","net","file")
         VIEW_TITLE={"boxes":"Slopboxes","changes":"Changes","netlog":"Network",
-                    "net":"Net rules","file":"File rules"}
+                    "procs":"Processes","net":"Net rules","file":"File rules"}
         LEFT={"boxes":"#s-tab","changes":"#cf-tab","netlog":"#nf-tab",
-              "net":"#w-list","file":"#r-list"}
+              "procs":"#pr-tab","net":"#w-list","file":"#r-list"}
         RIGHT={"boxes":"#box-detail","changes":"#cd-log","netlog":"#flow-wrap",
-               "net":"#rule-detail","file":"#rule-detail"}
+               "procs":"#proc-wrap","net":"#rule-detail","file":"#rule-detail"}
         # One direct key per list (shown — and highlighted for the current one — in
         # the bottom key bar). No tab strip: the active view is the lit-up key.
-        VIEW_KEY={"boxes":"b","changes":"c","netlog":"t","net":"w","file":"f"}
+        VIEW_KEY={"boxes":"b","changes":"c","netlog":"t","procs":"p",
+                  "net":"w","file":"f"}
         BINDINGS=[
             Binding("b","view_boxes","boxes"),
             Binding("c","view_changes","changes"),
             Binding("t","view_netlog","network"),
+            Binding("p","view_procs","processes"),
             Binding("w","view_net","net rules"),
             Binding("f","view_file","file rules"),
             Binding("escape","back","back"),
@@ -4562,6 +4936,7 @@ def _make_ui_app():
                     yield SessionTable(id="s-tab", cursor_type="row")
                     yield ChangesTable(id="cf-tab", cursor_type="row")
                     yield NetTable(id="nf-tab", cursor_type="row")
+                    yield NetTable(id="pr-tab", cursor_type="row")
                     yield RulesList(id="w-list")
                     yield FileRulesList(id="r-list")
                 with Vertical(id="right"):
@@ -4571,6 +4946,8 @@ def _make_ui_app():
                     yield DiffView(id="cd-log")
                     with VerticalScroll(id="flow-wrap"):
                         yield Static("", id="flow-detail")
+                    with VerticalScroll(id="proc-wrap"):
+                        yield Static("", id="proc-detail")
                     yield Static("", id="rule-detail")
             yield Static("", id="c-bar")
             yield Static("", id="status")
@@ -4581,7 +4958,9 @@ def _make_ui_app():
                 "F","Started","PID","Cmd","✓","✗","↑","↓","Age")
             self.query_one("#nf-tab",DataTable).add_columns(
                 "Time","","Method","Host","St","↑","↓")
-            self.query_one("#cf-tab",DataTable).add_columns("","S","Path","Size")
+            self.query_one("#cf-tab",DataTable).add_columns("","Path","Size")
+            self.query_one("#pr-tab",DataTable).add_columns(
+                "TGID","PPID","Exe","Argv")
             ensure_ca_cert()
             loop=asyncio.get_event_loop()
             # Start the single pyfuse3 overlay mount on its dedicated trio thread.
@@ -4632,24 +5011,38 @@ def _make_ui_app():
                 self._update_box_detail()
 
         async def on_unmount(self):
-            self._save_all_patches()
             if self.server: await self.server.stop()
             # Tear down the single overlay mount; lazy-unmount fallback keeps the
             # mount table clean even if a handler is wedged.
             try: self.overlay_mount.stop()
             except Exception: pass
 
-        def _save_all_patches(self):
-            for sid, p in list(self.sup.patches.items()):
-                if p.get("dirty"):
-                    try: self.sup.save_patch(sid)
-                    except Exception: pass
-
         def _on_evt(self, ev): self.call_later(self._apply_evt, ev)
+
+        def _select_sid(self, sid):
+            """Make `sid` the selected box (cursor + patch target) without disturbing
+            the current view."""
+            self._ch_sid=self._last_loaded_sid=sid
+            self.sup.selected_sid=sid
+            try:
+                tbl=self.query_one("#s-tab",DataTable)
+                tbl.move_cursor(row=tbl.get_row_index(sid), animate=False)
+            except Exception: pass
+
+        def _most_recent_sid(self):
+            if not self.sessions: return None
+            return max(self.sessions.items(),
+                       key=lambda kv: kv[1]["started"])[0]
 
         def _apply_evt(self, ev):
             t=ev["type"]
-            if t in ("session_added","session_updated"):
+            if t=="session_added":
+                s=ev["session"]; self.sessions={**self.sessions,s["session_id"]:s}
+                self._rebuild_sessions(preserve=True)
+                # A newly-launched box is ALWAYS selected (becomes the patch target).
+                self._select_sid(s["session_id"])
+                if self.view=="boxes": self._update_box_detail()
+            elif t=="session_updated":
                 s=ev["session"]; self.sessions={**self.sessions,s["session_id"]:s}
                 self._rebuild_sessions(preserve=True)
                 if self.view=="boxes": self._update_box_detail()
@@ -4658,7 +5051,14 @@ def _make_ui_app():
                 self.sessions={k:v for k,v in self.sessions.items() if k!=sid}
                 self._rebuild_sessions(preserve=True)
                 if self._ch_sid==sid:
-                    self._ch_sid=None; self._last_loaded_sid=None
+                    # The selected box was removed (e.g. an empty box that left no
+                    # changes): fall back to the next most-recent remaining entry.
+                    nxt=self._most_recent_sid()
+                    if nxt:
+                        self._select_sid(nxt)
+                    else:
+                        self._ch_sid=None; self._last_loaded_sid=None
+                        self.sup.selected_sid=None
                     self._ch_entries=[]; self._rebuild_ch()
                 if self.view=="boxes": self._update_box_detail()
             elif t=="approval_pending":
@@ -4687,33 +5087,29 @@ def _make_ui_app():
             self.sup.rescan()
             self._rebuild_sessions(preserve=True)
             self._render_appr()
-            # Autosave any in-memory patch that's been dirty and idle for 60s, to
-            # avoid thrashing the compressed file on every edit.
-            now=time.time()
-            for sid, p in list(self.sup.patches.items()):
-                if p.get("dirty") and now - p.get("touched", now) >= 60:
-                    self.sup.save_patch(sid)
             if self._ch_sid is None:
                 s=self._sel_session()
                 if s: self._ch_sid=self._last_loaded_sid=s["session_id"]
+            self.sup.selected_sid=self._ch_sid
             if self.view=="changes" and self._ch_sid:
                 self._load_changes(self._ch_sid)
             if self.view=="netlog" and self._ch_sid:
                 self._load_flows(self._ch_sid)
+            if self.view=="procs" and self._ch_sid:
+                self._load_procs(self._ch_sid)
             if self.view=="boxes":
                 self._update_box_detail()
             self._cbar()    # keep the dirty/count indicator current
 
         # ── view machinery: one left list at a time + its right-pane detail ────
         def _set_view(self, v):
-            if self.view=="changes" and v!="changes":
-                self._save_all_patches()      # leaving changes autosaves the patch
             self.view=v
             for k,sel in self.LEFT.items():
                 try: self.query_one(sel).display=(k==v)
                 except Exception: pass
             rsel=self.RIGHT[v]
-            for sel in ("#box-detail","#cd-log","#flow-wrap","#rule-detail"):
+            for sel in ("#box-detail","#cd-log","#flow-wrap","#proc-wrap",
+                        "#rule-detail"):
                 try: self.query_one(sel).display=(sel==rsel)
                 except Exception: pass
             try: self.query_one("#cd-info").display=(v=="changes")   # full-path header
@@ -4724,12 +5120,15 @@ def _make_ui_app():
                 self._update_cd_info()
             if v=="netlog" and self._ch_sid:
                 self._load_flows(self._ch_sid, force=True)
+            if v=="procs" and self._ch_sid:
+                self._load_procs(self._ch_sid, force=True)
             self._update_right()
             try: self.query_one(self.LEFT[v]).focus()
             except Exception: pass
 
         def action_view_boxes(self): self._set_view("boxes")
         def action_view_changes(self): self._set_view("changes")
+        def action_view_procs(self): self._set_view("procs")
         def action_view_netlog(self): self._set_view("netlog")
         def action_view_net(self): self._set_view("net")
         def action_view_file(self): self._set_view("file")
@@ -4738,18 +5137,21 @@ def _make_ui_app():
         # action keys advertised in the bottom bar for that view.
         _LEFT_HDR={
             "boxes":"● SLOPBOXES   [dim]R run · F fin · K kill · ✓/✗ conns[/]",
-            "changes":"📁 FILES   [dim]+ new · ~ mod · - del · [/][reverse red]![/][dim] stale · [/][blue]P[/][dim] patch · [/][magenta]A[/][dim] archive · O overlay[/]",
+            "changes":"📁 FILES   [dim]+ new · ~ mod · - del · [/][reverse red]![/][dim] stale[/]",
             "netlog":"🌐 CONNECTIONS   [dim]✓ allowed · ✗ denied · ↑ req · ↓ resp[/]",
+            "procs":"⚙ PROCESSES   [dim]tgid · ppid · exe · argv[/]",
             "net":"✓ NETWORK RULES   [dim]top → bottom, first match wins[/]",
             "file":"✓ FILE RULES   [dim]top → bottom, first match wins[/]"}
         _RIGHT_HDR={
             "boxes":"≣ DETAIL","changes":"≡ DIFF","netlog":"≡ REQUEST · RESPONSE",
+            "procs":"≡ ENVIRONMENT",
             "net":"⛁ WHAT IT MATCHES","file":"⛁ WHAT IT MATCHES"}
         _ACTS={
             "boxes":[("↵","review"),("k","kill"),("d","delete")],
             "changes":[("↵","diff"),("a","apply"),("x","discard"),
-                       ("X","disc all"),("s","save")],
+                       ("X","disc all")],
             "netlog":[("↑/↓","browse")],
+            "procs":[("↑/↓","browse")],
             "net":[("↵/e","edit"),("d","remove"),("^↑/^↓","move")],
             "file":[("a","add"),("↵/e","edit"),("d","remove"),("^↑/^↓","move")]}
 
@@ -4779,6 +5181,7 @@ def _make_ui_app():
         def _update_right(self):
             if self.view=="boxes": self._update_box_detail()
             elif self.view=="netlog": self._update_flow_detail()
+            elif self.view=="procs": self._update_proc_detail()
             elif self.view in ("net","file"): self._update_rule_detail()
 
         def _notify(self, title, body):
@@ -4911,13 +5314,16 @@ def _make_ui_app():
                 if i is None or not (0<=i<len(rules)):
                     d.update(Text("(no rule — changes are kept for review)", style="dim")); return
                 r=rules[i]; t=Text()
-                t.append(r.action.upper()+"\n",
-                         style="green bold" if r.action=="apply" else "red bold")
+                acol={"apply":"green bold","discard":"red bold",
+                      "passthrough":"cyan bold"}.get(r.action,"bold")
+                t.append(r.action.upper()+"\n", style=acol)
                 t.append("glob     ", style="dim"); t.append(r.pattern+"\n\n")
-                t.append("apply"if r.action=="apply" else "discard", style="bold")
-                t.append((" writes the change to the host during capture."
-                          if r.action=="apply" else
-                          " drops the change during capture.")+"\n", style="dim")
+                t.append(r.action, style="bold")
+                expl={"apply":" writes the change to the host during capture.",
+                      "discard":" drops the change during capture.",
+                      "passthrough":" acts directly on the real host and captures "
+                                    "nothing for this path."}.get(r.action,"")
+                t.append(expl+"\n", style="dim")
                 t.append("* in a segment · ** across dirs · @(a|b) !(x) {a,b} · "
                          "bare name = any depth · leading / = anchored", style="dim")
                 d.update(t)
@@ -4958,9 +5364,10 @@ def _make_ui_app():
         def _refresh_file_rules(self):
             lv=self.query_one("#r-list",ListView)
             idx=lv.index; lv.clear()
+            _col={"discard":"red","apply":"green","passthrough":"cyan"}
+            _sign={"discard":"−","apply":"+","passthrough":"→"}
             for r in self.frules_store.rules:
-                col="red" if r.action=="discard" else "green"
-                sign="−" if r.action=="discard" else "+"
+                col=_col.get(r.action,"green"); sign=_sign.get(r.action,"+")
                 lv.append(ListItem(Label(Text(f"{sign} {r.action} {r.pattern}", style=col))))
             n=len(self.frules_store.rules)
             if idx is not None and n: lv.index=min(idx, n-1)
@@ -5012,18 +5419,11 @@ def _make_ui_app():
                 t=Text(sym, style=col)
                 if e.get("stale"): t.append("!", style="reverse red")  # host is newer
                 return t
-            def src(e):
-                # where this change lives: P = patch (text), A = sqlar archive
-                # (binary/symlink/deletion), O = raw overlay in live/<sid>/up.
-                s=e.get("source")
-                if s=="patch": return Text("P", style="blue")
-                if s=="sqlar": return Text("A", style="magenta")
-                return Text("O", style="dim")
-            def short(p, n=44):
+            def short(p, n=46):
                 # Truncate from the *start* so the basename stays visible; the full
                 # path lives above the diff.
                 return p if len(p)<=n else "…"+p[-(n-1):]
-            rows=[(e["path"], [flag(e), src(e),
+            rows=[(e["path"], [flag(e),
                                Text(short(e["path"]), style="red" if e.get("stale") else ""),
                                fmt_bytes(e["size"]) if e["size"] else ""])
                   for e in self._ch_entries]
@@ -5053,20 +5453,18 @@ def _make_ui_app():
             return out
 
         def _update_cd_info(self, rel=None):
-            # Full path + kind/source/size/mode shown above the diff, since the file
+            # Full path + kind/size/mode shown above the diff, since the file
             # list truncates the path to keep the basename readable.
             info=self.query_one("#cd-info",Static)
             rel = rel if rel is not None else self._sel_path()
             ent = next((e for e in self._ch_entries if e["path"]==rel), None) if rel else None
             if not ent:
                 info.update(Text("")); return
-            mode = self.sup.change_mode(self._ch_sid, ent["path"], ent.get("source"))
-            srcname = {"overlay":"overlay","patch":"patch","sqlar":"archive"}.get(
-                ent.get("source"), ent.get("source") or "")
+            mode = self.sup.change_mode(self._ch_sid, ent["path"])
             t=Text()
             t.append("/"+ent["path"], style="bold")
             t.append("\n")
-            t.append(f"{ent['kind']} · {srcname}", style="dim")
+            t.append(f"{ent['kind']}", style="dim")
             if ent.get("size"): t.append(f" · {fmt_bytes(ent['size'])}", style="dim")
             if mode is not None:
                 t.append(f" · {stat_mod.filemode(mode)} {oct(stat_mod.S_IMODE(mode))}", style="dim")
@@ -5112,12 +5510,9 @@ def _make_ui_app():
             try: self.query_one("#status",Static).update(t)
             except Exception: pass
         def _cbar(self, msg=""):
-            sid=self._ch_sid
-            dirty=("[reverse red] ● UNSAVED PATCH — press s to save [/]  "
-                   if sid and self.sup.patch_dirty(sid) else "")
             n=len(self._ch_entries)
             extra=f"{n} change(s)" + (f"  ·  {msg}" if msg else "")
-            try: self.query_one("#c-bar",Static).update(f"  {dirty}[dim]{extra}[/]")
+            try: self.query_one("#c-bar",Static).update(f"  [dim]{extra}[/]")
             except Exception: pass
 
         def _sel_session(self):
@@ -5199,6 +5594,52 @@ def _make_ui_app():
             if not t.row_count: return None
             try: return t.coordinate_to_cell_key((t.cursor_row,0)).row_key.value
             except Exception: return None
+
+        # ── processes pane (the selected box's process table) ────────────────
+        def _load_procs(self, sid, force=False):
+            procs=self.sup.processes(sid)
+            cur=getattr(self,"_pr_procs",None)
+            if not force and procs==cur: return
+            self._pr_procs=procs
+            rows=[]
+            for pid, tgid, ppid, exe, argv in procs:
+                rows.append((str(pid), [
+                    str(tgid), str(ppid),
+                    Text((exe.rsplit("/",1)[-1] or exe)[:18], style="cyan"),
+                    Text(" ".join(argv)[:40], style="dim")]))
+            self._sync_table(self.query_one("#pr-tab",DataTable), rows)
+            self._update_proc_detail()
+
+        def _sel_proc(self):
+            t=self.query_one("#pr-tab",DataTable)
+            if not t.row_count: return None
+            try: return int(t.coordinate_to_cell_key((t.cursor_row,0)).row_key.value)
+            except Exception: return None
+
+        def _update_proc_detail(self):
+            d=self.query_one("#proc-detail",Static)
+            sid=self._ch_sid; pid=self._sel_proc()
+            if not sid or pid is None:
+                d.update(Text("(no process selected)", style="dim")); return
+            row=next((p for p in (self._pr_procs or []) if p[0]==pid), None)
+            t=Text()
+            if row:
+                _id,tgid,ppid,exe,argv=row
+                t.append(f"tgid {tgid}  ppid {ppid}\n", style="bold")
+                t.append("exe   ", style="dim"); t.append((exe or "?")+"\n")
+                t.append("argv  ", style="dim"); t.append(" ".join(argv)+"\n\n")
+            env=self.sup.process_env(sid, pid)
+            t.append("── environment ──\n", style="dim")
+            if not env:
+                t.append("(none captured — run with -t to record the environment)\n",
+                         style="dim")
+            for k in sorted(env):
+                t.append(k, style="cyan"); t.append("="+env[k]+"\n")
+            d.update(t)
+
+        @on(DataTable.RowHighlighted, "#pr-tab")
+        def _ph(self, ev):
+            if self.view=="procs": self._update_proc_detail()
 
         @on(DataTable.RowHighlighted, "#s-tab")
         def _sc(self, ev):
@@ -5292,11 +5733,6 @@ def _make_ui_app():
         def action_refresh(self):
             if self._ch_sid: self._load_changes(self._ch_sid)
 
-        def action_save_patch(self):
-            sid=self._ch_sid
-            if not sid: return
-            self.sup.save_patch(sid); self._load_changes(sid); self._cbar("patch saved")
-
         def _refresh_after(self, sid, p):
             self._load_changes(sid)
             if p is not None and any(e["path"]==p for e in self._ch_entries):
@@ -5338,9 +5774,39 @@ def _make_ui_app():
 
 
 def run_ui() -> int:
+    # A single UI instance only: if one is already running its control socket
+    # answers, so refuse a second.
+    if ui_is_running(SOCK_PATH):
+        print("slopbox: the UI is already running"
+              f" (control socket {SOCK_PATH}).\n"
+              "  Only one UI instance may run; use the existing one.",
+              file=sys.stderr)
+        return 4
     ensure_dirs()
     _make_ui_app()().run()
     return 0
+
+
+def cmd_patch() -> int:
+    """Print the unified patch for the UI's currently-selected slopbox to stdout,
+    by asking the running UI over the control socket."""
+    if not ui_is_running(SOCK_PATH):
+        print("slopbox: the UI is not running.", file=sys.stderr); return 3
+    rep = sync_request(SOCK_PATH, type="patch")
+    if not rep or not rep.get("ok"):
+        print("slopbox: " + ((rep or {}).get("error") or "no patch available"),
+              file=sys.stderr)
+        return 1
+    data = base64.b64decode(rep.get("patch") or b"")
+    sys.stdout.buffer.write(data)
+    return 0
+
+
+_USAGE = ("slopbox                         start the UI\n"
+          "       slopbox patch                   print selected box's patch (stdout)\n"
+          "       slopbox [-n] [-t] [-d] [-w HOST]... [-C DIR] -- CMD [ARGS...]\n"
+          "         -n  networking via mitmproxy   -t  process tracing\n"
+          "         -d  direct host access (no capture)")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -5364,20 +5830,39 @@ def main() -> int:
     if not argv:
         return run_ui()
 
-    ap = argparse.ArgumentParser(
-        prog="slopbox",
-        usage="slopbox            (start UI)\n"
-              "       slopbox [-w HOST]... [-n] [-C DIR] CMD [ARGS...]")
+    if argv[0] in ("-h", "--help"):
+        print("usage: " + _USAGE); return 0
+
+    if argv[0] == "patch":
+        return cmd_patch()
+
+    # The command MUST come after `--`. Flags come before it.
+    if "--" not in argv:
+        # A bare `slopbox ls` is the common mistake — point at the fix.
+        # Don't echo back the flags as the command (that would suggest an
+        # invalid `slopbox -- -t`); just show the canonical shape.
+        print("slopbox: the command must come after `--`.\n"
+              "  e.g.  slopbox -- CMD [ARGS...]\n"
+              "  (flags go before `--`:  slopbox -t -d -- ls -la)",
+              file=sys.stderr)
+        return 2
+
+    sep = argv.index("--")
+    pre, cmd = argv[:sep], argv[sep + 1:]
+
+    ap = argparse.ArgumentParser(prog="slopbox", add_help=False, usage=_USAGE)
     ap.add_argument("-w", dest="whitelist", action="append", default=[], metavar="HOST")
-    ap.add_argument("-n", dest="no_net", action="store_true")
+    ap.add_argument("-n", dest="net", action="store_true")
+    ap.add_argument("-t", dest="trace", action="store_true")
+    ap.add_argument("-d", dest="direct", action="store_true")
     ap.add_argument("-C", dest="chdir", default=None)
-    ap.add_argument("cmd", nargs=argparse.REMAINDER)
-    if argv[0] in ("-h","--help"):
-        ap.print_help(); return 0
-    ns = ap.parse_args(argv)
-    cmd = ns.cmd
-    if cmd and cmd[0] == "--": cmd = cmd[1:]
-    return cmd_run(cmd, ns.no_net, ns.whitelist, ns.chdir)
+    try:
+        ns = ap.parse_args(pre)
+    except SystemExit:
+        return 2
+    if not cmd:
+        print("slopbox: no command after `--`.", file=sys.stderr); return 2
+    return cmd_run(cmd, ns.net, ns.trace, ns.direct, ns.whitelist, ns.chdir)
 
 
 if __name__ == "__main__":
