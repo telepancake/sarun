@@ -4610,7 +4610,11 @@ class Session:
     session_id: str                # "YYYYmmdd-HHMMSS_PID" — the whole identity
     cmd: list
     shm_dir: str = ""              # the session backing dir: live/<sid> (up only)
-    status: str = "running"
+    # status is DERIVED (see .status): a box is "running" iff it currently has a live
+    # runner root (kernel-derived liveness via the held pidfd). These flags only record
+    # WHY a stopped box stopped — they never make a box appear running.
+    killed: bool = False           # the box was killed (vs exiting on its own)
+    errored: bool = False          # bwrap never launched (nothing was written)
     exit_code: "int | None" = None
     conn_allowed: int = 0
     conn_denied: int = 0
@@ -4641,10 +4645,25 @@ class Session:
         return base.partition("_")[0]
     @property
     def upper(self) -> str: return str(Path(self.shm_dir) / "up")
+    @property
+    def status(self) -> str:
+        # Box status is a property of its running roots, NOT a stored flag flipped on
+        # stop: a box is "running" iff it has a live runner root right now (kernel-
+        # derived liveness via the held pidfd — wrap-immune). With no running root the
+        # box is stopped, and the flags say why. A box discovered from disk (no held
+        # pidfd this UI run) is, by definition, not running.
+        if self.live and self.run_pidfd >= 0 and _pidfd_alive(self.run_pidfd):
+            return "running"
+        if self.killed:
+            return "killed"
+        if self.errored:
+            return "error"
+        return "finished"
     def to_dict(self) -> dict:
         d = {k: v for k, v in asdict(self).items() if k != "sess_rules"}
         d["sess_rules"] = [r.to_line() for r in self.sess_rules]
         d["upper"] = self.upper
+        d["status"] = self.status
         d["started"] = self.started; d["pid"] = self.pid; d["stamp"] = self.stamp
         return d
 
@@ -4659,9 +4678,11 @@ def discover_sessions() -> dict:
         for d in lh.iterdir():
             if not (d / "up").is_dir(): continue          # not a slopbox backing dir
             sid = d.name
+            # No held pidfd for a disk-discovered box (its runner, if any, belonged to a
+            # prior UI run we don't own), so .status derives to "finished" — correct: a
+            # box this UI isn't running can't be "running".
             out[sid] = Session(
                 session_id=sid, cmd=root_cmd(sid), shm_dir=str(d),
-                status="running" if _pid_alive(parse_sid(sid)[1]) else "finished",
                 live=False)
     sd = state_home()
     if sd.exists():
@@ -4671,7 +4692,7 @@ def discover_sessions() -> dict:
             if s is None:
                 s = out[sid] = Session(
                     session_id=sid, cmd=root_cmd(sid),
-                    shm_dir=str(live_dir(sid)), status="finished", live=False)
+                    shm_dir=str(live_dir(sid)), live=False)
             s.has_sqlar = bool(sqlar_list(af))
             s.has_flows = has_flows(af)
             # A renamed box (sid is a NAME, not an auto sid) remembers its birth sid so
@@ -5859,11 +5880,9 @@ class Supervisor:
                 self.sessions[sid] = s
                 self._emit(type="session_added", session=s.to_dict())
             elif not cur.live:
-                ns = "running" if _pid_alive(cur.pid) else (
-                    cur.status if cur.status == "killed" else "finished")
-                changed = (ns != cur.status
-                           or cur.has_sqlar != s.has_sqlar or cur.has_flows != s.has_flows)
-                cur.status = ns
+                # Status is derived (a non-live box can't be running — we don't revive it
+                # from a possibly-wrapped pid); only the reviewable-content flags can shift.
+                changed = (cur.has_sqlar != s.has_sqlar or cur.has_flows != s.has_flows)
                 cur.has_sqlar = s.has_sqlar; cur.has_flows = s.has_flows
                 if changed:
                     self._emit(type="session_updated", session=cur.to_dict())
@@ -6094,7 +6113,7 @@ class Supervisor:
             except Exception: pass
         _born = sqlar_meta_get(sqlar_path(sid), "born") or ""
         s = Session(session_id=sid, cmd=cmd, shm_dir=str(backing),
-                    status="running", live=True, run_pid=root_prov["tgid"],
+                    live=True, run_pid=root_prov["tgid"],
                     born=_born,
                     parent=parent_sid)   # kernel/name-derived; None for root boxes
         # Dup the runner's pidfd into the session so we own a persistent liveness handle.
@@ -6269,7 +6288,12 @@ class Supervisor:
             try: os.close(s.run_pidfd)
             except OSError: pass
             s.run_pidfd = -1
-        if s.status == "running": s.status = reported_status
+        # live=False + pidfd released ⇒ .status now derives to stopped; record WHY.
+        # (a killed box already carries s.killed; "finished" needs no flag.)
+        if reported_status == "error":
+            s.errored = True
+        elif reported_status == "killed":
+            s.killed = True
         s.exit_code = msg.get("exit_code")
         s.has_sqlar = bool(sqlar_list(sqlar_path(sid)))
         s.has_flows = has_flows(sqlar_path(sid))
@@ -6460,7 +6484,9 @@ class Supervisor:
         if not s or not _pid_alive(s.pid): return
         try: os.kill(s.pid, signal.SIGTERM)
         except ProcessLookupError: pass
-        s.status = "killed"
+        # Record intent; .status stays "running" until the runner root actually dies and
+        # teardown releases the pidfd, at which point it derives to "killed".
+        s.killed = True
         self._emit(type="session_updated", session=s.to_dict())
 
     def delete(self, sid) -> None:

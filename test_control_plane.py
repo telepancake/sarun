@@ -1341,8 +1341,7 @@ def test_rename_to_dotted_name():
         conn = sqlite3.connect(str(ps))
         conn.execute("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT)")
         conn.commit(); conn.close()
-        sup.sessions["PARENT"] = m.Session(session_id="PARENT", cmd=["p"], live=False,
-                                           status="finished")
+        sup.sessions["PARENT"] = m.Session(session_id="PARENT", cmd=["p"], live=False)
         # Rename ALPHA → PARENT.ALPHA (dotted target).
         r = sup.rename("ALPHA", "PARENT.ALPHA")
         check(r.get("ok") is True, f"rename-dotted: rename to PARENT.ALPHA ok (got {r})")
@@ -1440,7 +1439,6 @@ def _make_finished_box(sup, sid, with_content=False):
         conn.execute("INSERT OR REPLACE INTO sqlar VALUES('proof.txt',33188,0,4,X'41424344')")
     conn.commit(); conn.close()
     sup.sessions[sid] = m.Session(session_id=sid, cmd=["test"], live=False,
-                                  status="finished",
                                   shm_dir=str(m.live_dir(sid)))
 
 
