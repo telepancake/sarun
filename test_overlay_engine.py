@@ -393,20 +393,34 @@ def test_lazy_file_materialization():
         check(r.stdout.encode() == known_bytes + b"appended\n",
               "lazy: faulted-in file has correct content after append")
 
-        # (e) unconsolidate() rebuilds dir/symlink artifacts but leaves file evicted.
-        # File is already evicted (written via buffer into row), so consolidate sees
-        # data NOT NULL and leaves it as-is (no blob to deflate).
+        # (e) unconsolidate() leaves the file evicted and rebuilds NOTHING on disk:
+        # dirs/symlinks are now served from the rows (no up/<rel> artifacts). File is
+        # already evicted (written via buffer into row), so consolidate sees data NOT
+        # NULL and leaves it as-is (no blob to deflate).
         m.consolidate(str(fx.backing), fx.sid, ["x"], index=fx.index)
         blob_after_second = m.blob_path(fx.index.box_id, fx.index.row_id("evictme.txt"))
         # Now call unconsolidate — should NOT re-create the file blob.
         m.unconsolidate(str(fx.backing), fx.sid)
         check(not blob_after_second.exists(),
               "lazy: unconsolidate does NOT recreate file blob (stays evicted)")
-        # Dir and symlink up/<rel> artifacts must be rebuilt.
-        check((fx.up / "mydir").is_dir(),
-              "lazy: unconsolidate rebuilds dir up/<rel> artifact")
-        check((fx.up / "mylink").is_symlink(),
-              "lazy: unconsolidate rebuilds symlink up/<rel> artifact")
+        # NO dir/symlink up/<rel> artifacts on disk — they live only in the rows.
+        check(not (fx.up / "mydir").exists(),
+              "lazy: unconsolidate leaves no dir up/<rel> artifact (mirror-only)")
+        check(not (fx.up / "mylink").exists() and not (fx.up / "mylink").is_symlink(),
+              "lazy: unconsolidate leaves no symlink up/<rel> artifact (mirror-only)")
+        # A FRESH Index opened from the backing must serve the dir/symlink straight
+        # from the rows: the mirror loads them at Index.__init__ — this is exactly the
+        # contract a base box relies on after unconsolidate.
+        ridx = m.Index(fx.backing)
+        try:
+            check(ridx.kind_of("mydir") == "dir",
+                  "lazy: reopened Index serves dir from the row (kind_of)")
+            check(ridx.kind_of("mylink") == "symlink",
+                  "lazy: reopened Index serves symlink from the row (kind_of)")
+            check(ridx.symlink_target("mylink") == b"/some/target",
+                  "lazy: reopened Index preserves symlink target from the row")
+        finally:
+            ridx.close()
     finally:
         fx.stop()
 

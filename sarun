@@ -4434,9 +4434,10 @@ def _open_index_ro(shm_dir) -> "Index | None":
 def consolidate(shm_dir, session_id: str, cmd: list, index: "Index | None" = None,
                 progress=None) -> None:
     """Settle a box's overlay into its single sqlar at rest — PLACEMENT ONLY, no file
-    rules. Symlinks fold into their row; each regular file picks a per-file rest form
-    by size (small → folded sqlar blob; large → kept as a PERMANENT pool file, the row
-    left resident with data NULL); deletions/opacity become tombstone rows. Writer
+    rules. Symlinks/dirs already carry their truth in the row (target/mode/mtime written
+    at creation — no fold walk); each regular file picks a per-file rest form by size
+    (small → folded sqlar blob; large → kept as a PERMANENT pool file, the row left
+    resident with data NULL); deletions/opacity become tombstone rows. Writer
     provenance per path is recorded. Afterwards the sqlar (plus any kept pool files) is
     the box's complete at-rest form and the backing tree can be freed. Idempotent.
 
@@ -4465,15 +4466,14 @@ def consolidate(shm_dir, session_id: str, cmd: list, index: "Index | None" = Non
         return idx.writer_provenance(rel) if idx is not None else None
     moved = []
     blob_paths_to_evict = []
-    # 1) symlinks in the upper (regular files are now in the pool, not up/).
-    #    The os.walk finds only dirs and symlinks; the ap.is_file() branch is
-    #    a no-op since regular files no longer live in up/.
+    # 1) symlinks/dirs need NO fold walk: their rows already carry the truth — the
+    #    symlink target was written into the row at creation (set_entry target=...),
+    #    dir rows hold mode/mtime, and neither has an on-disk artifact. (A stray file
+    #    artifact under up/ is unexpected but still folded gracefully below.) The walk
+    #    here only catches such strays; the symlink-fold path is gone.
     paths = []
     for root, dirs, names in os.walk(upper, onerror=lambda _e: None):
         for nm in names: paths.append(Path(root) / nm)
-        for d in dirs:
-            p = Path(root) / d
-            if p.is_symlink(): paths.append(p)
     ordered = sorted(set(paths)); total_upper = len(ordered)
     for done, ap in enumerate(ordered, 1):
         rel = str(ap.relative_to(upper))
@@ -4481,18 +4481,7 @@ def consolidate(shm_dir, session_id: str, cmd: list, index: "Index | None" = Non
             try: progress(done, total_upper)
             except Exception: pass
         try:
-            if ap.is_symlink():
-                lst = ap.lstat()
-                tgt = os.readlink(ap).encode("utf-8", "surrogateescape")
-                data, sz = _sqlar_deflate(tgt)
-                sq.execute("UPDATE sqlar SET mode=?, mtime=?, sz=?, data=? WHERE name=?",
-                           (stat_mod.S_IFLNK | 0o777, int(lst.st_mtime_ns),
-                            len(tgt), sqlite3.Binary(data), rel))
-                if sq.execute("SELECT changes()").fetchone()[0] == 0:
-                    _sqlar_put_symlink(sq, rel, tgt, lst.st_mtime_ns)
-                p = _prov(rel)
-                if p: _sqlar_put_provenance(sq, rel, p)
-            elif ap.is_file():
+            if ap.is_file() and not ap.is_symlink():
                 # Regular files no longer live in up/; a file here is unexpected
                 # but handle it gracefully (fold it in, then remove).
                 st = ap.stat()
@@ -4553,14 +4542,19 @@ def consolidate(shm_dir, session_id: str, cmd: list, index: "Index | None" = Non
             for lroot, ldirs, lfiles in os.walk(lower, onerror=lambda _e: None):
                 for nm in ldirs + lfiles:
                     crel = os.path.relpath(os.path.join(lroot, nm), "/")
-                    if (upper / crel).exists() or (upper / crel).is_symlink():
-                        continue                          # re-materialized in upper
-                    # check pool / row for file entries (blob present OR evicted row)
+                    # Re-materialized children live in the ROW now (dirs/symlinks have
+                    # no upper artifact; files keep a pool blob or an evicted row). A
+                    # non-tombstone row of ANY kind means the child was re-created.
                     row = sq.execute("SELECT rowid, mode, data FROM sqlar WHERE name=?",
                                      (crel,)).fetchone()
-                    if row and stat_mod.S_ISREG(row[1]) and (
-                            blob_path(box_id, row[0]).exists() or row[2] is not None):
-                        continue                          # present in pool or row
+                    if row and not stat_mod.S_ISCHR(row[1]):
+                        if stat_mod.S_ISREG(row[1]):
+                            if blob_path(box_id, row[0]).exists() or row[2] is not None:
+                                continue                  # file present in pool or row
+                            # regular row with neither blob nor data: fall through to
+                            # tombstone (the bytes are gone).
+                        else:
+                            continue                      # dir/symlink re-created
                     _sqlar_put_tombstone(sq, crel)
     sq.commit(); sq.close()
     for ap in moved:
@@ -4572,45 +4566,14 @@ def consolidate(shm_dir, session_id: str, cmd: list, index: "Index | None" = Non
         idx.close()
 
 def unconsolidate(shm_dir, session_id: str) -> None:
-    """Prepare a finished box's sqlar for a live overlay run (lazy materialization).
-    Only dir and symlink up/<rel> artifacts are rebuilt — they are needed by
-    _resolve_st which reads them directly from disk. Regular file rows are left
-    EVICTED (data NOT NULL, no blob): the FUSE layer faults them in on demand.
-    Whiteouts and opacity need no upper artifact. Idempotent."""
+    """Prepare a finished box's sqlar for a live overlay run. There is NOTHING to
+    rebuild on disk: dirs and symlinks are served from the rows (the Index mirror
+    loads them at Index.__init__ — symlink targets and dir mode/mtime live in the
+    row), and regular file rows are left EVICTED (data NOT NULL, no blob) for the
+    FUSE layer to fault in on demand. The only on-disk artifact is the empty `up/`
+    sentinel that gates box discovery. Idempotent."""
     upper = Path(shm_dir) / "up"
     upper.mkdir(parents=True, exist_ok=True)
-    sp = sqlar_path(session_id)
-    if not sp.exists(): return
-    sq = _sqlar_open(sp)
-    try:
-        # ORDER BY name: parents before children so mkdir parents exist first.
-        rows = sq.execute("SELECT name, mode, sz, data, mtime FROM sqlar"
-                          " ORDER BY name").fetchall()
-        for name, mode, sz, data, mtime in rows:
-            kind = _kind_of_mode(mode)
-            if kind == "whiteout": continue
-            try:
-                if kind == "dir":
-                    dst = upper / name
-                    dst.mkdir(parents=True, exist_ok=True)
-                    try: os.chmod(dst, stat_mod.S_IMODE(mode))
-                    except OSError: pass
-                    # dirs carry no blob; nothing to clear
-                elif kind == "symlink" and data is not None:
-                    blob = bytes(data)
-                    content = blob if len(blob) == sz else zlib.decompress(blob)
-                    dst = upper / name
-                    dst.parent.mkdir(parents=True, exist_ok=True)
-                    if dst.is_symlink() or dst.exists(): remove_upper_entry(dst)
-                    os.symlink(os.fsdecode(content), dst)
-                    _restore_host_mtime_ns(dst, mtime, is_symlink=True)
-                # Regular files: intentionally left evicted (data NOT NULL, no blob).
-                # The FUSE _fault_in path inflates them on first write-open.
-            except OSError:
-                continue
-        sq.commit()
-    finally:
-        sq.close()
 
 def _pid_alive(pid: int) -> bool:
     if not pid: return False
@@ -5475,24 +5438,10 @@ class ChangeReview:
                     tgt_str = str(tgt_raw)
                 tgt_bytes = tgt_str.encode("utf-8", "surrogateescape")
                 if idx is not None:
-                    # Live box: the FUSE readlink path resolves a symlink through the up/
-                    # artifact (_backing_path → up/rel), and the row carries NULL data
-                    # (the target is folded in from the artifact at consolidate). Write a
-                    # real symlink in up/ + the index row through the lock-held Index so
-                    # the running mount serves it. (Single Index connection — no second
-                    # WAL handle racing the serve thread.)
-                    psess = self.reg.sessions.get(target_sid)
-                    if psess is None:
-                        return dict(ok=False, error=f"promote: session {target_sid} not tracked")
-                    sym_path = Path(psess.upper) / rel
-                    try:
-                        sym_path.parent.mkdir(parents=True, exist_ok=True)
-                        if sym_path.is_symlink() or sym_path.exists():
-                            sym_path.unlink()
-                        os.symlink(tgt_str, sym_path)
-                        _restore_host_mtime_ns(sym_path, mtime_ns, is_symlink=True)
-                    except OSError as e:
-                        return dict(ok=False, error=f"promote symlink: {e}")
+                    # Live box: the FUSE readlink/serve path resolves a symlink straight
+                    # from the row (target in the row, no on-disk artifact). Write the row
+                    # through the lock-held Index so the running mount serves it. (Single
+                    # Index connection — no second WAL handle racing the serve thread.)
                     idx.set_entry(rel, "symlink", stat_mod.S_IFLNK | 0o777, wid, "promoted",
                                   target=tgt_bytes, mtime_ns=mtime_ns)
                 else:

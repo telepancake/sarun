@@ -46,8 +46,10 @@ def test_one_db_only_and_blob_lifecycle():
         idx.set_entry("blob.bin", "file", stat_mod.S_IFREG | 0o644, wid, "create")
         bp = m.blob_path(idx.box_id, idx.row_id("blob.bin"))
         bp.parent.mkdir(parents=True, exist_ok=True); bp.write_bytes(bytes(range(256)))
-        os.symlink("/some/target", up / "lnk")
-        idx.set_entry("lnk", "symlink", stat_mod.S_IFLNK | 0o777, wid, "symlink")
+        # Symlink: the target goes into the row IMMEDIATELY (no on-disk artifact, no
+        # fold-at-consolidate) — mirrors the live FUSE symlink op.
+        idx.set_entry("lnk", "symlink", stat_mod.S_IFLNK | 0o777, wid, "symlink",
+                      target=b"/some/target", mtime_ns=0)
         assert Path("/etc/hostname").exists()
         idx.set_entry("etc/hostname", "whiteout", 0, wid, "unlink")
 
@@ -74,6 +76,10 @@ def test_one_db_only_and_blob_lifecycle():
               "all entries are in the one sqlar")
         check(m.sqlar_content(sp, "blob.bin") == bytes(range(256)),
               "binary content consolidated")
+        # The symlink target lives in the row (written at creation, not folded from an
+        # on-disk artifact) — readable at rest straight from the sqlar.
+        check(m.sqlar_content(sp, "lnk") == b"/some/target",
+              "symlink target stored in the row, readable at rest")
         tmode = m.sqlar_mode(sp, "etc/hostname")
         check(tmode is not None and stat_mod.S_ISCHR(tmode),
               "deletion is a char-device tombstone in the one db")
@@ -492,8 +498,14 @@ def test_promote_into_parent_unit():
         err = cr._promote_into_parent(parent_sid, rel_l, plan_l)
         check(err is None, "unit-promo symlink: no error")
         check(p_idx.kind_of(rel_l) == "symlink", "unit-promo symlink: parent kind=symlink")
+        # The promotion is mirror-only: the target lives in the row, NOT an on-disk
+        # artifact (the live serve path resolves readlink straight from the row).
+        check(p_idx.symlink_target(rel_l)
+              == b"/run/systemd/resolve/stub-resolv.conf",
+              "unit-promo symlink: target recorded in the parent row")
         sym = p_up / rel_l
-        check(sym.is_symlink(), "unit-promo symlink: symlink artifact in parent up/")
+        check(not sym.exists() and not sym.is_symlink(),
+              "unit-promo symlink: NO on-disk artifact in parent up/ (mirror-only)")
 
         # ── delete plan (path absent on host → del_entry, not whiteout) ──
         rel_d = "tmp/nonexistent_promo_path_test"
