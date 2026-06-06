@@ -77,7 +77,7 @@ def _mk_supervisor(sid, tracing):
     idx = m.Index(backing); idx.set_tracing(tracing)
     sup.indexes[sid] = idx
     sup.sessions[sid] = m.Session(
-        session_id=sid, cmd=["curl", "x"], shm_dir=str(backing),
+        session_id=sid, box_id=int(sid), cmd=["curl", "x"], shm_dir=str(backing),
         live=True, sess_rules=[m.Rule.parse("allow host:*")])
     return sup, idx, m.sqlar_path(sid)
 
@@ -110,7 +110,7 @@ def test_live_http_flow_through_engine():
     """A + B: a real proxied loopback GET drives the engine and lands a flow row,
     tagged via the REAL pidfd->host-pid->read_provenance chain with the HOST pid of a
     live local child (its real exe/argv/env)."""
-    sid = "20260605-000000_4101"
+    sid = "4101"
     up = _tiny_upstream(); uhost, uport = up.server_address
     sup, idx, sp = _mk_supervisor(sid, tracing=True)
 
@@ -209,7 +209,7 @@ def test_relay_payload_tagging_dedup():
     # The box root is this process's real host parent, so the flow process's PPid
     # chain bubbles up exactly to it (a genuine ancestor) and stops — no walk into
     # unrelated host system processes.
-    sid = "20260605-000000_%d" % m.tgid_of(os.getppid())
+    sid = "4102"
     sup, idx, sp = _mk_supervisor(sid, tracing=True)
     # 3c records the box root row at register; emulate it.
     idx.process_from_prov(dict(tgid=m.tgid_of(os.getppid()), ppid=0,
@@ -259,7 +259,7 @@ def test_peer_gone_and_no_pidfd_leave_untagged():
     """E: a pidfd of an already-exited process resolves to host pid <= 0, and the
     no-pidfd case yields {"tgid":0}; both leave the flow recorded but UNTAGGED -- no
     bogus process row is invented from a missing peer."""
-    sid = "20260605-000000_4103"
+    sid = "4103"
     sup, idx, sp = _mk_supervisor(sid, tracing=True)
 
     # peer-gone: open a pidfd, then let the child exit + be reaped, then resolve. A

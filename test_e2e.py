@@ -336,12 +336,10 @@ def run_nested_e2e(tmp):
 def run_named_box_e2e(tmp):
     """Launch the UI + a named box (MYBOX) via `slopbox MYBOX -- cmd`.
 
-    Verifies:
-    - The sqlar is written as MYBOX.sqlar (named, not a timestamp sid).
-    - The box has a 'born' meta timestamp so age/sort works.
-    - A second `slopbox MYBOX -- cmd` re-runs the same named box (existing name → rerun).
-    - A dotted child MYBOX.CHILD (parent = MYBOX finished sqlar) registers with the
-      correct parent and produces a MYBOX.CHILD.sqlar.
+    Verifies (box_id-identity model):
+    - The box's sqlar is <box_id>.sqlar; the NAME 'MYBOX' is a meta label.
+    - A dotted child MYBOX.CHILD (parent = MYBOX finished box) registers with the
+      correct parent pointer (parent_box_id = MYBOX's box_id).
     """
     m = SourceFileLoader("slopbox", SARUN).load_module()
     e = env_for(tmp)
@@ -376,23 +374,31 @@ def run_named_box_e2e(tmp):
               f"named-e2e: MYBOX run exited 0 (got {r.returncode}: {r.stderr.strip()[-200:]})")
         check("UI connected" in r.stderr, "named-e2e: MYBOX runner reports UI connected")
 
-        # Poll for MYBOX.sqlar.
+        def find_by_name(nm):
+            """The <box_id>.sqlar whose 'name' meta == nm, else None (box_id identity)."""
+            for p in state.glob("*.sqlar"):
+                if m.sqlar_meta_get(p, "name") == nm:
+                    return p
+            return None
+
+        # Poll for the MYBOX box (located by NAME meta, not by filename).
         deadline = time.time() + 30
         while time.time() < deadline:
-            if (state / "MYBOX.sqlar").exists():
+            if find_by_name("MYBOX") is not None:
                 break
             time.sleep(0.3)
-        check((state / "MYBOX.sqlar").exists(), "named-e2e: MYBOX.sqlar produced")
+        sp = find_by_name("MYBOX")
+        check(sp is not None, "named-e2e: a <box_id>.sqlar with name='MYBOX' produced")
 
-        if (state / "MYBOX.sqlar").exists():
-            sp = state / "MYBOX.sqlar"
+        if sp is not None:
             names = {n for n, _md, _mt, _sz in m.sqlar_list(sp)}
             check("named_proof.txt" in names,
                   "named-e2e: MYBOX sqlar contains named_proof.txt")
-            born = m.sqlar_meta_get(sp, "born")
-            check(bool(born), f"named-e2e: MYBOX born timestamp set (got {born!r})")
+            check(m.SID_RE.match(sp.stem) is not None,
+                  f"named-e2e: MYBOX sqlar is named by box_id (got {sp.stem!r})")
+            mybox_id = sp.stem
 
-        # Run MYBOX.CHILD (dotted child; parent = MYBOX finished sqlar).
+        # Run MYBOX.CHILD (dotted display path; parent resolves to MYBOX by name).
         r2 = subprocess.run(
             [PYBIN, SARUN, "MYBOX.CHILD", "--", "bash", "-c",
              "echo child-ok > /child_named_proof.txt"],
@@ -402,20 +408,20 @@ def run_named_box_e2e(tmp):
 
         deadline = time.time() + 30
         while time.time() < deadline:
-            if (state / "MYBOX.CHILD.sqlar").exists():
+            if find_by_name("CHILD") is not None:
                 break
             time.sleep(0.3)
-        check((state / "MYBOX.CHILD.sqlar").exists(),
-              "named-e2e: MYBOX.CHILD.sqlar produced")
+        sp_c = find_by_name("CHILD")
+        check(sp_c is not None, "named-e2e: a <box_id>.sqlar with name='CHILD' produced")
 
-        if (state / "MYBOX.CHILD.sqlar").exists():
-            sp_c = state / "MYBOX.CHILD.sqlar"
+        if sp_c is not None:
             names_c = {n for n, _md, _mt, _sz in m.sqlar_list(sp_c)}
             check("child_named_proof.txt" in names_c,
                   "named-e2e: MYBOX.CHILD sqlar contains child_named_proof.txt")
-            parent_sid = m.sqlar_meta_get(sp_c, "parent_sid")
-            check(parent_sid == "MYBOX",
-                  f"named-e2e: MYBOX.CHILD parent_sid is MYBOX (got {parent_sid!r})")
+            parent_box_id = m.sqlar_meta_get(sp_c, "parent_box_id")
+            check(parent_box_id == mybox_id,
+                  f"named-e2e: CHILD parent_box_id is MYBOX's box_id "
+                  f"(got {parent_box_id!r}, want {mybox_id!r})")
 
     finally:
         try:

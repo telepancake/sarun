@@ -33,7 +33,7 @@ def test_one_db_only_and_blob_lifecycle():
     tmp = Path(tempfile.mkdtemp(prefix="ofl-"))
     _redirect_state(tmp)
     try:
-        sid = "20260604-000000_111"
+        sid = "1001"
         backing = m.live_dir(sid); up = backing / "up"
         up.mkdir(parents=True)
         idx = m.Index(backing)
@@ -105,7 +105,7 @@ def test_process_and_env_tables_dedup_and_tag():
         # The PPid-bubbling boundary is the explicitly-registered root (process.root
         # column), exactly as the real register flow records it — so register our own
         # tgid as the root first; the bubble-up then stops at it: one process row.
-        sid = "20260604-000000_%d" % m.tgid_of(os.getpid())
+        sid = "1002"
         backing = m.live_dir(sid); (backing / "up").mkdir(parents=True)
         idx = m.Index(backing); idx.set_tracing(True)
         root_prov = m.read_provenance(os.getpid(), full_env=True)
@@ -144,7 +144,7 @@ def test_tracing_off_keeps_env_empty():
     tmp = Path(tempfile.mkdtemp(prefix="ofl-"))
     _redirect_state(tmp)
     try:
-        sid = "20260604-000000_888"
+        sid = "1003"
         backing = m.live_dir(sid); (backing / "up").mkdir(parents=True)
         idx = m.Index(backing)             # tracing OFF
         wid = idx.writer_for(os.getpid())
@@ -166,7 +166,7 @@ def test_consolidate_opaque_expands_tombstones():
         if lower is None:
             check(True, "opaque: no candidate lower dir (skipped)"); return
         rel = lower.lstrip("/")
-        sid = "20260604-000000_222"
+        sid = "1004"
         backing = m.live_dir(sid); up = backing / "up"
         (up / rel).mkdir(parents=True)
         idx = m.Index(backing)
@@ -209,7 +209,7 @@ def test_process_table_is_one_connected_tree():
     m.read_provenance = lambda pid, full_env=False: dict(
         ppid=chain.get(pid, 1), exe="/x/%d" % pid, argv=["p%d" % pid], env={})
     try:
-        sid = "20260604-000000_%d" % ROOT
+        sid = "2000"
         backing = m.live_dir(sid); (backing / "up").mkdir(parents=True)
         idx = m.Index(backing); idx.set_tracing(True)
         # 3c records the root row at register; emulate it (root never bubbles).
@@ -252,31 +252,27 @@ def test_process_table_is_one_connected_tree():
 
 def test_supervisor_no_mount_register_fails_closed():
     sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=None)
-    ack = sup.register(dict(session_id="20260604-000000_111", cmd=["true"]))
+    ack = sup.register(dict(session_id="BOX", cmd=["true"]))
     check(ack.get("ok") is False, "register without a mount fails closed (no ok)")
     check("error" in ack, "register failure carries an error message")
 
 
 def test_box_id_and_pool_layout():
-    """The box's stable pool id is minted once, unique per box, persisted in the
-    sqlar's own meta (so it survives the sqlar being renamed), and the blob path is
-    addressed by <box_id>/<shard>/<row_id> — never by host path."""
+    """box_id IS the box's identity now (the sqlar/backing stem). mint_box_id() hands
+    out max(existing)+1 and never reuses; the blob path is addressed by
+    <box_id>/<shard>/<row_id> — never by host path."""
     tmp = Path(tempfile.mkdtemp(prefix="pool-"))
     _redirect_state(tmp)
     try:
-        a = "20260604-000000_1"; b = "20260604-000000_2"
-        # mint sqlars (touch a meta entry so the files exist)
-        m.sqlar_meta_set(m.sqlar_path(a), "born", a)
-        m.sqlar_meta_set(m.sqlar_path(b), "born", b)
-        ida = m.ensure_box_id(a); idb = m.ensure_box_id(b)
+        # mint two fresh ids; each materializes its own <box_id>.sqlar.
+        ida = m.mint_box_id()
+        m.sqlar_meta_set(m.sqlar_path(ida), "name", "A")     # create <ida>.sqlar
+        idb = m.mint_box_id()
+        m.sqlar_meta_set(m.sqlar_path(idb), "name", "B")     # create <idb>.sqlar
         check(isinstance(ida, int) and isinstance(idb, int), "box ids are ints")
-        check(ida != idb, "distinct boxes get distinct pool ids")
-        check(m.ensure_box_id(a) == ida, "box id is stable across calls (minted once)")
-        # rename the sqlar file: the id travels with it (lives in meta, not the name)
-        renamed = m.sqlar_path("RENAMED")
-        m.sqlar_path(a).rename(renamed)
-        check(m.ensure_box_id("RENAMED") == ida,
-              "box id survives a sqlar rename (stored in meta, not the filename)")
+        check(ida != idb, "distinct boxes get distinct ids (no reuse)")
+        check(m.mint_box_id() > idb, "mint always advances past the highest existing id")
+        check(m.ensure_box_id(str(ida)) == ida, "ensure_box_id is the identity cast")
         # blob path layout: <pool>/<box_id>/<shard>/<row_id>, shard = row % SHARDS
         bp = m.blob_path(ida, 1234)
         check(bp.parent.parent == m.box_pool_dir(ida),
@@ -328,18 +324,20 @@ def test_pidfd_alive():
 
 
 def _finish_box_with_file(sup, sid, rel, content, parent=None):
-    """Make a finished (non-live) box whose sqlar holds one folded file `rel`. Wires a
-    Session (parent set) so ChangeReview._source picks the SqlarArchive path."""
+    """Make a finished (non-live) box whose sqlar holds one folded file `rel`. `sid` is
+    the box key str(box_id); `parent` is the parent's box_id (int) or None. Wires a
+    Session (parent_box_id set) so ChangeReview._source picks the SqlarArchive path."""
     backing = m.live_dir(sid); (backing / "up").mkdir(parents=True, exist_ok=True)
     idx = m.Index(backing); wid = idx.writer_for(os.getpid())
     idx.set_entry(rel, "file", stat_mod.S_IFREG | 0o644, wid, "create")
     bp = m.blob_path(idx.box_id, idx.row_id(rel))
     bp.parent.mkdir(parents=True, exist_ok=True); bp.write_bytes(content)
     m.consolidate(str(backing), sid, ["sh"], index=idx); idx.close()   # placement only
-    if parent is not None:
-        m.sqlar_meta_set(m.sqlar_path(sid), "parent_sid", parent)
-    sup.sessions[sid] = m.Session(session_id=sid, cmd=["c"], live=False,
-                                  shm_dir=str(backing), parent=parent)
+    pbid = int(parent) if parent is not None else None
+    if pbid is not None:
+        m.sqlar_meta_set(m.sqlar_path(sid), "parent_box_id", str(pbid))
+    sup.sessions[sid] = m.Session(session_id=sid, box_id=int(sid), cmd=["c"],
+                                  live=False, shm_dir=str(backing), parent_box_id=pbid)
 
 
 def test_finalize_apply_promotes_to_parent():
@@ -351,11 +349,12 @@ def test_finalize_apply_promotes_to_parent():
     orig_load = m.load_file_rules
     try:
         sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=None)
-        parent_sid, child_sid = "PARENT", "PARENT.CHILD"
+        parent_sid, child_sid = "10", "11"
         m._sqlar_open(m.sqlar_path(parent_sid)).close()
-        sup.sessions[parent_sid] = m.Session(session_id=parent_sid, cmd=["p"], live=False)
+        sup.sessions[parent_sid] = m.Session(session_id=parent_sid, box_id=10,
+                                             cmd=["p"], live=False)
         rel = "tmp/promo_file.txt"; content = b"promoted content\n"
-        _finish_box_with_file(sup, child_sid, rel, content, parent=parent_sid)
+        _finish_box_with_file(sup, child_sid, rel, content, parent=10)
 
         class _ApplyRule:
             def decide(self, r): return "apply" if r == rel else None
@@ -386,7 +385,7 @@ def test_finalize_apply_writes_host_for_root():
     try:
         host_path.unlink(missing_ok=True)
         sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=None)
-        sid = "20260604-000200_302"; content = b"root apply test\n"
+        sid = "302"; content = b"root apply test\n"
         _finish_box_with_file(sup, sid, host_rel, content, parent=None)
 
         class _ApplyRule:
@@ -413,13 +412,13 @@ def test_finalize_discard_copies_down_to_children():
     orig_load = m.load_file_rules
     try:
         sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=None)
-        b = "B"; child_inherits = "B.C"; child_owns = "B.D"
+        b = "20"; child_inherits = "21"; child_owns = "22"
         rel = "etc/shared.conf"; b_content = b"from B\n"; d_content = b"D's own\n"
         # B has the file; B.C does NOT (inherits it); B.D HAS its own copy.
         _finish_box_with_file(sup, b, rel, b_content)
         # B.C: a finished box that does not contain `rel` (give it an unrelated file).
-        _finish_box_with_file(sup, child_inherits, "other.txt", b"x\n", parent=b)
-        _finish_box_with_file(sup, child_owns, rel, d_content, parent=b)
+        _finish_box_with_file(sup, child_inherits, "other.txt", b"x\n", parent=20)
+        _finish_box_with_file(sup, child_owns, rel, d_content, parent=20)
 
         m.load_file_rules = lambda: type("R", (), {"decide": lambda self, r: None})()
         res = sup.review.discard(b, [rel])
@@ -460,14 +459,15 @@ def test_promote_into_parent_unit():
         rev = _FakeReview()
 
         # Set up a live parent index.
-        parent_sid = "20260604-000201_400"
+        parent_sid = "400"
         p_backing = m.live_dir(parent_sid); p_up = p_backing / "up"
         p_up.mkdir(parents=True)
         p_idx = m.Index(p_backing)
         rev.reg.indexes[parent_sid] = p_idx
 
         # Wire a minimal Session so _parent_sid / _promote_into_parent can find upper.
-        ps = m.Session(session_id=parent_sid, cmd=["p"], shm_dir=str(p_backing), live=True)
+        ps = m.Session(session_id=parent_sid, box_id=400, cmd=["p"],
+                       shm_dir=str(p_backing), live=True)
         rev.reg.sessions._s[parent_sid] = ps
 
         # Build the real ChangeReview, monkey-patch its reg.
@@ -518,7 +518,7 @@ def test_consolidate_size_based_placement():
     tmp = Path(tempfile.mkdtemp(prefix="ofl-"))
     _redirect_state(tmp)
     try:
-        sid = "20260604-000000_222"
+        sid = "1005"
         backing = m.live_dir(sid); up = backing / "up"; up.mkdir(parents=True)
         idx = m.Index(backing)
         wid = idx.writer_for(os.getpid())

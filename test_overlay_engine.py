@@ -31,7 +31,7 @@ class MountFixture:
         os.environ["XDG_STATE_HOME"] = str(self.tmp / "state")
         self.mnt = self.tmp / "mnt"
         self.live = self.tmp / "live"
-        self.sid = "20260604-000000_1"
+        self.sid = "1"
         self.backing = self.live / self.sid
         self.up = self.backing / "up"
         self.up.mkdir(parents=True)
@@ -293,7 +293,7 @@ def test_nested_lower_chaining():
     tmp = Path(tempfile.mkdtemp(prefix="ovl-nest-"))
     os.environ["XDG_STATE_HOME"] = str(tmp / "state")
     mnt = tmp / "mnt"; live = tmp / "live"
-    psid = "20260604-000000_1"; csid = "20260604-000000_2"
+    psid = "101"; csid = "102"
     pbk = live / psid; cbk = live / csid
     (pbk / "up").mkdir(parents=True); (cbk / "up").mkdir(parents=True)
     pidx = m.Index(pbk); cidx = m.Index(cbk)
@@ -466,7 +466,7 @@ def test_passthrough_kicks_up_to_parent():
     tmp = Path(tempfile.mkdtemp(prefix="ovl-ku-"))
     os.environ["XDG_STATE_HOME"] = str(tmp / "state")
     mnt = tmp / "mnt"; live = tmp / "live"
-    psid = "20260604-000000_1"; csid = "20260604-000000_2"
+    psid = "101"; csid = "102"
     pbk = live / psid; cbk = live / csid
     (pbk / "up").mkdir(parents=True); (cbk / "up").mkdir(parents=True)
     pidx = m.Index(pbk); cidx = m.Index(cbk)
@@ -534,7 +534,7 @@ def test_passthrough_kicks_up_to_parent():
         # (4) Per-file passthrough rule on the child (passthrough=False at session
         #     level, but one path is marked passthrough via FileRule). We use a fresh
         #     pair of sessions so the blanket-passthrough child above doesn't interfere.
-        psid2 = "20260604-000000_3"; csid2 = "20260604-000000_4"
+        psid2 = "103"; csid2 = "104"
         pbk2 = live / psid2; cbk2 = live / csid2
         (pbk2 / "up").mkdir(parents=True); (cbk2 / "up").mkdir(parents=True)
         pidx2 = m.Index(pbk2); cidx2 = m.Index(cbk2)
@@ -706,7 +706,7 @@ def test_terminated_parent_reads():
     tmp = Path(tempfile.mkdtemp(prefix="ovl-finpar-"))
     os.environ["XDG_STATE_HOME"] = str(tmp / "state")
     mnt = tmp / "mnt"; live = tmp / "live"
-    psid = "20260604-010000_1"; csid = "20260604-010000_2"
+    psid = "201"; csid = "202"
     pbk = live / psid; cbk = live / csid
     (pbk / "up").mkdir(parents=True); (cbk / "up").mkdir(parents=True)
     pidx = m.Index(pbk); cidx = m.Index(cbk)

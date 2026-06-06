@@ -39,31 +39,31 @@ def test_sid_validation_rejects_traversal():
     _redirect_state(tmp)
     try:
         m.ensure_dirs()
-        # valid_sid accepts the legitimate shapes and nothing else
-        check(m.valid_sid("20260604-000000_111"), "valid_sid: plain sid accepted")
-        check(m.valid_sid("20260604-000000_111.abc123"),
-              "valid_sid: suffixed sid accepted")
-        for bad in ("../escape", "a/b", "..", "/etc/passwd", "20260604-000000_111/..",
-                    "20260604-000000_111.ABCDEF", "x_1", "", None,
-                    "20260604-000000_111\n20260604-000000_222"):
+        # valid_sid validates the INTERNAL box key str(box_id): a plain decimal string.
+        check(m.valid_sid("123"), "valid_sid: plain box_id accepted")
+        check(m.valid_sid("1"), "valid_sid: single-digit box_id accepted")
+        for bad in ("../escape", "a/b", "..", "/etc/passwd", "12/..",
+                    "12.ABCDEF", "x_1", "", None, "ALPHA",
+                    "20260604-000000_111", "12\n13"):
             check(not m.valid_sid(bad), f"valid_sid: rejects {bad!r}")
 
-        # register() must reject a traversal sid BEFORE any mkdir, creating nothing
-        # outside live_home(). Use mount=None: the sid check fires first.
-        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=None)
+        # register() never uses session_id as a path component (it mints box_id). A
+        # traversal/garbage NAME is rejected as an invalid NAME and creates nothing.
+        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
         outside = tmp / "PWNED"
         ack = sup.register(dict(session_id=f"../../{outside.name}", cmd=["true"]))
-        check(ack.get("ok") is False, "register: traversal sid rejected (ok False)")
-        check(ack.get("error") == "invalid session_id",
-              "register: traversal sid gives 'invalid session_id'")
+        check(ack.get("ok") is False, "register: traversal name rejected (ok False)")
         check(not outside.exists(), "register: no dir created outside live_home()")
 
         ack2 = sup.register(dict(session_id="a/b/c", cmd=["true"]))
-        check(ack2.get("ok") is False, "register: slashed sid rejected")
-        # nothing leaked under live_home() either
+        check(ack2.get("ok") is False, "register: slashed name rejected")
+        # The only live/<id> dirs that exist are numeric box_id dirs, never the bad name.
         lh = m.live_home()
-        leaked = [p for p in (lh.iterdir() if lh.exists() else [])]
-        check(leaked == [], "register: no live/<sid> dir created for a bad sid")
+        names = [p.name for p in (lh.iterdir() if lh.exists() else [])]
+        check(all(m.SID_RE.match(n) for n in names),
+              f"register: only numeric box_id backing dirs exist (got {names})")
+        check("PWNED" not in names and "a" not in names,
+              "register: no live/<bad-name> dir created")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -192,9 +192,14 @@ class _FakeOps:
 class _FakeMount:
     def __init__(self): self.ops = _FakeOps()
     def is_healthy(self): return True
-    def add_session(self, *a, **k): pass
+    def add_session(self, sid, *a, **k):
+        # Real FUSE creates the box_root subfolder; mirror it so register()'s
+        # os.open(<mnt>/<box_id>) (nested reply-fd path) finds a real dir.
+        try: (m.mnt_point() / str(sid)).mkdir(parents=True, exist_ok=True)
+        except Exception: pass
     def remove_session(self, sid): self.ops.remove_session(sid)
     def add_ca_spoof(self, *a, **k): pass
+    def set_parent(self, sid, parent): pass
 
 
 def test_owner_token_required_for_teardown():
@@ -203,9 +208,9 @@ def test_owner_token_required_for_teardown():
     try:
         m.ensure_dirs()
         sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
-        sid = "20260604-000000_111"
-        ack = sup.register(dict(session_id=sid, cmd=["true"], want_net=False))
-        check(ack.get("ok") is True, "register: a valid sid registers")
+        ack = sup.register(dict(session_id="TOKBOX", cmd=["true"], want_net=False))
+        check(ack.get("ok") is True, "register: a valid box registers")
+        sid = ack["session_id"]
         token = ack.get("owner_token")
         check(bool(token), "register: an owner token is issued to the runner")
         check(sid in sup.sessions, "register: session present after register")
@@ -247,16 +252,16 @@ def test_register_net_wires_a_per_session_relay():
         t = threading.Thread(target=run_loop, daemon=True); t.start()
         ready.wait(5)
 
-        sid = "20260604-000000_333"
         # register must run on the relay loop's thread (it touches the loop)
         box = {}
         ev = threading.Event()
         def do_reg():
-            box["ack"] = sup.register(dict(session_id=sid, cmd=["true"], want_net=True))
+            box["ack"] = sup.register(dict(session_id="NETBOX", cmd=["true"], want_net=True))
             ev.set()
         rs_loop.call_soon_threadsafe(do_reg); ev.wait(5)
         ack = box["ack"]
         check(ack.get("ok") is True, "register(want_net) ok")
+        sid = ack["session_id"]   # the box's key str(box_id)
         relay = ack.get("relay")
         check(bool(relay) and Path(relay).exists(),
               "register(want_net): a per-session relay socket exists")
@@ -299,9 +304,10 @@ def test_box_cannot_register_or_unregister_a_foreign_session():
     try:
         m.ensure_dirs()
         sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
-        a, b = "20260604-000000_111", "20260604-000000_222"
-        tok_a = sup.register(dict(session_id=a, cmd=["true"]))["owner_token"]
-        sup.register(dict(session_id=b, cmd=["true"]))
+        ra = sup.register(dict(session_id="ABOX", cmd=["true"]))
+        rb = sup.register(dict(session_id="BBOX", cmd=["true"]))
+        a, b = ra["session_id"], rb["session_id"]
+        tok_a = ra["owner_token"]
         # A's token must not unregister B
         sup.unregister(dict(session_id=b, owner_token=tok_a))
         check(b in sup.sessions, "session B survives an unregister bearing A's token")
@@ -315,8 +321,8 @@ def test_box_cannot_register_or_unregister_a_foreign_session():
 
 def test_command_is_the_root_process_row():
     """register() persists the box's command as the ROOT process row (tgid == the
-    sid's host pid, argv == cmd) in the single <sid>.sqlar — the sole home for the
-    command, with no xattr anywhere. The row is present even for an EMPTY box (no
+    runner's host pid, argv == cmd) in the single <box_id>.sqlar — the sole home for
+    the command, with no xattr anywhere. The row is present even for an EMPTY box (no
     file changes), and root_cmd() reads it straight from the persisted db, so it
     survives after the runner (and its live Index) is gone."""
     tmp = Path(tempfile.mkdtemp(prefix="cp-"))
@@ -329,13 +335,13 @@ def test_command_is_the_root_process_row():
               "no set/get_cmd_xattr / CMD_XATTR symbols remain")
 
         sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
-        sid = "20260604-000000_4242"           # the suffix 4242 IS the root host pid
-        root_pid = m.parse_sid(sid)[1]
-        check(root_pid == 4242, "parse_sid recovers the host pid from the sid")
+        root_pid = 4242                        # the runner's host pid (kernel-derived)
         cmd = ["echo", "hello world"]
         prov = dict(ppid=7, exe="/usr/bin/echo", env={"FOO": "bar"})
-        ack = sup.register(dict(session_id=sid, cmd=cmd, prov=prov, want_trace=True))
+        ack = sup.register(dict(session_id="ECHOBOX", cmd=cmd, prov=prov,
+                                want_trace=True, _register_host_pid=root_pid))
         check(ack.get("ok") is True, "register ok")
+        sid = ack["session_id"]
 
         # the live process table carries the root row keyed by the host pid
         procs = sup.processes(sid)
@@ -455,16 +461,14 @@ def test_derive_parent_sid_owner_discovery():
         my_pid  = os.getpid()
         my_ppid = os.getppid()
 
-        sid_a = "20260604-000001_111"
-        sid_b = "20260604-000001_222"
-
         # Register session A: root_tgid == our ppid, supply a live pidfd so
         # _pidfd_alive(sess_a.run_pidfd) is True and the entry appears in root_map.
-        ack_a = sup.register(dict(session_id=sid_a, cmd=["true"],
+        ack_a = sup.register(dict(session_id="ABOX", cmd=["true"],
                                   root_tgid=my_ppid,
                                   _register_pidfd=pidfd_a,
                                   prov=dict(ppid=0, exe="/bin/sh", env={})))
         check(ack_a.get("ok") is True, "derive: session A registers ok")
+        sid_a = ack_a["session_id"]
         # register() dup'd the fd; close our copy so it doesn't leak.
         try: os.close(pidfd_a)
         except OSError: pass
@@ -473,10 +477,11 @@ def test_derive_parent_sid_owner_discovery():
         # Register session B: root_tgid is a synthetic dead pid; no pidfd supplied →
         # run_pidfd stays -1 → _pidfd_alive returns False → B never enters root_map.
         fake_root_b = 99999999   # unlikely to be alive, definitely not our ancestor
-        ack_b = sup.register(dict(session_id=sid_b, cmd=["true"],
+        ack_b = sup.register(dict(session_id="BBOX", cmd=["true"],
                                   root_tgid=fake_root_b,
                                   prov=dict(ppid=0, exe="/bin/false", env={})))
         check(ack_b.get("ok") is True, "derive: session B registers ok")
+        sid_b = ack_b["session_id"]
 
         # Both sessions must be marked live for _derive_parent_sid to see them.
         check(sup.sessions[sid_a].live, "derive: session A is live")
@@ -523,27 +528,24 @@ def test_register_parent_body_field_not_honoured():
         m.ensure_dirs()
         sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
 
-        sid_parent = "20260604-000002_111"
-        sid_child  = "20260604-000002_222"
-
-        sup.register(dict(session_id=sid_parent, cmd=["true"]))
+        ack_p = sup.register(dict(session_id="PARENTBOX", cmd=["true"]))
+        sid_parent = ack_p["session_id"]
         check(sup.sessions[sid_parent].live, "no-spoof: parent session live")
 
         # The child message carries a box-supplied 'parent_sid' (untrusted body field).
         # Supervisor.register should ignore it.  No _derived_parent_sid → top-level box.
-        ack = sup.register(dict(session_id=sid_child, cmd=["true"],
+        ack = sup.register(dict(session_id="CHILDBOX", cmd=["true"],
                                 parent_sid=sid_parent))   # untrusted field
         check(ack.get("ok") is True, "no-spoof: register with body parent_sid still ok")
+        sid_child = ack["session_id"]
 
-        # Verify add_session was called with parent=None (not sid_parent).
-        # The _FakeMount.add_session just records calls in _FakeOps; the test checks
-        # that no error was injected (ack ok=True + no error) and the session is live.
+        # Verify the child is top-level (body parent_sid not honoured).
         check(sup.sessions[sid_child].live, "no-spoof: child session is live")
-        # If the body field had been honoured and sid_parent was resolved, the
-        # overlay would have parent=sid_parent.  We verify it was NOT honoured by
-        # checking that a non-live derived parent would have failed closed:
-        ack2 = sup.register(dict(session_id="20260604-000002_333", cmd=["true"],
-                                 _derived_parent_sid=sid_child + "_nonexistent"))
+        check(sup.sessions[sid_child].parent_box_id is None,
+              "no-spoof: body parent_sid did NOT set the child's parent pointer")
+        # A non-live derived parent fails closed:
+        ack2 = sup.register(dict(session_id="ORPHANBOX", cmd=["true"],
+                                 _derived_parent_sid="99999"))
         check(ack2.get("ok") is False,
               "no-spoof: _derived_parent_sid naming a dead/absent session → fail-closed")
         check("not live" in (ack2.get("error") or ""),
@@ -561,10 +563,10 @@ def test_register_no_parent_is_top_level():
     try:
         m.ensure_dirs()
         sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
-        sid = "20260604-000003_111"
         # No _derived_parent_sid key → top-level
-        ack = sup.register(dict(session_id=sid, cmd=["true"]))
+        ack = sup.register(dict(session_id="TOPBOX", cmd=["true"]))
         check(ack.get("ok") is True, "top-level: register ok with no parent")
+        sid = ack["session_id"]
         check(sup.sessions[sid].live, "top-level: session is live")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -612,8 +614,7 @@ def test_channel_server_pidfd_register():
               f"_host_pid_from_pidfd returns our own pid (got {derived_pid})")
 
         # Send a register message with our own pidfd over SCM_RIGHTS
-        sid = "20260604-000010_777"
-        msg = dict(type="register", session_id=sid, cmd=["true"], want_net=False)
+        msg = dict(type="register", session_id="CSBOX", cmd=["true"], want_net=False)
         payload = (json.dumps(msg) + "\n").encode()
 
         pidfd = os.pidfd_open(os.getpid())
@@ -642,7 +643,8 @@ def test_channel_server_pidfd_register():
         check(ack and bool(ack.get("owner_token")),
               "channel-server: register ack includes an owner_token")
 
-        # Session is live in the supervisor
+        # Session is live in the supervisor (keyed by the minted box_id)
+        sid = ack.get("session_id") if ack else None
         check(sid in sup.sessions and sup.sessions[sid].live,
               "channel-server: session is live after pidfd-register")
 
@@ -674,19 +676,18 @@ def test_apply_kick_up_live_parent():
         m.ensure_dirs()
         sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
 
-        sid_p = "20260604-000100_111"   # parent
-        sid_c = "20260604-000100_222"   # child (nested under parent)
-
         # Register parent.
-        ack_p = sup.register(dict(session_id=sid_p, cmd=["parent"]))
+        ack_p = sup.register(dict(session_id="PARENT", cmd=["parent"]))
         check(ack_p.get("ok") is True, "kick-up: parent registers ok")
+        sid_p = ack_p["session_id"]
 
         # Register child with _derived_parent_sid pointing at parent.
-        ack_c = sup.register(dict(session_id=sid_c, cmd=["child"],
+        ack_c = sup.register(dict(session_id="CHILD", cmd=["child"],
                                   _derived_parent_sid=sid_p))
         check(ack_c.get("ok") is True, "kick-up: child registers ok with parent")
-        check(sup.sessions[sid_c].parent == sid_p,
-              "kick-up: Session.parent is set on the child")
+        sid_c = ack_c["session_id"]
+        check(str(sup.sessions[sid_c].parent_box_id) == sid_p,
+              "kick-up: Session.parent_box_id is set on the child")
 
         # Simulate a file change in child's overlay (set_entry + pool blob).
         child_idx = sup.indexes[sid_c]
@@ -745,10 +746,10 @@ def test_apply_root_box_still_writes_host():
     try:
         m.ensure_dirs()
         sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
-        sid = "20260604-000101_111"
-        sup.register(dict(session_id=sid, cmd=["root"]))
-        check(sup.sessions[sid].parent is None,
-              "root-box: Session.parent is None for a top-level box")
+        ack = sup.register(dict(session_id="ROOT", cmd=["root"]))
+        sid = ack["session_id"]
+        check(sup.sessions[sid].parent_box_id is None,
+              "root-box: Session.parent_box_id is None for a top-level box")
         # The parent_sid() helper must return None.
         check(sup.review._parent_sid(sid) is None,
               "root-box: _parent_sid returns None for root")
@@ -766,14 +767,13 @@ def test_apply_kick_up_finished_parent():
         m.ensure_dirs()
         sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
 
-        sid_p = "20260604-000102_111"
-        sid_c = "20260604-000102_222"
-
         # Register parent then child.
-        sup.register(dict(session_id=sid_p, cmd=["parent"]))
-        ack_c = sup.register(dict(session_id=sid_c, cmd=["child"],
+        ack_p = sup.register(dict(session_id="PARENT", cmd=["parent"]))
+        sid_p = ack_p["session_id"]
+        ack_c = sup.register(dict(session_id="CHILD", cmd=["child"],
                                   _derived_parent_sid=sid_p))
         check(ack_c.get("ok") is True, "kick-up-fin: child registers")
+        sid_c = ack_c["session_id"]
 
         # Tear down parent to simulate it finishing (it goes to sqlar).
         tok_p = sup._owner_tokens.get(sid_p, "")
@@ -783,9 +783,9 @@ def test_apply_kick_up_finished_parent():
         check(sid_p not in sup.indexes,
               "kick-up-fin: parent Index is gone after teardown")
 
-        # The child still knows its parent sid.
-        check(sup.sessions[sid_c].parent == sid_p,
-              "kick-up-fin: child still records parent sid")
+        # The child still knows its parent box_id.
+        check(str(sup.sessions[sid_c].parent_box_id) == sid_p,
+              "kick-up-fin: child still records parent box_id")
 
         # Manually set up a finished parent sqlar (it may have been cleaned up
         # if empty — ensure the sqlar exists by calling _sqlar_open).
@@ -807,8 +807,8 @@ def test_apply_kick_up_finished_parent():
         # it should still be in sessions dict if it had changes).
         # If the parent was cleaned up (no sqlar content), inject it back.
         if sid_p not in sup.sessions:
-            sup.sessions[sid_p] = m.Session(session_id=sid_p, cmd=["parent"],
-                                             live=False)
+            sup.sessions[sid_p] = m.Session(session_id=sid_p, box_id=int(sid_p),
+                                             cmd=["parent"], live=False)
 
         # Apply the child's change — should promote to parent sqlar.
         result = sup.review.apply(sid_c, [rel])
@@ -883,24 +883,20 @@ def test_register_reply_fd_nested_box():
             check(ready.wait(5), "reply-fd: loop started")
 
             # Register the parent session inline (no network path needed).
-            sid_parent = "20260606-000010_111"
-            ack_p = sup.register(dict(session_id=sid_parent, cmd=["parent"],
+            ack_p = sup.register(dict(session_id="PARENT", cmd=["parent"],
                                       root_tgid=os.getppid(),
                                       _register_pidfd=pidfd_parent,
                                       prov=dict(ppid=0, exe="/bin/sh", env={})))
             check(ack_p.get("ok") is True, "reply-fd: parent session registers ok")
+            sid_parent = ack_p["session_id"]
             # register() dup'd the pidfd; close our copy so it doesn't leak.
             try: os.close(pidfd_parent)
             except OSError: pass
             pidfd_parent = -1
 
-            # Pre-create the child's box_root directory so os.open() in register() works.
-            sid_child = "20260606-000010_222"
-            child_box_root = m.mnt_point() / sid_child
-            child_box_root.mkdir(parents=True, exist_ok=True)
-
-            # Send the child register and recvmsg the reply to capture the fd.
-            msg = dict(type="register", session_id=sid_child, cmd=["child"],
+            # Send the child register (kernel-derived parent = our process ancestry).
+            # _FakeMount.add_session creates the minted box_root so register's os.open works.
+            msg = dict(type="register", session_id="CHILD", cmd=["child"],
                        want_net=False)
             payload = (json.dumps(msg) + "\n").encode()
             own_pidfd = os.pidfd_open(os.getpid())
@@ -934,9 +930,12 @@ def test_register_reply_fd_nested_box():
             check(child_ack is not None, "reply-fd: child register got a reply")
             check(child_ack and child_ack.get("ok") is True,
                   f"reply-fd: child ack ok=True (got {child_ack!r})")
+            sid_child = child_ack.get("session_id") if child_ack else None
+            child_box_root = m.mnt_point() / str(sid_child) if sid_child else None
 
             # KEY ASSERTION: child is nested → should have received a mount fd.
-            parent_derived = sup.sessions[sid_child].parent if sid_child in sup.sessions else None
+            parent_derived = (sup.sessions[sid_child].parent_box_id
+                              if sid_child in sup.sessions else None)
             if child_mount_fd >= 0:
                 # The fd is an open_tree fd — a mount fd whose /proc/self/fd/N symlink
                 # resolves to "/" (the root of the cloned mount), not the source path.
@@ -1005,10 +1004,7 @@ def test_register_reply_fd_toplevel_no_fd():
         cs2_thread.start()
         check(ready2.wait(5), "reply-fd-top: loop started")
 
-        sid_top = "20260606-000011_444"
-        top_box_root = m.mnt_point() / sid_top
-        top_box_root.mkdir(parents=True, exist_ok=True)
-        msg_top = dict(type="register", session_id=sid_top, cmd=["top"], want_net=False)
+        msg_top = dict(type="register", session_id="TOPBOX", cmd=["top"], want_net=False)
         payload_top = (json.dumps(msg_top) + "\n").encode()
         own_pidfd2 = os.pidfd_open(os.getpid())
         top_fd = -1
@@ -1072,11 +1068,12 @@ def test_dotted_name_validation():
     check(not m.valid_dotted_name("a.B"), "dotted: lowercase segment rejected")
     check(not m.valid_dotted_name("A.b"), "dotted: lowercase second segment rejected")
     check(not m.valid_dotted_name("A-.B"), "dotted: trailing dash in segment rejected")
-    # valid_sid now accepts dotted names
-    check(m.valid_sid("A.B"), "valid_sid: dotted name accepted")
-    check(m.valid_sid("A.B.C"), "valid_sid: triple-dotted name accepted")
-    check(not m.valid_sid(".."), "valid_sid: '..' still rejected")
-    check(not m.valid_sid("A/B"), "valid_sid: slash still rejected")
+    # valid_sid is the INTERNAL box-key validator (decimal box_id): names are NOT keys.
+    check(not m.valid_sid("A.B"), "valid_sid: a NAME/display path is NOT a box key")
+    check(not m.valid_sid("A.B.C"), "valid_sid: dotted display path is NOT a box key")
+    check(not m.valid_sid(".."), "valid_sid: '..' rejected")
+    check(not m.valid_sid("A/B"), "valid_sid: slash rejected")
+    check(m.valid_sid("42"), "valid_sid: a decimal box_id IS a box key")
 
 
 def test_host_register_top_level_name():
@@ -1088,12 +1085,13 @@ def test_host_register_top_level_name():
         sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
         ack = sup.register(dict(session_id="ALPHA", cmd=["true"]))
         check(ack.get("ok") is True, "host-tl: register A ok")
-        check("ALPHA" in sup.sessions, "host-tl: ALPHA in sessions")
-        check(sup.sessions["ALPHA"].parent is None, "host-tl: ALPHA parent is None")
-        check(sup.sessions["ALPHA"].live, "host-tl: ALPHA is live")
-        # born timestamp set so age sorting works
-        born = sup.sessions["ALPHA"].born
-        check(bool(born), f"host-tl: born is set (got {born!r})")
+        sid = ack["session_id"]
+        check(sid in sup.sessions, "host-tl: box keyed by box_id is in sessions")
+        check(sup.sessions[sid].name == "ALPHA", "host-tl: NAME label is ALPHA")
+        check(sup.sessions[sid].parent_box_id is None, "host-tl: ALPHA parent is None")
+        check(sup.sessions[sid].live, "host-tl: ALPHA is live")
+        # age comes from on-disk ctime, not a parsed timestamp
+        check(sup.sessions[sid].started > 0, "host-tl: started (ctime) is set")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -1108,42 +1106,41 @@ def test_host_register_dotted_child():
         # Create parent A first.
         ack_a = sup.register(dict(session_id="ALPHA", cmd=["true"]))
         check(ack_a.get("ok") is True, "host-child: ALPHA registers ok")
-        # Create child A.B.
+        sid_a = ack_a["session_id"]
+        # Create child A.B (dotted display path: parent prefix must resolve).
         ack_ab = sup.register(dict(session_id="ALPHA.BETA", cmd=["true"]))
         check(ack_ab.get("ok") is True, f"host-child: ALPHA.BETA registers ok (got {ack_ab})")
-        check("ALPHA.BETA" in sup.sessions, "host-child: ALPHA.BETA in sessions")
-        check(sup.sessions["ALPHA.BETA"].parent == "ALPHA",
-              "host-child: ALPHA.BETA parent is ALPHA")
-        check(sup.sessions["ALPHA.BETA"].live, "host-child: ALPHA.BETA is live")
+        sid_ab = ack_ab["session_id"]
+        check(sup.sessions[sid_ab].name == "BETA", "host-child: child NAME is BETA")
+        check(str(sup.sessions[sid_ab].parent_box_id) == sid_a,
+              "host-child: child parent pointer is ALPHA's box_id")
+        check(sup.display_path(sid_ab) == "ALPHA.BETA",
+              "host-child: derived display path is ALPHA.BETA")
+        check(sup.sessions[sid_ab].live, "host-child: ALPHA.BETA is live")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
 def test_host_register_dotted_child_finished_parent():
-    """HOST: A.B with A finished (sqlar on disk) → parent resolves to A's sqlar."""
+    """HOST: A.B with A finished (sqlar on disk, name meta='ALPHA') → parent resolves to
+    A's box_id by NAME, child gets a parent pointer."""
     tmp = Path(tempfile.mkdtemp(prefix="cp-dn-finpar-"))
     _redirect_state(tmp)
     try:
         m.ensure_dirs()
         sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
-        # Write a minimal sqlar for the parent AFTER the Supervisor is created so that
-        # ALPHA exists on disk but is not a live session (discover_sessions already ran).
-        sp = m.sqlar_path("ALPHA")
-        sp.parent.mkdir(parents=True, exist_ok=True)
-        import sqlite3
-        conn = sqlite3.connect(str(sp))
-        conn.execute("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT)")
-        conn.execute("INSERT OR REPLACE INTO meta VALUES('born','20260101-000000_1')")
-        conn.commit(); conn.close()
-        # ALPHA is finished (sqlar exists, NOT live).
-        check(not (sup.sessions.get("ALPHA") and sup.sessions["ALPHA"].live),
-              "host-finpar: ALPHA not live")
-        check(m.sqlar_path("ALPHA").exists(), "host-finpar: ALPHA sqlar exists")
+        # Write a finished parent box on disk (numeric box_id stem, name meta='ALPHA')
+        # AFTER the Supervisor is created so it is not a live session.
+        pbid = m.mint_box_id()
+        m.sqlar_meta_set(m.sqlar_path(pbid), "name", "ALPHA")
+        check(sup.resolve_box("ALPHA") == str(pbid),
+              "host-finpar: ALPHA resolves to the finished box's box_id")
 
         ack = sup.register(dict(session_id="ALPHA.BETA", cmd=["true"]))
         check(ack.get("ok") is True, f"host-finpar: ALPHA.BETA registers ok (got {ack})")
-        check(sup.sessions["ALPHA.BETA"].parent == "ALPHA",
-              "host-finpar: parent is ALPHA (finished)")
+        sid_ab = ack["session_id"]
+        check(sup.sessions[sid_ab].parent_box_id == pbid,
+              "host-finpar: parent pointer is the finished ALPHA's box_id")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -1175,20 +1172,22 @@ def test_inbox_register_relname():
         # Register the parent (enclosing) box.
         ack_a = sup.register(dict(session_id="ALPHA", cmd=["parent"]))
         check(ack_a.get("ok") is True, "inbox: ALPHA registers ok")
+        sid_a = ack_a["session_id"]
 
-        # Simulate in-box child: relname=BETA, _derived_parent_sid=ALPHA (kernel-derived).
+        # Simulate in-box child: relname=BETA, _derived_parent_sid=ALPHA's box_id (kernel).
         ack_c = sup.register(dict(
-            session_id="20260606-000000_123",   # temp auto-sid (UI replaces it)
+            session_id=None,
             relname="BETA",
-            _derived_parent_sid="ALPHA",
+            _derived_parent_sid=sid_a,
             cmd=["child"]))
-        check(ack_c.get("ok") is True, f"inbox: ALPHA.BETA registers ok (got {ack_c})")
-        # UI should have created session ALPHA.BETA, not the temp sid.
-        check("ALPHA.BETA" in sup.sessions,
-              "inbox: resolved sid is ALPHA.BETA (not the temp auto-sid)")
-        check(sup.sessions["ALPHA.BETA"].parent == "ALPHA",
-              "inbox: ALPHA.BETA parent is ALPHA (kernel-derived, not overridable)")
-        check(sup.sessions["ALPHA.BETA"].live, "inbox: ALPHA.BETA is live")
+        check(ack_c.get("ok") is True, f"inbox: child registers ok (got {ack_c})")
+        sid_c = ack_c["session_id"]
+        check(sup.sessions[sid_c].name == "BETA", "inbox: child NAME is BETA")
+        check(str(sup.sessions[sid_c].parent_box_id) == sid_a,
+              "inbox: child parent is ALPHA (kernel-derived, not overridable)")
+        check(sup.display_path(sid_c) == "ALPHA.BETA",
+              "inbox: derived display path is ALPHA.BETA")
+        check(sup.sessions[sid_c].live, "inbox: child is live")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -1215,7 +1214,7 @@ def test_inbox_relname_with_dot_rejected():
 
 
 def test_inbox_relname_empty_default():
-    """IN-BOX: relname='' → default D<N> name assigned under enclosing box."""
+    """IN-BOX: relname='' → default A<n> auto-name assigned under enclosing box."""
     tmp = Path(tempfile.mkdtemp(prefix="cp-dn-default-"))
     _redirect_state(tmp)
     try:
@@ -1223,20 +1222,19 @@ def test_inbox_relname_empty_default():
         sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
         ack_a = sup.register(dict(session_id="ALPHA", cmd=["parent"]))
         check(ack_a.get("ok") is True, "inbox-default: ALPHA registers ok")
+        sid_a = ack_a["session_id"]
 
         ack_c = sup.register(dict(
-            session_id="20260606-000000_789",
-            relname="",       # empty = let the UI assign a default D<N>
-            _derived_parent_sid="ALPHA",
+            session_id=None,
+            relname="",       # empty = let the UI assign a default A<n>
+            _derived_parent_sid=sid_a,
             cmd=["child"]))
         check(ack_c.get("ok") is True, f"inbox-default: empty relname ok (got {ack_c})")
-        # The resolved sid must start with "ALPHA." and contain a "D" segment.
-        resolved = [s for s in sup.sessions if s.startswith("ALPHA.")]
-        check(len(resolved) == 1, f"inbox-default: exactly one ALPHA.* session (got {resolved})")
-        child_sid = resolved[0]
-        seg = child_sid.split(".", 1)[1]
-        check(seg.startswith("D"), f"inbox-default: segment starts with D (got {seg!r})")
-        check(sup.sessions[child_sid].parent == "ALPHA",
+        child_sid = ack_c["session_id"]
+        seg = sup.sessions[child_sid].name
+        check(seg.startswith("A") and seg[1:].isdigit(),
+              f"inbox-default: auto NAME is A<n> (got {seg!r})")
+        check(str(sup.sessions[child_sid].parent_box_id) == sid_a,
               "inbox-default: parent is ALPHA")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -1251,44 +1249,41 @@ def test_inbox_trust_kernel_parent_not_body():
         m.ensure_dirs()
         sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
         # Two parent boxes: ALPHA (live) and EVIL (live).
-        sup.register(dict(session_id="ALPHA", cmd=["alpha"]))
-        sup.register(dict(session_id="EVIL", cmd=["evil"]))
+        a = sup.register(dict(session_id="ALPHA", cmd=["alpha"]))["session_id"]
+        e = sup.register(dict(session_id="EVIL", cmd=["evil"]))["session_id"]
 
-        # A box inside ALPHA tries to forge its parent as EVIL via session_id.
-        # The kernel says _derived_parent_sid=ALPHA — that must win.
+        # A box inside ALPHA: relname is the ONLY box-supplied name; the parent comes
+        # from the kernel-derived _derived_parent_sid (ALPHA's box_id). A box-supplied
+        # session_id is ignored for naming entirely.
         ack = sup.register(dict(
             session_id="EVIL.SNEAKY",    # box tries to claim it's under EVIL
             relname="SNEAKY",
-            _derived_parent_sid="ALPHA", # kernel says it's inside ALPHA
+            _derived_parent_sid=a,       # kernel says it's inside ALPHA
             cmd=["sneaky"]))
         check(ack.get("ok") is True, "trust: SNEAKY registers (kernel parent honoured)")
-        # The resolved name should be ALPHA.SNEAKY, not EVIL.SNEAKY.
-        check("ALPHA.SNEAKY" in sup.sessions,
-              "trust: resolved as ALPHA.SNEAKY (kernel wins)")
-        check("EVIL.SNEAKY" not in sup.sessions,
-              "trust: EVIL.SNEAKY NOT created (box-body ignored)")
-        check(sup.sessions["ALPHA.SNEAKY"].parent == "ALPHA",
+        sid_s = ack["session_id"]
+        check(str(sup.sessions[sid_s].parent_box_id) == a,
               "trust: parent is kernel-derived ALPHA, not body-supplied EVIL")
+        check(sup.display_path(sid_s) == "ALPHA.SNEAKY",
+              "trust: derived display path is ALPHA.SNEAKY (kernel wins)")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def test_default_named_box_born_and_sort():
-    """A default D<N> or explicit named box gets a 'born' timestamp so age/sort works."""
+def test_default_named_box_age_from_ctime():
+    """A named box's age comes from its on-disk ctime (the numeric id carries no
+    timestamp), so started > 0 and age/sort works without any 'born' field."""
     tmp = Path(tempfile.mkdtemp(prefix="cp-dn-born-"))
     _redirect_state(tmp)
     try:
         m.ensure_dirs()
         sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
         ack = sup.register(dict(session_id="MYBOX", cmd=["true"]))
-        check(ack.get("ok") is True, "born: MYBOX registers ok")
-        s = sup.sessions["MYBOX"]
-        check(bool(s.born), f"born: Session.born is set (got {s.born!r})")
-        # parse_sid on a dotted/named sid returns (0, 0) → falls back to born.
-        check(m.parse_sid("MYBOX") == (0.0, 0),
-              "born: parse_sid('MYBOX') returns (0,0)")
+        check(ack.get("ok") is True, "age: MYBOX registers ok")
+        s = sup.sessions[ack["session_id"]]
+        check(not hasattr(s, "born"), "age: Session no longer has a 'born' field")
         check(s.started > 0,
-              f"born: Session.started uses born fallback > 0 (got {s.started})")
+              f"age: Session.started comes from ctime > 0 (got {s.started})")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -1322,34 +1317,39 @@ def test_dotted_path_safety():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def test_rename_to_dotted_name():
-    """rename() accepts dotted names; dotted rename with non-existent parent is rejected."""
+def test_rename_is_meta_only_label_write():
+    """rename() is a meta-only NAME label write: no file move, no id change. It works on
+    a LIVE box, rejects a dotted name (the dotted form is a derived display path, never
+    a stored label), and the box's identity (box_id key, sqlar path) is unchanged."""
     tmp = Path(tempfile.mkdtemp(prefix="cp-dn-rename-"))
     _redirect_state(tmp)
     try:
         m.ensure_dirs()
         sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
-        # Create and finish box ALPHA.
         ack = sup.register(dict(session_id="ALPHA", cmd=["true"]))
-        check(ack.get("ok") is True, "rename-dotted: ALPHA registers")
-        sup.unregister(dict(session_id="ALPHA", owner_token=ack["owner_token"],
-                            status="finished"))
-        # Create parent PARENT as a finished sqlar so ALPHA can rename to PARENT.ALPHA.
-        import sqlite3
-        ps = m.sqlar_path("PARENT")
-        ps.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(str(ps))
-        conn.execute("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT)")
-        conn.commit(); conn.close()
-        sup.sessions["PARENT"] = m.Session(session_id="PARENT", cmd=["p"], live=False)
-        # Rename ALPHA → PARENT.ALPHA (dotted target).
-        r = sup.rename("ALPHA", "PARENT.ALPHA")
-        check(r.get("ok") is True, f"rename-dotted: rename to PARENT.ALPHA ok (got {r})")
-        check(r.get("sid") == "PARENT.ALPHA", "rename-dotted: sid is PARENT.ALPHA")
-        # Rename to a dotted name whose parent doesn't exist: rejected.
-        r2 = sup.rename("PARENT", "MISSING.CHILD")
-        check(r2.get("ok") is False,
-              "rename-dotted: rename to MISSING.CHILD rejected (parent not exist)")
+        check(ack.get("ok") is True, "rename: ALPHA registers")
+        sid = ack["session_id"]
+        sp_before = m.sqlar_path(sid)
+        # Rename a LIVE box by box_id; identity (key + sqlar path) is unchanged.
+        r = sup.rename(sid, "BETA")
+        check(r.get("ok") is True, f"rename: live rename ok (got {r})")
+        check(r.get("name") == "BETA", "rename: new name reported")
+        check(sid in sup.sessions and sup.sessions[sid].name == "BETA",
+              "rename: NAME label updated in place, same box key")
+        check(m.sqlar_path(sid) == sp_before and sp_before.exists(),
+              "rename: NO file move (same sqlar path)")
+        check(m.sqlar_meta_get(sp_before, "name") == "BETA",
+              "rename: NAME persisted in meta")
+        # Resolve by the new name; the old name no longer resolves.
+        check(sup.resolve_box("BETA") == sid, "rename: resolves by new name")
+        check(sup.resolve_box("ALPHA") is None, "rename: old name no longer resolves")
+        # A dotted name is rejected (single-segment labels only).
+        r2 = sup.rename(sid, "X.Y")
+        check(r2.get("ok") is False, "rename: dotted name rejected")
+        # A sibling-name clash is rejected.
+        sup.register(dict(session_id="GAMMA", cmd=["true"]))
+        r3 = sup.rename(sid, "GAMMA")
+        check(r3.get("ok") is False, "rename: sibling NAME clash rejected")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -1423,195 +1423,169 @@ def test_box_tree_connector_skipped_when_prefix_has_no_box():
 
 # ── Feature 2: splice_delete ─────────────────────────────────────────────────
 
-def _make_finished_box(sup, sid, with_content=False):
-    """Create a minimal finished (non-live) box for splice_delete tests.
+def _make_finished_box(sup, sid, name=None, parent=None, with_content=False):
+    """Create a minimal finished (non-live) box for dissolve tests, keyed by the box
+    key str(box_id). `name` is the NAME label; `parent` is the parent's box_id (int).
     If with_content=True, insert a sqlar row so the box survives _maybe_remove_empty."""
     sp = m.sqlar_path(sid)
     sp.parent.mkdir(parents=True, exist_ok=True)
     import sqlite3
     conn = sqlite3.connect(str(sp))
     conn.execute("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT)")
-    conn.execute("INSERT OR REPLACE INTO meta VALUES('born','20260101-000000_1')")
+    if name is not None:
+        conn.execute("INSERT OR REPLACE INTO meta VALUES('name',?)", (name,))
+    if parent is not None:
+        conn.execute("INSERT OR REPLACE INTO meta VALUES('parent_box_id',?)", (str(parent),))
     if with_content:
         conn.execute(
             "CREATE TABLE IF NOT EXISTS sqlar"
             "(name TEXT PRIMARY KEY, mode INT, mtime INT, sz INT, data BLOB)")
         conn.execute("INSERT OR REPLACE INTO sqlar VALUES('proof.txt',33188,0,4,X'41424344')")
     conn.commit(); conn.close()
-    sup.sessions[sid] = m.Session(session_id=sid, cmd=["test"], live=False,
-                                  shm_dir=str(m.live_dir(sid)))
+    sup.sessions[sid] = m.Session(
+        session_id=sid, box_id=int(sid), name=name or "", cmd=["test"], live=False,
+        parent_box_id=(int(parent) if parent is not None else None),
+        shm_dir=str(m.live_dir(sid)))
 
 
-def test_splice_delete_happy_path():
-    """splice_delete('A.B') removes A.B and re-parents A.B.C→A.C, A.B.C.D→A.C.D.
-    Content is preserved; A.C's parent_sid meta resolves to A."""
+def test_dissolve_happy_path():
+    """dissolve(B) removes B and re-parents its DIRECT child C to B's own parent A (a
+    pointer write — no file moves, no id changes). Grandchild D stays under C. Content
+    and box_ids are preserved; C's parent_box_id meta now points at A."""
     tmp = Path(tempfile.mkdtemp(prefix="cp-splice-"))
     _redirect_state(tmp)
     try:
         m.ensure_dirs()
         sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
+        # Tree: A(1) ← B(2) ← C(3) ← D(4)
+        _make_finished_box(sup, "1", name="A")
+        _make_finished_box(sup, "2", name="B", parent=1)
+        _make_finished_box(sup, "3", name="C", parent=2, with_content=True)
+        _make_finished_box(sup, "4", name="D", parent=3, with_content=True)
 
-        # A: top-level parent (must exist so rename allows A.B.C→A.C).
-        _make_finished_box(sup, "A", with_content=False)
-        # A.B: the splice target — no content (empty sqlar, no flows, no upper).
-        _make_finished_box(sup, "A.B", with_content=False)
-        # A.B.C: child with content.
-        _make_finished_box(sup, "A.B.C", with_content=True)
-        m.sqlar_meta_set(m.sqlar_path("A.B.C"), "parent_sid", "A.B")
-        # A.B.C.D: grandchild with content.
-        _make_finished_box(sup, "A.B.C.D", with_content=True)
-        m.sqlar_meta_set(m.sqlar_path("A.B.C.D"), "parent_sid", "A.B.C")
+        r = sup.dissolve("2")
+        check(r.get("ok") is True, f"dissolve-happy: dissolve ok (got {r})")
+        check(r.get("deleted") == "2", "dissolve-happy: deleted is box 2 (B)")
+        check(r.get("reparented") == ["3"], f"dissolve-happy: only direct child C re-parented (got {r.get('reparented')})")
 
-        r = sup.splice_delete("A.B")
-        check(r.get("ok") is True, f"splice-happy: splice_delete ok (got {r})")
-        check(r.get("deleted") == "A.B", "splice-happy: deleted is A.B")
-        check(len(r.get("renamed", [])) == 2, f"splice-happy: 2 renames (got {r.get('renamed')})")
+        # B is gone; C and D remain with the SAME box_ids (no moves).
+        check("2" not in sup.sessions, "dissolve-happy: B not in sessions")
+        check(not m.sqlar_path("2").exists(), "dissolve-happy: 2.sqlar removed")
+        check(m.sqlar_path("3").exists(), "dissolve-happy: C (3.sqlar) kept, same id")
+        check(m.sqlar_path("4").exists(), "dissolve-happy: D (4.sqlar) kept, same id")
 
-        # A.B is gone.
-        check("A.B" not in sup.sessions, "splice-happy: A.B not in sessions")
-        check(not m.sqlar_path("A.B").exists(), "splice-happy: A.B.sqlar removed")
+        # Content preserved on C.
+        check(m.sqlar_content(m.sqlar_path("3"), "proof.txt") == b"ABCD",
+              "dissolve-happy: C content intact")
 
-        # Old paths gone.
-        check("A.B.C" not in sup.sessions, "splice-happy: A.B.C not in sessions")
-        check(not m.sqlar_path("A.B.C").exists(), "splice-happy: A.B.C.sqlar gone")
-        check("A.B.C.D" not in sup.sessions, "splice-happy: A.B.C.D not in sessions")
-        check(not m.sqlar_path("A.B.C.D").exists(), "splice-happy: A.B.C.D.sqlar gone")
-
-        # New paths exist.
-        check(m.sqlar_path("A.C").exists(), "splice-happy: A.C.sqlar exists")
-        check(m.sqlar_path("A.C.D").exists(), "splice-happy: A.C.D.sqlar exists")
-
-        # Content is preserved.
-        import sqlite3
-        conn = sqlite3.connect(str(m.sqlar_path("A.C")))
-        row = conn.execute("SELECT data FROM sqlar WHERE name='proof.txt'").fetchone()
-        conn.close()
-        check(row is not None and row[0] == b"ABCD", f"splice-happy: A.C content intact (got {row})")
-
-        # parent_sid meta updated correctly.
-        ac_parent = m.sqlar_meta_get(m.sqlar_path("A.C"), "parent_sid")
-        check(ac_parent == "A", f"splice-happy: A.C parent_sid='A' (got {ac_parent!r})")
-        acd_parent = m.sqlar_meta_get(m.sqlar_path("A.C.D"), "parent_sid")
-        check(acd_parent == "A.C", f"splice-happy: A.C.D parent_sid='A.C' (got {acd_parent!r})")
-
+        # C re-parented to A (1); D still under C (3).
+        check(m.sqlar_meta_get(m.sqlar_path("3"), "parent_box_id") == "1",
+              "dissolve-happy: C parent_box_id is now A (1)")
+        check(m.sqlar_meta_get(m.sqlar_path("4"), "parent_box_id") == "3",
+              "dissolve-happy: D parent_box_id unchanged (still C=3)")
+        # Derived display path reflects the splice: A.C, A.C.D.
+        check(sup.display_path("3") == "A.C", "dissolve-happy: C display path is A.C")
+        check(sup.display_path("4") == "A.C.D", "dissolve-happy: D display path is A.C.D")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def test_splice_delete_nonempty_finalizes_copydown():
-    """splice_delete now ALLOWS a non-empty box: its changes are finalized first. With
-    no matching rule, A.B's file is discarded — copied DOWN into the immediate child
-    A.B.C that lacks it — then A.B is spliced out (A.B.C → A.C). The child keeps the
-    inherited file (now its own); A.B is gone."""
+def test_dissolve_nonempty_finalizes_copydown():
+    """dissolve ALLOWS a non-empty box: its changes are finalized first. With no
+    matching rule, B's file is discarded — copied DOWN into the immediate child C that
+    lacks it — then B is dissolved and C re-parented to A. C keeps the inherited file."""
     tmp = Path(tempfile.mkdtemp(prefix="cp-splice-changes-"))
     _redirect_state(tmp)
     try:
         m.ensure_dirs()
         sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
-        _make_finished_box(sup, "A", with_content=False)
-        _make_finished_box(sup, "A.B", with_content=True)    # has 'proof.txt' (b"ABCD")
-        m.sqlar_meta_set(m.sqlar_path("A.B"), "parent_sid", "A")
-        _make_finished_box(sup, "A.B.C", with_content=False)  # inherits, owns nothing
-        m.sqlar_meta_set(m.sqlar_path("A.B.C"), "parent_sid", "A.B")
+        _make_finished_box(sup, "1", name="A")
+        _make_finished_box(sup, "2", name="B", parent=1, with_content=True)  # 'proof.txt'
+        _make_finished_box(sup, "3", name="C", parent=2)                     # inherits
 
-        r = sup.splice_delete("A.B")
-        check(r.get("ok") is True, f"splice-nonempty: now succeeds (got {r})")
-        check(r.get("deleted") == "A.B", "splice-nonempty: A.B deleted")
-        check(not m.sqlar_path("A.B").exists(), "splice-nonempty: A.B.sqlar gone")
-        # A.B.C was spliced to A.C and now OWNS the copied-down file.
-        check(m.sqlar_path("A.C").exists(), "splice-nonempty: A.C.sqlar exists")
-        check(m.sqlar_content(m.sqlar_path("A.C"), "proof.txt") == b"ABCD",
-              "splice-nonempty: A.B's file copied down into the child (A.C)")
-        ac_parent = m.sqlar_meta_get(m.sqlar_path("A.C"), "parent_sid")
-        check(ac_parent == "A", f"splice-nonempty: A.C re-parented to A (got {ac_parent!r})")
+        r = sup.dissolve("2")
+        check(r.get("ok") is True, f"dissolve-nonempty: succeeds (got {r})")
+        check(r.get("deleted") == "2", "dissolve-nonempty: B deleted")
+        check(not m.sqlar_path("2").exists(), "dissolve-nonempty: 2.sqlar gone")
+        # C now OWNS the copied-down file and is re-parented to A.
+        check(m.sqlar_content(m.sqlar_path("3"), "proof.txt") == b"ABCD",
+              "dissolve-nonempty: B's file copied down into the child C")
+        check(m.sqlar_meta_get(m.sqlar_path("3"), "parent_box_id") == "1",
+              "dissolve-nonempty: C re-parented to A (1)")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def test_splice_delete_refused_collision():
-    """splice_delete refuses if a rename target already exists (no partial renames)."""
-    tmp = Path(tempfile.mkdtemp(prefix="cp-splice-coll-"))
+def test_dissolve_top_level_child_becomes_top_level():
+    """Dissolving a TOP-LEVEL box re-parents its direct children to None (top-level):
+    the parent_box_id meta is cleared, not pointed elsewhere."""
+    tmp = Path(tempfile.mkdtemp(prefix="cp-splice-toplevel-"))
     _redirect_state(tmp)
     try:
         m.ensure_dirs()
         sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
-        _make_finished_box(sup, "A", with_content=False)
-        _make_finished_box(sup, "A.B", with_content=False)
-        _make_finished_box(sup, "A.B.C", with_content=True)
-        # Pre-create A.C (the rename target) so there's a collision.
-        _make_finished_box(sup, "A.C", with_content=False)
+        _make_finished_box(sup, "1", name="A")                 # top-level
+        _make_finished_box(sup, "2", name="C", parent=1, with_content=True)
 
-        r = sup.splice_delete("A.B")
-        check(r.get("ok") is False, f"splice-coll: refused (got {r})")
-        check("collide" in (r.get("error") or "").lower() or "already exists" in (r.get("error") or ""),
-              f"splice-coll: error mentions collision (got {r.get('error')!r})")
-        # A.B.C must still be present (no partial rename).
-        check(m.sqlar_path("A.B.C").exists(), "splice-coll: A.B.C.sqlar not renamed (no partial)")
+        r = sup.dissolve("1")
+        check(r.get("ok") is True, f"dissolve-top: ok (got {r})")
+        check(r.get("reparented") == ["2"], "dissolve-top: C re-parented")
+        check(not m.sqlar_path("1").exists(), "dissolve-top: A removed")
+        check(sup.sessions["2"].parent_box_id is None,
+              "dissolve-top: C is now top-level (parent_box_id None)")
+        check(m.sqlar_meta_get(m.sqlar_path("2"), "parent_box_id") in (None, ""),
+              "dissolve-top: C parent_box_id meta cleared")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def test_splice_delete_refused_live_descendant():
-    """splice_delete refuses if any descendant is live/running."""
+def test_dissolve_refused_when_target_live():
+    """dissolve refuses to dissolve a box that is itself live/running (but a LIVE
+    descendant is fine — re-parenting is a pointer write)."""
     tmp = Path(tempfile.mkdtemp(prefix="cp-splice-live-"))
     _redirect_state(tmp)
     try:
         m.ensure_dirs()
         sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
-        _make_finished_box(sup, "A", with_content=False)
-        _make_finished_box(sup, "A.B", with_content=False)
-        _make_finished_box(sup, "A.B.C", with_content=True)
-        # Make A.B.C appear live by setting live=True and creating an up/ dir.
-        ld = m.live_dir("A.B.C"); ld.mkdir(parents=True, exist_ok=True)
-        (ld / "up").mkdir(parents=True, exist_ok=True)
-        sup.sessions["A.B.C"].live = True
-        sup.sessions["A.B.C"].shm_dir = str(ld)
+        _make_finished_box(sup, "1", name="A")
+        _make_finished_box(sup, "2", name="B", parent=1)
+        # Make B itself appear live.
+        ld = m.live_dir("2"); (ld / "up").mkdir(parents=True, exist_ok=True)
+        sup.sessions["2"].live = True
+        sup.sessions["2"].run_pid = os.getpid()   # alive so _live() is True
+        try: sup.sessions["2"].run_pidfd = os.pidfd_open(os.getpid())
+        except Exception: pass
 
-        r = sup.splice_delete("A.B")
-        check(r.get("ok") is False, f"splice-live: refused (got {r})")
+        r = sup.dissolve("2")
+        check(r.get("ok") is False, f"dissolve-live: refused (got {r})")
         check("running" in (r.get("error") or "").lower(),
-              f"splice-live: error mentions running (got {r.get('error')!r})")
-        # No renames occurred.
-        check(m.sqlar_path("A.B.C").exists(), "splice-live: A.B.C.sqlar untouched")
+              f"dissolve-live: error mentions running (got {r.get('error')!r})")
+        check(m.sqlar_path("2").exists(), "dissolve-live: 2.sqlar untouched")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def test_splice_delete_shallowest_first_ordering():
-    """A 3-level subtree splices correctly, proving shallowest-first satisfies
-    rename()'s parent-exists guard: A.B.C→A.C (parent A) before A.B.C.D→A.C.D
-    (parent A.C, which must exist first)."""
-    tmp = Path(tempfile.mkdtemp(prefix="cp-splice-order-"))
+def test_dissolve_live_descendant_allowed():
+    """A LIVE direct child is re-parented by pointer (no refusal): dissolving B while C
+    is live still succeeds and C's parent pointer is updated in place."""
+    tmp = Path(tempfile.mkdtemp(prefix="cp-splice-livedesc-"))
     _redirect_state(tmp)
     try:
         m.ensure_dirs()
         sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
-        _make_finished_box(sup, "A", with_content=False)
-        _make_finished_box(sup, "A.B", with_content=False)
-        _make_finished_box(sup, "A.B.C", with_content=True)
-        _make_finished_box(sup, "A.B.C.D", with_content=True)
+        _make_finished_box(sup, "1", name="A")
+        _make_finished_box(sup, "2", name="B", parent=1)
+        _make_finished_box(sup, "3", name="C", parent=2, with_content=True)
+        # C is live.
+        ld = m.live_dir("3"); (ld / "up").mkdir(parents=True, exist_ok=True)
+        sup.sessions["3"].live = True
 
-        r = sup.splice_delete("A.B")
-        check(r.get("ok") is True, f"splice-order: splice_delete ok (got {r})")
-
-        # All expected targets exist.
-        check(m.sqlar_path("A.C").exists(), "splice-order: A.C.sqlar created")
-        check(m.sqlar_path("A.C.D").exists(), "splice-order: A.C.D.sqlar created")
-
-        # Verify rename order in result list (A.B.C → A.C before A.B.C.D → A.C.D).
-        renames = r.get("renamed", [])
-        old_names = [pair[0] for pair in renames]
-        check("A.B.C" in old_names, "splice-order: A.B.C in renamed list")
-        check("A.B.C.D" in old_names, "splice-order: A.B.C.D in renamed list")
-        check(old_names.index("A.B.C") < old_names.index("A.B.C.D"),
-              "splice-order: A.B.C renamed before A.B.C.D (shallowest-first)")
-
-        # parent_sid chain is correct.
-        check(m.sqlar_meta_get(m.sqlar_path("A.C"), "parent_sid") == "A",
-              "splice-order: A.C parent_sid='A'")
-        check(m.sqlar_meta_get(m.sqlar_path("A.C.D"), "parent_sid") == "A.C",
-              "splice-order: A.C.D parent_sid='A.C'")
-
+        r = sup.dissolve("2")
+        check(r.get("ok") is True, f"dissolve-livedesc: succeeds (got {r})")
+        check(sup.sessions["3"].parent_box_id == 1,
+              "dissolve-livedesc: live child C re-parented to A in place")
+        check(m.sqlar_meta_get(m.sqlar_path("3"), "parent_box_id") == "1",
+              "dissolve-livedesc: C's parent_box_id meta updated")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -1645,18 +1619,18 @@ if __name__ == "__main__":
               test_inbox_relname_with_dot_rejected,
               test_inbox_relname_empty_default,
               test_inbox_trust_kernel_parent_not_body,
-              test_default_named_box_born_and_sort,
+              test_default_named_box_age_from_ctime,
               test_dotted_path_safety,
-              test_rename_to_dotted_name,
+              test_rename_is_meta_only_label_write,
               # Feature 1: box-list tree
               test_box_tree_rows_indented_connectors_skipped,
               test_box_tree_connector_skipped_when_prefix_has_no_box,
-              # Feature 2: splice_delete
-              test_splice_delete_happy_path,
-              test_splice_delete_nonempty_finalizes_copydown,
-              test_splice_delete_refused_collision,
-              test_splice_delete_refused_live_descendant,
-              test_splice_delete_shallowest_first_ordering):
+              # Feature 2: dissolve (pointer re-parenting)
+              test_dissolve_happy_path,
+              test_dissolve_nonempty_finalizes_copydown,
+              test_dissolve_top_level_child_becomes_top_level,
+              test_dissolve_refused_when_target_live,
+              test_dissolve_live_descendant_allowed):
         print(f"\n== {t.__name__} ==")
         try:
             t()
