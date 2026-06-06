@@ -2469,12 +2469,26 @@ def _build_overlay_ops():
                                 except OSError:
                                     data = bytearray()
                 if data is None:
-                    # No own-overlay entry: seed from lower layer (host or parent box).
+                    # No own-overlay entry: seed from the lower layer (host or parent box).
                     layer, ap, _st = self._lower_resolve(sid, rel)
                     if layer in ("lower", "upper") and ap is not None:
                         try:
                             data = bytearray(open(ap, "rb").read())
                         except OSError:
+                            data = bytearray()
+                    elif layer in ("lower", "upper"):
+                        # ap is None: the lower file is EVICTED in an ancestor box (bytes
+                        # live in that session's sqlar row, not on disk). Fetch them so a
+                        # copy-up via the buffer doesn't silently start from empty.
+                        owning = self._owning_evicted_sid(sid, rel)
+                        if owning is not None:
+                            orow = self._index(owning).file_row(rel)
+                            if orow is not None and orow[4] is not None:
+                                blob = bytes(orow[4]); osz = orow[2]
+                                content = (blob if len(blob) == osz
+                                           else zlib.decompress(blob))
+                                data = bytearray(content)
+                        if data is None:
                             data = bytearray()
                     else:
                         data = bytearray()
@@ -3276,6 +3290,24 @@ def _build_overlay_ops():
                 return (pyfuse3.FileInfo(fh=nfh, direct_io=False, keep_cache=False),
                         self._entry(ino, st))
             def upper_op(sid, rel, upath, wid, idx):
+                # Tier-0: a new/small file buffers in RAM and deflates into the sqlar
+                # row on release — the common case (create()+write()+close, e.g. nearly
+                # everything ./configure writes) never materializes a pool file.
+                if self._should_buffer_write(sid, rel, flags, idx):
+                    wb = self._create_write_buffer(sid, rel, idx, flags, ctx)
+                    m = stat_mod.S_IFREG | (mode & 0o7777)
+                    if wb["mode"] != m:            # honor the explicit create() mode
+                        wb["mode"] = m
+                        idx.set_entry(rel, "file", m, wb["wid"], "create")
+                    with self._lock:
+                        nfh = self._next_fh; self._next_fh += 1
+                    self._wbuf[nfh] = wb
+                    self._wbuf_key[(sid, rel)] = nfh
+                    ino = self._ino_for(sid, rel)
+                    self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
+                    return (pyfuse3.FileInfo(fh=nfh, direct_io=False, keep_cache=False),
+                            self._entry(ino, self._buffer_stat(sid, rel)))
+                # Tier-1: large / forced-to-disk — pool blob + fd, as before.
                 # File bytes go to the pool blob, not up/<rel>. _new_file_blob
                 # handles whiteout removal and index set_entry.
                 try:

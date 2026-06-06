@@ -81,11 +81,11 @@ def test_readthrough_and_create():
         # create a new file
         r = fx.sh("mkdir -p sub && echo hello > sub/new.txt && cat sub/new.txt")
         check(r.returncode == 0 and r.stdout == "hello\n", "create file in new subdir")
-        # file bytes are now in the pool, not up/<rel>
-        blob = m.blob_path(fx.index.box_id, fx.index.row_id("sub/new.txt"))
-        check(blob.read_bytes() == b"hello\n",
-              "created file bytes landed in pool blob")
+        # a created small file buffers in RAM and deflates into the sqlar row on close
+        # (no pool blob); it reads back through the mount.
         check(fx.index.kind_of("sub/new.txt") == "file", "index: created file = 'file'")
+        check(fx.sh("cat sub/new.txt").stdout == "hello\n",
+              "created file reads back via overlay")
         check(fx.index.kind_of("sub") == "dir", "index: parent dir tracked")
     finally:
         fx.stop()
@@ -105,10 +105,10 @@ def test_copyup_modify():
         target = "etc_copy_test_marker"
         r2 = fx.sh(f"printf 'x' > {target}")
         check(r2.returncode == 0, "create marker via overlay")
-        # file bytes are in the pool blob, not up/<rel>
-        rid = fx.index.row_id(target)
-        check(rid is not None and m.blob_path(fx.index.box_id, rid).exists(),
-              "marker blob in pool")
+        # small file written via the overlay is captured (buffered, deflated into the
+        # sqlar row on close — no pool blob); read it back through the mount.
+        check(fx.index.kind_of(target) == "file", "marker captured in overlay index")
+        check(fx.sh(f"cat {target}").stdout == "x", "marker reads back via overlay")
     finally:
         fx.stop()
 
@@ -321,11 +321,10 @@ def test_nested_lower_chaining():
         check(r.stdout == "from-parent\nfrom-child\n",
               "child copies up the parent file and appends to its own copy")
         check(cidx.kind_of("pfile.txt") == "file", "child upper captured the file")
-        # parent's pool blob must be untouched (child wrote to its own blob)
-        p_rid = pidx.row_id("pfile.txt")
-        p_blob = m.blob_path(pidx.box_id, p_rid) if p_rid is not None else None
-        check(p_blob is not None and p_blob.read_bytes() == b"from-parent\n",
-              "parent's pool blob is untouched by the child's write")
+        # the parent's file is unchanged — the child copied up into its own overlay.
+        # Read through the parent's mount (tier-agnostic: serves row or blob).
+        check(sh(proot, "cat pfile.txt").stdout == "from-parent\n",
+              "parent's file untouched by the child's copy-up")
         # (3) a parent whiteout of a host file hides it from the child too.
         if Path("/etc/hostname").exists():
             sh(proot, "rm etc/hostname")
@@ -489,14 +488,12 @@ def test_passthrough_kicks_up_to_parent():
         check(r.returncode == 0 and r.stdout == "kicked\n",
               "kick-up: child write returns correct content")
 
-        # File must be in the PARENT's pool, not the child's.
-        p_rid = pidx.row_id("sub/f.txt")
+        # File must be captured in the PARENT's overlay, not the child's. Read through
+        # the parent's mount (tier-agnostic: serves the row or a blob).
         check(pidx.kind_of("sub/f.txt") == "file",
               "kick-up: parent index has the file")
-        p_blob = m.blob_path(pidx.box_id, p_rid) if p_rid is not None else None
-        check(p_blob is not None and p_blob.exists() and
-              p_blob.read_bytes() == b"kicked\n",
-              "kick-up: parent pool blob has the correct bytes")
+        check(sh(proot, "cat sub/f.txt").stdout == "kicked\n",
+              "kick-up: parent has the kicked-up bytes")
 
         # Child's index must have nothing for the file.
         check(cidx.kind_of("sub/f.txt") is None,
@@ -824,6 +821,34 @@ def test_terminated_parent_reads():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_wbuf_create_buffers():
+    """A brand-new file made via create() (the common create+write+close, e.g. nearly
+    everything ./configure writes) buffers in RAM and deflates straight into the sqlar
+    row on close — it NEVER materialises a pool blob, yet reads back through the mount."""
+    fx = MountFixture()
+    try:
+        fx.start()
+        r = fx.sh("echo hi > created.txt")          # create() path (new file)
+        check(r.returncode == 0, "create new file via create()")
+        rid = fx.index.row_id("created.txt")
+        check(rid is not None and fx.index.kind_of("created.txt") == "file",
+              "created file is tracked as a file")
+        check(not m.blob_path(fx.index.box_id, rid).exists(),
+              "created file made NO pool blob (RAM->row)")
+        row = fx.index.file_row("created.txt")
+        check(row is not None and row[4] is not None,
+              "created file's bytes are in the evicted sqlar row")
+        check(fx.sh("cat created.txt").stdout == "hi\n",
+              "created file reads back correctly via the mount")
+        # mode is honored (create 0600), proving the create() mode reached the buffer
+        r = fx.sh("install -m 600 /dev/null cmode.txt 2>/dev/null; "
+                  "printf data > cmode.txt; stat -c %a cmode.txt")
+        check(r.returncode == 0 and r.stdout.strip() == "600",
+              "create() mode is preserved through the buffer")
+    finally:
+        fx.stop()
+
+
 if __name__ == "__main__":
     for t in (test_readthrough_and_create, test_copyup_modify,
               test_otrunc_rewrite_shorter, test_delete_whiteout,
@@ -836,7 +861,8 @@ if __name__ == "__main__":
               test_passthrough_kicks_up_to_parent,
               test_wbuf_small_new_file, test_wbuf_otrunc_rewrite,
               test_wbuf_stat_coherence, test_wbuf_existing_file_preserve,
-              test_wbuf_spill, test_terminated_parent_reads):
+              test_wbuf_spill, test_wbuf_create_buffers,
+              test_terminated_parent_reads):
         print(f"\n== {t.__name__} ==")
         try:
             t()
