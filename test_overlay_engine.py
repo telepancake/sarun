@@ -230,7 +230,9 @@ def test_rename():
 
 def test_lower_symlink_copyup_preserves_type():
     """A lower (host) symlink that gets copied up (e.g. setattr on it) must remain a
-    symlink in the upper, NOT be materialized as its target's bytes."""
+    symlink — recorded as a symlink ROW with its target preserved, NOT materialized
+    as its target's bytes. Under the no-mirror invariant there is no on-disk up/<rel>
+    artifact; the copy-up records the kind+target in the Index/row."""
     fx = MountFixture()
     try:
         fx.start()
@@ -246,15 +248,27 @@ def test_lower_symlink_copyup_preserves_type():
         if host_link is None:
             check(True, "lower-symlink: no host symlink found (skipped)"); return
         rel = host_link.lstrip("/")
-        # touch -h sets mtime on the link itself (setattr utime, follow=False)
+        want_target = os.readlink(host_link).encode("utf-8", "surrogateescape")
+        # touch -h sets mtime on the link itself (setattr utime, follow=False) — this
+        # forces a copy-up of the lower symlink into this box's overlay.
         r = fx.sh(f"touch -h -d '2001-01-01' {rel} 2>&1; echo rc=$?")
-        # the upper artifact (if materialized) must be a symlink, not a file
+        # NEVER an on-disk artifact (no mirror); the link is a row.
         up_art = fx.up / rel
-        if up_art.exists() or up_art.is_symlink():
-            check(up_art.is_symlink(),
-                  "copied-up lower symlink stays a symlink (not target bytes)")
+        check(not up_art.exists() and not up_art.is_symlink(),
+              "copy-up of lower symlink leaves NO on-disk up/<rel> artifact")
+        # If a copy-up happened, the Index must record it as a symlink with the
+        # ORIGINAL target preserved (not the target's bytes as a file).
+        if fx.index.kind_of(rel) is not None:
+            check(fx.index.kind_of(rel) == "symlink",
+                  "copied-up lower symlink stays kind=symlink (not a file)")
+            check(fx.index.symlink_target(rel) == want_target,
+                  "copied-up lower symlink preserves its target in the row")
+            # the mount still serves the original target via readlink.
+            rl = fx.sh(f"readlink {rel}")
+            check(rl.stdout.strip().encode("utf-8", "surrogateescape") == want_target,
+                  "mount readlink returns the preserved target")
         else:
-            check(True, "lower symlink not materialized (no copy-up needed) — ok")
+            check(True, "lower symlink not copied up (no setattr captured) — ok")
     finally:
         fx.stop()
 

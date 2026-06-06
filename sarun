@@ -150,11 +150,17 @@ def live_dir(box_id) -> Path:
 # A box's regular-file BYTES live in a flat pool, addressed not by host path but
 # by <box_id>/<shard>/<row_id>: the box's stable id (filename-independent, so a
 # box rename never moves its bytes) and the sqlar entry's row id (stable across
-# renames once we update the name in place). This decouples the on-disk layout
-# from the logical tree — no mirrored directories, no symlink-escape surface on a
-# planted upper, and a box's whole working set drops as a unit when its <box_id>
-# dir is removed. The shard level keeps any one directory from collecting the
-# millions of inodes a large box can produce.
+# renames once we update the name in place). The NO-MIRROR invariant now holds for
+# ALL kinds: regular files in this pool, and dirs + symlinks ENTIRELY in the sqlar
+# rows (dir mode/mtime; symlink target written into the row at creation) served
+# from the in-RAM Index mirror — NOTHING is materialized under up/<rel>. The only
+# on-disk artifact in up/ is the empty `up/` dir itself, the box-backing sentinel
+# that gates discovery ((d/"up").is_dir()). This eliminates the last mirrored-on-
+# disk surface and the symlink-escape surface a planted upper symlink would expose:
+# readlink/getattr/readdir answer from the row/mirror, never os.readlink/lstat/
+# scandir of an artifact. A box's whole working set drops as a unit when its
+# <box_id> dir is removed; the shard level keeps any one directory from collecting
+# the millions of inodes a large box can produce.
 POOL_SHARDS = 1024
 # The AT-REST fold threshold: at consolidate/promote, a regular file at least this
 # large is kept as a PERMANENT pool file (the row stays resident: data NULL, bytes
@@ -4367,8 +4373,12 @@ def _is_overlay_marker(name: str) -> bool:
     return name == ".wh..opq" or name.startswith(".wh..wh.")
 
 def upper_has_changes(up: Path) -> bool:
-    """True if the overlay upper holds any real change (a created/modified file or
-    a whiteout deletion), ignoring the overlay's own opaque markers."""
+    """True if the overlay upper holds a STRAY on-disk artifact (a leftover file).
+    Under the no-mirror invariant up/ holds no change artifacts at all — files live
+    in the content pool, dirs/symlinks live in the sqlar rows — so this normally
+    returns False and the box's reviewable state is gauged from its sqlar
+    (sqlar_list/has_flows) by every caller. Kept as a defensive stray-artifact
+    detector (and to recognize a pre-invariant orphan tree)."""
     for root, _dirs, files in os.walk(up, onerror=lambda _e: None):
         if any(not _is_overlay_marker(nm) for nm in files):
             return True

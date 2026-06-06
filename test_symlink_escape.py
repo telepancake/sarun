@@ -1,15 +1,22 @@
 #!/usr/bin/env python3
 """Adversarial test: prove the DAEMON never follows a sandbox-planted symlink onto
-its host target (O_NOFOLLOW / follow_symlinks=False on every upper-path
+its host target (O_NOFOLLOW / follow_symlinks=False on every host-path
 open/stat/truncate/chmod/chown/utime).
 
 Why drive the daemon directly: in production bwrap binds <mnt>/<sid> as `/`, so an
 *absolute* symlink target resolves INSIDE the sandbox overlay, and the kernel
 follows symlinks against the sandbox root — the host is unreachable to the child.
-The residual risk is the *daemon itself* dereferencing a symlink
-upper-artifact while servicing copy-up or setattr. We exercise exactly that: plant
-a symlink in the upper that points at a host file, then invoke the daemon's
-write-side handlers on that path and assert the host target is untouched.
+The residual risk is the *daemon itself* dereferencing a symlink while servicing
+copy-up or setattr.
+
+NOTE — no-mirror invariant: a box-created symlink no longer materializes an on-disk
+up/<rel> artifact; its target lives ENTIRELY in the sqlar row and is served from
+the in-RAM Index mirror. So copy-up/readlink/setattr on an overlay symlink never
+touch a disk symlink at all (there is none): readlink returns the row target, and
+setattr updates the row, not an artifact. This test stays valid as the guard for
+the host-path surface: we still plant a symlink whose target is a host file and
+invoke the daemon's write-side handlers on that path, asserting the host target is
+untouched (the handlers must never dereference the link onto the host).
 
     /home/user/venv/bin/python test_symlink_escape.py
 """
@@ -42,7 +49,7 @@ def run():
     import pyfuse3
     tmp = Path(tempfile.mkdtemp(prefix="ovl-esc-"))
     os.environ["XDG_STATE_HOME"] = str(tmp / "state")    # keep the single db local
-    live = tmp / "live"; sid = "20260604-000000_2"
+    live = tmp / "live"; sid = "2"     # box_id is an integer identity (post-refactor)
     backing = live / sid; up = backing / "up"; up.mkdir(parents=True)
     target = tmp / "HOST_SECRET"; target.write_text("ORIGINAL\n")
     orig = target.read_text()
@@ -52,14 +59,20 @@ def run():
     ops = Ops("/", on_event=lambda **e: None)
     ops.add_session(sid, up, index)
 
-    # plant a symlink artifact in the upper, exactly as a sandboxed program would
-    # have via the symlink() handler: name "evil" -> the host target (absolute).
+    # Plant a symlink via the symlink() handler exactly as a sandboxed program would:
+    # name "evil" -> the host target (absolute). Under the no-mirror invariant this
+    # records a sqlar ROW (target in the row), NOT an on-disk artifact — assert both:
+    # the link is served from the mirror, and nothing was materialized in up/.
     sroot_ino = ops._ino_for(sid, "")
     loop = asyncio.new_event_loop()
     try:
         loop.run_until_complete(
             ops.symlink(sroot_ino, b"evil", os.fsencode(str(target)), Ctx(os.getpid())))
-        check((up / "evil").is_symlink(), "planted symlink artifact in upper")
+        check(index.kind_of("evil") == "symlink" and
+              index.symlink_target("evil") == os.fsencode(str(target)),
+              "planted symlink lives in the mirror row (no on-disk artifact)")
+        check(not (up / "evil").is_symlink() and not (up / "evil").exists(),
+              "symlink op materialized NO up/<rel> artifact")
         evil_ino = ops._ino_for(sid, "evil")
 
         # 1) copy-up via a WRITE open of the symlink path: must NOT write the host.
