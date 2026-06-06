@@ -4908,7 +4908,6 @@ class LiveUpper(ChangeSource):
         if settled:
             remove_upper_entry(src)
             cleanup_dirs(self.upper, src.parent)
-            self.review.reg._maybe_remove_empty(self.sid)
 
     def write_current(self, rel, data):
         rel = rel.lstrip("/")
@@ -5063,7 +5062,7 @@ class ChangeReview:
     `_source(sid)` selects (live overlay upper + in-RAM Index vs the box's sqlar).
     Holds one back-reference `self.reg` to the owning Supervisor registry, for the
     session set (`reg.sessions`/`reg.indexes`) and registry callbacks
-    (`reg._maybe_remove_empty`/`reg._emit`/`reg.delete`). Owns the per-run
+    (`reg._reap_empty`/`reg._emit`/`reg.delete`). Owns the per-run
     consolidation memo (`_consolidated`)."""
 
     def __init__(self, reg: "Supervisor"):
@@ -5497,8 +5496,10 @@ class ChangeReview:
         apply_paths, discard_paths = [], []
         for rel in changes:
             (apply_paths if frules.decide(rel) == "apply" else discard_paths).append(rel)
-        a = self.apply(sid, apply_paths) if apply_paths else dict(applied=[], errors=[])
-        d = self.discard(sid, discard_paths) if discard_paths else dict(discarded=[], errors=[])
+        a = self.apply(sid, apply_paths, reap=False) if apply_paths \
+            else dict(applied=[], errors=[])
+        d = self.discard(sid, discard_paths, reap=False) if discard_paths \
+            else dict(discarded=[], errors=[])
         return dict(applied=a.get("applied", []), discarded=d.get("discarded", []),
                     errors=a.get("errors", []) + d.get("errors", []))
 
@@ -5647,6 +5648,7 @@ class ChangeReview:
         result = _write_host_hunk(Path("/") / rel.lstrip("/"), new_lower)
         if not result["ok"]: return result
         src.settle(rel)
+        self.reg._reap_empty(sid)   # deferred: a hunk op may have emptied the box
         return dict(ok=True)
 
     def discard_hunk(self, sid, rel, index) -> dict:
@@ -5662,6 +5664,7 @@ class ChangeReview:
         err = src.write_current(rel, b"".join(new_upper))
         if err is not None: return err
         src.settle(rel)
+        self.reg._reap_empty(sid)   # deferred: a hunk op may have emptied the box
         return dict(ok=True)
 
     def patch_text(self, sid) -> bytes:
@@ -5701,7 +5704,7 @@ class ChangeReview:
                 out.append(b"Binary files " + a + b" and " + b + b" differ\n")
         return b"".join(out)
 
-    def apply(self, sid, paths) -> dict:
+    def apply(self, sid, paths, reap: bool = True) -> dict:
         # Apply == promote into the parent overlay (nested) or write the host (root).
         if paths is None: paths = [e["path"] for e in self.session_changes(sid)]
         src = self._source(sid)
@@ -5723,10 +5726,13 @@ class ChangeReview:
                 applied.append(rel)
             except OSError as e:
                 errors.append({"path": rel, "error": str(e)})
-        self.reg._maybe_remove_empty(sid)
+        # Deferred, top-level reap: remove the box if this emptied it. Suppressed
+        # (reap=False) when called as a sub-step of finalize_by_rules, so finalize never
+        # has the box deleted out from under its second (discard) pass.
+        if reap: self.reg._reap_empty(sid)
         return dict(applied=applied, errors=errors)
 
-    def discard(self, sid, paths) -> dict:
+    def discard(self, sid, paths, reap: bool = True) -> dict:
         # Drop each change from the box without writing the host — but first copy it
         # DOWN into any immediate child that inherits it, so the child's merged view is
         # unchanged (this is what lets a non-empty box with children be deleted).
@@ -5743,7 +5749,8 @@ class ChangeReview:
                 discarded.append(rel)
             except OSError as e:
                 errors.append({"path": rel, "error": str(e)})
-        self.reg._maybe_remove_empty(sid)
+        # Deferred top-level reap (suppressed within finalize_by_rules; see apply()).
+        if reap: self.reg._reap_empty(sid)
         return dict(discarded=discarded, errors=errors)
 
 
@@ -6608,109 +6615,120 @@ class Supervisor:
         s.killed = True
         self._emit(type="session_updated", session=s.to_dict())
 
-    def delete(self, sid, finalize: bool = False) -> None:
+    def _free_storage(self, sid) -> None:
+        """Low-level, NON-finalizing teardown: detach from the live mount, close+drop
+        the live Index, and remove the box's backing tree + ALL on-disk stores (sqlar,
+        WAL/shm, and the permanent pool dir). Used by dissolve() once a box's changes are
+        finalized/spliced, and as the forced free for an already-empty box. Idempotent;
+        does nothing for a still-running box. Handles both an in-sessions box and an
+        sqlar-only box (no Session object)."""
         s = self.sessions.get(sid)
-        if not s: return
-        if _pid_alive(s.pid) and s.live: return
-        # box-delete semantics: run the file rules first. 'apply'-matched files are
-        # promoted (parent overlay / host); the rest are discarded — copying down into
-        # immediate children so their views survive this box's removal. finalize may
-        # itself empty the box and trigger _maybe_remove_empty → delete(); if so, it is
-        # already gone and there is nothing left to nuke.
-        if finalize:
-            try: self.review.finalize_by_rules(sid)
-            except Exception as e:
-                print(f"slopbox(ui): finalize {sid} failed: {e}", file=sys.stderr)
-            s = self.sessions.get(sid)
-            if s is None:
-                return
-        # detach from the live mount if it was somehow still attached, close the
-        # index, and remove the backing tree + all on-disk stores.
+        if s is not None and _pid_alive(s.pid) and s.live:
+            return                                  # refuse to free a running box
         if self.mount is not None:
             self.mount.remove_session(sid)
         idx = self.indexes.pop(sid, None)
         if idx is not None:
             try: idx.close()
             except Exception: pass
-        if s.shm_dir:
+        if s is not None and s.shm_dir:
             rm_rf(s.shm_dir)
         sp = sqlar_path(sid)
         # Remove the box's permanent pool files too (its sqlar may hold resident rows
         # whose bytes live only in blob/<box_id>/). Read box_id BEFORE unlinking the
         # sqlar; sweep_orphan_pools() is the backstop if this is ever missed.
         bid = sqlar_meta_get(sp, "box_id") if sp.exists() else None
-        if sp.exists():
-            try: sp.unlink()
-            except OSError: pass
+        for suf in ("", "-wal", "-shm"):
+            p = Path(str(sp) + suf)
+            if p.exists():
+                try: p.unlink()
+                except OSError: pass
         if bid is not None:
             try: rm_rf(box_pool_dir(int(bid)))
             except (OSError, ValueError, TypeError): pass
-        if s.run_pidfd >= 0:
+        if s is not None and s.run_pidfd >= 0:
             try: os.close(s.run_pidfd)
             except OSError: pass
             s.run_pidfd = -1
         self.sessions.pop(sid, None)
         self._emit(type="session_removed", session_id=sid)
 
-    def splice_delete(self, sid) -> dict:
-        """Delete a STOPPED box that has children by splicing it out of the name
-        hierarchy: each descendant A.B.X becomes A.X (the deleted segment is removed
-        from all descendant paths). The box need NOT be empty — its own changes are
-        finalized by the file rules first (apply-matched promoted up/host, the rest
-        discarded, which copies each file DOWN into the immediate children that inherit
-        it) so no descendant's merged view changes. Fail-closed on any precondition
-        failure so the caller never sees partial state.
+    def delete(self, sid, finalize: bool = False) -> "dict | None":
+        """Remove a box. finalize=True routes to dissolve() (finalize the box's changes
+        via the file rules — apply-matched promoted up/host, the rest discarded with
+        copy-down — then splice it out of the name hierarchy and free its storage,
+        fail-closed). finalize=False is a forced, NON-finalizing free of storage for a
+        box that already holds nothing the caller wants kept (e.g. the deferred reap of
+        an emptied box, or after an explicit apply/discard). Returns dissolve()'s dict
+        when finalizing, else None."""
+        if finalize:
+            return self.dissolve(sid)
+        s = self.sessions.get(sid)
+        if s is None and not sqlar_path(sid).exists():
+            return None
+        if s is not None and _pid_alive(s.pid) and s.live:
+            return None
+        self._free_storage(sid)
+        return None
 
-        Preconditions (all checked before any rename):
+    def splice_delete(self, sid) -> dict:
+        """Back-compat entry point: identical to dissolve()."""
+        return self.dissolve(sid)
+
+    def dissolve(self, sid) -> dict:
+        """The ONE box-removal operation. Finalize sid's changes (apply-matched files
+        promoted up/host; the rest discarded — each copied DOWN into the immediate
+        children that inherit it, so no descendant's merged view changes), then splice
+        sid out of the name hierarchy by re-parenting/renaming its descendants
+        (A.B.X → A.X — the childless case is just zero descendants), then free sid's
+        storage (sqlar + pool). FAIL-CLOSED: if finalizing (or any copy-down) reports
+        errors, NOTHING is freed and NO splice happens — the error is surfaced and state
+        is left intact.
+
+        Preconditions (all checked before any mutation):
           1. sid exists and is not live/running.
-          2. No descendant is live (live boxes can't be renamed).
+          2. No descendant is live (renaming a live box would move its mount/relay keys;
+             that is deferred — see the final report).
           3. No computed target name collides with a pre-existing box.
-        Cascade order: shallowest descendants first so rename()'s parent-exists guard
-        is always satisfied (A.B.C->A.C before A.B.C.D->A.C.D, parent A.C exists)."""
+        Cascade order: shallowest descendants first so rename()'s parent-exists guard is
+        always satisfied (A.B.C→A.C before A.B.C.D→A.C.D, parent A.C exists)."""
         # ── 1. validate sid itself ───────────────────────────────────────────────
         if not self._box_exists(sid):
             return dict(ok=False, error=f"no slopbox '{sid}'")
         if self.review._live(sid):
             return dict(ok=False, error=f"'{sid}' is running; stop it first")
-        # ── 2. enumerate descendants ─────────────────────────────────────────────
+        # ── 2. enumerate descendants (live sessions + on-disk sqlar) ──────────────
         prefix = sid + "."
-        desc_set = set()
-        for k in self.sessions:
-            if k.startswith(prefix):
-                desc_set.add(k)
-        # also scan on-disk sqlar files so finished descendants are included
+        desc_set = set(k for k in self.sessions if k.startswith(prefix))
         sh = state_home()
         if sh.exists():
             for p in sh.glob("*.sqlar"):
                 k = p.name[:-len(".sqlar")]
                 if k.startswith(prefix):
                     desc_set.add(k)
-        if not desc_set:
-            # no children → ordinary delete (finalize the rules, then remove).
-            self.delete(sid, finalize=True)
-            return dict(ok=True, deleted=sid, renamed=[])
-        # ── 3. refuse if any descendant is live ──────────────────────────────────
+        # ── 3. refuse if any descendant is live (rename-live is deferred) ─────────
         for desc in desc_set:
             if self.review._live(desc):
                 return dict(ok=False, error=f"descendant '{desc}' is running; stop it first")
-        # ── 3b. finalize sid's OWN changes before renaming children: apply-matched
-        #        files promote up; the rest are discarded, copying each down into the
-        #        immediate children that inherit it (so their views are preserved).
+        # ── 4. finalize sid's OWN changes (FAIL-CLOSED) ──────────────────────────
+        # apply-matched files promote up; the rest are discarded, copying each down into
+        # the immediate children that inherit it. If anything errors we must NOT free the
+        # storage or splice — the whole safety point of finalizing before removal.
         try:
-            self.review.finalize_by_rules(sid)
+            res = self.review.finalize_by_rules(sid)
         except Exception as e:
             return dict(ok=False, error=f"finalizing '{sid}' failed: {e}")
-        # ── 4. compute new names ─────────────────────────────────────────────────
+        if res.get("errors"):
+            return dict(ok=False,
+                        error=f"finalizing '{sid}' had errors; nothing removed",
+                        finalize_errors=res["errors"])
+        # ── 5. compute new names + collision check BEFORE any rename ──────────────
         parent_parts = sid.split(".")
         def new_name_for(desc):
-            # drop sid's last segment from desc's dotted path
-            # e.g. sid=A.B, desc=A.B.C.D → new = A.C.D
-            # parent_parts[:-1] = A; desc.split(".")[:len(parent_parts)] = A.B;
-            # desc.split(".")[len(parent_parts):] = [C,D]
+            # drop sid's last segment from desc's dotted path (A.B.C.D → A.C.D for A.B).
             tail = desc.split(".")[len(parent_parts):]
             return ".".join(parent_parts[:-1] + tail) if parent_parts[:-1] else ".".join(tail)
         plan = {desc: new_name_for(desc) for desc in desc_set}
-        # ── 5. collision check BEFORE any rename ─────────────────────────────────
         for desc, tgt in plan.items():
             if self._box_exists(tgt):
                 return dict(ok=False,
@@ -6728,25 +6746,15 @@ class Supervisor:
                             renamed=renamed)
             renamed.append((desc, tgt))
             # update parent_sid meta on the newly-named sqlar so _attach_base_session
-            # resolves grandparent chains correctly after the splice (the meta was set
-            # at register time and now points at the deleted sid, which will be gone).
-            # New parent = tgt's immediate prefix, or "" (top-level) if no dot.
-            new_sp = sqlar_path(tgt)
+            # resolves grandparent chains after the splice (the meta was set at register
+            # time and now points at the deleted sid, which will be gone).
             new_psid = tgt.rsplit(".", 1)[0] if "." in tgt else ""
             try:
-                sqlar_meta_set(new_sp, "parent_sid", new_psid)
+                sqlar_meta_set(sqlar_path(tgt), "parent_sid", new_psid)
             except Exception:
                 pass
-        # ── 7. delete sid itself (now childless + empty) ─────────────────────────
-        if sid in self.sessions:
-            self.delete(sid)
-        else:
-            # sqlar-only box (not in sessions dict): remove the sqlar directly.
-            sp = sqlar_path(sid)
-            if sp.exists():
-                try: sp.unlink()
-                except OSError: pass
-            self._emit(type="session_removed", session_id=sid)
+        # ── 7. free sid's storage (now childless) ────────────────────────────────
+        self._free_storage(sid)
         return dict(ok=True, deleted=sid, renamed=renamed)
 
     def _index_for(self, sid) -> "Index | None":
@@ -6761,18 +6769,28 @@ class Supervisor:
             except sqlite3.Error: return None
         return None
 
-    def _maybe_remove_empty(self, sid) -> None:
-        """A finished session vanishes only when it holds nothing at all — no overlay
-        change, no sqlar entry, and no network log. The connection log alone is
-        reason enough to keep the entry around."""
+    def _box_is_empty(self, sid) -> bool:
+        """True when a finished box holds nothing at all — no overlay change, no sqlar
+        entry, and no network log. The connection log alone is reason enough to keep the
+        box. Live/running boxes are never 'empty' for removal purposes. This is a pure
+        PREDICATE: it never deletes (so it is safe to call from inside a loop)."""
         s = self.sessions.get(sid)
-        if not s or s.live or _pid_alive(s.pid): return
+        if not s or s.live or _pid_alive(s.pid): return False
         try: overlay = upper_has_changes(Path(s.upper))
         except OSError: overlay = False
         sqlar = bool(sqlar_list(sqlar_path(sid)))
         flows = has_flows(sqlar_path(sid))
-        if not overlay and not sqlar and not flows:
-            self.delete(sid)
+        return not overlay and not sqlar and not flows
+
+    def _reap_empty(self, sids) -> None:
+        """DEFERRED, top-level empty-box removal: after an operation that removes changes
+        (apply/discard/finalize/dissolve), delete the boxes it touched that now hold
+        nothing. Kept out of the low-level helpers so a box is never deleted out from
+        under a loop ('rugpull'). Accepts one sid or an iterable; ignores unknown ones."""
+        if isinstance(sids, str): sids = [sids]
+        for sid in list(sids or ()):
+            if self._box_is_empty(sid):
+                self.delete(sid)
 
     def _cmd_of(self, sid) -> list:
         s = self.sessions.get(sid)
@@ -9529,7 +9547,7 @@ def _make_ui_app():
                 # Splice-out path: if the box has children, splice_delete re-parents them.
                 def done_splice(ok):
                     if not ok: return
-                    r=self.sup.splice_delete(sid)
+                    r=self.sup.dissolve(sid)
                     if r.get("ok"):
                         self._status(f"spliced out '{sid}', re-parented {len(r['renamed'])} box(es)")
                     else:
@@ -9539,7 +9557,10 @@ def _make_ui_app():
                     f" and re-parent {len(desc)} descendant(s)?")), done_splice)
             else:
                 def done(ok):
-                    if ok: self.sup.delete(sid, finalize=True)
+                    if not ok: return
+                    r=self.sup.dissolve(sid)
+                    if not r.get("ok"):
+                        self._status(Text(r.get("error") or "delete failed", style="red"))
                 self.push_screen(Confirm(styled("Delete ", (s.get("stamp") or sid,"bold"), " and its overlay?")), done)
 
         def action_rename(self):
