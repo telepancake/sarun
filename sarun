@@ -2109,6 +2109,23 @@ class Index:
         except (ValueError, TypeError): argv = []
         return dict(pid=w[0], ppid=w[1], exe=w[2], argv=argv)
 
+    def row_mtime(self, rel: str) -> int:
+        """The row's stored mtime (integer ns), or 0 if missing. Used on the hot read
+        path to synthesize dir/symlink stat without an on-disk lstat."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT mtime FROM sqlar WHERE name=?", (rel,)).fetchone()
+        return int(row[0]) if row and row[0] is not None else 0
+
+    def row_mode_mtime(self, rel: str):
+        """(mode, mtime_ns) for the row, or (None, 0). Hot read path: synthesize a
+        dir/symlink stat from the row without touching disk."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT mode, mtime FROM sqlar WHERE name=?", (rel,)).fetchone()
+        if not row: return (None, 0)
+        return (int(row[0]), int(row[1]) if row[1] is not None else 0)
+
     def file_row(self, rel: str):
         """Return (rowid, mode, sz, mtime, data) for a file row, or None.
         Used on the hot read path to serve evicted (data NOT NULL) files."""
@@ -2670,6 +2687,28 @@ def _build_overlay_ops():
                 st_atime_ns=mtime_ns, st_mtime_ns=mtime_ns, st_ctime_ns=mtime_ns,
                 st_rdev=0, st_blocks=(sz + 511) // 512, st_blksize=512)
 
+        @staticmethod
+        def _synth_link_stat(size: int, mtime_ns: int):
+            """Synthetic stat for a symlink served from the mirror (no on-disk lstat).
+            mode S_IFLNK|0777, st_size == len(target). _entry() reads only these."""
+            from types import SimpleNamespace
+            return SimpleNamespace(
+                st_mode=stat_mod.S_IFLNK | 0o777, st_nlink=1, st_size=size,
+                st_atime_ns=mtime_ns, st_mtime_ns=mtime_ns, st_ctime_ns=mtime_ns,
+                st_rdev=0, st_blocks=0, st_blksize=512)
+
+        @staticmethod
+        def _synth_dir_stat(mode: int, mtime_ns: int):
+            """Synthetic stat for a dir served from the mirror (no on-disk lstat).
+            Mirrors _synth_dir_attrs: nlink 2, size 0."""
+            from types import SimpleNamespace
+            m = stat_mod.S_IFDIR | (stat_mod.S_IMODE(mode) or 0o755)
+            ts = mtime_ns if mtime_ns else time.time_ns()
+            return SimpleNamespace(
+                st_mode=m, st_nlink=2, st_size=0,
+                st_atime_ns=ts, st_mtime_ns=ts, st_ctime_ns=ts,
+                st_rdev=0, st_blocks=0, st_blksize=512)
+
         def _resolve_st(self, sid: str, rel: str):
             # Coherence seam: an open write buffer is the authoritative source for
             # size/mtime while a write is in progress — check before index/blob/lower.
@@ -2698,11 +2737,18 @@ def _build_overlay_ops():
                         if data is not None:
                             # evicted: path=None, stat from row
                             return ("upper", None, self._row_stat(mode, sz, mtime_ns))
-            elif k is not None:
-                ap = self._backing_path(sid, rel)
-                if ap is not None:
-                    try: return ("upper", ap, os.lstat(ap))
-                    except OSError: pass
+            elif k == "symlink":
+                # Served from the mirror: synthetic S_IFLNK stat, size == len(target),
+                # row mtime. No on-disk lstat (the artifact may not exist).
+                tgt = idx.symlink_target(rel) or b""
+                return ("upper", None,
+                        self._synth_link_stat(len(tgt), idx.row_mtime(rel)))
+            elif k == "dir":
+                # Served from the mirror: synthetic dir stat from the row mode/mtime.
+                mode, mtime_ns = idx.row_mode_mtime(rel)
+                return ("upper", None,
+                        self._synth_dir_stat(mode if mode is not None else 0o755,
+                                             mtime_ns))
             if idx.hidden_by_opaque(rel):
                 return ("absent", None, None)
             return self._lower_resolve(sid, rel)
@@ -2877,17 +2923,14 @@ def _build_overlay_ops():
             """Merged listing of <sid>/<rel>: [(name, (sid, childrel) or None, attrs)].
             None key marks a virtual/synthetic-only entry where attrs are supplied."""
             idx = self._index(sid)
-            names: dict = {}     # name -> (abspath_or_None, layer)
+            names: dict = {}     # name -> layer
             if not idx.is_opaque(rel):
                 for nm in self._lower_names(sid, rel):
                     names[nm] = "lower"
             if idx.has_overlay_state():
-                try:
-                    with os.scandir(self._upper_path(sid, rel)) as it:
-                        for de in it:
-                            names[de.name] = "upper"
-                except OSError: pass
-                # apply index children: whiteouts remove, others ensure present
+                # Overlay children come from the Index mirror (files in the pool, dirs/
+                # symlinks in the rows) — NOT os.scandir(upper): no dir/symlink artifacts
+                # live on disk. whiteouts remove a lower name; others ensure present.
                 whiteouts, present = idx.children_of(rel)
                 for name in whiteouts:
                     names.pop(name, None)
@@ -2955,9 +2998,12 @@ def _build_overlay_ops():
             sid, rel = key
             layer, ap, _st = self._resolve_st(sid, rel)
             if layer in ("absent", "whiteout"): raise pyfuse3.FUSEError(errno.ENOENT)
-            # ap is None only if unconsolidate() somehow failed to rebuild the up/
-            # symlink artifact for a finished parent (defensive; normally non-None).
-            if ap is None: raise pyfuse3.FUSEError(errno.EIO)
+            # Overlay symlink: served straight from the mirror (target in the row).
+            tgt = self._index(sid).symlink_target(rel)
+            if tgt is not None:
+                return bytes(tgt)
+            # Lower (host / ancestor) symlink: resolved path is a real on-disk link.
+            if ap is None: raise pyfuse3.FUSEError(errno.ENOENT)
             try: return os.fsencode(os.readlink(ap))
             except OSError as e: raise pyfuse3.FUSEError(e.errno or errno.EIO)
 
