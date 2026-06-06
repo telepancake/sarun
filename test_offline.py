@@ -101,11 +101,18 @@ def test_process_and_env_tables_dedup_and_tag():
     tmp = Path(tempfile.mkdtemp(prefix="ofl-"))
     _redirect_state(tmp)
     try:
-        # sid pid == this process's tgid, so the recorded writer IS the box root
-        # and the PPid-chain bubble-up stops at it: exactly one process row.
+        # sid pid == this process's tgid, so the recorded writer IS the box root.
+        # The PPid-bubbling boundary is the explicitly-registered root (process.root
+        # column), exactly as the real register flow records it — so register our own
+        # tgid as the root first; the bubble-up then stops at it: one process row.
         sid = "20260604-000000_%d" % m.tgid_of(os.getpid())
         backing = m.live_dir(sid); (backing / "up").mkdir(parents=True)
         idx = m.Index(backing); idx.set_tracing(True)
+        root_prov = m.read_provenance(os.getpid(), full_env=True)
+        idx.process_from_prov(dict(tgid=m.tgid_of(os.getpid()),
+                                   ppid=m.tgid_of(root_prov["ppid"]) if root_prov.get("ppid") else 0,
+                                   exe=root_prov["exe"], argv=root_prov["argv"],
+                                   env=root_prov.get("env") or {}), root=True)
         wid1 = idx.writer_for(os.getpid())
         wid2 = idx.writer_for(os.getpid())     # same tgid -> same row
         check(wid1 == wid2, "same tgid yields the same process row (deduped)")
