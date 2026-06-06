@@ -273,12 +273,17 @@ def sync_request(sock_path: str, timeout: float = 30.0, **msg: Any) -> "dict | N
     except (OSError, json.JSONDecodeError):
         return None
 
-def register_request(sock_path: str, timeout: float = 30.0, **msg: Any) -> "dict | None":
+def register_request(sock_path: str, timeout: float = 30.0, **msg: Any) -> "tuple[dict | None, int]":
     """Like sync_request but carries the caller's own pidfd over SCM_RIGHTS so the
     UI can derive the runner's HOST-namespace pid from /proc/self/fdinfo without
     relying on SO_PEERCRED.  Falls back to a plain sendall (no FD) if pidfd_open is
     unavailable (Python < 3.9, kernel ENOSYS, or any OSError) — the UI then gets
-    peer_pid=0 and treats this as a top-level runner.  Returns None on any failure."""
+    peer_pid=0 and treats this as a top-level runner.
+
+    For nested boxes the UI sends the child overlay's dir-fd alongside the JSON reply
+    (SCM_RIGHTS); the runner can then root bwrap via --bind-fd instead of --bind.
+
+    Returns (ack_dict | None, mount_fd) where mount_fd >= 0 iff the UI sent one."""
     pidfd = -1
     try:
         pidfd = os.pidfd_open(os.getpid())
@@ -294,15 +299,26 @@ def register_request(sock_path: str, timeout: float = 30.0, **msg: Any) -> "dict
                             array.array("i", [pidfd]).tobytes())])
             else:
                 s.sendall(payload)
-            buf = b""
-            while b"\n" not in buf:
-                chunk = s.recv(4096)
-                if not chunk: break
-                buf += chunk
-            line = buf.split(b"\n", 1)[0]
-            return json.loads(line.decode()) if line.strip() else None
+            # Use recvmsg so we can capture an optional dir-fd the UI may piggyback on
+            # the reply for nested boxes (NESTED LAUNCH mechanism).  CMSG_SPACE(4*4) is
+            # enough for one fd; use a generous buffer so we never truncate.
+            data, anc, _flags, _addr = s.recvmsg(65536, socket.CMSG_SPACE(4 * 4))
+            mount_fd = -1
+            for lvl, typ, cmsg_data in anc:
+                if lvl == socket.SOL_SOCKET and typ == socket.SCM_RIGHTS:
+                    a = array.array("i"); a.frombytes(cmsg_data)
+                    fds = a.tolist()
+                    if fds:
+                        mount_fd = fds[0]
+                    # close unexpected extras (shouldn't happen, defensive)
+                    for extra in fds[1:]:
+                        try: os.close(extra)
+                        except OSError: pass
+            line = data.split(b"\n", 1)[0]
+            ack = json.loads(line.decode()) if line.strip() else None
+            return ack, mount_fd
     except (OSError, json.JSONDecodeError):
-        return None
+        return None, -1
     finally:
         if pidfd >= 0:
             try: os.close(pidfd)
@@ -1282,6 +1298,77 @@ def root_cmd(sid: str) -> list:
 _PROV_ENV_KEYS = ("USER", "PWD", "SSH_CONNECTION", "TERM", "_")
 
 FICLONE = 0x40049409   # _IOW(0x94, 9, int) — btrfs/xfs reflink ioctl
+
+# ── fd-based mount primitives (Linux 5.2+, x86-64) ──────────────────────────
+# Used by the NESTED LAUNCH mechanism: the UI creates an open_tree "mount fd" for
+# the child overlay and ships it via SCM_RIGHTS to the nested runner.  The runner
+# calls move_mount to graft it at a known path inside the parent box, then passes
+# that path to bwrap -- avoiding any path resolution of the sibling overlay tree.
+import ctypes as _ctypes
+_LIBC: "_ctypes.CDLL | None" = None
+
+def _libc() -> "_ctypes.CDLL":
+    global _LIBC
+    if _LIBC is None:
+        _LIBC = _ctypes.CDLL("libc.so.6", use_errno=True)
+    return _LIBC
+
+_NR_open_tree  = 428   # x86-64 syscall number
+_NR_move_mount = 429
+
+_OPEN_TREE_CLONE  = 1
+_AT_EMPTY_PATH    = 0x1000
+_AT_FDCWD         = -100
+_MOVE_MOUNT_F_EMPTY_PATH = 0x00000004
+
+
+def _open_tree_fd(dir_fd: int) -> int:
+    """open_tree(dir_fd, "", OPEN_TREE_CLONE | AT_EMPTY_PATH) → mount-fd.
+
+    Returns a *mount fd* that can be passed via SCM_RIGHTS and grafted elsewhere
+    with move_mount.  The fd does NOT carry a path — it represents the filesystem
+    subtree rooted at dir_fd regardless of whether that path is accessible in the
+    caller's mount namespace.  Returns -1 on failure (old kernel, EPERM, etc.)."""
+    try:
+        libc = _libc()
+        fd = libc.syscall(_ctypes.c_long(_NR_open_tree),
+                          _ctypes.c_int(dir_fd),
+                          _ctypes.c_char_p(b""),
+                          _ctypes.c_uint(_OPEN_TREE_CLONE | _AT_EMPTY_PATH))
+        return int(fd) if int(fd) >= 0 else -1
+    except Exception:
+        return -1
+
+
+def _move_mount(tree_fd: int, dest: str) -> int:
+    """move_mount(tree_fd, "", AT_FDCWD, dest, MOVE_MOUNT_F_EMPTY_PATH).
+
+    Grafts the subtree represented by tree_fd (obtained via _open_tree_fd) at
+    dest.  dest must be an existing empty directory in the current mount namespace.
+    Returns 0 on success, errno (>0) on failure."""
+    try:
+        libc = _libc()
+        ret = libc.syscall(_ctypes.c_long(_NR_move_mount),
+                           _ctypes.c_int(tree_fd),
+                           _ctypes.c_char_p(b""),
+                           _ctypes.c_int(_AT_FDCWD),
+                           _ctypes.c_char_p(dest.encode()),
+                           _ctypes.c_uint(_MOVE_MOUNT_F_EMPTY_PATH))
+        if int(ret) < 0:
+            return _ctypes.get_errno()
+        return 0
+    except Exception:
+        return errno.ENOSYS
+
+
+def _lazy_umount(path: str) -> None:
+    """MNT_DETACH umount via umount2(2) syscall, best-effort."""
+    try:
+        _libc().syscall(_ctypes.c_long(166),   # NR_umount2
+                        _ctypes.c_char_p(path.encode()),
+                        _ctypes.c_int(0x2))    # MNT_DETACH
+    except Exception:
+        pass
 
 
 def _proc_status_field(pid: int, field: str) -> "int | None":
@@ -5586,6 +5673,26 @@ class Supervisor:
                    owner_token=token)
         if relay is not None:
             ack["relay"] = relay
+        # NESTED LAUNCH: for a child box, open a mount fd to the child's overlay root so
+        # the UI can pass it to the runner via SCM_RIGHTS.  The runner then uses
+        # move_mount to graft the child overlay at a known path inside the parent box
+        # and roots bwrap there.  This works even though the sibling <mnt>/<child_sid>
+        # isn't reachable by path inside the parent's mount namespace.
+        # The fd is opened by the UI — never supplied by the box.
+        if parent_sid is not None:
+            mfd = -1
+            try:
+                # Open a normal dir fd first; convert to mount fd via open_tree so the
+                # receiver can graft it via move_mount regardless of path reachability.
+                dir_fd = os.open(box_root, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    mfd = _open_tree_fd(dir_fd)
+                finally:
+                    os.close(dir_fd)
+                if mfd >= 0:
+                    ack["_mount_fd"] = mfd   # private key stripped before JSON send
+            except OSError:
+                pass  # fall through — caller falls back to top-level --bind path
         return ack
 
     def _owns(self, msg: dict, sid: str) -> bool:
@@ -6219,6 +6326,36 @@ def _recvmsg_blocking(conn):
         conn.setblocking(False)
 
 
+def _send_reply_with_fd(conn: socket.socket, reply: dict) -> None:
+    """Send a control reply JSON line back to the runner, optionally carrying a dir-fd
+    via SCM_RIGHTS for the nested-launch LAUNCH mechanism.
+
+    If the reply dict contains a private '_mount_fd' key (an int fd), pop it, encode
+    the remaining fields as JSON+newline, and ship both over sendmsg with SCM_RIGHTS —
+    the runner receives an fd to the child overlay root alongside the JSON ack.  The
+    UI closes its copy of the fd after sendmsg (kernel dup'd it to the peer).  For
+    top-level boxes (no '_mount_fd'), fall back to a plain sendall — byte-identical to
+    the previous behaviour.
+
+    Called via run_in_executor so the async loop stays unblocked while sendmsg blocks.
+    Raises OSError on send failure (caller catches and ignores, as before)."""
+    mfd = reply.pop("_mount_fd", None)    # strip private key; None for top-level
+    payload = (json.dumps(reply) + "\n").encode()
+    conn.setblocking(True)
+    try:
+        if mfd is not None and mfd >= 0:
+            # Send JSON + the dir-fd to the child overlay in one SCM_RIGHTS message.
+            conn.sendmsg([payload],
+                         [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
+                           array.array("i", [mfd]).tobytes())])
+            try: os.close(mfd)             # UI's copy — kernel dup'd it to the peer
+            except OSError: pass
+        else:
+            conn.sendall(payload)
+    finally:
+        conn.setblocking(False)
+
+
 def _ppid_of(pid: int) -> int:
     """PPid of pid from /proc/<pid>/status; 0 if unreadable."""
     v = _proc_status_field(pid, "PPid")
@@ -6347,8 +6484,8 @@ class ChannelServer:
                                                              peer_pidfd=_pidfd)
                         if reply is not None:
                             try:
-                                await self._loop.sock_sendall(
-                                    conn, (json.dumps(reply) + "\n").encode())
+                                await self._loop.run_in_executor(
+                                    None, _send_reply_with_fd, conn, reply)
                             except OSError:
                                 pass
                     continue
@@ -6359,8 +6496,8 @@ class ChannelServer:
                                                              peer_pidfd=_pidfd)
                         if reply is not None:
                             try:
-                                await self._loop.sock_sendall(
-                                    conn, (json.dumps(reply) + "\n").encode())
+                                await self._loop.run_in_executor(
+                                    None, _send_reply_with_fd, conn, reply)
                             except OSError:
                                 pass
                     break
@@ -6643,11 +6780,15 @@ def cmd_run(cmd, net, trace, direct, session_whitelist, chdir, reuse_sid=None) -
     # We send our own pidfd alongside the JSON so the UI can derive our HOST pid
     # via /proc/self/fdinfo (the codebase's universal identity path) instead of
     # SO_PEERCRED.  Works for both top-level runners and nested-box runners.
-    ack = register_request(_ctrl_sock, type="register", session_id=sid,
-                           cmd=list(cmd), prov=self_prov, root_tgid=os.getpid(),
-                           session_whitelist=session_whitelist, want_rerun=rerun,
-                           want_net=net, want_trace=trace, want_direct=direct)
+    # For nested boxes register_request also returns a dir-fd to the child overlay.
+    ack, mount_fd = register_request(_ctrl_sock, type="register", session_id=sid,
+                                     cmd=list(cmd), prov=self_prov, root_tgid=os.getpid(),
+                                     session_whitelist=session_whitelist, want_rerun=rerun,
+                                     want_net=net, want_trace=trace, want_direct=direct)
     if not ack or not ack.get("ok") or not ack.get("mount"):
+        if mount_fd >= 0:
+            try: os.close(mount_fd)
+            except OSError: pass
         if rerun:
             # A re-run can't relocate to a fresh sid — the identity IS the target box.
             print("slopbox: could not re-run this slopbox"
@@ -6657,11 +6798,14 @@ def cmd_run(cmd, net, trace, direct, session_whitelist, chdir, reuse_sid=None) -
         # collision on sid (same second + pid is impossible, but be safe) or the
         # UI failed to set up the overlay — retry once with a unique suffix.
         sid = sid + "." + uuid.uuid4().hex[:6]
-        ack = register_request(_ctrl_sock, type="register", session_id=sid,
-                               cmd=list(cmd), prov=self_prov, root_tgid=os.getpid(),
-                               session_whitelist=session_whitelist, want_rerun=False,
-                               want_net=net, want_trace=trace, want_direct=direct)
+        ack, mount_fd = register_request(_ctrl_sock, type="register", session_id=sid,
+                                         cmd=list(cmd), prov=self_prov, root_tgid=os.getpid(),
+                                         session_whitelist=session_whitelist, want_rerun=False,
+                                         want_net=net, want_trace=trace, want_direct=direct)
         if not ack or not ack.get("ok") or not ack.get("mount"):
+            if mount_fd >= 0:
+                try: os.close(mount_fd)
+                except OSError: pass
             print("slopbox: the UI could not set up the overlay for this session"
                   f"{(' — ' + ack['error']) if ack and ack.get('error') else ''}.",
                   file=sys.stderr)
@@ -6704,17 +6848,56 @@ def cmd_run(cmd, net, trace, direct, session_whitelist, chdir, reuse_sid=None) -
         # you). The bind-as-root confines the box to its subfolder; it cannot reach
         # <mnt>/ or another session's <sid>. No userns, no fd-passing, no inner mount.
         #
+        # NESTED LAUNCH: when mount_fd >= 0, the UI sent us a mount fd (open_tree fd)
+        # to the child overlay via SCM_RIGHTS.  We use move_mount to graft it at a
+        # temporary path inside the CURRENT (parent box) mount namespace, then pass
+        # that path to bwrap as --bind <tmpdir> /.  This avoids any path resolution of
+        # the sibling overlay root, which isn't reachable by path inside the parent
+        # box.  For a top-level box (mount_fd < 0) we keep --bind <path> / unchanged.
+        #
         # The host control socket is bind-mounted read-only at UI_SOCK_INBOX so that a
         # nested `./sarun -- cmd` inside the box can reach the UI. Parent identity is
         # kernel-derived (pidfd → _host_pid_from_pidfd → PPid walk) at the UI; the
         # box's runner sends its own pidfd on the register connection, and the UI
         # never trusts any pid or sid from the message body.
+        _nested_mp: "str | None" = None
+        if mount_fd >= 0:
+            # Graft child overlay at a tmpdir inside the parent box's namespace.
+            # /tmp is a fresh tmpfs inside the box (always writable), so create
+            # the mount point there; bwrap's --bind <tmpdir> / sees it normally.
+            try:
+                _nested_mp = tempfile.mkdtemp()
+                err = _move_mount(mount_fd, _nested_mp)
+                if err == 0:
+                    bind_root_args = ["--bind", _nested_mp, "/"]
+                else:
+                    # move_mount failed (old kernel or EPERM) — fall back to path
+                    print(f"slopbox: nested LAUNCH: move_mount errno={err}, "
+                          "falling back to path bind", file=sys.stderr)
+                    try: os.rmdir(_nested_mp)
+                    except OSError: pass
+                    _nested_mp = None
+                    bind_root_args = ["--bind", str(box_root), "/"]
+            except OSError:
+                _nested_mp = None
+                bind_root_args = ["--bind", str(box_root), "/"]
+            try: os.close(mount_fd)
+            except OSError: pass
+            mount_fd = -1   # consumed
+            popen_pass_fds: tuple = ()
+        else:
+            bind_root_args = ["--bind", str(box_root), "/"]
+            popen_pass_fds = ()
+        # When nested (inside a parent box), the host SOCK_PATH isn't accessible;
+        # the UI socket is already visible at UI_SOCK_INBOX inside the box, so
+        # bind-mount UI_SOCK_INBOX → UI_SOCK_INBOX (forwarding it to the child box).
+        _ui_sock_src = _ctrl_sock if _ctrl_sock == UI_SOCK_INBOX else SOCK_PATH
         args = ["bwrap",
-                "--bind", str(box_root), "/",
+                *bind_root_args,
                 "--proc", "/proc", "--dev", "/dev",
                 "--ro-bind-try", "/sys", "/sys",
                 "--tmpfs", "/tmp", "--tmpfs", "/run",
-                "--ro-bind", SOCK_PATH, UI_SOCK_INBOX,
+                "--ro-bind", _ui_sock_src, UI_SOCK_INBOX,
                 "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--unshare-net",
                 # Keep only the two caps a box needs to itself HOST a box: CAP_SYS_ADMIN
                 # (unshare pid/ipc/uts/mount) and CAP_NET_ADMIN (bring up loopback in the
@@ -6755,7 +6938,8 @@ def cmd_run(cmd, net, trace, direct, session_whitelist, chdir, reuse_sid=None) -
         args += ["--", sys.executable, find_self(), "--inner",
                  "--channel", chan, "--sid", sid, "--", *cmd]
 
-        proc = subprocess.Popen(args, preexec_fn=os.setpgrp)
+        proc = subprocess.Popen(args, preexec_fn=os.setpgrp,
+                                pass_fds=popen_pass_fds)
         launched = True
         try: os.setpgid(proc.pid, proc.pid)
         except OSError: pass
@@ -6778,6 +6962,15 @@ def cmd_run(cmd, net, trace, direct, session_whitelist, chdir, reuse_sid=None) -
         if old_ttou is not None:
             try: signal.signal(signal.SIGTTOU, old_ttou)
             except (OSError, ValueError): pass
+        # Leak guards: close any unconsumed mount_fd; detach the nested mount point.
+        if mount_fd >= 0:
+            try: os.close(mount_fd)
+            except OSError: pass
+        if _nested_mp is not None:
+            # Lazy umount after bwrap exits; then rmdir the mount point.
+            _lazy_umount(_nested_mp)
+            try: os.rmdir(_nested_mp)
+            except OSError: pass
 
     # Tell the UI we exited. The UI runs consolidate() on live/<sid>, removes
     # <mnt>/<sid> from the live set, and deletes live/<sid>. (The runner does NOT

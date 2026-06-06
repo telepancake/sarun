@@ -207,6 +207,132 @@ def run_with_ui(tmp):
         check(not still, "overlay unmounted after the UI exits (clean mount table)")
 
 
+def run_nested_e2e(tmp):
+    """Launch the UI + a parent box; from inside the parent box run ./sarun -- cmd
+    (the nested invocation) and assert:
+    - A CHILD session registers with parent set (proving the nested-launch path).
+    - The nested command can read a file written by the parent box through the
+      bind-fd'd child root (proving read-chaining through the child overlay).
+    The child's bwrap is rooted via --bind-fd instead of --bind, which is the
+    whole point of the mechanism tested here."""
+    m = SourceFileLoader("slopbox", SARUN).load_module()
+    e = env_for(tmp)
+    sock = str(Path(e["XDG_RUNTIME_DIR"]) / "slopbox" / "ui.sock")
+    mnt = Path(e["XDG_RUNTIME_DIR"]) / "slopbox" / "mnt"
+
+    harness = tmp / "ui_harness2.py"
+    harness.write_text(
+        "import os\n"
+        "from importlib.machinery import SourceFileLoader\n"
+        f"m = SourceFileLoader('slopbox', {SARUN!r}).load_module()\n"
+        "m.ensure_dirs()\n"
+        "app = m._make_ui_app()()\n"
+        "app.run(headless=True)\n")
+    ui = subprocess.Popen([PYBIN, str(harness)], env=e,
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    try:
+        if not wait_socket(sock, 30):
+            out = b""
+            try: out = ui.stdout.read(4000) if ui.stdout else b""
+            except Exception: pass
+            raise RuntimeError(f"Nested-e2e: UI socket never appeared. UI output:\n"
+                               f"{out.decode(errors='replace')}")
+
+        # The parent box script:
+        #  1. Writes a sentinel file via the overlay (proves parent overlay is live).
+        #  2. Launches a child box via `python SARUN -- cmd` (the NESTED LAUNCH).
+        #     Inside the child, we read the sentinel — if the child overlay correctly
+        #     chains reads through the parent, the sentinel is visible there too.
+        #  3. The child writes its own file so we can confirm the child ran.
+        #
+        # We pass the XDG env into the nested invocation explicitly so the nested
+        # runner finds the same UI socket as the parent runner.
+        nested_cmd = (
+            f"XDG_STATE_HOME={e['XDG_STATE_HOME']!r} "
+            f"XDG_RUNTIME_DIR={e['XDG_RUNTIME_DIR']!r} "
+            f"{PYBIN} {SARUN} -- "
+            "bash -c 'cat /parent_sentinel.txt > /child_proof.txt && "
+            "echo nested-ok >> /child_proof.txt'"
+        )
+        parent_script = (
+            "set -e; "
+            "echo parent-was-here > /parent_sentinel.txt; "
+            + nested_cmd
+        )
+        r = subprocess.run(
+            [PYBIN, SARUN, "--", "bash", "-c", parent_script],
+            env=e, capture_output=True, text=True, timeout=120)
+        stderr = r.stderr
+        check(r.returncode == 0,
+              f"nested-e2e: parent+nested box run exited 0 "
+              f"(got {r.returncode}: {stderr.strip()[-400:]})")
+        check("UI connected" in stderr,
+              "nested-e2e: parent runner reports UI connected")
+
+        # The UI's sqlar output will include TWO sessions (parent + child) after both
+        # finish. Poll for two *.sqlar files.
+        state = Path(e["XDG_STATE_HOME"]) / "slopbox"
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            if len(list(state.glob("*.sqlar"))) >= 2:
+                break
+            time.sleep(0.3)
+        sqlars = list(state.glob("*.sqlar"))
+        check(len(sqlars) >= 2,
+              f"nested-e2e: at least 2 sqlar files produced (got {len(sqlars)})")
+
+        # One sqlar must contain parent_sentinel.txt; another must contain child_proof.txt.
+        all_names: set = set()
+        for sp in sqlars:
+            try:
+                all_names |= {n for n, _md, _mt, _sz in m.sqlar_list(sp)}
+            except Exception:
+                pass
+        check("parent_sentinel.txt" in all_names,
+              "nested-e2e: parent sentinel captured in a sqlar")
+        check("child_proof.txt" in all_names,
+              "nested-e2e: child proof file captured in a sqlar (child ran)")
+
+        # Look for the child_proof content — it should start with "parent-was-here"
+        # proving the child read through the parent overlay.
+        child_content = b""
+        for sp in sqlars:
+            try:
+                c = m.sqlar_content(sp, "child_proof.txt")
+                if c:
+                    child_content = c; break
+            except Exception:
+                pass
+        check(b"parent-was-here" in child_content,
+              f"nested-e2e: child_proof contains parent sentinel content "
+              f"(got {child_content!r})")
+        check(b"nested-ok" in child_content,
+              f"nested-e2e: child_proof contains child's own line "
+              f"(got {child_content!r})")
+
+        # Verify stderr mentions TWO slopbox registrations (parent + child).
+        check(stderr.count("overlay root:") >= 2,
+              f"nested-e2e: stderr shows >=2 overlay roots "
+              f"(got {stderr.count('overlay root:')})")
+
+    finally:
+        try:
+            ui.send_signal(signal.SIGINT)
+            ui.wait(timeout=10)
+        except Exception:
+            try: ui.kill(); ui.wait(timeout=5)
+            except Exception: pass
+        time.sleep(0.5)
+        still = os.path.ismount(str(mnt))
+        if still:
+            try:
+                subprocess.run(["fusermount3", "-uz", str(mnt)],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               timeout=10)
+            except Exception: pass
+        check(not still, "nested-e2e: overlay unmounted after UI exits")
+
+
 def main():
     tmp = Path(tempfile.mkdtemp(prefix="e2e-"))
     try:
@@ -216,6 +342,8 @@ def main():
         test_dash_dash_required(tmp)
         print("\n== end-to-end with the UI ==")
         run_with_ui(tmp)
+        print("\n== nested-box e2e (LAUNCH mechanism) ==")
+        run_nested_e2e(tmp)
     except Exception as ex:
         import traceback; traceback.print_exc(); _fails.append(str(ex))
     finally:

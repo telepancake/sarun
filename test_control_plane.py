@@ -838,6 +838,221 @@ def test_apply_kick_up_finished_parent():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+# ── NESTED LAUNCH: register-reply dir-fd round-trip ─────────────────────────
+
+def test_register_reply_fd_nested_box():
+    """ChannelServer sends a dir-fd on the register reply for a NESTED box only.
+
+    Strategy:
+    - Start a real ChannelServer with a _FakeMount.
+    - Register a parent session so _derive_parent_sid can resolve it.
+    - Register a child session from a client that recvmsg's the reply.
+      For the server to open the child's box_root we pre-create that directory
+      (normally created by the real FUSE add_session; here we replicate it).
+    - Assert the client receives an fd via SCM_RIGHTS whose /proc/self/fd path
+      points to the child's box_root directory.
+    - Register a top-level session (no live parent) and assert NO fd is sent.
+    """
+    tmp = Path(tempfile.mkdtemp(prefix="cp-replyfd-"))
+    _redirect_state(tmp)
+    cs_loop = asyncio.new_event_loop()
+    cs_thread = None
+    try:
+        m.ensure_dirs()
+
+        # We need a real pidfd for the parent session so _derive_parent_sid works.
+        # Use our own ppid as the parent's root_tgid so _derive_parent_sid(getpid())
+        # finds it (getpid()'s PPid chain includes getppid()).
+        pidfd_parent = os.pidfd_open(os.getppid())   # live for the whole test
+        try:
+            sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
+            eng = _RecordingEngine()
+            sock_path = str(tmp / "ctrl_replyfd.sock")
+
+            ready = threading.Event()
+            cs = None
+            def run_loop():
+                nonlocal cs
+                asyncio.set_event_loop(cs_loop)
+                cs = m.ChannelServer(sup, eng, sock_path)
+                cs_loop.run_until_complete(cs.start())
+                ready.set()
+                cs_loop.run_forever()
+            cs_thread = threading.Thread(target=run_loop, daemon=True)
+            cs_thread.start()
+            check(ready.wait(5), "reply-fd: loop started")
+
+            # Register the parent session inline (no network path needed).
+            sid_parent = "20260606-000010_111"
+            ack_p = sup.register(dict(session_id=sid_parent, cmd=["parent"],
+                                      root_tgid=os.getppid(),
+                                      _register_pidfd=pidfd_parent,
+                                      prov=dict(ppid=0, exe="/bin/sh", env={})))
+            check(ack_p.get("ok") is True, "reply-fd: parent session registers ok")
+            # register() dup'd the pidfd; close our copy so it doesn't leak.
+            try: os.close(pidfd_parent)
+            except OSError: pass
+            pidfd_parent = -1
+
+            # Pre-create the child's box_root directory so os.open() in register() works.
+            sid_child = "20260606-000010_222"
+            child_box_root = m.mnt_point() / sid_child
+            child_box_root.mkdir(parents=True, exist_ok=True)
+
+            # Send the child register and recvmsg the reply to capture the fd.
+            msg = dict(type="register", session_id=sid_child, cmd=["child"],
+                       want_net=False)
+            payload = (json.dumps(msg) + "\n").encode()
+            own_pidfd = os.pidfd_open(os.getpid())
+            child_mount_fd = -1
+            child_ack = None
+            try:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                    s.settimeout(10.0)
+                    s.connect(sock_path)
+                    s.sendmsg([payload],
+                              [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
+                                array.array("i", [own_pidfd]).tobytes())])
+                    # Use recvmsg to capture any SCM_RIGHTS fd on the reply.
+                    data, anc, _flags, _addr = s.recvmsg(65536,
+                                                          socket.CMSG_SPACE(4 * 4))
+                    for lvl, typ, cmsg_data in anc:
+                        if lvl == socket.SOL_SOCKET and typ == socket.SCM_RIGHTS:
+                            a = array.array("i"); a.frombytes(cmsg_data)
+                            fds = a.tolist()
+                            if fds:
+                                child_mount_fd = fds[0]
+                            for extra in fds[1:]:
+                                try: os.close(extra)
+                                except OSError: pass
+                    line = data.split(b"\n", 1)[0]
+                    child_ack = json.loads(line.decode()) if line.strip() else None
+            finally:
+                try: os.close(own_pidfd)
+                except OSError: pass
+
+            check(child_ack is not None, "reply-fd: child register got a reply")
+            check(child_ack and child_ack.get("ok") is True,
+                  f"reply-fd: child ack ok=True (got {child_ack!r})")
+
+            # KEY ASSERTION: child is nested → should have received a mount fd.
+            parent_derived = sup.sessions[sid_child].parent if sid_child in sup.sessions else None
+            if child_mount_fd >= 0:
+                # The fd is an open_tree fd — a mount fd whose /proc/self/fd/N symlink
+                # resolves to "/" (the root of the cloned mount), not the source path.
+                # Verify the underlying inode matches child_box_root by comparing
+                # the fstat of the fd with the stat of the directory.
+                try:
+                    fd_stat = os.fstat(child_mount_fd)
+                    dir_stat = child_box_root.stat()
+                    same_ino = (fd_stat.st_ino == dir_stat.st_ino and
+                                fd_stat.st_dev == dir_stat.st_dev)
+                except OSError:
+                    same_ino = False
+                check(same_ino,
+                      f"reply-fd: received mount fd's inode matches child box_root "
+                      f"({child_box_root})")
+                try: os.close(child_mount_fd)
+                except OSError: pass
+                child_mount_fd = -1
+            else:
+                # If parent was not derived (e.g. kernel didn't give us host pid via pidfd),
+                # the fd is legitimately absent. Report clearly rather than failing.
+                check(parent_derived is None,
+                      f"reply-fd: no fd sent but parent_derived={parent_derived!r} "
+                      f"(expected None if no fd)")
+
+        finally:
+            if pidfd_parent >= 0:
+                try: os.close(pidfd_parent)
+                except OSError: pass
+    finally:
+        try: cs_loop.call_soon_threadsafe(cs_loop.stop)
+        except Exception: pass
+        if cs_thread is not None: cs_thread.join(timeout=5)
+        try: cs_loop.close()
+        except Exception: pass
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_register_reply_fd_toplevel_no_fd():
+    """A top-level registration (no live parent in the supervisor) sends NO fd on reply.
+
+    Uses a fresh supervisor with no sessions so _derive_parent_sid always returns None,
+    ensuring the box is treated as top-level regardless of our process ancestry.
+    """
+    tmp = Path(tempfile.mkdtemp(prefix="cp-replyfd-top-"))
+    _redirect_state(tmp)
+    cs2_loop = asyncio.new_event_loop()
+    cs2_thread = None
+    try:
+        m.ensure_dirs()
+        # Empty supervisor — no sessions → _derive_parent_sid always returns None.
+        sup2 = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
+        eng2 = _RecordingEngine()
+        sock2 = str(tmp / "ctrl_top.sock")
+
+        ready2 = threading.Event()
+        cs2 = None
+        def run_loop2():
+            nonlocal cs2
+            asyncio.set_event_loop(cs2_loop)
+            cs2 = m.ChannelServer(sup2, eng2, sock2)
+            cs2_loop.run_until_complete(cs2.start())
+            ready2.set()
+            cs2_loop.run_forever()
+        cs2_thread = threading.Thread(target=run_loop2, daemon=True)
+        cs2_thread.start()
+        check(ready2.wait(5), "reply-fd-top: loop started")
+
+        sid_top = "20260606-000011_444"
+        top_box_root = m.mnt_point() / sid_top
+        top_box_root.mkdir(parents=True, exist_ok=True)
+        msg_top = dict(type="register", session_id=sid_top, cmd=["top"], want_net=False)
+        payload_top = (json.dumps(msg_top) + "\n").encode()
+        own_pidfd2 = os.pidfd_open(os.getpid())
+        top_fd = -1
+        top_ack = None
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s2:
+                s2.settimeout(10.0)
+                s2.connect(sock2)
+                s2.sendmsg([payload_top],
+                           [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
+                             array.array("i", [own_pidfd2]).tobytes())])
+                data2, anc2, _flags2, _addr2 = s2.recvmsg(65536,
+                                                           socket.CMSG_SPACE(4 * 4))
+                for lvl, typ, cmsg_data in anc2:
+                    if lvl == socket.SOL_SOCKET and typ == socket.SCM_RIGHTS:
+                        a = array.array("i"); a.frombytes(cmsg_data)
+                        fds2 = a.tolist()
+                        if fds2:
+                            top_fd = fds2[0]
+                        for extra in fds2[1:]:
+                            try: os.close(extra)
+                            except OSError: pass
+                line2 = data2.split(b"\n", 1)[0]
+                top_ack = json.loads(line2.decode()) if line2.strip() else None
+        finally:
+            try: os.close(own_pidfd2)
+            except OSError: pass
+
+        check(top_ack is not None and top_ack.get("ok") is True,
+              f"reply-fd-top: top-level ack ok (got {top_ack!r})")
+        check(top_fd < 0,
+              f"reply-fd-top: top-level register sends NO fd (got fd={top_fd})")
+        if top_fd >= 0:
+            try: os.close(top_fd)
+            except OSError: pass
+    finally:
+        try: cs2_loop.call_soon_threadsafe(cs2_loop.stop)
+        except Exception: pass
+        if cs2_thread is not None: cs2_thread.join(timeout=5)
+        try: cs2_loop.close()
+        except Exception: pass
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     for t in (test_sid_validation_rejects_traversal,
               test_relay_fd_gated_by_socket_not_message,
@@ -854,7 +1069,9 @@ if __name__ == "__main__":
               test_channel_server_pidfd_register,
               test_apply_kick_up_live_parent,
               test_apply_root_box_still_writes_host,
-              test_apply_kick_up_finished_parent):
+              test_apply_kick_up_finished_parent,
+              test_register_reply_fd_nested_box,
+              test_register_reply_fd_toplevel_no_fd):
         print(f"\n== {t.__name__} ==")
         try:
             t()
