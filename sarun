@@ -4615,6 +4615,12 @@ def _pidfd_alive(pidfd: int) -> bool:
         return False
     return not r
 
+def _box_running(s) -> bool:
+    """True iff box `s` has a live runner root right now — the wrap-immune liveness
+    that Session.status uses. PID-reuse-safe: never trusts s.pid (a reused pid could
+    make a finished box look alive and be read or freed as if it were running)."""
+    return bool(s and s.live and s.run_pidfd >= 0 and _pidfd_alive(s.run_pidfd))
+
 def rm_rf(path) -> None:
     """Remove a tree, fixing perms (backing dirs are created with restrictive modes,
     e.g. 0700, so a plain rmtree would fail on subdirectories)."""
@@ -4689,7 +4695,7 @@ class Session:
         # derived liveness via the held pidfd — wrap-immune). With no running root the
         # box is stopped, and the flags say why. A box discovered from disk (no held
         # pidfd this UI run) is, by definition, not running.
-        if self.live and self.run_pidfd >= 0 and _pidfd_alive(self.run_pidfd):
+        if _box_running(self):
             return "running"
         if self.killed:
             return "killed"
@@ -5245,7 +5251,7 @@ class ChangeReview:
         the UI)."""
         if sid in self._consolidated: return None
         s = self.reg.sessions.get(sid)
-        if not s or s.live or _pid_alive(s.pid): return None
+        if not s or _box_running(s): return None
         self._consolidated.add(sid)
         if not (s.shm_dir and Path(s.shm_dir).exists()): return None
         idx = self.reg.indexes.pop(sid, None)
@@ -5299,7 +5305,7 @@ class ChangeReview:
 
     def _live(self, sid) -> bool:
         s = self.reg.sessions.get(sid)
-        return bool(s and (s.live or _pid_alive(s.pid)) and Path(s.upper).exists())
+        return bool(_box_running(s) and Path(s.upper).exists())
 
     def _source(self, sid) -> ChangeSource:
         """THE sole live-vs-consolidated branch in the change-review code: a live box
@@ -6759,7 +6765,7 @@ class Supervisor:
         # — the runner shares the launching shell's process group.
         sid = self.resolve_box(ident)
         s = self.sessions.get(sid) if sid is not None else None
-        if not s or not _pid_alive(s.pid): return
+        if not s or not _box_running(s): return
         try: os.kill(s.pid, signal.SIGTERM)
         except ProcessLookupError: pass
         # Record intent; .status stays "running" until the runner root actually dies and
@@ -6775,7 +6781,7 @@ class Supervisor:
         does nothing for a still-running box. Handles both an in-sessions box and an
         sqlar-only box (no Session object)."""
         s = self.sessions.get(sid)
-        if s is not None and _pid_alive(s.pid) and s.live:
+        if s is not None and _box_running(s):
             return                                  # refuse to free a running box
         if self.mount is not None:
             self.mount.remove_session(sid)
@@ -6820,7 +6826,7 @@ class Supervisor:
         s = self.sessions.get(sid)
         if s is None and not sqlar_path(sid).exists():
             return None
-        if s is not None and _pid_alive(s.pid) and s.live:
+        if s is not None and _box_running(s):
             return None
         self._free_storage(sid)
         return None
@@ -6899,7 +6905,7 @@ class Supervisor:
         box. Live/running boxes are never 'empty' for removal purposes. This is a pure
         PREDICATE: it never deletes (so it is safe to call from inside a loop)."""
         s = self.sessions.get(sid)
-        if not s or s.live or _pid_alive(s.pid): return False
+        if not s or _box_running(s): return False
         try: overlay = upper_has_changes(Path(s.upper))
         except OSError: overlay = False
         sqlar = bool(sqlar_list(sqlar_path(sid)))
