@@ -2037,13 +2037,13 @@ class Index:
             # Free the pool blobs of any file rows under the prefix before dropping the
             # rows — otherwise the bytes leak (the row that named them is gone).
             for rid, mode in self._db.execute(
-                    "SELECT rowid, mode FROM sqlar WHERE name LIKE ? ESCAPE '\\'",
-                    (_like_escape(pref) + "%",)).fetchall():
+                    "SELECT rowid, mode FROM sqlar WHERE substr(name,1,?)=?",
+                    (len(pref), pref)).fetchall():
                 if stat_mod.S_ISREG(mode):
                     try: blob_path(self.box_id, rid).unlink()
                     except OSError: pass
-            self._db.execute("DELETE FROM sqlar WHERE name LIKE ? ESCAPE '\\'",
-                             (_like_escape(pref) + "%",))
+            self._db.execute("DELETE FROM sqlar WHERE substr(name,1,?)=?",
+                             (len(pref), pref))
             self._db.commit()
             for s in (self._whiteouts, self._opaque):
                 for p in [p for p in s if p.startswith(pref)]: s.discard(p)
@@ -2060,8 +2060,8 @@ class Index:
         with self._lock:
             rows = self._db.execute(
                 "SELECT rowid, name, mode, opaque FROM sqlar"
-                " WHERE name LIKE ? ESCAPE '\\'",
-                (_like_escape(oldp) + "%",)).fetchall()
+                " WHERE substr(name,1,?)=?",
+                (len(oldp), oldp)).fetchall()
             for rowid, path, mode, opaque in rows:
                 np = newp + path[len(oldp):]
                 # drop any pre-existing row at the destination (keep source rowid)
@@ -4058,6 +4058,10 @@ def _build_overlay_ops():
                                   mtime_ns=getattr(st, "st_mtime_ns", 0))
                 else:
                     src_bp = self._backing_path(sid, rel_src)
+                    if src_bp is None:
+                        # No pool blob backs the source (e.g. an open write-buffered
+                        # file not yet spilled): nothing to reflink-copy from here.
+                        raise pyfuse3.FUSEError(errno.EIO)
                     dst_bp = self._new_file_blob(sid, rel_n, st.st_mode, wid,
                                                  "link_as_copy", detail=rel_src)
                     src = os.open(src_bp, os.O_RDONLY | os.O_NOFOLLOW)
@@ -5110,7 +5114,9 @@ class SqlarArchive(ChangeSource):
         # equal the host's bytes; drop the row then.
         rel = rel.lstrip("/")
         if (self.current_bytes(rel) or b"") == ChangeReview._lower_bytes(rel):
-            sqlar_remove(self.path, rel)
+            # A resident file keeps its bytes in the pool blob — drop the row AND the
+            # blob (sqlar_remove alone would orphan the blob on disk).
+            self._drop_row_and_blob(rel)
 
     def write_current(self, rel, data):
         rel = rel.lstrip("/")
@@ -7406,10 +7412,16 @@ class ChannelServer:
             # deflate pass, so run it in the executor (awaited — the CLI is blocked on
             # this reply) instead of inline, keeping the loop free for the UI/proxy.
             try:
-                sid = msg.get("sid") or self.sup.selected_sid
-                if not sid:
-                    return dict(ok=False, error="no slopbox selected in the UI")
-                if msg.get("sid"): self.sup.select(sid)
+                raw = msg.get("sid")
+                if raw:
+                    sid = self.sup.resolve_box(raw)          # NAME / path / box_id → box_id
+                    if sid is None:
+                        return dict(ok=False, error=f"no slopbox '{raw}'")
+                    self.sup.select(sid)
+                else:
+                    sid = self.sup.selected_sid
+                    if not sid:
+                        return dict(ok=False, error="no slopbox selected in the UI")
                 await self.sup.consolidate_in_executor(self._loop, sid)
                 data = self.sup.review.patch_text(sid)
                 return dict(ok=True, patch=base64.b64encode(data).decode())
@@ -7421,10 +7433,16 @@ class ChannelServer:
             # force-delete the box — unlike the UI we delete unconditionally, even with
             # network-flow rows, so the CLI op is predictable (box consumed).
             try:
-                sid = msg.get("sid") or self.sup.selected_sid
-                if not sid:
-                    return dict(ok=False, error="no slopbox selected in the UI")
-                if msg.get("sid"): self.sup.select(sid)
+                raw = msg.get("sid")
+                if raw:
+                    sid = self.sup.resolve_box(raw)          # NAME / path / box_id → box_id
+                    if sid is None:
+                        return dict(ok=False, error=f"no slopbox '{raw}'")
+                    self.sup.select(sid)
+                else:
+                    sid = self.sup.selected_sid
+                    if not sid:
+                        return dict(ok=False, error="no slopbox selected in the UI")
                 await self.sup.consolidate_in_executor(self._loop, sid)
                 paths = [e["path"] for e in self.sup.review.session_changes(sid)]
                 if t == "apply":
