@@ -154,12 +154,13 @@ def live_dir(session_id: str) -> Path:
 # dir is removed. The shard level keeps any one directory from collecting the
 # millions of inodes a large box can produce.
 POOL_SHARDS = 1024
-# At consolidate, a regular file at least this large is kept as a PERMANENT pool
-# file (the row stays resident: data NULL, bytes on disk) rather than folded into
-# the sqlar blob. Both are valid rest forms; the choice is per file, by size. Set to
-# the write-buffer spill threshold so "big enough to have spilled to a pool file
-# while live" and "big enough to stay a pool file at rest" coincide.
-POOL_RESIDENT_MIN = 1 << 20
+# The AT-REST fold threshold: at consolidate/promote, a regular file at least this
+# large is kept as a PERMANENT pool file (the row stays resident: data NULL, bytes
+# on disk) rather than folded inline into the sqlar blob. Both are valid rest forms;
+# the choice is per file, by size. This is a storage-layout knob, set near the
+# SQLite internal-vs-external-blob crossover. It is INDEPENDENT of WBUF_SPILL: that
+# is a live RAM-vs-disk write-buffer knob and the two need not coincide.
+POOL_RESIDENT_MIN = 64 << 10
 
 def pool_home() -> Path:
     return live_home() / "blob"
