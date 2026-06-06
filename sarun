@@ -81,6 +81,7 @@ import os
 import queue
 import re
 import resource
+import select
 import shutil
 import signal
 import socket
@@ -1452,8 +1453,6 @@ class Index:
         # come from the UI thread; the dict is GIL-atomic like the other RAM mirrors.
         self._active: dict = {}           # tgid -> last-seen monotonic
         self._dead_since: dict = {}       # tgid -> first monotonic kill(0) saw it dead
-        self._root_start: dict = {}       # root tgid -> /proc start_time at first sight
-        self._dead_roots: set = set()     # roots seen finished — PERMANENT (pid-wrap safe)
         self._tracing = False             # -t: record the process table
         # The box's hierarchy ROOTS: the tgids of every `slopbox -- cmd` launch (one
         # per run; a re-run adds another). Newly-inserted process rows bubble up their
@@ -1576,9 +1575,6 @@ class Index:
         self._touch_active(tgid)                  # active-set: re-stamp on every sight
         if root:
             self._roots.add(tgid)
-            # Pin the root's identity by start_time so a later pid wrap can't make a
-            # finished box look running again (tgid is a HOST pid — see register).
-            self._root_start.setdefault(tgid, _proc_start_time(tgid))
         cached = self._proc_cache.get(tgid)
         if cached is not None:
             if root:                              # promote an already-recorded row
@@ -1653,23 +1649,6 @@ class Index:
         """The box's hierarchy-root tgids (the PPid-bubbling / tree-walk boundary).
         GIL-atomic read of the RAM mirror (Index threading contract)."""
         return set(self._roots)
-
-    def running_roots(self) -> set:
-        """Roots whose runner process is STILL the same live process — alive AND its
-        /proc start_time matches what we pinned at first sight. A root seen finished is
-        recorded permanently (_dead_roots) and never reported running again, so a pid
-        wrap that reuses a finished runner's pid can never resurrect a dead box (this
-        gates which boxes a new child may attach to). GIL-atomic RAM read."""
-        out = set()
-        for t in list(self._roots):
-            if t in self._dead_roots:
-                continue
-            pinned = self._root_start.get(t)
-            if _pid_alive(t) and (pinned is None or _proc_start_time(t) == pinned):
-                out.add(t)
-            else:
-                self._dead_roots.add(t)        # permanent: finished stays finished
-        return out
 
     def live_processes(self) -> list:
         """htop-style live view of the box's ACTIVE SET: the recently-seen tgids only,
@@ -3870,6 +3849,18 @@ def _pid_alive(pid: int) -> bool:
     except PermissionError:
         return True
 
+def _pidfd_alive(pidfd: int) -> bool:
+    """True while the process the pidfd refers to is still running. A pidfd becomes
+    readable once its process exits (Linux >=5.3), so 'not readable' == alive. Wrap-
+    immune: the pidfd names one exact process incarnation, never a reused pid."""
+    if pidfd is None or pidfd < 0:
+        return False
+    try:
+        r, _, _ = select.select([pidfd], [], [], 0)
+    except (OSError, ValueError):
+        return False
+    return not r
+
 def rm_rf(path) -> None:
     """Remove a tree, fixing perms (backing dirs are created with restrictive modes,
     e.g. 0700, so a plain rmtree would fail on subdirectories)."""
@@ -3920,6 +3911,7 @@ class Session:
     has_flows: bool = False                           # the single db has flows
     born: str = ""                # original auto-sid if renamed (age/stamp source)
     run_pid: int = 0              # the live runner's host pid (set at register)
+    run_pidfd: int = -1           # held pidfd of the live runner; liveness handle, closed at teardown
     parent: "str | None" = None  # parent box sid (kernel-derived); None for root boxes
     # started time and pid are read out of the name; a renamed box (sid is a NAME, no
     # timestamp) falls back to `born`, the auto-sid it was launched under.
@@ -5264,10 +5256,21 @@ class Supervisor:
             if ca.strip():
                 self.mount.add_ca_spoof(sid, ca, SYSTEM_CA_FILES)
         box_root = str(mnt_point() / sid)
+        # Close any held pidfd from a prior run of this sid to avoid a leak.
+        _old = self.sessions.get(sid)
+        if _old is not None and _old.run_pidfd >= 0:
+            try: os.close(_old.run_pidfd)
+            except OSError: pass
         s = Session(session_id=sid, cmd=cmd, shm_dir=str(backing),
                     status="running", live=True, run_pid=root_prov["tgid"],
                     born=sqlar_meta_get(sqlar_path(sid), "born") or "",
                     parent=parent_sid)   # kernel-derived; None for root boxes
+        # Dup the runner's pidfd into the session so we own a persistent liveness handle.
+        # _handle keeps its own copy and closes it after this call; we need a separate fd.
+        _rfd = int(msg.get("_register_pidfd", -1))
+        if _rfd >= 0:
+            try: s.run_pidfd = os.dup(_rfd)
+            except OSError: s.run_pidfd = -1
         for h in msg.get("session_whitelist", []):
             s.sess_rules.append(Rule("allow", "host", h))
         self.sessions[sid] = s
@@ -5409,6 +5412,11 @@ class Supervisor:
         if not s:
             return
         s.live = False
+        # Release the runner's liveness pidfd now that the session is done.
+        if s.run_pidfd >= 0:
+            try: os.close(s.run_pidfd)
+            except OSError: pass
+            s.run_pidfd = -1
         if s.status == "running": s.status = reported_status
         s.exit_code = msg.get("exit_code")
         s.has_sqlar = bool(sqlar_list(sqlar_path(sid)))
@@ -5434,7 +5442,12 @@ class Supervisor:
             return
         self._stop_relay(sid)
         self._owner_tokens.pop(sid, None)
-        if self.sessions.pop(sid, None) is not None:
+        _s = self.sessions.pop(sid, None)
+        if _s is not None:
+            if _s.run_pidfd >= 0:
+                try: os.close(_s.run_pidfd)
+                except OSError: pass
+                _s.run_pidfd = -1
             self._emit(type="session_removed", session_id=sid)
 
     def _box_exists(self, sid) -> bool:
@@ -5597,6 +5610,10 @@ class Supervisor:
         if sp.exists():
             try: sp.unlink()
             except OSError: pass
+        if s.run_pidfd >= 0:
+            try: os.close(s.run_pidfd)
+            except OSError: pass
+            s.run_pidfd = -1
         del self.sessions[sid]
         self._emit(type="session_removed", session_id=sid)
 
@@ -5910,9 +5927,10 @@ def _ppid_of(pid: int) -> int:
 
 def _derive_parent_sid(peer_pid: int, sup: "Supervisor") -> "str | None":
     """Given the host-namespace pid of the connecting runner, walk the /proc PPid
-    chain upward and return the sid of the first live session whose root tgids
-    contain an ancestor of peer_pid.  Returns None if peer_pid is not inside any
-    known session's process forest (i.e. this is a top-level box).
+    chain upward and return the sid of the first live session whose run_pid matches
+    an ancestor of peer_pid — gated by the session's held pidfd so the match is
+    wrap-immune (the pidfd names one exact process incarnation; a finished runner
+    can never alias a reused pid).
 
     Security: peer_pid is derived from the runner's pidfd via _host_pid_from_pidfd
     (reads /proc/self/fdinfo/<pidfd> in the UI's host namespace) — the same path
@@ -5921,18 +5939,12 @@ def _derive_parent_sid(peer_pid: int, sup: "Supervisor") -> "str | None":
     is used.  The sid is never trusted from the box."""
     if peer_pid <= 1:
         return None
-    # Build {root_tgid -> sid} over sessions whose runner is STILL RUNNING. running_roots
-    # is pid-wrap safe (alive AND start_time matches; finished roots are permanently
-    # excluded), so a child can never attach to a box whose runner has exited — even if
-    # the OS later reuses that runner's pid.
+    # Build {run_pid -> sid} over sessions whose runner pidfd is STILL alive.
+    # _pidfd_alive is the sole liveness gate — no start_time, no kill(0).
     root_map: dict = {}
-    for sid, idx in sup.indexes.items():
-        sess = sup.sessions.get(sid)
-        if sess is None or not sess.live:
-            continue
-        for rt in idx.running_roots():
-            if rt > 0:
-                root_map[rt] = sid
+    for sid, sess in sup.sessions.items():
+        if sess.live and _pidfd_alive(sess.run_pidfd) and sess.run_pid > 0:
+            root_map[sess.run_pid] = sid
     if not root_map:
         return None
     # Walk the PPid chain from peer_pid upward; first match wins.
@@ -5988,18 +6000,17 @@ class ChannelServer:
         # The FIRST read on each control connection uses recvmsg so we can capture
         # the optional pidfd the runner sends alongside its register JSON.  The
         # control socket accepts a single pidfd on the register connection — used
-        # ONLY to derive the runner's HOST-namespace pid via _host_pid_from_pidfd
-        # (the codebase's universal /proc/self/fdinfo path).  No sid is ever trusted
-        # from the box; parent identity is derived from the pidfd ancestry walk.
+        # to derive the runner's HOST-namespace pid AND kept as the liveness handle
+        # for the session's run_pidfd (dup'd into the Session by register).
         # Non-register messages (unregister/drop/select/rename/patch) carry no FD
         # and are handled normally — peer_pid stays 0 for those.
         _peer_pid = 0
+        _pidfd = -1          # kept open until after _dispatch_control (register dups it)
         buf = b""
         try:
             _data, _anc, _flags, _addr = await self._loop.run_in_executor(
                 None, _recvmsg_blocking, conn)
             buf = _data
-            _pidfd = -1
             for lvl, typ, data in _anc:
                 if lvl == socket.SOL_SOCKET and typ == socket.SCM_RIGHTS:
                     a = array.array("i"); a.frombytes(data)
@@ -6013,9 +6024,12 @@ class ChannelServer:
                         except OSError: pass
             if _pidfd >= 0:
                 _peer_pid = _host_pid_from_pidfd(_pidfd)
+                # Do NOT close _pidfd here — pass it to _dispatch_control so
+                # register can dup it into the Session as the liveness handle.
+        except (OSError, asyncio.CancelledError):
+            if _pidfd >= 0:
                 try: os.close(_pidfd)
                 except OSError: pass
-        except (OSError, asyncio.CancelledError):
             try: conn.close()
             except OSError: pass
             return
@@ -6029,7 +6043,8 @@ class ChannelServer:
                 if b"\n" in buf:
                     line, buf = buf.split(b"\n", 1)
                     if line.strip():
-                        reply = await self._dispatch_control(line, _peer_pid)
+                        reply = await self._dispatch_control(line, _peer_pid,
+                                                             peer_pidfd=_pidfd)
                         if reply is not None:
                             try:
                                 await self._loop.sock_sendall(
@@ -6040,7 +6055,8 @@ class ChannelServer:
                 more = await self._loop.sock_recv(conn, 4096)
                 if not more:
                     if buf.strip():
-                        reply = await self._dispatch_control(buf, _peer_pid)
+                        reply = await self._dispatch_control(buf, _peer_pid,
+                                                             peer_pidfd=_pidfd)
                         if reply is not None:
                             try:
                                 await self._loop.sock_sendall(
@@ -6052,10 +6068,15 @@ class ChannelServer:
         except (OSError, asyncio.CancelledError):
             pass
         finally:
+            # Close _handle's own copy of the pidfd; register dup'd it if it kept it.
+            if _pidfd >= 0:
+                try: os.close(_pidfd)
+                except OSError: pass
             try: conn.close()
             except OSError: pass
 
-    async def _dispatch_control(self, line: bytes, peer_pid: int = 0) -> "dict | None":
+    async def _dispatch_control(self, line: bytes, peer_pid: int = 0,
+                               peer_pidfd: int = -1) -> "dict | None":
         try: msg = json.loads(line.decode())
         except json.JSONDecodeError: return None
         t = msg.get("type")
@@ -6068,6 +6089,7 @@ class ChannelServer:
                 msg["_derived_parent_sid"] = _derive_parent_sid(peer_pid, self.sup)
                 msg["_register_host_pid"] = peer_pid   # pidfd-derived HOST pid of the
                                                        # runner — the box's true root
+                msg["_register_pidfd"] = peer_pidfd    # server-injected; register dups it
                 return self.sup.register(msg)          # acks with the mount path
             except Exception as e:
                 return dict(ok=False, error=str(e))

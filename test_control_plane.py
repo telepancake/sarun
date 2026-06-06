@@ -445,6 +445,9 @@ def test_derive_parent_sid_owner_discovery():
     """
     tmp = Path(tempfile.mkdtemp(prefix="cp-nest-"))
     _redirect_state(tmp)
+    # Open pidfds before registering so each session has a live liveness handle.
+    # _derive_parent_sid now gates root_map on _pidfd_alive(sess.run_pidfd).
+    pidfd_a = os.pidfd_open(os.getppid())   # live: our parent is alive for the test
     try:
         m.ensure_dirs()
         sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
@@ -455,15 +458,20 @@ def test_derive_parent_sid_owner_discovery():
         sid_a = "20260604-000001_111"
         sid_b = "20260604-000001_222"
 
-        # Register session A with root tgid == our ppid (a real ancestor).
+        # Register session A: root_tgid == our ppid, supply a live pidfd so
+        # _pidfd_alive(sess_a.run_pidfd) is True and the entry appears in root_map.
         ack_a = sup.register(dict(session_id=sid_a, cmd=["true"],
                                   root_tgid=my_ppid,
+                                  _register_pidfd=pidfd_a,
                                   prov=dict(ppid=0, exe="/bin/sh", env={})))
         check(ack_a.get("ok") is True, "derive: session A registers ok")
+        # register() dup'd the fd; close our copy so it doesn't leak.
+        try: os.close(pidfd_a)
+        except OSError: pass
+        pidfd_a = -1
 
-        # Register session B with root tgid == our own pid (not an ancestor of itself
-        # when passed a *child* pid; we'll query with my_pid as the peer).
-        # We pick a synthetic tgid that is definitively NOT in our PPid chain.
+        # Register session B: root_tgid is a synthetic dead pid; no pidfd supplied →
+        # run_pidfd stays -1 → _pidfd_alive returns False → B never enters root_map.
         fake_root_b = 99999999   # unlikely to be alive, definitely not our ancestor
         ack_b = sup.register(dict(session_id=sid_b, cmd=["true"],
                                   root_tgid=fake_root_b,
@@ -498,6 +506,9 @@ def test_derive_parent_sid_owner_discovery():
               "derive: no live sessions → None")
 
     finally:
+        if pidfd_a >= 0:
+            try: os.close(pidfd_a)
+            except OSError: pass
         shutil.rmtree(tmp, ignore_errors=True)
 
 
