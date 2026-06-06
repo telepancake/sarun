@@ -6568,7 +6568,8 @@ def run_on_untrusted(argv, files, timeout=10, out_cap=256 * 1024, on_spawn=None)
                 sub[name] = inside + "/" + name
             real = [sub.get(a.strip("{}"), a) if (a.startswith("{") and a.endswith("}"))
                     else a for a in argv]
-            bw = ["bwrap", "--unshare-all", "--die-with-parent", "--new-session",
+            bw = ["bwrap", "--unshare-pid", "--unshare-ipc", "--unshare-uts",
+                  "--unshare-net", "--die-with-parent", "--new-session",
                   "--cap-drop", "ALL", "--ro-bind", "/", "/",
                   "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
                   "--ro-bind", td, inside, "--chdir", inside,
