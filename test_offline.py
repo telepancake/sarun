@@ -286,6 +286,43 @@ def test_box_id_and_pool_layout():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_running_roots_wrap_safe():
+    """running_roots() reports a root only while its runner is the SAME live process —
+    alive AND its pinned /proc start_time still matches. A finished root (dead, or a
+    pid-wrap that reused the pid with a different start_time) is permanently excluded,
+    so a dead box can never be resurrected as a parent."""
+    tmp = Path(tempfile.mkdtemp(prefix="ofl-rr-"))
+    _redirect_state(tmp)
+    try:
+        # (a) a genuinely live root: our own parent process, start_time pinned at record.
+        b1 = m.live_dir("20260604-000000_701"); (b1 / "up").mkdir(parents=True)
+        idx = m.Index(b1)
+        ppid = os.getppid()
+        idx.process_from_prov(dict(tgid=ppid, ppid=0, exe="x", argv=[], env={}), root=True)
+        check(ppid in idx.running_roots(), "live root reported running")
+
+        # (b) a dead root: a pid that isn't alive → excluded and flagged finished forever.
+        dead = 99999997
+        idx.process_from_prov(dict(tgid=dead, ppid=0, exe="x", argv=[], env={}), root=True)
+        check(dead not in idx.running_roots(), "dead root not reported running")
+        check(dead in idx._dead_roots, "dead root permanently flagged finished")
+        check(dead not in idx.running_roots(), "finished root stays finished on re-probe")
+        idx.close()
+
+        # (c) pid-wrap simulation: an ALIVE pid whose pinned start_time no longer matches
+        #     (the pid was reused by a different process) is treated as finished.
+        b2 = m.live_dir("20260604-000000_702"); (b2 / "up").mkdir(parents=True)
+        idx2 = m.Index(b2)
+        idx2.process_from_prov(dict(tgid=ppid, ppid=0, exe="x", argv=[], env={}), root=True)
+        idx2._root_start[ppid] = (idx2._root_start.get(ppid) or 0) + 10_000_000  # corrupt pin
+        check(ppid not in idx2.running_roots(),
+              "alive pid with mismatched start_time treated as finished (pid-wrap safe)")
+        check(ppid in idx2._dead_roots, "wrapped root permanently flagged finished")
+        idx2.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     for t in (test_one_db_only_and_blob_lifecycle,
               test_process_and_env_tables_dedup_and_tag,
@@ -293,6 +330,7 @@ if __name__ == "__main__":
               test_consolidate_opaque_expands_tombstones,
               test_process_table_is_one_connected_tree,
               test_supervisor_no_mount_register_fails_closed,
+              test_running_roots_wrap_safe,
               test_box_id_and_pool_layout):
         print(f"\n== {t.__name__} ==")
         try:

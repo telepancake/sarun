@@ -1452,6 +1452,8 @@ class Index:
         # come from the UI thread; the dict is GIL-atomic like the other RAM mirrors.
         self._active: dict = {}           # tgid -> last-seen monotonic
         self._dead_since: dict = {}       # tgid -> first monotonic kill(0) saw it dead
+        self._root_start: dict = {}       # root tgid -> /proc start_time at first sight
+        self._dead_roots: set = set()     # roots seen finished — PERMANENT (pid-wrap safe)
         self._tracing = False             # -t: record the process table
         # The box's hierarchy ROOTS: the tgids of every `slopbox -- cmd` launch (one
         # per run; a re-run adds another). Newly-inserted process rows bubble up their
@@ -1572,7 +1574,11 @@ class Index:
         tgid = int(prov.get("tgid") or 0)
         if not tgid: return None
         self._touch_active(tgid)                  # active-set: re-stamp on every sight
-        if root: self._roots.add(tgid)
+        if root:
+            self._roots.add(tgid)
+            # Pin the root's identity by start_time so a later pid wrap can't make a
+            # finished box look running again (tgid is a HOST pid — see register).
+            self._root_start.setdefault(tgid, _proc_start_time(tgid))
         cached = self._proc_cache.get(tgid)
         if cached is not None:
             if root:                              # promote an already-recorded row
@@ -1647,6 +1653,23 @@ class Index:
         """The box's hierarchy-root tgids (the PPid-bubbling / tree-walk boundary).
         GIL-atomic read of the RAM mirror (Index threading contract)."""
         return set(self._roots)
+
+    def running_roots(self) -> set:
+        """Roots whose runner process is STILL the same live process — alive AND its
+        /proc start_time matches what we pinned at first sight. A root seen finished is
+        recorded permanently (_dead_roots) and never reported running again, so a pid
+        wrap that reuses a finished runner's pid can never resurrect a dead box (this
+        gates which boxes a new child may attach to). GIL-atomic RAM read."""
+        out = set()
+        for t in list(self._roots):
+            if t in self._dead_roots:
+                continue
+            pinned = self._root_start.get(t)
+            if _pid_alive(t) and (pinned is None or _proc_start_time(t) == pinned):
+                out.add(t)
+            else:
+                self._dead_roots.add(t)        # permanent: finished stays finished
+        return out
 
     def live_processes(self) -> list:
         """htop-style live view of the box's ACTIVE SET: the recently-seen tgids only,
@@ -4897,8 +4920,12 @@ class Supervisor:
         root_prov = dict(msg.get("prov") or {})
         # The runner's own host pid is the box root. It equals the sid's pid suffix on a
         # first run; a re-run reuses an existing sid (different pid), so trust the
-        # runner-reported tgid and fall back to the sid only if absent.
-        root_prov["tgid"] = int(msg.get("root_tgid") or 0) or parse_sid(sid)[1]
+        # runner-reported tgid and fall back to the sid only if absent. Prefer the
+        # pidfd-derived HOST pid (_register_host_pid): the runner's self-reported
+        # os.getpid() is box-namespaced when the runner is itself inside a box, which
+        # would break the host-pid forest and the parent-ancestry match for nesting.
+        root_prov["tgid"] = (int(msg.get("_register_host_pid") or 0)
+                             or int(msg.get("root_tgid") or 0) or parse_sid(sid)[1])
         root_prov["argv"] = list(cmd)
         index.process_from_prov(root_prov, root=True)
         self.indexes[sid] = index
@@ -5576,13 +5603,16 @@ def _derive_parent_sid(peer_pid: int, sup: "Supervisor") -> "str | None":
     is used.  The sid is never trusted from the box."""
     if peer_pid <= 1:
         return None
-    # Build {root_tgid -> sid} for every CURRENTLY LIVE session with a live Index.
+    # Build {root_tgid -> sid} over sessions whose runner is STILL RUNNING. running_roots
+    # is pid-wrap safe (alive AND start_time matches; finished roots are permanently
+    # excluded), so a child can never attach to a box whose runner has exited — even if
+    # the OS later reuses that runner's pid.
     root_map: dict = {}
     for sid, idx in sup.indexes.items():
         sess = sup.sessions.get(sid)
         if sess is None or not sess.live:
             continue
-        for rt in idx.roots():
+        for rt in idx.running_roots():
             if rt > 0:
                 root_map[rt] = sid
     if not root_map:
@@ -5718,6 +5748,8 @@ class ChannelServer:
                 # _host_pid_from_pidfd — never from SO_PEERCRED.  The box never
                 # supplies this field; only kernel-trusted ancestry counts.
                 msg["_derived_parent_sid"] = _derive_parent_sid(peer_pid, self.sup)
+                msg["_register_host_pid"] = peer_pid   # pidfd-derived HOST pid of the
+                                                       # runner — the box's true root
                 return self.sup.register(msg)          # acks with the mount path
             except Exception as e:
                 return dict(ok=False, error=str(e))
