@@ -3943,6 +3943,47 @@ def _build_overlay_ops():
             finally:
                 self._req_exit()
 
+        def flush_wbuf(self, force: bool = False) -> None:
+            """Snapshot all dirty RAM-backed write buffers to their sqlar rows.
+
+            WHY: if the process dies with files still open, in-RAM bytes are lost.
+            This method snapshots each dirty buffer into the evicted sqlar row using
+            the same deflate path as release() — crash-resilient durability without
+            closing the file or resetting the buffer (the bytearray stays the live
+            authoritative copy; reads still serve from it, not from the row snapshot).
+
+            Called periodically by the trio serve task (_periodic_flush) and once on
+            exit in OverlayMount.stop() before the FUSE session is torn down.
+
+            MUST be called on the serve (trio) thread only — _wbuf is NOT thread-safe.
+            force=True snapshots even non-dirty buffers (used on exit so nothing is missed).
+            Spilled buffers (spilled_fd >= 0) are already on disk; skip them."""
+            for fh, wb in list(self._wbuf.items()):
+                try:
+                    if wb.get("spilled_fd", -1) >= 0:
+                        continue   # already on disk in the pool blob; not at risk
+                    if not force and not wb.get("dirty", False):
+                        continue   # unchanged since last snapshot; skip
+                    sid, rel = wb["sid"], wb["rel"]
+                    idx = self._index(sid)
+                    # Delete any stale pool blob so _resolve_st won't serve old bytes.
+                    rid = idx.row_id(rel)
+                    if rid is not None:
+                        bp = blob_path(idx.box_id, rid)
+                        if bp.exists():
+                            try: os.unlink(str(bp))
+                            except OSError: pass
+                    data_bytes = bytes(wb["data"])
+                    deflated, sz = _sqlar_deflate(data_bytes)
+                    # Mirror release()'s exact call — sets data NOT NULL in the row.
+                    idx.set_blob(rel, deflated, sz, wb["mode"],
+                                 wb["mtime_ns"], wb["wid"])
+                    # Mark clean so unchanged buffers are skipped on the next cycle.
+                    # write() already sets dirty=True on any subsequent write, so this is safe.
+                    wb["dirty"] = False
+                except Exception:
+                    pass   # one bad entry must not abort the rest
+
         def _notify(self, sid: str, rel: str = None, op: str = None) -> None:
             """Live-feedback seam: tell the UI a box's overlay changed so the Changes
             view refreshes event-driven (NOT by polling). Carries the affected `rel`
@@ -4012,11 +4053,25 @@ class OverlayMount:
             self._started.set()
             return
 
+        ops = self.ops
+
+        async def _periodic_flush():
+            """Snapshot dirty RAM write buffers every 5 s — runs on the serve thread
+            so _wbuf access is safe (no locks needed, same thread as all FUSE ops).
+            Cancelled cleanly when the nursery scope is cancelled on stop()."""
+            while True:
+                await trio.sleep(5)
+                try:
+                    ops.flush_wbuf()
+                except Exception:
+                    pass
+
         async def _main():
             self._trio_token = trio.lowlevel.current_trio_token()
             self._stop_trio = trio.Event()
             async with trio.open_nursery() as nursery:
                 nursery.start_soon(pyfuse3.main)
+                nursery.start_soon(_periodic_flush)
                 # signal "serving" only after the loop is running.
                 self._started.set()
                 await self._stop_trio.wait()
@@ -4096,6 +4151,18 @@ class OverlayMount:
         if ev is not None and token is not None:
             try:
                 import trio
+                # Force-flush all dirty RAM buffers on the serve thread BEFORE stopping,
+                # so open files' bytes reach the sqlar row even if the UI/process dies.
+                # run_sync schedules the call on the trio event loop (serve thread) and
+                # blocks the UI thread until it completes — safe because flush_wbuf is
+                # synchronous and _wbuf is only mutated by the serve thread.
+                if self.ops is not None:
+                    try:
+                        trio.from_thread.run_sync(self.ops.flush_wbuf,
+                                                  True,   # force=True
+                                                  trio_token=token)
+                    except Exception:
+                        pass   # best-effort; proceed with shutdown regardless
                 trio.from_thread.run_sync(ev.set, trio_token=token)
             except trio.RunFinishedError:
                 # The serve loop already finished (e.g. unmounted/crashed); the

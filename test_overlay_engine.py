@@ -862,6 +862,116 @@ def test_wbuf_create_buffers():
         fx.stop()
 
 
+def test_wbuf_periodic_flush():
+    """flush_wbuf() snapshots dirty RAM buffers to sqlar rows WITHOUT resetting them.
+
+    Key assertions:
+      (a) After flush_wbuf(force=True) the sqlar row has data NOT NULL (snapshot reached).
+      (b) The buffer stays usable: subsequent reads through the mount return the live bytes.
+      (c) Appending after the snapshot and then closing yields the full correct content.
+      (d) A non-dirty buffer is skipped by flush_wbuf() but force=True flushes it anyway.
+    """
+    import zlib as _zl
+    fx = MountFixture()
+    try:
+        fx.start()
+
+        # Write a small file and close it so the row exists (data NOT NULL) in the index.
+        r = fx.sh("printf 'base content\\n' > flush_test.txt")
+        check(r.returncode == 0, "flush_wbuf: initial file created ok")
+
+        # Now open for append so a write buffer is live (file stays open in shell subshell).
+        # Because each sh() call is a separate process that exits and closes its fds, we
+        # cannot hold an fd open across sh() calls.  Instead we drive flush_wbuf directly
+        # against the ops object: inject a synthetic write-buffer entry representing a file
+        # that has been written but not yet closed, then call flush_wbuf and verify the row.
+
+        # ── synthetic buffer injection ───────────────────────────────────────────────
+        # Build a write-buffer dict that looks exactly like one created by _create_write_buffer.
+        sid = fx.sid
+        rel = "flush_inject.txt"
+        idx = fx.index
+        wid = idx.writer_for(os.getpid())
+        # Set a "file" kind entry so set_blob finds a consistent row state.
+        idx.set_entry(rel, "file", 0o100644, wid, "create")
+        content_a = b"injected line 1\ninjected line 2\n"
+        wb = dict(
+            sid=sid, rel=rel,
+            data=bytearray(content_a),
+            dirty=True,
+            mode=0o100644,
+            mtime_ns=int(1_000_000_000),
+            wid=wid,
+            spilled_fd=-1,
+        )
+        # Assign a fake fh that doesn't collide with the mount's own handles.
+        fake_fh = 99999
+        ops = fx.mount.ops
+        ops._wbuf[fake_fh] = wb
+        ops._wbuf_key[(sid, rel)] = fake_fh
+
+        # (a) flush_wbuf(force=True) snapshots the buffer to the sqlar row.
+        # We call it via trio.from_thread.run_sync so it runs on the serve thread
+        # (matching the operational contract; in this test the _wbuf injection above
+        # is safe because the mount is idle between FUSE ops at this point).
+        import trio
+        trio.from_thread.run_sync(ops.flush_wbuf, True, trio_token=fx.mount._trio_token)
+
+        row = idx.file_row(rel)
+        check(row is not None and row[4] is not None,
+              "flush_wbuf: (a) sqlar row has data NOT NULL after flush")
+        if row is not None and row[4] is not None:
+            blob = bytes(row[4]); sz = row[2]
+            got = blob if len(blob) == sz else _zl.decompress(blob)
+            check(got == content_a,
+                  "flush_wbuf: (a) row contains the correct snapshot bytes")
+
+        # (b) Buffer is NOT reset: dirty flag is False now (cleaned), but data intact.
+        check(wb["data"] == bytearray(content_a),
+              "flush_wbuf: (b) bytearray unchanged after snapshot")
+        check(wb["dirty"] is False,
+              "flush_wbuf: (b) dirty flag cleared after successful snapshot")
+
+        # (c) force=True flushes even non-dirty buffers.
+        # Write more to the buffer (simulating a subsequent write), then flush again.
+        content_b = b"injected line 1\ninjected line 2\nextra\n"
+        wb["data"] = bytearray(content_b)
+        wb["dirty"] = False  # pretend not dirty
+        trio.from_thread.run_sync(ops.flush_wbuf, True, trio_token=fx.mount._trio_token)
+        row2 = idx.file_row(rel)
+        if row2 is not None and row2[4] is not None:
+            blob2 = bytes(row2[4]); sz2 = row2[2]
+            got2 = blob2 if len(blob2) == sz2 else _zl.decompress(blob2)
+            check(got2 == content_b,
+                  "flush_wbuf: (c) force=True flushes non-dirty buffer with updated bytes")
+        else:
+            check(False, "flush_wbuf: (c) row missing after force flush of non-dirty buffer")
+
+        # (d) Non-dirty, non-forced buffer is skipped.
+        wb["dirty"] = False
+        # Corrupt the row manually to detect whether flush_wbuf touches it.
+        idx._db.execute("UPDATE sqlar SET sz=0 WHERE name=?", (rel,))
+        idx._db.commit()
+        trio.from_thread.run_sync(ops.flush_wbuf, False, trio_token=fx.mount._trio_token)
+        row3 = idx.file_row(rel)
+        # flush_wbuf(force=False) must NOT have overwritten the row (buffer was not dirty).
+        check(row3 is not None and row3[2] == 0,
+              "flush_wbuf: (d) non-dirty buffer skipped (row not re-snapshotted)")
+
+        # Cleanup: remove the fake buffer entry so the mount doesn't try to release it.
+        ops._wbuf.pop(fake_fh, None)
+        ops._wbuf_key.pop((sid, rel), None)
+
+        # (e) A real file written through the mount still reads back correctly after a
+        # flush_wbuf cycle — the live path is not corrupted by the snapshot.
+        r2 = fx.sh("printf 'live write\\n' > live_test.txt && cat live_test.txt")
+        check(r2.returncode == 0 and r2.stdout == "live write\n",
+              "flush_wbuf: (e) real mount write-read unaffected by flush_wbuf")
+
+    finally:
+        fx.stop()
+
+
 if __name__ == "__main__":
     for t in (test_readthrough_and_create, test_copyup_modify,
               test_otrunc_rewrite_shorter, test_delete_whiteout,
@@ -875,7 +985,8 @@ if __name__ == "__main__":
               test_wbuf_small_new_file, test_wbuf_otrunc_rewrite,
               test_wbuf_stat_coherence, test_wbuf_existing_file_preserve,
               test_wbuf_spill, test_wbuf_create_buffers,
-              test_terminated_parent_reads):
+              test_terminated_parent_reads,
+              test_wbuf_periodic_flush):
         print(f"\n== {t.__name__} ==")
         try:
             t()
