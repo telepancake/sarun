@@ -6421,6 +6421,108 @@ class Supervisor:
         del self.sessions[sid]
         self._emit(type="session_removed", session_id=sid)
 
+    def splice_delete(self, sid) -> dict:
+        """Delete an EMPTY, STOPPED box that has children by splicing it out of the
+        name hierarchy: each descendant A.B.X becomes A.X (the deleted segment is
+        removed from all descendant paths).  Fail-closed on any precondition failure
+        so the caller never sees partial state.
+
+        Preconditions (all checked before any rename):
+          1. sid exists and is not live/running.
+          2. sid has no changes of its own (empty overlay + empty sqlar + no flows).
+          3. No descendant is live (live boxes can't be renamed).
+          4. No computed target name collides with a pre-existing box.
+        Cascade order: shallowest descendants first so rename()'s parent-exists guard
+        is always satisfied (A.B.C->A.C before A.B.C.D->A.C.D, parent A.C exists)."""
+        # ── 1. validate sid itself ───────────────────────────────────────────────
+        if not self._box_exists(sid):
+            return dict(ok=False, error=f"no slopbox '{sid}'")
+        if self.review._live(sid):
+            return dict(ok=False, error=f"'{sid}' is running; stop it first")
+        s = self.sessions.get(sid)
+        if s:
+            # empty overlay
+            try:
+                overlay_dirty = upper_has_changes(Path(s.upper))
+            except OSError:
+                overlay_dirty = False
+            if overlay_dirty:
+                return dict(ok=False, error=f"'{sid}' has overlay changes; apply or discard first")
+        sp = sqlar_path(sid)
+        if bool(sqlar_list(sp)):
+            return dict(ok=False, error=f"'{sid}' has sqlar entries; apply or discard first")
+        if has_flows(sp):
+            return dict(ok=False, error=f"'{sid}' has recorded network flows; delete normally")
+        # ── 2. enumerate descendants ─────────────────────────────────────────────
+        prefix = sid + "."
+        desc_set = set()
+        for k in self.sessions:
+            if k.startswith(prefix):
+                desc_set.add(k)
+        # also scan on-disk sqlar files so finished descendants are included
+        sh = state_home()
+        if sh.exists():
+            for p in sh.glob("*.sqlar"):
+                k = p.name[:-len(".sqlar")]
+                if k.startswith(prefix):
+                    desc_set.add(k)
+        if not desc_set:
+            # no children → ordinary delete (caller should use delete() but handle gracefully)
+            self.delete(sid)
+            return dict(ok=True, deleted=sid, renamed=[])
+        # ── 3. refuse if any descendant is live ──────────────────────────────────
+        for desc in desc_set:
+            if self.review._live(desc):
+                return dict(ok=False, error=f"descendant '{desc}' is running; stop it first")
+        # ── 4. compute new names ─────────────────────────────────────────────────
+        parent_parts = sid.split(".")
+        def new_name_for(desc):
+            # drop sid's last segment from desc's dotted path
+            # e.g. sid=A.B, desc=A.B.C.D → new = A.C.D
+            # parent_parts[:-1] = A; desc.split(".")[:len(parent_parts)] = A.B;
+            # desc.split(".")[len(parent_parts):] = [C,D]
+            tail = desc.split(".")[len(parent_parts):]
+            return ".".join(parent_parts[:-1] + tail) if parent_parts[:-1] else ".".join(tail)
+        plan = {desc: new_name_for(desc) for desc in desc_set}
+        # ── 5. collision check BEFORE any rename ─────────────────────────────────
+        for desc, tgt in plan.items():
+            if self._box_exists(tgt):
+                return dict(ok=False,
+                            error=f"rename would collide: '{tgt}' already exists "
+                            f"(while splicing out '{sid}')")
+        # ── 6. rename shallowest-first ───────────────────────────────────────────
+        ordered = sorted(desc_set, key=lambda d: len(d.split(".")))
+        renamed = []
+        for desc in ordered:
+            tgt = plan[desc]
+            r = self.rename(desc, tgt)
+            if not r.get("ok"):
+                return dict(ok=False,
+                            error=f"rename '{desc}'→'{tgt}' failed: {r.get('error')}",
+                            renamed=renamed)
+            renamed.append((desc, tgt))
+            # update parent_sid meta on the newly-named sqlar so _attach_base_session
+            # resolves grandparent chains correctly after the splice (the meta was set
+            # at register time and now points at the deleted sid, which will be gone).
+            # New parent = tgt's immediate prefix, or "" (top-level) if no dot.
+            new_sp = sqlar_path(tgt)
+            new_psid = tgt.rsplit(".", 1)[0] if "." in tgt else ""
+            try:
+                sqlar_meta_set(new_sp, "parent_sid", new_psid)
+            except Exception:
+                pass
+        # ── 7. delete sid itself (now childless + empty) ─────────────────────────
+        if sid in self.sessions:
+            self.delete(sid)
+        else:
+            # sqlar-only box (not in sessions dict): remove the sqlar directly.
+            sp = sqlar_path(sid)
+            if sp.exists():
+                try: sp.unlink()
+                except OSError: pass
+            self._emit(type="session_removed", session_id=sid)
+        return dict(ok=True, deleted=sid, renamed=renamed)
+
     def _index_for(self, sid) -> "Index | None":
         """The session's overlay index: the live one for a running box, else one
         opened on its backing dir. The live-change listing reads the box's upper
@@ -8364,13 +8466,23 @@ def _make_ui_app():
                 except Exception: pass
 
         def _rebuild_sessions(self, preserve=False):
+            # Build a DFS-ordered tree via the shared build_path_tree core (same pattern
+            # as the proc pane and changes pane).  Connector rows (a dotted prefix that
+            # has no actual box) are skipped — only real boxes appear.  The indent+connector
+            # scheme mirrors _ch_indent / the proc-pane indent exactly.
+            members={sid: tuple(sid.split(".")) for sid in self.sessions}
+            tree_rows=build_path_tree(members, lambda p: ".".join(p))
             rows=[]
-            for sid,s in sorted(self.sessions.items(),
-                                key=lambda x:x[1]["started"], reverse=True):
+            for key, _payload, depth, connector in tree_rows:
+                if connector: continue   # structural prefix with no real box — skip
+                s=self.sessions.get(key)
+                if s is None: continue
                 c=sty(s["status"])
                 flag={"running":"R","finished":"F","killed":"K"}.get(s["status"],"?")
-                rows.append((sid,[
-                    Text(flag, style=c), Text(s["stamp"], style=c),
+                indent="  "*depth + ("└ " if depth else "")
+                basename=key.rsplit(".",1)[-1]   # last segment; full sid for top-level boxes
+                rows.append((key,[
+                    Text(flag, style=c), Text(indent+basename, style=c),
                     str(s["pid"]), Text(" ".join(s["cmd"])[:24]),
                     Text(str(s["conn_allowed"]), style="green"),
                     Text(str(s["conn_denied"]), style="red"),
@@ -9183,9 +9295,26 @@ def _make_ui_app():
             s=self._sel_session()
             if not s: return
             if s["status"]=="running": self._status("kill it first"); return
-            def done(ok):
-                if ok: self.sup.delete(s["session_id"])
-            self.push_screen(Confirm(styled("Delete ", (s['stamp'],"bold"), " and its overlay?")), done)
+            sid=s["session_id"]
+            # Count direct and indirect descendants so we can offer splice-out.
+            prefix=sid+"."
+            desc=[k for k in self.sessions if k.startswith(prefix)]
+            if desc:
+                # Splice-out path: if the box has children, splice_delete re-parents them.
+                def done_splice(ok):
+                    if not ok: return
+                    r=self.sup.splice_delete(sid)
+                    if r.get("ok"):
+                        self._status(f"spliced out '{sid}', re-parented {len(r['renamed'])} box(es)")
+                    else:
+                        self._status(Text(r.get("error") or "splice failed", style="red"))
+                self.push_screen(Confirm(styled(
+                    "Delete ", (s.get("stamp") or sid, "bold"),
+                    f" and re-parent {len(desc)} descendant(s)?")), done_splice)
+            else:
+                def done(ok):
+                    if ok: self.sup.delete(sid)
+                self.push_screen(Confirm(styled("Delete ", (s.get("stamp") or sid,"bold"), " and its overlay?")), done)
 
         def action_rename(self):
             s=self._sel_session()

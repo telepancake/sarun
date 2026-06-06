@@ -1355,6 +1355,261 @@ def test_rename_to_dotted_name():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+# ── Feature 1: box-list tree helper unit tests ──────────────────────────────
+
+def test_box_tree_rows_indented_connectors_skipped():
+    """build_path_tree on a set of dotted box names yields the right (basename, depth)
+    in DFS order and SKIPS connector rows (dotted prefixes that are not real boxes)."""
+    # Box set: A (root), A.B (child), A.B.C (grandchild), X (separate root).
+    # There are NO connector rows here — all prefixes are real boxes.
+    sids = {"A", "A.B", "A.B.C", "X"}
+    members = {sid: tuple(sid.split(".")) for sid in sids}
+    tree = m.build_path_tree(members, lambda p: ".".join(p))
+
+    # Separate real rows from connectors; spec says connectors should be skipped in UI.
+    real = [(key, depth) for key, _payload, depth, connector in tree if not connector]
+    conn_rows = [(key, depth) for key, _payload, depth, connector in tree if connector]
+
+    # No connectors: every prefix (A, A.B) is itself a real box.
+    check(conn_rows == [], f"no connector rows when all prefixes are real boxes (got {conn_rows})")
+
+    # DFS order: A before A.B before A.B.C; X appears as a separate root.
+    keys_in_order = [k for k, _ in real]
+    check("A" in keys_in_order, "tree: A present")
+    check("A.B" in keys_in_order, "tree: A.B present")
+    check("A.B.C" in keys_in_order, "tree: A.B.C present")
+    check("X" in keys_in_order, "tree: X present")
+    check(keys_in_order.index("A") < keys_in_order.index("A.B"),
+          "tree: A before A.B (DFS)")
+    check(keys_in_order.index("A.B") < keys_in_order.index("A.B.C"),
+          "tree: A.B before A.B.C (DFS)")
+
+    # Depths: A=0, A.B=1, A.B.C=2, X=0.
+    depths = {k: d for k, d in real}
+    check(depths["A"] == 0, f"tree: A depth=0 (got {depths.get('A')})")
+    check(depths["A.B"] == 1, f"tree: A.B depth=1 (got {depths.get('A.B')})")
+    check(depths["A.B.C"] == 2, f"tree: A.B.C depth=2 (got {depths.get('A.B.C')})")
+    check(depths["X"] == 0, f"tree: X depth=0 (got {depths.get('X')})")
+
+    # Basenames match last segment of the sid.
+    basenames = {k: k.rsplit(".", 1)[-1] for k in keys_in_order}
+    check(basenames["A"] == "A", "basename A")
+    check(basenames["A.B"] == "B", "basename A.B → B")
+    check(basenames["A.B.C"] == "C", "basename A.B.C → C")
+    check(basenames["X"] == "X", "basename X")
+
+
+def test_box_tree_connector_skipped_when_prefix_has_no_box():
+    """When a dotted prefix is NOT a real box, build_path_tree emits a connector=True row.
+    The UI skips connector rows; only real boxes appear."""
+    # A.B.C exists but A.B does NOT → A.B is a connector.
+    sids = {"A", "A.B.C"}
+    members = {sid: tuple(sid.split(".")) for sid in sids}
+    tree = m.build_path_tree(members, lambda p: ".".join(p))
+
+    real_keys = [key for key, _p, _d, connector in tree if not connector]
+    conn_keys = [key for key, _p, _d, connector in tree if connector]
+
+    # A.B (the tuple ("A","B")) is a connector; A and A.B.C are real.
+    check("A" in real_keys, "connector-skip: A is real")
+    check("A.B.C" in real_keys, "connector-skip: A.B.C is real")
+    # build_path_tree uses the tuple as the key for connectors, not a sid string.
+    connector_tups = [key for key, _p, _d, connector in tree if connector]
+    check(("A", "B") in connector_tups,
+          f"connector-skip: (A,B) is a connector row (got {connector_tups})")
+    # The UI pattern: skip connector=True rows → only A and A.B.C survive.
+    check(len(real_keys) == 2,
+          f"connector-skip: exactly 2 real rows after skipping connector (got {real_keys})")
+
+
+# ── Feature 2: splice_delete ─────────────────────────────────────────────────
+
+def _make_finished_box(sup, sid, with_content=False):
+    """Create a minimal finished (non-live) box for splice_delete tests.
+    If with_content=True, insert a sqlar row so the box survives _maybe_remove_empty."""
+    sp = m.sqlar_path(sid)
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    import sqlite3
+    conn = sqlite3.connect(str(sp))
+    conn.execute("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT)")
+    conn.execute("INSERT OR REPLACE INTO meta VALUES('born','20260101-000000_1')")
+    if with_content:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS sqlar"
+            "(name TEXT PRIMARY KEY, mode INT, mtime INT, sz INT, data BLOB)")
+        conn.execute("INSERT OR REPLACE INTO sqlar VALUES('proof.txt',33188,0,4,X'41424344')")
+    conn.commit(); conn.close()
+    sup.sessions[sid] = m.Session(session_id=sid, cmd=["test"], live=False,
+                                  status="finished",
+                                  shm_dir=str(m.live_dir(sid)))
+
+
+def test_splice_delete_happy_path():
+    """splice_delete('A.B') removes A.B and re-parents A.B.C→A.C, A.B.C.D→A.C.D.
+    Content is preserved; A.C's parent_sid meta resolves to A."""
+    tmp = Path(tempfile.mkdtemp(prefix="cp-splice-"))
+    _redirect_state(tmp)
+    try:
+        m.ensure_dirs()
+        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
+
+        # A: top-level parent (must exist so rename allows A.B.C→A.C).
+        _make_finished_box(sup, "A", with_content=False)
+        # A.B: the splice target — no content (empty sqlar, no flows, no upper).
+        _make_finished_box(sup, "A.B", with_content=False)
+        # A.B.C: child with content.
+        _make_finished_box(sup, "A.B.C", with_content=True)
+        m.sqlar_meta_set(m.sqlar_path("A.B.C"), "parent_sid", "A.B")
+        # A.B.C.D: grandchild with content.
+        _make_finished_box(sup, "A.B.C.D", with_content=True)
+        m.sqlar_meta_set(m.sqlar_path("A.B.C.D"), "parent_sid", "A.B.C")
+
+        r = sup.splice_delete("A.B")
+        check(r.get("ok") is True, f"splice-happy: splice_delete ok (got {r})")
+        check(r.get("deleted") == "A.B", "splice-happy: deleted is A.B")
+        check(len(r.get("renamed", [])) == 2, f"splice-happy: 2 renames (got {r.get('renamed')})")
+
+        # A.B is gone.
+        check("A.B" not in sup.sessions, "splice-happy: A.B not in sessions")
+        check(not m.sqlar_path("A.B").exists(), "splice-happy: A.B.sqlar removed")
+
+        # Old paths gone.
+        check("A.B.C" not in sup.sessions, "splice-happy: A.B.C not in sessions")
+        check(not m.sqlar_path("A.B.C").exists(), "splice-happy: A.B.C.sqlar gone")
+        check("A.B.C.D" not in sup.sessions, "splice-happy: A.B.C.D not in sessions")
+        check(not m.sqlar_path("A.B.C.D").exists(), "splice-happy: A.B.C.D.sqlar gone")
+
+        # New paths exist.
+        check(m.sqlar_path("A.C").exists(), "splice-happy: A.C.sqlar exists")
+        check(m.sqlar_path("A.C.D").exists(), "splice-happy: A.C.D.sqlar exists")
+
+        # Content is preserved.
+        import sqlite3
+        conn = sqlite3.connect(str(m.sqlar_path("A.C")))
+        row = conn.execute("SELECT data FROM sqlar WHERE name='proof.txt'").fetchone()
+        conn.close()
+        check(row is not None and row[0] == b"ABCD", f"splice-happy: A.C content intact (got {row})")
+
+        # parent_sid meta updated correctly.
+        ac_parent = m.sqlar_meta_get(m.sqlar_path("A.C"), "parent_sid")
+        check(ac_parent == "A", f"splice-happy: A.C parent_sid='A' (got {ac_parent!r})")
+        acd_parent = m.sqlar_meta_get(m.sqlar_path("A.C.D"), "parent_sid")
+        check(acd_parent == "A.C", f"splice-happy: A.C.D parent_sid='A.C' (got {acd_parent!r})")
+
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_splice_delete_refused_has_changes():
+    """splice_delete refuses if the target box has sqlar entries (has changes)."""
+    tmp = Path(tempfile.mkdtemp(prefix="cp-splice-changes-"))
+    _redirect_state(tmp)
+    try:
+        m.ensure_dirs()
+        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
+        _make_finished_box(sup, "A", with_content=False)
+        _make_finished_box(sup, "A.B", with_content=True)   # has sqlar content → refused
+        _make_finished_box(sup, "A.B.C", with_content=True)
+
+        r = sup.splice_delete("A.B")
+        check(r.get("ok") is False, f"splice-changes: refused (got {r})")
+        check("sqlar" in (r.get("error") or ""),
+              f"splice-changes: error mentions sqlar (got {r.get('error')!r})")
+        # Nothing renamed.
+        check(m.sqlar_path("A.B").exists(), "splice-changes: A.B.sqlar still present")
+        check(m.sqlar_path("A.B.C").exists(), "splice-changes: A.B.C.sqlar still present")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_splice_delete_refused_collision():
+    """splice_delete refuses if a rename target already exists (no partial renames)."""
+    tmp = Path(tempfile.mkdtemp(prefix="cp-splice-coll-"))
+    _redirect_state(tmp)
+    try:
+        m.ensure_dirs()
+        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
+        _make_finished_box(sup, "A", with_content=False)
+        _make_finished_box(sup, "A.B", with_content=False)
+        _make_finished_box(sup, "A.B.C", with_content=True)
+        # Pre-create A.C (the rename target) so there's a collision.
+        _make_finished_box(sup, "A.C", with_content=False)
+
+        r = sup.splice_delete("A.B")
+        check(r.get("ok") is False, f"splice-coll: refused (got {r})")
+        check("collide" in (r.get("error") or "").lower() or "already exists" in (r.get("error") or ""),
+              f"splice-coll: error mentions collision (got {r.get('error')!r})")
+        # A.B.C must still be present (no partial rename).
+        check(m.sqlar_path("A.B.C").exists(), "splice-coll: A.B.C.sqlar not renamed (no partial)")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_splice_delete_refused_live_descendant():
+    """splice_delete refuses if any descendant is live/running."""
+    tmp = Path(tempfile.mkdtemp(prefix="cp-splice-live-"))
+    _redirect_state(tmp)
+    try:
+        m.ensure_dirs()
+        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
+        _make_finished_box(sup, "A", with_content=False)
+        _make_finished_box(sup, "A.B", with_content=False)
+        _make_finished_box(sup, "A.B.C", with_content=True)
+        # Make A.B.C appear live by setting live=True and creating an up/ dir.
+        ld = m.live_dir("A.B.C"); ld.mkdir(parents=True, exist_ok=True)
+        (ld / "up").mkdir(parents=True, exist_ok=True)
+        sup.sessions["A.B.C"].live = True
+        sup.sessions["A.B.C"].shm_dir = str(ld)
+
+        r = sup.splice_delete("A.B")
+        check(r.get("ok") is False, f"splice-live: refused (got {r})")
+        check("running" in (r.get("error") or "").lower(),
+              f"splice-live: error mentions running (got {r.get('error')!r})")
+        # No renames occurred.
+        check(m.sqlar_path("A.B.C").exists(), "splice-live: A.B.C.sqlar untouched")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_splice_delete_shallowest_first_ordering():
+    """A 3-level subtree splices correctly, proving shallowest-first satisfies
+    rename()'s parent-exists guard: A.B.C→A.C (parent A) before A.B.C.D→A.C.D
+    (parent A.C, which must exist first)."""
+    tmp = Path(tempfile.mkdtemp(prefix="cp-splice-order-"))
+    _redirect_state(tmp)
+    try:
+        m.ensure_dirs()
+        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
+        _make_finished_box(sup, "A", with_content=False)
+        _make_finished_box(sup, "A.B", with_content=False)
+        _make_finished_box(sup, "A.B.C", with_content=True)
+        _make_finished_box(sup, "A.B.C.D", with_content=True)
+
+        r = sup.splice_delete("A.B")
+        check(r.get("ok") is True, f"splice-order: splice_delete ok (got {r})")
+
+        # All expected targets exist.
+        check(m.sqlar_path("A.C").exists(), "splice-order: A.C.sqlar created")
+        check(m.sqlar_path("A.C.D").exists(), "splice-order: A.C.D.sqlar created")
+
+        # Verify rename order in result list (A.B.C → A.C before A.B.C.D → A.C.D).
+        renames = r.get("renamed", [])
+        old_names = [pair[0] for pair in renames]
+        check("A.B.C" in old_names, "splice-order: A.B.C in renamed list")
+        check("A.B.C.D" in old_names, "splice-order: A.B.C.D in renamed list")
+        check(old_names.index("A.B.C") < old_names.index("A.B.C.D"),
+              "splice-order: A.B.C renamed before A.B.C.D (shallowest-first)")
+
+        # parent_sid chain is correct.
+        check(m.sqlar_meta_get(m.sqlar_path("A.C"), "parent_sid") == "A",
+              "splice-order: A.C parent_sid='A'")
+        check(m.sqlar_meta_get(m.sqlar_path("A.C.D"), "parent_sid") == "A.C",
+              "splice-order: A.C.D parent_sid='A.C'")
+
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     for t in (test_sid_validation_rejects_traversal,
               test_relay_fd_gated_by_socket_not_message,
@@ -1386,7 +1641,16 @@ if __name__ == "__main__":
               test_inbox_trust_kernel_parent_not_body,
               test_default_named_box_born_and_sort,
               test_dotted_path_safety,
-              test_rename_to_dotted_name):
+              test_rename_to_dotted_name,
+              # Feature 1: box-list tree
+              test_box_tree_rows_indented_connectors_skipped,
+              test_box_tree_connector_skipped_when_prefix_has_no_box,
+              # Feature 2: splice_delete
+              test_splice_delete_happy_path,
+              test_splice_delete_refused_has_changes,
+              test_splice_delete_refused_collision,
+              test_splice_delete_refused_live_descendant,
+              test_splice_delete_shallowest_first_ordering):
         print(f"\n== {t.__name__} ==")
         try:
             t()
