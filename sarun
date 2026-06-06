@@ -4277,51 +4277,6 @@ def cleanup_dirs(upper: Path, start: Path) -> None:
         except OSError: break
         d = parent
 
-def _promote_to_parent_sqlar(parent_sid: str, rel: str, kind: str,
-                             bytes_or_target, mode, mtime_ns: int) -> None:
-    """Insert/update one change into the PARENT box's sqlar at consolidate time.
-    Called instead of the host write when `parent` is set on consolidate().
-    `kind` is 'file'|'symlink'|'whiteout'; `bytes_or_target` is bytes content
-    for files, bytes link-target for symlinks, and ignored for whiteouts."""
-    sp = sqlar_path(parent_sid)
-    conn = _sqlar_open(sp)
-    try:
-        if kind == "whiteout":
-            _sqlar_put_tombstone(conn, rel)
-        elif kind == "symlink":
-            tgt = bytes_or_target if isinstance(bytes_or_target, bytes) \
-                else str(bytes_or_target).encode("utf-8", "surrogateescape")
-            _sqlar_put_symlink(conn, rel, tgt, mtime_ns)
-        else:   # "file"
-            data = bytes_or_target if isinstance(bytes_or_target, bytes) else b""
-            _sqlar_put_file(conn, rel, data, mode, mtime_ns)
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def _apply_overlay_entry(upper: Path, ap: Path, rel: str,
-                         index: "Index | None" = None) -> None:
-    """Write one overlay change onto the host (the same effect as the UI's Apply),
-    then drop it from the overlay. A whiteout deletes; a file/symlink is copied."""
-    host = Path("/") / rel
-    is_deletion = (index is not None and index.kind_of(rel) == "whiteout")
-    try:
-        if is_deletion:
-            if host.is_dir() and not host.is_symlink(): shutil.rmtree(host)
-            elif host.exists() or host.is_symlink(): host.unlink()
-        elif ap.is_symlink():
-            tgt = os.readlink(ap)
-            if host.exists() or host.is_symlink(): host.unlink()
-            host.parent.mkdir(parents=True, exist_ok=True); os.symlink(tgt, host)
-        elif ap.is_file():
-            host.parent.mkdir(parents=True, exist_ok=True); shutil.copy2(ap, host)
-        else:
-            return                                       # unknown type: leave it
-    except OSError:
-        return
-    remove_upper_entry(ap)
-
 def _open_index_ro(shm_dir) -> "Index | None":
     """Open the session's single db for consolidate. None if absent."""
     sp = sqlar_path(Path(shm_dir).name)
@@ -4330,33 +4285,24 @@ def _open_index_ro(shm_dir) -> "Index | None":
     except sqlite3.Error: return None
 
 def consolidate(shm_dir, session_id: str, cmd: list, index: "Index | None" = None,
-                progress=None, parent: "str | None" = None) -> None:
-    """Finish a box: fill the NULL content blobs of its single sqlar from the overlay
-    upper (symlinks) and the pool blobs (regular files). consolidate does NOT copy rows
-    or translate schemas — each entry row already exists (the FUSE layer upserted it
-    on the mutating op with data=NULL); for a file we UPDATE that SAME row's blob with
-    the bytes from the pool blob; for a symlink we read from up/<rel>. Deletions/opacity
-    are already rows (tombstones); opaque dirs expand into per-lower-child tombstones.
-    Writer provenance per path is recorded into the `provenance` table. Afterwards the
-    sqlar is self-contained and the backing tree can be freed. Idempotent and additive.
+                progress=None) -> None:
+    """Settle a box's overlay into its single sqlar at rest — PLACEMENT ONLY, no file
+    rules. Symlinks fold into their row; each regular file picks a per-file rest form
+    by size (small → folded sqlar blob; large → kept as a PERMANENT pool file, the row
+    left resident with data NULL); deletions/opacity become tombstone rows. Writer
+    provenance per path is recorded. Afterwards the sqlar (plus any kept pool files) is
+    the box's complete at-rest form and the backing tree can be freed. Idempotent.
 
-    File rules are consulted first, top-to-bottom: a matching 'apply' writes the
-    change to the host (or, for a NESTED box with `parent` set, promotes into the
-    parent sqlar) and drops the row; a matching 'discard' just drops the row —
-    either way it reaches neither store.
+    Apply/discard of file rules is NOT done here — those run on box DELETE or on an
+    explicit UI action (ChangeReview.apply/discard), never on box stop. So consolidate
+    runs at stop purely to make the box reviewable; nothing reaches the host.
 
-    `parent`, if not None, is the parent box sid.  At each 'apply' branch the change
-    is promoted into the parent's sqlar instead of being written to the real host.
-
-    `progress`, if given, is called as progress(done, total) after each upper entry
-    is folded — the per-file deflate loop is the slow part — so a UI can render a
-    fraction while consolidate runs off the loop. It is a plain callback; an off-loop
-    caller must marshal any UI touch back to its own thread (never draw from here)."""
+    `progress`, if given, is called as progress(done, total) after each upper entry is
+    folded so a UI can render a fraction while consolidate runs off the loop."""
     upper = Path(shm_dir) / "up"
     if not upper.is_dir(): return
     own_index = index is None
     idx = index if index is not None else _open_index_ro(shm_dir)
-    frules = load_file_rules()
     sp = sqlar_path(session_id)
     # Pool id for this box: needed to locate blob files.
     box_id = ensure_box_id(session_id)
@@ -4370,9 +4316,6 @@ def consolidate(shm_dir, session_id: str, cmd: list, index: "Index | None" = Non
             _sqlar_put_file(sq, rel, content, mode, mtime_ns)
     def _prov(rel):
         return idx.writer_provenance(rel) if idx is not None else None
-    def _sq_remove(rel):
-        sq.execute("DELETE FROM sqlar WHERE name=?", (rel,))
-        sq.execute("DELETE FROM provenance WHERE path=?", (rel,))
     moved = []
     blob_paths_to_evict = []
     # 1) symlinks in the upper (regular files are now in the pool, not up/).
@@ -4387,34 +4330,9 @@ def consolidate(shm_dir, session_id: str, cmd: list, index: "Index | None" = Non
     ordered = sorted(set(paths)); total_upper = len(ordered)
     for done, ap in enumerate(ordered, 1):
         rel = str(ap.relative_to(upper))
-        act = frules.decide(rel)                         # apply / discard / passthrough / None
         if progress is not None:
             try: progress(done, total_upper)
             except Exception: pass
-        if act in ("discard", "passthrough"):
-            _sq_remove(rel)
-            remove_upper_entry(ap); cleanup_dirs(upper, ap.parent); continue
-        if act == "apply":
-            if parent is not None:
-                # Nested box: promote symlink/file into the parent sqlar.
-                try:
-                    if ap.is_symlink():
-                        lst = ap.lstat()
-                        tgt = os.readlink(ap).encode("utf-8", "surrogateescape")
-                        _promote_to_parent_sqlar(parent, rel, "symlink", tgt,
-                                                 stat_mod.S_IFLNK | 0o777,
-                                                 int(lst.st_mtime_ns))
-                    elif ap.is_file():
-                        st = ap.stat()
-                        _promote_to_parent_sqlar(parent, rel, "file",
-                                                 ap.read_bytes(), st.st_mode,
-                                                 int(st.st_mtime_ns))
-                    # dirs: nothing to promote
-                except OSError: pass
-                remove_upper_entry(ap)
-            else:
-                _apply_overlay_entry(upper, ap, rel, index=idx)
-            _sq_remove(rel); cleanup_dirs(upper, ap.parent); continue
         try:
             if ap.is_symlink():
                 lst = ap.lstat()
@@ -4439,47 +4357,22 @@ def consolidate(shm_dir, session_id: str, cmd: list, index: "Index | None" = Non
         except OSError:
             continue
         moved.append(ap)
-    # 1b) regular-file rows: bytes live in pool blobs (data IS NULL).
+    # 1b) regular-file rows: bytes live in pool blobs (data IS NULL). Place by size:
+    #     a large file stays a PERMANENT pool file (row resident: data NULL, blob kept
+    #     on disk — record its real size/mode/mtime so offline readers report correct
+    #     metadata); a small file folds into the sqlar blob and its pool file is evicted.
     file_rows = sq.execute(
         "SELECT rowid, name, mode FROM sqlar WHERE data IS NULL").fetchall()
     for rowid, rel, mode in file_rows:
         if not stat_mod.S_ISREG(mode): continue         # dir/symlink/tombstone rows
         bp = blob_path(box_id, rowid)
         if not bp.exists(): continue                     # no blob (not yet written)
-        act = frules.decide(rel)
         try:
             bst = os.stat(bp)
             mtime_ns = bst.st_mtime_ns
-            bmode = bst.st_mode
             content = bp.read_bytes()
         except OSError:
             continue
-        if act in ("discard", "passthrough"):
-            _sq_remove(rel)
-            blob_paths_to_evict.append(bp); continue
-        if act == "apply":
-            if parent is not None:
-                # Nested box: promote into the parent sqlar instead of the host.
-                try:
-                    _promote_to_parent_sqlar(parent, rel, "file", content,
-                                             mode, mtime_ns)
-                except Exception: pass
-            else:
-                # Write bytes to the host and drop the row.
-                host = Path("/") / rel
-                try:
-                    host.parent.mkdir(parents=True, exist_ok=True)
-                    host.write_bytes(content)
-                    try: os.chmod(host, stat_mod.S_IMODE(mode))
-                    except OSError: pass
-                    _restore_host_mtime_ns(host, mtime_ns, is_symlink=False)
-                except OSError: pass
-            _sq_remove(rel)
-            blob_paths_to_evict.append(bp); continue
-        # Default (no rule): place by size. A large file stays a PERMANENT pool file
-        # (row resident: data NULL, blob kept on disk) — record its real size/mode/
-        # mtime so offline readers (sqlar_list/entries) report correct metadata. A
-        # small file folds into the sqlar blob and its pool file is evicted.
         if len(content) >= POOL_RESIDENT_MIN:
             sq.execute("UPDATE sqlar SET mode=?, mtime=?, sz=?, data=NULL WHERE name=?",
                        (int(mode), int(mtime_ns), len(content), rel))
@@ -4497,27 +4390,14 @@ def consolidate(shm_dir, session_id: str, cmd: list, index: "Index | None" = Non
     #    re-assert for the orphaned-overlay path) + provenance.
     if idx is not None:
         for rel in idx.deletions():
-            act = frules.decide(rel)
-            if act in ("discard", "passthrough"):
-                _sq_remove(rel); continue
             host = Path("/") / rel
-            if act == "apply":
-                if parent is not None:
-                    # Nested box: promote whiteout as a tombstone in the parent sqlar.
-                    try: _promote_to_parent_sqlar(parent, rel, "whiteout", b"", 0, 0)
-                    except Exception: pass
-                else:
-                    try:
-                        if host.is_dir() and not host.is_symlink(): shutil.rmtree(host)
-                        elif host.exists() or host.is_symlink(): host.unlink()
-                    except OSError: pass
-                _sq_remove(rel); continue
             if host.exists() or host.is_symlink():
                 _sqlar_put_tombstone(sq, rel)
                 p = _prov(rel)
                 if p: _sqlar_put_provenance(sq, rel, p)
             else:
-                _sq_remove(rel)
+                sq.execute("DELETE FROM sqlar WHERE name=?", (rel,))
+                sq.execute("DELETE FROM provenance WHERE path=?", (rel,))
         # 3) opaque dirs: expand into per-lower-child tombstones for children not
         #    re-materialized in the upper or the pool.
         for drel in idx.opaque_dirs():
@@ -4534,8 +4414,6 @@ def consolidate(shm_dir, session_id: str, cmd: list, index: "Index | None" = Non
                     if row and stat_mod.S_ISREG(row[1]) and (
                             blob_path(box_id, row[0]).exists() or row[2] is not None):
                         continue                          # present in pool or row
-                    if frules.decide(crel) in ("apply", "discard", "passthrough"):
-                        continue
                     _sqlar_put_tombstone(sq, crel)
     sq.commit(); sq.close()
     for ap in moved:
@@ -5079,11 +4957,28 @@ class SqlarArchive(ChangeSource):
             out.append(dict(path=name, kind=kind, size=sz))
         return out
 
+    def _drop_row_and_blob(self, rel):
+        """Drop the row AND any permanent pool blob backing it (a resident file's bytes
+        live only on disk; sqlar_remove alone would orphan them)."""
+        rel = rel.lstrip("/")
+        bid = sqlar_meta_get(self.path, "box_id")
+        conn = _sqlar_open(self.path)
+        try:
+            row = conn.execute("SELECT rowid,data FROM sqlar WHERE name=?", (rel,)).fetchone()
+        except sqlite3.Error: row = None
+        finally: conn.close()
+        if bid is not None and row is not None and row[1] is None:
+            try:
+                bp = blob_path(int(bid), row[0])
+                if bp.exists(): bp.unlink()
+            except (OSError, ValueError, TypeError): pass
+        sqlar_remove(self.path, rel)
+
     def remove(self, rel):
-        sqlar_remove(self.path, rel.lstrip("/"))
+        self._drop_row_and_blob(rel)
 
     def discard(self, rel):
-        sqlar_remove(self.path, rel.lstrip("/"))
+        self._drop_row_and_blob(rel)
 
     def settle(self, rel):
         # After a hunk op the diff is gone exactly when the stored current bytes
@@ -5324,9 +5219,11 @@ class ChangeReview:
 
     def _promote_into_parent(self, parent_sid: str, rel: str,
                              plan: dict) -> "dict | None":
-        """Capture the change described by `plan` into the PARENT box's overlay
-        as a new pending change — instead of writing to the real host.  Returns
-        None on success, dict(ok=False, error=…) on failure.
+        """Capture the change described by `plan` into the target box's overlay as a
+        new pending change — instead of writing to the real host. The target is the
+        PARENT box for an 'apply', or an immediate CHILD box for a 'discard' copy-down
+        (preserving the child's inherited view). Returns None on success, dict(ok=False,
+        error=…) on failure.
 
         Live parent  → write into its in-RAM Index + pool blob / up/ symlink,
                        exactly as the FUSE layer would record a new write.
@@ -5428,6 +5325,66 @@ class ChangeReview:
             except Exception as e:
                 return dict(ok=False, error=f"promote to sqlar: {e}")
         return None   # success
+
+    # ── discard copy-down: pin a file into children before dropping it ─────────
+    def _immediate_children(self, sid: str) -> list:
+        """Direct child boxes of `sid` (parent == sid): live sessions plus finished
+        sqlar-only boxes (parent recorded in the sqlar's 'parent_sid' meta)."""
+        kids = set()
+        for c, s in self.reg.sessions.items():
+            if c != sid and s.parent == sid:
+                kids.add(c)
+        sh = state_home()
+        if sh.exists():
+            for p in sh.glob("*.sqlar"):
+                c = p.name[:-len(".sqlar")]
+                if c != sid and sqlar_meta_get(p, "parent_sid") == sid:
+                    kids.add(c)
+        return sorted(kids)
+
+    def _box_has_own_entry(self, child: str, rel: str) -> bool:
+        """True if `child` already resolves `rel` itself (its own file/symlink/dir/
+        whiteout), so a copy-down must NOT override the child's explicit decision."""
+        rel = rel.lstrip("/")
+        idx = self.reg.indexes.get(child)                 # live Index, or None
+        if idx is not None:
+            return idx.kind_of(rel) is not None
+        return sqlar_mode(sqlar_path(child), rel) is not None
+
+    def _copydown_to_children(self, sid: str, rel: str, src) -> None:
+        """Before dropping `rel` from `sid`, pin its current value into every immediate
+        child that inherits it (has no own entry) — so discarding from `sid` never
+        changes a child's merged view (the child keeps the value it was seeing). A
+        deletion (whiteout) copies down as a whiteout, preserving an 'absent' view."""
+        kids = self._immediate_children(sid)
+        if not kids:
+            return
+        plan = src.apply_plan(rel)
+        if plan is None or plan.get("kind") == "noop":
+            return
+        for child in kids:
+            if self._box_has_own_entry(child, rel):
+                continue
+            self._promote_into_parent(child, rel, plan)   # capture into the child
+
+    def finalize_by_rules(self, sid) -> dict:
+        """Run the file rules over a stopped box's whole change set, the way box DELETE
+        wants it: an 'apply'-matched path is promoted (parent overlay / host); every
+        other path (a 'discard' rule, 'passthrough', or no rule at all) is discarded —
+        which copies it down into immediate children that lack it. Afterwards the box
+        holds no file changes, so it is safe to remove (and splice out of any children's
+        names). No-op for a box with no changes."""
+        changes = [e["path"] for e in self.session_changes(sid)]
+        if not changes:
+            return dict(applied=[], discarded=[], errors=[])
+        frules = load_file_rules()
+        apply_paths, discard_paths = [], []
+        for rel in changes:
+            (apply_paths if frules.decide(rel) == "apply" else discard_paths).append(rel)
+        a = self.apply(sid, apply_paths) if apply_paths else dict(applied=[], errors=[])
+        d = self.discard(sid, discard_paths) if discard_paths else dict(discarded=[], errors=[])
+        return dict(applied=a.get("applied", []), discarded=d.get("discarded", []),
+                    errors=a.get("errors", []) + d.get("errors", []))
 
     def change_mode(self, sid, rel, source=None) -> "int | None":
         """st_mode for a changed file (for the path/mode header). None if N/A."""
@@ -5654,12 +5611,15 @@ class ChangeReview:
         return dict(applied=applied, errors=errors)
 
     def discard(self, sid, paths) -> dict:
-        # Drop each change from the change set without writing anything to the host.
+        # Drop each change from the box without writing the host — but first copy it
+        # DOWN into any immediate child that inherits it, so the child's merged view is
+        # unchanged (this is what lets a non-empty box with children be deleted).
         if paths is None: paths = [e["path"] for e in self.session_changes(sid)]
         src = self._source(sid)
         discarded, errors = [], []
         for rel in paths:
             try:
+                self._copydown_to_children(sid, rel, src)
                 src.discard(rel)
                 discarded.append(rel)
             except OSError as e:
@@ -5908,13 +5868,11 @@ class Supervisor:
         conn over that box's own files."""
         args = self.review._consolidate_prep(sid)
         if args is None: return
-        # Pass parent from the Session so 'apply' rules promote into the parent.
-        s = self.sessions.get(sid)
-        parent_sid = s.parent if s else None
+        # Placement only — apply/discard happen on delete / explicit UI, not here.
         try:
             await loop.run_in_executor(
                 None, functools.partial(consolidate, args["shm_dir"], sid,
-                                        args["cmd"], parent=parent_sid))
+                                        args["cmd"]))
         finally:
             self.review._consolidate_finish(sid)
 
@@ -6284,8 +6242,6 @@ class Supervisor:
         if not (backing.exists() and reported_status != "error"):
             return None
         cmd = list(s.cmd) if s else root_cmd(sid)
-        # Read parent from the Session so the consolidate fold knows where to promote.
-        parent_sid = s.parent if s else None
         self.review._consolidating.add(sid)
         self._emit(type="consolidate_started", session_id=sid)
         def _prog(done, total):
@@ -6298,8 +6254,7 @@ class Supervisor:
             self._emit(type="consolidate_finished", session_id=sid)
         if executor is None:
             try:
-                consolidate(str(backing), sid, cmd, index=index, progress=_prog,
-                            parent=parent_sid)
+                consolidate(str(backing), sid, cmd, index=index, progress=_prog)
                 _done(None)
             except Exception as e:
                 _done(e)
@@ -6308,8 +6263,7 @@ class Supervisor:
             try:
                 await executor.run_in_executor(
                     None, functools.partial(consolidate, str(backing), sid, cmd,
-                                            index=index, progress=_prog,
-                                            parent=parent_sid))
+                                            index=index, progress=_prog))
                 _done(None)
             except Exception as e:
                 _done(e)
@@ -6535,10 +6489,22 @@ class Supervisor:
         s.killed = True
         self._emit(type="session_updated", session=s.to_dict())
 
-    def delete(self, sid) -> None:
+    def delete(self, sid, finalize: bool = False) -> None:
         s = self.sessions.get(sid)
         if not s: return
         if _pid_alive(s.pid) and s.live: return
+        # box-delete semantics: run the file rules first. 'apply'-matched files are
+        # promoted (parent overlay / host); the rest are discarded — copying down into
+        # immediate children so their views survive this box's removal. finalize may
+        # itself empty the box and trigger _maybe_remove_empty → delete(); if so, it is
+        # already gone and there is nothing left to nuke.
+        if finalize:
+            try: self.review.finalize_by_rules(sid)
+            except Exception as e:
+                print(f"slopbox(ui): finalize {sid} failed: {e}", file=sys.stderr)
+            s = self.sessions.get(sid)
+            if s is None:
+                return
         # detach from the live mount if it was somehow still attached, close the
         # index, and remove the backing tree + all on-disk stores.
         if self.mount is not None:
@@ -6564,20 +6530,22 @@ class Supervisor:
             try: os.close(s.run_pidfd)
             except OSError: pass
             s.run_pidfd = -1
-        del self.sessions[sid]
+        self.sessions.pop(sid, None)
         self._emit(type="session_removed", session_id=sid)
 
     def splice_delete(self, sid) -> dict:
-        """Delete an EMPTY, STOPPED box that has children by splicing it out of the
-        name hierarchy: each descendant A.B.X becomes A.X (the deleted segment is
-        removed from all descendant paths).  Fail-closed on any precondition failure
-        so the caller never sees partial state.
+        """Delete a STOPPED box that has children by splicing it out of the name
+        hierarchy: each descendant A.B.X becomes A.X (the deleted segment is removed
+        from all descendant paths). The box need NOT be empty — its own changes are
+        finalized by the file rules first (apply-matched promoted up/host, the rest
+        discarded, which copies each file DOWN into the immediate children that inherit
+        it) so no descendant's merged view changes. Fail-closed on any precondition
+        failure so the caller never sees partial state.
 
         Preconditions (all checked before any rename):
           1. sid exists and is not live/running.
-          2. sid has no changes of its own (empty overlay + empty sqlar + no flows).
-          3. No descendant is live (live boxes can't be renamed).
-          4. No computed target name collides with a pre-existing box.
+          2. No descendant is live (live boxes can't be renamed).
+          3. No computed target name collides with a pre-existing box.
         Cascade order: shallowest descendants first so rename()'s parent-exists guard
         is always satisfied (A.B.C->A.C before A.B.C.D->A.C.D, parent A.C exists)."""
         # ── 1. validate sid itself ───────────────────────────────────────────────
@@ -6585,20 +6553,6 @@ class Supervisor:
             return dict(ok=False, error=f"no slopbox '{sid}'")
         if self.review._live(sid):
             return dict(ok=False, error=f"'{sid}' is running; stop it first")
-        s = self.sessions.get(sid)
-        if s:
-            # empty overlay
-            try:
-                overlay_dirty = upper_has_changes(Path(s.upper))
-            except OSError:
-                overlay_dirty = False
-            if overlay_dirty:
-                return dict(ok=False, error=f"'{sid}' has overlay changes; apply or discard first")
-        sp = sqlar_path(sid)
-        if bool(sqlar_list(sp)):
-            return dict(ok=False, error=f"'{sid}' has sqlar entries; apply or discard first")
-        if has_flows(sp):
-            return dict(ok=False, error=f"'{sid}' has recorded network flows; delete normally")
         # ── 2. enumerate descendants ─────────────────────────────────────────────
         prefix = sid + "."
         desc_set = set()
@@ -6613,13 +6567,20 @@ class Supervisor:
                 if k.startswith(prefix):
                     desc_set.add(k)
         if not desc_set:
-            # no children → ordinary delete (caller should use delete() but handle gracefully)
-            self.delete(sid)
+            # no children → ordinary delete (finalize the rules, then remove).
+            self.delete(sid, finalize=True)
             return dict(ok=True, deleted=sid, renamed=[])
         # ── 3. refuse if any descendant is live ──────────────────────────────────
         for desc in desc_set:
             if self.review._live(desc):
                 return dict(ok=False, error=f"descendant '{desc}' is running; stop it first")
+        # ── 3b. finalize sid's OWN changes before renaming children: apply-matched
+        #        files promote up; the rest are discarded, copying each down into the
+        #        immediate children that inherit it (so their views are preserved).
+        try:
+            self.review.finalize_by_rules(sid)
+        except Exception as e:
+            return dict(ok=False, error=f"finalizing '{sid}' failed: {e}")
         # ── 4. compute new names ─────────────────────────────────────────────────
         parent_parts = sid.split(".")
         def new_name_for(desc):
@@ -9459,7 +9420,7 @@ def _make_ui_app():
                     f" and re-parent {len(desc)} descendant(s)?")), done_splice)
             else:
                 def done(ok):
-                    if ok: self.sup.delete(sid)
+                    if ok: self.sup.delete(sid, finalize=True)
                 self.push_screen(Confirm(styled("Delete ", (s.get("stamp") or sid,"bold"), " and its overlay?")), done)
 
         def action_rename(self):

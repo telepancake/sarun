@@ -327,110 +327,112 @@ def test_pidfd_alive():
             p.kill(); p.wait()
 
 
-def test_consolidate_promote_to_parent_sqlar():
-    """_promote_to_parent_sqlar and the consolidate parent path: call consolidate()
-    directly with a monkey-patched load_file_rules that returns an 'apply' rule so
-    the pool-blob file is promoted into the parent sqlar instead of the real host."""
+def _finish_box_with_file(sup, sid, rel, content, parent=None):
+    """Make a finished (non-live) box whose sqlar holds one folded file `rel`. Wires a
+    Session (parent set) so ChangeReview._source picks the SqlarArchive path."""
+    backing = m.live_dir(sid); (backing / "up").mkdir(parents=True, exist_ok=True)
+    idx = m.Index(backing); wid = idx.writer_for(os.getpid())
+    idx.set_entry(rel, "file", stat_mod.S_IFREG | 0o644, wid, "create")
+    bp = m.blob_path(idx.box_id, idx.row_id(rel))
+    bp.parent.mkdir(parents=True, exist_ok=True); bp.write_bytes(content)
+    m.consolidate(str(backing), sid, ["sh"], index=idx); idx.close()   # placement only
+    if parent is not None:
+        m.sqlar_meta_set(m.sqlar_path(sid), "parent_sid", parent)
+    sup.sessions[sid] = m.Session(session_id=sid, cmd=["c"], live=False,
+                                  shm_dir=str(backing), parent=parent)
+
+
+def test_finalize_apply_promotes_to_parent():
+    """finalize_by_rules with an 'apply' rule promotes the file into the PARENT box's
+    sqlar (not the host) and drops it from the child — apply now lives on the delete /
+    explicit path, not in consolidate()."""
     tmp = Path(tempfile.mkdtemp(prefix="ofl-promo-"))
     _redirect_state(tmp)
     orig_load = m.load_file_rules
     try:
-        parent_sid = "20260604-000200_300"
-        child_sid  = "20260604-000200_301"
+        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=None)
+        parent_sid, child_sid = "PARENT", "PARENT.CHILD"
+        m._sqlar_open(m.sqlar_path(parent_sid)).close()
+        sup.sessions[parent_sid] = m.Session(session_id=parent_sid, cmd=["p"], live=False)
+        rel = "tmp/promo_file.txt"; content = b"promoted content\n"
+        _finish_box_with_file(sup, child_sid, rel, content, parent=parent_sid)
 
-        # Set up child's overlay.
-        backing = m.live_dir(child_sid); up = backing / "up"
-        up.mkdir(parents=True)
-        idx = m.Index(backing)
-        wid = idx.writer_for(os.getpid())
-        rel = "tmp/promo_file.txt"
-        content = b"promoted content\n"
-        idx.set_entry(rel, "file", stat_mod.S_IFREG | 0o644, wid, "create")
-        bp = m.blob_path(idx.box_id, idx.row_id(rel))
-        bp.parent.mkdir(parents=True, exist_ok=True)
-        bp.write_bytes(content)
-
-        # Ensure the parent's sqlar exists (empty schema).
-        p_sp = m.sqlar_path(parent_sid)
-        m._sqlar_open(p_sp).close()
-
-        # Monkey-patch load_file_rules to return an 'apply' rule for our rel.
         class _ApplyRule:
             def decide(self, r): return "apply" if r == rel else None
         m.load_file_rules = lambda: _ApplyRule()
 
-        # Run consolidate with parent set.
-        m.consolidate(str(backing), child_sid, ["sh"], index=idx,
-                      parent=parent_sid)
-
-        # The parent's sqlar should carry the promoted entry.
-        rows = m.sqlar_list(p_sp)
-        names = {r[0] for r in rows}
-        check(rel in names,
-              f"consolidate promote: parent sqlar has {rel!r}")
-        pmode = m.sqlar_mode(p_sp, rel)
-        check(pmode is not None and stat_mod.S_ISREG(pmode),
-              "consolidate promote: entry mode is regular-file")
+        res = sup.review.finalize_by_rules(child_sid)
+        check(rel in res.get("applied", []), f"finalize: rel applied (got {res})")
+        p_sp = m.sqlar_path(parent_sid)
         check(m.sqlar_content(p_sp, rel) == content,
-              "consolidate promote: parent sqlar content matches child bytes")
-
-        # The child's sqlar should NOT have the row (it was dropped, not stored).
-        c_sp = m.sqlar_path(child_sid)
-        c_names = _names(c_sp)
-        check(rel not in c_names,
-              "consolidate promote: child sqlar has no row for the promoted path")
-
-        # The real host must NOT have been written.
-        host_path = Path("/") / rel
-        check(not host_path.exists(),
-              "consolidate promote: real host not written (/tmp/promo_file.txt absent)")
-
-        idx.close()
+              "finalize apply: promoted bytes in parent sqlar")
+        check(rel not in _names(m.sqlar_path(child_sid)),
+              "finalize apply: dropped from child sqlar")
+        check(not (Path("/") / rel).exists(),
+              "finalize apply: real host not written")
     finally:
         m.load_file_rules = orig_load
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def test_consolidate_root_box_apply_still_writes_host():
-    """consolidate() with parent=None and an 'apply' rule writes the real host — the
-    original behaviour is unchanged for root boxes."""
+def test_finalize_apply_writes_host_for_root():
+    """finalize_by_rules with an 'apply' rule on a ROOT box (no parent) writes the host
+    — the original apply-to-host behaviour, now triggered on delete, not on stop."""
     tmp = Path(tempfile.mkdtemp(prefix="ofl-root-apply-"))
     _redirect_state(tmp)
     orig_load = m.load_file_rules
-    # Use a path we can actually write; /tmp is always writable.
     host_rel = "tmp/root_apply_test_sarun_offline.txt"
     host_path = Path("/") / host_rel
     try:
         host_path.unlink(missing_ok=True)
+        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=None)
+        sid = "20260604-000200_302"; content = b"root apply test\n"
+        _finish_box_with_file(sup, sid, host_rel, content, parent=None)
 
-        sid = "20260604-000200_302"
-        backing = m.live_dir(sid); up = backing / "up"
-        up.mkdir(parents=True)
-        idx = m.Index(backing)
-        wid = idx.writer_for(os.getpid())
-        content = b"root apply test\n"
-        idx.set_entry(host_rel, "file", stat_mod.S_IFREG | 0o644, wid, "create")
-        bp = m.blob_path(idx.box_id, idx.row_id(host_rel))
-        bp.parent.mkdir(parents=True, exist_ok=True)
-        bp.write_bytes(content)
-
-        # Monkey-patch load_file_rules to apply this specific path.
         class _ApplyRule:
             def decide(self, r): return "apply" if r == host_rel else None
         m.load_file_rules = lambda: _ApplyRule()
 
-        # parent=None → host write.
-        m.consolidate(str(backing), sid, ["sh"], index=idx, parent=None)
-
-        check(host_path.exists(),
-              "root-box apply: real host was written")
+        res = sup.review.finalize_by_rules(sid)
+        check(host_rel in res.get("applied", []), f"root apply: rel applied (got {res})")
+        check(host_path.exists(), "root-box apply: real host was written")
         if host_path.exists():
-            check(host_path.read_bytes() == content,
-                  "root-box apply: host content matches")
-        idx.close()
+            check(host_path.read_bytes() == content, "root-box apply: host content matches")
     finally:
         m.load_file_rules = orig_load
         host_path.unlink(missing_ok=True)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_finalize_discard_copies_down_to_children():
+    """A discard (no matching rule → discard) copies the file DOWN into immediate
+    children that don't have it, then drops it from the box — so a child's inherited
+    view survives. A child that already owns the file is left untouched."""
+    tmp = Path(tempfile.mkdtemp(prefix="ofl-copydown-"))
+    _redirect_state(tmp)
+    orig_load = m.load_file_rules
+    try:
+        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=None)
+        b = "B"; child_inherits = "B.C"; child_owns = "B.D"
+        rel = "etc/shared.conf"; b_content = b"from B\n"; d_content = b"D's own\n"
+        # B has the file; B.C does NOT (inherits it); B.D HAS its own copy.
+        _finish_box_with_file(sup, b, rel, b_content)
+        # B.C: a finished box that does not contain `rel` (give it an unrelated file).
+        _finish_box_with_file(sup, child_inherits, "other.txt", b"x\n", parent=b)
+        _finish_box_with_file(sup, child_owns, rel, d_content, parent=b)
+
+        m.load_file_rules = lambda: type("R", (), {"decide": lambda self, r: None})()
+        res = sup.review.discard(b, [rel])
+        check(rel in res.get("discarded", []), f"copydown: discarded from B (got {res})")
+        check(rel not in _names(m.sqlar_path(b)), "copydown: gone from B")
+        # B.C (inheritor) now OWNS the file with B's content.
+        check(m.sqlar_content(m.sqlar_path(child_inherits), rel) == b_content,
+              "copydown: B's bytes pinned into the inheriting child B.C")
+        # B.D kept its own version (not overwritten).
+        check(m.sqlar_content(m.sqlar_path(child_owns), rel) == d_content,
+              "copydown: child that owned the file is left untouched")
+    finally:
+        m.load_file_rules = orig_load
         shutil.rmtree(tmp, ignore_errors=True)
 
 
@@ -593,8 +595,9 @@ if __name__ == "__main__":
               test_supervisor_no_mount_register_fails_closed,
               test_pidfd_alive,
               test_box_id_and_pool_layout,
-              test_consolidate_promote_to_parent_sqlar,
-              test_consolidate_root_box_apply_still_writes_host,
+              test_finalize_apply_promotes_to_parent,
+              test_finalize_apply_writes_host_for_root,
+              test_finalize_discard_copies_down_to_children,
               test_consolidate_size_based_placement,
               test_promote_into_parent_unit):
         print(f"\n== {t.__name__} ==")

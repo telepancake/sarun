@@ -1498,24 +1498,32 @@ def test_splice_delete_happy_path():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def test_splice_delete_refused_has_changes():
-    """splice_delete refuses if the target box has sqlar entries (has changes)."""
+def test_splice_delete_nonempty_finalizes_copydown():
+    """splice_delete now ALLOWS a non-empty box: its changes are finalized first. With
+    no matching rule, A.B's file is discarded — copied DOWN into the immediate child
+    A.B.C that lacks it — then A.B is spliced out (A.B.C → A.C). The child keeps the
+    inherited file (now its own); A.B is gone."""
     tmp = Path(tempfile.mkdtemp(prefix="cp-splice-changes-"))
     _redirect_state(tmp)
     try:
         m.ensure_dirs()
         sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
         _make_finished_box(sup, "A", with_content=False)
-        _make_finished_box(sup, "A.B", with_content=True)   # has sqlar content → refused
-        _make_finished_box(sup, "A.B.C", with_content=True)
+        _make_finished_box(sup, "A.B", with_content=True)    # has 'proof.txt' (b"ABCD")
+        m.sqlar_meta_set(m.sqlar_path("A.B"), "parent_sid", "A")
+        _make_finished_box(sup, "A.B.C", with_content=False)  # inherits, owns nothing
+        m.sqlar_meta_set(m.sqlar_path("A.B.C"), "parent_sid", "A.B")
 
         r = sup.splice_delete("A.B")
-        check(r.get("ok") is False, f"splice-changes: refused (got {r})")
-        check("sqlar" in (r.get("error") or ""),
-              f"splice-changes: error mentions sqlar (got {r.get('error')!r})")
-        # Nothing renamed.
-        check(m.sqlar_path("A.B").exists(), "splice-changes: A.B.sqlar still present")
-        check(m.sqlar_path("A.B.C").exists(), "splice-changes: A.B.C.sqlar still present")
+        check(r.get("ok") is True, f"splice-nonempty: now succeeds (got {r})")
+        check(r.get("deleted") == "A.B", "splice-nonempty: A.B deleted")
+        check(not m.sqlar_path("A.B").exists(), "splice-nonempty: A.B.sqlar gone")
+        # A.B.C was spliced to A.C and now OWNS the copied-down file.
+        check(m.sqlar_path("A.C").exists(), "splice-nonempty: A.C.sqlar exists")
+        check(m.sqlar_content(m.sqlar_path("A.C"), "proof.txt") == b"ABCD",
+              "splice-nonempty: A.B's file copied down into the child (A.C)")
+        ac_parent = m.sqlar_meta_get(m.sqlar_path("A.C"), "parent_sid")
+        check(ac_parent == "A", f"splice-nonempty: A.C re-parented to A (got {ac_parent!r})")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -1645,7 +1653,7 @@ if __name__ == "__main__":
               test_box_tree_connector_skipped_when_prefix_has_no_box,
               # Feature 2: splice_delete
               test_splice_delete_happy_path,
-              test_splice_delete_refused_has_changes,
+              test_splice_delete_nonempty_finalizes_copydown,
               test_splice_delete_refused_collision,
               test_splice_delete_refused_live_descendant,
               test_splice_delete_shallowest_first_ordering):
