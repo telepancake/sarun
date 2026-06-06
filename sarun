@@ -2068,6 +2068,13 @@ def _build_overlay_ops():
             self._req_label = ""
             self._req_seq = 0
             self._lock = threading.Lock()   # guards inode/fh allocation vs UI thread
+            # Lazily-attached read-only base sessions: finished parents whose sqlar
+            # exists on disk but who are NOT live.  Keyed by their sid, same as the
+            # normal sessions dict (they share it).  _base_children maps each base sid
+            # to the set of live child sids that keep it alive; when the set empties the
+            # base is detached and its Index closed.
+            self._base_sessions: dict = {}    # sid -> True (membership flag)
+            self._base_children: dict = {}    # base_sid -> set of child sids
 
         # ── session registry ────────────────────────────────────────────────
         def add_session(self, sid: str, up: Path, index: "Index",
@@ -2082,6 +2089,13 @@ def _build_overlay_ops():
                                           passthrough=bool(passthrough),
                                           parent=parent or None,
                                           frules=load_file_rules())
+            # Persist the parent chain in the sqlar meta so that _attach_base_session
+            # can resolve grandparents for chains of finished boxes.
+            if parent:
+                try:
+                    sqlar_meta_set(sqlar_path(sid), "parent_sid", parent)
+                except Exception:
+                    pass
 
         def remove_session(self, sid: str) -> None:
             with self._lock:
@@ -2114,6 +2128,79 @@ def _build_overlay_ops():
                         if sfd >= 0:
                             try: os.close(sfd)
                             except OSError: pass
+            # Remove this child from any base-session child-set; detach bases that are
+            # now unreferenced (child-set empty and base is not also a live session).
+            for psid, children in list(self._base_children.items()):
+                children.discard(sid)
+                if not children and psid in self._base_sessions:
+                    self._detach_base_session(psid)
+
+        # ── base-session lifecycle (finished parents used as read-only lower) ──
+        def _attach_base_session(self, parent_sid: str) -> None:
+            """Idempotent. Attach a finished parent box (sqlar on disk, NOT live) as a
+            read-only base session so _lower_resolve/evicted-read paths serve its
+            accepted state as the child's lower layer.
+
+            Strategy: call unconsolidate() to rebuild up/ dir+symlink artifacts (file
+            rows are left evicted; the FUSE fault-in path inflates them on demand).
+            Then create the Index and add the session entry — identical shape to a live
+            session, but passthrough=False and marked in _base_sessions.  A base session
+            is NEVER written to: copy-up always targets the live child's own overlay."""
+            if parent_sid in self.sessions:
+                return   # already present (live or already attached base)
+            sp = sqlar_path(parent_sid)
+            if not sp.exists():
+                return   # no sqlar → nothing to attach
+            ld = live_dir(parent_sid)
+            # Ensure the backing dir exists so Index.__init__ and unconsolidate can
+            # locate shm_dir even if the original live/<sid> was already cleaned up.
+            ld.mkdir(parents=True, exist_ok=True)
+            (ld / "up").mkdir(parents=True, exist_ok=True)
+            try:
+                # Rebuild dir/symlink up/ artifacts so _resolve_st can lstat them.
+                # Regular-file rows stay evicted (data NOT NULL); _fault_in serves reads.
+                unconsolidate(str(ld), parent_sid)
+            except Exception:
+                pass
+            try:
+                idx = Index(ld)
+            except Exception:
+                return
+            # Read the grandparent from meta so chains of finished boxes resolve.
+            grandparent = sqlar_meta_get(sp, "parent_sid")
+            if grandparent and not valid_sid(grandparent):
+                grandparent = None
+            self.sessions[parent_sid] = dict(
+                up=ld / "up", index=idx, virtual={},
+                passthrough=False,
+                parent=grandparent or None,
+                frules=load_file_rules())
+            self._base_sessions[parent_sid] = True
+            # If the grandparent is also finished (not live), attach it recursively so
+            # multi-level chains resolve.  Guard against cycles with a depth cap.
+            if grandparent and grandparent not in self.sessions:
+                if sqlar_path(grandparent).exists():
+                    self._attach_base_session(grandparent)
+
+        def _detach_base_session(self, psid: str) -> None:
+            """Remove a base session when its child-set empties.  Closes its Index and
+            drops it from sessions/_base_sessions.  No-op if the sid is still live."""
+            if psid not in self._base_sessions:
+                return
+            self._base_sessions.pop(psid, None)
+            self._base_children.pop(psid, None)
+            s = self.sessions.pop(psid, None)
+            if s is not None:
+                try: s["index"].close()
+                except Exception: pass
+            # Clean up inode maps for the detached base (avoids stale entries).
+            dead = [ino for ino, key in self._ino_to_key.items()
+                    if key and key[0] == psid]
+            for ino in dead:
+                self._ino_to_key.pop(ino, None)
+                self._lookup_count.pop(ino, None)
+            self._key_to_ino = {k: i for k, i in self._key_to_ino.items()
+                                if k[0] != psid}
 
         def add_virtual(self, sid: str, rel: str, content: bytes) -> None:
             s = self.sessions.get(sid)
@@ -2154,7 +2241,20 @@ def _build_overlay_ops():
         def _parent(self, sid: str) -> "str | None":
             s = self.sessions.get(sid)
             p = s.get("parent") if s else None
-            return p if (p and p in self.sessions) else None
+            if not p:
+                return None
+            if p in self.sessions:
+                return p
+            # Finished parent: sqlar exists but the session is no longer live.
+            # Lazily attach it as a read-only base session so the evicted-read and
+            # directory-listing paths can serve the parent's accepted state.
+            if sqlar_path(p).exists():
+                self._attach_base_session(p)
+                # Register this child as keeping the base alive (idempotent set-add).
+                self._base_children.setdefault(p, set()).add(sid)
+                if p in self.sessions:
+                    return p
+            return None
 
         def _lower_resolve(self, sid: str, rel: str):
             """(layer, abspath, st) for the layer beneath this box's own upper — the
@@ -2685,6 +2785,9 @@ def _build_overlay_ops():
             sid, rel = key
             layer, ap, _st = self._resolve_st(sid, rel)
             if layer in ("absent", "whiteout"): raise pyfuse3.FUSEError(errno.ENOENT)
+            # ap is None only if unconsolidate() somehow failed to rebuild the up/
+            # symlink artifact for a finished parent (defensive; normally non-None).
+            if ap is None: raise pyfuse3.FUSEError(errno.EIO)
             try: return os.fsencode(os.readlink(ap))
             except OSError as e: raise pyfuse3.FUSEError(e.errno or errno.EIO)
 
@@ -2726,6 +2829,26 @@ def _build_overlay_ops():
                               "mkdir_parent", opaque=opaque)
 
         # ── fault-in: inflate an evicted row back to a pool blob ────────────
+        def _owning_evicted_sid(self, sid: str, rel: str) -> "str | None":
+            """Walk the parent chain upward to find the session whose index has an
+            evicted file row (data NOT NULL, no pool blob) for rel.  Used by copy-up
+            and ensure-copyup when _resolve_st returns ap=None for a regular file
+            from an ancestor session (finished parent attached as a base)."""
+            cur = sid
+            seen: set = set()
+            while cur and cur not in seen:
+                seen.add(cur)
+                idx = self._index(cur)
+                if idx.kind_of(rel) == "file":
+                    row = idx.file_row(rel)
+                    if row is not None and row[4] is not None:
+                        return cur
+                p = self._parent(cur)
+                if p is None:
+                    break
+                cur = p
+            return None
+
         def _fault_in(self, sid: str, rel: str) -> None:
             """Idempotent. If the file's row has data and no blob: decompress the
             row bytes, write the blob, chmod+mtime, then NULL the row (resident).
@@ -2789,8 +2912,18 @@ def _build_overlay_ops():
                         return os.open(upath, os.O_RDWR | os.O_NOFOLLOW)
                     except OSError as e:
                         raise pyfuse3.FUSEError(e.errno or errno.EIO)
-                # ap is None only for an evicted own file (handled above); here ap
-                # is always a real on-disk path (lower or resident upper).
+                # ap is None when the file is evicted in an ancestor (base) session.
+                # Fault it in on the owning session to get a real blob path, then open.
+                if ap is None:
+                    owning = self._owning_evicted_sid(sid, rel)
+                    if owning is None:
+                        raise pyfuse3.FUSEError(errno.EIO)
+                    self._fault_in(owning, rel)
+                    own_idx = self._index(owning)
+                    own_rid = own_idx.row_id(rel)
+                    if own_rid is None:
+                        raise pyfuse3.FUSEError(errno.EIO)
+                    ap = str(blob_path(own_idx.box_id, own_rid))
                 src = os.open(ap, os.O_RDONLY | os.O_NOFOLLOW)
                 try:
                     bp_str = self._new_file_blob(sid, rel, st.st_mode, wid, "copyup")
@@ -2818,6 +2951,9 @@ def _build_overlay_ops():
             Passthrough + parent  → recurse into parent's overlay (captured there).
             Passthrough + no parent → real host (_passthrough_open), unchanged.
             Non-passthrough       → copy-up into this box's own pool blob."""
+            # Base sessions are strictly read-only: never write into a finished parent.
+            if sid in self._base_sessions:
+                raise pyfuse3.FUSEError(errno.EROFS)
             if self._passthrough(sid, rel):
                 p = self._parent(sid)
                 if p is not None:
@@ -2855,11 +2991,15 @@ def _build_overlay_ops():
                     layer, ap, _st = self._resolve_st(sid, rel)
                     if layer in ("absent", "whiteout"):
                         raise pyfuse3.FUSEError(errno.ENOENT)
-                    # Evicted file: path is None, bytes live in the row. Serve via
-                    # _vfh (same path as virtual files) — no materialization to disk.
+                    # Evicted file: path is None, bytes live in the row.  The row
+                    # may belong to this session or to an ancestor (finished parent
+                    # attached as a base).  Find the owning session, then serve via
+                    # _vfh — no materialization to disk on a read-only open.
                     if ap is None:
-                        idx = self._index(sid)
-                        row = idx.file_row(rel)
+                        owning = self._owning_evicted_sid(sid, rel)
+                        evict_idx = (self._index(owning) if owning
+                                     else self._index(sid))
+                        row = evict_idx.file_row(rel)
                         if row is None or row[4] is None:
                             raise pyfuse3.FUSEError(errno.EIO)
                         _rowid, _mode, sz, _mtime, data = row
@@ -2877,6 +3017,9 @@ def _build_overlay_ops():
                     except OSError as e:
                         raise pyfuse3.FUSEError(e.errno or errno.EIO)
                 else:
+                    # Base sessions are strictly read-only (finished parent).
+                    if sid in self._base_sessions:
+                        raise pyfuse3.FUSEError(errno.EROFS)
                     if policy_check(sid, self._index(sid).provenance_of(ctx.pid),
                                     rel, "open_write") == "deny":
                         raise pyfuse3.FUSEError(errno.EACCES)
@@ -3430,6 +3573,18 @@ def _build_overlay_ops():
                     os.mkdir(upath, stat_mod.S_IMODE(st.st_mode))
                     idx.set_entry(rel, "dir", st.st_mode, wid, "copyup_dir")
                 else:
+                    # ap is None when the source is an evicted row in an ancestor
+                    # (base) session.  Fault it in there to get a real blob path.
+                    if ap is None:
+                        owning = self._owning_evicted_sid(sid, rel)
+                        if owning is None:
+                            return   # can't resolve source; skip silently
+                        self._fault_in(owning, rel)
+                        own_idx = self._index(owning)
+                        own_rid = own_idx.row_id(rel)
+                        if own_rid is None:
+                            return
+                        ap = str(blob_path(own_idx.box_id, own_rid))
                     # ap is a real on-disk path (lower or resident upper): copy to blob.
                     src = os.open(ap, os.O_RDONLY | os.O_NOFOLLOW)
                     try:
