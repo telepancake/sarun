@@ -323,6 +323,187 @@ def test_running_roots_wrap_safe():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_consolidate_promote_to_parent_sqlar():
+    """_promote_to_parent_sqlar and the consolidate parent path: call consolidate()
+    directly with a monkey-patched load_file_rules that returns an 'apply' rule so
+    the pool-blob file is promoted into the parent sqlar instead of the real host."""
+    tmp = Path(tempfile.mkdtemp(prefix="ofl-promo-"))
+    _redirect_state(tmp)
+    orig_load = m.load_file_rules
+    try:
+        parent_sid = "20260604-000200_300"
+        child_sid  = "20260604-000200_301"
+
+        # Set up child's overlay.
+        backing = m.live_dir(child_sid); up = backing / "up"
+        up.mkdir(parents=True)
+        idx = m.Index(backing)
+        wid = idx.writer_for(os.getpid())
+        rel = "tmp/promo_file.txt"
+        content = b"promoted content\n"
+        idx.set_entry(rel, "file", stat_mod.S_IFREG | 0o644, wid, "create")
+        bp = m.blob_path(idx.box_id, idx.row_id(rel))
+        bp.parent.mkdir(parents=True, exist_ok=True)
+        bp.write_bytes(content)
+
+        # Ensure the parent's sqlar exists (empty schema).
+        p_sp = m.sqlar_path(parent_sid)
+        m._sqlar_open(p_sp).close()
+
+        # Monkey-patch load_file_rules to return an 'apply' rule for our rel.
+        class _ApplyRule:
+            def decide(self, r): return "apply" if r == rel else None
+        m.load_file_rules = lambda: _ApplyRule()
+
+        # Run consolidate with parent set.
+        m.consolidate(str(backing), child_sid, ["sh"], index=idx,
+                      parent=parent_sid)
+
+        # The parent's sqlar should carry the promoted entry.
+        rows = m.sqlar_list(p_sp)
+        names = {r[0] for r in rows}
+        check(rel in names,
+              f"consolidate promote: parent sqlar has {rel!r}")
+        pmode = m.sqlar_mode(p_sp, rel)
+        check(pmode is not None and stat_mod.S_ISREG(pmode),
+              "consolidate promote: entry mode is regular-file")
+        check(m.sqlar_content(p_sp, rel) == content,
+              "consolidate promote: parent sqlar content matches child bytes")
+
+        # The child's sqlar should NOT have the row (it was dropped, not stored).
+        c_sp = m.sqlar_path(child_sid)
+        c_names = _names(c_sp)
+        check(rel not in c_names,
+              "consolidate promote: child sqlar has no row for the promoted path")
+
+        # The real host must NOT have been written.
+        host_path = Path("/") / rel
+        check(not host_path.exists(),
+              "consolidate promote: real host not written (/tmp/promo_file.txt absent)")
+
+        idx.close()
+    finally:
+        m.load_file_rules = orig_load
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_consolidate_root_box_apply_still_writes_host():
+    """consolidate() with parent=None and an 'apply' rule writes the real host — the
+    original behaviour is unchanged for root boxes."""
+    tmp = Path(tempfile.mkdtemp(prefix="ofl-root-apply-"))
+    _redirect_state(tmp)
+    orig_load = m.load_file_rules
+    # Use a path we can actually write; /tmp is always writable.
+    host_rel = "tmp/root_apply_test_sarun_offline.txt"
+    host_path = Path("/") / host_rel
+    try:
+        host_path.unlink(missing_ok=True)
+
+        sid = "20260604-000200_302"
+        backing = m.live_dir(sid); up = backing / "up"
+        up.mkdir(parents=True)
+        idx = m.Index(backing)
+        wid = idx.writer_for(os.getpid())
+        content = b"root apply test\n"
+        idx.set_entry(host_rel, "file", stat_mod.S_IFREG | 0o644, wid, "create")
+        bp = m.blob_path(idx.box_id, idx.row_id(host_rel))
+        bp.parent.mkdir(parents=True, exist_ok=True)
+        bp.write_bytes(content)
+
+        # Monkey-patch load_file_rules to apply this specific path.
+        class _ApplyRule:
+            def decide(self, r): return "apply" if r == host_rel else None
+        m.load_file_rules = lambda: _ApplyRule()
+
+        # parent=None → host write.
+        m.consolidate(str(backing), sid, ["sh"], index=idx, parent=None)
+
+        check(host_path.exists(),
+              "root-box apply: real host was written")
+        if host_path.exists():
+            check(host_path.read_bytes() == content,
+                  "root-box apply: host content matches")
+        idx.close()
+    finally:
+        m.load_file_rules = orig_load
+        host_path.unlink(missing_ok=True)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_promote_into_parent_unit():
+    """Unit-test _promote_into_parent directly: a live parent Index receives the
+    promotion for all three plan kinds (file / symlink / delete)."""
+    import stat as stat_mod
+    tmp = Path(tempfile.mkdtemp(prefix="ofl-unit-promo-"))
+    _redirect_state(tmp)
+    try:
+        class _FakeSessions:
+            def get(self, k, d=None): return self._s.get(k, d)
+            def __contains__(self, k): return k in self._s
+            def __getitem__(self, k): return self._s[k]
+            def __init__(self): self._s = {}
+
+        class _FakeReg:
+            def __init__(self):
+                self.sessions = _FakeSessions()
+                self.indexes = {}
+
+        class _FakeReview:
+            def __init__(self): self.reg = _FakeReg()
+
+        rev = _FakeReview()
+
+        # Set up a live parent index.
+        parent_sid = "20260604-000201_400"
+        p_backing = m.live_dir(parent_sid); p_up = p_backing / "up"
+        p_up.mkdir(parents=True)
+        p_idx = m.Index(p_backing)
+        rev.reg.indexes[parent_sid] = p_idx
+
+        # Wire a minimal Session so _parent_sid / _promote_into_parent can find upper.
+        ps = m.Session(session_id=parent_sid, cmd=["p"], shm_dir=str(p_backing), live=True)
+        rev.reg.sessions._s[parent_sid] = ps
+
+        # Build the real ChangeReview, monkey-patch its reg.
+        cr = m.ChangeReview(rev.reg)
+
+        # ── file plan ──
+        rel_f = "usr/lib/promo.so"
+        content = b"\x7fELF\x00"
+        plan_f = dict(kind="file", data=content, chmod=stat_mod.S_IFREG | 0o644)
+        err = cr._promote_into_parent(parent_sid, rel_f, plan_f)
+        check(err is None, "unit-promo file: no error returned")
+        check(p_idx.kind_of(rel_f) == "file", "unit-promo file: parent Index kind=file")
+        p_rid = p_idx.row_id(rel_f)
+        check(p_rid is not None, "unit-promo file: parent Index has row_id")
+        bp = m.blob_path(p_idx.box_id, p_rid)
+        check(bp.exists() and bp.read_bytes() == content,
+              "unit-promo file: blob content correct")
+
+        # ── symlink plan ──
+        rel_l = "etc/resolv.conf"
+        plan_l = dict(kind="symlink", target="/run/systemd/resolve/stub-resolv.conf")
+        err = cr._promote_into_parent(parent_sid, rel_l, plan_l)
+        check(err is None, "unit-promo symlink: no error")
+        check(p_idx.kind_of(rel_l) == "symlink", "unit-promo symlink: parent kind=symlink")
+        sym = p_up / rel_l
+        check(sym.is_symlink(), "unit-promo symlink: symlink artifact in parent up/")
+
+        # ── delete plan (path absent on host → del_entry, not whiteout) ──
+        rel_d = "tmp/nonexistent_promo_path_test"
+        plan_d = dict(kind="delete")
+        err = cr._promote_into_parent(parent_sid, rel_d, plan_d)
+        check(err is None, "unit-promo delete: no error")
+        # Either whiteout or del_entry depending on host presence; both are fine.
+        # We just confirm no crash and no host write.
+        host_d = Path("/") / rel_d
+        check(not host_d.exists(), "unit-promo delete: host not touched")
+
+        p_idx.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     for t in (test_one_db_only_and_blob_lifecycle,
               test_process_and_env_tables_dedup_and_tag,
@@ -331,7 +512,10 @@ if __name__ == "__main__":
               test_process_table_is_one_connected_tree,
               test_supervisor_no_mount_register_fails_closed,
               test_running_roots_wrap_safe,
-              test_box_id_and_pool_layout):
+              test_box_id_and_pool_layout,
+              test_consolidate_promote_to_parent_sqlar,
+              test_consolidate_root_box_apply_still_writes_host,
+              test_promote_into_parent_unit):
         print(f"\n== {t.__name__} ==")
         try:
             t()
