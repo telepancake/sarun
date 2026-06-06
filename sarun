@@ -1935,17 +1935,6 @@ class Index:
             self._whiteouts.discard(path); self._kinds.pop(path, None)
             self._opaque.discard(path)
 
-    def mirror_kind(self, path: str, kind: str) -> None:
-        """Update ONLY the RAM mirror for `path` to `kind` — for callers that already
-        wrote the sqlar row directly (e.g. a resident-file or symlink promotion) and
-        just need the hot-read mirror to agree. Does not touch the db row. `kind` is one
-        of file/symlink/dir/whiteout."""
-        with self._lock:
-            if kind == "whiteout":
-                self._whiteouts.add(path); self._kinds.pop(path, None)
-            else:
-                self._kinds[path] = kind; self._whiteouts.discard(path)
-
     def row_id(self, rel: str) -> "int | None":
         """The sqlar rowid for `rel` — names the blob in the pool."""
         with self._lock:
@@ -5344,11 +5333,13 @@ class ChangeReview:
                 else:
                     # Lower has nothing here: drop the box's own row + any pool blob.
                     if idx is not None:
+                        # Drop the row FIRST, then the blob (Stage A ordering: never
+                        # leave a resident row whose blob is gone).
                         rid = idx.row_id(rel)
+                        idx.del_entry(rel, op="promoted_del")
                         if rid is not None:
                             try: blob_path(box_id, rid).unlink()
                             except OSError: pass
-                        idx.del_entry(rel, op="promoted_del")
                     else:
                         _drop_sqlar_row_and_blob(sp, box_id, rel)
             elif kind == "symlink":
@@ -5358,15 +5349,13 @@ class ChangeReview:
                 else:
                     tgt_str = str(tgt_raw)
                 tgt_bytes = tgt_str.encode("utf-8", "surrogateescape")
-                # Storage: write the symlink row into the box's sqlar.
-                conn = _sqlar_open(sp)
-                try: _sqlar_put_symlink(conn, rel, tgt_bytes, mtime_ns); conn.commit()
-                finally: conn.close()
                 if idx is not None:
-                    # Live mirror: the FUSE readlink path resolves a symlink through the
-                    # up/ artifact (_backing_path → up/rel), so write a real symlink and
-                    # mark the mirror kind. set_entry would NULL the row written above, so
-                    # update only the RAM mirror here, not the row.
+                    # Live box: the FUSE readlink path resolves a symlink through the up/
+                    # artifact (_backing_path → up/rel), and the row carries NULL data
+                    # (the target is folded in from the artifact at consolidate). Write a
+                    # real symlink in up/ + the index row through the lock-held Index so
+                    # the running mount serves it. (Single Index connection — no second
+                    # WAL handle racing the serve thread.)
                     psess = self.reg.sessions.get(target_sid)
                     if psess is None:
                         return dict(ok=False, error=f"promote: session {target_sid} not tracked")
@@ -5379,7 +5368,12 @@ class ChangeReview:
                         _restore_host_mtime_ns(sym_path, mtime_ns, is_symlink=True)
                     except OSError as e:
                         return dict(ok=False, error=f"promote symlink: {e}")
-                    idx.mirror_kind(rel, "symlink")
+                    idx.set_entry(rel, "symlink", stat_mod.S_IFLNK | 0o777, wid, "promoted")
+                else:
+                    # At rest: the target bytes live in the sqlar row itself.
+                    conn = _sqlar_open(sp)
+                    try: _sqlar_put_symlink(conn, rel, tgt_bytes, mtime_ns); conn.commit()
+                    finally: conn.close()
             elif kind == "file":
                 data = plan.get("data")
                 if data is None and "copy_from" in plan:
@@ -5391,41 +5385,48 @@ class ChangeReview:
                 mode = plan.get("chmod") or (stat_mod.S_IFREG | 0o644)
                 if not stat_mod.S_ISREG(mode):
                     mode = stat_mod.S_IFREG | stat_mod.S_IMODE(mode)
-                # Size-based placement matching consolidate / POOL_RESIDENT_MIN: large
-                # files (and ANY file for a live box, whose serve path reads the pool
-                # blob) become a resident row (data NULL) + a pool blob; small files for
-                # a non-live box fold inline into the sqlar row.
-                resident = (idx is not None) or (len(data) >= POOL_RESIDENT_MIN)
-                if resident:
-                    conn = _sqlar_open(sp)
-                    try:
-                        # Resident row: data NULL, real uncompressed size.
-                        conn.execute(
-                            "INSERT INTO sqlar(name,mode,mtime,sz,data) VALUES(?,?,?,?,NULL)"
-                            " ON CONFLICT(name) DO UPDATE SET mode=excluded.mode,"
-                            " mtime=excluded.mtime, sz=excluded.sz, data=NULL",
-                            (rel, int(mode), int(mtime_ns), len(data)))
-                        conn.commit()
-                        rid = conn.execute("SELECT rowid FROM sqlar WHERE name=?",
-                                           (rel,)).fetchone()[0]
-                    finally:
-                        conn.close()
+                if idx is not None:
+                    # Live box: a file's bytes live in the pool blob (the serve path reads
+                    # blob_path first); the row stays resident (data NULL). Upsert the row
+                    # through the lock-held Index, then write the blob — exactly as the
+                    # FUSE write path records a new file.
+                    idx.set_entry(rel, "file", mode, wid, "promoted")
+                    rid = idx.row_id(rel)
+                    if rid is None:
+                        return dict(ok=False, error="promote: row_id missing after set_entry")
                     bp = blob_path(box_id, rid)
                     try:
                         bp.parent.mkdir(parents=True, exist_ok=True)
                         bp.write_bytes(data)
                     except OSError as e:
                         return dict(ok=False, error=f"promote write blob: {e}")
-                    if idx is not None:
-                        # Keep the live mirror consistent: kind=file. The row already
-                        # holds the resident invariant (data NULL, real sz) from the
-                        # INSERT above, and _resolve_st serves the file from the pool
-                        # blob — so no further row mutation is needed.
-                        idx.mirror_kind(rel, "file")
                 else:
-                    conn = _sqlar_open(sp)
-                    try: _sqlar_put_file(conn, rel, data, mode, mtime_ns); conn.commit()
-                    finally: conn.close()
+                    # At rest: size-based placement matching consolidate /
+                    # POOL_RESIDENT_MIN — a large file stays a PERMANENT pool blob
+                    # (resident row: data NULL, real sz), a small file folds inline.
+                    if len(data) >= POOL_RESIDENT_MIN:
+                        conn = _sqlar_open(sp)
+                        try:
+                            conn.execute(
+                                "INSERT INTO sqlar(name,mode,mtime,sz,data) VALUES(?,?,?,?,NULL)"
+                                " ON CONFLICT(name) DO UPDATE SET mode=excluded.mode,"
+                                " mtime=excluded.mtime, sz=excluded.sz, data=NULL",
+                                (rel, int(mode), int(mtime_ns), len(data)))
+                            conn.commit()
+                            rid = conn.execute("SELECT rowid FROM sqlar WHERE name=?",
+                                               (rel,)).fetchone()[0]
+                        finally:
+                            conn.close()
+                        bp = blob_path(box_id, rid)
+                        try:
+                            bp.parent.mkdir(parents=True, exist_ok=True)
+                            bp.write_bytes(data)
+                        except OSError as e:
+                            return dict(ok=False, error=f"promote write blob: {e}")
+                    else:
+                        conn = _sqlar_open(sp)
+                        try: _sqlar_put_file(conn, rel, data, mode, mtime_ns); conn.commit()
+                        finally: conn.close()
         except sqlite3.Error as e:
             return dict(ok=False, error=f"promote to sqlar: {e}")
         return None   # success
