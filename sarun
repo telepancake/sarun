@@ -1655,6 +1655,7 @@ class Index:
         self._whiteouts: set = set()
         self._kinds: dict = {}
         self._opaque: set = set()
+        self._targets: dict = {}          # rel -> symlink target bytes (RAM mirror)
         self._lock = threading.Lock()     # serialize SQLite + mirror mutations
         self._load_mirror()
         # Stable pool id == the box's identity == the backing dir / sqlar stem.
@@ -1664,13 +1665,17 @@ class Index:
         self._tracing = bool(on)
 
     def _load_mirror(self) -> None:
-        for path, mode, opaque in self._db.execute(
-                "SELECT name, mode, opaque FROM sqlar"):
+        for path, mode, opaque, sz, data in self._db.execute(
+                "SELECT name, mode, opaque, sz, data FROM sqlar"):
             kind = _kind_of_mode(mode)
             if kind == "whiteout":
                 self._whiteouts.add(path)
             else:
                 self._kinds[path] = kind
+            if kind == "symlink" and data is not None:
+                blob = bytes(data)
+                self._targets[path] = (blob if len(blob) == sz
+                                       else zlib.decompress(blob))
             if opaque:
                 self._opaque.add(path)
         # Hierarchy roots recorded by earlier runs (PPid-bubbling boundary).
@@ -1690,6 +1695,12 @@ class Index:
     def kind_of(self, rel: str) -> "str | None":
         if rel in self._whiteouts: return "whiteout"
         return self._kinds.get(rel)
+
+    def symlink_target(self, rel: str) -> "bytes | None":
+        """The symlink target bytes for `rel`, or None if rel is not a symlink in the
+        mirror. Served straight from RAM (no disk readlink)."""
+        if self._kinds.get(rel) != "symlink": return None
+        return self._targets.get(rel)
 
     def is_opaque(self, rel: str) -> bool:
         return rel in self._opaque
@@ -1928,15 +1939,32 @@ class Index:
                 (int(mode), op_q, first, last, path))
 
     def set_entry(self, path, kind, mode, writer_id, op,
-                  detail: str = "", opaque=None) -> None:
+                  detail: str = "", opaque=None, target=None,
+                  mtime_ns=None) -> None:
         with self._lock:
             self._upsert(path, self._row_mode(kind, mode), writer_id, opaque)
+            if kind == "symlink" and target is not None:
+                # Put the target into the row IMMEDIATELY (deflated, sz=len) so the
+                # row is the single source of truth — no fold-at-consolidate desync.
+                tgt = target if isinstance(target, (bytes, bytearray)) else \
+                    str(target).encode("utf-8", "surrogateescape")
+                data, sz = _sqlar_deflate(bytes(tgt))
+                m = int(mtime_ns) if mtime_ns is not None else 0
+                self._db.execute(
+                    "UPDATE sqlar SET sz=?, data=?, mtime=? WHERE name=?",
+                    (sz, sqlite3.Binary(data), m, path))
             self._db.commit()
             # RAM mirror — mutate under the SAME lock.
             if kind == "whiteout":
                 self._whiteouts.add(path); self._kinds.pop(path, None)
+                self._targets.pop(path, None)
             else:
                 self._kinds[path] = kind; self._whiteouts.discard(path)
+                if kind == "symlink":
+                    if target is not None:
+                        self._targets[path] = bytes(tgt)
+                else:
+                    self._targets.pop(path, None)
             if opaque is not None:
                 if opaque: self._opaque.add(path)
                 else: self._opaque.discard(path)
@@ -1946,7 +1974,7 @@ class Index:
             self._db.execute("DELETE FROM sqlar WHERE name=?", (path,))
             self._db.commit()
             self._whiteouts.discard(path); self._kinds.pop(path, None)
-            self._opaque.discard(path)
+            self._opaque.discard(path); self._targets.pop(path, None)
 
     def row_id(self, rel: str) -> "int | None":
         """The sqlar rowid for `rel` — names the blob in the pool."""
@@ -1981,6 +2009,11 @@ class Index:
             if old_kind is not None:
                 self._kinds[new] = old_kind
             opaque_had = new in self._opaque  # already handled above
+            # move the symlink target alongside the kind (drop any pre-existing new)
+            self._targets.pop(new, None)
+            old_tgt = self._targets.pop(old, None)
+            if old_tgt is not None:
+                self._targets[new] = old_tgt
 
     def prune_subtree(self, prefix: str) -> None:
         pref = prefix + "/"
@@ -2000,6 +2033,8 @@ class Index:
                 for p in [p for p in s if p.startswith(pref)]: s.discard(p)
             for p in [p for p in self._kinds if p.startswith(pref)]:
                 self._kinds.pop(p, None)
+            for p in [p for p in self._targets if p.startswith(pref)]:
+                self._targets.pop(p, None)
 
     def reparent(self, old: str, new: str, writer_id) -> None:
         """Rename the whole subtree old/ -> new/ IN PLACE (UPDATE name, keep rowids).
@@ -2023,9 +2058,15 @@ class Index:
                 kind = _kind_of_mode(mode)
                 self._whiteouts.discard(path); self._kinds.pop(path, None)
                 self._opaque.discard(path)
+                # symlink target moves with the row (rowid + data preserved on disk);
+                # carry the RAM mirror over too.
+                old_tgt = self._targets.pop(path, None)
+                self._targets.pop(np, None)
                 # also drop any pre-existing mirror entry at the new name
                 self._whiteouts.discard(np); self._kinds.pop(np, None)
                 self._opaque.discard(np)
+                if kind == "symlink" and old_tgt is not None:
+                    self._targets[np] = old_tgt
                 if kind == "whiteout": self._whiteouts.add(np)
                 else: self._kinds[np] = kind
                 if opaque: self._opaque.add(np)
@@ -2102,7 +2143,7 @@ class Index:
             self._db.commit()
             # RAM mirror: ensure kind is "file" (whiteout cleared by _upsert logic).
             self._kinds[rel] = "file"
-            self._whiteouts.discard(rel)
+            self._whiteouts.discard(rel); self._targets.pop(rel, None)
 
     def close(self) -> None:
         try: self._db.close()
@@ -3466,10 +3507,12 @@ def _build_overlay_ops():
                     raise pyfuse3.FUSEError(e.errno or errno.EIO)
                 if idx.kind_of(rel) == "whiteout":
                     idx.del_entry(rel)
-                idx.set_entry(rel, "symlink", stat_mod.S_IFLNK | 0o777, wid, "symlink")
+                st = os.lstat(upath)
+                tgt = target.encode("utf-8", "surrogateescape")
+                idx.set_entry(rel, "symlink", stat_mod.S_IFLNK | 0o777, wid, "symlink",
+                              target=tgt, mtime_ns=st.st_mtime_ns)
                 ino = self._ino_for(sid, rel)
                 self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
-                st = os.lstat(upath)
                 return self._entry(ino, st)
             return self._mutate(parent_inode, name, ctx, "symlink", host_op, upper_op)
 
@@ -3730,9 +3773,12 @@ def _build_overlay_ops():
             if layer in ("lower", "upper"):     # host, or (nested) an ancestor's upper
                 if stat_mod.S_ISLNK(st.st_mode):
                     upath = self._upper_path(sid, rel)
-                    os.symlink(os.readlink(ap), upath)
+                    tgt = os.readlink(ap)
+                    os.symlink(tgt, upath)
                     idx.set_entry(rel, "symlink", stat_mod.S_IFLNK | 0o777, wid,
-                                  "copyup_symlink")
+                                  "copyup_symlink",
+                                  target=tgt.encode("utf-8", "surrogateescape"),
+                                  mtime_ns=getattr(st, "st_mtime_ns", 0))
                 elif stat_mod.S_ISDIR(st.st_mode):
                     upath = self._upper_path(sid, rel)
                     os.mkdir(upath, stat_mod.S_IMODE(st.st_mode))
@@ -3945,9 +3991,12 @@ def _build_overlay_ops():
                 if stat_mod.S_ISLNK(st.st_mode):
                     ups = self._upper_path(sid, rel_src)
                     upn = self._upper_path(sid, rel_n)
-                    os.symlink(os.readlink(ups), upn)
+                    tgt = os.readlink(ups)
+                    os.symlink(tgt, upn)
                     idx.set_entry(rel_n, "symlink", stat_mod.S_IFLNK | 0o777, wid,
-                                  "link_as_copy", detail=rel_src)
+                                  "link_as_copy", detail=rel_src,
+                                  target=tgt.encode("utf-8", "surrogateescape"),
+                                  mtime_ns=getattr(st, "st_mtime_ns", 0))
                 else:
                     src_bp = self._backing_path(sid, rel_src)
                     dst_bp = self._new_file_blob(sid, rel_n, st.st_mode, wid,
@@ -5394,7 +5443,8 @@ class ChangeReview:
                         _restore_host_mtime_ns(sym_path, mtime_ns, is_symlink=True)
                     except OSError as e:
                         return dict(ok=False, error=f"promote symlink: {e}")
-                    idx.set_entry(rel, "symlink", stat_mod.S_IFLNK | 0o777, wid, "promoted")
+                    idx.set_entry(rel, "symlink", stat_mod.S_IFLNK | 0o777, wid, "promoted",
+                                  target=tgt_bytes, mtime_ns=mtime_ns)
                 else:
                     # At rest: the target bytes live in the sqlar row itself.
                     conn = _sqlar_open(sp)
