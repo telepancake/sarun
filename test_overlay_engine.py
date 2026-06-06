@@ -352,13 +352,92 @@ def test_nested_lower_chaining():
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_lazy_file_materialization():
+    """Evicted files (data in row, blob absent) are readable without faulting to
+    disk, and fault in only on write. unconsolidate() leaves files evicted."""
+    fx = MountFixture()
+    try:
+        fx.start()
+        known_bytes = b"lazy content line\n"
+        # Create a regular file and a dir and a symlink through the mount.
+        r = fx.sh("printf 'lazy content line\\n' > evictme.txt && "
+                  "mkdir mydir && "
+                  "ln -s /some/target mylink")
+        check(r.returncode == 0, "lazy: created file, dir, symlink")
+
+        # Consolidate with index= kept open so the live mount stays valid.
+        blob_before = m.blob_path(fx.index.box_id, fx.index.row_id("evictme.txt"))
+        m.consolidate(str(fx.backing), fx.sid, ["x"], index=fx.index)
+
+        # (a) Blob must be gone (evicted).
+        check(not blob_before.exists(), "lazy: pool blob evicted after consolidate")
+
+        # (b) stat through the mount reports the right size (from row, no blob).
+        r = fx.sh("wc -c < evictme.txt")
+        check(r.returncode == 0 and r.stdout.strip() == str(len(known_bytes)),
+              "lazy: stat of evicted file reports correct size")
+
+        # (c) cat returns exact bytes served from row; blob remains absent.
+        r = fx.sh("cat evictme.txt")
+        check(r.returncode == 0 and r.stdout.encode() == known_bytes,
+              "lazy: read of evicted file returns correct bytes")
+        check(not blob_before.exists(),
+              "lazy: blob still absent after read-only open (no materialization)")
+
+        # (d) Append faults in: blob must appear with correct content.
+        r = fx.sh("printf 'appended\\n' >> evictme.txt && cat evictme.txt")
+        check(r.returncode == 0, "lazy: append to evicted file succeeds")
+        check(blob_before.exists(), "lazy: blob materialized (faulted in) after write")
+        check(r.stdout.encode() == known_bytes + b"appended\n",
+              "lazy: faulted-in file has correct content after append")
+
+        # (e) unconsolidate() rebuilds dir/symlink artifacts but leaves file evicted.
+        # First consolidate again so everything is stored (blob re-created by fault-in
+        # above, so consolidate will deflate it back into the row).
+        m.consolidate(str(fx.backing), fx.sid, ["x"], index=fx.index)
+        blob_after_second = m.blob_path(fx.index.box_id, fx.index.row_id("evictme.txt"))
+        # Now call unconsolidate — should NOT re-create the file blob.
+        m.unconsolidate(str(fx.backing), fx.sid)
+        check(not blob_after_second.exists(),
+              "lazy: unconsolidate does NOT recreate file blob (stays evicted)")
+        # Dir and symlink up/<rel> artifacts must be rebuilt.
+        check((fx.up / "mydir").is_dir(),
+              "lazy: unconsolidate rebuilds dir up/<rel> artifact")
+        check((fx.up / "mylink").is_symlink(),
+              "lazy: unconsolidate rebuilds symlink up/<rel> artifact")
+    finally:
+        fx.stop()
+
+
+def test_hardlink_as_copy():
+    """link() of a regular file is a copy across overlay layers: both names hold the
+    content, and the dest is an independent file whose bytes are in the pool (this
+    regressed when file bytes moved out of up/<rel> into the pool)."""
+    fx = MountFixture()
+    try:
+        fx.start()
+        r = fx.sh("printf 'orig\\n' > f && ln f g && cat g")
+        check(r.returncode == 0 and r.stdout == "orig\n",
+              "hardlink dest reads the source content")
+        check(fx.index.kind_of("g") == "file", "index: hardlink dest is a file")
+        blob = m.blob_path(fx.index.box_id, fx.index.row_id("g"))
+        check(blob.exists() and blob.read_bytes() == b"orig\n",
+              "hardlink dest bytes are in the pool")
+        # link-as-copy: the two names are independent (overlay can't true-hardlink).
+        r = fx.sh("printf 'changed\\n' > f; cat g")
+        check(r.stdout == "orig\n", "dest is independent of a later source rewrite")
+    finally:
+        fx.stop()
+
+
 if __name__ == "__main__":
     for t in (test_readthrough_and_create, test_copyup_modify,
               test_otrunc_rewrite_shorter, test_delete_whiteout,
               test_symlink_and_readlink, test_provenance_recorded, test_opaque_dir,
               test_rename, test_lower_symlink_copyup_preserves_type,
               test_passthrough_acts_on_host_records_nothing,
-              test_nested_lower_chaining):
+              test_nested_lower_chaining,
+              test_lazy_file_materialization, test_hardlink_as_copy):
         print(f"\n== {t.__name__} ==")
         try:
             t()

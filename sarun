@@ -1830,6 +1830,23 @@ class Index:
         except (ValueError, TypeError): argv = []
         return dict(pid=w[0], ppid=w[1], exe=w[2], argv=argv)
 
+    def file_row(self, rel: str):
+        """Return (rowid, mode, sz, mtime, data) for a file row, or None.
+        Used on the hot read path to serve evicted (data NOT NULL) files."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT rowid, mode, sz, mtime, data FROM sqlar WHERE name=?",
+                (rel,)).fetchone()
+        return row  # None or (rowid, mode, sz, mtime, data)
+
+    def mark_resident(self, rel: str) -> None:
+        """After a fault-in: NULL the row's data+sz to restore the live invariant
+        (blob in pool, row empty). Called only after the blob is safely written."""
+        with self._lock:
+            self._db.execute(
+                "UPDATE sqlar SET data=NULL, sz=0 WHERE name=?", (rel,))
+            self._db.commit()
+
     def close(self) -> None:
         try: self._db.close()
         except (sqlite3.Error, AttributeError): pass
@@ -2058,6 +2075,16 @@ def _build_overlay_ops():
             return str(bp)
 
         # ── layer resolution ───────────────────────────────────────
+        @staticmethod
+        def _row_stat(mode: int, sz: int, mtime_ns: int):
+            """Fake stat-like object for an evicted file (blob absent, bytes in row).
+            path is None; _entry() only reads the fields below."""
+            from types import SimpleNamespace
+            return SimpleNamespace(
+                st_mode=mode, st_nlink=1, st_size=sz,
+                st_atime_ns=mtime_ns, st_mtime_ns=mtime_ns, st_ctime_ns=mtime_ns,
+                st_rdev=0, st_blocks=(sz + 511) // 512, st_blksize=512)
+
         def _resolve_st(self, sid: str, rel: str):
             idx = self._index(sid)
             if not idx.has_overlay_state():
@@ -2065,7 +2092,23 @@ def _build_overlay_ops():
             k = idx.kind_of(rel)
             if k == "whiteout":
                 return ("whiteout", None, None)
-            if k is not None:
+            if k == "file":
+                # File is resident if its pool blob exists; evicted if blob absent
+                # but the row carries data; absent otherwise.
+                rid = idx.row_id(rel)
+                if rid is not None:
+                    bp = blob_path(idx.box_id, rid)
+                    if bp.exists():
+                        try: return ("upper", str(bp), os.lstat(str(bp)))
+                        except OSError: pass
+                    # blob absent: check for evicted row (data NOT NULL)
+                    row = idx.file_row(rel)
+                    if row is not None:
+                        _rowid, mode, sz, mtime_ns, data = row
+                        if data is not None:
+                            # evicted: path=None, stat from row
+                            return ("upper", None, self._row_stat(mode, sz, mtime_ns))
+            elif k is not None:
                 ap = self._backing_path(sid, rel)
                 if ap is not None:
                     try: return ("upper", ap, os.lstat(ap))
@@ -2362,6 +2405,27 @@ def _build_overlay_ops():
                 idx.set_entry(cur, "dir", stat_mod.S_IFDIR | 0o755, wid,
                               "mkdir_parent", opaque=opaque)
 
+        # ── fault-in: inflate an evicted row back to a pool blob ────────────
+        def _fault_in(self, sid: str, rel: str) -> None:
+            """Idempotent. If the file's row has data and no blob: decompress the
+            row bytes, write the blob, chmod+mtime, then NULL the row (resident).
+            No-op if already resident (blob exists) or data already NULL."""
+            idx = self._index(sid)
+            row = idx.file_row(rel)
+            if row is None: return
+            rowid, mode, sz, mtime_ns, data = row
+            if data is None: return                      # already resident (NULL)
+            bp = blob_path(idx.box_id, rowid)
+            if bp.exists(): return                       # blob already present
+            blob = bytes(data)
+            content = blob if len(blob) == sz else zlib.decompress(blob)
+            bp.parent.mkdir(parents=True, exist_ok=True)
+            bp.write_bytes(content)
+            try: os.chmod(bp, stat_mod.S_IMODE(mode))
+            except OSError: pass
+            _restore_host_mtime_ns(bp, mtime_ns, is_symlink=False)
+            idx.mark_resident(rel)                       # NULL data in row
+
         # ── copy-up ─────────────────────────────────────────────
         def _ensure_copyup(self, sid: str, rel: str, flags: int, ctx) -> int:
             """Materialize a lower (or absent) file into the pool; return an O_RDWR
@@ -2377,6 +2441,14 @@ def _build_overlay_ops():
                     bp = blob_path(idx.box_id, rid)
                     if bp.exists():
                         try:
+                            return os.open(str(bp), os.O_RDWR | os.O_NOFOLLOW)
+                        except OSError as e:
+                            raise pyfuse3.FUSEError(e.errno or errno.EIO)
+                    # evicted (blob absent, data in row): fault in then open blob
+                    row = idx.file_row(rel)
+                    if row is not None and row[4] is not None:
+                        try:
+                            self._fault_in(sid, rel)
                             return os.open(str(bp), os.O_RDWR | os.O_NOFOLLOW)
                         except OSError as e:
                             raise pyfuse3.FUSEError(e.errno or errno.EIO)
@@ -2397,7 +2469,8 @@ def _build_overlay_ops():
                         return os.open(upath, os.O_RDWR | os.O_NOFOLLOW)
                     except OSError as e:
                         raise pyfuse3.FUSEError(e.errno or errno.EIO)
-                # Regular file from lower/upper: copy bytes into the pool blob.
+                # ap is None only for an evicted own file (handled above); here ap
+                # is always a real on-disk path (lower or resident upper).
                 src = os.open(ap, os.O_RDONLY | os.O_NOFOLLOW)
                 try:
                     bp_str = self._new_file_blob(sid, rel, st.st_mode, wid, "copyup")
@@ -2437,6 +2510,20 @@ def _build_overlay_ops():
                     layer, ap, _st = self._resolve_st(sid, rel)
                     if layer in ("absent", "whiteout"):
                         raise pyfuse3.FUSEError(errno.ENOENT)
+                    # Evicted file: path is None, bytes live in the row. Serve via
+                    # _vfh (same path as virtual files) — no materialization to disk.
+                    if ap is None:
+                        idx = self._index(sid)
+                        row = idx.file_row(rel)
+                        if row is None or row[4] is None:
+                            raise pyfuse3.FUSEError(errno.EIO)
+                        _rowid, _mode, sz, _mtime, data = row
+                        blob = bytes(data)
+                        content = blob if len(blob) == sz else zlib.decompress(blob)
+                        with self._lock:
+                            fh = self._next_fh; self._next_fh += 1
+                        self._vfh[fh] = (sid, rel, content)
+                        return pyfuse3.FileInfo(fh=fh, direct_io=False, keep_cache=False)
                     try:
                         # O_NOFOLLOW: never dereference a symlink at the final path
                         # component on the read path either — defensive even where the
@@ -2747,6 +2834,13 @@ def _build_overlay_ops():
                     if layer == "lower":
                         fd = self._ensure_copyup(sid, rel, os.O_RDWR, ctx)
                         os.close(fd)
+                    else:
+                        # layer=="upper": for an evicted own file (path None) fault in
+                        # before the blob fd ops below touch the backing path.
+                        if idx.kind_of(rel) == "file":
+                            bp_str = self._backing_path(sid, rel)
+                            if bp_str is not None and not os.path.exists(bp_str):
+                                self._fault_in(sid, rel)
                     # For a file: the blob is the backing artifact; for dir/symlink: up/<rel>.
                     upath = self._backing_path(sid, rel) or self._upper_path(sid, rel)
                     wid = idx.writer_for(ctx.pid)
@@ -2815,8 +2909,15 @@ def _build_overlay_ops():
             k = idx.kind_of(rel)
             if k == "file":
                 rid = idx.row_id(rel)
-                if rid is not None and blob_path(idx.box_id, rid).exists():
-                    return   # already has a blob
+                if rid is not None:
+                    bp = blob_path(idx.box_id, rid)
+                    if bp.exists():
+                        return   # already resident (blob present)
+                    # evicted own file: fault in (inflate row -> blob); no re-copy
+                    row = idx.file_row(rel)
+                    if row is not None and row[4] is not None:
+                        self._fault_in(sid, rel)
+                        return
             else:
                 upath = self._upper_path(sid, rel)
                 if os.path.lexists(upath): return
@@ -2833,7 +2934,7 @@ def _build_overlay_ops():
                     os.mkdir(upath, stat_mod.S_IMODE(st.st_mode))
                     idx.set_entry(rel, "dir", st.st_mode, wid, "copyup_dir")
                 else:
-                    # Regular file: copy into pool blob, not up/<rel>.
+                    # ap is a real on-disk path (lower or resident upper): copy to blob.
                     src = os.open(ap, os.O_RDONLY | os.O_NOFOLLOW)
                     try:
                         bp_str = self._new_file_blob(sid, rel, st.st_mode, wid, "copyup")
@@ -3019,32 +3120,37 @@ def _build_overlay_ops():
                     ino = self._ino_for(sid, rel_n)
                     self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
                     return self._entry(ino, os.lstat(hn))
-                self._copyup_one(sid, rel_src, wid)
+                self._copyup_one(sid, rel_src, wid)   # materializes the source (blob for a file)
                 self._ensure_parent_dirs(sid, rel_n, wid)
-                ups = self._upper_path(sid, rel_src); upn = self._upper_path(sid, rel_n)
                 idx = self._index(sid)
                 try:
                     if stat_mod.S_ISLNK(st.st_mode):
+                        # Symlinks are real up/<rel> artifacts on both ends.
+                        ups = self._upper_path(sid, rel_src)
+                        upn = self._upper_path(sid, rel_n)
                         os.symlink(os.readlink(ups), upn)
                         idx.set_entry(rel_n, "symlink", stat_mod.S_IFLNK | 0o777, wid,
                                       "link_as_copy", detail=rel_src)
                     else:
-                        src = os.open(ups, os.O_RDONLY | os.O_NOFOLLOW)
+                        # A regular file's bytes are in the pool: copy the source blob
+                        # into a fresh dest blob (hardlink-as-copy across overlay layers).
+                        src_bp = self._backing_path(sid, rel_src)
+                        dst_bp = self._new_file_blob(sid, rel_n, st.st_mode, wid,
+                                                     "link_as_copy", detail=rel_src)
+                        src = os.open(src_bp, os.O_RDONLY | os.O_NOFOLLOW)
                         try:
-                            dst = os.open(upn, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
+                            dst = os.open(dst_bp, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
                                           stat_mod.S_IMODE(st.st_mode))
                             try: reflink_or_copy(src, dst)
                             finally: os.close(dst)
                         finally:
                             os.close(src)
-                        idx.set_entry(rel_n, "file", st.st_mode, wid, "link_as_copy",
-                                      detail=rel_src)
                 except OSError as e:
                     raise pyfuse3.FUSEError(e.errno or errno.EIO)
                 ino = self._ino_for(sid, rel_n)
                 self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
                 self._notify(sid)
-                return self._entry(ino, os.lstat(upn))
+                return self._entry(ino, os.lstat(self._backing_path(sid, rel_n)))
             finally:
                 self._req_exit()
 
@@ -3473,11 +3579,12 @@ def consolidate(shm_dir, session_id: str, cmd: list, index: "Index | None" = Non
                     crel = os.path.relpath(os.path.join(lroot, nm), "/")
                     if (upper / crel).exists() or (upper / crel).is_symlink():
                         continue                          # re-materialized in upper
-                    # check pool for file entries
-                    row = sq.execute("SELECT rowid, mode FROM sqlar WHERE name=?",
+                    # check pool / row for file entries (blob present OR evicted row)
+                    row = sq.execute("SELECT rowid, mode, data FROM sqlar WHERE name=?",
                                      (crel,)).fetchone()
-                    if row and stat_mod.S_ISREG(row[1]) and blob_path(box_id, row[0]).exists():
-                        continue                          # re-materialized in pool
+                    if row and stat_mod.S_ISREG(row[1]) and (
+                            blob_path(box_id, row[0]).exists() or row[2] is not None):
+                        continue                          # present in pool or row
                     if frules.decide(crel) in ("apply", "discard", "passthrough"):
                         continue
                     _sqlar_put_tombstone(sq, crel)
@@ -3491,26 +3598,21 @@ def consolidate(shm_dir, session_id: str, cmd: list, index: "Index | None" = Non
         idx.close()
 
 def unconsolidate(shm_dir, session_id: str) -> None:
-    """The inverse of consolidate(): re-materialize a finished box's sqlar back into a
-    live overlay. Dirs and symlinks are recreated as real up/<rel> artifacts (unchanged).
-    Regular files: bytes are inflated and written to the pool blob (blob_path) instead
-    of up/<rel>; the shard dir is created; then the row's data is NULLed. Whiteouts and
-    opacity need no upper artifact. Idempotent — an already-live (NULL-blob) file row
-    whose pool blob exists is left as-is."""
+    """Prepare a finished box's sqlar for a live overlay run (lazy materialization).
+    Only dir and symlink up/<rel> artifacts are rebuilt — they are needed by
+    _resolve_st which reads them directly from disk. Regular file rows are left
+    EVICTED (data NOT NULL, no blob): the FUSE layer faults them in on demand.
+    Whiteouts and opacity need no upper artifact. Idempotent."""
     upper = Path(shm_dir) / "up"
     upper.mkdir(parents=True, exist_ok=True)
     sp = sqlar_path(session_id)
     if not sp.exists(): return
-    # Pool id for this box.
-    box_id = ensure_box_id(session_id)
     sq = _sqlar_open(sp)
     try:
-        # ORDER BY name puts a directory immediately before its children, so parents
-        # exist before we write into them (we also mkdir parents defensively).
-        rows = sq.execute("SELECT rowid, name, mode, sz, data, mtime FROM sqlar"
+        # ORDER BY name: parents before children so mkdir parents exist first.
+        rows = sq.execute("SELECT name, mode, sz, data, mtime FROM sqlar"
                           " ORDER BY name").fetchall()
-        cleared = []
-        for rowid, name, mode, sz, data, mtime in rows:
+        for name, mode, sz, data, mtime in rows:
             kind = _kind_of_mode(mode)
             if kind == "whiteout": continue
             try:
@@ -3519,33 +3621,19 @@ def unconsolidate(shm_dir, session_id: str) -> None:
                     dst.mkdir(parents=True, exist_ok=True)
                     try: os.chmod(dst, stat_mod.S_IMODE(mode))
                     except OSError: pass
-                    continue                       # dirs carry no blob to clear
-                if data is None:
-                    # Already live (NULL blob). For a file: if the pool blob already
-                    # exists the entry is in the correct live state — leave it.
-                    continue
-                blob = bytes(data)
-                content = blob if len(blob) == sz else zlib.decompress(blob)
-                if kind == "symlink":
+                    # dirs carry no blob; nothing to clear
+                elif kind == "symlink" and data is not None:
+                    blob = bytes(data)
+                    content = blob if len(blob) == sz else zlib.decompress(blob)
                     dst = upper / name
                     dst.parent.mkdir(parents=True, exist_ok=True)
                     if dst.is_symlink() or dst.exists(): remove_upper_entry(dst)
                     os.symlink(os.fsdecode(content), dst)
                     _restore_host_mtime_ns(dst, mtime, is_symlink=True)
-                else:
-                    # Regular file: write to pool blob, NOT up/<rel>.
-                    bp = blob_path(box_id, rowid)
-                    bp.parent.mkdir(parents=True, exist_ok=True)
-                    if bp.exists(): bp.unlink()
-                    bp.write_bytes(content)
-                    try: os.chmod(bp, stat_mod.S_IMODE(mode))
-                    except OSError: pass
-                    _restore_host_mtime_ns(bp, mtime, is_symlink=False)
-                cleared.append(name)
+                # Regular files: intentionally left evicted (data NOT NULL, no blob).
+                # The FUSE _fault_in path inflates them on first write-open.
             except OSError:
                 continue
-        for name in cleared:                       # restore the live NULL-blob invariant
-            sq.execute("UPDATE sqlar SET data=NULL, sz=0 WHERE name=?", (name,))
         sq.commit()
     finally:
         sq.close()
