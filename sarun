@@ -1713,6 +1713,11 @@ class Index:
             if anc in self._opaque: return True
         return False
 
+    def all_kinds(self) -> tuple:
+        """Snapshot of every path with a (non-whiteout) index kind. UI-thread read of
+        the RAM mirror; GIL-atomic like the other accessors."""
+        return tuple(self._kinds.keys())
+
     def children_of(self, rel: str) -> tuple:
         """Index entries that are DIRECT children of dir `rel`, for the merged
         readdir scan: (whiteouts, present). `whiteouts` is the set of child names
@@ -4880,49 +4885,58 @@ class LiveUpper(ChangeSource):
         self.idx = review.reg.indexes.get(sid)    # only the live in-RAM index (no reopen)
 
     def current_bytes(self, rel):
+        # Files: bytes live in the pool blob (or an evicted row) — read via the same
+        # row-or-pool path the offline reader uses. Dirs/symlinks/whiteouts: no bytes.
         rel = rel.lstrip("/")
-        p = self.upper / rel
-        if p.is_file() and not is_whiteout(p):
-            try: return p.read_bytes()
-            except OSError: return None
-        return None
+        if self.idx is None: return None
+        if self.idx.kind_of(rel) != "file": return None
+        return sqlar_content(sqlar_path(self.sid), rel)
 
     def current_mode(self, rel):
         rel = rel.lstrip("/")
-        try: return (self.upper / rel).lstat().st_mode
-        except OSError: return None
+        if self.idx is None: return None
+        mode, _mt = self.idx.row_mode_mtime(rel)
+        return mode
 
     def current_mtime(self, rel):
         rel = rel.lstrip("/")
-        try: return (self.upper / rel).lstat().st_mtime_ns
-        except OSError: return None
+        if self.idx is None: return None
+        kind = self.idx.kind_of(rel)
+        if kind == "file":
+            # File mtime is the blob/row mtime (consolidate stamps it); fall back to
+            # the row's stored mtime for an evicted/unflushed file.
+            row = self.idx.file_row(rel)
+            if row is not None and row[3]:
+                return row[3]
+        _mode, mt = self.idx.row_mode_mtime(rel)
+        return mt or None
 
     def entries(self):
-        if not self.s or not self.upper.exists(): return []
-        upper, idx = self.upper, self.idx
+        # Enumerate straight from the live Index mirror — files (pool/row), dirs and
+        # symlinks (rows), whiteouts and opaque-dir expansions. No os.walk of up/:
+        # dirs/symlinks have no on-disk artifact, files live in the pool, not up/.
+        if not self.s or self.idx is None: return []
+        idx = self.idx
         entries: dict = {}
-        paths = []
-        for root, dirs, files in os.walk(upper, onerror=lambda _e: None):
-            rootp = Path(root)
-            for nm in files: paths.append(rootp / nm)
-            for nm in dirs:
-                p = rootp / nm
-                if p.is_symlink(): paths.append(p)
-        for ap in sorted(set(paths)):
-            try:
-                if ap.is_dir() and not ap.is_symlink(): continue
-            except OSError:
-                continue
-            rel = str(ap.relative_to(upper))
-            # Cheap backbone: size + a host-I/O-free kind. is_text / stale / precise
-            # created-vs-modified are decorated lazily per visible row.
-            try:
-                is_lnk = ap.is_symlink()
-                size = ap.stat().st_size if (ap.is_file() and not is_lnk) else 0
-            except OSError:
-                is_lnk = False; size = 0
-            entries[rel] = dict(path=rel,
-                                kind="symlink" if is_lnk else "changed", size=size)
+        for rel in sorted(idx.all_kinds()):
+            kind = idx.kind_of(rel)
+            if kind == "dir":
+                continue                       # bare dirs aren't change rows
+            if kind == "symlink":
+                tgt = idx.symlink_target(rel) or b""
+                entries[rel] = dict(path=rel, kind="symlink", size=len(tgt))
+            elif kind == "file":
+                row = idx.file_row(rel)   # (rowid, mode, sz, mtime, data)
+                size = 0
+                if row is not None:
+                    rid, _m, sz, _mt, data = row
+                    if data is not None:
+                        size = sz             # evicted: row carries the size
+                    else:
+                        # resident: bytes in the pool blob; row sz may be 0 pre-fold.
+                        try: size = blob_path(idx.box_id, rid).stat().st_size
+                        except OSError: size = sz
+                entries[rel] = dict(path=rel, kind="changed", size=size)
         if idx is not None:
             for rel in idx.deletions():
                 entries[rel] = dict(path=rel, kind="deleted", size=0)
@@ -4942,95 +4956,93 @@ class LiveUpper(ChangeSource):
                     if added >= self._OPAQUE_DELETE_CAP: break
         return [entries[k] for k in sorted(entries)]
 
+    def _drop_row_and_blob(self, rel, op):
+        """Drop the Index row for `rel` (any kind), evicting a file's pool blob too.
+        Dirs/symlinks/whiteouts have no on-disk artifact — the row is the change."""
+        if self.idx is None: return
+        rid = (self.idx.row_id(rel)
+               if self.idx.kind_of(rel) == "file" else None)
+        self.idx.del_entry(rel, op=op)
+        if rid is not None:
+            try: blob_path(self.idx.box_id, rid).unlink()
+            except OSError: pass
+
     def remove(self, rel):
-        rel = rel.lstrip("/")
-        p = self.upper / rel
-        # Pool-backed regular file: drop the Index row + blob, then upper artifact.
-        if self.idx is not None and self.idx.kind_of(rel) == "file":
-            rid = self.idx.row_id(rel)
-            self.idx.del_entry(rel, op="applied")
-            if rid is not None:
-                try: blob_path(self.idx.box_id, rid).unlink()
-                except OSError: pass
-        remove_upper_entry(p)
-        cleanup_dirs(self.upper, p.parent)
+        self._drop_row_and_blob(rel.lstrip("/"), "applied")
 
     def discard(self, rel):
         """Drop a change without writing the host (handles whiteouts in the Index)."""
-        rel = rel.lstrip("/")
-        p = self.upper / rel
-        if self.idx is not None and self.idx.kind_of(rel) == "whiteout":
-            self.idx.del_entry(rel, op="discard_whiteout")
-        elif self.idx is not None and self.idx.kind_of(rel) == "file":
-            # Pool-backed: also evict the blob.
-            rid = self.idx.row_id(rel)
-            self.idx.del_entry(rel, op="discarded")
-            if rid is not None:
-                try: blob_path(self.idx.box_id, rid).unlink()
-                except OSError: pass
-        remove_upper_entry(p)
-        cleanup_dirs(self.upper, p.parent)
+        self._drop_row_and_blob(rel.lstrip("/"), "discarded")
 
     def settle(self, rel):
         """If the overlay copy no longer differs from the host (or a created file has
-        been emptied), drop it from the overlay and clean up."""
+        been emptied), drop it from the overlay. Only regular files settle; dirs/
+        symlinks/whiteouts are explicit decisions kept until applied/discarded."""
         rel = rel.lstrip("/")
-        src = self.upper / rel; dst = Path("/") / rel
-        if not src.is_file(): return
+        if self.idx is None or self.idx.kind_of(rel) != "file": return
+        cur = self.current_bytes(rel)
+        if cur is None: return
+        dst = Path("/") / rel
         try:
-            up = src.read_bytes()
-            settled = (up == dst.read_bytes()) if dst.exists() else (len(up) == 0)
+            settled = (cur == dst.read_bytes()) if dst.exists() else (len(cur) == 0)
         except OSError:
             return
         if settled:
-            remove_upper_entry(src)
-            cleanup_dirs(self.upper, src.parent)
+            self._drop_row_and_blob(rel, "settled")
 
     def write_current(self, rel, data):
+        """Revert bytes into the live file's pool blob (for discard_hunk). The blob is
+        the authoritative file rest form — write it through the Index row."""
         rel = rel.lstrip("/")
-        src = self.upper / rel
-        # LOW-3: refuse to write through a symlink planted in the upper.
-        if _is_symlink(src):
-            return dict(ok=False, error="refusing to write through a symlink")
+        if self.idx is None or self.idx.kind_of(rel) != "file":
+            return dict(ok=False, error="not a regular file in the overlay")
+        rid = self.idx.row_id(rel)
+        if rid is None:
+            return dict(ok=False, error="missing row for file")
+        bp = blob_path(self.idx.box_id, rid)
         try:
-            src.write_bytes(data)
+            bp.parent.mkdir(parents=True, exist_ok=True)
+            bp.write_bytes(data)
+            # If the file was evicted (bytes in the row), the blob is now the truth —
+            # NULL the row so it can't shadow the new content.
+            self.idx.mark_resident(rel)
         except OSError as e:
             return dict(ok=False, error=str(e))
         return None
 
     def apply_plan(self, rel):
+        # Plan straight from the mirror/row/pool — no on-disk dir/symlink artifact.
         rel = rel.lstrip("/")
-        src = self.upper / rel
-        # A deletion may come from a whiteout or an opaque parent dir.
-        if self._kinds.get(rel) == "deleted" or is_whiteout(src):
+        if self.idx is None:
+            return dict(kind="noop")
+        kind = self.idx.kind_of(rel)
+        # A deletion may come from a whiteout or an opaque parent dir (entries()).
+        if kind == "whiteout" or self._kinds.get(rel) == "deleted":
             return dict(kind="delete")
-        if src.is_symlink():
-            try: m = src.lstat().st_mtime_ns
-            except OSError: m = None
-            return dict(kind="symlink", target=os.readlink(src), mtime_ns=m)
-        if src.is_dir():
+        if kind == "symlink":
+            tgt = self.idx.symlink_target(rel) or b""
+            return dict(kind="symlink",
+                        target=bytes(tgt).decode("utf-8", "surrogateescape"),
+                        mtime_ns=self.idx.row_mtime(rel) or None)
+        if kind == "dir":
             return dict(kind="dir")
-        if src.is_file():
-            return dict(kind="file", copy_from=src)    # copy2: preserves mode+mtime
-        # Pool-backed regular file: blob lives in the pool, not in up/.
-        # The Index tracks it as kind="file"; read the blob from the pool.
-        if self.idx is not None and self.idx.kind_of(rel) == "file":
-            rid = self.idx.row_id(rel)
-            if rid is not None:
-                bp = blob_path(self.idx.box_id, rid)
-                if bp.exists():
-                    try:
-                        st = bp.lstat()
-                        # Get mode from the sqlar row (the blob file itself has
-                        # pool-internal perms, not the original file mode).
-                        row = self.idx._db.execute(
-                            "SELECT mode FROM sqlar WHERE name=?", (rel,)).fetchone()
-                        mode = row[0] if row else (stat_mod.S_IFREG | 0o644)
+        if kind == "file":
+            row = self.idx.file_row(rel)   # (rowid, mode, sz, mtime, data)
+            if row is not None:
+                rid, mode, sz, mtime, data = row
+                if data is None:
+                    bp = blob_path(self.idx.box_id, rid)
+                    if bp.exists():
                         return dict(kind="file", copy_from=bp,
                                     chmod=stat_mod.S_IMODE(mode),
-                                    mtime_ns=st.st_mtime_ns)
-                    except OSError:
-                        pass
+                                    mtime_ns=mtime or None)
+                else:
+                    # evicted: bytes live in the row — hand them directly.
+                    blob = bytes(data)
+                    content = blob if len(blob) == sz else zlib.decompress(blob)
+                    return dict(kind="file", data=content,
+                                chmod=stat_mod.S_IMODE(mode),
+                                mtime_ns=mtime or None)
         return dict(kind="noop")
 
     @property
