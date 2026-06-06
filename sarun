@@ -6716,7 +6716,15 @@ def cmd_run(cmd, net, trace, direct, session_whitelist, chdir, reuse_sid=None) -
                 "--tmpfs", "/tmp", "--tmpfs", "/run",
                 "--ro-bind", SOCK_PATH, UI_SOCK_INBOX,
                 "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--unshare-net",
-                "--cap-drop", "ALL", "--die-with-parent",
+                # Keep only the two caps a box needs to itself HOST a box: CAP_SYS_ADMIN
+                # (unshare pid/ipc/uts/mount) and CAP_NET_ADMIN (bring up loopback in the
+                # nested netns). Drop the other ~38. We can't know in advance whether a
+                # box will run `./sarun` inside it, so every box must keep these (a leaf
+                # box like run_on_untrusted, which provably never nests, still drops ALL).
+                # sarun is not the hard isolation boundary — compose it inside another
+                # sandbox if stronger lockdown is wanted.
+                "--cap-drop", "ALL", "--cap-add", "CAP_SYS_ADMIN",
+                "--cap-add", "CAP_NET_ADMIN", "--die-with-parent",
                 "--chdir", chdir or os.getcwd()]
         if bwrap_supports("--as-pid-1"):
             args += ["--as-pid-1"]
