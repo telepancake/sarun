@@ -78,7 +78,7 @@ def _mk_supervisor(sid, tracing):
     sup.indexes[sid] = idx
     sup.sessions[sid] = m.Session(
         session_id=sid, cmd=["curl", "x"], shm_dir=str(backing),
-        status="running", live=True, sess_rules=[m.Rule.parse("allow host:*")])
+        live=True, sess_rules=[m.Rule.parse("allow host:*")])
     return sup, idx, m.sqlar_path(sid)
 
 
