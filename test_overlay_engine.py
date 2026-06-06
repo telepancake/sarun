@@ -454,6 +454,126 @@ def test_rename_dir_replace_no_ghost():
         fx.stop()
 
 
+def test_passthrough_kicks_up_to_parent():
+    """A nested box (child) in blanket-passthrough mode kicks write ops up to the
+    parent's overlay rather than the real host:
+      - create/write in the child lands in the PARENT's pool blob;
+      - child's own index has nothing for that path;
+      - the real host filesystem is untouched.
+    Also covers a per-file passthrough rule on the child."""
+    tmp = Path(tempfile.mkdtemp(prefix="ovl-ku-"))
+    os.environ["XDG_STATE_HOME"] = str(tmp / "state")
+    mnt = tmp / "mnt"; live = tmp / "live"
+    psid = "20260604-000000_1"; csid = "20260604-000000_2"
+    pbk = live / psid; cbk = live / csid
+    (pbk / "up").mkdir(parents=True); (cbk / "up").mkdir(parents=True)
+    pidx = m.Index(pbk); cidx = m.Index(cbk)
+    mount = m.OverlayMount(mnt, lower="/")
+
+    def sh(root, script, timeout=15):
+        return subprocess.run(["timeout", str(timeout), "bash", "-c", script],
+                              cwd=str(root), capture_output=True, text=True)
+    try:
+        if not mount.start():
+            raise RuntimeError(f"mount failed: {mount._start_error}")
+        # P: normal overlay session; C: passthrough=True, parent=P.
+        mount.add_session(psid, pbk / "up", pidx)
+        mount.add_session(csid, cbk / "up", cidx, passthrough=True, parent=psid)
+        proot = mnt / psid; croot = mnt / csid
+
+        # (1) Child creates a file. Passthrough→kick up→captured in parent.
+        r = sh(croot, "mkdir -p sub && echo kicked > sub/f.txt && cat sub/f.txt")
+        check(r.returncode == 0 and r.stdout == "kicked\n",
+              "kick-up: child write returns correct content")
+
+        # File must be in the PARENT's pool, not the child's.
+        p_rid = pidx.row_id("sub/f.txt")
+        check(pidx.kind_of("sub/f.txt") == "file",
+              "kick-up: parent index has the file")
+        p_blob = m.blob_path(pidx.box_id, p_rid) if p_rid is not None else None
+        check(p_blob is not None and p_blob.exists() and
+              p_blob.read_bytes() == b"kicked\n",
+              "kick-up: parent pool blob has the correct bytes")
+
+        # Child's index must have nothing for the file.
+        check(cidx.kind_of("sub/f.txt") is None,
+              "kick-up: child index has nothing for the kicked-up file")
+
+        # Real host must be untouched.
+        check(not Path("/sub/f.txt").exists(),
+              "kick-up: real host is untouched")
+
+        # (2) Child creates another file then deletes it (unlink kick-up).
+        sh(croot, "echo tmp > tmp.txt")
+        # tmp.txt must now exist in parent
+        check(pidx.kind_of("tmp.txt") == "file",
+              "kick-up: create then delete — created in parent")
+        sh(croot, "rm tmp.txt")
+        # After unlink, parent records a whiteout or no entry (depending on lower).
+        # The important thing: it's not still kind=="file" in the parent.
+        check(pidx.kind_of("tmp.txt") != "file",
+              "kick-up: unlink removed/whiteout-ed from parent overlay")
+        check(cidx.kind_of("tmp.txt") is None,
+              "kick-up: child index still has nothing after unlink")
+
+        # (3) Child overwrites (O_TRUNC) an existing parent file: must update the
+        #     parent blob, not create a new child blob.
+        sh(proot, "echo original > shared.txt")
+        p_rid_before = pidx.row_id("shared.txt")
+        r = sh(croot, "echo overwritten > shared.txt && cat shared.txt")
+        check(r.returncode == 0 and r.stdout == "overwritten\n",
+              "kick-up: O_TRUNC overwrite from child gives new content")
+        p_rid_after = pidx.row_id("shared.txt")
+        check(p_rid_after is not None, "kick-up: parent still has the row after overwrite")
+        p_blob_after = m.blob_path(pidx.box_id, p_rid_after)
+        check(p_blob_after.exists() and p_blob_after.read_bytes() == b"overwritten\n",
+              "kick-up: parent blob updated by child overwrite")
+        check(cidx.kind_of("shared.txt") is None,
+              "kick-up: child index still empty after overwrite")
+
+        # (4) Per-file passthrough rule on the child (passthrough=False at session
+        #     level, but one path is marked passthrough via FileRule). We use a fresh
+        #     pair of sessions so the blanket-passthrough child above doesn't interfere.
+        psid2 = "20260604-000000_3"; csid2 = "20260604-000000_4"
+        pbk2 = live / psid2; cbk2 = live / csid2
+        (pbk2 / "up").mkdir(parents=True); (cbk2 / "up").mkdir(parents=True)
+        pidx2 = m.Index(pbk2); cidx2 = m.Index(cbk2)
+        mount.add_session(psid2, pbk2 / "up", pidx2)
+        # Child is NOT blanket-passthrough but inherits per-file rule below.
+        mount.add_session(csid2, cbk2 / "up", cidx2, parent=psid2)
+        # Inject a FileRules with one passthrough rule directly into the session dict.
+        fr = m.FileRules.__new__(m.FileRules)
+        fr.path = None
+        fr.rules = [m.FileRule(action="passthrough", pattern="pt_only.txt")]
+        mount.ops.sessions[csid2]["frules"] = fr
+        proot2 = mnt / psid2; croot2 = mnt / csid2
+        r = sh(croot2, "echo per-file > pt_only.txt && cat pt_only.txt")
+        check(r.returncode == 0 and r.stdout == "per-file\n",
+              "kick-up per-file rule: create+read")
+        check(pidx2.kind_of("pt_only.txt") == "file",
+              "kick-up per-file rule: landed in parent overlay")
+        check(cidx2.kind_of("pt_only.txt") is None,
+              "kick-up per-file rule: child index untouched")
+        check(not Path("/pt_only.txt").exists(),
+              "kick-up per-file rule: real host untouched")
+        try: pidx2.close(); cidx2.close()
+        except Exception: pass
+
+    finally:
+        try:
+            mount.stop()
+        finally:
+            try:
+                if os.path.ismount(str(mnt)):
+                    subprocess.run(["fusermount3", "-uz", str(mnt)],
+                                   stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL, timeout=10)
+            except Exception: pass
+            try: pidx.close(); cidx.close()
+            except Exception: pass
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     for t in (test_readthrough_and_create, test_copyup_modify,
               test_otrunc_rewrite_shorter, test_delete_whiteout,
@@ -462,7 +582,8 @@ if __name__ == "__main__":
               test_passthrough_acts_on_host_records_nothing,
               test_nested_lower_chaining,
               test_lazy_file_materialization, test_hardlink_as_copy,
-              test_rename_dir_replace_no_ghost):
+              test_rename_dir_replace_no_ghost,
+              test_passthrough_kicks_up_to_parent):
         print(f"\n== {t.__name__} ==")
         try:
             t()

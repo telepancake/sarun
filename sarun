@@ -2560,6 +2560,31 @@ def _build_overlay_ops():
                 return os.open(bp_str, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o644)
 
         # ── open / read / write / release ───────────────────────────────────
+        def _write_open(self, sid: str, rel: str, flags: int, ctx) -> int:
+            """Open a file for writing, honoring the kick-up chain.
+            Passthrough + parent  → recurse into parent's overlay (captured there).
+            Passthrough + no parent → real host (_passthrough_open), unchanged.
+            Non-passthrough       → copy-up into this box's own pool blob."""
+            if self._passthrough(sid, rel):
+                p = self._parent(sid)
+                if p is not None:
+                    return self._write_open(p, rel, flags, ctx)   # KICK UP
+                return self._passthrough_open(rel, flags)          # ROOT: real host
+            fd = self._ensure_copyup(sid, rel, flags, ctx)
+            # Honor O_TRUNC on the overlay path. With FUSE atomic_o_trunc the
+            # kernel passes O_TRUNC to open() (and sends NO separate
+            # setattr(size=0)), so the handler must truncate itself — else a
+            # rewrite-shorter (e.g. `>` over an existing upper file, as
+            # config.status does when it reuses a sed fragment) keeps the old
+            # tail bytes past the new length and the file reads back corrupt.
+            if flags & os.O_TRUNC:
+                try: os.ftruncate(fd, 0)
+                except OSError as e:
+                    os.close(fd)
+                    raise pyfuse3.FUSEError(e.errno or errno.EIO)
+            self._notify(sid, rel, "modified")
+            return fd
+
         async def open(self, inode, flags, ctx):
             key = self._key(inode)
             if key is None: raise pyfuse3.FUSEError(errno.EISDIR)
@@ -2603,22 +2628,7 @@ def _build_overlay_ops():
                                     rel, "open_write") == "deny":
                         raise pyfuse3.FUSEError(errno.EACCES)
                     self._index(sid).writer_for(ctx.pid)   # tracing/provenance
-                    if self._passthrough(sid, rel):
-                        fd = self._passthrough_open(rel, flags)   # flags carry O_TRUNC
-                    else:
-                        fd = self._ensure_copyup(sid, rel, flags, ctx)
-                        # Honor O_TRUNC on the overlay path. With FUSE atomic_o_trunc the
-                        # kernel passes O_TRUNC to open() (and sends NO separate
-                        # setattr(size=0)), so the handler must truncate itself — else a
-                        # rewrite-shorter (e.g. `>` over an existing upper file, as
-                        # config.status does when it reuses a sed fragment) keeps the old
-                        # tail bytes past the new length and the file reads back corrupt.
-                        if flags & os.O_TRUNC:
-                            try: os.ftruncate(fd, 0)
-                            except OSError as e:
-                                os.close(fd)
-                                raise pyfuse3.FUSEError(e.errno or errno.EIO)
-                        self._notify(sid, rel, "modified")
+                    fd = self._write_open(sid, rel, flags, ctx)
                 with self._lock:
                     fh = self._next_fh; self._next_fh += 1
                     self._fd_table[fh] = fd
@@ -2674,6 +2684,24 @@ def _build_overlay_ops():
                 except OSError: pass
 
         # ── create / mkdir / symlink ─────────────────────────────────────────
+        def _mutate_at(self, sid: str, rel: str, ctx, op, host_op, upper_op):
+            """Passthrough-vs-overlay fork for _mutate, with kick-up recursion.
+            Passthrough + parent  → recurse into parent's overlay (captured there).
+            Passthrough + no parent → host_op on real host, unchanged.
+            Non-passthrough       → upper_op records into this sid's own overlay."""
+            if self._passthrough(sid, rel):
+                p = self._parent(sid)
+                if p is not None:
+                    return self._mutate_at(p, rel, ctx, op, host_op, upper_op)  # KICK UP
+                return host_op(sid, rel, self._host_path(rel))  # ROOT: real host
+            wid = self._index(sid).writer_for(ctx.pid)
+            self._ensure_parent_dirs(sid, rel, wid)
+            idx = self._index(sid)
+            upath = self._upper_path(sid, rel)
+            res = upper_op(sid, rel, upath, wid, idx)
+            self._notify(sid, rel, "created")
+            return res
+
         def _mutate(self, parent_inode, name, ctx, op, host_op, upper_op):
             # THE single checked entry point for node-creating mutating handlers:
             # the security preamble (decode/key/ENOENT/writer/policy_check/EACCES/
@@ -2690,14 +2718,7 @@ def _build_overlay_ops():
                 raise pyfuse3.FUSEError(errno.EACCES)
             self._req_enter(f"{op} {sid}/{rel}")
             try:
-                if self._passthrough(sid, rel):
-                    return host_op(sid, rel, self._host_path(rel))
-                self._ensure_parent_dirs(sid, rel, wid)
-                idx = self._index(sid)
-                upath = self._upper_path(sid, rel)
-                res = upper_op(sid, rel, upath, wid, idx)
-                self._notify(sid, rel, "created")
-                return res
+                return self._mutate_at(sid, rel, ctx, op, host_op, upper_op)
             finally:
                 self._req_exit()
 
@@ -2803,6 +2824,22 @@ def _build_overlay_ops():
         def _merged_children(self, sid: str, rel: str) -> list:
             return [n for n, _k, _a in self._scan_dir(sid, rel)]
 
+        def _unlink_overlay(self, sid: str, rel: str, wid) -> None:
+            """Overlay (captured) unlink for sid. Removes the backing artifact and
+            updates the index. Used directly and as the kick-up target."""
+            idx = self._index(sid)
+            bp = self._backing_path(sid, rel)
+            if bp is not None and os.path.lexists(bp):
+                try: os.unlink(bp)
+                except OSError as e: raise pyfuse3.FUSEError(e.errno or errno.EIO)
+            lower_exists = (not idx.hidden_by_opaque(rel)
+                            and self._lower_exists(sid, rel))
+            if lower_exists:
+                idx.set_entry(rel, "whiteout", 0, wid, "unlink")
+            else:
+                idx.del_entry(rel, op="unlink", writer_id=wid)
+            self._notify(sid, rel, "deleted")
+
         async def unlink(self, parent_inode, name, ctx):
             name = os.fsdecode(name)
             pkey = self._key(parent_inode)
@@ -2816,28 +2853,38 @@ def _build_overlay_ops():
             self._req_enter(f"unlink {sid}/{rel}")
             try:
                 if self._passthrough(sid, rel):
+                    p = self._parent(sid)
+                    if p is not None:
+                        # KICK UP: captured delete in the parent's overlay.
+                        pwid = self._index(p).writer_for(ctx.pid)
+                        self._unlink_overlay(p, rel, pwid)
+                        return
                     host = self._host_path(rel)
                     try: os.unlink(host)          # unlink never follows the final link
                     except FileNotFoundError: raise pyfuse3.FUSEError(errno.ENOENT)
                     except OSError as e: raise pyfuse3.FUSEError(e.errno or errno.EIO)
                     return
-                idx = self._index(sid)
-                # Remove the backing artifact before mutating the index.
-                # Files: pool blob. Symlinks: real up/<rel>. Either way use
-                # _backing_path so we never accidentally skip a file's blob.
-                bp = self._backing_path(sid, rel)
-                if bp is not None and os.path.lexists(bp):
-                    try: os.unlink(bp)
-                    except OSError as e: raise pyfuse3.FUSEError(e.errno or errno.EIO)
-                lower_exists = (not idx.hidden_by_opaque(rel)
-                                and self._lower_exists(sid, rel))
-                if lower_exists:
-                    idx.set_entry(rel, "whiteout", 0, wid, "unlink")
-                else:
-                    idx.del_entry(rel, op="unlink", writer_id=wid)
-                self._notify(sid, rel, "deleted")
+                self._unlink_overlay(sid, rel, wid)
             finally:
                 self._req_exit()
+
+        def _rmdir_overlay(self, sid: str, rel: str, wid) -> None:
+            """Overlay (captured) rmdir for sid. Used directly and as kick-up target."""
+            if self._merged_children(sid, rel):
+                raise pyfuse3.FUSEError(errno.ENOTEMPTY)
+            idx = self._index(sid)
+            upath = self._upper_path(sid, rel)
+            if os.path.isdir(upath) and not os.path.islink(upath):
+                try: os.rmdir(upath)
+                except OSError as e: raise pyfuse3.FUSEError(e.errno or errno.EIO)
+            idx.prune_subtree(rel)
+            lower_is_dir = (not idx.hidden_by_opaque(rel)
+                            and self._lower_is_dir(sid, rel))
+            if lower_is_dir:
+                idx.set_entry(rel, "whiteout", 0, wid, "rmdir")
+            else:
+                idx.del_entry(rel, op="rmdir", writer_id=wid)
+            self._notify(sid, rel, "deleted")
 
         async def rmdir(self, parent_inode, name, ctx):
             name = os.fsdecode(name)
@@ -2852,31 +2899,73 @@ def _build_overlay_ops():
             self._req_enter(f"rmdir {sid}/{rel}")
             try:
                 if self._passthrough(sid, rel):
+                    p = self._parent(sid)
+                    if p is not None:
+                        # KICK UP: captured rmdir in the parent's overlay.
+                        pwid = self._index(p).writer_for(ctx.pid)
+                        self._rmdir_overlay(p, rel, pwid)
+                        return
                     host = self._host_path(rel)
                     if os.path.islink(host): raise pyfuse3.FUSEError(errno.ENOTDIR)
                     try: os.rmdir(host)
                     except FileNotFoundError: raise pyfuse3.FUSEError(errno.ENOENT)
                     except OSError as e: raise pyfuse3.FUSEError(e.errno or errno.EIO)
                     return
-                if self._merged_children(sid, rel):
-                    raise pyfuse3.FUSEError(errno.ENOTEMPTY)
-                idx = self._index(sid)
-                upath = self._upper_path(sid, rel)
-                if os.path.isdir(upath) and not os.path.islink(upath):
-                    try: os.rmdir(upath)
-                    except OSError as e: raise pyfuse3.FUSEError(e.errno or errno.EIO)
-                idx.prune_subtree(rel)
-                lower_is_dir = (not idx.hidden_by_opaque(rel)
-                                and self._lower_is_dir(sid, rel))
-                if lower_is_dir:
-                    idx.set_entry(rel, "whiteout", 0, wid, "rmdir")
-                else:
-                    idx.del_entry(rel, op="rmdir", writer_id=wid)
-                self._notify(sid, rel, "deleted")
+                self._rmdir_overlay(sid, rel, wid)
             finally:
                 self._req_exit()
 
         # ── setattr ──────────────────────────────────────────────────────────
+        def _setattr_overlay(self, sid: str, rel: str, inode: int,
+                             attr, fields, ctx) -> "pyfuse3.EntryAttributes":
+            """Overlay (captured) setattr body for sid. Copy-up if needed, apply
+            attr changes to the backing artifact, update index. Returns EntryAttributes
+            using `inode` (the caller's FUSE inode) so the kernel cache is correct."""
+            idx = self._index(sid)
+            wid = idx.writer_for(ctx.pid)
+            layer = self._resolve(sid, rel)
+            if layer in ("absent", "whiteout"):
+                raise pyfuse3.FUSEError(errno.ENOENT)
+            if layer == "lower":
+                fd = self._ensure_copyup(sid, rel, os.O_RDWR, ctx)
+                os.close(fd)
+            else:
+                if idx.kind_of(rel) == "file":
+                    bp_str = self._backing_path(sid, rel)
+                    if bp_str is not None and not os.path.exists(bp_str):
+                        self._fault_in(sid, rel)
+            upath = self._backing_path(sid, rel) or self._upper_path(sid, rel)
+            is_link = stat_mod.S_ISLNK(os.lstat(upath).st_mode)
+            try:
+                if (fields.update_size or fields.update_mode) and not is_link:
+                    fd = os.open(upath, os.O_RDWR | os.O_NOFOLLOW)
+                    try:
+                        if fields.update_size: os.ftruncate(fd, attr.st_size)
+                        if fields.update_mode:
+                            os.fchmod(fd, stat_mod.S_IMODE(attr.st_mode))
+                    finally:
+                        os.close(fd)
+                if fields.update_uid or fields.update_gid:
+                    uid = attr.st_uid if fields.update_uid else -1
+                    gid = attr.st_gid if fields.update_gid else -1
+                    os.chown(upath, uid, gid, follow_symlinks=False)
+                if fields.update_mtime or fields.update_atime:
+                    st0 = os.lstat(upath)
+                    atime_ns = (attr.st_atime_ns if fields.update_atime
+                                else st0.st_atime_ns)
+                    mtime_ns = (attr.st_mtime_ns if fields.update_mtime
+                                else st0.st_mtime_ns)
+                    os.utime(upath, ns=(atime_ns, mtime_ns), follow_symlinks=False)
+            except OSError as e:
+                raise pyfuse3.FUSEError(e.errno or errno.EIO)
+            st = os.lstat(upath)
+            if stat_mod.S_ISDIR(st.st_mode): kind = "dir"
+            elif stat_mod.S_ISLNK(st.st_mode): kind = "symlink"
+            else: kind = "file"
+            idx.set_entry(rel, kind, st.st_mode, wid, "setattr")
+            self._notify(sid, rel, "modified")
+            return self._entry(inode, st)
+
         async def setattr(self, inode, attr, fields, fh, ctx):
             key = self._key(inode)
             if key is None: raise pyfuse3.FUSEError(errno.EPERM)
@@ -2885,69 +2974,43 @@ def _build_overlay_ops():
             if policy_check(sid, self._index(sid).provenance_of(ctx.pid),
                             rel, "setattr") == "deny":
                 raise pyfuse3.FUSEError(errno.EACCES)
-            idx = self._index(sid)
             self._req_enter(f"setattr {sid}/{rel}")
             try:
-                passthrough = self._passthrough(sid, rel)
-                if passthrough:
+                if self._passthrough(sid, rel):
+                    p = self._parent(sid)
+                    if p is not None:
+                        # KICK UP: captured setattr in the parent's overlay.
+                        return self._setattr_overlay(p, rel, inode, attr, fields, ctx)
                     upath = self._host_path(rel)
                     if not os.path.lexists(upath):
                         raise pyfuse3.FUSEError(errno.ENOENT)
-                    wid = idx.writer_for(ctx.pid)
-                else:
-                    layer = self._resolve(sid, rel)
-                    if layer in ("absent", "whiteout"):
-                        raise pyfuse3.FUSEError(errno.ENOENT)
-                    if layer == "lower":
-                        fd = self._ensure_copyup(sid, rel, os.O_RDWR, ctx)
-                        os.close(fd)
-                    else:
-                        # layer=="upper": for an evicted own file (path None) fault in
-                        # before the blob fd ops below touch the backing path.
-                        if idx.kind_of(rel) == "file":
-                            bp_str = self._backing_path(sid, rel)
-                            if bp_str is not None and not os.path.exists(bp_str):
-                                self._fault_in(sid, rel)
-                    # For a file: the blob is the backing artifact; for dir/symlink: up/<rel>.
-                    upath = self._backing_path(sid, rel) or self._upper_path(sid, rel)
-                    wid = idx.writer_for(ctx.pid)
-                is_link = stat_mod.S_ISLNK(os.lstat(upath).st_mode)
-                try:
-                    # size/mode operate on file content/inode: open ONE O_NOFOLLOW fd
-                    # and use fchmod/ftruncate. O_NOFOLLOW makes the open of a
-                    # symlink upper-artifact raise ELOOP → we never touch its target.
-                    if (fields.update_size or fields.update_mode) and not is_link:
-                        fd = os.open(upath, os.O_RDWR | os.O_NOFOLLOW)
-                        try:
-                            if fields.update_size: os.ftruncate(fd, attr.st_size)
-                            if fields.update_mode:
-                                os.fchmod(fd, stat_mod.S_IMODE(attr.st_mode))
-                        finally:
-                            os.close(fd)
-                    # chown/utime have real no-follow variants (lchown / utimensat
-                    # AT_SYMLINK_NOFOLLOW): they act on the link itself, never target.
-                    if fields.update_uid or fields.update_gid:
-                        uid = attr.st_uid if fields.update_uid else -1
-                        gid = attr.st_gid if fields.update_gid else -1
-                        os.chown(upath, uid, gid, follow_symlinks=False)
-                    if fields.update_mtime or fields.update_atime:
-                        st0 = os.lstat(upath)
-                        atime_ns = (attr.st_atime_ns if fields.update_atime
-                                    else st0.st_atime_ns)
-                        mtime_ns = (attr.st_mtime_ns if fields.update_mtime
-                                    else st0.st_mtime_ns)
-                        os.utime(upath, ns=(atime_ns, mtime_ns), follow_symlinks=False)
-                except OSError as e:
-                    raise pyfuse3.FUSEError(e.errno or errno.EIO)
-                st = os.lstat(upath)
-                if passthrough:
-                    return self._entry(inode, st)
-                if stat_mod.S_ISDIR(st.st_mode): kind = "dir"
-                elif stat_mod.S_ISLNK(st.st_mode): kind = "symlink"
-                else: kind = "file"
-                idx.set_entry(rel, kind, st.st_mode, wid, "setattr")
-                self._notify(sid, rel, "modified")
-                return self._entry(inode, st)
+                    is_link = stat_mod.S_ISLNK(os.lstat(upath).st_mode)
+                    try:
+                        if (fields.update_size or fields.update_mode) and not is_link:
+                            fd = os.open(upath, os.O_RDWR | os.O_NOFOLLOW)
+                            try:
+                                if fields.update_size: os.ftruncate(fd, attr.st_size)
+                                if fields.update_mode:
+                                    os.fchmod(fd, stat_mod.S_IMODE(attr.st_mode))
+                            finally:
+                                os.close(fd)
+                        # chown/utime have real no-follow variants (lchown / utimensat
+                        # AT_SYMLINK_NOFOLLOW): they act on the link itself, never target.
+                        if fields.update_uid or fields.update_gid:
+                            uid = attr.st_uid if fields.update_uid else -1
+                            gid = attr.st_gid if fields.update_gid else -1
+                            os.chown(upath, uid, gid, follow_symlinks=False)
+                        if fields.update_mtime or fields.update_atime:
+                            st0 = os.lstat(upath)
+                            atime_ns = (attr.st_atime_ns if fields.update_atime
+                                        else st0.st_atime_ns)
+                            mtime_ns = (attr.st_mtime_ns if fields.update_mtime
+                                        else st0.st_mtime_ns)
+                            os.utime(upath, ns=(atime_ns, mtime_ns), follow_symlinks=False)
+                    except OSError as e:
+                        raise pyfuse3.FUSEError(e.errno or errno.EIO)
+                    return self._entry(inode, os.lstat(upath))
+                return self._setattr_overlay(sid, rel, inode, attr, fields, ctx)
             finally:
                 self._req_exit()
 
@@ -3025,6 +3088,92 @@ def _build_overlay_ops():
                 else:
                     self._copyup_one(sid, child, wid)
 
+        def _rename_overlay(self, sid: str, rel_o: str, rel_n: str,
+                            flags: int, st_o, ctx) -> None:
+            """Overlay (captured) rename body for sid. Used directly and as kick-up
+            target. Caller holds _req_enter; st_o is lstat of the source."""
+            idx = self._index(sid)
+            wid = idx.writer_for(ctx.pid)
+            layer_n = self._resolve(sid, rel_n)
+            if flags & getattr(pyfuse3, "RENAME_NOREPLACE", 1):
+                if layer_n not in ("absent", "whiteout"):
+                    raise pyfuse3.FUSEError(errno.EEXIST)
+            dst_shadows_lower = (not idx.hidden_by_opaque(rel_n)
+                                 and self._lower_is_dir(sid, rel_n))
+            is_dir = stat_mod.S_ISDIR(st_o.st_mode)
+            is_reg = stat_mod.S_ISREG(st_o.st_mode)
+            src_shadowed_lower = (not idx.hidden_by_opaque(rel_o)
+                                  and self._lower_exists(sid, rel_o))
+            if is_dir:
+                self._materialize_tree(sid, rel_o, wid)
+            else:
+                self._copyup_one(sid, rel_o, wid)
+            # Remove any existing destination overlay artifact.
+            # For a file dst: also remove its pool blob.
+            if idx.kind_of(rel_n) == "file":
+                dst_bp = self._backing_path(sid, rel_n)
+                if dst_bp and os.path.lexists(dst_bp):
+                    try: os.unlink(dst_bp)
+                    except OSError: pass
+            upn = self._upper_path(sid, rel_n)
+            try:
+                lst = os.lstat(upn)
+                if stat_mod.S_ISDIR(lst.st_mode) and not stat_mod.S_ISLNK(lst.st_mode):
+                    shutil.rmtree(upn)
+                else:
+                    os.unlink(upn)
+            except FileNotFoundError:
+                pass
+            self._ensure_parent_dirs(sid, rel_n, wid)
+            if is_dir:
+                # Move the up subtree (dirs + symlinks); file blobs stay put,
+                # addressed by rowid which reparent preserves.
+                upo = self._upper_path(sid, rel_o)
+                try:
+                    os.rename(upo, upn)
+                except OSError as e:
+                    raise pyfuse3.FUSEError(e.errno or errno.EIO)
+                # Drop the destination's prior overlay subtree (rows + their pool
+                # blobs) before moving the source over it — else those entries
+                # survive as ghosts with orphaned bytes.
+                idx.prune_subtree(rel_n)
+                idx.reparent(rel_o, rel_n, wid)
+                idx.set_entry(rel_n, "dir", st_o.st_mode, wid, "rename_to",
+                              opaque=1 if dst_shadows_lower else None)
+                if src_shadowed_lower:
+                    idx.set_entry(rel_o, "whiteout", 0, wid, "rename_from")
+                else:
+                    idx.del_entry(rel_o, op="rename_from", writer_id=wid)
+            elif is_reg:
+                # Regular file: NO os.rename — blob stays at its rowid address.
+                # rename_row moves the index entry in place (keeps rowid+blob).
+                idx.rename_row(rel_o, rel_n, wid)
+                if dst_shadows_lower:
+                    # UPSERT to set opaque without changing rowid/kind.
+                    idx.set_entry(rel_n, "file", st_o.st_mode, wid, "rename_to",
+                                  opaque=1)
+                if src_shadowed_lower:
+                    idx.set_entry(rel_o, "whiteout", 0, wid, "rename_from")
+                # rename_row already removed rel_o from the index; if src was NOT
+                # lower-shadowed, nothing more to do (del_entry already implicit).
+            else:
+                # Symlink: move the real up artifact.
+                upo = self._upper_path(sid, rel_o)
+                try:
+                    os.rename(upo, upn)
+                except OSError as e:
+                    raise pyfuse3.FUSEError(e.errno or errno.EIO)
+                idx.rename_row(rel_o, rel_n, wid)
+                if dst_shadows_lower:
+                    idx.set_entry(rel_n, "symlink", st_o.st_mode, wid, "rename_to",
+                                  opaque=1)
+                if src_shadowed_lower:
+                    idx.set_entry(rel_o, "whiteout", 0, wid, "rename_from")
+            self._remap_inode_subtree(sid, rel_o, rel_n)
+            # rename = remove-old + add-new for the live map.
+            self._notify(sid, rel_o, "deleted")
+            self._notify(sid, rel_n, "created")
+
         async def rename(self, parent_old, name_old, parent_new, name_new,
                          flags, ctx):
             if flags & getattr(pyfuse3, "RENAME_EXCHANGE", 2):
@@ -3040,13 +3189,24 @@ def _build_overlay_ops():
             if policy_check(sid, self._index(sid).provenance_of(ctx.pid),
                             rel_o, "rename") == "deny":
                 raise pyfuse3.FUSEError(errno.EACCES)
-            idx = self._index(sid)
-            wid = idx.writer_for(ctx.pid)
             # passthrough: both ends act on the real host. Both-ends-or-overlay:
             # only when BOTH paths pass through do we touch the host; if either side
             # is captured we fall through to overlay capture below. Symlink safety:
             # rename(2) operates on the names, never dereferences the final components.
             if self._passthrough(sid, rel_o) and self._passthrough(sid, rel_n):
+                p = self._parent(sid)
+                if p is not None:
+                    # KICK UP: rename as a captured op in the parent's overlay.
+                    # Resolve st_o through the parent (since the file lives there).
+                    layer_o, _ap_o, st_o = self._resolve_st(p, rel_o)
+                    if layer_o in ("absent", "whiteout"):
+                        raise pyfuse3.FUSEError(errno.ENOENT)
+                    self._req_enter(f"rename {sid}/{rel_o}->{rel_n}")
+                    try:
+                        self._rename_overlay(p, rel_o, rel_n, flags, st_o, ctx)
+                        return
+                    finally:
+                        self._req_exit()
                 self._req_enter(f"rename {sid}/{rel_o}->{rel_n}")
                 try:
                     ho = self._host_path(rel_o); hn = self._host_path(rel_n)
@@ -3062,87 +3222,9 @@ def _build_overlay_ops():
             layer_o, _ap_o, st_o = self._resolve_st(sid, rel_o)
             if layer_o in ("absent", "whiteout"):
                 raise pyfuse3.FUSEError(errno.ENOENT)
-            layer_n = self._resolve(sid, rel_n)
-            if flags & getattr(pyfuse3, "RENAME_NOREPLACE", 1):
-                if layer_n not in ("absent", "whiteout"):
-                    raise pyfuse3.FUSEError(errno.EEXIST)
             self._req_enter(f"rename {sid}/{rel_o}->{rel_n}")
             try:
-                dst_shadows_lower = (not idx.hidden_by_opaque(rel_n)
-                                     and self._lower_is_dir(sid, rel_n))
-                is_dir = stat_mod.S_ISDIR(st_o.st_mode)
-                is_reg = stat_mod.S_ISREG(st_o.st_mode)
-                src_shadowed_lower = (not idx.hidden_by_opaque(rel_o)
-                                      and self._lower_exists(sid, rel_o))
-                if is_dir:
-                    self._materialize_tree(sid, rel_o, wid)
-                else:
-                    self._copyup_one(sid, rel_o, wid)
-                # Remove any existing destination overlay artifact.
-                # For a file dst: also remove its pool blob.
-                if idx.kind_of(rel_n) == "file":
-                    dst_bp = self._backing_path(sid, rel_n)
-                    if dst_bp and os.path.lexists(dst_bp):
-                        try: os.unlink(dst_bp)
-                        except OSError: pass
-                upn = self._upper_path(sid, rel_n)
-                try:
-                    lst = os.lstat(upn)
-                    if stat_mod.S_ISDIR(lst.st_mode) and not stat_mod.S_ISLNK(lst.st_mode):
-                        shutil.rmtree(upn)
-                    else:
-                        os.unlink(upn)
-                except FileNotFoundError:
-                    pass
-                self._ensure_parent_dirs(sid, rel_n, wid)
-                if is_dir:
-                    # Move the up subtree (dirs + symlinks); file blobs stay put,
-                    # addressed by rowid which reparent preserves.
-                    upo = self._upper_path(sid, rel_o)
-                    try:
-                        os.rename(upo, upn)
-                    except OSError as e:
-                        raise pyfuse3.FUSEError(e.errno or errno.EIO)
-                    # Drop the destination's prior overlay subtree (rows + their pool
-                    # blobs) before moving the source over it — else those entries
-                    # survive as ghosts with orphaned bytes.
-                    idx.prune_subtree(rel_n)
-                    idx.reparent(rel_o, rel_n, wid)
-                    idx.set_entry(rel_n, "dir", st_o.st_mode, wid, "rename_to",
-                                  opaque=1 if dst_shadows_lower else None)
-                    if src_shadowed_lower:
-                        idx.set_entry(rel_o, "whiteout", 0, wid, "rename_from")
-                    else:
-                        idx.del_entry(rel_o, op="rename_from", writer_id=wid)
-                elif is_reg:
-                    # Regular file: NO os.rename — blob stays at its rowid address.
-                    # rename_row moves the index entry in place (keeps rowid+blob).
-                    idx.rename_row(rel_o, rel_n, wid)
-                    if dst_shadows_lower:
-                        # UPSERT to set opaque without changing rowid/kind.
-                        idx.set_entry(rel_n, "file", st_o.st_mode, wid, "rename_to",
-                                      opaque=1)
-                    if src_shadowed_lower:
-                        idx.set_entry(rel_o, "whiteout", 0, wid, "rename_from")
-                    # rename_row already removed rel_o from the index; if src was NOT
-                    # lower-shadowed, nothing more to do (del_entry already implicit).
-                else:
-                    # Symlink: move the real up artifact.
-                    upo = self._upper_path(sid, rel_o)
-                    try:
-                        os.rename(upo, upn)
-                    except OSError as e:
-                        raise pyfuse3.FUSEError(e.errno or errno.EIO)
-                    idx.rename_row(rel_o, rel_n, wid)
-                    if dst_shadows_lower:
-                        idx.set_entry(rel_n, "symlink", st_o.st_mode, wid, "rename_to",
-                                      opaque=1)
-                    if src_shadowed_lower:
-                        idx.set_entry(rel_o, "whiteout", 0, wid, "rename_from")
-                self._remap_inode_subtree(sid, rel_o, rel_n)
-                # rename = remove-old + add-new for the live map.
-                self._notify(sid, rel_o, "deleted")
-                self._notify(sid, rel_n, "created")
+                self._rename_overlay(sid, rel_o, rel_n, flags, st_o, ctx)
             finally:
                 self._req_exit()
 
@@ -3160,6 +3242,39 @@ def _build_overlay_ops():
                     self._key_to_ino.pop(oldkey, None)
                     self._key_to_ino[newkey] = ino
                     self._ino_to_key[ino] = newkey
+
+        def _link_overlay(self, sid: str, rel_src: str, rel_n: str,
+                          st, ino: int, ctx) -> "pyfuse3.EntryAttributes":
+            """Overlay (captured) link body for sid. Used directly and as kick-up
+            target. ino is the FUSE inode for rel_n (from the caller's session)."""
+            idx = self._index(sid)
+            wid = idx.writer_for(ctx.pid)
+            self._copyup_one(sid, rel_src, wid)
+            self._ensure_parent_dirs(sid, rel_n, wid)
+            try:
+                if stat_mod.S_ISLNK(st.st_mode):
+                    ups = self._upper_path(sid, rel_src)
+                    upn = self._upper_path(sid, rel_n)
+                    os.symlink(os.readlink(ups), upn)
+                    idx.set_entry(rel_n, "symlink", stat_mod.S_IFLNK | 0o777, wid,
+                                  "link_as_copy", detail=rel_src)
+                else:
+                    src_bp = self._backing_path(sid, rel_src)
+                    dst_bp = self._new_file_blob(sid, rel_n, st.st_mode, wid,
+                                                 "link_as_copy", detail=rel_src)
+                    src = os.open(src_bp, os.O_RDONLY | os.O_NOFOLLOW)
+                    try:
+                        dst = os.open(dst_bp, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
+                                      stat_mod.S_IMODE(st.st_mode))
+                        try: reflink_or_copy(src, dst)
+                        finally: os.close(dst)
+                    finally:
+                        os.close(src)
+            except OSError as e:
+                raise pyfuse3.FUSEError(e.errno or errno.EIO)
+            self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
+            self._notify(sid, rel_n, "created")
+            return self._entry(ino, os.lstat(self._backing_path(sid, rel_n)))
 
         async def link(self, inode, new_parent, new_name, ctx):
             new_name = os.fsdecode(new_name)
@@ -3181,6 +3296,15 @@ def _build_overlay_ops():
                 # Both-ends-or-overlay: hardlink on the host only when BOTH source and
                 # new name pass through; if either is captured, fall through to copy-up.
                 if self._passthrough(sid, rel_src) and self._passthrough(sid, rel_n):
+                    p = self._parent(sid)
+                    if p is not None:
+                        # KICK UP: link-as-copy in the parent's overlay.
+                        # Resolve st through the parent (source lives there).
+                        player, _pap, pst = self._resolve_st(p, rel_src)
+                        if player in ("absent", "whiteout"):
+                            raise pyfuse3.FUSEError(errno.ENOENT)
+                        ino = self._ino_for(sid, rel_n)
+                        return self._link_overlay(p, rel_src, rel_n, pst, ino, ctx)
                     hs = self._host_path(rel_src); hn = self._host_path(rel_n)
                     try:
                         os.makedirs(os.path.dirname(hn) or "/", exist_ok=True)
@@ -3191,37 +3315,8 @@ def _build_overlay_ops():
                     ino = self._ino_for(sid, rel_n)
                     self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
                     return self._entry(ino, os.lstat(hn))
-                self._copyup_one(sid, rel_src, wid)   # materializes the source (blob for a file)
-                self._ensure_parent_dirs(sid, rel_n, wid)
-                idx = self._index(sid)
-                try:
-                    if stat_mod.S_ISLNK(st.st_mode):
-                        # Symlinks are real up/<rel> artifacts on both ends.
-                        ups = self._upper_path(sid, rel_src)
-                        upn = self._upper_path(sid, rel_n)
-                        os.symlink(os.readlink(ups), upn)
-                        idx.set_entry(rel_n, "symlink", stat_mod.S_IFLNK | 0o777, wid,
-                                      "link_as_copy", detail=rel_src)
-                    else:
-                        # A regular file's bytes are in the pool: copy the source blob
-                        # into a fresh dest blob (hardlink-as-copy across overlay layers).
-                        src_bp = self._backing_path(sid, rel_src)
-                        dst_bp = self._new_file_blob(sid, rel_n, st.st_mode, wid,
-                                                     "link_as_copy", detail=rel_src)
-                        src = os.open(src_bp, os.O_RDONLY | os.O_NOFOLLOW)
-                        try:
-                            dst = os.open(dst_bp, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
-                                          stat_mod.S_IMODE(st.st_mode))
-                            try: reflink_or_copy(src, dst)
-                            finally: os.close(dst)
-                        finally:
-                            os.close(src)
-                except OSError as e:
-                    raise pyfuse3.FUSEError(e.errno or errno.EIO)
                 ino = self._ino_for(sid, rel_n)
-                self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
-                self._notify(sid, rel_n, "created")
-                return self._entry(ino, os.lstat(self._backing_path(sid, rel_n)))
+                return self._link_overlay(sid, rel_src, rel_n, st, ino, ctx)
             finally:
                 self._req_exit()
 
