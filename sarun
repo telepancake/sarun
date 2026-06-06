@@ -1115,6 +1115,27 @@ def sqlar_remove(path, name) -> int:
         except OSError: pass
     return left
 
+def _drop_sqlar_row_and_blob(path, box_id, rel) -> None:
+    """Drop one sqlar row AND any permanent pool blob backing it. The row is removed
+    FIRST (sqlar_remove): a failed removal must never leave a resident row whose blob
+    is gone (a zombie reading as an empty file); a crash between the two only orphans
+    the blob, which sweep_orphan_pools reclaims. `box_id` may be None (no blob check)."""
+    rel = rel.lstrip("/")
+    conn = _sqlar_open(path)
+    try:
+        row = conn.execute("SELECT rowid,data FROM sqlar WHERE name=?", (rel,)).fetchone()
+    except sqlite3.Error: row = None
+    finally: conn.close()
+    bp = None
+    if box_id is not None and row is not None and row[1] is None:
+        try: bp = blob_path(int(box_id), row[0])
+        except (ValueError, TypeError): bp = None
+    sqlar_remove(path, rel)
+    if bp is not None:
+        try:
+            if bp.exists(): bp.unlink()
+        except OSError: pass
+
 
 # ════════════════════════════════════════════════════════════════════════════
 #  Network log — every gated request/response for a session, written live by the
@@ -1913,6 +1934,17 @@ class Index:
             self._db.commit()
             self._whiteouts.discard(path); self._kinds.pop(path, None)
             self._opaque.discard(path)
+
+    def mirror_kind(self, path: str, kind: str) -> None:
+        """Update ONLY the RAM mirror for `path` to `kind` — for callers that already
+        wrote the sqlar row directly (e.g. a resident-file or symlink promotion) and
+        just need the hot-read mirror to agree. Does not touch the db row. `kind` is one
+        of file/symlink/dir/whiteout."""
+        with self._lock:
+            if kind == "whiteout":
+                self._whiteouts.add(path); self._kinds.pop(path, None)
+            else:
+                self._kinds[path] = kind; self._whiteouts.discard(path)
 
     def row_id(self, rel: str) -> "int | None":
         """The sqlar rowid for `rel` — names the blob in the pool."""
@@ -4966,28 +4998,8 @@ class SqlarArchive(ChangeSource):
     def _drop_row_and_blob(self, rel):
         """Drop the row AND any permanent pool blob backing it (a resident file's bytes
         live only on disk; sqlar_remove alone would orphan them)."""
-        rel = rel.lstrip("/")
         bid = sqlar_meta_get(self.path, "box_id")
-        conn = _sqlar_open(self.path)
-        try:
-            row = conn.execute("SELECT rowid,data FROM sqlar WHERE name=?", (rel,)).fetchone()
-        except sqlite3.Error: row = None
-        finally: conn.close()
-        # Compute the resident blob path BEFORE removing the row (the path is derived
-        # from box_id + rowid, not from the row's continued existence).
-        bp = None
-        if bid is not None and row is not None and row[1] is None:
-            try: bp = blob_path(int(bid), row[0])
-            except (ValueError, TypeError): bp = None
-        # Remove the row FIRST: if row-removal fails we must not be left with a resident
-        # row whose blob is gone (a zombie that reads as an empty file). A crash after
-        # row-removal but before the unlink only leaves an orphan blob, which
-        # sweep_orphan_pools reclaims.
-        sqlar_remove(self.path, rel)
-        if bp is not None:
-            try:
-                if bp.exists(): bp.unlink()
-            except OSError: pass
+        _drop_sqlar_row_and_blob(self.path, bid, rel)
 
     def remove(self, rel):
         self._drop_row_and_blob(rel)
@@ -5240,61 +5252,135 @@ class ChangeReview:
         # Only promote if the parent session is still tracked (live or finished).
         return psid if psid in self.reg.sessions else None
 
-    def _promote_into_parent(self, parent_sid: str, rel: str,
+    def _raw_parent_sid(self, sid: str) -> "str | None":
+        """The parent sid of `sid` from the Session (if tracked) else the sqlar
+        'parent_sid' meta — the RAW parent chain, including parents that are not
+        currently registered as sessions. None / "" means a top-level box. This is
+        the chain _lower_has walks to the host; unlike _parent_sid it does NOT
+        require the parent to be a live/tracked session."""
+        s = self.reg.sessions.get(sid)
+        if s is not None and s.parent:
+            return s.parent
+        psid = sqlar_meta_get(sqlar_path(sid), "parent_sid")
+        return psid or None
+
+    def _own_kind(self, sid: str, rel: str) -> "str | None":
+        """`sid`'s OWN entry kind for `rel` (file/symlink/dir/whiteout) or None if the
+        box has no own entry. Reads the live Index mirror if open, else the sqlar mode.
+        This is the box's overlay decision only — it does NOT chain to the lower."""
+        rel = rel.lstrip("/")
+        idx = self.reg.indexes.get(sid)
+        if idx is not None:
+            return idx.kind_of(rel)
+        mode = sqlar_mode(sqlar_path(sid), rel)
+        if mode is None:
+            return None
+        return _kind_of_mode(mode)
+
+    def _lower_has(self, sid: str, rel: str) -> bool:
+        """Does sid's LOWER (what it inherits, ignoring sid's own overlay) currently
+        resolve `rel` to a PRESENT entry? Walks the parent chain to the host:
+          - no parent (top-level box): whether the host path exists or is a symlink;
+          - has parent p: inspect p's OWN entry — a tombstone/whiteout means the parent
+            deleted it (False); a real present entry (file/symlink/dir) means True; if p
+            has no own entry, recurse into p's lower.
+        This generalizes the old hardcoded Path("/")/rel host check to nested boxes."""
+        rel = rel.lstrip("/")
+        psid = self._raw_parent_sid(sid)
+        if not psid:
+            host = Path("/") / rel
+            return host.exists() or host.is_symlink()
+        k = self._own_kind(psid, rel)
+        if k == "whiteout":
+            return False
+        if k is not None:
+            return True
+        return self._lower_has(psid, rel)
+
+    def _promote_into_parent(self, target_sid: str, rel: str,
                              plan: dict) -> "dict | None":
-        """Capture the change described by `plan` into the target box's overlay as a
-        new pending change — instead of writing to the real host. The target is the
-        PARENT box for an 'apply', or an immediate CHILD box for a 'discard' copy-down
+        """Capture the change described by `plan` into the TARGET box's overlay as a new
+        pending change — instead of writing to the real host. The target is the PARENT
+        box for an 'apply', or an immediate CHILD box for a 'discard' copy-down
         (preserving the child's inherited view). Returns None on success, dict(ok=False,
         error=…) on failure.
 
-        Live parent  → write into its in-RAM Index + pool blob / up/ symlink,
-                       exactly as the FUSE layer would record a new write.
-        Finished parent → INSERT/UPDATE the row in the parent's sqlar directly,
-                          so the parent's SqlarArchive reviewer sees it."""
+        ONE code path, keyed by the target box's own storage (its <sid>.sqlar row plus a
+        pool blob for large file bytes) — it does NOT branch on whether the box has a
+        live in-RAM Index. If a live Index IS open for the target, the write additionally
+        keeps that RAM mirror (and the live-serve up/ symlink artifact) consistent so a
+        running FUSE mount keeps serving the new value. The RAM mirror is an accelerator,
+        never separate semantics."""
         rel = rel.lstrip("/")
         kind = plan.get("kind", "noop")
         if kind == "noop":
             return None
 
-        parent_idx = self.reg.indexes.get(parent_sid)   # live Index or None
-        if parent_idx is not None:
-            # ── Live parent path ──────────────────────────────────────────────
-            # Use a best-effort writer id: ask the parent index for the current
-            # process (any writer attribution is fine; never block on perfect prov).
-            try: wid = parent_idx.writer_for(os.getpid())
+        idx = self.reg.indexes.get(target_sid)   # live Index, or None
+        sp = sqlar_path(target_sid)
+        mtime_ns = plan.get("mtime_ns") or int(time.time() * 1e9)
+        try:
+            box_id = idx.box_id if idx is not None else ensure_box_id(target_sid)
+        except Exception as e:
+            return dict(ok=False, error=f"promote: box id: {e}")
+        # Best-effort writer id for the live mirror (any attribution is fine).
+        wid = 0
+        if idx is not None:
+            try: wid = idx.writer_for(os.getpid())
             except Exception: wid = 0
 
+        try:
             if kind == "delete":
-                host = Path("/") / rel
-                if host.exists() or host.is_symlink():
-                    # whiteout: parent lower has the path
-                    parent_idx.set_entry(rel, "whiteout", 0, wid, "promoted")
+                # Tombstone iff the target's own LOWER still resolves rel to a present
+                # entry (so the deletion must shadow it); otherwise just drop the box's
+                # own row. This walks the box's PARENT chain — NOT the real host — fixing
+                # the old bug where the live branch checked Path("/")/rel directly.
+                if self._lower_has(target_sid, rel):
+                    if idx is not None:
+                        idx.set_entry(rel, "whiteout", 0, wid, "promoted")
+                    else:
+                        conn = _sqlar_open(sp)
+                        try: _sqlar_put_tombstone(conn, rel); conn.commit()
+                        finally: conn.close()
                 else:
-                    # path absent in parent's lower: nothing to delete
-                    parent_idx.del_entry(rel, op="promoted_del")
+                    # Lower has nothing here: drop the box's own row + any pool blob.
+                    if idx is not None:
+                        rid = idx.row_id(rel)
+                        if rid is not None:
+                            try: blob_path(box_id, rid).unlink()
+                            except OSError: pass
+                        idx.del_entry(rel, op="promoted_del")
+                    else:
+                        _drop_sqlar_row_and_blob(sp, box_id, rel)
             elif kind == "symlink":
                 tgt_raw = plan.get("target", "")
                 if isinstance(tgt_raw, bytes):
                     tgt_str = tgt_raw.decode("utf-8", "surrogateescape")
                 else:
                     tgt_str = str(tgt_raw)
-                mtime_ns = plan.get("mtime_ns") or int(time.time() * 1e9)
-                psess = self.reg.sessions.get(parent_sid)
-                if psess is None:
-                    return dict(ok=False, error=f"promote: session {parent_sid} not tracked")
-                parent_up = Path(psess.upper)
-                sym_path = parent_up / rel
-                try:
-                    sym_path.parent.mkdir(parents=True, exist_ok=True)
-                    if sym_path.is_symlink() or sym_path.exists():
-                        sym_path.unlink()
-                    os.symlink(tgt_str, sym_path)
-                    _restore_host_mtime_ns(sym_path, mtime_ns, is_symlink=True)
-                except OSError as e:
-                    return dict(ok=False, error=f"promote symlink: {e}")
-                parent_idx.set_entry(rel, "symlink", stat_mod.S_IFLNK | 0o777,
-                                     wid, "promoted")
+                tgt_bytes = tgt_str.encode("utf-8", "surrogateescape")
+                # Storage: write the symlink row into the box's sqlar.
+                conn = _sqlar_open(sp)
+                try: _sqlar_put_symlink(conn, rel, tgt_bytes, mtime_ns); conn.commit()
+                finally: conn.close()
+                if idx is not None:
+                    # Live mirror: the FUSE readlink path resolves a symlink through the
+                    # up/ artifact (_backing_path → up/rel), so write a real symlink and
+                    # mark the mirror kind. set_entry would NULL the row written above, so
+                    # update only the RAM mirror here, not the row.
+                    psess = self.reg.sessions.get(target_sid)
+                    if psess is None:
+                        return dict(ok=False, error=f"promote: session {target_sid} not tracked")
+                    sym_path = Path(psess.upper) / rel
+                    try:
+                        sym_path.parent.mkdir(parents=True, exist_ok=True)
+                        if sym_path.is_symlink() or sym_path.exists():
+                            sym_path.unlink()
+                        os.symlink(tgt_str, sym_path)
+                        _restore_host_mtime_ns(sym_path, mtime_ns, is_symlink=True)
+                    except OSError as e:
+                        return dict(ok=False, error=f"promote symlink: {e}")
+                    idx.mirror_kind(rel, "symlink")
             elif kind == "file":
                 data = plan.get("data")
                 if data is None and "copy_from" in plan:
@@ -5306,50 +5392,43 @@ class ChangeReview:
                 mode = plan.get("chmod") or (stat_mod.S_IFREG | 0o644)
                 if not stat_mod.S_ISREG(mode):
                     mode = stat_mod.S_IFREG | stat_mod.S_IMODE(mode)
-                # set_entry upserts the sqlar row (data=NULL); then write blob.
-                parent_idx.set_entry(rel, "file", mode, wid, "promoted")
-                rid = parent_idx.row_id(rel)
-                if rid is None:
-                    return dict(ok=False, error="promote: row_id missing after set_entry")
-                bp = blob_path(parent_idx.box_id, rid)
-                try:
-                    bp.parent.mkdir(parents=True, exist_ok=True)
-                    bp.write_bytes(data)
-                except OSError as e:
-                    return dict(ok=False, error=f"promote write blob: {e}")
-        else:
-            # ── Finished parent path ──────────────────────────────────────────
-            sp = sqlar_path(parent_sid)
-            try:
-                conn = _sqlar_open(sp)
-                try:
-                    mtime_ns = plan.get("mtime_ns") or int(time.time() * 1e9)
-                    if kind == "delete":
-                        _sqlar_put_tombstone(conn, rel)
-                    elif kind == "symlink":
-                        tgt_raw = plan.get("target", "")
-                        if isinstance(tgt_raw, str):
-                            tgt_bytes = tgt_raw.encode("utf-8", "surrogateescape")
-                        else:
-                            tgt_bytes = bytes(tgt_raw)
-                        _sqlar_put_symlink(conn, rel, tgt_bytes, mtime_ns)
-                    elif kind == "file":
-                        data = plan.get("data")
-                        if data is None and "copy_from" in plan:
-                            try: data = Path(plan["copy_from"]).read_bytes()
-                            except OSError as e:
-                                return dict(ok=False, error=f"promote read blob: {e}")
-                        if data is None:
-                            return dict(ok=False, error="promote: no file data in plan")
-                        mode = plan.get("chmod") or (stat_mod.S_IFREG | 0o644)
-                        if not stat_mod.S_ISREG(mode):
-                            mode = stat_mod.S_IFREG | stat_mod.S_IMODE(mode)
-                        _sqlar_put_file(conn, rel, data, mode, mtime_ns)
-                    conn.commit()
-                finally:
-                    conn.close()
-            except Exception as e:
-                return dict(ok=False, error=f"promote to sqlar: {e}")
+                # Size-based placement matching consolidate / POOL_RESIDENT_MIN: large
+                # files (and ANY file for a live box, whose serve path reads the pool
+                # blob) become a resident row (data NULL) + a pool blob; small files for
+                # a non-live box fold inline into the sqlar row.
+                resident = (idx is not None) or (len(data) >= POOL_RESIDENT_MIN)
+                if resident:
+                    conn = _sqlar_open(sp)
+                    try:
+                        # Resident row: data NULL, real uncompressed size.
+                        conn.execute(
+                            "INSERT INTO sqlar(name,mode,mtime,sz,data) VALUES(?,?,?,?,NULL)"
+                            " ON CONFLICT(name) DO UPDATE SET mode=excluded.mode,"
+                            " mtime=excluded.mtime, sz=excluded.sz, data=NULL",
+                            (rel, int(mode), int(mtime_ns), len(data)))
+                        conn.commit()
+                        rid = conn.execute("SELECT rowid FROM sqlar WHERE name=?",
+                                           (rel,)).fetchone()[0]
+                    finally:
+                        conn.close()
+                    bp = blob_path(box_id, rid)
+                    try:
+                        bp.parent.mkdir(parents=True, exist_ok=True)
+                        bp.write_bytes(data)
+                    except OSError as e:
+                        return dict(ok=False, error=f"promote write blob: {e}")
+                    if idx is not None:
+                        # Keep the live mirror consistent: kind=file. The row already
+                        # holds the resident invariant (data NULL, real sz) from the
+                        # INSERT above, and _resolve_st serves the file from the pool
+                        # blob — so no further row mutation is needed.
+                        idx.mirror_kind(rel, "file")
+                else:
+                    conn = _sqlar_open(sp)
+                    try: _sqlar_put_file(conn, rel, data, mode, mtime_ns); conn.commit()
+                    finally: conn.close()
+        except sqlite3.Error as e:
+            return dict(ok=False, error=f"promote to sqlar: {e}")
         return None   # success
 
     # ── discard copy-down: pin a file into children before dropping it ─────────
@@ -5377,21 +5456,32 @@ class ChangeReview:
             return idx.kind_of(rel) is not None
         return sqlar_mode(sqlar_path(child), rel) is not None
 
-    def _copydown_to_children(self, sid: str, rel: str, src) -> None:
+    def _copydown_to_children(self, sid: str, rel: str, src) -> "dict | None":
         """Before dropping `rel` from `sid`, pin its current value into every immediate
         child that inherits it (has no own entry) — so discarding from `sid` never
         changes a child's merged view (the child keeps the value it was seeing). A
-        deletion (whiteout) copies down as a whiteout, preserving an 'absent' view."""
+        deletion (whiteout) copies down as a whiteout, preserving an 'absent' view.
+        Returns None on success; dict(ok=False, error=…) if any child copy-down failed
+        (the caller MUST NOT then drop `rel` from `sid` — the child would lose its
+        inherited view)."""
         kids = self._immediate_children(sid)
         if not kids:
-            return
+            return None
         plan = src.apply_plan(rel)
-        if plan is None or plan.get("kind") == "noop":
-            return
+        if plan is None:
+            # Source claims this path but its bytes can't be read (e.g. a resident row
+            # whose blob is gone): fail closed rather than copy down an empty file.
+            return dict(ok=False, error=f"copy-down: {rel} not readable from source")
+        if plan.get("kind") == "noop":
+            return None
         for child in kids:
             if self._box_has_own_entry(child, rel):
                 continue
-            self._promote_into_parent(child, rel, plan)   # capture into the child
+            err = self._promote_into_parent(child, rel, plan)   # capture into the child
+            if err is not None:
+                return dict(ok=False,
+                            error=f"copy-down into {child}: {err.get('error', err)}")
+        return None
 
     def finalize_by_rules(self, sid) -> dict:
         """Run the file rules over a stopped box's whole change set, the way box DELETE
@@ -5645,7 +5735,10 @@ class ChangeReview:
         discarded, errors = [], []
         for rel in paths:
             try:
-                self._copydown_to_children(sid, rel, src)
+                cd = self._copydown_to_children(sid, rel, src)
+                if cd is not None:
+                    # Copy-down failed: do NOT drop rel — a child still inherits it.
+                    errors.append({"path": rel, **cd}); continue
                 src.discard(rel)
                 discarded.append(rel)
             except OSError as e:
