@@ -39,11 +39,13 @@ def test_one_db_only_and_blob_lifecycle():
         idx = m.Index(backing)
         wid = idx.writer_for(os.getpid())
 
-        # FUSE-op simulation: bytes land in the upper, the row is upserted NULL-blob.
-        (up / "newfile.txt").write_text("hello\nworld\n")
+        # FUSE-op simulation: bytes land in the pool blob, the row is upserted NULL-blob.
         idx.set_entry("newfile.txt", "file", stat_mod.S_IFREG | 0o644, wid, "create")
-        (up / "blob.bin").write_bytes(bytes(range(256)))
+        bp = m.blob_path(idx.box_id, idx.row_id("newfile.txt"))
+        bp.parent.mkdir(parents=True, exist_ok=True); bp.write_bytes(b"hello\nworld\n")
         idx.set_entry("blob.bin", "file", stat_mod.S_IFREG | 0o644, wid, "create")
+        bp = m.blob_path(idx.box_id, idx.row_id("blob.bin"))
+        bp.parent.mkdir(parents=True, exist_ok=True); bp.write_bytes(bytes(range(256)))
         os.symlink("/some/target", up / "lnk")
         idx.set_entry("lnk", "symlink", stat_mod.S_IFLNK | 0o777, wid, "symlink")
         assert Path("/etc/hostname").exists()
@@ -163,8 +165,11 @@ def test_consolidate_opaque_expands_tombstones():
         idx = m.Index(backing)
         wid = idx.writer_for(os.getpid())
         idx.set_entry(rel, "dir", stat_mod.S_IFDIR | 0o755, wid, "mkdir", opaque=1)
-        (up / rel / "kept.txt").write_text("x")
         idx.set_entry(rel + "/kept.txt", "file", stat_mod.S_IFREG | 0o644, wid, "create")
+        bp = m.blob_path(idx.box_id, idx.row_id(rel + "/kept.txt"))
+        bp.parent.mkdir(parents=True, exist_ok=True); bp.write_bytes(b"x")
+        # the dir must also exist in up/ for the opaque expansion check
+        (up / rel).mkdir(parents=True, exist_ok=True)
 
         m.consolidate(str(backing), sid, ["sh"], index=idx)
         sp = m.sqlar_path(sid)

@@ -1428,6 +1428,8 @@ class Index:
         self._opaque: set = set()
         self._lock = threading.Lock()     # serialize SQLite + mirror mutations
         self._load_mirror()
+        # Stable pool id: minted once, lives in meta, survives sqlar rename.
+        self.box_id = ensure_box_id(self.backing.name)
 
     def set_tracing(self, on: bool) -> None:
         self._tracing = bool(on)
@@ -1716,6 +1718,40 @@ class Index:
             self._whiteouts.discard(path); self._kinds.pop(path, None)
             self._opaque.discard(path)
 
+    def row_id(self, rel: str) -> "int | None":
+        """The sqlar rowid for `rel` — names the blob in the pool."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT rowid FROM sqlar WHERE name=?", (rel,)).fetchone()
+        return row[0] if row else None
+
+    def rename_row(self, old: str, new: str, writer_id=None) -> None:
+        """Single-row in-place rename: preserves rowid (and thus blob address).
+        Deletes any pre-existing row at `new`, then renames `old`->>`new` in-place.
+        Updates the RAM mirror accordingly."""
+        with self._lock:
+            # drop any pre-existing entry at the destination
+            self._db.execute("DELETE FROM sqlar WHERE name=?", (new,))
+            # rename in-place (rowid preserved)
+            if writer_id is not None:
+                self._db.execute(
+                    "UPDATE sqlar SET name=?, last_writer=? WHERE name=?",
+                    (new, writer_id, old))
+            else:
+                self._db.execute(
+                    "UPDATE sqlar SET name=? WHERE name=?", (new, old))
+            self._db.commit()
+            # mirror: move old -> new, dropping any prior new
+            for s in (self._whiteouts, self._opaque):
+                had = new in s; s.discard(new)
+                if old in s: s.discard(old); s.add(new)
+                elif had: pass  # old not present; new was, now gone — correct
+            kind = self._kinds.pop(new, None)  # drop any pre-existing new kind
+            old_kind = self._kinds.pop(old, None)
+            if old_kind is not None:
+                self._kinds[new] = old_kind
+            opaque_had = new in self._opaque  # already handled above
+
     def prune_subtree(self, prefix: str) -> None:
         pref = prefix + "/"
         with self._lock:
@@ -1728,25 +1764,30 @@ class Index:
                 self._kinds.pop(p, None)
 
     def reparent(self, old: str, new: str, writer_id) -> None:
+        """Rename the whole subtree old/ -> new/ IN PLACE (UPDATE name, keep rowids).
+        Rowid stability is required so file blobs (addressed by box_id+rowid) never
+        move on disk across a directory rename."""
         oldp = old + "/"; newp = new + "/"
         with self._lock:
             rows = self._db.execute(
-                "SELECT name, mode, opaque, writer, last_writer FROM sqlar"
+                "SELECT rowid, name, mode, opaque FROM sqlar"
                 " WHERE name LIKE ? ESCAPE '\\'",
                 (_like_escape(oldp) + "%",)).fetchall()
-            for path, mode, opaque, writer, last_writer in rows:
+            for rowid, path, mode, opaque in rows:
                 np = newp + path[len(oldp):]
-                self._db.execute("DELETE FROM sqlar WHERE name=?", (path,))
-                self._db.execute(
-                    "INSERT OR REPLACE INTO sqlar"
-                    "(name,mode,mtime,sz,data,opaque,writer,last_writer)"
-                    " VALUES(?,?,?,?,?,?,?,?)",
-                    (np, mode, 0, 0, None, opaque, writer, last_writer))
+                # drop any pre-existing row at the destination (keep source rowid)
+                self._db.execute("DELETE FROM sqlar WHERE name=? AND rowid!=?",
+                                 (np, rowid))
+                self._db.execute("UPDATE sqlar SET name=? WHERE rowid=?", (np, rowid))
             self._db.commit()
-            for path, mode, opaque, writer, last_writer in rows:
+            for _rowid, path, mode, opaque in rows:
                 np = newp + path[len(oldp):]
                 kind = _kind_of_mode(mode)
-                self._whiteouts.discard(path); self._kinds.pop(path, None); self._opaque.discard(path)
+                self._whiteouts.discard(path); self._kinds.pop(path, None)
+                self._opaque.discard(path)
+                # also drop any pre-existing mirror entry at the new name
+                self._whiteouts.discard(np); self._kinds.pop(np, None)
+                self._opaque.discard(np)
                 if kind == "whiteout": self._whiteouts.add(np)
                 else: self._kinds[np] = kind
                 if opaque: self._opaque.add(np)
@@ -1989,6 +2030,33 @@ def _build_overlay_ops():
             except OSError as e:
                 raise pyfuse3.FUSEError(e.errno or errno.EIO)
 
+        # ── pool-backed artifact path helpers ────────────────────────────────
+        def _backing_path(self, sid: str, rel: str) -> "str | None":
+            """The on-disk artifact for rel in OUR upper. Files: pool blob. Dirs/
+            symlinks: real upper path. Others: None."""
+            idx = self._index(sid)
+            k = idx.kind_of(rel)
+            if k == "file":
+                rid = idx.row_id(rel)
+                if rid is None: return None
+                return str(blob_path(idx.box_id, rid))
+            if k in ("dir", "symlink"):
+                return self._upper_path(sid, rel)
+            return None
+
+        def _new_file_blob(self, sid: str, rel: str, mode, wid, op: str,
+                           detail: str = "") -> str:
+            """Ensure the FILE row for rel exists; return the blob path string.
+            Clears a stale whiteout entry first. The blob shard dir is created."""
+            idx = self._index(sid)
+            if idx.kind_of(rel) == "whiteout":
+                idx.del_entry(rel)
+            idx.set_entry(rel, "file", mode, wid, op, detail=detail)
+            rid = idx.row_id(rel)
+            bp = blob_path(idx.box_id, rid)
+            bp.parent.mkdir(parents=True, exist_ok=True)
+            return str(bp)
+
         # ── layer resolution ───────────────────────────────────────
         def _resolve_st(self, sid: str, rel: str):
             idx = self._index(sid)
@@ -1998,9 +2066,10 @@ def _build_overlay_ops():
             if k == "whiteout":
                 return ("whiteout", None, None)
             if k is not None:
-                up = self._upper_path(sid, rel)
-                try: return ("upper", up, os.lstat(up))
-                except OSError: pass
+                ap = self._backing_path(sid, rel)
+                if ap is not None:
+                    try: return ("upper", ap, os.lstat(ap))
+                    except OSError: pass
             if idx.hidden_by_opaque(rel):
                 return ("absent", None, None)
             return self._lower_resolve(sid, rel)
@@ -2295,25 +2364,25 @@ def _build_overlay_ops():
 
         # ── copy-up ─────────────────────────────────────────────
         def _ensure_copyup(self, sid: str, rel: str, flags: int, ctx) -> int:
-            """Materialize a lower (or absent) file into the upper; return an O_RDWR
-            fd on it. Fail-closed: any copy error propagates."""
-            wid = self._index(sid).writer_for(ctx.pid)
-            self._ensure_parent_dirs(sid, rel, wid)
-            upath = self._upper_path(sid, rel)
-            if os.path.lexists(upath):
-                # O_NOFOLLOW: if the upper artifact is itself a symlink (planted by
-                # the sandbox to point at a host file), this raises ELOOP rather than
-                # opening the target — fail closed, never dereference.
-                try:
-                    return os.open(upath, os.O_RDWR | os.O_NOFOLLOW)
-                except OSError as e:
-                    raise pyfuse3.FUSEError(e.errno or errno.EIO)
-            layer, ap, st = self._resolve_st(sid, rel)
+            """Materialize a lower (or absent) file into the pool; return an O_RDWR
+            fd on the blob. Regular files go to the pool blob (flat, no host-path
+            layout); symlinks/dirs still get real up/<rel> artifacts via _copyup_one.
+            Fail-closed: any copy error propagates."""
             idx = self._index(sid)
+            wid = idx.writer_for(ctx.pid)
+            # FIRST: if already a file in the index with a blob, just open it.
+            if idx.kind_of(rel) == "file":
+                rid = idx.row_id(rel)
+                if rid is not None:
+                    bp = blob_path(idx.box_id, rid)
+                    if bp.exists():
+                        try:
+                            return os.open(str(bp), os.O_RDWR | os.O_NOFOLLOW)
+                        except OSError as e:
+                            raise pyfuse3.FUSEError(e.errno or errno.EIO)
+            # Resolve the source from lower/upper layers.
+            layer, ap, st = self._resolve_st(sid, rel)
             if layer in ("lower", "upper"):
-                # The source is the layer beneath this box's own upper: a host file, or
-                # (nested) a file in an ancestor's upper. Either way `ap` is a real
-                # on-disk path we copy from.
                 # A lower symlink/dir must copy up preserving its type — never open
                 # it O_RDONLY (that would follow a symlink onto its target and
                 # materialize the target's bytes as a regular file). _copyup_one does
@@ -2321,31 +2390,34 @@ def _build_overlay_ops():
                 # upper artifact O_NOFOLLOW. (A symlink open-for-write is unusual; the
                 # caller gets an fd on the preserved artifact.)
                 if not stat_mod.S_ISREG(st.st_mode):
+                    self._ensure_parent_dirs(sid, rel, wid)
                     self._copyup_one(sid, rel, wid)
+                    upath = self._upper_path(sid, rel)
                     try:
                         return os.open(upath, os.O_RDWR | os.O_NOFOLLOW)
                     except OSError as e:
                         raise pyfuse3.FUSEError(e.errno or errno.EIO)
-                mode = stat_mod.S_IMODE(st.st_mode)
+                # Regular file from lower/upper: copy bytes into the pool blob.
                 src = os.open(ap, os.O_RDONLY | os.O_NOFOLLOW)
                 try:
-                    dst = os.open(upath, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, mode)
+                    bp_str = self._new_file_blob(sid, rel, st.st_mode, wid, "copyup")
+                    mode = stat_mod.S_IMODE(st.st_mode)
+                    dst = os.open(bp_str, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, mode)
                     try:
-                        method = reflink_or_copy(src, dst)
+                        reflink_or_copy(src, dst)
                     except OSError as e:
                         os.close(dst)
-                        try: os.unlink(upath)
+                        try: os.unlink(bp_str)
                         except OSError: pass
                         raise pyfuse3.FUSEError(e.errno or errno.EIO)
                 finally:
                     os.close(src)
-                idx.set_entry(rel, "file", st.st_mode, wid, "copyup", detail=method)
                 return dst
             else:
-                # absent (or whiteout cleared) -> brand new upper file
-                fd = os.open(upath, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o644)
-                idx.set_entry(rel, "file", stat_mod.S_IFREG | 0o644, wid, "create")
-                return fd
+                # absent (or whiteout cleared) -> brand new pool blob
+                bp_str = self._new_file_blob(sid, rel, stat_mod.S_IFREG | 0o644,
+                                             wid, "create")
+                return os.open(bp_str, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o644)
 
         # ── open / read / write / release ───────────────────────────────────
         async def open(self, inode, flags, ctx):
@@ -2493,15 +2565,15 @@ def _build_overlay_ops():
                 return (pyfuse3.FileInfo(fh=nfh, direct_io=False, keep_cache=False),
                         self._entry(ino, st))
             def upper_op(sid, rel, upath, wid, idx):
+                # File bytes go to the pool blob, not up/<rel>. _new_file_blob
+                # handles whiteout removal and index set_entry.
                 try:
-                    fd = os.open(upath, flags | os.O_CREAT | os.O_NOFOLLOW,
+                    bp = self._new_file_blob(sid, rel, stat_mod.S_IFREG | (mode & 0o7777),
+                                             wid, "create")
+                    fd = os.open(bp, flags | os.O_CREAT | os.O_NOFOLLOW,
                                  mode & 0o7777)
                 except OSError as e:
                     raise pyfuse3.FUSEError(e.errno or errno.EIO)
-                if idx.kind_of(rel) == "whiteout":
-                    idx.del_entry(rel)
-                idx.set_entry(rel, "file", stat_mod.S_IFREG | (mode & 0o7777),
-                              wid, "create")
                 st = os.fstat(fd)
                 ino = self._ino_for(sid, rel)
                 self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
@@ -2596,9 +2668,12 @@ def _build_overlay_ops():
                     except OSError as e: raise pyfuse3.FUSEError(e.errno or errno.EIO)
                     return
                 idx = self._index(sid)
-                upath = self._upper_path(sid, rel)
-                if os.path.lexists(upath):
-                    try: os.unlink(upath)
+                # Remove the backing artifact before mutating the index.
+                # Files: pool blob. Symlinks: real up/<rel>. Either way use
+                # _backing_path so we never accidentally skip a file's blob.
+                bp = self._backing_path(sid, rel)
+                if bp is not None and os.path.lexists(bp):
+                    try: os.unlink(bp)
                     except OSError as e: raise pyfuse3.FUSEError(e.errno or errno.EIO)
                 lower_exists = (not idx.hidden_by_opaque(rel)
                                 and self._lower_exists(sid, rel))
@@ -2672,7 +2747,8 @@ def _build_overlay_ops():
                     if layer == "lower":
                         fd = self._ensure_copyup(sid, rel, os.O_RDWR, ctx)
                         os.close(fd)
-                    upath = self._upper_path(sid, rel)
+                    # For a file: the blob is the backing artifact; for dir/symlink: up/<rel>.
+                    upath = self._backing_path(sid, rel) or self._upper_path(sid, rel)
                     wid = idx.writer_for(ctx.pid)
                 is_link = stat_mod.S_ISLNK(os.lstat(upath).st_mode)
                 try:
@@ -2731,29 +2807,43 @@ def _build_overlay_ops():
 
         # ── copy-up of one entry (for rename/link materialization) ───────────
         def _copyup_one(self, sid: str, rel: str, wid) -> None:
-            upath = self._upper_path(sid, rel)
-            if os.path.lexists(upath): return
+            """Copy one entry into the upper/pool. Symlinks and dirs are real up/<rel>
+            artifacts. Regular files go into the pool blob (flat, rowid-addressed).
+            The early-return guard uses the correct backing per type."""
+            idx = self._index(sid)
+            # For files: the blob is the backing; for dirs/symlinks: up/<rel>.
+            k = idx.kind_of(rel)
+            if k == "file":
+                rid = idx.row_id(rel)
+                if rid is not None and blob_path(idx.box_id, rid).exists():
+                    return   # already has a blob
+            else:
+                upath = self._upper_path(sid, rel)
+                if os.path.lexists(upath): return
             self._ensure_parent_dirs(sid, rel, wid)
             layer, ap, st = self._resolve_st(sid, rel)
-            idx = self._index(sid)
             if layer in ("lower", "upper"):     # host, or (nested) an ancestor's upper
                 if stat_mod.S_ISLNK(st.st_mode):
+                    upath = self._upper_path(sid, rel)
                     os.symlink(os.readlink(ap), upath)
                     idx.set_entry(rel, "symlink", stat_mod.S_IFLNK | 0o777, wid,
                                   "copyup_symlink")
                 elif stat_mod.S_ISDIR(st.st_mode):
+                    upath = self._upper_path(sid, rel)
                     os.mkdir(upath, stat_mod.S_IMODE(st.st_mode))
                     idx.set_entry(rel, "dir", st.st_mode, wid, "copyup_dir")
                 else:
+                    # Regular file: copy into pool blob, not up/<rel>.
                     src = os.open(ap, os.O_RDONLY | os.O_NOFOLLOW)
                     try:
-                        dst = os.open(upath, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
+                        bp_str = self._new_file_blob(sid, rel, st.st_mode, wid, "copyup")
+                        dst = os.open(bp_str, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
                                       stat_mod.S_IMODE(st.st_mode))
                         try: reflink_or_copy(src, dst)
                         finally: os.close(dst)
                     finally:
                         os.close(src)
-                    idx.set_entry(rel, "file", st.st_mode, wid, "copyup")
+                    # set_entry already done by _new_file_blob
 
         def _materialize_tree(self, sid: str, rel: str, wid) -> None:
             """Walk the merged view of rel and copy every entry into the upper."""
@@ -2813,12 +2903,21 @@ def _build_overlay_ops():
                 dst_shadows_lower = (not idx.hidden_by_opaque(rel_n)
                                      and self._lower_is_dir(sid, rel_n))
                 is_dir = stat_mod.S_ISDIR(st_o.st_mode)
+                is_reg = stat_mod.S_ISREG(st_o.st_mode)
+                src_shadowed_lower = (not idx.hidden_by_opaque(rel_o)
+                                      and self._lower_exists(sid, rel_o))
                 if is_dir:
                     self._materialize_tree(sid, rel_o, wid)
                 else:
                     self._copyup_one(sid, rel_o, wid)
-                upo = self._upper_path(sid, rel_o); upn = self._upper_path(sid, rel_n)
-                # remove existing destination upper artifact
+                # Remove any existing destination overlay artifact.
+                # For a file dst: also remove its pool blob.
+                if idx.kind_of(rel_n) == "file":
+                    dst_bp = self._backing_path(sid, rel_n)
+                    if dst_bp and os.path.lexists(dst_bp):
+                        try: os.unlink(dst_bp)
+                        except OSError: pass
+                upn = self._upper_path(sid, rel_n)
                 try:
                     lst = os.lstat(upn)
                     if stat_mod.S_ISDIR(lst.st_mode) and not stat_mod.S_ISLNK(lst.st_mode):
@@ -2828,25 +2927,46 @@ def _build_overlay_ops():
                 except FileNotFoundError:
                     pass
                 self._ensure_parent_dirs(sid, rel_n, wid)
-                try:
-                    os.rename(upo, upn)
-                except OSError as e:
-                    raise pyfuse3.FUSEError(e.errno or errno.EIO)
-                # index update
-                src_shadowed_lower = (not idx.hidden_by_opaque(rel_o)
-                                      and self._lower_exists(sid, rel_o))
                 if is_dir:
+                    # Move the up subtree (dirs + symlinks); file blobs stay put,
+                    # addressed by rowid which reparent preserves.
+                    upo = self._upper_path(sid, rel_o)
+                    try:
+                        os.rename(upo, upn)
+                    except OSError as e:
+                        raise pyfuse3.FUSEError(e.errno or errno.EIO)
                     idx.reparent(rel_o, rel_n, wid)
                     idx.set_entry(rel_n, "dir", st_o.st_mode, wid, "rename_to",
                                   opaque=1 if dst_shadows_lower else None)
+                    if src_shadowed_lower:
+                        idx.set_entry(rel_o, "whiteout", 0, wid, "rename_from")
+                    else:
+                        idx.del_entry(rel_o, op="rename_from", writer_id=wid)
+                elif is_reg:
+                    # Regular file: NO os.rename — blob stays at its rowid address.
+                    # rename_row moves the index entry in place (keeps rowid+blob).
+                    idx.rename_row(rel_o, rel_n, wid)
+                    if dst_shadows_lower:
+                        # UPSERT to set opaque without changing rowid/kind.
+                        idx.set_entry(rel_n, "file", st_o.st_mode, wid, "rename_to",
+                                      opaque=1)
+                    if src_shadowed_lower:
+                        idx.set_entry(rel_o, "whiteout", 0, wid, "rename_from")
+                    # rename_row already removed rel_o from the index; if src was NOT
+                    # lower-shadowed, nothing more to do (del_entry already implicit).
                 else:
-                    knd = ("symlink" if stat_mod.S_ISLNK(st_o.st_mode) else "file")
-                    idx.set_entry(rel_n, knd, st_o.st_mode, wid, "rename_to",
-                                  opaque=1 if dst_shadows_lower else None)
-                if src_shadowed_lower:
-                    idx.set_entry(rel_o, "whiteout", 0, wid, "rename_from")
-                else:
-                    idx.del_entry(rel_o, op="rename_from", writer_id=wid)
+                    # Symlink: move the real up artifact.
+                    upo = self._upper_path(sid, rel_o)
+                    try:
+                        os.rename(upo, upn)
+                    except OSError as e:
+                        raise pyfuse3.FUSEError(e.errno or errno.EIO)
+                    idx.rename_row(rel_o, rel_n, wid)
+                    if dst_shadows_lower:
+                        idx.set_entry(rel_n, "symlink", st_o.st_mode, wid, "rename_to",
+                                      opaque=1)
+                    if src_shadowed_lower:
+                        idx.set_entry(rel_o, "whiteout", 0, wid, "rename_from")
                 self._remap_inode_subtree(sid, rel_o, rel_n)
                 # rename = remove-old + add-new for the live map.
                 self._notify(sid, rel_o, "deleted")
@@ -3204,13 +3324,13 @@ def _open_index_ro(shm_dir) -> "Index | None":
 def consolidate(shm_dir, session_id: str, cmd: list, index: "Index | None" = None,
                 progress=None) -> None:
     """Finish a box: fill the NULL content blobs of its single sqlar from the overlay
-    upper, then tear the upper down. consolidate does NOT copy rows or translate
-    schemas — each entry row already exists (the FUSE layer upserted it on the
-    mutating op with data=NULL); for a file/symlink we just UPDATE that SAME row's
-    blob with the bytes the box wrote into the upper. Deletions/opacity are already
-    rows (tombstones); opaque dirs expand into per-lower-child tombstones. Writer
-    provenance per path is recorded into the `provenance` table. Afterwards the sqlar
-    is self-contained and the backing tree can be freed. Idempotent and additive.
+    upper (symlinks) and the pool blobs (regular files). consolidate does NOT copy rows
+    or translate schemas — each entry row already exists (the FUSE layer upserted it
+    on the mutating op with data=NULL); for a file we UPDATE that SAME row's blob with
+    the bytes from the pool blob; for a symlink we read from up/<rel>. Deletions/opacity
+    are already rows (tombstones); opaque dirs expand into per-lower-child tombstones.
+    Writer provenance per path is recorded into the `provenance` table. Afterwards the
+    sqlar is self-contained and the backing tree can be freed. Idempotent and additive.
 
     File rules are consulted first, top-to-bottom: a matching 'apply' writes the
     change to the host and drops the row, a matching 'discard' just drops the row —
@@ -3226,6 +3346,8 @@ def consolidate(shm_dir, session_id: str, cmd: list, index: "Index | None" = Non
     idx = index if index is not None else _open_index_ro(shm_dir)
     frules = load_file_rules()
     sp = sqlar_path(session_id)
+    # Pool id for this box: needed to locate blob files.
+    box_id = ensure_box_id(session_id)
     sq = _sqlar_open(sp)
     def _set_blob(rel, content: bytes, mode, mtime_ns) -> None:
         data, sz = _sqlar_deflate(content)
@@ -3240,19 +3362,22 @@ def consolidate(shm_dir, session_id: str, cmd: list, index: "Index | None" = Non
         sq.execute("DELETE FROM sqlar WHERE name=?", (rel,))
         sq.execute("DELETE FROM provenance WHERE path=?", (rel,))
     moved = []
-    # 1) created/modified files + symlinks in the upper (dirs are structural).
+    blob_paths_to_evict = []
+    # 1) symlinks in the upper (regular files are now in the pool, not up/).
+    #    The os.walk finds only dirs and symlinks; the ap.is_file() branch is
+    #    a no-op since regular files no longer live in up/.
     paths = []
     for root, dirs, names in os.walk(upper, onerror=lambda _e: None):
         for nm in names: paths.append(Path(root) / nm)
         for d in dirs:
             p = Path(root) / d
             if p.is_symlink(): paths.append(p)
-    ordered = sorted(set(paths)); total = len(ordered)
+    ordered = sorted(set(paths)); total_upper = len(ordered)
     for done, ap in enumerate(ordered, 1):
         rel = str(ap.relative_to(upper))
         act = frules.decide(rel)                         # apply / discard / passthrough / None
         if progress is not None:
-            try: progress(done, total)
+            try: progress(done, total_upper)
             except Exception: pass
         if act in ("discard", "passthrough"):
             _sq_remove(rel)
@@ -3273,6 +3398,8 @@ def consolidate(shm_dir, session_id: str, cmd: list, index: "Index | None" = Non
                 p = _prov(rel)
                 if p: _sqlar_put_provenance(sq, rel, p)
             elif ap.is_file():
+                # Regular files no longer live in up/; a file here is unexpected
+                # but handle it gracefully (fold it in, then remove).
                 st = ap.stat()
                 _set_blob(rel, ap.read_bytes(), st.st_mode, st.st_mtime_ns)
                 p = _prov(rel)
@@ -3282,6 +3409,40 @@ def consolidate(shm_dir, session_id: str, cmd: list, index: "Index | None" = Non
         except OSError:
             continue
         moved.append(ap)
+    # 1b) regular-file rows: bytes live in pool blobs (data IS NULL).
+    file_rows = sq.execute(
+        "SELECT rowid, name, mode FROM sqlar WHERE data IS NULL").fetchall()
+    for rowid, rel, mode in file_rows:
+        if not stat_mod.S_ISREG(mode): continue         # dir/symlink/tombstone rows
+        bp = blob_path(box_id, rowid)
+        if not bp.exists(): continue                     # no blob (not yet written)
+        act = frules.decide(rel)
+        try:
+            bst = os.stat(bp)
+            mtime_ns = bst.st_mtime_ns
+            bmode = bst.st_mode
+            content = bp.read_bytes()
+        except OSError:
+            continue
+        if act in ("discard", "passthrough"):
+            _sq_remove(rel)
+            blob_paths_to_evict.append(bp); continue
+        if act == "apply":
+            # Write bytes to the host and drop the row.
+            host = Path("/") / rel
+            try:
+                host.parent.mkdir(parents=True, exist_ok=True)
+                host.write_bytes(content)
+                try: os.chmod(host, stat_mod.S_IMODE(mode))
+                except OSError: pass
+                _restore_host_mtime_ns(host, mtime_ns, is_symlink=False)
+            except OSError: pass
+            _sq_remove(rel)
+            blob_paths_to_evict.append(bp); continue
+        _set_blob(rel, content, mode, mtime_ns)
+        p = _prov(rel)
+        if p: _sqlar_put_provenance(sq, rel, p)
+        blob_paths_to_evict.append(bp)
     # 2) deletions (whiteouts) from the index -> tombstone rows (already present, but
     #    re-assert for the orphaned-overlay path) + provenance.
     if idx is not None:
@@ -3303,7 +3464,7 @@ def consolidate(shm_dir, session_id: str, cmd: list, index: "Index | None" = Non
             else:
                 _sq_remove(rel)
         # 3) opaque dirs: expand into per-lower-child tombstones for children not
-        #    re-materialized in the upper.
+        #    re-materialized in the upper or the pool.
         for drel in idx.opaque_dirs():
             lower = Path("/") / drel
             if not lower.is_dir(): continue
@@ -3312,59 +3473,74 @@ def consolidate(shm_dir, session_id: str, cmd: list, index: "Index | None" = Non
                     crel = os.path.relpath(os.path.join(lroot, nm), "/")
                     if (upper / crel).exists() or (upper / crel).is_symlink():
                         continue                          # re-materialized in upper
+                    # check pool for file entries
+                    row = sq.execute("SELECT rowid, mode FROM sqlar WHERE name=?",
+                                     (crel,)).fetchone()
+                    if row and stat_mod.S_ISREG(row[1]) and blob_path(box_id, row[0]).exists():
+                        continue                          # re-materialized in pool
                     if frules.decide(crel) in ("apply", "discard", "passthrough"):
                         continue
                     _sqlar_put_tombstone(sq, crel)
     sq.commit(); sq.close()
     for ap in moved:
         remove_upper_entry(ap); cleanup_dirs(upper, ap.parent)
+    for bp in blob_paths_to_evict:
+        try: bp.unlink()
+        except OSError: pass
     if own_index and idx is not None:
         idx.close()
 
 def unconsolidate(shm_dir, session_id: str) -> None:
     """The inverse of consolidate(): re-materialize a finished box's sqlar back into a
-    live overlay upper so a re-run (`slopbox NAME -- cmd`) sees its accumulated state.
-    For every non-whiteout row, recreate the entry under up/<rel> — a directory, a
-    symlink, or a file whose bytes are inflated from the blob — carrying its mode and
-    exact ns mtime, then NULL the row's blob. That restores the live invariant (bytes
-    live in the upper; the sqlar row's data is NULL until the next consolidate fills
-    it again). Whiteouts and opacity need no upper artifact: the fresh Index loads them
-    straight from these same rows. Idempotent — an already-live (NULL-blob) file row is
-    left as-is."""
+    live overlay. Dirs and symlinks are recreated as real up/<rel> artifacts (unchanged).
+    Regular files: bytes are inflated and written to the pool blob (blob_path) instead
+    of up/<rel>; the shard dir is created; then the row's data is NULLed. Whiteouts and
+    opacity need no upper artifact. Idempotent — an already-live (NULL-blob) file row
+    whose pool blob exists is left as-is."""
     upper = Path(shm_dir) / "up"
     upper.mkdir(parents=True, exist_ok=True)
     sp = sqlar_path(session_id)
     if not sp.exists(): return
+    # Pool id for this box.
+    box_id = ensure_box_id(session_id)
     sq = _sqlar_open(sp)
     try:
         # ORDER BY name puts a directory immediately before its children, so parents
         # exist before we write into them (we also mkdir parents defensively).
-        rows = sq.execute("SELECT name, mode, sz, data, mtime FROM sqlar"
+        rows = sq.execute("SELECT rowid, name, mode, sz, data, mtime FROM sqlar"
                           " ORDER BY name").fetchall()
         cleared = []
-        for name, mode, sz, data, mtime in rows:
+        for rowid, name, mode, sz, data, mtime in rows:
             kind = _kind_of_mode(mode)
             if kind == "whiteout": continue
-            dst = upper / name
             try:
                 if kind == "dir":
+                    dst = upper / name
                     dst.mkdir(parents=True, exist_ok=True)
                     try: os.chmod(dst, stat_mod.S_IMODE(mode))
                     except OSError: pass
                     continue                       # dirs carry no blob to clear
-                if data is None: continue          # already live (NULL blob): leave it
+                if data is None:
+                    # Already live (NULL blob). For a file: if the pool blob already
+                    # exists the entry is in the correct live state — leave it.
+                    continue
                 blob = bytes(data)
                 content = blob if len(blob) == sz else zlib.decompress(blob)
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                if dst.is_symlink() or dst.exists(): remove_upper_entry(dst)
                 if kind == "symlink":
+                    dst = upper / name
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    if dst.is_symlink() or dst.exists(): remove_upper_entry(dst)
                     os.symlink(os.fsdecode(content), dst)
                     _restore_host_mtime_ns(dst, mtime, is_symlink=True)
                 else:
-                    dst.write_bytes(content)
-                    try: os.chmod(dst, stat_mod.S_IMODE(mode))
+                    # Regular file: write to pool blob, NOT up/<rel>.
+                    bp = blob_path(box_id, rowid)
+                    bp.parent.mkdir(parents=True, exist_ok=True)
+                    if bp.exists(): bp.unlink()
+                    bp.write_bytes(content)
+                    try: os.chmod(bp, stat_mod.S_IMODE(mode))
                     except OSError: pass
-                    _restore_host_mtime_ns(dst, mtime, is_symlink=False)
+                    _restore_host_mtime_ns(bp, mtime, is_symlink=False)
                 cleared.append(name)
             except OSError:
                 continue

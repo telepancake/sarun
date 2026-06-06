@@ -81,8 +81,10 @@ def test_readthrough_and_create():
         # create a new file
         r = fx.sh("mkdir -p sub && echo hello > sub/new.txt && cat sub/new.txt")
         check(r.returncode == 0 and r.stdout == "hello\n", "create file in new subdir")
-        check((fx.up / "sub" / "new.txt").read_text() == "hello\n",
-              "created file landed in upper")
+        # file bytes are now in the pool, not up/<rel>
+        blob = m.blob_path(fx.index.box_id, fx.index.row_id("sub/new.txt"))
+        check(blob.read_bytes() == b"hello\n",
+              "created file bytes landed in pool blob")
         check(fx.index.kind_of("sub/new.txt") == "file", "index: created file = 'file'")
         check(fx.index.kind_of("sub") == "dir", "index: parent dir tracked")
     finally:
@@ -103,7 +105,10 @@ def test_copyup_modify():
         target = "etc_copy_test_marker"
         r2 = fx.sh(f"printf 'x' > {target}")
         check(r2.returncode == 0, "create marker via overlay")
-        check((fx.up / target).exists(), "marker in upper")
+        # file bytes are in the pool blob, not up/<rel>
+        rid = fx.index.row_id(target)
+        check(rid is not None and m.blob_path(fx.index.box_id, rid).exists(),
+              "marker blob in pool")
     finally:
         fx.stop()
 
@@ -316,8 +321,11 @@ def test_nested_lower_chaining():
         check(r.stdout == "from-parent\nfrom-child\n",
               "child copies up the parent file and appends to its own copy")
         check(cidx.kind_of("pfile.txt") == "file", "child upper captured the file")
-        check((pbk / "up" / "pfile.txt").read_text() == "from-parent\n",
-              "parent's upper is untouched by the child's write")
+        # parent's pool blob must be untouched (child wrote to its own blob)
+        p_rid = pidx.row_id("pfile.txt")
+        p_blob = m.blob_path(pidx.box_id, p_rid) if p_rid is not None else None
+        check(p_blob is not None and p_blob.read_bytes() == b"from-parent\n",
+              "parent's pool blob is untouched by the child's write")
         # (3) a parent whiteout of a host file hides it from the child too.
         if Path("/etc/hostname").exists():
             sh(proot, "rm etc/hostname")
