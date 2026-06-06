@@ -430,6 +430,30 @@ def test_hardlink_as_copy():
         fx.stop()
 
 
+def test_rename_dir_replace_no_ghost():
+    """Renaming a dir OVER a populated overlay dir must not leave the destination's
+    prior children behind as ghost rows / orphaned pool blobs (reparent only renames
+    the source subtree; the destination subtree must be pruned first)."""
+    fx = MountFixture()
+    try:
+        fx.start()
+        # dest dir with its own overlay file (row + pool blob), source dir with another
+        r = fx.sh("mkdir d2 && printf 'old\\n' > d2/old.txt && "
+                  "mkdir d1 && printf 'new\\n' > d1/new.txt && "
+                  "mv -T d1 d2 && cat d2/new.txt; echo rc=$?")
+        check("new" in r.stdout and "rc=0" in r.stdout, "mv -T dir over populated dir")
+        old_rid = fx.index.row_id("d2/old.txt")
+        check(fx.index.kind_of("d2/old.txt") is None,
+              "destination's prior child is gone (no ghost row)")
+        check(old_rid is None, "ghost row id cleared")
+        # the merged listing shows only the source's child
+        r = fx.sh("ls d2")
+        check(r.stdout.strip() == "new.txt", "renamed dir shows only the source content")
+        check(fx.index.kind_of("d2/new.txt") == "file", "source child reparented")
+    finally:
+        fx.stop()
+
+
 if __name__ == "__main__":
     for t in (test_readthrough_and_create, test_copyup_modify,
               test_otrunc_rewrite_shorter, test_delete_whiteout,
@@ -437,7 +461,8 @@ if __name__ == "__main__":
               test_rename, test_lower_symlink_copyup_preserves_type,
               test_passthrough_acts_on_host_records_nothing,
               test_nested_lower_chaining,
-              test_lazy_file_materialization, test_hardlink_as_copy):
+              test_lazy_file_materialization, test_hardlink_as_copy,
+              test_rename_dir_replace_no_ghost):
         print(f"\n== {t.__name__} ==")
         try:
             t()

@@ -1755,6 +1755,14 @@ class Index:
     def prune_subtree(self, prefix: str) -> None:
         pref = prefix + "/"
         with self._lock:
+            # Free the pool blobs of any file rows under the prefix before dropping the
+            # rows — otherwise the bytes leak (the row that named them is gone).
+            for rid, mode in self._db.execute(
+                    "SELECT rowid, mode FROM sqlar WHERE name LIKE ? ESCAPE '\\'",
+                    (_like_escape(pref) + "%",)).fetchall():
+                if stat_mod.S_ISREG(mode):
+                    try: blob_path(self.box_id, rid).unlink()
+                    except OSError: pass
             self._db.execute("DELETE FROM sqlar WHERE name LIKE ? ESCAPE '\\'",
                              (_like_escape(pref) + "%",))
             self._db.commit()
@@ -3036,6 +3044,10 @@ def _build_overlay_ops():
                         os.rename(upo, upn)
                     except OSError as e:
                         raise pyfuse3.FUSEError(e.errno or errno.EIO)
+                    # Drop the destination's prior overlay subtree (rows + their pool
+                    # blobs) before moving the source over it — else those entries
+                    # survive as ghosts with orphaned bytes.
+                    idx.prune_subtree(rel_n)
                     idx.reparent(rel_o, rel_n, wid)
                     idx.set_entry(rel_n, "dir", st_o.st_mode, wid, "rename_to",
                                   opaque=1 if dst_shadows_lower else None)
@@ -3149,7 +3161,7 @@ def _build_overlay_ops():
                     raise pyfuse3.FUSEError(e.errno or errno.EIO)
                 ino = self._ino_for(sid, rel_n)
                 self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
-                self._notify(sid)
+                self._notify(sid, rel_n, "created")
                 return self._entry(ino, os.lstat(self._backing_path(sid, rel_n)))
             finally:
                 self._req_exit()
