@@ -201,6 +201,7 @@ def mnt_point() -> Path:
     return runtime_home() / "mnt"
 
 SOCK_PATH      = str(runtime_home() / "ui.sock")        # control + FD channel
+UI_SOCK_INBOX  = "/run/slopbox/ui.sock"                  # fixed in-box path for the above
 MITM_CONFDIR   = data_home() / "mitmproxy"              # CA, generated once
 CA_CERT        = MITM_CONFDIR / "mitmproxy-ca-cert.pem"
 RULES_FILE     = config_home() / "netrules"             # allow/deny network rules
@@ -4866,7 +4867,17 @@ class Supervisor:
         root_prov["argv"] = list(cmd)
         index.process_from_prov(root_prov, root=True)
         self.indexes[sid] = index
-        self.mount.add_session(sid, up, index, passthrough=direct)
+        # Parent sid: kernel-derived only (_derived_parent_sid, injected by ChannelServer
+        # from SO_PEERCRED + PPid walk).  Never taken from the message body itself.
+        parent_sid = msg.get("_derived_parent_sid")   # None for top-level boxes
+        if parent_sid is not None:
+            # Fail closed: if a parent was derived but is no longer live, refuse the
+            # registration rather than silently promoting to a top-level box.
+            ps = self.sessions.get(parent_sid)
+            if ps is None or not ps.live:
+                self.indexes.pop(sid, None)
+                return dict(ok=False, error=f"derived parent session {parent_sid!r} is not live")
+        self.mount.add_session(sid, up, index, passthrough=direct, parent=parent_sid)
         # CA-augmented trust bundle as virtual files, if networked.
         net = bool(msg.get("want_net"))
         if net:
@@ -5510,6 +5521,53 @@ def _recvmsg_blocking(conn):
         conn.setblocking(False)
 
 
+def _ppid_of(pid: int) -> int:
+    """PPid of pid from /proc/<pid>/status; 0 if unreadable."""
+    v = _proc_status_field(pid, "PPid")
+    return v if v is not None else 0
+
+
+def _derive_parent_sid(peer_pid: int, sup: "Supervisor") -> "str | None":
+    """Given the host-namespace pid of the connecting runner, walk the /proc PPid
+    chain upward and return the sid of the first live session whose root tgids
+    contain an ancestor of peer_pid.  Returns None if peer_pid is not inside any
+    known session's process forest (i.e. this is a top-level box).
+
+    Security: peer_pid comes from SO_PEERCRED on the host-side control socket, so
+    it is already in the host pid namespace — no pidfd/fdinfo dance needed here.
+    The sid is never taken from the message body; only this kernel-derived mapping
+    is trusted."""
+    if peer_pid <= 1:
+        return None
+    # Build {root_tgid -> sid} for every CURRENTLY LIVE session with a live Index.
+    root_map: dict = {}
+    for sid, idx in sup.indexes.items():
+        sess = sup.sessions.get(sid)
+        if sess is None or not sess.live:
+            continue
+        for rt in idx.roots():
+            if rt > 0:
+                root_map[rt] = sid
+    if not root_map:
+        return None
+    # Walk the PPid chain from peer_pid upward; first match wins.
+    seen: set = set()
+    pid = tgid_of(peer_pid)
+    for _ in range(64):
+        if pid <= 1:
+            break
+        if pid in seen:
+            break
+        seen.add(pid)
+        if pid in root_map:
+            return root_map[pid]
+        ppid = _ppid_of(pid)
+        if ppid <= 1:
+            break
+        pid = tgid_of(ppid)
+    return None
+
+
 class ChannelServer:
     """
     The UI control socket (ui.sock). It carries control messages ONLY (register /
@@ -5542,6 +5600,15 @@ class ChannelServer:
             asyncio.ensure_future(self._handle(conn))
 
     async def _handle(self, conn: socket.socket) -> None:
+        # Read SO_PEERCRED BEFORE setblocking(False): it's a getsockopt, not a recv,
+        # so it works at any blocking mode, but doing it first avoids any race.
+        # The control socket is host-side, so the pid is already in the host namespace.
+        try:
+            _cr = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
+                                  struct.calcsize("3i"))
+            _peer_pid, _, _ = struct.unpack("3i", _cr)
+        except OSError:
+            _peer_pid = 0
         conn.setblocking(False)
         try:
             # Control client: each line is JSON. Any ancillary FDs on this socket are
@@ -5554,7 +5621,7 @@ class ChannelServer:
                 if b"\n" in buf:
                     line, buf = buf.split(b"\n", 1)
                     if line.strip():
-                        reply = await self._dispatch_control(line)
+                        reply = await self._dispatch_control(line, _peer_pid)
                         if reply is not None:
                             try:
                                 await self._loop.sock_sendall(
@@ -5565,7 +5632,7 @@ class ChannelServer:
                 more = await self._loop.sock_recv(conn, 4096)
                 if not more:
                     if buf.strip():
-                        reply = await self._dispatch_control(buf)
+                        reply = await self._dispatch_control(buf, _peer_pid)
                         if reply is not None:
                             try:
                                 await self._loop.sock_sendall(
@@ -5580,12 +5647,15 @@ class ChannelServer:
             try: conn.close()
             except OSError: pass
 
-    async def _dispatch_control(self, line: bytes) -> "dict | None":
+    async def _dispatch_control(self, line: bytes, peer_pid: int = 0) -> "dict | None":
         try: msg = json.loads(line.decode())
         except json.JSONDecodeError: return None
         t = msg.get("type")
         if t == "register":
             try:
+                # Derive the parent sid from kernel identity (SO_PEERCRED + PPid walk).
+                # The box never supplies this — only kernel-trusted ancestry counts.
+                msg["_derived_parent_sid"] = _derive_parent_sid(peer_pid, self.sup)
                 return self.sup.register(msg)          # acks with the mount path
             except Exception as e:
                 return dict(ok=False, error=str(e))
@@ -5803,16 +5873,21 @@ def cmd_run(cmd, net, trace, direct, session_whitelist, chdir, reuse_sid=None) -
     if not cmd:
         print("slopbox: no command given", file=sys.stderr); return 2
 
+    # A nested runner (launched INSIDE an already-running box) reaches the UI via
+    # UI_SOCK_INBOX (the host socket bind-mounted into the box at a fixed path).  A
+    # top-level runner on the host uses SOCK_PATH.  Pure path-presence: no env var.
+    _ctrl_sock = UI_SOCK_INBOX if os.path.exists(UI_SOCK_INBOX) else SOCK_PATH
+
     # The UI is now the mount provider: it owns the single pyfuse3 overlay and
     # exposes this box as a subfolder under it. So the UI MUST be running — fail
     # fast and clearly otherwise. (We deliberately trade no-UI operation for live
     # feedback + per-write policy; there is no run-without-UI path.)
-    if not ui_is_running(SOCK_PATH):
+    if not ui_is_running(_ctrl_sock):
         print("slopbox: the UI is not running.\n"
               "  The UI owns the overlay mount that the slopbox binds as its root,\n"
               "  so a slopbox cannot run without it. Start the UI first:\n"
               "      slopbox            # (in another terminal)\n"
-              f"  (expected control socket: {SOCK_PATH})", file=sys.stderr)
+              f"  (expected control socket: {_ctrl_sock})", file=sys.stderr)
         return 3
 
     # The session id is the whole identity: it names the live/<sid> backing dir, the
@@ -5830,7 +5905,7 @@ def cmd_run(cmd, net, trace, direct, session_whitelist, chdir, reuse_sid=None) -
     # Register with the UI and BLOCK until it has created live/<sid>, built the
     # index, added the session to the mount, and exposed <mnt>/<sid> — only then
     # does the bwrap bind target exist. The ack carries the absolute mount path.
-    ack = sync_request(SOCK_PATH, type="register", session_id=sid,
+    ack = sync_request(_ctrl_sock, type="register", session_id=sid,
                        cmd=list(cmd), prov=self_prov, root_tgid=os.getpid(),
                        session_whitelist=session_whitelist, want_rerun=rerun,
                        want_net=net, want_trace=trace, want_direct=direct)
@@ -5844,7 +5919,7 @@ def cmd_run(cmd, net, trace, direct, session_whitelist, chdir, reuse_sid=None) -
         # collision on sid (same second + pid is impossible, but be safe) or the
         # UI failed to set up the overlay — retry once with a unique suffix.
         sid = sid + "." + uuid.uuid4().hex[:6]
-        ack = sync_request(SOCK_PATH, type="register", session_id=sid,
+        ack = sync_request(_ctrl_sock, type="register", session_id=sid,
                            cmd=list(cmd), prov=self_prov, root_tgid=os.getpid(),
                            session_whitelist=session_whitelist, want_rerun=False,
                            want_net=net, want_trace=trace, want_direct=direct)
@@ -5890,11 +5965,16 @@ def cmd_run(cmd, net, trace, direct, session_whitelist, chdir, reuse_sid=None) -
         # as its root (own pid/ipc/uts/net namespaces, all caps dropped, runs as
         # you). The bind-as-root confines the box to its subfolder; it cannot reach
         # <mnt>/ or another session's <sid>. No userns, no fd-passing, no inner mount.
+        #
+        # The host control socket is bind-mounted read-only at UI_SOCK_INBOX so that a
+        # nested `./sarun -- cmd` inside the box can reach the UI. Parent identity is
+        # kernel-derived (SO_PEERCRED + PPid walk) at the UI; the box never supplies it.
         args = ["bwrap",
                 "--bind", str(box_root), "/",
                 "--proc", "/proc", "--dev", "/dev",
                 "--ro-bind-try", "/sys", "/sys",
                 "--tmpfs", "/tmp", "--tmpfs", "/run",
+                "--ro-bind", SOCK_PATH, UI_SOCK_INBOX,
                 "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--unshare-net",
                 "--cap-drop", "ALL", "--die-with-parent",
                 "--chdir", chdir or os.getcwd()]
@@ -5954,7 +6034,7 @@ def cmd_run(cmd, net, trace, direct, session_whitelist, chdir, reuse_sid=None) -
     # Tell the UI we exited. The UI runs consolidate() on live/<sid>, removes
     # <mnt>/<sid> from the live set, and deletes live/<sid>. (The runner does NOT
     # consolidate: the UI owns the index/mount and the only live index handle.)
-    sync_send(SOCK_PATH, type="unregister", session_id=sid, owner_token=owner_token,
+    sync_send(_ctrl_sock, type="unregister", session_id=sid, owner_token=owner_token,
               status="finished" if launched else "error",
               exit_code=(code or 0) if launched else 1)
     print(f"slopbox: {sid} exited ({code if launched else 1}). "

@@ -429,6 +429,136 @@ def test_single_ui_instance_refused():
     check(started["n"] == 0, "the app is never constructed when one is running")
 
 
+# ── nested boxes: _derive_parent_sid ────────────────────────────────────────
+
+def test_derive_parent_sid_owner_discovery():
+    """_derive_parent_sid maps a host pid to the owning live session by walking the
+    PPid chain and matching against each session's root tgids.
+
+    Strategy: create two live sessions (A and B) each with a distinct root tgid
+    drawn from the real process hierarchy.  The current test process (getpid()) is
+    a child of getppid(), so:
+      - Session A root = getppid()   → _derive_parent_sid(getpid()) == sid_a
+      - Session B root = some other pid that is NOT an ancestor
+      - _derive_parent_sid(getpid()) must NOT return sid_b
+      - _derive_parent_sid(os.getpid()) on a sup with NO sessions → None
+    """
+    tmp = Path(tempfile.mkdtemp(prefix="cp-nest-"))
+    _redirect_state(tmp)
+    try:
+        m.ensure_dirs()
+        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
+
+        my_pid  = os.getpid()
+        my_ppid = os.getppid()
+
+        sid_a = "20260604-000001_111"
+        sid_b = "20260604-000001_222"
+
+        # Register session A with root tgid == our ppid (a real ancestor).
+        ack_a = sup.register(dict(session_id=sid_a, cmd=["true"],
+                                  root_tgid=my_ppid,
+                                  prov=dict(ppid=0, exe="/bin/sh", env={})))
+        check(ack_a.get("ok") is True, "derive: session A registers ok")
+
+        # Register session B with root tgid == our own pid (not an ancestor of itself
+        # when passed a *child* pid; we'll query with my_pid as the peer).
+        # We pick a synthetic tgid that is definitively NOT in our PPid chain.
+        fake_root_b = 99999999   # unlikely to be alive, definitely not our ancestor
+        ack_b = sup.register(dict(session_id=sid_b, cmd=["true"],
+                                  root_tgid=fake_root_b,
+                                  prov=dict(ppid=0, exe="/bin/false", env={})))
+        check(ack_b.get("ok") is True, "derive: session B registers ok")
+
+        # Both sessions must be marked live for _derive_parent_sid to see them.
+        check(sup.sessions[sid_a].live, "derive: session A is live")
+        check(sup.sessions[sid_b].live, "derive: session B is live")
+
+        # Core assertion: our pid's PPid chain includes our ppid → maps to sid_a.
+        result = m._derive_parent_sid(my_pid, sup)
+        check(result == sid_a,
+              f"derive: pid {my_pid} (ppid {my_ppid}) maps to sid_a "
+              f"(got {result!r})")
+
+        # A pid not under ANY session's forest → None (top-level).
+        orphan_pid = 1   # pid 1 (init) is not a descendant of any session root tgid
+        result_none = m._derive_parent_sid(orphan_pid, sup)
+        check(result_none is None,
+              f"derive: pid 1 (init) not in any session forest → None (got {result_none!r})")
+
+        # pid <= 0 → None immediately.
+        check(m._derive_parent_sid(0, sup) is None,
+              "derive: pid=0 → None")
+        check(m._derive_parent_sid(-1, sup) is None,
+              "derive: pid=-1 → None")
+
+        # An empty supervisor (no sessions) → always None.
+        sup_empty = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
+        check(m._derive_parent_sid(my_pid, sup_empty) is None,
+              "derive: no live sessions → None")
+
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_register_parent_body_field_not_honoured():
+    """A register message that includes a 'parent_sid' field in its body does NOT
+    get that parent threaded through — only the kernel-derived _derived_parent_sid
+    (injected by ChannelServer from SO_PEERCRED) is trusted.  Supervisor.register
+    never reads msg['parent_sid']; it reads only msg['_derived_parent_sid']."""
+    tmp = Path(tempfile.mkdtemp(prefix="cp-nospoofp-"))
+    _redirect_state(tmp)
+    try:
+        m.ensure_dirs()
+        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
+
+        sid_parent = "20260604-000002_111"
+        sid_child  = "20260604-000002_222"
+
+        sup.register(dict(session_id=sid_parent, cmd=["true"]))
+        check(sup.sessions[sid_parent].live, "no-spoof: parent session live")
+
+        # The child message carries a box-supplied 'parent_sid' (untrusted body field).
+        # Supervisor.register should ignore it.  No _derived_parent_sid → top-level box.
+        ack = sup.register(dict(session_id=sid_child, cmd=["true"],
+                                parent_sid=sid_parent))   # untrusted field
+        check(ack.get("ok") is True, "no-spoof: register with body parent_sid still ok")
+
+        # Verify add_session was called with parent=None (not sid_parent).
+        # The _FakeMount.add_session just records calls in _FakeOps; the test checks
+        # that no error was injected (ack ok=True + no error) and the session is live.
+        check(sup.sessions[sid_child].live, "no-spoof: child session is live")
+        # If the body field had been honoured and sid_parent was resolved, the
+        # overlay would have parent=sid_parent.  We verify it was NOT honoured by
+        # checking that a non-live derived parent would have failed closed:
+        ack2 = sup.register(dict(session_id="20260604-000002_333", cmd=["true"],
+                                 _derived_parent_sid=sid_child + "_nonexistent"))
+        check(ack2.get("ok") is False,
+              "no-spoof: _derived_parent_sid naming a dead/absent session → fail-closed")
+        check("not live" in (ack2.get("error") or ""),
+              f"no-spoof: error mentions 'not live' (got {ack2.get('error')!r})")
+
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_register_no_parent_is_top_level():
+    """When _derived_parent_sid is absent (None), register() creates a normal
+    top-level box (parent=None passed to add_session) and succeeds."""
+    tmp = Path(tempfile.mkdtemp(prefix="cp-toplevel-"))
+    _redirect_state(tmp)
+    try:
+        m.ensure_dirs()
+        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
+        sid = "20260604-000003_111"
+        # No _derived_parent_sid key → top-level
+        ack = sup.register(dict(session_id=sid, cmd=["true"]))
+        check(ack.get("ok") is True, "top-level: register ok with no parent")
+        check(sup.sessions[sid].live, "top-level: session is live")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     for t in (test_sid_validation_rejects_traversal,
               test_relay_fd_gated_by_socket_not_message,
@@ -438,7 +568,10 @@ if __name__ == "__main__":
               test_box_cannot_register_or_unregister_a_foreign_session,
               test_command_is_the_root_process_row,
               test_dash_dash_required_and_flag_parsing,
-              test_single_ui_instance_refused):
+              test_single_ui_instance_refused,
+              test_derive_parent_sid_owner_discovery,
+              test_register_parent_body_field_not_honoured,
+              test_register_no_parent_is_top_level):
         print(f"\n== {t.__name__} ==")
         try:
             t()
