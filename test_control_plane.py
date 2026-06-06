@@ -1053,6 +1053,308 @@ def test_register_reply_fd_toplevel_no_fd():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+# ── scoped dotted box names ──────────────────────────────────────────────────
+
+def test_dotted_name_validation():
+    """valid_dotted_name accepts dotted paths and rejects unsafe/malformed names."""
+    check(m.valid_dotted_name("A"), "dotted: single segment accepted")
+    check(m.valid_dotted_name("MYBOX"), "dotted: multi-char accepted")
+    check(m.valid_dotted_name("A.B"), "dotted: two segments accepted")
+    check(m.valid_dotted_name("A.B.C"), "dotted: three segments accepted")
+    check(m.valid_dotted_name("FOO.BAR2-BAZ"), "dotted: dash in segment accepted")
+    check(not m.valid_dotted_name(""), "dotted: empty string rejected")
+    check(not m.valid_dotted_name("."), "dotted: bare dot rejected")
+    check(not m.valid_dotted_name(".."), "dotted: '..' rejected")
+    check(not m.valid_dotted_name(".A"), "dotted: leading dot rejected")
+    check(not m.valid_dotted_name("A."), "dotted: trailing dot rejected")
+    check(not m.valid_dotted_name("A..B"), "dotted: consecutive dots rejected")
+    check(not m.valid_dotted_name("A/B"), "dotted: slash rejected")
+    check(not m.valid_dotted_name("a.B"), "dotted: lowercase segment rejected")
+    check(not m.valid_dotted_name("A.b"), "dotted: lowercase second segment rejected")
+    check(not m.valid_dotted_name("A-.B"), "dotted: trailing dash in segment rejected")
+    # valid_sid now accepts dotted names
+    check(m.valid_sid("A.B"), "valid_sid: dotted name accepted")
+    check(m.valid_sid("A.B.C"), "valid_sid: triple-dotted name accepted")
+    check(not m.valid_sid(".."), "valid_sid: '..' still rejected")
+    check(not m.valid_sid("A/B"), "valid_sid: slash still rejected")
+
+
+def test_host_register_top_level_name():
+    """HOST: register with a single-segment NAME (no parent) creates a top-level box."""
+    tmp = Path(tempfile.mkdtemp(prefix="cp-dn-tl-"))
+    _redirect_state(tmp)
+    try:
+        m.ensure_dirs()
+        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
+        ack = sup.register(dict(session_id="ALPHA", cmd=["true"]))
+        check(ack.get("ok") is True, "host-tl: register A ok")
+        check("ALPHA" in sup.sessions, "host-tl: ALPHA in sessions")
+        check(sup.sessions["ALPHA"].parent is None, "host-tl: ALPHA parent is None")
+        check(sup.sessions["ALPHA"].live, "host-tl: ALPHA is live")
+        # born timestamp set so age sorting works
+        born = sup.sessions["ALPHA"].born
+        check(bool(born), f"host-tl: born is set (got {born!r})")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_host_register_dotted_child():
+    """HOST: A.B with A live → creates child B of A (parent = A)."""
+    tmp = Path(tempfile.mkdtemp(prefix="cp-dn-child-"))
+    _redirect_state(tmp)
+    try:
+        m.ensure_dirs()
+        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
+        # Create parent A first.
+        ack_a = sup.register(dict(session_id="ALPHA", cmd=["true"]))
+        check(ack_a.get("ok") is True, "host-child: ALPHA registers ok")
+        # Create child A.B.
+        ack_ab = sup.register(dict(session_id="ALPHA.BETA", cmd=["true"]))
+        check(ack_ab.get("ok") is True, f"host-child: ALPHA.BETA registers ok (got {ack_ab})")
+        check("ALPHA.BETA" in sup.sessions, "host-child: ALPHA.BETA in sessions")
+        check(sup.sessions["ALPHA.BETA"].parent == "ALPHA",
+              "host-child: ALPHA.BETA parent is ALPHA")
+        check(sup.sessions["ALPHA.BETA"].live, "host-child: ALPHA.BETA is live")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_host_register_dotted_child_finished_parent():
+    """HOST: A.B with A finished (sqlar on disk) → parent resolves to A's sqlar."""
+    tmp = Path(tempfile.mkdtemp(prefix="cp-dn-finpar-"))
+    _redirect_state(tmp)
+    try:
+        m.ensure_dirs()
+        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
+        # Write a minimal sqlar for the parent AFTER the Supervisor is created so that
+        # ALPHA exists on disk but is not a live session (discover_sessions already ran).
+        sp = m.sqlar_path("ALPHA")
+        sp.parent.mkdir(parents=True, exist_ok=True)
+        import sqlite3
+        conn = sqlite3.connect(str(sp))
+        conn.execute("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT)")
+        conn.execute("INSERT OR REPLACE INTO meta VALUES('born','20260101-000000_1')")
+        conn.commit(); conn.close()
+        # ALPHA is finished (sqlar exists, NOT live).
+        check(not (sup.sessions.get("ALPHA") and sup.sessions["ALPHA"].live),
+              "host-finpar: ALPHA not live")
+        check(m.sqlar_path("ALPHA").exists(), "host-finpar: ALPHA sqlar exists")
+
+        ack = sup.register(dict(session_id="ALPHA.BETA", cmd=["true"]))
+        check(ack.get("ok") is True, f"host-finpar: ALPHA.BETA registers ok (got {ack})")
+        check(sup.sessions["ALPHA.BETA"].parent == "ALPHA",
+              "host-finpar: parent is ALPHA (finished)")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_host_register_dotted_parent_not_existing():
+    """HOST: A.B with A NOT existing → fail-closed with a clear error."""
+    tmp = Path(tempfile.mkdtemp(prefix="cp-dn-nopar-"))
+    _redirect_state(tmp)
+    try:
+        m.ensure_dirs()
+        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
+        ack = sup.register(dict(session_id="ALPHA.BETA", cmd=["true"]))
+        check(ack.get("ok") is False, "host-nopar: rejected (ok False)")
+        check("ALPHA" in (ack.get("error") or ""),
+              f"host-nopar: error mentions missing parent (got {ack.get('error')!r})")
+        # Nothing created.
+        check("ALPHA.BETA" not in sup.sessions, "host-nopar: no session created")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_inbox_register_relname():
+    """IN-BOX: relname=B with enclosing A → absolute A.B, parent A (authoritative)."""
+    tmp = Path(tempfile.mkdtemp(prefix="cp-dn-inbox-"))
+    _redirect_state(tmp)
+    try:
+        m.ensure_dirs()
+        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
+        # Register the parent (enclosing) box.
+        ack_a = sup.register(dict(session_id="ALPHA", cmd=["parent"]))
+        check(ack_a.get("ok") is True, "inbox: ALPHA registers ok")
+
+        # Simulate in-box child: relname=BETA, _derived_parent_sid=ALPHA (kernel-derived).
+        ack_c = sup.register(dict(
+            session_id="20260606-000000_123",   # temp auto-sid (UI replaces it)
+            relname="BETA",
+            _derived_parent_sid="ALPHA",
+            cmd=["child"]))
+        check(ack_c.get("ok") is True, f"inbox: ALPHA.BETA registers ok (got {ack_c})")
+        # UI should have created session ALPHA.BETA, not the temp sid.
+        check("ALPHA.BETA" in sup.sessions,
+              "inbox: resolved sid is ALPHA.BETA (not the temp auto-sid)")
+        check(sup.sessions["ALPHA.BETA"].parent == "ALPHA",
+              "inbox: ALPHA.BETA parent is ALPHA (kernel-derived, not overridable)")
+        check(sup.sessions["ALPHA.BETA"].live, "inbox: ALPHA.BETA is live")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_inbox_relname_with_dot_rejected():
+    """IN-BOX: relname containing a dot or slash is rejected (prevents subtree escape)."""
+    tmp = Path(tempfile.mkdtemp(prefix="cp-dn-escape-"))
+    _redirect_state(tmp)
+    try:
+        m.ensure_dirs()
+        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
+        ack_a = sup.register(dict(session_id="ALPHA", cmd=["parent"]))
+
+        for bad_relname in ("A.B", "../ESCAPE", "/ESCAPE", "A/B"):
+            ack = sup.register(dict(
+                session_id="20260606-000000_123",
+                relname=bad_relname,
+                _derived_parent_sid="ALPHA",
+                cmd=["child"]))
+            check(ack.get("ok") is False,
+                  f"inbox-escape: relname {bad_relname!r} rejected (ok False)")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_inbox_relname_empty_default():
+    """IN-BOX: relname='' → default D<N> name assigned under enclosing box."""
+    tmp = Path(tempfile.mkdtemp(prefix="cp-dn-default-"))
+    _redirect_state(tmp)
+    try:
+        m.ensure_dirs()
+        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
+        ack_a = sup.register(dict(session_id="ALPHA", cmd=["parent"]))
+        check(ack_a.get("ok") is True, "inbox-default: ALPHA registers ok")
+
+        ack_c = sup.register(dict(
+            session_id="20260606-000000_789",
+            relname="",       # empty = let the UI assign a default D<N>
+            _derived_parent_sid="ALPHA",
+            cmd=["child"]))
+        check(ack_c.get("ok") is True, f"inbox-default: empty relname ok (got {ack_c})")
+        # The resolved sid must start with "ALPHA." and contain a "D" segment.
+        resolved = [s for s in sup.sessions if s.startswith("ALPHA.")]
+        check(len(resolved) == 1, f"inbox-default: exactly one ALPHA.* session (got {resolved})")
+        child_sid = resolved[0]
+        seg = child_sid.split(".", 1)[1]
+        check(seg.startswith("D"), f"inbox-default: segment starts with D (got {seg!r})")
+        check(sup.sessions[child_sid].parent == "ALPHA",
+              "inbox-default: parent is ALPHA")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_inbox_trust_kernel_parent_not_body():
+    """IN-BOX: a message with relname MUST use the kernel-derived parent, not any
+    parent the box might embed in its session_id or message body."""
+    tmp = Path(tempfile.mkdtemp(prefix="cp-dn-trust-"))
+    _redirect_state(tmp)
+    try:
+        m.ensure_dirs()
+        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
+        # Two parent boxes: ALPHA (live) and EVIL (live).
+        sup.register(dict(session_id="ALPHA", cmd=["alpha"]))
+        sup.register(dict(session_id="EVIL", cmd=["evil"]))
+
+        # A box inside ALPHA tries to forge its parent as EVIL via session_id.
+        # The kernel says _derived_parent_sid=ALPHA — that must win.
+        ack = sup.register(dict(
+            session_id="EVIL.SNEAKY",    # box tries to claim it's under EVIL
+            relname="SNEAKY",
+            _derived_parent_sid="ALPHA", # kernel says it's inside ALPHA
+            cmd=["sneaky"]))
+        check(ack.get("ok") is True, "trust: SNEAKY registers (kernel parent honoured)")
+        # The resolved name should be ALPHA.SNEAKY, not EVIL.SNEAKY.
+        check("ALPHA.SNEAKY" in sup.sessions,
+              "trust: resolved as ALPHA.SNEAKY (kernel wins)")
+        check("EVIL.SNEAKY" not in sup.sessions,
+              "trust: EVIL.SNEAKY NOT created (box-body ignored)")
+        check(sup.sessions["ALPHA.SNEAKY"].parent == "ALPHA",
+              "trust: parent is kernel-derived ALPHA, not body-supplied EVIL")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_default_named_box_born_and_sort():
+    """A default D<N> or explicit named box gets a 'born' timestamp so age/sort works."""
+    tmp = Path(tempfile.mkdtemp(prefix="cp-dn-born-"))
+    _redirect_state(tmp)
+    try:
+        m.ensure_dirs()
+        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
+        ack = sup.register(dict(session_id="MYBOX", cmd=["true"]))
+        check(ack.get("ok") is True, "born: MYBOX registers ok")
+        s = sup.sessions["MYBOX"]
+        check(bool(s.born), f"born: Session.born is set (got {s.born!r})")
+        # parse_sid on a dotted/named sid returns (0, 0) → falls back to born.
+        check(m.parse_sid("MYBOX") == (0.0, 0),
+              "born: parse_sid('MYBOX') returns (0,0)")
+        check(s.started > 0,
+              f"born: Session.started uses born fallback > 0 (got {s.started})")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_dotted_path_safety():
+    """Dotted names with '..' or '/' embedded are rejected before any mkdir."""
+    tmp = Path(tempfile.mkdtemp(prefix="cp-dn-safe-"))
+    _redirect_state(tmp)
+    try:
+        m.ensure_dirs()
+        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
+        bad_names = [
+            "../ESCAPE",
+            "A/B",
+            "A..B",
+            ".HIDDEN",
+            "A.",
+        ]
+        for bad in bad_names:
+            ack = sup.register(dict(session_id=bad, cmd=["true"]))
+            check(ack.get("ok") is False,
+                  f"path-safety: {bad!r} rejected before mkdir")
+            # Verify nothing was created under live_home.
+            lh = m.live_home()
+            if lh.exists():
+                created = [d.name for d in lh.iterdir()
+                           if (d / "up").is_dir()]
+                check(bad not in created,
+                      f"path-safety: no live/{bad!r} dir created")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_rename_to_dotted_name():
+    """rename() accepts dotted names; dotted rename with non-existent parent is rejected."""
+    tmp = Path(tempfile.mkdtemp(prefix="cp-dn-rename-"))
+    _redirect_state(tmp)
+    try:
+        m.ensure_dirs()
+        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
+        # Create and finish box ALPHA.
+        ack = sup.register(dict(session_id="ALPHA", cmd=["true"]))
+        check(ack.get("ok") is True, "rename-dotted: ALPHA registers")
+        sup.unregister(dict(session_id="ALPHA", owner_token=ack["owner_token"],
+                            status="finished"))
+        # Create parent PARENT as a finished sqlar so ALPHA can rename to PARENT.ALPHA.
+        import sqlite3
+        ps = m.sqlar_path("PARENT")
+        ps.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(ps))
+        conn.execute("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT)")
+        conn.commit(); conn.close()
+        sup.sessions["PARENT"] = m.Session(session_id="PARENT", cmd=["p"], live=False,
+                                           status="finished")
+        # Rename ALPHA → PARENT.ALPHA (dotted target).
+        r = sup.rename("ALPHA", "PARENT.ALPHA")
+        check(r.get("ok") is True, f"rename-dotted: rename to PARENT.ALPHA ok (got {r})")
+        check(r.get("sid") == "PARENT.ALPHA", "rename-dotted: sid is PARENT.ALPHA")
+        # Rename to a dotted name whose parent doesn't exist: rejected.
+        r2 = sup.rename("PARENT", "MISSING.CHILD")
+        check(r2.get("ok") is False,
+              "rename-dotted: rename to MISSING.CHILD rejected (parent not exist)")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     for t in (test_sid_validation_rejects_traversal,
               test_relay_fd_gated_by_socket_not_message,
@@ -1071,7 +1373,20 @@ if __name__ == "__main__":
               test_apply_root_box_still_writes_host,
               test_apply_kick_up_finished_parent,
               test_register_reply_fd_nested_box,
-              test_register_reply_fd_toplevel_no_fd):
+              test_register_reply_fd_toplevel_no_fd,
+              # scoped dotted names
+              test_dotted_name_validation,
+              test_host_register_top_level_name,
+              test_host_register_dotted_child,
+              test_host_register_dotted_child_finished_parent,
+              test_host_register_dotted_parent_not_existing,
+              test_inbox_register_relname,
+              test_inbox_relname_with_dot_rejected,
+              test_inbox_relname_empty_default,
+              test_inbox_trust_kernel_parent_not_body,
+              test_default_named_box_born_and_sort,
+              test_dotted_path_safety,
+              test_rename_to_dotted_name):
         print(f"\n== {t.__name__} ==")
         try:
             t()

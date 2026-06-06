@@ -179,13 +179,36 @@ SID_RE = re.compile(r"\d{8}-\d{6}_\d+(\.[0-9a-f]{6})?\Z")
 # (patch/apply/discard/rename) on the command line, and it is a traversal-safe path
 # component (no '/', no '.', no '..') usable directly as the box's <name>.sqlar identity.
 NAME_RE = re.compile(r"[A-Z]([A-Z0-9-]*[A-Z0-9])?\Z")
+# A DOTTED box name: one or more NAME segments separated by '.'.  Each segment must
+# satisfy NAME_RE; the whole string must have no empty segments (no leading/trailing/
+# consecutive dots), no '/' and no '..'.  By construction each segment is traversal-safe,
+# so the whole dotted string is safe as a single path component (we store A.B as one dir).
+DOTTED_NAME_RE = re.compile(
+    r"[A-Z]([A-Z0-9-]*[A-Z0-9])?(\.[A-Z]([A-Z0-9-]*[A-Z0-9])?)* \Z".replace(" ", ""))
 
 def valid_name(name: "str | None") -> bool:
     return bool(isinstance(name, str) and NAME_RE.match(name))
 
+def valid_dotted_name(name: "str | None") -> bool:
+    """True for a dotted-path name: one or more NAME segments joined by '.'.
+    Each segment matches NAME_RE (starts with a capital letter, only CAPS/digits/'-',
+    never ends with '-').  Rejects empty string, leading/trailing dots, consecutive dots
+    ('..'), any '/', and any standalone '..' segment — all traversal-safe by construction.
+    A single-segment name (no dot) is also valid (it equals valid_name)."""
+    if not isinstance(name, str) or not name:
+        return False
+    # Fast structural rejection before the regex: no '/' ever; '..' as a whole name;
+    # leading or trailing '.'.
+    if "/" in name or name.startswith(".") or name.endswith("."):
+        return False
+    for seg in name.split("."):
+        if not NAME_RE.match(seg):   # catches empty seg, '..' etc.
+            return False
+    return True
+
 def valid_sid(sid: "str | None") -> bool:
-    # A box identity is either an auto sid (timestamp_pid) or a renamed box's NAME.
-    return bool(isinstance(sid, str) and (SID_RE.match(sid) or NAME_RE.match(sid)))
+    # A box identity is a timestamp auto-sid, a single-segment NAME, or a dotted NAME path.
+    return bool(isinstance(sid, str) and (SID_RE.match(sid) or valid_dotted_name(sid)))
 
 def relay_dir(session_id: str) -> Path:
     """The per-session directory that holds ONLY this box's relay socket. Bound into
@@ -5726,21 +5749,130 @@ class Supervisor:
         bind target, so the runner can bwrap onto it. Fail-closed: any setup error is
         reported in the ack, never swallowed."""
         sid = msg.get("session_id")
-        # HIGH-2: sid is used as a path component (live/<sid>, <mnt>/<sid>, the relay
-        # dir, the patch/sqlar). Reject anything that isn't the one legitimate shape
-        # BEFORE any mkdir — a traversal sid (".." / a slash) must create nothing.
-        if not valid_sid(sid):
-            return dict(ok=False, error="invalid session_id")
         cmd = msg.get("cmd", [])
+        # HIGH-2: for non-relname messages the session_id is used as a path component.
+        # Reject traversal sids BEFORE any other check (including mount) so that a
+        # bad sid never creates directories.  relname messages supply a temp auto-sid
+        # that the UI will replace — only validate it's not a path-traversal pattern.
+        relname = msg.get("relname")
+        if relname is None:
+            if not valid_sid(sid):
+                return dict(ok=False, error="invalid session_id")
+        else:
+            # For in-box (relname) messages the session_id is a temp auto-sid from the
+            # runner.  It must still be a valid sid (not a traversal string).
+            if sid is not None and not valid_sid(sid):
+                return dict(ok=False, error="invalid session_id")
         if self.mount is None or not self.mount.is_healthy():
             return dict(ok=False, error="overlay mount is not available")
-        # Re-run (`slopbox NAME -- cmd`): the sid is an existing finished box. Refuse if
-        # it is already live, then un-consolidate its sqlar back into a fresh upper so
-        # the new command sees the box's accumulated state.
-        rerun = bool(msg.get("want_rerun"))
+
+        # ── SCOPED DOTTED NAME RESOLUTION ──────────────────────────────────────
+        # Two launch contexts with different trust models:
+        #   IN-BOX  (relname present): runner is inside a parent box; the UI
+        #           derives the parent from kernel ancestry (_derived_parent_sid,
+        #           authoritative). The runner only supplies a SINGLE segment; the
+        #           UI builds the absolute name = <enclosing_name>.<segment>.
+        #   HOST    (no relname): runner is on the host; the name is an absolute
+        #           dotted path (parent = prefix minus last segment, must exist).
+        #
+        # In both cases: non-existent name → CREATE; existing name → RERUN.
+        # Timestamp auto-sids (make_sid) pass through unchanged (no name resolution).
+
+        _derived_parent_sid = msg.get("_derived_parent_sid")  # kernel-derived; None = top-level
+        # relname already read above (for the early HIGH-2 check); reuse it.
+
+        if relname is not None:
+            # ── IN-BOX LAUNCH ──────────────────────────────────────────────────
+            # relname is the box-supplied relative single segment (may be empty for
+            # default naming).  Reject anything that is not a plain single segment
+            # (dots, slashes, or '..' would let a box escape its subtree).
+            # TRUST: parent = _derived_parent_sid ONLY (kernel-derived); the box
+            # cannot choose its own parent via relname or session_id.
+            if relname and (not valid_name(relname) or "." in relname or "/" in relname):
+                return dict(ok=False,
+                            error="invalid relname: must be a single NAME segment "
+                                  "(no dots, no slashes, no '..')")
+            if _derived_parent_sid is None:
+                return dict(ok=False, error="relname supplied but no enclosing box found")
+            enclosing_sess = self.sessions.get(_derived_parent_sid)
+            if enclosing_sess is None or not enclosing_sess.live:
+                return dict(ok=False,
+                            error=f"enclosing box {_derived_parent_sid!r} is not live")
+            # Enclosing box's name (may be a timestamp or a dotted name).
+            enclosing_name = enclosing_sess.session_id
+            if relname:
+                # Absolute name = <enclosing>.<segment>
+                abs_name = enclosing_name + "." + relname
+            else:
+                # Default: assign D<N> so the name is stable and unique.
+                seg = "D" + str(ensure_box_id(make_sid()))
+                abs_name = enclosing_name + "." + seg
+            # Override whatever session_id the runner sent — never trust it for naming.
+            sid = abs_name
+            parent_sid = _derived_parent_sid   # authoritative (kernel-derived)
+
+        else:
+            # ── HOST LAUNCH (or timestamp auto-sid, no name) ───────────────────
+            if sid is None:
+                # No session_id at all — shouldn't happen in normal flow, but guard it.
+                return dict(ok=False, error="missing session_id")
+
+            if valid_dotted_name(sid) and "." in sid:
+                # Dotted host name: parent = prefix (everything before the last dot).
+                # The parent MUST exist (live or finished-sqlar) — fail closed.
+                prefix = sid.rsplit(".", 1)[0]
+                if not self._resolve_session_name(prefix):
+                    return dict(ok=False,
+                                error=f"parent box '{prefix}' does not exist "
+                                      f"(create it before launching a child)")
+                parent_sid = prefix
+            elif valid_name(sid):
+                # Top-level single-segment name: no parent.
+                parent_sid = None
+            elif SID_RE.match(sid):
+                # Timestamp auto-sid: use the kernel-derived parent (existing behaviour).
+                parent_sid = _derived_parent_sid
+            else:
+                # HIGH-2: reject traversal sids BEFORE any mkdir.
+                return dict(ok=False, error="invalid session_id")
+
+            # For dotted/named sids (host launches), validate the full dotted name.
+            if not SID_RE.match(sid) and not valid_dotted_name(sid):
+                return dict(ok=False, error="invalid session_id")
+
+        # HIGH-2: final safety check — sid must be valid before ANY mkdir.
+        if not valid_sid(sid):
+            return dict(ok=False, error="invalid session_id")
+
+        # ── PARENT VALIDATION (non-relname timestamp path) ──────────────────
+        if relname is None and parent_sid is not None and SID_RE.match(sid):
+            # Existing kernel-derived parent check (unchanged from original behaviour).
+            ps = self.sessions.get(parent_sid)
+            if ps is None or not ps.live:
+                return dict(ok=False,
+                            error=f"derived parent session {parent_sid!r} is not live")
+
+        # ── CREATE-VS-RERUN ────────────────────────────────────────────────────
+        # For named boxes the runner may not know whether the box exists; derive
+        # rerun from existence.  For timestamp sids keep the runner's want_rerun flag.
+        if SID_RE.match(sid):
+            rerun = bool(msg.get("want_rerun"))
+        else:
+            rerun = bool(self._resolve_session_name(sid))
+
         if rerun and (sid in self.indexes
                       or (self.sessions.get(sid) and self.sessions[sid].live)):
             return dict(ok=False, error="slopbox is already running")
+
+        # ── DEFAULT born TIMESTAMP for named/D-N boxes ─────────────────────────
+        # Timestamp sids carry their start-time in the name; named boxes store it in
+        # sqlar meta "born" so age/ordering keep working.  Set it on first CREATE only.
+        _born_to_set: "str | None" = None
+        if not SID_RE.match(sid) and not rerun:
+            existing_born = sqlar_meta_get(sqlar_path(sid), "born") or ""
+            if not existing_born:
+                _born_to_set = make_sid()   # fresh timestamp = birth instant
+
         backing = live_dir(sid)
         up = backing / "up"
         try:
@@ -5776,17 +5908,23 @@ class Supervisor:
         root_prov["argv"] = list(cmd)
         index.process_from_prov(root_prov, root=True)
         self.indexes[sid] = index
-        # Parent sid: kernel-derived only (_derived_parent_sid, injected by ChannelServer
-        # from pidfd → _host_pid_from_pidfd → PPid walk).  Never taken from the
-        # message body itself.
-        parent_sid = msg.get("_derived_parent_sid")   # None for top-level boxes
-        if parent_sid is not None:
-            # Fail closed: if a parent was derived but is no longer live, refuse the
-            # registration rather than silently promoting to a top-level box.
-            ps = self.sessions.get(parent_sid)
-            if ps is None or not ps.live:
+        # Parent sid: for in-box launches parent_sid was set above (kernel-derived).
+        # For host dotted names parent_sid was set from the name prefix.
+        # For host timestamp sids parent_sid == _derived_parent_sid (unchanged behaviour).
+        # For in-box, parent_sid is already validated above; for dotted-name host
+        # launches the prefix existence was already checked.
+        if parent_sid is not None and relname is None and not SID_RE.match(sid):
+            # Host dotted-name parent: must exist (live or finished sqlar).
+            # Already verified above via _resolve_session_name; the finished-parent
+            # attach path (_attach_base_session) handles it via add_session(parent=).
+            pass
+        if relname is not None and parent_sid is not None:
+            # In-box: re-verify the enclosing box is still live (race guard).
+            ps2 = self.sessions.get(parent_sid)
+            if ps2 is None or not ps2.live:
                 self.indexes.pop(sid, None)
-                return dict(ok=False, error=f"derived parent session {parent_sid!r} is not live")
+                return dict(ok=False,
+                            error=f"enclosing box {parent_sid!r} is no longer live")
         self.mount.add_session(sid, up, index, passthrough=direct, parent=parent_sid)
         # CA-augmented trust bundle as virtual files, if networked.
         net = bool(msg.get("want_net"))
@@ -5803,10 +5941,16 @@ class Supervisor:
         if _old is not None and _old.run_pidfd >= 0:
             try: os.close(_old.run_pidfd)
             except OSError: pass
+        # Persist the birth timestamp for named boxes so discover_sessions / Session.started
+        # can determine age (timestamp sids carry age in the name; named boxes don't).
+        if _born_to_set:
+            try: sqlar_meta_set(sqlar_path(sid), "born", _born_to_set)
+            except Exception: pass
+        _born = sqlar_meta_get(sqlar_path(sid), "born") or ""
         s = Session(session_id=sid, cmd=cmd, shm_dir=str(backing),
                     status="running", live=True, run_pid=root_prov["tgid"],
-                    born=sqlar_meta_get(sqlar_path(sid), "born") or "",
-                    parent=parent_sid)   # kernel-derived; None for root boxes
+                    born=_born,
+                    parent=parent_sid)   # kernel/name-derived; None for root boxes
         # Dup the runner's pidfd into the session so we own a persistent liveness handle.
         # _handle keeps its own copy and closes it after this call; we need a separate fd.
         _rfd = int(msg.get("_register_pidfd", -1))
@@ -6016,6 +6160,17 @@ class Supervisor:
         return bool(sid and (sid in self.sessions or sqlar_path(sid).exists()
                              or live_dir(sid).exists()))
 
+    def _resolve_session_name(self, name: str) -> "str | None":
+        """Return `name` if it refers to an existing box (live OR finished-with-sqlar),
+        else None.  Used to decide create-vs-rerun for named boxes."""
+        if not name:
+            return None
+        if name in self.sessions:
+            return name
+        if sqlar_path(name).exists():
+            return name
+        return None
+
     def select(self, sid) -> dict:
         """Resolve a box identity (an sid or a renamed box's NAME) and make it the UI's
         selected box (the target of bare `slopbox patch`/`apply`/`discard`/`rename`).
@@ -6030,10 +6185,13 @@ class Supervisor:
         """Rename a FINISHED box to `new_name`, moving its on-disk identity with it:
         <sid>.sqlar (+ wal/shm) and any live/<sid> backing become <new_name>.* . The
         box's birth sid is preserved in meta so its age/timestamp display survives.
-        A running box can't be renamed (its mount/relay/bwrap are keyed by the sid)."""
-        if not valid_name(new_name):
-            return dict(ok=False, error="invalid name: CAPS, digits and '-', "
-                        "start with a letter, no trailing '-'")
+        A running box can't be renamed (its mount/relay/bwrap are keyed by the sid).
+        `new_name` may be a dotted path (e.g. A.B); if dotted, the parent prefix (A)
+        must already exist as a box."""
+        # Accept both single-segment and dotted names; reject everything else.
+        if not valid_dotted_name(new_name):
+            return dict(ok=False, error="invalid name: dotted CAPS segments (e.g. BOB or A.B), "
+                        "no trailing '-' on any segment")
         if not self._box_exists(sid):
             return dict(ok=False, error="no slopbox selected")
         if new_name == sid:
@@ -6044,6 +6202,11 @@ class Supervisor:
             return dict(ok=False, error="slopbox is consolidating; try again in a moment")
         if self._box_exists(new_name):
             return dict(ok=False, error=f"name '{new_name}' is already in use")
+        # Dotted target: require the parent prefix to exist (fail-closed, mirrors register).
+        if "." in new_name:
+            prefix = new_name.rsplit(".", 1)[0]
+            if not self._box_exists(prefix):
+                return dict(ok=False, error=f"parent box '{prefix}' does not exist")
         old_sqlar, new_sqlar = sqlar_path(sid), sqlar_path(new_name)
         try:
             for suf in ("", "-wal", "-shm"):
@@ -6917,11 +7080,46 @@ def cmd_run(cmd, net, trace, direct, session_whitelist, chdir, reuse_sid=None) -
               f"  (expected control socket: {_ctrl_sock})", file=sys.stderr)
         return 3
 
-    # The session id is the whole identity: it names the live/<sid> backing dir, the
-    # <mnt>/<sid> mount subfolder, and the single db (<sid>.sqlar). A re-run reuses an
-    # existing box's identity (`reuse_sid`); a fresh run mints timestamp + our pid.
-    rerun = reuse_sid is not None
-    sid = reuse_sid if rerun else make_sid()
+    # Detect whether we are running INSIDE a box (nested launch) or on the host.
+    # Pure path-presence: the host socket is bind-mounted at UI_SOCK_INBOX inside any
+    # running box (it's the same check that chose _ctrl_sock above).
+    _in_box = (_ctrl_sock == UI_SOCK_INBOX)
+
+    # Build the register message fields for naming.
+    #
+    # IN-BOX launch: send only a RELATIVE single-segment name (flag `relname`) so the
+    # UI can scope it under the kernel-derived enclosing box.  Never send an absolute
+    # name from inside a box — the box must not influence its own parent.
+    #
+    # HOST launch: send the absolute name (possibly dotted) as `session_id`.  The UI
+    # resolves the parent from the name prefix and decides create-vs-rerun.
+    #
+    # Timestamp auto-sids (no user name) use the existing rerun=False / make_sid() path.
+    _extra_reg: dict = {}
+    if _in_box and reuse_sid is not None:
+        # In-box named launch: reuse_sid is the single segment typed by the user.
+        # Reject dots/slashes here to prevent subtree escape (the UI also checks).
+        if not valid_name(reuse_sid) or "." in reuse_sid or "/" in reuse_sid:
+            print(f"slopbox: in-box name must be a single segment (no dots/slashes): "
+                  f"{reuse_sid!r}", file=sys.stderr)
+            return 2
+        _extra_reg["relname"] = reuse_sid
+        sid = make_sid()          # temp auto-sid; UI assigns the real name
+        rerun = False             # UI decides create-vs-rerun from the resolved name
+    elif _in_box and reuse_sid is None:
+        # In-box, no name: send empty relname so the UI assigns a default D<N>.
+        _extra_reg["relname"] = ""
+        sid = make_sid()
+        rerun = False
+    elif not _in_box and reuse_sid is not None:
+        # Host named launch: send the absolute name (may be dotted, e.g. A.B).
+        # The UI resolves the parent from the name prefix and decides create-vs-rerun.
+        sid = reuse_sid
+        rerun = False             # UI decides; we don't know if the name exists
+    else:
+        # Host, no name: plain timestamp auto-sid (original behaviour).
+        sid = make_sid()
+        rerun = False
 
     # Our own HOST-namespace provenance: this runner is the box's root process for this
     # run. The UI persists it as a root process row (tgid == our pid, argv == cmd); a
@@ -6939,18 +7137,19 @@ def cmd_run(cmd, net, trace, direct, session_whitelist, chdir, reuse_sid=None) -
     ack, mount_fd = register_request(_ctrl_sock, type="register", session_id=sid,
                                      cmd=list(cmd), prov=self_prov, root_tgid=os.getpid(),
                                      session_whitelist=session_whitelist, want_rerun=rerun,
-                                     want_net=net, want_trace=trace, want_direct=direct)
+                                     want_net=net, want_trace=trace, want_direct=direct,
+                                     **_extra_reg)
     if not ack or not ack.get("ok") or not ack.get("mount"):
         if mount_fd >= 0:
             try: os.close(mount_fd)
             except OSError: pass
-        if rerun:
-            # A re-run can't relocate to a fresh sid — the identity IS the target box.
-            print("slopbox: could not re-run this slopbox"
+        if reuse_sid is not None:
+            # A named run (create or rerun) can't relocate — the name IS the identity.
+            print("slopbox: could not start slopbox"
                   f"{(' — ' + ack['error']) if ack and ack.get('error') else ''}.",
                   file=sys.stderr)
             return 1
-        # collision on sid (same second + pid is impossible, but be safe) or the
+        # collision on auto-sid (same second + pid is impossible, but be safe) or the
         # UI failed to set up the overlay — retry once with a unique suffix.
         sid = sid + "." + uuid.uuid4().hex[:6]
         ack, mount_fd = register_request(_ctrl_sock, type="register", session_id=sid,
@@ -6965,7 +7164,12 @@ def cmd_run(cmd, net, trace, direct, session_whitelist, chdir, reuse_sid=None) -
                   f"{(' — ' + ack['error']) if ack and ack.get('error') else ''}.",
                   file=sys.stderr)
             return 1
-    box_root = ack["mount"]                      # <mnt>/<sid>
+    box_root = ack["mount"]                      # <mnt>/<resolved_sid>
+    # For in-box named launches the UI resolved a different sid (e.g. PARENT.B) than the
+    # temp auto-sid we sent.  Extract the real sid from the mount path so unregister
+    # uses the right key.  For host launches the sid we sent IS the real sid.
+    sid = Path(box_root).name
+    # For shm_dir, prefer the ack value (UI tells us the real backing path).
     shm_dir = ack.get("shm_dir", str(live_dir(sid)))
     can_net = net and bool(ack.get("net")) and CA_CERT.exists()
     # The owner token is held HERE, in the runner (outside the box). Only we can
@@ -9034,13 +9238,14 @@ def cmd_discard(target=None) -> int:
 
 
 def cmd_rename(target, new_name) -> int:
-    """Rename a slopbox (`target` sid/NAME, else the UI's selection) to NEW_NAME."""
+    """Rename a slopbox (`target` sid/NAME, else the UI's selection) to NEW_NAME.
+    NEW_NAME may be a dotted path (e.g. A.B); the parent must already exist."""
     if not new_name:
         print("slopbox: usage: slopbox [NAME] rename NEWNAME", file=sys.stderr)
         return 2
-    if not valid_name(new_name):
-        print("slopbox: invalid name — CAPS, digits and '-', start with a letter, "
-              "no trailing '-' (e.g. BOB5-24-YES).", file=sys.stderr)
+    if not valid_dotted_name(new_name):
+        print("slopbox: invalid name — dotted CAPS segments (e.g. BOB or A.B), "
+              "no trailing '-' on any segment.", file=sys.stderr)
         return 2
     if not ui_is_running(SOCK_PATH):
         print("slopbox: the UI is not running.", file=sys.stderr); return 3
@@ -9090,20 +9295,27 @@ def main() -> int:
     if argv[0] in ("-h", "--help"):
         print("usage: " + _USAGE); return 0
 
-    # An optional leading box NAME (CAPS) selects that box; the rest of the line then
-    # applies to it. `slopbox BOB patch`, `slopbox BOB rename NEW`, `slopbox BOB -- ls`,
-    # or bare `slopbox BOB` (just select). A missing box is an error.
+    # An optional leading box NAME (dotted or single segment, all-CAPS) selects that
+    # box; the rest of the line then applies to it. `slopbox BOB patch`,
+    # `slopbox A.B rename NEW`, `slopbox BOB -- ls`, or bare `slopbox BOB` (select).
+    # For a `-- cmd`, a non-existent name means CREATE a new box with that name.
+    # A missing existing box (for select/patch/apply/discard/rename) is an error.
     target = None
-    if valid_name(argv[0]):
+    if argv and valid_dotted_name(argv[0]):
         target = argv[0]; argv = argv[1:]
-        if ui_is_running(SOCK_PATH):
-            rep = sync_request(SOCK_PATH, type="select", sid=target)
-            if not rep or not rep.get("ok"):
-                print("slopbox: " + ((rep or {}).get("error")
-                                     or f"no slopbox '{target}'"), file=sys.stderr)
-                return 1
-        elif not (sqlar_path(target).exists() or live_dir(target).exists()):
-            print(f"slopbox: no slopbox '{target}'", file=sys.stderr); return 1
+        # Only try to select an EXISTING box for non-run ops.  For `-- cmd`, the name
+        # might be a NEW box to create; defer the existence check to cmd_run/register.
+        _is_run_op = "--" in argv
+        if not _is_run_op:
+            # select/patch/apply/discard/rename: the box must exist.
+            if ui_is_running(SOCK_PATH):
+                rep = sync_request(SOCK_PATH, type="select", sid=target)
+                if not rep or not rep.get("ok"):
+                    print("slopbox: " + ((rep or {}).get("error")
+                                         or f"no slopbox '{target}'"), file=sys.stderr)
+                    return 1
+            elif not (sqlar_path(target).exists() or live_dir(target).exists()):
+                print(f"slopbox: no slopbox '{target}'", file=sys.stderr); return 1
         if not argv:
             return 0                          # bare `slopbox NAME` just selects
 

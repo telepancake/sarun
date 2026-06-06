@@ -333,6 +333,108 @@ def run_nested_e2e(tmp):
         check(not still, "nested-e2e: overlay unmounted after UI exits")
 
 
+def run_named_box_e2e(tmp):
+    """Launch the UI + a named box (MYBOX) via `slopbox MYBOX -- cmd`.
+
+    Verifies:
+    - The sqlar is written as MYBOX.sqlar (named, not a timestamp sid).
+    - The box has a 'born' meta timestamp so age/sort works.
+    - A second `slopbox MYBOX -- cmd` re-runs the same named box (existing name → rerun).
+    - A dotted child MYBOX.CHILD (parent = MYBOX finished sqlar) registers with the
+      correct parent and produces a MYBOX.CHILD.sqlar.
+    """
+    m = SourceFileLoader("slopbox", SARUN).load_module()
+    e = env_for(tmp)
+    sock = str(Path(e["XDG_RUNTIME_DIR"]) / "slopbox" / "ui.sock")
+    mnt = Path(e["XDG_RUNTIME_DIR"]) / "slopbox" / "mnt"
+    state = Path(e["XDG_STATE_HOME"]) / "slopbox"
+
+    harness = tmp / "ui_harness3.py"
+    harness.write_text(
+        "import os\n"
+        "from importlib.machinery import SourceFileLoader\n"
+        f"m = SourceFileLoader('slopbox', {SARUN!r}).load_module()\n"
+        "m.ensure_dirs()\n"
+        "app = m._make_ui_app()()\n"
+        "app.run(headless=True)\n")
+    ui = subprocess.Popen([PYBIN, str(harness)], env=e,
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    try:
+        if not wait_socket(sock, 30):
+            out = b""
+            try: out = ui.stdout.read(4000) if ui.stdout else b""
+            except Exception: pass
+            raise RuntimeError(f"Named-e2e: UI socket never appeared. UI output:\n"
+                               f"{out.decode(errors='replace')}")
+
+        # Run a named box MYBOX.
+        r = subprocess.run(
+            [PYBIN, SARUN, "MYBOX", "--", "bash", "-c",
+             "echo named-box-ok > /named_proof.txt"],
+            env=e, capture_output=True, text=True, timeout=60)
+        check(r.returncode == 0,
+              f"named-e2e: MYBOX run exited 0 (got {r.returncode}: {r.stderr.strip()[-200:]})")
+        check("UI connected" in r.stderr, "named-e2e: MYBOX runner reports UI connected")
+
+        # Poll for MYBOX.sqlar.
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            if (state / "MYBOX.sqlar").exists():
+                break
+            time.sleep(0.3)
+        check((state / "MYBOX.sqlar").exists(), "named-e2e: MYBOX.sqlar produced")
+
+        if (state / "MYBOX.sqlar").exists():
+            sp = state / "MYBOX.sqlar"
+            names = {n for n, _md, _mt, _sz in m.sqlar_list(sp)}
+            check("named_proof.txt" in names,
+                  "named-e2e: MYBOX sqlar contains named_proof.txt")
+            born = m.sqlar_meta_get(sp, "born")
+            check(bool(born), f"named-e2e: MYBOX born timestamp set (got {born!r})")
+
+        # Run MYBOX.CHILD (dotted child; parent = MYBOX finished sqlar).
+        r2 = subprocess.run(
+            [PYBIN, SARUN, "MYBOX.CHILD", "--", "bash", "-c",
+             "echo child-ok > /child_named_proof.txt"],
+            env=e, capture_output=True, text=True, timeout=60)
+        check(r2.returncode == 0,
+              f"named-e2e: MYBOX.CHILD run exited 0 (got {r2.returncode}: {r2.stderr.strip()[-200:]})")
+
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            if (state / "MYBOX.CHILD.sqlar").exists():
+                break
+            time.sleep(0.3)
+        check((state / "MYBOX.CHILD.sqlar").exists(),
+              "named-e2e: MYBOX.CHILD.sqlar produced")
+
+        if (state / "MYBOX.CHILD.sqlar").exists():
+            sp_c = state / "MYBOX.CHILD.sqlar"
+            names_c = {n for n, _md, _mt, _sz in m.sqlar_list(sp_c)}
+            check("child_named_proof.txt" in names_c,
+                  "named-e2e: MYBOX.CHILD sqlar contains child_named_proof.txt")
+            parent_sid = m.sqlar_meta_get(sp_c, "parent_sid")
+            check(parent_sid == "MYBOX",
+                  f"named-e2e: MYBOX.CHILD parent_sid is MYBOX (got {parent_sid!r})")
+
+    finally:
+        try:
+            ui.send_signal(signal.SIGINT)
+            ui.wait(timeout=10)
+        except Exception:
+            try: ui.kill(); ui.wait(timeout=5)
+            except Exception: pass
+        time.sleep(0.5)
+        still = os.path.ismount(str(mnt))
+        if still:
+            try:
+                subprocess.run(["fusermount3", "-uz", str(mnt)],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               timeout=10)
+            except Exception: pass
+        check(not still, "named-e2e: overlay unmounted after UI exits")
+
+
 def main():
     tmp = Path(tempfile.mkdtemp(prefix="e2e-"))
     try:
@@ -344,6 +446,8 @@ def main():
         run_with_ui(tmp)
         print("\n== nested-box e2e (LAUNCH mechanism) ==")
         run_nested_e2e(tmp)
+        print("\n== named-box e2e (dotted scoped names) ==")
+        run_named_box_e2e(tmp)
     except Exception as ex:
         import traceback; traceback.print_exc(); _fails.append(str(ex))
     finally:
