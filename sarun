@@ -4609,6 +4609,12 @@ def discover_sessions() -> dict:
                     shm_dir=str(live_dir(sid)), live=False)
             s.has_sqlar = bool(sqlar_list(af))
             s.has_flows = has_flows(af)
+            # Restore the parent chain from the sqlar meta so a box discovered after a UI
+            # restart still knows which box it was nested in. Without this, a nested box
+            # comes back with parent=None and apply/promote would target the host instead
+            # of the real parent. Empty/missing meta means a top-level box (parent None).
+            psid = sqlar_meta_get(af, "parent_sid")
+            s.parent = psid or None
             # A renamed box (sid is a NAME, not an auto sid) remembers its birth sid so
             # its age/timestamp display survives the rename.
             if not SID_RE.match(sid):
@@ -4967,12 +4973,21 @@ class SqlarArchive(ChangeSource):
             row = conn.execute("SELECT rowid,data FROM sqlar WHERE name=?", (rel,)).fetchone()
         except sqlite3.Error: row = None
         finally: conn.close()
+        # Compute the resident blob path BEFORE removing the row (the path is derived
+        # from box_id + rowid, not from the row's continued existence).
+        bp = None
         if bid is not None and row is not None and row[1] is None:
-            try:
-                bp = blob_path(int(bid), row[0])
-                if bp.exists(): bp.unlink()
-            except (OSError, ValueError, TypeError): pass
+            try: bp = blob_path(int(bid), row[0])
+            except (ValueError, TypeError): bp = None
+        # Remove the row FIRST: if row-removal fails we must not be left with a resident
+        # row whose blob is gone (a zombie that reads as an empty file). A crash after
+        # row-removal but before the unlink only leaves an orphan blob, which
+        # sweep_orphan_pools reclaims.
         sqlar_remove(self.path, rel)
+        if bp is not None:
+            try:
+                if bp.exists(): bp.unlink()
+            except OSError: pass
 
     def remove(self, rel):
         self._drop_row_and_blob(rel)
@@ -5014,10 +5029,18 @@ class SqlarArchive(ChangeSource):
         if stat_mod.S_ISCHR(mode):               # tombstone → delete
             return dict(kind="delete")
         mtime_ns = sqlar_mtime(self.path, rel)   # stored integer ns; restored on host
+        # The row exists (mode is not None), so the content MUST be readable. A None here
+        # means a resident row whose pool blob is missing — do NOT silently coerce it to
+        # an empty file (that would write a zero-byte file over the lower). Treat it as
+        # "not in archive" so the caller reports an error rather than corrupting data. A
+        # genuinely empty file has data non-NULL with sz=0, so sqlar_content returns b"".
+        content = sqlar_content(self.path, rel)
+        if content is None:
+            return None
         if stat_mod.S_ISLNK(mode):
-            tgt = (sqlar_content(self.path, rel) or b"").decode("utf-8", "surrogateescape")
+            tgt = content.decode("utf-8", "surrogateescape")
             return dict(kind="symlink", target=tgt, mtime_ns=mtime_ns)
-        return dict(kind="file", data=sqlar_content(self.path, rel) or b"",
+        return dict(kind="file", data=content,
                     chmod=stat_mod.S_IMODE(mode), mtime_ns=mtime_ns)
 
 
@@ -5257,7 +5280,10 @@ class ChangeReview:
                 else:
                     tgt_str = str(tgt_raw)
                 mtime_ns = plan.get("mtime_ns") or int(time.time() * 1e9)
-                parent_up = Path(self.reg.sessions[parent_sid].upper)
+                psess = self.reg.sessions.get(parent_sid)
+                if psess is None:
+                    return dict(ok=False, error=f"promote: session {parent_sid} not tracked")
+                parent_up = Path(psess.upper)
                 sym_path = parent_up / rel
                 try:
                     sym_path.parent.mkdir(parents=True, exist_ok=True)
