@@ -1336,13 +1336,19 @@ def _libc() -> "_ctypes.CDLL":
         _LIBC = _ctypes.CDLL("libc.so.6", use_errno=True)
     return _LIBC
 
-_NR_open_tree  = 428   # x86-64 syscall number
-_NR_move_mount = 429
+# open_tree/move_mount/umount2 are reached through glibc's NAMED wrappers when present
+# (glibc >= 2.36 for the first two; umount2 forever) — those resolve the correct per-arch
+# syscall number for us. Only on older glibc do we fall back to raw syscall() with numbers
+# from the asm-generic table (shared by x86-64/arm64/riscv64 — the new mount-API syscalls
+# were assigned the same numbers there).
+_OPEN_TREE_NR  = {"x86_64": 428, "aarch64": 428, "riscv64": 428}
+_MOVE_MOUNT_NR = {"x86_64": 429, "aarch64": 429, "riscv64": 429}
 
 _OPEN_TREE_CLONE  = 1
 _AT_EMPTY_PATH    = 0x1000
 _AT_FDCWD         = -100
 _MOVE_MOUNT_F_EMPTY_PATH = 0x00000004
+_MNT_DETACH       = 0x00000002
 
 
 def _open_tree_fd(dir_fd: int) -> int:
@@ -1354,10 +1360,18 @@ def _open_tree_fd(dir_fd: int) -> int:
     caller's mount namespace.  Returns -1 on failure (old kernel, EPERM, etc.)."""
     try:
         libc = _libc()
-        fd = libc.syscall(_ctypes.c_long(_NR_open_tree),
-                          _ctypes.c_int(dir_fd),
-                          _ctypes.c_char_p(b""),
-                          _ctypes.c_uint(_OPEN_TREE_CLONE | _AT_EMPTY_PATH))
+        fn = getattr(libc, "open_tree", None)
+        if fn is not None:                                  # arch-correct named wrapper
+            fn.restype = _ctypes.c_int
+            fn.argtypes = (_ctypes.c_int, _ctypes.c_char_p, _ctypes.c_uint)
+            fd = fn(dir_fd, b"", _OPEN_TREE_CLONE | _AT_EMPTY_PATH)
+        else:                                               # pre-2.36 glibc fallback
+            nr = _OPEN_TREE_NR.get(os.uname().machine)
+            if nr is None:
+                return -1
+            fd = libc.syscall(_ctypes.c_long(nr), _ctypes.c_int(dir_fd),
+                              _ctypes.c_char_p(b""),
+                              _ctypes.c_uint(_OPEN_TREE_CLONE | _AT_EMPTY_PATH))
         return int(fd) if int(fd) >= 0 else -1
     except Exception:
         return -1
@@ -1371,25 +1385,36 @@ def _move_mount(tree_fd: int, dest: str) -> int:
     Returns 0 on success, errno (>0) on failure."""
     try:
         libc = _libc()
-        ret = libc.syscall(_ctypes.c_long(_NR_move_mount),
-                           _ctypes.c_int(tree_fd),
-                           _ctypes.c_char_p(b""),
-                           _ctypes.c_int(_AT_FDCWD),
-                           _ctypes.c_char_p(dest.encode()),
-                           _ctypes.c_uint(_MOVE_MOUNT_F_EMPTY_PATH))
-        if int(ret) < 0:
-            return _ctypes.get_errno()
-        return 0
+        fn = getattr(libc, "move_mount", None)
+        if fn is not None:                                  # arch-correct named wrapper
+            fn.restype = _ctypes.c_int
+            fn.argtypes = (_ctypes.c_int, _ctypes.c_char_p, _ctypes.c_int,
+                           _ctypes.c_char_p, _ctypes.c_uint)
+            ret = fn(tree_fd, b"", _AT_FDCWD, dest.encode(),
+                     _MOVE_MOUNT_F_EMPTY_PATH)
+        else:                                               # pre-2.36 glibc fallback
+            nr = _MOVE_MOUNT_NR.get(os.uname().machine)
+            if nr is None:
+                return errno.ENOSYS
+            ret = libc.syscall(_ctypes.c_long(nr), _ctypes.c_int(tree_fd),
+                               _ctypes.c_char_p(b""), _ctypes.c_int(_AT_FDCWD),
+                               _ctypes.c_char_p(dest.encode()),
+                               _ctypes.c_uint(_MOVE_MOUNT_F_EMPTY_PATH))
+        return 0 if int(ret) >= 0 else _ctypes.get_errno()
     except Exception:
         return errno.ENOSYS
 
 
 def _lazy_umount(path: str) -> None:
-    """MNT_DETACH umount via umount2(2) syscall, best-effort."""
+    """MNT_DETACH umount via the umount2(2) named wrapper (arch-correct), best-effort."""
     try:
-        _libc().syscall(_ctypes.c_long(166),   # NR_umount2
-                        _ctypes.c_char_p(path.encode()),
-                        _ctypes.c_int(0x2))    # MNT_DETACH
+        libc = _libc()
+        fn = getattr(libc, "umount2", None)
+        if fn is None:
+            return
+        fn.restype = _ctypes.c_int
+        fn.argtypes = (_ctypes.c_char_p, _ctypes.c_int)
+        fn(path.encode(), _MNT_DETACH)
     except Exception:
         pass
 
