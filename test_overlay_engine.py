@@ -782,20 +782,18 @@ def test_terminated_parent_reads():
               "finpar: child write over parent file succeeds")
         check(cidx.kind_of("pfile.txt") == "file",
               "finpar: child's index has the overridden file")
-        # Parent's sqlar row must still have "parent-content\n"
+        # Parent's sqlar row must be UNTOUCHED: a copy-up reads a finished (read-only)
+        # parent's bytes directly from its row — it must NOT fault it in or NULL the row
+        # (doing so would move the finished box's only copy into a throwaway pool blob).
+        import zlib as _zl
         parent_row = pidx.file_row("pfile.txt")
+        check(parent_row is not None and parent_row[4] is not None,
+              "finpar: parent sqlar row still holds its data (not faulted-in/NULLed)")
         if parent_row is not None and parent_row[4] is not None:
             blob = bytes(parent_row[4])
-            content = (blob if len(blob) == parent_row[2]
-                       else __import__("zlib").decompress(blob))
+            content = blob if len(blob) == parent_row[2] else _zl.decompress(blob)
             check(content == b"parent-content\n",
-                  "finpar: parent sqlar row is untouched after child write")
-        else:
-            # Row may have been faulted-in (data NULLed); verify via the file on the mount.
-            r2 = sh(proot if psid in (mount.ops.sessions if mount.ops else {}) else croot,
-                    "cat pfile.txt 2>/dev/null || true")
-            # Just confirm child has overridden correctly (checked above).
-            check(True, "finpar: parent sqlar state could not be checked (row faulted in)")
+                  "finpar: parent sqlar row content unchanged after child copy-up")
 
         # (5) A path the parent never had falls through to the real host.
         r_host = sh(croot, "cat /etc/hostname 2>/dev/null; echo rc=$?")
@@ -806,6 +804,21 @@ def test_terminated_parent_reads():
         r = sh(croot, "cat pdir/sub.txt")
         check(r.returncode == 0 and r.stdout == "subfile\n",
               "finpar: child reads file inside parent's subdirectory")
+
+        # (7) Detach + purge: the finished parent was attached on demand as a read-only
+        #     base; removing the last child detaches it and reclaims the transient
+        #     backing, while the durable <sid>.sqlar is preserved.
+        check(psid in mount.ops.sessions and psid in mount.ops._base_sessions,
+              "finpar: finished parent attached on demand as a read-only base")
+        check(m.live_dir(psid).exists(),
+              "finpar: base's transient backing exists while attached")
+        mount.remove_session(csid)
+        check(psid not in mount.ops.sessions,
+              "finpar: base detached after its last child exits")
+        check(not m.live_dir(psid).exists(),
+              "finpar: base's transient backing purged on detach")
+        check(m.sqlar_path(psid).exists(),
+              "finpar: parent's durable sqlar preserved across detach")
 
     finally:
         try: mount.stop()

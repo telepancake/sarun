@@ -2249,6 +2249,15 @@ def _build_overlay_ops():
                 self._lookup_count.pop(ino, None)
             self._key_to_ino = {k: i for k, i in self._key_to_ino.items()
                                 if k[0] != psid}
+            # Purge the transient backing the attach rebuilt (unconsolidate'd up/ dir &
+            # symlink artifacts). It is fully reconstructable from the box's <sid>.sqlar
+            # (which we never touch), so dropping it just reclaims the scratch space; a
+            # later re-attach rebuilds it. Copy-ups read a base read-only, so there are
+            # no faulted-in pool blobs to lose.
+            try:
+                rm_rf(live_dir(psid))
+            except Exception:
+                pass
 
         def add_virtual(self, sid: str, rel: str, content: bytes) -> None:
             s = self.sessions.get(sid)
@@ -2477,19 +2486,10 @@ def _build_overlay_ops():
                         except OSError:
                             data = bytearray()
                     elif layer in ("lower", "upper"):
-                        # ap is None: the lower file is EVICTED in an ancestor box (bytes
-                        # live in that session's sqlar row, not on disk). Fetch them so a
-                        # copy-up via the buffer doesn't silently start from empty.
-                        owning = self._owning_evicted_sid(sid, rel)
-                        if owning is not None:
-                            orow = self._index(owning).file_row(rel)
-                            if orow is not None and orow[4] is not None:
-                                blob = bytes(orow[4]); osz = orow[2]
-                                content = (blob if len(blob) == osz
-                                           else zlib.decompress(blob))
-                                data = bytearray(content)
-                        if data is None:
-                            data = bytearray()
+                        # ap is None: the lower file is EVICTED in an ancestor box — read
+                        # its row bytes (read-only) so a buffered copy-up isn't empty.
+                        eb = self._evicted_bytes(sid, rel)
+                        data = bytearray(eb) if eb is not None else bytearray()
                     else:
                         data = bytearray()
             # ── mode for this file ──────────────────────────────────
@@ -2911,6 +2911,21 @@ def _build_overlay_ops():
                 cur = p
             return None
 
+        def _evicted_bytes(self, sid: str, rel: str) -> "bytes | None":
+            """Decompressed content of an evicted file (bytes in a sqlar row, no blob),
+            read from the OWNING session's row WITHOUT mutating it. The owning session
+            may be this box or an ancestor; an ancestor attached as a base is read-only,
+            so a copy-up/seed reads its bytes here rather than faulting it in (which
+            would NULL its row and move its only copy into a throwaway pool blob)."""
+            owning = self._owning_evicted_sid(sid, rel)
+            if owning is None:
+                return None
+            row = self._index(owning).file_row(rel)
+            if row is None or row[4] is None:
+                return None
+            blob = bytes(row[4]); sz = row[2]
+            return blob if len(blob) == sz else zlib.decompress(blob)
+
         def _fault_in(self, sid: str, rel: str) -> None:
             """Idempotent. If the file's row has data and no blob: decompress the
             row bytes, write the blob, chmod+mtime, then NULL the row (resident).
@@ -2975,17 +2990,20 @@ def _build_overlay_ops():
                     except OSError as e:
                         raise pyfuse3.FUSEError(e.errno or errno.EIO)
                 # ap is None when the file is evicted in an ancestor (base) session.
-                # Fault it in on the owning session to get a real blob path, then open.
+                # Copy its row bytes into the child's OWN blob without faulting in /
+                # mutating the read-only base (that would null the finished box's row).
                 if ap is None:
-                    owning = self._owning_evicted_sid(sid, rel)
-                    if owning is None:
+                    data = self._evicted_bytes(sid, rel)
+                    if data is None:
                         raise pyfuse3.FUSEError(errno.EIO)
-                    self._fault_in(owning, rel)
-                    own_idx = self._index(owning)
-                    own_rid = own_idx.row_id(rel)
-                    if own_rid is None:
-                        raise pyfuse3.FUSEError(errno.EIO)
-                    ap = str(blob_path(own_idx.box_id, own_rid))
+                    bp_str = self._new_file_blob(sid, rel, st.st_mode, wid, "copyup")
+                    try:
+                        dst = os.open(bp_str, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
+                                      stat_mod.S_IMODE(st.st_mode))
+                        os.write(dst, data)
+                    except OSError as e:
+                        raise pyfuse3.FUSEError(e.errno or errno.EIO)
+                    return dst
                 src = os.open(ap, os.O_RDONLY | os.O_NOFOLLOW)
                 try:
                     bp_str = self._new_file_blob(sid, rel, st.st_mode, wid, "copyup")
@@ -3653,18 +3671,22 @@ def _build_overlay_ops():
                     os.mkdir(upath, stat_mod.S_IMODE(st.st_mode))
                     idx.set_entry(rel, "dir", st.st_mode, wid, "copyup_dir")
                 else:
-                    # ap is None when the source is an evicted row in an ancestor
-                    # (base) session.  Fault it in there to get a real blob path.
+                    # ap is None when the source is an evicted row in an ancestor (base)
+                    # session.  Write its row bytes into the child's blob WITHOUT
+                    # mutating the read-only base (no fault-in / row-null).
                     if ap is None:
-                        owning = self._owning_evicted_sid(sid, rel)
-                        if owning is None:
+                        data = self._evicted_bytes(sid, rel)
+                        if data is None:
                             return   # can't resolve source; skip silently
-                        self._fault_in(owning, rel)
-                        own_idx = self._index(owning)
-                        own_rid = own_idx.row_id(rel)
-                        if own_rid is None:
-                            return
-                        ap = str(blob_path(own_idx.box_id, own_rid))
+                        bp_str = self._new_file_blob(sid, rel, st.st_mode, wid, "copyup")
+                        try:
+                            dst = os.open(bp_str, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
+                                          stat_mod.S_IMODE(st.st_mode))
+                            try: os.write(dst, data)
+                            finally: os.close(dst)
+                        except OSError:
+                            pass
+                        return
                     # ap is a real on-disk path (lower or resident upper): copy to blob.
                     src = os.open(ap, os.O_RDONLY | os.O_NOFOLLOW)
                     try:
