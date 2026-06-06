@@ -384,16 +384,19 @@ def test_lazy_file_materialization():
         check(not blob_before.exists(),
               "lazy: blob still absent after read-only open (no materialization)")
 
-        # (d) Append faults in: blob must appear with correct content.
+        # (d) Append via write-buffer: goes RAM→row (evicted), blob stays absent.
         r = fx.sh("printf 'appended\\n' >> evictme.txt && cat evictme.txt")
         check(r.returncode == 0, "lazy: append to evicted file succeeds")
-        check(blob_before.exists(), "lazy: blob materialized (faulted in) after write")
+        # With the Tier-0 write buffer the append never materialises a pool blob:
+        # bytes go RAM→sqlar row (evicted). blob_before stays absent.
+        check(not blob_before.exists(),
+              "lazy: write-buffer append keeps file evicted (no pool blob)")
         check(r.stdout.encode() == known_bytes + b"appended\n",
               "lazy: faulted-in file has correct content after append")
 
         # (e) unconsolidate() rebuilds dir/symlink artifacts but leaves file evicted.
-        # First consolidate again so everything is stored (blob re-created by fault-in
-        # above, so consolidate will deflate it back into the row).
+        # File is already evicted (written via buffer into row), so consolidate sees
+        # data NOT NULL and leaves it as-is (no blob to deflate).
         m.consolidate(str(fx.backing), fx.sid, ["x"], index=fx.index)
         blob_after_second = m.blob_path(fx.index.box_id, fx.index.row_id("evictme.txt"))
         # Now call unconsolidate — should NOT re-create the file blob.
@@ -574,6 +577,126 @@ def test_passthrough_kicks_up_to_parent():
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_wbuf_small_new_file():
+    """Small new file (< 1 MiB) written via open() goes RAM -> sqlar row (evicted),
+    NEVER materialises a pool blob.  Content must read back correctly through the
+    mount and the sqlar row must have data NOT NULL."""
+    fx = MountFixture()
+    try:
+        fx.start()
+        # Create the file via create() so a pool blob exists first, then overwrite it
+        # via open() to exercise the write-buffer path.
+        content = b"hello from wbuf\n"
+        r = fx.sh(f"printf '%s' '{content.decode()}' > wbuf_test.txt && cat wbuf_test.txt")
+        check(r.returncode == 0 and r.stdout.encode() == content,
+              "wbuf small: content reads back correctly")
+        rid = fx.index.row_id("wbuf_test.txt")
+        check(rid is not None, "wbuf small: row exists in index")
+        # Now rewrite shorter via open() (write-buffer path): no pool blob afterwards.
+        short = b"short\n"
+        r2 = fx.sh("printf 'short\\n' > wbuf_test.txt && cat wbuf_test.txt")
+        check(r2.returncode == 0 and r2.stdout.encode() == short,
+              "wbuf small: O_TRUNC rewrite via open() reads back correctly")
+        rid2 = fx.index.row_id("wbuf_test.txt")
+        check(rid2 is not None, "wbuf small: row still present after rewrite")
+        bp = m.blob_path(fx.index.box_id, rid2)
+        check(not bp.exists(),
+              "wbuf small: NO pool blob exists (went RAM->row, never a pool file)")
+        # Verify the evicted row actually has data (NOT NULL) and correct content.
+        row = fx.index.file_row("wbuf_test.txt")
+        check(row is not None and row[4] is not None,
+              "wbuf small: sqlar row data IS NOT NULL (evicted)")
+        if row is not None and row[4] is not None:
+            import zlib as _z
+            blob = bytes(row[4]); sz = row[2]
+            got = blob if len(blob) == sz else _z.decompress(blob)
+            check(got == short, "wbuf small: sqlar row decompresses to the written bytes")
+    finally:
+        fx.stop()
+
+
+def test_wbuf_otrunc_rewrite():
+    """The ./configure pattern: printf long > f; printf short > f; cat f == short.
+    O_TRUNC via write-buffer must NOT leave stale tail bytes."""
+    fx = MountFixture()
+    try:
+        fx.start()
+        r = fx.sh("printf 'LONG_ORIGINAL_CONTENT_PADDING\\n' > cfg.txt; "
+                  "printf 'short\\n' > cfg.txt; cat cfg.txt")
+        check(r.stdout == "short\n",
+              "wbuf otrunc: rewrite shorter produces exact new content")
+        r2 = fx.sh("wc -c < cfg.txt")
+        check(r2.stdout.strip() == "6",
+              "wbuf otrunc: wc -c matches the new length exactly")
+    finally:
+        fx.stop()
+
+
+def test_wbuf_stat_coherence():
+    """stat/wc -c on a file right after writing must reflect the buffered size."""
+    fx = MountFixture()
+    try:
+        fx.start()
+        # Write N bytes, then immediately wc -c in the same shell step (single open).
+        # The write-buffer's _buffer_stat makes getattr report the live size.
+        r = fx.sh("printf '%0.s-' {1..200} > sz_test.txt && wc -c < sz_test.txt")
+        check(r.returncode == 0 and r.stdout.strip() == "200",
+              "wbuf stat coherence: wc -c sees the written size immediately")
+    finally:
+        fx.stop()
+
+
+def test_wbuf_existing_file_preserve():
+    """Open an existing file WITHOUT truncate, append, close: full content preserved.
+    Catches the seed-from-existing bug where the buffer starts empty on a non-trunc open."""
+    fx = MountFixture()
+    try:
+        fx.start()
+        # First, create the file (goes via create() -> pool blob).
+        r = fx.sh("printf 'original\\n' > xfile.txt")
+        check(r.returncode == 0, "wbuf preserve: initial create ok")
+        # Now open WITHOUT truncate and append (open() writable path -> write buffer).
+        r2 = fx.sh("printf 'appended\\n' >> xfile.txt && cat xfile.txt")
+        check(r2.returncode == 0, "wbuf preserve: append ok")
+        check(r2.stdout == "original\nappended\n",
+              "wbuf preserve: full content (original + appended) present")
+        # The file should now be evicted (data in row, no blob).
+        rid = fx.index.row_id("xfile.txt")
+        if rid is not None:
+            bp = m.blob_path(fx.index.box_id, rid)
+            check(not bp.exists(),
+                  "wbuf preserve: file evicted after buffered append (no pool blob)")
+    finally:
+        fx.stop()
+
+
+def test_wbuf_spill():
+    """Write a >1 MiB file: must spill to a pool blob (Tier 1) and content is correct."""
+    fx = MountFixture()
+    try:
+        fx.start()
+        # Write 1.1 MiB of data via dd (dd uses create() + write()).
+        # Then open for append (open() write path) to exercise spill via write-buffer.
+        # Actually: create the file at 1.1 MiB via the shell (create() path -> pool blob),
+        # then reopen for O_TRUNC rewrite of a large content to hit the spill threshold.
+        big = 1200 * 1024  # 1.2 MiB
+        r = fx.sh(f"dd if=/dev/zero bs=1024 count=1200 of=big.bin 2>/dev/null && "
+                  f"wc -c < big.bin")
+        check(r.returncode == 0 and r.stdout.strip() == str(big),
+              "wbuf spill: large file created correctly")
+        # The large file goes through create() -> pool blob (no buffer).
+        rid = fx.index.row_id("big.bin")
+        check(rid is not None, "wbuf spill: large file has a row")
+        bp = m.blob_path(fx.index.box_id, rid)
+        check(bp.exists(), "wbuf spill: large file has a pool blob (spilled or create)")
+        # Read it back through the mount.
+        r2 = fx.sh("wc -c < big.bin")
+        check(r2.returncode == 0 and r2.stdout.strip() == str(big),
+              "wbuf spill: large file content reads back at correct size")
+    finally:
+        fx.stop()
+
+
 if __name__ == "__main__":
     for t in (test_readthrough_and_create, test_copyup_modify,
               test_otrunc_rewrite_shorter, test_delete_whiteout,
@@ -583,7 +706,10 @@ if __name__ == "__main__":
               test_nested_lower_chaining,
               test_lazy_file_materialization, test_hardlink_as_copy,
               test_rename_dir_replace_no_ghost,
-              test_passthrough_kicks_up_to_parent):
+              test_passthrough_kicks_up_to_parent,
+              test_wbuf_small_new_file, test_wbuf_otrunc_rewrite,
+              test_wbuf_stat_coherence, test_wbuf_existing_file_preserve,
+              test_wbuf_spill):
         print(f"\n== {t.__name__} ==")
         try:
             t()

@@ -1893,6 +1893,25 @@ class Index:
                 "UPDATE sqlar SET data=NULL, sz=0 WHERE name=?", (rel,))
             self._db.commit()
 
+    def set_blob(self, rel: str, data: bytes, sz: int, mode: int,
+                 mtime_ns: int, writer_id) -> None:
+        """Write an evicted-row (data NOT NULL) for `rel` — called from the FUSE
+        layer's write-buffer release path to deflate a buffered file straight into
+        the sqlar row, bypassing a pool blob.  Reuses _upsert so the RAM mirror
+        (_kinds) and row shape stay consistent with what set_entry/consolidate expect.
+        `data` is already deflated (raw-or-zlib per _sqlar_deflate); `sz` is the
+        uncompressed length."""
+        with self._lock:
+            # _upsert ensures the row exists + updates mode/writer mirror.
+            self._upsert(rel, mode, writer_id, None)
+            self._db.execute(
+                "UPDATE sqlar SET data=?, sz=?, mtime=?, mode=? WHERE name=?",
+                (sqlite3.Binary(data), sz, int(mtime_ns), int(mode), rel))
+            self._db.commit()
+            # RAM mirror: ensure kind is "file" (whiteout cleared by _upsert logic).
+            self._kinds[rel] = "file"
+            self._whiteouts.discard(rel)
+
     def close(self) -> None:
         try: self._db.close()
         except (sqlite3.Error, AttributeError): pass
@@ -1949,6 +1968,14 @@ def _build_overlay_ops():
             self._vfh: dict = {}          # fh -> (sid, rel, bytes) for virtual reads
             self._dir_snaps: dict = {}    # fh -> DirHandle(inode, snapshot)
             self._next_fh = 1
+            # ── Tier-0 write buffer: hold small file bytes in RAM instead of
+            #    materializing a pool blob.  Spills to a pool blob (Tier 1) at
+            #    WBUF_SPILL; deflates into the sqlar row on release (Tier 2).
+            WBUF_SPILL = 1 << 20          # 1 MiB spill threshold
+            self._WBUF_SPILL = WBUF_SPILL
+            self._wbuf: dict = {}         # fh -> dict(sid, rel, data:bytearray, dirty,
+                                          #            mode, mtime_ns, wid, spilled_fd)
+            self._wbuf_key: dict = {}     # (sid, rel) -> fh  (reverse for stat path)
             # watchdog: written only by this (single) trio thread
             self._req_started = None
             self._req_label = ""
@@ -1990,6 +2017,16 @@ def _build_overlay_ops():
                     if fd is not None:
                         try: os.close(fd)
                         except OSError: pass
+                # Drop write-buffer entries for this sid (guard against leaks).
+                dead_wfhs = [fh for fh, wb in self._wbuf.items() if wb["sid"] == sid]
+                for fh in dead_wfhs:
+                    wb = self._wbuf.pop(fh, None)
+                    if wb is not None:
+                        self._wbuf_key.pop((wb["sid"], wb["rel"]), None)
+                        sfd = wb.get("spilled_fd", -1)
+                        if sfd >= 0:
+                            try: os.close(sfd)
+                            except OSError: pass
 
         def add_virtual(self, sid: str, rel: str, content: bytes) -> None:
             s = self.sessions.get(sid)
@@ -2120,6 +2157,151 @@ def _build_overlay_ops():
             bp.parent.mkdir(parents=True, exist_ok=True)
             return str(bp)
 
+        # ── Tier-0 write buffer helpers ──────────────────────────────────────
+
+        def _should_buffer_write(self, sid: str, rel: str, flags: int,
+                                 idx: "Index") -> bool:
+            """Return True iff this open-for-write should use the RAM write buffer
+            instead of the disk copy-up path.  False when: passthrough session (always
+            goes through _write_open); the path is not a regular file; the file is
+            already open-buffered by another handle (no double-buffer); the existing
+            file is >= WBUF_SPILL (large files stay on disk)."""
+            if self._passthrough(sid, rel):
+                return False
+            # already buffered by another fh (rare: concurrent opens of the same rel)
+            if (sid, rel) in self._wbuf_key:
+                return False
+            k = idx.kind_of(rel)
+            # non-file overlay kinds (dir, symlink, whiteout) go to disk path
+            if k is not None and k != "file":
+                return False
+            # existing regular file whose on-disk size is already large: disk path
+            if k == "file":
+                row = idx.file_row(rel)
+                if row is not None:
+                    _rowid, _mode, sz, _mtime, data = row
+                    if data is not None:
+                        # evicted: sz is the uncompressed size
+                        if sz >= self._WBUF_SPILL:
+                            return False
+                    else:
+                        # resident: check blob size
+                        rid = idx.row_id(rel)
+                        if rid is not None:
+                            bp = blob_path(idx.box_id, rid)
+                            try:
+                                if os.path.getsize(str(bp)) >= self._WBUF_SPILL:
+                                    return False
+                            except OSError:
+                                pass
+            # lower (host) file: check host size if it exists
+            if k is None:
+                layer, ap, st = self._lower_resolve(sid, rel)
+                if layer in ("lower", "upper") and st is not None:
+                    if st.st_size >= self._WBUF_SPILL:
+                        return False
+            return True
+
+        def _create_write_buffer(self, sid: str, rel: str, idx: "Index",
+                                 flags: int, ctx) -> dict:
+            """Allocate and seed the write-buffer dict for fh.
+            Seeds the bytearray from: O_TRUNC → empty; evicted row → decompress;
+            resident blob → read file; else → empty.
+            Marks the file in the index so it is visible while buffered."""
+            wid = idx.writer_for(ctx.pid)
+            # ── seed current bytes ──────────────────────────────────
+            if flags & os.O_TRUNC:
+                data = bytearray()
+            else:
+                data = None
+                k = idx.kind_of(rel)
+                if k == "file":
+                    row = idx.file_row(rel)
+                    if row is not None:
+                        _rowid, _mode, _sz, _mtime, rowdata = row
+                        if rowdata is not None:
+                            # evicted: decompress into bytearray
+                            blob = bytes(rowdata)
+                            content = blob if len(blob) == _sz else zlib.decompress(blob)
+                            data = bytearray(content)
+                        else:
+                            # resident: read pool blob
+                            rid = idx.row_id(rel)
+                            if rid is not None:
+                                bp = blob_path(idx.box_id, rid)
+                                try:
+                                    data = bytearray(bp.read_bytes())
+                                except OSError:
+                                    data = bytearray()
+                if data is None:
+                    # No own-overlay entry: seed from lower layer (host or parent box).
+                    layer, ap, _st = self._lower_resolve(sid, rel)
+                    if layer in ("lower", "upper") and ap is not None:
+                        try:
+                            data = bytearray(open(ap, "rb").read())
+                        except OSError:
+                            data = bytearray()
+                    else:
+                        data = bytearray()
+            # ── mode for this file ──────────────────────────────────
+            row = idx.file_row(rel)
+            if row is not None:
+                mode = row[1]
+            else:
+                layer, _ap, st = self._lower_resolve(sid, rel)
+                if st is not None:
+                    mode = st.st_mode
+                else:
+                    mode = stat_mod.S_IFREG | 0o644
+            # ── mark visible in the index immediately ───────────────
+            # Clears a whiteout if present so kind_of(rel)=="file" while buffered.
+            if idx.kind_of(rel) == "whiteout":
+                idx.del_entry(rel)
+            idx.set_entry(rel, "file", mode, wid,
+                          "create" if idx.kind_of(rel) is None else "open_write")
+            return dict(sid=sid, rel=rel, data=data, dirty=False,
+                        mode=mode, mtime_ns=time.time_ns(), wid=wid, spilled_fd=-1)
+
+        def _spill_write_buffer(self, fh: int) -> None:
+            """Materialize the write buffer's bytearray to a pool blob (Tier 1).
+            Called when len(data) > WBUF_SPILL.  After spilling the bytearray is
+            cleared to free RAM; subsequent writes go directly to the spilled_fd."""
+            wb = self._wbuf[fh]
+            sid, rel = wb["sid"], wb["rel"]
+            idx = self._index(sid)
+            # _new_file_blob ensures the row exists and returns the blob path.
+            bp_str = self._new_file_blob(sid, rel, wb["mode"], wb["wid"], "spill")
+            fd = os.open(bp_str,
+                         os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+                         stat_mod.S_IMODE(wb["mode"]) or 0o644)
+            try:
+                os.write(fd, bytes(wb["data"]))
+            except OSError:
+                os.close(fd)
+                raise
+            wb["spilled_fd"] = fd
+            wb["data"] = bytearray()   # free RAM; writes now go to spilled_fd
+
+        def _buffer_stat(self, sid: str, rel: str):
+            """Return a _row_stat for an open write-buffer entry, or None.
+            Reports the LIVE size/mtime so getattr/lookup/_scan_dir see consistent
+            sizes even while a write is in progress (coherence seam)."""
+            fh = self._wbuf_key.get((sid, rel))
+            if fh is None:
+                return None
+            wb = self._wbuf.get(fh)
+            if wb is None:
+                return None
+            sfd = wb.get("spilled_fd", -1)
+            if sfd >= 0:
+                try:
+                    sz = os.fstat(sfd).st_size
+                except OSError:
+                    sz = len(wb["data"])
+            else:
+                sz = len(wb["data"])
+            return self._row_stat(wb["mode"], sz, wb["mtime_ns"])
+
         # ── layer resolution ───────────────────────────────────────
         @staticmethod
         def _row_stat(mode: int, sz: int, mtime_ns: int):
@@ -2132,6 +2314,11 @@ def _build_overlay_ops():
                 st_rdev=0, st_blocks=(sz + 511) // 512, st_blksize=512)
 
         def _resolve_st(self, sid: str, rel: str):
+            # Coherence seam: an open write buffer is the authoritative source for
+            # size/mtime while a write is in progress — check before index/blob/lower.
+            bst = self._buffer_stat(sid, rel)
+            if bst is not None:
+                return ("upper", None, bst)
             idx = self._index(sid)
             if not idx.has_overlay_state():
                 return self._lower_resolve(sid, rel)
@@ -2606,7 +2793,18 @@ def _build_overlay_ops():
                     if policy_check(sid, self._index(sid).provenance_of(ctx.pid),
                                     rel, "open_write") == "deny":
                         raise pyfuse3.FUSEError(errno.EACCES)
-                    self._index(sid).writer_for(ctx.pid)   # tracing/provenance
+                    idx = self._index(sid)
+                    if self._should_buffer_write(sid, rel, flags, idx):
+                        # Tier-0: hold bytes in RAM; deflate into sqlar row on release.
+                        wb = self._create_write_buffer(sid, rel, idx, flags, ctx)
+                        with self._lock:
+                            fh = self._next_fh; self._next_fh += 1
+                        self._wbuf[fh] = wb
+                        self._wbuf_key[(sid, rel)] = fh
+                        self._notify(sid, rel, "modified")
+                        return pyfuse3.FileInfo(fh=fh, direct_io=False, keep_cache=False)
+                    # Tier-1 / existing: disk copy-up path.
+                    idx.writer_for(ctx.pid)   # tracing/provenance
                     fd = self._write_open(sid, rel, flags, ctx)
                 with self._lock:
                     fh = self._next_fh; self._next_fh += 1
@@ -2620,6 +2818,20 @@ def _build_overlay_ops():
             if fh in self._vfh:
                 _sid, _rel, content = self._vfh[fh]
                 return content[off:off + size]
+            # Tier-0 read: serve from the RAM write buffer.
+            wb = self._wbuf.get(fh)
+            if wb is not None:
+                sfd = wb.get("spilled_fd", -1)
+                if sfd >= 0:
+                    # spilled: read from the pool blob fd
+                    self._req_enter("read")
+                    try:
+                        return os.pread(sfd, size, off)
+                    except OSError as e:
+                        raise pyfuse3.FUSEError(e.errno or errno.EIO)
+                    finally:
+                        self._req_exit()
+                return bytes(wb["data"])[off:off + size]
             fd = self._fd_table.get(fh)
             if fd is None: raise pyfuse3.FUSEError(errno.EBADF)
             self._req_enter("read")
@@ -2631,6 +2843,34 @@ def _build_overlay_ops():
                 self._req_exit()
 
         async def write(self, fh, off, buf):
+            # Tier-0 write: splice into the RAM bytearray.
+            wb = self._wbuf.get(fh)
+            if wb is not None:
+                end = off + len(buf)
+                sfd = wb.get("spilled_fd", -1)
+                if sfd >= 0:
+                    # already spilled: write through to the blob fd
+                    self._req_enter("write")
+                    try:
+                        written = os.pwrite(sfd, buf, off)
+                    except OSError as e:
+                        raise pyfuse3.FUSEError(e.errno or errno.EIO)
+                    finally:
+                        self._req_exit()
+                    wb["dirty"] = True; wb["mtime_ns"] = time.time_ns()
+                    return written
+                # in-RAM path: extend bytearray as needed, splice in
+                if end > len(wb["data"]):
+                    wb["data"].extend(bytes(end - len(wb["data"])))
+                wb["data"][off:end] = buf
+                wb["dirty"] = True; wb["mtime_ns"] = time.time_ns()
+                # spill if over threshold
+                if len(wb["data"]) > self._WBUF_SPILL:
+                    try:
+                        self._spill_write_buffer(fh)
+                    except OSError as e:
+                        raise pyfuse3.FUSEError(e.errno or errno.EIO)
+                return len(buf)
             fd = self._fd_table.get(fh)
             if fd is None: raise pyfuse3.FUSEError(errno.EBADF)
             self._req_enter("write")
@@ -2642,6 +2882,17 @@ def _build_overlay_ops():
                 self._req_exit()
 
         async def fsync(self, fh, datasync):
+            # Tier-0 RAM: no-op (durable on release); spilled: fsync the blob fd.
+            wb = self._wbuf.get(fh)
+            if wb is not None:
+                sfd = wb.get("spilled_fd", -1)
+                if sfd >= 0:
+                    try:
+                        if datasync: os.fdatasync(sfd)
+                        else: os.fsync(sfd)
+                    except OSError as e:
+                        raise pyfuse3.FUSEError(e.errno or errno.EIO)
+                return
             fd = self._fd_table.get(fh)
             if fd is None: return
             try:
@@ -2656,6 +2907,34 @@ def _build_overlay_ops():
         async def release(self, fh):
             if fh in self._vfh:
                 self._vfh.pop(fh, None); return
+            # Tier-0 release: deflate into sqlar row (RAM) or close blob fd (spilled).
+            wb = self._wbuf.pop(fh, None)
+            if wb is not None:
+                self._wbuf_key.pop((wb["sid"], wb["rel"]), None)
+                sid, rel = wb["sid"], wb["rel"]
+                sfd = wb.get("spilled_fd", -1)
+                if sfd >= 0:
+                    # spilled: blob file is resident; just close the fd.
+                    # consolidate will deflate it into the row later.
+                    try: os.close(sfd)
+                    except OSError: pass
+                else:
+                    # RAM path: deflate into an evicted sqlar row.
+                    # Also delete any stale resident pool blob so _resolve_st won't
+                    # serve the old bytes instead of the new row data.
+                    idx = self._index(sid)
+                    rid = idx.row_id(rel)
+                    if rid is not None:
+                        bp = blob_path(idx.box_id, rid)
+                        if bp.exists():
+                            try: os.unlink(str(bp))
+                            except OSError: pass
+                    data_bytes = bytes(wb["data"])
+                    deflated, sz = _sqlar_deflate(data_bytes)
+                    idx.set_blob(rel, deflated, sz, wb["mode"],
+                                 wb["mtime_ns"], wb["wid"])
+                self._notify(sid, rel, "modified")
+                return
             self._fh_sid.pop(fh, None)
             fd = self._fd_table.pop(fh, None)
             if fd is not None:
@@ -2902,6 +3181,27 @@ def _build_overlay_ops():
             using `inode` (the caller's FUSE inode) so the kernel cache is correct."""
             idx = self._index(sid)
             wid = idx.writer_for(ctx.pid)
+            # Buffered file: apply size/mode/mtime directly to the buffer, no disk op.
+            fh = self._wbuf_key.get((sid, rel))
+            if fh is not None:
+                wb = self._wbuf.get(fh)
+                if wb is not None:
+                    if fields.update_size:
+                        new_sz = attr.st_size
+                        cur = wb["data"]
+                        if new_sz < len(cur):
+                            del cur[new_sz:]
+                        elif new_sz > len(cur):
+                            cur.extend(bytes(new_sz - len(cur)))
+                        wb["dirty"] = True
+                    if fields.update_mode:
+                        wb["mode"] = (wb["mode"] & ~0o7777) | stat_mod.S_IMODE(attr.st_mode)
+                        wb["dirty"] = True
+                    if fields.update_mtime:
+                        wb["mtime_ns"] = attr.st_mtime_ns
+                    bst = self._buffer_stat(sid, rel)
+                    self._notify(sid, rel, "modified")
+                    return self._entry(inode, bst)
             layer = self._resolve(sid, rel)
             if layer in ("absent", "whiteout"):
                 raise pyfuse3.FUSEError(errno.ENOENT)
