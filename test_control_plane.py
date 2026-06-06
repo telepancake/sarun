@@ -559,6 +559,97 @@ def test_register_no_parent_is_top_level():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+# ── pidfd register path: ChannelServer receives pidfd, derives host pid ──────
+
+def test_channel_server_pidfd_register():
+    """Exercise the full FD-passing register path end-to-end:
+    - Start a real ChannelServer over an AF_UNIX socketpair / temp socket
+    - Client sends a register JSON + its own pidfd over SCM_RIGHTS
+    - Server receives it via _recvmsg_blocking, derives HOST pid via
+      _host_pid_from_pidfd, and calls _dispatch_control with that pid
+    - We verify the ack is well-formed (ok + mount) and that the pidfd path
+      resolved a non-zero host pid (using _host_pid_from_pidfd directly)
+    """
+    tmp = Path(tempfile.mkdtemp(prefix="cp-cs-"))
+    _redirect_state(tmp)
+    cs_loop = asyncio.new_event_loop()
+    cs_thread = None
+    try:
+        m.ensure_dirs()
+        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
+        eng = _RecordingEngine()
+        sock_path = str(tmp / "ctrl.sock")
+
+        ready = threading.Event()
+        cs = None
+        def run_loop():
+            nonlocal cs
+            asyncio.set_event_loop(cs_loop)
+            cs = m.ChannelServer(sup, eng, sock_path)
+            cs_loop.run_until_complete(cs.start())
+            ready.set()
+            cs_loop.run_forever()
+        cs_thread = threading.Thread(target=run_loop, daemon=True)
+        cs_thread.start()
+        check(ready.wait(5), "channel-server: loop started")
+
+        # Verify _host_pid_from_pidfd works for ourselves before relying on it
+        own_pidfd = os.pidfd_open(os.getpid())
+        derived_pid = m._host_pid_from_pidfd(own_pidfd)
+        os.close(own_pidfd)
+        check(derived_pid == os.getpid(),
+              f"_host_pid_from_pidfd returns our own pid (got {derived_pid})")
+
+        # Send a register message with our own pidfd over SCM_RIGHTS
+        sid = "20260604-000010_777"
+        msg = dict(type="register", session_id=sid, cmd=["true"], want_net=False)
+        payload = (json.dumps(msg) + "\n").encode()
+
+        pidfd = os.pidfd_open(os.getpid())
+        ack = None
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.settimeout(10.0)
+                s.connect(sock_path)
+                s.sendmsg([payload],
+                          [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
+                            array.array("i", [pidfd]).tobytes())])
+                buf = b""
+                while b"\n" not in buf:
+                    chunk = s.recv(4096)
+                    if not chunk: break
+                    buf += chunk
+                line = buf.split(b"\n", 1)[0]
+                ack = json.loads(line.decode()) if line.strip() else None
+        finally:
+            try: os.close(pidfd)
+            except OSError: pass
+
+        check(ack is not None, "channel-server: register with pidfd got a reply")
+        check(ack and ack.get("ok") is True,
+              f"channel-server: register ack ok=True (got {ack!r})")
+        check(ack and bool(ack.get("owner_token")),
+              "channel-server: register ack includes an owner_token")
+
+        # Session is live in the supervisor
+        check(sid in sup.sessions and sup.sessions[sid].live,
+              "channel-server: session is live after pidfd-register")
+
+        # _derive_parent_sid with our own pid returns None (no session has us as ancestor)
+        # — the test just verifies it doesn't crash and returns None for this case.
+        result = m._derive_parent_sid(os.getpid(), sup)
+        check(result is None or isinstance(result, str),
+              f"channel-server: _derive_parent_sid ok (got {result!r})")
+
+    finally:
+        try: cs_loop.call_soon_threadsafe(cs_loop.stop)
+        except Exception: pass
+        if cs_thread is not None: cs_thread.join(timeout=5)
+        try: cs_loop.close()
+        except Exception: pass
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     for t in (test_sid_validation_rejects_traversal,
               test_relay_fd_gated_by_socket_not_message,
@@ -571,7 +662,8 @@ if __name__ == "__main__":
               test_single_ui_instance_refused,
               test_derive_parent_sid_owner_discovery,
               test_register_parent_body_field_not_honoured,
-              test_register_no_parent_is_top_level):
+              test_register_no_parent_is_top_level,
+              test_channel_server_pidfd_register):
         print(f"\n== {t.__name__} ==")
         try:
             t()

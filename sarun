@@ -272,6 +272,41 @@ def sync_request(sock_path: str, timeout: float = 30.0, **msg: Any) -> "dict | N
     except (OSError, json.JSONDecodeError):
         return None
 
+def register_request(sock_path: str, timeout: float = 30.0, **msg: Any) -> "dict | None":
+    """Like sync_request but carries the caller's own pidfd over SCM_RIGHTS so the
+    UI can derive the runner's HOST-namespace pid from /proc/self/fdinfo without
+    relying on SO_PEERCRED.  Falls back to a plain sendall (no FD) if pidfd_open is
+    unavailable (Python < 3.9, kernel ENOSYS, or any OSError) — the UI then gets
+    peer_pid=0 and treats this as a top-level runner.  Returns None on any failure."""
+    pidfd = -1
+    try:
+        pidfd = os.pidfd_open(os.getpid())
+    except (OSError, AttributeError):
+        pass
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout); s.connect(sock_path)
+            payload = (json.dumps(msg) + "\n").encode()
+            if pidfd >= 0:
+                s.sendmsg([payload],
+                          [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
+                            array.array("i", [pidfd]).tobytes())])
+            else:
+                s.sendall(payload)
+            buf = b""
+            while b"\n" not in buf:
+                chunk = s.recv(4096)
+                if not chunk: break
+                buf += chunk
+            line = buf.split(b"\n", 1)[0]
+            return json.loads(line.decode()) if line.strip() else None
+    except (OSError, json.JSONDecodeError):
+        return None
+    finally:
+        if pidfd >= 0:
+            try: os.close(pidfd)
+            except OSError: pass
+
 def ui_is_running(sock_path: str) -> bool:
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
@@ -4868,7 +4903,8 @@ class Supervisor:
         index.process_from_prov(root_prov, root=True)
         self.indexes[sid] = index
         # Parent sid: kernel-derived only (_derived_parent_sid, injected by ChannelServer
-        # from SO_PEERCRED + PPid walk).  Never taken from the message body itself.
+        # from pidfd → _host_pid_from_pidfd → PPid walk).  Never taken from the
+        # message body itself.
         parent_sid = msg.get("_derived_parent_sid")   # None for top-level boxes
         if parent_sid is not None:
             # Fail closed: if a parent was derived but is no longer live, refuse the
@@ -5533,10 +5569,11 @@ def _derive_parent_sid(peer_pid: int, sup: "Supervisor") -> "str | None":
     contain an ancestor of peer_pid.  Returns None if peer_pid is not inside any
     known session's process forest (i.e. this is a top-level box).
 
-    Security: peer_pid comes from SO_PEERCRED on the host-side control socket, so
-    it is already in the host pid namespace — no pidfd/fdinfo dance needed here.
-    The sid is never taken from the message body; only this kernel-derived mapping
-    is trusted."""
+    Security: peer_pid is derived from the runner's pidfd via _host_pid_from_pidfd
+    (reads /proc/self/fdinfo/<pidfd> in the UI's host namespace) — the same path
+    every other host-pid derivation in the codebase uses.  It is never taken from
+    SO_PEERCRED or from the message body; only this kernel-trusted ancestry walk
+    is used.  The sid is never trusted from the box."""
     if peer_pid <= 1:
         return None
     # Build {root_tgid -> sid} for every CURRENTLY LIVE session with a live Index.
@@ -5600,23 +5637,46 @@ class ChannelServer:
             asyncio.ensure_future(self._handle(conn))
 
     async def _handle(self, conn: socket.socket) -> None:
-        # Read SO_PEERCRED BEFORE setblocking(False): it's a getsockopt, not a recv,
-        # so it works at any blocking mode, but doing it first avoids any race.
-        # The control socket is host-side, so the pid is already in the host namespace.
+        # The FIRST read on each control connection uses recvmsg so we can capture
+        # the optional pidfd the runner sends alongside its register JSON.  The
+        # control socket accepts a single pidfd on the register connection — used
+        # ONLY to derive the runner's HOST-namespace pid via _host_pid_from_pidfd
+        # (the codebase's universal /proc/self/fdinfo path).  No sid is ever trusted
+        # from the box; parent identity is derived from the pidfd ancestry walk.
+        # Non-register messages (unregister/drop/select/rename/patch) carry no FD
+        # and are handled normally — peer_pid stays 0 for those.
+        _peer_pid = 0
+        buf = b""
         try:
-            _cr = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
-                                  struct.calcsize("3i"))
-            _peer_pid, _, _ = struct.unpack("3i", _cr)
-        except OSError:
-            _peer_pid = 0
-        conn.setblocking(False)
+            _data, _anc, _flags, _addr = await self._loop.run_in_executor(
+                None, _recvmsg_blocking, conn)
+            buf = _data
+            _pidfd = -1
+            for lvl, typ, data in _anc:
+                if lvl == socket.SOL_SOCKET and typ == socket.SCM_RIGHTS:
+                    a = array.array("i"); a.frombytes(data)
+                    fds = a.tolist()
+                    if fds:
+                        _pidfd = fds[0]
+                    # Close any extra ancillary FDs beyond the first; we only
+                    # expect one pidfd on the register connection.
+                    for extra in fds[1:]:
+                        try: os.close(extra)
+                        except OSError: pass
+            if _pidfd >= 0:
+                _peer_pid = _host_pid_from_pidfd(_pidfd)
+                try: os.close(_pidfd)
+                except OSError: pass
+        except (OSError, asyncio.CancelledError):
+            try: conn.close()
+            except OSError: pass
+            return
         try:
-            # Control client: each line is JSON. Any ancillary FDs on this socket are
-            # rejected (closed): the control socket never carries connection FDs — that
-            # is the per-session RelayServer's job. A register message produces a reply
-            # (the mount path + owner token) written back on the same connection so the
-            # runner can block on it.
-            buf = b""
+            # Control client: each line is JSON.  The control socket accepts a
+            # single pidfd on the register connection (used above to derive peer_pid);
+            # subsequent lines carry no FDs.  A register message produces a reply
+            # (the mount path + owner token) written back on the same connection so
+            # the runner can block on it.
             while True:
                 if b"\n" in buf:
                     line, buf = buf.split(b"\n", 1)
@@ -5653,8 +5713,10 @@ class ChannelServer:
         t = msg.get("type")
         if t == "register":
             try:
-                # Derive the parent sid from kernel identity (SO_PEERCRED + PPid walk).
-                # The box never supplies this — only kernel-trusted ancestry counts.
+                # Derive the parent sid from kernel identity (pidfd → host pid → PPid
+                # walk).  peer_pid was obtained from the runner's pidfd via
+                # _host_pid_from_pidfd — never from SO_PEERCRED.  The box never
+                # supplies this field; only kernel-trusted ancestry counts.
                 msg["_derived_parent_sid"] = _derive_parent_sid(peer_pid, self.sup)
                 return self.sup.register(msg)          # acks with the mount path
             except Exception as e:
@@ -5905,10 +5967,13 @@ def cmd_run(cmd, net, trace, direct, session_whitelist, chdir, reuse_sid=None) -
     # Register with the UI and BLOCK until it has created live/<sid>, built the
     # index, added the session to the mount, and exposed <mnt>/<sid> — only then
     # does the bwrap bind target exist. The ack carries the absolute mount path.
-    ack = sync_request(_ctrl_sock, type="register", session_id=sid,
-                       cmd=list(cmd), prov=self_prov, root_tgid=os.getpid(),
-                       session_whitelist=session_whitelist, want_rerun=rerun,
-                       want_net=net, want_trace=trace, want_direct=direct)
+    # We send our own pidfd alongside the JSON so the UI can derive our HOST pid
+    # via /proc/self/fdinfo (the codebase's universal identity path) instead of
+    # SO_PEERCRED.  Works for both top-level runners and nested-box runners.
+    ack = register_request(_ctrl_sock, type="register", session_id=sid,
+                           cmd=list(cmd), prov=self_prov, root_tgid=os.getpid(),
+                           session_whitelist=session_whitelist, want_rerun=rerun,
+                           want_net=net, want_trace=trace, want_direct=direct)
     if not ack or not ack.get("ok") or not ack.get("mount"):
         if rerun:
             # A re-run can't relocate to a fresh sid — the identity IS the target box.
@@ -5919,10 +5984,10 @@ def cmd_run(cmd, net, trace, direct, session_whitelist, chdir, reuse_sid=None) -
         # collision on sid (same second + pid is impossible, but be safe) or the
         # UI failed to set up the overlay — retry once with a unique suffix.
         sid = sid + "." + uuid.uuid4().hex[:6]
-        ack = sync_request(_ctrl_sock, type="register", session_id=sid,
-                           cmd=list(cmd), prov=self_prov, root_tgid=os.getpid(),
-                           session_whitelist=session_whitelist, want_rerun=False,
-                           want_net=net, want_trace=trace, want_direct=direct)
+        ack = register_request(_ctrl_sock, type="register", session_id=sid,
+                               cmd=list(cmd), prov=self_prov, root_tgid=os.getpid(),
+                               session_whitelist=session_whitelist, want_rerun=False,
+                               want_net=net, want_trace=trace, want_direct=direct)
         if not ack or not ack.get("ok") or not ack.get("mount"):
             print("slopbox: the UI could not set up the overlay for this session"
                   f"{(' — ' + ack['error']) if ack and ack.get('error') else ''}.",
@@ -5968,7 +6033,9 @@ def cmd_run(cmd, net, trace, direct, session_whitelist, chdir, reuse_sid=None) -
         #
         # The host control socket is bind-mounted read-only at UI_SOCK_INBOX so that a
         # nested `./sarun -- cmd` inside the box can reach the UI. Parent identity is
-        # kernel-derived (SO_PEERCRED + PPid walk) at the UI; the box never supplies it.
+        # kernel-derived (pidfd → _host_pid_from_pidfd → PPid walk) at the UI; the
+        # box's runner sends its own pidfd on the register connection, and the UI
+        # never trusts any pid or sid from the message body.
         args = ["bwrap",
                 "--bind", str(box_root), "/",
                 "--proc", "/proc", "--dev", "/dev",
