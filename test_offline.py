@@ -508,6 +508,82 @@ def test_promote_into_parent_unit():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_consolidate_size_based_placement():
+    """consolidate() chooses a per-file rest form by size: a small file folds into the
+    sqlar blob (data NOT NULL, pool file evicted); a large file (>= POOL_RESIDENT_MIN)
+    stays a PERMANENT pool file (row resident: data NULL, blob kept). sqlar_content
+    and the SqlarArchive readers serve BOTH forms, and delete() removes the pool dir."""
+    tmp = Path(tempfile.mkdtemp(prefix="ofl-"))
+    _redirect_state(tmp)
+    try:
+        sid = "20260604-000000_222"
+        backing = m.live_dir(sid); up = backing / "up"; up.mkdir(parents=True)
+        idx = m.Index(backing)
+        wid = idx.writer_for(os.getpid())
+
+        small = b"a tiny config line\n"
+        big = (b"X" * 7) * (m.POOL_RESIDENT_MIN // 7 + 1)   # > threshold
+        check(len(big) >= m.POOL_RESIDENT_MIN, "big file is at/above the resident threshold")
+        for rel, payload in (("etc/small.conf", small), ("var/big.bin", big)):
+            idx.set_entry(rel, "file", stat_mod.S_IFREG | 0o644, wid, "create")
+            bp = m.blob_path(idx.box_id, idx.row_id(rel))
+            bp.parent.mkdir(parents=True, exist_ok=True); bp.write_bytes(payload)
+
+        small_bp = m.blob_path(idx.box_id, idx.row_id("etc/small.conf"))
+        big_bp = m.blob_path(idx.box_id, idx.row_id("var/big.bin"))
+        box_id = idx.box_id
+        sp = m.sqlar_path(sid)
+
+        m.consolidate(str(backing), sid, ["sh"], index=idx)
+
+        # ── small file: folded into the row, pool file gone ─────────────────────
+        conn = sqlite3.connect(str(sp))
+        try:
+            srow = conn.execute("SELECT sz,data FROM sqlar WHERE name='etc/small.conf'").fetchone()
+            brow = conn.execute("SELECT sz,data FROM sqlar WHERE name='var/big.bin'").fetchone()
+        finally: conn.close()
+        check(srow is not None and srow[1] is not None,
+              "small file folded into the sqlar blob (data NOT NULL)")
+        check(not small_bp.exists(), "small file's pool blob was evicted")
+
+        # ── large file: stays a permanent pool file (resident row) ──────────────
+        check(brow is not None and brow[1] is None,
+              "large file row stays resident (data IS NULL)")
+        check(brow[0] == len(big),
+              f"resident row records real uncompressed size (got {brow[0]}, want {len(big)})")
+        check(big_bp.exists(), "large file's pool blob is KEPT as the rest form")
+
+        # ── both rest forms read back correctly through sqlar_content ────────────
+        check(m.sqlar_content(sp, "etc/small.conf") == small,
+              "sqlar_content serves the folded (evicted) small file")
+        check(m.sqlar_content(sp, "var/big.bin") == big,
+              "sqlar_content serves the resident large file from its pool blob")
+
+        # ── SqlarArchive.entries() reports the real size for the resident row ────
+        # Build a minimal Supervisor just to host a ChangeReview / SqlarArchive.
+        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=None)
+        arch = m.SqlarArchive(sup.review, sid)
+        ent = {e["path"]: e for e in arch.entries()}
+        check(ent.get("var/big.bin", {}).get("size") == len(big),
+              "SqlarArchive.entries() reports the resident file's real size")
+        check(arch.current_bytes("var/big.bin") == big,
+              "SqlarArchive.current_bytes serves the resident large file")
+        check(arch.apply_plan("var/big.bin").get("data") == big,
+              "SqlarArchive.apply_plan carries the resident file's bytes")
+
+        # ── delete() removes the box's pool dir (no leaked permanent blobs) ──────
+        pool_dir = m.box_pool_dir(box_id)
+        check(pool_dir.exists(), "pool dir present before delete")
+        idx.close()
+        sup.sessions[sid] = m.Session(session_id=sid, cmd=["sh"], live=False,
+                                      shm_dir=str(backing))
+        sup.delete(sid)
+        check(not pool_dir.exists(), "delete() removed the box's pool dir")
+        check(not sp.exists(), "delete() removed the sqlar")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     for t in (test_one_db_only_and_blob_lifecycle,
               test_process_and_env_tables_dedup_and_tag,
@@ -519,6 +595,7 @@ if __name__ == "__main__":
               test_box_id_and_pool_layout,
               test_consolidate_promote_to_parent_sqlar,
               test_consolidate_root_box_apply_still_writes_host,
+              test_consolidate_size_based_placement,
               test_promote_into_parent_unit):
         print(f"\n== {t.__name__} ==")
         try:

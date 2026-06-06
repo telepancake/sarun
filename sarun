@@ -154,6 +154,12 @@ def live_dir(session_id: str) -> Path:
 # dir is removed. The shard level keeps any one directory from collecting the
 # millions of inodes a large box can produce.
 POOL_SHARDS = 1024
+# At consolidate, a regular file at least this large is kept as a PERMANENT pool
+# file (the row stays resident: data NULL, bytes on disk) rather than folded into
+# the sqlar blob. Both are valid rest forms; the choice is per file, by size. Set to
+# the write-buffer spill threshold so "big enough to have spilled to a pool file
+# while live" and "big enough to stay a pool file at rest" coincide.
+POOL_RESIDENT_MIN = 1 << 20
 
 def pool_home() -> Path:
     return live_home() / "blob"
@@ -1062,17 +1068,34 @@ def sqlar_mtime(path, name) -> "int | None":
 
 def sqlar_content(path, name) -> "bytes | None":
     """Decompressed bytes for one entry (the symlink target for a symlink); None if
-    missing, a tombstone, or content not yet consolidated (NULL blob)."""
+    missing or a tombstone. Reads EITHER rest form: an evicted/folded row (bytes
+    compressed in `data`) or a permanently-resident row (data NULL; bytes in the pool
+    blob at blob_path(box_id, rowid) — the uncompressed file on disk)."""
     path = Path(path)
     if not path.exists(): return None
     conn = _sqlar_open(path)
     try:
-        row = conn.execute("SELECT sz,data FROM sqlar WHERE name=?", (name,)).fetchone()
+        row = conn.execute("SELECT rowid,sz,data FROM sqlar WHERE name=?",
+                           (name,)).fetchone()
     except sqlite3.Error: row = None
     finally: conn.close()
-    if not row or row[1] is None: return None
-    sz, data = row[0], bytes(row[1])
-    return data if len(data) == sz else zlib.decompress(data)
+    if not row: return None
+    rowid, sz, data = row
+    if data is not None:
+        data = bytes(data)
+        return data if len(data) == sz else zlib.decompress(data)
+    # Resident: bytes live in the pool blob (the permanent file rest form). Locate it
+    # by the box's stable pool id (sqlar meta) + the row's stable rowid.
+    bid = sqlar_meta_get(path, "box_id")
+    if bid is None: return None
+    try:
+        bp = blob_path(int(bid), rowid)
+    except (ValueError, TypeError):
+        return None
+    try:
+        return bp.read_bytes() if bp.exists() else None
+    except OSError:
+        return None
 
 def sqlar_remove(path, name) -> int:
     """Drop one entry; unlink the archive when it empties of entries. Returns
@@ -4453,10 +4476,23 @@ def consolidate(shm_dir, session_id: str, cmd: list, index: "Index | None" = Non
                 except OSError: pass
             _sq_remove(rel)
             blob_paths_to_evict.append(bp); continue
-        _set_blob(rel, content, mode, mtime_ns)
+        # Default (no rule): place by size. A large file stays a PERMANENT pool file
+        # (row resident: data NULL, blob kept on disk) — record its real size/mode/
+        # mtime so offline readers (sqlar_list/entries) report correct metadata. A
+        # small file folds into the sqlar blob and its pool file is evicted.
+        if len(content) >= POOL_RESIDENT_MIN:
+            sq.execute("UPDATE sqlar SET mode=?, mtime=?, sz=?, data=NULL WHERE name=?",
+                       (int(mode), int(mtime_ns), len(content), rel))
+            if sq.execute("SELECT changes()").fetchone()[0] == 0:
+                # Orphaned overlay with no live-index row: create a resident row.
+                sq.execute("INSERT INTO sqlar(name,mode,mtime,sz,data) VALUES(?,?,?,?,NULL)",
+                           (rel, int(mode), int(mtime_ns), len(content)))
+            # blob NOT evicted: it IS the rest form.
+        else:
+            _set_blob(rel, content, mode, mtime_ns)
+            blob_paths_to_evict.append(bp)
         p = _prov(rel)
         if p: _sqlar_put_provenance(sq, rel, p)
-        blob_paths_to_evict.append(bp)
     # 2) deletions (whiteouts) from the index -> tombstone rows (already present, but
     #    re-assert for the orphaned-overlay path) + provenance.
     if idx is not None:
@@ -5063,7 +5099,17 @@ class SqlarArchive(ChangeSource):
             blob, sz = _sqlar_deflate(data)
             conn.execute("UPDATE sqlar SET sz=?, data=? WHERE name=?",
                          (sz, sqlite3.Binary(blob), rel)); conn.commit()
+            row = conn.execute("SELECT rowid FROM sqlar WHERE name=?", (rel,)).fetchone()
         finally: conn.close()
+        # If this file was a permanent pool file (resident), the row now carries the
+        # authoritative bytes — drop the stale blob so it can't shadow the new content
+        # (blob_path is checked before the row in _resolve_st).
+        bid = sqlar_meta_get(self.path, "box_id")
+        if bid is not None and row is not None:
+            try:
+                bp = blob_path(int(bid), row[0])
+                if bp.exists(): bp.unlink()
+            except (OSError, ValueError, TypeError): pass
         return None
 
     def apply_plan(self, rel):
@@ -6504,9 +6550,16 @@ class Supervisor:
         if s.shm_dir:
             rm_rf(s.shm_dir)
         sp = sqlar_path(sid)
+        # Remove the box's permanent pool files too (its sqlar may hold resident rows
+        # whose bytes live only in blob/<box_id>/). Read box_id BEFORE unlinking the
+        # sqlar; sweep_orphan_pools() is the backstop if this is ever missed.
+        bid = sqlar_meta_get(sp, "box_id") if sp.exists() else None
         if sp.exists():
             try: sp.unlink()
             except OSError: pass
+        if bid is not None:
+            try: rm_rf(box_pool_dir(int(bid)))
+            except (OSError, ValueError, TypeError): pass
         if s.run_pidfd >= 0:
             try: os.close(s.run_pidfd)
             except OSError: pass
