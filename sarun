@@ -1953,6 +1953,11 @@ class Index:
                 self._db.execute(
                     "UPDATE sqlar SET sz=?, data=?, mtime=? WHERE name=?",
                     (sz, sqlite3.Binary(data), m, path))
+            elif mtime_ns is not None:
+                # Dir (or any non-symlink) row: record mtime so the synthesized stat
+                # served from the mirror carries a stable timestamp.
+                self._db.execute("UPDATE sqlar SET mtime=? WHERE name=?",
+                                 (int(mtime_ns), path))
             self._db.commit()
             # RAM mirror — mutate under the SAME lock.
             if kind == "whiteout":
@@ -2501,16 +2506,14 @@ def _build_overlay_ops():
 
         # ── pool-backed artifact path helpers ────────────────────────────────
         def _backing_path(self, sid: str, rel: str) -> "str | None":
-            """The on-disk artifact for rel in OUR upper. Files: pool blob. Dirs/
-            symlinks: real upper path. Others: None."""
+            """The on-disk artifact for rel in OUR upper: a regular file's pool blob.
+            Dirs and symlinks have NO on-disk artifact (served from the mirror/row),
+            so they — like everything else — return None."""
             idx = self._index(sid)
-            k = idx.kind_of(rel)
-            if k == "file":
+            if idx.kind_of(rel) == "file":
                 rid = idx.row_id(rel)
                 if rid is None: return None
                 return str(blob_path(idx.box_id, rid))
-            if k in ("dir", "symlink"):
-                return self._upper_path(sid, rel)
             return None
 
         def _new_file_blob(self, sid: str, rel: str, mode, wid, op: str,
@@ -3009,8 +3012,9 @@ def _build_overlay_ops():
 
         # ── parent-dir materialization ───────────────────────────────────────
         def _ensure_parent_dirs(self, sid: str, rel: str, wid) -> None:
-            """Materialize the chain of parent dirs of rel into the upper. Each level
-            is a single mkdir; opacity is recorded if it shadows a lower dir."""
+            """Record the chain of parent dirs of rel as dir ROWS in the mirror — no
+            on-disk artifact (dirs are served from the index, not from up/). Each level
+            already tracked as a dir is left untouched (opacity preserved)."""
             parent = rel.rsplit("/", 1)[0] if "/" in rel else ""
             if not parent: return
             idx = self._index(sid)
@@ -3018,31 +3022,31 @@ def _build_overlay_ops():
             cur = ""
             for p in parts:
                 cur = (cur + "/" + p) if cur else p
-                upath = self._upper_path(sid, cur)
-                # os.path.isdir follows symlinks: a symlink in the upper pointing at a
-                # host directory would be treated as "already a dir" and writes would
-                # land through it onto the host. Require a real directory.
-                try:
-                    if stat_mod.S_ISDIR(os.lstat(upath).st_mode):
-                        continue
-                except OSError:
-                    pass
-                self._ensure_parent_dirs(sid, cur, wid)
-                try:
-                    os.mkdir(upath, 0o755)
-                except FileExistsError:
-                    pass
-                except OSError as e:
-                    raise pyfuse3.FUSEError(e.errno or errno.EIO)
-                opaque = 0
-                try:
-                    if stat_mod.S_ISDIR(os.lstat(self._lower_path(cur)).st_mode):
-                        # a real lower dir still showing through -> not opaque
-                        opaque = 0
-                except OSError:
-                    pass
+                if idx.kind_of(cur) == "dir":
+                    continue
+                # Record this level as a dir row. A freshly-recorded parent never
+                # carries opacity (it shows the lower through); a dir explicitly
+                # recreated over a lower dir gets opacity recorded by mkdir/rename.
                 idx.set_entry(cur, "dir", stat_mod.S_IFDIR | 0o755, wid,
-                              "mkdir_parent", opaque=opaque)
+                              "mkdir_parent", opaque=0)
+
+        def _readlink_source(self, sid: str, rel: str, ap: "str | None") -> "str | None":
+            """The symlink target for a copy-up source. ap is non-None for a host/lower
+            link (os.readlink). For an overlay link (ancestor's mirror) ap is None —
+            walk the parent chain for the owning session's row target. None if neither."""
+            if ap is not None:
+                try: return os.readlink(ap)
+                except OSError: return None
+            cur = sid; seen: set = set()
+            while cur and cur not in seen:
+                seen.add(cur)
+                tgt = self._index(cur).symlink_target(rel)
+                if tgt is not None:
+                    return tgt.decode("utf-8", "surrogateescape")
+                p = self._parent(cur)
+                if p is None: break
+                cur = p
+            return None
 
         # ── fault-in: inflate an evicted row back to a pool blob ────────────
         def _owning_evicted_sid(self, sid: str, rel: str) -> "str | None":
@@ -3129,20 +3133,16 @@ def _build_overlay_ops():
             # Resolve the source from lower/upper layers.
             layer, ap, st = self._resolve_st(sid, rel)
             if layer in ("lower", "upper"):
-                # A lower symlink/dir must copy up preserving its type — never open
-                # it O_RDONLY (that would follow a symlink onto its target and
-                # materialize the target's bytes as a regular file). _copyup_one does
-                # the type-correct copy (symlink→symlink, dir→dir); then re-open the
-                # upper artifact O_NOFOLLOW. (A symlink open-for-write is unusual; the
-                # caller gets an fd on the preserved artifact.)
+                # A lower symlink/dir is copied up preserving its type — into the
+                # mirror row, NOT an on-disk artifact (_copyup_one records the dir/
+                # symlink row). There is no fd to hand back: opening a symlink/dir for
+                # write is degenerate (the kernel resolves symlinks before open, and a
+                # dir open-for-write is EISDIR). Record the row, then refuse the fd.
                 if not stat_mod.S_ISREG(st.st_mode):
                     self._ensure_parent_dirs(sid, rel, wid)
                     self._copyup_one(sid, rel, wid)
-                    upath = self._upper_path(sid, rel)
-                    try:
-                        return os.open(upath, os.O_RDWR | os.O_NOFOLLOW)
-                    except OSError as e:
-                        raise pyfuse3.FUSEError(e.errno or errno.EIO)
+                    raise pyfuse3.FUSEError(
+                        errno.EISDIR if stat_mod.S_ISDIR(st.st_mode) else errno.EINVAL)
                 # ap is None when the file is evicted in an ancestor (base) session.
                 # Copy its row bytes into the child's OWN blob without faulting in /
                 # mutating the read-only base (that would null the finished box's row).
@@ -3511,18 +3511,15 @@ def _build_overlay_ops():
                 self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
                 return self._entry(ino, os.lstat(host))
             def upper_op(sid, rel, upath, wid, idx):
-                try:
-                    os.mkdir(upath, mode & 0o7777)
-                except OSError as e:
-                    raise pyfuse3.FUSEError(e.errno or errno.EIO)
                 if idx.kind_of(rel) == "whiteout":
                     idx.del_entry(rel)
                 opaque = 1 if self._lower_is_dir(sid, rel) else 0   # recreated over lower dir
-                idx.set_entry(rel, "dir", stat_mod.S_IFDIR | (mode & 0o7777), wid,
-                              "mkdir", opaque=opaque)
+                dmode = stat_mod.S_IFDIR | (mode & 0o7777)
+                idx.set_entry(rel, "dir", dmode, wid, "mkdir", opaque=opaque,
+                              mtime_ns=time.time_ns())
                 ino = self._ino_for(sid, rel)
                 self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
-                st = os.lstat(upath)
+                st = self._synth_dir_stat(dmode, idx.row_mtime(rel))
                 return self._entry(ino, st)
             return self._mutate(parent_inode, name, ctx, "mkdir", host_op, upper_op)
 
@@ -3538,27 +3535,23 @@ def _build_overlay_ops():
                 self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
                 return self._entry(ino, os.lstat(host))
             def upper_op(sid, rel, upath, wid, idx):
-                # remove a stale upper artifact (no-follow safe: unlink/rmtree by lstat)
-                try:
-                    lst = os.lstat(upath)
-                    if stat_mod.S_ISDIR(lst.st_mode): shutil.rmtree(upath)
-                    else: os.unlink(upath)
-                except FileNotFoundError:
-                    pass
-                except OSError as e:
-                    raise pyfuse3.FUSEError(e.errno or errno.EIO)
-                try:
-                    os.symlink(target, upath)
-                except OSError as e:
-                    raise pyfuse3.FUSEError(e.errno or errno.EIO)
+                # Symlink lives ONLY in the row (target + mode + mtime) — no on-disk
+                # artifact. A prior dir/symlink/file row at rel is overwritten by the
+                # symlink row; a pre-existing FILE row's pool blob is dropped first.
+                if idx.kind_of(rel) == "file":
+                    rid = idx.row_id(rel)
+                    if rid is not None:
+                        try: blob_path(idx.box_id, rid).unlink()
+                        except OSError: pass
                 if idx.kind_of(rel) == "whiteout":
                     idx.del_entry(rel)
-                st = os.lstat(upath)
+                mt = time.time_ns()
                 tgt = target.encode("utf-8", "surrogateescape")
                 idx.set_entry(rel, "symlink", stat_mod.S_IFLNK | 0o777, wid, "symlink",
-                              target=tgt, mtime_ns=st.st_mtime_ns)
+                              target=tgt, mtime_ns=mt)
                 ino = self._ino_for(sid, rel)
                 self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
+                st = self._synth_link_stat(len(tgt), idx.row_mtime(rel))
                 return self._entry(ino, st)
             return self._mutate(parent_inode, name, ctx, "symlink", host_op, upper_op)
 
@@ -3615,10 +3608,7 @@ def _build_overlay_ops():
             if self._merged_children(sid, rel):
                 raise pyfuse3.FUSEError(errno.ENOTEMPTY)
             idx = self._index(sid)
-            upath = self._upper_path(sid, rel)
-            if os.path.isdir(upath) and not os.path.islink(upath):
-                try: os.rmdir(upath)
-                except OSError as e: raise pyfuse3.FUSEError(e.errno or errno.EIO)
+            # Dir lives only in the mirror — no on-disk artifact to rmdir.
             idx.prune_subtree(rel)
             lower_is_dir = (not idx.hidden_by_opaque(rel)
                             and self._lower_is_dir(sid, rel))
@@ -3690,13 +3680,39 @@ def _build_overlay_ops():
             if layer in ("absent", "whiteout"):
                 raise pyfuse3.FUSEError(errno.ENOENT)
             if layer == "lower":
-                fd = self._ensure_copyup(sid, rel, os.O_RDWR, ctx)
-                os.close(fd)
+                # Copy up the lower entry first (file→blob, dir/symlink→mirror row).
+                if stat_mod.S_ISREG(self._resolve_st(sid, rel)[2].st_mode):
+                    fd = self._ensure_copyup(sid, rel, os.O_RDWR, ctx)
+                    os.close(fd)
+                else:
+                    self._ensure_parent_dirs(sid, rel, wid)
+                    self._copyup_one(sid, rel, wid)
             else:
                 if idx.kind_of(rel) == "file":
                     bp_str = self._backing_path(sid, rel)
                     if bp_str is not None and not os.path.exists(bp_str):
                         self._fault_in(sid, rel)
+            # Dir / symlink: no on-disk artifact — apply to the mirror row only. uid/gid
+            # is squashed, so chown is an accepted no-op; mode/mtime update the row.
+            k = idx.kind_of(rel)
+            if k in ("dir", "symlink"):
+                cur_mode, cur_mt = idx.row_mode_mtime(rel)
+                if cur_mode is None:
+                    cur_mode = (stat_mod.S_IFDIR | 0o755 if k == "dir"
+                                else stat_mod.S_IFLNK | 0o777)
+                new_mode = cur_mode
+                if fields.update_mode:
+                    new_mode = (cur_mode & ~0o7777) | stat_mod.S_IMODE(attr.st_mode)
+                new_mt = (attr.st_mtime_ns if fields.update_mtime else cur_mt)
+                # symlink: keep its target row data (set_entry target=None preserves it).
+                idx.set_entry(rel, k, new_mode, wid, "setattr", mtime_ns=new_mt)
+                if k == "dir":
+                    st = self._synth_dir_stat(new_mode, idx.row_mtime(rel))
+                else:
+                    tgt = idx.symlink_target(rel) or b""
+                    st = self._synth_link_stat(len(tgt), idx.row_mtime(rel))
+                self._notify(sid, rel, "modified")
+                return self._entry(inode, st)
             upath = self._backing_path(sid, rel) or self._upper_path(sid, rel)
             is_link = stat_mod.S_ISLNK(os.lstat(upath).st_mode)
             try:
@@ -3811,24 +3827,23 @@ def _build_overlay_ops():
                     if row is not None and row[4] is not None:
                         self._fault_in(sid, rel)
                         return
-            else:
-                upath = self._upper_path(sid, rel)
-                if os.path.lexists(upath): return
+            elif idx.kind_of(rel) in ("dir", "symlink"):
+                return   # already recorded in this box's mirror
             self._ensure_parent_dirs(sid, rel, wid)
             layer, ap, st = self._resolve_st(sid, rel)
             if layer in ("lower", "upper"):     # host, or (nested) an ancestor's upper
                 if stat_mod.S_ISLNK(st.st_mode):
-                    upath = self._upper_path(sid, rel)
-                    tgt = os.readlink(ap)
-                    os.symlink(tgt, upath)
+                    # Record the symlink as a row only (no on-disk artifact). The target
+                    # comes from the owning mirror (overlay link) or os.readlink (host).
+                    tgt = self._readlink_source(sid, rel, ap)
+                    if tgt is None: return
                     idx.set_entry(rel, "symlink", stat_mod.S_IFLNK | 0o777, wid,
                                   "copyup_symlink",
                                   target=tgt.encode("utf-8", "surrogateescape"),
                                   mtime_ns=getattr(st, "st_mtime_ns", 0))
                 elif stat_mod.S_ISDIR(st.st_mode):
-                    upath = self._upper_path(sid, rel)
-                    os.mkdir(upath, stat_mod.S_IMODE(st.st_mode))
-                    idx.set_entry(rel, "dir", st.st_mode, wid, "copyup_dir")
+                    idx.set_entry(rel, "dir", st.st_mode, wid, "copyup_dir",
+                                  mtime_ns=getattr(st, "st_mtime_ns", 0))
                 else:
                     # ap is None when the source is an evicted row in an ancestor (base)
                     # session.  Write its row bytes into the child's blob WITHOUT
@@ -3890,31 +3905,17 @@ def _build_overlay_ops():
                 self._materialize_tree(sid, rel_o, wid)
             else:
                 self._copyup_one(sid, rel_o, wid)
-            # Remove any existing destination overlay artifact.
-            # For a file dst: also remove its pool blob.
+            # Remove any existing destination FILE pool blob (dirs/symlinks carry no
+            # on-disk artifact; their rows are replaced by reparent/rename_row below).
             if idx.kind_of(rel_n) == "file":
                 dst_bp = self._backing_path(sid, rel_n)
                 if dst_bp and os.path.lexists(dst_bp):
                     try: os.unlink(dst_bp)
                     except OSError: pass
-            upn = self._upper_path(sid, rel_n)
-            try:
-                lst = os.lstat(upn)
-                if stat_mod.S_ISDIR(lst.st_mode) and not stat_mod.S_ISLNK(lst.st_mode):
-                    shutil.rmtree(upn)
-                else:
-                    os.unlink(upn)
-            except FileNotFoundError:
-                pass
             self._ensure_parent_dirs(sid, rel_n, wid)
             if is_dir:
-                # Move the up subtree (dirs + symlinks); file blobs stay put,
-                # addressed by rowid which reparent preserves.
-                upo = self._upper_path(sid, rel_o)
-                try:
-                    os.rename(upo, upn)
-                except OSError as e:
-                    raise pyfuse3.FUSEError(e.errno or errno.EIO)
+                # Move the dir subtree in the mirror (rows). File blobs stay put,
+                # addressed by rowid which reparent preserves — no on-disk rename.
                 # Drop the destination's prior overlay subtree (rows + their pool
                 # blobs) before moving the source over it — else those entries
                 # survive as ghosts with orphaned bytes.
@@ -3939,12 +3940,8 @@ def _build_overlay_ops():
                 # rename_row already removed rel_o from the index; if src was NOT
                 # lower-shadowed, nothing more to do (del_entry already implicit).
             else:
-                # Symlink: move the real up artifact.
-                upo = self._upper_path(sid, rel_o)
-                try:
-                    os.rename(upo, upn)
-                except OSError as e:
-                    raise pyfuse3.FUSEError(e.errno or errno.EIO)
+                # Symlink: move the row in place (target data preserved by rename_row).
+                # _copyup_one above recorded rel_o's symlink row in this box's mirror.
                 idx.rename_row(rel_o, rel_n, wid)
                 if dst_shadows_lower:
                     idx.set_entry(rel_n, "symlink", st_o.st_mode, wid, "rename_to",
@@ -4035,13 +4032,18 @@ def _build_overlay_ops():
             self._ensure_parent_dirs(sid, rel_n, wid)
             try:
                 if stat_mod.S_ISLNK(st.st_mode):
-                    ups = self._upper_path(sid, rel_src)
-                    upn = self._upper_path(sid, rel_n)
-                    tgt = os.readlink(ups)
-                    os.symlink(tgt, upn)
+                    # link-as-copy of a symlink: copy the target into a new row (no
+                    # on-disk artifact). _copyup_one above recorded rel_src's target
+                    # into this box's mirror; fall back to the source resolution.
+                    tgt_b = idx.symlink_target(rel_src)
+                    if tgt_b is None:
+                        _l, ap_s, _s = self._resolve_st(sid, rel_src)
+                        tgt_s = self._readlink_source(sid, rel_src, ap_s)
+                        tgt_b = (tgt_s.encode("utf-8", "surrogateescape")
+                                 if tgt_s is not None else b"")
                     idx.set_entry(rel_n, "symlink", stat_mod.S_IFLNK | 0o777, wid,
                                   "link_as_copy", detail=rel_src,
-                                  target=tgt.encode("utf-8", "surrogateescape"),
+                                  target=tgt_b,
                                   mtime_ns=getattr(st, "st_mtime_ns", 0))
                 else:
                     src_bp = self._backing_path(sid, rel_src)
@@ -4059,7 +4061,9 @@ def _build_overlay_ops():
                 raise pyfuse3.FUSEError(e.errno or errno.EIO)
             self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
             self._notify(sid, rel_n, "created")
-            return self._entry(ino, os.lstat(self._backing_path(sid, rel_n)))
+            # Symlink dst has no on-disk artifact: stat it via the mirror.
+            _l, _ap, st_n = self._resolve_st(sid, rel_n)
+            return self._entry(ino, st_n)
 
         async def link(self, inode, new_parent, new_name, ctx):
             new_name = os.fsdecode(new_name)
