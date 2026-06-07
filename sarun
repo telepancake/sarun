@@ -1985,19 +1985,30 @@ class Index:
         self._proc_cache[tgid] = pid_row
         self._prov_by_proc[pid_row] = dict(pid=tgid, ppid=ppid_tgid, exe=exe, argv=argv)
         # A root is its own boundary; never bubble above it into the runner's ancestry.
-        if inserted and not root: self._bubble_parent(tgid, ppid_tgid)
+        # Pass through depth/seen-set if present (injected by _bubble_parent to carry
+        # the cap across the mutual recursion).
+        if inserted and not root:
+            self._bubble_parent(tgid, ppid_tgid,
+                                _depth=int(prov.get("_bubble_depth") or 0),
+                                _seen=prov.get("_bubble_seen") or None)
         return pid_row
 
-    def _bubble_parent(self, tgid: int, ppid: int) -> None:
+    def _bubble_parent(self, tgid: int, ppid: int,
+                       _depth: int = 0, _seen: "set | None" = None) -> None:
         """Record this row's parent (and so its whole PPid chain) so the per-box
         process table forms ONE tree rooted at the sid's host pid. Runs only when a
         row was genuinely new — the dedup short-circuit of process_from_prov stops
         the recursion at the first ancestor already present (the root row, recorded
-        at register, is always present), guaranteeing termination. Best-effort: a
-        failed ancestor /proc read links a minimal row and stops, never raises.
+        at register, is always present). Best-effort: a failed ancestor /proc read links
+        a minimal row and stops, never raises.
         STOPS at: a root tgid (boundary — never walk above a `slopbox -- cmd` launch
-        into the runner's own host ancestry), ppid<=1 (init), or any already-recorded
-        parent."""
+        into the runner's own host ancestry), ppid<=1 (init), any already-recorded
+        parent, or a depth/cycle cap (64 levels / seen-set, matching _lower_has /
+        display_path) so a pathological or cyclic process tree cannot overflow the stack."""
+        if _depth >= 64: return                  # depth cap — same limit as _lower_has
+        if _seen is None: _seen = set()
+        if tgid in _seen: return                 # cycle guard
+        _seen.add(tgid)
         if tgid in self._roots: return           # a root row is the boundary
         if ppid <= 1: return                     # reached init; no system procs
         if ppid in self._proc_cache: return      # parent already linked (roots always are)
@@ -2011,7 +2022,8 @@ class Index:
         parent = dict(tgid=tgid_of(ppid) or ppid,
                       ppid=tgid_of(pprov.get("ppid")) if pprov.get("ppid") else 0,
                       exe=pprov.get("exe") or "", argv=pprov.get("argv") or [],
-                      env=pprov.get("env") or {})
+                      env=pprov.get("env") or {},
+                      _bubble_depth=_depth + 1, _bubble_seen=_seen)
         self.process_from_prov(parent)           # recurses up; dedup ends the walk
 
     def proc_info(self, tgid: int) -> "tuple | None":
