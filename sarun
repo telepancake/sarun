@@ -2703,7 +2703,8 @@ def _build_overlay_ops():
                     layer, ap, _st = self._lower_resolve(sid, rel)
                     if layer in ("lower", "upper") and ap is not None:
                         try:
-                            data = bytearray(open(ap, "rb").read())
+                            with open(ap, "rb") as f:
+                                data = bytearray(f.read())
                         except OSError:
                             data = bytearray()
                     elif layer in ("lower", "upper"):
