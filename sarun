@@ -61,9 +61,11 @@ ambient caps are absent, the runner adds `--unshare-user` to create a fresh
 UNPRIVILEGED user namespace and synthesizes the two caps inside it, which lets
 slopbox run with no ambient privilege under rootless Podman / Fedora toolbox
 (where nested user namespaces are allowed). The userns path keeps the launching
-uid via bwrap's default identity map (no --uid/--gid), and retains the same two
-caps for now (a later change will drop them entirely there). If neither path is
-available the runner refuses with an actionable error. Because CAP_SYS_ADMIN is near root-
+uid via bwrap's default identity map (no --uid/--gid) and runs the box CAP-LESS
+(it drops all caps — more isolated, and avoids bwrap's non-root "unexpected
+capabilities" check). If neither path is available the runner refuses with an
+actionable error. (Hosting a NESTED box from inside a userns box is not yet
+supported — child-overlay grafting needs caps the cap-less box lacks; see TODO.) Because CAP_SYS_ADMIN is near root-
 equivalent for many escapes, a slopbox is an INSPECTION/REVIEW sandbox, not a
 hard containment boundary against a hostile payload — compose it inside a
 stronger sandbox if you need real containment. The bind-as-root confines the box
@@ -8175,6 +8177,21 @@ def cmd_run(cmd, net, trace, direct, session_whitelist, chdir, reuse_sid=None) -
                         "--unshare-net"]
         if _runner_mode == "userns":
             unshare_args.append("--unshare-user")
+        # Caps: in "ambient" mode the box runs as root and KEEPS CAP_SYS_ADMIN /
+        # CAP_NET_ADMIN so it can host a nested box via inherited caps. In "userns"
+        # mode the box runs as a NON-root mapped uid; retaining caps there would make
+        # a nested bwrap refuse ("Unexpected capabilities but not setuid"), and a
+        # cap-less box is strictly more isolated, so we DROP all caps. bwrap still
+        # brings up loopback during --unshare-net setup before dropping to the child,
+        # so the box's own networking works. KNOWN LIMITATION: hosting a NESTED box
+        # from inside a userns box is not yet supported — grafting the child overlay
+        # needs CAP_SYS_ADMIN/move_mount the cap-less box lacks (see the TODO section).
+        # A leaf box (run_on_untrusted) drops ALL regardless.
+        if _runner_mode == "userns":
+            cap_args = ["--cap-drop", "ALL"]
+        else:
+            cap_args = ["--cap-drop", "ALL", "--cap-add", "CAP_SYS_ADMIN",
+                        "--cap-add", "CAP_NET_ADMIN"]
         args = ["bwrap",
                 *bind_root_args,
                 "--proc", "/proc", "--dev", "/dev",
@@ -8182,19 +8199,7 @@ def cmd_run(cmd, net, trace, direct, session_whitelist, chdir, reuse_sid=None) -
                 "--tmpfs", "/tmp", "--tmpfs", "/run",
                 "--ro-bind", _ui_sock_src, UI_SOCK_INBOX,
                 *unshare_args,
-                # Keep only the two caps a box needs to itself HOST a box:
-                # CAP_SYS_ADMIN (unshare pid/ipc/uts/mount) and CAP_NET_ADMIN
-                # (bring up loopback in the nested netns). Drop the other ~38.
-                # In "ambient" mode these come from the process's ambient set; in
-                # "userns" mode they are synthesized inside the fresh --unshare-user
-                # namespace and retained here (v1 — a later change drops them in the
-                # userns path). We can't know in advance whether a box will run
-                # `./sarun` inside it, so every box must keep these (a leaf box like
-                # run_on_untrusted, which provably never nests, still drops ALL).
-                # sarun is not the hard isolation boundary — compose it inside
-                # another sandbox if stronger lockdown is wanted.
-                "--cap-drop", "ALL", "--cap-add", "CAP_SYS_ADMIN",
-                "--cap-add", "CAP_NET_ADMIN", "--die-with-parent",
+                *cap_args, "--die-with-parent",
                 "--chdir", chdir or os.getcwd()]
         if bwrap_supports("--as-pid-1"):
             args += ["--as-pid-1"]
@@ -10383,16 +10388,19 @@ if __name__ == "__main__":
 # Parked here so a future reader (human or LLM) scanning the section list finds
 # them. Delete an item once it's done.
 #
-#  - Unprivileged-userns runner: DONE. cmd_run now picks ambient-caps vs. a
-#    `bwrap --unshare-user` path at runtime (_have_ambient_caps /
-#    _userns_runner_works), synthesizing CAP_SYS_ADMIN + CAP_NET_ADMIN inside a
-#    fresh user namespace so slopbox runs with no ambient privilege under rootless
-#    podman / Fedora toolbox. FOLLOW-ON: in the userns path, drop
-#    CAP_SYS_ADMIN/CAP_NET_ADMIN entirely (a nested box would then create its OWN
-#    --unshare-user namespace rather than relying on inherited caps) for tighter
-#    default isolation. Verified here: true double-userns nesting (a second
-#    --unshare-user inside the first) currently fails with EPERM on the uid map,
-#    so that follow-on needs the cap-free nesting model, not just a flag flip.
+#  - Unprivileged-userns runner: DONE for a SINGLE box. cmd_run picks ambient-caps
+#    vs. a `bwrap --unshare-user` path at runtime (_have_ambient_caps /
+#    _userns_runner_works); the userns path runs the box CAP-LESS (drops ALL — more
+#    isolated, and avoids bwrap's non-root "unexpected capabilities" check) and works
+#    with NO ambient privilege under rootless podman / Fedora toolbox. Validated as a
+#    real non-root user: single box (networked) launch + capture all work.
+#    REMAINING (harder): hosting a NESTED box from INSIDE a userns box. The cap-less
+#    box can't graft the child overlay — fails `bwrap: Can't find source path …/mnt/N`
+#    because move_mount/fd-passing of the child overlay needs CAP_SYS_ADMIN the box no
+#    longer holds. (A second --unshare-user DOES compose — the inner userns is fine;
+#    the blocker is the overlay-mount graft, not the uid map.) Fix needs the child
+#    overlay grafted where CAP_SYS_ADMIN is held (e.g. inside the inner's own userns
+#    via the passed mount fd).
 #  - structural-diff is untested: add an end-to-end test for the quick/finish split
 #    AND the > _STRUCT_MAX recognized-binary path (the branch that once hid the
 #    fmt_bytes NameError). test_new_coverage guards only the regression class.
