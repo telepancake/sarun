@@ -2165,17 +2165,18 @@ class Index:
 
     def prune_subtree(self, prefix: str) -> None:
         pref = prefix + "/"
+        pref_hi = pref[:-1] + chr(ord(pref[-1]) + 1)  # prefix range upper bound
         with self._lock:
             # Free the pool blobs of any file rows under the prefix before dropping the
             # rows — otherwise the bytes leak (the row that named them is gone).
             for rid, mode in self._db.execute(
-                    "SELECT rowid, mode FROM sqlar WHERE substr(name,1,?)=?",
-                    (len(pref), pref)).fetchall():
+                    "SELECT rowid, mode FROM sqlar WHERE name >= ? AND name < ?",
+                    (pref, pref_hi)).fetchall():
                 if stat_mod.S_ISREG(mode):
                     try: blob_path(self.box_id, rid).unlink()
                     except OSError: pass
-            self._db.execute("DELETE FROM sqlar WHERE substr(name,1,?)=?",
-                             (len(pref), pref))
+            self._db.execute("DELETE FROM sqlar WHERE name >= ? AND name < ?",
+                             (pref, pref_hi))
             self._db.commit()
             for s in (self._whiteouts, self._opaque):
                 for p in [p for p in s if p.startswith(pref)]: s.discard(p)
@@ -2189,11 +2190,12 @@ class Index:
         Rowid stability is required so file blobs (addressed by box_id+rowid) never
         move on disk across a directory rename."""
         oldp = old + "/"; newp = new + "/"
+        oldp_hi = oldp[:-1] + chr(ord(oldp[-1]) + 1)  # prefix range upper bound
         with self._lock:
             rows = self._db.execute(
                 "SELECT rowid, name, mode, opaque FROM sqlar"
-                " WHERE substr(name,1,?)=?",
-                (len(oldp), oldp)).fetchall()
+                " WHERE name >= ? AND name < ?",
+                (oldp, oldp_hi)).fetchall()
             for rowid, path, mode, opaque in rows:
                 np = newp + path[len(oldp):]
                 # drop any pre-existing row at the destination (keep source rowid)
