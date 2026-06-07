@@ -152,7 +152,8 @@ _collect_docs_cache: "str | None" = None
 def collect_docs() -> str:
     """Scan the program's own source for `#:`-prefixed doc blocks and return them
     joined as a Rich-markup string (blank line between blocks). Cached: the source
-    never changes during a run. Falls back to a short fallback string on any error."""
+    never changes during a run. Falls back to a short fallback string on read error;
+    returns "" for a legitimately empty doc set."""
     global _collect_docs_cache
     if _collect_docs_cache is not None:
         return _collect_docs_cache
@@ -160,26 +161,28 @@ def collect_docs() -> str:
         src_path = os.path.abspath(__file__)
         with open(src_path, "r", encoding="utf-8", errors="replace") as fh:
             lines = fh.readlines()
-        blocks = []
-        current: "list[str]" = []
-        for raw in lines:
-            stripped = raw.rstrip("\n")
-            if stripped == "#:":
-                current.append("")
-            elif stripped.startswith("#: "):
-                current.append(stripped[3:])
-            else:
-                if current:
-                    blocks.append("\n".join(current))
-                    current = []
-        if current:
-            blocks.append("\n".join(current))
-        result = "\n\n".join(blocks) if blocks else ""
-        _collect_docs_cache = result
-        return result
-    except Exception:
+    except Exception as e:
+        print(f"slopbox: collect_docs: could not read source {__file__!r}: {e}",
+              file=sys.stderr)
         _collect_docs_cache = "[dim](slopbox — run commands in an inspectable sandbox)[/]"
         return _collect_docs_cache
+    blocks = []
+    current: "list[str]" = []
+    for raw in lines:
+        stripped = raw.rstrip("\n")
+        if stripped == "#:":
+            current.append("")
+        elif stripped.startswith("#: "):
+            current.append(stripped[3:])
+        else:
+            if current:
+                blocks.append("\n".join(current))
+                current = []
+    if current:
+        blocks.append("\n".join(current))
+    result = "\n\n".join(blocks) if blocks else ""
+    _collect_docs_cache = result
+    return result
 
 # ════════════════════════════════════════════════════════════════════════════
 #  Paths
@@ -1214,7 +1217,9 @@ def sqlar_remove(path, name) -> int:
         conn.execute("DELETE FROM provenance WHERE path=?", (name,)); conn.commit()
         left = conn.execute("SELECT COUNT(*) FROM sqlar").fetchone()[0]
         flows = conn.execute("SELECT COUNT(*) FROM flows").fetchone()[0]
-    except sqlite3.Error: left = 1; flows = 1
+    except sqlite3.Error as e:
+        print(f"slopbox: sqlar_remove {path} {name}: {e}", file=sys.stderr)
+        left = 1; flows = 1
     finally: conn.close()
     if left == 0 and flows == 0:
         try: path.unlink()
@@ -4338,7 +4343,10 @@ class OverlayMount:
         self._started.wait(timeout=30)
         if self._start_error is not None:
             return False
-        return self._started.is_set()
+        if not self._started.is_set():
+            self._start_error = TimeoutError("overlay mount did not come up in 30s")
+            return False
+        return True
 
     def _run(self) -> None:
         import pyfuse3, trio
@@ -8809,9 +8817,18 @@ def _make_ui_app():
             # Section-guarded: a failure in any one section must NOT abort the rest
             # (e.g. a rescan/render error used to starve the live proc refresh, so
             # dead rows never retired). Each section is independent and best-effort.
+            _tick_err_count = getattr(self, "_tick_err_count", 0)
             def _g(fn):
+                nonlocal _tick_err_count
                 try: fn()
-                except Exception: pass
+                except Exception as _e:
+                    _tick_err_count += 1
+                    # Throttle: log the first occurrence and every 20th thereafter.
+                    if _tick_err_count == 1 or _tick_err_count % 20 == 0:
+                        import traceback as _tb
+                        print(f"slopbox: _tick error (#{_tick_err_count}):",
+                              _tb.format_exc().rstrip(), file=sys.stderr)
+            self._tick_err_count = _tick_err_count
             _g(self.sup.rescan)
             _g(lambda: self._rebuild_sessions(preserve=True))
             _g(self._render_appr)
