@@ -1569,18 +1569,27 @@ def tgid_of(pid: int) -> int:
     return t if t is not None else int(pid)
 
 
-def _proc_start_time(pid: int) -> int:
-    """The process's start time (field 22 of /proc/<pid>/stat, jiffies since boot).
-    0 if unreadable. Cheap and stable for a live process; used to detect PID reuse so
-    a provenance cache entry is not reused across two different processes (LOW-1)."""
+def _parse_proc_stat(pid: int) -> "tuple[int, int]":
+    """Parse /proc/<pid>/stat and return (ppid, start_time).  Both fields are 0 on
+    any error.  The comm field may contain spaces and parentheses, so the split is
+    anchored after the last ')' (rfind) — the same dance used by both callers."""
     try:
         with open(f"/proc/{pid}/stat", "rb") as f:
             st = f.read()
         rp = st.rfind(b")")
         rest = st[rp + 2:].split() if rp >= 0 else []
-        return int(rest[19]) if len(rest) >= 20 else 0
+        ppid = int(rest[1]) if len(rest) >= 2 else 0
+        start_time = int(rest[19]) if len(rest) >= 20 else 0
+        return ppid, start_time
     except (OSError, ValueError):
-        return 0
+        return 0, 0
+
+
+def _proc_start_time(pid: int) -> int:
+    """The process's start time (field 22 of /proc/<pid>/stat, jiffies since boot).
+    0 if unreadable. Cheap and stable for a live process; used to detect PID reuse so
+    a provenance cache entry is not reused across two different processes (LOW-1)."""
+    return _parse_proc_stat(pid)[1]
 
 
 def read_provenance(pid: int, full_env: bool = False) -> dict:
@@ -1600,17 +1609,9 @@ def read_provenance(pid: int, full_env: bool = False) -> dict:
     except OSError: pass
     try: info["exe"] = os.readlink(f"{base}/exe")
     except OSError: pass
-    try:
-        with open(f"{base}/stat", "rb") as f:
-            st = f.read()
-        # comm is parenthesized and may contain spaces/parens; split after the last ')'
-        rp = st.rfind(b")")
-        rest = st[rp + 2:].split() if rp >= 0 else []
-        # fields after comm: state(0) ppid(1) ... starttime(19) (jiffies since boot).
-        # starttime distinguishes a reused pid from the original process (LOW-1).
-        if len(rest) >= 2: info["ppid"] = int(rest[1])
-        if len(rest) >= 20: info["start_time"] = int(rest[19])
-    except (OSError, ValueError): pass
+    # Parse /proc/<pid>/stat via the shared helper (comm may contain spaces/parens).
+    ppid, start_time = _parse_proc_stat(pid)
+    info["ppid"] = ppid; info["start_time"] = start_time
     try:
         with open(f"{base}/environ", "rb") as f:
             env_raw = f.read()
