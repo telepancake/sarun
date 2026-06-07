@@ -5632,6 +5632,11 @@ class ChangeReview:
                             bp.parent.mkdir(parents=True, exist_ok=True)
                             bp.write_bytes(data)
                         except OSError as e:
+                            # The row was committed but the blob was never written.
+                            # Delete the row now so we never leave a resident row
+                            # whose blob is missing (would read back as empty).
+                            try: sqlar_remove(sp, rel)
+                            except Exception: pass
                             return dict(ok=False, error=f"promote write blob: {e}")
                     else:
                         conn = _sqlar_open(sp)
