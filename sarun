@@ -154,6 +154,7 @@ except Exception:
 #   7870   UI — `slopbox`
 #   9762   CLI commands
 #   9857   Entry
+#  10262   TODO — deferred follow-ups (read me)
 #
 # NOTE: update line numbers here whenever sections change.
 
@@ -10254,3 +10255,37 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  TODO — deferred follow-ups (read me)
+# ════════════════════════════════════════════════════════════════════════════
+# Non-blocking follow-ups distilled from code reviews. Each is deferred on purpose
+# (lower value, or larger/riskier than its payoff); none breaks current behavior.
+# Parked here so a future reader (human or LLM) scanning the section list finds
+# them. Delete an item once it's done.
+#
+#  - Unprivileged-userns runner: the box runner (Runner section, the bwrap arg
+#    list) relies on AMBIENT CAP_SYS_ADMIN + CAP_NET_ADMIN. To run with no ambient
+#    privilege inside rootless podman / Fedora toolbox, add a `bwrap --unshare-user`
+#    path that synthesizes those caps in a fresh user namespace (single uid/gid map
+#    + setgroups deny), with runtime detection to choose ambient-caps vs userns.
+#    The FUSE mount is already userns-free (setuid fusermount3).  [under research]
+#  - structural-diff is untested: add an end-to-end test for the quick/finish split
+#    AND the > _STRUCT_MAX recognized-binary path (the branch that once hid the
+#    fmt_bytes NameError). test_new_coverage guards only the regression class.
+#  - LiveUpper.apply_plan builds the whole change set (_kinds, incl. opaque-dir
+#    expansion) just to answer "is this one rel deleted?" — a single-rel check is
+#    cheaper.
+#  - Index.children_of scans all entries per readdir (O(total)); a
+#    parent -> {child: kind} index would make it O(children). Deferred: must stay
+#    coherent across set_entry / del_entry / prune_subtree / reparent / write_evicted.
+#  - sqlar helpers open a fresh sqlite connection per call; a per-box pooled
+#    connection would cut overhead (DDL-per-open is already gated by user_version).
+#  - NetworkPolicy._resolve does blocking DNS (getaddrinfo) on the asyncio loop;
+#    a real fix needs the mitmproxy addon chain (precheck) made async, which the
+#    sync addon interface currently prevents.
+#  - HTTPS/CONNECT proxy-gate path has no test — needs TLS scaffolding (mitmproxy
+#    CA + a live/local TLS endpoint).
+#  - This TABLE OF CONTENTS has hand-maintained line numbers that drift; add a
+#    check or generate it so it can't silently go stale.
