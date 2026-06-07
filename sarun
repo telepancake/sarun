@@ -7046,6 +7046,10 @@ class _GatingAddon:
 
     def _deny(self, flow):
         from mitmproxy import http
+        # Mark the flow at deny-time so response() can read the flag directly
+        # rather than sniffing the response body (which could be streamed or
+        # compressed, or accidentally match a real upstream 403 body).
+        flow.metadata["slopbox_denied"] = True
         flow.response = http.Response.make(
             403, b"slopbox: denied\n", {"Content-Type": "text/plain"})
 
@@ -7073,8 +7077,7 @@ class _GatingAddon:
 
     def response(self, flow):
         req, resp = flow.request, flow.response
-        denied = bool(resp and resp.status_code == 403
-                      and b"slopbox: denied" in (resp.content or b""))
+        denied = bool(flow.metadata.get("slopbox_denied"))
         sid = _CURRENT_BOX_ID.get(); action = "deny" if denied else "allow"
         self.sup.note_traffic(
             sid, req.host, req.port, req.scheme, action,
@@ -8153,7 +8156,7 @@ def _make_ui_app():
         def __init__(self, cur): super().__init__(); self.cur=cur
         def compose(self):
             with Vertical(id="rule-box"):
-                yield Label(f" Rename {self.cur}", id="rule-title")
+                yield Label(styled(" Rename ", (self.cur, "bold")), id="rule-title")
                 yield Input(value="", id="rule-input")
                 yield Label("[dim]CAPITALS, digits and [b]-[/b] · start with a letter · "
                             "no trailing [b]-[/b]   e.g. [b]BOB5-24-YES[/b] · "
@@ -9816,8 +9819,9 @@ def _make_ui_app():
                     if not ok: return
                     r=self.sup.dissolve(sid)
                     if r.get("ok"):
-                        self._status(f"dissolved '{label}', re-parented "
-                                     f"{len(r.get('reparented',[]))} box(es)")
+                        self._status(styled(
+                            "dissolved '", (label, "bold"),
+                            f"', re-parented {len(r.get('reparented',[]))} box(es)"))
                     else:
                         self._status(Text(r.get("error") or "dissolve failed", style="red"))
                 self.push_screen(Confirm(styled(
@@ -9839,7 +9843,7 @@ def _make_ui_app():
                 if not name: return
                 rep=self.sup.rename(sid, name)
                 if not rep.get("ok"): self._status(rep.get("error") or "rename failed")
-                else: self._status(f"renamed → {rep['name']}")
+                else: self._status(styled("renamed → ", (rep['name'], "bold")))
             self.push_screen(RenameModal(s.get("name") or sid), done)
 
         def action_ap_allow(self): self._ap_once("allow")
