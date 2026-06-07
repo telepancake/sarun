@@ -8446,7 +8446,8 @@ def _make_ui_app():
         #main { height:1fr; }
         #left  { width:2fr; border:solid $primary; }
         #right { width:3fr; border:solid $primary; }
-        #box-detail, #rule-detail { height:1fr; padding:0 1; }
+        #box-wrap { height:1fr; } #box-detail { height:auto; padding:0 1; }
+        #rule-detail { height:1fr; padding:0 1; }
         #c-bar { height:1; background:$surface; color:$text-muted; padding:0 1; }
         #status { height:1; background:$surface; color:$text-muted; padding:0 1; }
         DataTable { height:1fr; } ListView { height:1fr; }
@@ -8467,7 +8468,7 @@ def _make_ui_app():
                     "procs":"Processes","net":"Net rules","file":"File rules"}
         LEFT={"boxes":"#s-tab","changes":"#cf-tab","netlog":"#nf-tab",
               "procs":"#pr-tab","net":"#w-list","file":"#r-list"}
-        RIGHT={"boxes":"#box-detail","changes":"#cd-log","netlog":"#flow-wrap",
+        RIGHT={"boxes":"#box-wrap","changes":"#cd-log","netlog":"#flow-wrap",
                "procs":"#proc-wrap","net":"#rule-detail","file":"#rule-detail"}
         # One direct key per list (shown — and highlighted for the current one — in
         # the bottom key bar). No tab strip: the active view is the lit-up key.
@@ -8570,7 +8571,8 @@ def _make_ui_app():
                 with Vertical(id="right"):
                     yield Static("", id="right-title", classes="pt")
                     yield Static("", id="cd-info")
-                    yield Static("", id="box-detail")
+                    with VerticalScroll(id="box-wrap"):
+                        yield Static("", id="box-detail")
                     yield DiffView(id="cd-log")
                     with VerticalScroll(id="flow-wrap"):
                         yield Static("", id="flow-detail")
