@@ -3287,11 +3287,13 @@ def _build_overlay_ops():
                     if data is None:
                         raise pyfuse3.FUSEError(errno.EIO)
                     bp_str = self._new_file_blob(sid, rel, st.st_mode, wid, "copyup")
+                    dst = os.open(bp_str, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
+                                  stat_mod.S_IMODE(st.st_mode))
                     try:
-                        dst = os.open(bp_str, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
-                                      stat_mod.S_IMODE(st.st_mode))
                         os.write(dst, data)
                     except OSError as e:
+                        try: os.close(dst)
+                        except OSError: pass
                         raise pyfuse3.FUSEError(e.errno or errno.EIO)
                     return dst
                 src = os.open(ap, os.O_RDONLY | os.O_NOFOLLOW)
@@ -5643,6 +5645,10 @@ class ChangeReview:
                         bp.parent.mkdir(parents=True, exist_ok=True)
                         bp.write_bytes(data)
                     except OSError as e:
+                        # Roll back the row so we never leave a resident row whose
+                        # blob is missing (mirrors the at-rest branch's rollback).
+                        try: idx.del_entry(rel, op="promoted_blob_fail")
+                        except Exception: pass
                         return dict(ok=False, error=f"promote write blob: {e}")
                 else:
                     # At rest: size-based placement matching consolidate /
