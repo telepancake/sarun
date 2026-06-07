@@ -9554,7 +9554,10 @@ def _make_ui_app():
 
         def _load_flows(self, sid, force=False):
             flows=self.sup.flows(sid)
-            if not force and flows==self._nf_flows:
+            # Flows are append-only (AUTOINCREMENT id, never updated). A cheap
+            # change-key (count, last id) is equivalent to full equality for these.
+            def _flows_key(fl): return (len(fl), fl[-1]["id"] if fl else None)
+            if not force and _flows_key(flows)==_flows_key(self._nf_flows):
                 return
             self._nf_flows=flows
             def row(f):
