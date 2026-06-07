@@ -80,6 +80,7 @@ import errno
 import fcntl
 import fnmatch
 import functools
+import heapq as _heapq
 import ipaddress
 import itertools
 import hashlib
@@ -1509,7 +1510,24 @@ def _libc() -> "_ctypes.CDLL":
     global _LIBC
     if _LIBC is None:
         _LIBC = _ctypes.CDLL("libc.so.6", use_errno=True)
+        _libc_init_sigs(_LIBC)
     return _LIBC
+
+def _libc_init_sigs(lib) -> None:
+    """Set argtypes/restype on each named libc wrapper once (not every call)."""
+    for name, restype, argtypes in (
+        ("open_tree",  _ctypes.c_int,
+         (_ctypes.c_int, _ctypes.c_char_p, _ctypes.c_uint)),
+        ("move_mount", _ctypes.c_int,
+         (_ctypes.c_int, _ctypes.c_char_p, _ctypes.c_int,
+          _ctypes.c_char_p, _ctypes.c_uint)),
+        ("umount2",    _ctypes.c_int,
+         (_ctypes.c_char_p, _ctypes.c_int)),
+    ):
+        fn = getattr(lib, name, None)
+        if fn is not None:
+            fn.restype = restype
+            fn.argtypes = argtypes
 
 # open_tree/move_mount/umount2 are reached through glibc's NAMED wrappers when present
 # (glibc >= 2.36 for the first two; umount2 forever) — those resolve the correct per-arch
@@ -1537,8 +1555,6 @@ def _open_tree_fd(dir_fd: int) -> int:
         libc = _libc()
         fn = getattr(libc, "open_tree", None)
         if fn is not None:                                  # arch-correct named wrapper
-            fn.restype = _ctypes.c_int
-            fn.argtypes = (_ctypes.c_int, _ctypes.c_char_p, _ctypes.c_uint)
             fd = fn(dir_fd, b"", _OPEN_TREE_CLONE | _AT_EMPTY_PATH)
         else:                                               # pre-2.36 glibc fallback
             nr = _OPEN_TREE_NR.get(os.uname().machine)
@@ -1562,9 +1578,6 @@ def _move_mount(tree_fd: int, dest: str) -> int:
         libc = _libc()
         fn = getattr(libc, "move_mount", None)
         if fn is not None:                                  # arch-correct named wrapper
-            fn.restype = _ctypes.c_int
-            fn.argtypes = (_ctypes.c_int, _ctypes.c_char_p, _ctypes.c_int,
-                           _ctypes.c_char_p, _ctypes.c_uint)
             ret = fn(tree_fd, b"", _AT_FDCWD, dest.encode(),
                      _MOVE_MOUNT_F_EMPTY_PATH)
         else:                                               # pre-2.36 glibc fallback
@@ -1587,8 +1600,6 @@ def _lazy_umount(path: str) -> None:
         fn = getattr(libc, "umount2", None)
         if fn is None:
             return
-        fn.restype = _ctypes.c_int
-        fn.argtypes = (_ctypes.c_char_p, _ctypes.c_int)
         fn(path.encode(), _MNT_DETACH)
     except Exception:
         pass
@@ -1869,7 +1880,9 @@ class Index:
         now = time.monotonic()
         self._active[tgid] = now
         if len(self._active) > _ACTIVE_CAP:
-            for t, _seen in sorted(self._active.items(), key=lambda kv: kv[1]):
+            overflow = len(self._active) - _ACTIVE_CAP
+            for t, _seen in _heapq.nsmallest(
+                    overflow + 16, self._active.items(), key=lambda kv: kv[1]):
                 if len(self._active) <= _ACTIVE_CAP: break
                 if t == tgid or _pid_alive(t): continue
                 self._active.pop(t, None); self._dead_since.pop(t, None)
