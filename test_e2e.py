@@ -441,6 +441,122 @@ def run_named_box_e2e(tmp):
         check(not still, "named-e2e: overlay unmounted after UI exits")
 
 
+def run_forced_userns_e2e(tmp):
+    """Exercise the unprivileged-user-namespace runner path (SLOPBOX_FORCE_USERNS=1):
+    box launch + overlay capture must work through `bwrap --unshare-user`, and a
+    NESTED box (a box that launches ./sarun inside it) must also register and
+    capture — proving nesting works via the userns path.
+
+    Skipped (not failed) if _userns_runner_works() is False in this environment."""
+    m = SourceFileLoader("slopbox", SARUN).load_module()
+    if not m._userns_runner_works():
+        print("  SKIP forced-userns e2e: unprivileged user namespaces unavailable here")
+        return
+    e = env_for(tmp)
+    e["SLOPBOX_FORCE_USERNS"] = "1"
+    sock = str(Path(e["XDG_RUNTIME_DIR"]) / "slopbox" / "ui.sock")
+    mnt = Path(e["XDG_RUNTIME_DIR"]) / "slopbox" / "mnt"
+
+    harness = tmp / "ui_harness_userns.py"
+    harness.write_text(
+        "import os\n"
+        "from importlib.machinery import SourceFileLoader\n"
+        f"m = SourceFileLoader('slopbox', {SARUN!r}).load_module()\n"
+        "m.ensure_dirs()\n"
+        "app = m._make_ui_app()()\n"
+        "app.run(headless=True)\n")
+    ui = subprocess.Popen([PYBIN, str(harness)], env=e,
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    try:
+        if not wait_socket(sock, 30):
+            out = b""
+            try: out = ui.stdout.read(4000) if ui.stdout else b""
+            except Exception: pass
+            raise RuntimeError("forced-userns: UI socket never appeared. UI output:\n"
+                               f"{out.decode(errors='replace')}")
+
+        # Part 1: a simple box write captured through the --unshare-user path.
+        r = subprocess.run(
+            [PYBIN, SARUN, "-n", "--", "bash", "-c",
+             "echo userns-capture > /userns_proof.txt"],
+            env=e, capture_output=True, text=True, timeout=120)
+        check(r.returncode == 0,
+              f"forced-userns: simple box run exited 0 "
+              f"(got {r.returncode}: {r.stderr.strip()[-400:]})")
+        check("UI connected" in r.stderr,
+              "forced-userns: runner reports UI connected (userns path)")
+
+        # Part 2: a NESTED box where the OUTER box runs through the userns path.
+        # The outer box's `--unshare-user` namespace synthesizes CAP_SYS_ADMIN /
+        # CAP_NET_ADMIN, so INSIDE the outer box those caps are *ambient* — the
+        # inner ./sarun then takes the ordinary ambient path and nests normally.
+        # This proves nesting works via the userns path: the outer userns is what
+        # makes the inner box launchable. (We unset SLOPBOX_FORCE_USERNS for the
+        # inner call so it uses the now-ambient caps rather than trying to create
+        # a second userns inside the first — double-userns nesting is the later
+        # follow-on, not v1.)
+        nested_cmd = (
+            "unset SLOPBOX_FORCE_USERNS; "
+            f"XDG_STATE_HOME={e['XDG_STATE_HOME']!r} "
+            f"XDG_RUNTIME_DIR={e['XDG_RUNTIME_DIR']!r} "
+            f"{PYBIN} {SARUN} -- "
+            "bash -c 'echo nested-userns-ok > /nested_userns_proof.txt'"
+        )
+        parent_script = (
+            "set -e; "
+            "echo parent-userns > /parent_userns_proof.txt; "
+            + nested_cmd
+        )
+        r2 = subprocess.run(
+            [PYBIN, SARUN, "--", "bash", "-c", parent_script],
+            env=e, capture_output=True, text=True, timeout=120)
+        check(r2.returncode == 0,
+              f"forced-userns: nested box run exited 0 "
+              f"(got {r2.returncode}: {r2.stderr.strip()[-400:]})")
+        check(r2.stderr.count("overlay root:") >= 2,
+              f"forced-userns: nested run shows >=2 overlay roots "
+              f"(got {r2.stderr.count('overlay root:')})")
+
+        # Poll for all three captured files across the produced sqlars.
+        state = Path(e["XDG_STATE_HOME"]) / "slopbox"
+        deadline = time.time() + 30
+        wanted = {"userns_proof.txt", "parent_userns_proof.txt",
+                  "nested_userns_proof.txt"}
+        all_names: set = set()
+        while time.time() < deadline:
+            all_names = set()
+            for sp in state.glob("*.sqlar"):
+                try:
+                    all_names |= {n for n, _md, _mt, _sz in m.sqlar_list(sp)}
+                except Exception:
+                    pass
+            if wanted <= all_names:
+                break
+            time.sleep(0.3)
+        check("userns_proof.txt" in all_names,
+              "forced-userns: simple-box write captured (userns path)")
+        check("parent_userns_proof.txt" in all_names,
+              "forced-userns: parent box write captured")
+        check("nested_userns_proof.txt" in all_names,
+              "forced-userns: NESTED box write captured (nesting via userns works)")
+    finally:
+        try:
+            ui.send_signal(signal.SIGINT)
+            ui.wait(timeout=10)
+        except Exception:
+            try: ui.kill(); ui.wait(timeout=5)
+            except Exception: pass
+        time.sleep(0.5)
+        still = os.path.ismount(str(mnt))
+        if still:
+            try:
+                subprocess.run(["fusermount3", "-uz", str(mnt)],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               timeout=10)
+            except Exception: pass
+        check(not still, "forced-userns: overlay unmounted after UI exits")
+
+
 def main():
     tmp = Path(tempfile.mkdtemp(prefix="e2e-"))
     try:
@@ -454,6 +570,8 @@ def main():
         run_nested_e2e(tmp)
         print("\n== named-box e2e (dotted scoped names) ==")
         run_named_box_e2e(tmp)
+        print("\n== forced-userns e2e (unprivileged --unshare-user runner) ==")
+        run_forced_userns_e2e(Path(tempfile.mkdtemp(prefix="e2e-userns-")))
     except Exception as ex:
         import traceback; traceback.print_exc(); _fails.append(str(ex))
     finally:
