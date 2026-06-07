@@ -324,17 +324,36 @@ def mnt_point() -> Path:
     <mnt>/<box_id>. Empty at rest."""
     return runtime_home() / "mnt"
 
-SOCK_PATH      = str(runtime_home() / "ui.sock")        # control-only socket
 UI_SOCK_INBOX  = "/run/slopbox/ui.sock"                  # fixed in-box path for the above
-MITM_CONFDIR   = data_home() / "mitmproxy"              # CA, generated once
-CA_CERT        = MITM_CONFDIR / "mitmproxy-ca-cert.pem"
-RULES_FILE     = config_home() / "netrules"             # allow/deny network rules
-FILE_RULES_FILE = config_home() / "filerules"           # apply/discard by path glob
+
+# Lazy path accessors (like mnt_point()/live_home()): evaluated at call time so that
+# tests redirecting XDG env vars after import get the correct paths.  The old
+# module-level constants (SOCK_PATH etc.) were computed once at import, snapshotting
+# whatever XDG vars were set then — a latent test-isolation bug.
+def sock_path() -> str:
+    """Unix socket path for the UI's control channel."""
+    return str(runtime_home() / "ui.sock")
+
+def mitm_confdir() -> Path:
+    """Directory holding the mitmproxy CA and config (generated once)."""
+    return data_home() / "mitmproxy"
+
+def ca_cert_path() -> Path:
+    """Path to the mitmproxy CA certificate PEM file."""
+    return mitm_confdir() / "mitmproxy-ca-cert.pem"
+
+def rules_file() -> Path:
+    """Path to the network allow/deny rules file."""
+    return config_home() / "netrules"
+
+def file_rules_file() -> Path:
+    """Path to the file apply/discard glob-rules file."""
+    return config_home() / "filerules"
 
 def ensure_dirs() -> None:
     """Create our host-side config/data/runtime directories. Called by the UI and
     the runner — never by the in-slopbox --inner process."""
-    for p in (data_home(), config_home(), runtime_home(), MITM_CONFDIR, state_home()):
+    for p in (data_home(), config_home(), runtime_home(), mitm_confdir(), state_home()):
         try: p.mkdir(parents=True, exist_ok=True)
         except OSError: pass
     # live/ holds provenance (pid/exe/argv of writers) — restrict it.
@@ -346,10 +365,10 @@ def ensure_dirs() -> None:
     except OSError: pass
     # migrate the old single "rules" file to its new name "netrules"
     old_rules = config_home() / "rules"
-    if old_rules.exists() and not RULES_FILE.exists():
-        try: old_rules.rename(RULES_FILE)
+    if old_rules.exists() and not rules_file().exists():
+        try: old_rules.rename(rules_file())
         except OSError: pass
-    for f in (RULES_FILE, FILE_RULES_FILE):
+    for f in (rules_file(), file_rules_file()):
         try: f.touch(exist_ok=True)
         except OSError: pass
 
@@ -794,7 +813,7 @@ class FileRules(_RuleListBase):
         return None
 
 def load_file_rules() -> FileRules:
-    return FileRules(FILE_RULES_FILE)
+    return FileRules(file_rules_file())
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -6595,7 +6614,7 @@ class Supervisor:
         net = bool(msg.get("want_net"))
         if net:
             try:
-                ca = CA_CERT.read_bytes() if CA_CERT.exists() else b""
+                ca = ca_cert_path().read_bytes() if ca_cert_path().exists() else b""
             except OSError:
                 ca = b""
             if ca.strip():
@@ -7199,7 +7218,7 @@ class ProxyEngine:
             # listening server of its own (we feed it connections by hand).
             # Updating options fires ConfigureHook synchronously; we also trigger a
             # full configure so addons like TlsConfig build their cert store now.
-            opts.update(confdir=str(MITM_CONFDIR), server=False)
+            opts.update(confdir=str(mitm_confdir()), server=False)
             master.addons.trigger(mhooks.ConfigureHook(set(opts.keys())))
             self._master = master
             self._opts = opts
@@ -7652,29 +7671,30 @@ class ChannelServer:
 # ════════════════════════════════════════════════════════════════════════════
 
 def ensure_ca_cert() -> "Path | None":
-    """Generate the mitmproxy CA cert if not already present. Returns CA_CERT on
-    success or None if mitmdump is unavailable or times out."""
-    if CA_CERT.exists(): return CA_CERT
+    """Generate the mitmproxy CA cert if not already present. Returns ca_cert_path()
+    on success or None if mitmdump is unavailable or times out."""
+    _ca = ca_cert_path()
+    if _ca.exists(): return _ca
     try:
         # Port 0: let mitmdump pick a free ephemeral port — no TOCTOU race.
         proc = subprocess.Popen(
             ["mitmdump", "-q", "--listen-host", "127.0.0.1",
-             "--listen-port", "0", "--set", f"confdir={MITM_CONFDIR}"],
+             "--listen-port", "0", "--set", f"confdir={mitm_confdir()}"],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL)
         for _ in range(50):
-            if CA_CERT.exists(): break
+            if _ca.exists(): break
             time.sleep(0.1)
         proc.terminate()
         try: proc.wait(timeout=3)
         except Exception: proc.kill()
     except FileNotFoundError:
         pass
-    if not CA_CERT.exists():
+    if not _ca.exists():
         print("slopbox: ensure_ca_cert: mitmdump timed out; CA cert not generated",
               file=sys.stderr)
         return None
-    return CA_CERT
+    return _ca
 
 
 # Where the various distros keep the system CA bundle that OpenSSL/curl/git read
@@ -7815,8 +7835,8 @@ def cmd_run(cmd, net, trace, direct, session_whitelist, chdir, reuse_sid=None) -
 
     # A nested runner (launched INSIDE an already-running box) reaches the UI via
     # UI_SOCK_INBOX (the host socket bind-mounted into the box at a fixed path).  A
-    # top-level runner on the host uses SOCK_PATH.  Pure path-presence: no env var.
-    _ctrl_sock = UI_SOCK_INBOX if os.path.exists(UI_SOCK_INBOX) else SOCK_PATH
+    # top-level runner on the host uses sock_path().  Pure path-presence: no env var.
+    _ctrl_sock = UI_SOCK_INBOX if os.path.exists(UI_SOCK_INBOX) else sock_path()
 
     # The UI is now the mount provider: it owns the single pyfuse3 overlay and
     # exposes this box as a subfolder under it. So the UI MUST be running — fail
@@ -7898,7 +7918,7 @@ def cmd_run(cmd, net, trace, direct, session_whitelist, chdir, reuse_sid=None) -
     sid = Path(box_root).name
     # For shm_dir, prefer the ack value (UI tells us the real backing path).
     shm_dir = ack.get("shm_dir", str(live_dir(sid)))
-    can_net = net and bool(ack.get("net")) and CA_CERT.exists()
+    can_net = net and bool(ack.get("net")) and ca_cert_path().exists()
     # The owner token is held HERE, in the runner (outside the box). Only we can
     # unregister this session; in-box code never sees it.
     owner_token = ack.get("owner_token", "")
@@ -7974,10 +7994,10 @@ def cmd_run(cmd, net, trace, direct, session_whitelist, chdir, reuse_sid=None) -
         else:
             bind_root_args = ["--bind", str(box_root), "/"]
             popen_pass_fds = ()
-        # When nested (inside a parent box), the host SOCK_PATH isn't accessible;
+        # When nested (inside a parent box), the host sock_path() isn't accessible;
         # the UI socket is already visible at UI_SOCK_INBOX inside the box, so
         # bind-mount UI_SOCK_INBOX → UI_SOCK_INBOX (forwarding it to the child box).
-        _ui_sock_src = _ctrl_sock if _ctrl_sock == UI_SOCK_INBOX else SOCK_PATH
+        _ui_sock_src = _ctrl_sock if _ctrl_sock == UI_SOCK_INBOX else sock_path()
         args = ["bwrap",
                 *bind_root_args,
                 "--proc", "/proc", "--dev", "/dev",
@@ -8004,7 +8024,8 @@ def cmd_run(cmd, net, trace, direct, session_whitelist, chdir, reuse_sid=None) -
             # not <mnt>/).
             chan_dir = os.path.dirname(chan)
             args += ["--bind", chan_dir, chan_dir]
-            args += ["--ro-bind", str(CA_CERT), str(CA_CERT)]
+            _ca = ca_cert_path()
+            args += ["--ro-bind", str(_ca), str(_ca)]
             proxy = f"http://127.0.0.1:{INNER_PROXY_PORT}"
             for var in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
                 args += ["--setenv", var, proxy]
@@ -8013,13 +8034,13 @@ def cmd_run(cmd, net, trace, direct, session_whitelist, chdir, reuse_sid=None) -
             # bundle-based tools at the in-overlay system bundle path; fall back to
             # the bare CA if no system bundle was found.
             primary = primary_ca_path()
-            cafile = primary if primary else str(CA_CERT)
+            cafile = primary if primary else str(_ca)
             for var in ("REQUESTS_CA_BUNDLE", "SSL_CERT_FILE",
                         "CURL_CA_BUNDLE", "GIT_SSL_CAINFO"):
                 args += ["--setenv", var, cafile]
             # node merges NODE_EXTRA_CA_CERTS with its built-in roots, so it only
             # needs the addition, not the whole bundle.
-            args += ["--setenv", "NODE_EXTRA_CA_CERTS", str(CA_CERT)]
+            args += ["--setenv", "NODE_EXTRA_CA_CERTS", str(_ca)]
         # run our own --inner, which starts the forwarder then execs cmd
         args += ["--", sys.executable, find_self(), "--inner",
                  "--channel", chan, "--", *cmd]
@@ -8401,8 +8422,8 @@ def _make_ui_app():
             # screen frame-by-frame.
             self.animation_level="none"
             self.view="boxes"
-            self.rules_store=Rules(RULES_FILE)
-            self.frules_store=FileRules(FILE_RULES_FILE)
+            self.rules_store=Rules(rules_file())
+            self.frules_store=FileRules(file_rules_file())
             # The UI owns the single pyfuse3 overlay mount (started in on_mount on a
             # dedicated trio thread). The Supervisor drives it as boxes come and go.
             # NB: not `self.mount` — that would shadow textual App.mount().
@@ -8505,9 +8526,9 @@ def _make_ui_app():
             except Exception: pass
             self.engine=ProxyEngine(self.sup, loop,
                                     lambda coro: asyncio.create_task(coro))
-            self.server=ChannelServer(self.sup, self.engine, SOCK_PATH)
+            self.server=ChannelServer(self.sup, self.engine, sock_path())
             await self.server.start()
-            msg = f"listening · {SOCK_PATH}"
+            msg = f"listening · {sock_path()}"
             if mount_ok:
                 msg += f"  ·  overlay {mnt_point()}"
             else:
@@ -9996,9 +10017,9 @@ def _make_ui_app():
 def run_ui() -> int:
     # A single UI instance only: if one is already running its control socket
     # answers, so refuse a second.
-    if ui_is_running(SOCK_PATH):
+    if ui_is_running(sock_path()):
         print("slopbox: the UI is already running"
-              f" (control socket {SOCK_PATH}).\n"
+              f" (control socket {sock_path()}).\n"
               "  Only one UI instance may run; use the existing one.",
               file=sys.stderr)
         return 4
@@ -10011,9 +10032,9 @@ def cmd_patch(target=None) -> int:
     """Print the unified patch for a slopbox to stdout, by asking the running UI over
     the control socket. `target` (an sid/NAME) selects the box; None = the UI's
     currently-selected box."""
-    if not ui_is_running(SOCK_PATH):
+    if not ui_is_running(sock_path()):
         print("slopbox: the UI is not running.", file=sys.stderr); return 3
-    rep = sync_request(SOCK_PATH, type="patch", sid=target)
+    rep = sync_request(sock_path(), type="patch", sid=target)
     if not rep or not rep.get("ok"):
         print("slopbox: " + ((rep or {}).get("error") or "no patch available"),
               file=sys.stderr)
@@ -10027,9 +10048,9 @@ def _cmd_review(verb: str, done: str, target=None) -> int:
     """Shared body for apply/discard: act on a box (`target` sid/NAME, else the UI's
     selection) over the control socket, then print the summary. The box is consumed
     (force-deleted) by the UI."""
-    if not ui_is_running(SOCK_PATH):
+    if not ui_is_running(sock_path()):
         print("slopbox: the UI is not running.", file=sys.stderr); return 3
-    rep = sync_request(SOCK_PATH, type=verb, sid=target)
+    rep = sync_request(sock_path(), type=verb, sid=target)
     if not rep or not rep.get("ok"):
         print("slopbox: " + ((rep or {}).get("error") or f"nothing to {verb}"),
               file=sys.stderr)
@@ -10059,9 +10080,9 @@ def cmd_rename(target, new_name) -> int:
         print("slopbox: invalid name — a single CAPS segment (e.g. BOB), "
               "no dots, no trailing '-'.", file=sys.stderr)
         return 2
-    if not ui_is_running(SOCK_PATH):
+    if not ui_is_running(sock_path()):
         print("slopbox: the UI is not running.", file=sys.stderr); return 3
-    rep = sync_request(SOCK_PATH, type="rename", sid=target, name=new_name)
+    rep = sync_request(sock_path(), type="rename", sid=target, name=new_name)
     if not rep or not rep.get("ok"):
         print("slopbox: " + ((rep or {}).get("error") or "rename failed"),
               file=sys.stderr)
@@ -10119,8 +10140,8 @@ def main() -> int:
         _is_run_op = "--" in argv
         if not _is_run_op:
             # select/patch/apply/discard/rename: the box must exist.
-            if ui_is_running(SOCK_PATH):
-                rep = sync_request(SOCK_PATH, type="select", sid=target)
+            if ui_is_running(sock_path()):
+                rep = sync_request(sock_path(), type="select", sid=target)
                 if not rep or not rep.get("ok"):
                     print("slopbox: " + ((rep or {}).get("error")
                                          or f"no slopbox '{target}'"), file=sys.stderr)
