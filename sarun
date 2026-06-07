@@ -8956,7 +8956,7 @@ def _make_ui_app():
                 if s is None: continue
                 c=sty(s["status"])
                 flag={"running":"R","finished":"F","killed":"K"}.get(s["status"],"?")
-                indent="  "*depth + ("└ " if depth else "")
+                indent=self._ch_indent(depth)
                 basename=s.get("name") or key   # the box's NAME (display only)
                 rows.append((key,[
                     Text(flag, style=c), Text(indent+basename, style=c),
@@ -9623,7 +9623,7 @@ def _make_ui_app():
             present={}; new_pp={}
             rows=[]
             for pid, tgid, ppid, exe, argv, depth, conn in tree:
-                indent="  "*depth + ("└ " if depth else "")
+                indent=self._ch_indent(depth)
                 nm=Text(indent+(exe.rsplit("/",1)[-1] or exe or "?")[:18], style="cyan")
                 ar=Text(" ".join(argv)[:40], style="dim")
                 if conn:                          # structural-only ancestor: dimmed
