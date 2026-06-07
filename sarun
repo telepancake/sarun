@@ -8491,8 +8491,11 @@ def _make_ui_app():
             self.query_one("#cf-tab",DataTable).add_columns("","Path","Size")
             self.query_one("#pr-tab",DataTable).add_columns(
                 "TGID","PPID","Exe","Argv")
-            ensure_ca_cert()
             loop=asyncio.get_running_loop()
+            # ensure_ca_cert may block up to ~5 s (polling for mitmdump to write
+            # the CA cert file); run it in a thread-pool executor so it does not
+            # stall the UI event loop during startup.
+            await loop.run_in_executor(None, ensure_ca_cert)
             # Start the single pyfuse3 overlay mount on its dedicated trio thread.
             # Until it is up, no slopbox can run (it has nowhere to bind its root).
             mount_ok=self.overlay_mount.start()
