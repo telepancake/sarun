@@ -666,25 +666,21 @@ class Rule:
         return Rule(action=action, kind=kind, pattern=s)
 
 
-class Rules:
-    """An ordered rule list, evaluated top-to-bottom — first match wins."""
+class _RuleListBase:
+    """Shared ordered-rule-list machinery for Rules and FileRules.
+    Subclasses supply _elem_class (a type with parse/to_line) and decide()."""
+    _elem_class: type
+
     def __init__(self, path: Path):
         self.path = path; self.rules: list = []; self.load()
     def load(self) -> None:
         try: text = self.path.read_text()
         except OSError: text = ""
-        self.rules = [r for r in (Rule.parse(ln) for ln in text.splitlines()) if r]
+        self.rules = [r for r in (self._elem_class.parse(ln) for ln in text.splitlines()) if r]
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text("".join(r.to_line() + "\n" for r in self.rules))
-    def needs_dns(self) -> bool:
-        return any(r.kind in ("ip", "cname") for r in self.rules)
-    def decide(self, host, port, url=None, ips=(), cnames=()) -> "str | None":
-        for r in self.rules:
-            if r.matches(host, port, url, ips, cnames):
-                return r.action
-        return None
-    def insert(self, rule: Rule, at_top: bool = False) -> None:
+    def insert(self, rule, at_top: bool = False) -> None:
         self.rules.insert(0 if at_top else len(self.rules), rule); self.save()
     def remove_at(self, i: int) -> None:
         if 0 <= i < len(self.rules): del self.rules[i]; self.save()
@@ -694,6 +690,19 @@ class Rules:
             self.rules[i], self.rules[j] = self.rules[j], self.rules[i]
             self.save(); return j
         return i
+
+
+class Rules(_RuleListBase):
+    """An ordered rule list, evaluated top-to-bottom — first match wins."""
+    _elem_class = Rule
+
+    def needs_dns(self) -> bool:
+        return any(r.kind in ("ip", "cname") for r in self.rules)
+    def decide(self, host, port, url=None, ips=(), cnames=()) -> "str | None":
+        for r in self.rules:
+            if r.matches(host, port, url, ips, cnames):
+                return r.action
+        return None
 
 
 #: [b]Change review — apply, discard, patch, and file rules[/]
@@ -768,33 +777,16 @@ class FileRule:
         return FileRule(action=action, pattern=pat)
 
 
-class FileRules:
+class FileRules(_RuleListBase):
     """An ordered apply/discard rule list, evaluated top-to-bottom — first match
     wins. Same shape as the network Rules, so the UI edits both the same way."""
-    def __init__(self, path: Path):
-        self.path = path; self.rules: list = []; self.load()
-    def load(self) -> None:
-        try: text = self.path.read_text()
-        except OSError: text = ""
-        self.rules = [r for r in (FileRule.parse(ln) for ln in text.splitlines()) if r]
-    def save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text("".join(r.to_line() + "\n" for r in self.rules))
+    _elem_class = FileRule
+
     def decide(self, rel: str) -> "str | None":
         for r in self.rules:
             if r.matches(rel):
                 return r.action
         return None
-    def insert(self, rule: FileRule, at_top: bool = False) -> None:
-        self.rules.insert(0 if at_top else len(self.rules), rule); self.save()
-    def remove_at(self, i: int) -> None:
-        if 0 <= i < len(self.rules): del self.rules[i]; self.save()
-    def move(self, i: int, delta: int) -> int:
-        j = i + delta
-        if 0 <= i < len(self.rules) and 0 <= j < len(self.rules):
-            self.rules[i], self.rules[j] = self.rules[j], self.rules[i]
-            self.save(); return j
-        return i
 
 def load_file_rules() -> FileRules:
     return FileRules(FILE_RULES_FILE)
