@@ -7101,8 +7101,13 @@ class Supervisor:
         PREDICATE: it never deletes (so it is safe to call from inside a loop)."""
         s = self.sessions.get(sid)
         if not s or _box_running(s): return False
-        try: overlay = upper_has_changes(Path(s.upper))
-        except OSError: overlay = False
+        # Guard: when shm_dir is empty, Path(s.upper) resolves to the relative path
+        # "up", which would walk the process cwd — wrong. Treat as no overlay.
+        if not s.shm_dir:
+            overlay = False
+        else:
+            try: overlay = upper_has_changes(Path(s.upper))
+            except OSError: overlay = False
         sqlar = bool(sqlar_list(sqlar_path(sid)))
         flows = has_flows(sqlar_path(sid))
         return not overlay and not sqlar and not flows
