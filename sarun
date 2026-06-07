@@ -4483,10 +4483,7 @@ def is_whiteout(p: Path) -> bool:
 def _is_symlink(p: Path) -> bool:
     """True if p is itself a symlink (lstat, never follows). Used to refuse writing
     THROUGH a symlink onto the host / into the upper from the UI thread (LOW-3)."""
-    try:
-        return stat_mod.S_ISLNK(os.lstat(p).st_mode)
-    except OSError:
-        return False
+    return Path(p).is_symlink()
 
 def _restore_host_mtime_ns(host, mtime_ns, is_symlink: bool) -> None:
     """Set host's mtime to exactly `mtime_ns` integer nanoseconds (atime too). For a
