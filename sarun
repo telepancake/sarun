@@ -45,6 +45,11 @@ deny/prompt would attach. Provenance (pid/exe/argv of the writer) is captured
 synchronously and recorded in the per-box `<box_id>.sqlar`. Since the UI is now
 the mount provider, `slopbox CMD` REQUIRES a running UI and fails fast otherwise.
 
+Security note: policy_check is a v1 always-allow stub — the per-write enforcement
+seam exists but is not yet enforcing. The system is "security-ready, not
+security-complete": writes are captured and attributed but never blocked at the
+FUSE layer in this version.
+
 Isolation is UNCHANGED: the runner still does `bwrap --bind <mnt>/<box_id> / …`
 with the same flags (own PID/IPC/UTS/net namespaces, all caps dropped, runs as
 you). The bind-as-root confines the box to its own subfolder; it cannot reach
