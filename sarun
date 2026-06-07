@@ -104,6 +104,7 @@ import uuid
 import zlib
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 # libmagic is built to handle hostile input, so the in-process type sniff is fine;
@@ -2778,7 +2779,6 @@ def _build_overlay_ops():
         def _row_stat(mode: int, sz: int, mtime_ns: int):
             """Fake stat-like object for an evicted file (blob absent, bytes in row).
             path is None; _entry() only reads the fields below."""
-            from types import SimpleNamespace
             return SimpleNamespace(
                 st_mode=mode, st_nlink=1, st_size=sz,
                 st_atime_ns=mtime_ns, st_mtime_ns=mtime_ns, st_ctime_ns=mtime_ns,
@@ -2788,7 +2788,6 @@ def _build_overlay_ops():
         def _synth_link_stat(size: int, mtime_ns: int):
             """Synthetic stat for a symlink served from the mirror (no on-disk lstat).
             mode S_IFLNK|0777, st_size == len(target). _entry() reads only these."""
-            from types import SimpleNamespace
             return SimpleNamespace(
                 st_mode=stat_mod.S_IFLNK | 0o777, st_nlink=1, st_size=size,
                 st_atime_ns=mtime_ns, st_mtime_ns=mtime_ns, st_ctime_ns=mtime_ns,
@@ -2798,7 +2797,6 @@ def _build_overlay_ops():
         def _synth_dir_stat(mode: int, mtime_ns: int):
             """Synthetic stat for a dir served from the mirror (no on-disk lstat).
             Mirrors _synth_dir_attrs: nlink 2, size 0."""
-            from types import SimpleNamespace
             m = stat_mod.S_IFDIR | (stat_mod.S_IMODE(mode) or 0o755)
             ts = mtime_ns if mtime_ns else time.time_ns()
             return SimpleNamespace(
