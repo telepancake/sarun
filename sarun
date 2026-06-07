@@ -8083,56 +8083,56 @@ def _make_ui_app():
         @on(Button.Pressed,"#rb-cancel")
         def _c(self): self.dismiss(None)
 
-    class RuleLineModal(ModalScreen):
+    class _SimpleInputModal(ModalScreen):
+        """Base for single-Input modals: title label, one Input, one help label.
+        title may be a str or a Rich Text; initial is the starting input value.
+        Dismisses with the stripped input value (str) on submit, None on cancel."""
+        BINDINGS=[("escape","cancel","")]
+        def __init__(self, title, help_text, initial=""):
+            super().__init__()
+            self._title=title; self._help=help_text; self._initial=initial
+        def compose(self):
+            with Vertical(id="rule-box"):
+                yield Label(self._title, id="rule-title")
+                yield Input(value=self._initial, id="rule-input")
+                yield Label(self._help)
+        def on_mount(self): self.query_one("#rule-input",Input).focus()
+        def action_cancel(self): self.dismiss(None)
+        @on(Input.Submitted,"#rule-input")
+        def _save(self): self.dismiss(self.query_one("#rule-input",Input).value.strip())
+
+    class RuleLineModal(_SimpleInputModal):
         # Edit one existing rule as a full line. Returns the new line or None.
-        BINDINGS=[("escape","cancel","")]
-        def __init__(self, line): super().__init__(); self.line=line
-        def compose(self):
-            with Vertical(id="rule-box"):
-                yield Label(" Edit rule", id="rule-title")
-                yield Input(value=self.line, id="rule-input")
-                yield Label("[dim]<allow|deny> <kind>:<pattern>   "
-                            "(host/cname take [b]*[/b] wildcards) · Enter save · "
-                            "Esc cancel[/]")
-        def on_mount(self): self.query_one("#rule-input",Input).focus()
-        def action_cancel(self): self.dismiss(None)
-        @on(Input.Submitted,"#rule-input")
-        def _save(self): self.dismiss(self.query_one("#rule-input",Input).value.strip())
+        def __init__(self, line):
+            super().__init__(
+                " Edit rule",
+                "[dim]<allow|deny> <kind>:<pattern>   "
+                "(host/cname take [b]*[/b] wildcards) · Enter save · "
+                "Esc cancel[/]",
+                initial=line)
 
-    class FileRuleLineModal(ModalScreen):
+    class FileRuleLineModal(_SimpleInputModal):
         # Add or edit one file rule as a full line. Returns the new line or None.
-        BINDINGS=[("escape","cancel","")]
-        def __init__(self, line): super().__init__(); self.line=line
-        def compose(self):
-            with Vertical(id="rule-box"):
-                yield Label(" File rule", id="rule-title")
-                yield Input(value=self.line, id="rule-input")
-                yield Label("[dim]<apply|discard> <path-glob>   e.g. "
-                            "[b]discard *.log[/b] · [b]apply src/**/*.py[/b] · "
-                            "[b]discard .~*[/b] · [b]apply /etc/**[/b]\n"
-                            "[b]*[/b] stays in one path segment · [b]**[/b] crosses "
-                            "dirs · a bare name matches at any depth · leading "
-                            "[b]/[/b] anchors at root · Enter save · Esc cancel[/]")
-        def on_mount(self): self.query_one("#rule-input",Input).focus()
-        def action_cancel(self): self.dismiss(None)
-        @on(Input.Submitted,"#rule-input")
-        def _save(self): self.dismiss(self.query_one("#rule-input",Input).value.strip())
+        def __init__(self, line):
+            super().__init__(
+                " File rule",
+                "[dim]<apply|discard> <path-glob>   e.g. "
+                "[b]discard *.log[/b] · [b]apply src/**/*.py[/b] · "
+                "[b]discard .~*[/b] · [b]apply /etc/**[/b]\n"
+                "[b]*[/b] stays in one path segment · [b]**[/b] crosses "
+                "dirs · a bare name matches at any depth · leading "
+                "[b]/[/b] anchors at root · Enter save · Esc cancel[/]",
+                initial=line)
 
-    class RenameModal(ModalScreen):
+    class RenameModal(_SimpleInputModal):
         # Rename the selected box. Returns the new NAME or None.
-        BINDINGS=[("escape","cancel","")]
-        def __init__(self, cur): super().__init__(); self.cur=cur
-        def compose(self):
-            with Vertical(id="rule-box"):
-                yield Label(styled(" Rename ", (self.cur, "bold")), id="rule-title")
-                yield Input(value="", id="rule-input")
-                yield Label("[dim]CAPITALS, digits and [b]-[/b] · start with a letter · "
-                            "no trailing [b]-[/b]   e.g. [b]BOB5-24-YES[/b] · "
-                            "Enter save · Esc cancel[/]")
-        def on_mount(self): self.query_one("#rule-input",Input).focus()
-        def action_cancel(self): self.dismiss(None)
-        @on(Input.Submitted,"#rule-input")
-        def _save(self): self.dismiss(self.query_one("#rule-input",Input).value.strip())
+        def __init__(self, cur):
+            super().__init__(
+                styled(" Rename ", (cur, "bold")),
+                "[dim]CAPITALS, digits and [b]-[/b] · start with a letter · "
+                "no trailing [b]-[/b]   e.g. [b]BOB5-24-YES[/b] · "
+                "Enter save · Esc cancel[/]",
+                initial="")
 
     # ── widget subclasses ─────────────────────────────────────────────────────
     # Each list carries its own key bindings, delegating to the app's actions. The
