@@ -1199,20 +1199,34 @@ def sqlar_remove(path, name) -> int:
 
 def _drop_sqlar_row_and_blob(path, box_id, rel) -> None:
     """Drop one sqlar row AND any permanent pool blob backing it. The row is removed
-    FIRST (sqlar_remove): a failed removal must never leave a resident row whose blob
-    is gone (a zombie reading as an empty file); a crash between the two only orphans
-    the blob, which sweep_orphan_pools reclaims. `box_id` may be None (no blob check)."""
+    FIRST: a failed removal must never leave a resident row whose blob is gone (a
+    zombie reading as an empty file); a crash between the two only orphans the blob,
+    which sweep_orphan_pools reclaims. `box_id` may be None (no blob check).
+    Uses a single connection for both the rowid read and the delete."""
+    path = Path(path)
     rel = rel.lstrip("/")
+    if not path.exists(): return
     conn = _sqlar_open(path)
-    try:
-        row = conn.execute("SELECT rowid,data FROM sqlar WHERE name=?", (rel,)).fetchone()
-    except sqlite3.Error: row = None
-    finally: conn.close()
     bp = None
-    if box_id is not None and row is not None and row[1] is None:
-        try: bp = blob_path(int(box_id), row[0])
-        except (ValueError, TypeError): bp = None
-    sqlar_remove(path, rel)
+    try:
+        try:
+            row = conn.execute("SELECT rowid,data FROM sqlar WHERE name=?",
+                               (rel,)).fetchone()
+        except sqlite3.Error: row = None
+        if box_id is not None and row is not None and row[1] is None:
+            try: bp = blob_path(int(box_id), row[0])
+            except (ValueError, TypeError): bp = None
+        # Delete the row (and its provenance), then check emptiness — mirrors sqlar_remove
+        try:
+            conn.execute("DELETE FROM sqlar WHERE name=?", (name := rel,))
+            conn.execute("DELETE FROM provenance WHERE path=?", (name,)); conn.commit()
+            left = conn.execute("SELECT COUNT(*) FROM sqlar").fetchone()[0]
+            flows = conn.execute("SELECT COUNT(*) FROM flows").fetchone()[0]
+        except sqlite3.Error: left = 1; flows = 1
+    finally: conn.close()
+    if left == 0 and flows == 0:
+        try: path.unlink()
+        except OSError: pass
     if bp is not None:
         try:
             if bp.exists(): bp.unlink()
