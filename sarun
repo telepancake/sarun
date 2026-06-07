@@ -6044,7 +6044,7 @@ class NetworkPolicy:
             return {"action": decided, "scope": "rule"}
         self._counter += 1
         rid = f"{sid[:8]}-{self._counter}"
-        fut = asyncio.get_event_loop().create_future()
+        fut = asyncio.get_running_loop().create_future()
         # Resolve now so the approval UI can offer IP / CNAME matches to the user.
         ips, cnames = self._resolve(host)
         self.pending[rid] = Pending(rid, sid, host, port, scheme, time.time(), fut,
@@ -6322,7 +6322,7 @@ class Supervisor:
         sweep_orphan_pools()
         lh = live_home()
         if not lh.exists(): return
-        loop = loop or asyncio.get_event_loop()
+        loop = loop or asyncio.get_running_loop()
         for d in sorted(lh.iterdir()):
             if not (d / "up").is_dir(): continue
             sid = d.name
@@ -7200,7 +7200,7 @@ class RelayServer:
         except OSError: pass
         self._sock.listen(64)
         self._sock.setblocking(False)
-        self._task = asyncio.ensure_future(self._accept_loop())
+        self._task = asyncio.create_task(self._accept_loop())
 
     async def _accept_loop(self) -> None:
         while True:
@@ -7208,7 +7208,7 @@ class RelayServer:
                 conn, _ = await self._loop.sock_accept(self._sock)
             except (OSError, asyncio.CancelledError):
                 break
-            asyncio.ensure_future(self._handle(conn))
+            asyncio.create_task(self._handle(conn))
 
     async def _handle(self, conn: socket.socket) -> None:
         conn.setblocking(False)
@@ -7387,9 +7387,9 @@ class ChannelServer:
         os.chmod(self.sock_path, 0o600)
         self._sock.listen(128)
         self._sock.setblocking(False)
-        self._loop = asyncio.get_event_loop()
+        self._loop = asyncio.get_running_loop()
         self.sup.attach_relay_factory(self._loop, self.engine)
-        self._task = asyncio.ensure_future(self._accept_loop())
+        self._task = asyncio.create_task(self._accept_loop())
 
     async def _accept_loop(self) -> None:
         while True:
@@ -7397,7 +7397,7 @@ class ChannelServer:
                 conn, _ = await self._loop.sock_accept(self._sock)
             except (OSError, asyncio.CancelledError):
                 break
-            asyncio.ensure_future(self._handle(conn))
+            asyncio.create_task(self._handle(conn))
 
     async def _handle(self, conn: socket.socket) -> None:
         # The FIRST read on each control connection uses recvmsg so we can capture
@@ -8417,7 +8417,7 @@ def _make_ui_app():
             self.query_one("#pr-tab",DataTable).add_columns(
                 "TGID","PPID","Exe","Argv")
             ensure_ca_cert()
-            loop=asyncio.get_event_loop()
+            loop=asyncio.get_running_loop()
             # Start the single pyfuse3 overlay mount on its dedicated trio thread.
             # Until it is up, no slopbox can run (it has nowhere to bind its root).
             mount_ok=self.overlay_mount.start()
@@ -8426,7 +8426,7 @@ def _make_ui_app():
             try: await self.sup.sweep_orphans(loop)
             except Exception: pass
             self.engine=ProxyEngine(self.sup, loop,
-                                    lambda coro: asyncio.ensure_future(coro))
+                                    lambda coro: asyncio.create_task(coro))
             self.server=ChannelServer(self.sup, self.engine, SOCK_PATH)
             await self.server.start()
             msg = f"listening · {SOCK_PATH}"
