@@ -50,10 +50,16 @@ seam exists but is not yet enforcing. The system is "security-ready, not
 security-complete": writes are captured and attributed but never blocked at the
 FUSE layer in this version.
 
-Isolation is UNCHANGED: the runner still does `bwrap --bind <mnt>/<box_id> / …`
-with the same flags (own PID/IPC/UTS/net namespaces, all caps dropped, runs as
-you). The bind-as-root confines the box to its own subfolder; it cannot reach
-`<mnt>/` or another box's subtree. Same uid as the UI, so no allow_other.
+Isolation: the runner does `bwrap --bind <mnt>/<box_id> / …` with own
+PID/IPC/UTS/net namespaces, runs as you, and drops all caps EXCEPT CAP_SYS_ADMIN
+and CAP_NET_ADMIN — a box keeps those two so it can itself host a nested box
+(unshare pid/ipc/uts/mount + bring up loopback in the nested netns); a provably-
+leaf box (run_on_untrusted) drops ALL. Because CAP_SYS_ADMIN is near root-
+equivalent for many escapes, a slopbox is an INSPECTION/REVIEW sandbox, not a
+hard containment boundary against a hostile payload — compose it inside a
+stronger sandbox if you need real containment. The bind-as-root confines the box
+to its own subfolder; it cannot reach `<mnt>/` or another box's subtree. Same uid
+as the UI, so no allow_other.
 
 Options (slopbox [FLAGS] -- CMD ...; the command MUST follow `--`):
   -n         enable networking via mitmproxy (default: off)
@@ -5358,6 +5364,13 @@ class SqlarArchive(ChangeSource):
 # ════════════════════════════════════════════════════════════════════════════
 #  ChangeReview
 # ════════════════════════════════════════════════════════════════════════════
+def fmt_bytes(n) -> str:
+    """Human byte size (1.5M / 3.0K / 42B). Module-level so non-UI callers
+    (ChangeReview.structural_diff_quick) can use it too — the UI closes over it."""
+    for u, d in (("G", 1 << 30), ("M", 1 << 20), ("K", 1 << 10)):
+        if n >= d: return f"{n/d:.1f}{u}"
+    return f"{n}B"
+
 class ChangeReview:
     """The box-change review model over the ChangeSource barrier. Lists, diffs,
     applies, and discards a box's changes (whole-file and per-hunk) and computes
@@ -8182,10 +8195,6 @@ def _make_ui_app():
             else: t.append(frag)
         return t
 
-    def fmt_bytes(n):
-        for u, d in (("G",1<<30),("M",1<<20),("K",1<<10)):
-            if n >= d: return f"{n/d:.1f}{u}"
-        return f"{n}B"
     def fmt_age(ts):
         s = int(time.time()-ts)
         if s<60: return f"{s}s"

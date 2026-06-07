@@ -611,3 +611,21 @@ def test_https_connect_proxy_gate_skipped():
     pytest.skip(
         "HTTPS/CONNECT requires real TLS plumbing (mitmproxy CA, live TLS endpoint, "
         "running ProxyServer + event loop). Infrastructure not available in this env.")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+
+def test_fmt_bytes_is_module_level():
+    """Regression guard: fmt_bytes must be a MODULE-LEVEL function. It was once
+    defined only as a nested function inside _make_ui_app while being referenced
+    from ChangeReview.structural_diff_quick (module scope) — a latent NameError on
+    the >4MiB binary-diff path. If it ever re-nests, m.fmt_bytes vanishes and this
+    fails."""
+    assert callable(getattr(m, "fmt_bytes", None)), "fmt_bytes is not module-level"
+    assert m.fmt_bytes(1 << 20) == "1.0M"
+    assert m.fmt_bytes(3) == "3B"
+    # And the previously-crashing caller path must not raise NameError for fmt_bytes:
+    # structural_diff_quick references fmt_bytes in its size-cap branch (module scope).
+    import inspect
+    src = inspect.getsource(m.ChangeReview.structural_diff_quick)
+    assert "fmt_bytes" in src  # the call site still exists and now resolves
