@@ -1143,6 +1143,18 @@ def sqlar_mtime(path, name) -> "int | None":
     finally: conn.close()
     return row[0] if row else None
 
+def sqlar_mode_mtime(path, name) -> "tuple[int, int] | tuple[None, None]":
+    """Fetch mode AND mtime in a single SELECT — use at call sites that need both."""
+    path = Path(path)
+    if not path.exists(): return None, None
+    conn = _sqlar_open(path)
+    try:
+        row = conn.execute("SELECT mode, mtime FROM sqlar WHERE name=?",
+                           (name,)).fetchone()
+    except sqlite3.Error: row = None
+    finally: conn.close()
+    return (row[0], row[1]) if row else (None, None)
+
 def box_id_of_sqlar(path) -> "int | None":
     """The box_id for a <box_id>.sqlar path: its filename stem (box_id IS the identity)."""
     try: return int(Path(path).stem)
@@ -5226,11 +5238,10 @@ class SqlarArchive(ChangeSource):
 
     def apply_plan(self, rel):
         rel = rel.lstrip("/")
-        mode = sqlar_mode(self.path, rel)
+        mode, mtime_ns = sqlar_mode_mtime(self.path, rel)  # single SELECT for both
         if mode is None: return None
         if stat_mod.S_ISCHR(mode):               # tombstone → delete
             return dict(kind="delete")
-        mtime_ns = sqlar_mtime(self.path, rel)   # stored integer ns; restored on host
         # The row exists (mode is not None), so the content MUST be readable. A None here
         # means a resident row whose pool blob is missing — do NOT silently coerce it to
         # an empty file (that would write a zero-byte file over the lower). Treat it as
