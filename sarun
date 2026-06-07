@@ -731,22 +731,22 @@ class Rules:
 # A pattern with no slash, or no leading /, matches at any depth (so *.txt, .~*,
 # a, dir/**/*.txt). A leading / anchors at the filesystem root.
 
-_GLOB_FLAGS = None
-
-def _path_match(pat: str, rel: str) -> bool:
-    global _GLOB_FLAGS
-    pat = pat.strip()
-    if not pat: return False
+@functools.cache
+def _glob_flags() -> int:
     # Lazy import: keeps a bare `import slopbox` (the in-slopbox --inner path)
     # stdlib-only — only the runner/UI that actually matches files needs wcmatch.
     from wcmatch import glob as _wg
-    if _GLOB_FLAGS is None:
-        _GLOB_FLAGS = _wg.GLOBSTAR | _wg.EXTGLOB | _wg.BRACE | _wg.DOTGLOB
+    return _wg.GLOBSTAR | _wg.EXTGLOB | _wg.BRACE | _wg.DOTGLOB
+
+def _path_match(pat: str, rel: str) -> bool:
+    pat = pat.strip()
+    if not pat: return False
+    from wcmatch import glob as _wg
     s = "/" + rel.lstrip("/")                    # the change's absolute path
     if "/" not in pat or not pat.startswith("/"):
         pat = "**/" + pat                        # bare name / relative → any depth
     try:
-        return bool(_wg.globmatch(s, pat, flags=_GLOB_FLAGS))
+        return bool(_wg.globmatch(s, pat, flags=_glob_flags()))
     except ValueError:
         return False
 
