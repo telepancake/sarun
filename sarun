@@ -70,6 +70,7 @@ never change.
 
 from __future__ import annotations
 
+import abc
 import argparse
 import array
 import asyncio
@@ -5016,55 +5017,55 @@ def differ_for(mtype: str, data: bytes):
         return (["tar", "-tvf", "{in}"], "tar (tar -tvf)")
     return None
 
-class ChangeSource:
+class ChangeSource(abc.ABC):
     """The single abstraction barrier over the two concrete representations of a
     box's change set — {the live in-RAM Index (canonical)} vs {the box's one
     sqlar archive (at rest)}. Every change-review operation talks only to this
     interface; `ChangeReview._source(sid)` is the SOLE place that branches
     live-vs-consolidated. Implementors: LiveUpper, SqlarArchive."""
 
+    @abc.abstractmethod
     def current_bytes(self, rel) -> "bytes | None":
         """Bytes for a changed entry in the current state, or None for whiteouts,
         directories, or missing entries."""
-        raise NotImplementedError
 
+    @abc.abstractmethod
     def current_mode(self, rel) -> "int | None":
         """st_mode for the changed entry, or None on any error / missing entry."""
-        raise NotImplementedError
 
+    @abc.abstractmethod
     def current_mtime(self, rel) -> "int | None":
         """Stored-side mtime as integer NANOSECONDS (st_mtime_ns) for the changed entry
         (the diff-base for the stale check), or None if unavailable."""
-        raise NotImplementedError
 
+    @abc.abstractmethod
     def entries(self) -> list:
         """Cheap change records [{path,kind,size}, ...] — NO per-entry host I/O.
         kind is the host-I/O-free class (deleted/symlink/changed); is_text/stale/
         precise created-vs-modified are decorated lazily per visible row by the UI."""
-        raise NotImplementedError
 
+    @abc.abstractmethod
     def remove(self, rel) -> None:
         """Drop/forget a change after a whole-file apply or discard."""
-        raise NotImplementedError
 
+    @abc.abstractmethod
     def discard(self, rel) -> None:
         """Drop a change without writing the host (handles whiteouts and deletions)."""
-        raise NotImplementedError
 
+    @abc.abstractmethod
     def settle(self, rel) -> None:
         """Post-hunk-op cleanup: forget the change if it no longer differs."""
-        raise NotImplementedError
 
+    @abc.abstractmethod
     def write_current(self, rel, data: bytes) -> "dict | None":
         """Revert bytes back into the current state (for discard_hunk). Returns a
         dict(ok=False, error=...) to abort, or None on success."""
-        raise NotImplementedError
 
+    @abc.abstractmethod
     def apply_plan(self, rel) -> "dict | None":
         """How to materialise this change onto the host: dict(kind=...) where kind
         is 'delete' | 'symlink' (target=) | 'dir' | 'file' (data=, mode=). None if
         the entry is not in this source."""
-        raise NotImplementedError
 
 
 # ════════════════════════════════════════════════════════════════════════════
