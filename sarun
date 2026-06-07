@@ -2011,22 +2011,20 @@ class Index:
         means leave as-is on update; writer_id None means leave as-is on update.
         `writer` records the FIRST process to touch the path (set once); `last_writer`
         records the MOST RECENT (advanced on every named write)."""
-        row = self._db.execute(
-            "SELECT opaque, writer, last_writer FROM sqlar WHERE name=?",
-            (path,)).fetchone()
-        if row is None:
-            self._db.execute(
-                "INSERT INTO sqlar(name,mode,mtime,sz,data,opaque,writer,last_writer)"
-                " VALUES(?,?,?,?,?,?,?,?)",
-                (path, int(mode), 0, 0, None,
-                 int(opaque) if opaque is not None else 0, writer_id, writer_id))
-        else:
-            op_q = int(opaque) if opaque is not None else row[0]
-            first = row[1] if row[1] is not None else writer_id   # FIRST: fill once
-            last = writer_id if writer_id is not None else row[2]  # LAST: advance
-            self._db.execute(
-                "UPDATE sqlar SET mode=?, opaque=?, writer=?, last_writer=? WHERE name=?",
-                (int(mode), op_q, first, last, path))
+        # opaque=None → NULL here so the ON CONFLICT clause can distinguish
+        # "leave as-is" (NULL → COALESCE keeps existing) from "set to 0" (0).
+        # COALESCE(?,0) in the INSERT VALUES defaults a fresh row to 0 when opaque
+        # is None (NULL), matching the original behaviour.
+        op = int(opaque) if opaque is not None else None
+        self._db.execute(
+            "INSERT INTO sqlar(name,mode,mtime,sz,data,opaque,writer,last_writer)"
+            " VALUES(?,?,0,0,NULL,COALESCE(?,0),?,?)"
+            " ON CONFLICT(name) DO UPDATE SET"
+            "  mode=excluded.mode,"
+            "  opaque=COALESCE(excluded.opaque, sqlar.opaque),"
+            "  writer=COALESCE(sqlar.writer, excluded.writer),"
+            "  last_writer=COALESCE(excluded.last_writer, sqlar.last_writer)",
+            (path, int(mode), op, writer_id, writer_id))
 
     def set_entry(self, path, kind, mode, writer_id, op,
                   detail: str = "", opaque=None, target=None,
