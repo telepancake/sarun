@@ -7619,8 +7619,12 @@ class ChannelServer:
                 return self.sup.register(msg)          # acks with the mount path
             except Exception as e:
                 return dict(ok=False, error=str(e))
-        elif t == "unregister": await self.sup.unregister_async(msg, self._loop)
-        elif t == "remove": self.sup.drop(msg)
+        elif t == "unregister":
+            await self.sup.unregister_async(msg, self._loop)
+            return None   # fire-and-forget; no reply
+        elif t == "remove":
+            self.sup.drop(msg)
+            return None   # fire-and-forget; no reply
         elif t == "select":
             # `slopbox NAME …`: select a box by sid/NAME (and move the UI cursor).
             return self.sup.select(msg.get("sid"))
@@ -7660,7 +7664,10 @@ class ChannelServer:
                 return dict(ok=True, count=n, sid=sid, errors=res.get("errors", []))
             except Exception as e:
                 return dict(ok=False, error=str(e))
-        return None
+        else:
+            # Unrecognized message type: reply with an explicit error rather than
+            # silently dropping the connection so protocol mismatches are visible.
+            return dict(ok=False, error=f"unknown control type {t!r}")
 
     async def _resolve_and_consolidate(self, msg: dict) -> "tuple[str | None, dict | None]":
         """Resolve the target sid from msg (explicit 'sid' field or the UI selection),
