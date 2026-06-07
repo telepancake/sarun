@@ -54,7 +54,16 @@ Isolation: the runner does `bwrap --bind <mnt>/<box_id> / …` with own
 PID/IPC/UTS/net namespaces, runs as you, and drops all caps EXCEPT CAP_SYS_ADMIN
 and CAP_NET_ADMIN — a box keeps those two so it can itself host a nested box
 (unshare pid/ipc/uts/mount + bring up loopback in the nested netns); a provably-
-leaf box (run_on_untrusted) drops ALL. Because CAP_SYS_ADMIN is near root-
+leaf box (run_on_untrusted) drops ALL. Those two caps come from one of two paths,
+chosen automatically per run: (1) AMBIENT — the process already holds them (fast
+path, e.g. running as root or with the caps granted by the host); (2) USERNS — if
+ambient caps are absent, the runner adds `--unshare-user` to create a fresh
+UNPRIVILEGED user namespace and synthesizes the two caps inside it, which lets
+slopbox run with no ambient privilege under rootless Podman / Fedora toolbox
+(where nested user namespaces are allowed). The userns path keeps the launching
+uid via bwrap's default identity map (no --uid/--gid), and retains the same two
+caps for now (a later change will drop them entirely there). If neither path is
+available the runner refuses with an actionable error. Because CAP_SYS_ADMIN is near root-
 equivalent for many escapes, a slopbox is an INSPECTION/REVIEW sandbox, not a
 hard containment boundary against a hostile payload — compose it inside a
 stronger sandbox if you need real containment. The bind-as-root confines the box
@@ -10374,12 +10383,16 @@ if __name__ == "__main__":
 # Parked here so a future reader (human or LLM) scanning the section list finds
 # them. Delete an item once it's done.
 #
-#  - Unprivileged-userns runner: the box runner (Runner section, the bwrap arg
-#    list) relies on AMBIENT CAP_SYS_ADMIN + CAP_NET_ADMIN. To run with no ambient
-#    privilege inside rootless podman / Fedora toolbox, add a `bwrap --unshare-user`
-#    path that synthesizes those caps in a fresh user namespace (single uid/gid map
-#    + setgroups deny), with runtime detection to choose ambient-caps vs userns.
-#    The FUSE mount is already userns-free (setuid fusermount3).  [under research]
+#  - Unprivileged-userns runner: DONE. cmd_run now picks ambient-caps vs. a
+#    `bwrap --unshare-user` path at runtime (_have_ambient_caps /
+#    _userns_runner_works), synthesizing CAP_SYS_ADMIN + CAP_NET_ADMIN inside a
+#    fresh user namespace so slopbox runs with no ambient privilege under rootless
+#    podman / Fedora toolbox. FOLLOW-ON: in the userns path, drop
+#    CAP_SYS_ADMIN/CAP_NET_ADMIN entirely (a nested box would then create its OWN
+#    --unshare-user namespace rather than relying on inherited caps) for tighter
+#    default isolation. Verified here: true double-userns nesting (a second
+#    --unshare-user inside the first) currently fails with EPERM on the uid map,
+#    so that follow-on needs the cap-free nesting model, not just a flag flip.
 #  - structural-diff is untested: add an end-to-end test for the quick/finish split
 #    AND the > _STRUCT_MAX recognized-binary path (the branch that once hid the
 #    fmt_bytes NameError). test_new_coverage guards only the regression class.
