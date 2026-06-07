@@ -8514,6 +8514,7 @@ def _make_ui_app():
             self._struct_timer=None   # 0.1s debounce handle
             self._struct_spin_timer=None; self._struct_spin_item=None; self._struct_spin_i=0
             self._struct_job=None
+            self._tick_err_count=0    # throttled error counter for _tick guard sections
 
         def compose(self) -> ComposeResult:
             yield Header()
@@ -8918,18 +8919,15 @@ def _make_ui_app():
             # Section-guarded: a failure in any one section must NOT abort the rest
             # (e.g. a rescan/render error used to starve the live proc refresh, so
             # dead rows never retired). Each section is independent and best-effort.
-            _tick_err_count = getattr(self, "_tick_err_count", 0)
             def _g(fn):
-                nonlocal _tick_err_count
                 try: fn()
                 except Exception as _e:
-                    _tick_err_count += 1
+                    self._tick_err_count += 1
                     # Throttle: log the first occurrence and every 20th thereafter.
-                    if _tick_err_count == 1 or _tick_err_count % 20 == 0:
+                    if self._tick_err_count == 1 or self._tick_err_count % 20 == 0:
                         import traceback as _tb
-                        print(f"slopbox: _tick error (#{_tick_err_count}):",
+                        print(f"slopbox: _tick error (#{self._tick_err_count}):",
                               _tb.format_exc().rstrip(), file=sys.stderr)
-            self._tick_err_count = _tick_err_count
             _g(self.sup.rescan)
             _g(lambda: self._rebuild_sessions(preserve=True))
             _g(self._render_appr)
@@ -8957,8 +8955,7 @@ def _make_ui_app():
                 try: self.query_one(sel).display=(k==v)
                 except Exception: pass
             rsel=self.RIGHT[v]
-            for sel in ("#box-detail","#cd-log","#flow-wrap","#proc-wrap",
-                        "#rule-detail"):
+            for sel in set(self.RIGHT.values()):
                 try: self.query_one(sel).display=(sel==rsel)
                 except Exception: pass
             try: self.query_one("#cd-info").display=(v=="changes")   # full-path header
