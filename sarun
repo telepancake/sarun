@@ -1143,6 +1143,17 @@ def sqlar_mtime(path, name) -> "int | None":
     finally: conn.close()
     return row[0] if row else None
 
+def sqlar_nonempty(path) -> bool:
+    """True if the sqlar has at least one entry — cheaper than fetching all rows."""
+    path = Path(path)
+    if not path.exists(): return False
+    conn = _sqlar_open(path)
+    try:
+        row = conn.execute("SELECT 1 FROM sqlar LIMIT 1").fetchone()
+    except sqlite3.Error: row = None
+    finally: conn.close()
+    return row is not None
+
 def sqlar_mode_mtime(path, name) -> "tuple[int, int] | tuple[None, None]":
     """Fetch mode AND mtime in a single SELECT — use at call sites that need both."""
     path = Path(path)
@@ -4836,7 +4847,7 @@ def discover_sessions() -> dict:
                 s = out[sid] = Session(
                     session_id=sid, box_id=int(sid), cmd=root_cmd(sid),
                     shm_dir=str(live_dir(sid)), live=False)
-            s.has_sqlar = bool(sqlar_list(af))
+            s.has_sqlar = sqlar_nonempty(af)
             s.has_flows = has_flows(af)
             # The NAME label and parent pointer come from meta. Empty/missing parent meta
             # means a top-level box (parent None). Without the parent pointer a nested box
@@ -5359,7 +5370,7 @@ class ChangeReview:
         free a spent backing tree). MUST run on the UI loop. Idempotent."""
         s = self.reg.sessions.get(sid)
         if not s: return
-        s.has_sqlar = bool(sqlar_list(sqlar_path(sid)))
+        s.has_sqlar = sqlar_nonempty(sqlar_path(sid))
         try: empty = not upper_has_changes(Path(s.upper))
         except OSError: empty = False
         if empty and s.shm_dir:
@@ -6714,7 +6725,7 @@ class Supervisor:
         elif reported_status == "killed":
             s.killed = True
         s.exit_code = msg.get("exit_code")
-        s.has_sqlar = bool(sqlar_list(sqlar_path(sid)))
+        s.has_sqlar = sqlar_nonempty(sqlar_path(sid))
         s.has_flows = has_flows(sqlar_path(sid))
         self.review._consolidated.add(sid)
         # nothing reviewable at all -> drop the entry entirely
