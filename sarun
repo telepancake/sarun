@@ -73,6 +73,7 @@ from __future__ import annotations
 import argparse
 import array
 import asyncio
+import collections
 import base64
 import contextvars
 import difflib
@@ -1272,6 +1273,7 @@ def _drop_sqlar_row_and_blob(path, box_id, rel) -> None:
 _FLOW_BODY_CAP = 1 << 20    # store at most 1 MiB of each body (but record true size)
 _PROC_RETIRE_S = 4.0        # live proc pane: keep a dead tgid (highlighted) this long
 _ACTIVE_CAP    = 4096       # active set hard cap (bounds RAM when the pane is unwatched)
+_DNS_CACHE_CAP = 4096       # bounded LRU cap for NetworkPolicy._dns_cache
 
 def _hdr_text(items) -> str:
     out = []
@@ -6025,7 +6027,7 @@ class NetworkPolicy:
                  record=None, emit=None):
         self.rules = rules
         self.pending: dict = {}
-        self._dns_cache: dict = {}
+        self._dns_cache: collections.OrderedDict = collections.OrderedDict()
         self._counter = 0
         self._resolve_session = resolve_session or (lambda sid: None)
         self._record = record or (lambda *a, **k: None)
@@ -6037,6 +6039,7 @@ class NetworkPolicy:
         IPv6 (and IPv4). All best-effort — failures just yield empty lists."""
         cached = self._dns_cache.get(host)
         if cached is not None:
+            self._dns_cache.move_to_end(host)   # LRU: mark recently used
             return cached
         ips, cnames = set(), set()
         try:
@@ -6052,7 +6055,10 @@ class NetworkPolicy:
                 ips.add(sa[0])
         except OSError:
             pass
-        res = (sorted(ips), sorted(cnames)); self._dns_cache[host] = res
+        res = (sorted(ips), sorted(cnames))
+        self._dns_cache[host] = res
+        if len(self._dns_cache) > _DNS_CACHE_CAP:
+            self._dns_cache.popitem(last=False)  # evict oldest entry
         return res
 
     def decide(self, s: Session, host: str, port: int,
