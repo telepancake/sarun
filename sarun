@@ -7481,17 +7481,8 @@ class ChannelServer:
             # deflate pass, so run it in the executor (awaited — the CLI is blocked on
             # this reply) instead of inline, keeping the loop free for the UI/proxy.
             try:
-                raw = msg.get("sid")
-                if raw:
-                    sid = self.sup.resolve_box(raw)          # NAME / path / box_id → box_id
-                    if sid is None:
-                        return dict(ok=False, error=f"no slopbox '{raw}'")
-                    self.sup.select(sid)
-                else:
-                    sid = self.sup.selected_sid
-                    if not sid:
-                        return dict(ok=False, error="no slopbox selected in the UI")
-                await self.sup.consolidate_in_executor(self._loop, sid)
+                sid, err = await self._resolve_and_consolidate(msg)
+                if err is not None: return err
                 data = self.sup.review.patch_text(sid)
                 return dict(ok=True, patch=base64.b64encode(data).decode())
             except Exception as e:
@@ -7502,17 +7493,8 @@ class ChannelServer:
             # force-delete the box — unlike the UI we delete unconditionally, even with
             # network-flow rows, so the CLI op is predictable (box consumed).
             try:
-                raw = msg.get("sid")
-                if raw:
-                    sid = self.sup.resolve_box(raw)          # NAME / path / box_id → box_id
-                    if sid is None:
-                        return dict(ok=False, error=f"no slopbox '{raw}'")
-                    self.sup.select(sid)
-                else:
-                    sid = self.sup.selected_sid
-                    if not sid:
-                        return dict(ok=False, error="no slopbox selected in the UI")
-                await self.sup.consolidate_in_executor(self._loop, sid)
+                sid, err = await self._resolve_and_consolidate(msg)
+                if err is not None: return err
                 paths = [e["path"] for e in self.sup.review.session_changes(sid)]
                 if t == "apply":
                     res = self.sup.review.apply(sid, paths)
@@ -7526,6 +7508,24 @@ class ChannelServer:
             except Exception as e:
                 return dict(ok=False, error=str(e))
         return None
+
+    async def _resolve_and_consolidate(self, msg: dict) -> "tuple[str | None, dict | None]":
+        """Resolve the target sid from msg (explicit 'sid' field or the UI selection),
+        select it, and consolidate in the executor.  Returns (sid, None) on success or
+        (None, error_reply) when the sid cannot be resolved.  Raises on consolidation
+        errors (the caller's try/except covers those)."""
+        raw = msg.get("sid")
+        if raw:
+            sid = self.sup.resolve_box(raw)          # NAME / path / box_id → box_id
+            if sid is None:
+                return None, dict(ok=False, error=f"no slopbox '{raw}'")
+            self.sup.select(sid)
+        else:
+            sid = self.sup.selected_sid
+            if not sid:
+                return None, dict(ok=False, error="no slopbox selected in the UI")
+        await self.sup.consolidate_in_executor(self._loop, sid)
+        return sid, None
 
     async def stop(self) -> None:
         if getattr(self, "_task", None):
