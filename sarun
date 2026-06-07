@@ -63,6 +63,11 @@ meta table. Renaming a box is a meta-only label write — the id and backing dir
 never change.
 """
 
+#: [b]slopbox[/] — run a command in a lightweight, inspectable sandbox.
+#: Every command runs inside a [cyan]bwrap[/] container with a private filesystem overlay and
+#: no real network access. The UI lets you review every file the command touched,
+#: approve or deny outbound connections, and apply or discard changes when done.
+
 from __future__ import annotations
 
 import argparse
@@ -135,6 +140,43 @@ except Exception:
 #   9857   Entry
 #
 # NOTE: update line numbers here whenever sections change.
+
+# User docs are `#:`-prefixed Rich-markup blocks dispersed beside the code they document;
+# collected here and shown in the right pane when no box is selected. Keep them next to
+# the relevant code.
+_collect_docs_cache: "str | None" = None
+
+def collect_docs() -> str:
+    """Scan the program's own source for `#:`-prefixed doc blocks and return them
+    joined as a Rich-markup string (blank line between blocks). Cached: the source
+    never changes during a run. Falls back to a short fallback string on any error."""
+    global _collect_docs_cache
+    if _collect_docs_cache is not None:
+        return _collect_docs_cache
+    try:
+        src_path = os.path.abspath(__file__)
+        with open(src_path, "r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+        blocks = []
+        current: "list[str]" = []
+        for raw in lines:
+            stripped = raw.rstrip("\n")
+            if stripped == "#:":
+                current.append("")
+            elif stripped.startswith("#: "):
+                current.append(stripped[3:])
+            else:
+                if current:
+                    blocks.append("\n".join(current))
+                    current = []
+        if current:
+            blocks.append("\n".join(current))
+        result = "\n\n".join(blocks) if blocks else ""
+        _collect_docs_cache = result
+        return result
+    except Exception:
+        _collect_docs_cache = "[dim](slopbox — run commands in an inspectable sandbox)[/]"
+        return _collect_docs_cache
 
 # ════════════════════════════════════════════════════════════════════════════
 #  Paths
@@ -405,6 +447,16 @@ def ui_is_running(sock_path: str) -> bool:
     except OSError:
         return False
 
+
+#: [b]Network model[/]
+#: A slopbox has [b]no real network[/] — only loopback. Outbound connections are only possible
+#: when you pass [cyan]-n[/] (networking flag) AND the UI is running to gate them.
+#: A tiny in-box forwarder hands each accepted connection's file descriptor to the UI over a
+#: Unix socket ([cyan]SCM_RIGHTS[/]). The UI feeds it to an in-process [cyan]mitmproxy[/] instance,
+#: which checks it against your allow/deny rules and — if no rule matches — asks you.
+#: The real upstream fetch happens in the UI's network context; the box never touches the host network.
+#: If the UI is not running, the forwarder has nowhere to send connections, so the box simply
+#: has no network at all and never blocks waiting for a human.
 
 # ════════════════════════════════════════════════════════════════════════════
 #  Inner forwarder — `slopbox --inner` (runs as pid-1-ish inside the slopbox)
@@ -1360,6 +1412,15 @@ def root_cmd(sid: str) -> list:
     try: return list(json.loads(row[0]))
     except (ValueError, TypeError): return []
 
+
+#: [b]Filesystem / overlay model[/]
+#: Each slopbox sees a [b]copy-on-write overlay[/] of the host filesystem ([cyan]/[/]) as its root.
+#: Reads fall through to the real host unless the box has written that path.
+#: Writes are captured in the box's private overlay — the host is [b]never touched[/] until you
+#: explicitly [cyan]apply[/] changes. Every write is recorded in a per-box [cyan].sqlar[/] database
+#: (an SQLite archive) so the UI can show exactly what changed and let you review diffs.
+#: A box's identity is its stable integer [cyan]box_id[/] — renaming a box changes only its
+#: display label, never its backing data or id.
 
 # ════════════════════════════════════════════════════════════════════════════
 #  Overlay engine — pyfuse3 copy-on-write overlay, multiplexed per box
@@ -8856,7 +8917,12 @@ def _make_ui_app():
             d=self.query_one("#box-detail",Static)
             s=self._sel_session()
             if not s:
-                d.update(Text("(no slopbox selected)", style="dim")); return
+                doc=collect_docs()
+                if doc:
+                    d.update(Text.from_markup(doc))
+                else:
+                    d.update(Text("(no slopbox selected)", style="dim"))
+                return
             sid=s["session_id"]
             t=Text()
             t.append((s.get("path") or s.get("name") or sid)+"\n",

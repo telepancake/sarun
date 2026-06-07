@@ -598,6 +598,17 @@ def test_consolidate_size_based_placement():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_collect_docs():
+    """collect_docs() returns a non-empty Rich-markup string that includes the
+    seeded intro phrase — regression cover for the #: doc-block mechanism."""
+    docs = m.collect_docs()
+    check(bool(docs), "collect_docs() returns a non-empty string")
+    check("slopbox" in docs, "collect_docs() contains the word 'slopbox'")
+    check("copy-on-write overlay" in docs, "collect_docs() contains the seeded filesystem phrase")
+    # Calling again hits the cache (same object).
+    check(m.collect_docs() is docs, "collect_docs() is cached (same object on second call)")
+
+
 if __name__ == "__main__":
     for t in (test_one_db_only_and_blob_lifecycle,
               test_process_and_env_tables_dedup_and_tag,
@@ -611,7 +622,8 @@ if __name__ == "__main__":
               test_finalize_apply_writes_host_for_root,
               test_finalize_discard_copies_down_to_children,
               test_consolidate_size_based_placement,
-              test_promote_into_parent_unit):
+              test_promote_into_parent_unit,
+              test_collect_docs):
         print(f"\n== {t.__name__} ==")
         try:
             t()
