@@ -108,8 +108,33 @@ try:
 except Exception:
     magic = None
 
-# Sections: grep -n "^# ═" sarun | awk 'NR%2==0' lists each closing bar (18 sections);
-# the title is the line just above each.
+# TABLE OF CONTENTS — regenerate with: grep -n "^#  [A-Z]" sarun
+#
+#    140   Paths
+#    311   Wire protocol (control messages: newline JSON; FD messages: SCM_RIGHTS)
+#    410   Inner forwarder — `slopbox --inner` (runs as pid-1-ish inside the slopbox)
+#    538   Rules
+#    642   File rules — apply / discard a change by path glob (first match wins)
+#    732   Patch codec & tree utilities
+#    939   Sqlar — the single per-box database (index + at-rest archive)
+#   1150   Network log
+#   1221   Session model & box metadata helpers
+#   1365   Overlay engine — pyfuse3 copy-on-write overlay, multiplexed per box
+#   4170   Overlay mount manager — OverlayMount (trio thread) + Session model & discovery
+#   4748   ChangeSource (abstract interface)
+#   4888   LiveUpper & SqlarArchive (change substrate implementations)
+#   5164   ChangeReview
+#   5864   NetworkPolicy
+#   5979   Supervisor
+#   6911   In-process mitmproxy: drive one connection per passed FD
+#   7063   Control + FD-channel socket server (inside the UI)
+#   7464   CA generation
+#   7515   Runner — `slopbox CMD [ARGS...]`
+#   7870   UI — `slopbox`
+#   9762   CLI commands
+#   9857   Entry
+#
+# NOTE: update line numbers here whenever sections change.
 
 # ════════════════════════════════════════════════════════════════════════════
 #  Paths
@@ -704,16 +729,13 @@ def load_file_rules() -> FileRules:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  Session model + discovery + robust removal
+#  Patch codec & tree utilities
 # ════════════════════════════════════════════════════════════════════════════
-
-# ════════════════════════════════════════════════════════════════════════════
-#  Patch codec — a byte-exact unified diff (multi-file), computed ON DEMAND from
-#  the single sqlar (there is no patch file at rest). Used to render text diffs in
-#  the Changes view, to apply/discard an individual hunk, and to print a box's
-#  whole patch over the control socket (`slopbox patch`). The original command is
-#  the box's ROOT process row in the same sqlar (the root-flagged process.id row).
-# ════════════════════════════════════════════════════════════════════════════
+# Patch codec: byte-exact unified diff (multi-file), computed ON DEMAND from the
+# single sqlar (no patch file at rest). Used to render text diffs in the Changes
+# view, to apply/discard individual hunks, and to print via `slopbox patch`.
+# Tree utilities: build_path_tree/build_proc_tree/nearest_surviving_row — generic
+# stateless tree assembly shared by the file and process panes.
 
 def ut_split(data: bytes) -> list:
     """Split bytes into lines on \\n, keeping the terminator on each line (the last
@@ -914,40 +936,27 @@ def build_file_patch(rel, lower, upper, created, deleted) -> dict:
                                         created=created, deleted=deleted)]))[rel]
 
 # ════════════════════════════════════════════════════════════════════════════
-#  The single per-instance database — ONE sqlite file per slopbox (the sqlar).
+#  Sqlar — the single per-box database (index + at-rest archive)
+# ════════════════════════════════════════════════════════════════════════════
+# ONE database file per box, at sqlar_path(box_id). It is BOTH the live index
+# (consulted on every FUSE op, mirrored in RAM for the hot path) AND the at-rest
+# archive. Schema:
+#   sqlar(name, mode, mtime, sz, data, opaque, writer, last_writer)
+#       every file/dir/symlink/whiteout entry. `mtime` is integer NANOSECONDS
+#       (st_mtime_ns). `data` is the zlib-deflated blob (NULL for a resident file
+#       whose bytes live in the pool). A char-device mode with NULL data is a
+#       deletion tombstone. `opaque`=1 marks an opaque directory. `writer`/
+#       `last_writer` are process.id FKs for the first/most-recent writer.
+#   provenance(path, pid, ppid, exe, argv) — per-path writer provenance.
+#   process(id, tgid, ppid, exe, argv, env_id, root) — one row per traced tgid;
+#       `root`=1 marks a hierarchy root. A re-run adds another root → FOREST.
+#   env(id, hash, env) — unique environment json, deduped by hash.
+#   meta(key, value) — small per-box strings (e.g. the box's display `name`).
+#   flows(...) — every gated request/response for the box.
 #
-#  There is exactly ONE database file per box, at sqlar_path(box_id). It is BOTH the
-#  live index (consulted on every FUSE op, mirrored in RAM for the hot path) AND
-#  the at-rest archive. It holds ALL state in one schema:
-#
-#    sqlar(name, mode, mtime, sz, data, opaque, writer, last_writer)
-#        every file/dir/symlink/whiteout entry with its metadata. `mtime` is the
-#        modification time as integer NANOSECONDS (st_mtime_ns), stored exactly so
-#        sub-second mtime ordering survives consolidate→sqlar→apply→host. `data` is the
-#        zlib-deflated file content (NULL for a resident file whose bytes live in the
-#        pool blob). A char-device mode with NULL data is a deletion tombstone
-#        (whiteout). `opaque`=1 marks an opaque directory. `writer` is the
-#        process-table id (FK to process.id) of the FIRST process to produce the
-#        entry; `last_writer` is the id of the MOST RECENT process to modify it (the
-#        two differ when a path is rewritten by a later process, e.g. a re-run).
-#    provenance(path, pid, ppid, exe, argv)
-#        per-path writer provenance (pid/exe/argv).
-#    process(id, tgid, ppid, exe, argv, env_id, root)
-#        the box's process table (one row per traced tgid); env_id -> env.id.
-#        `root`=1 marks a hierarchy root — the process a `slopbox -- cmd` launch
-#        recorded. A box re-run (`slopbox NAME -- cmd`) adds another root, so the
-#        table is a FOREST; PPid bubbling stops at any root.
-#    env(id, hash, env)
-#        unique environment json, deduped by hash and referenced by env_id.
-#    meta(key, value)
-#        small per-box key/value strings (e.g. the box's display `name`).
-#    flows(...)
-#        every gated request/response for the box.
-#
-#  The `up/` directory is the box-backing sentinel (its existence gates discovery).
-#  Regular-file BYTES live in pool blobs; dirs and symlinks have no on-disk
-#  artifact — their rows (mode/mtime for dirs; target for symlinks) are the truth,
-#  served from the in-RAM Index mirror.
+# `up/` is the box-backing sentinel only. Regular-file bytes live in pool blobs;
+# dirs and symlinks have no on-disk artifact — their rows are the truth, served
+# from the in-RAM Index mirror.
 # ════════════════════════════════════════════════════════════════════════════
 
 def sqlar_path(box_id) -> Path:
@@ -1138,11 +1147,11 @@ def _drop_sqlar_row_and_blob(path, box_id, rel) -> None:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  Network log — every gated request/response for a session, written live by the
-#  in-process mitmproxy into the `flows` table of the box's single sqlar db (the
-#  same file as the file index). No separate flows file. Each flow can carry the
-#  process-table id (process_id) of the in-box process that opened the connection.
+#  Network log
 # ════════════════════════════════════════════════════════════════════════════
+# Every gated request/response, written live by the in-process mitmproxy into the
+# `flows` table of the box's sqlar db. No separate file. Each flow carries the
+# process-table id (process_id) of the in-box process that opened the connection.
 
 _FLOW_BODY_CAP = 1 << 20    # store at most 1 MiB of each body (but record true size)
 _PROC_RETIRE_S = 4.0        # live proc pane: keep a dead tgid (highlighted) this long
@@ -1208,6 +1217,12 @@ def has_flows(path) -> bool:
     finally: conn.close()
 
 
+# ════════════════════════════════════════════════════════════════════════════
+#  Session model & box metadata helpers
+# ════════════════════════════════════════════════════════════════════════════
+# process_list, sqlar_meta_get/set, _all_box_ids, mint_box_id, ensure_box_id,
+# sweep_orphan_pools, process_roots, sqlar_writer_id, process_env, root_cmd —
+# box-id/meta/process helpers used by Supervisor, the CLI commands, and the UI.
 def process_list(path) -> list:
     """[(id, tgid, ppid, exe, argv-list)] for the box's process table."""
     path = Path(path)
@@ -1347,19 +1362,16 @@ def root_cmd(sid: str) -> list:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  Overlay engine — pyfuse3 copy-on-write overlay, multiplexed per session.
-#
-#  The UI owns ONE pyfuse3 mount (see OverlayMount). Its synthetic root lists one
-#  subfolder <sid> per live session; <mnt>/<sid>/… is a merged overlay of
-#  lower=/ + that session's upper (live/<sid>/up) with whiteouts/opacity tracked
-#  in the per-box <sid>.sqlar. Inode numbers span the whole mount; each inode carries
-#  its (sid, rel) so one Operations object serves every box.
-#
-#  This design has NO user namespaces, NO /dev/fuse fd-passing, and NO inner
-#  mount/pivot_root — deliberately, so it nests cleanly inside containers
-#  (toolbox, etc.) needing nothing beyond fusermount3. The mount is made the
-#  ordinary way via fusermount3 and bwrap binds the subfolder as root.
+#  Overlay engine — pyfuse3 copy-on-write overlay, multiplexed per box
 # ════════════════════════════════════════════════════════════════════════════
+# ONE pyfuse3 mount (see OverlayMount). Its synthetic root lists one subfolder
+# <box_id> per live box; <mnt>/<box_id>/… is a merged overlay of lower=/ plus
+# that box's private state (files in pool, dirs/symlinks in Index rows). Inode
+# numbers span the whole mount; each inode carries its (sid, rel) so one
+# Operations object serves every box.
+# No user namespaces, no /dev/fuse fd-passing, no inner mount/pivot_root —
+# so the mount nests cleanly inside containers (toolbox etc.) with nothing
+# beyond fusermount3. bwrap binds the <box_id> subfolder as the box's root.
 
 # Selected env keys captured per writer (provenance).
 _PROV_ENV_KEYS = ("USER", "PWD", "SSH_CONNECTION", "TERM", "_")
@@ -1463,6 +1475,7 @@ def _lazy_umount(path: str) -> None:
         pass
 
 
+# ── provenance & policy ──────────────────────────────────────────────────────
 def _proc_status_field(pid: int, field: str) -> "int | None":
     """One integer field (e.g. Tgid, PPid) from /proc/<pid>/status. None if gone."""
     try:
@@ -1551,6 +1564,7 @@ def policy_check(sid: str, prov: dict, path: str, op: str) -> str:
     return "allow"
 
 
+# ── copy helpers ─────────────────────────────────────────────────────────────
 def reflink_or_copy(src_fd: int, dst_fd: int) -> str:
     """Clone src into dst. Tries FICLONE (O(1) on btrfs/xfs/bcachefs); on any of the
     not-supported errnos falls back to copy_file_range, then to a 1 MiB read/write
@@ -1595,6 +1609,7 @@ def _kind_of_mode(mode: int) -> str:
     return "file"
 
 
+# ── Index (in-RAM mirror + per-box sqlar write-through) ─────────────────────
 class Index:
     """The single per-instance database (sqlar_path(sid)) + a write-through RAM
     mirror. There is exactly ONE sqlite file per box; this class is the set of
@@ -2172,6 +2187,7 @@ class DirHandle:
     snapshot: "list | None" = None
 
 
+# ── MultiplexOverlayFs (pyfuse3 FUSE operations) ────────────────────────────
 def _build_overlay_ops():
     """Build the MultiplexOverlayFs class. Imports pyfuse3 lazily so that importing
     this module (e.g. the --inner forwarder, or offline tests) does not require
@@ -4151,14 +4167,15 @@ def _build_overlay_ops():
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  Overlay mount manager — owns the single pyfuse3 mount on a trio thread.
-#
-#  The pyfuse3 serve loop runs on trio in a dedicated background thread of the UI
-#  process; the Textual UI + mitmproxy run on asyncio in the main thread. The two
-#  loops cannot share a thread, so the serving thread does all FUSE I/O and hands
-#  events to the UI thread-safely (a thread-safe queue drained via an asyncio
-#  callback). Index/RAM mutations are single-writer on the serving thread.
+#  Overlay mount manager — OverlayMount (trio thread) + Session model & discovery
 # ════════════════════════════════════════════════════════════════════════════
+# pyfuse3 serve loop runs on trio in a dedicated background thread; Textual UI +
+# mitmproxy run on asyncio in the main thread. The two loops cannot share a thread:
+# the serving thread does all FUSE I/O and hands events to the UI thread-safely (a
+# thread-safe queue drained via asyncio). Index/RAM mutations are single-writer on
+# the serving thread.
+# Session model & discovery: Session dataclass, discover_sessions(), liveness
+# helpers (_pid_alive/_pidfd_alive/_box_running), and rm_rf() follow OverlayMount.
 
 class OverlayMount:
     def __init__(self, mountpoint: Path, lower: str = "/"):
@@ -4343,6 +4360,7 @@ class OverlayMount:
             pass
 
 
+# ── consolidate / unconsolidate ──────────────────────────────────────────────
 def _is_overlay_marker(name: str) -> bool:
     """Guard against legacy char-device whiteout / opaque-directory marker names
     (.wh..opq, .wh..wh.*) appearing in the upper. These are never created by this
@@ -4727,8 +4745,10 @@ def discover_sessions() -> dict:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  Supervisor (in-process inside the UI)
+#  ChangeSource (abstract interface)
 # ════════════════════════════════════════════════════════════════════════════
+# Pending (network-approval request), hunk helpers, and differ registry precede
+# the change-source classes because they are used by both ChangeReview and the UI.
 
 @dataclass
 class Pending:
@@ -4813,9 +4833,6 @@ def differ_for(mtype: str, data: bytes):
         return (["tar", "-tvf", "{in}"], "tar (tar -tvf)")
     return None
 
-# ════════════════════════════════════════════════════════════════════════════
-#  ChangeSource: the one abstraction barrier over a box's change substrate
-# ════════════════════════════════════════════════════════════════════════════
 class ChangeSource:
     """The single abstraction barrier over the two concrete representations of a
     box's change set — {the live in-RAM Index (canonical)} vs {the box's one
@@ -4867,6 +4884,9 @@ class ChangeSource:
         raise NotImplementedError
 
 
+# ════════════════════════════════════════════════════════════════════════════
+#  LiveUpper & SqlarArchive (change substrate implementations)
+# ════════════════════════════════════════════════════════════════════════════
 class LiveUpper(ChangeSource):
     """Change substrate for a running box: the live in-RAM Index (canonical; files in
     the pool, dirs/symlinks as rows, deletions and opaque-dir expansions tracked
@@ -5140,6 +5160,9 @@ class SqlarArchive(ChangeSource):
                     chmod=stat_mod.S_IMODE(mode), mtime_ns=mtime_ns)
 
 
+# ════════════════════════════════════════════════════════════════════════════
+#  ChangeReview
+# ════════════════════════════════════════════════════════════════════════════
 class ChangeReview:
     """The box-change review model over the ChangeSource barrier. Lists, diffs,
     applies, and discards a box's changes (whole-file and per-hunk) and computes
@@ -5837,6 +5860,9 @@ class ChangeReview:
         return dict(discarded=discarded, errors=errors)
 
 
+# ════════════════════════════════════════════════════════════════════════════
+#  NetworkPolicy
+# ════════════════════════════════════════════════════════════════════════════
 class NetworkPolicy:
     """Owns the network decisioning: the permanent ruleset, the DNS resolve memo,
     and the pending-approval bookkeeping. Holds NO session/index registry state —
@@ -5949,6 +5975,9 @@ class NetworkPolicy:
                     url=p.url, ips=p.ips, cnames=p.cnames)
 
 
+# ════════════════════════════════════════════════════════════════════════════
+#  Supervisor
+# ════════════════════════════════════════════════════════════════════════════
 class Supervisor:
     """The session registry: owns the live session set (lifecycle, relay plumbing,
     flow recording) and composes `self.policy` (a NetworkPolicy) and `self.review`
@@ -7876,6 +7905,7 @@ def _make_ui_app():
         return f"{s//3600}h{(s%3600)//60:02d}m"
     sty = lambda st: {"running":"green","finished":"dim","killed":"red","error":"red"}.get(st,"")
 
+    # ── modals ────────────────────────────────────────────────────────────────
     class Confirm(ModalScreen):
         BINDINGS=[("y","yes",""),("n","no",""),("escape","no","")]
         def __init__(self,m): super().__init__(); self.m=m
@@ -7992,6 +8022,7 @@ def _make_ui_app():
         @on(Input.Submitted,"#rule-input")
         def _save(self): self.dismiss(self.query_one("#rule-input",Input).value.strip())
 
+    # ── widget subclasses ─────────────────────────────────────────────────────
     # Each list carries its own key bindings, delegating to the app's actions. The
     # bottom key bar advertises them per view (and lights up the current list's key).
     class SessionTable(DataTable):
@@ -8083,6 +8114,7 @@ def _make_ui_app():
             i=self._idx()
             if i is not None: self.app._hunk_discard(i)
 
+    # ── app + layout ──────────────────────────────────────────────────────────
     class UI(App):
         ENABLE_COMMAND_PALETTE=False   # free Ctrl+P (and drop the unused palette)
         TITLE="slopbox"
@@ -8479,6 +8511,7 @@ def _make_ui_app():
             try: self.overlay_mount.stop()
             except Exception: pass
 
+        # ── event handling ────────────────────────────────────────────────────
         def _on_evt(self, ev): self.call_later(self._apply_evt, ev)
 
         def _select_sid(self, sid):
@@ -8790,6 +8823,7 @@ def _make_ui_app():
                 try: table.move_cursor(row=table.get_row_index(saved),animate=False)
                 except Exception: pass
 
+        # ── pane renderers ────────────────────────────────────────────────────
         def _rebuild_sessions(self, preserve=False):
             # Build a DFS-ordered tree via the shared build_path_tree core (same pattern
             # as the proc pane and changes pane).  Connector rows (a dotted prefix that
@@ -9600,6 +9634,7 @@ def _make_ui_app():
         def _file_hl(self, ev):
             if self.view=="file": self._update_rule_detail()
 
+        # ── actions ───────────────────────────────────────────────────────────
         def action_back(self):
             """Esc steps back: diff → file list; any other list → slopboxes."""
             if self.view=="changes":
@@ -9723,6 +9758,11 @@ def _make_ui_app():
     return UI
 
 
+# ════════════════════════════════════════════════════════════════════════════
+#  CLI commands
+# ════════════════════════════════════════════════════════════════════════════
+# run_ui, cmd_run, cmd_patch, cmd_apply, cmd_discard, cmd_rename — the top-level
+# entry points for each slopbox subcommand, called from main().
 def run_ui() -> int:
     # A single UI instance only: if one is already running its control socket
     # answers, so refuse a second.
