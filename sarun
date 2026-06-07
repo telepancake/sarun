@@ -4396,6 +4396,13 @@ class OverlayMount:
         """Mount the single overlay and start serving. Blocks until the serve loop is
         actually up (or failed). Returns True on success. Fail-closed: a mount
         failure is reported, never swallowed."""
+        # Fail fast with an actionable message if the FUSE device is missing,
+        # rather than letting pyfuse3/fusermount3 die with a cryptic error.
+        if not os.path.exists("/dev/fuse"):
+            self._start_error = RuntimeError(
+                "FUSE device /dev/fuse missing; toolbox provides it, plain "
+                "podman needs `--device /dev/fuse`")
+            return False
         try:
             self.mountpoint.mkdir(parents=True, exist_ok=True)
         except OSError as e:
@@ -8116,20 +8123,67 @@ def cmd_run(cmd, net, trace, direct, session_whitelist, chdir, reuse_sid=None) -
         # the UI socket is already visible at UI_SOCK_INBOX inside the box, so
         # bind-mount UI_SOCK_INBOX → UI_SOCK_INBOX (forwarding it to the child box).
         _ui_sock_src = _ctrl_sock if _ctrl_sock == UI_SOCK_INBOX else sock_path()
+        # ── runner mode (computed ONCE) ─────────────────────────────────────
+        # Two ways to get the runner's two required caps (CAP_SYS_ADMIN to
+        # unshare pid/ipc/uts/mount; CAP_NET_ADMIN to bring up loopback in the
+        # nested netns):
+        #   "ambient" — the process already holds them (fast path; e.g. running
+        #               as root, or with the caps granted by the container).
+        #   "userns"  — synthesize a fresh UNPRIVILEGED user namespace via
+        #               `--unshare-user` and retain the same two caps inside it.
+        #               This is what lets slopbox run in rootless Podman / Fedora
+        #               toolbox, where you lack ambient caps but CAN create
+        #               nested user namespaces. (v1 keeps the caps; a later change
+        #               will drop them entirely in this path.)
+        # SLOPBOX_FORCE_USERNS=1 forces the userns path even when ambient caps
+        # exist, so the new path is testable where the fast path would win.
+        _force_userns = os.environ.get("SLOPBOX_FORCE_USERNS") == "1"
+        if not _force_userns and _have_ambient_caps():
+            _runner_mode = "ambient"
+        elif _userns_runner_works():
+            _runner_mode = "userns"
+        else:
+            print(
+                "slopbox: cannot create the runner sandbox.\n"
+                "  No ambient CAP_SYS_ADMIN/CAP_NET_ADMIN, and unprivileged user\n"
+                "  namespaces are unavailable — so there is no way to obtain the two\n"
+                "  caps a box needs (unshare pid/ipc/uts/mount; bring up loopback).\n"
+                "  Likely causes and fixes:\n"
+                "    - Docker's default seccomp profile blocks nested user namespaces.\n"
+                "      Run under rootless Podman or a Fedora toolbox instead.\n"
+                "    - Ubuntu 24.04 restricts unprivileged userns via AppArmor\n"
+                "      (kernel.apparmor_restrict_unprivileged_userns=1). Either set it\n"
+                "      to 0 (sysctl) or ship an AppArmor profile carrying the `userns,`\n"
+                "      rule for this binary.\n"
+                "    - /dev/fuse must be present: a toolbox provides it; under plain\n"
+                "      podman add `--device /dev/fuse`.",
+                file=sys.stderr)
+            return 4
+        # --unshare-* flags: in userns mode we additionally unshare the user
+        # namespace. bwrap's default identity map maps the launching uid/gid to
+        # themselves, so the box still "runs as you" — no --uid/--gid needed.
+        unshare_args = ["--unshare-pid", "--unshare-ipc", "--unshare-uts",
+                        "--unshare-net"]
+        if _runner_mode == "userns":
+            unshare_args.append("--unshare-user")
         args = ["bwrap",
                 *bind_root_args,
                 "--proc", "/proc", "--dev", "/dev",
                 "--ro-bind-try", "/sys", "/sys",
                 "--tmpfs", "/tmp", "--tmpfs", "/run",
                 "--ro-bind", _ui_sock_src, UI_SOCK_INBOX,
-                "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--unshare-net",
-                # Keep only the two caps a box needs to itself HOST a box: CAP_SYS_ADMIN
-                # (unshare pid/ipc/uts/mount) and CAP_NET_ADMIN (bring up loopback in the
-                # nested netns). Drop the other ~38. We can't know in advance whether a
-                # box will run `./sarun` inside it, so every box must keep these (a leaf
-                # box like run_on_untrusted, which provably never nests, still drops ALL).
-                # sarun is not the hard isolation boundary — compose it inside another
-                # sandbox if stronger lockdown is wanted.
+                *unshare_args,
+                # Keep only the two caps a box needs to itself HOST a box:
+                # CAP_SYS_ADMIN (unshare pid/ipc/uts/mount) and CAP_NET_ADMIN
+                # (bring up loopback in the nested netns). Drop the other ~38.
+                # In "ambient" mode these come from the process's ambient set; in
+                # "userns" mode they are synthesized inside the fresh --unshare-user
+                # namespace and retained here (v1 — a later change drops them in the
+                # userns path). We can't know in advance whether a box will run
+                # `./sarun` inside it, so every box must keep these (a leaf box like
+                # run_on_untrusted, which provably never nests, still drops ALL).
+                # sarun is not the hard isolation boundary — compose it inside
+                # another sandbox if stronger lockdown is wanted.
                 "--cap-drop", "ALL", "--cap-add", "CAP_SYS_ADMIN",
                 "--cap-add", "CAP_NET_ADMIN", "--die-with-parent",
                 "--chdir", chdir or os.getcwd()]
