@@ -1427,9 +1427,15 @@ def _all_box_ids() -> set:
     return out
 
 def mint_box_id() -> int:
-    """Mint a fresh, never-before-used box_id: max(existing on disk)+1. Single-process
-    (the UI) mints ids, so the scan-then-assign needs no cross-process lock. Called
-    EAGERLY at box creation so a path is always derivable from the id."""
+    """Mint a fresh, never-before-used box_id: max(existing on disk)+1.
+
+    INVARIANT: exactly ONE process (the UI's Supervisor) ever calls this function.
+    The scan-then-assign is therefore race-free without a cross-process lock.
+    If that invariant were violated (e.g. two UI instances), collisions could occur.
+    Cross-process locking is intentionally out of scope; the ChannelServer already
+    prevents a second UI instance from starting (run_ui() checks ui_is_running()
+    before launching). Called EAGERLY at box creation so a path is always derivable
+    from the id."""
     return max(_all_box_ids(), default=0) + 1
 
 def as_box_id(box_id) -> int:
