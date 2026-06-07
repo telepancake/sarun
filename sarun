@@ -298,16 +298,7 @@ def valid_dotted_name(name: "str | None") -> bool:
     never ends with '-').  Rejects empty string, leading/trailing dots, consecutive dots
     ('..'), any '/', and any standalone '..' segment — all traversal-safe by construction.
     A single-segment name (no dot) is also valid (it equals valid_name)."""
-    if not isinstance(name, str) or not name:
-        return False
-    # Fast structural rejection before the regex: no '/' ever; '..' as a whole name;
-    # leading or trailing '.'.
-    if "/" in name or name.startswith(".") or name.endswith("."):
-        return False
-    for seg in name.split("."):
-        if not NAME_RE.match(seg):   # catches empty seg, '..' etc.
-            return False
-    return True
+    return bool(isinstance(name, str) and DOTTED_NAME_RE.match(name))
 
 def valid_box_id(box_id: "str | None") -> bool:
     # The internal box key is str(box_id): a plain decimal string. This validates a
