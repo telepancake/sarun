@@ -5619,15 +5619,9 @@ class ChangeReview:
         """Direct child boxes of `sid` (parent_box_id == sid's box_id): live sessions
         plus finished sqlar-only boxes (parent recorded in 'parent_box_id' meta)."""
         kids = set()
-        for c, s in self.reg.sessions.items():
-            if c != sid and s.parent_box_id is not None and str(s.parent_box_id) == sid:
+        for c, m in self.reg._all_box_meta().items():
+            if c != sid and m["parent_box_id"] == sid:
                 kids.add(c)
-        sh = state_home()
-        if sh.exists():
-            for p in sh.glob("*.sqlar"):
-                c = p.stem
-                if c != sid and sqlar_meta_get(p, "parent_box_id") == sid:
-                    kids.add(c)
         return sorted(kids, key=lambda k: int(k) if BOX_ID_RE.match(k) else 0)
 
     def _box_has_own_entry(self, child: str, rel: str) -> bool:
@@ -6139,21 +6133,38 @@ class Supervisor:
         self._auto_n += 1
         return "A" + str(n)
 
+    def _all_box_meta(self) -> dict:
+        """Enumerate every known box (live sessions + on-disk *.sqlar files whose stem
+        matches BOX_ID_RE) and return {key: {"name": str, "parent_box_id": str|None}}.
+        Live-session data takes precedence over on-disk sqlar data (same as _box_name /
+        _box_parent).  No caching — a fresh scan per call matches current behaviour."""
+        meta: dict = {}
+        for key, s in self.sessions.items():
+            if not BOX_ID_RE.match(key): continue
+            meta[key] = {
+                "name": s.name or "",
+                "parent_box_id": str(s.parent_box_id) if s.parent_box_id is not None else None,
+            }
+        sh = state_home()
+        if sh.exists():
+            for p in sh.glob("*.sqlar"):
+                k = p.stem
+                if not BOX_ID_RE.match(k): continue
+                if k not in meta:
+                    nm = sqlar_meta_get(p, "name") or ""
+                    pbid = sqlar_meta_get(p, "parent_box_id") or None
+                    meta[k] = {"name": nm, "parent_box_id": pbid}
+        return meta
+
     def _name_index(self) -> dict:
         """{name: box_id} over every box (live sessions + on-disk sqlar 'name' meta).
         The reverse of the derived-display-path direction; used by resolve_box."""
         out: dict = {}
-        for key, s in self.sessions.items():
-            if s.name:
-                try: out[s.name] = int(key)
+        for key, m in self._all_box_meta().items():
+            nm = m["name"]
+            if nm and nm not in out:
+                try: out[nm] = int(key)
                 except (ValueError, TypeError): pass
-        sh = state_home()
-        if sh.exists():
-            for p in sh.glob("*.sqlar"):
-                nm = sqlar_meta_get(p, "name")
-                if nm and nm not in out:
-                    try: out[nm] = int(p.stem)
-                    except ValueError: pass
         return out
 
     def _find_named_child(self, name: str, parent_box_id) -> "str | None":
@@ -6161,16 +6172,13 @@ class Supervisor:
         `parent_box_id` (None=top-level), else None. Siblings must have unique NAMEs;
         this is the enforcement/rerun lookup. Scans live sessions + on-disk meta."""
         pbid = int(parent_box_id) if parent_box_id is not None else None
-        keys = set(self.sessions)
-        sh = state_home()
-        if sh.exists():
-            for p in sh.glob("*.sqlar"):
-                if BOX_ID_RE.match(p.stem):
-                    keys.add(p.stem)
-        for k in keys:
-            if not BOX_ID_RE.match(k): continue
-            if self._box_name(k) == name and self._box_parent(k) == pbid:
-                return k
+        for k, m in self._all_box_meta().items():
+            if m["name"] == name:
+                v = m["parent_box_id"]
+                try: kpbid = int(v) if v else None
+                except (ValueError, TypeError): kpbid = None
+                if kpbid == pbid:
+                    return k
         return None
 
     def _box_name(self, box_id) -> "str | None":
@@ -6226,13 +6234,7 @@ class Supervisor:
             bid = self._name_index().get(s)
             return str(bid) if bid is not None else None
         # Dotted path: find the box whose derived display path equals s.
-        keys = set(self.sessions)
-        sh = state_home()
-        if sh.exists():
-            for p in sh.glob("*.sqlar"):
-                keys.add(p.stem)
-        for k in keys:
-            if not BOX_ID_RE.match(k): continue
+        for k in self._all_box_meta():
             if self.display_path(k) == s:
                 return k
         return None
