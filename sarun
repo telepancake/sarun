@@ -9208,11 +9208,9 @@ def _make_ui_app():
             self._skip_conn_ch()
             self._decorate_visible()
 
-        def _skip_conn_ch(self):
-            # Keep the cursor off dimmed connector dir rows: nudge to the next real entry.
-            conn=self._ch_conn
+        def _skip_conn(self, t, conn):
+            # Nudge the cursor off a connector row: scan forward then back to nearest real row.
             if not conn: return
-            t=self.query_one("#cf-tab",DataTable)
             if not t.row_count: return
             try: ck=t.coordinate_to_cell_key((t.cursor_row,0)).row_key.value
             except Exception: return
@@ -9224,6 +9222,10 @@ def _make_ui_app():
             if nxt is not None:
                 try: t.move_cursor(row=nxt, animate=False)
                 except Exception: pass
+
+        def _skip_conn_ch(self):
+            # Keep the cursor off dimmed connector dir rows: nudge to the next real entry.
+            self._skip_conn(self.query_one("#cf-tab",DataTable), self._ch_conn)
 
         def _decorate_visible(self):
             # Viewport-scoped lazy decoration: compute is_text/stale/precise-kind ONLY
@@ -9655,20 +9657,7 @@ def _make_ui_app():
 
         def _skip_conn_proc(self):
             # Keep the cursor off dimmed connector rows: nudge to the next real member.
-            conn=getattr(self,"_pr_conn",None)
-            if not conn: return
-            t=self.query_one("#pr-tab",DataTable)
-            if not t.row_count: return
-            try: ck=t.coordinate_to_cell_key((t.cursor_row,0)).row_key.value
-            except Exception: return
-            if ck not in conn: return
-            keys=[rk.value for rk in t.rows]
-            i=t.cursor_row
-            nxt=next((j for j in range(i+1,len(keys)) if keys[j] not in conn),
-                     next((j for j in range(i-1,-1,-1) if keys[j] not in conn), None))
-            if nxt is not None:
-                try: t.move_cursor(row=nxt, animate=False)
-                except Exception: pass
+            self._skip_conn(self.query_one("#pr-tab",DataTable), getattr(self,"_pr_conn",None))
 
         def _sel_proc(self):
             t=self.query_one("#pr-tab",DataTable)
