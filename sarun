@@ -5147,13 +5147,9 @@ class LiveUpper(ChangeSource):
                                 mtime_ns=mtime or None)
         return dict(kind="noop")
 
-    @property
+    @functools.cached_property
     def _kinds(self):
-        k = getattr(self, "_kinds_cache", None)
-        if k is None:
-            k = {e["path"]: e["kind"] for e in self.entries()}
-            self._kinds_cache = k
-        return k
+        return {e["path"]: e["kind"] for e in self.entries()}
 
 
 class SqlarArchive(ChangeSource):
