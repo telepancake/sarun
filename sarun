@@ -82,6 +82,7 @@ import fnmatch
 import functools
 import ipaddress
 import itertools
+import hashlib
 import json
 import os
 import queue
@@ -988,6 +989,8 @@ def parse_patch(data: bytes) -> dict:
             cur = files[rel] = dict(rel=rel, created=created, deleted=deleted, hunks=[])
         elif line.startswith(b"@@") and cur is not None:
             m = re.search(rb"-(\d+)(?:,\d+)? \+(\d+)", line)
+            if m is None:
+                raise ValueError(f"parse_patch: malformed @@ header: {line!r}")
             cur["hunks"].append(dict(a1=int(m.group(1)) - 1,
                                      b1=int(m.group(2)) - 1, lines=[]))
         elif cur and cur["hunks"] and line[:1] in (b" ", b"-", b"+"):
@@ -1893,7 +1896,7 @@ class Index:
             eid = None
             if self._tracing:
                 env_json = json.dumps(env, sort_keys=True)
-                env_hash = str(zlib.crc32(env_json.encode())) + ":" + str(len(env_json))
+                env_hash = hashlib.sha256(env_json.encode()).hexdigest()
                 self._db.execute("INSERT OR IGNORE INTO env(hash,env) VALUES(?,?)",
                                  (env_hash, env_json))
                 eid = self._db.execute("SELECT id FROM env WHERE hash=?",
@@ -5484,18 +5487,27 @@ class ChangeReview:
           - has parent p: inspect p's OWN entry — a tombstone/whiteout means the parent
             deleted it (False); a real present entry (file/symlink/dir) means True; if p
             has no own entry, recurse into p's lower.
-        This generalizes the old hardcoded Path("/")/rel host check to nested boxes."""
+        This generalizes the old hardcoded Path("/")/rel host check to nested boxes.
+        A `seen` set and depth cap (matching display_path) guard against circular
+        parent_box_id chains."""
         rel = rel.lstrip("/")
-        psid = self._raw_parent_key(sid)
-        if not psid:
-            host = Path("/") / rel
-            return host.exists() or host.is_symlink()
-        k = self._own_kind(psid, rel)
-        if k == "whiteout":
-            return False
-        if k is not None:
-            return True
-        return self._lower_has(psid, rel)
+        cur = sid
+        seen: set = set()
+        for _ in range(64):
+            psid = self._raw_parent_key(cur)
+            if not psid:
+                host = Path("/") / rel
+                return host.exists() or host.is_symlink()
+            if psid in seen:
+                return False        # cycle in parent chain: stop safely
+            seen.add(psid)
+            k = self._own_kind(psid, rel)
+            if k == "whiteout":
+                return False
+            if k is not None:
+                return True
+            cur = psid
+        return False                # depth exceeded: treat as not found
 
     def _promote_into_parent(self, target_sid: str, rel: str,
                              plan: dict) -> "dict | None":
