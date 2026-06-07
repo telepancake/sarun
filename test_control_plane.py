@@ -841,17 +841,19 @@ def test_apply_kick_up_finished_parent():
 # ── NESTED LAUNCH: register-reply dir-fd round-trip ─────────────────────────
 
 def test_register_reply_fd_nested_box():
-    """ChannelServer sends a dir-fd on the register reply for a NESTED box only.
+    """A NESTED box's register reply carries NO fd (path-bind nested-launch).
+
+    The nested-launch mechanism roots a child box by binding the parent-exposed
+    synthetic path /<KIDS_DIR>/<child> rather than receiving a mount fd, so the
+    register reply must NOT carry any SCM_RIGHTS fd.
 
     Strategy:
     - Start a real ChannelServer with a _FakeMount.
     - Register a parent session so _derive_parent_sid can resolve it.
     - Register a child session from a client that recvmsg's the reply.
-      For the server to open the child's box_root we pre-create that directory
-      (normally created by the real FUSE add_session; here we replicate it).
-    - Assert the client receives an fd via SCM_RIGHTS whose /proc/self/fd path
-      points to the child's box_root directory.
-    - Register a top-level session (no live parent) and assert NO fd is sent.
+    - Assert the reply carries no fd, and the child is registered with its parent
+      derived from kernel ancestry (the pointer the UI uses to expose the child
+      under the parent's /<KIDS_DIR>).
     """
     tmp = Path(tempfile.mkdtemp(prefix="cp-replyfd-"))
     _redirect_state(tmp)
@@ -927,39 +929,31 @@ def test_register_reply_fd_nested_box():
                 try: os.close(own_pidfd)
                 except OSError: pass
 
-            check(child_ack is not None, "reply-fd: child register got a reply")
+            check(child_ack is not None, "nested-register: child register got a reply")
             check(child_ack and child_ack.get("ok") is True,
-                  f"reply-fd: child ack ok=True (got {child_ack!r})")
+                  f"nested-register: child ack ok=True (got {child_ack!r})")
             sid_child = child_ack.get("session_id") if child_ack else None
-            child_box_root = m.mnt_point() / str(sid_child) if sid_child else None
 
-            # KEY ASSERTION: child is nested → should have received a mount fd.
-            parent_derived = (sup.sessions[sid_child].parent_box_id
-                              if sid_child in sup.sessions else None)
+            # KEY ASSERTION: the nested-launch mechanism no longer ships any fd. A
+            # nested box roots its bwrap by binding the parent-exposed synthetic path
+            # /<KIDS_DIR>/<child> instead of receiving a mount fd, so NO SCM_RIGHTS fd
+            # must accompany the register reply (for nested OR top-level boxes).
+            check(child_mount_fd < 0,
+                  f"nested-register: NO fd is sent (path-bind mechanism); "
+                  f"got fd={child_mount_fd}")
             if child_mount_fd >= 0:
-                # The fd is an open_tree fd — a mount fd whose /proc/self/fd/N symlink
-                # resolves to "/" (the root of the cloned mount), not the source path.
-                # Verify the underlying inode matches child_box_root by comparing
-                # the fstat of the fd with the stat of the directory.
-                try:
-                    fd_stat = os.fstat(child_mount_fd)
-                    dir_stat = child_box_root.stat()
-                    same_ino = (fd_stat.st_ino == dir_stat.st_ino and
-                                fd_stat.st_dev == dir_stat.st_dev)
-                except OSError:
-                    same_ino = False
-                check(same_ino,
-                      f"reply-fd: received mount fd's inode matches child box_root "
-                      f"({child_box_root})")
                 try: os.close(child_mount_fd)
                 except OSError: pass
                 child_mount_fd = -1
-            else:
-                # If parent was not derived (e.g. kernel didn't give us host pid via pidfd),
-                # the fd is legitimately absent. Report clearly rather than failing.
-                check(parent_derived is None,
-                      f"reply-fd: no fd sent but parent_derived={parent_derived!r} "
-                      f"(expected None if no fd)")
+            # The child must still be registered with its parent derived from kernel
+            # ancestry — that pointer is what makes the UI expose the child under the
+            # parent's /<KIDS_DIR>. (parent_derived may be None only if the kernel
+            # withheld our host pid via pidfd; report rather than hard-fail on that.)
+            parent_derived = (sup.sessions[sid_child].parent_box_id
+                              if sid_child in sup.sessions else None)
+            check(parent_derived is not None or sid_child not in sup.sessions,
+                  f"nested-register: child's parent derived from kernel ancestry "
+                  f"(parent_box_id={parent_derived!r})")
 
         finally:
             if pidfd_parent >= 0:

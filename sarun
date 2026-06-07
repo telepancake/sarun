@@ -50,27 +50,29 @@ seam exists but is not yet enforcing. The system is "security-ready, not
 security-complete": writes are captured and attributed but never blocked at the
 FUSE layer in this version.
 
-Isolation: the runner does `bwrap --bind <mnt>/<box_id> / …` with own
-PID/IPC/UTS/net namespaces, runs as you, and drops all caps EXCEPT CAP_SYS_ADMIN
-and CAP_NET_ADMIN — a box keeps those two so it can itself host a nested box
-(unshare pid/ipc/uts/mount + bring up loopback in the nested netns); a provably-
-leaf box (run_on_untrusted) drops ALL. Those two caps come from one of two paths,
-chosen automatically per run: (1) AMBIENT — the process already holds them (fast
-path, e.g. running as root or with the caps granted by the host); (2) USERNS — if
-ambient caps are absent, the runner adds `--unshare-user` to create a fresh
-UNPRIVILEGED user namespace and synthesizes the two caps inside it, which lets
-slopbox run with no ambient privilege under rootless Podman / Fedora toolbox
-(where nested user namespaces are allowed). The userns path keeps the launching
-uid via bwrap's default identity map (no --uid/--gid) and runs the box CAP-LESS
-(it drops all caps — more isolated, and avoids bwrap's non-root "unexpected
-capabilities" check). If neither path is available the runner refuses with an
-actionable error. (Hosting a NESTED box from inside a userns box is not yet
-supported — child-overlay grafting needs caps the cap-less box lacks; see TODO.) Because CAP_SYS_ADMIN is near root-
-equivalent for many escapes, a slopbox is an INSPECTION/REVIEW sandbox, not a
-hard containment boundary against a hostile payload — compose it inside a
-stronger sandbox if you need real containment. The bind-as-root confines the box
-to its own subfolder; it cannot reach `<mnt>/` or another box's subtree. Same uid
-as the UI, so no allow_other.
+Isolation: the runner does `bwrap --bind <overlay-root> / …` with own
+PID/IPC/UTS/net namespaces and runs as you. A box's bwrap needs CAP_SYS_ADMIN (to
+unshare pid/ipc/uts/mount) and CAP_NET_ADMIN (to bring up loopback in the nested
+netns); those come from one of two paths, chosen automatically per run: (1)
+AMBIENT — the process already holds them (fast path, e.g. running as root or with
+caps granted by the host), and the box KEEPS the two caps; (2) USERNS — if ambient
+caps are absent, the runner adds `--unshare-user` to create a fresh UNPRIVILEGED
+user namespace (which grants all caps INSIDE it for free, needing no privilege in
+the parent) and then runs the box CAP-LESS. The userns path keeps the launching
+uid via bwrap's default identity map (no --uid/--gid), lets slopbox run with no
+ambient privilege under rootless Podman / Fedora toolbox (where nested user
+namespaces are allowed), and is strictly more isolated (cap-less, and it avoids
+bwrap's non-root "unexpected capabilities" check). If neither path is available the
+runner refuses with an actionable error. A NESTED box is hosted the same way in
+both modes: it binds the parent-exposed synthetic path /<KIDS_DIR>/<sid> (its own
+overlay root, served by the UI FUSE and reachable inside the parent) as its root,
+inside its own user namespace — so even a cap-less userns box can host children
+with no privilege. Because CAP_SYS_ADMIN is near root-equivalent for many escapes,
+the ambient-mode box is an INSPECTION/REVIEW sandbox, not a hard containment
+boundary against a hostile payload — compose it inside a stronger sandbox (or use
+the cap-less userns mode) if you need real containment. The bind-as-root confines
+the box to its own subtree; it cannot reach `<mnt>/` or a sibling's subtree (it can
+reach its own descendants via /<KIDS_DIR>). Same uid as the UI, so no allow_other.
 
 Options (slopbox [FLAGS] -- CMD ...; the command MUST follow `--`):
   -n         enable networking via mitmproxy (default: off)
@@ -350,6 +352,18 @@ def mnt_point() -> Path:
 
 UI_SOCK_INBOX  = "/run/slopbox/ui.sock"                  # fixed in-box path for the above
 
+# NESTED LAUNCH: each box's FUSE root carries a hidden synthetic directory listing
+# the box's live child boxes, each entry routing to that child's own overlay root
+# (the SAME inodes as the top-level <mnt>/<child>). A nested runner — which cannot
+# reach <mnt>/<child> by path — roots its bwrap with `--bind /<KIDS_DIR>/<child> /`,
+# exactly like a top-level box binds <mnt>/<sid>. That bind happens inside the box's
+# own user namespace where bwrap holds CAP_SYS_ADMIN for free, so nested boxes need
+# NO ambient privilege and NO move_mount/fd-passing. Recursion is automatic: a
+# child's own root again presents its own KIDS_DIR. The name is reserved; it is
+# lookup-able by exact path but intentionally NOT listed in readdir (so `find /` /
+# `tar /` inside a box never descend into descendants).
+KIDS_DIR = ".slopbox-kids"
+
 # Lazy path accessors (like mnt_point()/live_home()): evaluated at call time so that
 # tests redirecting XDG env vars after import get the correct paths.  The old
 # module-level constants (SOCK_PATH etc.) were computed once at import, snapshotting
@@ -434,17 +448,16 @@ def sync_request(sock_path: str, timeout: float = 30.0, **msg: Any) -> "dict | N
     except (OSError, json.JSONDecodeError):
         return None
 
-def register_request(sock_path: str, timeout: float = 30.0, **msg: Any) -> "tuple[dict | None, int]":
+def register_request(sock_path: str, timeout: float = 30.0, **msg: Any) -> "dict | None":
     """Like sync_request but carries the caller's own pidfd over SCM_RIGHTS so the
     UI can derive the runner's HOST-namespace pid from /proc/self/fdinfo without
     relying on SO_PEERCRED.  Falls back to a plain sendall (no FD) if pidfd_open is
     unavailable (Python < 3.9, kernel ENOSYS, or any OSError) — the UI then gets
     peer_pid=0 and treats this as a top-level runner.
 
-    For nested boxes the UI sends the child overlay's dir-fd alongside the JSON reply
-    (SCM_RIGHTS); the runner can then root bwrap via --bind-fd instead of --bind.
-
-    Returns (ack_dict | None, mount_fd) where mount_fd >= 0 iff the UI sent one."""
+    Returns the ack dict (the mount path + owner token), or None on failure. A nested
+    box does NOT receive any fd here: it roots bwrap by binding the parent-exposed
+    synthetic path /<KIDS_DIR>/<sid> (see the runner's NESTED LAUNCH comment)."""
     pidfd = -1
     try:
         pidfd = os.pidfd_open(os.getpid())
@@ -460,26 +473,16 @@ def register_request(sock_path: str, timeout: float = 30.0, **msg: Any) -> "tupl
                             array.array("i", [pidfd]).tobytes())])
             else:
                 s.sendall(payload)
-            # Use recvmsg so we can capture an optional dir-fd the UI may piggyback on
-            # the reply for nested boxes (NESTED LAUNCH mechanism).  CMSG_SPACE(4*4) is
-            # enough for one fd; use a generous buffer so we never truncate.
-            data, anc, _flags, _addr = s.recvmsg(65536, socket.CMSG_SPACE(4 * 4))
-            mount_fd = -1
-            for lvl, typ, cmsg_data in anc:
-                if lvl == socket.SOL_SOCKET and typ == socket.SCM_RIGHTS:
-                    a = array.array("i"); a.frombytes(cmsg_data)
-                    fds = a.tolist()
-                    if fds:
-                        mount_fd = fds[0]
-                    # close unexpected extras (shouldn't happen, defensive)
-                    for extra in fds[1:]:
-                        try: os.close(extra)
-                        except OSError: pass
-            line = data.split(b"\n", 1)[0]
-            ack = json.loads(line.decode()) if line.strip() else None
-            return ack, mount_fd
+            buf = b""
+            while b"\n" not in buf:
+                chunk = s.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+            line = buf.split(b"\n", 1)[0]
+            return json.loads(line.decode()) if line.strip() else None
     except (OSError, json.JSONDecodeError):
-        return None, -1
+        return None
     finally:
         if pidfd >= 0:
             try: os.close(pidfd)
@@ -1564,113 +1567,6 @@ _PROV_ENV_KEYS = ("USER", "PWD", "SSH_CONNECTION", "TERM", "_")
 
 FICLONE = 0x40049409   # _IOW(0x94, 9, int) — btrfs/xfs reflink ioctl
 
-# ── fd-based mount primitives (Linux 5.2+, x86-64) ──────────────────────────
-# Used by the NESTED LAUNCH mechanism: the UI creates an open_tree "mount fd" for
-# the child overlay and ships it via SCM_RIGHTS to the nested runner.  The runner
-# calls move_mount to graft it at a known path inside the parent box, then passes
-# that path to bwrap -- avoiding any path resolution of the sibling overlay tree.
-import ctypes as _ctypes
-_LIBC: "_ctypes.CDLL | None" = None
-
-def _libc() -> "_ctypes.CDLL":
-    global _LIBC
-    if _LIBC is None:
-        _LIBC = _ctypes.CDLL("libc.so.6", use_errno=True)
-        _libc_init_sigs(_LIBC)
-    return _LIBC
-
-def _libc_init_sigs(lib) -> None:
-    """Set argtypes/restype on each named libc wrapper once (not every call)."""
-    for name, restype, argtypes in (
-        ("open_tree",  _ctypes.c_int,
-         (_ctypes.c_int, _ctypes.c_char_p, _ctypes.c_uint)),
-        ("move_mount", _ctypes.c_int,
-         (_ctypes.c_int, _ctypes.c_char_p, _ctypes.c_int,
-          _ctypes.c_char_p, _ctypes.c_uint)),
-        ("umount2",    _ctypes.c_int,
-         (_ctypes.c_char_p, _ctypes.c_int)),
-    ):
-        fn = getattr(lib, name, None)
-        if fn is not None:
-            fn.restype = restype
-            fn.argtypes = argtypes
-
-# open_tree/move_mount/umount2 are reached through glibc's NAMED wrappers when present
-# (glibc >= 2.36 for the first two; umount2 forever) — those resolve the correct per-arch
-# syscall number for us. Only on older glibc do we fall back to raw syscall() with numbers
-# from the asm-generic table (shared by x86-64/arm64/riscv64 — the new mount-API syscalls
-# were assigned the same numbers there).
-_OPEN_TREE_NR  = {"x86_64": 428, "aarch64": 428, "riscv64": 428}
-_MOVE_MOUNT_NR = {"x86_64": 429, "aarch64": 429, "riscv64": 429}
-
-_OPEN_TREE_CLONE  = 1
-_AT_EMPTY_PATH    = 0x1000
-_AT_FDCWD         = -100
-_MOVE_MOUNT_F_EMPTY_PATH = 0x00000004
-_MNT_DETACH       = 0x00000002
-
-
-def _open_tree_fd(dir_fd: int) -> int:
-    """open_tree(dir_fd, "", OPEN_TREE_CLONE | AT_EMPTY_PATH) → mount-fd.
-
-    Returns a *mount fd* that can be passed via SCM_RIGHTS and grafted elsewhere
-    with move_mount.  The fd does NOT carry a path — it represents the filesystem
-    subtree rooted at dir_fd regardless of whether that path is accessible in the
-    caller's mount namespace.  Returns -1 on failure (old kernel, EPERM, etc.)."""
-    try:
-        libc = _libc()
-        fn = getattr(libc, "open_tree", None)
-        if fn is not None:                                  # arch-correct named wrapper
-            fd = fn(dir_fd, b"", _OPEN_TREE_CLONE | _AT_EMPTY_PATH)
-        else:                                               # pre-2.36 glibc fallback
-            nr = _OPEN_TREE_NR.get(os.uname().machine)
-            if nr is None:
-                return -1
-            fd = libc.syscall(_ctypes.c_long(nr), _ctypes.c_int(dir_fd),
-                              _ctypes.c_char_p(b""),
-                              _ctypes.c_uint(_OPEN_TREE_CLONE | _AT_EMPTY_PATH))
-        return int(fd) if int(fd) >= 0 else -1
-    except Exception:
-        return -1
-
-
-def _move_mount(tree_fd: int, dest: str) -> int:
-    """move_mount(tree_fd, "", AT_FDCWD, dest, MOVE_MOUNT_F_EMPTY_PATH).
-
-    Grafts the subtree represented by tree_fd (obtained via _open_tree_fd) at
-    dest.  dest must be an existing empty directory in the current mount namespace.
-    Returns 0 on success, errno (>0) on failure."""
-    try:
-        libc = _libc()
-        fn = getattr(libc, "move_mount", None)
-        if fn is not None:                                  # arch-correct named wrapper
-            ret = fn(tree_fd, b"", _AT_FDCWD, dest.encode(),
-                     _MOVE_MOUNT_F_EMPTY_PATH)
-        else:                                               # pre-2.36 glibc fallback
-            nr = _MOVE_MOUNT_NR.get(os.uname().machine)
-            if nr is None:
-                return errno.ENOSYS
-            ret = libc.syscall(_ctypes.c_long(nr), _ctypes.c_int(tree_fd),
-                               _ctypes.c_char_p(b""), _ctypes.c_int(_AT_FDCWD),
-                               _ctypes.c_char_p(dest.encode()),
-                               _ctypes.c_uint(_MOVE_MOUNT_F_EMPTY_PATH))
-        return 0 if int(ret) >= 0 else _ctypes.get_errno()
-    except Exception:
-        return errno.ENOSYS
-
-
-def _lazy_umount(path: str) -> None:
-    """MNT_DETACH umount via the umount2(2) named wrapper (arch-correct), best-effort."""
-    try:
-        libc = _libc()
-        fn = getattr(libc, "umount2", None)
-        if fn is None:
-            return
-        fn(path.encode(), _MNT_DETACH)
-    except Exception:
-        pass
-
-
 # ── provenance & policy ──────────────────────────────────────────────────────
 def _proc_status_field(pid: int, field: str) -> "int | None":
     """One integer field (e.g. Tgid, PPid) from /proc/<pid>/status. None if gone."""
@@ -2655,6 +2551,15 @@ def _build_overlay_ops():
                     return p
             return None
 
+        def _live_children(self, sid: str) -> list:
+            """Live child box keys whose parent is `sid`, for the synthetic KIDS_DIR.
+            `parent` is stored as the parent's box key str (add_session), so this is a
+            direct equality scan over the live session registry — sorted for stable
+            readdir order. Base (finished, read-only) sessions are NOT included: a
+            nested box can only be rooted on a child that is currently live."""
+            return sorted(c for c, s in self.sessions.items()
+                          if s.get("parent") == sid and c not in self._base_sessions)
+
         def _lower_resolve(self, sid: str, rel: str):
             """(layer, abspath, st) for the layer beneath this box's own upper — the
             parent box's merged view if nested, else the real host. The returned path
@@ -3067,6 +2972,23 @@ def _build_overlay_ops():
         async def lookup(self, parent_inode, name, ctx=None):
             name = os.fsdecode(name)
             pkey = self._key(parent_inode)
+            # Synthetic per-box kids dir (KIDS_DIR): hidden at each box root. Looking up
+            # KIDS_DIR at a box root yields a synthetic dir inode; looking up a name
+            # under it yields that child's REAL overlay-root inode (key (child, "")),
+            # so all deeper traversal/IO resolves natively in the child's namespace and
+            # a bind of this path clones the child's overlay just like the top level.
+            if pkey is not None and name not in (".", ".."):
+                psid, prel = pkey
+                if prel == KIDS_DIR:
+                    if psid in self.sessions and name in self._live_children(psid):
+                        ino = self._ino_for(name, "")
+                        self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
+                        return self._synth_dir_attrs(ino)
+                    return self._neg_entry()
+                if prel == "" and name == KIDS_DIR and psid in self.sessions:
+                    ino = self._ino_for(psid, KIDS_DIR)
+                    self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
+                    return self._synth_dir_attrs(ino)
             if name == ".":
                 ckey = pkey
             elif name == "..":
@@ -3108,6 +3030,8 @@ def _build_overlay_ops():
             sid, rel = key
             if sid not in self.sessions:
                 raise pyfuse3.FUSEError(errno.ENOENT)
+            if rel == KIDS_DIR:                         # synthetic kids dir (hidden)
+                return self._synth_dir_attrs(inode)
             if not rel:                                 # a session root
                 return self._synth_dir_attrs(inode)
             if self._is_virtual(sid, rel):
@@ -3188,7 +3112,12 @@ def _build_overlay_ops():
                         snap.append((sid, self._synth_dir_attrs(ino)))
                 else:
                     sid, rel = key
-                    if sid in self.sessions:
+                    if rel == KIDS_DIR and sid in self.sessions:
+                        # synthetic kids dir: list this box's live children, each
+                        # mapped to its real overlay-root inode (same as top level).
+                        snap = [(c, self._synth_dir_attrs(self._ino_for(c, "")))
+                                for c in self._live_children(sid)]
+                    elif sid in self.sessions:
                         snap = [(name, attrs)
                                 for name, _k, attrs in self._scan_dir(sid, rel)]
                     else:
@@ -3644,6 +3573,13 @@ def _build_overlay_ops():
             name = os.fsdecode(name)
             pkey = self._key(parent_inode)
             if pkey is None: raise pyfuse3.FUSEError(errno.EACCES)
+            # KIDS_DIR is a reserved synthetic namespace: no real node may be created,
+            # removed, or shadowed at it or directly under it (entries there are routed
+            # views of live child boxes). Operations that land INSIDE a child resolve to
+            # that child's own inode and never reach here with a KIDS_DIR parent.
+            _pp_sid, _pp_rel = pkey
+            if _pp_rel == KIDS_DIR or (_pp_rel == "" and name == KIDS_DIR):
+                raise pyfuse3.FUSEError(errno.EPERM)
             sid, rel = self._child_key(pkey, name)
             if sid not in self.sessions: raise pyfuse3.FUSEError(errno.ENOENT)
             wid = self._index(sid).writer_for(ctx.pid)
@@ -3791,6 +3727,13 @@ def _build_overlay_ops():
             name = os.fsdecode(name)
             pkey = self._key(parent_inode)
             if pkey is None: raise pyfuse3.FUSEError(errno.EACCES)
+            # KIDS_DIR is a reserved synthetic namespace: no real node may be created,
+            # removed, or shadowed at it or directly under it (entries there are routed
+            # views of live child boxes). Operations that land INSIDE a child resolve to
+            # that child's own inode and never reach here with a KIDS_DIR parent.
+            _pp_sid, _pp_rel = pkey
+            if _pp_rel == KIDS_DIR or (_pp_rel == "" and name == KIDS_DIR):
+                raise pyfuse3.FUSEError(errno.EPERM)
             sid, rel = self._child_key(pkey, name)
             if sid not in self.sessions: raise pyfuse3.FUSEError(errno.ENOENT)
             wid = self._index(sid).writer_for(ctx.pid)
@@ -3834,6 +3777,13 @@ def _build_overlay_ops():
             name = os.fsdecode(name)
             pkey = self._key(parent_inode)
             if pkey is None: raise pyfuse3.FUSEError(errno.EACCES)
+            # KIDS_DIR is a reserved synthetic namespace: no real node may be created,
+            # removed, or shadowed at it or directly under it (entries there are routed
+            # views of live child boxes). Operations that land INSIDE a child resolve to
+            # that child's own inode and never reach here with a KIDS_DIR parent.
+            _pp_sid, _pp_rel = pkey
+            if _pp_rel == KIDS_DIR or (_pp_rel == "" and name == KIDS_DIR):
+                raise pyfuse3.FUSEError(errno.EPERM)
             sid, rel = self._child_key(pkey, name)
             if sid not in self.sessions: raise pyfuse3.FUSEError(errno.ENOENT)
             wid = self._index(sid).writer_for(ctx.pid)
@@ -4170,6 +4120,10 @@ def _build_overlay_ops():
             name_old = os.fsdecode(name_old); name_new = os.fsdecode(name_new)
             pko = self._key(parent_old); pkn = self._key(parent_new)
             if pko is None or pkn is None: raise pyfuse3.FUSEError(errno.EACCES)
+            # Neither end may touch the reserved KIDS_DIR synthetic namespace.
+            for _pk, _nm in ((pko, name_old), (pkn, name_new)):
+                if _pk[1] == KIDS_DIR or (_pk[1] == "" and _nm == KIDS_DIR):
+                    raise pyfuse3.FUSEError(errno.EPERM)
             sid_o, rel_o = self._child_key(pko, name_old)
             sid_n, rel_n = self._child_key(pkn, name_new)
             if sid_o != sid_n or sid_o not in self.sessions:
@@ -4283,6 +4237,8 @@ def _build_overlay_ops():
             new_name = os.fsdecode(new_name)
             key = self._key(inode); pkn = self._key(new_parent)
             if key is None or pkn is None: raise pyfuse3.FUSEError(errno.EPERM)
+            if pkn[1] == KIDS_DIR or (pkn[1] == "" and new_name == KIDS_DIR):
+                raise pyfuse3.FUSEError(errno.EPERM)   # reserved synthetic namespace
             sid, rel_src = key
             sid_n, rel_n = self._child_key(pkn, new_name)
             if sid != sid_n or sid not in self.sessions:
@@ -6718,26 +6674,9 @@ class Supervisor:
                    owner_token=token, box_id=int(sid), session_id=sid, name=name)
         if relay is not None:
             ack["relay"] = relay
-        # NESTED LAUNCH: for a child box, open a mount fd to the child's overlay root so
-        # the UI can pass it to the runner via SCM_RIGHTS.  The runner then uses
-        # move_mount to graft the child overlay at a known path inside the parent box
-        # and roots bwrap there.  This works even though the sibling <mnt>/<child_sid>
-        # isn't reachable by path inside the parent's mount namespace.
-        # The fd is opened by the UI — never supplied by the box.
-        if parent_box_id is not None:
-            mfd = -1
-            try:
-                # Open a normal dir fd first; convert to mount fd via open_tree so the
-                # receiver can graft it via move_mount regardless of path reachability.
-                dir_fd = os.open(box_root, os.O_RDONLY | os.O_DIRECTORY)
-                try:
-                    mfd = _open_tree_fd(dir_fd)
-                finally:
-                    os.close(dir_fd)
-                if mfd >= 0:
-                    ack["_mount_fd"] = mfd   # private key stripped before JSON send
-            except OSError:
-                pass  # fall through — caller falls back to top-level --bind path
+        # NESTED LAUNCH: nothing extra to send. A nested runner roots bwrap by binding
+        # the parent-exposed synthetic path /<KIDS_DIR>/<sid> (the child's overlay root,
+        # served by the same FUSE mount and reachable inside the parent). No fd-passing.
         return ack
 
     def _owns(self, msg: dict, sid: str) -> bool:
@@ -7457,32 +7396,15 @@ def _recvmsg_blocking(conn):
         conn.setblocking(False)
 
 
-def _send_reply_with_fd(conn: socket.socket, reply: dict) -> None:
-    """Send a control reply JSON line back to the runner, optionally carrying a dir-fd
-    via SCM_RIGHTS for the nested-launch LAUNCH mechanism.
+def _send_reply(conn: socket.socket, reply: dict) -> None:
+    """Send a control reply JSON line (newline-terminated) back to the runner.
 
-    If the reply dict contains a private '_mount_fd' key (an int fd), pop it, encode
-    the remaining fields as JSON+newline, and ship both over sendmsg with SCM_RIGHTS —
-    the runner receives an fd to the child overlay root alongside the JSON ack.  The
-    UI closes its copy of the fd after sendmsg (kernel dup'd it to the peer).  For
-    top-level boxes (no '_mount_fd'), fall back to a plain sendall — byte-identical to
-    the previous behaviour.
-
-    Called via run_in_executor so the async loop stays unblocked while sendmsg blocks.
+    Called via run_in_executor so the async loop stays unblocked while sendall blocks.
     Raises OSError on send failure (caller catches and ignores, as before)."""
-    mfd = reply.pop("_mount_fd", None)    # strip private key; None for top-level
     payload = (json.dumps(reply) + "\n").encode()
     conn.setblocking(True)
     try:
-        if mfd is not None and mfd >= 0:
-            # Send JSON + the dir-fd to the child overlay in one SCM_RIGHTS message.
-            conn.sendmsg([payload],
-                         [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
-                           array.array("i", [mfd]).tobytes())])
-            try: os.close(mfd)             # UI's copy — kernel dup'd it to the peer
-            except OSError: pass
-        else:
-            conn.sendall(payload)
+        conn.sendall(payload)
     finally:
         conn.setblocking(False)
 
@@ -7616,7 +7538,7 @@ class ChannelServer:
                         if reply is not None:
                             try:
                                 await self._loop.run_in_executor(
-                                    None, _send_reply_with_fd, conn, reply)
+                                    None, _send_reply, conn, reply)
                             except OSError:
                                 pass
                     continue
@@ -7628,7 +7550,7 @@ class ChannelServer:
                         if reply is not None:
                             try:
                                 await self._loop.run_in_executor(
-                                    None, _send_reply_with_fd, conn, reply)
+                                    None, _send_reply, conn, reply)
                             except OSError:
                                 pass
                     break
@@ -8034,16 +7956,12 @@ def cmd_run(cmd, net, trace, direct, session_whitelist, chdir, reuse_sid=None) -
     # We send our own pidfd alongside the JSON so the UI can derive our HOST pid
     # via /proc/self/fdinfo (the codebase's universal identity path) instead of
     # SO_PEERCRED.  Works for both top-level runners and nested-box runners.
-    # For nested boxes register_request also returns a dir-fd to the child overlay.
-    ack, mount_fd = register_request(_ctrl_sock, type="register", session_id=sid,
-                                     cmd=list(cmd), prov=self_prov, root_tgid=os.getpid(),
-                                     session_whitelist=session_whitelist, want_rerun=rerun,
-                                     want_net=net, want_trace=trace, want_direct=direct,
-                                     **_extra_reg)
+    ack = register_request(_ctrl_sock, type="register", session_id=sid,
+                           cmd=list(cmd), prov=self_prov, root_tgid=os.getpid(),
+                           session_whitelist=session_whitelist, want_rerun=rerun,
+                           want_net=net, want_trace=trace, want_direct=direct,
+                           **_extra_reg)
     if not ack or not ack.get("ok") or not ack.get("mount"):
-        if mount_fd >= 0:
-            try: os.close(mount_fd)
-            except OSError: pass
         print("slopbox: could not start slopbox"
               f"{(' — ' + ack['error']) if ack and ack.get('error') else ''}.",
               file=sys.stderr)
@@ -8085,51 +8003,32 @@ def cmd_run(cmd, net, trace, direct, session_whitelist, chdir, reuse_sid=None) -
         # the box can reach nothing but its own per-session FD relay.
         chan = relay_path if (can_net and relay_path) else ""
 
-        # bwrap security boundary: the box's <mnt>/<sid> subfolder is bind-mounted
-        # as its root (own pid/ipc/uts/net namespaces, all caps dropped, runs as
-        # you). The bind-as-root confines the box to its subfolder; it cannot reach
-        # <mnt>/ or another session's <sid>. No userns, no fd-passing, no inner mount.
+        # bwrap security boundary: the box's overlay root is bind-mounted as its root
+        # (own pid/ipc/uts/net namespaces, runs as you). The bind-as-root confines the
+        # box to its own subtree; it cannot reach <mnt>/ or a sibling's overlay.
         #
-        # NESTED LAUNCH: when mount_fd >= 0, the UI sent us a mount fd (open_tree fd)
-        # to the child overlay via SCM_RIGHTS.  We use move_mount to graft it at a
-        # temporary path inside the CURRENT (parent box) mount namespace, then pass
-        # that path to bwrap as --bind <tmpdir> /.  This avoids any path resolution of
-        # the sibling overlay root, which isn't reachable by path inside the parent
-        # box.  For a top-level box (mount_fd < 0) we keep --bind <path> / unchanged.
+        # NESTED LAUNCH: a top-level box binds its overlay by host path (<mnt>/<sid>).
+        # A nested box cannot — <mnt>/<sid> isn't reachable by path inside the parent
+        # box. Instead the parent box's FUSE root exposes a hidden synthetic directory
+        # (KIDS_DIR) whose entries are the parent's live child boxes, each routing to
+        # that child's real overlay root. So this nested runner roots bwrap with
+        # `--bind /<KIDS_DIR>/<sid> /` — a path that IS reachable inside the parent,
+        # served by the same UI FUSE mount. The bind itself runs inside this box's own
+        # (possibly unprivileged) user namespace where bwrap holds CAP_SYS_ADMIN for
+        # free, exactly like the top-level bind — so nested boxes need no ambient caps,
+        # no move_mount, and no fd-passing. The child overlay is fully writable through
+        # this path (copy-up targets the child's own upper, keyed by inode).
         #
         # The host control socket is bind-mounted read-only at UI_SOCK_INBOX so that a
         # nested `./sarun -- cmd` inside the box can reach the UI. Parent identity is
         # kernel-derived (pidfd → _host_pid_from_pidfd → PPid walk) at the UI; the
         # box's runner sends its own pidfd on the register connection, and the UI
         # never trusts any pid or sid from the message body.
-        _nested_mp: "str | None" = None
-        if mount_fd >= 0:
-            # Graft child overlay at a tmpdir inside the parent box's namespace.
-            # /tmp is a fresh tmpfs inside the box (always writable), so create
-            # the mount point there; bwrap's --bind <tmpdir> / sees it normally.
-            try:
-                _nested_mp = tempfile.mkdtemp()
-                err = _move_mount(mount_fd, _nested_mp)
-                if err == 0:
-                    bind_root_args = ["--bind", _nested_mp, "/"]
-                else:
-                    # move_mount failed (old kernel or EPERM) — fall back to path
-                    print(f"slopbox: nested LAUNCH: move_mount errno={err}, "
-                          "falling back to path bind", file=sys.stderr)
-                    try: os.rmdir(_nested_mp)
-                    except OSError: pass
-                    _nested_mp = None
-                    bind_root_args = ["--bind", str(box_root), "/"]
-            except OSError:
-                _nested_mp = None
-                bind_root_args = ["--bind", str(box_root), "/"]
-            try: os.close(mount_fd)
-            except OSError: pass
-            mount_fd = -1   # consumed
-            popen_pass_fds: tuple = ()
+        if _in_box:
+            bind_root_args = ["--bind", f"/{KIDS_DIR}/{sid}", "/"]
         else:
             bind_root_args = ["--bind", str(box_root), "/"]
-            popen_pass_fds = ()
+        popen_pass_fds: tuple = ()
         # When nested (inside a parent box), the host sock_path() isn't accessible;
         # the UI socket is already visible at UI_SOCK_INBOX inside the box, so
         # bind-mount UI_SOCK_INBOX → UI_SOCK_INBOX (forwarding it to the child box).
@@ -8178,15 +8077,19 @@ def cmd_run(cmd, net, trace, direct, session_whitelist, chdir, reuse_sid=None) -
         if _runner_mode == "userns":
             unshare_args.append("--unshare-user")
         # Caps: in "ambient" mode the box runs as root and KEEPS CAP_SYS_ADMIN /
-        # CAP_NET_ADMIN so it can host a nested box via inherited caps. In "userns"
-        # mode the box runs as a NON-root mapped uid; retaining caps there would make
-        # a nested bwrap refuse ("Unexpected capabilities but not setuid"), and a
-        # cap-less box is strictly more isolated, so we DROP all caps. bwrap still
-        # brings up loopback during --unshare-net setup before dropping to the child,
-        # so the box's own networking works. KNOWN LIMITATION: hosting a NESTED box
-        # from inside a userns box is not yet supported — grafting the child overlay
-        # needs CAP_SYS_ADMIN/move_mount the cap-less box lacks (see the TODO section).
-        # A leaf box (run_on_untrusted) drops ALL regardless.
+        # CAP_NET_ADMIN so its own bwrap can unshare pid/ipc/uts/mount and bring up
+        # loopback. In "userns" mode the box runs as a NON-root mapped uid and we DROP
+        # all caps — retaining them would make a nested bwrap refuse ("Unexpected
+        # capabilities but not setuid"), and a cap-less box is strictly more isolated.
+        # bwrap still brings up loopback during --unshare-net setup before dropping to
+        # the child, so the box's own networking works.
+        #
+        # Hosting a NESTED box works in BOTH modes: a nested box roots its bwrap by
+        # binding the parent-exposed synthetic path /<KIDS_DIR>/<sid> (see the NESTED
+        # LAUNCH comment above). That bind runs inside the nested box's OWN user
+        # namespace — created by its own `--unshare-user`, which needs no caps in the
+        # parent — where bwrap holds CAP_SYS_ADMIN for free. So a cap-less userns box
+        # can host children with no privilege, exactly like the top level.
         if _runner_mode == "userns":
             cap_args = ["--cap-drop", "ALL"]
         else:
@@ -8255,15 +8158,6 @@ def cmd_run(cmd, net, trace, direct, session_whitelist, chdir, reuse_sid=None) -
         if old_ttou is not None:
             try: signal.signal(signal.SIGTTOU, old_ttou)
             except (OSError, ValueError): pass
-        # Leak guards: close any unconsumed mount_fd; detach the nested mount point.
-        if mount_fd >= 0:
-            try: os.close(mount_fd)
-            except OSError: pass
-        if _nested_mp is not None:
-            # Lazy umount after bwrap exits; then rmdir the mount point.
-            _lazy_umount(_nested_mp)
-            try: os.rmdir(_nested_mp)
-            except OSError: pass
 
     # Tell the UI we exited. The UI runs consolidate() on live/<sid>, removes
     # <mnt>/<sid> from the live set, and deletes live/<sid>. (The runner does NOT
@@ -10388,19 +10282,17 @@ if __name__ == "__main__":
 # Parked here so a future reader (human or LLM) scanning the section list finds
 # them. Delete an item once it's done.
 #
-#  - Unprivileged-userns runner: DONE for a SINGLE box. cmd_run picks ambient-caps
-#    vs. a `bwrap --unshare-user` path at runtime (_have_ambient_caps /
+#  - Unprivileged-userns runner: DONE, including NESTED boxes. cmd_run picks
+#    ambient-caps vs. a `bwrap --unshare-user` path at runtime (_have_ambient_caps /
 #    _userns_runner_works); the userns path runs the box CAP-LESS (drops ALL — more
 #    isolated, and avoids bwrap's non-root "unexpected capabilities" check) and works
-#    with NO ambient privilege under rootless podman / Fedora toolbox. Validated as a
-#    real non-root user: single box (networked) launch + capture all work.
-#    REMAINING (harder): hosting a NESTED box from INSIDE a userns box. The cap-less
-#    box can't graft the child overlay — fails `bwrap: Can't find source path …/mnt/N`
-#    because move_mount/fd-passing of the child overlay needs CAP_SYS_ADMIN the box no
-#    longer holds. (A second --unshare-user DOES compose — the inner userns is fine;
-#    the blocker is the overlay-mount graft, not the uid map.) Fix needs the child
-#    overlay grafted where CAP_SYS_ADMIN is held (e.g. inside the inner's own userns
-#    via the passed mount fd).
+#    with NO ambient privilege under rootless podman / Fedora toolbox. A nested box no
+#    longer needs caps to be hosted: instead of grafting the child overlay via
+#    move_mount/fd-passing (which needed CAP_SYS_ADMIN the cap-less box lacks), the
+#    parent box's FUSE root exposes each child's overlay root at the synthetic path
+#    /<KIDS_DIR>/<child>, and the nested runner roots bwrap with `--bind` of that path
+#    INSIDE its own `--unshare-user` namespace (where bwrap has CAP_SYS_ADMIN for
+#    free). Same code path in both modes; no move_mount, no fd-passing.
 #  - structural-diff is untested: add an end-to-end test for the quick/finish split
 #    AND the > _STRUCT_MAX recognized-binary path (the branch that once hid the
 #    fmt_bytes NameError). test_new_coverage guards only the regression class.

@@ -212,13 +212,15 @@ def run_nested_e2e(tmp):
     (the nested invocation) and assert:
     - A CHILD session registers with parent set (proving the nested-launch path).
     - The nested command can read a file written by the parent box through the
-      bind-fd'd child root (proving read-chaining through the child overlay).
-    The child's bwrap is rooted via --bind-fd instead of --bind, which is the
-    whole point of the mechanism tested here."""
+      child root (proving read-chaining through the child overlay).
+    The child's bwrap is rooted by binding the parent-exposed synthetic path
+    /<KIDS_DIR>/<child> as its root — the nested-launch mechanism tested here.
+    (This case runs in ambient-caps mode; the cap-less userns variant is asserted
+    by run_forced_userns_e2e.)"""
     m = SourceFileLoader("slopbox", SARUN).load_module()
     if not m._have_ambient_caps():
-        print("  SKIP nested-e2e: nested boxes need ambient CAP_SYS_ADMIN/CAP_NET_ADMIN; "
-              "the unprivileged userns path hosts single boxes only (see TODO).")
+        print("  SKIP nested-e2e: this ambient-caps variant needs CAP_SYS_ADMIN/"
+              "CAP_NET_ADMIN; the cap-less userns variant runs in run_forced_userns_e2e.")
         return
     e = env_for(tmp)
     sock = str(Path(e["XDG_RUNTIME_DIR"]) / "slopbox" / "ui.sock")
@@ -511,11 +513,66 @@ def run_forced_userns_e2e(tmp):
             time.sleep(0.3)
         check("userns_proof.txt" in all_names,
               "forced-userns: simple-box write captured (userns path)")
-        # NESTED box under the userns path is a KNOWN LIMITATION: the cap-less userns
-        # box can't graft the child overlay (needs CAP_SYS_ADMIN/move_mount). Not
-        # asserted here — see the TODO section in sarun.
-        print("  NOTE forced-userns: nested-box-under-userns is a known limitation "
-              "(child-overlay graft needs CAP_SYS_ADMIN); not asserted — see TODO.")
+
+        # Part 3: a NESTED box under the userns path. A cap-less userns box hosts a
+        # child by binding the parent-exposed synthetic /<KIDS_DIR>/<child> as the
+        # child's root, inside the child's OWN --unshare-user namespace (caps for
+        # free) — no ambient privilege, no move_mount. Assert the child runs, reads
+        # the parent's overlay (read-chaining), and its write is captured.
+        #
+        # This requires creating a userns FROM INSIDE a cap-dropped userns. That is
+        # the normal case for a real unprivileged user, but it FAILS for uid 0:
+        # writing the inner userns's uid_map needs CAP_SETUID in the parent userns,
+        # and the single-uid self-map exception does not apply to a cap-dropped root.
+        # So when this suite runs AS ROOT (forcing the userns path artificially), the
+        # nested case can't be exercised here — probe for it and NOTE-skip if absent.
+        # (Validated manually as a real non-root user; see commit message / TODO.)
+        probe = subprocess.run(
+            ["bwrap", "--unshare-user", "--cap-drop", "ALL", "--dev-bind", "/", "/",
+             "--", "bwrap", "--unshare-user", "--dev-bind", "/", "/", "--",
+             "true"],
+            capture_output=True, timeout=30)
+        if probe.returncode != 0:
+            print("  NOTE forced-userns: nested-in-userns not exercisable in this "
+                  "context (creating a userns inside a cap-dropped userns failed — "
+                  "expected as root; works for a real unprivileged user). Skipping "
+                  "the nested assertions.")
+            return
+        nested_cmd = (
+            f"XDG_STATE_HOME={e['XDG_STATE_HOME']!r} "
+            f"XDG_RUNTIME_DIR={e['XDG_RUNTIME_DIR']!r} "
+            f"SLOPBOX_FORCE_USERNS=1 "
+            f"{PYBIN} {SARUN} -- "
+            "bash -c 'cat /userns_parent.txt > /userns_child.txt && "
+            "echo userns-nested-ok >> /userns_child.txt'"
+        )
+        parent_script = ("set -e; echo userns-parent-here > /userns_parent.txt; "
+                         + nested_cmd)
+        rn = subprocess.run(
+            [PYBIN, SARUN, "--", "bash", "-c", parent_script],
+            env=e, capture_output=True, text=True, timeout=120)
+        check(rn.returncode == 0,
+              f"forced-userns: nested (parent+child) run exited 0 "
+              f"(got {rn.returncode}: {rn.stderr.strip()[-500:]})")
+        check(rn.stderr.count("overlay root:") >= 2,
+              f"forced-userns: stderr shows >=2 overlay roots (parent+child nested) "
+              f"(got {rn.stderr.count('overlay root:')})")
+        # Poll for the child's captured proof across all sqlars.
+        child = b""
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            for sp in state.glob("*.sqlar"):
+                try:
+                    c = m.sqlar_content(sp, "userns_child.txt")
+                    if c: child = c; break
+                except Exception: pass
+            if child: break
+            time.sleep(0.3)
+        check(b"userns-parent-here" in child,
+              f"forced-userns: nested child read parent overlay (read-chaining) "
+              f"(got {child!r})")
+        check(b"userns-nested-ok" in child,
+              "forced-userns: nested child's own write captured (cap-less nested host)")
     finally:
         try:
             ui.send_signal(signal.SIGINT)

@@ -609,6 +609,78 @@ def test_collect_docs():
     check(m.collect_docs() is docs, "collect_docs() is cached (same object on second call)")
 
 
+def test_synthetic_kids_dir_routing():
+    """The NESTED-LAUNCH mechanism: each box's FUSE root exposes a hidden synthetic
+    KIDS_DIR whose entries are the box's live children, each routing to that child's
+    REAL overlay-root inode. A nested runner binds /<KIDS_DIR>/<child> as its root
+    instead of receiving a mount fd. Verify routing, isolation, recursion, hiding,
+    and the reserved-namespace write guard. Skipped if pyfuse3 is unavailable."""
+    try:
+        import pyfuse3
+    except Exception:
+        check(True, "kids-dir: pyfuse3 not installed — SKIP")
+        return
+    import asyncio
+    from types import SimpleNamespace
+    fs = m._build_overlay_ops()(lower="/")
+
+    def mk(sid, parent=None):
+        backing = m.live_dir(sid); (backing / "up").mkdir(parents=True, exist_ok=True)
+        fs.add_session(sid, backing / "up", m.Index(backing), parent=parent)
+
+    # 1 (top) -> 2 (child) -> 3 (grandchild); sibling tree 9 -> 8.
+    mk("1"); mk("2", parent="1"); mk("3", parent="2"); mk("9"); mk("8", parent="9")
+    R = pyfuse3.ROOT_INODE
+    K = m.KIDS_DIR.encode()
+
+    async def run():
+        check(fs._live_children("1") == ["2"], "kids-dir: _live_children('1')==['2']")
+        check(fs._live_children("3") == [], "kids-dir: leaf box has no children")
+
+        ino1 = (await fs.lookup(R, b"1")).st_ino
+        ek = await fs.lookup(ino1, K)
+        check(stat_mod.S_ISDIR(ek.st_mode) and ek.st_ino != 0,
+              "kids-dir: lookup <root>/KIDS_DIR -> synthetic dir")
+
+        viak = await fs.lookup(ek.st_ino, b"2")
+        direct = await fs.lookup(R, b"2")
+        check(viak.st_ino == direct.st_ino == fs._ino_for("2", ""),
+              "kids-dir: KIDS_DIR/<child> routes to the child's REAL overlay root inode")
+
+        check((await fs.lookup(ek.st_ino, b"99")).st_ino == 0,
+              "kids-dir: a non-child name under KIDS_DIR is a negative entry")
+        check((await fs.lookup(ek.st_ino, b"8")).st_ino == 0,
+              "kids-dir: a sibling-tree box is NOT reachable (isolation preserved)")
+
+        check(stat_mod.S_ISDIR((await fs.getattr(ek.st_ino)).st_mode),
+              "kids-dir: getattr(KIDS_DIR inode) -> dir")
+
+        # Recursion: the child's own root again exposes its own KIDS_DIR.
+        ek2 = await fs.lookup(direct.st_ino, K)
+        e3 = await fs.lookup(ek2.st_ino, b"3")
+        check(e3.st_ino == fs._ino_for("3", ""),
+              "kids-dir: recursion — KIDS_DIR/<child>/KIDS_DIR/<grandchild> resolves")
+
+        # Hidden: KIDS_DIR never appears in the box root's directory listing.
+        check(m.KIDS_DIR not in [n for n, _k, _a in fs._scan_dir("1", "")],
+              "kids-dir: KIDS_DIR is hidden from box-root readdir")
+
+        # Reserved-namespace write guard.
+        ctx = SimpleNamespace(pid=os.getpid(), uid=os.getuid(), gid=os.getgid(), umask=0)
+        async def expect_eperm(coro, label):
+            try:
+                await coro; check(False, f"kids-dir: {label} should raise")
+            except pyfuse3.FUSEError as e:
+                check(e.errno == 1, f"kids-dir: {label} -> EPERM (errno={e.errno})")
+        await expect_eperm(fs.mkdir(ino1, K, 0o755, ctx), "mkdir of the reserved name")
+        await expect_eperm(fs.mkdir(ek.st_ino, b"x", 0o755, ctx), "mkdir under KIDS_DIR")
+        await expect_eperm(fs.unlink(ino1, K, ctx), "unlink of the reserved name")
+        r = await fs.mkdir(ino1, b"realdir", 0o755, ctx)
+        check(r.st_ino != 0, "kids-dir: a normal mkdir at the box root still works")
+
+    asyncio.run(run())
+
+
 if __name__ == "__main__":
     for t in (test_one_db_only_and_blob_lifecycle,
               test_process_and_env_tables_dedup_and_tag,
@@ -623,7 +695,8 @@ if __name__ == "__main__":
               test_finalize_discard_copies_down_to_children,
               test_consolidate_size_based_placement,
               test_promote_into_parent_unit,
-              test_collect_docs):
+              test_collect_docs,
+              test_synthetic_kids_dir_routing):
         print(f"\n== {t.__name__} ==")
         try:
             t()
