@@ -6317,9 +6317,27 @@ class Supervisor:
         if "." not in s:
             bid = self._name_index().get(s)
             return str(bid) if bid is not None else None
-        # Dotted path: find the box whose derived display path equals s.
-        for k in self._all_box_meta():
-            if self.display_path(k) == s:
+        # Dotted path: build the display-path lookup once from the snapshot,
+        # deriving each box's dotted path from in-snapshot name/parent pointers
+        # (no per-ancestor DB reopen).
+        meta = self._all_box_meta()
+        def _snap_display_path(key: str, snap: dict, depth: int = 64) -> str:
+            parts = []
+            k = key
+            seen: set = set()
+            for _ in range(depth):
+                if k in seen: break
+                seen.add(k)
+                m = snap.get(k)
+                if m is None: parts.append(k); break
+                nm = m["name"]
+                parts.append(nm if nm else k)
+                pbid = m["parent_box_id"]
+                if not pbid: break
+                k = str(pbid)
+            return ".".join(reversed(parts))
+        for k in meta:
+            if _snap_display_path(k, meta) == s:
                 return k
         return None
 
