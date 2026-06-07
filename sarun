@@ -1215,8 +1215,8 @@ def sqlar_remove(path, name) -> int:
     try:
         conn.execute("DELETE FROM sqlar WHERE name=?", (name,))
         conn.execute("DELETE FROM provenance WHERE path=?", (name,)); conn.commit()
-        left = conn.execute("SELECT COUNT(*) FROM sqlar").fetchone()[0]
-        flows = conn.execute("SELECT COUNT(*) FROM flows").fetchone()[0]
+        left = conn.execute("SELECT EXISTS(SELECT 1 FROM sqlar)").fetchone()[0]
+        flows = conn.execute("SELECT EXISTS(SELECT 1 FROM flows)").fetchone()[0]
     except sqlite3.Error as e:
         print(f"slopbox: sqlar_remove {path} {name}: {e}", file=sys.stderr)
         left = 1; flows = 1
@@ -1249,8 +1249,8 @@ def _drop_sqlar_row_and_blob(path, box_id, rel) -> None:
         try:
             conn.execute("DELETE FROM sqlar WHERE name=?", (name := rel,))
             conn.execute("DELETE FROM provenance WHERE path=?", (name,)); conn.commit()
-            left = conn.execute("SELECT COUNT(*) FROM sqlar").fetchone()[0]
-            flows = conn.execute("SELECT COUNT(*) FROM flows").fetchone()[0]
+            left = conn.execute("SELECT EXISTS(SELECT 1 FROM sqlar)").fetchone()[0]
+            flows = conn.execute("SELECT EXISTS(SELECT 1 FROM flows)").fetchone()[0]
         except sqlite3.Error: left = 1; flows = 1
     finally: conn.close()
     if left == 0 and flows == 0:
@@ -1328,7 +1328,7 @@ def has_flows(path) -> bool:
     path = Path(path)
     if not path.exists(): return False
     conn = _sqlar_open(path)
-    try: return conn.execute("SELECT COUNT(*) FROM flows").fetchone()[0] > 0
+    try: return bool(conn.execute("SELECT EXISTS(SELECT 1 FROM flows)").fetchone()[0])
     except sqlite3.Error: return False
     finally: conn.close()
 
