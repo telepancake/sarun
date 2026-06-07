@@ -2199,7 +2199,6 @@ class Index:
             old_kind = self._kinds.pop(old, None)
             if old_kind is not None:
                 self._kinds[new] = old_kind
-            opaque_had = new in self._opaque  # already handled above
             # move the symlink target alongside the kind (drop any pre-existing new)
             self._targets.pop(new, None)
             old_tgt = self._targets.pop(old, None)
