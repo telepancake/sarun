@@ -9638,7 +9638,11 @@ def _make_ui_app():
         def _cbar(self, msg=""):
             n=len(self._ch_entries)
             extra=f"{n} change(s)" + (f"  ·  {msg}" if msg else "")
-            try: self.query_one("#c-bar",Static).update(f"  [dim]{extra}[/]")
+            # Persistent indicator when mitmproxy is unavailable: networking is off
+            # and all connections from slopboxes will be silently dropped.
+            net_warn = ("  [red bold]⚡ mitmproxy unavailable — networking disabled[/]"
+                        if self.engine is not None and not self.engine.ready else "")
+            try: self.query_one("#c-bar",Static).update(f"  [dim]{extra}[/]{net_warn}")
             except Exception: pass
 
         def _sel_session(self):
