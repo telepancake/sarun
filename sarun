@@ -1029,6 +1029,8 @@ def sqlar_path(box_id) -> Path:
     # The box's single db, named by its stable integer id: <box_id>.sqlar.
     return state_home() / (str(box_id) + ".sqlar")
 
+_SQLAR_SCHEMA_VERSION = 2  # bump when DDL or migration list changes
+
 def _sqlar_open(path) -> "sqlite3.Connection":
     path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
     # 0700: the single db holds writer provenance (pid/exe/argv/env).
@@ -1040,28 +1042,33 @@ def _sqlar_open(path) -> "sqlite3.Connection":
     try: os.chmod(str(path), 0o600)
     except OSError: pass
     conn.execute("PRAGMA busy_timeout=3000")
-    conn.executescript(
-        "CREATE TABLE IF NOT EXISTS sqlar"
-        "(name TEXT PRIMARY KEY, mode INT, mtime INT, sz INT, data BLOB,"
-        " opaque INT DEFAULT 0, writer INT, last_writer INT);"
-        "CREATE TABLE IF NOT EXISTS provenance"
-        "(path TEXT PRIMARY KEY, pid INT, ppid INT, exe TEXT, argv TEXT);"
-        "CREATE TABLE IF NOT EXISTS env"
-        "(id INTEGER PRIMARY KEY AUTOINCREMENT, hash TEXT UNIQUE, env TEXT);"
-        "CREATE TABLE IF NOT EXISTS process"
-        "(id INTEGER PRIMARY KEY AUTOINCREMENT, tgid INT UNIQUE, ppid INT,"
-        " exe TEXT, argv TEXT, env_id INT, root INT DEFAULT 0);"
-        "CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);"
-        "CREATE TABLE IF NOT EXISTS flows("
-        " id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, action TEXT,"
-        " method TEXT, scheme TEXT, host TEXT, port INT, url TEXT, status INT,"
-        " process_id INT, req_headers TEXT, req_len INT, req_body BLOB,"
-        " resp_headers TEXT, resp_len INT, resp_body BLOB);")
-    # Migrate boxes created by an older schema: add columns introduced later. The
-    # one DDL above is authoritative for fresh DBs; these top up existing files.
-    _ensure_columns(conn, "sqlar", {"last_writer": "INT"})
-    _ensure_columns(conn, "process", {"root": "INT DEFAULT 0"})
-    conn.commit()
+    # Gate the one-time DDL + migrations behind user_version so repeated opens
+    # (the common case) skip straight to returning the connection.
+    ver = conn.execute("PRAGMA user_version").fetchone()[0]
+    if ver < _SQLAR_SCHEMA_VERSION:
+        conn.executescript(
+            "CREATE TABLE IF NOT EXISTS sqlar"
+            "(name TEXT PRIMARY KEY, mode INT, mtime INT, sz INT, data BLOB,"
+            " opaque INT DEFAULT 0, writer INT, last_writer INT);"
+            "CREATE TABLE IF NOT EXISTS provenance"
+            "(path TEXT PRIMARY KEY, pid INT, ppid INT, exe TEXT, argv TEXT);"
+            "CREATE TABLE IF NOT EXISTS env"
+            "(id INTEGER PRIMARY KEY AUTOINCREMENT, hash TEXT UNIQUE, env TEXT);"
+            "CREATE TABLE IF NOT EXISTS process"
+            "(id INTEGER PRIMARY KEY AUTOINCREMENT, tgid INT UNIQUE, ppid INT,"
+            " exe TEXT, argv TEXT, env_id INT, root INT DEFAULT 0);"
+            "CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);"
+            "CREATE TABLE IF NOT EXISTS flows("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, action TEXT,"
+            " method TEXT, scheme TEXT, host TEXT, port INT, url TEXT, status INT,"
+            " process_id INT, req_headers TEXT, req_len INT, req_body BLOB,"
+            " resp_headers TEXT, resp_len INT, resp_body BLOB);")
+        # Migrate boxes created by an older schema: add columns introduced later.
+        # The one DDL above is authoritative for fresh DBs; these top up existing files.
+        _ensure_columns(conn, "sqlar", {"last_writer": "INT"})
+        _ensure_columns(conn, "process", {"root": "INT DEFAULT 0"})
+        conn.execute(f"PRAGMA user_version = {_SQLAR_SCHEMA_VERSION}")
+        conn.commit()
     return conn
 
 def _ensure_columns(conn, table: str, cols: dict) -> None:
