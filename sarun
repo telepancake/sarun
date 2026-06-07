@@ -87,11 +87,6 @@ meta table. Renaming a box is a meta-only label write — the id and backing dir
 never change.
 """
 
-#: [b]slopbox[/] — run a command in a lightweight, inspectable sandbox.
-#: Every command runs inside a [cyan]bwrap[/] container with a private filesystem overlay and
-#: no real network access. The UI lets you review every file the command touched,
-#: approve or deny outbound connections, and apply or discard changes when done.
-
 from __future__ import annotations
 
 import abc
@@ -144,37 +139,56 @@ except Exception:
 
 # TABLE OF CONTENTS — regenerate with: grep -n "^#  [A-Z]" sarun
 #
-#    140   Paths
-#    311   Wire protocol (control messages: newline JSON; FD messages: SCM_RIGHTS)
-#    410   Inner forwarder — `slopbox --inner` (runs as pid-1-ish inside the slopbox)
-#    538   Rules
-#    642   File rules — apply / discard a change by path glob (first match wins)
-#    732   Patch codec & tree utilities
-#    939   Sqlar — the single per-box database (index + at-rest archive)
-#   1150   Network log
-#   1221   Session model & box metadata helpers
-#   1365   Overlay engine — pyfuse3 copy-on-write overlay, multiplexed per box
-#   4170   Overlay mount manager — OverlayMount (trio thread) + Session model & discovery
-#   4748   ChangeSource (abstract interface)
-#   4888   LiveUpper & SqlarArchive (change substrate implementations)
-#   5164   ChangeReview
-#   5864   NetworkPolicy
-#   5979   Supervisor
-#   6911   In-process mitmproxy: drive one connection per passed FD
-#   7063   Control + FD-channel socket server (inside the UI)
-#   7464   CA generation
-#   7515   Runner — `slopbox CMD [ARGS...]`
-#   7870   UI — `slopbox`
-#   9762   CLI commands
-#   9857   Entry
-#  10262   TODO — deferred follow-ups (read me)
+#    230   Paths
+#    432   Wire protocol (control messages: newline JSON; FD messages: SCM_RIGHTS)
+#    525   Inner forwarder — `slopbox --inner` (runs as pid-1-ish inside the slopbox)
+#    662   Rules
+#    789   File rules — apply / discard a change by path glob (first match wins)
+#    862   Patch codec & tree utilities
+#   1071   Sqlar — the single per-box database (index + at-rest archive)
+#   1338   Network log
+#   1410   Session model & box metadata helpers
+#   1569   Overlay engine — pyfuse3 copy-on-write overlay, multiplexed per box
+#   4351   Overlay mount manager — OverlayMount (trio thread) + Session model & discovery
+#   4939   ChangeSource (abstract interface)
+#   5079   LiveUpper & SqlarArchive (change substrate implementations)
+#   5355   ChangeReview
+#   6074   NetworkPolicy
+#   6194   Supervisor
+#   7140   In-process mitmproxy: drive one connection per passed FD
+#   7295   Control + FD-channel socket server (inside the UI)
+#   7688   CA generation
+#   7740   Runner — `slopbox CMD [ARGS...]`
+#   8204   UI — `slopbox`
+#  10107   CLI commands
+#  10202   Entry
+#  10295   User's manual — the standalone onboarding docs (shown first in the UI)
+#  10351   TODO — deferred follow-ups (read me)
 #
 # NOTE: update line numbers here whenever sections change.
 
-# User docs are `#:`-prefixed Rich-markup blocks dispersed beside the code they document;
-# collected here and shown in the right pane when no box is selected. Keep them next to
-# the relevant code.
+# User docs are `#:`-prefixed Rich-markup blocks dispersed beside the code they
+# document; collect_docs() gathers them and the right pane shows them when no box is
+# selected. Keep each block next to the relevant code — but the pane order is NOT
+# source order: every block's title starts with a section number (e.g.
+# `[b]10 · Network model[/]`) and collect_docs sorts by it, so the reading order is
+# deliberate no matter where in the file a block physically lives. Numbers 1–5 are the
+# standalone User's manual (parked in its own section near the end of the file); 6+ are
+# the per-topic reference blocks that sit beside their code. Renumber a title to move
+# it; leave gaps if you want room to insert.
 _collect_docs_cache: "str | None" = None
+
+def _doc_sort_key(block: str):
+    """Sort key for a collected doc block: the leading section number in its title.
+    The first line begins with `N` (or `N.M`) once Rich `[markup]` is stripped; a
+    block with no number sorts after every numbered one, keeping source order there
+    (the sort is stable). Parsed numerically so 2 precedes 10, not the reverse."""
+    first = block.split("\n", 1)[0]
+    plain = re.sub(r"\[/?[^\]]*\]", "", first)          # drop Rich [tags]
+    m = re.match(r"\s*(\d+(?:\.\d+)*)", plain)
+    if not m:
+        return (1, ())
+    return (0, tuple(int(n) for n in m.group(1).split(".")))
 
 def collect_docs() -> str:
     """Scan the program's own source for `#:`-prefixed doc blocks and return them
@@ -207,6 +221,7 @@ def collect_docs() -> str:
                 current = []
     if current:
         blocks.append("\n".join(current))
+    blocks.sort(key=_doc_sort_key)        # deliberate reading order, not source order
     result = "\n\n".join(blocks) if blocks else ""
     _collect_docs_cache = result
     return result
@@ -298,7 +313,7 @@ def box_ctime(box_id) -> float:
 # dir. It is never derived from a name and never changes (a rename is a meta-only
 # label write). Any id that arrives as a path component MUST be validated as a plain
 # decimal string before use.
-#: [b]Box identity, names, and nesting[/]
+#: [b]9 · Boxes — identity, names, and nesting[/]
 #: Every box has a stable integer [cyan]box_id[/] that never changes — renaming only changes the
 #: display label, never the backing data. Box [b]names[/] are ALL-CAPS identifiers
 #: ([cyan]MY-BOX[/], [cyan]WORK[/]) — capitals only, digits, hyphens; must start with a letter.
@@ -496,7 +511,7 @@ def ui_is_running(sock_path: str) -> bool:
         return False
 
 
-#: [b]Network model[/]
+#: [b]10 · Network model[/]
 #: A slopbox has [b]no real network[/] — only loopback. Outbound connections are only possible
 #: when you pass [cyan]-n[/] (networking flag) AND the UI is running to gate them.
 #: A tiny in-box forwarder hands each accepted connection's file descriptor to the UI over a
@@ -634,7 +649,7 @@ def run_inner(channel_path: str, cmd: list) -> int:
     return code or 0
 
 
-#: [b]Network allow/deny rules[/]
+#: [b]11 · Network allow/deny rules[/]
 #: Rules are evaluated top-to-bottom; the [b]first match wins[/]. Rule kinds:
 #:   [cyan]host:PATTERN[/]   match by hostname (glob: [cyan]*[/] / [cyan]?[/]; [cyan]*.example.com[/] also matches bare [cyan]example.com[/])
 #:   [cyan]ip:ADDR[/]        match by resolved IP address or CIDR network (e.g. [cyan]10.0.0.0/8[/])
@@ -756,7 +771,7 @@ class Rules(_RuleListBase):
         return None
 
 
-#: [b]Change review — apply, discard, patch, and file rules[/]
+#: [b]12 · Change review — apply, discard, patch, and file rules[/]
 #: After a box finishes, its changes are held in a private overlay for you to review.
 #: You can act on the whole box or on individual files:
 #:   [cyan]apply[/]    — write the box's changes to the real host filesystem, then remove the box
@@ -1541,7 +1556,7 @@ def root_cmd(sid: str) -> list:
     except (ValueError, TypeError): return []
 
 
-#: [b]Filesystem / overlay model[/]
+#: [b]8 · Filesystem & overlay model[/]
 #: Each slopbox sees a [b]copy-on-write overlay[/] of the host filesystem ([cyan]/[/]) as its root.
 #: Reads fall through to the real host unless the box has written that path.
 #: Writes are captured in the box's private overlay — the host is [b]never touched[/] until you
@@ -7871,7 +7886,7 @@ def run_on_untrusted(argv, files, timeout=10, out_cap=256 * 1024, on_spawn=None)
     except Exception as e:
         return (False, "", f"sandbox error: {e}")
 
-#: [b]Running a command in a slopbox[/]
+#: [b]6 · Running a command in a slopbox[/]
 #: [cyan]slopbox [NAME] [FLAGS] -- CMD [ARGS…][/]
 #:
 #: The command [b]must[/] follow [cyan]--[/]. Flags go before it:
@@ -8170,7 +8185,7 @@ def cmd_run(cmd, net, trace, direct, session_whitelist, chdir, reuse_sid=None) -
     return (code or 0) if launched else 1
 
 
-#: [b]UI panes and navigation[/]
+#: [b]7 · The UI — panes and navigation[/]
 #: The UI has two panels: a left list and a right detail. Switch views with:
 #:   [cyan]b[/]  Boxes — all slopboxes; select one, press [cyan]↵[/] to review its changes
 #:   [cyan]c[/]  Changes — the file tree of what the selected box wrote; [cyan]↵[/] on a file shows its diff
@@ -10274,6 +10289,62 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  User's manual — the standalone onboarding docs (shown first in the UI)
+# ════════════════════════════════════════════════════════════════════════════
+# These `#:` blocks teach the whole tool rather than any one piece of code, so they
+# live here instead of beside a function. They carry the lowest section numbers (1–5),
+# so collect_docs() sorts them to the top of the right pane — a first-time reader meets
+# them before the per-topic reference blocks (6+) that sit next to their code.
+
+#: [b]1 · What is slopbox?[/]
+#: [b]slopbox[/] runs a single command inside a lightweight, inspectable sandbox, so you can
+#: run untrusted or unfamiliar programs without trusting them up front. The command runs
+#: in a [cyan]bwrap[/] sandbox over a [b]copy-on-write overlay[/] of your whole filesystem, with no
+#: real network. Nothing it does touches your real system until you review it and choose
+#: to [b]apply[/] it — and anything you don't apply simply never happened.
+#: It is [b]not[/] a container runtime: the program runs as you, as an ordinary process, just
+#: with its writes captured and its network gated. Reach for it to try an installer, run
+#: a build, or let an agent loose — then see exactly what it changed and what it talked
+#: to before you keep any of it.
+
+#: [b]2 · The two halves — UI and runner[/]
+#: slopbox is one program with two roles, told apart by whether you give it a command:
+#:   [cyan]slopbox[/]                  start the [b]UI[/] — the control panel; leave it running
+#:   [cyan]slopbox -- CMD [ARGS…][/]   run [b]CMD[/] inside a sandbox — the runner
+#: The UI owns the filesystem overlay and answers network prompts, so it must already be
+#: running before you launch any sandboxed command: a runner with no UI fails fast,
+#: because it has nowhere to mount its root. The usual setup is to open the UI in one
+#: terminal and leave it, then run commands from another.
+
+#: [b]3 · Quick start — your first box[/]
+#: [cyan]1.[/] In one terminal, start the UI:        [cyan]slopbox[/]
+#: [cyan]2.[/] In another, run something harmless:   [cyan]slopbox -- touch hello.txt[/]
+#: [cyan]3.[/] Back in the UI, press [cyan]b[/] (Boxes); the finished box is listed. Select it and
+#:    press [cyan]↵[/] to review what it did.
+#: [cyan]4.[/] Press [cyan]c[/] (Changes) to see the file tree it wrote; [cyan]↵[/] on a file shows its diff.
+#: [cyan]5.[/] Decide: [cyan]apply[/] writes a change to your real filesystem, [cyan]discard[/] throws it away.
+#: That is the whole loop — [b]run → inspect → apply or discard[/]. Everything else is detail.
+
+#: [b]4 · The life of a box[/]
+#: A [b]box[/] is one sandboxed run together with everything it captured. It moves through:
+#:   [b]running[/]    the command is live — watch its writes, processes, and network as it goes
+#:   [b]finished[/]   the command exited — its changes wait in a private overlay for review
+#:   [b]reviewed[/]   you applied or discarded its changes, and the box is removed
+#: While a box runs you can intervene: signal one of its processes, or kill the whole box.
+#: Nothing reaches the host until you apply it, so a box you never get around to reviewing
+#: is harmless — it just holds its captured changes until you do.
+
+#: [b]5 · Tips & common mistakes[/]
+#:   • The command goes [b]after[/] [cyan]--[/]; flags go before it. [cyan]slopbox ls[/] — with no [cyan]--[/] —
+#:     is the usual first mistake, and is rejected; write [cyan]slopbox -- ls[/].
+#:   • [b]No network by default.[/] If a command hangs fetching something, it has no network:
+#:     re-run with [cyan]-n[/] and approve the connection in the UI.
+#:   • [b]Start the UI first.[/] A runner with no UI has nowhere to mount its overlay.
+#:   • [b]Nothing is permanent until you [cyan]apply[/].[/] Experiment freely; discard the mess.
+#:   • [b]Keep the UI running[/] while boxes are live — quitting it tears down their filesystem.
 
 
 # ════════════════════════════════════════════════════════════════════════════
