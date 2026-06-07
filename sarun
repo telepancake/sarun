@@ -5251,6 +5251,7 @@ class SqlarArchive(ChangeSource):
     def write_current(self, rel, data):
         rel = rel.lstrip("/")
         conn = _sqlar_open(self.path)
+        row = None
         try:
             blob, sz = _sqlar_deflate(data)
             conn.execute("UPDATE sqlar SET sz=?, data=? WHERE name=?",
@@ -6081,6 +6082,7 @@ class NetworkPolicy:
             result = await asyncio.wait_for(asyncio.shield(fut), timeout=300)
         except asyncio.TimeoutError:
             result = {"action": "deny", "scope": "once"}
+            fut.cancel()
         self.pending.pop(rid, None)
         action, scope = result["action"], result["scope"]
         # The UI hands back the exact rule it wants ("kind:pattern") and where to
