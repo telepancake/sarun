@@ -802,9 +802,12 @@ class Rules(_RuleListBase):
 #:   [cyan]discard[/]  drop the changes without writing the host. Discarding a [b]parent[/] first copies the
 #:            inherited files [b]down[/] into its children, so their view survives. Whole box ([cyan]X[/]),
 #:            one file ([cyan]x[/]), or one hunk ([cyan]x[/] in the diff view).
-#:   [cyan]delete[/]   ([cyan]d[/] in the Boxes pane) remove a whole box and its overlay. Refuses a running
-#:            box — [cyan]kill[/] it first. If it has children they are re-parented [b]up[/] to its own parent
-#:            (the opposite of discard's copy-down).
+#:   [cyan]delete[/]   ([cyan]d[/] in the Boxes pane) finalize a whole box and remove it. It first runs your
+#:            [b]file rules[/] (§14) over the box's changes: a path matching an [cyan]apply[/] rule is written out
+#:            ([b]so with such a rule delete CAN write to the host[/] / parent), and every other path is
+#:            discarded. With no file rules — the default — that means discard everything. Then any
+#:            children are re-parented [b]up[/] to its own parent (the opposite of discard's copy-down).
+#:            Refuses a running box — [cyan]kill[/] it first.
 #:   [cyan]kill[/]     ([cyan]k[/] in the Boxes pane) stop a still-running box; it then becomes [b]killed[/].
 #: [b]Heads-up on removal:[/] in the UI, apply/discard only remove the box once it is completely
 #: empty — a box that still has a network log stays in the list until you [cyan]delete[/] it. (The
@@ -820,13 +823,14 @@ class Rules(_RuleListBase):
 #: File rules save you from reviewing the same paths by hand every time. Each rule is an
 #: action plus a path glob; for any changed path the [b]first matching[/] rule decides (edit them
 #: in the File rules pane, [cyan]f[/]):
-#:   [cyan]apply PATTERN[/]        write matching paths to the host automatically on review
+#:   [cyan]apply PATTERN[/]        write matching paths to the host automatically on review or delete
 #:   [cyan]discard PATTERN[/]      drop matching paths automatically (e.g. caches, [cyan]**/__pycache__/**[/])
 #:   [cyan]passthrough PATTERN[/]  do not capture at all — writes to matching paths go [b]straight to the
 #:                        host while the box runs[/] (the box can really change those paths)
 #: Glob syntax (extended, bash-style): [cyan]*[/] within a segment, [cyan]**[/] across dirs, [cyan]?[/] one char,
-#: [cyan]@(a|b)[/] / [cyan]!(x)[/] groups, [cyan]{a,b}[/] brace expansion. A pattern with no leading [cyan]/[/] matches at
-#: any depth; a leading [cyan]/[/] anchors at the filesystem root.
+#: [cyan]@(a|b)[/] / [cyan]!(x)[/] groups, [cyan]{a,b}[/] brace expansion. Matching includes dotfiles (a leading [cyan]*[/]
+#: matches [cyan].bashrc[/]). A pattern with no leading [cyan]/[/] matches at any depth; a leading [cyan]/[/] anchors
+#: at the filesystem root.
 #
 # Patterns are extended shell globs (bash-style) over the change's absolute path,
 # via wcmatch with GLOBSTAR + EXTGLOB + BRACE:
@@ -10163,8 +10167,9 @@ def _make_ui_app():
 # entry points for each slopbox subcommand, called from main().
 
 #: [b]10 · Controlling boxes from the command line[/]
-#: Everything you can do to a box in the UI you can also do from a second terminal — handy
-#: for scripts. These subcommands talk to the running UI over its control socket (so the UI
+#: Most of what you do to a box in the UI you can also do from a second terminal — handy
+#: for scripts. ([cyan]kill[/] and [cyan]delete[/] are the exceptions: UI-only, no command-line form.)
+#: These subcommands talk to the running UI over its control socket (so the UI
 #: must be up), and act on a box by NAME, or on the UI's currently-selected box if you omit it:
 #:   [cyan]slopbox [NAME] apply[/]     apply the box's changes to the host, then remove the box
 #:   [cyan]slopbox [NAME] discard[/]   discard the box's changes, then remove the box
