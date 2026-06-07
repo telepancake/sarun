@@ -380,7 +380,7 @@ def test_lazy_file_materialization():
 
         # Consolidate with index= kept open so the live mount stays valid.
         blob_before = m.blob_path(fx.index.box_id, fx.index.row_id("evictme.txt"))
-        m.consolidate(str(fx.backing), fx.sid, ["x"], index=fx.index)
+        m.consolidate(str(fx.backing), fx.sid, index=fx.index)
 
         # (a) Blob must be gone (evicted).
         check(not blob_before.exists(), "lazy: pool blob evicted after consolidate")
@@ -411,10 +411,10 @@ def test_lazy_file_materialization():
         # dirs/symlinks are now served from the rows (no up/<rel> artifacts). File is
         # already evicted (written via buffer into row), so consolidate sees data NOT
         # NULL and leaves it as-is (no blob to deflate).
-        m.consolidate(str(fx.backing), fx.sid, ["x"], index=fx.index)
+        m.consolidate(str(fx.backing), fx.sid, index=fx.index)
         blob_after_second = m.blob_path(fx.index.box_id, fx.index.row_id("evictme.txt"))
         # Now call unconsolidate — should NOT re-create the file blob.
-        m.unconsolidate(str(fx.backing), fx.sid)
+        m.unconsolidate(str(fx.backing))
         check(not blob_after_second.exists(),
               "lazy: unconsolidate does NOT recreate file blob (stays evicted)")
         # NO dir/symlink up/<rel> artifacts on disk — they live only in the rows.
@@ -770,7 +770,7 @@ def test_terminated_parent_reads():
         # Record parent_sid in meta before consolidation (add_session already did this
         # for the child; we also need the parent's own parent chain for later tests,
         # but here the parent is top-level, so no meta entry needed).
-        m.consolidate(str(pbk), psid, ["x"], index=pidx)
+        m.consolidate(str(pbk), psid, index=pidx)
         # After consolidate: pool blobs evicted (data in sqlar rows), up/ artifacts removed.
         p_rid = pidx.row_id("pfile.txt")
         p_blob = m.blob_path(pidx.box_id, p_rid) if p_rid is not None else None

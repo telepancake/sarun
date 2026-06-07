@@ -30,24 +30,25 @@ Filesystem model: the UI owns ONE pyfuse3 overlay mount, served from a
 dedicated trio thread and created the ordinary way (`pyfuse3.init` via the
 setuid `fusermount3` helper — no root, no user namespace, no fd-passing, no
 mount(2)/pivot_root anywhere). That single mount is *multiplexed*: its synthetic
-root lists one subfolder per live slopbox, `<mnt>/<sid>`, each presenting a
-copy-on-write overlay of lower=`/` plus that session's private upper (backing
-dir holds only `live/<sid>/up`; overlay state lives in the per-box
-`<sid>.sqlar`). A slopbox writing to
-`<mnt>/<sid>/etc/hostname` reads through to the host file unless it wrote there.
+root lists one subfolder per live slopbox, `<mnt>/<box_id>`, each presenting a
+copy-on-write overlay of lower=`/` plus that box's private upper. A box's
+identity is its stable integer box_id, minted at creation and never changed.
+Files are content-addressed pool blobs; dirs and symlinks are sqlar rows served
+from the in-RAM Index mirror. `up/` holds NO file/dir/symlink artifacts — it is
+only the discovery sentinel (an empty dir). A slopbox writing to
+`<mnt>/<box_id>/etc/hostname` reads through to the host file unless it wrote there.
 
 Because the UI serves every filesystem op, it sits in the I/O path exactly like
 it already does for network requests: the Changes view updates live as writes
 happen, and a per-write policy hook (policy_check) is the obvious place where a
 deny/prompt would attach. Provenance (pid/exe/argv of the writer) is captured
-synchronously and recorded in the per-box `<sid>.sqlar`. Since the UI is now the
-mount provider,
-`slopbox CMD` REQUIRES a running UI and fails fast otherwise.
+synchronously and recorded in the per-box `<box_id>.sqlar`. Since the UI is now
+the mount provider, `slopbox CMD` REQUIRES a running UI and fails fast otherwise.
 
-Isolation is UNCHANGED: the runner still does `bwrap --bind <mnt>/<sid> / …`
+Isolation is UNCHANGED: the runner still does `bwrap --bind <mnt>/<box_id> / …`
 with the same flags (own PID/IPC/UTS/net namespaces, all caps dropped, runs as
 you). The bind-as-root confines the box to its own subfolder; it cannot reach
-`<mnt>/` or another session's `<sid>`. Same uid as the UI, so no allow_other.
+`<mnt>/` or another box's subtree. Same uid as the UI, so no allow_other.
 
 Options (slopbox [FLAGS] -- CMD ...; the command MUST follow `--`):
   -n         enable networking via mitmproxy (default: off)
@@ -56,10 +57,10 @@ Options (slopbox [FLAGS] -- CMD ...; the command MUST follow `--`):
   -w HOST    pre-allow HOST for this session (repeatable)
   -C DIR     working directory inside the slopbox (default: cwd)
 
-A session is named by the time it started and the runner's pid
-(YYYYmmdd-HHMMSS_PID); that name is the live/ subfolder and the mount
-subfolder, and the only thing stored besides the captured changes is the
-command itself.
+A box is identified by its stable integer box_id. Its human-readable name (and
+optional parent_box_id for nesting) are stored in the box's `<box_id>.sqlar`
+meta table. Renaming a box is a meta-only label write — the id and backing dirs
+never change.
 """
 
 from __future__ import annotations
@@ -132,13 +133,12 @@ def runtime_home() -> Path:
     return Path(base) / "slopbox" if base else data_home()
 
 def live_home() -> Path:
-    """Per-session overlay backing: live/<sid>/up (the box's working bytes) plus the
-    per-session relay socket dir. Sits next to the per-box <sid>.sqlar under
-    state_home — i.e. ON DISK, not the RAM-backed XDG_RUNTIME_DIR tmpfs. A box's
-    writes (every copy-up, every extracted file) land here, so its capacity must track
-    the disk, not a fraction of RAM; being on the same filesystem as the lower (/) also
-    lets copy-up reflink. (runtime_home keeps only the small ephemera: the control/
-    relay sockets and the FUSE mountpoint.) Created mode 0700."""
+    """Root of per-box backing dirs: live/<box_id>/up is the discovery sentinel (an
+    empty dir that gates box discovery — box writes do NOT land here). Sits next to
+    the per-box <box_id>.sqlar under state_home — i.e. ON DISK, not the RAM-backed
+    XDG_RUNTIME_DIR tmpfs. Being on the same filesystem as the lower (/) lets pool
+    blobs reflink at copy-up. (runtime_home keeps only small ephemera: the control
+    socket and the FUSE mountpoint.) Created mode 0700."""
     return state_home() / "live"
 
 def live_dir(box_id) -> Path:
@@ -247,10 +247,10 @@ def relay_sock_path(box_id) -> str:
 
 def mnt_point() -> Path:
     """The single pyfuse3 mountpoint the UI owns; box subfolders live under it as
-    <mnt>/<sid>. Empty at rest."""
+    <mnt>/<box_id>. Empty at rest."""
     return runtime_home() / "mnt"
 
-SOCK_PATH      = str(runtime_home() / "ui.sock")        # control + FD channel
+SOCK_PATH      = str(runtime_home() / "ui.sock")        # control-only socket
 UI_SOCK_INBOX  = "/run/slopbox/ui.sock"                  # fixed in-box path for the above
 MITM_CONFDIR   = data_home() / "mitmproxy"              # CA, generated once
 CA_CERT        = MITM_CONFDIR / "mitmproxy-ca-cert.pem"
@@ -306,8 +306,8 @@ def sync_send(sock_path: str, timeout: float = 5.0, **msg: Any) -> None:
 
 def sync_request(sock_path: str, timeout: float = 30.0, **msg: Any) -> "dict | None":
     """Send one control message and wait for a single newline-JSON reply. Used by the
-    runner to register a session and block until the UI has created live/<sid> and
-    exposed <mnt>/<sid> (so the bwrap bind target exists). None on any failure."""
+    runner to register a box and block until the UI has created live/<box_id> and
+    exposed <mnt>/<box_id> (so the bwrap bind target exists). None on any failure."""
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
             s.settimeout(timeout); s.connect(sock_path)
@@ -386,12 +386,11 @@ def ui_is_running(sock_path: str) -> bool:
 # ════════════════════════════════════════════════════════════════════════════
 #
 # Listens on 127.0.0.1:INNER_PROXY_PORT. For each accepted connection, sends the
-# connection's FD plus the session id to the UI's FD channel over a Unix socket
-# that was bind-mounted into the slopbox. Then execs the real command. The
-# forwarder holds no bytes; the UI drives the proxied conversation.
+# connection's FD to the UI's relay socket (a Unix socket bind-mounted into the
+# slopbox). Then execs the real command. The forwarder holds no bytes; the UI
+# drives the proxied conversation.
 
-def run_inner(channel_path: str, _session_id: str, cmd: list) -> int:
-    # _session_id unused: the UI derives the session from which relay socket the FD arrives on.
+def run_inner(channel_path: str, cmd: list) -> int:
     stop = threading.Event()
 
     def _peer_pidfd(conn: socket.socket) -> int:
@@ -713,7 +712,7 @@ def load_file_rules() -> FileRules:
 #  the single sqlar (there is no patch file at rest). Used to render text diffs in
 #  the Changes view, to apply/discard an individual hunk, and to print a box's
 #  whole patch over the control socket (`slopbox patch`). The original command is
-#  the box's ROOT process row in the same sqlar (tgid == the sid's pid).
+#  the box's ROOT process row in the same sqlar (the root-flagged process.id row).
 # ════════════════════════════════════════════════════════════════════════════
 
 def ut_split(data: bytes) -> list:
@@ -727,20 +726,6 @@ def ut_split(data: bytes) -> list:
         lines.append(parts[-1])
     return lines
 
-# Legacy timestamp parser retained ONLY for tests that still build "YYYYmmdd-HHMMSS_PID"
-# strings. A box's identity is now its integer box_id; this is no longer on any code path.
-_SID_FMT = "%Y%m%d-%H%M%S"
-
-def parse_sid(sid: str) -> tuple:
-    """(started_epoch, pid) from a "YYYYmmdd-HHMMSS_PID" name; zeros if malformed.
-    A rare ".<hex>" collision suffix is stripped before parsing the host pid."""
-    if not isinstance(sid, str): return 0.0, 0
-    stamp, _, pids = sid.partition(".")[0].rpartition("_")
-    try: started = time.mktime(time.strptime(stamp, _SID_FMT))
-    except (ValueError, OverflowError): started = 0.0
-    try: pid = int(pids)
-    except ValueError: pid = 0
-    return started, pid
 
 _PROC_TREE_DEPTH = 64   # defensive cap on a root→self walk (cycles / runaway chains)
 
@@ -931,7 +916,7 @@ def build_file_patch(rel, lower, upper, created, deleted) -> dict:
 # ════════════════════════════════════════════════════════════════════════════
 #  The single per-instance database — ONE sqlite file per slopbox (the sqlar).
 #
-#  There is exactly ONE database file per box, at sqlar_path(sid). It is BOTH the
+#  There is exactly ONE database file per box, at sqlar_path(box_id). It is BOTH the
 #  live index (consulted on every FUSE op, mirrored in RAM for the hot path) AND
 #  the at-rest archive. It holds ALL state in one schema:
 #
@@ -939,9 +924,9 @@ def build_file_patch(rel, lower, upper, created, deleted) -> dict:
 #        every file/dir/symlink/whiteout entry with its metadata. `mtime` is the
 #        modification time as integer NANOSECONDS (st_mtime_ns), stored exactly so
 #        sub-second mtime ordering survives consolidate→sqlar→apply→host. `data` is the
-#        zlib-deflated file content (NULL until consolidate() fills it from the
-#        overlay upper). A char-device mode with NULL data is a deletion
-#        tombstone (whiteout). `opaque`=1 marks an opaque directory. `writer` is the
+#        zlib-deflated file content (NULL for a resident file whose bytes live in the
+#        pool blob). A char-device mode with NULL data is a deletion tombstone
+#        (whiteout). `opaque`=1 marks an opaque directory. `writer` is the
 #        process-table id (FK to process.id) of the FIRST process to produce the
 #        entry; `last_writer` is the id of the MOST RECENT process to modify it (the
 #        two differ when a path is rewritten by a later process, e.g. a re-run).
@@ -951,7 +936,7 @@ def build_file_patch(rel, lower, upper, created, deleted) -> dict:
 #        the box's process table (one row per traced tgid); env_id -> env.id.
 #        `root`=1 marks a hierarchy root — the process a `slopbox -- cmd` launch
 #        recorded. A box re-run (`slopbox NAME -- cmd`) adds another root, so the
-#        table is a FOREST; PPid bubbling stops at any root, not at the sid's pid.
+#        table is a FOREST; PPid bubbling stops at any root.
 #    env(id, hash, env)
 #        unique environment json, deduped by hash and referenced by env_id.
 #    meta(key, value)
@@ -959,15 +944,11 @@ def build_file_patch(rel, lower, upper, created, deleted) -> dict:
 #    flows(...)
 #        every gated request/response for the box.
 #
-#  The overlay upper (live/<sid>/up) is a directory of real files where the box's
-#  bytes land fast during the run; it is NOT a database. consolidate() reads those
-#  bytes and UPDATEs each already-existing sqlar row's NULL `data` in place, then
-#  tears the upper down — the sqlar is then self-contained.
+#  The `up/` directory is the box-backing sentinel (its existence gates discovery).
+#  Regular-file BYTES live in pool blobs; dirs and symlinks have no on-disk
+#  artifact — their rows (mode/mtime for dirs; target for symlinks) are the truth,
+#  served from the in-RAM Index mirror.
 # ════════════════════════════════════════════════════════════════════════════
-
-def _like_escape(s: str) -> str:
-    """Escape \\ % _ for use with LIKE ? ESCAPE '\\\\'."""
-    return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 def sqlar_path(box_id) -> Path:
     # The box's single db, named by its stable integer id: <box_id>.sqlar.
@@ -1245,7 +1226,7 @@ def process_list(path) -> list:
     return out
 
 def sqlar_meta_get(path, key: str) -> "str | None":
-    """Read one small per-box meta string (e.g. the renamed box's birth sid) from a
+    """Read one small per-box meta string (e.g. the box's display `name`) from a
     sqlar on disk. None if absent."""
     path = Path(path)
     if not path.exists(): return None
@@ -2330,27 +2311,21 @@ def _build_overlay_ops():
             read-only base session so _lower_resolve/evicted-read paths serve its
             accepted state as the child's lower layer.
 
-            Strategy: call unconsolidate() to rebuild up/ dir+symlink artifacts (file
-            rows are left evicted; the FUSE fault-in path inflates them on demand).
-            Then create the Index and add the session entry — identical shape to a live
-            session, but passthrough=False and marked in _base_sessions.  A base session
-            is NEVER written to: copy-up always targets the live child's own overlay."""
+            Create the Index from the backing dir (regular-file rows stay evicted; the
+            FUSE fault-in path inflates them on demand) and add the session entry —
+            identical shape to a live session, but passthrough=False and marked in
+            _base_sessions.  A base session is NEVER written to: copy-up always targets
+            the live child's own overlay."""
             if parent_sid in self.sessions:
                 return   # already present (live or already attached base)
             sp = sqlar_path(parent_sid)
             if not sp.exists():
                 return   # no sqlar → nothing to attach
             ld = live_dir(parent_sid)
-            # Ensure the backing dir exists so Index.__init__ and unconsolidate can
-            # locate shm_dir even if the original live/<sid> was already cleaned up.
+            # Ensure the backing dir and the up/ sentinel exist so Index.__init__ can
+            # locate shm_dir even if the original live/<box_id> was already cleaned up.
             ld.mkdir(parents=True, exist_ok=True)
             (ld / "up").mkdir(parents=True, exist_ok=True)
-            try:
-                # Rebuild dir/symlink up/ artifacts so _resolve_st can lstat them.
-                # Regular-file rows stay evicted (data NOT NULL); _fault_in serves reads.
-                unconsolidate(str(ld), parent_sid)
-            except Exception:
-                pass
             try:
                 idx = Index(ld)
             except Exception:
@@ -2390,11 +2365,11 @@ def _build_overlay_ops():
                 self._lookup_count.pop(ino, None)
             self._key_to_ino = {k: i for k, i in self._key_to_ino.items()
                                 if k[0] != psid}
-            # Purge the transient backing the attach rebuilt (unconsolidate'd up/ dir &
-            # symlink artifacts). It is fully reconstructable from the box's <sid>.sqlar
-            # (which we never touch), so dropping it just reclaims the scratch space; a
-            # later re-attach rebuilds it. Copy-ups read a base read-only, so there are
-            # no faulted-in pool blobs to lose.
+            # Purge the transient backing the attach created (live/<box_id> with the up/
+            # sentinel). It is fully reconstructable from the box's <box_id>.sqlar (which
+            # we never touch), so dropping it just reclaims scratch space; a later
+            # re-attach rebuilds it. Copy-ups read a base read-only, so there are no
+            # faulted-in pool blobs to lose.
             try:
                 rm_rf(live_dir(psid))
             except Exception:
@@ -3119,8 +3094,8 @@ def _build_overlay_ops():
         def _ensure_copyup(self, sid: str, rel: str, flags: int, ctx) -> int:
             """Materialize a lower (or absent) file into the pool; return an O_RDWR
             fd on the blob. Regular files go to the pool blob (flat, no host-path
-            layout); symlinks/dirs still get real up/<rel> artifacts via _copyup_one.
-            Fail-closed: any copy error propagates."""
+            layout); dirs/symlinks are mirrored via _copyup_one (row-only, no on-disk
+            artifact). Fail-closed: any copy error propagates."""
             idx = self._index(sid)
             wid = idx.writer_for(ctx.pid)
             # FIRST: if already a file in the index with a blob, just open it.
@@ -3724,10 +3699,10 @@ def _build_overlay_ops():
                     st = self._synth_link_stat(len(tgt), idx.row_mtime(rel))
                 self._notify(sid, rel, "modified")
                 return self._entry(inode, st)
+            # Dir/symlink returned early above; only regular files reach here.
             upath = self._backing_path(sid, rel) or self._upper_path(sid, rel)
-            is_link = stat_mod.S_ISLNK(os.lstat(upath).st_mode)
             try:
-                if (fields.update_size or fields.update_mode) and not is_link:
+                if fields.update_size or fields.update_mode:
                     fd = os.open(upath, os.O_RDWR | os.O_NOFOLLOW)
                     try:
                         if fields.update_size: os.ftruncate(fd, attr.st_size)
@@ -3749,10 +3724,7 @@ def _build_overlay_ops():
             except OSError as e:
                 raise pyfuse3.FUSEError(e.errno or errno.EIO)
             st = os.lstat(upath)
-            if stat_mod.S_ISDIR(st.st_mode): kind = "dir"
-            elif stat_mod.S_ISLNK(st.st_mode): kind = "symlink"
-            else: kind = "file"
-            idx.set_entry(rel, kind, st.st_mode, wid, "setattr")
+            idx.set_entry(rel, "file", st.st_mode, wid, "setattr")
             self._notify(sid, rel, "modified")
             return self._entry(inode, st)
 
@@ -3821,9 +3793,10 @@ def _build_overlay_ops():
 
         # ── copy-up of one entry (for rename/link materialization) ───────────
         def _copyup_one(self, sid: str, rel: str, wid) -> None:
-            """Copy one entry into the upper/pool. Symlinks and dirs are real up/<rel>
-            artifacts. Regular files go into the pool blob (flat, rowid-addressed).
-            The early-return guard uses the correct backing per type."""
+            """Copy one entry into the overlay. Dirs and symlinks are mirrored into the
+            Index row only (no on-disk artifact). Regular files go into the pool blob
+            (flat, rowid-addressed). The early-return guard uses the correct backing
+            per type."""
             idx = self._index(sid)
             # For files: the blob is the backing; for dirs/symlinks: up/<rel>.
             k = idx.kind_of(rel)
@@ -4450,7 +4423,7 @@ def _open_index_ro(shm_dir) -> "Index | None":
     try: return Index(Path(shm_dir))
     except sqlite3.Error: return None
 
-def consolidate(shm_dir, session_id: str, cmd: list, index: "Index | None" = None,
+def consolidate(shm_dir, session_id: str, index: "Index | None" = None,
                 progress=None) -> None:
     """Settle a box's overlay into its single sqlar at rest — PLACEMENT ONLY, no file
     rules. Symlinks/dirs already carry their truth in the row (target/mode/mtime written
@@ -4584,13 +4557,10 @@ def consolidate(shm_dir, session_id: str, cmd: list, index: "Index | None" = Non
     if own_index and idx is not None:
         idx.close()
 
-def unconsolidate(shm_dir, session_id: str) -> None:
-    """Prepare a finished box's sqlar for a live overlay run. There is NOTHING to
-    rebuild on disk: dirs and symlinks are served from the rows (the Index mirror
-    loads them at Index.__init__ — symlink targets and dir mode/mtime live in the
-    row), and regular file rows are left EVICTED (data NOT NULL, no blob) for the
-    FUSE layer to fault in on demand. The only on-disk artifact is the empty `up/`
-    sentinel that gates box discovery. Idempotent."""
+def unconsolidate(shm_dir) -> None:
+    """Ensure the empty `up/` discovery sentinel exists inside `shm_dir`. The Index
+    mirror (dirs, symlinks) and pool blobs (regular files) are the authoritative
+    state — nothing is rebuilt on disk. Idempotent."""
     upper = Path(shm_dir) / "up"
     upper.mkdir(parents=True, exist_ok=True)
 
@@ -4848,10 +4818,10 @@ def differ_for(mtype: str, data: bytes):
 # ════════════════════════════════════════════════════════════════════════════
 class ChangeSource:
     """The single abstraction barrier over the two concrete representations of a
-    box's change set — {live overlay upper + in-RAM Index} vs {the box's one
-    sqlar archive}. Every change-review operation talks only to this interface;
-    `ChangeReview._source(sid)` is the SOLE place that branches live-vs-consolidated.
-    Implementors: LiveUpper, SqlarArchive."""
+    box's change set — {the live in-RAM Index (canonical)} vs {the box's one
+    sqlar archive (at rest)}. Every change-review operation talks only to this
+    interface; `ChangeReview._source(sid)` is the SOLE place that branches
+    live-vs-consolidated. Implementors: LiveUpper, SqlarArchive."""
 
     def current_bytes(self, rel) -> "bytes | None":
         """Bytes for a changed entry in the current state, or None for whiteouts,
@@ -4877,6 +4847,10 @@ class ChangeSource:
         """Drop/forget a change after a whole-file apply or discard."""
         raise NotImplementedError
 
+    def discard(self, rel) -> None:
+        """Drop a change without writing the host (handles whiteouts and deletions)."""
+        raise NotImplementedError
+
     def settle(self, rel) -> None:
         """Post-hunk-op cleanup: forget the change if it no longer differs."""
         raise NotImplementedError
@@ -4894,14 +4868,14 @@ class ChangeSource:
 
 
 class LiveUpper(ChangeSource):
-    """Change substrate for a running box: the overlay upper dir plus the session's
-    live in-RAM Index (deletions / opaque-dir expansion)."""
+    """Change substrate for a running box: the live in-RAM Index (canonical; files in
+    the pool, dirs/symlinks as rows, deletions and opaque-dir expansions tracked
+    in memory)."""
     _OPAQUE_DELETE_CAP = 500
 
     def __init__(self, review, sid):
         self.review, self.sid = review, sid
         self.s = review.reg.sessions.get(sid)
-        self.upper = Path(self.s.upper) if self.s else None
         self.idx = review.reg.indexes.get(sid)    # only the live in-RAM index (no reopen)
 
     def current_bytes(self, rel):
@@ -5170,7 +5144,7 @@ class ChangeReview:
     """The box-change review model over the ChangeSource barrier. Lists, diffs,
     applies, and discards a box's changes (whole-file and per-hunk) and computes
     its on-demand patch; routes every operation through the one ChangeSource that
-    `_source(sid)` selects (live overlay upper + in-RAM Index vs the box's sqlar).
+    `_source(sid)` selects (live in-RAM Index vs the box's at-rest sqlar).
     Holds one back-reference `self.reg` to the owning Supervisor registry, for the
     session set (`reg.sessions`/`reg.indexes`) and registry callbacks
     (`reg._reap_empty`/`reg._emit`/`reg.delete`). Owns the per-run
@@ -5245,7 +5219,7 @@ class ChangeReview:
         """Loop-thread half of consolidation: decide whether `sid` (a finished,
         not-yet-consolidated box) needs folding and, if so, mark it consolidated and
         close + drop its live Index handle (a finished box has none live, but a stale
-        handle may linger). Returns the off-loop work args (shm_dir/cmd) or None when
+        handle may linger). Returns the off-loop work args (shm_dir) or None when
         there is nothing to do. Mutates registry state, so it MUST run on the UI loop;
         the heavy consolidate() it enables runs OFF the loop (sync here, worker for
         the UI)."""
@@ -5258,7 +5232,7 @@ class ChangeReview:
         if idx is not None:
             try: idx.close()
             except Exception: pass
-        return dict(shm_dir=s.shm_dir, cmd=list(s.cmd))
+        return dict(shm_dir=s.shm_dir)
 
     def _consolidate_finish(self, sid) -> None:
         """Loop-thread half: post-consolidate registry bookkeeping (has_sqlar refresh,
@@ -5280,7 +5254,7 @@ class ChangeReview:
         args = self._consolidate_prep(sid)
         if args is None: return
         try:
-            consolidate(args["shm_dir"], sid, args["cmd"])
+            consolidate(args["shm_dir"], sid)
         except Exception:
             return
         self._consolidate_finish(sid)
@@ -5309,7 +5283,7 @@ class ChangeReview:
 
     def _source(self, sid) -> ChangeSource:
         """THE sole live-vs-consolidated branch in the change-review code: a live box
-        reads/writes its overlay upper + in-RAM Index, a finished one its sqlar."""
+        reads/writes its in-RAM Index (canonical), a finished one its sqlar."""
         return LiveUpper(self, sid) if self._live(sid) else SqlarArchive(self, sid)
 
     @staticmethod
@@ -5415,12 +5389,11 @@ class ChangeReview:
         (preserving the child's inherited view). Returns None on success, dict(ok=False,
         error=…) on failure.
 
-        ONE code path, keyed by the target box's own storage (its <sid>.sqlar row plus a
-        pool blob for large file bytes) — it does NOT branch on whether the box has a
+        ONE code path, keyed by the target box's own storage (its <box_id>.sqlar row plus
+        a pool blob for large file bytes) — it does NOT branch on whether the box has a
         live in-RAM Index. If a live Index IS open for the target, the write additionally
-        keeps that RAM mirror (and the live-serve up/ symlink artifact) consistent so a
-        running FUSE mount keeps serving the new value. The RAM mirror is an accelerator,
-        never separate semantics."""
+        keeps that RAM mirror consistent so a running FUSE mount keeps serving the new
+        value. The RAM mirror is an accelerator, never separate semantics."""
         rel = rel.lstrip("/")
         kind = plan.get("kind", "noop")
         if kind == "noop":
@@ -5597,8 +5570,8 @@ class ChangeReview:
         wants it: an 'apply'-matched path is promoted (parent overlay / host); every
         other path (a 'discard' rule, 'passthrough', or no rule at all) is discarded —
         which copies it down into immediate children that lack it. Afterwards the box
-        holds no file changes, so it is safe to remove (and splice out of any children's
-        names). No-op for a box with no changes."""
+        holds no file changes, so it is safe to dissolve. No-op for a box with no
+        changes."""
         changes = [e["path"] for e in self.session_changes(sid)]
         if not changes:
             return dict(applied=[], discarded=[], errors=[])
@@ -6222,7 +6195,7 @@ class Supervisor:
                 # No live Index for an orphan: consolidate opens its own sqlar conn over
                 # this box's own files, so running it in a thread is safe.
                 await loop.run_in_executor(
-                    None, consolidate, str(d), sid, root_cmd(sid))
+                    None, consolidate, str(d), sid)
             except Exception as e:
                 print(f"slopbox(ui): sweep of {sid} failed: {e}", file=sys.stderr)
                 continue
@@ -6243,8 +6216,7 @@ class Supervisor:
         # Placement only — apply/discard happen on delete / explicit UI, not here.
         try:
             await loop.run_in_executor(
-                None, functools.partial(consolidate, args["shm_dir"], sid,
-                                        args["cmd"]))
+                None, functools.partial(consolidate, args["shm_dir"], sid))
         finally:
             self.review._consolidate_finish(sid)
 
@@ -6383,7 +6355,7 @@ class Supervisor:
                 os.umask(old)
             os.chmod(backing, 0o700)
             if rerun and sqlar_path(sid).exists():
-                unconsolidate(backing, sid)        # materialize prior state into up/
+                unconsolidate(backing)             # ensure up/ sentinel exists
             index = Index(backing)
         except (OSError, sqlite3.Error) as e:
             return dict(ok=False, error=f"overlay setup failed: {e}")
@@ -6547,7 +6519,6 @@ class Supervisor:
         it, the sync path ignores it."""
         if not (backing.exists() and reported_status != "error"):
             return None
-        cmd = list(s.cmd) if s else root_cmd(sid)
         self.review._consolidating.add(sid)
         self._emit(type="consolidate_started", session_id=sid)
         def _prog(done, total):
@@ -6560,7 +6531,7 @@ class Supervisor:
             self._emit(type="consolidate_finished", session_id=sid)
         if executor is None:
             try:
-                consolidate(str(backing), sid, cmd, index=index, progress=_prog)
+                consolidate(str(backing), sid, index=index, progress=_prog)
                 _done(None)
             except Exception as e:
                 _done(e)
@@ -6568,7 +6539,7 @@ class Supervisor:
         async def _run():
             try:
                 await executor.run_in_executor(
-                    None, functools.partial(consolidate, str(backing), sid, cmd,
+                    None, functools.partial(consolidate, str(backing), sid,
                                             index=index, progress=_prog))
                 _done(None)
             except Exception as e:
@@ -6793,7 +6764,7 @@ class Supervisor:
             rm_rf(s.shm_dir)
         sp = sqlar_path(sid)
         # Remove the box's permanent pool files too (its sqlar may hold resident rows
-        # whose bytes live only in blob/<box_id>/). box_id IS the sid key now.
+        # whose bytes live only in blob/<box_id>/ — validated before use).
         bid = sid if SID_RE.match(str(sid)) else None
         for suf in ("", "-wal", "-shm"):
             p = Path(str(sp) + suf)
@@ -6830,10 +6801,6 @@ class Supervisor:
             return None
         self._free_storage(sid)
         return None
-
-    def splice_delete(self, ident) -> dict:
-        """Alias: identical to dissolve()."""
-        return self.dissolve(ident)
 
     def dissolve(self, ident) -> dict:
         """The ONE box-removal operation. Finalize sid's changes (apply-matched files
@@ -6887,18 +6854,6 @@ class Supervisor:
         self._free_storage(sid)
         return dict(ok=True, deleted=sid, reparented=reparented)
 
-    def _index_for(self, sid) -> "Index | None":
-        """The session's overlay index: the live one for a running box, else one
-        opened on its backing dir. The live-change listing reads the box's upper
-        plus this index (deletions/opacity) — not whiteout scanning."""
-        idx = self.indexes.get(sid)
-        if idx is not None: return idx
-        s = self.sessions.get(sid)
-        if s and s.shm_dir and sqlar_path(sid).exists():
-            try: return Index(Path(s.shm_dir))
-            except sqlite3.Error: return None
-        return None
-
     def _box_is_empty(self, sid) -> bool:
         """True when a finished box holds nothing at all — no overlay change, no sqlar
         entry, and no network log. The connection log alone is reason enough to keep the
@@ -6921,10 +6876,6 @@ class Supervisor:
         for sid in list(sids or ()):
             if self._box_is_empty(sid):
                 self.delete(sid)
-
-    def _cmd_of(self, sid) -> list:
-        s = self.sessions.get(sid)
-        return list(s.cmd) if s else []
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -7839,7 +7790,7 @@ def cmd_run(cmd, net, trace, direct, session_whitelist, chdir, reuse_sid=None) -
             args += ["--setenv", "NODE_EXTRA_CA_CERTS", str(CA_CERT)]
         # run our own --inner, which starts the forwarder then execs cmd
         args += ["--", sys.executable, find_self(), "--inner",
-                 "--channel", chan, "--sid", sid, "--", *cmd]
+                 "--channel", chan, "--", *cmd]
 
         proc = subprocess.Popen(args, preexec_fn=os.setpgrp,
                                 pass_fds=popen_pass_fds)
@@ -8161,7 +8112,7 @@ def _make_ui_app():
         #rule-btns { height:3; margin-top:1; }
         ModalScreen { align:center middle; }
         """
-        # The single left-hand list cycles through these sources; the right pane
+        # The left-hand view is switched among these sources; the right pane
         # shows the matching detail. Approvals are not a view — they arrive as a
         # transient top banner with global keys, so they never steal the cursor.
         VIEWS=("boxes","changes","netlog","procs","net","file")
@@ -8235,6 +8186,7 @@ def _make_ui_app():
             self._fin_procs={}        # sid -> (procs, tree)  (built once, cached)
             self._pr_conn=set()       # connector-only proc row keys (cursor skips)
             self._pr_procs=[]; self._pr_key=None   # current proc-pane rows + repaint key
+            self._pr_pp={}            # tgid->ppid map from the last proc-tree build
             # Off-loop consolidation progress: sid -> (done, total) for the box(es)
             # currently folding in a worker thread. The in-progress set itself lives on
             # review._consolidating (consulted for placeholder gating); this only holds
@@ -8345,18 +8297,18 @@ def _make_ui_app():
             # live Index, and consolidate opens its own sqlar conn over this box's own
             # files, so nothing else touches that box's sqlar while it runs.
             self.run_worker(
-                lambda: self._consolidate_worker(sid, args["shm_dir"], args["cmd"]),
+                lambda: self._consolidate_worker(sid, args["shm_dir"]),
                 thread=True, exclusive=False, name=f"consolidate:{sid}")
             return True
 
-        def _consolidate_worker(self, sid, shm_dir, cmd):
+        def _consolidate_worker(self, sid, shm_dir):
             """Worker-THREAD body: the slow deflate pass. Touches only this box's files
             via consolidate(); every UI/registry touch is marshaled back to the loop
             with call_from_thread (progress + completion). Never draws from here."""
             def _prog(done, total):
                 self.call_from_thread(self._cons_progress_update, sid, done, total)
             try:
-                consolidate(shm_dir, sid, cmd, progress=_prog)
+                consolidate(shm_dir, sid, progress=_prog)
             except Exception as e:
                 self.call_from_thread(self._consolidate_failed, sid, str(e)); return
             self.call_from_thread(self._consolidate_done, sid)
@@ -8761,8 +8713,8 @@ def _make_ui_app():
 
         def _keybar(self):
             t=Text()
-            # the four list keys; the current view is lit up (its key reversed and
-            # its name in bright bold, the others dim) so "which list" is obvious.
+            # Six view keys: the current view is lit up (its key reversed and
+            # its name in bright bold, the others dim) so "which view" is obvious.
             for v in self.VIEWS:
                 k=self.VIEW_KEY[v]; on=(v==self.view)
                 t.append(f" {k} ", style="reverse bold" if on else "bold")
@@ -9492,7 +9444,7 @@ def _make_ui_app():
                 key=procs; dead=set()
             cur=getattr(self,"_pr_key",None)
             if not force and key==cur: return
-            # BUG2: before the rebuild, note the cursored proc's tgid (real row key is
+            # Capture the cursored proc's tgid before the rebuild (real row key is
             # str(pid)->tgid via the prior snapshot; connector key is "c<tgid>"); if it
             # vanishes we relocate the cursor to its nearest surviving ancestor below.
             pt=self.query_one("#pr-tab",DataTable)
@@ -9532,11 +9484,11 @@ def _make_ui_app():
                 rows.append((rk, [tg, pp, nm, ar]))
             ppid_of=dict(prev_pp); ppid_of.update(new_pp)
             self._pr_pp=new_pp
-            # BUG1: capture the user's vertical scroll so a scrolled-down tree view
+            # Capture the user's vertical scroll so a scrolled-down tree view
             # survives the rebuild (clear()+re-add resets scroll_y to 0).
             scroll_y=pt.scroll_offset.y
             self._sync_table(pt, rows)
-            # BUG2: cursored proc vanished -> move to its nearest surviving ancestor
+            # If the cursored proc vanished, move to its nearest surviving ancestor
             # (root only if the whole chain is gone). _sync_table left the cursor at row
             # 0 since the key was absent; relocate before connector-skip.
             if cur_tg is not None and cur_tg not in present:
@@ -9545,7 +9497,7 @@ def _make_ui_app():
                     try: pt.move_cursor(row=pt.get_row_index(rk), animate=False)
                     except Exception: pass
             self._skip_conn_proc()
-            # BUG1: restore scroll after rows/cursor settle, clamped to new content.
+            # Restore scroll after rows/cursor settle, clamped to new content.
             try: pt.scroll_to(y=min(scroll_y, max(0, pt.virtual_size.height-pt.scrollable_content_region.height)), animate=False)
             except Exception: pass
             self._update_proc_detail()
@@ -9868,16 +9820,15 @@ _USAGE = ("slopbox                         start the UI\n"
 def main() -> int:
     argv = sys.argv[1:]
 
-    # inner mode: slopbox --inner --channel PATH --sid SID -- CMD...
+    # inner mode: slopbox --inner --channel PATH -- CMD...
     if argv and argv[0] == "--inner":
         ap = argparse.ArgumentParser(prog="slopbox --inner")
         ap.add_argument("--channel", default="")
-        ap.add_argument("--sid", required=True)
         ap.add_argument("cmd", nargs=argparse.REMAINDER)
         ns = ap.parse_args(argv[1:])
         cmd = ns.cmd
         if cmd and cmd[0] == "--": cmd = cmd[1:]
-        return run_inner(ns.channel, ns.sid, cmd)
+        return run_inner(ns.channel, cmd)
 
     if not argv:
         return run_ui()

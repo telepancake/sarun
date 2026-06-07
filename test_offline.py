@@ -66,7 +66,7 @@ def test_one_db_only_and_blob_lifecycle():
         check(row is not None and row[0] is None,
               "file entry exists with a NULL blob during the run")
 
-        m.consolidate(str(backing), sid, ["echo", "hi"], index=idx)
+        m.consolidate(str(backing), sid, index=idx)
 
         # after consolidate the SAME row's blob is populated.
         check(m.sqlar_content(sp, "newfile.txt") == b"hello\nworld\n",
@@ -184,7 +184,7 @@ def test_consolidate_opaque_expands_tombstones():
         # the dir must also exist in up/ for the opaque expansion check
         (up / rel).mkdir(parents=True, exist_ok=True)
 
-        m.consolidate(str(backing), sid, ["sh"], index=idx)
+        m.consolidate(str(backing), sid, index=idx)
         sp = m.sqlar_path(sid)
         names = _names(sp)
         lower_children = [os.path.relpath(os.path.join(r, n), "/")
@@ -338,7 +338,7 @@ def _finish_box_with_file(sup, sid, rel, content, parent=None):
     idx.set_entry(rel, "file", stat_mod.S_IFREG | 0o644, wid, "create")
     bp = m.blob_path(idx.box_id, idx.row_id(rel))
     bp.parent.mkdir(parents=True, exist_ok=True); bp.write_bytes(content)
-    m.consolidate(str(backing), sid, ["sh"], index=idx); idx.close()   # placement only
+    m.consolidate(str(backing), sid, index=idx); idx.close()   # placement only
     pbid = int(parent) if parent is not None else None
     if pbid is not None:
         m.sqlar_meta_set(m.sqlar_path(sid), "parent_box_id", str(pbid))
@@ -548,7 +548,7 @@ def test_consolidate_size_based_placement():
         box_id = idx.box_id
         sp = m.sqlar_path(sid)
 
-        m.consolidate(str(backing), sid, ["sh"], index=idx)
+        m.consolidate(str(backing), sid, index=idx)
 
         # ── small file: folded into the row, pool file gone ─────────────────────
         conn = sqlite3.connect(str(sp))
