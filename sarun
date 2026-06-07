@@ -8353,6 +8353,7 @@ def _make_ui_app():
             self.server=None
             self._sel_sid=None
             self._ch_entries=[]
+            self._ch_index={}    # {path -> entry} mirror of _ch_entries for O(1) lookup
             # Changes pane is a directory TREE (same scheme as procs): _ch_rows is the
             # DFS-ordered render list [(key, name, depth, connector)], built from
             # _ch_entries only when the change set actually changes (so the 0.3s tick
@@ -8736,7 +8737,7 @@ def _make_ui_app():
                     else:
                         self._sel_sid=None; self._last_loaded_sid=None
                         self.sup.selected_sid=None
-                    self._ch_entries=[]; self._rebuild_ch()
+                    self._ch_entries=[]; self._ch_index={}; self._rebuild_ch()
                 if self.view=="boxes": self._update_box_detail()
             elif t=="select_box":
                 # A CLI `slopbox NAME …` selected this box: move the cursor to it.
@@ -9430,7 +9431,7 @@ def _make_ui_app():
             # list truncates the path to keep the basename readable.
             info=self.query_one("#cd-info",Static)
             rel = rel if rel is not None else self._sel_path()
-            ent = next((e for e in self._ch_entries if e["path"]==rel), None) if rel else None
+            ent = self._ch_index.get(rel) if rel else None
             if not ent:
                 info.update(Text("")); return
             mode = self.sup.review.change_mode(self._sel_sid, ent["path"])
@@ -9533,7 +9534,7 @@ def _make_ui_app():
             # Mid-fold: show a placeholder row, never the partial state. _changes_for
             # already started the worker; just render the wait.
             if self._is_consolidating(sid):
-                self._ch_entries=[]
+                self._ch_entries=[]; self._ch_index={}
                 self._sync_table(self.query_one("#cf-tab",DataTable),
                                  [("consolidating",
                                    [Text(""), Text("consolidating…", style="dim"),
@@ -9547,6 +9548,7 @@ def _make_ui_app():
             if not force and entries==self._ch_entries:
                 return
             self._ch_entries=entries
+            self._ch_index={e["path"]:e for e in entries}
             self._rebuild_ch(preserve=True)
             self._cbar()
 
