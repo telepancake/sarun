@@ -5233,6 +5233,10 @@ class LiveUpper(ChangeSource):
                         return dict(kind="file", copy_from=bp,
                                     chmod=stat_mod.S_IMODE(mode),
                                     mtime_ns=mtime or None)
+                    # Resident row with no pool blob: bytes unreadable.  Return None
+                    # (not "noop") so callers treat this the same as SqlarArchive's
+                    # missing-blob case — fail closed rather than silently skip.
+                    return None
                 else:
                     # evicted: bytes live in the row — hand them directly.
                     blob = bytes(data)
