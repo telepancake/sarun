@@ -1095,12 +1095,22 @@ def _sqlar_open(path) -> "sqlite3.Connection":
         conn.commit()
     return conn
 
+_IDENT_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
+
 def _ensure_columns(conn, table: str, cols: dict) -> None:
     """Add any missing `cols` (name -> SQL decl) to `table` in place. CREATE TABLE
     IF NOT EXISTS never alters an existing table, so a db written by an older schema
-    keeps its old column set until this tops it up."""
+    keeps its old column set until this tops it up.
+
+    `table` and each column `name` are validated against a strict identifier regex
+    before interpolation into DDL, guarding against accidental injection if a future
+    migration introduces a non-literal value."""
+    if not _IDENT_RE.match(table):
+        raise ValueError(f"_ensure_columns: invalid table identifier: {table!r}")
     have = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
     for name, decl in cols.items():
+        if not _IDENT_RE.match(name):
+            raise ValueError(f"_ensure_columns: invalid column identifier: {name!r}")
         if name not in have:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
 
