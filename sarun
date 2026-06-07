@@ -389,12 +389,7 @@ def sync_request(sock_path: str, timeout: float = 30.0, **msg: Any) -> "dict | N
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
             s.settimeout(timeout); s.connect(sock_path)
             s.sendall((json.dumps(msg) + "\n").encode())
-            buf = b""
-            while b"\n" not in buf:
-                chunk = s.recv(4096)
-                if not chunk: break
-                buf += chunk
-            line = buf.split(b"\n", 1)[0]
+            line = s.makefile("rb").readline()
             return json.loads(line.decode()) if line.strip() else None
     except (OSError, json.JSONDecodeError):
         return None
