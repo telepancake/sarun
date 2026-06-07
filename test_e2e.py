@@ -394,7 +394,7 @@ def run_named_box_e2e(tmp):
             names = {n for n, _md, _mt, _sz in m.sqlar_list(sp)}
             check("named_proof.txt" in names,
                   "named-e2e: MYBOX sqlar contains named_proof.txt")
-            check(m.SID_RE.match(sp.stem) is not None,
+            check(m.BOX_ID_RE.match(sp.stem) is not None,
                   f"named-e2e: MYBOX sqlar is named by box_id (got {sp.stem!r})")
             mybox_id = sp.stem
 

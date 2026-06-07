@@ -223,7 +223,7 @@ def box_ctime(box_id) -> float:
 # dir. It is never derived from a name and never changes (a rename is a meta-only
 # label write). Any id that arrives as a path component MUST be validated as a plain
 # decimal string before use.
-SID_RE = re.compile(r"\d+\Z")
+BOX_ID_RE = re.compile(r"\d+\Z")
 # A user-assigned box name: CAPITALS / digits / '-', starts with a letter, never ends
 # with a '-'. Uppercase so it can never collide with a lowercase subcommand verb
 # (patch/apply/discard/rename) on the command line, and it is a traversal-safe path
@@ -256,10 +256,10 @@ def valid_dotted_name(name: "str | None") -> bool:
             return False
     return True
 
-def valid_sid(sid: "str | None") -> bool:
+def valid_box_id(box_id: "str | None") -> bool:
     # The internal box key is str(box_id): a plain decimal string. This validates a
     # path component / teardown key — NOT a user-facing name (see valid_name).
-    return bool(isinstance(sid, str) and SID_RE.match(sid))
+    return bool(isinstance(box_id, str) and BOX_ID_RE.match(box_id))
 
 def relay_dir(box_id) -> Path:
     """The per-session directory that holds ONLY this box's relay socket. Bound into
@@ -1220,7 +1220,7 @@ def has_flows(path) -> bool:
 # ════════════════════════════════════════════════════════════════════════════
 #  Session model & box metadata helpers
 # ════════════════════════════════════════════════════════════════════════════
-# process_list, sqlar_meta_get/set, _all_box_ids, mint_box_id, ensure_box_id,
+# process_list, sqlar_meta_get/set, _all_box_ids, mint_box_id, as_box_id,
 # sweep_orphan_pools, process_roots, sqlar_writer_id, process_env, root_cmd —
 # box-id/meta/process helpers used by Supervisor, the CLI commands, and the UI.
 def process_list(path) -> list:
@@ -1284,7 +1284,7 @@ def mint_box_id() -> int:
     EAGERLY at box creation so a path is always derivable from the id."""
     return max(_all_box_ids(), default=0) + 1
 
-def ensure_box_id(box_id) -> int:
+def as_box_id(box_id) -> int:
     """box_id IS the identity now (the sqlar/backing stem), so this is the identity
     cast itself. Kept as a one-liner so the many call sites that pass a box's key and
     want its int read unchanged."""
@@ -1551,9 +1551,9 @@ def read_provenance(pid: int, full_env: bool = False) -> dict:
     return info
 
 
-def policy_check(sid: str, prov: dict, path: str, op: str) -> str:
+def policy_check(box_id: str, prov: dict, path: str, op: str) -> str:
     """THE policy hook. Called once per mutating overlay op (create/write/unlink/
-    rename/setattr/…) with the session id, the writer's provenance (pid/exe/argv),
+    rename/setattr/…) with the box id, the writer's provenance (pid/exe/argv),
     the overlay-relative path, and the operation name. Returns "allow" or "deny".
 
     For v1 this always allows. It exists as the single, obvious seam where
@@ -2348,7 +2348,7 @@ def _build_overlay_ops():
                 return
             # Read the grandparent pointer from meta so chains of finished boxes resolve.
             grandparent = sqlar_meta_get(sp, "parent_box_id")
-            if grandparent and not valid_sid(grandparent):
+            if grandparent and not valid_box_id(grandparent):
                 grandparent = None
             self.sessions[parent_sid] = dict(
                 up=ld / "up", index=idx, virtual={},
@@ -4463,7 +4463,7 @@ def consolidate(shm_dir, session_id: str, index: "Index | None" = None,
     idx = index if index is not None else _open_index_ro(shm_dir)
     sp = sqlar_path(session_id)
     # Pool id for this box: needed to locate blob files.
-    box_id = ensure_box_id(session_id)
+    box_id = as_box_id(session_id)
     sq = _sqlar_open(sp)
     def _set_blob(rel, content: bytes, mode, mtime_ns) -> None:
         data, sz = _sqlar_deflate(content)
@@ -4717,7 +4717,7 @@ def discover_sessions() -> dict:
         for d in lh.iterdir():
             if not (d / "up").is_dir(): continue          # not a slopbox backing dir
             sid = d.name
-            if not SID_RE.match(sid): continue            # not a box_id-named dir
+            if not BOX_ID_RE.match(sid): continue            # not a box_id-named dir
             # No held pidfd for a disk-discovered box (its runner, if any, belonged to a
             # prior UI run we don't own), so .status derives to "finished" — correct: a
             # box this UI isn't running can't be "running".
@@ -4728,7 +4728,7 @@ def discover_sessions() -> dict:
     if sd.exists():
         for af in sd.glob("*.sqlar"):
             sid = af.name[:-len(".sqlar")]
-            if not SID_RE.match(sid): continue            # not a box_id-named sqlar
+            if not BOX_ID_RE.match(sid): continue            # not a box_id-named sqlar
             s = out.get(sid)
             if s is None:
                 s = out[sid] = Session(
@@ -4970,7 +4970,7 @@ class LiveUpper(ChangeSource):
                     if added >= self._OPAQUE_DELETE_CAP: break
         return [entries[k] for k in sorted(entries)]
 
-    def _drop_row_and_blob(self, rel, op):
+    def _drop_index_row_and_blob(self, rel, op):
         """Drop the Index row for `rel` (any kind), evicting a file's pool blob too.
         Dirs/symlinks/whiteouts have no on-disk artifact — the row is the change."""
         if self.idx is None: return
@@ -4982,11 +4982,11 @@ class LiveUpper(ChangeSource):
             except OSError: pass
 
     def remove(self, rel):
-        self._drop_row_and_blob(rel.lstrip("/"), "applied")
+        self._drop_index_row_and_blob(rel.lstrip("/"), "applied")
 
     def discard(self, rel):
         """Drop a change without writing the host (handles whiteouts in the Index)."""
-        self._drop_row_and_blob(rel.lstrip("/"), "discarded")
+        self._drop_index_row_and_blob(rel.lstrip("/"), "discarded")
 
     def settle(self, rel):
         """If the overlay copy no longer differs from the host (or a created file has
@@ -5002,7 +5002,7 @@ class LiveUpper(ChangeSource):
         except OSError:
             return
         if settled:
-            self._drop_row_and_blob(rel, "settled")
+            self._drop_index_row_and_blob(rel, "settled")
 
     def write_current(self, rel, data):
         """Revert bytes into the live file's pool blob (for discard_hunk). The blob is
@@ -5348,7 +5348,7 @@ class ChangeReview:
                 _restore_host_mtime_ns(host, plan.get("mtime_ns"), is_symlink=False)
         return None
 
-    def _parent_sid(self, sid: str) -> "str | None":
+    def _parent_key(self, sid: str) -> "str | None":
         """Return the parent box's key str(parent_box_id) if this box is nested and the
         parent is a known session, else None. Used by the apply paths to decide whether
         to write the host or promote into the parent's overlay."""
@@ -5359,11 +5359,11 @@ class ChangeReview:
         # Only promote if the parent session is still tracked (live or finished).
         return psid if psid in self.reg.sessions else None
 
-    def _raw_parent_sid(self, sid: str) -> "str | None":
+    def _raw_parent_key(self, sid: str) -> "str | None":
         """The parent box key of `sid` from the Session (if tracked) else the sqlar
         'parent_box_id' meta — the RAW parent chain, including parents that are not
         currently registered as sessions. None / "" means a top-level box. This is
-        the chain _lower_has walks to the host; unlike _parent_sid it does NOT
+        the chain _lower_has walks to the host; unlike _parent_key it does NOT
         require the parent to be a live/tracked session."""
         s = self.reg.sessions.get(sid)
         if s is not None and s.parent_box_id is not None:
@@ -5393,7 +5393,7 @@ class ChangeReview:
             has no own entry, recurse into p's lower.
         This generalizes the old hardcoded Path("/")/rel host check to nested boxes."""
         rel = rel.lstrip("/")
-        psid = self._raw_parent_sid(sid)
+        psid = self._raw_parent_key(sid)
         if not psid:
             host = Path("/") / rel
             return host.exists() or host.is_symlink()
@@ -5426,7 +5426,7 @@ class ChangeReview:
         sp = sqlar_path(target_sid)
         mtime_ns = plan.get("mtime_ns") or int(time.time() * 1e9)
         try:
-            box_id = idx.box_id if idx is not None else ensure_box_id(target_sid)
+            box_id = idx.box_id if idx is not None else as_box_id(target_sid)
         except Exception as e:
             return dict(ok=False, error=f"promote: box id: {e}")
         # Best-effort writer id for the live mirror (any attribution is fine).
@@ -5550,7 +5550,7 @@ class ChangeReview:
                 c = p.stem
                 if c != sid and sqlar_meta_get(p, "parent_box_id") == sid:
                     kids.add(c)
-        return sorted(kids, key=lambda k: int(k) if SID_RE.match(k) else 0)
+        return sorted(kids, key=lambda k: int(k) if BOX_ID_RE.match(k) else 0)
 
     def _box_has_own_entry(self, child: str, rel: str) -> bool:
         """True if `child` already resolves `rel` itself (its own file/symlink/dir/
@@ -5814,7 +5814,7 @@ class ChangeReview:
         # Apply == promote into the parent overlay (nested) or write the host (root).
         if paths is None: paths = [e["path"] for e in self.session_changes(sid)]
         src = self._source(sid)
-        parent_sid = self._parent_sid(sid)   # None for root boxes
+        parent_sid = self._parent_key(sid)   # None for root boxes
         applied, errors = [], []
         for rel in paths:
             host = Path("/") / rel.lstrip("/")
@@ -6087,10 +6087,10 @@ class Supervisor:
         sh = state_home()
         if sh.exists():
             for p in sh.glob("*.sqlar"):
-                if SID_RE.match(p.stem):
+                if BOX_ID_RE.match(p.stem):
                     keys.add(p.stem)
         for k in keys:
-            if not SID_RE.match(k): continue
+            if not BOX_ID_RE.match(k): continue
             if self._box_name(k) == name and self._box_parent(k) == pbid:
                 return k
         return None
@@ -6137,7 +6137,7 @@ class Supervisor:
             return None
         s = str(name_or_path_or_id)
         # Plain box_id key.
-        if SID_RE.match(s):
+        if BOX_ID_RE.match(s):
             if s in self.sessions or sqlar_path(s).exists() or live_dir(s).exists():
                 return s
             return None
@@ -6154,7 +6154,7 @@ class Supervisor:
             for p in sh.glob("*.sqlar"):
                 keys.add(p.stem)
         for k in keys:
-            if not SID_RE.match(k): continue
+            if not BOX_ID_RE.match(k): continue
             if self.display_path(k) == s:
                 return k
         return None
@@ -6216,7 +6216,7 @@ class Supervisor:
         for d in sorted(lh.iterdir()):
             if not (d / "up").is_dir(): continue
             sid = d.name
-            if not SID_RE.match(sid): continue           # not a box_id-named backing dir
+            if not BOX_ID_RE.match(sid): continue           # not a box_id-named backing dir
             # A live backing dir at UI startup is an orphan from a prior run (the box_id
             # carries no pid, so liveness can't be read from it; this UI owns no runner
             # for it). A box launched this run is created after sweep, so never seen here.
@@ -6516,7 +6516,7 @@ class Supervisor:
         QUIESCENT — the single writer is done with it) and pop the Index handle. Returns
         (sid, s, index, backing, reported_status) or None to abort."""
         sid = msg.get("session_id")
-        if not valid_sid(sid):
+        if not valid_box_id(sid):
             return None
         if not self._owns(msg, sid):
             print(f"slopbox(ui): rejected unregister of {sid} (bad owner token)",
@@ -6616,7 +6616,7 @@ class Supervisor:
     def drop(self, msg: dict) -> None:
         # Runner reports the session left nothing to review; remove it outright.
         sid = msg.get("session_id")
-        if not valid_sid(sid):
+        if not valid_box_id(sid):
             return
         if not self._owns(msg, sid):
             print(f"slopbox(ui): rejected remove of {sid} (bad owner token)",
@@ -6794,7 +6794,7 @@ class Supervisor:
         sp = sqlar_path(sid)
         # Remove the box's permanent pool files too (its sqlar may hold resident rows
         # whose bytes live only in blob/<box_id>/ — validated before use).
-        bid = sid if SID_RE.match(str(sid)) else None
+        bid = sid if BOX_ID_RE.match(str(sid)) else None
         for suf in ("", "-wal", "-shm"):
             p = Path(str(sp) + suf)
             if p.exists():
@@ -6915,8 +6915,8 @@ class Supervisor:
 # handle_fd before the mitmproxy handler runs; asyncio copies the current context
 # into the child tasks mitmproxy spawns, so each connection's hooks see their own
 # session id even when many run concurrently.
-_CURRENT_SID: "contextvars.ContextVar[str]" = contextvars.ContextVar(
-    "slopbox_session_id", default="")
+_CURRENT_BOX_ID: "contextvars.ContextVar[str]" = contextvars.ContextVar(
+    "slopbox_box_id", default="")
 # Per-connection originating workload-process provenance (set by RelayServer after
 # resolving the pidfd --inner sent to a HOST-namespace pid and reading host /proc).
 # Keys: tgid/ppid/exe/argv/env, all HOST-namespace — the same invariant the FUSE
@@ -6941,7 +6941,7 @@ class _GatingAddon:
 
     async def _gate(self, flow, scheme: str, url: str = "") -> None:
         res = await self.sup.policy.approval_request(
-            _CURRENT_SID.get(), flow.request.host, flow.request.port, scheme, url)
+            _CURRENT_BOX_ID.get(), flow.request.host, flow.request.port, scheme, url)
         if res.get("action") != "allow":
             self._deny(flow)
 
@@ -6957,7 +6957,7 @@ class _GatingAddon:
         else:
             # https was already gated at CONNECT; here we only enforce a URL-level
             # deny rule, so we don't prompt twice for the same connection.
-            if self.sup.policy.precheck(_CURRENT_SID.get(), flow.request.host,
+            if self.sup.policy.precheck(_CURRENT_BOX_ID.get(), flow.request.host,
                                         flow.request.port, url) == "deny":
                 self._deny(flow)
 
@@ -6965,7 +6965,7 @@ class _GatingAddon:
         req, resp = flow.request, flow.response
         denied = bool(resp and resp.status_code == 403
                       and b"slopbox: denied" in (resp.content or b""))
-        sid = _CURRENT_SID.get(); action = "deny" if denied else "allow"
+        sid = _CURRENT_BOX_ID.get(); action = "deny" if denied else "allow"
         self.sup.note_traffic(
             sid, req.host, req.port, req.scheme, action,
             len(req.content or b""),
@@ -7027,7 +7027,7 @@ class ProxyEngine:
     def ready(self) -> bool:
         return self._ready
 
-    async def handle_fd(self, fd: int, session_id: str) -> None:
+    async def handle_fd(self, fd: int, box_id: str) -> None:
         if not self._ready:
             try: os.close(fd)
             except OSError: pass
@@ -7044,7 +7044,7 @@ class ProxyEngine:
             except OSError: pass
             return
 
-        _CURRENT_SID.set(session_id)
+        _CURRENT_BOX_ID.set(box_id)
         handler = ProxyConnectionHandler(
             self._master, reader, writer, self._opts, self._mode)
         # Seed the regular-proxy top layer exactly as mitmproxy's RegularInstance
@@ -7065,15 +7065,15 @@ class ProxyEngine:
 
 class RelayServer:
     """A per-session FD relay. One of these is created by the Supervisor for each
-    networked box; it listens on that box's OWN relay socket (relay_sock_path(sid),
-    bound into only that box). Every FD that arrives here is gated as `sid` — the
-    sender cannot choose another session's rules, because there is no sid in the
-    message and this loop is hard-bound to one sid. This socket carries FD messages
+    networked box; it listens on that box's OWN relay socket (relay_sock_path(box_id),
+    bound into only that box). Every FD that arrives here is gated as `box_id` — the
+    sender cannot choose another session's rules, because there is no box_id in the
+    message and this loop is hard-bound to one box_id. This socket carries FD messages
     ONLY: it never accepts a register/unregister/control message, so untrusted in-box
     code that can reach it can do nothing but hand us its own connections."""
-    def __init__(self, engine: "ProxyEngine", sid: str, sock_path: str,
+    def __init__(self, engine: "ProxyEngine", box_id: str, sock_path: str,
                  loop: asyncio.AbstractEventLoop):
-        self.engine = engine; self.sid = sid; self.sock_path = sock_path
+        self.engine = engine; self.box_id = box_id; self.sock_path = sock_path
         self._loop = loop; self._sock = None; self._task = None
 
     def start(self) -> None:
@@ -7111,7 +7111,7 @@ class RelayServer:
             # [request_socket, pidfd]: index 0 is always the connection socket the
             # engine drives; index 1, if present, is a pidfd for the connecting in-box
             # workload process. The payload carries no process fields — the pidfd is
-            # the channel. The sid is NEVER taken from the message; it is THIS relay's.
+            # the channel. The box_id is NEVER taken from the message; it is THIS relay's.
             pidfd = fds[1] if len(fds) > 1 else -1
             for extra in fds[2:]:
                 try: os.close(extra)
@@ -7133,7 +7133,7 @@ class RelayServer:
                     try: os.close(pidfd)
                     except OSError: pass
                 _CURRENT_PROV.set(prov)
-                await self.engine.handle_fd(fds[0], self.sid)
+                await self.engine.handle_fd(fds[0], self.box_id)
         except (OSError, asyncio.CancelledError):
             try: conn.close()
             except OSError: pass
@@ -8193,7 +8193,7 @@ def _make_ui_app():
             self.sup.on_event=self._on_evt
             self.engine=None
             self.server=None
-            self._ch_sid=None
+            self._sel_sid=None
             self._ch_entries=[]
             # Changes pane is a directory TREE (same scheme as procs): _ch_rows is the
             # DFS-ordered render list [(key, name, depth, connector)], built from
@@ -8266,7 +8266,7 @@ def _make_ui_app():
 
         async def on_mount(self):
             self.query_one("#s-tab",DataTable).add_columns(
-                "F","Started","PID","Cmd","✓","✗","↑","↓","Age")
+                "F","Name","PID","Cmd","✓","✗","↑","↓","Age")
             self.query_one("#nf-tab",DataTable).add_columns(
                 "Time","","Method","Host","St","↑","↓")
             self.query_one("#cf-tab",DataTable).add_columns("","Path","Size")
@@ -8361,7 +8361,7 @@ def _make_ui_app():
             self._fin_changes.pop(sid, None)   # force a fresh read of the folded sqlar
             self._ch_decor.pop(sid, None)
             self._render_cons_bar()
-            if self._ch_sid==sid:
+            if self._sel_sid==sid:
                 if self.view=="changes": self._load_changes(sid, force=True)
                 elif self.view=="boxes": self._update_box_detail()
                 elif self.view=="procs": self._load_procs(sid, force=True)
@@ -8381,7 +8381,7 @@ def _make_ui_app():
             cons=self.sup.review._consolidating
             if not cons:
                 bar.set_class(False,"show"); bar.update(""); return
-            sid=self._ch_sid if self._ch_sid in cons else next(iter(cons))
+            sid=self._sel_sid if self._sel_sid in cons else next(iter(cons))
             done,total=self._cons_progress.get(sid,(0,0))
             t=Text()
             t.append("⟳ Consolidating ", style="bold")
@@ -8480,8 +8480,8 @@ def _make_ui_app():
             # proc pane is open so dead rows retire within _PROC_RETIRE_S even when
             # no overlay events are arriving. _load_procs is a cheap O(active set)
             # kill(0) probe and diffs the table in place (no blink, cursor kept).
-            if self.view=="procs" and self._ch_sid:
-                try: self._load_procs(self._ch_sid)
+            if self.view=="procs" and self._sel_sid:
+                try: self._load_procs(self._sel_sid)
                 except Exception: pass
             changed=set()
             try:
@@ -8497,9 +8497,9 @@ def _make_ui_app():
             # refresh the live change listing for the affected box if it's on screen.
             # No force: _load_changes reads the cheap in-RAM map and the table diffs
             # in place — the 0.3s drain never re-walks the overlay.
-            if self.view=="changes" and self._ch_sid in changed:
-                self._load_changes(self._ch_sid)
-            if self.view=="boxes" and self._ch_sid in changed:
+            if self.view=="changes" and self._sel_sid in changed:
+                self._load_changes(self._sel_sid)
+            if self.view=="boxes" and self._sel_sid in changed:
                 self._update_box_detail()
 
         async def on_unmount(self):
@@ -8517,7 +8517,7 @@ def _make_ui_app():
         def _select_sid(self, sid):
             """Make `sid` the selected box (cursor + patch target) without disturbing
             the current view."""
-            self._ch_sid=self._last_loaded_sid=sid
+            self._sel_sid=self._last_loaded_sid=sid
             self.sup.selected_sid=sid
             try:
                 tbl=self.query_one("#s-tab",DataTable)
@@ -8551,7 +8551,7 @@ def _make_ui_app():
                     self._fin_changes.pop(sid, None)
                     try: self._changes_for(sid)   # populates the cache or starts the fold
                     except Exception: pass
-                    if self.view=="changes" and self._ch_sid==sid:
+                    if self.view=="changes" and self._sel_sid==sid:
                         self._load_changes(sid, force=True)
                 if self.view=="boxes": self._update_box_detail()
             elif t=="session_renamed":
@@ -8569,14 +8569,14 @@ def _make_ui_app():
                 self._ch_decor.pop(sid, None)
                 self.sessions={k:v for k,v in self.sessions.items() if k!=sid}
                 self._rebuild_sessions(preserve=True)
-                if self._ch_sid==sid:
+                if self._sel_sid==sid:
                     # The selected box was removed (e.g. an empty box that left no
                     # changes): fall back to the next most-recent remaining entry.
                     nxt=self._most_recent_sid()
                     if nxt:
                         self._select_sid(nxt)
                     else:
-                        self._ch_sid=None; self._last_loaded_sid=None
+                        self._sel_sid=None; self._last_loaded_sid=None
                         self.sup.selected_sid=None
                     self._ch_entries=[]; self._rebuild_ch()
                 if self.view=="boxes": self._update_box_detail()
@@ -8621,7 +8621,7 @@ def _make_ui_app():
                 self._cons_progress.pop(sid, None)
                 self._fin_changes.pop(sid, None); self._ch_decor.pop(sid, None)
                 self._render_cons_bar()
-                if self._ch_sid==sid:
+                if self._sel_sid==sid:
                     if self.view=="changes": self._load_changes(sid, force=True)
                     elif self.view=="boxes": self._update_box_detail()
                     elif self.view=="procs": self._load_procs(sid, force=True)
@@ -8643,16 +8643,16 @@ def _make_ui_app():
             _g(self.sup.rescan)
             _g(lambda: self._rebuild_sessions(preserve=True))
             _g(self._render_appr)
-            if self._ch_sid is None:
+            if self._sel_sid is None:
                 s=self._sel_session()
-                if s: self._ch_sid=self._last_loaded_sid=s["session_id"]
-            self.sup.selected_sid=self._ch_sid
-            if self.view=="changes" and self._ch_sid:
-                _g(lambda: self._load_changes(self._ch_sid))
-            if self.view=="netlog" and self._ch_sid:
-                _g(lambda: self._load_flows(self._ch_sid))
-            if self.view=="procs" and self._ch_sid:
-                _g(lambda: self._load_procs(self._ch_sid))
+                if s: self._sel_sid=self._last_loaded_sid=s["session_id"]
+            self.sup.selected_sid=self._sel_sid
+            if self.view=="changes" and self._sel_sid:
+                _g(lambda: self._load_changes(self._sel_sid))
+            if self.view=="netlog" and self._sel_sid:
+                _g(lambda: self._load_flows(self._sel_sid))
+            if self.view=="procs" and self._sel_sid:
+                _g(lambda: self._load_procs(self._sel_sid))
             if self.view=="boxes":
                 _g(self._update_box_detail)
             _g(self._cbar)    # keep the dirty/count indicator current
@@ -8674,13 +8674,13 @@ def _make_ui_app():
             try: self.query_one("#cd-info").display=(v=="changes")   # full-path header
             except Exception: pass
             self._titles()
-            if v=="changes" and self._ch_sid:
-                self._load_changes(self._ch_sid, force=True)
+            if v=="changes" and self._sel_sid:
+                self._load_changes(self._sel_sid, force=True)
                 self._update_cd_info()
-            if v=="netlog" and self._ch_sid:
-                self._load_flows(self._ch_sid, force=True)
-            if v=="procs" and self._ch_sid:
-                self._load_procs(self._ch_sid, force=True)
+            if v=="netlog" and self._sel_sid:
+                self._load_flows(self._sel_sid, force=True)
+            if v=="procs" and self._sel_sid:
+                self._load_procs(self._sel_sid, force=True)
             self._update_right()
             try: self.query_one(self.LEFT[v]).focus()
             except Exception: pass
@@ -8695,13 +8695,13 @@ def _make_ui_app():
             # the pane (a finished box's full table still contains it).
             target=None
             try:
-                if self.view=="changes" and self._ch_sid:
+                if self.view=="changes" and self._sel_sid:
                     rel=self._sel_path()
-                    if rel: target=self.sup.writer_id(self._ch_sid, rel)
-                elif self.view=="netlog" and self._ch_sid:
+                    if rel: target=self.sup.writer_id(self._sel_sid, rel)
+                elif self.view=="netlog" and self._sel_sid:
                     fid=self._sel_flow()
                     if fid is not None:
-                        f=self.sup.flow_detail(self._ch_sid, fid)
+                        f=self.sup.flow_detail(self._sel_sid, fid)
                         if f: target=f.get("process_id")
             except Exception: target=None
             self._set_view("procs")
@@ -9048,7 +9048,7 @@ def _make_ui_app():
             # undecorated changed/symlink row renders with a neutral '…' placeholder
             # rather than a guessed kind; deleted is known from the backbone.
             sigs={"created":("+","green"),"modified":("~","yellow"),"deleted":("-","red")}
-            d=self._decor_of(self._ch_sid, e["path"])
+            d=self._decor_of(self._sel_sid, e["path"])
             kind=d["kind"] if d else e["kind"]
             stale=bool(d and d.get("stale"))
             sym,col=sigs.get(kind,("…","dim"))
@@ -9113,7 +9113,7 @@ def _make_ui_app():
             # for the REAL rows currently scrolled into view (DataTable renders only
             # those), cache per (sid,rel), then repaint just those cells. Connector dir
             # rows need no decoration. Never iterates all n.
-            sid=self._ch_sid
+            sid=self._sel_sid
             if sid is None or self.view!="changes": return
             try: tbl=self.query_one("#cf-tab",DataTable)
             except Exception: return
@@ -9256,7 +9256,7 @@ def _make_ui_app():
             self._stop_struct_spin()
             # The result is now cached; re-render the diff in place (quick() returns the
             # full cached lines, no job, so no new worker is kicked).
-            if (self.view=="changes" and self._ch_sid==sid
+            if (self.view=="changes" and self._sel_sid==sid
                     and self._sel_path()==rel):
                 self._load_diff(sid, rel, keep_pos=True)
 
@@ -9268,13 +9268,13 @@ def _make_ui_app():
             ent = next((e for e in self._ch_entries if e["path"]==rel), None) if rel else None
             if not ent:
                 info.update(Text("")); return
-            mode = self.sup.review.change_mode(self._ch_sid, ent["path"])
+            mode = self.sup.review.change_mode(self._sel_sid, ent["path"])
             # The selected row is visible → use its lazy decoration for the precise
             # kind/stale (decorate on the spot if it hasn't been seen yet).
-            d=self._decor_of(self._ch_sid, ent["path"])
+            d=self._decor_of(self._sel_sid, ent["path"])
             if d is None and ent["kind"]!="deleted":
-                try: d=self._ch_decor.setdefault(self._ch_sid, {}).setdefault(
-                    ent["path"], self.sup.review.decorate(self._ch_sid, ent["path"]))
+                try: d=self._ch_decor.setdefault(self._sel_sid, {}).setdefault(
+                    ent["path"], self.sup.review.decorate(self._sel_sid, ent["path"]))
                 except Exception: d=None
             kind=d["kind"] if d else ent["kind"]
             stale=bool(d and d.get("stale"))
@@ -9322,7 +9322,7 @@ def _make_ui_app():
             elif n: dv.index=0   # highlight a hunk so a/x act without an extra step
 
         def _hunk_op(self, index, discard):
-            sid=self._ch_sid; p=self._sel_path()
+            sid=self._sel_sid; p=self._sel_path()
             if not sid or p is None: return
             r=(self.sup.review.discard_hunk if discard
                else self.sup.review.apply_hunk)(sid, p, index)
@@ -9406,7 +9406,7 @@ def _make_ui_app():
 
         def _update_flow_detail(self):
             d=self.query_one("#flow-detail",Static)
-            sid=self._ch_sid; fid=self._sel_flow()
+            sid=self._sel_sid; fid=self._sel_flow()
             if not sid or fid is None:
                 d.update(Text("(no connection selected)", style="dim")); return
             f=self.sup.flow_detail(sid, fid)
@@ -9561,7 +9561,7 @@ def _make_ui_app():
 
         def _update_proc_detail(self):
             d=self.query_one("#proc-detail",Static)
-            sid=self._ch_sid; pid=self._sel_proc()
+            sid=self._sel_sid; pid=self._sel_proc()
             if not sid or pid is None:
                 d.update(Text("(no process selected)", style="dim")); return
             row=next((p for p in (self._pr_procs or []) if p[0]==pid), None)
@@ -9591,7 +9591,7 @@ def _make_ui_app():
         def _sc(self, ev):
             if ev.row_key and ev.row_key.value:
                 sid=ev.row_key.value
-                self._ch_sid=sid
+                self._sel_sid=sid
                 if sid!=self._last_loaded_sid:
                     self._last_loaded_sid=sid
                     self._load_changes(sid, force=True)
@@ -9601,17 +9601,17 @@ def _make_ui_app():
         def _s_open(self, ev):
             # Enter on a slopbox → review its changes.
             if ev.row_key and ev.row_key.value:
-                self._ch_sid=ev.row_key.value; self._last_loaded_sid=ev.row_key.value
+                self._sel_sid=ev.row_key.value; self._last_loaded_sid=ev.row_key.value
                 self._set_view("changes")
 
         @on(DataTable.RowHighlighted, "#cf-tab")
         def _cc(self, ev):
             if ev.row_key and ev.row_key.value in self._ch_conn:
                 self._skip_conn_ch(); return       # nudge off the dimmed dir row
-            if ev.row_key and ev.row_key.value and self._ch_sid:
+            if ev.row_key and ev.row_key.value and self._sel_sid:
                 self._decorate_visible()
                 self._update_cd_info(ev.row_key.value)
-                self._load_diff(self._ch_sid, ev.row_key.value)
+                self._load_diff(self._sel_sid, ev.row_key.value)
 
         @on(DataTable.RowHighlighted, "#nf-tab")
         def _nc(self, ev):
@@ -9621,8 +9621,8 @@ def _make_ui_app():
         def _f_open(self, ev):
             # Enter on a real file focuses the diff/hunk pane for it; dir rows are inert.
             if ev.row_key and ev.row_key.value and ev.row_key.value not in self._ch_conn \
-               and self._ch_sid:
-                self._load_diff(self._ch_sid, ev.row_key.value)
+               and self._sel_sid:
+                self._load_diff(self._sel_sid, ev.row_key.value)
                 try: self.query_one("#cd-log",DiffView).focus()
                 except Exception: pass
 
@@ -9715,7 +9715,7 @@ def _make_ui_app():
             self.push_screen(RuleModal(action, a), done)
 
         def action_refresh(self):
-            if self._ch_sid: self._load_changes(self._ch_sid)
+            if self._sel_sid: self._load_changes(self._sel_sid)
 
         def _refresh_after(self, sid, p):
             self._invalidate_changes(sid)   # a real edit changed the set
@@ -9727,13 +9727,13 @@ def _make_ui_app():
                 except Exception: pass
 
         def action_apply_one(self):
-            p,sid=self._sel_path(),self._ch_sid
+            p,sid=self._sel_path(),self._sel_sid
             if p and sid:
                 r=self.sup.review.apply(sid,[p]); self._cbar(f"applied {len(r['applied'])}")
                 self._refresh_after(sid, p)
 
         def action_apply_all(self):
-            sid=self._ch_sid
+            sid=self._sel_sid
             if not sid: return
             s=self.sessions.get(sid,{})
             warn="\n[yellow]still running[/]" if s.get("status")=="running" else ""
@@ -9744,12 +9744,12 @@ def _make_ui_app():
             self.push_screen(Confirm(f"Apply all {len(self._ch_entries)} changes?{warn}"), done)
 
         def action_discard_one(self):
-            p,sid=self._sel_path(),self._ch_sid
+            p,sid=self._sel_path(),self._sel_sid
             if p and sid:
                 self.sup.review.discard(sid,[p]); self._refresh_after(sid, p)
 
         def action_discard_all(self):
-            sid=self._ch_sid
+            sid=self._sel_sid
             if not sid: return
             def done(ok):
                 if ok: self.sup.review.discard(sid,None); self._refresh_after(sid, None)
@@ -9927,7 +9927,7 @@ def main() -> int:
     pre, cmd = argv[:sep], argv[sep + 1:]
 
     ap = argparse.ArgumentParser(prog="slopbox", add_help=False, usage=_USAGE)
-    ap.add_argument("-w", dest="whitelist", action="append", default=[], metavar="HOST")
+    ap.add_argument("-w", dest="session_whitelist", action="append", default=[], metavar="HOST")
     ap.add_argument("-n", dest="net", action="store_true")
     ap.add_argument("-t", dest="trace", action="store_true")
     ap.add_argument("-d", dest="direct", action="store_true")
@@ -9938,7 +9938,7 @@ def main() -> int:
         return 2
     if not cmd:
         print("slopbox: no command after `--`.", file=sys.stderr); return 2
-    return cmd_run(cmd, ns.net, ns.trace, ns.direct, ns.whitelist, ns.chdir,
+    return cmd_run(cmd, ns.net, ns.trace, ns.direct, ns.session_whitelist, ns.chdir,
                    reuse_sid=target)
 
 

@@ -39,13 +39,13 @@ def test_sid_validation_rejects_traversal():
     _redirect_state(tmp)
     try:
         m.ensure_dirs()
-        # valid_sid validates the INTERNAL box key str(box_id): a plain decimal string.
-        check(m.valid_sid("123"), "valid_sid: plain box_id accepted")
-        check(m.valid_sid("1"), "valid_sid: single-digit box_id accepted")
+        # valid_box_id validates the INTERNAL box key str(box_id): a plain decimal string.
+        check(m.valid_box_id("123"), "valid_box_id: plain box_id accepted")
+        check(m.valid_box_id("1"), "valid_box_id: single-digit box_id accepted")
         for bad in ("../escape", "a/b", "..", "/etc/passwd", "12/..",
                     "12.ABCDEF", "x_1", "", None, "ALPHA",
                     "20260604-000000_111", "12\n13"):
-            check(not m.valid_sid(bad), f"valid_sid: rejects {bad!r}")
+            check(not m.valid_box_id(bad), f"valid_box_id: rejects {bad!r}")
 
         # register() never uses session_id as a path component (it mints box_id). A
         # traversal/garbage NAME is rejected as an invalid NAME and creates nothing.
@@ -60,7 +60,7 @@ def test_sid_validation_rejects_traversal():
         # The only live/<id> dirs that exist are numeric box_id dirs, never the bad name.
         lh = m.live_home()
         names = [p.name for p in (lh.iterdir() if lh.exists() else [])]
-        check(all(m.SID_RE.match(n) for n in names),
+        check(all(m.BOX_ID_RE.match(n) for n in names),
               f"register: only numeric box_id backing dirs exist (got {names})")
         check("PWNED" not in names and "a" not in names,
               "register: no live/<bad-name> dir created")
@@ -91,8 +91,8 @@ class _RecordingEngine:
     def __init__(self):
         self.calls = []      # list of sids
         self.done = threading.Event()
-    async def handle_fd(self, fd, session_id):
-        self.calls.append(session_id)
+    async def handle_fd(self, fd, box_id):
+        self.calls.append(box_id)
         try: os.close(fd)
         except OSError: pass
         self.done.set()
@@ -751,8 +751,8 @@ def test_apply_root_box_still_writes_host():
         check(sup.sessions[sid].parent_box_id is None,
               "root-box: Session.parent_box_id is None for a top-level box")
         # The parent_sid() helper must return None.
-        check(sup.review._parent_sid(sid) is None,
-              "root-box: _parent_sid returns None for root")
+        check(sup.review._parent_key(sid) is None,
+              "root-box: _parent_key returns None for root")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -803,7 +803,7 @@ def test_apply_kick_up_finished_parent():
         bp.parent.mkdir(parents=True, exist_ok=True)
         bp.write_bytes(content)
 
-        # Verify _parent_sid still resolves (even though parent is finished,
+        # Verify _parent_key still resolves (even though parent is finished,
         # it should still be in sessions dict if it had changes).
         # If the parent was cleaned up (no sqlar content), inject it back.
         if sid_p not in sup.sessions:
@@ -813,7 +813,7 @@ def test_apply_kick_up_finished_parent():
         # Apply the child's change — should promote to parent sqlar.
         result = sup.review.apply(sid_c, [rel])
         # If parent resolves, the change gets promoted.
-        psid = sup.review._parent_sid(sid_c)
+        psid = sup.review._parent_key(sid_c)
         if psid is not None:
             check(result.get("errors") == [], f"kick-up-fin: no errors (got {result})")
             # Parent's sqlar should now carry the row.
@@ -1068,12 +1068,12 @@ def test_dotted_name_validation():
     check(not m.valid_dotted_name("a.B"), "dotted: lowercase segment rejected")
     check(not m.valid_dotted_name("A.b"), "dotted: lowercase second segment rejected")
     check(not m.valid_dotted_name("A-.B"), "dotted: trailing dash in segment rejected")
-    # valid_sid is the INTERNAL box-key validator (decimal box_id): names are NOT keys.
-    check(not m.valid_sid("A.B"), "valid_sid: a NAME/display path is NOT a box key")
-    check(not m.valid_sid("A.B.C"), "valid_sid: dotted display path is NOT a box key")
-    check(not m.valid_sid(".."), "valid_sid: '..' rejected")
-    check(not m.valid_sid("A/B"), "valid_sid: slash rejected")
-    check(m.valid_sid("42"), "valid_sid: a decimal box_id IS a box key")
+    # valid_box_id is the INTERNAL box-key validator (decimal box_id): names are NOT keys.
+    check(not m.valid_box_id("A.B"), "valid_box_id: a NAME/display path is NOT a box key")
+    check(not m.valid_box_id("A.B.C"), "valid_box_id: dotted display path is NOT a box key")
+    check(not m.valid_box_id(".."), "valid_box_id: '..' rejected")
+    check(not m.valid_box_id("A/B"), "valid_box_id: slash rejected")
+    check(m.valid_box_id("42"), "valid_box_id: a decimal box_id IS a box key")
 
 
 def test_host_register_top_level_name():

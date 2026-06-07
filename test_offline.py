@@ -278,7 +278,7 @@ def test_box_id_and_pool_layout():
         check(isinstance(ida, int) and isinstance(idb, int), "box ids are ints")
         check(ida != idb, "distinct boxes get distinct ids (no reuse)")
         check(m.mint_box_id() > idb, "mint always advances past the highest existing id")
-        check(m.ensure_box_id(str(ida)) == ida, "ensure_box_id is the identity cast")
+        check(m.as_box_id(str(ida)) == ida, "as_box_id is the identity cast")
         # blob path layout: <pool>/<box_id>/<shard>/<row_id>, shard = row % SHARDS
         bp = m.blob_path(ida, 1234)
         check(bp.parent.parent == m.box_pool_dir(ida),
@@ -471,7 +471,7 @@ def test_promote_into_parent_unit():
         p_idx = m.Index(p_backing)
         rev.reg.indexes[parent_sid] = p_idx
 
-        # Wire a minimal Session so _parent_sid / _promote_into_parent can find upper.
+        # Wire a minimal Session so _parent_key / _promote_into_parent can find upper.
         ps = m.Session(session_id=parent_sid, box_id=400, cmd=["p"],
                        shm_dir=str(p_backing), live=True)
         rev.reg.sessions._s[parent_sid] = ps
