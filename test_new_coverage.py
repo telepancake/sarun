@@ -629,3 +629,69 @@ def test_fmt_bytes_is_module_level():
     import inspect
     src = inspect.getsource(m.ChangeReview.structural_diff_quick)
     assert "fmt_bytes" in src  # the call site still exists and now resolves
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Test: runner-mode detection (ambient caps vs. unprivileged userns)
+# ════════════════════════════════════════════════════════════════════════════
+
+def test_capeff_has_caps_parses_known_hex():
+    """_capeff_has_caps must require BOTH CAP_SYS_ADMIN (bit 21) and
+    CAP_NET_ADMIN (bit 12)."""
+    CAP_NET_ADMIN = 1 << 12
+    CAP_SYS_ADMIN = 1 << 21
+    both = CAP_NET_ADMIN | CAP_SYS_ADMIN
+    assert m._capeff_has_caps(format(both, "x")) is True
+    # A full set (all 64 bits) trivially includes both.
+    assert m._capeff_has_caps("0000003fffffffff") is True
+    # Only one of the two → False.
+    assert m._capeff_has_caps(format(CAP_SYS_ADMIN, "x")) is False
+    assert m._capeff_has_caps(format(CAP_NET_ADMIN, "x")) is False
+    # Empty / no caps → False.
+    assert m._capeff_has_caps("0000000000000000") is False
+    # Malformed → False, no raise.
+    assert m._capeff_has_caps("not-hex") is False
+    assert m._capeff_has_caps(None) is False
+
+
+def test_have_ambient_caps_reflects_status_file(tmp_path, monkeypatch):
+    """_have_ambient_caps parses CapEff from /proc/self/status; True when both
+    caps present, False when absent, False when the file is unreadable."""
+    CAP_NET_ADMIN = 1 << 12
+    CAP_SYS_ADMIN = 1 << 21
+    both = format(CAP_NET_ADMIN | CAP_SYS_ADMIN, "016x")
+    none = "0000000000000000"
+
+    real_open = open
+    def fake_open(path, *a, **k):
+        if path == "/proc/self/status":
+            return real_open(status_file, *a, **k)
+        return real_open(path, *a, **k)
+
+    status_file = str(tmp_path / "status_both")
+    with real_open(status_file, "w") as f:
+        f.write(f"Name:\tx\nCapEff:\t{both}\n")
+    monkeypatch.setattr("builtins.open", fake_open)
+    assert m._have_ambient_caps() is True
+
+    status_file = str(tmp_path / "status_none")
+    with real_open(status_file, "w") as f:
+        f.write(f"Name:\tx\nCapEff:\t{none}\n")
+    assert m._have_ambient_caps() is False
+
+    # Missing file → OSError swallowed → False.
+    def raising_open(path, *a, **k):
+        if path == "/proc/self/status":
+            raise FileNotFoundError(path)
+        return real_open(path, *a, **k)
+    monkeypatch.setattr("builtins.open", raising_open)
+    assert m._have_ambient_caps() is False
+
+
+def test_userns_runner_works_returns_bool_no_raise():
+    """The end-to-end userns probe must return a bool and never raise,
+    regardless of environment."""
+    r = m._userns_runner_works()
+    assert isinstance(r, bool)
+    # Cached: second call returns the same value.
+    assert m._userns_runner_works() is r

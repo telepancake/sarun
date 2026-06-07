@@ -7799,6 +7799,61 @@ def bwrap_supports(flag: str) -> bool:
             _BWRAP_HELP = ""
     return flag in _BWRAP_HELP
 
+# ── runner-mode detection: ambient caps vs. unprivileged user namespace ─────
+# The runner needs CAP_SYS_ADMIN (to unshare pid/ipc/uts/mount) and
+# CAP_NET_ADMIN (to bring up loopback in the nested netns). There are two ways
+# to have them: (a) ambient — the process already holds them (fast path, e.g.
+# running as root in this dev container); (b) synthesize them inside a fresh
+# unprivileged user namespace via `bwrap --unshare-user`, which works in
+# rootless Podman / Fedora toolbox where you lack ambient caps but CAN create
+# nested user namespaces.
+
+def _capeff_has_caps(capeff_hex: str) -> bool:
+    """Return True iff the CapEff hex string has BOTH CAP_SYS_ADMIN (bit 21)
+    and CAP_NET_ADMIN (bit 12) set. Pure/testable: takes the hex string."""
+    try:
+        bits = int(capeff_hex, 16)
+    except (ValueError, TypeError):
+        return False
+    CAP_NET_ADMIN = 12
+    CAP_SYS_ADMIN = 21
+    return bool(bits & (1 << CAP_SYS_ADMIN)) and bool(bits & (1 << CAP_NET_ADMIN))
+
+def _have_ambient_caps() -> bool:
+    """True iff this process holds BOTH CAP_SYS_ADMIN and CAP_NET_ADMIN in its
+    effective set (parsed from /proc/self/status CapEff). False if unreadable."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("CapEff:"):
+                    return _capeff_has_caps(line.split(":", 1)[1].strip())
+    except OSError:
+        return False
+    return False
+
+_USERNS_RUNNER_WORKS = None
+def _userns_runner_works() -> bool:
+    """True iff we can synthesize the runner's caps in a fresh unprivileged user
+    namespace. END-TO-END probe: `bwrap --unshare-user --unshare-net
+    --dev-bind / / --cap-add CAP_SYS_ADMIN --cap-add CAP_NET_ADMIN -- /bin/true`.
+    --unshare-net exercises loopback setup, which needs CAP_NET_ADMIN inside the
+    new userns — this deliberately catches the Ubuntu 24.04 AppArmor case where
+    a userns is created but caps are stripped (a bare `unshare` check misses it).
+    Cached; returns False on any error/timeout/missing bwrap."""
+    global _USERNS_RUNNER_WORKS
+    if _USERNS_RUNNER_WORKS is not None:
+        return _USERNS_RUNNER_WORKS
+    try:
+        r = subprocess.run(
+            ["bwrap", "--unshare-user", "--unshare-net", "--dev-bind", "/", "/",
+             "--cap-add", "CAP_SYS_ADMIN", "--cap-add", "CAP_NET_ADMIN",
+             "--", "/bin/true"],
+            capture_output=True, timeout=15)
+        _USERNS_RUNNER_WORKS = (r.returncode == 0)
+    except Exception:
+        _USERNS_RUNNER_WORKS = False
+    return _USERNS_RUNNER_WORKS
+
 # ── hardened runner for UNTRUSTED parsers ──────────────────────────────────
 # The ONLY place we spawn a parser (readelf/openssl/objdump/…) over bytes that
 # came out of a box. General primitive: "run this argv over these untrusted
