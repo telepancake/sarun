@@ -265,6 +265,15 @@ def box_ctime(box_id) -> float:
 # dir. It is never derived from a name and never changes (a rename is a meta-only
 # label write). Any id that arrives as a path component MUST be validated as a plain
 # decimal string before use.
+#: [b]Box identity, names, and nesting[/]
+#: Every box has a stable integer [cyan]box_id[/] that never changes — renaming only changes the
+#: display label, never the backing data. Box [b]names[/] are ALL-CAPS identifiers
+#: ([cyan]MY-BOX[/], [cyan]WORK[/]) — capitals only, digits, hyphens; must start with a letter.
+#: If you do not supply a name, the box gets an automatic name ([cyan]A1[/], [cyan]A2[/], …).
+#: Boxes can be [b]nested[/] with dotted names: [cyan]PARENT.CHILD[/] places CHILD inside PARENT's
+#: overlay, so CHILD sees PARENT's captured changes as its lower layer. Discarding PARENT
+#: copies its files down into children so their inherited view survives.
+
 BOX_ID_RE = re.compile(r"\d+\Z")
 # A user-assigned box name: CAPITALS / digits / '-', starts with a letter, never ends
 # with a '-'. Uppercase so it can never collide with a lowercase subcommand verb
@@ -586,6 +595,15 @@ def run_inner(channel_path: str, cmd: list) -> int:
     return code or 0
 
 
+#: [b]Network allow/deny rules[/]
+#: Rules are evaluated top-to-bottom; the [b]first match wins[/]. Rule kinds:
+#:   [cyan]host:PATTERN[/]   match by hostname (glob: [cyan]*[/] / [cyan]?[/]; [cyan]*.example.com[/] also matches bare [cyan]example.com[/])
+#:   [cyan]ip:ADDR[/]        match by resolved IP address or CIDR network (e.g. [cyan]10.0.0.0/8[/])
+#:   [cyan]cname:PATTERN[/]  match any name in the DNS CNAME/alias chain
+#:   [cyan]url:PREFIX[/]     match http(s) URLs by exact value or prefix
+#: Add [cyan]:PORT[/] to a host pattern to restrict it to one port (e.g. [cyan]host:api.github.com:443[/]).
+#: Scope when prompted: [b]once[/] (this request), [b]session[/] (until box exits), [b]permanent[/] (saved).
+
 # ════════════════════════════════════════════════════════════════════════════
 #  Rules
 # ════════════════════════════════════════════════════════════════════════════
@@ -689,6 +707,20 @@ class Rules:
             self.save(); return j
         return i
 
+
+#: [b]Change review — apply, discard, patch, and file rules[/]
+#: After a box finishes, its changes are held in a private overlay for you to review.
+#: You can act on the whole box or on individual files:
+#:   [cyan]apply[/]    — write the box's changes to the real host filesystem, then remove the box
+#:   [cyan]discard[/]  — drop all changes and remove the box
+#:   [cyan]patch[/]    — print a unified diff of the box's changes to stdout
+#:
+#: [b]File rules[/] let you automate per-path decisions using glob patterns (first match wins):
+#:   [cyan]apply PATTERN[/]    — automatically write matching paths to the host on review
+#:   [cyan]discard PATTERN[/]  — automatically drop matching paths
+#:   [cyan]passthrough PATTERN[/] — write directly to the host during capture (no capture)
+#: Glob syntax: [cyan]*[/] within a segment, [cyan]**[/] across dirs, [cyan]@(a|b)[/] alternation,
+#: [cyan]{a,b}[/] brace expansion. A bare name matches at any depth; a leading [cyan]/[/] anchors at root.
 
 # ════════════════════════════════════════════════════════════════════════════
 #  File rules — apply / discard a change by path glob (first match wins)
@@ -7667,6 +7699,22 @@ def run_on_untrusted(argv, files, timeout=10, out_cap=256 * 1024, on_spawn=None)
     except Exception as e:
         return (False, "", f"sandbox error: {e}")
 
+#: [b]Running a command in a slopbox[/]
+#: [cyan]slopbox [NAME] [FLAGS] -- CMD [ARGS…][/]
+#:
+#: The command [b]must[/] follow [cyan]--[/]. Flags go before it:
+#:   [cyan]-n[/]        enable outbound networking via mitmproxy (default: off — loopback only)
+#:   [cyan]-t[/]        enable process tracing (capture pid/exe/argv of every writer)
+#:   [cyan]-d[/]        direct host access — no overlay, no capture (for trusted commands)
+#:   [cyan]-w HOST[/]   pre-allow HOST for this session (repeatable)
+#:   [cyan]-C DIR[/]    working directory inside the slopbox (default: current directory)
+#:
+#: An optional [cyan]NAME[/] (all-caps) before the flags re-uses or creates a named box.
+#: The UI must be running: it owns the overlay mount the box binds as its root.
+#: Examples:
+#:   [cyan]slopbox -- pip install requests[/]       (anonymous box, no network)
+#:   [cyan]slopbox -n -- curl https://example.com[/] (with network approval)
+#:   [cyan]slopbox WORK -n -- make[/]               (named WORK box, with network)
 def cmd_run(cmd, net, trace, direct, session_whitelist, chdir, reuse_sid=None) -> int:
     if not cmd:
         print("slopbox: no command given", file=sys.stderr); return 2
@@ -7926,6 +7974,21 @@ def cmd_run(cmd, net, trace, direct, session_whitelist, chdir, reuse_sid=None) -
           f"Review changes in the UI.", file=sys.stderr)
     return (code or 0) if launched else 1
 
+
+#: [b]UI panes and navigation[/]
+#: The UI has two panels: a left list and a right detail. Switch views with:
+#:   [cyan]b[/]  Boxes — all slopboxes; select one, press [cyan]↵[/] to review its changes
+#:   [cyan]c[/]  Changes — the file tree of what the selected box wrote; [cyan]↵[/] on a file shows its diff
+#:   [cyan]t[/]  Network log — every connection the box made and whether it was allowed
+#:   [cyan]p[/]  Processes — the process tree of writers captured during the run
+#:   [cyan]w[/]  Net rules — the permanent allow/deny ruleset (edit with [cyan]a[/]/[cyan]e[/]/[cyan]d[/]/[cyan]↑↓[/])
+#:   [cyan]f[/]  File rules — the apply/discard/passthrough ruleset (same editing keys)
+#:
+#: In the Changes diff view: [cyan]a[/] applies a hunk to the host, [cyan]x[/]/[cyan]d[/] discards it.
+#: When a network connection needs approval a banner appears at the top:
+#:   [cyan]y[/] / [cyan]n[/]  allow / deny this request once
+#:   [cyan]Y[/] / [cyan]N[/]  allow / deny and add a permanent rule
+#: Press [cyan]esc[/] to go back, [cyan]q[/] to quit.
 
 # ════════════════════════════════════════════════════════════════════════════
 #  UI — `slopbox`
