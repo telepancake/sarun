@@ -63,18 +63,33 @@ repeated `stat()`s of the same path are served by the kernel. The cost was in
 
 ## The fix
 
-`keep_cache=True` on **read-only opens of a real on-disk file** (host lower, or a
-resident upper blob), plus a small `auto_cache`-style guard so a changed file is
-never served stale:
+The principle: **keep the kernel page cache on every read-only open, except when
+the bytes are actively changing.** What `keep_cache=True` buys is not "skip a fast
+RAM copy" — it's that the kernel serves repeat reads *from its own page cache
+without ever calling our `read()`*. No FUSE round-trip, no Python, no GIL. That
+win is independent of whether our backing is a disk fd or a `bytes` in RAM, so it
+applies to every read-only path, not just the disk one.
 
-- `MultiplexOverlayFs.open()` now returns `keep_cache=(not writable)`. Writable
-  opens, and the RAM/evicted/virtual fast-paths, still pass `keep_cache=False`
-  (they serve from RAM — there's no FUSE re-read to avoid — and a `False` open
-  naturally flushes any stale cache for that inode).
-- New `_autocache(inode, st)`: remembers the `(size, mtime_ns)` last handed to the
-  kernel for each inode and calls `pyfuse3.invalidate_inode()` the moment it
-  changes. This mirrors libfuse's `auto_cache` option (which is a *high-level*
-  libfuse feature, not a `-o` mount option pyfuse3 accepts, so it's implemented
+So the split between paths is about **coherence, not speed**:
+
+- **Real on-disk files** (host lower, or a resident upper blob): `keep_cache=True`,
+  guarded by `_autocache` — this is the bulk of the configure read storm.
+- **Virtual files** (the synthesized CA bundle): immutable for the session, so
+  `keep_cache=True` with an `mtime_ns=0` sentinel — re-reads stay in the kernel,
+  and the sentinel still differs from any real file's mtime so a virtual→real
+  transition at the same path invalidates.
+- **Evicted files** (row bytes, cold): stable until mutated, so `keep_cache=True`
+  keyed on the row's `(size, mtime)`.
+- **The live write-buffer read path** (a read-only opener seeing a file that
+  *another fd is mid-write on*): `keep_cache=False`. Here the bytes really are
+  changing under the reader, so the cache must be dropped on open. This is the one
+  read-only path that stays uncached, and the reason is coherence, not throughput.
+- **Writable opens**: `keep_cache=False` (the bytes are changing under them).
+
+`_autocache(inode, size, mtime_ns)` remembers the `(size, mtime_ns)` last handed to
+the kernel for each inode and calls `pyfuse3.invalidate_inode()` the moment it
+changes. This mirrors libfuse's `auto_cache` option (which is a *high-level*
+libfuse feature, not a `-o` mount option pyfuse3 accepts, so it's implemented
   here directly).
 
 ### Why this is coherent
