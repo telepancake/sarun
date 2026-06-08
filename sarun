@@ -8569,6 +8569,122 @@ def cmd_run(cmd, net, trace, direct, session_whitelist, chdir, reuse_sid=None) -
 #  UI — `slopbox`
 # ════════════════════════════════════════════════════════════════════════════
 
+def _reconcile_datatable_fallback(table, keys, cell_fn):
+    """Last-resort reconcile: clear and re-add. Correct but O(n) heavy and resets the
+    cursor by key — used only if the fast path hits an unrecognized DataTable layout."""
+    saved = None
+    if table.row_count:
+        try: saved = table.coordinate_to_cell_key(
+            (table.cursor_row, 0)).row_key.value
+        except Exception: saved = None
+    table.clear()
+    for key in keys:
+        table.add_row(*cell_fn(key), key=key)
+    if saved is not None:
+        try: table.move_cursor(row=table.get_row_index(saved), animate=False)
+        except Exception: pass
+    return list(keys)
+
+
+def reconcile_datatable(table, keys, cell_fn, *, update_cells=True, pin_scroll=True):
+    """Bring a Textual DataTable to the ordered row `keys`, incrementally and WITHOUT
+    ever clearing it. `cell_fn(key)` returns that row's cell list and is called ONLY
+    when its cells are actually needed — every new row, plus survivors when
+    update_cells=True — so a 40k-row table never re-renders 40k cells just to absorb a
+    handful of new files.
+
+    Rebuilds the table's row maps (`_data` / `rows` / `_row_locations`) in a SINGLE
+    O(n) pass that REUSES the existing Row object (and its cell dict) for every
+    surviving key — so no Row or Rich renderable is recreated — appends fresh Rows
+    only for new keys, drops vanished ones, and lays the result out directly in
+    `keys` order. This deliberately bypasses DataTable.add_row()/remove_row(), each of
+    which re-derives the full ordered-row list via the cursor/hover watchers and so
+    turns a bulk update into O(n²) — the actual cause of the multi-second stalls.
+
+    Cursor (tracked by row KEY) and the cursor row's on-screen position are preserved,
+    so a steady stream of inserts/removals never throws the selection. Returns the
+    keys added this pass (in `keys` order) for optional lazy decoration.
+
+    Generic: the changes tree, the process tree, the box list and the flow table all
+    route through here. It is wrapped so any DataTable-internals drift degrades to a
+    correct (if slower) clear+rebuild rather than a crash.
+    """
+    keys = list(keys)
+    try:
+        from textual.widgets._data_table import RowKey, Row, TwoWayDict, CellKey
+    except Exception:
+        return _reconcile_datatable_fallback(table, keys, cell_fn)
+
+    # ── snapshot the selection and the cursor row's screen position ──
+    saved_key = None; anchor = None
+    try:
+        if table.row_count:
+            saved_key = table.coordinate_to_cell_key(
+                (table.cursor_row, 0)).row_key.value
+            anchor = table.cursor_row - int(table.scroll_offset.y)
+    except Exception:
+        saved_key = None
+
+    try:
+        colkeys = [c.key for c in table.ordered_columns]
+        old_data = table._data
+        old_rows = table.rows
+        new_data = {}
+        new_rows = {}
+        added = []
+        for k in keys:
+            rk = RowKey(k)
+            existing = old_rows.get(rk)
+            if existing is not None:                 # survivor — reuse the Row object
+                new_rows[rk] = existing
+                d = old_data.get(rk)
+                if d is None:                        # shouldn't happen; rebuild cells
+                    d = {col: cell for col, cell in zip(colkeys, cell_fn(k))}
+                elif update_cells:                   # rewrite changed cells in place
+                    for col, val in zip(colkeys, cell_fn(k)):
+                        if d.get(col) != val:
+                            d[col] = val             # one refresh repaints it
+                new_data[rk] = d
+            else:                                    # brand-new row
+                new_data[rk] = {col: cell
+                                for col, cell in zip(colkeys, cell_fn(k))}
+                new_rows[rk] = Row(rk, 1, None, False)
+                added.append(k)
+        # forget cell-update bookkeeping for rows that are leaving — only when there
+        # IS any (the huge changes table never calls update_cell, so this whole 40k
+        # set-diff is skipped there).
+        if table._updated_cells:
+            for rk in (set(old_rows) - set(new_rows)):
+                for col in old_data.get(rk, ()):
+                    table._updated_cells.discard(CellKey(rk, col))
+        # commit: insertion order of new_rows IS the desired display order
+        table._data = new_data
+        table.rows = new_rows
+        table._row_locations = TwoWayDict(
+            {rk: i for i, rk in enumerate(new_rows)})
+        if added:
+            table._new_rows.update(RowKey(k) for k in added)
+        table._require_update_dimensions = True
+        table._update_count += 1
+        table.refresh(layout=True)
+    except Exception:
+        return _reconcile_datatable_fallback(table, keys, cell_fn)
+
+    # ── restore the selection and keep its row visually stationary ──
+    if saved_key is not None:
+        try:
+            idx = table.get_row_index(saved_key)
+            table.move_cursor(row=idx, column=table.cursor_column,
+                              animate=False, scroll=False)
+            if pin_scroll and anchor is not None:
+                table.scroll_to(y=max(0, idx - anchor), animate=False, force=True)
+            else:
+                table._scroll_cursor_into_view()
+        except Exception:
+            pass
+    return added
+
+
 def _make_ui_app():
     """Build and return the Textual UI App class. Factored out of run_ui() so tests
     can construct it under app.run_test() without entering the blocking run loop."""
@@ -8905,6 +9021,10 @@ def _make_ui_app():
             # is computed once and cached here, invalidated only on a real edit.
             self._live_changes={}     # sid -> {rel -> record}
             self._fin_changes={}      # sid -> [entry,...]  (cached finished set)
+            # Cheap dirtiness counter: bumped on every fold so the changes pane can
+            # skip the O(n log n) sort/tree pass on ticks where nothing changed.
+            self._live_ver={}         # sid -> int (bumped per folded event)
+            self._ch_ver_shown=None   # (sid, ver) last rendered into the changes table
             # Viewport-lazy per-row decoration: is_text/stale/precise-kind computed
             # ONLY for rows scrolled into view, cached per (sid -> {rel -> decor})
             # so a row is decorated at most once until its sid cache is invalidated.
@@ -9167,6 +9287,7 @@ def _make_ui_app():
                 host=Path("/")/rel
                 kind="modified" if (host.exists() or host.is_symlink()) else "created"
                 m[rel]=dict(path=rel, kind=kind, size=0)
+            self._live_ver[sid]=self._live_ver.get(sid,0)+1
 
         def _invalidate_changes(self, sid):
             """A real edit happened to a box's change set (hunk/whole-file apply or
@@ -9502,33 +9623,17 @@ def _make_ui_app():
             t.append("N", style="reverse"); t.append(" deny rule…")
             bar.update(t); bar.set_class(True,"show")
 
-        def _sync_table(self, table, rows):
-            # Reconcile a DataTable against the desired (key, cells) rows IN PLACE.
-            # When the set+order of rows is unchanged we only rewrite changed cells,
-            # so the cursor, scroll and selection are never disturbed by a refresh.
-            # Only a structural change (row added/removed/reordered) rebuilds, and
-            # even then the cursor is restored by key.
-            cur=[rk.value for rk in table.rows]
-            new=[k for k,_ in rows]
-            if cur==new:
-                cols=list(table.columns)
-                for key,cells in rows:
-                    for ck,val in zip(cols,cells):
-                        try:
-                            if table.get_cell(key,ck)!=val:
-                                table.update_cell(key,ck,val,update_width=False)
-                        except Exception: pass
-                return
-            saved=None
-            if table.row_count:
-                try: saved=table.coordinate_to_cell_key((table.cursor_row,0)).row_key.value
-                except Exception: saved=None
-            table.clear()
-            for key,cells in rows:
-                table.add_row(*cells,key=key)
-            if saved is not None:
-                try: table.move_cursor(row=table.get_row_index(saved),animate=False)
-                except Exception: pass
+        def _sync_table(self, table, rows, update_cells=True):
+            # Convenience wrapper over the generic incremental reconciler for the small
+            # tables (boxes / flows / procs) whose cells are cheap to precompute: split
+            # the [(key, cells), ...] list into an ordered key list + a lookup cell_fn.
+            # Rows are reconciled fully IN PLACE — never cleared and recreated — so the
+            # cursor and scroll survive a steady stream of inserts/removals. The huge
+            # changes table bypasses this and feeds the reconciler a lazy cell_fn
+            # directly (see _rebuild_ch) so it never materializes 40k cells per tick.
+            d = dict(rows)
+            return reconcile_datatable(table, [k for k, _ in rows], d.__getitem__,
+                                       update_cells=update_cells)
 
         # ── pane renderers ────────────────────────────────────────────────────
         def _rebuild_sessions(self, preserve=False):
@@ -9791,15 +9896,25 @@ def _make_ui_app():
             self._ch_rows=rows; self._ch_conn=conn
 
         def _rebuild_ch(self, preserve=False):
-            # Rebuild the cached tree (set/order/labels) then feed it to _sync_table;
-            # only runs when _ch_entries actually changed, so the 0.3s tick never sorts.
+            # Recompute the DFS tree (set/order/labels) and reconcile it INTO the table
+            # incrementally: only the added/removed/moved rows touch the widget, so a
+            # build that adds files every tick never clears+rebuilds 40k rows and never
+            # throws the cursor. Cells of surviving rows are repainted lazily and
+            # viewport-scoped by _decorate_visible (update_cells=False below).
             self._build_ch_tree()
             ent={e["path"]:e for e in self._ch_entries}
-            rows=[]
-            for rk, name, depth, connector in self._ch_rows:
-                if connector: rows.append((rk, self._conn_cells(name, depth)))
-                else: rows.append((rk, self._ch_cells(ent[rk], depth)))
-            self._sync_table(self.query_one("#cf-tab",DataTable), rows)
+            meta={rk:(name,depth,connector)
+                  for rk, name, depth, connector in self._ch_rows}
+            keys=[rk for rk, *_rest in self._ch_rows]
+            def cell_fn(rk):
+                name, depth, connector = meta[rk]
+                return (self._conn_cells(name, depth) if connector
+                        else self._ch_cells(ent[rk], depth))
+            # update_cells=False: survivors keep their cells untouched here; their
+            # is_text/stale/kind decoration is repainted lazily, viewport-scoped, by
+            # _decorate_visible — so cell_fn is invoked only for newly-added rows.
+            reconcile_datatable(self.query_one("#cf-tab",DataTable), keys, cell_fn,
+                                update_cells=False)
             self._skip_conn_ch()
             self._decorate_visible()
 
@@ -10082,6 +10197,14 @@ def _make_ui_app():
             return None if k in self._ch_conn else k
 
         def _load_changes(self, sid, force=False):
+            # Fast skip: for a live box on a steady tick, if not a single fold event
+            # landed since the last render, the change set is bit-identical — don't
+            # even sort it. This is what keeps an idle 40k-change pane from burning a
+            # full O(n log n) pass every 0.3s.
+            if not force and self.sup.review._live(sid):
+                ver=self._live_ver.get(sid,0)
+                if self._ch_ver_shown==(sid,ver):
+                    return
             entries=self._changes_for(sid)   # kicks the off-loop fold if needed
             # Mid-fold: show a placeholder row, never the partial state. _changes_for
             # already started the worker; just render the wait.
@@ -10094,6 +10217,10 @@ def _make_ui_app():
                 self._ch_rows=[]; self._ch_conn=set()
                 self._cbar("consolidating…")
                 return
+            # Record the version we are about to reflect so the next idle tick skips
+            # the sort above. (Done for both the no-op and the rebuild path.)
+            if self.sup.review._live(sid):
+                self._ch_ver_shown=(sid, self._live_ver.get(sid,0))
             # Only touch the table when the set of changes actually differs, so the
             # periodic refresh keeps the pane live without blinking or losing the
             # cursor while nothing is changing.
@@ -10240,13 +10367,14 @@ def _make_ui_app():
                 rows.append((rk, [tg, pp, nm, ar]))
             ppid_of=dict(prev_pp); ppid_of.update(new_pp)
             self._pr_pp=new_pp
-            # Capture the user's vertical scroll so a scrolled-down tree view
-            # survives the rebuild (clear()+re-add resets scroll_y to 0).
+            # Capture the user's vertical scroll so a scrolled-down tree view keeps its
+            # absolute position (the incremental reconcile pins the cursor row, but the
+            # proc pane prefers to hold absolute scroll across its own cursor relocation).
             scroll_y=pt.scroll_offset.y
             self._sync_table(pt, rows)
             # If the cursored proc vanished, move to its nearest surviving ancestor
-            # (root only if the whole chain is gone). _sync_table left the cursor at row
-            # 0 since the key was absent; relocate before connector-skip.
+            # (root only if the whole chain is gone). The reconcile left the cursor where
+            # its key still resolves, or clamped if it vanished; relocate before skip.
             if cur_tg is not None and cur_tg not in present:
                 rk=nearest_surviving_row(cur_tg, ppid_of, present)
                 if rk is not None:
