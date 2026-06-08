@@ -1332,8 +1332,13 @@ def _ensure_columns(conn, table: str, cols: dict) -> None:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
 
 def _sqlar_deflate(content: bytes):
-    comp = zlib.compress(content, 6)
-    return (comp, len(content)) if len(comp) < len(content) else (content, len(content))
+    """Pack file/symlink content for a sqlar `data` blob, returning (data, sz) where
+    `sz` is the true uncompressed length. Compression is DISABLED: content is stored
+    verbatim, so sz == len(data) always — the sqlar "stored uncompressed" form. Read
+    paths still transparently inflate any legacy rows where len(data) < sz, so existing
+    compressed archives keep working; to re-enable compression, deflate here when it
+    shrinks and return (comp, len(content))."""
+    return (content, len(content))
 
 def _sqlar_put_file(conn, name, content: bytes, mode, mtime_ns) -> None:
     """`mtime_ns` is integer nanoseconds (st_mtime_ns); stored as-is."""
