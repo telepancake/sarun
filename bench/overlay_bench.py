@@ -41,7 +41,9 @@ from pathlib import Path
 
 def load_sarun():
     here = Path(__file__).resolve().parent
-    path = here.parent / "sarun"
+    # SARUN_PATH lets a caller point at a specific revision of the script (e.g. a
+    # pre-change baseline checked out to a temp file) for before/after comparison.
+    path = Path(os.environ.get("SARUN_PATH") or (here.parent / "sarun"))
     loader = importlib.machinery.SourceFileLoader("sarunmod", str(path))
     spec = importlib.util.spec_from_loader("sarunmod", loader)
     mod = importlib.util.module_from_spec(spec)
@@ -198,18 +200,49 @@ def run_coherence(box_root):
     print("COHERENCE: all reads fresh — PASS")
 
 
+def run_exec(sarun, box_root, rel, exec_cmd):
+    """Run an arbitrary command with its cwd inside the live overlay, so the tool
+    drives the FUSE ops directly (no bwrap). `rel` is a path relative to the box
+    root (the merged view of /); it is created as a copy-up dir. Used to point a
+    third-party suite (e.g. pjdfstest's `prove`) at the overlay."""
+    workdir = os.path.join(box_root, rel.lstrip("/"))
+    os.makedirs(workdir, exist_ok=True)
+    print(f"exec cwd={workdir}\n  $ {' '.join(exec_cmd)}")
+    p = subprocess.run(exec_cmd, cwd=workdir)
+    print(f"exec rc={p.returncode}")
+    sys.exit(p.returncode)
+
+
 def main():
     mode = sys.argv[1]
     proj = None
     runs = 3
+    rel = "root/ovbench-work"
+    exec_cmd = None
     a = sys.argv[2:]
     while a:
         if a[0] == "--proj":
             proj = a[1]; a = a[2:]
         elif a[0] == "--runs":
             runs = int(a[1]); a = a[2:]
+        elif a[0] == "--rel":
+            rel = a[1]; a = a[2:]
+        elif a[0] == "--":
+            exec_cmd = a[1:]; break
         else:
             a = a[1:]
+
+    if mode == "exec":
+        sarun = load_sarun()
+        tmproot, mount, box_root, sid = setup_overlay(sarun)
+        try:
+            run_exec(sarun, box_root, rel, exec_cmd)
+        finally:
+            try: mount.stop()
+            except Exception: pass
+            shutil.rmtree(tmproot, ignore_errors=True)
+        return
+
     assert proj, "need --proj DIR"
     proj = str(Path(proj).resolve())
     cmd = ["./configure"]

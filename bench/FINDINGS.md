@@ -127,6 +127,37 @@ Every case must read back the new bytes on the next open. With the fix in place
 all reads are fresh; class (B) is the one that exercises `_autocache` specifically
 (on a kernel without `FUSE_AUTO_INVAL_DATA` it would go stale without it).
 
+## Regression gate with pjdfstest (a real FUSE suite)
+
+The bespoke `coherence` mode targets the one property this change is *about*
+(read-only cross-open page-cache coherence — which no standard suite exercises,
+since fsx opens `O_RDWR` and never hits the `keep_cache=True` path, and pjdfstest
+is metadata-only). For broad POSIX coverage of the overlay surface the `open` /
+`read` paths sit on, [pjdfstest](https://github.com/pjd/pjdfstest) is the standard
+suite and is importable — but the overlay's *intentional* divergences (uid/gid
+squashing, `setxattr→ENOSYS`, virtual CA files, and an atime-fidelity gap on
+synthetic dir/symlink inodes) mean it can't pass clean. Use it as a **before/after
+regression gate**, not a pass/fail oracle:
+
+```sh
+git clone --depth 1 https://github.com/pjd/pjdfstest /tmp/pjdfstest
+( cd /tmp/pjdfstest && autoreconf -ifs && ./configure && make pjdfstest )
+T=/tmp/pjdfstest/tests
+PJD="$T/open $T/truncate $T/ftruncate $T/unlink $T/mkdir $T/rmdir \
+     $T/utimensat $T/rename $T/symlink $T/link"
+# baseline revision -> temp file, then diff failure sets across the change:
+git show <base>:sarun > /tmp/sarun.base
+SARUN_PATH=/tmp/sarun.base uv run bench/overlay_bench.py exec --rel root/wd -- prove -r $PJD
+                         uv run bench/overlay_bench.py exec --rel root/wd -- prove -r $PJD
+```
+
+`exec` mode mounts the overlay and runs an arbitrary command with its cwd inside
+the merged view (no bwrap), so `prove` drives the FUSE ops directly. `SARUN_PATH`
+points the harness at a specific revision of the script. Across this change the
+result was **6646 tests, an identical failure set on both revisions** — i.e. no
+POSIX regression. (Heads-up for re-runs: don't name the shell var `GROUPS` — it's
+a bash special variable and your assignment gets silently clobbered.)
+
 ## What's left (out of scope here)
 
 The remaining 2.35× is not read amplification. It's the per-op cost of serving
