@@ -121,6 +121,27 @@ def test_unlink_open_buffer_no_resurrect():
         fx.stop()
 
 
+def test_lazy_unlink_then_write_no_resurrect():
+    """Open an EXISTING file O_RDWR (lazy — not yet materialized), unlink it, THEN
+    write through the held fd, then close. POSIX unlink-open: the writes succeed on
+    the detached fd but the NAME must stay gone — the write must not resurrect a row
+    at the path."""
+    fx = MountFixture(); fx.start()
+    try:
+        fx.sh("printf 'ORIGINAL' > ghost.txt")     # an existing captured file
+        r = fx.sh(
+            "exec 3<>ghost.txt; rm ghost.txt; printf 'LATE' >&3; exec 3>&-; "
+            "test -e ghost.txt && echo PRESENT || echo GONE")
+        check(r.returncode == 0,
+              f"lazy-unlink-write: ran (rc={r.returncode}, err={r.stderr!r})")
+        check(r.stdout.strip() == "GONE",
+              f"lazy-unlink-write: name stays gone after write+close (got {r.stdout.strip()!r})")
+        check(fx.index.kind_of("ghost.txt") in (None, "whiteout"),
+              "lazy-unlink-write: no resurrected row at the path")
+    finally:
+        fx.stop()
+
+
 def test_rename_open_buffer_follows():
     """Renaming a file that is still open in a write buffer must carry the data to
     the new name; the old name must not reappear after the writer closes."""
@@ -187,6 +208,7 @@ if __name__ == "__main__":
     for fn in (test_concurrent_read_while_buffered,
                test_concurrent_read_existing_while_buffered,
                test_unlink_open_buffer_no_resurrect,
+               test_lazy_unlink_then_write_no_resurrect,
                test_rename_open_buffer_follows,
                test_parallel_write_read_rename_unlink):
         print(f"\n== {fn.__name__} ==")

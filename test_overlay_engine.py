@@ -915,7 +915,8 @@ def test_wbuf_periodic_flush():
         # that has been written but not yet closed, then call flush_wbuf and verify the row.
 
         # ── synthetic buffer injection ───────────────────────────────────────────────
-        # Build a write-buffer dict that looks exactly like one created by _create_write_buffer.
+        # Build a write-handle dict that looks exactly like a materialized RAM handle
+        # (i.e. one whose first write has happened): flush_wbuf only snapshots those.
         sid = fx.sid
         rel = "flush_inject.txt"
         idx = fx.index
@@ -927,6 +928,8 @@ def test_wbuf_periodic_flush():
             sid=sid, rel=rel,
             data=bytearray(content_a),
             dirty=True,
+            materialized=True,
+            orphan=False,
             mode=0o100644,
             mtime_ns=int(1_000_000_000),
             wid=wid,
