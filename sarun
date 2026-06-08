@@ -2626,6 +2626,7 @@ def _build_overlay_ops():
                         if sfd >= 0:
                             try: os.close(sfd)
                             except OSError: pass
+                        self._close_src_fd(wb)   # lazy handle's source read fd
             # Remove this child from any base-session child-set; detach bases that are
             # now unreferenced (child-set empty and base is not also a live session).
             for psid, children in list(self._base_children.items()):
@@ -2854,132 +2855,146 @@ def _build_overlay_ops():
 
         # ── Tier-0 write buffer helpers ──────────────────────────────────────
 
-        def _should_buffer_write(self, sid: str, rel: str, flags: int,
-                                 idx: "Index") -> bool:
-            """Return True iff this open-for-write should use the RAM write buffer
-            instead of the disk copy-up path.  False when: passthrough session (always
-            goes through _write_open); the path is not a regular file; the file is
-            already open-buffered by another handle (no double-buffer); the existing
-            file is >= WBUF_SPILL (large files stay on disk)."""
-            if self._passthrough(sid, rel):
-                return False
-            # already buffered by another fh (rare: concurrent opens of the same rel)
-            if (sid, rel) in self._wbuf_key:
-                return False
-            k = idx.kind_of(rel)
-            # non-file overlay kinds (dir, symlink, whiteout) go to disk path
-            if k is not None and k != "file":
-                return False
-            # existing regular file whose on-disk size is already large: disk path
+        def _source_bytes(self, sid: str, rel: str) -> bytes:
+            """Whole current content of `rel` from the layer BENEATH an (about to be
+            or freshly) materialized handle: own resident blob / evicted row, else the
+            lower layer (host or parent box). Empty if it resolves to nothing. Used to
+            seed a write handle's backing on its first real mutation."""
+            k = self._index(sid).kind_of(rel)
             if k == "file":
+                idx = self._index(sid)
                 row = idx.file_row(rel)
                 if row is not None:
-                    _rowid, _mode, sz, _mtime, data = row
-                    if data is not None:
-                        # evicted: sz is the uncompressed size
-                        if sz >= self._WBUF_SPILL:
-                            return False
-                    else:
-                        # resident: check blob size
-                        rid = idx.row_id(rel)
-                        if rid is not None:
-                            bp = blob_path(idx.box_id, rid)
-                            try:
-                                if os.path.getsize(str(bp)) >= self._WBUF_SPILL:
-                                    return False
-                            except OSError:
-                                pass
-            # lower (host) file: check host size if it exists
-            if k is None:
-                layer, ap, st = self._lower_resolve(sid, rel)
-                if layer in ("lower", "upper") and st is not None:
-                    if st.st_size >= self._WBUF_SPILL:
-                        return False
-            return True
+                    _rid, _mode, _sz, _mt, rowdata = row
+                    if rowdata is not None:
+                        blob = bytes(rowdata)
+                        return blob if len(blob) == _sz else zlib.decompress(blob)
+                    rid = idx.row_id(rel)
+                    if rid is not None:
+                        bp = blob_path(idx.box_id, rid)
+                        try: return bp.read_bytes()
+                        except OSError: return b""
+            layer, ap, _st = self._lower_resolve(sid, rel)
+            if layer in ("lower", "upper") and ap is not None:
+                try:
+                    with open(ap, "rb") as f: return f.read()
+                except OSError: return b""
+            if layer in ("lower", "upper"):           # evicted in an ancestor box
+                eb = self._evicted_bytes(sid, rel)
+                return eb if eb is not None else b""
+            return b""
 
-        def _create_write_buffer(self, sid: str, rel: str, idx: "Index",
-                                 flags: int, ctx) -> dict:
-            """Allocate and seed the write-buffer dict for fh.
-            Seeds the bytearray from: O_TRUNC → empty; evicted row → decompress;
-            resident blob → read file; else → empty.
-            Marks the file in the index so it is visible while buffered."""
+        def _open_write_handle(self, sid: str, rel: str, idx: "Index",
+                               flags: int, ctx) -> dict:
+            """The SINGLE captured-write path. Returns a write-handle dict.
+
+            A plain open of an existing file is LAZY: the handle starts
+            unmaterialized — no copy-up, no pool blob, no index row, invisible to the
+            coherence map — so reads come straight from the source and a close with no
+            write records nothing and leaves mtime untouched. The first real mutation
+            (write / ftruncate / chmod) materializes it via _materialize_backing,
+            which alone picks RAM vs pool-blob storage by size. O_TRUNC and a genuine
+            create ARE modifications, so they materialize (empty) at open."""
             wid = idx.writer_for(ctx.pid)
-            # ── seed current bytes ──────────────────────────────────
-            if flags & os.O_TRUNC:
-                data = bytearray()
-            else:
-                data = None
-                k = idx.kind_of(rel)
-                if k == "file":
-                    row = idx.file_row(rel)
-                    if row is not None:
-                        _rowid, _mode, _sz, _mtime, rowdata = row
-                        if rowdata is not None:
-                            # evicted: decompress into bytearray
-                            blob = bytes(rowdata)
-                            content = blob if len(blob) == _sz else zlib.decompress(blob)
-                            data = bytearray(content)
-                        else:
-                            # resident: read pool blob
-                            rid = idx.row_id(rel)
-                            if rid is not None:
-                                bp = blob_path(idx.box_id, rid)
-                                try:
-                                    data = bytearray(bp.read_bytes())
-                                except OSError:
-                                    data = bytearray()
-                if data is None:
-                    # No own-overlay entry: seed from the lower layer (host or parent box).
-                    layer, ap, _st = self._lower_resolve(sid, rel)
-                    if layer in ("lower", "upper") and ap is not None:
-                        try:
-                            with open(ap, "rb") as f:
-                                data = bytearray(f.read())
-                        except OSError:
-                            data = bytearray()
-                    elif layer in ("lower", "upper"):
-                        # ap is None: the lower file is EVICTED in an ancestor box — read
-                        # its row bytes (read-only) so a buffered copy-up isn't empty.
-                        eb = self._evicted_bytes(sid, rel)
-                        data = bytearray(eb) if eb is not None else bytearray()
-                    else:
-                        data = bytearray()
-            # ── mode for this file ──────────────────────────────────
+            layer, ap, src_st = self._resolve_st(sid, rel)
             row = idx.file_row(rel)
             if row is not None:
                 mode = row[1]
-            else:
-                layer, _ap, st = self._lower_resolve(sid, rel)
-                if st is not None:
-                    mode = st.st_mode
-                else:
-                    mode = stat_mod.S_IFREG | 0o644
-            # ── seed mtime + spurious-capture guard ─────────────────
-            # Resolve the pre-open source ONCE. It yields the mtime to seed (merely
-            # opening for write must NOT bump mtime) and whether this path already
-            # existed in the LOWER layer — so a clean, non-modifying open can revert
-            # its row on release instead of recording a phantom change. A real write,
-            # an O_TRUNC, or a chmod marks the buffer dirty and is always recorded;
-            # a prior overlay capture ("upper") or a genuine create (absent/whiteout)
-            # is never reverted.
-            pre_layer, _pa, src_st = self._resolve_st(sid, rel)
-            if flags & os.O_TRUNC:
-                mtime_ns = time.time_ns()            # truncate IS a modification
             elif src_st is not None:
-                _m = getattr(src_st, "st_mtime_ns", None)
-                mtime_ns = _m if _m is not None else time.time_ns()
+                mode = src_st.st_mode
             else:
-                mtime_ns = time.time_ns()            # brand-new file: now
-            # ── mark visible in the index immediately ───────────────
-            # Clears a whiteout if present so kind_of(rel)=="file" while buffered.
+                mode = stat_mod.S_IFREG | 0o644
+            mode = stat_mod.S_IFREG | stat_mod.S_IMODE(mode)
+            wb = dict(sid=sid, rel=rel, mode=mode, wid=wid, ctx=ctx, orphan=False,
+                      materialized=False, seed_empty=False, src_fd=-1,
+                      src_size=getattr(src_st, "st_size", 0),
+                      data=bytearray(), spilled_fd=-1, dirty=False, mtime_ns=0)
+            new_file = layer in ("absent", "whiteout")
+            if (flags & os.O_TRUNC) or new_file:
+                # A modification at open: materialize EMPTY now and stamp mtime.
+                wb["seed_empty"] = True
+                wb["mtime_ns"] = time.time_ns()
+                self._materialize_backing(wb, idx)
+                wb["dirty"] = True
+                return wb
+            # Existing file, plain open: stay lazy. mtime tracks the source until a
+            # real write advances it; until then nothing is captured.  Hold a read fd
+            # on the source (when it has a path) so reads-before-write are O(1), not a
+            # re-read of the whole file per request.
+            _m = getattr(src_st, "st_mtime_ns", None)
+            wb["mtime_ns"] = _m if _m is not None else time.time_ns()
+            if ap is not None:
+                try:
+                    wb["src_fd"] = os.open(ap, os.O_RDONLY | os.O_NOFOLLOW)
+                except OSError:
+                    wb["src_fd"] = -1
+            return wb
+
+        def _materialize_backing(self, wb: dict, idx: "Index") -> None:
+            """Give an unmaterialized handle real storage on its first mutation. ONE
+            place decides where the bytes live, by size:
+              • empty backing  — O_TRUNC / a genuine create (RAM, zero bytes);
+              • RAM bytearray  — small source, seeded from _source_bytes;
+              • pool blob      — large source, via the shared copy-up (_ensure_copyup
+                                 handles resident / evicted / lower / absent alike).
+            Creates the index row. Does NOT register the coherence key (the caller
+            holds the fh) and does NOT touch mtime — the triggering op owns that.
+            No-op if already materialized."""
+            if wb.get("materialized"):
+                return
+            sid, rel = wb["sid"], wb["rel"]
+            if wb.get("orphan"):
+                # Detached (unlinked while open before any write): give it a private
+                # RAM backing seeded from the still-open source fd, but touch NOTHING
+                # in the index — the name stays gone and release discards the bytes
+                # (POSIX unlink-open). Stays in RAM: it is never committed or spilled.
+                seed = bytearray()
+                sfd = wb.get("src_fd", -1)
+                if not wb.get("seed_empty") and sfd is not None and sfd >= 0:
+                    try:
+                        os.lseek(sfd, 0, 0)
+                        while True:
+                            chunk = os.read(sfd, 1 << 20)
+                            if not chunk: break
+                            seed += chunk
+                    except OSError:
+                        pass
+                self._close_src_fd(wb)
+                wb["data"] = seed
+                wb["spilled_fd"] = -1
+                wb["materialized"] = True
+                return
             if idx.kind_of(rel) == "whiteout":
                 idx.del_entry(rel)
-            idx.set_entry(rel, "file", mode, wid,
-                          "create" if idx.kind_of(rel) is None else "open_write")
-            return dict(sid=sid, rel=rel, data=data,
-                        dirty=bool(flags & os.O_TRUNC),
-                        mode=mode, mtime_ns=mtime_ns, wid=wid, spilled_fd=-1,
-                        revert_if_clean=(pre_layer == "lower"))
+            if (not wb.get("seed_empty")) and wb["src_size"] > self._WBUF_SPILL:
+                # Large source: back the handle by a pool-blob fd (no whole-file read
+                # into RAM). _ensure_copyup materializes the blob with the source
+                # content + mtime; a following write advances mtime itself.
+                fd = self._ensure_copyup(sid, rel, os.O_RDWR, wb["ctx"])
+                wb["spilled_fd"] = fd
+                wb["data"] = bytearray()
+            else:
+                op = "create" if idx.kind_of(rel) is None else "open_write"
+                # Read the source BEFORE set_entry: once the row exists kind_of(rel)
+                # becomes "file" and _source_bytes would read our own empty row
+                # instead of the underlying lower/parent content.
+                seed = (bytearray() if wb.get("seed_empty")
+                        else bytearray(self._source_bytes(sid, rel)))
+                idx.set_entry(rel, "file", wb["mode"], wb["wid"], op)
+                wb["data"] = seed
+                wb["spilled_fd"] = -1
+            self._close_src_fd(wb)
+            wb["materialized"] = True
+            self._notify(sid, rel, "modified")
+
+        @staticmethod
+        def _close_src_fd(wb: dict) -> None:
+            """Release the read fd a lazy handle held on its source (if any)."""
+            sfd = wb.get("src_fd", -1)
+            if sfd is not None and sfd >= 0:
+                try: os.close(sfd)
+                except OSError: pass
+            wb["src_fd"] = -1
 
         def _spill_write_buffer(self, fh: int) -> None:
             """Materialize the write buffer's bytearray to a pool blob (Tier 1).
@@ -3009,8 +3024,8 @@ def _build_overlay_ops():
             if fh is None:
                 return None
             wb = self._wbuf.get(fh)
-            if wb is None:
-                return None
+            if wb is None or not wb.get("materialized"):
+                return None         # unmaterialized: the file IS still the source
             sfd = wb.get("spilled_fd", -1)
             if sfd >= 0:
                 try:
@@ -3031,8 +3046,8 @@ def _build_overlay_ops():
             if fh is None:
                 return None
             wb = self._wbuf.get(fh)
-            if wb is None or wb.get("orphan"):
-                return None
+            if wb is None or wb.get("orphan") or not wb.get("materialized"):
+                return None         # unmaterialized: foreign readers see the source
             sfd = wb.get("spilled_fd", -1)
             if sfd >= 0:
                 try:
@@ -3057,7 +3072,8 @@ def _build_overlay_ops():
             if fh is None:
                 return
             wb = self._wbuf.get(fh)
-            if wb is None or wb.get("orphan") or wb.get("spilled_fd", -1) >= 0:
+            if (wb is None or wb.get("orphan") or not wb.get("materialized")
+                    or wb.get("spilled_fd", -1) >= 0):
                 return
             idx = self._index(sid)
             rid = idx.row_id(rel)
@@ -3731,18 +3747,27 @@ def _build_overlay_ops():
                                     rel, "open_write") == "deny":
                         raise pyfuse3.FUSEError(errno.EACCES)
                     idx = self._index(sid)
-                    if self._should_buffer_write(sid, rel, flags, idx):
-                        # Tier-0: hold bytes in RAM; deflate into sqlar row on release.
-                        wb = self._create_write_buffer(sid, rel, idx, flags, ctx)
+                    if self._passthrough(sid, rel):
+                        # Passthrough / kick-up: write to the real host, or (nested)
+                        # capture in the parent box's overlay. Unchanged disk handle.
+                        idx.writer_for(ctx.pid)
+                        fd = self._write_open(sid, rel, flags, ctx)
+                    elif idx.kind_of(rel) in ("dir", "symlink"):
+                        # Degenerate writable open of a non-regular entry; let the
+                        # copy-up path raise the right errno (the kernel usually
+                        # blocks this before it reaches us).
+                        fd = self._ensure_copyup(sid, rel, flags, ctx)
+                    else:
+                        # The SINGLE captured-write path: one lazy handle. Nothing is
+                        # copied up, no row is created, and mtime is untouched until the
+                        # first real mutation; storage tier (RAM vs pool blob) is chosen
+                        # then, inside _materialize_backing.
+                        wb = self._open_write_handle(sid, rel, idx, flags, ctx)
                         with self._lock:
                             fh = self._next_fh; self._next_fh += 1
                         self._wbuf[fh] = wb
                         self._wbuf_key[(sid, rel)] = fh
-                        self._notify(sid, rel, "modified")
                         return pyfuse3.FileInfo(fh=fh, direct_io=False, keep_cache=False)
-                    # Tier-1 / existing: disk copy-up path.
-                    idx.writer_for(ctx.pid)   # tracing/provenance
-                    fd = self._write_open(sid, rel, flags, ctx)
                 with self._lock:
                     fh = self._next_fh; self._next_fh += 1
                     self._fd_table[fh] = fd
@@ -3755,9 +3780,22 @@ def _build_overlay_ops():
             if fh in self._vfh:
                 _sid, _rel, content = self._vfh[fh]
                 return content[off:off + size]
-            # Tier-0 read: serve from the RAM write buffer.
+            # Write-handle read: serve from the live backing, or — while still lazy —
+            # straight from the source (the file hasn't diverged from it yet).
             wb = self._wbuf.get(fh)
             if wb is not None:
+                if not wb.get("materialized"):
+                    self._req_enter("read")
+                    try:
+                        sfd = wb.get("src_fd", -1)
+                        if sfd is not None and sfd >= 0:
+                            return os.pread(sfd, size, off)
+                        # evicted source (no path; small): slice its bytes
+                        return self._source_bytes(wb["sid"], wb["rel"])[off:off + size]
+                    except OSError as e:
+                        raise pyfuse3.FUSEError(e.errno or errno.EIO)
+                    finally:
+                        self._req_exit()
                 sfd = wb.get("spilled_fd", -1)
                 if sfd >= 0:
                     # spilled: read from the pool blob fd
@@ -3780,9 +3818,14 @@ def _build_overlay_ops():
                 self._req_exit()
 
         async def write(self, fh, off, buf):
-            # Tier-0 write: splice into the RAM bytearray.
+            # Captured write: splice into the handle's backing.
             wb = self._wbuf.get(fh)
             if wb is not None:
+                # First mutation of a lazy handle: materialize now (this is the ONE
+                # spot that turns an open into a captured change). The size at this
+                # moment picks RAM vs pool-blob backing.
+                if not wb.get("materialized"):
+                    self._materialize_backing(wb, self._index(wb["sid"]))
                 end = off + len(buf)
                 sfd = wb.get("spilled_fd", -1)
                 if sfd >= 0:
@@ -3801,8 +3844,9 @@ def _build_overlay_ops():
                     wb["data"].extend(bytes(end - len(wb["data"])))
                 wb["data"][off:end] = buf
                 wb["dirty"] = True; wb["mtime_ns"] = time.time_ns()
-                # spill if over threshold
-                if len(wb["data"]) > self._WBUF_SPILL:
+                # spill if over threshold — but never an orphan (spilling re-creates a
+                # row; a detached unlink-open handle must stay invisible in RAM).
+                if len(wb["data"]) > self._WBUF_SPILL and not wb.get("orphan"):
                     try:
                         self._spill_write_buffer(fh)
                     except OSError as e:
@@ -3844,15 +3888,24 @@ def _build_overlay_ops():
         async def release(self, fh):
             if fh in self._vfh:
                 self._vfh.pop(fh, None); return
-            # Tier-0 release: deflate into sqlar row (RAM) or close blob fd (spilled).
+            # Write-handle release: an unmaterialized handle never captured anything
+            # (no row, no blob, no mtime bump) — so a non-modifying open is simply
+            # forgotten. A materialized handle commits: spilled blob stays resident,
+            # RAM bytes deflate into the sqlar row.
             wb = self._wbuf.pop(fh, None)
             if wb is not None:
-                self._wbuf_key.pop((wb["sid"], wb["rel"]), None)
                 sid, rel = wb["sid"], wb["rel"]
+                # Only drop the coherence key if it still points at THIS handle (a
+                # concurrent re-open of the same path may have superseded it).
+                if self._wbuf_key.get((sid, rel)) == fh:
+                    self._wbuf_key.pop((sid, rel), None)
+                if not wb.get("materialized"):
+                    self._close_src_fd(wb)      # lazy, never written: nothing captured
+                    return
                 sfd = wb.get("spilled_fd", -1)
                 if wb.get("orphan"):
                     # Path was unlinked/overwritten while this fd stayed open: the
-                    # buffer must NOT re-create a row (unlink-open semantics). Just
+                    # handle must NOT re-create a row (unlink-open semantics). Just
                     # release any spilled blob fd; its (already-unlinked) inode dies.
                     if sfd >= 0:
                         try: os.close(sfd)
@@ -3864,27 +3917,15 @@ def _build_overlay_ops():
                     try: os.close(sfd)
                     except OSError: pass
                 else:
-                    # RAM path. A CLEAN buffer (opened for write but never written,
-                    # truncated, or chmod'd) over a file that already existed in the
-                    # lower layer must NOT record a phantom change: drop the row that
-                    # open() added and restore the lower view. Guard against a
-                    # concurrent writer that materialized a real blob meanwhile — that
-                    # blob's bytes must never be clobbered.
+                    # RAM path: deflate into an evicted sqlar row. Delete any stale
+                    # resident pool blob first so _resolve_st won't serve old bytes.
                     idx = self._index(sid)
                     rid = idx.row_id(rel)
-                    bp = blob_path(idx.box_id, rid) if rid is not None else None
-                    blob_present = bool(bp and bp.exists())
-                    if (wb.get("revert_if_clean") and not wb.get("dirty")
-                            and not blob_present):
-                        idx.del_entry(rel)
-                        self._notify(sid, rel, "reverted")
-                        return
-                    # Otherwise commit the buffered bytes (a real change or a new
-                    # file). Delete any stale resident pool blob first so _resolve_st
-                    # won't serve the old bytes instead of the new row data.
-                    if blob_present:
-                        try: os.unlink(str(bp))
-                        except OSError: pass
+                    if rid is not None:
+                        bp = blob_path(idx.box_id, rid)
+                        if bp.exists():
+                            try: os.unlink(str(bp))
+                            except OSError: pass
                     data_bytes = bytes(wb["data"])
                     deflated, sz = _sqlar_deflate(data_bytes)
                     idx.set_blob(rel, deflated, sz, wb["mode"],
@@ -3961,40 +4002,25 @@ def _build_overlay_ops():
                 return (pyfuse3.FileInfo(fh=nfh, direct_io=False, keep_cache=False),
                         self._entry(ino, st))
             def upper_op(sid, rel, upath, wid, idx):
-                # Tier-0: a new/small file buffers in RAM and deflates into the sqlar
-                # row on release — the common case (create()+write()+close, e.g. nearly
-                # everything ./configure writes) never materializes a pool file.
-                if self._should_buffer_write(sid, rel, flags, idx):
-                    wb = self._create_write_buffer(sid, rel, idx, flags, ctx)
-                    m = stat_mod.S_IFREG | (mode & 0o7777)
-                    if wb["mode"] != m:            # honor the explicit create() mode
-                        wb["mode"] = m
+                # A create() is a genuine new file: the SINGLE write handle materializes
+                # it (empty, captured) at open — RAM for the common small case, a pool
+                # blob only once it grows past the spill threshold. Honor the explicit
+                # create() mode.
+                wb = self._open_write_handle(sid, rel, idx, flags | os.O_CREAT, ctx)
+                m = stat_mod.S_IFREG | (mode & 0o7777)
+                if wb["mode"] != m:
+                    wb["mode"] = m
+                    if wb.get("materialized"):
                         idx.set_entry(rel, "file", m, wb["wid"], "create")
-                    with self._lock:
-                        nfh = self._next_fh; self._next_fh += 1
-                    self._wbuf[nfh] = wb
-                    self._wbuf_key[(sid, rel)] = nfh
-                    ino = self._ino_for(sid, rel)
-                    self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
-                    return (pyfuse3.FileInfo(fh=nfh, direct_io=False, keep_cache=False),
-                            self._entry(ino, self._buffer_stat(sid, rel)))
-                # Tier-1: large / forced-to-disk — pool blob + fd, as before.
-                # File bytes go to the pool blob, not up/<rel>. _new_file_blob
-                # handles whiteout removal and index set_entry.
-                try:
-                    bp = self._new_file_blob(sid, rel, stat_mod.S_IFREG | (mode & 0o7777),
-                                             wid, "create")
-                    fd = os.open(bp, flags | os.O_CREAT | os.O_NOFOLLOW,
-                                 mode & 0o7777)
-                except OSError as e:
-                    raise pyfuse3.FUSEError(e.errno or errno.EIO)
-                st = os.fstat(fd)
-                ino = self._ino_for(sid, rel)
-                self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
                 with self._lock:
                     nfh = self._next_fh; self._next_fh += 1
-                    self._fd_table[nfh] = fd
-                    self._fh_sid[nfh] = sid
+                self._wbuf[nfh] = wb
+                self._wbuf_key[(sid, rel)] = nfh
+                ino = self._ino_for(sid, rel)
+                self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
+                st = self._buffer_stat(sid, rel)
+                if st is None:                    # rare: create() over an existing file
+                    _l, _a, st = self._resolve_st(sid, rel)
                 return (pyfuse3.FileInfo(fh=nfh, direct_io=False, keep_cache=False),
                         self._entry(ino, st))
             return self._mutate(parent_inode, name, ctx, "create", host_op, upper_op)
@@ -4172,22 +4198,47 @@ def _build_overlay_ops():
             using `inode` (the caller's FUSE inode) so the kernel cache is correct."""
             idx = self._index(sid)
             wid = idx.writer_for(ctx.pid)
-            # Buffered file: apply size/mode/mtime directly to the buffer, no disk op.
+            # Open write handle: apply size/mode/mtime to its live backing, no disk
+            # copy-up. A size or mode change is a real modification, so it materializes
+            # a still-lazy handle first (truncate advances mtime; chmod preserves it).
             fh = self._wbuf_key.get((sid, rel))
             if fh is not None:
                 wb = self._wbuf.get(fh)
                 if wb is not None:
+                    real_change = (fields.update_size or fields.update_mode
+                                   or fields.update_mtime or fields.update_atime)
+                    if real_change and not wb.get("materialized"):
+                        self._materialize_backing(wb, idx)
+                    if not wb.get("materialized"):
+                        # uid/gid-only (squashed no-op) on a still-lazy handle:
+                        # report the source attrs and capture nothing.
+                        layer, _ap, st = self._resolve_st(sid, rel)
+                        if layer in ("absent", "whiteout"):
+                            raise pyfuse3.FUSEError(errno.ENOENT)
+                        return self._entry(inode, st)
                     if fields.update_size:
                         new_sz = attr.st_size
-                        cur = wb["data"]
-                        if new_sz < len(cur):
-                            del cur[new_sz:]
-                        elif new_sz > len(cur):
-                            cur.extend(bytes(new_sz - len(cur)))
+                        sfd = wb.get("spilled_fd", -1)
+                        if sfd >= 0:
+                            try: os.ftruncate(sfd, new_sz)
+                            except OSError as e:
+                                raise pyfuse3.FUSEError(e.errno or errno.EIO)
+                        else:
+                            cur = wb["data"]
+                            if new_sz < len(cur):
+                                del cur[new_sz:]
+                            elif new_sz > len(cur):
+                                cur.extend(bytes(new_sz - len(cur)))
                         wb["dirty"] = True
+                        if not fields.update_mtime:
+                            wb["mtime_ns"] = time.time_ns()   # truncate bumps mtime
                     if fields.update_mode:
                         wb["mode"] = (wb["mode"] & ~0o7777) | stat_mod.S_IMODE(attr.st_mode)
                         wb["dirty"] = True
+                        sfd = wb.get("spilled_fd", -1)
+                        if sfd >= 0:
+                            try: os.fchmod(sfd, stat_mod.S_IMODE(wb["mode"]))
+                            except OSError: pass
                     if fields.update_mtime:
                         wb["mtime_ns"] = attr.st_mtime_ns
                     bst = self._buffer_stat(sid, rel)
@@ -4683,27 +4734,14 @@ def _build_overlay_ops():
             Spilled buffers (spilled_fd >= 0) are already on disk; skip them."""
             for fh, wb in list(self._wbuf.items()):
                 try:
+                    if not wb.get("materialized"):
+                        continue   # lazy handle: never mutated, nothing captured
                     if wb.get("orphan"):
                         continue   # unlinked while open: must not re-create its row
                     if wb.get("spilled_fd", -1) >= 0:
                         continue   # already on disk in the pool blob; not at risk
-                    if not wb.get("dirty", False):
-                        if not force:
-                            continue   # unchanged since last snapshot; skip
-                        # Exit (force) pass over a CLEAN buffer: a revertable one — a
-                        # non-modifying open of an existing lower file — is a phantom
-                        # change, so drop its row instead of freezing it (mirrors
-                        # release()). A clean NEW file is a real empty creation and is
-                        # persisted below. Never clobber a concurrently-built blob.
-                        if wb.get("revert_if_clean"):
-                            _sid, _rel = wb["sid"], wb["rel"]
-                            _idx = self._index(_sid)
-                            _rid = _idx.row_id(_rel)
-                            _bp = (blob_path(_idx.box_id, _rid)
-                                   if _rid is not None else None)
-                            if not (_bp and _bp.exists()):
-                                _idx.del_entry(_rel)
-                                continue
+                    if not force and not wb.get("dirty", False):
+                        continue   # unchanged since last snapshot; skip
                     sid, rel = wb["sid"], wb["rel"]
                     idx = self._index(sid)
                     # Delete any stale pool blob so _resolve_st won't serve old bytes.
@@ -9337,9 +9375,7 @@ def _make_ui_app():
             # pop-then-(maybe)-reinsert moves the touched key to the END of the dict,
             # so iteration order tracks recency for the live tail preview.
             m.pop(rel, None)
-            if op=="reverted":
-                pass   # row removed from the overlay: drop it from the change map
-            elif op=="deleted":
+            if op=="deleted":
                 host=Path("/")/rel
                 # A create-then-delete of a host-absent path leaves no change.
                 if host.exists() or host.is_symlink():
