@@ -456,6 +456,36 @@ def test_hardlink_as_copy():
         # link-as-copy: the two names are independent (overlay can't true-hardlink).
         r = fx.sh("printf 'changed\\n' > f; cat g")
         check(r.stdout == "orig\n", "dest is independent of a later source rewrite")
+        # A real hardlink shares the source inode's mtime; link-as-copy must too, or
+        # a tree cloned with `cp -al` lands every file at copy-time and autotools
+        # (which compares only mtimes) spuriously re-runs autoconf.
+        r = fx.sh("printf 'h' > h && touch -d @1000000000 h && ln h h2 && "
+                  "[ \"$(stat -c %Y h)\" = \"$(stat -c %Y h2)\" ] && echo SAME || echo DIFF")
+        check(r.stdout.strip() == "SAME", "link-as-copy preserves the source mtime")
+    finally:
+        fx.stop()
+
+
+def test_cpal_clone_preserves_mtime_ordering():
+    """Workload-level guard for the autotools-in-a-box break: a source tree cloned
+    with `cp -al` (the cheap per-arch clone) must keep its RELATIVE mtime ordering,
+    so a generated file that ships newer than its source stays newer. A real
+    hardlink gets this for free (shared inode); the overlay's link-as-copy only does
+    if it preserves source mtimes. This is the cross-file, emergent property that the
+    per-op pjdfstest/fsx batteries structurally cannot see — autotools breaks on
+    exactly this."""
+    fx = MountFixture()
+    try:
+        fx.start()
+        # 'configure' (generated) ships NEWER than 'configure.ac' (source).
+        r = fx.sh(
+            "mkdir src && echo src > src/configure.ac && echo gen > src/configure && "
+            "touch -d @1700000000 src/configure.ac && "
+            "touch -d @1700000009 src/configure && "
+            "cp -al src dst && "
+            "([ dst/configure -nt dst/configure.ac ] && echo OK || echo BROKEN)")
+        check(r.stdout.strip() == "OK",
+              "cp -al clone keeps configure newer than configure.ac (no autoconf rerun)")
     finally:
         fx.stop()
 
@@ -1013,6 +1043,7 @@ if __name__ == "__main__":
               test_lazy_file_materialization, test_hardlink_as_copy,
               test_rename_dir_replace_no_ghost,
               test_passthrough_kicks_up_to_parent,
+              test_cpal_clone_preserves_mtime_ordering,
               test_wbuf_small_new_file, test_wbuf_otrunc_rewrite,
               test_wbuf_stat_coherence, test_wbuf_existing_file_preserve,
               test_wbuf_spill, test_wbuf_create_buffers,

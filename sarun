@@ -4714,6 +4714,19 @@ def _build_overlay_ops():
                         finally: os.close(dst)
                     finally:
                         os.close(src)
+                    # A hardlink shares the source inode's timestamps; link-as-copy
+                    # must too. A resident file serves its mtime from the blob's lstat,
+                    # so stamp the blob with the source mtime/atime — otherwise a tree
+                    # cloned with `cp -al` lands every file at copy-time, and autotools
+                    # (which compares only mtimes) sees `configure` no longer newest and
+                    # spuriously re-runs autoconf. The symlink branch above already
+                    # preserves mtime via the row; this is the regular-file counterpart.
+                    mt = getattr(st, "st_mtime_ns", 0)
+                    at = getattr(st, "st_atime_ns", mt)
+                    try:
+                        os.utime(dst_bp, ns=(at, mt), follow_symlinks=False)
+                    except OSError:
+                        pass
             except OSError as e:
                 raise pyfuse3.FUSEError(e.errno or errno.EIO)
             self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
