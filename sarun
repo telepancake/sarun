@@ -1909,8 +1909,10 @@ class Index:
     operations on it that the FUSE layer needs — there is no separate index.db.
 
     On every mutating FUSE op the entry row is upserted into the `sqlar` table
-    right then (data = NULL for files: the bytes are in the overlay upper and the
-    NULL blob is filled in during consolidate()). The hot read paths
+    right then — per file, as it happens, with no separate finished form to build
+    later. A regular file's bytes go to its pool blob (row resident, data = NULL) or,
+    for a small file, are deflated inline into the row at release; either way the row
+    is a complete rest form the moment the file is closed. The hot read paths
     (lookup/getattr/readdir) touch ONLY the RAM mirror; the db is written on
     mutation and read for provenance / process detail. Opened
     check_same_thread=False — the serve loop owns all mutations (under
@@ -4903,18 +4905,26 @@ def consolidate(shm_dir, session_id: str, index: "Index | None" = None,
             try:
                 bst = os.stat(bp)
                 mtime_ns = bst.st_mtime_ns
-                content = bp.read_bytes()
+                size = bst.st_size                            # authoritative — never read the bytes for sizing
             except OSError:
                 continue
-            if len(content) >= POOL_RESIDENT_MIN:
+            if size >= POOL_RESIDENT_MIN:
+                # Large file: stays a PERMANENT pool blob — it is ALREADY at rest. Only
+                # the row's metadata needs settling, so read nothing (st_size suffices);
+                # reading multi-MB blobs here only to measure + discard them was the bulk
+                # O(total-bytes) pass that froze the UI.
                 sq.execute("UPDATE sqlar SET mode=?, mtime=?, sz=?, data=NULL WHERE name=?",
-                           (int(mode), int(mtime_ns), len(content), rel))
+                           (int(mode), int(mtime_ns), size, rel))
                 if sq.execute("SELECT changes()").fetchone()[0] == 0:
                     # Orphaned overlay with no live-index row: create a resident row.
                     sq.execute("INSERT INTO sqlar(name,mode,mtime,sz,data) VALUES(?,?,?,?,NULL)",
-                               (rel, int(mode), int(mtime_ns), len(content)))
+                               (rel, int(mode), int(mtime_ns), size))
                 # blob NOT evicted: it IS the rest form.
             else:
+                # Small file: fold the bytes inline and evict the pool blob (read only here,
+                # where the bytes are actually needed for the inline blob).
+                try: content = bp.read_bytes()
+                except OSError: continue
                 _set_blob(rel, content, mode, mtime_ns)
                 blob_paths_to_evict.append(bp)
             p = _prov(rel)
@@ -5686,14 +5696,15 @@ class ChangeReview:
 
     # ─── source-agnostic change interface ──────────────────────────────────
     def session_changes(self, sid) -> list:
-        """All changes for a session. Everything comes from the one sqlar (when
-        consolidated) plus the live overlay upper (while running) — there is no
-        separate patch source. SYNCHRONOUS consolidation; the interactive UI must NOT
-        call this for a finished box on the loop (it would block) — it triggers the
-        off-loop worker and reads only once the box is consolidated. While a box is
-        mid-consolidation its (partial) state is off-limits: refuse the read."""
+        """All changes for a session, read straight from the box's own store. In the
+        per-file model there is no separate "finished form" to build first: every entry
+        is written into the box's single sqlar as it happens (file rows resident with
+        bytes in the pool, dirs/symlinks/whiteouts carried in the row), so a stopped box
+        is ALREADY at rest. Reads therefore go directly to the rows — NO consolidate pass
+        on the loop. (The one-time fold of an overlay still happens at box exit and in the
+        startup orphan sweep; consolidate is recovery/placement, not a read gate.) While a
+        box is mid-fold (`_consolidating`) its partial state is off-limits: refuse."""
         if sid in self._consolidating: return []
-        self._ensure_consolidated(sid)
         return self._entries(sid)
 
     def _live(self, sid) -> bool:
@@ -6000,9 +6011,17 @@ class ChangeReview:
         """Run the file rules over a stopped box's whole change set, the way box DELETE
         wants it: an 'apply'-matched path is promoted (parent overlay / host); every
         other path (a 'discard' rule, 'passthrough', or no rule at all) is discarded —
-        which copies it down into immediate children that lack it. Afterwards the box
-        holds no file changes, so it is safe to dissolve. No-op for a box with no
-        changes."""
+        which copies it down into immediate children that lack it. No-op for a box with
+        no changes.
+
+        Reads the change set straight from the box's store — NO consolidate pass (a
+        stopped box is already at rest; see session_changes). The per-row discard is the
+        only step that touches the box's storage one entry at a time, and its ONLY
+        externally-visible effect is the copy-down into immediate children; with no child
+        to inherit, it is skipped here and dissolve()'s _free_storage drops the whole
+        archive (sqlar + pool) in bulk — avoiding a commit + emptiness re-check per row
+        over a large box. After this returns, the box holds at most the (now harmless)
+        discard rows, which dissolve frees immediately."""
         changes = [e["path"] for e in self.session_changes(sid)]
         if not changes:
             return dict(applied=[], discarded=[], errors=[])
@@ -6012,8 +6031,14 @@ class ChangeReview:
             (apply_paths if frules.decide(rel) == "apply" else discard_paths).append(rel)
         a = self.apply(sid, apply_paths, reap=False) if apply_paths \
             else dict(applied=[], errors=[])
-        d = self.discard(sid, discard_paths, reap=False) if discard_paths \
-            else dict(discarded=[], errors=[])
+        # Per-row discard exists only to copy paths DOWN into immediate children. With no
+        # children, dropping each row (a commit + an emptiness re-check apiece) is pure
+        # churn — _free_storage in dissolve() removes the whole archive right after. So
+        # only pay the per-row cost when a child actually needs the copy-down.
+        if discard_paths and self._immediate_children(sid):
+            d = self.discard(sid, discard_paths, reap=False)
+        else:
+            d = dict(discarded=discard_paths, errors=[])
         return dict(applied=a.get("applied", []), discarded=d.get("discarded", []),
                     errors=a.get("errors", []) + d.get("errors", []))
 
