@@ -16,6 +16,10 @@ slopbox — run an untrusted process in an unprivileged bwrap slopbox.
     slopbox                 start the UI (network approval + change review)
     slopbox CMD [ARGS...]   run CMD slopboxed
 
+Navigating the source: major section headers match `^#  [A-Z]` — list them
+with `grep -n "^#  [A-Z]" sarun`. A line-numbered table of contents (kept in
+sync with those headers) sits just below the imports.
+
 Network model: the slopbox has NO real network — only loopback. A tiny
 forwarder inside the slopbox listens on 127.0.0.1:8080 (the proxy the program
 is told to use) and hands each accepted connection's FD out to the UI over a
@@ -1524,7 +1528,6 @@ def _drop_sqlar_row_and_blob(path, box_id, rel) -> None:
 # process-table id (process_id) of the in-box process that opened the connection.
 
 _FLOW_BODY_CAP = 1 << 20    # store at most 1 MiB of each body (but record true size)
-_PROC_RETIRE_S = 4.0        # live proc pane: keep a dead tgid (highlighted) this long
 _ACTIVE_CAP    = 4096       # active set hard cap (bounds RAM when the pane is unwatched)
 _DNS_CACHE_CAP = 4096       # bounded LRU cap for NetworkPolicy._dns_cache
 
@@ -1942,7 +1945,6 @@ class Index:
         # persisted — the persistent `process` table keeps the full history). Reads
         # come from the UI thread; the dict is GIL-atomic like the other RAM mirrors.
         self._active: dict = {}           # tgid -> last-seen monotonic
-        self._dead_since: dict = {}       # tgid -> first monotonic kill(0) saw it dead
         self._tracing = False             # -t: record the process table
         # The box's hierarchy ROOTS: the tgids of every `slopbox -- cmd` launch (one
         # per run; a re-run adds another). Newly-inserted process rows bubble up their
@@ -2040,7 +2042,7 @@ class Index:
     def _touch_active(self, tgid: int) -> None:
         """Re-stamp a tgid in the active set (last-seen monotonic) and keep the set
         bounded: when it crosses the cap, drop the oldest-seen dead entries so RAM
-        stays bounded even if the proc pane is never opened to drive retirement.
+        stays bounded even if the proc pane is never opened to drive pruning.
         Serve/relay-thread write; GIL-atomic dict ops (Index threading contract)."""
         now = time.monotonic()
         self._active[tgid] = now
@@ -2050,7 +2052,7 @@ class Index:
                     overflow + 16, self._active.items(), key=lambda kv: kv[1]):
                 if len(self._active) <= _ACTIVE_CAP: break
                 if t == tgid or _pid_alive(t): continue
-                self._active.pop(t, None); self._dead_since.pop(t, None)
+                self._active.pop(t, None)
 
     def writer_for(self, pid: int) -> int:
         """Resolve the FUSE ctx.pid (a TID) to its tgid and return that tgid's
@@ -2171,28 +2173,18 @@ class Index:
         return set(self._roots)
 
     def live_processes(self) -> list:
-        """htop-style live view of the box's ACTIVE SET: the recently-seen tgids only,
+        """htop-style live view of the box's ACTIVE SET: the RUNNING tgids only,
         decorated from the in-memory caches (NO full-table scan, cost O(active set)).
-        Returns [(id, tgid, ppid, exe, argv-list, alive, dead)] where `alive` is a
-        kill(0) liveness probe over just the active set and `dead` flags a row that
-        kill(0) reports gone but is still inside its retirement grace window. A tgid
-        first seen dead is stamped and kept (highlighted) for _PROC_RETIRE_S, then
-        pruned from the active set — the persistent `process` table is untouched.
+        Returns [(id, tgid, ppid, exe, argv-list)] — the same shape the finished-box
+        `processes()` history yields — for every tgid a kill(0) probe still reports
+        alive. A tgid that has exited is dropped from the active set on sight (no
+        recently-finished grace window); the persistent `process` table is untouched.
         UI-thread read of the GIL-atomic active-set/cache dicts (Index contract)."""
-        now = time.monotonic()
         out = []
         for tgid in list(self._active):
-            alive = _pid_alive(tgid)
-            if alive:
-                self._dead_since.pop(tgid, None)
-            else:
-                first = self._dead_since.get(tgid)
-                if first is None:
-                    self._dead_since[tgid] = first = now
-                if now - first >= _PROC_RETIRE_S:    # retire: drop from the live pane
-                    self._active.pop(tgid, None)
-                    self._dead_since.pop(tgid, None)
-                    continue
+            if not _pid_alive(tgid):
+                self._active.pop(tgid, None)     # exited: drop from the live pane at once
+                continue
             pid_row = self._proc_cache.get(tgid)
             prov = self._prov_by_proc.get(pid_row) if pid_row is not None else None
             if prov is not None:
@@ -2200,7 +2192,7 @@ class Index:
             else:
                 ppid, exe, argv = 0, "", []
             out.append((pid_row if pid_row is not None else tgid, tgid, ppid,
-                        exe or "", list(argv), alive, not alive))
+                        exe or "", list(argv)))
         out.sort(key=lambda r: r[1])
         return out
 
@@ -9459,9 +9451,9 @@ def _make_ui_app():
             self.sup.review.invalidate_struct(sid)
 
         def _drain_overlay_events(self):
-            # Live proc retirement runs on THIS reliable 0.3s cadence (not the 3s
+            # Live proc pruning runs on THIS reliable 0.3s cadence (not the 3s
             # _tick, which can be starved): re-poll the active set every tick the
-            # proc pane is open so dead rows retire within _PROC_RETIRE_S even when
+            # proc pane is open so exited processes drop off promptly even when
             # no overlay events are arriving. _load_procs is a cheap O(active set)
             # kill(0) probe and diffs the table in place (no blink, cursor kept).
             if self.view=="procs" and self._sel_sid:
@@ -10455,8 +10447,9 @@ def _make_ui_app():
         # ── processes pane (the selected box's process table) ────────────────
         def _load_procs(self, sid, force=False):
             # LIVE box: the Index's bounded active set (htop-style), O(active set), no
-            # full-table query — dead-but-not-yet-retired rows are highlighted. FINISHED
-            # box: the full immutable process history, tree-built once and cached.
+            # full-table query — only the still-running processes (exited ones drop off
+            # at once, no recently-finished grace). FINISHED box: the full immutable
+            # process history, tree-built once and cached.
             # Both render as a process TREE: build_proc_tree gives DFS-ordered rows,
             # depth-indented; connector-only ancestors (added to connect the tree) are
             # dimmed and the cursor skips them. The live lookup resolves ancestors
@@ -10475,9 +10468,7 @@ def _make_ui_app():
             live=self.sup.processes_live(sid)
             if live is not None:
                 self._fin_procs.pop(sid, None)
-                key=live
-                procs=[(p, tg, pp, ex, av) for (p, tg, pp, ex, av, _al, _dd) in live]
-                dead={tg for (_p, tg, _pp, _ex, _av, _al, dd) in live if dd}
+                key=procs=live
                 tree=build_proc_tree(procs, root,
                                      lambda tg: self.sup.proc_info(sid, tg))
             else:
@@ -10485,7 +10476,7 @@ def _make_ui_app():
                     procs=self.sup.processes(sid)
                     self._fin_procs[sid]=(procs, build_proc_tree(procs, root, None))
                 procs,tree=self._fin_procs[sid]
-                key=procs; dead=set()
+                key=procs
             cur=getattr(self,"_pr_key",None)
             if not force and key==cur: return
             # Capture the cursored proc's tgid before the rebuild (real row key is
@@ -10518,10 +10509,6 @@ def _make_ui_app():
                     rk="c"+str(tgid)
                     tg=Text(str(tgid), style="dim"); pp=Text(str(ppid), style="dim")
                     nm.stylize("dim"); ar.stylize("dim")
-                elif tgid in dead:                # htop-style: process exited, flashing out
-                    rk=str(pid)
-                    tg=Text(str(tgid), style="red"); pp=Text(str(ppid), style="red")
-                    nm.stylize("red"); ar.stylize("red")
                 else:
                     rk=str(pid); tg=str(tgid); pp=str(ppid)
                 present[tgid]=rk; new_pp[tgid]=ppid
