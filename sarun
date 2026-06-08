@@ -1151,6 +1151,15 @@ def _sqlar_open(path) -> "sqlite3.Connection":
     try: os.chmod(str(path), 0o600)
     except OSError: pass
     conn.execute("PRAGMA busy_timeout=3000")
+    # Max-throughput / minimal-durability posture: the per-box .sqlar is an
+    # ephemeral overlay index (consolidated on exit), so we trade durability for
+    # speed. WAL keeps the long-lived Index handle and these short-lived helper
+    # connections able to read/write the same file concurrently; synchronous=OFF
+    # means commits NEVER fsync — not even at WAL checkpoint. Atomic-commit still
+    # survives a process crash (kill); only a power loss / OS crash can lose
+    # recent commits or corrupt the file — an accepted risk for this state.
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=OFF")
     # Gate the one-time DDL + migrations behind user_version so repeated opens
     # (the common case) skip straight to returning the connection.
     ver = conn.execute("PRAGMA user_version").fetchone()[0]
@@ -1791,7 +1800,11 @@ class Index:
         _sqlar_open(self.db_path).close()
         self._db = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self._db.execute("PRAGMA journal_mode=WAL")
-        self._db.execute("PRAGMA synchronous=NORMAL")
+        # synchronous=OFF: commits never fsync (not even at checkpoint) — max
+        # throughput on the per-op write-through path. Atomic-commit survives a
+        # process crash; only power loss / OS crash risks recent commits. The
+        # per-box index is ephemeral (consolidated on exit), so this is fine.
+        self._db.execute("PRAGMA synchronous=OFF")
         self._proc_cache: dict = {}       # (tgid) -> process.id (this process only)
         self._prov_cache: dict = {}       # host pid -> provenance dict (hot-path cache)
         self._prov_by_proc: dict = {}     # process.id -> provenance dict
