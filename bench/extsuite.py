@@ -1,11 +1,18 @@
 """Shared plumbing for the external filesystem test batteries (pjdfstest, fsx).
 
 These suites need a REAL kernel FUSE mount (they run external binaries that do
-real syscalls), so unlike the in-process overlay tests they require fusermount3 +
-/dev/fuse and skip cleanly when those (or the build toolchain / network) are
-missing. The suites are fetched + built into a cache on first use, pinned to a
-fixed revision for determinism; set SARUN_TEST_CACHE to relocate it, or point
-PJDFSTEST_DIR / FSX_BIN at a prebuilt copy to skip the build.
+real syscalls). Like sarun itself — which declares its Python deps in a uv header
+and installs them on run — the batteries PROVISION what they need and run, rather
+than silently skipping: the suite source is fetched + built on demand (pinned to a
+fixed revision; set SARUN_TEST_CACHE to relocate the cache, or PJDFSTEST_DIR /
+FSX_BIN to point at a prebuilt copy), and the system tools they depend on
+(fusermount3, prove, cc/make/git/autoconf) are apt-installed when missing
+(`ensure_tools` / `require_*`, best-effort, needs root + apt).
+
+A skip is therefore the EXCEPTION, reserved for what genuinely cannot be
+provisioned: no root/apt to install with, or no /dev/fuse device (a kernel/
+container capability, not a package). Those skips name the precise reason so a
+"skipped" result is never mistaken for "verified".
 """
 import os
 import shutil
@@ -47,8 +54,70 @@ def have(*tools):
     return all(shutil.which(t) for t in tools)
 
 
-def fuse_available():
-    return os.path.exists("/dev/fuse") and bool(shutil.which("fusermount3"))
+# System tool -> the Debian package that provides it. Used to auto-provision the
+# batteries' system prerequisites the way uv provisions sarun's Python deps.
+_PKG_FOR = {
+    "fusermount3": "fuse3",
+    "bwrap":       "bubblewrap",
+    "prove":       "perl",
+    "cc":          "build-essential",
+    "gcc":         "build-essential",
+    "make":        "build-essential",
+    "git":         "git",
+    "autoreconf":  "autoconf automake",
+    "automake":    "automake",
+    "curl":        "curl",
+    "pkg-config":  "pkg-config",
+}
+_apt_updated = False
+
+
+def _can_apt():
+    return os.geteuid() == 0 and shutil.which("apt-get") is not None
+
+
+def _apt_install(pkgs):
+    global _apt_updated
+    if not _can_apt():
+        return False
+    env = dict(os.environ, DEBIAN_FRONTEND="noninteractive")
+    if not _apt_updated:
+        subprocess.run(["apt-get", "update"], env=env,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        _apt_updated = True
+    print(f"  provisioning (apt-get install): {' '.join(pkgs)}")
+    r = subprocess.run(["apt-get", "install", "-y", "--no-install-recommends", *pkgs],
+                       env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return r.returncode == 0
+
+
+def ensure_tools(*tools):
+    """Ensure each tool is on PATH, apt-installing its package if missing
+    (best-effort). Returns the list still missing afterward (empty = all present)."""
+    missing = [t for t in tools if not shutil.which(t)]
+    if missing:
+        pkgs = sorted({p for t in missing for p in _PKG_FOR.get(t, "").split()})
+        if pkgs:
+            _apt_install(pkgs)
+        missing = [t for t in tools if not shutil.which(t)]
+    return missing
+
+
+def require_tools(*tools):
+    """Provision the tools or skip() with a precise, honest reason."""
+    missing = ensure_tools(*tools)
+    if missing:
+        why = "apt+root unavailable to install them" if not _can_apt() else "install failed"
+        skip(f"missing {', '.join(missing)} ({why})")
+
+
+def require_fuse():
+    """A real FUSE mount needs fusermount3 (installable) and /dev/fuse (not — it's a
+    kernel/container capability). Install the former; skip with a clear reason if the
+    device is absent."""
+    require_tools("fusermount3")
+    if not os.path.exists("/dev/fuse"):
+        skip("/dev/fuse missing — container has no FUSE device (cannot be apt-installed)")
 
 
 def load_sarun():
@@ -99,8 +168,7 @@ def ensure_pjdfstest():
     if pre:
         root = Path(pre)
     else:
-        if not have("git", "autoreconf", "make", "cc"):
-            skip("pjdfstest build needs git/autoreconf/make/cc")
+        require_tools("git", "autoreconf", "make", "cc")
         root = CACHE / "pjdfstest"
         try:
             _git_checkout(PJDFSTEST_URL, PJDFSTEST_COMMIT, root)
@@ -127,8 +195,7 @@ def ensure_fsx():
     pre = os.environ.get("FSX_BIN")
     if pre and os.access(pre, os.X_OK):
         return Path(pre)
-    if not have("cc", "curl"):
-        skip("fsx build needs cc + curl")
+    require_tools("cc", "curl")
     CACHE.mkdir(parents=True, exist_ok=True)
     src = CACHE / "fsx-linux.c"
     binary = CACHE / "fsx"

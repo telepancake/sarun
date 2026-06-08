@@ -45,8 +45,7 @@ def _run_fsx(box_root, fsx, numops, extra):
 
 
 def test_fsx_integrity():
-    if not extsuite.fuse_available():
-        return extsuite.skip("no /dev/fuse or fusermount3")
+    extsuite.require_fuse()           # installs fusermount3; skips only if /dev/fuse absent
     fsx = extsuite.ensure_fsx()
     with extsuite.overlay_session() as box_root:
         # Default mix (incl. mmap), then a no-mmap pass to stress the plain

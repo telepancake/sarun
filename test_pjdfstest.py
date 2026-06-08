@@ -85,10 +85,8 @@ def parse_failures(output):
 
 
 def test_pjdfstest_no_regressions():
-    if not extsuite.fuse_available():
-        return extsuite.skip("no /dev/fuse or fusermount3")
-    if not extsuite.have("prove"):
-        return extsuite.skip("prove (perl Test::Harness) not installed")
+    extsuite.require_fuse()           # installs fusermount3; skips only if /dev/fuse absent
+    extsuite.require_tools("prove")   # installs perl (Test::Harness) if missing
     tests_dir, _binary = extsuite.ensure_pjdfstest()
     group_paths = [str(tests_dir / g) for g in GROUPS]
 
