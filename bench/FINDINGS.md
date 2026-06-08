@@ -127,36 +127,41 @@ Every case must read back the new bytes on the next open. With the fix in place
 all reads are fresh; class (B) is the one that exercises `_autocache` specifically
 (on a kernel without `FUSE_AUTO_INVAL_DATA` it would go stale without it).
 
-## Regression gate with pjdfstest (a real FUSE suite)
+## External test batteries (wired into the suite)
 
-The bespoke `coherence` mode targets the one property this change is *about*
-(read-only cross-open page-cache coherence — which no standard suite exercises,
-since fsx opens `O_RDWR` and never hits the `keep_cache=True` path, and pjdfstest
-is metadata-only). For broad POSIX coverage of the overlay surface the `open` /
-`read` paths sit on, [pjdfstest](https://github.com/pjd/pjdfstest) is the standard
-suite and is importable — but the overlay's *intentional* divergences (uid/gid
-squashing, `setxattr→ENOSYS`, virtual CA files, and an atime-fidelity gap on
-synthetic dir/symlink inodes) mean it can't pass clean. Use it as a **before/after
-regression gate**, not a pass/fail oracle:
+Two standard FUSE batteries now run alongside the repo's `test_*.py` (they mount
+the real overlay, so they skip cleanly when `/dev/fuse`/`fusermount3`/the build
+toolchain aren't present). Shared plumbing — mount, fetch+build, version pinning —
+lives in `bench/extsuite.py`.
 
-```sh
-git clone --depth 1 https://github.com/pjd/pjdfstest /tmp/pjdfstest
-( cd /tmp/pjdfstest && autoreconf -ifs && ./configure && make pjdfstest )
-T=/tmp/pjdfstest/tests
-PJD="$T/open $T/truncate $T/ftruncate $T/unlink $T/mkdir $T/rmdir \
-     $T/utimensat $T/rename $T/symlink $T/link"
-# baseline revision -> temp file, then diff failure sets across the change:
-git show <base>:sarun > /tmp/sarun.base
-SARUN_PATH=/tmp/sarun.base uv run bench/overlay_bench.py exec --rel root/wd -- prove -r $PJD
-                         uv run bench/overlay_bench.py exec --rel root/wd -- prove -r $PJD
-```
+- **`test_fsx.py`** — fsx, the data-integrity fuzzer. A long randomized stream of
+  read / write / mmap / truncate ops on one file, checked against an in-memory
+  model; aborts on the first wrong byte. A true pass/fail gate for the
+  capture-write path (lazy handle → RAM buffer → pool-blob spill → copy-up →
+  truncate). It opens `O_RDWR`, so it does *not* touch the read-only `keep_cache`
+  path — that's the bespoke `coherence` check's job; fsx is the write-side net.
 
-`exec` mode mounts the overlay and runs an arbitrary command with its cwd inside
-the merged view (no bwrap), so `prove` drives the FUSE ops directly. `SARUN_PATH`
-points the harness at a specific revision of the script. Across this change the
-result was **6646 tests, an identical failure set on both revisions** — i.e. no
-POSIX regression. (Heads-up for re-runs: don't name the shell var `GROUPS` — it's
-a bash special variable and your assignment gets silently clobbered.)
+- **`test_pjdfstest.py`** — [pjdfstest](https://github.com/pjd/pjdfstest), the
+  POSIX-semantics suite, used as a **regression gate, not a pass/fail oracle**. The
+  overlay diverges on purpose (uid/gid squashing, `setxattr→ENOSYS`, synthetic
+  dir/symlink inodes with no atime, virtual CA files), so it can't pass clean:
+  ~3958 of 7093 assertions fail at steady state, almost all uid-squash permission
+  subtests. The pinned suite's per-assertion failure set is checked in as
+  `bench/pjdfstest_baseline.txt`; the test FAILS only on a failure *not* in the
+  baseline (a real regression), reports newly-passing assertions as "fixed", and
+  re-baselines under `SARUN_PJDFSTEST_UPDATE=1`. The baseline is anchored to this
+  environment's kernel + the pinned revision.
+
+This is the right shape for an intentionally-nonstandard fs: **diff the failure
+set across a change, don't chase a green run.** Across the `keep_cache` change the
+pjdfstest failure set was byte-identical before and after — no POSIX regression —
+and fsx stayed corruption-free.
+
+I did **not** wire up xfstests: it's kernel/fs-generic, assumes a block device or
+a `_scratch_mount` it controls, and most of its coverage is fs-feature-specific
+(reflink, quota, dax, log replay) — a poor fit for a multiplexed FUSE subfolder,
+and far more maintenance than signal. fsx (which xfstests itself vendors) gives
+the data-integrity coverage that matters here without the rig.
 
 ## What's left (out of scope here)
 
