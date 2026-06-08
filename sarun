@@ -2543,6 +2543,9 @@ def _build_overlay_ops():
             self._vfh: dict = {}          # fh -> (sid, rel, bytes) for virtual reads
             self._dir_snaps: dict = {}    # fh -> DirHandle(inode, snapshot)
             self._next_fh = 1
+            # auto_cache bookkeeping: inode -> (size, mtime_ns) last handed to the
+            # kernel page cache on a read-only open. Drives _autocache's invalidation.
+            self._cache_sig: dict = {}
             # ── Tier-0 write buffer: hold small file bytes in RAM instead of
             #    materializing a pool blob.  Spills to a pool blob (Tier 1) at
             #    WBUF_SPILL; deflates into the sqlar row on release (Tier 2).
@@ -3204,6 +3207,23 @@ def _build_overlay_ops():
             if not s: return False
             return rel in s["virtual"] and self._index(sid).kind_of(rel) is None
 
+        # ── auto_cache: page-cache coherence under keep_cache ────────────────
+        def _autocache(self, inode: int, st) -> None:
+            """Mirror libfuse's `auto_cache`: a read-only open keeps the kernel page
+            cache (keep_cache=True), but the moment a file's (size, mtime) differs from
+            what was cached we drop the stale data so a copy-up / overwrite / host-side
+            change is never served from a stale cache. Safe to call inline: per the
+            pyfuse3 docs invalidate_inode only blocks under writeback caching, which is
+            off here (enable_writeback_cache = False)."""
+            sig = (st.st_size, getattr(st, "st_mtime_ns", 0))
+            prev = self._cache_sig.get(inode)
+            if prev is not None and prev != sig:
+                try:
+                    pyfuse3.invalidate_inode(inode, attr_only=False)
+                except OSError:
+                    pass
+            self._cache_sig[inode] = sig
+
         # ── attr construction ────────────────────────────────────────────────
         def _entry(self, ino: int, st) -> "pyfuse3.EntryAttributes":
             a = pyfuse3.EntryAttributes()
@@ -3371,6 +3391,7 @@ def _build_overlay_ops():
                 c = self._lookup_count.get(inode, 0) - nlookup
                 if c <= 0:
                     self._lookup_count.pop(inode, None)
+                    self._cache_sig.pop(inode, None)
                 else:
                     self._lookup_count[inode] = c
 
@@ -3772,7 +3793,17 @@ def _build_overlay_ops():
                     fh = self._next_fh; self._next_fh += 1
                     self._fd_table[fh] = fd
                     self._fh_sid[fh] = sid
-                return pyfuse3.FileInfo(fh=fh, direct_io=False, keep_cache=False)
+                # Read-only opens of a real on-disk file (host lower, or a resident
+                # upper blob) keep the kernel page cache ACROSS re-opens — so a
+                # configure-style fork/exec storm stops re-reading sh/cc1/libc/headers
+                # through FUSE on every exec. _autocache drops that cache the instant
+                # the file's (size, mtime) changed since we last cached it, so a
+                # copy-up / overwrite / host-side change is never served stale. Writable
+                # opens, and the RAM/evicted/virtual paths above, never keep cache.
+                if not writable:
+                    self._autocache(inode, _st)
+                return pyfuse3.FileInfo(fh=fh, direct_io=False,
+                                        keep_cache=not writable)
             finally:
                 self._req_exit()
 
