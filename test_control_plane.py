@@ -116,8 +116,11 @@ def test_relay_fd_gated_by_socket_not_message():
             asyncio.set_event_loop(loop)
             nonlocal rs
             rs = m.RelayServer(eng, sid_a, path, loop)
-            rs.start()
-            ready.set()
+            # start() calls asyncio.create_task(), which needs a RUNNING loop — in
+            # production register() runs it on the live relay loop. Mirror that: boot it
+            # as the loop's first callback, then signal ready once the socket is bound.
+            def _boot(): rs.start(); ready.set()
+            loop.call_soon(_boot)
             loop.run_forever()
         t = threading.Thread(target=run_loop, daemon=True); t.start()
         ready.wait(5)
@@ -159,7 +162,9 @@ def test_relay_socket_does_not_dispatch_control():
             asyncio.set_event_loop(loop)
             nonlocal rs
             rs = m.RelayServer(eng, sid_a, path, loop)
-            rs.start(); ready.set(); loop.run_forever()
+            def _boot(): rs.start(); ready.set()
+            loop.call_soon(_boot)
+            loop.run_forever()
         t = threading.Thread(target=run_loop, daemon=True); t.start()
         ready.wait(5)
 
@@ -676,14 +681,26 @@ def test_apply_kick_up_live_parent():
         m.ensure_dirs()
         sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
 
-        # Register parent.
-        ack_p = sup.register(dict(session_id="PARENT", cmd=["parent"]))
+        # Register parent + child LIVE: supply a live pidfd so _box_running() is True
+        # and apply() takes the LiveUpper path (operates on the in-RAM Index). Without
+        # this the box looks finished, apply() uses the SqlarArchive path, and the
+        # change is dropped from the on-disk sqlar but NOT the RAM mirror this test
+        # inspects — which is the live, in-box scenario the test name promises.
+        p_pidfd = os.pidfd_open(os.getpid())
+        ack_p = sup.register(dict(session_id="PARENT", cmd=["parent"],
+                                  root_tgid=os.getpid(), _register_pidfd=p_pidfd))
+        try: os.close(p_pidfd)
+        except OSError: pass
         check(ack_p.get("ok") is True, "kick-up: parent registers ok")
         sid_p = ack_p["session_id"]
 
-        # Register child with _derived_parent_sid pointing at parent.
+        # Register child with _derived_parent_sid pointing at parent (also live).
+        c_pidfd = os.pidfd_open(os.getpid())
         ack_c = sup.register(dict(session_id="CHILD", cmd=["child"],
-                                  _derived_parent_sid=sid_p))
+                                  _derived_parent_sid=sid_p,
+                                  root_tgid=os.getpid(), _register_pidfd=c_pidfd))
+        try: os.close(c_pidfd)
+        except OSError: pass
         check(ack_c.get("ok") is True, "kick-up: child registers ok with parent")
         sid_c = ack_c["session_id"]
         check(str(sup.sessions[sid_c].parent_box_id) == sid_p,
