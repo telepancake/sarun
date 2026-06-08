@@ -2954,6 +2954,19 @@ def _build_overlay_ops():
                     mode = st.st_mode
                 else:
                     mode = stat_mod.S_IFREG | 0o644
+            # ── seed mtime from the CURRENT source, not wall-clock ──
+            # Merely opening a file for write must NOT bump its mtime. A real write
+            # (the write op) or O_TRUNC advances it to now; a clean open keeps the
+            # source time — matching POSIX and the disk copy-up path, so an autotools
+            # build's mtime-ordered dependency graph survives unchanged inside the box.
+            if flags & os.O_TRUNC:
+                mtime_ns = time.time_ns()            # truncate IS a modification
+            else:
+                _l, _a, src_st = self._resolve_st(sid, rel)
+                mtime_ns = (getattr(src_st, "st_mtime_ns", None)
+                            if src_st is not None else None)
+                if mtime_ns is None:
+                    mtime_ns = time.time_ns()        # brand-new file: now
             # ── mark visible in the index immediately ───────────────
             # Clears a whiteout if present so kind_of(rel)=="file" while buffered.
             if idx.kind_of(rel) == "whiteout":
@@ -2961,7 +2974,7 @@ def _build_overlay_ops():
             idx.set_entry(rel, "file", mode, wid,
                           "create" if idx.kind_of(rel) is None else "open_write")
             return dict(sid=sid, rel=rel, data=data, dirty=False,
-                        mode=mode, mtime_ns=time.time_ns(), wid=wid, spilled_fd=-1)
+                        mode=mode, mtime_ns=mtime_ns, wid=wid, spilled_fd=-1)
 
         def _spill_write_buffer(self, fh: int) -> None:
             """Materialize the write buffer's bytearray to a pool blob (Tier 1).
@@ -3593,6 +3606,12 @@ def _build_overlay_ops():
                         try: os.close(dst)
                         except OSError: pass
                         raise pyfuse3.FUSEError(e.errno or errno.EIO)
+                    # Copy-up is transparent: the materialized blob must carry the
+                    # SOURCE mtime, not its own creation time (resident-file getattr
+                    # and consolidation both read the blob's on-disk mtime). A later
+                    # real write re-bumps it; a metadata-only op (chmod) keeps it.
+                    _restore_host_mtime_ns(bp_str, getattr(st, "st_mtime_ns", None),
+                                           is_symlink=False)
                     return dst
                 src = os.open(ap, os.O_RDONLY | os.O_NOFOLLOW)
                 try:
@@ -3608,6 +3627,9 @@ def _build_overlay_ops():
                         raise pyfuse3.FUSEError(e.errno or errno.EIO)
                 finally:
                     os.close(src)
+                # Preserve the source mtime onto the new blob (see note above).
+                _restore_host_mtime_ns(bp_str, getattr(st, "st_mtime_ns", None),
+                                       is_symlink=False)
                 return dst
             else:
                 # absent (or whiteout cleared) -> brand new pool blob
@@ -4346,6 +4368,9 @@ def _build_overlay_ops():
                             finally: os.close(dst)
                         except OSError:
                             pass
+                        # Transparent copy-up keeps the source mtime (see _ensure_copyup).
+                        _restore_host_mtime_ns(bp_str, getattr(st, "st_mtime_ns", None),
+                                               is_symlink=False)
                         return
                     # ap is a real on-disk path (lower or resident upper): copy to blob.
                     src = os.open(ap, os.O_RDONLY | os.O_NOFOLLOW)
@@ -4357,6 +4382,9 @@ def _build_overlay_ops():
                         finally: os.close(dst)
                     finally:
                         os.close(src)
+                    # Transparent copy-up keeps the source mtime (see _ensure_copyup).
+                    _restore_host_mtime_ns(bp_str, getattr(st, "st_mtime_ns", None),
+                                           is_symlink=False)
                     # set_entry already done by _new_file_blob
 
         def _materialize_tree(self, sid: str, rel: str, wid) -> None:
