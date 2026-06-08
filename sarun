@@ -3003,6 +3003,91 @@ def _build_overlay_ops():
                 sz = len(wb["data"])
             return self._row_stat(wb["mode"], sz, wb["mtime_ns"])
 
+        def _buffer_bytes(self, sid: str, rel: str) -> "bytes | None":
+            """Live bytes of an open Tier-0 write buffer for (sid, rel), or None.
+            Coherence seam for *foreign* readers: a second (read-only) open of a file
+            still held open for write must see the bytes already in RAM — never the
+            stale/absent row or blob behind the buffer. Spilled buffers are read back
+            from their pool-blob fd. Orphaned buffers (unlinked) are invisible."""
+            fh = self._wbuf_key.get((sid, rel))
+            if fh is None:
+                return None
+            wb = self._wbuf.get(fh)
+            if wb is None or wb.get("orphan"):
+                return None
+            sfd = wb.get("spilled_fd", -1)
+            if sfd >= 0:
+                try:
+                    sz = os.fstat(sfd).st_size
+                except OSError:
+                    return None
+                out = bytearray()
+                while len(out) < sz:
+                    chunk = os.pread(sfd, sz - len(out), len(out))
+                    if not chunk:
+                        break
+                    out.extend(chunk)
+                return bytes(out)
+            return bytes(wb["data"])
+
+        def _wbuf_snapshot_one(self, sid: str, rel: str) -> None:
+            """Commit a live (non-spilled, non-orphan) RAM buffer for (sid, rel) into
+            its sqlar row so any path-addressed reader / copy-up / rename sees the
+            current bytes. Mirrors flush_wbuf()'s per-entry body. Leaves the buffer
+            open and authoritative (a later write re-dirties it; release re-commits)."""
+            fh = self._wbuf_key.get((sid, rel))
+            if fh is None:
+                return
+            wb = self._wbuf.get(fh)
+            if wb is None or wb.get("orphan") or wb.get("spilled_fd", -1) >= 0:
+                return
+            idx = self._index(sid)
+            rid = idx.row_id(rel)
+            if rid is not None:
+                bp = blob_path(idx.box_id, rid)
+                if bp.exists():
+                    try: os.unlink(str(bp))
+                    except OSError: pass
+            deflated, sz = _sqlar_deflate(bytes(wb["data"]))
+            idx.set_blob(rel, deflated, sz, wb["mode"], wb["mtime_ns"], wb["wid"])
+            wb["dirty"] = False
+
+        def _orphan_wbuf(self, sid: str, rel: str) -> None:
+            """Detach a live write buffer from its path on unlink. The path stops being
+            visible (the key is dropped, so _buffer_stat and the double-buffer guard no
+            longer see it) and release()/flush_wbuf() will NOT re-create its row — but
+            the owning fd keeps working until close (POSIX unlink-open semantics)."""
+            fh = self._wbuf_key.pop((sid, rel), None)
+            if fh is None:
+                return
+            wb = self._wbuf.get(fh)
+            if wb is not None:
+                wb["orphan"] = True
+
+        def _retarget_wbuf(self, sid: str, rel_o: str, rel_n: str) -> None:
+            """Carry a live write buffer from rel_o to rel_n on rename so continued
+            writes and the eventual release land at the new name. Any buffer shadowing
+            the destination is orphaned first (its name is being overwritten)."""
+            if rel_o == rel_n:
+                return
+            self._orphan_wbuf(sid, rel_n)
+            fh = self._wbuf_key.pop((sid, rel_o), None)
+            if fh is None:
+                return
+            wb = self._wbuf.get(fh)
+            if wb is None:
+                return
+            wb["rel"] = rel_n
+            self._wbuf_key[(sid, rel_n)] = fh
+
+        def _retarget_wbuf_subtree(self, sid: str, rel_o: str, rel_n: str) -> None:
+            """Rename-of-directory variant: move every buffer keyed under rel_o/ to the
+            matching rel_n/ path (rows are reparented in lockstep by reparent())."""
+            oldp = rel_o + "/"; newp = rel_n + "/"
+            for (ksid, krel) in [k for k in self._wbuf_key
+                                 if k[0] == sid and k[1].startswith(oldp)]:
+                self._retarget_wbuf(sid, krel, newp + krel[len(oldp):])
+
         # ── layer resolution ───────────────────────────────────────
         @staticmethod
         def _row_stat(mode: int, sz: int, mtime_ns: int):
@@ -3457,6 +3542,10 @@ def _build_overlay_ops():
             artifact). Fail-closed: any copy error propagates."""
             idx = self._index(sid)
             wid = idx.writer_for(ctx.pid)
+            # A concurrent Tier-0 buffer holds the live bytes in RAM; commit them to
+            # the row/blob first so this disk-path open sees current content, not an
+            # empty or stale backing.
+            self._wbuf_snapshot_one(sid, rel)
             # FIRST: if already a file in the index with a blob, just open it.
             if idx.kind_of(rel) == "file":
                 rid = idx.row_id(rel)
@@ -3569,6 +3658,16 @@ def _build_overlay_ops():
             self._req_enter(f"open {sid}/{rel}")
             try:
                 if not writable:
+                    # Coherence seam: a file still held open in a Tier-0 write buffer
+                    # is authoritative in RAM. A second (read-only) opener must see
+                    # those live bytes, not the stale/absent row or blob behind them.
+                    bbytes = self._buffer_bytes(sid, rel)
+                    if bbytes is not None:
+                        with self._lock:
+                            fh = self._next_fh; self._next_fh += 1
+                        self._vfh[fh] = (sid, rel, bbytes)
+                        return pyfuse3.FileInfo(fh=fh, direct_io=False,
+                                                keep_cache=False)
                     layer, ap, _st = self._resolve_st(sid, rel)
                     if layer in ("absent", "whiteout"):
                         raise pyfuse3.FUSEError(errno.ENOENT)
@@ -3724,6 +3823,14 @@ def _build_overlay_ops():
                 self._wbuf_key.pop((wb["sid"], wb["rel"]), None)
                 sid, rel = wb["sid"], wb["rel"]
                 sfd = wb.get("spilled_fd", -1)
+                if wb.get("orphan"):
+                    # Path was unlinked/overwritten while this fd stayed open: the
+                    # buffer must NOT re-create a row (unlink-open semantics). Just
+                    # release any spilled blob fd; its (already-unlinked) inode dies.
+                    if sfd >= 0:
+                        try: os.close(sfd)
+                        except OSError: pass
+                    return
                 if sfd >= 0:
                     # spilled: blob file is resident; just close the fd.
                     # consolidate will deflate it into the row later.
@@ -3917,6 +4024,10 @@ def _build_overlay_ops():
             """Overlay (captured) unlink for sid. Removes the backing artifact and
             updates the index. Used directly and as the kick-up target."""
             idx = self._index(sid)
+            # Detach any open write buffer for this path first: its name is going away,
+            # so it must neither stay visible nor resurrect the file when the writer
+            # closes (the owning fd keeps working until then — unlink-open semantics).
+            self._orphan_wbuf(sid, rel)
             bp = self._backing_path(sid, rel)
             if bp is not None and os.path.lexists(bp):
                 try: os.unlink(bp)
@@ -4276,6 +4387,15 @@ def _build_overlay_ops():
             is_reg = stat_mod.S_ISREG(st_o.st_mode)
             src_shadowed_lower = (not idx.hidden_by_opaque(rel_o)
                                   and self._lower_exists(sid, rel_o))
+            # Commit any in-flight write buffer(s) under the source into their rows
+            # before they are copied/reparented, so the move carries the live bytes.
+            if is_dir:
+                for krel in [k[1] for k in self._wbuf_key
+                             if k[0] == sid
+                             and (k[1] == rel_o or k[1].startswith(rel_o + "/"))]:
+                    self._wbuf_snapshot_one(sid, krel)
+            else:
+                self._wbuf_snapshot_one(sid, rel_o)
             if is_dir:
                 self._materialize_tree(sid, rel_o, wid)
             else:
@@ -4324,6 +4444,12 @@ def _build_overlay_ops():
                 if src_shadowed_lower:
                     idx.set_entry(rel_o, "whiteout", 0, wid, "rename_from")
             self._remap_inode_subtree(sid, rel_o, rel_n)
+            # Carry any still-open write buffer(s) to the new name so continued writes
+            # and the eventual release land at rel_n (rows moved above in lockstep).
+            if is_dir:
+                self._retarget_wbuf_subtree(sid, rel_o, rel_n)
+            else:
+                self._retarget_wbuf(sid, rel_o, rel_n)
             # rename = remove-old + add-new for the live map.
             self._notify(sid, rel_o, "deleted")
             self._notify(sid, rel_n, "created")
@@ -4407,6 +4533,8 @@ def _build_overlay_ops():
             target. ino is the FUSE inode for rel_n (from the caller's session)."""
             idx = self._index(sid)
             wid = idx.writer_for(ctx.pid)
+            # Commit any in-flight write buffer on the source so the copy sees live bytes.
+            self._wbuf_snapshot_one(sid, rel_src)
             self._copyup_one(sid, rel_src, wid)
             self._ensure_parent_dirs(sid, rel_n, wid)
             try:
@@ -4511,6 +4639,8 @@ def _build_overlay_ops():
             Spilled buffers (spilled_fd >= 0) are already on disk; skip them."""
             for fh, wb in list(self._wbuf.items()):
                 try:
+                    if wb.get("orphan"):
+                        continue   # unlinked while open: must not re-create its row
                     if wb.get("spilled_fd", -1) >= 0:
                         continue   # already on disk in the pool blob; not at risk
                     if not force and not wb.get("dirty", False):
