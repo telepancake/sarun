@@ -2543,6 +2543,9 @@ def _build_overlay_ops():
             self._vfh: dict = {}          # fh -> (sid, rel, bytes) for virtual reads
             self._dir_snaps: dict = {}    # fh -> DirHandle(inode, snapshot)
             self._next_fh = 1
+            # auto_cache bookkeeping: inode -> (size, mtime_ns) last handed to the
+            # kernel page cache on a read-only open. Drives _autocache's invalidation.
+            self._cache_sig: dict = {}
             # ── Tier-0 write buffer: hold small file bytes in RAM instead of
             #    materializing a pool blob.  Spills to a pool blob (Tier 1) at
             #    WBUF_SPILL; deflates into the sqlar row on release (Tier 2).
@@ -3204,6 +3207,31 @@ def _build_overlay_ops():
             if not s: return False
             return rel in s["virtual"] and self._index(sid).kind_of(rel) is None
 
+        # ── auto_cache: page-cache coherence under keep_cache ────────────────
+        def _autocache(self, inode: int, size: int, mtime_ns: int) -> bool:
+            """Mirror libfuse's `auto_cache`: a read-only open keeps the kernel page
+            cache (keep_cache=True), but the moment a file's (size, mtime) differs from
+            what was cached we drop the stale data so a copy-up / overwrite / host-side
+            change — or a virtual file giving way to a real one at the same path — is
+            never served from a stale cache. Returns the keep_cache flag (always True;
+            the call site uses it for readability). Safe to call inline: per the pyfuse3
+            docs invalidate_inode only blocks under writeback caching, which is off here
+            (enable_writeback_cache = False).
+
+            A virtual/immutable file passes mtime_ns=0: its bytes never change for the
+            session, so the kernel keeps the cache across re-opens, and the sentinel
+            still differs from any real file's mtime so the virtual→real transition
+            invalidates."""
+            sig = (size, mtime_ns)
+            prev = self._cache_sig.get(inode)
+            if prev is not None and prev != sig:
+                try:
+                    pyfuse3.invalidate_inode(inode, attr_only=False)
+                except OSError:
+                    pass
+            self._cache_sig[inode] = sig
+            return True
+
         # ── attr construction ────────────────────────────────────────────────
         def _entry(self, ino: int, st) -> "pyfuse3.EntryAttributes":
             a = pyfuse3.EntryAttributes()
@@ -3371,6 +3399,7 @@ def _build_overlay_ops():
                 c = self._lookup_count.get(inode, 0) - nlookup
                 if c <= 0:
                     self._lookup_count.pop(inode, None)
+                    self._cache_sig.pop(inode, None)
                 else:
                     self._lookup_count[inode] = c
 
@@ -3465,14 +3494,14 @@ def _build_overlay_ops():
             sid, rel = key
             layer, ap, _st = self._resolve_st(sid, rel)
             if layer in ("absent", "whiteout"): raise pyfuse3.FUSEError(errno.ENOENT)
-            # Overlay symlink: served straight from the mirror (target in the row).
-            tgt = self._index(sid).symlink_target(rel)
-            if tgt is not None:
-                return bytes(tgt)
-            # Lower (host / ancestor) symlink: resolved path is a real on-disk link.
-            if ap is None: raise pyfuse3.FUSEError(errno.ENOENT)
-            try: return os.fsencode(os.readlink(ap))
-            except OSError as e: raise pyfuse3.FUSEError(e.errno or errno.EIO)
+            # _readlink_source resolves all three cases: this box's own mirror row, a
+            # host/lower on-disk link (ap set -> os.readlink), AND an ancestor's row
+            # (ap is None -> walk the parent chain). The old code only checked this
+            # box's own index, so a symlink owned by a FINISHED parent (served from a
+            # base session, ap=None) wrongly ENOENT'd.
+            tgt = self._readlink_source(sid, rel, ap)
+            if tgt is None: raise pyfuse3.FUSEError(errno.ENOENT)
+            return os.fsencode(tgt)
 
         # ── parent-dir materialization ───────────────────────────────────────
         def _ensure_parent_dirs(self, sid: str, rel: str, wid) -> None:
@@ -3697,7 +3726,12 @@ def _build_overlay_ops():
                 with self._lock:
                     fh = self._next_fh; self._next_fh += 1
                 self._vfh[fh] = (sid, rel, content)
-                return pyfuse3.FileInfo(fh=fh, direct_io=False, keep_cache=False)
+                # Virtual bytes are immutable for the session (mtime_ns=0 sentinel) —
+                # keep the kernel cache so re-reads of the synthesized CA bundle don't
+                # re-enter Python; _autocache still invalidates if this path later
+                # becomes a real file.
+                keep = self._autocache(inode, len(content), 0)
+                return pyfuse3.FileInfo(fh=fh, direct_io=False, keep_cache=keep)
             self._req_enter(f"open {sid}/{rel}")
             try:
                 if not writable:
@@ -3731,7 +3765,11 @@ def _build_overlay_ops():
                         with self._lock:
                             fh = self._next_fh; self._next_fh += 1
                         self._vfh[fh] = (sid, rel, content)
-                        return pyfuse3.FileInfo(fh=fh, direct_io=False, keep_cache=False)
+                        # Evicted bytes are stable until the file is mutated; keep the
+                        # kernel cache, keyed on the row's (size, mtime) so a later
+                        # rewrite invalidates.
+                        keep = self._autocache(inode, sz, _mtime or 0)
+                        return pyfuse3.FileInfo(fh=fh, direct_io=False, keep_cache=keep)
                     try:
                         # O_NOFOLLOW: never dereference a symlink at the final path
                         # component on the read path either — defensive even where the
@@ -3772,7 +3810,20 @@ def _build_overlay_ops():
                     fh = self._next_fh; self._next_fh += 1
                     self._fd_table[fh] = fd
                     self._fh_sid[fh] = sid
-                return pyfuse3.FileInfo(fh=fh, direct_io=False, keep_cache=False)
+                # Read-only opens of a real on-disk file (host lower, or a resident
+                # upper blob) keep the kernel page cache ACROSS re-opens — so a
+                # configure-style fork/exec storm stops re-reading sh/cc1/libc/headers
+                # through FUSE on every exec. _autocache drops that cache the instant
+                # the file's (size, mtime) changed since we last cached it, so a
+                # copy-up / overwrite / host-side change is never served stale. Writable
+                # opens never keep cache (bytes changing under them); the live
+                # write-buffer read path above also stays uncached (another fd is
+                # actively mutating it), but the immutable virtual and stable evicted
+                # paths now keep cache too.
+                keep = self._autocache(inode, _st.st_size,
+                                       getattr(_st, "st_mtime_ns", 0)) \
+                    if not writable else False
+                return pyfuse3.FileInfo(fh=fh, direct_io=False, keep_cache=keep)
             finally:
                 self._req_exit()
 
@@ -4663,6 +4714,19 @@ def _build_overlay_ops():
                         finally: os.close(dst)
                     finally:
                         os.close(src)
+                    # A hardlink shares the source inode's timestamps; link-as-copy
+                    # must too. A resident file serves its mtime from the blob's lstat,
+                    # so stamp the blob with the source mtime/atime — otherwise a tree
+                    # cloned with `cp -al` lands every file at copy-time, and autotools
+                    # (which compares only mtimes) sees `configure` no longer newest and
+                    # spuriously re-runs autoconf. The symlink branch above already
+                    # preserves mtime via the row; this is the regular-file counterpart.
+                    mt = getattr(st, "st_mtime_ns", 0)
+                    at = getattr(st, "st_atime_ns", mt)
+                    try:
+                        os.utime(dst_bp, ns=(at, mt), follow_symlinks=False)
+                    except OSError:
+                        pass
             except OSError as e:
                 raise pyfuse3.FUSEError(e.errno or errno.EIO)
             self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
