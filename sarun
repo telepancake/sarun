@@ -4078,7 +4078,13 @@ def _build_overlay_ops():
             upath = self._backing_path(sid, rel) or self._upper_path(sid, rel)
             try:
                 if fields.update_size or fields.update_mode:
-                    fd = os.open(upath, os.O_RDWR | os.O_NOFOLLOW)
+                    # Open O_RDWR only when truncating. A mode-only change must NOT
+                    # require write access to the contents: chmod of a read-only file
+                    # is legal (fchmod only needs ownership), so open O_RDONLY there.
+                    # Otherwise `chmod +x` on a 0444 file — e.g. e2fsprogs' generated
+                    # `compile_et` — would fail with EACCES ("Permission denied").
+                    oflags = os.O_RDWR if fields.update_size else os.O_RDONLY
+                    fd = os.open(upath, oflags | os.O_NOFOLLOW)
                     try:
                         if fields.update_size: os.ftruncate(fd, attr.st_size)
                         if fields.update_mode:
@@ -4124,7 +4130,10 @@ def _build_overlay_ops():
                     is_link = stat_mod.S_ISLNK(os.lstat(upath).st_mode)
                     try:
                         if (fields.update_size or fields.update_mode) and not is_link:
-                            fd = os.open(upath, os.O_RDWR | os.O_NOFOLLOW)
+                            # O_RDWR only when truncating; a mode-only change must not
+                            # demand write access (chmod of a read-only file is legal).
+                            oflags = os.O_RDWR if fields.update_size else os.O_RDONLY
+                            fd = os.open(upath, oflags | os.O_NOFOLLOW)
                             try:
                                 if fields.update_size: os.ftruncate(fd, attr.st_size)
                                 if fields.update_mode:
