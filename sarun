@@ -1140,25 +1140,49 @@ def sqlar_path(box_id) -> Path:
 
 _SQLAR_SCHEMA_VERSION = 2  # bump when DDL or migration list changes
 
-def _sqlar_open(path) -> "sqlite3.Connection":
+# ── One connection per db (no WAL) ───────────────────────────────────────────
+# Exactly ONE sqlite connection touches a given .sqlar at a time, so there is never
+# a second concurrent handle to the same file — which is why no WAL is needed (plain
+# rollback journal, single writer). A LIVE box's connection is owned by its Index and
+# registered here; every standalone helper borrows THAT one connection (under the db's
+# lock) via _sqlar_open() instead of opening a rival handle. A FINISHED box (no live
+# Index) just gets a short-lived throwaway connection per call.
+class _DbHandle:
+    __slots__ = ("conn", "lock", "pinned", "last_used", "closed")
+    def __init__(self, conn):
+        self.conn = conn
+        self.lock = threading.RLock()   # serializes the one connection across threads
+        self.pinned = False             # True while a live box's Index owns the handle
+        self.last_used = time.monotonic()
+        self.closed = False
+
+_DB_REG: "dict[str, _DbHandle]" = {}    # db abspath -> cached handle (pinned if live)
+_DB_REG_LOCK = threading.Lock()
+_DB_IDLE_TTL = 30.0                      # keep a finished box's connection cached this
+                                         # long (seconds) after its last use, then sweep
+
+def _db_key(path) -> str:
+    return os.path.abspath(os.fspath(path))
+
+def _open_raw(path) -> "sqlite3.Connection":
+    """Open + schema-init ONE raw connection (no WAL). check_same_thread=False: a
+    registered handle is used by the serve thread and the UI thread, serialized by the
+    handle's lock; a throwaway handle is used within a single helper call."""
     path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
     # 0700: the single db holds writer provenance (pid/exe/argv/env).
     old = os.umask(0o077)
     try:
-        conn = sqlite3.connect(str(path))
+        conn = sqlite3.connect(str(path), check_same_thread=False)
     finally:
         os.umask(old)
     try: os.chmod(str(path), 0o600)
     except OSError: pass
     conn.execute("PRAGMA busy_timeout=3000")
-    # Max-throughput / minimal-durability posture: the per-box .sqlar is an
-    # ephemeral overlay index (consolidated on exit), so we trade durability for
-    # speed. WAL keeps the long-lived Index handle and these short-lived helper
-    # connections able to read/write the same file concurrently; synchronous=OFF
-    # means commits NEVER fsync — not even at WAL checkpoint. Atomic-commit still
-    # survives a process crash (kill); only a power loss / OS crash can lose
-    # recent commits or corrupt the file — an accepted risk for this state.
-    conn.execute("PRAGMA journal_mode=WAL")
+    # One connection per db ⇒ no concurrent writers ⇒ no WAL. Force rollback journal
+    # (converting any file an older build left in WAL) and skip fsync for speed:
+    # atomic-commit still survives a process crash; only power loss / OS crash can lose
+    # recent commits — fine for this ephemeral, consolidated-on-exit index.
+    conn.execute("PRAGMA journal_mode=DELETE")
     conn.execute("PRAGMA synchronous=OFF")
     # Gate the one-time DDL + migrations behind user_version so repeated opens
     # (the common case) skip straight to returning the connection.
@@ -1188,6 +1212,105 @@ def _sqlar_open(path) -> "sqlite3.Connection":
         conn.execute(f"PRAGMA user_version = {_SQLAR_SCHEMA_VERSION}")
         conn.commit()
     return conn
+
+class _DbConn:
+    """A borrowed view of a db's ONE cached connection, returned by _sqlar_open(). It
+    holds the db's lock until close(); close() does NOT close the connection — the
+    handle stays cached (reused by the next borrow) and is reclaimed later by the idle
+    sweep (after _DB_IDLE_TTL), at process exit, or when the box is deleted. A live
+    box's handle is the same one its Index owns. Legacy
+    `conn = _sqlar_open(p); try: ...; finally: conn.close()` call sites work unchanged.
+    row_factory is applied per statement via a fresh cursor so it never leaks onto the
+    shared connection (which the Index reads with default tuple rows)."""
+    __slots__ = ("_h", "_rf")
+    def __init__(self, h):
+        self._h = h; self._rf = None
+    @property
+    def row_factory(self): return self._rf
+    @row_factory.setter
+    def row_factory(self, v): self._rf = v
+    def execute(self, *a):
+        cur = self._h.conn.cursor()
+        if self._rf is not None: cur.row_factory = self._rf
+        return cur.execute(*a)
+    def executescript(self, *a): return self._h.conn.executescript(*a)
+    def commit(self): return self._h.conn.commit()
+    def rollback(self): return self._h.conn.rollback()
+    def cursor(self): return self._h.conn.cursor()
+    def close(self) -> None:
+        try: self._h.conn.rollback()        # leave the cached/shared conn clean
+        except sqlite3.Error: pass
+        self._h.last_used = time.monotonic()
+        self._h.lock.release()
+
+def _db_sweep_idle() -> None:
+    """Close + drop cached connections idle longer than _DB_IDLE_TTL. Never touches a
+    pinned (live box) handle, nor one currently in use (lock held)."""
+    now = time.monotonic()
+    victims = []
+    with _DB_REG_LOCK:
+        for k, h in list(_DB_REG.items()):
+            if h.pinned or now - h.last_used <= _DB_IDLE_TTL:
+                continue
+            if h.lock.acquire(blocking=False):   # skip if a borrow is active
+                _DB_REG.pop(k, None); h.closed = True
+                victims.append(h)
+    for h in victims:
+        try: h.conn.close()
+        except sqlite3.Error: pass
+        finally: h.lock.release()
+
+def _sqlar_open(path) -> "_DbConn":
+    """Borrow the ONE cached connection for `path` (ALWAYS close() it). Live box → its
+    Index's registered handle; finished box → a cached handle kept _DB_IDLE_TTL after
+    its last use. Held under the db lock so there is never a 2nd concurrent connection."""
+    _db_sweep_idle()
+    key = _db_key(path)
+    while True:
+        with _DB_REG_LOCK:
+            h = _DB_REG.get(key)
+            if h is None or h.closed:
+                h = _DbHandle(_open_raw(path)); _DB_REG[key] = h
+            h.last_used = time.monotonic()
+        h.lock.acquire()
+        with _DB_REG_LOCK:                       # re-check: not swept while we waited
+            if _DB_REG.get(key) is h and not h.closed:
+                h.last_used = time.monotonic()
+                return _DbConn(h)
+        h.lock.release()                         # swept under us → retry with a fresh one
+
+def _sqlar_register(path) -> _DbHandle:
+    """Adopt + register a live box's single connection (called once by its Index); pin
+    it so the idle sweep never reclaims it while the box is running."""
+    key = _db_key(path)
+    with _DB_REG_LOCK:
+        h = _DB_REG.get(key)
+        if h is None or h.closed:
+            h = _DbHandle(_open_raw(path)); _DB_REG[key] = h
+        h.pinned = True
+        h.last_used = time.monotonic()
+        return h
+
+def _sqlar_unpin(path) -> None:
+    """Release a live box's pin so its cached connection becomes eligible for the idle
+    sweep (kept _DB_IDLE_TTL for just-finished reads). The connection is NOT closed."""
+    with _DB_REG_LOCK:
+        h = _DB_REG.get(_db_key(path))
+        if h is not None:
+            h.pinned = False
+            h.last_used = time.monotonic()
+
+def _sqlar_unregister(path) -> None:
+    """Drop + close a box's cached connection NOW (on box deletion, before unlinking the
+    db). Helpers then reopen a fresh cached connection on demand."""
+    key = _db_key(path)
+    with _DB_REG_LOCK:
+        h = _DB_REG.pop(key, None)
+    if h is None: return
+    with h.lock:
+        try: h.conn.close()
+        except sqlite3.Error: pass
+        h.closed = True
 
 _IDENT_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
 
@@ -1346,6 +1469,7 @@ def sqlar_remove(path, name) -> int:
         left = 1; flows = 1
     finally: conn.close()
     if left == 0 and flows == 0:
+        _sqlar_unregister(path)
         try: path.unlink()
         except OSError: pass
     return left
@@ -1378,6 +1502,7 @@ def _drop_sqlar_row_and_blob(path, box_id, rel) -> None:
         except sqlite3.Error: left = 1; flows = 1
     finally: conn.close()
     if left == 0 and flows == 0:
+        _sqlar_unregister(path)
         try: path.unlink()
         except OSError: pass
     if bp is not None:
@@ -1796,15 +1921,12 @@ class Index:
         self.backing = Path(backing)
         # The single db: state_home/<box_id>.sqlar. The box_id is the backing dir name.
         self.db_path = sqlar_path(self.backing.name)
-        # Create the parent dir + the one schema (the single source of the schema).
-        _sqlar_open(self.db_path).close()
-        self._db = sqlite3.connect(str(self.db_path), check_same_thread=False)
-        self._db.execute("PRAGMA journal_mode=WAL")
-        # synchronous=OFF: commits never fsync (not even at checkpoint) — max
-        # throughput on the per-op write-through path. Atomic-commit survives a
-        # process crash; only power loss / OS crash risks recent commits. The
-        # per-box index is ephemeral (consolidated on exit), so this is fine.
-        self._db.execute("PRAGMA synchronous=OFF")
+        # Register this box's ONE connection (created + schema-init here) so every
+        # standalone helper that touches this same db borrows it under the shared lock
+        # instead of opening a rival handle — there is never a 2nd live connection, so
+        # no WAL. _db is the raw connection; _lock (below) is the db's shared lock.
+        self._dbh = _sqlar_register(self.db_path)
+        self._db = self._dbh.conn
         self._proc_cache: dict = {}       # (tgid) -> process.id (this process only)
         self._prov_cache: dict = {}       # host pid -> provenance dict (hot-path cache)
         self._prov_by_proc: dict = {}     # process.id -> provenance dict
@@ -1825,7 +1947,7 @@ class Index:
         self._kinds: dict = {}
         self._opaque: set = set()
         self._targets: dict = {}          # rel -> symlink target bytes (RAM mirror)
-        self._lock = threading.Lock()     # serialize SQLite + mirror mutations
+        self._lock = self._dbh.lock       # the db's shared lock (SQLite + mirror)
         self._load_mirror()
         # Stable pool id == the box's identity == the backing dir / sqlar stem.
         self.box_id = int(self.backing.name)
@@ -2077,8 +2199,8 @@ class Index:
 
     def add_flow(self, fl: dict) -> None:
         """Append one completed flow to the box's single sqlar via THIS handle — the
-        one writer (under self._lock), so a flow write never opens a second handle to
-        the WAL db and never races the serve thread into SQLITE_BUSY."""
+        one writer (under self._lock), so a flow write reuses the box's single
+        connection instead of opening a rival handle that races the serve thread."""
         rb = fl.get("req_body") or b""; pb = fl.get("resp_body") or b""
         with self._lock:
             self._db.execute(
@@ -2355,7 +2477,10 @@ class Index:
             self._whiteouts.discard(rel); self._targets.pop(rel, None)
 
     def close(self) -> None:
-        try: self._db.close()
+        # Unpin the box's single connection but KEEP it cached so just-finished reads
+        # reuse it; the idle sweep (after _DB_IDLE_TTL), box deletion, or process exit
+        # reclaims it.
+        try: _sqlar_unpin(self.db_path)
         except (sqlite3.Error, AttributeError): pass
 
 
@@ -6977,8 +7102,8 @@ class Supervisor:
         pidfd); tag the flow with that process's process-table id, inserting the
         process+env row keyed by the host tgid.
         Routes the write through the live Index (the single writer, under its lock) so
-        the flow never opens a second WAL handle and races the serve thread; falls back
-        to a direct write only when no live Index exists (session already torn down)."""
+        the flow reuses the box's single connection instead of a rival handle; falls
+        back to a throwaway connection only when no live Index exists (torn down)."""
         prov = fl.pop("prov", None) or {}
         idx = self.indexes.get(sid)
         if idx is not None:
@@ -7078,6 +7203,7 @@ class Supervisor:
         # Remove the box's permanent pool files too (its sqlar may hold resident rows
         # whose bytes live only in blob/<box_id>/ — validated before use).
         bid = sid if BOX_ID_RE.match(str(sid)) else None
+        _sqlar_unregister(sp)   # close + drop any cached connection before unlinking the db
         for suf in ("", "-wal", "-shm"):
             p = Path(str(sp) + suf)
             if p.exists():
