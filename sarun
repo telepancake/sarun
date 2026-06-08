@@ -1524,7 +1524,6 @@ def _drop_sqlar_row_and_blob(path, box_id, rel) -> None:
 # process-table id (process_id) of the in-box process that opened the connection.
 
 _FLOW_BODY_CAP = 1 << 20    # store at most 1 MiB of each body (but record true size)
-_PROC_RETIRE_S = 4.0        # live proc pane: keep a dead tgid (highlighted) this long
 _ACTIVE_CAP    = 4096       # active set hard cap (bounds RAM when the pane is unwatched)
 _DNS_CACHE_CAP = 4096       # bounded LRU cap for NetworkPolicy._dns_cache
 
@@ -2171,28 +2170,20 @@ class Index:
         return set(self._roots)
 
     def live_processes(self) -> list:
-        """htop-style live view of the box's ACTIVE SET: the recently-seen tgids only,
-        decorated from the in-memory caches (NO full-table scan, cost O(active set)).
-        Returns [(id, tgid, ppid, exe, argv-list, alive, dead)] where `alive` is a
-        kill(0) liveness probe over just the active set and `dead` flags a row that
-        kill(0) reports gone but is still inside its retirement grace window. A tgid
-        first seen dead is stamped and kept (highlighted) for _PROC_RETIRE_S, then
-        pruned from the active set — the persistent `process` table is untouched.
+        """htop-style live view of the box's ACTIVE SET: only the tgids that are
+        RUNNING right now, decorated from the in-memory caches (NO full-table scan,
+        cost O(active set)). Returns [(id, tgid, ppid, exe, argv-list, alive, dead)]
+        with alive=True / dead=False for every row: a tgid that kill(0) reports gone
+        is dropped from the active set immediately (no "recently finished" grace),
+        the same display rule the live changes/flows panes use — show only what is
+        currently live. The persistent `process` table keeps the full history.
         UI-thread read of the GIL-atomic active-set/cache dicts (Index contract)."""
-        now = time.monotonic()
         out = []
         for tgid in list(self._active):
-            alive = _pid_alive(tgid)
-            if alive:
+            if not _pid_alive(tgid):          # exited: drop from the live pane at once
+                self._active.pop(tgid, None)
                 self._dead_since.pop(tgid, None)
-            else:
-                first = self._dead_since.get(tgid)
-                if first is None:
-                    self._dead_since[tgid] = first = now
-                if now - first >= _PROC_RETIRE_S:    # retire: drop from the live pane
-                    self._active.pop(tgid, None)
-                    self._dead_since.pop(tgid, None)
-                    continue
+                continue
             pid_row = self._proc_cache.get(tgid)
             prov = self._prov_by_proc.get(pid_row) if pid_row is not None else None
             if prov is not None:
@@ -2200,7 +2191,7 @@ class Index:
             else:
                 ppid, exe, argv = 0, "", []
             out.append((pid_row if pid_row is not None else tgid, tgid, ppid,
-                        exe or "", list(argv), alive, not alive))
+                        exe or "", list(argv), True, False))
         out.sort(key=lambda r: r[1])
         return out
 
@@ -3303,6 +3294,29 @@ def _build_overlay_ops():
         def inflight_age(self):
             t = self._req_started
             return (time.monotonic() - t) if t is not None else None
+
+        def open_files(self, sid: str) -> list:
+            """The captured-write files this box currently holds OPEN, as
+            [(rel, size_bytes), …] — read from the live write-handle registry
+            (_wbuf_key: (sid,rel)->fh). Drives the live Changes pane's "only open
+            files" view; a file drops off as soon as its write handle is released.
+            UI-thread read of the GIL-atomic handle dicts (same contract as the live
+            active-set read in Index.live_processes)."""
+            out = []
+            for (s, rel), fh in list(self._wbuf_key.items()):
+                if s != sid:
+                    continue
+                wb = self._wbuf.get(fh)
+                sz = 0
+                if wb is not None:
+                    sfd = wb.get("spilled_fd", -1)
+                    if sfd >= 0:
+                        try: sz = os.fstat(sfd).st_size
+                        except OSError: sz = 0
+                    else:
+                        sz = len(wb.get("data") or b"")
+                out.append((rel, sz))
+            return out
 
         # ── child-path utility for synthetic root vs session paths ───────────
         def _child_key(self, parent_key, name: str):
@@ -4974,6 +4988,10 @@ class OverlayMount:
 
     def inflight_age(self):
         return self.ops.inflight_age() if self.ops else None
+
+    def open_files(self, sid):
+        """Captured-write files box `sid` currently holds open: [(rel, size), …]."""
+        return self.ops.open_files(sid) if self.ops else []
 
     # A handler wedged longer than this is treated as hung (watchdog).
     WATCHDOG_HANG_S = 30.0
@@ -6752,6 +6770,11 @@ class Supervisor:
             rules, resolve_session=self.sessions.get,
             record=self._record_traffic, emit=self._emit)
         self.selected_sid = None         # the UI's current box (target of `patch`)
+        # In-flight (requested, not-yet-responded) flows per live box: sid -> {fid: rec}.
+        # The live Network pane shows ONLY these "open flows"; a flow is added when its
+        # request is gated/sent and removed when the response (or an error) arrives, at
+        # which point the completed exchange is persisted to the box's sqlar for review.
+        self._open_flows: dict = {}
         self.review = ChangeReview(self) # change-review model (owns consolidation memo)
         self.on_event = lambda ev: None
         # HIGH-1: per-session owner tokens + relay sockets. A box can reach only its
@@ -7267,6 +7290,7 @@ class Supervisor:
         if self.mount is not None:
             self.mount.remove_session(sid)
         index = self.indexes.pop(sid, None)
+        self._open_flows.pop(sid, None)   # box stopped: no flow can still be in flight
         return sid, s, index, live_dir(sid), reported_status
 
     def _teardown_fold(self, sid, s, index, backing, reported_status, executor):
@@ -7460,6 +7484,31 @@ class Supervisor:
     def flow_detail(self, sid, fid) -> "dict | None":
         return flows_get(sqlar_path(sid), fid)
 
+    # ── in-flight ("open") flows: the live Network pane's source ───────────────
+    def note_flow_open(self, sid, rec: dict) -> None:
+        """Register one in-flight flow (request gated/sent, response pending). Keyed by
+        the mitmproxy flow id so the matching response/error can retire it. Called from
+        the gating addon on the UI's asyncio loop (same thread that reads it)."""
+        if not sid or not rec.get("id"): return
+        self._open_flows.setdefault(sid, {})[rec["id"]] = rec
+
+    def note_flow_close(self, sid, fid) -> None:
+        """Retire an in-flight flow once its response (or error) lands."""
+        d = self._open_flows.get(sid)
+        if d is not None:
+            d.pop(fid, None)
+            if not d: self._open_flows.pop(sid, None)
+
+    def open_flows(self, sid) -> list:
+        """The box's currently OPEN (in-flight) flows, oldest first — the live Network
+        pane's source. Empty once every request has been answered."""
+        d = self._open_flows.get(sid) or {}
+        return sorted(d.values(), key=lambda r: r.get("ts", 0))
+
+    def open_flow_detail(self, sid, fid) -> "dict | None":
+        """Detail record for one in-flight flow (request known, response pending)."""
+        return (self._open_flows.get(sid) or {}).get(fid)
+
     def processes(self, sid) -> list:
         """The box's process table: [(id, tgid, ppid, exe, argv-list)]."""
         return process_list(sqlar_path(sid))
@@ -7524,6 +7573,7 @@ class Supervisor:
         if self.mount is not None:
             self.mount.remove_session(sid)
         idx = self.indexes.pop(sid, None)
+        self._open_flows.pop(sid, None)
         if idx is not None:
             try: idx.close()
             except Exception: pass
@@ -7708,11 +7758,36 @@ class _GatingAddon:
             if self.sup.policy.precheck(_CURRENT_BOX_ID.get(), flow.request.host,
                                         flow.request.port, url) == "deny":
                 self._deny(flow)
+        # An allowed request is now IN FLIGHT (sent upstream, awaiting a response):
+        # surface it in the live Network pane. A denied one already carries its 403
+        # and is handled wholly by response() below — never an "open flow".
+        if not flow.metadata.get("slopbox_denied"):
+            self._note_open(flow)
+
+    def _note_open(self, flow):
+        req = flow.request
+        try: req_body = bytes(req.content or b"")
+        except Exception: req_body = b""
+        self.sup.note_flow_open(_CURRENT_BOX_ID.get(), dict(
+            id=flow.id, ts=time.time(), action="allow", method=req.method,
+            scheme=req.scheme, host=req.host, port=req.port, url=req.pretty_url,
+            status=0, req_headers=_hdr_text(list(req.headers.items())),
+            req_len=len(req_body), req_body=req_body[:_FLOW_BODY_CAP],
+            resp_headers="", resp_len=0, resp_body=b""))
+
+    def error(self, flow):
+        # Upstream failure / client disconnect with no response: the flow is no longer
+        # in flight, so drop it from the live pane (nothing to persist — never completed).
+        try: self.sup.note_flow_close(_CURRENT_BOX_ID.get(), getattr(flow, "id", None))
+        except Exception: pass
 
     def response(self, flow):
         req, resp = flow.request, flow.response
         denied = bool(flow.metadata.get("slopbox_denied"))
         sid = _CURRENT_BOX_ID.get(); action = "deny" if denied else "allow"
+        # No longer in flight: retire it from the live "open flows" pane before the
+        # completed exchange is persisted below for after-the-fact review.
+        self.sup.note_flow_close(sid, flow.id)
         self.sup.note_traffic(
             sid, req.host, req.port, req.scheme, action,
             len(req.content or b""),
@@ -8710,10 +8785,14 @@ def cmd_run(cmd, net, trace, direct, session_whitelist, chdir, reuse_sid=None) -
 #: pane then has its own keys (shown live in the bottom bar). [cyan]esc[/] goes back, [cyan]q[/] quits.
 #:   [cyan]b[/]  Boxes      — all slopboxes; [cyan]↵[/] reviews the selected box's changes
 #:   [cyan]c[/]  Changes    — the file tree the box wrote; [cyan]↵[/] on a file shows its diff
-#:   [cyan]t[/]  Network    — log of every connection the box made and whether it was allowed
-#:   [cyan]p[/]  Processes  — the process tree of writers captured during the run
+#:   [cyan]t[/]  Network    — the connections the box made and whether each was allowed
+#:   [cyan]p[/]  Processes  — the box's process tree
 #:   [cyan]w[/]  Net rules  — the saved allow/deny ruleset
 #:   [cyan]f[/]  File rules — the saved apply/discard/passthrough ruleset
+#: While a box is [b]running[/], these three panes show only what is [b]live right now[/] — the
+#: files it currently has open, the connections still in flight, and the processes still
+#: running — each entry dropping off as it finishes. The complete record (every file it
+#: wrote, every connection it made, the full process tree) appears once the box exits.
 #:
 #: [b]Boxes pane:[/]  [cyan]k[/] kill a running box · [cyan]d[/] delete a box and its overlay · [cyan]n[/] rename it.
 #: [b]Changes pane:[/]  [cyan]a[/] apply the selected file · [cyan]A[/] apply all · [cyan]x[/] discard the file ·
@@ -9378,17 +9457,19 @@ def _make_ui_app():
             if len(cons)>1: t.append(f"  (+{len(cons)-1} more)", style="dim")
             bar.update(t); bar.set_class(True,"show")
 
-        # ── change-set cache: live (incremental) vs finished (static) ──────────
+        # ── change-set cache: live (open files) vs finished (static) ───────────
         def _changes_for(self, sid):
-            """The change-entry list for a box, cheap on the hot path. A live box is
-            served from its incremental map (seeded once); a finished box from a
-            cache computed once and invalidated only on a real edit. A finished box
-            that still needs folding kicks the off-loop worker and reads as empty
-            (placeholder) until it completes."""
+            """The Changes-pane entry list for a box, cheap on the hot path. A LIVE box
+            shows ONLY the files it currently holds open for write (snapshot of the
+            overlay's write-handle registry) — the same "what's live right now" rule
+            the process and flow panes use; a file leaves the pane when its handle is
+            released. A FINISHED box shows its full, immutable change set (computed once
+            and invalidated only on a real edit); one that still needs folding kicks the
+            off-loop worker and reads as empty (placeholder) until it completes."""
             if sid is None: return []
             if self.sup.review._live(sid):
                 self._fin_changes.pop(sid, None)
-                return self._live_list(sid)
+                return self._open_changes(sid)
             self._live_changes.pop(sid, None)
             if self._maybe_start_consolidate(sid):
                 return []                              # mid-fold: placeholder, no read
@@ -9396,6 +9477,23 @@ def _make_ui_app():
                 try: self._fin_changes[sid]=self.sup.review.session_changes(sid)
                 except Exception: self._fin_changes[sid]=[]
             return self._fin_changes[sid]
+
+        def _open_changes(self, sid):
+            """Live Changes-pane source: ONLY the files the box currently holds open for
+            write, sorted for a stable table. Read straight from the overlay's live
+            write-handle registry, so a file appears once it's being written and drops
+            off the moment it's closed. The complete change set is still captured and
+            shown once the box finishes."""
+            out=[]
+            try:
+                for rel,size in self.overlay_mount.open_files(sid):
+                    rel=rel.lstrip("/")
+                    host=Path("/")/rel
+                    kind="modified" if (host.exists() or host.is_symlink()) else "created"
+                    out.append(dict(path=rel, kind=kind, size=size))
+            except Exception: pass
+            out.sort(key=lambda e: e["path"])
+            return out
 
         def _live_map(self, sid):
             """The live change set as a {rel->record} dict, seeded with ONE full pass
@@ -9413,12 +9511,6 @@ def _make_ui_app():
                 self._live_changes[sid]=m
             return m
 
-        def _live_list(self, sid):
-            """Sorted entry list for a live box — for the interactive review table,
-            which needs a stable order to scroll/select against."""
-            m=self._live_map(sid)
-            return [m[k] for k in sorted(m)]
-
         def _live_recent(self, sid, n):
             """The n most-recently-changed entries for a live box, newest first,
             straight from the notify-stream order — no sort. O(n) regardless of how
@@ -9428,11 +9520,19 @@ def _make_ui_app():
             return len(m), [m[k] for k in keys]
 
         def _fold_event(self, sid, rel, op):
-            """Fold one enriched FUSE event into the live map in O(1). Converges to the
-            same SET the full walk produces: deletions mark 'deleted'; creates/mods
-            upsert with kind 'modified' if the host path exists else 'created'."""
-            if rel is None or sid not in self._live_changes: return
-            m=self._live_changes[sid]; rel=rel.lstrip("/")
+            """Fold one enriched FUSE event for a live box. ALWAYS bumps the box's
+            change version, which is how the open-files Changes pane learns to re-snapshot
+            the overlay's write-handle set (a file opening or closing for write rides in
+            on these same events). ADDITIONALLY folds into the accumulating recency map
+            that backs the box-detail "recently changed" tail, when that map has been
+            seeded. Converges to the same SET the full walk produces: deletions mark
+            'deleted'; creates/mods upsert 'modified' if the host path exists else
+            'created'."""
+            if rel is None: return
+            self._live_ver[sid]=self._live_ver.get(sid,0)+1
+            m=self._live_changes.get(sid)
+            if m is None: return                       # tail map not seeded — version is enough
+            rel=rel.lstrip("/")
             # The row's content moved: drop its cached decoration so it's recomputed
             # lazily the next time it's visible.
             self._ch_decor.get(sid, {}).pop(rel, None)
@@ -9448,7 +9548,6 @@ def _make_ui_app():
                 host=Path("/")/rel
                 kind="modified" if (host.exists() or host.is_symlink()) else "created"
                 m[rel]=dict(path=rel, kind=kind, size=0)
-            self._live_ver[sid]=self._live_ver.get(sid,0)+1
 
         def _invalidate_changes(self, sid):
             """A real edit happened to a box's change set (hunk/whole-file apply or
@@ -9459,11 +9558,11 @@ def _make_ui_app():
             self.sup.review.invalidate_struct(sid)
 
         def _drain_overlay_events(self):
-            # Live proc retirement runs on THIS reliable 0.3s cadence (not the 3s
+            # Live proc pruning runs on THIS reliable 0.3s cadence (not the 3s
             # _tick, which can be starved): re-poll the active set every tick the
-            # proc pane is open so dead rows retire within _PROC_RETIRE_S even when
-            # no overlay events are arriving. _load_procs is a cheap O(active set)
-            # kill(0) probe and diffs the table in place (no blink, cursor kept).
+            # proc pane is open so an exited process leaves the pane promptly even
+            # when no overlay events are arriving. _load_procs is a cheap O(active
+            # set) kill(0) probe and diffs the table in place (no blink, cursor kept).
             if self.view=="procs" and self._sel_sid:
                 try: self._load_procs(self._sel_sid)
                 except Exception: pass
@@ -9620,7 +9719,7 @@ def _make_ui_app():
             except Exception: pass
             # Section-guarded: a failure in any one section must NOT abort the rest
             # (e.g. a rescan/render error used to starve the live proc refresh, so
-            # dead rows never retired). Each section is independent and best-effort.
+            # exited rows lingered). Each section is independent and best-effort.
             def _g(fn):
                 try: fn()
                 except Exception as _e:
@@ -9680,8 +9779,8 @@ def _make_ui_app():
             # Cross-pane jump: entering procs FROM a changes/netlog row focuses the
             # process responsible — the file's writer (sqlar writer tag / live Index)
             # or the flow's process_id. Resolve BEFORE switching; graceful if the
-            # process isn't in the displayed list (retired / none recorded): just show
-            # the pane (a finished box's full table still contains it).
+            # process isn't in the displayed list (already exited / none recorded):
+            # just show the pane (a finished box's full table still contains it).
             target=None
             try:
                 if self.view=="changes" and self._sel_sid:
@@ -10393,10 +10492,17 @@ def _make_ui_app():
             self._cbar()
 
         def _load_flows(self, sid, force=False):
-            flows=self.sup.flows(sid)
-            # Flows are append-only (AUTOINCREMENT id, never updated). A cheap
-            # change-key (count, last id) is equivalent to full equality for these.
-            def _flows_key(fl): return (len(fl), fl[-1]["id"] if fl else None)
+            # LIVE box: only the OPEN (in-flight) flows — requests sent and awaiting a
+            # response, the same "show only what's live right now" rule the process and
+            # changes panes use; each drops off when its response lands. FINISHED box:
+            # the full, persisted connection log.
+            live=False
+            try: live=self.sup.review._live(sid)
+            except Exception: pass
+            flows=self.sup.open_flows(sid) if live else self.sup.flows(sid)
+            # The visible set can SHRINK (a flow closing) as well as grow, so key on the
+            # exact id sequence rather than a (count,last-id) shortcut.
+            def _flows_key(fl): return tuple(f["id"] for f in fl)
             if not force and _flows_key(flows)==_flows_key(self._nf_flows):
                 return
             self._nf_flows=flows
@@ -10419,9 +10525,12 @@ def _make_ui_app():
             sid=self._sel_sid; fid=self._sel_flow()
             if not sid or fid is None:
                 d.update(Text("(no connection selected)", style="dim")); return
-            f=self.sup.flow_detail(sid, fid)
+            # A live box's selected row is an in-flight flow (not yet persisted): fall
+            # back to its in-memory record so the detail shows the request + pending.
+            f=self.sup.flow_detail(sid, fid) or self.sup.open_flow_detail(sid, fid)
             if not f:
                 d.update(Text("(gone)", style="dim")); return
+            pending=not f.get("resp_headers") and not f.get("status")
             def body(blob, n):
                 if not blob: return Text("  (empty)\n", style="dim")
                 raw=bytes(blob)
@@ -10441,9 +10550,13 @@ def _make_ui_app():
             t.append((f["req_headers"] or "").rstrip()+"\n", style="")
             t.append("── request body ──\n", style="dim"); t.append(body(f["req_body"], f["req_len"]))
             t.append("\n")
-            t.append(f"── response  [{f['status']}] ──\n", style="dim")
-            t.append((f["resp_headers"] or "").rstrip()+"\n", style="")
-            t.append("── response body ──\n", style="dim"); t.append(body(f["resp_body"], f["resp_len"]))
+            if pending:
+                t.append("── response ──\n", style="dim")
+                t.append("  (in flight — awaiting response)\n", style="yellow")
+            else:
+                t.append(f"── response  [{f['status']}] ──\n", style="dim")
+                t.append((f["resp_headers"] or "").rstrip()+"\n", style="")
+                t.append("── response body ──\n", style="dim"); t.append(body(f["resp_body"], f["resp_len"]))
             d.update(t)
 
         def _sel_flow(self):
@@ -10455,7 +10568,8 @@ def _make_ui_app():
         # ── processes pane (the selected box's process table) ────────────────
         def _load_procs(self, sid, force=False):
             # LIVE box: the Index's bounded active set (htop-style), O(active set), no
-            # full-table query — dead-but-not-yet-retired rows are highlighted. FINISHED
+            # full-table query — only processes RUNNING right now (an exited process
+            # leaves the pane immediately, no "recently finished" grace). FINISHED
             # box: the full immutable process history, tree-built once and cached.
             # Both render as a process TREE: build_proc_tree gives DFS-ordered rows,
             # depth-indented; connector-only ancestors (added to connect the tree) are
@@ -10477,7 +10591,6 @@ def _make_ui_app():
                 self._fin_procs.pop(sid, None)
                 key=live
                 procs=[(p, tg, pp, ex, av) for (p, tg, pp, ex, av, _al, _dd) in live]
-                dead={tg for (_p, tg, _pp, _ex, _av, _al, dd) in live if dd}
                 tree=build_proc_tree(procs, root,
                                      lambda tg: self.sup.proc_info(sid, tg))
             else:
@@ -10485,7 +10598,7 @@ def _make_ui_app():
                     procs=self.sup.processes(sid)
                     self._fin_procs[sid]=(procs, build_proc_tree(procs, root, None))
                 procs,tree=self._fin_procs[sid]
-                key=procs; dead=set()
+                key=procs
             cur=getattr(self,"_pr_key",None)
             if not force and key==cur: return
             # Capture the cursored proc's tgid before the rebuild (real row key is
@@ -10518,10 +10631,6 @@ def _make_ui_app():
                     rk="c"+str(tgid)
                     tg=Text(str(tgid), style="dim"); pp=Text(str(ppid), style="dim")
                     nm.stylize("dim"); ar.stylize("dim")
-                elif tgid in dead:                # htop-style: process exited, flashing out
-                    rk=str(pid)
-                    tg=Text(str(tgid), style="red"); pp=Text(str(ppid), style="red")
-                    nm.stylize("red"); ar.stylize("red")
                 else:
                     rk=str(pid); tg=str(tgid); pp=str(ppid)
                 present[tgid]=rk; new_pp[tgid]=ppid
