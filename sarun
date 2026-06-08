@@ -3494,14 +3494,14 @@ def _build_overlay_ops():
             sid, rel = key
             layer, ap, _st = self._resolve_st(sid, rel)
             if layer in ("absent", "whiteout"): raise pyfuse3.FUSEError(errno.ENOENT)
-            # Overlay symlink: served straight from the mirror (target in the row).
-            tgt = self._index(sid).symlink_target(rel)
-            if tgt is not None:
-                return bytes(tgt)
-            # Lower (host / ancestor) symlink: resolved path is a real on-disk link.
-            if ap is None: raise pyfuse3.FUSEError(errno.ENOENT)
-            try: return os.fsencode(os.readlink(ap))
-            except OSError as e: raise pyfuse3.FUSEError(e.errno or errno.EIO)
+            # _readlink_source resolves all three cases: this box's own mirror row, a
+            # host/lower on-disk link (ap set -> os.readlink), AND an ancestor's row
+            # (ap is None -> walk the parent chain). The old code only checked this
+            # box's own index, so a symlink owned by a FINISHED parent (served from a
+            # base session, ap=None) wrongly ENOENT'd.
+            tgt = self._readlink_source(sid, rel, ap)
+            if tgt is None: raise pyfuse3.FUSEError(errno.ENOENT)
+            return os.fsencode(tgt)
 
         # ── parent-dir materialization ───────────────────────────────────────
         def _ensure_parent_dirs(self, sid: str, rel: str, wid) -> None:
