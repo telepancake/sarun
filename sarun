@@ -2954,27 +2954,32 @@ def _build_overlay_ops():
                     mode = st.st_mode
                 else:
                     mode = stat_mod.S_IFREG | 0o644
-            # ── seed mtime from the CURRENT source, not wall-clock ──
-            # Merely opening a file for write must NOT bump its mtime. A real write
-            # (the write op) or O_TRUNC advances it to now; a clean open keeps the
-            # source time — matching POSIX and the disk copy-up path, so an autotools
-            # build's mtime-ordered dependency graph survives unchanged inside the box.
+            # ── seed mtime + spurious-capture guard ─────────────────
+            # Resolve the pre-open source ONCE. It yields the mtime to seed (merely
+            # opening for write must NOT bump mtime) and whether this path already
+            # existed in the LOWER layer — so a clean, non-modifying open can revert
+            # its row on release instead of recording a phantom change. A real write,
+            # an O_TRUNC, or a chmod marks the buffer dirty and is always recorded;
+            # a prior overlay capture ("upper") or a genuine create (absent/whiteout)
+            # is never reverted.
+            pre_layer, _pa, src_st = self._resolve_st(sid, rel)
             if flags & os.O_TRUNC:
                 mtime_ns = time.time_ns()            # truncate IS a modification
+            elif src_st is not None:
+                _m = getattr(src_st, "st_mtime_ns", None)
+                mtime_ns = _m if _m is not None else time.time_ns()
             else:
-                _l, _a, src_st = self._resolve_st(sid, rel)
-                mtime_ns = (getattr(src_st, "st_mtime_ns", None)
-                            if src_st is not None else None)
-                if mtime_ns is None:
-                    mtime_ns = time.time_ns()        # brand-new file: now
+                mtime_ns = time.time_ns()            # brand-new file: now
             # ── mark visible in the index immediately ───────────────
             # Clears a whiteout if present so kind_of(rel)=="file" while buffered.
             if idx.kind_of(rel) == "whiteout":
                 idx.del_entry(rel)
             idx.set_entry(rel, "file", mode, wid,
                           "create" if idx.kind_of(rel) is None else "open_write")
-            return dict(sid=sid, rel=rel, data=data, dirty=False,
-                        mode=mode, mtime_ns=mtime_ns, wid=wid, spilled_fd=-1)
+            return dict(sid=sid, rel=rel, data=data,
+                        dirty=bool(flags & os.O_TRUNC),
+                        mode=mode, mtime_ns=mtime_ns, wid=wid, spilled_fd=-1,
+                        revert_if_clean=(pre_layer == "lower"))
 
         def _spill_write_buffer(self, fh: int) -> None:
             """Materialize the write buffer's bytearray to a pool blob (Tier 1).
@@ -3859,16 +3864,27 @@ def _build_overlay_ops():
                     try: os.close(sfd)
                     except OSError: pass
                 else:
-                    # RAM path: deflate into an evicted sqlar row.
-                    # Also delete any stale resident pool blob so _resolve_st won't
-                    # serve the old bytes instead of the new row data.
+                    # RAM path. A CLEAN buffer (opened for write but never written,
+                    # truncated, or chmod'd) over a file that already existed in the
+                    # lower layer must NOT record a phantom change: drop the row that
+                    # open() added and restore the lower view. Guard against a
+                    # concurrent writer that materialized a real blob meanwhile — that
+                    # blob's bytes must never be clobbered.
                     idx = self._index(sid)
                     rid = idx.row_id(rel)
-                    if rid is not None:
-                        bp = blob_path(idx.box_id, rid)
-                        if bp.exists():
-                            try: os.unlink(str(bp))
-                            except OSError: pass
+                    bp = blob_path(idx.box_id, rid) if rid is not None else None
+                    blob_present = bool(bp and bp.exists())
+                    if (wb.get("revert_if_clean") and not wb.get("dirty")
+                            and not blob_present):
+                        idx.del_entry(rel)
+                        self._notify(sid, rel, "reverted")
+                        return
+                    # Otherwise commit the buffered bytes (a real change or a new
+                    # file). Delete any stale resident pool blob first so _resolve_st
+                    # won't serve the old bytes instead of the new row data.
+                    if blob_present:
+                        try: os.unlink(str(bp))
+                        except OSError: pass
                     data_bytes = bytes(wb["data"])
                     deflated, sz = _sqlar_deflate(data_bytes)
                     idx.set_blob(rel, deflated, sz, wb["mode"],
@@ -4671,8 +4687,23 @@ def _build_overlay_ops():
                         continue   # unlinked while open: must not re-create its row
                     if wb.get("spilled_fd", -1) >= 0:
                         continue   # already on disk in the pool blob; not at risk
-                    if not force and not wb.get("dirty", False):
-                        continue   # unchanged since last snapshot; skip
+                    if not wb.get("dirty", False):
+                        if not force:
+                            continue   # unchanged since last snapshot; skip
+                        # Exit (force) pass over a CLEAN buffer: a revertable one — a
+                        # non-modifying open of an existing lower file — is a phantom
+                        # change, so drop its row instead of freezing it (mirrors
+                        # release()). A clean NEW file is a real empty creation and is
+                        # persisted below. Never clobber a concurrently-built blob.
+                        if wb.get("revert_if_clean"):
+                            _sid, _rel = wb["sid"], wb["rel"]
+                            _idx = self._index(_sid)
+                            _rid = _idx.row_id(_rel)
+                            _bp = (blob_path(_idx.box_id, _rid)
+                                   if _rid is not None else None)
+                            if not (_bp and _bp.exists()):
+                                _idx.del_entry(_rel)
+                                continue
                     sid, rel = wb["sid"], wb["rel"]
                     idx = self._index(sid)
                     # Delete any stale pool blob so _resolve_st won't serve old bytes.
@@ -9306,7 +9337,9 @@ def _make_ui_app():
             # pop-then-(maybe)-reinsert moves the touched key to the END of the dict,
             # so iteration order tracks recency for the live tail preview.
             m.pop(rel, None)
-            if op=="deleted":
+            if op=="reverted":
+                pass   # row removed from the overlay: drop it from the change map
+            elif op=="deleted":
                 host=Path("/")/rel
                 # A create-then-delete of a host-absent path leaves no change.
                 if host.exists() or host.is_symlink():

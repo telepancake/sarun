@@ -101,6 +101,24 @@ def _is_old(mtime_ns):
     return abs(mtime_ns - OLD_NS) <= SLACK_NS
 
 
+def settle(pred, timeout=5.0):
+    """Poll `pred` until true or timeout. FUSE release() — which runs the revert /
+    commit — is delivered asynchronously after a child closes its fd, so any check
+    of the authoritative index right after the shell returns must wait for it."""
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            if pred(): return True
+        except Exception: pass
+        time.sleep(0.01)
+    try: return bool(pred())
+    except Exception: return False
+
+
+def _released(fx, rel):
+    return (fx.sid, rel) not in fx.mount.ops._wbuf_key
+
+
 def test_readonly_preserves_mtime():
     """Baseline: a file the box only reads reports its real lower mtime."""
     fx = MountFixture()
@@ -138,26 +156,31 @@ def test_chmod_preserves_mtime_bumps_ctime():
         fx.stop()
 
 
-def test_open_for_write_no_write_preserves_mtime():
-    """Opening a small file O_RDWR and closing it WITHOUT writing must not advance
-    mtime.  The Tier-0 write buffer used to seed its mtime from the wall clock and
-    persist that into the sqlar row on release, so a clean open-for-write of a
-    shipped file recorded a bogus "now".  We assert on the PERSISTED row mtime
-    directly — the kernel attr cache (ATTR_TIMEOUT) masks this through stat(), but
-    the row is what consolidation and a post-cache-expiry getattr report."""
+def test_clean_reopen_of_captured_file_preserves_mtime():
+    """Re-opening an ALREADY-captured file O_RDWR and closing it without writing
+    must not bump its recorded mtime.  (This file legitimately stays captured — it
+    was changed earlier — so the revert does not apply; the Tier-0 buffer's seeded
+    mtime is what's committed, and it must come from the source, not the clock.)"""
     fx = MountFixture()
-    fx.seed_lower("aclocal.m4", b"dnl generated\n")
     fx.start()
     try:
-        # bash `<>` opens O_RDWR (no truncate); we write nothing before closing.
-        r = fx.sh("exec 3<>aclocal.m4; exec 3>&-")
-        check(r.returncode == 0, f"open-no-write: ran (err={r.stderr!r})")
-        row = fx.index.file_row("aclocal.m4")    # (rowid, mode, sz, mtime, data)
-        check(row is not None, "open-no-write: file captured in the overlay")
-        if row is not None:
-            check(_is_old(row[3]),
-                  f"open-no-write: persisted mtime is the source time, not now "
-                  f"(got {row[3]}, want ~{OLD_NS})")
+        fx.sh("printf 'first\\n' > generated.h")     # real change -> captured
+        # Wait for the write's release to commit a non-zero mtime into the row.
+        settle(lambda: (fx.index.file_row("generated.h") or (0, 0, 0, 0, 0))[3] != 0)
+        row1 = fx.index.file_row("generated.h")
+        check(row1 is not None and row1[3] != 0,
+              f"reopen: first write captured+committed (row={row1})")
+        mt1 = row1[3] if row1 else 0
+        time.sleep(0.05)
+        r = fx.sh("exec 3<>generated.h; exec 3>&-")   # clean reopen, no write
+        check(r.returncode == 0, f"reopen: ran (err={r.stderr!r})")
+        settle(lambda: _released(fx, "generated.h"))  # reopen's release has run
+        row2 = fx.index.file_row("generated.h")
+        check(row2 is not None, "reopen: file stays captured (it was really changed)")
+        if row2 is not None:
+            check(row2[3] == mt1,
+                  f"reopen: clean reopen did NOT bump mtime "
+                  f"(was {mt1}, now {row2[3]})")
     finally:
         fx.stop()
 
@@ -219,13 +242,88 @@ def test_dependency_ordering_survives_chmod():
         fx.stop()
 
 
+def test_clean_open_for_write_records_no_change():
+    """A non-modifying pass — opening an existing lower file O_RDWR, reading it,
+    and closing WITHOUT writing — must leave NO change in the overlay.  The buffer
+    used to capture the file (and persist a row) just for being opened writable."""
+    fx = MountFixture()
+    fx.seed_lower("Makefile.in", b"all:\n\t@true\n")
+    fx.start()
+    try:
+        # O_RDWR (bash `<>`), read the contents, close — never write.
+        r = fx.sh("exec 3<>Makefile.in; cat <&3 >/dev/null; exec 3>&-")
+        check(r.returncode == 0, f"clean-open: ran (err={r.stderr!r})")
+        # The revert happens in release() (async); wait for it to settle.
+        ok = settle(lambda: fx.index.kind_of("Makefile.in") is None)
+        check(ok,
+              f"clean-open: NOT captured as a change "
+              f"(kind={fx.index.kind_of('Makefile.in')!r}, want None)")
+    finally:
+        fx.stop()
+
+
+def test_real_write_records_change():
+    """Counterpart: a genuine write MUST still be captured — the revert must never
+    swallow a real modification."""
+    fx = MountFixture()
+    fx.seed_lower("Makefile.in", b"all:\n")
+    fx.start()
+    try:
+        r = fx.sh("printf 'clean:\\n' >> Makefile.in")
+        check(r.returncode == 0, f"write-capture: ran (err={r.stderr!r})")
+        check(fx.index.kind_of("Makefile.in") == "file",
+              f"write-capture: captured (kind={fx.index.kind_of('Makefile.in')!r})")
+        check((fx.root / "Makefile.in").read_text().endswith("clean:\n"),
+              "write-capture: appended bytes are visible")
+    finally:
+        fx.stop()
+
+
+def test_truncate_records_change():
+    """`>file` (O_TRUNC, no bytes written) IS a modification and must be captured —
+    the revert must key off real change, not merely off 'no write() happened'."""
+    fx = MountFixture()
+    fx.seed_lower("config.cache", b"old cached junk\n")
+    fx.start()
+    try:
+        r = fx.sh(": > config.cache")          # truncate to empty, write nothing
+        check(r.returncode == 0, f"trunc-capture: ran (err={r.stderr!r})")
+        check(fx.index.kind_of("config.cache") == "file",
+              f"trunc-capture: captured (kind={fx.index.kind_of('config.cache')!r})")
+        check((fx.root / "config.cache").read_bytes() == b"",
+              "trunc-capture: file is now empty")
+    finally:
+        fx.stop()
+
+
+def test_new_empty_file_is_recorded():
+    """A genuine creation (a file that did NOT exist before) must be recorded even
+    with no bytes written — `touch newfile` / `> newfile` is a real change."""
+    fx = MountFixture()
+    fx.start()
+    try:
+        r = fx.sh("exec 3>brand_new.stamp; exec 3>&-")   # O_WRONLY|O_CREAT, no write
+        check(r.returncode == 0, f"new-file: ran (err={r.stderr!r})")
+        check(fx.index.kind_of("brand_new.stamp") == "file",
+              f"new-file: empty creation recorded "
+              f"(kind={fx.index.kind_of('brand_new.stamp')!r})")
+        check((fx.root / "brand_new.stamp").exists(),
+              "new-file: visible through the mount")
+    finally:
+        fx.stop()
+
+
 if __name__ == "__main__":
     for fn in (test_readonly_preserves_mtime,
                test_chmod_preserves_mtime_bumps_ctime,
-               test_open_for_write_no_write_preserves_mtime,
+               test_clean_reopen_of_captured_file_preserves_mtime,
                test_real_write_advances_mtime,
                test_truncate_open_advances_mtime,
-               test_dependency_ordering_survives_chmod):
+               test_dependency_ordering_survives_chmod,
+               test_clean_open_for_write_records_no_change,
+               test_real_write_records_change,
+               test_truncate_records_change,
+               test_new_empty_file_is_recorded):
         print(f"\n== {fn.__name__} ==")
         try:
             fn()
