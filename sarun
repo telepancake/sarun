@@ -447,6 +447,16 @@ def ensure_dirs() -> None:
         except OSError: pass
 
 INNER_PROXY_PORT = 8080   # forwarder's listen port inside the slopbox
+# Per-box synthetic DNS + catch-all forwarders (proxy-UNAWARE in-box programs).
+# The box's netns has only loopback, and the kernel routes ALL of 127/8 to lo, so
+# a listener on 0.0.0.0 receives connections to any 127.x.y.z and getsockname()
+# reveals which synthetic IP was dialed. The resolver hands out synthetic 127/8 IPs
+# for domains; the catch-all forwarders translate a connection-to-synthetic-IP back
+# to its domain and forward it (with metadata) to the same relay the proxy path uses.
+INNER_DNS_ADDR = "127.0.0.53"   # where in-box resolv.conf points (systemd-resolved-style)
+INNER_DNS_PORT = 53
+INNER_HTTP_PORT = 80            # catch-all forwarder: plaintext → relay as scheme=http
+INNER_HTTPS_PORT = 443          # catch-all forwarder: TLS → relay as scheme=https
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -551,8 +561,157 @@ def ui_is_running(sock_path: str) -> bool:
 # slopbox). Then execs the real command. The forwarder holds no bytes; the UI
 # drives the proxied conversation.
 
+# ── Synthetic-IP DNS for proxy-UNAWARE in-box programs ──────────────────────
+#
+# A program that does its own DNS and connects to an IP never sees HTTP_PROXY. To
+# intercept it we (1) run a tiny DNS resolver that answers every A query with a
+# stable synthetic 127/8 IP, (2) point the box's /etc/resolv.conf at it, and (3)
+# run catch-all forwarders on :80/:443 that, on accept, map the dialed synthetic IP
+# back to its domain and forward the connection (with that domain as metadata) to
+# the same relay the proxy path uses. A connection to an UNMAPPED 127.x (a real IP
+# the program hard-coded, or a synthetic we never handed out) is closed: direct-IP
+# traffic stays blocked. The ip↔domain map lives ONLY in-box; the UI never needs it.
+
+class SyntheticDNS:
+    """Allocates stable synthetic 127/8 IPv4 addresses for domains and reverses them.
+
+    Pool: 127.0.0.0/8 minus the two reserved rendezvous IPs (127.0.0.1 = inner proxy
+    listener, 127.0.0.53 = this resolver) and the broadcast-ish 127.0.0.0. Same domain
+    always maps to the same IP (dedup, so a chatty resolver can't exhaust the pool);
+    pool exhaustion raises so the caller can answer SERVFAIL.
+
+    Threading contract (mirrors Index): the DNS thread allocates and the :80/:443
+    forwarder threads only ever reverse-lookup. All access is single dict op under a
+    Lock; the maps are plain dicts so reads outside the lock would also be GIL-atomic,
+    but we take the lock for the allocate read-modify-write (lookup-or-mint must be one
+    critical section or two domains could race onto the same fresh IP)."""
+
+    # 127/8 has ~16.7M usable addresses; we never come close, but cap the search.
+    _LO_NET = 0x7F000000          # 127.0.0.0
+    _LO_BCAST = 0x7FFFFFFF        # 127.255.255.255
+    _RESERVED = frozenset({0x7F000000, 0x7F000001, 0x7F000035})  # .0, proxy .1, dns .53
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._by_domain: dict[str, str] = {}
+        self._by_ip: dict[str, str] = {}
+        self._next = self._LO_NET + 2   # start past 127.0.0.0/.1; .53 skipped in loop
+
+    def ip_for(self, domain: str) -> str:
+        """Stable synthetic IP for `domain`. Raises RuntimeError on pool exhaustion."""
+        domain = domain.lower().rstrip(".")
+        with self._lock:
+            ip = self._by_domain.get(domain)
+            if ip is not None:
+                return ip
+            n = self._next
+            while n < self._LO_BCAST:
+                if n not in self._RESERVED:
+                    ipstr = socket.inet_ntoa(struct.pack("!I", n))
+                    self._next = n + 1
+                    self._by_domain[domain] = ipstr
+                    self._by_ip[ipstr] = domain
+                    return ipstr
+                n += 1
+            raise RuntimeError("synthetic 127/8 pool exhausted")
+
+    def domain_for(self, ip: str) -> "str | None":
+        """Reverse lookup for the forwarders; None if `ip` was never handed out."""
+        return self._by_ip.get(ip)
+
+
+# ── Minimal DNS wire codec (no new deps) ────────────────────────────────────
+# We only need: parse one question (QNAME labels + qtype + qclass) out of a query,
+# and build a response with zero or one A answer. glibc sends these as single UDP
+# datagrams, so we never deal with TCP/53 or message reassembly here.
+
+_DNS_QTYPE_A = 1
+_DNS_QTYPE_AAAA = 28
+
+
+def _dns_parse_question(pkt: bytes) -> "tuple[int, str, int] | None":
+    """Return (txid, qname, qtype) for the first question, or None if malformed.
+
+    Hand-rolled: 12-byte header, then QDCOUNT≥1 questions of label-sequences. We read
+    only the first question (the only shape glibc emits for these tiny lookups)."""
+    try:
+        if len(pkt) < 12:
+            return None
+        txid, _flags, qdcount = struct.unpack("!HHH", pkt[:6])
+        if qdcount < 1:
+            return None
+        pos = 12
+        labels = []
+        while True:
+            if pos >= len(pkt):
+                return None
+            ln = pkt[pos]; pos += 1
+            if ln == 0:
+                break
+            if ln & 0xC0:   # compression pointer in a question is malformed for us
+                return None
+            if pos + ln > len(pkt):
+                return None
+            # QNAME labels are already A-labels (punycode) on the wire for IDNs;
+            # latin-1 is a lossless byte→str mapping that the allocator keys on as-is.
+            labels.append(pkt[pos:pos + ln].decode("latin-1"))
+            pos += ln
+        if pos + 4 > len(pkt):
+            return None
+        qtype, _qclass = struct.unpack("!HH", pkt[pos:pos + 4])
+        return txid, ".".join(labels), qtype
+    except (struct.error, UnicodeError, IndexError):
+        return None
+
+
+def _dns_build_response(pkt: bytes, txid: int, *, rcode: int = 0,
+                        a_ip: "str | None" = None, ttl: int = 30) -> bytes:
+    """Build a response echoing the query's question section. If `a_ip` is given,
+    append exactly one A answer; otherwise zero answers (NOERROR/empty, or SERVFAIL
+    when rcode is set). We copy the question bytes verbatim from the query so we never
+    have to re-encode the QNAME."""
+    # Question section = everything from offset 12 up to and including qtype+qclass.
+    pos = 12
+    while pos < len(pkt) and pkt[pos] != 0:
+        pos += 1 + pkt[pos]
+    qend = pos + 1 + 4   # null label + qtype(2) + qclass(2)
+    question = pkt[12:qend]
+    ancount = 1 if a_ip is not None else 0
+    # flags: QR=1, Opcode=0, AA=1, RD copied from query, RA=0, rcode.
+    rd = pkt[2] & 0x01 if len(pkt) > 2 else 0
+    flags = 0x8000 | (0x0400) | (rd << 8) | (rcode & 0x0F)
+    header = struct.pack("!HHHHHH", txid, flags, 1, ancount, 0, 0)
+    out = header + question
+    if a_ip is not None:
+        # Answer: name compression pointer to the question (offset 12), A/IN, ttl, rdata.
+        out += struct.pack("!HHHIH", 0xC00C, _DNS_QTYPE_A, 1, ttl, 4)
+        out += socket.inet_aton(a_ip)
+    return out
+
+
+def _dns_handle_packet(pkt: bytes, dns: SyntheticDNS) -> "bytes | None":
+    """Pure function: query bytes → response bytes (or None to drop a malformed
+    packet). Factored out so it round-trips in a unit test without a real socket."""
+    q = _dns_parse_question(pkt)
+    if q is None:
+        return None
+    txid, qname, qtype = q
+    if qtype == _DNS_QTYPE_A:
+        if not qname:
+            return _dns_build_response(pkt, txid, rcode=0)   # empty
+        try:
+            ip = dns.ip_for(qname)
+        except RuntimeError:
+            return _dns_build_response(pkt, txid, rcode=2)   # SERVFAIL on exhaustion
+        return _dns_build_response(pkt, txid, a_ip=ip)
+    # AAAA → NOERROR with ZERO answers so clients fall back to IPv4 (synthetic is v4
+    # only). Any other qtype → same empty NOERROR shape.
+    return _dns_build_response(pkt, txid, rcode=0)
+
+
 def run_inner(channel_path: str, cmd: list) -> int:
     stop = threading.Event()
+    dns = SyntheticDNS()
 
     def _peer_pidfd(conn: socket.socket) -> int:
         """A pidfd for the connecting in-box workload process, or -1.
@@ -580,21 +739,31 @@ def run_inner(channel_path: str, cmd: list) -> int:
             # OSError (e.g. ENOSYS on old kernels, ESRCH if peer already reaped).
             return -1
 
-    def forward_one(conn: socket.socket) -> None:
+    def forward_one(conn: socket.socket, meta: "dict | None" = None) -> None:
+        """Hand `conn` (+ a pidfd for the connecting workload) to the per-box relay.
+
+        `meta` is the small JSON header the UI reads to learn the connection's KIND:
+          - None / {"kind":"proxy"}  → proxy-AWARE path (HTTP_PROXY client; the relay
+            drives a regular HttpProxy layer, destination from the client's request).
+          - {"kind":"direct","host":..,"port":..,"scheme":..} → proxy-UNAWARE path
+            (catch-all forwarder; the relay drives a reverse-proxy layer to that host).
+        Both paths share this one sendmsg(json, SCM_RIGHTS([conn_fd, pidfd]))."""
         pidfd = _peer_pidfd(conn)
+        if meta is None:
+            meta = {"kind": "proxy"}
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as ch:
                 ch.connect(channel_path)
                 # The relay socket is per-session and bound into ONLY this box, so the
                 # UI derives the session from which socket the FD arrived on. We send
                 # the request socket (index 0) and, if we could open one, a pidfd for
-                # the connecting workload process (index 1) over SCM_RIGHTS. No
-                # process fields travel in the payload — the pidfd IS the channel, and
-                # the UI resolves the HOST pid + provenance itself. No session_id is
-                # ever shipped (the UI never trusts a sid from inside a box).
+                # the connecting workload process (index 1) over SCM_RIGHTS. The JSON
+                # payload carries only the intended-destination metadata, never any
+                # process fields (the pidfd IS the process channel) and never a
+                # session_id (the UI never trusts a sid from inside a box).
                 fds = [conn.fileno()] if pidfd < 0 else [conn.fileno(), pidfd]
                 ch.sendmsg(
-                    [b"\x00"],
+                    [json.dumps(meta).encode()],
                     [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
                       array.array("i", fds).tobytes())],
                 )
@@ -627,9 +796,79 @@ def run_inner(channel_path: str, cmd: list) -> int:
             threading.Thread(target=forward_one, args=(conn,), daemon=True).start()
         srv.close()
 
-    # Only run the forwarder if a channel exists (i.e. networked + UI present).
+    def dns_server() -> None:
+        """UDP resolver on INNER_DNS_ADDR:53. Answers A with a synthetic 127/8 IP,
+        AAAA/other with NOERROR-empty, SERVFAIL on pool exhaustion. Never crashes on a
+        malformed packet — a bad datagram is dropped and we keep serving."""
+        srv = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            srv.bind((INNER_DNS_ADDR, INNER_DNS_PORT))
+        except OSError as e:
+            print(f"slopbox(inner): cannot bind DNS: {e}", file=sys.stderr)
+            return
+        srv.settimeout(0.5)
+        while not stop.is_set():
+            try:
+                pkt, addr = srv.recvfrom(4096)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            try:
+                resp = _dns_handle_packet(pkt, dns)
+                if resp is not None:
+                    srv.sendto(resp, addr)
+            except OSError:
+                pass
+        srv.close()
+
+    def catch_all(port: int, scheme: str) -> None:
+        """Bind 0.0.0.0:port and forward each accepted connection by the SYNTHETIC IP
+        the client dialed. getsockname() reveals which 127.x the kernel routed to lo.
+        If that IP maps to a domain we handed out → forward with direct metadata; if it
+        does not (a real IP, or a synthetic never allocated) → CLOSE it. Direct-IP and
+        unresolved traffic stays blocked — that exclusion is the security property."""
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            srv.bind(("0.0.0.0", port))
+            srv.listen(64)
+        except OSError as e:
+            print(f"slopbox(inner): cannot listen :{port}: {e}", file=sys.stderr)
+            return
+        srv.settimeout(0.5)
+        while not stop.is_set():
+            try:
+                conn, _ = srv.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            threading.Thread(target=_handle_catch_all,
+                             args=(conn, port, scheme), daemon=True).start()
+        srv.close()
+
+    def _handle_catch_all(conn: socket.socket, port: int, scheme: str) -> None:
+        try:
+            dest_ip = conn.getsockname()[0]
+        except OSError:
+            conn.close(); return
+        domain = dns.domain_for(dest_ip)
+        if domain is None:
+            # Unmapped synthetic / real direct IP → blocked. (No relay send.)
+            conn.close(); return
+        forward_one(conn, {"kind": "direct", "host": domain,
+                           "port": port, "scheme": scheme})
+
+    # Only run the forwarders if a channel exists (i.e. networked + UI present).
     if channel_path and os.path.exists(os.path.dirname(channel_path) or "/"):
         threading.Thread(target=listener, daemon=True).start()
+        threading.Thread(target=dns_server, daemon=True).start()
+        threading.Thread(target=catch_all,
+                         args=(INNER_HTTP_PORT, "http"), daemon=True).start()
+        threading.Thread(target=catch_all,
+                         args=(INNER_HTTPS_PORT, "https"), daemon=True).start()
 
     # Run the real command as a foreground job *inside* this PID namespace. We are
     # PID 1 here, so the process-group ids we put on the controlling terminal are
@@ -7745,6 +7984,12 @@ class Supervisor:
                 ca = b""
             if ca.strip():
                 self.mount.add_ca_spoof(sid, ca, SYSTEM_CA_FILES)
+            # Point the box's resolver at our in-box synthetic DNS thread (run_inner's
+            # dns_server on INNER_DNS_ADDR:53) so proxy-UNAWARE programs resolve to
+            # synthetic 127/8 IPs the catch-all forwarders can intercept.
+            if self.mount.ops is not None:
+                self.mount.ops.add_virtual(sid, "etc/resolv.conf",
+                                           b"nameserver 127.0.0.53\n")
         box_root = str(mnt_point() / sid)
         # Close any held pidfd from a prior run of this sid to avoid a leak.
         _old = self.sessions.get(sid)
@@ -8305,6 +8550,13 @@ _CURRENT_BOX_ID: "contextvars.ContextVar[str]" = contextvars.ContextVar(
 # A completed flow is tagged from this so its process row carries a host pid.
 _CURRENT_PROV: "contextvars.ContextVar[dict]" = contextvars.ContextVar(
     "slopbox_prov", default={"tgid": 0})
+# Per-connection intended destination for the DIRECT path (proxy-UNAWARE in-box
+# program intercepted via the synthetic-IP catch-all forwarder). The relay reads the
+# domain/port/scheme from --inner's JSON meta and stashes it here so handle_fd can
+# pin a reverse-proxy upstream to the REAL host — the synthetic IP is never dialed.
+# (None for the proxy-aware path, where the client itself names the destination.)
+_CURRENT_DEST: "contextvars.ContextVar[tuple | None]" = contextvars.ContextVar(
+    "slopbox_dest", default=None)
 
 
 class _GatingAddon:
@@ -8314,6 +8566,24 @@ class _GatingAddon:
     TLS work — so this only has to make the allow/deny decision."""
     def __init__(self, sup: "Supervisor"):
         self.sup = sup
+
+    def _normalize_direct_host(self, flow) -> bool:
+        """On the DIRECT path the trusted domain is _CURRENT_DEST's host, not whatever
+        the client put in the request. For our flow the client did send the real Host/
+        SNI (reverse mode mints a cert for that host), but an http client could have
+        sent a bare IP — so we OVERRIDE flow.request.host to the contextvar's domain so
+        gating + logging key on the real name. Returns False (caller must DENY) if a
+        direct flow somehow has no resolvable domain — direct traffic that can't be
+        matched to a name is never allowed."""
+        dest = _CURRENT_DEST.get()
+        if dest is None:
+            return True   # proxy-aware path: client named the destination itself
+        host, port, _scheme = dest
+        if not host:
+            return False
+        if flow.request.host != host:
+            flow.request.host = host
+        return True
 
     def _deny(self, flow):
         from mitmproxy import http
@@ -8332,21 +8602,35 @@ class _GatingAddon:
             self._deny(flow)
 
     async def http_connect(self, flow):
-        # https: gate the tunnel by host/ip/cname (the URL isn't visible yet).
+        # Only the proxy-AWARE https path sends a CONNECT. Normalize (a no-op here) and
+        # gate the tunnel by host/ip/cname (the URL isn't visible yet). Mark the flow so
+        # request() below knows the tunnel was already gated and doesn't prompt twice.
+        if not self._normalize_direct_host(flow):
+            self._deny(flow); return
+        flow.metadata["slopbox_connect_gated"] = True
         await self._gate(flow, "https")
 
     async def request(self, flow):
+        # Force the trusted domain onto the request before any gating/logging. On the
+        # DIRECT path there is no CONNECT, so this is where _CURRENT_DEST is applied and
+        # where https-direct gets its one-and-only host/ip/cname gate.
+        if not self._normalize_direct_host(flow):
+            self._deny(flow)
+            return
         url = flow.request.pretty_url
         if flow.request.scheme == "http":
             # http has no CONNECT: this is the one place we gate it (URL known).
             await self._gate(flow, "http", url)
-        else:
-            # https was already gated at CONNECT; here we only enforce a URL-level
-            # deny rule, so we don't prompt twice for the same connection.
+        elif flow.metadata.get("slopbox_connect_gated"):
+            # Proxy-aware https already gated at CONNECT; here we only enforce a
+            # URL-level deny rule, so we don't prompt twice for the same connection.
             if self.sup.policy.precheck(_CURRENT_BOX_ID.get(), flow.request.host,
                                         flow.request.port, url,
                                         proc=_CURRENT_PROV.get()) == "deny":
                 self._deny(flow)
+        else:
+            # Direct https (reverse mode, no CONNECT): gate host/ip/cname here once.
+            await self._gate(flow, "https", url)
         # An allowed request is now IN FLIGHT (sent upstream, awaiting a response):
         # surface it in the live Network pane. A denied one already carries its 403
         # and is handled wholly by response() below — never an "open flow".
@@ -8413,6 +8697,7 @@ class ProxyEngine:
         self._master = None
         self._opts = None
         self._mode = None
+        self._reverse_cache: dict = {}   # "reverse:scheme://host:port" → ReverseMode
         self._ready = False
         try:
             from mitmproxy import options as moptions, addons, hooks as mhooks
@@ -8439,8 +8724,29 @@ class ProxyEngine:
     def ready(self) -> bool:
         return self._ready
 
-    async def handle_fd(self, fd: int, box_id: str) -> None:
+    def _reverse_mode(self, scheme: str, host: str, port: int):
+        """A cached mitmproxy ReverseMode pinned to scheme://host:port. The direct
+        path passes this as the connection's proxy_mode so the ReverseProxy layer
+        sets context.server.address = (host, port) and, for https, context.server.sni
+        = host — which makes TlsConfig mint/serve a spoofed cert for `host` using the
+        SAME CA-backed cert store the proxy path uses. The synthetic IP is never used."""
+        from mitmproxy.proxy import mode_specs
+        key = f"reverse:{scheme}://{host}:{port}"
+        m = self._reverse_cache.get(key)
+        if m is None:
+            m = mode_specs.ProxyMode.parse(key)
+            self._reverse_cache[key] = m
+        return m
+
+    async def handle_fd(self, fd: int, box_id: str, *, kind: str = "proxy",
+                        dest: "tuple | None" = None) -> None:
         if not self._ready:
+            try: os.close(fd)
+            except OSError: pass
+            return
+        # Direct path requires a resolvable destination; a direct connection we can't
+        # tie to a domain must be DENIED (closed), never silently proxied.
+        if kind == "direct" and (not dest or not dest[0]):
             try: os.close(fd)
             except OSError: pass
             return
@@ -8457,11 +8763,21 @@ class ProxyEngine:
             return
 
         _CURRENT_BOX_ID.set(box_id)
-        handler = ProxyConnectionHandler(
-            self._master, reader, writer, self._opts, self._mode)
-        # Seed the regular-proxy top layer exactly as mitmproxy's RegularInstance
-        # does; without it the NextLayer addon has no layer stack to reason about.
-        handler.layer = layers.modes.HttpProxy(handler.layer.context)
+        _CURRENT_DEST.set(dest)
+        if kind == "direct":
+            host, port, scheme = dest
+            mode = self._reverse_mode(scheme, host, port)
+            handler = ProxyConnectionHandler(
+                self._master, reader, writer, self._opts, mode)
+            # Seed the reverse-proxy top layer; it reads client.proxy_mode (the
+            # ReverseMode above), pins the upstream to host:port and the SNI to host.
+            handler.layer = layers.modes.ReverseProxy(handler.layer.context)
+        else:
+            handler = ProxyConnectionHandler(
+                self._master, reader, writer, self._opts, self._mode)
+            # Seed the regular-proxy top layer exactly as mitmproxy's RegularInstance
+            # does; without it the NextLayer addon has no layer stack to reason about.
+            handler.layer = layers.modes.HttpProxy(handler.layer.context)
         try:
             await handler.handle_client()
         except Exception:
@@ -8512,13 +8828,26 @@ class RelayServer:
     async def _handle(self, conn: socket.socket) -> None:
         conn.setblocking(False)
         try:
-            _msg, anc, _flags, _addr = await self._loop.run_in_executor(
+            msg, anc, _flags, _addr = await self._loop.run_in_executor(
                 None, _recvmsg_blocking, conn)
             fds = []
             for lvl, typ, data in anc:
                 if lvl == socket.SOL_SOCKET and typ == socket.SCM_RIGHTS:
                     a = array.array("i"); a.frombytes(data); fds.extend(a.tolist())
             conn.close()
+            # --inner's payload is a small JSON header naming the connection's KIND and,
+            # for the direct path, the intended host/port/scheme. An empty payload or a
+            # legacy b"\x00" is treated as a proxy connection (fail-safe).
+            kind, dest = "proxy", None
+            if msg and msg not in (b"\x00",):
+                try:
+                    meta = json.loads(msg.decode())
+                    if isinstance(meta, dict) and meta.get("kind") == "direct":
+                        kind = "direct"
+                        dest = (str(meta.get("host", "")), int(meta.get("port", 0)),
+                                str(meta.get("scheme", "https")))
+                except (ValueError, TypeError, UnicodeDecodeError):
+                    kind, dest = "proxy", None
             # The ancillary fd array from --inner is [request_socket] or
             # [request_socket, pidfd]: index 0 is always the connection socket the
             # engine drives; index 1, if present, is a pidfd for the connecting in-box
@@ -8547,7 +8876,8 @@ class RelayServer:
                     try: os.close(pidfd)
                     except OSError: pass
                 _CURRENT_PROV.set(prov)
-                await self.engine.handle_fd(fds[0], self.box_id)
+                _CURRENT_DEST.set(dest)
+                await self.engine.handle_fd(fds[0], self.box_id, kind=kind, dest=dest)
         except (OSError, asyncio.CancelledError):
             try: conn.close()
             except OSError: pass

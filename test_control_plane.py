@@ -90,9 +90,13 @@ class _RecordingEngine:
     """Stand-in ProxyEngine that just records (sid) it was asked to gate an FD as."""
     def __init__(self):
         self.calls = []      # list of sids
+        self.kinds = []      # list of connection kinds (proxy/direct)
+        self.dests = []      # list of intended destinations (None for proxy)
         self.done = threading.Event()
-    async def handle_fd(self, fd, box_id):
+    async def handle_fd(self, fd, box_id, *, kind="proxy", dest=None):
         self.calls.append(box_id)
+        self.kinds.append(kind)
+        self.dests.append(dest)
         try: os.close(fd)
         except OSError: pass
         self.done.set()
@@ -181,6 +185,51 @@ def test_relay_socket_does_not_dispatch_control():
         # the RelayServer exposes no control entrypoint at all
         check(not hasattr(rs, "_dispatch_control"),
               "relay: RelayServer has no control dispatcher")
+    finally:
+        _shutdown_loop(loop, rs, t)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_relay_direct_meta_sets_kind_and_dest():
+    """A direct-path FD (JSON meta {kind:direct,host,port,scheme}) is gated as the
+    relay's sid AND carries the intended destination through to handle_fd, while a
+    proxy/empty payload stays kind=proxy. This is the UI receive side of the
+    synthetic-IP forwarder protocol."""
+    tmp = Path(tempfile.mkdtemp(prefix="cp-"))
+    _redirect_state(tmp)
+    rs = None; t = None
+    loop = asyncio.new_event_loop()
+    try:
+        m.ensure_dirs()
+        sid_a = "20260604-000000_111"
+        os.makedirs(m.relay_dir(sid_a), mode=0o700, exist_ok=True)
+        eng = _RecordingEngine()
+        path = m.relay_sock_path(sid_a)
+        ready = threading.Event()
+        def run_loop():
+            asyncio.set_event_loop(loop)
+            nonlocal rs
+            rs = m.RelayServer(eng, sid_a, path, loop)
+            def _boot(): rs.start(); ready.set()
+            loop.call_soon(_boot)
+            loop.run_forever()
+        t = threading.Thread(target=run_loop, daemon=True); t.start()
+        ready.wait(5)
+
+        s0, s1 = socket.socketpair()
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
+            c.connect(path)
+            c.sendmsg([json.dumps({"kind": "direct", "host": "api.example.com",
+                                   "port": 443, "scheme": "https"}).encode()],
+                      [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
+                        array.array("i", [s0.fileno()]).tobytes())])
+        s0.close(); s1.close()
+
+        check(eng.done.wait(5), "relay(direct): FD handed to the engine")
+        check(eng.calls == [sid_a], "relay(direct): still gated as the relay's own sid")
+        check(eng.kinds == ["direct"], "relay(direct): kind propagated as direct")
+        check(eng.dests == [("api.example.com", 443, "https")],
+              f"relay(direct): dest propagated (got {eng.dests})")
     finally:
         _shutdown_loop(loop, rs, t)
         shutil.rmtree(tmp, ignore_errors=True)
@@ -1607,6 +1656,7 @@ if __name__ == "__main__":
     for t in (test_sid_validation_rejects_traversal,
               test_relay_fd_gated_by_socket_not_message,
               test_relay_socket_does_not_dispatch_control,
+              test_relay_direct_meta_sets_kind_and_dest,
               test_owner_token_required_for_teardown,
               test_register_net_wires_a_per_session_relay,
               test_box_cannot_register_or_unregister_a_foreign_session,
