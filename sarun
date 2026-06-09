@@ -12640,11 +12640,22 @@ def _make_ui_app():
             sel=self._sel_output()
             # Pull each listed entry's content (in id order) and split into lines tagged
             # with the owning entry's id + stream — the unit the margin/style apply to.
-            segs=[]   # (oid, stream, text)
-            for r in rows:
-                det=self.sup.output_detail(sid, r["id"])
-                if not det: continue
-                segs.append((r["id"], r.get("stream",0), self._out_decode(det.get("content"))))
+            # Cache the fetched+decoded segments keyed on the listed id-set, so a mere
+            # cursor move (RowHighlighted → here) re-marks the selection without re-reading
+            # every entry's content from the db; the list changing (filter / new writes
+            # during a run) has a new key and re-fetches.
+            seg_key=tuple(r["id"] for r in rows)
+            cached=getattr(self,"_out_segs",None)
+            if cached is not None and cached[0]==seg_key:
+                segs=cached[1]
+            else:
+                segs=[]   # (oid, stream, text)
+                for r in rows:
+                    det=self.sup.output_detail(sid, r["id"])
+                    if not det: continue
+                    segs.append((r["id"], r.get("stream",0),
+                                 self._out_decode(det.get("content"))))
+                self._out_segs=(seg_key, segs)
             full="".join(s[2] for s in segs)
             # CAP: concatenated output can be huge. Keep a window of _OUT_CAP chars centred
             # on the selected entry so the selection is always on-screen; note any elision.
