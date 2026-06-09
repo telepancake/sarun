@@ -213,7 +213,7 @@ def _pyfuse3_build(src_dir, dest):
             "Cython/meson via build isolation). Install uv: "
             "https://docs.astral.sh/uv/")
     try:
-        subprocess.run([uv, "pip", "install", "--target", str(dest),
+        subprocess.run([uv, "pip", "install", "--target", str(dest), "--no-deps",
                         str(src_dir)], check=True)
     except subprocess.CalledProcessError as e:
         raise RuntimeError(
