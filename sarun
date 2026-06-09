@@ -100,6 +100,220 @@ never change.
 
 from __future__ import annotations
 
+# ════════════════════════════════════════════════════════════════════════════
+#  0 · Patched pyfuse3 bootstrap (MANDATORY — runs before any `import pyfuse3`)
+# ════════════════════════════════════════════════════════════════════════════
+# Stock pyfuse3 3.4.2's FUSE write() handler drops the RequestContext, so the
+# Ops.write handler can't see the writing process's pid — which the (later)
+# stdout/stderr capture feature needs. The FUSE protocol DOES carry the caller
+# pid on every WRITE; pyfuse3 just doesn't surface it. A 2-line source patch
+# (thread `get_request_context(c.req)` into the write call, like the ~24 other
+# handlers already do) fixes it, and the pid is correct even through an
+# inherited fd (a forked child writing via the parent's fd reports the CHILD).
+#
+# We build our OWN patched pyfuse3 from the pinned, sha256-verified sdist and
+# shadow any stock install via sys.path. This is MANDATORY: there is NO fallback
+# to stock pyfuse3 — a hard assertion after import refuses to run otherwise, so
+# tests, subagents, and users all run the identical patched library.
+#
+# Bootstrap is skipped only for `--inner` (the in-sandbox network forwarder,
+# which never touches pyfuse3 and where no build toolchain/network exists).
+import hashlib as _bootstrap_hashlib
+import os as _bootstrap_os
+import sys as _bootstrap_sys
+
+_PYFUSE3_VERSION = "3.4.2"
+# Pinned sdist: URL + sha256 of pyfuse3-3.4.2.tar.gz on PyPI. We fetch the
+# tarball directly (NOT `pip download` — its metadata step is broken in this
+# env) and fail loudly on a digest mismatch.
+_PYFUSE3_SDIST_URL = (
+    "https://files.pythonhosted.org/packages/98/c8/"
+    "8d4b00354b0aae1660310c6853cad7228af7efc344b3ff7d8cc4a894343d/"
+    "pyfuse3-3.4.2.tar.gz")
+_PYFUSE3_SDIST_SHA256 = (
+    "0a59031969c4ba51a5ec1b67f3c5c24f641a6a3f8119a86edad56debcb9084d9")
+
+# The patch, embedded as exact (old -> new) source edits applied programmatically
+# to the extracted sdist. handlers.pxi: thread the request context into both
+# write entry points; _pyfuse3.py: add the required `ctx` param to Operations.write.
+_PYFUSE3_PATCH = (
+    ("src/pyfuse3/handlers.pxi",
+     "async def fuse_write_async (_Container c, pbuf):\n"
+     "    cdef int ret\n"
+     "    cdef size_t len_\n"
+     "\n"
+     "    try:\n"
+     "        len_ = await operations.write(c.fh, c.off, pbuf)",
+     "async def fuse_write_async (_Container c, pbuf):\n"
+     "    cdef int ret\n"
+     "    cdef size_t len_\n"
+     "    ctx = get_request_context(c.req)\n"
+     "    try:\n"
+     "        len_ = await operations.write(c.fh, c.off, pbuf, ctx)"),
+    ("src/pyfuse3/handlers.pxi",
+     "async def fuse_write_buf_async (_Container c, buf):\n"
+     "    cdef int ret\n"
+     "    cdef size_t len_\n"
+     "\n"
+     "    try:\n"
+     "        len_ = await operations.write(c.fh, c.off, buf)",
+     "async def fuse_write_buf_async (_Container c, buf):\n"
+     "    cdef int ret\n"
+     "    cdef size_t len_\n"
+     "    ctx = get_request_context(c.req)\n"
+     "    try:\n"
+     "        len_ = await operations.write(c.fh, c.off, buf, ctx)"),
+    ("src/pyfuse3/_pyfuse3.py",
+     "    async def write(self, fh: FileHandleT, off: int, buf: bytes) -> int:",
+     "    async def write(self, fh: FileHandleT, off: int, buf: bytes, ctx) -> int:"),
+)
+
+# Short, stable identity of the patch so the cache key changes if the patch does.
+_PYFUSE3_PATCH_HASH = _bootstrap_hashlib.sha256(
+    repr(_PYFUSE3_PATCH).encode()).hexdigest()[:12]
+
+
+def _pyfuse3_cache_dir():
+    """`<XDG_CACHE_HOME or ~/.cache>/sarun/pyfuse3-<ver>-pidwrite-<patchhash>`.
+    The patch hash in the key means a changed patch builds a fresh dir, never
+    reusing a stale extension."""
+    from pathlib import Path
+    base = _bootstrap_os.environ.get("XDG_CACHE_HOME") or \
+        _bootstrap_os.path.expanduser("~/.cache")
+    return Path(base) / "sarun" / (
+        f"pyfuse3-{_PYFUSE3_VERSION}-pidwrite-{_PYFUSE3_PATCH_HASH}")
+
+
+def _pyfuse3_build(src_dir, dest):
+    """Apply the embedded patch to the extracted sdist at *src_dir*, force a
+    Cython regen, and `uv pip install --target dest`. Raises with an actionable
+    message on toolchain/build failure."""
+    import shutil
+    import subprocess
+    for rel, old, new in _PYFUSE3_PATCH:
+        p = src_dir / rel
+        text = p.read_text()
+        if old not in text:
+            raise RuntimeError(
+                f"pyfuse3 patch failed: anchor not found in {rel} (sdist "
+                f"changed?). Bootstrap cannot produce the patched build.")
+        p.write_text(text.replace(old, new, 1))
+    # BUILD SNAG: the sdist ships a pre-generated __init__.c; editing a .pxi does
+    # NOT bump the .pyx mtime, so Cython won't regenerate and the patch silently
+    # won't take effect. Delete the stale C and bump the source mtimes.
+    init_c = src_dir / "src/pyfuse3/__init__.c"
+    if init_c.exists():
+        init_c.unlink()
+    for rel in ("src/pyfuse3/__init__.pyx", "src/pyfuse3/handlers.pxi"):
+        (src_dir / rel).touch()
+    uv = shutil.which("uv")
+    if uv is None:
+        raise RuntimeError(
+            "patched pyfuse3 bootstrap needs `uv` on PATH to build (it pulls "
+            "Cython/meson via build isolation). Install uv: "
+            "https://docs.astral.sh/uv/")
+    try:
+        subprocess.run([uv, "pip", "install", "--target", str(dest),
+                        str(src_dir)], check=True)
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(
+            "building patched pyfuse3 failed. This build needs a C toolchain "
+            "and libfuse3 development headers. On Fedora: `sudo dnf install "
+            "gcc pkgconf-pkg-config fuse3-devel`; on Debian/Ubuntu: `sudo apt "
+            "install gcc pkg-config libfuse3-dev`. Underlying error: "
+            f"{e}") from e
+
+
+def _ensure_patched_pyfuse3():
+    """Make our patched pyfuse3 build importable (shadowing any stock install).
+
+    Fast path: if the cache already holds a completed build, just prepend it to
+    sys.path. Slow path (under a cache-root file lock so parallel runs/tests
+    don't race or double-build): download + verify the pinned sdist, patch it,
+    build into a temp dir, atomically rename into place, then prepend to
+    sys.path. A `.complete` marker + build-then-rename means a half-built cache
+    is never used. MANDATORY — never falls back to stock pyfuse3; raises with an
+    actionable message instead."""
+    from pathlib import Path
+    cache = _pyfuse3_cache_dir()
+    marker = cache / ".complete"
+    if marker.exists() and (cache / "pyfuse3").exists():
+        _bootstrap_sys.path.insert(0, str(cache))
+        return
+
+    import fcntl
+    import shutil
+    import tarfile
+    import tempfile
+    import urllib.request
+
+    lock_root = cache.parent
+    lock_root.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_root / f".{cache.name}.lock"
+    with open(lock_path, "w") as lock_fd:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        # Re-check under the lock: another process may have built it while we
+        # waited on the lock.
+        if marker.exists() and (cache / "pyfuse3").exists():
+            _bootstrap_sys.path.insert(0, str(cache))
+            return
+
+        with tempfile.TemporaryDirectory(dir=str(lock_root),
+                                         prefix=".build-") as td:
+            tdp = Path(td)
+            tar_path = tdp / "pyfuse3.tar.gz"
+            try:
+                with urllib.request.urlopen(_PYFUSE3_SDIST_URL) as r:
+                    data = r.read()
+            except Exception as e:
+                raise RuntimeError(
+                    "patched pyfuse3 bootstrap could not download the pinned "
+                    f"sdist ({_PYFUSE3_SDIST_URL}). The FIRST run needs network "
+                    f"access; later runs are cached and offline. Error: {e}"
+                ) from e
+            digest = _bootstrap_hashlib.sha256(data).hexdigest()
+            if digest != _PYFUSE3_SDIST_SHA256:
+                raise RuntimeError(
+                    "patched pyfuse3 bootstrap: sdist sha256 mismatch "
+                    f"(got {digest}, expected {_PYFUSE3_SDIST_SHA256}). "
+                    "Refusing to build from an unexpected tarball.")
+            tar_path.write_bytes(data)
+            extract_root = tdp / "extract"
+            with tarfile.open(tar_path) as tf:
+                tf.extractall(extract_root)
+            src_dir = extract_root / f"pyfuse3-{_PYFUSE3_VERSION}"
+            staging = tdp / "target"
+            _pyfuse3_build(src_dir, staging)
+            (staging / ".complete").write_text(_PYFUSE3_PATCH_HASH + "\n")
+            # Atomic publish: rename the fully-built staging dir into the cache
+            # path. If a racing builder beat us (dir now exists), keep theirs.
+            if not cache.exists():
+                try:
+                    _bootstrap_os.rename(str(staging), str(cache))
+                except OSError:
+                    if not cache.exists():
+                        shutil.copytree(str(staging), str(cache))
+        _bootstrap_sys.path.insert(0, str(cache))
+
+
+# Skip the bootstrap (and the pyfuse3 import/assert) for the in-sandbox `--inner`
+# forwarder: it never uses pyfuse3 and runs where no build toolchain/network
+# exists. Every other entry path (UI, runner, tests via SourceFileLoader, `-h`)
+# loads the patched build and asserts it below.
+if "--inner" not in _bootstrap_sys.argv:
+    _ensure_patched_pyfuse3()
+    import inspect as _bootstrap_inspect
+    import pyfuse3
+    # Hard assertion: refuse to run on stock pyfuse3. The patched build's
+    # Operations.write carries a `ctx` parameter; stock does not.
+    if "ctx" not in _bootstrap_inspect.signature(
+            pyfuse3.Operations.write).parameters:
+        raise SystemExit(
+            "FATAL: active pyfuse3 is NOT the patched build (Operations.write "
+            "lacks `ctx`). The patched pyfuse3 (which surfaces the writer pid on "
+            f"FUSE write) is mandatory. Its cache is {_pyfuse3_cache_dir()}; "
+            "delete it to force a clean rebuild.")
+
 import abc
 import argparse
 import array
@@ -4652,7 +4866,10 @@ def _build_overlay_ops():
             finally:
                 self._req_exit()
 
-        async def write(self, fh, off, buf):
+        async def write(self, fh, off, buf, ctx):
+            # `ctx` (writer uid/gid/pid, surfaced by our patched pyfuse3) is
+            # threaded through for the forthcoming stdout/stderr capture feature;
+            # the write path does not consume it yet.
             # Captured write: splice into the handle's backing.
             wb = self._wbuf.get(fh)
             if wb is not None:
