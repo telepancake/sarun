@@ -1,0 +1,697 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+"""
+oaita_fakeserver — a zero-dependency, OpenAI-compatible FAKE API server.
+
+A reusable test double for the OpenAI HTTP API. Tests (and later the real
+`oaita` client) drive it for exact, network-free control over what the
+"model" returns. It is pure stdlib — no `openai`, no `httpx`, no anything —
+yet it speaks the wire format the official `openai` SDK parses without error:
+proper `chat.completion` JSON for non-streaming calls and a valid
+Server-Sent-Events stream of `chat.completion.chunk` objects for streaming.
+
+Two ways to consume it:
+
+  • imported by a test —
+        loader = importlib.machinery.SourceFileLoader(
+            "oaita_fakeserver", "/path/to/oaita_fakeserver")
+        m = loader.load_module()
+        with m.FakeOpenAIServer() as srv:
+            srv.enqueue("hi there")
+            base_url = srv.base_url            # point the openai SDK here
+            ...
+            assert srv.requests[-1].model == "test-model"
+
+  • run directly — `./oaita_fakeserver` runs a built-in self-smoke that
+    exercises every code path with `urllib` (no third-party deps) and prints
+    `ALL PASS` / `N FAILURE(S)`.
+
+Design contract: the server gives EXACT control. A test ENQUEUEs canned
+responses (`CannedChat` / `CannedError` / `CannedRaw`, or a bare str/dict) and
+the server pops them FIFO; every received request is CAPTURED as a
+`CapturedRequest` for later assertions. If a chat request arrives with an empty
+queue and no `default`, the server answers 500 with a loud "nothing enqueued"
+error — so a test that forgot to enqueue fails obviously rather than silently.
+
+Sections:
+    1 · Imports & small helpers
+    2 · Canned-response value types (CannedChat / CannedError / CannedRaw)
+    3 · Request capture (CapturedRequest)
+    4 · The HTTP request handler
+    5 · The server (FakeOpenAIServer)
+    6 · __main__ self-smoke
+"""
+
+from __future__ import annotations
+
+# ════════════════════════════════════════════════════════════════════════════
+#  1 · Imports & small helpers
+# ════════════════════════════════════════════════════════════════════════════
+import json
+import threading
+import time
+from dataclasses import dataclass, field
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
+
+# Compact JSON: no superfluous whitespace, matching what real API servers emit.
+_JSON = dict(separators=(",", ":"), ensure_ascii=False)
+
+
+def _dumps(obj) -> str:
+    return json.dumps(obj, **_JSON)
+
+
+_counter_lock = threading.Lock()
+_counter = 0
+
+
+def _gen_id(prefix: str = "chatcmpl") -> str:
+    """Stable-ish, monotonically-unique id like the real `chatcmpl-...`."""
+    global _counter
+    with _counter_lock:
+        _counter += 1
+        n = _counter
+    return f"{prefix}-fake{int(time.time()*1000):x}{n:04x}"
+
+
+def _default_usage() -> dict:
+    return {"prompt_tokens": 9, "completion_tokens": 12, "total_tokens": 21}
+
+
+def _split_content(content: str, n: int) -> list[str]:
+    """Split `content` into up to `n` non-empty contiguous pieces (chars)."""
+    if not content:
+        return []
+    n = max(1, int(n))
+    if n >= len(content):
+        # One piece per char (still non-empty), capped at len(content).
+        return list(content)
+    size, rem = divmod(len(content), n)
+    pieces, i = [], 0
+    for k in range(n):
+        # Spread the remainder across the first `rem` pieces.
+        step = size + (1 if k < rem else 0)
+        pieces.append(content[i:i + step])
+        i += step
+    return [p for p in pieces if p]
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  2 · Canned-response value types
+# ════════════════════════════════════════════════════════════════════════════
+def _normalize_tool_calls(tool_calls) -> list[dict]:
+    """Coerce each entry into OpenAI tool-call shape.
+
+    Accepts either a dict already in OpenAI shape, or a convenience
+    tuple/namedtuple `(name, arguments, id)` where `arguments` is a JSON string.
+    """
+    out = []
+    for i, tc in enumerate(tool_calls or []):
+        if isinstance(tc, dict):
+            out.append(tc)
+            continue
+        # tuple / namedtuple: (name, arguments, id) — id optional.
+        name = tc[0]
+        arguments = tc[1] if len(tc) > 1 else "{}"
+        tc_id = tc[2] if len(tc) > 2 and tc[2] else f"call_fake{i:03d}"
+        out.append({
+            "id": tc_id,
+            "type": "function",
+            "function": {"name": name, "arguments": arguments},
+        })
+    return out
+
+
+@dataclass
+class CannedChat:
+    """A canned chat-completion answer (non-stream JSON or SSE chunks)."""
+    content: str | None = None
+    tool_calls: list | None = None
+    finish_reason: str = "stop"
+    model: str = "test-model"
+    id: str | None = None
+    created: int | None = None
+    usage: dict | None = None
+    role: str = "assistant"
+    n_content_chunks: int = 3
+
+    def __post_init__(self):
+        if self.id is None:
+            self.id = _gen_id()
+        if self.created is None:
+            self.created = int(time.time())
+        if self.usage is None:
+            self.usage = _default_usage()
+        if self.tool_calls is not None:
+            self.tool_calls = _normalize_tool_calls(self.tool_calls)
+            # If a caller set tool_calls but left finish_reason at its default,
+            # the OpenAI-correct finish_reason is "tool_calls".
+            if self.finish_reason == "stop":
+                self.finish_reason = "tool_calls"
+
+    # --- non-streaming rendering ------------------------------------------
+    def to_completion(self) -> dict:
+        """Render a full `chat.completion` object."""
+        message: dict = {"role": self.role, "content": self.content}
+        if self.tool_calls:
+            message["tool_calls"] = self.tool_calls
+        return {
+            "id": self.id,
+            "object": "chat.completion",
+            "created": self.created,
+            "model": self.model,
+            "choices": [{
+                "index": 0,
+                "message": message,
+                "finish_reason": self.finish_reason,
+                "logprobs": None,
+            }],
+            "usage": self.usage,
+        }
+
+    # --- streaming rendering ----------------------------------------------
+    def _chunk(self, delta: dict, finish_reason=None) -> dict:
+        return {
+            "id": self.id,
+            "object": "chat.completion.chunk",
+            "created": self.created,
+            "model": self.model,
+            "choices": [{
+                "index": 0,
+                "delta": delta,
+                "finish_reason": finish_reason,
+                "logprobs": None,
+            }],
+        }
+
+    def to_chunks(self, include_usage: bool = False) -> list[dict]:
+        """Render the ordered list of `chat.completion.chunk` objects."""
+        chunks: list[dict] = []
+
+        # 1) Opening chunk carries the role (and empty content, as OpenAI does).
+        chunks.append(self._chunk({"role": self.role, "content": ""}))
+
+        # 2) Content deltas (only when there is content to stream).
+        for piece in _split_content(self.content or "", self.n_content_chunks):
+            chunks.append(self._chunk({"content": piece}))
+
+        # 3) Tool-call deltas — one delta per call, arguments sent whole.
+        for idx, tc in enumerate(self.tool_calls or []):
+            chunks.append(self._chunk({"tool_calls": [{
+                "index": idx,
+                "id": tc.get("id"),
+                "type": "function",
+                "function": {
+                    "name": tc["function"]["name"],
+                    "arguments": tc["function"].get("arguments", ""),
+                },
+            }]}))
+
+        # 4) Terminal chunk: empty delta + finish_reason.
+        chunks.append(self._chunk({}, finish_reason=self.finish_reason))
+
+        # 5) Optional usage-only chunk (stream_options.include_usage).
+        if include_usage:
+            tail = {
+                "id": self.id,
+                "object": "chat.completion.chunk",
+                "created": self.created,
+                "model": self.model,
+                "choices": [],
+                "usage": self.usage,
+            }
+            chunks.append(tail)
+        return chunks
+
+
+@dataclass
+class CannedError:
+    """A canned error response (returned before any stream begins)."""
+    status_code: int
+    body: dict | None = None
+    message: str | None = None
+    type: str = "invalid_request_error"
+    code: str | None = None
+
+    def render(self) -> dict:
+        if self.body is not None:
+            return self.body
+        return {"error": {
+            "message": self.message or "fake error",
+            "type": self.type,
+            "code": self.code,
+            "param": None,
+        }}
+
+
+@dataclass
+class CannedRaw:
+    """A verbatim JSON body for full manual control / odd shapes."""
+    body: dict
+    status_code: int = 200
+
+
+def _coerce(item):
+    """Coerce an enqueued value into one of the Canned* types."""
+    if isinstance(item, (CannedChat, CannedError, CannedRaw)):
+        return item
+    if isinstance(item, str):
+        return CannedChat(content=item)
+    if isinstance(item, dict):
+        return CannedRaw(body=item)
+    raise TypeError(f"cannot enqueue {type(item).__name__}: {item!r}")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  3 · Request capture
+# ════════════════════════════════════════════════════════════════════════════
+@dataclass
+class CapturedRequest:
+    """Everything received for one request, for test assertions."""
+    method: str
+    path: str                       # no query string
+    query: dict
+    headers: dict                   # lower-cased keys
+    body: bytes
+    json: dict | None               # parsed JSON body, or None
+
+    # Convenience read-only views over the parsed JSON / headers. -----------
+    @property
+    def messages(self):
+        return (self.json or {}).get("messages")
+
+    @property
+    def model(self):
+        return (self.json or {}).get("model")
+
+    @property
+    def stream(self):
+        return (self.json or {}).get("stream")
+
+    @property
+    def tools(self):
+        return (self.json or {}).get("tools")
+
+    @property
+    def authorization(self):
+        return self.headers.get("authorization")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  4 · The HTTP request handler
+# ════════════════════════════════════════════════════════════════════════════
+class _Handler(BaseHTTPRequestHandler):
+    # The owning FakeOpenAIServer sets this on the server instance.
+    protocol_version = "HTTP/1.1"
+
+    @property
+    def fake(self) -> "FakeOpenAIServer":
+        return self.server.fake          # type: ignore[attr-defined]
+
+    # Silence stderr access logging — tests run many of these.
+    def log_message(self, *a, **k):
+        pass
+
+    # --- low-level response helpers ---------------------------------------
+    def _send_json(self, status: int, obj: dict):
+        payload = _dumps(obj).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _send_error_envelope(self, status: int, message: str,
+                             type_: str = "invalid_request_error",
+                             code=None):
+        self._send_json(status, {"error": {
+            "message": message, "type": type_, "code": code, "param": None,
+        }})
+
+    def _read_body(self) -> bytes:
+        n = int(self.headers.get("Content-Length") or 0)
+        return self.rfile.read(n) if n > 0 else b""
+
+    def _capture(self, body: bytes) -> CapturedRequest:
+        parsed = urlparse(self.path)
+        try:
+            parsed_json = json.loads(body) if body else None
+            if not isinstance(parsed_json, dict):
+                parsed_json = parsed_json if isinstance(parsed_json, dict) else None
+        except Exception:
+            parsed_json = None
+        headers = {k.lower(): v for k, v in self.headers.items()}
+        req = CapturedRequest(
+            method=self.command,
+            path=parsed.path,
+            query={k: (v[0] if len(v) == 1 else v)
+                   for k, v in parse_qs(parsed.query).items()},
+            headers=headers,
+            body=body,
+            json=parsed_json,
+        )
+        self.fake._record(req)
+        return req
+
+    # --- HTTP verbs -------------------------------------------------------
+    def do_GET(self):
+        body = self._read_body()
+        req = self._capture(body)
+        if req.path == "/v1/models":
+            return self._handle_models()
+        return self._send_error_envelope(404, f"Unknown route: {req.path}",
+                                          "not_found_error")
+
+    def do_POST(self):
+        body = self._read_body()
+        req = self._capture(body)
+        if req.path == "/v1/chat/completions":
+            return self._handle_chat(req)
+        if req.path == "/v1/completions":
+            return self._handle_legacy_completions(req)
+        return self._send_error_envelope(404, f"Unknown route: {req.path}",
+                                          "not_found_error")
+
+    # --- route: GET /v1/models --------------------------------------------
+    def _handle_models(self):
+        models = self.fake.models
+        now = int(time.time())
+        data = [{
+            "id": m, "object": "model", "created": now,
+            "owned_by": "oaita-fake",
+        } for m in models]
+        self._send_json(200, {"object": "list", "data": data})
+
+    # --- route: POST /v1/chat/completions ---------------------------------
+    def _handle_chat(self, req: CapturedRequest):
+        canned = self.fake._next_canned()
+        if canned is None:
+            return self._send_error_envelope(
+                500,
+                "oaita_fakeserver: no canned response was enqueued for this "
+                "chat request (enqueue one, or pass default=...)",
+                "fake_empty_queue",
+            )
+
+        if isinstance(canned, CannedError):
+            return self._send_json(canned.status_code, canned.render())
+
+        if isinstance(canned, CannedRaw):
+            # Raw is returned as-is, regardless of stream flag.
+            return self._send_json(canned.status_code, canned.body)
+
+        # CannedChat: stream or non-stream depending on the REQUEST body.
+        body = req.json or {}
+        if body.get("stream") is True:
+            include_usage = bool(
+                (body.get("stream_options") or {}).get("include_usage"))
+            return self._stream_chat(canned, include_usage)
+        return self._send_json(200, canned.to_completion())
+
+    def _stream_chat(self, canned: CannedChat, include_usage: bool):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        # No Content-Length: this is a streamed response. HTTP/1.1 keep-alive
+        # without Content-Length requires chunked transfer encoding.
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        for chunk in canned.to_chunks(include_usage=include_usage):
+            self._sse_write(b"data: " + _dumps(chunk).encode("utf-8") + b"\n\n")
+        self._sse_write(b"data: [DONE]\n\n")
+        # Terminate the chunked stream.
+        self.wfile.write(b"0\r\n\r\n")
+        self.wfile.flush()
+
+    def _sse_write(self, payload: bytes):
+        """Write one SSE event as an HTTP/1.1 chunked frame, then flush."""
+        self.wfile.write(f"{len(payload):X}\r\n".encode("ascii"))
+        self.wfile.write(payload)
+        self.wfile.write(b"\r\n")
+        self.wfile.flush()
+
+    # --- route: POST /v1/completions (legacy text completion) -------------
+    def _handle_legacy_completions(self, req: CapturedRequest):
+        canned = self.fake._next_canned()
+        if canned is None:
+            return self._send_error_envelope(
+                500,
+                "oaita_fakeserver: no canned response was enqueued for this "
+                "legacy completions request",
+                "fake_empty_queue",
+            )
+        if isinstance(canned, CannedError):
+            return self._send_json(canned.status_code, canned.render())
+        if isinstance(canned, CannedRaw):
+            return self._send_json(canned.status_code, canned.body)
+        # CannedChat -> text_completion shape.
+        self._send_json(200, {
+            "id": canned.id.replace("chatcmpl", "cmpl"),
+            "object": "text_completion",
+            "created": canned.created,
+            "model": canned.model,
+            "choices": [{
+                "index": 0,
+                "text": canned.content or "",
+                "finish_reason": canned.finish_reason,
+                "logprobs": None,
+            }],
+            "usage": canned.usage,
+        })
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  5 · The server
+# ════════════════════════════════════════════════════════════════════════════
+class FakeOpenAIServer:
+    """A threaded fake OpenAI server with an enqueue/capture contract."""
+
+    def __init__(self, host: str = "127.0.0.1", port: int = 0, default=None):
+        self.host = host
+        self._want_port = port
+        self.default = default
+        self.models = ["test-model"]
+        self._queue: list = []
+        self.requests: list[CapturedRequest] = []
+        self._lock = threading.Lock()
+        self._httpd: ThreadingHTTPServer | None = None
+        self._thread: threading.Thread | None = None
+        self.port: int | None = None
+
+    # --- lifecycle --------------------------------------------------------
+    def start(self) -> "FakeOpenAIServer":
+        if self._httpd is not None:
+            return self
+        httpd = ThreadingHTTPServer((self.host, self._want_port), _Handler)
+        httpd.fake = self                 # type: ignore[attr-defined]
+        httpd.daemon_threads = True
+        self.port = httpd.server_address[1]
+        self._httpd = httpd
+        self._thread = threading.Thread(
+            target=httpd.serve_forever, name="fake-openai", daemon=True)
+        self._thread.start()
+        return self
+
+    def stop(self):
+        if self._httpd is None:
+            return
+        httpd, self._httpd = self._httpd, None
+        httpd.shutdown()
+        httpd.server_close()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+            self._thread = None
+
+    def __enter__(self) -> "FakeOpenAIServer":
+        return self.start()
+
+    def __exit__(self, *exc):
+        self.stop()
+        return False
+
+    # --- urls -------------------------------------------------------------
+    @property
+    def base_url(self) -> str:
+        return f"http://{self.host}:{self.port}/v1"
+
+    def url(self, path: str) -> str:
+        return self.base_url.rstrip("/") + "/" + path.lstrip("/")
+
+    # --- enqueue / capture (thread-safe) ----------------------------------
+    def enqueue(self, item) -> "FakeOpenAIServer":
+        canned = _coerce(item)
+        with self._lock:
+            self._queue.append(canned)
+        return self
+
+    def enqueue_chat(self, **kwargs) -> "FakeOpenAIServer":
+        return self.enqueue(CannedChat(**kwargs))
+
+    def _next_canned(self):
+        """Pop the next canned response (FIFO), or fall back to `default`.
+
+        Returns None only when the queue is empty AND no `default` is set,
+        which the handler renders as a loud 500 — enforcing the exact-control
+        contract. A `default` is coerced just like an enqueued value (str ->
+        CannedChat, dict -> CannedRaw, or a Canned* instance passed through).
+        """
+        with self._lock:
+            if self._queue:
+                return self._queue.pop(0)
+        if self.default is not None:
+            return _coerce(self.default)
+        return None
+
+    def _record(self, req: CapturedRequest):
+        with self._lock:
+            self.requests.append(req)
+
+    def reset(self):
+        with self._lock:
+            self._queue.clear()
+            self.requests.clear()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  6 · __main__ self-smoke
+# ════════════════════════════════════════════════════════════════════════════
+def _selfsmoke() -> int:
+    """Exercise every code path with urllib (no third-party deps)."""
+    import urllib.request
+    import urllib.error
+
+    failures = 0
+
+    def check(name: str, cond: bool, extra: str = ""):
+        nonlocal failures
+        mark = "ok " if cond else "FAIL"
+        if not cond:
+            failures += 1
+        line = f"  {mark}  {name}"
+        if extra:
+            line += f"   ({extra})"
+        print(line)
+
+    def http(method, url, data=None, headers=None):
+        body = None
+        if data is not None:
+            body = _dumps(data).encode("utf-8")
+        req = urllib.request.Request(url, data=body, method=method,
+                                     headers=headers or {})
+        try:
+            resp = urllib.request.urlopen(req, timeout=10)
+            return resp.status, resp.read(), resp
+        except urllib.error.HTTPError as e:
+            return e.code, e.read(), e
+
+    with FakeOpenAIServer() as srv:
+        # ---------- 1: GET /v1/models ----------
+        st, raw, _ = http("GET", srv.url("models"))
+        obj = json.loads(raw)
+        ids = [m["id"] for m in obj.get("data", [])]
+        check("GET /v1/models 200 + test-model present",
+              st == 200 and "test-model" in ids, f"status={st} ids={ids}")
+
+        # ---------- 2: non-stream chat ----------
+        srv.enqueue(CannedChat(content="hello world from fake"))
+        st, raw, _ = http("POST", srv.url("chat/completions"),
+                          data={"model": "test-model",
+                                "messages": [{"role": "user", "content": "hi"}]})
+        obj = json.loads(raw)
+        msg = obj["choices"][0]
+        check("non-stream chat content + object + finish_reason",
+              st == 200
+              and obj.get("object") == "chat.completion"
+              and msg["message"]["content"] == "hello world from fake"
+              and msg["finish_reason"] == "stop",
+              f"status={st} content={msg['message'].get('content')!r}")
+
+        # ---------- 3: streaming chat ----------
+        srv.enqueue(CannedChat(content="streamed reply here",
+                               n_content_chunks=3))
+        body = _dumps({"model": "test-model", "stream": True,
+                       "messages": [{"role": "user", "content": "go"}]})
+        req = urllib.request.Request(
+            srv.url("chat/completions"), data=body.encode("utf-8"),
+            method="POST", headers={"Accept": "text/event-stream"})
+        resp = urllib.request.urlopen(req, timeout=10)
+        ctype = resp.headers.get("Content-Type", "")
+        events = []
+        for line in resp.read().decode("utf-8").splitlines():
+            line = line.strip()
+            if line.startswith("data: "):
+                events.append(line[len("data: "):])
+        assembled = ""
+        first_has_role = False
+        last_finish = None
+        saw_done = events and events[-1] == "[DONE]"
+        for i, ev in enumerate(e for e in events if e != "[DONE]"):
+            d = json.loads(ev)
+            delta = d["choices"][0]["delta"]
+            if i == 0 and delta.get("role") == "assistant":
+                first_has_role = True
+            assembled += delta.get("content") or ""
+            if d["choices"][0].get("finish_reason"):
+                last_finish = d["choices"][0]["finish_reason"]
+        check("stream content-type text/event-stream",
+              "text/event-stream" in ctype, ctype)
+        check("stream reassembles to full content",
+              assembled == "streamed reply here", f"got={assembled!r}")
+        check("stream first delta carried role", first_has_role)
+        check("stream last delta carried finish_reason", last_finish == "stop",
+              f"finish={last_finish}")
+        check("stream terminated with [DONE]", bool(saw_done))
+
+        # ---------- 4: tool call (non-stream) ----------
+        srv.enqueue(CannedChat(
+            tool_calls=[("get_weather", _dumps({"city": "sf"}), "call_1")]))
+        st, raw, _ = http("POST", srv.url("chat/completions"),
+                          data={"model": "test-model",
+                                "messages": [{"role": "user", "content": "wx"}]})
+        obj = json.loads(raw)
+        tc = obj["choices"][0]["message"]["tool_calls"][0]
+        check("tool call name + finish_reason tool_calls",
+              tc["function"]["name"] == "get_weather"
+              and obj["choices"][0]["finish_reason"] == "tool_calls",
+              f"name={tc['function']['name']} "
+              f"finish={obj['choices'][0]['finish_reason']}")
+
+        # ---------- 5: error ----------
+        srv.enqueue(CannedError(status_code=429, message="slow down"))
+        st, raw, _ = http("POST", srv.url("chat/completions"),
+                          data={"model": "test-model",
+                                "messages": [{"role": "user", "content": "x"}]})
+        obj = json.loads(raw)
+        check("error returns 429 + envelope message",
+              st == 429 and obj["error"]["message"] == "slow down",
+              f"status={st} msg={obj.get('error', {}).get('message')!r}")
+
+        # ---------- 6: request capture ----------
+        # 1 models + 4 chat posts (non-stream, stream, tool, error) = 5 total.
+        n = len(srv.requests)
+        chat_reqs = [r for r in srv.requests if r.path == "/v1/chat/completions"]
+        sample = chat_reqs[0] if chat_reqs else None
+        ok_capture = (
+            n == 5
+            and sample is not None
+            and sample.model == "test-model"
+            and isinstance(sample.messages, list)
+            and sample.messages[0]["content"] == "hi")
+        check("requests captured (count + json shape)", ok_capture,
+              f"count={n} model={getattr(sample, 'model', None)}")
+
+    if failures:
+        print(f"\n{failures} FAILURE(S)")
+        return 1
+    print("\nALL PASS")
+    return 0
+
+
+if __name__ == "__main__":
+    import sys
+    sys.exit(_selfsmoke())

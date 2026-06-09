@@ -1,0 +1,259 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#   "openai>=1.30",
+# ]
+# ///
+"""
+oaita_fakeclient — a reusable OpenAI client building block for tests.
+
+Wraps the official ``openai`` Python SDK to provide a clean "fake test client
+that sends canned prompts" abstraction. The SDK is configured to contact
+ONLY the specified ``base_url`` (no phone-home, no real OpenAI), with
+``max_retries=0`` so error-injection tests fail fast, and a short timeout so
+timeouts surface quickly.
+
+Public API:
+
+  make_client(base_url, api_key, max_retries, timeout) -> openai.OpenAI
+      Return a configured SDK client.
+
+  CannedPrompt(messages, user, model, stream, tools, tool_choice, extra)
+      Dataclass describing a single chat-completion request.
+      ``user`` is a shorthand for a single user-role message.
+
+  send(client, prompt) -> ChatCompletion | StreamResult
+      Send one prompt.  Non-stream returns the SDK ChatCompletion; stream
+      returns an assembled StreamResult.
+
+  assemble_stream(stream) -> StreamResult
+      Standalone helper — consumes a streaming SDK iterator and assembles
+      the result.
+
+  run_prompts(base_url, prompts, **client_kwargs) -> list
+      Convenience: make a client, send each prompt, return the result list.
+
+Sections:
+    1 · Imports & configuration helpers
+    2 · CannedPrompt dataclass
+    3 · StreamResult & stream assembly
+    4 · send() and run_prompts()
+    5 · __main__ CLI smoke
+"""
+
+from __future__ import annotations
+
+# ════════════════════════════════════════════════════════════════════════════
+#  1 · Imports & configuration helpers
+# ════════════════════════════════════════════════════════════════════════════
+import os
+import sys
+from dataclasses import dataclass, field
+from typing import Any
+
+import openai
+
+
+def make_client(
+    base_url: str,
+    api_key: str = "test-key",
+    max_retries: int = 0,
+    timeout: float = 10.0,
+) -> openai.OpenAI:
+    """Return a configured ``openai.OpenAI`` client.
+
+    Parameters
+    ----------
+    base_url:
+        The root URL of the (fake or real) OpenAI-compatible server,
+        e.g. ``http://127.0.0.1:12345/v1``.
+    api_key:
+        The bearer token to send.  Arbitrary for a fake server; must be
+        non-empty because the SDK refuses a blank key.
+    max_retries:
+        Default 0 — no retry/back-off, so error-injection tests fail fast.
+    timeout:
+        Request timeout in seconds.  Small default so hangs surface quickly.
+    """
+    return openai.OpenAI(
+        base_url=base_url,
+        api_key=api_key,
+        max_retries=max_retries,
+        timeout=timeout,
+    )
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  2 · CannedPrompt dataclass
+# ════════════════════════════════════════════════════════════════════════════
+@dataclass
+class CannedPrompt:
+    """A single chat-completion request descriptor.
+
+    Either supply a full ``messages`` list or use the ``user`` shorthand.
+    When ``messages`` is ``None`` and ``user`` is set, the prompt expands to
+    ``[{"role": "user", "content": user}]``.
+
+    ``extra`` is a free-form dict of extra kwargs passed verbatim to
+    ``client.chat.completions.create(...)`` (e.g. ``{"temperature": 0.2}``).
+    """
+
+    messages: list | None = None
+    user: str | None = None
+    model: str = "test-model"
+    stream: bool = False
+    tools: list | None = None
+    tool_choice: Any = None
+    extra: dict | None = None
+
+    def _resolved_messages(self) -> list:
+        if self.messages is not None:
+            return self.messages
+        if self.user is not None:
+            return [{"role": "user", "content": self.user}]
+        raise ValueError("CannedPrompt: supply either 'messages' or 'user'")
+
+    def to_kwargs(self) -> dict:
+        """Build the kwargs dict for ``client.chat.completions.create``."""
+        kw: dict = {
+            "model": self.model,
+            "messages": self._resolved_messages(),
+            "stream": self.stream,
+        }
+        if self.tools is not None:
+            kw["tools"] = self.tools
+        if self.tool_choice is not None:
+            kw["tool_choice"] = self.tool_choice
+        if self.extra:
+            kw.update(self.extra)
+        return kw
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  3 · StreamResult & stream assembly
+# ════════════════════════════════════════════════════════════════════════════
+@dataclass
+class StreamResult:
+    """The assembled result of consuming a streaming chat-completion response.
+
+    Attributes
+    ----------
+    content:
+        Concatenated text deltas from the stream.
+    tool_calls:
+        Assembled list of ``{"id": ..., "name": ..., "arguments": ...}``
+        dicts, reconstructed from delta fragments by accumulating
+        ``function.arguments`` across chunks per ``index``.
+    finish_reason:
+        The ``finish_reason`` from the terminal chunk.
+    chunks:
+        The list of raw ``ChatCompletionChunk`` objects received.
+    role:
+        The role from the first role-carrying delta (usually ``"assistant"``).
+    """
+
+    content: str = ""
+    tool_calls: list = field(default_factory=list)
+    finish_reason: str | None = None
+    chunks: list = field(default_factory=list)
+    role: str | None = None
+
+
+def assemble_stream(stream) -> StreamResult:
+    """Consume a streaming SDK iterator and return an assembled StreamResult.
+
+    Handles both text deltas and tool-call deltas.  Tool-call fragments are
+    accumulated per ``index`` and merged into a final list of
+    ``{"id", "name", "arguments"}`` dicts.
+    """
+    result = StreamResult()
+    # Keyed by tool-call index → accumulator dict.
+    tc_acc: dict[int, dict] = {}
+
+    for chunk in stream:
+        result.chunks.append(chunk)
+        choice = chunk.choices[0] if chunk.choices else None
+        if choice is None:
+            continue
+
+        delta = choice.delta
+
+        # Role (first chunk usually carries it).
+        if delta.role and result.role is None:
+            result.role = delta.role
+
+        # Text content.
+        if delta.content:
+            result.content += delta.content
+
+        # Tool-call deltas — accumulate by index.
+        if delta.tool_calls:
+            for tc_delta in delta.tool_calls:
+                idx = tc_delta.index
+                if idx not in tc_acc:
+                    tc_acc[idx] = {"id": None, "name": None, "arguments": ""}
+                acc = tc_acc[idx]
+                if tc_delta.id:
+                    acc["id"] = tc_delta.id
+                fn = tc_delta.function
+                if fn:
+                    if fn.name:
+                        acc["name"] = fn.name
+                    if fn.arguments:
+                        acc["arguments"] += fn.arguments
+
+        # Finish reason (last substantive chunk).
+        if choice.finish_reason:
+            result.finish_reason = choice.finish_reason
+
+    # Flatten accumulated tool calls in index order.
+    if tc_acc:
+        result.tool_calls = [tc_acc[i] for i in sorted(tc_acc)]
+
+    return result
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  4 · send() and run_prompts()
+# ════════════════════════════════════════════════════════════════════════════
+def send(client: openai.OpenAI, prompt: CannedPrompt):
+    """Send one CannedPrompt via the SDK client.
+
+    Non-streaming → returns the SDK ``ChatCompletion`` object.
+    Streaming    → consumes the stream and returns a ``StreamResult``.
+    """
+    kw = prompt.to_kwargs()
+    if prompt.stream:
+        stream = client.chat.completions.create(**kw)
+        return assemble_stream(stream)
+    else:
+        return client.chat.completions.create(**kw)
+
+
+def run_prompts(base_url: str, prompts: list, **client_kwargs) -> list:
+    """Make a client, send each CannedPrompt, return the list of results.
+
+    ``client_kwargs`` are forwarded to ``make_client``.
+    """
+    client = make_client(base_url, **client_kwargs)
+    return [send(client, p) for p in prompts]
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  5 · __main__ CLI smoke
+# ════════════════════════════════════════════════════════════════════════════
+if __name__ == "__main__":
+    base_url = (
+        sys.argv[1] if len(sys.argv) > 1
+        else os.environ.get("OPENAI_BASE_URL", "http://127.0.0.1:8000/v1")
+    )
+    print(f"Sending to {base_url} …")
+    client = make_client(base_url)
+    prompt = CannedPrompt(user="Say hello in five words.")
+    try:
+        result = send(client, prompt)
+        print("Assistant:", result.choices[0].message.content)
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
