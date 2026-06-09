@@ -698,11 +698,6 @@ def ensure_dirs() -> None:
     except OSError: pass
     try: mnt_point().mkdir(parents=True, exist_ok=True)
     except OSError: pass
-    # migrate the old single "rules" file to its new name "netrules"
-    old_rules = config_home() / "rules"
-    if old_rules.exists() and not rules_file().exists():
-        try: old_rules.rename(rules_file())
-        except OSError: pass
     for f in (rules_file(), file_rules_file()):
         try: f.touch(exist_ok=True)
         except OSError: pass
@@ -977,7 +972,8 @@ def _dns_handle_packet(pkt: bytes, dns: SyntheticDNS) -> "bytes | None":
     return _dns_build_response(pkt, txid, rcode=0)
 
 
-def run_inner(channel_path: str, cmd: list, echo_path: str = "") -> int:
+def run_inner(channel_path: str, cmd: list, echo_path: str = "",
+              capture: bool = False) -> int:
     stop = threading.Event()
     dns = SyntheticDNS()
 
@@ -1150,10 +1146,16 @@ def run_inner(channel_path: str, cmd: list, echo_path: str = "") -> int:
     # (so the UI records it with the writer's ctx.pid). A reader thread decodes the echo
     # frames the UI streams back and writes each payload to OUR real fd 1/2, so the user
     # sees output live. stdin stays INHERITED (unchanged).
+    #
+    # RECORDING and LIVE ECHO are decoupled: `capture` opens the sinks (the sinks are
+    # FUSE files at the box root, so they work even for a NESTED box whose root IS the
+    # UI's mount). Live echo additionally needs echo.sock, which lives in the UI's
+    # live/<sid>/chan dir — a path a nested (sandboxed) runner cannot reach. So a nested
+    # box records output but gets no live replay; `echo_path` is empty in that case.
     out_fd = err_fd = -1
     echo_conn = None
     echo_done = threading.Event()
-    if echo_path:
+    if capture:
         try:
             out_fd = os.open("/" + SINK_STDOUT_REL, os.O_WRONLY)
             err_fd = os.open("/" + SINK_STDERR_REL, os.O_WRONLY)
@@ -1164,7 +1166,7 @@ def run_inner(channel_path: str, cmd: list, echo_path: str = "") -> int:
                     try: os.close(fd)
                     except OSError: pass
             out_fd = err_fd = -1
-        if out_fd >= 0:
+        if out_fd >= 0 and echo_path:
             try:
                 echo_conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                 echo_conn.connect(echo_path)
@@ -10361,11 +10363,20 @@ def cmd_run(cmd, net, env_capture, direct, session_whitelist, chdir, reuse_sid=N
         # namespace — created by its own `--unshare-user`, which needs no caps in the
         # parent — where bwrap holds CAP_SYS_ADMIN for free. So a cap-less userns box
         # can host children with no privilege, exactly like the top level.
+        # The synthetic-DNS interception runs listeners on PRIVILEGED ports inside the
+        # box — the resolver on 127.0.0.53:53 and the catch-all forwarders on :80/:443
+        # (proxy-unaware programs dial those exact ports). Binding <1024 needs
+        # CAP_NET_BIND_SERVICE; without it the binds fail EACCES and interception
+        # silently breaks. The box has its OWN netns (loopback only, fully isolated), so
+        # this cap cannot touch the host or other boxes — it only lets the in-box
+        # forwarders bind. Granted in BOTH modes (a root box with the other two caps
+        # still lacks NET_BIND_SERVICE in its dropped-ALL capset).
         if _runner_mode == "userns":
-            cap_args = ["--cap-drop", "ALL"]
+            cap_args = ["--cap-drop", "ALL", "--cap-add", "CAP_NET_BIND_SERVICE"]
         else:
             cap_args = ["--cap-drop", "ALL", "--cap-add", "CAP_SYS_ADMIN",
-                        "--cap-add", "CAP_NET_ADMIN"]
+                        "--cap-add", "CAP_NET_ADMIN",
+                        "--cap-add", "CAP_NET_BIND_SERVICE"]
         args = ["bwrap",
                 *bind_root_args,
                 "--proc", "/proc", "--dev", "/dev",
@@ -10378,10 +10389,16 @@ def cmd_run(cmd, net, env_capture, direct, session_whitelist, chdir, reuse_sid=N
         if bwrap_supports("--as-pid-1"):
             args += ["--as-pid-1"]
         # Capture mode needs the chan dir (holding echo.sock) bound in even when the box
-        # is NOT networked — echo.sock lives alongside relay.sock in relay_dir(sid).
+        # is NOT networked — echo.sock lives alongside relay.sock in relay_dir(sid). But a
+        # NESTED box runs inside its parent's sandbox (with --tmpfs /tmp and no bind of the
+        # UI's live/ tree), so that host dir is unreachable: bind only if it actually
+        # exists here, otherwise drop live echo (the FUSE sinks still record output).
         if capture_on and echo_path and not (can_net and chan):
             chan_dir = os.path.dirname(echo_path)
-            args += ["--bind", chan_dir, chan_dir]
+            if os.path.isdir(chan_dir):
+                args += ["--bind", chan_dir, chan_dir]
+            else:
+                echo_path = ""   # nested/sandboxed runner: record-only, no live replay
         if can_net and chan:
             # bind ONLY this box's relay-socket directory in (holds nothing but the
             # per-session relay.sock) so the forwarder can reach its own relay — and
@@ -10407,9 +10424,14 @@ def cmd_run(cmd, net, env_capture, direct, session_whitelist, chdir, reuse_sid=N
             # needs the addition, not the whole bundle.
             args += ["--setenv", "NODE_EXTRA_CA_CERTS", str(_ca)]
         # run our own --inner, which starts the forwarder then execs cmd. In capture mode
-        # pass --echo so --inner points the child's stdout/stderr at the sink files and
-        # replays the echoed bytes onto the real terminal.
-        inner_extra = ["--echo", echo_path] if (capture_on and echo_path) else []
+        # pass --capture so --inner points the child's stdout/stderr at the sink files;
+        # add --echo only when echo.sock is reachable (dropped for nested boxes) so the
+        # echoed bytes are also replayed onto the real terminal.
+        inner_extra = []
+        if capture_on:
+            inner_extra += ["--capture"]
+            if echo_path:
+                inner_extra += ["--echo", echo_path]
         args += ["--", sys.executable, find_self(), "--inner",
                  "--channel", chan, *inner_extra, "--", *cmd]
 
@@ -13208,12 +13230,13 @@ def main() -> int:
     if argv and argv[0] == "--inner":
         ap = argparse.ArgumentParser(prog="slopbox --inner")
         ap.add_argument("--channel", default="")
+        ap.add_argument("--capture", action="store_true")  # redirect stdout/stderr → sinks
         ap.add_argument("--echo", default="")     # capture: echo.sock for live replay
         ap.add_argument("cmd", nargs=argparse.REMAINDER)
         ns = ap.parse_args(argv[1:])
         cmd = ns.cmd
         if cmd and cmd[0] == "--": cmd = cmd[1:]
-        return run_inner(ns.channel, cmd, echo_path=ns.echo)
+        return run_inner(ns.channel, cmd, echo_path=ns.echo, capture=ns.capture)
 
     if not argv:
         return run_ui()
