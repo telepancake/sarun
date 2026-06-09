@@ -363,7 +363,7 @@ def test_finalize_apply_promotes_to_parent():
         _finish_box_with_file(sup, child_sid, rel, content, parent=10)
 
         class _ApplyRule:
-            def decide(self, r): return "apply" if r == rel else None
+            def decide(self, r, box=""): return "apply" if r == rel else None
         m.load_file_rules = lambda: _ApplyRule()
 
         res = sup.review.finalize_by_rules(child_sid)
@@ -395,7 +395,7 @@ def test_finalize_apply_writes_host_for_root():
         _finish_box_with_file(sup, sid, host_rel, content, parent=None)
 
         class _ApplyRule:
-            def decide(self, r): return "apply" if r == host_rel else None
+            def decide(self, r, box=""): return "apply" if r == host_rel else None
         m.load_file_rules = lambda: _ApplyRule()
 
         res = sup.review.finalize_by_rules(sid)
@@ -426,7 +426,7 @@ def test_finalize_discard_copies_down_to_children():
         _finish_box_with_file(sup, child_inherits, "other.txt", b"x\n", parent=20)
         _finish_box_with_file(sup, child_owns, rel, d_content, parent=20)
 
-        m.load_file_rules = lambda: type("R", (), {"decide": lambda self, r: None})()
+        m.load_file_rules = lambda: type("R", (), {"decide": lambda self, r, box="": None})()
         res = sup.review.discard(b, [rel])
         check(rel in res.get("discarded", []), f"copydown: discarded from B (got {res})")
         check(rel not in _names(m.sqlar_path(b)), "copydown: gone from B")
