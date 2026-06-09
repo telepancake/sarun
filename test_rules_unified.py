@@ -358,6 +358,24 @@ def test_process_identity():
         check(by_rid[rid_parent][5] == 0, "parent is a depth-0 root node")
         check(by_rid[rid_a][5] == 1 and by_rid[rid_b][5] == 1,
               "both child incarnations are depth-1 children of the parent")
+
+        # PARENT pid reuse, child recorded FIRST: a parent's pid is reused (new start)
+        # and a child of the NEW parent is recorded before the new parent itself. The
+        # parent link must read /proc and bind the NEW incarnation, never the stale
+        # cached row (the gap a naive _proc_current trust would leave).
+        REUSE = 6000
+        idx.process_from_prov(dict(tgid=REUSE, start_time=111, exe="/bin/old",
+                                   argv=["old"], env={}))
+        stale_row = idx._current_row(REUSE)
+        m._proc_start_time = lambda pid: 222 if pid == REUSE else 0
+        m.read_provenance = lambda pid, full_env=False: dict(
+            ppid=0, exe="/bin/new", argv=["new"], env={}, start_time=222)
+        fresh_row = idx._resolve_parent(REUSE)
+        check(fresh_row is not None and fresh_row != stale_row,
+              f"parent pid reuse (child-first): links the NEW incarnation, not the stale "
+              f"row (stale={stale_row}, fresh={fresh_row})")
+        check(idx._current_row(REUSE) == fresh_row,
+              "current incarnation advances to the new parent row")
         idx.close()
     finally:
         m.read_provenance, m.tgid_of, m._proc_start_time = orig_rp, orig_tg, orig_st

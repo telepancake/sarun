@@ -1341,7 +1341,7 @@ def sqlar_path(box_id) -> Path:
     # The box's single db, named by its stable integer id: <box_id>.sqlar.
     return state_home() / (str(box_id) + ".sqlar")
 
-_SQLAR_SCHEMA_VERSION = 3  # bump when DDL or migration list changes
+_SQLAR_SCHEMA_VERSION = 1  # marks the one-time DDL as applied (no migrations — unreleased)
 
 # ── One connection per db (no WAL) ───────────────────────────────────────────
 # Exactly ONE sqlite connection touches a given .sqlar at a time, so there is never
@@ -1387,8 +1387,8 @@ def _open_raw(path) -> "sqlite3.Connection":
     # recent commits — fine for this ephemeral, consolidated-on-exit index.
     conn.execute("PRAGMA journal_mode=DELETE")
     conn.execute("PRAGMA synchronous=OFF")
-    # Gate the one-time DDL + migrations behind user_version so repeated opens
-    # (the common case) skip straight to returning the connection.
+    # Gate the one-time DDL behind user_version so repeated opens (the common case)
+    # skip straight to returning the connection.
     ver = conn.execute("PRAGMA user_version").fetchone()[0]
     if ver < _SQLAR_SCHEMA_VERSION:
         conn.executescript(
@@ -1399,6 +1399,9 @@ def _open_raw(path) -> "sqlite3.Connection":
             "(path TEXT PRIMARY KEY, pid INT, ppid INT, exe TEXT, argv TEXT);"
             "CREATE TABLE IF NOT EXISTS env"
             "(id INTEGER PRIMARY KEY AUTOINCREMENT, hash TEXT UNIQUE, env TEXT);"
+            # process: one row per process INCARNATION, identified by (tgid,start) so a
+            # reused pid is a distinct row; parent_id is the parent's row id (structure),
+            # ppid is the parent's pid (display only).
             "CREATE TABLE IF NOT EXISTS process"
             "(id INTEGER PRIMARY KEY AUTOINCREMENT, tgid INT, start INT,"
             " ppid INT, parent_id INT, exe TEXT, cwd TEXT, argv TEXT, env_id INT,"
@@ -1409,13 +1412,6 @@ def _open_raw(path) -> "sqlite3.Connection":
             " method TEXT, scheme TEXT, host TEXT, port INT, url TEXT, status INT,"
             " process_id INT, req_headers TEXT, req_len INT, req_body BLOB,"
             " resp_headers TEXT, resp_len INT, resp_body BLOB);")
-        # Migrate boxes created by an older schema: add columns introduced later.
-        # The one DDL above is authoritative for fresh DBs; these top up existing files.
-        _ensure_columns(conn, "sqlar", {"last_writer": "INT"})
-        # process: per-incarnation identity (tgid,start) + row-id parent linkage; the
-        # fresh DDL above is authoritative — these top up any partial schema.
-        _ensure_columns(conn, "process", {"root": "INT DEFAULT 0", "cwd": "TEXT",
-                                          "start": "INT", "parent_id": "INT"})
         conn.execute(f"PRAGMA user_version = {_SQLAR_SCHEMA_VERSION}")
         conn.commit()
     return conn
@@ -1519,24 +1515,6 @@ def _sqlar_unregister(path) -> None:
         except sqlite3.Error: pass
         h.closed = True
 
-_IDENT_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
-
-def _ensure_columns(conn, table: str, cols: dict) -> None:
-    """Add any missing `cols` (name -> SQL decl) to `table` in place. CREATE TABLE
-    IF NOT EXISTS never alters an existing table, so a db written by an older schema
-    keeps its old column set until this tops it up.
-
-    `table` and each column `name` are validated against a strict identifier regex
-    before interpolation into DDL, guarding against accidental injection if a future
-    migration introduces a non-literal value."""
-    if not _IDENT_RE.match(table):
-        raise ValueError(f"_ensure_columns: invalid table identifier: {table!r}")
-    have = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
-    for name, decl in cols.items():
-        if not _IDENT_RE.match(name):
-            raise ValueError(f"_ensure_columns: invalid column identifier: {name!r}")
-        if name not in have:
-            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
 
 def _sqlar_deflate(content: bytes):
     """Pack file/symlink content for a sqlar `data` blob, returning (data, sz) where
@@ -2410,17 +2388,21 @@ class Index:
         if _seen is None: _seen = set()
         if ptgid in _seen: return self._current_row(ptgid)  # cycle guard
         _seen.add(ptgid)
-        cur = self._proc_current.get(ptgid)
-        if cur is not None:                      # parent already linked (roots always are)
-            return cur[1]
+        # Key the parent on its LIVE (tgid,start): if its pid was reused since we last
+        # saw it, that's a new incarnation row — never reuse the stale _proc_current.
+        pstart = _proc_start_time(ppid)
+        cached = self._proc_cache.get((ptgid, pstart)) if pstart else None
+        if cached is not None:                   # this exact incarnation already linked
+            self._proc_current[ptgid] = (pstart, cached)
+            return cached
         try:
             pprov = read_provenance(ppid, full_env=self._tracing)
         except OSError:
-            pprov = dict(ppid=0, exe="", argv=[], env={}, start_time=0)
+            pprov = dict(ppid=0, exe="", argv=[], env={}, start_time=pstart)
         # A live parent yields its own ppid (walk continues up); a vanished parent
         # yields ppid 0 — a minimal row is still linked, then the next frame stops at
         # ppid<=1 since the grandparent is unreachable.
-        parent = dict(tgid=ptgid, start_time=pprov.get("start_time") or 0,
+        parent = dict(tgid=ptgid, start_time=pprov.get("start_time") or pstart,
                       ppid=tgid_of(pprov.get("ppid")) if pprov.get("ppid") else 0,
                       parent_pid=pprov.get("ppid") or 0,
                       exe=pprov.get("exe") or "", argv=pprov.get("argv") or [],
