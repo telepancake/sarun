@@ -300,9 +300,73 @@ def test_clause_list_editor():
     asyncio.run(drive())
 
 
+def test_process_identity():
+    """Process identity is per-incarnation (tgid,start) — 16-bit PIDs roll over during a
+    big build, so a tgid alone cannot identify a process. Asserts: (1) two rows with the
+    SAME tgid but DIFFERENT start_time are DISTINCT rows; (2) a child's parent_id is the
+    parent's ROW id (not its tgid); (3) build_proc_tree links them via row ids."""
+    tmp = Path(tempfile.mkdtemp(prefix="procid-"))
+    os.environ["XDG_STATE_HOME"] = str(tmp / "state")
+    os.environ["XDG_CONFIG_HOME"] = str(tmp / "cfg")
+    sid = "1"; backing = tmp / "live" / sid
+    (backing / "up").mkdir(parents=True)
+    # No /proc reads: feed explicit (tgid,start) + parent_pid through process_from_prov.
+    # Stub read_provenance/tgid_of so the synthetic parent walk is deterministic.
+    PARENT, CHILD = 5000, 5001
+    orig_rp, orig_tg, orig_st = m.read_provenance, m.tgid_of, m._proc_start_time
+    m.tgid_of = lambda pid: int(pid or 0)
+    m._proc_start_time = lambda pid: 0          # unknown unless explicitly supplied
+    m.read_provenance = lambda pid, full_env=False: dict(
+        ppid=0, exe="/bin/parent", argv=["parent"], env={}, start_time=111)
+    try:
+        idx = m.Index(backing)
+        # The parent (root incarnation) at start 111.
+        rid_parent = idx.process_from_prov(
+            dict(tgid=PARENT, start_time=111, ppid=0, exe="/bin/parent",
+                 argv=["parent"], env={}), root=True)
+        # Child incarnation A: pid CHILD, start 222, parented to PARENT.
+        rid_a = idx.process_from_prov(
+            dict(tgid=CHILD, start_time=222, ppid=PARENT, parent_pid=PARENT,
+                 exe="/bin/a", argv=["a"], env={}))
+        # Child incarnation B: SAME pid CHILD reused, start 333 → a DISTINCT row.
+        rid_b = idx.process_from_prov(
+            dict(tgid=CHILD, start_time=333, ppid=PARENT, parent_pid=PARENT,
+                 exe="/bin/b", argv=["b"], env={}))
+
+        check(rid_a != rid_b,
+              f"same tgid + different start_time = distinct rows ({rid_a} != {rid_b})")
+        sp = m.sqlar_path(sid)
+        rows = m.process_list(sp)
+        child_rows = [r for r in rows if r[1] == CHILD]
+        check(len(child_rows) == 2,
+              f"two persisted process rows for the one reused tgid (got {len(child_rows)})")
+        # parent_id is the parent's ROW id, NOT its tgid.
+        for r in child_rows:
+            rid, tgid, ppid, parent_id, exe, argv = r
+            check(parent_id == rid_parent,
+                  f"child {rid} parent_id is the parent's ROW id {rid_parent} (got {parent_id})")
+            check(parent_id != PARENT,
+                  "parent_id is a row id, not the parent's tgid/pid")
+
+        # build_proc_tree links by row id: parent appears once, both child incarnations
+        # are distinct nodes under it.
+        tree = m.build_proc_tree(rows, m.process_roots(sp), None)
+        by_rid = {t[0]: t for t in tree}
+        check(rid_parent in by_rid and rid_a in by_rid and rid_b in by_rid,
+              "tree contains the parent and both child incarnations as distinct nodes")
+        # both children are one level below the (depth-0) parent.
+        check(by_rid[rid_parent][5] == 0, "parent is a depth-0 root node")
+        check(by_rid[rid_a][5] == 1 and by_rid[rid_b][5] == 1,
+              "both child incarnations are depth-1 children of the parent")
+        idx.close()
+    finally:
+        m.read_provenance, m.tgid_of, m._proc_start_time = orig_rp, orig_tg, orig_st
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     for fn in (test_model, test_live_box_scope, test_approval_box_rule, test_process_facet_live,
-               test_clause_list_editor):
+               test_process_identity, test_clause_list_editor):
         print(f"== {fn.__name__} ==")
         try:
             fn()

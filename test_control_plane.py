@@ -349,12 +349,14 @@ def test_command_is_the_root_process_row():
         sid = ack["session_id"]
 
         # the live process table carries the root row keyed by the host pid
+        # process_list rows are (id, tgid, ppid, parent_id, exe, argv).
         procs = sup.processes(sid)
         root = next((p for p in procs if p[1] == root_pid), None)
         check(root is not None, "a process row exists for the sid's root pid")
-        check(root and root[4] == cmd, "root row argv IS the command")
-        check(root and root[3] == "/usr/bin/echo", "root row carries the runner exe")
+        check(root and root[5] == cmd, "root row argv IS the command")
+        check(root and root[4] == "/usr/bin/echo", "root row carries the runner exe")
         check(root and root[2] == 7, "root row carries the runner ppid")
+        check(root and root[3] is None, "the root row has no parent_id (it IS a root)")
 
         # the command is retrievable via the lookup helper while live
         check(m.root_cmd(sid) == cmd, "root_cmd(sid) returns the command")
