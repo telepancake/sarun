@@ -16,15 +16,26 @@ slopbox — run an untrusted process in an unprivileged bwrap slopbox.
     slopbox                 start the UI (network approval + change review)
     slopbox CMD [ARGS...]   run CMD slopboxed
 
-Network model: the slopbox has NO real network — only loopback. A tiny
-forwarder inside the slopbox listens on 127.0.0.1:8080 (the proxy the program
-is told to use) and hands each accepted connection's FD out to the UI over a
-Unix socket (SCM_RIGHTS). The UI feeds that socket to an in-process mitmproxy,
-which gates it against the rules / asks you, and performs the real upstream
-fetch in the UI's own network context. No slirp, no host ports reachable from
-the slopbox, no proxy listening anywhere the slopbox could abuse. If no UI is
-running, the forwarder has nowhere to hand connections, so the slopbox simply
-has no network — it never blocks waiting on an absent human.
+Network model: the slopbox's network namespace has NO route to the internet —
+only loopback. The box runs three in-netns rendezvous services, all forwarding
+over the per-box relay socket to the UI's in-process mitmproxy:
+
+  • HTTP proxy on 127.0.0.1:8080 — proxy-AWARE clients set HTTP_PROXY and
+    connect here; each accepted FD is handed to the UI via SCM_RIGHTS.
+  • DNS resolver on 127.0.0.53:53 — answers every A query with a stable
+    synthetic 127/8 IP; AAAA returns empty so clients fall back to IPv4.
+    (/etc/resolv.conf is synthesized to point here for networked boxes.)
+  • Catch-all TCP listeners on 0.0.0.0:80 and :443 — proxy-UNAWARE clients
+    connect to the synthetic IP; getsockname() recovers which IP was dialed,
+    a reverse map yields the real hostname, and the connection is forwarded
+    with that hostname as metadata. A connection to an UNMAPPED IP (hard-coded
+    real address, or a synthetic never handed out) is closed immediately —
+    direct-IP egress is blocked.
+
+All three paths reach the same mitmproxy addon, gated by hostname. The box
+never dials the real upstream; the UI's own network context does that. If no UI
+is running, the forwarder has nowhere to forward, so the box simply has no
+network and never blocks waiting on an absent human.
 
 Filesystem model: the UI owns ONE pyfuse3 overlay mount, served from a
 dedicated trio thread and created the ordinary way (`pyfuse3.init` via the
@@ -543,12 +554,16 @@ def ui_is_running(sock_path: str) -> bool:
 
 
 #: [b]12 · Network model[/]
-#: A slopbox has [b]no real network[/] — only loopback. Outbound connections are only possible
-#: when you pass [cyan]-n[/] (networking flag) AND the UI is running to gate them.
-#: A tiny in-box forwarder hands each accepted connection's file descriptor to the UI over a
-#: Unix socket ([cyan]SCM_RIGHTS[/]). The UI feeds it to an in-process [cyan]mitmproxy[/] instance,
-#: which checks it against your allow/deny rules and — if no rule matches — asks you.
-#: The real upstream fetch happens in the UI's network context; the box never touches the host network.
+#: A slopbox has [b]no real network[/] — its netns has no route to the internet, only loopback.
+#: Outbound connections reach the UI only when you pass [cyan]-n[/] (networking flag) AND the UI is running.
+#: Three in-box rendezvous services forward connections to the UI's in-process [cyan]mitmproxy[/]:
+#:   [cyan]HTTP proxy[/] (127.0.0.1:8080) — proxy-aware clients set [cyan]HTTP_PROXY[/] and connect here.
+#:   [cyan]DNS resolver[/] (127.0.0.53:53) — answers A queries with synthetic 127/8 IPs so proxy-unaware
+#:     clients can be intercepted; AAAA returns empty, directing clients to IPv4.
+#:   [cyan]Catch-all :80/:443[/] — proxy-unaware clients dial a synthetic IP; the listener maps it back
+#:     to the real hostname and forwards the connection. An unmapped (hard-coded) IP is closed.
+#: All paths reach the same [cyan]mitmproxy[/] addon, gated by your allow/deny rules.
+#: The upstream fetch happens in the UI's network context; the box never touches the host network.
 #: If the UI is not running, the forwarder has nowhere to send connections, so the box simply
 #: has no network at all and never blocks waiting for a human.
 
@@ -556,10 +571,13 @@ def ui_is_running(sock_path: str) -> bool:
 #  Inner forwarder — `slopbox --inner` (runs as pid-1-ish inside the slopbox)
 # ════════════════════════════════════════════════════════════════════════════
 #
-# Listens on 127.0.0.1:INNER_PROXY_PORT. For each accepted connection, sends the
-# connection's FD to the UI's relay socket (a Unix socket bind-mounted into the
-# slopbox). Then execs the real command. The forwarder holds no bytes; the UI
-# drives the proxied conversation.
+# Runs three forwarding services inside the box's netns, all funnelling into the
+# same per-box relay socket (a Unix socket bind-mounted into the slopbox):
+#   • Proxy listener on 127.0.0.1:INNER_PROXY_PORT — proxy-aware clients (HTTP_PROXY).
+#   • DNS resolver on INNER_DNS_ADDR:53 — synthetic-IP allocator for proxy-unaware clients.
+#   • Catch-all listeners on 0.0.0.0:80/443 — intercept connections to synthetic IPs.
+# Then execs the real command. The forwarder holds no bytes; the UI drives each
+# proxied conversation in its own network context.
 
 # ── Synthetic-IP DNS for proxy-UNAWARE in-box programs ──────────────────────
 #
@@ -2013,8 +2031,15 @@ def _hdr_text(items) -> str:
 
 def _decode_body_display(raw: bytes, headers: str) -> "tuple[str, str] | None":
     """Decode a content-encoded body for DISPLAY only — never mutates stored bytes.
-    Returns (rendered_text, label) or None if the encoding is unrecognised / fails.
-    `headers` is the flat 'Key: Value\\n…' string from req_headers / resp_headers."""
+    Returns (rendered_text, label) or None when the body needs no decoding or the
+    encoding is unrecognised/unsupported (caller falls back to raw UTF-8 or binary).
+    `headers` is the flat 'Key: Value\\n…' string from req_headers / resp_headers.
+
+    Supported Content-Encoding: gzip, deflate (zlib-wrapped or raw), identity.
+    brotli (br) is skipped (no dep) → returns None → caller shows raw.
+    Multipart bodies are rendered part-by-part regardless of Content-Encoding:
+    each part's Content-Transfer-Encoding (base64 or quoted-printable) is decoded
+    so field values and uploaded files show as their real content, not wire encoding."""
     # Parse Content-Encoding (case-insensitive) from the flat header string.
     encoding = ""
     for line in headers.splitlines():
@@ -8536,6 +8561,9 @@ class Supervisor:
 # ════════════════════════════════════════════════════════════════════════════
 
 VERSION = "0.1.0"
+# Injected as X-Slopbox-Version on every ALLOWED upstream request so server logs
+# carry a tool fingerprint. Denied flows never get the header — they never reach
+# the upstream, so the header would only appear in the 403 the box sees.
 
 # A per-connection session id, read by the gating addon's hooks. It is set in
 # handle_fd before the mitmproxy handler runs; asyncio copies the current context
@@ -8635,7 +8663,7 @@ class _GatingAddon:
         # surface it in the live Network pane. A denied one already carries its 403
         # and is handled wholly by response() below — never an "open flow".
         if not flow.metadata.get("slopbox_denied"):
-            flow.request.headers["X-Slopbox-Version"] = VERSION
+            flow.request.headers["X-Slopbox-Version"] = VERSION  # only on allowed flows
             self._note_open(flow)
 
     def _note_open(self, flow):
@@ -11469,6 +11497,9 @@ def _make_ui_app():
                         out.append(Text(f"{i:04x}  {h:<48}  {a}", style="dim"))
                 raw=base64.b64decode(d.get("content") or b"")
                 before_enc=d.get("content_before")
+                # A modified binary carries BOTH content_before (lower/host bytes) and
+                # content (overlay bytes) so we can show before+after hexdumps side by
+                # side. A created or deleted binary has no content_before.
                 if before_enc:
                     raw_before=base64.b64decode(before_enc)
                     out.append(Text(f"── before ── binary · {fmt_bytes(len(raw_before))}", style="dim"))
@@ -11756,6 +11787,9 @@ def _make_ui_app():
                 d.update(Text("(gone)", style="dim")); return
             pending=not f.get("resp_headers") and not f.get("status")
             def body(blob, n, hdrs=""):
+                # Render body bytes for DISPLAY: try content-decoded form first (gzip /
+                # deflate / multipart+per-part transfer-encoding), then plain UTF-8, then
+                # "binary · N". `n` is the TRUE body size (may exceed len(blob) if capped).
                 if not blob: return Text("  (empty)\n", style="dim")
                 raw=bytes(blob)
                 decoded=_decode_body_display(raw, hdrs)
