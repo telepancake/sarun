@@ -1,10 +1,24 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#   "textual>=0.60", "mitmproxy>=11", "wcmatch>=8.4",
+#   "pyfuse3>=3.2", "trio>=0.22", "python-magic>=0.4",
+# ]
+# ///
 """End-to-end: start the real UI process, run a real `slopbox CMD` against it, and
 verify (a) the box writes/modifies/deletes through the UI-served overlay, (b) the UI
 consolidates on exit into patch/sqlar/tombstones + provenance, (c) the mount table
 is clean afterwards, and (d) `slopbox CMD` with NO UI fails fast.
 
-    /home/user/venv/bin/python test_e2e.py
+    ./test_e2e.py            # uv installs deps and provisions the box interpreter
+    uv run test_e2e.py       # same thing, explicit
+
+Needs real bwrap (works in this sandbox). The test process runs under uv (so it
+has sarun's deps for the in-process SourceFileLoader), and the UI/box subprocesses
+reuse that same deps-equipped interpreter via sys.executable — there is NO
+hardcoded venv. First run also builds the patched pyfuse3 (section 0 of sarun),
+~25 s once, then cached.
 
 Self-safety: isolated XDG temp tree; the UI is launched headless and killed in a
 finally; the overlay is lazy-unmounted on the way out.
@@ -14,7 +28,9 @@ import stat as stat_mod
 from pathlib import Path
 from importlib.machinery import SourceFileLoader
 
-PYBIN = "/home/user/venv/bin/python"
+# The interpreter the box/UI subprocesses run under: the very one running this test,
+# which uv (the shebang above) has already equipped with sarun's deps. No hardcoded venv.
+PYBIN = sys.executable
 SARUN = "/home/user/sarun/sarun"
 
 _fails = []
@@ -591,6 +607,169 @@ def run_forced_userns_e2e(tmp):
         check(not still, "forced-userns: overlay unmounted after UI exits")
 
 
+def _launch_ui(tmp, e):
+    """Start the headless UI; return (proc, sock, mnt) once its control socket is up."""
+    sock = str(Path(e["XDG_RUNTIME_DIR"]) / "slopbox" / "ui.sock")
+    mnt = Path(e["XDG_RUNTIME_DIR"]) / "slopbox" / "mnt"
+    harness = tmp / "ui_harness.py"
+    harness.write_text(
+        "from importlib.machinery import SourceFileLoader\n"
+        f"m = SourceFileLoader('slopbox', {SARUN!r}).load_module()\n"
+        "m.ensure_dirs()\n"
+        "app = m._make_ui_app()()\n"
+        "app.run(headless=True)\n")
+    ui = subprocess.Popen([PYBIN, str(harness)], env=e,
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    if not wait_socket(sock, 30):
+        out = b""
+        try: out = ui.stdout.read(4000) if ui.stdout else b""
+        except Exception: pass
+        raise RuntimeError(f"UI socket never appeared. UI output:\n{out.decode(errors='replace')}")
+    return ui, sock, mnt
+
+
+def _seed_allow_all(e):
+    """Pre-seed a permanent allow-all netrule so the headless UI never blocks on a
+    no-match prompt (there is no human to answer one in an e2e run)."""
+    cfg = Path(e["XDG_CONFIG_HOME"]) / "slopbox"
+    cfg.mkdir(parents=True, exist_ok=True)
+    (cfg / "netrules").write_text("allow host:*\n")
+
+
+def _kill_ui(ui, mnt):
+    try:
+        ui.send_signal(signal.SIGINT); ui.wait(timeout=10)
+    except Exception:
+        try: ui.kill(); ui.wait(timeout=5)
+        except Exception: pass
+    time.sleep(0.5)
+    if os.path.ismount(str(mnt)):
+        try: subprocess.run(["fusermount3", "-uz", str(mnt)],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+        except Exception: pass
+
+
+def _box_sqlar(e, timeout=20):
+    """Poll for the one consolidated <box_id>.sqlar the UI writes after the box exits."""
+    state = Path(e["XDG_STATE_HOME"]) / "slopbox"
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        sqlars = list(state.glob("*.sqlar"))
+        if sqlars: return sqlars[0]
+        time.sleep(0.3)
+    return None
+
+
+def run_dns_e2e(tmp):
+    """Proxy-UNAWARE network interception (the synthetic-DNS path). A program that does
+    its OWN DNS and connects to an IP never sees HTTP_PROXY, so it must be caught a
+    different way: the box's /etc/resolv.conf points at the in-box resolver
+    (127.0.0.53:53), which answers every A query with a stable synthetic 127/8 IP; the
+    catch-all listeners on :80/:443 recover the dialed synthetic IP via getsockname(),
+    map it back to the domain, and relay it. Those are PRIVILEGED ports bound inside a
+    cap-dropped box — they need CAP_NET_BIND_SERVICE, without which the whole mechanism
+    silently fails (EACCES on bind). This test is the regression guard for that."""
+    import re, sqlite3
+    m = SourceFileLoader("slopbox", SARUN).load_module()
+    e = env_for(tmp); _seed_allow_all(e)
+    ui, sock, mnt = _launch_ui(tmp, e)
+    try:
+        script = (
+            "echo '--- libc resolution ---'; "
+            "python3 -c 'import socket; print(\"RESOLVED\", socket.gethostbyname(\"example.com\"))' "
+            "|| echo resolve-failed; "
+            "echo '--- proxy-unaware http (catch-all) ---'; "
+            "curl --noproxy '*' -s -o /dev/null "
+            "-w 'CATCHALL_CODE=%{http_code} REMOTE=%{remote_ip}\\n' --max-time 15 http://example.com/ "
+            "|| echo catchall-failed; "
+            "echo '--- direct dial to an unallocated synthetic IP must be blocked ---'; "
+            "curl --noproxy '*' -s -o /dev/null -w 'BLOCKED_CODE=%{http_code}\\n' "
+            "--max-time 6 http://127.0.0.231/ ; echo \"BLOCKED_RC=$?\"")
+        r = subprocess.run([PYBIN, SARUN, "-n", "--", "bash", "-c", script],
+                           env=e, capture_output=True, text=True, timeout=120)
+        out = r.stdout
+        check(r.returncode == 0,
+              f"dns-e2e: box run exited 0 (got {r.returncode}: {r.stderr.strip()[-200:]})")
+        # 1. libc getaddrinfo returns a synthetic 127/8 IP (resolv.conf → in-box resolver)
+        mo = re.search(r"RESOLVED (\d+\.\d+\.\d+\.\d+)", out)
+        check(mo is not None and mo.group(1).startswith("127."),
+              f"dns-e2e: libc resolution returns a synthetic 127/8 IP "
+              f"(got {mo.group(1) if mo else 'none'})")
+        # 2. the proxy-unaware curl was intercepted by the catch-all (dialed a 127/8
+        #    synthetic IP) and reached upstream through the relay → mitmproxy
+        mo2 = re.search(r"CATCHALL_CODE=(\d+) REMOTE=(\S+)", out)
+        check(mo2 is not None and mo2.group(1) not in ("000", "") and mo2.group(2).startswith("127."),
+              f"dns-e2e: proxy-unaware http intercepted via catch-all + synthetic IP "
+              f"(got {mo2.group(0) if mo2 else 'none'})")
+        # 3. a direct dial to a synthetic IP we never handed out is BLOCKED — the
+        #    catch-all maps it to no domain and closes it (the exclusion security property)
+        check("BLOCKED_CODE=000" in out and "BLOCKED_RC=0" not in out,
+              f"dns-e2e: direct dial to an unallocated synthetic IP is blocked "
+              f"(got {[ln for ln in out.splitlines() if 'BLOCKED' in ln]})")
+        # 4. the interception is recorded as a flow naming the real domain
+        sp = _box_sqlar(e)
+        flows = []
+        if sp:
+            c = sqlite3.connect(str(sp))
+            try: flows = c.execute("SELECT host,port,scheme,status FROM flows").fetchall()
+            except sqlite3.Error: flows = []
+            finally: c.close()
+        check(any(f[0] == "example.com" and f[1] == 80 for f in flows),
+              f"dns-e2e: the intercepted connection is logged as a flow for the domain "
+              f"(got {flows})")
+    finally:
+        _kill_ui(ui, mnt)
+
+
+def run_capture_e2e(tmp):
+    """Default stdout/stderr capture. With no -t the child's stdout/stderr are redirected
+    through FUSE capture-sink files: every write is recorded in the `outputs` table —
+    per-writer, attributed by the patched pyfuse3's write-pid — AND echoed live back to
+    the runner's real terminal. Verify (a) the runner SEES the output live (echo works),
+    (b) each write lands in `outputs` on the right stream, and (c) writes from DIFFERENT
+    processes are attributed to DIFFERENT process rows (the point of the per-write pid)."""
+    import sqlite3
+    m = SourceFileLoader("slopbox", SARUN).load_module()
+    e = env_for(tmp)
+    ui, sock, mnt = _launch_ui(tmp, e)
+    try:
+        mo, me = "OUT-MARKER-7f3a", "ERR-MARKER-9c2b"
+        # outer bash writes mo to stdout (builtin → outer pid); a SEPARATE child bash
+        # writes me to stderr (its own pid) → two distinct writers.
+        script = f"echo {mo}; bash -c 'echo {me} 1>&2'; true"
+        r = subprocess.run([PYBIN, SARUN, "--", "bash", "-c", script],   # no -t → capture
+                           env=e, capture_output=True, text=True, timeout=90)
+        check(r.returncode == 0,
+              f"capture-e2e: box run exited 0 (got {r.returncode}: {r.stderr.strip()[-200:]})")
+        # (a) live echo: the box output is replayed onto the runner's own stdout/stderr
+        check(mo in r.stdout, "capture-e2e: child stdout is echoed live to the runner")
+        check(me in r.stderr or me in r.stdout,
+              "capture-e2e: child stderr is echoed live to the runner")
+        # (b)+(c) the outputs table
+        sp = _box_sqlar(e)
+        rows, procs = [], []
+        if sp:
+            c = sqlite3.connect(str(sp))
+            try:
+                rows = c.execute("SELECT stream, process_id, content FROM outputs").fetchall()
+                procs = c.execute("SELECT id, exe FROM process").fetchall()
+            except sqlite3.Error: rows = []
+            finally: c.close()
+        def _has(marker, stream):
+            return any(s == stream and marker.encode() in bytes(content or b"")
+                       for s, _pid, content in rows)
+        check(_has(mo, 0), "capture-e2e: stdout write recorded in outputs on stream=0")
+        check(_has(me, 1), "capture-e2e: stderr write recorded in outputs on stream=1")
+        pids = {pid for _s, pid, _c in rows}
+        check(len(pids) >= 2,
+              f"capture-e2e: writes from different processes get different process_id "
+              f"(got {sorted(pids)})")
+        check(pids and pids <= {p[0] for p in procs},
+              "capture-e2e: every outputs.process_id resolves to a process row (provenance)")
+    finally:
+        _kill_ui(ui, mnt)
+
+
 def main():
     tmp = Path(tempfile.mkdtemp(prefix="e2e-"))
     try:
@@ -606,6 +785,10 @@ def main():
         run_named_box_e2e(tmp)
         print("\n== forced-userns e2e (unprivileged --unshare-user runner) ==")
         run_forced_userns_e2e(Path(tempfile.mkdtemp(prefix="e2e-userns-")))
+        print("\n== synthetic-DNS e2e (proxy-unaware interception) ==")
+        run_dns_e2e(Path(tempfile.mkdtemp(prefix="e2e-dns-")))
+        print("\n== stdout/stderr capture e2e ==")
+        run_capture_e2e(Path(tempfile.mkdtemp(prefix="e2e-cap-")))
     except Exception as ex:
         import traceback; traceback.print_exc(); _fails.append(str(ex))
     finally:
