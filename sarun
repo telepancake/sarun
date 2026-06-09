@@ -9252,89 +9252,110 @@ def _make_ui_app():
         @on(Input.Submitted,"#rule-input")
         def _save(self): self.dismiss(self.query_one("#rule-input",Input).value.strip())
 
+    class ClauseRow(Horizontal):
+        """One editable line of a boolean match expression: enabled · and/or · not ·
+        kind · pattern · remove. A REUSABLE building block — it knows only about Match
+        kinds, nothing about rules — so the same row drives rule editing, search, and
+        any future match UI. read() returns the Clause it currently shows."""
+        def __init__(self, kinds, clause=None, default_kind=""):
+            super().__init__(classes="clause-row")
+            self._kinds=list(kinds)
+            self._c=clause or Clause(Match(default_kind or self._kinds[0], ""))
+        def compose(self):
+            c=self._c
+            yield Checkbox("on", value=c.enabled, id="cl-en")
+            yield Select([("and","and"),("or","or")], value=c.join,
+                         allow_blank=False, id="cl-join")
+            yield Checkbox("not", value=c.negate, id="cl-not")
+            yield Select([(k,k) for k in self._kinds], value=c.match.kind,
+                         allow_blank=False, id="cl-kind")
+            yield Input(value=c.match.pattern, placeholder="pattern", id="cl-pat")
+            yield Button("✕", id="cl-rm", classes="cl-rm")
+        def read(self) -> "Clause":
+            return Clause(Match(self.query_one("#cl-kind",Select).value,
+                                self.query_one("#cl-pat",Input).value.strip()),
+                          join=self.query_one("#cl-join",Select).value,
+                          negate=self.query_one("#cl-not",Checkbox).value,
+                          enabled=self.query_one("#cl-en",Checkbox).value)
+        @on(Button.Pressed,"#cl-rm")
+        def _remove(self, ev): ev.stop(); self.remove()
+
+    class ClauseList(Vertical):
+        """A REUSABLE editor for a list of Clauses — the boolean match expression the
+        whole app composes (rules today; search and other matchers later). Parameterised
+        only by the Match kinds it offers; emits no rule/action concept. clauses() reads
+        the current expression (rows with an empty pattern are dropped)."""
+        def __init__(self, kinds, clauses=None, default_kind="", id=None):
+            super().__init__(id=id)
+            self._kinds=list(kinds); self._default=default_kind or self._kinds[0]
+            self._init=list(clauses) if clauses else [Clause(Match(self._default,""))]
+        def compose(self):
+            with Vertical(id="clause-rows"):
+                for c in self._init:
+                    yield ClauseRow(self._kinds, c, self._default)
+            yield Button("+ add condition", id="cl-add", classes="cl-add")
+        @on(Button.Pressed,"#cl-add")
+        def _add(self, ev):
+            ev.stop()
+            self.query_one("#clause-rows",Vertical).mount(
+                ClauseRow(self._kinds, None, self._default))
+        def clauses(self) -> list:
+            out=[]
+            for row in self.query(ClauseRow):
+                c=row.read()
+                if c.match.pattern:
+                    out.append(c)
+            return out
+
     class RuleFormModal(ModalScreen):
-        """ONE structured rule editor for both rule domains — the single match form the
-        whole app edits rules through. `domain` ('net'|'file') is the search type the
-        caller specifies; the form simply hides the fields that don't apply to it (the
-        kind selector is net-only, the action vocabulary differs), while the box scope
-        and pattern are common to both. Returns the composed rule line — parseable by
-        the domain's own parser (Rule.parse / FileRule.parse) — or None on cancel."""
-        BINDINGS=[("escape","cancel","")]
-        _ACTIONS={"net":("allow","deny"),
-                  "file":("apply","discard","passthrough")}
+        """The rule editor: an action selector over a reusable ClauseList (the boolean
+        match expression). `domain` ('net'|'file') only chooses the action vocabulary and
+        which Match kinds the clause rows offer — the editing machinery is identical, and
+        the very same ClauseList is meant to back search and other matchers. Dismisses
+        with a built Rule/FileRule (or None on cancel)."""
+        BINDINGS=[("escape","cancel",""),("ctrl+s","save","")]
+        _ACTIONS={"net":("allow","deny"), "file":FILE_ACTIONS}
         _KINDS={"net":NET_KINDS, "file":FILE_KINDS}
+        _DEFAULT={"net":"host","file":"path"}
         def __init__(self, domain, rule=None, title=None):
             super().__init__()
             self.domain=domain; self.rule=rule
             self._title=title or (" Net rule" if domain=="net" else " File rule")
-        def _seed(self):
-            # Prefill the single-condition form from an existing rule: its first
-            # non-box clause is the kind/pattern, a box clause (if any) the box scope.
-            dk="host" if self.domain=="net" else "path"
-            action=self._ACTIONS[self.domain][0]; kind=dk; pat=""; box=""
-            r=self.rule
-            if r:
-                action=r.action
-                for c in r.clauses:
-                    if c.match.kind=="box": box=c.match.pattern
-                    elif not pat: kind, pat = c.match.kind, c.match.pattern
-            return action, kind, pat, box
         def compose(self):
-            acts=self._ACTIONS[self.domain]; kinds=self._KINDS[self.domain]
-            action,kind,pat,box=self._seed()
+            acts=self._ACTIONS[self.domain]
             with Vertical(id="rule-box"):
                 yield Label(self._title, id="rule-title")
                 yield Label("[dim]action[/]")
                 yield Select([(a,a) for a in acts], id="rf-action", allow_blank=False,
-                             value=action)
-                if self.domain=="net":
-                    yield Label("[dim]match[/]")
-                    yield Select([(k,k) for k in kinds if k!="box"], id="rf-kind",
-                                 allow_blank=False, value=(kind if kind!="box" else "host"))
-                yield Label("[dim]pattern[/]")
-                yield Input(value=pat, id="rf-pat",
-                            placeholder=("host[:PORT] · ip/CIDR · cname · url-prefix"
-                                         if self.domain=="net"
-                                         else "path glob, e.g. **/*.log or src/**"))
-                yield Label("[dim]box scope — glob over the box name (blank = every box)[/]")
-                yield Input(value=box, id="rf-box",
-                            placeholder="e.g. backend-*  or  A.B*  (blank = all boxes)")
+                             value=(self.rule.action if self.rule else acts[0]))
+                yield Label("[dim]match — conditions, folded top-to-bottom by each "
+                            "row's and/or (first row's join is ignored)[/]")
+                yield ClauseList(self._KINDS[self.domain],
+                                 clauses=(self.rule.clauses if self.rule else None),
+                                 default_kind=self._DEFAULT[self.domain], id="rf-clauses")
                 yield Label(self._help())
                 with Horizontal(id="rule-btns"):
-                    yield Button("Save [↵]", id="rf-save", variant="primary")
+                    yield Button("Save [^s]", id="rf-save", variant="primary")
                     yield Button("Cancel [esc]", id="rf-cancel")
         def _help(self):
-            if self.domain=="net":
-                return ("[dim]host & cname take [b]*[/b] wildcards "
-                        "([b]*.example.com[/b] also matches example.com); box scope "
-                        "uses the same globs as paths · Enter save · Esc cancel[/]")
-            return ("[dim][b]*[/b] in a segment · [b]**[/b] across dirs · "
-                    "[b]@(a|b) !(x) {a,b}[/b] · bare name = any depth · leading "
-                    "[b]/[/b] anchored · box scope uses the same globs · "
-                    "Enter save · Esc cancel[/]")
-        def on_mount(self): self.query_one("#rf-pat",Input).focus()
-        def _line(self):
-            pat=self.query_one("#rf-pat",Input).value.strip()
-            if not pat: return None
-            box=self.query_one("#rf-box",Input).value.strip()
-            action=self.query_one("#rf-action",Select).value
+            kinds={"net":"host:NAME[:PORT] · ip:ADDR|CIDR · cname:NAME · url:PREFIX · box:GLOB",
+                   "file":"path:GLOB (bare ok) · box:GLOB"}[self.domain]
+            return (f"[dim]kinds: {kinds}\nhost/cname take [b]*[/b]; paths & box take "
+                    "[b]* ** ? @(a|b) {a,b}[/b] · ^s save · esc cancel[/]")
+        def _build(self):
+            clauses=self.query_one(ClauseList).clauses()
+            if not any(c.enabled for c in clauses):   # refuse a rule with no live condition
+                return None
             cls=Rule if self.domain=="net" else FileRule
-            kind=self.query_one("#rf-kind",Select).value if self.domain=="net" else "path"
-            rule=cls.single(action, kind, pat)
-            if box: rule.clauses.append(Clause(Match("box", box)))
-            return rule.to_line()
-        def _save(self):
-            line=self._line()
-            if line: self.dismiss(line)
+            return cls(self.query_one("#rf-action",Select).value, clauses)
+        def action_save(self):
+            r=self._build()
+            if r is not None: self.dismiss(r)
         def action_cancel(self): self.dismiss(None)
-        @on(Input.Submitted,"#rf-pat")
-        def _sub_pat(self): self._save()
-        @on(Input.Submitted,"#rf-box")
-        def _sub_box(self): self._save()
         @on(Button.Pressed,"#rf-save")
-        def _b_save(self): self._save()
+        def _b_save(self, ev): ev.stop(); self.action_save()
         @on(Button.Pressed,"#rf-cancel")
-        def _b_cancel(self): self.dismiss(None)
+        def _b_cancel(self, ev): ev.stop(); self.dismiss(None)
 
     class RenameModal(_SimpleInputModal):
         # Rename the selected box. Returns the new NAME or None.
@@ -9464,9 +9485,18 @@ def _make_ui_app():
         #cd-info { height:auto; padding:0 1; background:$panel; }
         #confirm-box { width:64; height:auto; padding:1 2; background:$surface; border:tall $error; }
         #confirm-msg { margin-bottom:1; } #confirm-btns { height:3; }
-        #rule-box { width:72; height:auto; padding:1 2; background:$surface; border:tall $warning; }
+        #rule-box { width:98; height:auto; max-height:90%; padding:1 2;
+                    background:$surface; border:tall $warning; }
         #rule-title { margin-bottom:1; } #rule-input { margin-bottom:1; }
         #rule-btns { height:3; margin-top:1; }
+        #clause-rows { height:auto; max-height:16; }
+        .clause-row { height:3; width:1fr; }
+        .clause-row Select { width:11; }
+        .clause-row Checkbox { width:8; min-width:8; }
+        .clause-row #cl-kind { width:11; }
+        .clause-row Input { width:1fr; }
+        .clause-row .cl-rm { width:5; min-width:5; }
+        .cl-add { width:auto; height:3; margin-top:0; }
         ModalScreen { align:center middle; }
         """
         # The left-hand view is switched among these sources; the right pane
@@ -10326,11 +10356,9 @@ def _make_ui_app():
         def _rule_edit_at(self, i):
             rules=self.rules_store.rules
             if i is None or not (0<=i<len(rules)): return
-            def done(line):
-                if line is None: return
-                r=Rule.parse(line)
-                if not r: self._status("invalid rule — keeping the old one"); return
-                rules[i]=r; self.rules_store.save(); self._refresh_rules()
+            def done(rule):
+                if rule is None: return
+                rules[i]=rule; self.rules_store.save(); self._refresh_rules()
                 try: self.query_one("#w-list",ListView).index=i
                 except Exception: pass
             self.push_screen(RuleFormModal("net", rule=rules[i],
@@ -10361,12 +10389,9 @@ def _make_ui_app():
             self._refresh_file_rules()
 
         def _file_rule_add(self):
-            def done(line):
-                if not line: return
-                r=FileRule.parse(line)
-                if not r:
-                    self._status("invalid file rule — use: apply|discard <glob>"); return
-                self.frules_store.insert(r); self._file_rules_changed()
+            def done(rule):
+                if rule is None: return
+                self.frules_store.insert(rule); self._file_rules_changed()
                 try: self.query_one("#r-list",ListView).index=len(self.frules_store.rules)-1
                 except Exception: pass
             self.push_screen(RuleFormModal("file", title=" New file rule"), done)
@@ -10374,11 +10399,9 @@ def _make_ui_app():
         def _file_rule_edit_at(self, i):
             rules=self.frules_store.rules
             if i is None or not (0<=i<len(rules)): return
-            def done(line):
-                if line is None: return
-                r=FileRule.parse(line)
-                if not r: self._status("invalid file rule — keeping the old one"); return
-                rules[i]=r; self.frules_store.save(); self._file_rules_changed()
+            def done(rule):
+                if rule is None: return
+                rules[i]=rule; self.frules_store.save(); self._file_rules_changed()
                 try: self.query_one("#r-list",ListView).index=i
                 except Exception: pass
             self.push_screen(RuleFormModal("file", rule=rules[i],

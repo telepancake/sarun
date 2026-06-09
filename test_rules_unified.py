@@ -12,8 +12,8 @@ single Match. Covers three layers:
      (incl. multi-clause and/or/not/off and the box kind), and Rules/FileRules.decide;
   2. evaluation against a LIVE box — a box-scoped file passthrough rule over a real
      overlay mount, and a multi-clause net rule through a real Supervisor/policy;
-  3. the UI — RuleFormModal composes a parseable line, and an approval saves a
-     box-scoped rule.
+  3. the UI — the reusable ClauseList editor (add/remove rows, per-row kind/and-or/
+     not/enabled) building a rule in a running app, and an approval saving a box rule.
 
 Run standalone (uv provisions deps):  ./test_rules_unified.py
 """
@@ -154,31 +154,8 @@ def _freevar(fn, name):
     fv = fn.__code__.co_freevars
     return fn.__closure__[fv.index(name)].cell_contents if name in fv else None
 
-def test_form_and_approval():
-    App = m._make_ui_app()
-    RuleFormModal = _freevar(App._file_rule_add, "RuleFormModal")
-    check(RuleFormModal is not None, "RuleFormModal reachable")
-    if RuleFormModal is None: return
-
-    class _In:
-        def __init__(self, v): self.value = v
-    def compose(domain, action, pat, box, kind="host"):
-        mod = RuleFormModal(domain)
-        stubs = {"#rf-pat": _In(pat), "#rf-box": _In(box),
-                 "#rf-action": _In(action), "#rf-kind": _In(kind)}
-        object.__setattr__(mod, "query_one", lambda sel, cls=None: stubs[sel])
-        return mod._line()
-
-    check(compose("file", "discard", "**/*.log", "A.B*") == "discard **/*.log and box:A.B*",
-          "form: file composes path + box clause")
-    check(m.FileRule.parse(compose("file", "discard", "**/*.log", "A.B*")).clauses[1].match.kind == "box",
-          "form: file line parses back to a box clause")
-    check(compose("file", "passthrough", "s.txt", "") == "passthrough s.txt", "form: file no box")
-    check(compose("net", "deny", "example.com", "backend-*") == "deny host:example.com and box:backend-*",
-          "form: net composes host + box clause")
-    check(compose("net", "allow", "10.0.0.0/8", "", kind="ip") == "allow ip:10.0.0.0/8", "form: net ip, no box")
-    check(compose("file", "discard", "", "X") is None, "form: empty pattern -> no line")
-
+def test_approval_box_rule():
+    # A connection approval can save a box-scoped rule (the box rides in as a clause).
     d = Path(tempfile.mkdtemp()); rules = m.Rules(d / "netrules"); pol = m.NetworkPolicy(rules)
     async def drive():
         sess = types.SimpleNamespace(box_id=1, sess_rules=[])
@@ -194,8 +171,63 @@ def test_form_and_approval():
     shutil.rmtree(d, ignore_errors=True)
 
 
+def test_clause_list_editor():
+    """Drive the REAL reusable ClauseList editor in a running app: it starts with one
+    row, 'add condition' mounts another, each row's kind/pattern/join/not/enabled read
+    back into a Clause, the modal builds the domain's rule from them, removing a row
+    drops its clause, and a rule with no live condition is refused."""
+    App = m._make_ui_app()
+    RuleFormModal = _freevar(App._file_rule_add, "RuleFormModal")
+
+    async def drive():
+        from textual.widgets import Input, Select
+        app = App()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            modal = RuleFormModal("file")
+            app.push_screen(modal, lambda r: None)
+            await pilot.pause(); await pilot.pause()
+            cl = modal.query_one("#rf-clauses")
+            rows = list(modal.query(".clause-row"))
+            check(len(rows) == 1, "editor starts with one clause row")
+            check(rows[0].query_one("#cl-kind", Select).value == "path",
+                  "file row defaults to the path kind")
+            rows[0].query_one("#cl-pat", Input).value = "**/*.log"
+            cl._add(types.SimpleNamespace(stop=lambda: None))
+            await pilot.pause(); await pilot.pause()
+            rows = list(modal.query(".clause-row"))
+            check(len(rows) == 2, "'add condition' mounts a second row")
+            rows[1].query_one("#cl-kind", Select).value = "box"
+            rows[1].query_one("#cl-pat", Input).value = "A.B*"
+            await pilot.pause()
+            check([(c.match.kind, c.match.pattern) for c in cl.clauses()]
+                  == [("path", "**/*.log"), ("box", "A.B*")], "clauses() reads both rows in order")
+            rule = modal._build()
+            check(type(rule).__name__ == "FileRule"
+                  and rule.to_line() == "apply **/*.log and box:A.B*",
+                  f"modal builds the domain rule from the rows (got {rule and rule.to_line()!r})")
+            rows[1]._remove(types.SimpleNamespace(stop=lambda: None))
+            await pilot.pause(); await pilot.pause()
+            check(len(cl.clauses()) == 1, "removing a row drops its clause")
+            list(modal.query(".clause-row"))[0].query_one("#cl-pat", Input).value = ""
+            await pilot.pause()
+            check(modal._build() is None, "a rule with no live condition is refused")
+            modal.dismiss(None); await pilot.pause()
+            net = RuleFormModal("net"); app.push_screen(net, lambda r: None)
+            await pilot.pause(); await pilot.pause()
+            r0 = net.query(".clause-row")[0]
+            r0.query_one("#cl-kind", Select).value = "host"
+            r0.query_one("#cl-pat", Input).value = "api.test"
+            await pilot.pause()
+            nr = net._build()
+            check(type(nr).__name__ == "Rule" and nr.to_line() == "allow host:api.test",
+                  "the same editor builds a net Rule")
+    asyncio.run(drive())
+
+
 def main():
-    for fn in (test_model, test_live_box_scope, test_form_and_approval):
+    for fn in (test_model, test_live_box_scope, test_approval_box_rule,
+               test_clause_list_editor):
         print(f"== {fn.__name__} ==")
         try:
             fn()
