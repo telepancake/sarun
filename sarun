@@ -676,6 +676,9 @@ def run_inner(channel_path: str, cmd: list) -> int:
 #:   [cyan]cname:PATTERN[/]  match any name in the DNS CNAME/alias chain
 #:   [cyan]url:PREFIX[/]     match http(s) URLs by exact value or prefix
 #: Add [cyan]:PORT[/] to a host pattern to restrict it to one port (e.g. [cyan]host:api.github.com:443[/]).
+#: A rule may also be limited to some boxes with a [cyan][BOXGLOB][/] prefix — a glob over the box's
+#: hierarchical name, e.g. [cyan][backend-*] deny host:*[/] or [cyan][A.B*] allow host:api.test[/]; no
+#: prefix means every box (the same box-scope field file rules use).
 #: When no rule matches you are prompted, and choose a [b]scope[/]: [b]once[/] (this request only),
 #: [b]session[/] (a rule that lasts until the box exits), or [b]permanent[/] (saved to the rules file,
 #: see §15). Edit the saved ruleset any time in the Net rules pane ([cyan]w[/]); order matters.
@@ -931,6 +934,10 @@ class Rules(_RuleListBase):
 #: [cyan]@(a|b)[/] / [cyan]!(x)[/] groups, [cyan]{a,b}[/] brace expansion. Matching includes dotfiles (a leading [cyan]*[/]
 #: matches [cyan].bashrc[/]). A pattern with no leading [cyan]/[/] matches at any depth; a leading [cyan]/[/] anchors
 #: at the filesystem root.
+#: [b]Box scope:[/] a rule may be limited to some boxes by prefixing it with [cyan][BOXGLOB][/] — a glob
+#: (same wildcards) over the box's hierarchical name, e.g. [cyan][backend-*] discard **/*.log[/] or
+#: [cyan][A.B*] passthrough secret.txt[/]. No prefix means every box. The form's [b]box scope[/] field
+#: sets it; blank = all boxes.
 #
 # Patterns are extended shell globs (bash-style) over the change's absolute path,
 # via wcmatch with GLOBSTAR + EXTGLOB + BRACE:
@@ -6814,12 +6821,14 @@ class NetworkPolicy:
             fut.cancel()
         self.pending.pop(rid, None)
         action, scope = result["action"], result["scope"]
-        # The UI hands back the exact rule it wants ("kind:pattern") and where to
-        # put it; we only synthesise a host rule if it didn't supply one.
+        # The UI hands back the exact rule it wants ("kind:pattern"), an optional box
+        # scope, and where to put it; we only synthesise a host rule if it gave no spec.
         spec = result.get("spec") or f"host:{host}"
         at_top = result.get("at_top", False)
+        box = (result.get("box") or "").strip()
         if scope in ("session", "permanent"):
-            rule = Rule.parse(f"{action} {spec}")
+            prefix = f"[{box}] " if box else ""
+            rule = Rule.parse(f"{prefix}{action} {spec}")
             if rule:
                 if scope == "session":
                     s.sess_rules.insert(0 if at_top else len(s.sess_rules), rule)
@@ -6830,11 +6839,11 @@ class NetworkPolicy:
         self._emit(type="approval_resolved", request_id=rid)
         return {"action": action, "scope": scope}
 
-    def resolve(self, rid, action, scope, spec=None, at_top=False) -> None:
+    def resolve(self, rid, action, scope, spec=None, at_top=False, box="") -> None:
         p = self.pending.get(rid)
         if p and not p.future.done():
             p.future.set_result({"action": action, "scope": scope,
-                                 "spec": spec, "at_top": at_top})
+                                 "spec": spec, "at_top": at_top, "box": box})
 
     def _pending_dict(self, rid) -> dict:
         p = self.pending[rid]
@@ -9084,7 +9093,7 @@ def _make_ui_app():
     from textual.screen import ModalScreen
     from textual.widgets import (
         Button, Checkbox, DataTable, Header, Input, Label,
-        ListItem, ListView, Static)
+        ListItem, ListView, Select, Static)
     from rich.text import Text
 
     # Build a styled line as data: each fragment is (text, style); the text is
@@ -9125,7 +9134,7 @@ def _make_ui_app():
         # Let the user write the exact rule (kind:pattern) and choose where it goes,
         # instead of the program guessing. It shows what this request can be matched
         # on — host, resolved IPs, CNAME chain, URL — so those are easy to copy.
-        # Returns (scope, spec, at_top) or None.
+        # Returns (scope, spec, at_top, box) or None; box is an optional box-name glob.
         BINDINGS=[("escape","cancel",""),("ctrl+p","perm","")]
         def __init__(self, action, appr):
             super().__init__(); self.action=action; self.a=appr
@@ -9148,6 +9157,8 @@ def _make_ui_app():
                 yield Label("[dim]host & cname take [b]*[/b] wildcards — "
                             "[b]*.example.com[/b] matches example.com and any "
                             "subdomain; [b]*[/b] alone matches anything[/]")
+                yield Input(value="", id="rule-box",
+                            placeholder="box scope glob (blank = every box)")
                 yield Checkbox("insert at top (checked first)", id="rule-top")
                 with Horizontal(id="rule-btns"):
                     yield Button("This session [↵]", id="rb-sess", variant="primary")
@@ -9155,10 +9166,11 @@ def _make_ui_app():
                     yield Button("Cancel [esc]", id="rb-cancel")
         def on_mount(self): self.query_one("#rule-input",Input).focus()
         def _spec(self): return self.query_one("#rule-input",Input).value.strip()
+        def _box(self): return self.query_one("#rule-box",Input).value.strip()
         def _top(self): return self.query_one("#rule-top",Checkbox).value
         def _go(self, scope):
             s=self._spec()
-            if s: self.dismiss((scope, s, self._top()))
+            if s: self.dismiss((scope, s, self._top(), self._box()))
         def action_perm(self): self._go("permanent")
         def action_cancel(self): self.dismiss(None)
         @on(Input.Submitted,"#rule-input")
@@ -9188,28 +9200,74 @@ def _make_ui_app():
         @on(Input.Submitted,"#rule-input")
         def _save(self): self.dismiss(self.query_one("#rule-input",Input).value.strip())
 
-    class RuleLineModal(_SimpleInputModal):
-        # Edit one existing rule as a full line. Returns the new line or None.
-        def __init__(self, line):
-            super().__init__(
-                " Edit rule",
-                "[dim]<allow|deny> <kind>:<pattern>   "
-                "(host/cname take [b]*[/b] wildcards) · Enter save · "
-                "Esc cancel[/]",
-                initial=line)
-
-    class FileRuleLineModal(_SimpleInputModal):
-        # Add or edit one file rule as a full line. Returns the new line or None.
-        def __init__(self, line):
-            super().__init__(
-                " File rule",
-                "[dim]<apply|discard> <path-glob>   e.g. "
-                "[b]discard *.log[/b] · [b]apply src/**/*.py[/b] · "
-                "[b]discard .~*[/b] · [b]apply /etc/**[/b]\n"
-                "[b]*[/b] stays in one path segment · [b]**[/b] crosses "
-                "dirs · a bare name matches at any depth · leading "
-                "[b]/[/b] anchors at root · Enter save · Esc cancel[/]",
-                initial=line)
+    class RuleFormModal(ModalScreen):
+        """ONE structured rule editor for both rule domains — the single match form the
+        whole app edits rules through. `domain` ('net'|'file') is the search type the
+        caller specifies; the form simply hides the fields that don't apply to it (the
+        kind selector is net-only, the action vocabulary differs), while the box scope
+        and pattern are common to both. Returns the composed rule line — parseable by
+        the domain's own parser (Rule.parse / FileRule.parse) — or None on cancel."""
+        BINDINGS=[("escape","cancel","")]
+        _ACTIONS={"net":("allow","deny"),
+                  "file":("apply","discard","passthrough")}
+        def __init__(self, domain, rule=None, title=None):
+            super().__init__()
+            self.domain=domain; self.rule=rule
+            self._title=title or (" Net rule" if domain=="net" else " File rule")
+        def compose(self):
+            r=self.rule; acts=self._ACTIONS[self.domain]
+            with Vertical(id="rule-box"):
+                yield Label(self._title, id="rule-title")
+                yield Label("[dim]action[/]")
+                yield Select([(a,a) for a in acts], id="rf-action", allow_blank=False,
+                             value=(r.action if r else acts[0]))
+                if self.domain=="net":
+                    yield Label("[dim]match[/]")
+                    yield Select([(k,k) for k in RULE_KINDS], id="rf-kind",
+                                 allow_blank=False, value=(r.kind if r else "host"))
+                yield Label("[dim]pattern[/]")
+                yield Input(value=(r.pattern if r else ""), id="rf-pat",
+                            placeholder=("host[:PORT] · ip/CIDR · cname · url-prefix"
+                                         if self.domain=="net"
+                                         else "path glob, e.g. **/*.log or src/**"))
+                yield Label("[dim]box scope — glob over the box name (blank = every box)[/]")
+                yield Input(value=(r.box if r else ""), id="rf-box",
+                            placeholder="e.g. backend-*  or  A.B*  (blank = all boxes)")
+                yield Label(self._help())
+                with Horizontal(id="rule-btns"):
+                    yield Button("Save [↵]", id="rf-save", variant="primary")
+                    yield Button("Cancel [esc]", id="rf-cancel")
+        def _help(self):
+            if self.domain=="net":
+                return ("[dim]host & cname take [b]*[/b] wildcards "
+                        "([b]*.example.com[/b] also matches example.com); box scope "
+                        "uses the same globs as paths · Enter save · Esc cancel[/]")
+            return ("[dim][b]*[/b] in a segment · [b]**[/b] across dirs · "
+                    "[b]@(a|b) !(x) {a,b}[/b] · bare name = any depth · leading "
+                    "[b]/[/b] anchored · box scope uses the same globs · "
+                    "Enter save · Esc cancel[/]")
+        def on_mount(self): self.query_one("#rf-pat",Input).focus()
+        def _line(self):
+            pat=self.query_one("#rf-pat",Input).value.strip()
+            if not pat: return None
+            box=self.query_one("#rf-box",Input).value.strip()
+            action=self.query_one("#rf-action",Select).value
+            if self.domain=="net":
+                kind=self.query_one("#rf-kind",Select).value
+                return Rule(action, kind, pat, box).to_line()
+            return FileRule(action, pat, box).to_line()
+        def _save(self):
+            line=self._line()
+            if line: self.dismiss(line)
+        def action_cancel(self): self.dismiss(None)
+        @on(Input.Submitted,"#rf-pat")
+        def _sub_pat(self): self._save()
+        @on(Input.Submitted,"#rf-box")
+        def _sub_box(self): self._save()
+        @on(Button.Pressed,"#rf-save")
+        def _b_save(self): self._save()
+        @on(Button.Pressed,"#rf-cancel")
+        def _b_cancel(self): self.dismiss(None)
 
     class RenameModal(_SimpleInputModal):
         # Rename the selected box. Returns the new NAME or None.
@@ -10144,7 +10202,11 @@ def _make_ui_app():
                 t.append(("ALLOW" if r.action=="allow" else "DENY")+"\n",
                          style="green bold" if r.action=="allow" else "red bold")
                 t.append("kind     ", style="dim"); t.append(r.kind+"\n")
-                t.append("pattern  ", style="dim"); t.append(r.pattern+"\n\n")
+                t.append("pattern  ", style="dim"); t.append(r.pattern+"\n")
+                t.append("box      ", style="dim")
+                t.append((r.box+"  (only in matching boxes)") if r.box
+                         else "any box\n", style="" if r.box else "dim")
+                t.append("\n" if r.box else "\n")
                 help={"host":"Match the request's hostname. * and ? wildcards; "
                               "*.example.com also matches example.com. Optional :PORT.",
                       "ip":"Match a resolved IP — a literal address or a CIDR network "
@@ -10161,7 +10223,11 @@ def _make_ui_app():
                 acol={"apply":"green bold","discard":"red bold",
                       "passthrough":"cyan bold"}.get(r.action,"bold")
                 t.append(r.action.upper()+"\n", style=acol)
-                t.append("glob     ", style="dim"); t.append(r.pattern+"\n\n")
+                t.append("glob     ", style="dim"); t.append(r.pattern+"\n")
+                t.append("box      ", style="dim")
+                t.append((r.box+"  (only in matching boxes)\n") if r.box
+                         else "any box\n", style="" if r.box else "dim")
+                t.append("\n")
                 t.append(r.action, style="bold")
                 expl={"apply":" writes the change to the host during capture.",
                       "discard":" drops the change during capture.",
@@ -10179,7 +10245,8 @@ def _make_ui_app():
             for r in self.rules_store.rules:
                 col="red" if r.action=="deny" else "green"
                 sign="−" if r.action=="deny" else "+"
-                lv.append(ListItem(Label(Text(f"{sign} {r.kind}:{r.pattern}", style=col))))
+                scope=f"[{r.box}] " if r.box else ""
+                lv.append(ListItem(Label(Text(f"{sign} {scope}{r.kind}:{r.pattern}", style=col))))
             n=len(self.rules_store.rules)
             if idx is not None and n: lv.index=min(idx, n-1)
 
@@ -10199,7 +10266,8 @@ def _make_ui_app():
                 rules[i]=r; self.rules_store.save(); self._refresh_rules()
                 try: self.query_one("#w-list",ListView).index=i
                 except Exception: pass
-            self.push_screen(RuleLineModal(rules[i].to_line()), done)
+            self.push_screen(RuleFormModal("net", rule=rules[i],
+                                           title=" Edit net rule"), done)
 
         @on(ListView.Selected, "#w-list")
         def _rule_activated(self, ev):
@@ -10212,7 +10280,8 @@ def _make_ui_app():
             _sign={"discard":"−","apply":"+","passthrough":"→"}
             for r in self.frules_store.rules:
                 col=_col.get(r.action,"green"); sign=_sign.get(r.action,"+")
-                lv.append(ListItem(Label(Text(f"{sign} {r.action} {r.pattern}", style=col))))
+                scope=f"[{r.box}] " if r.box else ""
+                lv.append(ListItem(Label(Text(f"{sign} {scope}{r.action} {r.pattern}", style=col))))
             n=len(self.frules_store.rules)
             if idx is not None and n: lv.index=min(idx, n-1)
 
@@ -10233,7 +10302,7 @@ def _make_ui_app():
                 self.frules_store.insert(r); self._file_rules_changed()
                 try: self.query_one("#r-list",ListView).index=len(self.frules_store.rules)-1
                 except Exception: pass
-            self.push_screen(FileRuleLineModal("discard "), done)
+            self.push_screen(RuleFormModal("file", title=" New file rule"), done)
 
         def _file_rule_edit_at(self, i):
             rules=self.frules_store.rules
@@ -10245,7 +10314,8 @@ def _make_ui_app():
                 rules[i]=r; self.frules_store.save(); self._file_rules_changed()
                 try: self.query_one("#r-list",ListView).index=i
                 except Exception: pass
-            self.push_screen(FileRuleLineModal(rules[i].to_line()), done)
+            self.push_screen(RuleFormModal("file", rule=rules[i],
+                                           title=" Edit file rule"), done)
 
         def _file_rule_del(self, i):
             self.frules_store.remove_at(i); self._file_rules_changed()
@@ -10966,8 +11036,8 @@ def _make_ui_app():
             rid=a["request_id"]
             def done(res):
                 if res:
-                    scope,spec,at_top=res
-                    self.sup.policy.resolve(rid, action, scope, spec, at_top)
+                    scope,spec,at_top,box=res
+                    self.sup.policy.resolve(rid, action, scope, spec, at_top, box)
             self.push_screen(RuleModal(action, a), done)
 
         def action_refresh(self):
