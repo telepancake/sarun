@@ -56,6 +56,18 @@ deny/prompt would attach. Provenance (pid/exe/argv of the writer) is captured
 synchronously and recorded in the per-box `<box_id>.sqlar`. Since the UI is now
 the mount provider, `slopbox CMD` REQUIRES a running UI and fails fast otherwise.
 
+Output capture model: by default a box's stdout and stderr are redirected through
+two hidden FUSE sink files (`.slopbox-stdout` / `.slopbox-stderr`) at the overlay
+root so every write is attributed per-write to its actual writer — even across a
+fork — via `ctx.pid` in the FUSE write handler (surfaced by a small patch to
+pyfuse3; see section 0 below). Each write is stored as one row in the `outputs`
+table (stream 0=stdout, 1=stderr) and simultaneously enqueued onto a per-session
+echo socket so the user sees output live on the real terminal. Use `-t` to
+pass stdout/stderr straight through with no capture; use `-d` to skip the overlay
+entirely. The outputs pane (`o`) reviews every recorded write. `-e` additionally
+records each writer's full environment (off by default; provenance is always
+recorded).
+
 Security note: policy_check is a v1 always-allow stub — the per-write enforcement
 seam exists but is not yet enforcing. The system is "security-ready, not
 security-complete": writes are captured and attributed but never blocked at the
@@ -104,21 +116,28 @@ from __future__ import annotations
 # ════════════════════════════════════════════════════════════════════════════
 #  0 · Patched pyfuse3 bootstrap (MANDATORY — runs before any `import pyfuse3`)
 # ════════════════════════════════════════════════════════════════════════════
-# Stock pyfuse3 3.4.2's FUSE write() handler drops the RequestContext, so the
-# Ops.write handler can't see the writing process's pid — which the (later)
-# stdout/stderr capture feature needs. The FUSE protocol DOES carry the caller
-# pid on every WRITE; pyfuse3 just doesn't surface it. A 2-line source patch
-# (thread `get_request_context(c.req)` into the write call, like the ~24 other
-# handlers already do) fixes it, and the pid is correct even through an
-# inherited fd (a forked child writing via the parent's fd reports the CHILD).
+# WHY: stdout/stderr capture needs per-write attribution — knowing which process
+# made each write, even across a fork where a child writes via an inherited fd.
+# The FUSE protocol carries the caller's pid on every WRITE request, but stock
+# pyfuse3 3.4.2 drops the RequestContext before calling Ops.write, so the handler
+# never sees it. The other ~24 handlers already call get_request_context(c.req);
+# write just needs the same 2-line treatment.
 #
-# We build our OWN patched pyfuse3 from the pinned, sha256-verified sdist and
-# shadow any stock install via sys.path. This is MANDATORY: there is NO fallback
-# to stock pyfuse3 — a hard assertion after import refuses to run otherwise, so
-# tests, subagents, and users all run the identical patched library.
+# WHAT: download the pinned, sha256-verified pyfuse3-3.4.2 sdist → apply the
+# embedded patch (thread `get_request_context(c.req)` into both fuse_write_async
+# and fuse_write_buf_async; add `ctx` param to Operations.write) → build with
+# `uv pip install --no-deps --target` → prepend the cache dir to sys.path →
+# assert the patched signature. Stock pyfuse3 anywhere on sys.path is shadowed.
+# MANDATORY: there is NO fallback — a hard assertion after import refuses to run
+# on stock pyfuse3, so tests, subagents, and users all run the identical build.
+#
+# FIRST-RUN COST: network (one sdist fetch) + C toolchain + Cython/meson build,
+# ~25 s on a warm machine. Subsequent runs hit the cache at
+# `~/.cache/sarun/pyfuse3-<ver>-pidwrite-<patchhash>` and add < 1 ms.
+# The patch hash in the cache name means a changed patch builds a fresh dir.
 #
 # Bootstrap is skipped only for `--inner` (the in-sandbox network forwarder,
-# which never touches pyfuse3 and where no build toolchain/network exists).
+# which never uses pyfuse3 and runs where no build toolchain or network exists).
 import hashlib as _bootstrap_hashlib
 import os as _bootstrap_os
 import sys as _bootstrap_sys
@@ -187,8 +206,9 @@ def _pyfuse3_cache_dir():
 
 def _pyfuse3_build(src_dir, dest):
     """Apply the embedded patch to the extracted sdist at *src_dir*, force a
-    Cython regen, and `uv pip install --target dest`. Raises with an actionable
-    message on toolchain/build failure."""
+    Cython regen, and `uv pip install --no-deps --target dest` (--no-deps: build
+    isolation already pulled Cython/meson; we only want the pyfuse3 wheel itself).
+    Raises with an actionable message on toolchain/build failure."""
     import shutil
     import subprocess
     for rel, old, new in _PYFUSE3_PATCH:
@@ -365,33 +385,35 @@ try:
 except Exception:
     magic = None
 
-# TABLE OF CONTENTS — regenerate with: grep -n "^#  [A-Z]" sarun
+# TABLE OF CONTENTS — regenerate with: grep -n "^#  [A-Z0-9]" sarun
 #
-#    230   Paths
-#    451   Wire protocol (control messages: newline JSON; FD messages: SCM_RIGHTS)
-#    544   Inner forwarder — `slopbox --inner` (runs as pid-1-ish inside the slopbox)
-#    684   Rules
-#    816   File rules — apply / discard a change by path glob (first match wins)
-#    901   Patch codec & tree utilities
-#   1110   Sqlar — the single per-box database (index + at-rest archive)
-#   1377   Network log
-#   1449   Session model & box metadata helpers
-#   1611   Overlay engine — pyfuse3 copy-on-write overlay, multiplexed per box
-#   4393   Overlay mount manager — OverlayMount (trio thread) + Session model & discovery
-#   4981   ChangeSource (abstract interface)
-#   5121   LiveUpper & SqlarArchive (change substrate implementations)
-#   5397   ChangeReview
-#   6116   NetworkPolicy
-#   6236   Supervisor
-#   7182   In-process mitmproxy: drive one connection per passed FD
-#   7337   Control + FD-channel socket server (inside the UI)
-#   7730   CA generation
-#   7782   Runner — `slopbox CMD [ARGS...]`
-#   8257   UI — `slopbox`
-#  10160   CLI commands
-#  10269   Entry
-#  10362   User's manual — the standalone onboarding docs (shown first in the UI)
-#  10421   TODO — deferred follow-ups (read me)
+#    115   0 · Patched pyfuse3 bootstrap (MANDATORY — runs before any `import pyfuse3`)
+#    470   Paths
+#    713   Wire protocol (control messages: newline JSON; FD messages: SCM_RIGHTS)
+#    810   Inner forwarder — `slopbox --inner` (runs as pid-1-ish inside the slopbox)
+#   1257   Rules
+#   1648   File rules — apply / discard a change by path glob (first match wins)
+#   1721   Patch codec & tree utilities
+#   1930   Sqlar — the single per-box database (index + at-rest archive)
+#   2331   Network log
+#   2567   Session model & box metadata helpers
+#   2779   Overlay engine — pyfuse3 copy-on-write overlay, multiplexed per box
+#   6103   Overlay mount manager — OverlayMount (trio thread) + Session model & discovery
+#   6707   ChangeSource (abstract interface)
+#   6847   LiveUpper & SqlarArchive (change substrate implementations)
+#   7123   ChangeReview
+#   7866   NetworkPolicy
+#   7998   Supervisor
+#   9088   In-process mitmproxy: drive one connection per passed FD
+#   9347   Control + FD-channel socket server (inside the UI)
+#   9453   Output capture echo channel (UI → --inner live replay)
+#   9907   CA generation
+#   9959   Runner — `slopbox CMD [ARGS...]`
+#  10469   UI — `slopbox`
+#  13062   CLI commands
+#  13173   Entry
+#  13271   User's manual — the standalone onboarding docs (shown first in the UI)
+#  13330   TODO — deferred follow-ups (read me)
 #
 # NOTE: update line numbers here whenever sections change.
 
@@ -614,7 +636,8 @@ def echo_sock_path(box_id) -> str:
     return str(relay_dir(box_id) / "echo.sock")
 
 # Hidden capture-sink files at the box root: the child's stdout/stderr are pointed at
-# these via O_WRONLY so its writes flow THROUGH FUSE, giving per-write ctx.pid
+# these O_WRONLY so every write flows through FUSE (direct_io=True on open, so no
+# kernel write-back cache delays delivery or mixes writers), giving per-write ctx.pid
 # attribution. They resolve by exact name (lookup) but are NOT listed in readdir.
 SINK_STDOUT_REL = ".slopbox-stdout"
 SINK_STDERR_REL = ".slopbox-stderr"
@@ -2760,6 +2783,10 @@ def root_cmd(sid: str) -> list:
 #: Each captured write also records its [b]provenance[/] — the pid, exe and argv of the process
 #: that made it — visible in the Processes pane. Add [cyan]-e[/] to also capture each writer's full
 #: environment (off by default; provenance itself is always recorded).
+#: By default a box's [b]stdout and stderr[/] are also captured: every write is stored per-write
+#: in the [cyan]outputs[/] table (attributed to the writing process via ctx.pid) and echoed live to
+#: your terminal. The Output pane ([cyan]o[/]) reviews the full record. Use [cyan]-t[/] to pass stdout/stderr
+#: straight through without capture (useful when you want raw terminal control sequences).
 #: [cyan]-d[/] ([b]direct[/]) opts a box out of all of this: no overlay, no capture — its writes go
 #: straight to the real filesystem like a normal command. Use it only for trusted commands.
 
@@ -9447,7 +9474,14 @@ class RelayServer:
 # frames those onto echo.sock, where --inner (inside the box) reads them and replays
 # each payload to the REAL fd 1/2 so the user sees output live. The bounded queue +
 # `await put` applies BACKPRESSURE to the one slow FUSE write (suspending just that
-# trio request) without blocking the event loop.
+# trio request) without blocking the event loop or other requests.
+#
+# Flush ordering: when the child's last sink fd closes (FUSE release), the FUSE ops
+# layer calls flush_and_close(), which enqueues a None sentinel AFTER all already-
+# queued frames. The drain task processes the sentinel last, half-closes the socket
+# (write_eof), then --inner's reader thread sees EOF and drains the remaining bytes
+# before echo_done fires — so trailing output is never truncated even if the child
+# exits immediately after its last write.
 
 # Wire frame: [stream:1][len:4 big-endian][payload]. Module-level codec so it is
 # unit-testable without a socket.
@@ -10416,26 +10450,30 @@ def cmd_run(cmd, net, env_capture, direct, session_whitelist, chdir, reuse_sid=N
 
 
 #: [b]8 · The UI — panes and keys[/]
-#: The UI has two panels: a left list and a right detail. Six keys switch the view; each
+#: The UI has two panels: a left list and a right detail. Seven keys switch the view; each
 #: pane then has its own keys (shown live in the bottom bar). [cyan]esc[/] goes back, [cyan]q[/] quits.
 #:   [cyan]b[/]  Boxes      — all slopboxes; [cyan]↵[/] reviews the selected box's changes
 #:   [cyan]c[/]  Changes    — the file tree the box wrote; [cyan]↵[/] on a file shows its diff
 #:   [cyan]t[/]  Network    — the connections the box made and whether each was allowed
 #:   [cyan]p[/]  Processes  — the box's process tree
-#:   [cyan]o[/]  Output     — the box's captured stdout/stderr outputs; the whole stream, the selected write marked
+#:   [cyan]o[/]  Output     — the box's captured stdout/stderr (default capture mode only).
+#:             Left: one row per write — time, stream (out/err), writing process, byte count.
+#:             Right: the listed writes concatenated in order; the selected write's lines are
+#:             margin-marked ([b]▌[/]) so you can locate a single write in its surrounding context.
 #:   [cyan]w[/]  Net rules  — the saved allow/deny ruleset
 #:   [cyan]f[/]  File rules — the saved apply/discard/passthrough ruleset
-#: While a box is [b]running[/], these three panes show only what is [b]live right now[/] — the
-#: files it currently has open, the connections still in flight, and the processes still
-#: running — each entry dropping off as it finishes. The complete record (every file it
-#: wrote, every connection it made, the full process tree) appears once the box exits.
+#: While a box is [b]running[/], the Changes, Network, Processes and Output panes show only
+#: what is [b]live right now[/] — the files it currently has open, the connections still in
+#: flight, processes still running, and output still arriving — each entry dropping off as
+#: it finishes. The complete record appears once the box exits.
 #:
 #: [b]Filter a list[/] ([cyan]/[/]):  in the Changes, Network, Processes and Output panes, [cyan]/[/] opens
 #: a filter editor — the same and/or/not clause rows as the rule forms — and keeps only the
 #: entries that match (paths/process facets for changes, host/ip/cname/url for network,
 #: process facets for procs and for output). Press [cyan]/[/] again to clear it. The active filter
 #: shows in the bottom bar. In the Output pane the right side concatenates only the writes
-#: that survive the filter.
+#: that survive the filter (the margin marker still highlights the selected write within
+#: that filtered stream).
 #: [b]Follow the trail[/] ([cyan]c[/] / [cyan]t[/] / [cyan]p[/] / [cyan]o[/] across these panes):  the view keys also
 #: cross-navigate WITH an automatic filter — from a change, [cyan]p[/] shows exactly the
 #: process(es) that wrote it; from a flow, [cyan]p[/] shows the process that made it; from a
@@ -10445,6 +10483,8 @@ def cmd_run(cmd, net, env_capture, direct, session_whitelist, chdir, reuse_sid=N
 #: [b]Boxes pane:[/]  [cyan]k[/] kill a running box · [cyan]d[/] delete a box and its overlay · [cyan]n[/] rename it.
 #: [b]Changes pane:[/]  [cyan]a[/] apply the selected file · [cyan]A[/] apply all · [cyan]x[/] discard the file ·
 #:   [cyan]X[/] discard all · [cyan]r[/] refresh.  In the diff view, [cyan]a[/] applies just that hunk, [cyan]x[/] discards it.
+#: [b]Output pane:[/]  [cyan]↑[/]/[cyan]↓[/] browse; [cyan]/[/] filter by writing-process facets (exe, cwd, arg, etc.);
+#:   [cyan]p[/] jumps to the writing process in the Processes pane with an auto-filter.
 #: [b]Net rules / File rules:[/]  [cyan]e[/] edit · [cyan]d[/] delete · [cyan]ctrl+↑[/]/[cyan]ctrl+↓[/] move the rule up/down
 #:   (first match wins, so order matters). File rules also take [cyan]a[/] to add; net rules are added
 #:   from the approval prompt instead (below).
