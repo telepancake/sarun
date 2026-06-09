@@ -678,8 +678,10 @@ def run_inner(channel_path: str, cmd: list) -> int:
 #: Add [cyan]:PORT[/] to a host pattern to restrict it to one port (e.g. [cyan]host:api.github.com:443[/]).
 #: A rule is an action over one or more [b]clauses[/] joined with [cyan]and[/]/[cyan]or[/], each optionally
 #: [cyan]not[/]-negated, so one rule can require several things at once, e.g.
-#: [cyan]deny host:api.* and not box:trusted[/]. The [cyan]box:GLOB[/] clause matches the box's hierarchical
-#: name (same globs as paths), so a rule can apply only in some boxes.
+#: [cyan]deny host:api.* and not box:trusted[/]. Besides the connection kinds above, clauses can match
+#: the box and the [b]process that opened the connection[/]: [cyan]box:GLOB[/] (the box's hierarchical name),
+#: [cyan]exe:PATH[/] (its command pathname), [cyan]cwd:PATH[/] (working dir), [cyan]arg:GLOB[/] (any one of its argv) —
+#: e.g. [cyan]deny host:* and exe:**/curl[/]. exe/cwd take path globs; box/arg take plain globs.
 #: When no rule matches you are prompted, and choose a [b]scope[/]: [b]once[/] (this request only),
 #: [b]session[/] (a rule that lasts until the box exits), or [b]permanent[/] (saved to the rules file,
 #: see §15). Edit the saved ruleset any time in the Net rules pane ([cyan]w[/]); order matters.
@@ -688,11 +690,13 @@ def run_inner(channel_path: str, cmd: list) -> int:
 #  Rules
 # ════════════════════════════════════════════════════════════════════════════
 
-# Match kinds. 'box' (a glob over the box's hierarchical name) is shared by both
-# domains; the rest are domain-specific. Each domain's editor offers its own set.
-NET_KINDS  = ("host", "ip", "cname", "url", "box")
-FILE_KINDS = ("path", "box")
-RULE_KINDS = ("host", "ip", "cname", "url", "path", "box")
+# Match kinds. The SHARED kinds — 'box' (a glob over the box's hierarchical name) and
+# the triggering-process facets exe/cwd/arg — apply in every domain; the rest are
+# domain-specific. Each domain's editor offers its own set.
+SUBJECT_KINDS = ("box", "exe", "cwd", "arg")
+NET_KINDS  = ("host", "ip", "cname", "url") + SUBJECT_KINDS
+FILE_KINDS = ("path",) + SUBJECT_KINDS
+RULE_KINDS = ("host", "ip", "cname", "url", "path") + SUBJECT_KINDS
 
 
 def _host_glob(pat: str, name: str) -> bool:
@@ -783,16 +787,49 @@ def eval_clauses(target, clauses) -> bool:
 
 
 @dataclass
+class Subject:
+    """The box + the triggering PROCESS a match is evaluated against — the context
+    shared by every domain. For a flow it's the process that opened the connection; for
+    a file rule it's the path's FIRST writer (the process whose decision the path is
+    locked to). An empty field simply never matches its kind. New process-facets are
+    cheap to add here without touching any rule code."""
+    box: str = ""
+    exe: str = ""          # the process's command pathname
+    cwd: str = ""          # its working directory
+    argv: tuple = ()       # its argument vector
+
+def _subject_match(m: Match, s: Subject) -> bool:
+    """match_one for the kinds every domain shares — the box and the triggering
+    process. The single place these live, so a file rule and a net rule test them
+    identically and a new facet is one line. exe/cwd are pathnames, matched with the
+    same path-glob semantics as file paths (a bare pattern matches at any depth, a
+    leading / anchors); box and argv are plain strings matched with the raw glob."""
+    k, p = m.kind, m.pattern
+    if k == "box": return _glob_match(p, s.box)
+    if k == "exe": return _path_match(p, s.exe)
+    if k == "cwd": return _path_match(p, s.cwd)
+    if k == "arg": return any(_glob_match(p, a) for a in (s.argv or ()))
+    return False
+
+
+def _subject_of(box="", proc=None) -> Subject:
+    """Build a Subject from a box name + a process provenance dict (exe/cwd/argv)."""
+    proc = proc or {}
+    return Subject(box=box or "", exe=proc.get("exe") or "",
+                   cwd=proc.get("cwd") or "", argv=tuple(proc.get("argv") or ()))
+
+
+@dataclass
 class ConnTarget:
     """A network request under evaluation. Knows how to test ONE Match against itself
-    (match_one) for each connection kind — host/ip/cname/url — plus the shared 'box'
-    kind. The and/or/not composition is not its concern (see eval_clauses)."""
-    host: str
-    port: int
+    (match_one) for each connection kind — host/ip/cname/url — then defers the shared
+    box/process kinds to _subject_match. Composition is not its concern (eval_clauses)."""
+    host: str = ""
+    port: int = 0
     url: "str | None" = None
     ips: tuple = ()
     cnames: tuple = ()
-    box: str = ""
+    subject: Subject = field(default_factory=Subject)
 
     def match_one(self, m: Match) -> bool:
         k, p = m.kind, m.pattern
@@ -808,24 +845,21 @@ class ConnTarget:
             return any(_host_glob(p, c) for c in self.cnames)
         if k == "url":
             return bool(self.url) and (self.url == p or self.url.startswith(p))
-        if k == "box":
-            return _glob_match(p, self.box)
-        return False
+        return _subject_match(m, self.subject)
 
 
 @dataclass
 class PathTarget:
     """A changed path under evaluation — the file-domain counterpart of ConnTarget.
-    Tests the 'path' kind against its rel, plus the shared 'box' kind."""
-    rel: str
-    box: str = ""
+    Tests the 'path' kind against its rel, then defers box/process kinds to the subject
+    (a file rule's subject is the path's FIRST writer)."""
+    rel: str = ""
+    subject: Subject = field(default_factory=Subject)
 
     def match_one(self, m: Match) -> bool:
         if m.kind == "path":
             return _path_match(m.pattern, self.rel)
-        if m.kind == "box":
-            return _glob_match(m.pattern, self.box)
-        return False
+        return _subject_match(m, self.subject)
 
 
 @dataclass
@@ -948,6 +982,11 @@ class _RuleListBase:
             self.rules[i], self.rules[j] = self.rules[j], self.rules[i]
             self.save(); return j
         return i
+    def needs_proc(self) -> bool:
+        """True if any rule tests a process facet — lets a hot caller skip resolving the
+        triggering process's provenance when no rule would use it."""
+        return any(c.match.kind in ("exe", "cwd", "arg")
+                   for r in self.rules for c in r.clauses)
 
 
 class Rules(_RuleListBase):
@@ -957,8 +996,9 @@ class Rules(_RuleListBase):
     def needs_dns(self) -> bool:
         return any(c.match.kind in ("ip", "cname")
                    for r in self.rules for c in r.clauses)
-    def decide(self, host, port, url=None, ips=(), cnames=(), box="") -> "str | None":
-        target = ConnTarget(host, port, url, ips, cnames, box)
+    def decide(self, host, port, url=None, ips=(), cnames=(), box="",
+               proc=None) -> "str | None":
+        target = ConnTarget(host, port, url, ips, cnames, _subject_of(box, proc))
         for r in self.rules:
             if r.matches(target):
                 return r.action
@@ -1004,9 +1044,11 @@ class Rules(_RuleListBase):
 #: matches [cyan].bashrc[/]). A pattern with no leading [cyan]/[/] matches at any depth; a leading [cyan]/[/] anchors
 #: at the filesystem root.
 #: [b]Clauses:[/] a rule's action applies over one or more clauses joined with [cyan]and[/]/[cyan]or[/] (each
-#: optionally [cyan]not[/]-negated), e.g. [cyan]discard **/*.log and box:backend-*[/]. The [cyan]box:GLOB[/] clause
-#: (same wildcards) matches the box's hierarchical name, so a rule can apply only in some boxes;
-#: with no box clause it applies in every box.
+#: optionally [cyan]not[/]-negated), e.g. [cyan]discard **/*.log and box:backend-*[/]. Besides [cyan]path[/], a clause
+#: can match the box and the [b]process that triggered the change[/]: [cyan]box:GLOB[/] (the box's name),
+#: [cyan]exe:PATH[/], [cyan]cwd:PATH[/], [cyan]arg:GLOB[/]. The process matched is the path's [b]first writer[/] (so a
+#: passthrough rule can never fire on an already-recorded file). With no box clause a rule applies
+#: in every box.
 #
 # Patterns are extended shell globs (bash-style) over the change's absolute path,
 # via wcmatch with GLOBSTAR + EXTGLOB + BRACE:
@@ -1047,8 +1089,8 @@ class FileRules(_RuleListBase):
     wins. Same shape as the network Rules, so the UI edits both the same way."""
     _elem_class = FileRule
 
-    def decide(self, rel: str, box: str = "") -> "str | None":
-        target = PathTarget(rel, box)
+    def decide(self, rel: str, box: str = "", proc=None) -> "str | None":
+        target = PathTarget(rel, _subject_of(box, proc))
         for r in self.rules:
             if r.matches(target):
                 return r.action
@@ -1355,7 +1397,7 @@ def _open_raw(path) -> "sqlite3.Connection":
             "(id INTEGER PRIMARY KEY AUTOINCREMENT, hash TEXT UNIQUE, env TEXT);"
             "CREATE TABLE IF NOT EXISTS process"
             "(id INTEGER PRIMARY KEY AUTOINCREMENT, tgid INT UNIQUE, ppid INT,"
-            " exe TEXT, argv TEXT, env_id INT, root INT DEFAULT 0);"
+            " exe TEXT, cwd TEXT, argv TEXT, env_id INT, root INT DEFAULT 0);"
             "CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);"
             "CREATE TABLE IF NOT EXISTS flows("
             " id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, action TEXT,"
@@ -1365,7 +1407,7 @@ def _open_raw(path) -> "sqlite3.Connection":
         # Migrate boxes created by an older schema: add columns introduced later.
         # The one DDL above is authoritative for fresh DBs; these top up existing files.
         _ensure_columns(conn, "sqlar", {"last_writer": "INT"})
-        _ensure_columns(conn, "process", {"root": "INT DEFAULT 0"})
+        _ensure_columns(conn, "process", {"root": "INT DEFAULT 0", "cwd": "TEXT"})
         conn.execute(f"PRAGMA user_version = {_SQLAR_SCHEMA_VERSION}")
         conn.commit()
     return conn
@@ -1861,6 +1903,25 @@ def sqlar_writer_id(path, rel) -> "int | None":
     finally: conn.close()
     return row[0] if row and row[0] is not None else None
 
+def sqlar_first_writer_prov(path, rel) -> "dict | None":
+    """Provenance (exe/cwd/argv) of the FIRST process to write `rel`, read from a
+    stopped box's single sqlar (the `writer` tag → process row). Used to match a file
+    rule's process facets at delete/finalize time. None if no writer is recorded."""
+    path = Path(path)
+    if not path.exists(): return None
+    conn = _sqlar_open(path)
+    try:
+        w = conn.execute(
+            "SELECT process.tgid, process.ppid, process.exe, process.cwd, process.argv"
+            " FROM sqlar JOIN process ON sqlar.writer=process.id"
+            " WHERE sqlar.name=?", (rel,)).fetchone()
+    except sqlite3.Error: w = None
+    finally: conn.close()
+    if not w: return None
+    try: argv = json.loads(w[4]) if w[4] else []
+    except (ValueError, TypeError): argv = []
+    return dict(pid=w[0], ppid=w[1], exe=w[2] or "", cwd=w[3] or "", argv=argv)
+
 def process_env(path, proc_id) -> dict:
     """The deduped environment for one process row (resolved via env_id)."""
     path = Path(path)
@@ -1972,7 +2033,7 @@ def read_provenance(pid: int, full_env: bool = False) -> dict:
     (/proc reads are the one place best-effort OSError is acceptable). full_env
     captures the whole environment (for the process table when tracing is on);
     otherwise only the small _PROV_ENV_KEYS subset is kept."""
-    info = dict(pid=int(pid), ppid=0, exe="", argv=[], env={}, start_time=0)
+    info = dict(pid=int(pid), ppid=0, exe="", cwd="", argv=[], env={}, start_time=0)
     base = f"/proc/{pid}"
     try:
         with open(f"{base}/cmdline", "rb") as f:
@@ -1981,6 +2042,8 @@ def read_provenance(pid: int, full_env: bool = False) -> dict:
                         for p in raw.split(b"\x00") if p]
     except OSError: pass
     try: info["exe"] = os.readlink(f"{base}/exe")
+    except OSError: pass
+    try: info["cwd"] = os.readlink(f"{base}/cwd")
     except OSError: pass
     # Parse /proc/<pid>/stat via the shared helper (comm may contain spaces/parens).
     ppid, start_time = _parse_proc_stat(pid)
@@ -2224,7 +2287,8 @@ class Index:
             else self.provenance_of(pid)
         ppid_tgid = tgid_of(prov["ppid"]) if prov.get("ppid") else 0
         return self.process_from_prov(dict(tgid=tgid, ppid=ppid_tgid,
-                                           exe=prov["exe"], argv=prov["argv"],
+                                           exe=prov["exe"], cwd=prov.get("cwd") or "",
+                                           argv=prov["argv"],
                                            env=prov.get("env") or {})) or tgid
 
     def process_from_prov(self, prov: dict, root: bool = False) -> "int | None":
@@ -2248,6 +2312,7 @@ class Index:
             return cached
         ppid_tgid = int(prov.get("ppid") or 0)
         exe = prov.get("exe") or ""
+        cwd = prov.get("cwd") or ""
         argv = prov.get("argv") or []
         env = prov.get("env") or {}
         with self._lock:
@@ -2260,15 +2325,16 @@ class Index:
                 eid = self._db.execute("SELECT id FROM env WHERE hash=?",
                                        (env_hash,)).fetchone()[0]
             cur = self._db.execute(
-                "INSERT OR IGNORE INTO process(tgid,ppid,exe,argv,env_id,root)"
-                " VALUES(?,?,?,?,?,?)",
-                (tgid, ppid_tgid, exe, json.dumps(argv), eid, 1 if root else 0))
+                "INSERT OR IGNORE INTO process(tgid,ppid,exe,cwd,argv,env_id,root)"
+                " VALUES(?,?,?,?,?,?,?)",
+                (tgid, ppid_tgid, exe, cwd, json.dumps(argv), eid, 1 if root else 0))
             inserted = cur.rowcount > 0   # newly recorded vs. already present
             pid_row = self._db.execute("SELECT id FROM process WHERE tgid=?",
                                        (tgid,)).fetchone()[0]
             self._db.commit()
         self._proc_cache[tgid] = pid_row
-        self._prov_by_proc[pid_row] = dict(pid=tgid, ppid=ppid_tgid, exe=exe, argv=argv)
+        self._prov_by_proc[pid_row] = dict(pid=tgid, ppid=ppid_tgid, exe=exe,
+                                           cwd=cwd, argv=argv)
         # A root is its own boundary; never bubble above it into the runner's ancestry.
         # Pass through depth/seen-set if present (injected by _bubble_parent to carry
         # the cap across the mutual recursion).
@@ -2566,17 +2632,27 @@ class Index:
     def writer_provenance(self, path: str) -> "dict | None":
         # No lock: consolidate-only precondition — called post-teardown with the box
         # dead and the serve thread stopped, so there is no concurrent writer.
+        return self._prov_for_writer(path, "last_writer")
+
+    def first_writer_provenance(self, path: str) -> "dict | None":
+        """Provenance (exe/cwd/argv) of the FIRST process to write `path` — the writer a
+        file rule's process match is locked to (see _passthrough). Takes _lock: callable
+        from the serve thread on the live db. None if the path has no recorded writer."""
+        with self._lock:
+            return self._prov_for_writer(path, "writer")
+
+    def _prov_for_writer(self, path: str, col: str) -> "dict | None":
         cur = self._db.execute(
-            "SELECT last_writer FROM sqlar WHERE name=?", (path,)).fetchone()
+            f"SELECT {col} FROM sqlar WHERE name=?", (path,)).fetchone()
         if not cur or cur[0] is None: return None
         cached = self._prov_by_proc.get(cur[0])
         if cached is not None: return dict(cached)
         w = self._db.execute(
-            "SELECT tgid,ppid,exe,argv FROM process WHERE id=?", (cur[0],)).fetchone()
+            "SELECT tgid,ppid,exe,cwd,argv FROM process WHERE id=?", (cur[0],)).fetchone()
         if not w: return None
-        try: argv = json.loads(w[3]) if w[3] else []
+        try: argv = json.loads(w[4]) if w[4] else []
         except (ValueError, TypeError): argv = []
-        return dict(pid=w[0], ppid=w[1], exe=w[2], argv=argv)
+        return dict(pid=w[0], ppid=w[1], exe=w[2], cwd=w[3] or "", argv=argv)
 
     def row_mtime(self, rel: str) -> int:
         """The row's stored mtime (integer ns), or 0 if missing. Used on the hot read
@@ -2961,15 +3037,32 @@ def _build_overlay_ops():
             return out
 
         # ── passthrough (direct host action, nothing captured) ───────────────
-        def _passthrough(self, sid: str, rel: str) -> bool:
+        def _passthrough(self, sid: str, rel: str, ctx=None) -> bool:
             """True when this op should act on the REAL host fs and record nothing in
             the overlay/sqlar — either the whole box is in direct mode (-d) or a
-            file-rule marks this path 'passthrough'."""
+            file-rule marks this path 'passthrough'. A rule's process facets (exe/cwd/arg)
+            are matched against the path's FIRST writer: once a path is recorded that
+            writer is fixed, so a passthrough rule can never fire on an already-recorded
+            file (an impossible state); for a not-yet-recorded path the current opener
+            (ctx) is the prospective first writer."""
             s = self.sessions.get(sid)
             if not s: return False
             if s.get("passthrough"): return True
             fr = s.get("frules")
-            return bool(fr and fr.decide(rel, s.get("box_path", "")) == "passthrough")
+            if not fr: return False
+            proc = self._first_writer_proc(sid, rel, ctx) if fr.needs_proc() else None
+            return fr.decide(rel, s.get("box_path", ""), proc=proc) == "passthrough"
+
+        def _first_writer_proc(self, sid: str, rel: str, ctx) -> "dict | None":
+            # The process a file rule matches: the path's recorded FIRST writer, or — for
+            # a not-yet-recorded path — the current opener (its prospective first writer).
+            idx = self._index(sid)
+            if idx is None: return None
+            prov = idx.first_writer_provenance(rel)
+            if prov is None and ctx is not None:
+                try: prov = idx.provenance_of(ctx.pid)
+                except Exception: prov = None
+            return prov
 
         def _host_path(self, rel: str) -> str:
             """The real host path for a passthrough op (lower root + rel)."""
@@ -3876,7 +3969,7 @@ def _build_overlay_ops():
             # Base sessions are strictly read-only: never write into a finished parent.
             if sid in self._base_sessions:
                 raise pyfuse3.FUSEError(errno.EROFS)
-            if self._passthrough(sid, rel):
+            if self._passthrough(sid, rel, ctx):
                 p = self._parent(sid)
                 if p is not None:
                     return self._write_open(p, rel, flags, ctx)   # KICK UP
@@ -3965,7 +4058,7 @@ def _build_overlay_ops():
                                     rel, "open_write") == "deny":
                         raise pyfuse3.FUSEError(errno.EACCES)
                     idx = self._index(sid)
-                    if self._passthrough(sid, rel):
+                    if self._passthrough(sid, rel, ctx):
                         # Passthrough / kick-up: write to the real host, or (nested)
                         # capture in the parent box's overlay. Unchanged disk handle.
                         idx.writer_for(ctx.pid)
@@ -4175,7 +4268,7 @@ def _build_overlay_ops():
             Passthrough + parent  → recurse into parent's overlay (captured there).
             Passthrough + no parent → host_op on real host, unchanged.
             Non-passthrough       → upper_op records into this sid's own overlay."""
-            if self._passthrough(sid, rel):
+            if self._passthrough(sid, rel, ctx):
                 p = self._parent(sid)
                 if p is not None:
                     return self._mutate_at(p, rel, ctx, op, host_op, upper_op)  # KICK UP
@@ -4354,7 +4447,7 @@ def _build_overlay_ops():
                 raise pyfuse3.FUSEError(errno.EACCES)
             self._req_enter(f"unlink {sid}/{rel}")
             try:
-                if self._passthrough(sid, rel):
+                if self._passthrough(sid, rel, ctx):
                     p = self._parent(sid)
                     if p is not None:
                         # KICK UP: captured delete in the parent's overlay.
@@ -4404,7 +4497,7 @@ def _build_overlay_ops():
                 raise pyfuse3.FUSEError(errno.EACCES)
             self._req_enter(f"rmdir {sid}/{rel}")
             try:
-                if self._passthrough(sid, rel):
+                if self._passthrough(sid, rel, ctx):
                     p = self._parent(sid)
                     if p is not None:
                         # KICK UP: captured rmdir in the parent's overlay.
@@ -4557,7 +4650,7 @@ def _build_overlay_ops():
                 raise pyfuse3.FUSEError(errno.EACCES)
             self._req_enter(f"setattr {sid}/{rel}")
             try:
-                if self._passthrough(sid, rel):
+                if self._passthrough(sid, rel, ctx):
                     p = self._parent(sid)
                     if p is not None:
                         # KICK UP: captured setattr in the parent's overlay.
@@ -4803,7 +4896,7 @@ def _build_overlay_ops():
             # only when BOTH paths pass through do we touch the host; if either side
             # is captured we fall through to overlay capture below. Symlink safety:
             # rename(2) operates on the names, never dereferences the final components.
-            if self._passthrough(sid, rel_o) and self._passthrough(sid, rel_n):
+            if self._passthrough(sid, rel_o, ctx) and self._passthrough(sid, rel_n, ctx):
                 p = self._parent(sid)
                 if p is not None:
                     # KICK UP: rename as a captured op in the parent's overlay.
@@ -4936,7 +5029,7 @@ def _build_overlay_ops():
             try:
                 # Both-ends-or-overlay: hardlink on the host only when BOTH source and
                 # new name pass through; if either is captured, fall through to copy-up.
-                if self._passthrough(sid, rel_src) and self._passthrough(sid, rel_n):
+                if self._passthrough(sid, rel_src, ctx) and self._passthrough(sid, rel_n, ctx):
                     p = self._parent(sid)
                     if p is not None:
                         # KICK UP: link-as-copy in the parent's overlay.
@@ -6507,9 +6600,12 @@ class ChangeReview:
         frules = load_file_rules()
         try: box = self.reg.display_path(sid)
         except Exception: box = ""
+        sp = sqlar_path(sid)
         apply_paths, discard_paths = [], []
         for rel in changes:
-            (apply_paths if frules.decide(rel, box) == "apply" else discard_paths).append(rel)
+            proc = sqlar_first_writer_prov(sp, rel)   # match the path's FIRST writer
+            (apply_paths if frules.decide(rel, box, proc) == "apply"
+             else discard_paths).append(rel)
         a = self.apply(sid, apply_paths, reap=False) if apply_paths \
             else dict(applied=[], errors=[])
         # Per-row discard exists only to copy paths DOWN into immediate children. With no
@@ -6829,32 +6925,34 @@ class NetworkPolicy:
         return res
 
     def decide(self, s: Session, host: str, port: int,
-               url: str = None) -> "str | None":
+               url: str = None, proc=None) -> "str | None":
         need_dns = self.rules.needs_dns() or any(
             c.match.kind in ("ip", "cname") for r in s.sess_rules for c in r.clauses)
         ips, cnames = self._resolve(host) if need_dns else ((), ())
         try: box = self._box_path(s.box_id)
         except Exception: box = ""
-        target = ConnTarget(host, port, url, ips, cnames, box)
+        # `proc` is the provenance of the process that opened this connection, so a rule
+        # can match it on exe/cwd/arg (just like file rules match the writing process).
+        target = ConnTarget(host, port, url, ips, cnames, _subject_of(box, proc))
         # session rules first (temporary overrides), then the permanent ruleset; each
         # evaluated top-to-bottom, first match wins. A rule with a box clause that this
         # box doesn't satisfy simply doesn't match (its clauses fold to False).
         for r in s.sess_rules:
             if r.matches(target):
                 return r.action
-        return self.rules.decide(host, port, url, ips, cnames, box)
+        return self.rules.decide(host, port, url, ips, cnames, box, proc)
 
-    def precheck(self, sid, host, port, url=None) -> "str | None":
+    def precheck(self, sid, host, port, url=None, proc=None) -> "str | None":
         """Rule-only decision (no prompting) for the given request."""
         s = self._resolve_session(sid)
         if not s: return "deny"
-        return self.decide(s, host, port, url)
+        return self.decide(s, host, port, url, proc)
 
-    async def approval_request(self, sid, host, port, scheme, url="") -> dict:
+    async def approval_request(self, sid, host, port, scheme, url="", proc=None) -> dict:
         s = self._resolve_session(sid)
         if not s:
             return {"action": "deny", "scope": "once"}
-        decided = self.decide(s, host, port, url)
+        decided = self.decide(s, host, port, url, proc)
         if decided:
             self._record(s, host, port, scheme, decided)
             return {"action": decided, "scope": "rule"}
@@ -7948,7 +8046,8 @@ class _GatingAddon:
 
     async def _gate(self, flow, scheme: str, url: str = "") -> None:
         res = await self.sup.policy.approval_request(
-            _CURRENT_BOX_ID.get(), flow.request.host, flow.request.port, scheme, url)
+            _CURRENT_BOX_ID.get(), flow.request.host, flow.request.port, scheme, url,
+            proc=_CURRENT_PROV.get())
         if res.get("action") != "allow":
             self._deny(flow)
 
@@ -7965,7 +8064,8 @@ class _GatingAddon:
             # https was already gated at CONNECT; here we only enforce a URL-level
             # deny rule, so we don't prompt twice for the same connection.
             if self.sup.policy.precheck(_CURRENT_BOX_ID.get(), flow.request.host,
-                                        flow.request.port, url) == "deny":
+                                        flow.request.port, url,
+                                        proc=_CURRENT_PROV.get()) == "deny":
                 self._deny(flow)
         # An allowed request is now IN FLIGHT (sent upstream, awaiting a response):
         # surface it in the live Network pane. A denied one already carries its 403
@@ -9338,10 +9438,11 @@ def _make_ui_app():
                     yield Button("Save [^s]", id="rf-save", variant="primary")
                     yield Button("Cancel [esc]", id="rf-cancel")
         def _help(self):
-            kinds={"net":"host:NAME[:PORT] · ip:ADDR|CIDR · cname:NAME · url:PREFIX · box:GLOB",
-                   "file":"path:GLOB (bare ok) · box:GLOB"}[self.domain]
-            return (f"[dim]kinds: {kinds}\nhost/cname take [b]*[/b]; paths & box take "
-                    "[b]* ** ? @(a|b) {a,b}[/b] · ^s save · esc cancel[/]")
+            facets="exe:PATH · cwd:PATH · arg:GLOB · box:GLOB"   # the triggering process + box
+            kinds={"net":f"host:NAME[:PORT] · ip:ADDR|CIDR · cname:NAME · url:PREFIX · {facets}",
+                   "file":f"path:GLOB (bare ok) · {facets}"}[self.domain]
+            return (f"[dim]kinds: {kinds}\nexe/cwd match the {'flow' if self.domain=='net' else 'file'}'s "
+                    "process; paths/exe/cwd take [b]* ** ? @(a|b) {a,b}[/b] · ^s save · esc cancel[/]")
         def _build(self):
             clauses=self.query_one(ClauseList).clauses()
             if not any(c.enabled for c in clauses):   # refuse a rule with no live condition
@@ -10299,7 +10400,10 @@ def _make_ui_app():
                        "cname":"any name in the DNS CNAME/alias chain",
                        "url":"http(s) URL by exact value or prefix",
                        "path":"changed path (extended glob: * ** ? @(a|b) {a,b}; bare = any depth)",
-                       "box":"the box's hierarchical name (same globs as paths)"}
+                       "box":"the box's hierarchical name (same globs as paths)",
+                       "exe":"triggering process's command pathname (path globs)",
+                       "cwd":"triggering process's working directory (path globs)",
+                       "arg":"any one of the triggering process's argv (raw glob)"}
             for n,c in enumerate(r.clauses):
                 lead=""
                 if n: lead+=c.join+" "

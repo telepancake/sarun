@@ -35,17 +35,27 @@ def test_model():
     R, F, Match, Clause = m.Rule, m.FileRule, m.Match, m.Clause
 
     # atomic predicates + generic targets (each target tests ONE Match)
+    subj = m.Subject(box="backend-1", exe="/usr/bin/curl", cwd="/home/u",
+                     argv=("curl", "--insecure", "https://x"))
     ct = m.ConnTarget("api.example.com", 443, "http://api.example.com/x",
-                      ("10.0.0.1",), ("cdn.example.com",), "backend-1")
+                      ("10.0.0.1",), ("cdn.example.com",), subj)
     check(ct.match_one(Match("host", "*.example.com")) is True, "ConnTarget host")
     check(ct.match_one(Match("ip", "10.0.0.0/8")) is True, "ConnTarget ip/CIDR")
     check(ct.match_one(Match("cname", "cdn.*")) is True, "ConnTarget cname")
     check(ct.match_one(Match("url", "http://api.example.com/")) is True, "ConnTarget url prefix")
     check(ct.match_one(Match("box", "backend-*")) is True, "ConnTarget box")
     check(ct.match_one(Match("path", "x")) is False, "ConnTarget ignores path kind")
-    pt = m.PathTarget("etc/secret/key", "A.B")
+    # shared process facets (exe/cwd/arg) — same on both targets
+    check(ct.match_one(Match("exe", "curl")) is True, "process exe: bare matches basename (path glob)")
+    check(ct.match_one(Match("exe", "/usr/bin/curl")) is True, "process exe: absolute anchors")
+    check(ct.match_one(Match("exe", "wget")) is False, "process exe: non-match")
+    check(ct.match_one(Match("cwd", "/home/*")) is True, "process cwd")
+    check(ct.match_one(Match("arg", "--insecure")) is True, "process arg: any argv element")
+    check(ct.match_one(Match("arg", "--quiet")) is False, "process arg: non-match")
+    pt = m.PathTarget("etc/secret/key", m.Subject(box="A.B", exe="/bin/sh", argv=("sh",)))
     check(pt.match_one(Match("path", "**/secret/**")) is True, "PathTarget path")
     check(pt.match_one(Match("box", "A.*")) is True, "PathTarget box")
+    check(pt.match_one(Match("exe", "sh")) is True, "PathTarget shares the exe facet")
     check(pt.match_one(Match("host", "x")) is False, "PathTarget ignores host kind")
 
     # generic and/or/not/enabled fold (target-agnostic)
@@ -96,6 +106,20 @@ def test_model():
         fr.rules = [F.parse("passthrough secret.txt and box:A.*"), F.parse("discard *")]
         check(fr.decide("secret.txt", box="A.B") == "passthrough", "file decide: path AND box")
         check(fr.decide("secret.txt") == "discard", "file decide: no box -> scoped rule skipped")
+        # process facets thread through decide() — net matches the flow's process,
+        # file matches the writing process.
+        pr = m.Rules(d / "p")
+        pr.rules = [R.parse("deny host:* and exe:**/curl"), R.parse("allow host:*")]
+        check(pr.decide("x", 443, proc={"exe": "/usr/bin/curl"}) == "deny",
+              "net decide: matches the flow's process exe")
+        check(pr.decide("x", 443, proc={"exe": "/usr/bin/wget"}) == "allow",
+              "net decide: other exe falls through")
+        fpr = m.FileRules(d / "fp")
+        fpr.rules = [F.parse("passthrough *.key and arg:--export")]
+        check(fpr.decide("a.key", proc={"argv": ["gpg", "--export"]}) == "passthrough",
+              "file decide: matches the writer's argv")
+        check(fpr.decide("a.key", proc={"argv": ["gpg", "--list"]}) is None,
+              "file decide: writer argv no match")
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
@@ -171,6 +195,57 @@ def test_approval_box_rule():
     shutil.rmtree(d, ignore_errors=True)
 
 
+def test_process_facet_live():
+    """End to end: a real write records the path's FIRST writer; a passthrough rule with
+    a process facet (exe/arg) matches that recorded writer, and a non-matching facet
+    doesn't — the 'locked to the first writer' behaviour. Also exercises the stopped-box
+    reader sqlar_first_writer_prov."""
+    tmp = Path(tempfile.mkdtemp(prefix="procmatch-"))
+    os.environ["XDG_STATE_HOME"] = str(tmp / "state")
+    os.environ["XDG_CONFIG_HOME"] = str(tmp / "cfg")
+    mnt = tmp / "mnt"; sid = "1"; backing = tmp / "live" / sid
+    (backing / "up").mkdir(parents=True)
+    index = m.Index(backing); mount = m.OverlayMount(mnt, lower="/")
+    if not mount.start():
+        check(False, f"overlay mount failed: {mount._start_error}"); return
+    mount.add_session(sid, backing / "up", index, passthrough=False)
+    ops = mount.ops; root = mnt / sid
+    try:
+        # a real captured write through the mount records bash as the path's first writer
+        r = subprocess.run(["bash", "-c", "echo hi > note.txt"], cwd=str(root),
+                           capture_output=True, text=True)
+        check(r.returncode == 0, f"captured write succeeded (err={r.stderr!r})")
+        prov = index.first_writer_provenance("note.txt")
+        check(prov is not None and prov.get("exe", "").endswith("bash")
+              and prov.get("argv") and prov.get("cwd"),
+              f"first_writer_provenance returns the writer exe/cwd/argv (got {prov})")
+
+        fr = m.FileRules.__new__(m.FileRules); fr.path = None
+        ops.sessions[sid]["frules"] = fr
+        fr.rules = [m.FileRule.parse("passthrough note.txt and exe:**/bash")]
+        check(ops._passthrough(sid, "note.txt") is True,
+              "passthrough rule matches the recorded first-writer exe")
+        fr.rules = [m.FileRule.parse("passthrough note.txt and exe:**/python3")]
+        check(ops._passthrough(sid, "note.txt") is False,
+              "passthrough rule with a non-matching exe does not fire (locked to first writer)")
+        fr.rules = [m.FileRule.parse("passthrough note.txt and arg:-c")]
+        check(ops._passthrough(sid, "note.txt") is True,
+              "passthrough rule matches an argv element of the first writer")
+        fr.rules = [m.FileRule.parse("passthrough note.txt and cwd:**")]
+        check(ops._passthrough(sid, "note.txt") is True,
+              "passthrough rule matches the first writer's recorded cwd")
+    finally:
+        try: mount.stop()
+        except Exception: pass
+        try:
+            if os.path.ismount(str(mnt)):
+                subprocess.run(["fusermount3", "-uz", str(mnt)],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+        except Exception: pass
+        index.close()
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_clause_list_editor():
     """Drive the REAL reusable ClauseList editor in a running app: it starts with one
     row, 'add condition' mounts another, each row's kind/pattern/join/not/enabled read
@@ -226,7 +301,7 @@ def test_clause_list_editor():
 
 
 def main():
-    for fn in (test_model, test_live_box_scope, test_approval_box_rule,
+    for fn in (test_model, test_live_box_scope, test_approval_box_rule, test_process_facet_live,
                test_clause_list_editor):
         print(f"== {fn.__name__} ==")
         try:
