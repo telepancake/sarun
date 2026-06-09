@@ -104,6 +104,7 @@ import functools
 import heapq as _heapq
 import ipaddress
 import itertools
+import gzip
 import hashlib
 import json
 import os
@@ -1769,6 +1770,95 @@ def _hdr_text(items) -> str:
         if isinstance(v, bytes): v = v.decode("latin-1", "replace")
         out.append(f"{k}: {v}")
     return "\n".join(out)
+
+def _decode_body_display(raw: bytes, headers: str) -> "tuple[str, str] | None":
+    """Decode a content-encoded body for DISPLAY only — never mutates stored bytes.
+    Returns (rendered_text, label) or None if the encoding is unrecognised / fails.
+    `headers` is the flat 'Key: Value\\n…' string from req_headers / resp_headers."""
+    # Parse Content-Encoding (case-insensitive) from the flat header string.
+    encoding = ""
+    for line in headers.splitlines():
+        if line.lower().startswith("content-encoding:"):
+            encoding = line.split(":", 1)[1].strip().lower()
+            break
+
+    # Parse Content-Type for multipart (checked regardless of Content-Encoding).
+    content_type = ""
+    boundary = ""
+    for line in headers.splitlines():
+        if line.lower().startswith("content-type:"):
+            content_type = line.split(":", 1)[1].strip()
+            break
+    if "multipart" in content_type.lower():
+        for part in content_type.split(";"):
+            p = part.strip()
+            if p.lower().startswith("boundary="):
+                boundary = p[len("boundary="):].strip().strip('"')
+                break
+
+    decoded: "bytes | None" = None
+    label = ""
+
+    if encoding == "gzip":
+        try:
+            decoded = gzip.decompress(raw)
+            label = "gzip"
+        except Exception:
+            return None
+    elif encoding == "deflate":
+        # Servers send either zlib-wrapped deflate or raw deflate; try both.
+        try:
+            decoded = zlib.decompress(raw)
+            label = "deflate"
+        except zlib.error:
+            try:
+                decoded = zlib.decompress(raw, -zlib.MAX_WBITS)
+                label = "deflate(raw)"
+            except Exception:
+                return None
+    elif encoding in ("br", "") and not boundary:
+        # brotli: skip (no dep); no encoding + no multipart: nothing to do here.
+        return None
+    elif encoding == "identity" and not boundary:
+        # identity means no encoding; nothing to decode without a multipart body.
+        return None
+    elif encoding not in ("", "identity") and not boundary:
+        return None
+
+    # Multipart rendering: parse parts regardless of encoding.
+    if boundary:
+        data = decoded if decoded is not None else raw
+        sep = ("--" + boundary).encode("latin-1", "replace")
+        parts = data.split(sep)
+        lines = []
+        for i, part in enumerate(parts[1:], 1):   # skip preamble before first --boundary
+            part = part.lstrip(b"\r\n")
+            if part.rstrip() == b"--":
+                break
+            # Split part headers from body at the first blank line.
+            if b"\r\n\r\n" in part:
+                phdr, pbody = part.split(b"\r\n\r\n", 1)
+            elif b"\n\n" in part:
+                phdr, pbody = part.split(b"\n\n", 1)
+            else:
+                phdr, pbody = b"", part
+            pbody = pbody.rstrip(b"\r\n")
+            lines.append(f"── part {i} ──")
+            lines.append(phdr.decode("utf-8", "replace"))
+            # Binary-aware body preview.
+            try:
+                lines.append(pbody.decode("utf-8"))
+            except UnicodeDecodeError:
+                lines.append(f"<binary {len(pbody)} bytes>")
+        mp_label = "multipart" + (f"+{label}" if label else "")
+        return ("\n".join(lines), mp_label)
+
+    # Plain decoded text.
+    assert decoded is not None
+    try:
+        return (decoded.decode("utf-8"), label)
+    except UnicodeDecodeError:
+        return (decoded.decode("latin-1", "replace"), label + "(latin-1)")
 
 def flows_add(path, fl: dict) -> None:
     rb = fl.get("req_body") or b""; pb = fl.get("resp_body") or b""
@@ -6349,9 +6439,13 @@ class ChangeReview:
                      diff="symlink → " + tgt.decode("utf-8", "replace"))
             return dict(is_text=False, hunks=[], diff=d)
         raw = src.current_bytes(rel) or b""
-        return dict(is_text=False, hunks=[],
-                    diff=dict(kind="modified" if host.exists() else "created",
-                              content=base64.b64encode(raw).decode()))
+        kind = "modified" if host.exists() else "created"
+        d = dict(kind=kind, content=base64.b64encode(raw).decode())
+        if kind == "modified":
+            before = self._lower_bytes(rel)
+            if before:
+                d["content_before"] = base64.b64encode(before).decode()
+        return dict(is_text=False, hunks=[], diff=d)
 
     def _consolidate_prep(self, sid) -> "dict | None":
         """Loop-thread half of consolidation: decide whether `sid` (a finished,
@@ -8176,6 +8270,8 @@ class Supervisor:
 #  In-process mitmproxy: drive one connection per passed FD
 # ════════════════════════════════════════════════════════════════════════════
 
+VERSION = "0.1.0"
+
 # A per-connection session id, read by the gating addon's hooks. It is set in
 # handle_fd before the mitmproxy handler runs; asyncio copies the current context
 # into the child tasks mitmproxy spawns, so each connection's hooks see their own
@@ -8235,6 +8331,7 @@ class _GatingAddon:
         # surface it in the live Network pane. A denied one already carries its 403
         # and is handled wholly by response() below — never an "open flow".
         if not flow.metadata.get("slopbox_denied"):
+            flow.request.headers["X-Slopbox-Version"] = VERSION
             self._note_open(flow)
 
     def _note_open(self, flow):
@@ -11015,12 +11112,21 @@ def _make_ui_app():
                     else: out.append(Text(ln, style="dim"))
                 if not diff.strip(): out.append(Text("(no textual diff)", style="dim"))
             else:
+                def _hexdump(data, out):
+                    for i in range(0,min(len(data),256),16):
+                        ch=data[i:i+16]; h=" ".join(f"{b:02x}" for b in ch)
+                        a="".join(chr(b) if 0x20<=b<0x7f else "." for b in ch)
+                        out.append(Text(f"{i:04x}  {h:<48}  {a}", style="dim"))
                 raw=base64.b64decode(d.get("content") or b"")
-                out.append(Text(f"binary · {fmt_bytes(len(raw))}", style="dim"))
-                for i in range(0,min(len(raw),256),16):
-                    ch=raw[i:i+16]; h=" ".join(f"{b:02x}" for b in ch)
-                    a="".join(chr(b) if 0x20<=b<0x7f else "." for b in ch)
-                    out.append(Text(f"{i:04x}  {h:<48}  {a}", style="dim"))
+                before_enc=d.get("content_before")
+                if before_enc:
+                    raw_before=base64.b64decode(before_enc)
+                    out.append(Text(f"── before ── binary · {fmt_bytes(len(raw_before))}", style="dim"))
+                    _hexdump(raw_before, out)
+                    out.append(Text(f"── after ──  binary · {fmt_bytes(len(raw))}", style="dim"))
+                else:
+                    out.append(Text(f"binary · {fmt_bytes(len(raw))}", style="dim"))
+                _hexdump(raw, out)
             return out
 
         _STRUCT_STYLE={"type":"yellow","hdr":"bold cyan","+":"green","-":"red",
@@ -11299,9 +11405,17 @@ def _make_ui_app():
             if not f:
                 d.update(Text("(gone)", style="dim")); return
             pending=not f.get("resp_headers") and not f.get("status")
-            def body(blob, n):
+            def body(blob, n, hdrs=""):
                 if not blob: return Text("  (empty)\n", style="dim")
                 raw=bytes(blob)
+                decoded=_decode_body_display(raw, hdrs)
+                if decoded is not None:
+                    txt, lbl = decoded
+                    t=Text(txt[:8000])
+                    if len(txt)>8000 or n>len(raw): t.append(f"\n  … {fmt_bytes(n)} total\n", style="dim")
+                    else: t.append("\n")
+                    if lbl: t.append(f"  [{lbl}]\n", style="dim")
+                    return t
                 try:
                     txt=raw.decode("utf-8")
                     t=Text(txt[:8000])
@@ -11316,7 +11430,7 @@ def _make_ui_app():
             t.append(f["url"], style="cyan"); t.append("\n\n")
             t.append("── request headers ──\n", style="dim")
             t.append((f["req_headers"] or "").rstrip()+"\n", style="")
-            t.append("── request body ──\n", style="dim"); t.append(body(f["req_body"], f["req_len"]))
+            t.append("── request body ──\n", style="dim"); t.append(body(f["req_body"], f["req_len"], f.get("req_headers") or ""))
             t.append("\n")
             if pending:
                 t.append("── response ──\n", style="dim")
@@ -11324,7 +11438,7 @@ def _make_ui_app():
             else:
                 t.append(f"── response  [{f['status']}] ──\n", style="dim")
                 t.append((f["resp_headers"] or "").rstrip()+"\n", style="")
-                t.append("── response body ──\n", style="dim"); t.append(body(f["resp_body"], f["resp_len"]))
+                t.append("── response body ──\n", style="dim"); t.append(body(f["resp_body"], f["resp_len"], f.get("resp_headers") or ""))
             d.update(t)
 
         def _sel_flow(self):
