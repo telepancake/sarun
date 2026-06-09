@@ -79,7 +79,7 @@ def run():
         try:
             fi = loop.run_until_complete(ops.open(evil_ino, os.O_RDWR, Ctx(os.getpid())))
             # if it returned a fh, write through it
-            loop.run_until_complete(ops.write(fi.fh, 0, b"PWNED"))
+            loop.run_until_complete(ops.write(fi.fh, 0, b"PWNED", Ctx(os.getpid())))
             loop.run_until_complete(ops.release(fi.fh))
         except pyfuse3.FUSEError as e:
             pass   # ELOOP/EACCES is the correct fail-closed outcome

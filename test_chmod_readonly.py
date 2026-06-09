@@ -95,7 +95,8 @@ def run():
         fi, _ = loop.run_until_complete(
             ops.create(root, b"compile_et", stat_mod.S_IFREG | 0o644,
                        os.O_WRONLY | os.O_CREAT | os.O_TRUNC, Ctx(os.getpid())))
-        loop.run_until_complete(ops.write(fi.fh, 0, b"#!/bin/sh\necho compile_et\n"))
+        loop.run_until_complete(
+            ops.write(fi.fh, 0, b"#!/bin/sh\necho compile_et\n", Ctx(os.getpid())))
         loop.run_until_complete(ops.release(fi.fh))
 
         # subst makes the generated file READ-ONLY (0444).

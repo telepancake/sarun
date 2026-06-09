@@ -349,7 +349,7 @@ def test_file_rule_passthrough_dispatch():
         # Inject a per-file FileRules into the session with one passthrough rule.
         fr = m.FileRules.__new__(m.FileRules)
         fr.path = None
-        fr.rules = [m.FileRule(action="passthrough", pattern="pt_match.txt")]
+        fr.rules = [m.FileRule.single("passthrough", "path", "pt_match.txt")]
         fx.mount.ops.sessions[fx.sid]["frules"] = fr
 
         # Write the passthrough-matching path — should land on the real lower.

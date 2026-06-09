@@ -113,7 +113,7 @@ def test_process_and_env_tables_dedup_and_tag():
         # tgid as the root first; the bubble-up then stops at it: one process row.
         sid = "1002"
         backing = m.live_dir(sid); (backing / "up").mkdir(parents=True)
-        idx = m.Index(backing); idx.set_tracing(True)
+        idx = m.Index(backing); idx.set_env_capture(True)
         root_prov = m.read_provenance(os.getpid(), full_env=True)
         idx.process_from_prov(dict(tgid=m.tgid_of(os.getpid()),
                                    ppid=m.tgid_of(root_prov["ppid"]) if root_prov.get("ppid") else 0,
@@ -217,7 +217,7 @@ def test_process_table_is_one_connected_tree():
     try:
         sid = "2000"
         backing = m.live_dir(sid); (backing / "up").mkdir(parents=True)
-        idx = m.Index(backing); idx.set_tracing(True)
+        idx = m.Index(backing); idx.set_env_capture(True)
         # 3c records the root row at register; emulate it (root never bubbles).
         idx.process_from_prov(dict(tgid=ROOT, ppid=0, exe="", argv=["root"], env={}))
         # First op by the deepest process: record LEAF -> bubble LEAF->MID->ROOT.
@@ -225,20 +225,27 @@ def test_process_table_is_one_connected_tree():
                                    argv=["leaf"], env={}))
 
         sp = m.sqlar_path(sid)
-        by_tgid = {tgid: ppid for _rid, tgid, ppid, _exe, _argv in m.process_list(sp)}
+        # rows keyed by ROW id now (the identity); each carries its tgid + parent_id (the
+        # parent's ROW id, the structural link — PID-reuse proof). Build tgid->row and the
+        # row->parent_id map to assert connectivity via row ids.
+        rows = m.process_list(sp)
+        rid_of = {tgid: rid for rid, tgid, _pp, _par, _exe, _argv in rows}
+        par_of = {rid: par for rid, _tg, _pp, par, _exe, _argv in rows}
+        by_tgid = {tgid: ppid for _rid, tgid, ppid, _par, _exe, _argv in rows}
         for p in (ROOT, MID, LEAF):
-            check(p in by_tgid, "level pid %d has a process row" % p)
-        # connectivity: each non-root row's ppid points at another recorded row.
-        for tgid, ppid in by_tgid.items():
+            check(p in rid_of, "level pid %d has a process row" % p)
+        # connectivity: each non-root row's parent_id is the ROW id of another recorded row.
+        for tgid, rid in rid_of.items():
             if tgid != ROOT:
-                check(ppid in by_tgid,
-                      "row tgid=%d ppid=%d points at a recorded row" % (tgid, ppid))
-        # exactly one root: the only row whose ppid is not itself recorded.
-        roots = [t for t, ppid in by_tgid.items() if ppid not in by_tgid]
-        check(roots == [ROOT], "the sole dangling parent is the box root")
+                par = par_of[rid]
+                check(par in par_of,
+                      "row tgid=%d parent_id=%r points at a recorded row" % (tgid, par))
+        # exactly one root: the only row whose parent_id is NULL (no recorded parent).
+        roots = [tgid for tgid, rid in rid_of.items() if not par_of[rid]]
+        check(roots == [ROOT], "the sole parentless row is the box root")
 
         # idempotent: re-recording a known process adds no rows and no new bubbling.
-        n_before = len(by_tgid)
+        n_before = len(rows)
         idx.process_from_prov(dict(tgid=LEAF, ppid=MID, exe="", argv=[], env={}))
         check(len(m.process_list(sp)) == n_before,
               "re-recording a known process does not re-bubble")
@@ -246,7 +253,7 @@ def test_process_table_is_one_connected_tree():
         # init parent terminates the walk: a process whose ppid is pid 1 records
         # ONLY itself, never pid 0/1 or host system procs.
         idx.process_from_prov(dict(tgid=0x7fffffff, ppid=1, exe="", argv=[], env={}))
-        tgids = {t for _r, t, _p, _e, _a in m.process_list(sp)}
+        tgids = {t for _r, t, _p, _par, _e, _a in m.process_list(sp)}
         check(0x7fffffff in tgids, "the pid-1-parented process is recorded")
         check(0 not in tgids and 1 not in tgids,
               "init (pid 0/1) is never recorded — walk stops at the boundary")
@@ -363,7 +370,7 @@ def test_finalize_apply_promotes_to_parent():
         _finish_box_with_file(sup, child_sid, rel, content, parent=10)
 
         class _ApplyRule:
-            def decide(self, r): return "apply" if r == rel else None
+            def decide(self, r, box="", proc=None): return "apply" if r == rel else None
         m.load_file_rules = lambda: _ApplyRule()
 
         res = sup.review.finalize_by_rules(child_sid)
@@ -395,7 +402,7 @@ def test_finalize_apply_writes_host_for_root():
         _finish_box_with_file(sup, sid, host_rel, content, parent=None)
 
         class _ApplyRule:
-            def decide(self, r): return "apply" if r == host_rel else None
+            def decide(self, r, box="", proc=None): return "apply" if r == host_rel else None
         m.load_file_rules = lambda: _ApplyRule()
 
         res = sup.review.finalize_by_rules(sid)
@@ -426,7 +433,7 @@ def test_finalize_discard_copies_down_to_children():
         _finish_box_with_file(sup, child_inherits, "other.txt", b"x\n", parent=20)
         _finish_box_with_file(sup, child_owns, rel, d_content, parent=20)
 
-        m.load_file_rules = lambda: type("R", (), {"decide": lambda self, r: None})()
+        m.load_file_rules = lambda: type("R", (), {"decide": lambda self, r, box="", proc=None: None})()
         res = sup.review.discard(b, [rel])
         check(rel in res.get("discarded", []), f"copydown: discarded from B (got {res})")
         check(rel not in _names(m.sqlar_path(b)), "copydown: gone from B")
