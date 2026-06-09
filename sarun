@@ -109,6 +109,7 @@ import hashlib
 import json
 import os
 import queue
+import quopri
 import re
 import resource
 import select
@@ -1843,9 +1844,28 @@ def _decode_body_display(raw: bytes, headers: str) -> "tuple[str, str] | None":
             else:
                 phdr, pbody = b"", part
             pbody = pbody.rstrip(b"\r\n")
-            lines.append(f"── part {i} ──")
-            lines.append(phdr.decode("utf-8", "replace"))
-            # Binary-aware body preview.
+            hdr_text = phdr.decode("utf-8", "replace")
+            # A part may carry its OWN Content-Transfer-Encoding (base64 / quoted-
+            # printable); decode it so an uploaded file or field shows as its real
+            # content instead of a wall of base64.
+            cte = ""
+            for hl in hdr_text.splitlines():
+                if hl.lower().startswith("content-transfer-encoding:"):
+                    cte = hl.split(":", 1)[1].strip().lower(); break
+            ptag = ""
+            if cte == "base64":
+                try:
+                    pbody = base64.b64decode(b"".join(pbody.split())); ptag = " · base64"
+                except Exception:
+                    ptag = " · base64?"
+            elif cte == "quoted-printable":
+                try:
+                    pbody = quopri.decodestring(pbody); ptag = " · quoted-printable"
+                except Exception:
+                    pass
+            lines.append(f"── part {i}{ptag} ──")
+            lines.append(hdr_text)
+            # Binary-aware body preview (on the transfer-decoded bytes).
             try:
                 lines.append(pbody.decode("utf-8"))
             except UnicodeDecodeError:

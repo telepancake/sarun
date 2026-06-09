@@ -201,6 +201,36 @@ def test_decode_multipart():
         check("multipart" in label, f"B: multipart label contains 'multipart' (got {label!r})")
 
 
+def test_decode_multipart_base64_part():
+    """A multipart part with Content-Transfer-Encoding: base64 (or quoted-printable) is
+    transfer-decoded so its real content shows, not a wall of base64."""
+    import base64 as _b64
+    secret = "the real file contents — héllo"
+    b64 = _b64.b64encode(secret.encode("utf-8")).decode("ascii")
+    body = (
+        "------B\r\n"
+        'Content-Disposition: form-data; name="upload"; filename="a.txt"\r\n'
+        "Content-Transfer-Encoding: base64\r\n"
+        "\r\n"
+        f"{b64}\r\n"
+        "------B\r\n"
+        'Content-Disposition: form-data; name="note"\r\n'
+        "Content-Transfer-Encoding: quoted-printable\r\n"
+        "\r\n"
+        "caf=C3=A9 time\r\n"
+        "------B--\r\n"
+    ).encode("utf-8")
+    headers = 'Content-Type: multipart/form-data; boundary="----B"'
+    result = m._decode_body_display(body, headers)
+    check(result is not None, "B: base64 multipart returns non-None")
+    if result:
+        text, _ = result
+        check(secret in text, "B: base64 part is decoded to its real content")
+        check(b64 not in text, "B: raw base64 string is NOT shown verbatim")
+        check("café time" in text, "B: quoted-printable part decoded")
+        check("base64" in text, "B: a per-part base64 tag is shown")
+
+
 def test_decode_brotli_returns_none():
     """brotli Content-Encoding returns None (no dep — graceful skip)."""
     headers = "Content-Encoding: br\nContent-Type: text/plain"
