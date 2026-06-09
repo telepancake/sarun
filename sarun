@@ -706,36 +706,135 @@ def _ip_match(pat: str, ip: str) -> bool:
         return False
 
 
+# ── shared glob engine ───────────────────────────────────────────────────────
+# The one place the extended-glob (wcmatch) vocabulary is configured/invoked, so a
+# file-path rule, a box-name scope, and anything else matching the same wildcards
+# behave identically. Lazy import keeps a bare `import slopbox` (the in-box --inner
+# path) stdlib-only — only the runner/UI that actually matches needs wcmatch.
+@functools.cache
+def _glob_flags() -> int:
+    from wcmatch import glob as _wg
+    return _wg.GLOBSTAR | _wg.EXTGLOB | _wg.BRACE | _wg.DOTGLOB
+
+def _glob_match(pat: str, s: str) -> bool:
+    """True if `s` matches the extended shell glob `pat`. Empty pattern → False."""
+    pat = pat.strip()
+    if not pat: return False
+    from wcmatch import glob as _wg
+    try:
+        return bool(_wg.globmatch(s, pat, flags=_glob_flags()))
+    except ValueError:
+        return False
+
+
+def _split_box(line: str) -> "tuple[str, str]":
+    """Peel an optional leading box scope off a rule line: `[BOXGLOB] rest` → (glob,
+    rest). Recognised only when a `[...]` group sits at the very start and its closing
+    bracket is followed by a SPACE then non-empty content — exactly the form to_line()
+    emits. That space requirement leaves a bare bracket pattern untouched: an IPv6 host
+    literal (`[::1]`, `[::1]:8080`) or a char-class glob (`[abc]*.txt`) has no `'] '`,
+    and a char-class inside the scope itself (`[back[12]] allow …`) closes at the first
+    bracket a space follows. Returns ("", line) when there is no scope."""
+    s = line.strip()
+    if not s.startswith("["):
+        return "", s
+    cut = s.find("] ")                            # scope ends at the first ']' a space follows
+    if cut <= 0:
+        return "", s
+    rest = s[cut + 2:].strip()
+    if not rest:
+        return "", s
+    return s[1:cut].strip(), rest
+
+
+@dataclass
+class Match:
+    """THE single search/match struct every rule domain embeds. `kind` selects which
+    facet of a target to test — 'host'/'ip'/'cname'/'url' for a connection, 'path' for
+    a file change; `pattern` is the per-kind needle; `box` is an optional glob over the
+    box's hierarchical display name ('' = every box), matched with the same wcmatch
+    engine as file globs so a rule can be scoped to just some boxes. Targets implement
+    `matches(Match)` (see ConnTarget / PathTarget); the box gate is the shared first
+    step, so common logic lives here, kind-specific logic lives on each target."""
+    kind: str
+    pattern: str
+    box: str = ""
+
+    def box_ok(self, box_name: str) -> bool:
+        return (not self.box) or _glob_match(self.box, box_name or "")
+
+    def to_suffix(self) -> str:
+        return f"[{self.box}] " if self.box else ""
+
+
+def _conn_kind_match(kind, pattern, host, port, url, ips, cnames) -> bool:
+    """Kind-specific connection test (no box gate) — host/ip/cname/url. Shared by the
+    network ConnTarget and anywhere a single connection rule is evaluated."""
+    k, p = kind, pattern
+    if k == "host":
+        # optional :port suffix (but not for bare IPv6 literals)
+        if ":" in p and p.rpartition(":")[2].isdigit() and not p.startswith("["):
+            h, _, pp = p.rpartition(":")
+            return _host_glob(h, host) and int(pp) == port
+        return _host_glob(p, host)
+    if k == "ip":
+        return any(_ip_match(p, ip) for ip in ips)
+    if k == "cname":
+        return any(_host_glob(p, c) for c in cnames)
+    if k == "url":
+        return bool(url) and (url == p or url.startswith(p))
+    return False
+
+
+@dataclass
+class ConnTarget:
+    """A network request under evaluation. Implements the generic match convention:
+    does THIS connection satisfy a Match? Box gate first, then the kind facet."""
+    host: str
+    port: int
+    url: "str | None" = None
+    ips: tuple = ()
+    cnames: tuple = ()
+    box: str = ""
+
+    def matches(self, m: Match) -> bool:
+        return m.box_ok(self.box) and _conn_kind_match(
+            m.kind, m.pattern, self.host, self.port, self.url, self.ips, self.cnames)
+
+
+@dataclass
+class PathTarget:
+    """A changed path under evaluation. The file-domain counterpart of ConnTarget."""
+    rel: str
+    box: str = ""
+
+    def matches(self, m: Match) -> bool:
+        return m.box_ok(self.box) and m.kind == "path" and _path_match(m.pattern, self.rel)
+
+
 @dataclass
 class Rule:
     action: str            # "allow" | "deny"
     kind: str              # one of RULE_KINDS
     pattern: str
+    box: str = ""          # optional box-name glob scope ('' = every box)
 
-    def matches(self, host, port, url, ips, cnames) -> bool:
-        k, p = self.kind, self.pattern
-        if k == "host":
-            # optional :port suffix (but not for bare IPv6 literals)
-            if ":" in p and p.rpartition(":")[2].isdigit() and not p.startswith("["):
-                h, _, pp = p.rpartition(":")
-                return _host_glob(h, host) and int(pp) == port
-            return _host_glob(p, host)
-        if k == "ip":
-            return any(_ip_match(p, ip) for ip in ips)
-        if k == "cname":
-            return any(_host_glob(p, c) for c in cnames)
-        if k == "url":
-            return bool(url) and (url == p or url.startswith(p))
-        return False
+    @property
+    def match(self) -> Match:
+        return Match(self.kind, self.pattern, self.box)
+
+    def matches(self, host, port, url, ips=(), cnames=(), box="") -> bool:
+        return ConnTarget(host, port, url, ips, cnames, box).matches(self.match)
 
     def to_line(self) -> str:
-        return f"{self.action} {self.kind}:{self.pattern}"
+        return f"{self.match.to_suffix()}{self.action} {self.kind}:{self.pattern}"
 
     @staticmethod
     def parse(line: str) -> "Rule | None":
         s = line.strip()
         if not s or s.startswith("#"):
             return None
+        box, s = _split_box(s)
         action = "allow"
         # explicit verb, or legacy "!" deny prefix
         low = s.lower()
@@ -751,7 +850,7 @@ class Rule:
                 kind = maybe.lower(); s = rest.strip()
         if not s:
             return None
-        return Rule(action=action, kind=kind, pattern=s)
+        return Rule(action=action, kind=kind, pattern=s, box=box)
 
 
 class _RuleListBase:
@@ -786,9 +885,10 @@ class Rules(_RuleListBase):
 
     def needs_dns(self) -> bool:
         return any(r.kind in ("ip", "cname") for r in self.rules)
-    def decide(self, host, port, url=None, ips=(), cnames=()) -> "str | None":
+    def decide(self, host, port, url=None, ips=(), cnames=(), box="") -> "str | None":
+        target = ConnTarget(host, port, url, ips, cnames, box)
         for r in self.rules:
-            if r.matches(host, port, url, ips, cnames):
+            if target.matches(r.match):
                 return r.action
         return None
 
@@ -841,24 +941,15 @@ class Rules(_RuleListBase):
 # A pattern with no slash, or no leading /, matches at any depth (so *.txt, .~*,
 # a, dir/**/*.txt). A leading / anchors at the filesystem root.
 
-@functools.cache
-def _glob_flags() -> int:
-    # Lazy import: keeps a bare `import slopbox` (the in-slopbox --inner path)
-    # stdlib-only — only the runner/UI that actually matches files needs wcmatch.
-    from wcmatch import glob as _wg
-    return _wg.GLOBSTAR | _wg.EXTGLOB | _wg.BRACE | _wg.DOTGLOB
-
 def _path_match(pat: str, rel: str) -> bool:
+    """Glob a change's ABSOLUTE path with the shared wcmatch engine. A bare/relative
+    pattern matches at any depth (**/ prefix); a leading / anchors at the root."""
     pat = pat.strip()
     if not pat: return False
-    from wcmatch import glob as _wg
     s = "/" + rel.lstrip("/")                    # the change's absolute path
     if "/" not in pat or not pat.startswith("/"):
         pat = "**/" + pat                        # bare name / relative → any depth
-    try:
-        return bool(_wg.globmatch(s, pat, flags=_glob_flags()))
-    except ValueError:
-        return False
+    return _glob_match(pat, s)
 
 
 FILE_ACTIONS = ("apply", "discard", "passthrough")
@@ -867,23 +958,29 @@ FILE_ACTIONS = ("apply", "discard", "passthrough")
 class FileRule:
     action: str            # "apply" | "discard" | "passthrough"
     pattern: str
+    box: str = ""          # optional box-name glob scope ('' = every box)
 
-    def matches(self, rel: str) -> bool:
-        return _path_match(self.pattern, rel)
+    @property
+    def match(self) -> Match:
+        return Match("path", self.pattern, self.box)
+
+    def matches(self, rel: str, box: str = "") -> bool:
+        return PathTarget(rel, box).matches(self.match)
 
     def to_line(self) -> str:
-        return f"{self.action} {self.pattern}"
+        return f"{self.match.to_suffix()}{self.action} {self.pattern}"
 
     @staticmethod
     def parse(line: str) -> "FileRule | None":
         s = line.strip()
         if not s or s.startswith("#"):
             return None
+        box, s = _split_box(s)
         verb, _, rest = s.partition(" ")
         action = verb.lower(); pat = rest.strip()
         if action not in FILE_ACTIONS or not pat:
             return None
-        return FileRule(action=action, pattern=pat)
+        return FileRule(action=action, pattern=pat, box=box)
 
 
 class FileRules(_RuleListBase):
@@ -891,9 +988,10 @@ class FileRules(_RuleListBase):
     wins. Same shape as the network Rules, so the UI edits both the same way."""
     _elem_class = FileRule
 
-    def decide(self, rel: str) -> "str | None":
+    def decide(self, rel: str, box: str = "") -> "str | None":
+        target = PathTarget(rel, box)
         for r in self.rules:
-            if r.matches(rel):
+            if target.matches(r.match):
                 return r.action
         return None
 
