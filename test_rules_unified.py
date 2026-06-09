@@ -124,6 +124,62 @@ def test_model():
         shutil.rmtree(d, ignore_errors=True)
 
 
+# ── 1b · per-entry FILTER targets + the internal "ids" kind ──────────────────
+def test_filter_targets():
+    """The list-filter targets each test their own domain kinds, the shared box/exe/cwd/
+    arg facets, and the INTERNAL "ids" kind (a comma-separated set of process ROW ids,
+    never a user kind) against the row id(s) the entry carries."""
+    Match = m.Match
+
+    # _ids_of parses a comma list into an int set; junk is dropped, never raises.
+    check(m._ids_of("5,7") == {5, 7}, "_ids_of parses a comma list")
+    check(m._ids_of(" 5 , 7 ,") == {5, 7}, "_ids_of trims and skips empties")
+    check(m._ids_of("5,x,7") == {5, 7}, "_ids_of skips non-numeric tokens")
+    check(m._ids_of("") == set() and m._ids_of(None) == set(), "_ids_of empty -> empty set")
+    # "ids" is INTERNAL — never offered as a user kind.
+    for kinds in (m.NET_KINDS, m.FILE_KINDS, m.SUBJECT_KINDS, m.RULE_KINDS):
+        check("ids" not in kinds, f"'ids' absent from {kinds!r}")
+
+    subj = m.Subject(box="backend-1", exe="/usr/bin/curl", cwd="/home/u",
+                     argv=("curl", "--insecure"))
+
+    # Changes entry: path + shared facets + ids = {first,last writer}.
+    pt = m.PathTarget("etc/secret/key", subj, ids=(5, 7))
+    check(pt.match_one(Match("path", "**/secret/**")) is True, "PathTarget path")
+    check(pt.match_one(Match("box", "backend-*")) is True, "PathTarget box facet")
+    check(pt.match_one(Match("exe", "curl")) is True, "PathTarget exe facet")
+    check(pt.match_one(Match("ids", "7")) is True, "PathTarget ids: last writer matches")
+    check(pt.match_one(Match("ids", "5,99")) is True, "PathTarget ids: first writer matches")
+    check(pt.match_one(Match("ids", "99")) is False, "PathTarget ids: no overlap -> False")
+    check(m.PathTarget("a", subj).match_one(Match("ids", "5")) is False,
+          "PathTarget with no ids never matches the ids kind")
+
+    # Flow entry: host/url + facets + ids = {process_id}.
+    ct = m.ConnTarget("api.example.com", 443, "http://api.example.com/x",
+                      subject=subj, ids=(7,))
+    check(ct.match_one(Match("host", "*.example.com")) is True, "ConnTarget host")
+    check(ct.match_one(Match("url", "http://api.example.com/")) is True, "ConnTarget url")
+    check(ct.match_one(Match("exe", "**/curl")) is True, "ConnTarget exe facet")
+    check(ct.match_one(Match("ids", "7,8")) is True, "ConnTarget ids: process_id matches")
+    check(ct.match_one(Match("ids", "8")) is False, "ConnTarget ids: other id -> False")
+
+    # Process entry: shared facets + ids = {own row id}.
+    prt = m.ProcFilterTarget(7, subj)
+    check(prt.match_one(Match("exe", "/usr/bin/curl")) is True, "ProcFilterTarget exe")
+    check(prt.match_one(Match("cwd", "/home/*")) is True, "ProcFilterTarget cwd")
+    check(prt.match_one(Match("arg", "--insecure")) is True, "ProcFilterTarget arg")
+    check(prt.match_one(Match("box", "backend-*")) is True, "ProcFilterTarget box")
+    check(prt.match_one(Match("ids", "5,7")) is True, "ProcFilterTarget ids: own row matches")
+    check(prt.match_one(Match("ids", "5,8")) is False, "ProcFilterTarget ids: own row absent -> False")
+    check(prt.match_one(Match("host", "x")) is False, "ProcFilterTarget ignores net kinds")
+
+    # eval_clauses folds an ids clause exactly like any other (used for navigation).
+    Clause = m.Clause
+    cl = [Clause(Match("ids", "7"))]
+    check(m.eval_clauses(m.ProcFilterTarget(7, subj), cl) is True, "ids fold: matching row kept")
+    check(m.eval_clauses(m.ProcFilterTarget(8, subj), cl) is False, "ids fold: other row dropped")
+
+
 # ── 2 · evaluation against a live box ────────────────────────────────────────
 def test_live_box_scope():
     tmp = Path(tempfile.mkdtemp(prefix="boxscope-"))
@@ -300,6 +356,153 @@ def test_clause_list_editor():
     asyncio.run(drive())
 
 
+def test_list_filtering():
+    """Drive the REAL app's procs pane and assert the '/' filter (and a generated "ids"
+    filter) renders exactly the matching subset. Stubs the Supervisor's data getters so
+    the pane is populated deterministically (no live box / fuse), then sets the view's
+    filter state and forces a reload, reading back the rendered DataTable row keys."""
+    from textual.widgets import DataTable
+    App = m._make_ui_app()
+    SearchModal = _freevar(App.action_filter, "SearchModal")
+    check(SearchModal is not None, "SearchModal reachable from action_filter closure")
+
+    sid = "1"
+    # Four processes: a root bash, a curl, a wget, a python — distinct row ids.
+    procs = [(1, 10, 0, None, "/bin/bash", ["bash"]),
+             (2, 11, 10, 1, "/usr/bin/curl", ["curl", "http://x"]),
+             (3, 12, 10, 1, "/usr/bin/wget", ["wget", "http://y"]),
+             (4, 13, 10, 1, "/usr/bin/python3", ["python3", "s.py"])]
+    cwds = {1: "/root", 2: "/home/u", 3: "/home/u", 4: "/srv"}
+
+    async def drive():
+        app = App()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            # Stub the data layer: a finished box (processes_live None) with our table.
+            app.sup.proc_roots = lambda s: {1}
+            app.sup.processes_live = lambda s: None
+            app.sup.processes = lambda s: list(procs)
+            app.sup.proc_prov = lambda s, rid: dict(
+                exe=dict((p[0], p[4]) for p in procs).get(rid, ""),
+                cwd=cwds.get(rid, ""),
+                argv=dict((p[0], p[5]) for p in procs).get(rid, []))
+            app.sup.review._live = lambda s: False
+            app._maybe_start_consolidate = lambda s: False
+            app.sessions = {sid: dict(session_id=sid, name="BOX", path="BOX")}
+            app._sel_sid = sid
+            app.view = "procs"
+
+            def rendered():
+                t = app.query_one("#pr-tab", DataTable)
+                return [rk.value for rk in t.rows]
+
+            app._load_procs(sid, force=True)
+            await pilot.pause()
+            check(set(rendered()) == {"1", "2", "3", "4"},
+                  f"unfiltered procs pane shows all rows (got {rendered()})")
+
+            # User filter: exe glob keeping only curl + wget.
+            app._view_filters["procs"] = {"clauses": [m.Clause(m.Match("exe", "**/{curl,wget}"))],
+                                     "on": True, "generated": False}
+            app._load_procs(sid, force=True)
+            await pilot.pause()
+            check(set(rendered()) == {"2", "3"},
+                  f"exe filter keeps only curl+wget (got {rendered()})")
+
+            # cwd facet narrows to one of them.
+            app._view_filters["procs"] = {"clauses": [m.Clause(m.Match("cwd", "/srv")),
+                                                 m.Clause(m.Match("exe", "**/python3"), join="and")],
+                                     "on": True, "generated": False}
+            app._load_procs(sid, force=True)
+            await pilot.pause()
+            check(set(rendered()) == {"4"}, f"cwd+exe filter keeps python (got {rendered()})")
+
+            # GENERATED "ids" filter (what c/t/p navigation builds) selects exact rows.
+            app._view_filters["procs"] = {"clauses": [m.Clause(m.Match("ids", "2,4"))],
+                                     "on": True, "generated": True}
+            app._load_procs(sid, force=True)
+            await pilot.pause()
+            check(set(rendered()) == {"2", "4"},
+                  f"generated ids filter selects exactly rows 2,4 (got {rendered()})")
+
+            # esc cancels a generated filter in place -> full list, filter off.
+            app.action_back()
+            await pilot.pause()
+            check(set(rendered()) == {"1", "2", "3", "4"}
+                  and app._view_filters["procs"]["on"] is False,
+                  f"esc clears the generated filter -> full list (got {rendered()})")
+
+            # Filtering OFF -> '/' opens the SearchModal seeded with no clauses; its kinds
+            # are the procs vocabulary WITHOUT the internal ids kind.
+            app.view = "procs"
+            app.action_filter()
+            await pilot.pause(); await pilot.pause()
+            modal = app.screen
+            check(isinstance(modal, SearchModal), "/' opens the search modal when off")
+            kinds = _freevar(App.action_filter, "SearchModal") and modal._kinds
+            check("ids" not in modal._kinds and set(modal._kinds) == set(m.SUBJECT_KINDS),
+                  f"procs search offers SUBJECT_KINDS without ids (got {modal._kinds})")
+            modal.dismiss(None); await pilot.pause()
+
+            # Full c→p navigation: from changes, _nav("procs") sets the generated ids
+            # filter and the procs pane renders exactly the writer rows.
+            app.sup.writer_id = lambda s, rel: 2
+            app.sup.first_writer_id = lambda s, rel: 4
+            app._sel_path = lambda: "x.txt"
+            app.view = "changes"
+            app._nav("procs")
+            await pilot.pause()
+            st = app._view_filters["procs"]
+            check(st["on"] and st["generated"] and app.view == "procs",
+                  "c→p sets a generated filter and switches view")
+            check(set(rendered()) == {"2", "4"},
+                  f"c→p shows exactly the change's writers (got {rendered()})")
+            # A second nav whose source yields no ids drops the stale generated filter.
+            app._sel_path = lambda: None
+            app.view = "changes"
+            app._nav("procs")
+            await pilot.pause()
+            check(app._view_filters["procs"]["on"] is False
+                  and set(rendered()) == {"1", "2", "3", "4"},
+                  f"c→p with no writer clears the stale generated filter (got {rendered()})")
+
+    asyncio.run(drive())
+
+
+def test_nav_ids():
+    """The c/t/p cross-navigation resolver builds the right "ids" filter: changes→procs
+    pins to the change's first+last writer, netlog→procs to the flow's process, and
+    procs→changes/netlog to the selected process row. Tested at the resolver level
+    (_nav_ids) with the selection getters + supervisor stubbed."""
+    import types as _t
+    App = m._make_ui_app()
+    app = App.__new__(App)               # no Textual mount: exercise pure logic
+    app.view = ""; app._sel_sid = "1"
+    sup = _t.SimpleNamespace(
+        first_writer_id=lambda s, rel: 5, writer_id=lambda s, rel: 7,
+        flow_detail=lambda s, fid: {"process_id": 9}, open_flow_detail=lambda s, fid: None)
+    app.sup = sup
+    app._sel_path = lambda: "a/b.txt"
+    app._sel_flow = lambda: 3
+    app._sel_proc = lambda: 42
+
+    app.view = "changes"
+    check(app._nav_ids("changes", "procs") == [5, 7],
+          "changes→procs: first + last writer ids")
+    sup.first_writer_id = lambda s, rel: 7   # first==last: de-duped to one
+    check(app._nav_ids("changes", "procs") == [7], "changes→procs: dedups equal writers")
+    app.view = "netlog"
+    check(app._nav_ids("netlog", "procs") == [9], "netlog→procs: flow's process_id")
+    app.view = "procs"
+    check(app._nav_ids("procs", "changes") == [42], "procs→changes: selected proc row")
+    check(app._nav_ids("procs", "netlog") == [42], "procs→netlog: selected proc row")
+    # transitions that don't auto-filter
+    check(app._nav_ids("changes", "netlog") is None, "changes→netlog: no auto-filter")
+    check(app._nav_ids("procs", "procs") is None, "same-view: no auto-filter")
+    app._sel_sid = None
+    check(app._nav_ids("changes", "procs") is None, "no selected box: no filter")
+
+
 def test_process_identity():
     """Process identity is per-incarnation (tgid,start) — 16-bit PIDs roll over during a
     big build, so a tgid alone cannot identify a process. Asserts: (1) two rows with the
@@ -383,8 +586,9 @@ def test_process_identity():
 
 
 def main():
-    for fn in (test_model, test_live_box_scope, test_approval_box_rule, test_process_facet_live,
-               test_process_identity, test_clause_list_editor):
+    for fn in (test_model, test_filter_targets, test_live_box_scope, test_approval_box_rule,
+               test_process_facet_live, test_process_identity, test_clause_list_editor,
+               test_list_filtering, test_nav_ids):
         print(f"== {fn.__name__} ==")
         try:
             fn()

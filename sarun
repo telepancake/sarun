@@ -819,6 +819,34 @@ def _subject_of(box="", proc=None) -> Subject:
                    cwd=proc.get("cwd") or "", argv=tuple(proc.get("argv") or ()))
 
 
+def _ids_of(pattern: str) -> "set[int]":
+    """Parse the INTERNAL "ids" kind's pattern — a comma-separated list of process ROW
+    ids (e.g. "5,7") — into a set. Non-numeric / empty fields are skipped. Only ever
+    built programmatically (cross-pane navigation), never typed: an "ids" Match asks a
+    target "is this entry one of these rows?", so a list view can be pinned to exactly
+    the processes/files/flows a navigation selected. Not a user kind (absent from every
+    *_KINDS), so the search kind-picker never offers it."""
+    out = set()
+    for tok in (pattern or "").split(","):
+        tok = tok.strip()
+        if tok:
+            try: out.add(int(tok))
+            except ValueError: pass
+    return out
+
+
+def _clauses_expr(clauses) -> str:
+    """A short, human-readable rendering of a Clause list (the '/' filter expression for
+    the bottom bar) — kind:pattern segments joined by each clause's and/or, with off/not
+    prefixes. Same grammar as Rule.to_line minus the action."""
+    seg = []
+    for n, c in enumerate(clauses):
+        parts = ([c.join] if n else []) + (["off"] if not c.enabled else []) \
+                + (["not"] if c.negate else []) + [f"{c.match.kind}:{c.match.pattern}"]
+        seg.append(" ".join(parts))
+    return " ".join(seg)
+
+
 @dataclass
 class ConnTarget:
     """A network request under evaluation. Knows how to test ONE Match against itself
@@ -830,6 +858,7 @@ class ConnTarget:
     ips: tuple = ()
     cnames: tuple = ()
     subject: Subject = field(default_factory=Subject)
+    ids: tuple = ()            # the row id(s) this flow carries — for the internal "ids" kind
 
     def match_one(self, m: Match) -> bool:
         k, p = m.kind, m.pattern
@@ -845,6 +874,8 @@ class ConnTarget:
             return any(_host_glob(p, c) for c in self.cnames)
         if k == "url":
             return bool(self.url) and (self.url == p or self.url.startswith(p))
+        if k == "ids":
+            return bool(set(self.ids) & _ids_of(p))
         return _subject_match(m, self.subject)
 
 
@@ -855,10 +886,29 @@ class PathTarget:
     (a file rule's subject is the path's FIRST writer)."""
     rel: str = ""
     subject: Subject = field(default_factory=Subject)
+    ids: tuple = ()            # the change's writer row id(s) — for the internal "ids" kind
 
     def match_one(self, m: Match) -> bool:
         if m.kind == "path":
             return _path_match(m.pattern, self.rel)
+        if m.kind == "ids":
+            return bool(set(self.ids) & _ids_of(m.pattern))
+        return _subject_match(m, self.subject)
+
+
+@dataclass
+class ProcFilterTarget:
+    """A process row under evaluation — the procs-pane counterpart of Path/ConnTarget,
+    used only for list FILTERING (processes have no rules). Tests the shared box/process
+    facets (box/exe/cwd/arg) against its own Subject, and the internal "ids" kind against
+    its OWN row id, so a navigation can pin the procs pane to exactly the writer(s) of a
+    change or the process behind a flow."""
+    row_id: int = 0
+    subject: Subject = field(default_factory=Subject)
+
+    def match_one(self, m: Match) -> bool:
+        if m.kind == "ids":
+            return self.row_id in _ids_of(m.pattern)
         return _subject_match(m, self.subject)
 
 
@@ -1892,6 +1942,34 @@ def sqlar_writer_id(path, rel) -> "int | None":
     finally: conn.close()
     return row[0] if row and row[0] is not None else None
 
+def sqlar_first_writer_id(path, rel) -> "int | None":
+    """The process-table row id of the FIRST process to write `rel` (the sqlar `writer`
+    tag), or None — the first-writer counterpart of sqlar_writer_id. Finished-box read."""
+    path = Path(path)
+    if not path.exists(): return None
+    conn = _sqlar_open(path)
+    try:
+        row = conn.execute("SELECT writer FROM sqlar WHERE name=?", (rel,)).fetchone()
+    except sqlite3.Error: row = None
+    finally: conn.close()
+    return row[0] if row and row[0] is not None else None
+
+def sqlar_proc_prov(path, proc_id) -> "dict | None":
+    """Provenance (exe/cwd/argv) of ONE process row, read from a finished box's sqlar.
+    None if the row id isn't recorded. Used to build the procs-pane filter Subject."""
+    path = Path(path)
+    if not path.exists(): return None
+    conn = _sqlar_open(path)
+    try:
+        w = conn.execute("SELECT exe,cwd,argv FROM process WHERE id=?",
+                         (proc_id,)).fetchone()
+    except sqlite3.Error: w = None
+    finally: conn.close()
+    if not w: return None
+    try: argv = json.loads(w[2]) if w[2] else []
+    except (ValueError, TypeError): argv = []
+    return dict(exe=w[0] or "", cwd=w[1] or "", argv=argv)
+
 def sqlar_first_writer_prov(path, rel) -> "dict | None":
     """Provenance (exe/cwd/argv) of the FIRST process to write `rel`, read from a
     stopped box's single sqlar (the `writer` tag → process row). Used to match a file
@@ -2668,6 +2746,25 @@ class Index:
                     "SELECT last_writer FROM sqlar WHERE name=?", (path,)).fetchone()
         except sqlite3.Error: return None
         return row[0] if row and row[0] is not None else None
+
+    def first_writer_id_for(self, path: str) -> "int | None":
+        """The process-table row id that FIRST wrote `path` (the sqlar `writer` tag), or
+        None — the first-writer counterpart of writer_id_for, used to pin the procs pane
+        to a change's writers. UI-thread read under _lock (Index threading contract)."""
+        try:
+            with self._lock:
+                row = self._db.execute(
+                    "SELECT writer FROM sqlar WHERE name=?", (path,)).fetchone()
+        except sqlite3.Error: return None
+        return row[0] if row and row[0] is not None else None
+
+    def proc_prov_for(self, row_id: int) -> "dict | None":
+        """Provenance (exe/cwd/argv) of ANY recorded process ROW id, from the GIL-atomic
+        RAM mirror — for the procs-pane filter Subject. None if the row was never seen."""
+        prov = self._prov_by_proc.get(row_id)
+        if prov is None: return None
+        return dict(exe=prov["exe"] or "", cwd=prov.get("cwd") or "",
+                    argv=list(prov["argv"]))
 
     def writer_provenance(self, path: str) -> "dict | None":
         # No lock: consolidate-only precondition — called post-teardown with the box
@@ -7897,6 +7994,27 @@ class Supervisor:
         if idx is not None: return idx.writer_id_for(rel.lstrip("/"))
         return sqlar_writer_id(sqlar_path(sid), rel.lstrip("/"))
 
+    def first_writer_id(self, sid, rel) -> "int | None":
+        """The row id of the FIRST process to write `rel` in box `sid` (the writer a file
+        rule's process facets lock to). Live box → its in-RAM Index; finished → sqlar."""
+        idx = self.indexes.get(sid)
+        if idx is not None: return idx.first_writer_id_for(rel.lstrip("/"))
+        return sqlar_first_writer_id(sqlar_path(sid), rel.lstrip("/"))
+
+    def first_writer_prov(self, sid, rel) -> "dict | None":
+        """Provenance (exe/cwd/argv) of the path's FIRST writer — the Subject a change's
+        filter facets match (consistent with file rules). Live Index → finished sqlar."""
+        idx = self.indexes.get(sid)
+        if idx is not None: return idx.first_writer_provenance(rel.lstrip("/"))
+        return sqlar_first_writer_prov(sqlar_path(sid), rel.lstrip("/"))
+
+    def proc_prov(self, sid, row_id) -> "dict | None":
+        """Provenance (exe/cwd/argv) of one process ROW — the procs-pane filter Subject.
+        Live box → its in-RAM Index cache; finished → the sqlar process table."""
+        idx = self.indexes.get(sid)
+        if idx is not None: return idx.proc_prov_for(row_id)
+        return sqlar_proc_prov(sqlar_path(sid), row_id)
+
     def kill(self, ident) -> None:
         # s.pid is the runner ("slopbox CMD") process. SIGTERM to it trips the runner's
         # handler, which tears down the bwrap group and unmounts; we must NOT killpg here
@@ -9151,6 +9269,17 @@ def cmd_run(cmd, net, trace, direct, session_whitelist, chdir, reuse_sid=None) -
 #: running — each entry dropping off as it finishes. The complete record (every file it
 #: wrote, every connection it made, the full process tree) appears once the box exits.
 #:
+#: [b]Filter a list[/] ([cyan]/[/]):  in the Changes, Network and Processes panes, [cyan]/[/] opens a
+#: filter editor — the same and/or/not clause rows as the rule forms — and keeps only the
+#: entries that match (paths/process facets for changes, host/ip/cname/url for network,
+#: process facets for procs). Press [cyan]/[/] again to clear it. The active filter shows in the
+#: bottom bar.
+#: [b]Follow the trail[/] ([cyan]c[/] / [cyan]t[/] / [cyan]p[/] across these three panes):  the view keys also
+#: cross-navigate WITH an automatic filter — from a change, [cyan]p[/] shows exactly the
+#: process(es) that wrote it; from a flow, [cyan]p[/] shows the process that made it; from a
+#: process, [cyan]c[/] / [cyan]t[/] show exactly its changes / connections. [cyan]esc[/] (or [cyan]/[/]) returns to the
+#: full list.
+#:
 #: [b]Boxes pane:[/]  [cyan]k[/] kill a running box · [cyan]d[/] delete a box and its overlay · [cyan]n[/] rename it.
 #: [b]Changes pane:[/]  [cyan]a[/] apply the selected file · [cyan]A[/] apply all · [cyan]x[/] discard the file ·
 #:   [cyan]X[/] discard all · [cyan]r[/] refresh.  In the diff view, [cyan]a[/] applies just that hunk, [cyan]x[/] discards it.
@@ -9506,6 +9635,41 @@ def _make_ui_app():
         @on(Button.Pressed,"#rf-cancel")
         def _b_cancel(self, ev): ev.stop(); self.dismiss(None)
 
+    class SearchModal(ModalScreen):
+        """The list '/' filter editor: the SAME reusable ClauseList as the rule form, but
+        with NO action — there is nothing to do here, only a match expression to filter
+        the current list by. `kinds` is the view's user vocabulary (FILE/NET/SUBJECT,
+        always WITHOUT the internal "ids" kind). Seeded with the view's current clauses so
+        toggling the filter back on reopens what you last typed. Dismisses with the new
+        clause list (Save, non-empty) or None (Cancel)."""
+        BINDINGS=[("escape","cancel",""),("ctrl+s","save","")]
+        def __init__(self, kinds, clauses=None, default_kind="", title=" Filter"):
+            super().__init__()
+            self._kinds=kinds; self._clauses=clauses
+            self._default=default_kind or kinds[0]; self._title=title
+        def compose(self):
+            with Vertical(id="rule-box"):
+                yield Label(self._title, id="rule-title")
+                yield Label("[dim]keep only entries matching — conditions folded "
+                            "top-to-bottom by each row's and/or[/]")
+                yield ClauseList(self._kinds, clauses=self._clauses,
+                                 default_kind=self._default, id="sf-clauses")
+                yield Label("[dim]'/' clears the filter · ^s apply · esc cancel[/]")
+                with Horizontal(id="rule-btns"):
+                    yield Button("Apply [^s]", id="sf-save", variant="primary")
+                    yield Button("Cancel [esc]", id="sf-cancel")
+        def _build(self):
+            cl=self.query_one(ClauseList).clauses()
+            return cl if any(c.enabled for c in cl) else None
+        def action_save(self):
+            cl=self._build()
+            if cl is not None: self.dismiss(cl)
+        def action_cancel(self): self.dismiss(None)
+        @on(Button.Pressed,"#sf-save")
+        def _b_save(self, ev): ev.stop(); self.action_save()
+        @on(Button.Pressed,"#sf-cancel")
+        def _b_cancel(self, ev): ev.stop(); self.dismiss(None)
+
     class RenameModal(_SimpleInputModal):
         # Rename the selected box. Returns the new NAME or None.
         def __init__(self, cur):
@@ -9662,6 +9826,10 @@ def _make_ui_app():
         # the bottom key bar). No tab strip: the active view is the lit-up key.
         VIEW_KEY={"boxes":"b","changes":"c","netlog":"t","procs":"p",
                   "net":"w","file":"f"}
+        # The three filterable list views and the user Match kinds '/' offers for each
+        # (always WITHOUT the internal "ids" kind — that's built only by c/t/p navigation).
+        FILTERABLE={"changes":FILE_KINDS, "netlog":NET_KINDS, "procs":SUBJECT_KINDS}
+        FILTER_DEFAULT={"changes":"path", "netlog":"host", "procs":"exe"}
         BINDINGS=[
             Binding("b","view_boxes","boxes"),
             Binding("c","view_changes","changes"),
@@ -9669,6 +9837,7 @@ def _make_ui_app():
             Binding("p","view_procs","processes"),
             Binding("w","view_net","net rules"),
             Binding("f","view_file","file rules"),
+            Binding("/","filter","filter"),
             Binding("escape","back","back"),
             Binding("q","quit","quit"),
             # Approval keys act on the oldest pending request from anywhere, without
@@ -9687,6 +9856,12 @@ def _make_ui_app():
             # screen frame-by-frame.
             self.animation_level="none"
             self.view="boxes"
+            # Per-view '/' filter state: each filterable view keeps its clause list (so
+            # toggling off then on reopens the last expression), an on/off flag, and a
+            # "generated" flag — True when c/t/p navigation auto-built an "ids" filter
+            # (cancelled by '/' or esc), False for a user-typed one ('/' toggles it).
+            self._view_filters={v:{"clauses":[], "on":False, "generated":False}
+                           for v in self.FILTERABLE}
             self.rules_store=Rules(rules_file())
             self.frules_store=FileRules(file_rules_file())
             # The UI owns the single pyfuse3 overlay mount (started in on_mount on a
@@ -10226,34 +10401,153 @@ def _make_ui_app():
             except Exception: pass
 
         def action_view_boxes(self): self._set_view("boxes")
-        def action_view_changes(self): self._set_view("changes")
-        def action_view_procs(self):
-            # Cross-pane jump: entering procs FROM a changes/netlog row focuses the
-            # process responsible — the file's writer (sqlar writer tag / live Index)
-            # or the flow's process_id. Resolve BEFORE switching; graceful if the
-            # process isn't in the displayed list (already exited / none recorded):
-            # just show the pane (a finished box's full table still contains it).
-            target=None
-            try:
-                if self.view=="changes" and self._sel_sid:
-                    rel=self._sel_path()
-                    if rel: target=self.sup.writer_id(self._sel_sid, rel)
-                elif self.view=="netlog" and self._sel_sid:
-                    fid=self._sel_flow()
-                    if fid is not None:
-                        f=self.sup.flow_detail(self._sel_sid, fid)
-                        if f: target=f.get("process_id")
-            except Exception: target=None
-            self._set_view("procs")
-            if target is not None: self._focus_proc(target)
-        def _focus_proc(self, pid):
-            try:
-                t=self.query_one("#pr-tab",DataTable)
-                t.move_cursor(row=t.get_row_index(str(pid)), animate=False)
-            except Exception: pass   # not in the displayed active set — leave cursor
-        def action_view_netlog(self): self._set_view("netlog")
+        def action_view_changes(self): self._nav("changes")
+        def action_view_procs(self): self._nav("procs")
+        def action_view_netlog(self): self._nav("netlog")
         def action_view_net(self): self._set_view("net")
         def action_view_file(self): self._set_view("file")
+
+        # ── c/t/p cross-pane auto-filter navigation ───────────────────────────
+        # The same keys that switch among changes/netlog/procs ALSO, when crossing
+        # between these three, pin the destination to exactly the entries tied to the
+        # current cursor — a GENERATED "ids" filter the destination's load function
+        # applies, cancelled by '/' or esc. Other transitions just switch the view.
+        def _nav(self, dest):
+            ids=None
+            try: ids=self._nav_ids(self.view, dest)
+            except Exception: ids=None
+            # A cross-nav between the three filterable panes OWNS the destination's
+            # generated filter: set it to the new ids, or — when this nav produces none
+            # (e.g. a change with no recorded writer) — drop a stale generated one so we
+            # never land showing a PREVIOUS navigation's filter. A user-typed filter on
+            # the destination is left untouched (only '/' toggles those).
+            if dest in self.FILTERABLE and self.view in self.FILTERABLE and self.view!=dest:
+                if ids:
+                    self._view_filters[dest]={"clauses":[Clause(Match("ids",",".join(map(str,ids))))],
+                                              "on":True, "generated":True}
+                elif self._view_filters[dest]["generated"]:
+                    self._view_filters[dest]={"clauses":[], "on":False, "generated":False}
+            self._set_view(dest)
+
+        def _nav_ids(self, src, dest) -> "list | None":
+            """The process ROW ids the destination should be pinned to for an src→dest
+            cross-navigation, or None for transitions that don't auto-filter. Resolved
+            against the CURRENT cursor before the view switches."""
+            if not self._sel_sid: return None
+            sid=self._sel_sid
+            if src=="changes" and dest=="procs":
+                rel=self._sel_path()                       # → the change's writers
+                if not rel: return None
+                ids=[i for i in (self.sup.first_writer_id(sid, rel),
+                                 self.sup.writer_id(sid, rel)) if i is not None]
+                # de-dup preserving order; first==last writer is the common case
+                return list(dict.fromkeys(ids)) or None
+            if src=="netlog" and dest=="procs":
+                fid=self._sel_flow()                       # → the flow's process
+                if fid is None: return None
+                f=self.sup.flow_detail(sid, fid) or self.sup.open_flow_detail(sid, fid)
+                pid=f.get("process_id") if f else None
+                return [pid] if pid is not None else None
+            if src=="procs" and dest in ("changes","netlog"):
+                pid=self._sel_proc()                       # → this proc's changes / flows
+                return [pid] if pid is not None else None
+            return None
+
+        # ── '/' list filtering ────────────────────────────────────────────────
+        def action_filter(self):
+            """'/' on a filterable list. OFF → open the search modal seeded with the
+            view's last clauses; on Apply turn filtering on (user-typed). ON → clear it
+            (a generated filter cancels; a user one keeps its clauses for next time).
+            On a non-filterable view '/' does nothing."""
+            v=self.view
+            if v not in self.FILTERABLE: return
+            st=self._view_filters[v]
+            if st["on"]:
+                self._clear_filter(v); return                # toggle / cancel
+            seed=st["clauses"] or None
+            def done(clauses):
+                if not clauses: return                       # Cancel: no change
+                self._view_filters[v]={"clauses":clauses, "on":True, "generated":False}
+                self._reload_view(v)
+            self.push_screen(SearchModal(self.FILTERABLE[v], clauses=seed,
+                                         default_kind=self.FILTER_DEFAULT[v]), done)
+
+        def _clear_filter(self, v):
+            # Turn a view's filter off, KEEPING its clause value for next time (a
+            # generated "ids" filter is dropped — it's never reopened), then re-render.
+            st=self._view_filters[v]
+            if st["generated"]: st["clauses"]=[]
+            st["on"]=False; st["generated"]=False
+            self._reload_view(v)
+
+        def _reload_view(self, v):
+            # Force the view's list to rebuild under the new filter state, then refresh the
+            # bottom bar (filter indicator).
+            self._keybar()
+            if not self._sel_sid: return
+            if v=="changes": self._load_changes(self._sel_sid, force=True)
+            elif v=="netlog": self._load_flows(self._sel_sid, force=True)
+            elif v=="procs": self._load_procs(self._sel_sid, force=True)
+
+        def _filter_clauses(self, v):
+            """The active clause list for view `v`, or None when its filter is off — what
+            the load functions consult to decide whether to filter."""
+            st=self._view_filters.get(v)
+            return st["clauses"] if st and st["on"] else None
+
+        def _filter_changes(self, sid, entries):
+            """Keep only the change entries matching the changes filter. A change's target
+            tests its rel (path), the FIRST writer's box/exe/cwd/arg (consistent with file
+            rules), and the internal "ids" kind against {first,last writer row id}."""
+            clauses=self._filter_clauses("changes")
+            if not clauses: return entries
+            box=self._box_name_for(sid)
+            out=[]
+            for e in entries:
+                rel=e["path"]
+                ids=tuple(i for i in (self.sup.first_writer_id(sid, rel),
+                                      self.sup.writer_id(sid, rel)) if i is not None)
+                subj=_subject_of(box, self.sup.first_writer_prov(sid, rel))
+                if eval_clauses(PathTarget(rel, subj, ids), clauses):
+                    out.append(e)
+            return out
+
+        def _filter_flows(self, sid, flows):
+            """Keep only flows matching the netlog filter. A flow's target tests
+            host/url/port and its process's box/exe/cwd/arg, plus "ids" vs {process_id}."""
+            clauses=self._filter_clauses("netlog")
+            if not clauses: return flows
+            box=self._box_name_for(sid)
+            out=[]
+            for f in flows:
+                pid=f.get("process_id")
+                subj=_subject_of(box, self.sup.proc_prov(sid, pid) if pid is not None else None)
+                tgt=ConnTarget(host=f.get("host") or "", port=f.get("port") or 0,
+                               url=f.get("url"), subject=subj,
+                               ids=() if pid is None else (pid,))
+                if eval_clauses(tgt, clauses):
+                    out.append(f)
+            return out
+
+        def _filter_procs(self, sid, rows):
+            """Keep only proc rows matching the procs filter. `rows` are (rid, key, subj-
+            tuple) — a proc's target tests its own box/exe/cwd/arg and "ids" vs its row id.
+            Returns the surviving subset (same row shape)."""
+            clauses=self._filter_clauses("procs")
+            if not clauses: return rows
+            box=self._box_name_for(sid)
+            out=[]
+            for rid, exe, cwd, argv in rows:
+                subj=Subject(box=box, exe=exe or "", cwd=cwd or "", argv=tuple(argv or ()))
+                if eval_clauses(ProcFilterTarget(rid, subj), clauses):
+                    out.append((rid, exe, cwd, argv))
+            return out
+
+        def _box_name_for(self, sid):
+            # The box's dotted display name (for the shared box: filter kind).
+            s=self.sessions.get(sid)
+            if s is None: return ""
+            return s.get("path") or s.get("name") or sid
 
         # Per-view pane headers (left = the list, right = its detail) and the set of
         # action keys advertised in the bottom bar for that view.
@@ -10296,7 +10590,17 @@ def _make_ui_app():
             t.append(" │  ", style="dim")
             for k,lab in self._ACTS[self.view]:
                 t.append(k, style="bold"); t.append(f" {lab}  ", style="dim")
+            if self.view in self.FILTERABLE:
+                t.append("/", style="bold"); t.append(" filter  ", style="dim")
             t.append(" esc back  q quit", style="dim")
+            # Active '/' filter: show the expression + how to clear it, so a filtered
+            # (or auto-navigated) list never looks mysteriously empty.
+            st=self._view_filters.get(self.view)
+            if st and st["on"]:
+                t.append("    ")
+                t.append("⦿ filter ", style="bold yellow")
+                t.append(_clauses_expr(st["clauses"])[:60], style="yellow")
+                t.append("  ['/' clears]", style="dim")
             try: self.query_one("#keybar",Static).update(t)
             except Exception: pass
 
@@ -10926,6 +11230,9 @@ def _make_ui_app():
                 if self._ch_ver_shown==(sid,ver):
                     return
             entries=self._changes_for(sid)   # kicks the off-loop fold if needed
+            # '/' filter: keep only matching changes before any render/reconcile, so the
+            # tree/cursor/scroll machinery downstream sees exactly the visible subset.
+            entries=self._filter_changes(sid, entries)
             # Mid-fold: show a placeholder row, never the partial state. _changes_for
             # already started the worker; just render the wait.
             if self._is_consolidating(sid):
@@ -10960,6 +11267,7 @@ def _make_ui_app():
             try: live=self.sup.review._live(sid)
             except Exception: pass
             flows=self.sup.open_flows(sid) if live else self.sup.flows(sid)
+            flows=self._filter_flows(sid, flows)   # '/' filter: keep only matching flows
             # The visible set can SHRINK (a flow closing) as well as grow, so key on the
             # exact id sequence rather than a (count,last-id) shortcut.
             def _flows_key(fl): return tuple(f["id"] for f in fl)
@@ -11082,14 +11390,29 @@ def _make_ui_app():
                 except (ValueError, TypeError): cur_rid=None
             prev_par=getattr(self,"_pr_parent",{})
             self._pr_key=key
-            self._pr_procs=[(p,tg,pp,ex,av) for (p,tg,pp,ex,av,_d,c) in tree if not c]
-            self._pr_conn={("c"+str(rid)) for (rid,_tg,_pp,_ex,_av,_d,c) in tree if c}
+            # '/' filter: keep only matching REAL processes. The tree's connectors are
+            # structural ancestry that the filter would mostly strip anyway, so a filtered
+            # pane renders the surviving processes FLAT (no connectors, depth 0) — the
+            # point of the filter is "show me exactly these rows", not the hierarchy.
+            allowed=None
+            if self._filter_clauses("procs") is not None:
+                src=[(rid,ex,av) for (rid,_tg,_pp,_par,ex,av) in procs]
+                rows_in=[(rid, ex, (self.sup.proc_prov(sid,rid) or {}).get("cwd") or "", av)
+                         for rid,ex,av in src]
+                allowed={rid for (rid,_e,_c,_a) in self._filter_procs(sid, rows_in)}
+            self._pr_procs=[(p,tg,pp,ex,av) for (p,tg,pp,ex,av,_d,c) in tree
+                            if not c and (allowed is None or p in allowed)]
+            self._pr_conn=(set() if allowed is not None else
+                           {("c"+str(rid)) for (rid,_tg,_pp,_ex,_av,_d,c) in tree if c})
             # New-tree maps for the ancestor walk: row id->row key (present) and
             # row id->parent row id (combined with the prior snapshot so a multi-level
             # vanish still resolves). Connector parents come from lookup.
             present={}; new_par={}
             rows=[]
             for rid, tgid, ppid, exe, argv, depth, conn in tree:
+                if allowed is not None and (conn or rid not in allowed):
+                    continue                      # filtered out (or a connector we drop)
+                if allowed is not None: depth=0    # flat render under a filter
                 indent=self._ch_indent(depth)
                 nm=Text(indent+(exe.rsplit("/",1)[-1] or exe or "?")[:18], style="cyan")
                 ar=Text(" ".join(argv)[:40], style="dim")
@@ -11212,7 +11535,13 @@ def _make_ui_app():
 
         # ── actions ───────────────────────────────────────────────────────────
         def action_back(self):
-            """Esc steps back: diff → file list; any other list → slopboxes."""
+            """Esc steps back: diff → file list; any other list → slopboxes. But first, a
+            GENERATED filter (auto-built by c/t/p navigation) is cancelled in place — esc
+            returns the auto-filtered list to the full one without leaving the view. A
+            user-typed filter keeps esc's normal meaning ('/' toggles it instead)."""
+            st=self._view_filters.get(self.view)
+            if st and st["on"] and st["generated"]:
+                self._clear_filter(self.view); return
             if self.view=="changes":
                 try: in_diff=self.focused is self.query_one("#cd-log",DiffView)
                 except Exception: in_diff=False
