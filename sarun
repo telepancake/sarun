@@ -2667,7 +2667,7 @@ def _build_overlay_ops():
             with self._lock:
                 self.sessions[sid] = dict(up=Path(up), index=index, virtual={},
                                           passthrough=bool(passthrough),
-                                          parent=parent or None,
+                                          parent=parent or None, box_path="",
                                           frules=load_file_rules())
             # Persist the parent pointer in the sqlar meta so that _attach_base_session
             # can resolve grandparents for chains of finished boxes.
@@ -2676,6 +2676,15 @@ def _build_overlay_ops():
                     sqlar_meta_set(sqlar_path(sid), "parent_box_id", str(parent))
                 except Exception:
                     pass
+
+        def set_box_path(self, sid: str, path: str) -> None:
+            """Cache the box's current hierarchical display name on its session dict, so
+            the serve thread can gate file rules by box name (`_passthrough`) with a
+            plain dict read — no cross-thread display_path walk. Pushed by the Supervisor
+            on register/rename/reparent."""
+            s = self.sessions.get(sid)
+            if s is not None:
+                s["box_path"] = path or ""
 
         def set_parent(self, sid: str, parent: "str | None") -> None:
             """Re-point a live session's parent box key (dissolve re-parenting). The
@@ -2901,7 +2910,7 @@ def _build_overlay_ops():
             if not s: return False
             if s.get("passthrough"): return True
             fr = s.get("frules")
-            return bool(fr and fr.decide(rel) == "passthrough")
+            return bool(fr and fr.decide(rel, s.get("box_path", "")) == "passthrough")
 
         def _host_path(self, rel: str) -> str:
             """The real host path for a passthrough op (lower root + rel)."""
@@ -5065,6 +5074,10 @@ class OverlayMount:
         if self.ops is not None:
             self.ops.set_parent(sid, parent)
 
+    def set_box_path(self, sid: str, path: str) -> None:
+        if self.ops is not None:
+            self.ops.set_box_path(sid, path)
+
     def add_ca_spoof(self, sid: str, ca_bytes: bytes, bundle_paths) -> None:
         """Register the CA-augmented trust bundle as virtual files for this session:
         the box sees system_ca + our mitmproxy CA at every bundle path, but the
@@ -6433,9 +6446,11 @@ class ChangeReview:
         if not changes:
             return dict(applied=[], discarded=[], errors=[])
         frules = load_file_rules()
+        try: box = self.reg.display_path(sid)
+        except Exception: box = ""
         apply_paths, discard_paths = [], []
         for rel in changes:
-            (apply_paths if frules.decide(rel) == "apply" else discard_paths).append(rel)
+            (apply_paths if frules.decide(rel, box) == "apply" else discard_paths).append(rel)
         a = self.apply(sid, apply_paths, reap=False) if apply_paths \
             else dict(applied=[], errors=[])
         # Per-row discard exists only to copy paths DOWN into immediate children. With no
@@ -6713,7 +6728,7 @@ class NetworkPolicy:
     its owning Supervisor."""
 
     def __init__(self, rules: Rules, resolve_session=None,
-                 record=None, emit=None):
+                 record=None, emit=None, box_path=None):
         self.rules = rules
         self.pending: dict = {}
         self._dns_cache: collections.OrderedDict = collections.OrderedDict()
@@ -6721,6 +6736,10 @@ class NetworkPolicy:
         self._resolve_session = resolve_session or (lambda sid: None)
         self._record = record or (lambda *a, **k: None)
         self._emit = emit or (lambda **ev: None)
+        # Box display-name resolver (box_id -> dotted name), so a rule's box scope can
+        # be tested against the box that opened the connection. Runs on the UI loop
+        # alongside this policy, so a live display_path walk is safe.
+        self._box_path = box_path or (lambda box_id: "")
 
     def _resolve(self, host: str) -> tuple:
         """Best-effort DNS: (ips, cnames). Cached for the UI's lifetime. Uses
@@ -6755,12 +6774,16 @@ class NetworkPolicy:
         need_dns = self.rules.needs_dns() or any(
             r.kind in ("ip", "cname") for r in s.sess_rules)
         ips, cnames = self._resolve(host) if need_dns else ((), ())
+        try: box = self._box_path(s.box_id)
+        except Exception: box = ""
+        target = ConnTarget(host, port, url, ips, cnames, box)
         # session rules first (temporary overrides), then the permanent ruleset;
-        # each evaluated top-to-bottom, first match wins.
+        # each evaluated top-to-bottom, first match wins. A rule whose box scope
+        # doesn't match this box is skipped (target.matches gates on box first).
         for r in s.sess_rules:
-            if r.matches(host, port, url, ips, cnames):
+            if target.matches(r.match):
                 return r.action
-        return self.rules.decide(host, port, url, ips, cnames)
+        return self.rules.decide(host, port, url, ips, cnames, box)
 
     def precheck(self, sid, host, port, url=None) -> "str | None":
         """Rule-only decision (no prompting) for the given request."""
@@ -6866,7 +6889,8 @@ class Supervisor:
         self.sessions: dict = {}
         self.policy = NetworkPolicy(
             rules, resolve_session=self.sessions.get,
-            record=self._record_traffic, emit=self._emit)
+            record=self._record_traffic, emit=self._emit,
+            box_path=self.display_path)
         self.selected_sid = None         # the UI's current box (target of `patch`)
         # In-flight (requested, not-yet-responded) flows per live box: sid -> {fid: rec}.
         # The live Network pane shows ONLY these "open flows"; a flow is added when its
@@ -6991,6 +7015,17 @@ class Supervisor:
             if p is None: break
             bid = int(p)
         return ".".join(reversed(parts))
+
+    def _refresh_box_paths(self) -> None:
+        """Push every LIVE box's current display name into the overlay's session dicts,
+        so the FUSE serve thread can gate file rules by box name with a plain dict read.
+        Recomputes ALL live boxes (there are few) so an ancestor rename or a reparent
+        updates each descendant's cached path too. Call after register/rename/dissolve."""
+        if self.mount is None: return
+        for sid, s in list(self.sessions.items()):
+            if not _box_running(s): continue
+            try: self.mount.set_box_path(sid, self.display_path(s.box_id))
+            except Exception: pass
 
     def resolve_box(self, name_or_path_or_id) -> "str | None":
         """Resolve a user-facing identifier to the internal box key str(box_id), or None
@@ -7312,6 +7347,9 @@ class Supervisor:
         for h in msg.get("session_whitelist", []):
             s.sess_rules.append(Rule("allow", "host", h))
         self.sessions[sid] = s
+        # Now that the box's name + parent are recorded, cache its (and any descendant's)
+        # display name into the overlay so file rules can be box-scoped from first write.
+        self._refresh_box_paths()
         self.review._consolidated.discard(sid)
         # HIGH-1: mint an owner token kept OUTSIDE the box (returned to the runner
         # only). unregister/drop must present it, so no box can tear down a session.
@@ -7541,6 +7579,8 @@ class Supervisor:
         else:
             # Finished/discovered box with no live Session: surface the change anyway.
             self._emit(type="session_renamed", session_id=sid, name=new_name)
+        # The new name changes this box's display path and every live descendant's.
+        self._refresh_box_paths()
         return dict(ok=True, sid=sid, old=old, name=new_name)
 
     def note_traffic(self, sid, host, port, scheme, action, bu, bd, status) -> None:
@@ -7774,6 +7814,8 @@ class Supervisor:
                 self.mount.set_parent(
                     child, str(new_parent) if new_parent is not None else None)
             reparented.append(child)
+        # Re-parenting changed each live child's (and its descendants') display path.
+        self._refresh_box_paths()
         # ── free sid's storage ────────────────────────────────────────────────────
         self._free_storage(sid)
         return dict(ok=True, deleted=sid, reparented=reparented)
