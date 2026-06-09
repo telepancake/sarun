@@ -74,7 +74,7 @@ def _mk_supervisor(sid, tracing):
     rules = m.Rules(_TMP / "rules.txt")     # empty permanent ruleset
     sup = m.Supervisor(rules)
     backing = m.live_dir(sid); (backing / "up").mkdir(parents=True, exist_ok=True)
-    idx = m.Index(backing); idx.set_tracing(tracing)
+    idx = m.Index(backing); idx.set_env_capture(tracing)
     sup.indexes[sid] = idx
     sup.sessions[sid] = m.Session(
         session_id=sid, box_id=int(sid), cmd=["curl", "x"], shm_dir=str(backing),

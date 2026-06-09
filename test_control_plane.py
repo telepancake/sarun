@@ -393,7 +393,7 @@ def test_command_is_the_root_process_row():
         cmd = ["echo", "hello world"]
         prov = dict(ppid=7, exe="/usr/bin/echo", env={"FOO": "bar"})
         ack = sup.register(dict(session_id="ECHOBOX", cmd=cmd, prov=prov,
-                                want_trace=True, _register_host_pid=root_pid))
+                                want_env=True, _register_host_pid=root_pid))
         check(ack.get("ok") is True, "register ok")
         sid = ack["session_id"]
 
@@ -448,9 +448,10 @@ def _run_main(argv, **patches):
 
 def test_dash_dash_required_and_flag_parsing():
     seen = {}
-    def fake_run(cmd, net, trace, direct, wl, chdir, reuse_sid=None):
-        seen.update(cmd=cmd, net=net, trace=trace, direct=direct, wl=wl, chdir=chdir,
-                    reuse_sid=reuse_sid)
+    def fake_run(cmd, net, env_capture, direct, wl, chdir, reuse_sid=None,
+                 capture=True):
+        seen.update(cmd=cmd, net=net, env_capture=env_capture, direct=direct, wl=wl,
+                    chdir=chdir, reuse_sid=reuse_sid, capture=capture)
         return 0
 
     # missing `--` is refused with a clear, fixable message.
@@ -459,19 +460,25 @@ def test_dash_dash_required_and_flag_parsing():
     check("ls" in err, "error suggests the corrected `slopbox -- ls`")
     check(not seen, "cmd_run not called when `--` is missing")
 
-    # defaults: NOTHING enabled (no net, no trace, no direct).
+    # defaults: net/env/direct off; capture ON (the new default, no -t).
     seen.clear()
     rc, _ = _run_main(["--", "echo", "hi"], cmd_run=fake_run)
     check(seen.get("cmd") == ["echo", "hi"], "command parsed after `--`")
-    check(seen.get("net") is False and seen.get("trace") is False
-          and seen.get("direct") is False, "default run enables nothing")
+    check(seen.get("net") is False and seen.get("env_capture") is False
+          and seen.get("direct") is False, "default run: net/env/direct off")
+    check(seen.get("capture") is True, "default run captures stdout/stderr")
 
-    # all three flags, combinable, before `--`.
+    # -t now means passthrough: capture OFF.
     seen.clear()
-    rc, _ = _run_main(["-n", "-t", "-d", "-w", "ex.com", "--", "ls", "-la"],
+    rc, _ = _run_main(["-t", "--", "echo", "hi"], cmd_run=fake_run)
+    check(seen.get("capture") is False, "-t disables capture (passthrough)")
+
+    # -n/-e/-d, combinable, before `--`. -e is env capture (independent).
+    seen.clear()
+    rc, _ = _run_main(["-n", "-e", "-d", "-w", "ex.com", "--", "ls", "-la"],
                       cmd_run=fake_run)
-    check(seen.get("net") and seen.get("trace") and seen.get("direct"),
-          "-n/-t/-d are independent and combinable")
+    check(seen.get("net") and seen.get("env_capture") and seen.get("direct"),
+          "-n/-e/-d are independent and combinable")
     check(seen.get("cmd") == ["ls", "-la"], "flags before `--`, args (incl. -la) after")
     check(seen.get("wl") == ["ex.com"], "-w whitelist parsed")
 

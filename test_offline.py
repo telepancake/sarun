@@ -113,7 +113,7 @@ def test_process_and_env_tables_dedup_and_tag():
         # tgid as the root first; the bubble-up then stops at it: one process row.
         sid = "1002"
         backing = m.live_dir(sid); (backing / "up").mkdir(parents=True)
-        idx = m.Index(backing); idx.set_tracing(True)
+        idx = m.Index(backing); idx.set_env_capture(True)
         root_prov = m.read_provenance(os.getpid(), full_env=True)
         idx.process_from_prov(dict(tgid=m.tgid_of(os.getpid()),
                                    ppid=m.tgid_of(root_prov["ppid"]) if root_prov.get("ppid") else 0,
@@ -217,7 +217,7 @@ def test_process_table_is_one_connected_tree():
     try:
         sid = "2000"
         backing = m.live_dir(sid); (backing / "up").mkdir(parents=True)
-        idx = m.Index(backing); idx.set_tracing(True)
+        idx = m.Index(backing); idx.set_env_capture(True)
         # 3c records the root row at register; emulate it (root never bubbles).
         idx.process_from_prov(dict(tgid=ROOT, ppid=0, exe="", argv=["root"], env={}))
         # First op by the deepest process: record LEAF -> bubble LEAF->MID->ROOT.

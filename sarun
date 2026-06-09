@@ -87,7 +87,8 @@ reach its own descendants via /<KIDS_DIR>). Same uid as the UI, so no allow_othe
 
 Options (slopbox [FLAGS] -- CMD ...; the command MUST follow `--`):
   -n         enable networking via mitmproxy (default: off)
-  -t         enable process tracing (default: off)
+  -e         capture each writer's environment (default: off)
+  -t         pass stdout/stderr straight through, no capture (default: capture)
   -d         direct host access / no capture (default: off)
   -w HOST    pre-allow HOST for this session (repeatable)
   -C DIR     working directory inside the slopbox (default: cwd)
@@ -606,6 +607,18 @@ def relay_dir(box_id) -> Path:
 def relay_sock_path(box_id) -> str:
     return str(relay_dir(box_id) / "relay.sock")
 
+def echo_sock_path(box_id) -> str:
+    """The per-session echo socket, alongside relay.sock in the chan dir (which is
+    bind-mounted into the box). The UI's EchoServer listens here; --inner connects
+    to receive captured stdout/stderr bytes and replay them on the real terminal."""
+    return str(relay_dir(box_id) / "echo.sock")
+
+# Hidden capture-sink files at the box root: the child's stdout/stderr are pointed at
+# these via O_WRONLY so its writes flow THROUGH FUSE, giving per-write ctx.pid
+# attribution. They resolve by exact name (lookup) but are NOT listed in readdir.
+SINK_STDOUT_REL = ".slopbox-stdout"
+SINK_STDERR_REL = ".slopbox-stderr"
+
 def mnt_point() -> Path:
     """The single pyfuse3 mountpoint the UI owns; box subfolders live under it as
     <mnt>/<box_id>. Empty at rest."""
@@ -941,7 +954,7 @@ def _dns_handle_packet(pkt: bytes, dns: SyntheticDNS) -> "bytes | None":
     return _dns_build_response(pkt, txid, rcode=0)
 
 
-def run_inner(channel_path: str, cmd: list) -> int:
+def run_inner(channel_path: str, cmd: list, echo_path: str = "") -> int:
     stop = threading.Event()
     dns = SyntheticDNS()
 
@@ -1108,15 +1121,73 @@ def run_inner(channel_path: str, cmd: list) -> int:
     # (bash/dash) save and restore the terminal's foreground group without hitting
     # "Cannot set tty process group (No such process)". The command gets its own
     # process group and the terminal handed to it; restored when it exits.
+    # ── capture mode: child stdout/stderr → sink files; echo replays live ────────
+    # The sinks are hidden files at the box ROOT ('/'); opening them O_WRONLY and using
+    # them as the child's stdout/stderr makes every write flow THROUGH the FUSE layer
+    # (so the UI records it with the writer's ctx.pid). A reader thread decodes the echo
+    # frames the UI streams back and writes each payload to OUR real fd 1/2, so the user
+    # sees output live. stdin stays INHERITED (unchanged).
+    out_fd = err_fd = -1
+    echo_conn = None
+    echo_done = threading.Event()
+    if echo_path:
+        try:
+            out_fd = os.open("/" + SINK_STDOUT_REL, os.O_WRONLY)
+            err_fd = os.open("/" + SINK_STDERR_REL, os.O_WRONLY)
+        except OSError as e:
+            print(f"slopbox(inner): cannot open capture sinks: {e}", file=sys.stderr)
+            for fd in (out_fd, err_fd):
+                if fd >= 0:
+                    try: os.close(fd)
+                    except OSError: pass
+            out_fd = err_fd = -1
+        if out_fd >= 0:
+            try:
+                echo_conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                echo_conn.connect(echo_path)
+            except OSError:
+                echo_conn = None       # no live replay; the box still records output
+            if echo_conn is not None:
+                def _echo_reader(conn):
+                    # Decode framed (stream, payload) and replay to the real terminal.
+                    buf = b""
+                    real = {0: 1, 1: 2}
+                    try:
+                        while True:
+                            chunk = conn.recv(65536)
+                            if not chunk:
+                                break                  # EOF: UI half-closed after flush
+                            buf += chunk
+                            frames, buf = echo_decode(buf)
+                            for stream, payload in frames:
+                                fd = real.get(stream, 1)
+                                try: os.write(fd, payload)
+                                except OSError: pass
+                    except OSError:
+                        pass
+                    finally:
+                        echo_done.set()
+                threading.Thread(target=_echo_reader, args=(echo_conn,),
+                                 daemon=True).start()
+
     tty_fd = next((fd for fd in (0, 1, 2) if os.isatty(fd)), None)
     old_fg = None
     if tty_fd is not None:
         try: old_fg = os.tcgetpgrp(tty_fd)
         except OSError: old_fg = None
+    # In capture mode the child's stdout/stderr ARE the sink fds (not a tty); stdin is
+    # inherited. Otherwise (-t passthrough) keep today's inherited-terminal behavior.
+    popen_kw = {}
+    if out_fd >= 0 and err_fd >= 0:
+        popen_kw = dict(stdout=out_fd, stderr=err_fd)
     try:
-        proc = subprocess.Popen(cmd, preexec_fn=os.setpgrp)
+        proc = subprocess.Popen(cmd, preexec_fn=os.setpgrp, **popen_kw)
     except FileNotFoundError:
         print(f"slopbox(inner): command not found: {cmd[0]}", file=sys.stderr)
+        for fd in (out_fd, err_fd):
+            if fd >= 0:
+                try: os.close(fd)
+                except OSError: pass
         return 127
     try: os.setpgid(proc.pid, proc.pid)
     except OSError: pass
@@ -1130,6 +1201,17 @@ def run_inner(channel_path: str, cmd: list) -> int:
     except KeyboardInterrupt:
         proc.terminate()
         code = proc.wait()
+    # Close our copies of the sink fds so the FUSE `release` fires; that makes the UI
+    # flush the echo queue and half-close echo.sock. Then wait for the reader to drain
+    # all remaining bytes to the real terminal (so trailing output is never truncated).
+    for fd in (out_fd, err_fd):
+        if fd >= 0:
+            try: os.close(fd)
+            except OSError: pass
+    if echo_conn is not None:
+        echo_done.wait(timeout=5.0)
+        try: echo_conn.close()
+        except OSError: pass
     if tty_fd is not None:
         if old_fg is not None:
             try: os.tcsetpgrp(tty_fd, old_fg)
@@ -1854,6 +1936,9 @@ def build_file_patch(rel, lower, upper, created, deleted) -> dict:
 #   env(id, hash, env) — unique environment json, deduped by hash.
 #   meta(key, value) — small per-box strings (e.g. the box's display `name`).
 #   flows(...) — every gated request/response for the box.
+#   outputs(id, ts, process_id, stream, content) — one row per captured stdout/
+#       stderr write (stream 0=stdout, 1=stderr), attributed per-write to the
+#       writing process (process_id FK) via the FUSE sink write handler's ctx.pid.
 #
 # `up/` is the box-backing sentinel only. Regular-file bytes live in pool blobs;
 # dirs and symlinks have no on-disk artifact — their rows are the truth, served
@@ -1934,7 +2019,13 @@ def _open_raw(path) -> "sqlite3.Connection":
             " id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, action TEXT,"
             " method TEXT, scheme TEXT, host TEXT, port INT, url TEXT, status INT,"
             " process_id INT, req_headers TEXT, req_len INT, req_body BLOB,"
-            " resp_headers TEXT, resp_len INT, resp_body BLOB);")
+            " resp_headers TEXT, resp_len INT, resp_body BLOB);"
+            # outputs: one row per captured stdout/stderr write, attributed to the
+            # writing process (process_id) via per-write ctx.pid. stream 0=stdout,
+            # 1=stderr. content is the raw bytes of that one write.
+            "CREATE TABLE IF NOT EXISTS outputs("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, process_id INT,"
+            " stream INT, content BLOB);")
         conn.execute(f"PRAGMA user_version = {_SQLAR_SCHEMA_VERSION}")
         conn.commit()
     return conn
@@ -2410,6 +2501,56 @@ def has_flows(path) -> bool:
     finally: conn.close()
 
 
+# ── captured stdout/stderr (mirrors the flows readers) ───────────────────────
+def outputs_add(path, rec: dict) -> None:
+    """Append one captured stdout/stderr write to the box's sqlar. Standalone helper
+    (mirrors flows_add); the live box writes through Index.add_output instead."""
+    content = rec.get("content") or b""
+    conn = _sqlar_open(path)
+    try:
+        conn.execute(
+            "INSERT INTO outputs(ts,process_id,stream,content) VALUES(?,?,?,?)",
+            (rec.get("ts", time.time()), rec.get("process_id"),
+             int(rec.get("stream", 0)), sqlite3.Binary(content)))
+        conn.commit()
+    finally:
+        conn.close()
+
+def outputs_list(path) -> list:
+    # Omit `content` from the listing (it can be large); callers fetch it per-row.
+    path = Path(path)
+    if not path.exists(): return []
+    conn = _sqlar_open(path); conn.row_factory = sqlite3.Row
+    try:
+        return [dict(r) for r in conn.execute(
+            "SELECT id,ts,process_id,stream,length(content) AS len"
+            " FROM outputs ORDER BY id").fetchall()]
+    except sqlite3.Error:
+        return []
+    finally:
+        conn.close()
+
+def outputs_get(path, oid) -> "dict | None":
+    path = Path(path)
+    if not path.exists(): return None
+    conn = _sqlar_open(path); conn.row_factory = sqlite3.Row
+    try:
+        r = conn.execute("SELECT * FROM outputs WHERE id=?", (oid,)).fetchone()
+        return dict(r) if r else None
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+
+def has_outputs(path) -> bool:
+    path = Path(path)
+    if not path.exists(): return False
+    conn = _sqlar_open(path)
+    try: return bool(conn.execute("SELECT EXISTS(SELECT 1 FROM outputs)").fetchone()[0])
+    except sqlite3.Error: return False
+    finally: conn.close()
+
+
 # ════════════════════════════════════════════════════════════════════════════
 #  Session model & box metadata helpers
 # ════════════════════════════════════════════════════════════════════════════
@@ -2617,7 +2758,7 @@ def root_cmd(sid: str) -> list:
 #: explicitly [cyan]apply[/] (§9). Every write is recorded in a per-box [cyan].sqlar[/] database (an SQLite
 #: archive) so the UI can show exactly what changed and let you review diffs.
 #: Each captured write also records its [b]provenance[/] — the pid, exe and argv of the process
-#: that made it — visible in the Processes pane. Add [cyan]-t[/] to also capture each writer's full
+#: that made it — visible in the Processes pane. Add [cyan]-e[/] to also capture each writer's full
 #: environment (off by default; provenance itself is always recorded).
 #: [cyan]-d[/] ([b]direct[/]) opts a box out of all of this: no overlay, no capture — its writes go
 #: straight to the real filesystem like a normal command. Use it only for trusted commands.
@@ -2686,8 +2827,8 @@ def read_provenance(pid: int, full_env: bool = False) -> dict:
     the write handler while the caller is still blocked (and thus still in /proc).
     Every field is best-effort — a vanished pid yields zeros/empties, never raises
     (/proc reads are the one place best-effort OSError is acceptable). full_env
-    captures the whole environment (for the process table when tracing is on);
-    otherwise only the small _PROV_ENV_KEYS subset is kept."""
+    captures the whole environment (for the process table when -e env capture is
+    on); otherwise only the small _PROV_ENV_KEYS subset is kept."""
     info = dict(pid=int(pid), ppid=0, exe="", cwd="", argv=[], env={}, start_time=0)
     base = f"/proc/{pid}"
     try:
@@ -2793,10 +2934,10 @@ class Index:
     self._lock); the UI thread reads concurrently and relies on the lock for
     SQLite safety and GIL-protected dict reads for the RAM mirror.
 
-    A box's process tracing (when -t is on) records each unique tgid into the
-    `process` table here, deduping its environment via the `env` table; the
-    process row id tags both modified file entries (the `writer` column) and
-    network flows."""
+    A box always records each unique tgid into the `process` table here; with -e
+    (env capture) on it also dedups the writer's full environment via the `env`
+    table. The process row id tags modified file entries (the `writer` column),
+    network flows, and captured stdout/stderr outputs."""
 
     def __init__(self, backing: Path):
         self.backing = Path(backing)
@@ -2823,7 +2964,7 @@ class Index:
         # come from the UI thread; the dict is GIL-atomic like the other RAM mirrors.
         self._active: dict = {}           # tgid -> last-seen monotonic
         self._dead_since: dict = {}       # tgid -> first monotonic kill(0) saw it dead
-        self._tracing = False             # -t: record the process table
+        self._env_capture = False         # -e: capture each writer's full environment
         # The box's hierarchy ROOTS: the process-table ROW IDS of every `slopbox -- cmd`
         # launch (one per run; a re-run adds another). Newly-inserted process rows bubble
         # up their PPid chain until they reach a root, so the table stays one connected
@@ -2840,8 +2981,8 @@ class Index:
         # Stable pool id == the box's identity == the backing dir / sqlar stem.
         self.box_id = int(self.backing.name)
 
-    def set_tracing(self, on: bool) -> None:
-        self._tracing = bool(on)
+    def set_env_capture(self, on: bool) -> None:
+        self._env_capture = bool(on)
 
     def _load_mirror(self) -> None:
         for path, mode, opaque, sz, data in self._db.execute(
@@ -2951,11 +3092,11 @@ class Index:
         stale one. Always returns an id even if /proc is gone. The id tags the file entry."""
         tgid = tgid_of(pid)
         self._touch_active(tgid)                 # active-set: re-stamp on every sight
-        # When tracing, capture the FULL environment for the process table; the
+        # With env capture on, grab the FULL environment for the process table; the
         # subset-cached provenance_of() is enough otherwise. Resolve the parent to
         # its tgid and hand off to the single insert/dedup path (which also bubbles
         # the PPid chain up to the box root so the table stays one connected tree).
-        prov = read_provenance(pid, full_env=True) if self._tracing \
+        prov = read_provenance(pid, full_env=True) if self._env_capture \
             else self.provenance_of(pid)
         start = int(prov.get("start_time") or 0)
         cached = self._proc_cache.get((tgid, start))
@@ -3011,7 +3152,7 @@ class Index:
                 _seen=prov.get("_bubble_seen") or None)
         with self._lock:
             eid = None
-            if self._tracing:
+            if self._env_capture:
                 env_json = json.dumps(env, sort_keys=True)
                 env_hash = hashlib.sha256(env_json.encode()).hexdigest()
                 self._db.execute("INSERT OR IGNORE INTO env(hash,env) VALUES(?,?)",
@@ -3062,7 +3203,7 @@ class Index:
             self._proc_current[ptgid] = (pstart, cached)
             return cached
         try:
-            pprov = read_provenance(ppid, full_env=self._tracing)
+            pprov = read_provenance(ppid, full_env=self._env_capture)
         except OSError:
             pprov = dict(ppid=0, exe="", argv=[], env={}, start_time=pstart)
         # A live parent yields its own ppid (walk continues up); a vanished parent
@@ -3141,6 +3282,19 @@ class Index:
                  sqlite3.Binary(rb[:_FLOW_BODY_CAP]),
                  _hdr_text(fl.get("resp_headers")), len(pb),
                  sqlite3.Binary(pb[:_FLOW_BODY_CAP])))
+            self._db.commit()
+
+    def add_output(self, process_id: "int | None", stream: int, content: bytes,
+                   ts: "float | None" = None) -> None:
+        """Append one captured stdout/stderr write to the box's single sqlar via THIS
+        handle (the one writer, under self._lock) — mirrors add_flow. `process_id` is the
+        writer's process-table row id (already resolved via writer_for(ctx.pid) in the
+        sink write handler); stream 0=stdout, 1=stderr; content is that write's bytes."""
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO outputs(ts,process_id,stream,content) VALUES(?,?,?,?)",
+                (ts if ts is not None else time.time(), process_id, int(stream),
+                 sqlite3.Binary(content)))
             self._db.commit()
 
     def provenance_of(self, pid: int) -> dict:
@@ -3454,6 +3608,7 @@ def _build_overlay_ops():
     this module (e.g. the --inner forwarder, or offline tests) does not require
     pyfuse3/trio. Returns the class."""
     import pyfuse3
+    import trio
 
     # Short timeouts for an untrusted, mutating mount: a box can change the merged
     # view at any moment (copy-up, whiteout, opaque), so the kernel must not cache
@@ -3490,6 +3645,9 @@ def _build_overlay_ops():
             self._fd_table: dict = {}     # fh -> open fd (regular files)
             self._fh_sid: dict = {}       # fh -> sid (so teardown can close a box's fds)
             self._vfh: dict = {}          # fh -> (sid, rel, bytes) for virtual reads
+            self._sink_fh: dict = {}      # fh -> (sid, rel, stream) for capture sinks
+            self._echo_enqueue: dict = {} # sid -> callable(stream, bytes)->cf.Future
+            self._echo_flush: dict = {}   # sid -> callable() flush+half-close the echo
             self._dir_snaps: dict = {}    # fh -> DirHandle(inode, snapshot)
             self._next_fh = 1
             # auto_cache bookkeeping: inode -> (size, mtime_ns) last handed to the
@@ -3526,6 +3684,7 @@ def _build_overlay_ops():
             # through the parent, down to the real host at the root box.
             with self._lock:
                 self.sessions[sid] = dict(up=Path(up), index=index, virtual={},
+                                          sinks={},
                                           passthrough=bool(passthrough),
                                           parent=parent or None, box_path="",
                                           frules=load_file_rules())
@@ -3588,6 +3747,11 @@ def _build_overlay_ops():
                             try: os.close(sfd)
                             except OSError: pass
                         self._close_src_fd(wb)   # lazy handle's source read fd
+                # Drop any still-open capture-sink fhs + the echo callbacks for this box.
+                for fh in [f for f, (s, _r, _st) in self._sink_fh.items() if s == sid]:
+                    self._sink_fh.pop(fh, None)
+                self._echo_enqueue.pop(sid, None)
+                self._echo_flush.pop(sid, None)
             # Remove this child from any base-session child-set; detach bases that are
             # now unreferenced (child-set empty and base is not also a live session).
             for psid, children in list(self._base_children.items()):
@@ -3668,6 +3832,26 @@ def _build_overlay_ops():
         def add_virtual(self, sid: str, rel: str, content: bytes) -> None:
             s = self.sessions.get(sid)
             if s is not None: s["virtual"][rel.lstrip("/")] = content
+
+        # ── capture sinks (stdout/stderr) ───────────────────────────────────
+        def add_sink(self, sid: str, rel: str, stream: int) -> None:
+            """Register a hidden write-sink file at <sid>/<rel>. Its writes never become
+            file bytes; each is recorded to `outputs` (attributed per-write via ctx.pid)
+            and echoed live. stream 0=stdout, 1=stderr."""
+            s = self.sessions.get(sid)
+            if s is not None: s["sinks"][rel.lstrip("/")] = int(stream)
+
+        def _is_sink(self, sid: str, rel: str) -> bool:
+            s = self.sessions.get(sid)
+            return bool(s and rel in s["sinks"])
+
+        def set_echo_queue(self, sid: str, enqueue, flush=None) -> None:
+            """Attach the per-session echo enqueue callable (EchoServer.enqueue) and an
+            optional flush callable (EchoServer.flush_and_close). The sink write handler
+            calls enqueue to stream captured bytes; release calls flush when the last
+            sink closes, so --inner drains trailing output before exiting."""
+            self._echo_enqueue[sid] = enqueue
+            if flush is not None: self._echo_flush[sid] = flush
 
         # ── inode bookkeeping ───────────────────────────────────────────────
         def _ino_for(self, sid: str, rel: str) -> int:
@@ -4260,6 +4444,24 @@ def _build_overlay_ops():
             a.entry_timeout = ENTRY_TIMEOUT
             return a
 
+        def _sink_attrs(self, ino: int) -> "pyfuse3.EntryAttributes":
+            # A capture sink is a synthetic, write-targeted regular file: size 0, mode
+            # writable. The child only ever opens it O_WRONLY.
+            a = pyfuse3.EntryAttributes()
+            a.st_ino = ino
+            a.st_mode = stat_mod.S_IFREG | 0o666
+            a.st_nlink = 1
+            a.st_uid = self.squash_uid
+            a.st_gid = self.squash_gid
+            a.st_size = 0
+            a.st_blksize = 512
+            a.st_blocks = 0
+            now = time.time_ns()
+            a.st_atime_ns = a.st_mtime_ns = a.st_ctime_ns = now
+            a.attr_timeout = ATTR_TIMEOUT
+            a.entry_timeout = ENTRY_TIMEOUT
+            return a
+
         def _neg_entry(self) -> "pyfuse3.EntryAttributes":
             a = pyfuse3.EntryAttributes()
             a.st_ino = 0
@@ -4361,6 +4563,10 @@ def _build_overlay_ops():
                 ino = self._ino_for(sid, rel)
                 self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
                 return self._virtual_attrs(sid, rel, ino)
+            if self._is_sink(sid, rel):
+                ino = self._ino_for(sid, rel)
+                self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
+                return self._sink_attrs(ino)
             layer, _ap, st = self._resolve_st(sid, rel)
             if layer in ("absent", "whiteout"):
                 return self._neg_entry()
@@ -4387,6 +4593,8 @@ def _build_overlay_ops():
                 return self._synth_dir_attrs(inode)
             if self._is_virtual(sid, rel):
                 return self._virtual_attrs(sid, rel, inode)
+            if self._is_sink(sid, rel):
+                return self._sink_attrs(inode)
             layer, _ap, st = self._resolve_st(sid, rel)
             if layer in ("absent", "whiteout"):
                 raise pyfuse3.FUSEError(errno.ENOENT)
@@ -4719,6 +4927,16 @@ def _build_overlay_ops():
             if key is None: raise pyfuse3.FUSEError(errno.EISDIR)
             sid, rel = key
             writable = (flags & (os.O_WRONLY | os.O_RDWR)) != 0
+            if self._is_sink(sid, rel):
+                # A capture sink: register the fh carrying (sid, rel, stream). direct_io
+                # is REQUIRED so each write reaches write() synchronously with the real
+                # writer's ctx.pid — a writeback cache would flush via a kernel thread
+                # whose pid is not the workload's, breaking per-write attribution.
+                stream = self.sessions[sid]["sinks"][rel]
+                with self._lock:
+                    fh = self._next_fh; self._next_fh += 1
+                self._sink_fh[fh] = (sid, rel, stream)
+                return pyfuse3.FileInfo(fh=fh, direct_io=True, keep_cache=False)
             if self._is_virtual(sid, rel) and not writable:
                 content = self.sessions[sid]["virtual"][rel]
                 with self._lock:
@@ -4867,9 +5085,28 @@ def _build_overlay_ops():
                 self._req_exit()
 
         async def write(self, fh, off, buf, ctx):
-            # `ctx` (writer uid/gid/pid, surfaced by our patched pyfuse3) is
-            # threaded through for the forthcoming stdout/stderr capture feature;
-            # the write path does not consume it yet.
+            # `ctx` (writer uid/gid/pid, surfaced by our patched pyfuse3) carries the
+            # WRITING process's pid — the whole point of the patch. The capture sinks
+            # consume it for per-write attribution; the file-write path below leaves it
+            # untouched (open() already attributed the writer there).
+            sink = self._sink_fh.get(fh)
+            if sink is not None:
+                sid, _rel, stream = sink
+                data = bytes(buf)
+                # PER-WRITE attribution: resolve this exact write's pid → process row.
+                wid = self._index(sid).writer_for(ctx.pid)
+                self._index(sid).add_output(wid, stream, data)
+                # Live echo: enqueue onto the per-session bounded queue and AWAIT it, so a
+                # slow consumer backpressures just this request (the .result() blocks in a
+                # trio worker thread, suspending this coroutine — other requests proceed).
+                enq = self._echo_enqueue.get(sid)
+                if enq is not None:
+                    fut = enq(stream, data)
+                    try:
+                        await trio.to_thread.run_sync(fut.result)
+                    except Exception:
+                        pass                        # echo best-effort; the row is durable
+                return len(buf)                     # never stored as file bytes
             # Captured write: splice into the handle's backing.
             wb = self._wbuf.get(fh)
             if wb is not None:
@@ -4940,6 +5177,17 @@ def _build_overlay_ops():
         async def release(self, fh):
             if fh in self._vfh:
                 self._vfh.pop(fh, None); return
+            sink = self._sink_fh.pop(fh, None)
+            if sink is not None:
+                sid = sink[0]
+                # When the child's last sink fd closes, flush the echo queue and
+                # half-close so --inner drains all remaining bytes before exiting.
+                if not any(s == sid for (s, _r, _st) in self._sink_fh.values()):
+                    flush = self._echo_flush.get(sid)
+                    if flush is not None:
+                        try: flush()
+                        except Exception: pass
+                return
             # Write-handle release: an unmaterialized handle never captured anything
             # (no row, no blob, no mtime bump) — so a non-modifying open is simply
             # forgotten. A materialized handle commits: spilled blob stays resident,
@@ -7795,6 +8043,7 @@ class Supervisor:
         # any session, nor gate its traffic as another sid.
         self._owner_tokens: dict = {}     # sid -> random token (kept OUTSIDE the box)
         self._relays: dict = {}           # sid -> RelayServer
+        self._echoes: dict = {}           # sid -> EchoServer (capture-mode live echo)
         self._relay_loop = None           # asyncio loop the relays run on
         self._relay_engine = None         # ProxyEngine relays hand FDs to
         self.sessions.update(discover_sessions())
@@ -7989,9 +8238,34 @@ class Supervisor:
             try: rs.stop()
             except Exception: pass
 
+    def _start_echo(self, sid: str) -> "EchoServer | None":
+        """Create + start this box's echo server on echo_sock_path(sid) (alongside the
+        relay socket in the chan dir, bind-mounted into the box). None if no asyncio loop
+        is attached (offline tests / no relay machinery), in which case capture still
+        records to the table — only the live replay is absent."""
+        if self._relay_loop is None:
+            return None
+        self._stop_echo(sid)
+        es = EchoServer(sid, echo_sock_path(sid), self._relay_loop)
+        try:
+            es.start()
+        except OSError as e:
+            print(f"slopbox(ui): echo socket for {sid} failed: {e}", file=sys.stderr)
+            return None
+        self._echoes[sid] = es
+        return es
+
+    def _stop_echo(self, sid: str) -> None:
+        es = self._echoes.pop(sid, None)
+        if es is not None:
+            try: es.stop()
+            except Exception: pass
+
     def stop_all_relays(self) -> None:
         for sid in list(self._relays):
             self._stop_relay(sid)
+        for sid in list(self._echoes):
+            self._stop_echo(sid)
 
     def _emit(self, **ev: Any) -> None:
         # Decorate any session dict with its DERIVED dotted display path (presentation
@@ -8190,9 +8464,10 @@ class Supervisor:
             index = Index(backing)
         except (OSError, sqlite3.Error) as e:
             return dict(ok=False, error=f"overlay setup failed: {e}")
-        trace = bool(msg.get("want_trace"))
+        env_capture = bool(msg.get("want_env"))
         direct = bool(msg.get("want_direct"))
-        index.set_tracing(trace)
+        want_capture = bool(msg.get("want_capture"))
+        index.set_env_capture(env_capture)
         # The box's ROOT process row: tgid == the runner's host pid, argv == the workload
         # command. Prefer the pidfd-derived HOST pid; the runner's self-reported
         # os.getpid() is box-namespaced when the runner is itself inside a box.
@@ -8260,11 +8535,27 @@ class Supervisor:
         self._owner_tokens[sid] = token
         # HIGH-1: a networked box gets its OWN relay socket, bound into only that box.
         relay = self._start_relay(sid) if net else None
+        # Capture mode (default; suppressed by -t): expose the two hidden sink files at
+        # the box root so the child's stdout/stderr write THROUGH the FUSE layer (giving
+        # us per-write ctx.pid attribution), and start the echo server that streams the
+        # captured bytes back to --inner for live display on the real terminal.
+        echo = None
+        if want_capture and self.mount is not None and self.mount.ops is not None:
+            self.mount.ops.add_sink(sid, SINK_STDOUT_REL, 0)
+            self.mount.ops.add_sink(sid, SINK_STDERR_REL, 1)
+            echo = self._start_echo(sid)
+            if echo is not None:
+                self.mount.ops.set_echo_queue(sid, echo.enqueue, echo.flush_and_close)
         self._emit(type="session_added", session=s.to_dict())
         ack = dict(ok=True, mount=box_root, shm_dir=str(backing), net=net,
-                   owner_token=token, box_id=int(sid), session_id=sid, name=name)
+                   owner_token=token, box_id=int(sid), session_id=sid, name=name,
+                   capture=want_capture)
         if relay is not None:
             ack["relay"] = relay
+        # Advertise echo.sock only if its server actually started (else the runner skips
+        # live replay; capture still records every write through the sinks).
+        if echo is not None:
+            ack["echo"] = echo_sock_path(sid)
         # NESTED LAUNCH: nothing extra to send. A nested runner roots bwrap by binding
         # the parent-exposed synthetic path /<KIDS_DIR>/<sid> (the child's overlay root,
         # served by the same FUSE mount and reachable inside the parent). No fd-passing.
@@ -8323,6 +8614,7 @@ class Supervisor:
                   file=sys.stderr)
             return None
         self._stop_relay(sid)
+        self._stop_echo(sid)
         self._owner_tokens.pop(sid, None)
         s = self.sessions.get(sid)
         reported_status = msg.get("status", "finished")
@@ -8424,6 +8716,7 @@ class Supervisor:
                   file=sys.stderr)
             return
         self._stop_relay(sid)
+        self._stop_echo(sid)
         self._owner_tokens.pop(sid, None)
         _s = self.sessions.pop(sid, None)
         if _s is not None:
@@ -8524,6 +8817,12 @@ class Supervisor:
 
     def flow_detail(self, sid, fid) -> "dict | None":
         return flows_get(sqlar_path(sid), fid)
+
+    def outputs(self, sid) -> list:
+        return outputs_list(sqlar_path(sid))
+
+    def output_detail(self, sid, oid) -> "dict | None":
+        return outputs_get(sqlar_path(sid), oid)
 
     # ── in-flight ("open") flows: the live Network pane's source ───────────────
     def note_flow_open(self, sid, rec: dict) -> None:
@@ -9138,6 +9437,157 @@ class RelayServer:
         except FileNotFoundError: pass
 
 
+# ════════════════════════════════════════════════════════════════════════════
+#  Output capture echo channel (UI → --inner live replay)
+# ════════════════════════════════════════════════════════════════════════════
+# When a box runs in capture mode (the default; -t opts out), its child's stdout/
+# stderr are pointed at the two hidden FUSE sink files. The sink write() handler
+# records every write to the `outputs` table (attributed per-write via ctx.pid) AND
+# enqueues (stream, bytes) onto a per-session bounded queue. A per-session drain task
+# frames those onto echo.sock, where --inner (inside the box) reads them and replays
+# each payload to the REAL fd 1/2 so the user sees output live. The bounded queue +
+# `await put` applies BACKPRESSURE to the one slow FUSE write (suspending just that
+# trio request) without blocking the event loop.
+
+# Wire frame: [stream:1][len:4 big-endian][payload]. Module-level codec so it is
+# unit-testable without a socket.
+def echo_encode_frame(stream: int, payload: bytes) -> bytes:
+    return bytes([stream & 0xFF]) + struct.pack("!I", len(payload)) + payload
+
+def echo_decode(buf: bytes) -> "tuple[list, bytes]":
+    """Decode as many whole frames as `buf` holds. Returns (frames, remainder) where
+    frames is [(stream, payload)] and remainder is the trailing partial frame (carry it
+    into the next call). Pure: a stream reader feeds bytes in and re-feeds the
+    remainder, so a frame split across reads reassembles."""
+    out = []
+    i = 0
+    n = len(buf)
+    while n - i >= 5:
+        stream = buf[i]
+        (plen,) = struct.unpack("!I", buf[i + 1:i + 5])
+        if n - (i + 5) < plen:
+            break                                  # partial payload: stop, keep remainder
+        out.append((stream, buf[i + 5:i + 5 + plen]))
+        i += 5 + plen
+    return out, buf[i:]
+
+
+_ECHO_QUEUE_MAX = 256       # bounded: a slow echo consumer backpressures one FUSE write
+
+
+class EchoServer:
+    """Per-session UI-side echo endpoint. Listens on echo_sock_path(sid); the sink
+    write() handler calls enqueue((stream, bytes)) (awaitable, bounded → backpressure);
+    a drain task frames the queued bytes to the single connected --inner client. On
+    close (both sinks released at child exit) the queue is flushed and the connection is
+    closed half-way so --inner drains remaining bytes (no truncation), then EOF.
+
+    Robust if --inner never connects or drops early: enqueue never blocks forever — when
+    no client is attached we keep at most _ECHO_QUEUE_MAX frames and drop the oldest, so
+    the table still records every write and the sink writes never deadlock."""
+    def __init__(self, sid: str, sock_path: str, loop: asyncio.AbstractEventLoop):
+        self.sid = sid; self.sock_path = sock_path; self._loop = loop
+        self._sock = None; self._accept_task = None; self._drain_task = None
+        self._queue: "asyncio.Queue" = asyncio.Queue(maxsize=_ECHO_QUEUE_MAX)
+        self._writer: "asyncio.StreamWriter | None" = None
+        self._closing = False
+
+    def start(self) -> None:
+        try: os.makedirs(os.path.dirname(self.sock_path), mode=0o700, exist_ok=True)
+        except OSError: pass
+        try: os.unlink(self.sock_path)
+        except FileNotFoundError: pass
+        self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._sock.bind(self.sock_path)
+        try: os.chmod(self.sock_path, 0o600)
+        except OSError: pass
+        self._sock.listen(1)
+        self._sock.setblocking(False)
+        self._accept_task = asyncio.create_task(self._accept_loop())
+        self._drain_task = asyncio.create_task(self._drain_loop())
+
+    def enqueue(self, stream: int, payload: bytes) -> "asyncio.Future":
+        """Schedule (stream, payload) onto the bounded queue from ANOTHER thread (the
+        FUSE serve/trio thread). Returns a concurrent.futures.Future the caller awaits
+        (off the asyncio loop) so a full queue applies backpressure to that one write.
+        Never deadlocks: if the queue is full and no client is attached, the oldest frame
+        is dropped so the put completes — the table already has the bytes."""
+        async def _put():
+            if self._closing:
+                return
+            if self._writer is None and self._queue.full():
+                try: self._queue.get_nowait()      # no consumer: drop oldest, never block
+                except asyncio.QueueEmpty: pass
+            await self._queue.put((stream, payload))
+        return asyncio.run_coroutine_threadsafe(_put(), self._loop)
+
+    async def _accept_loop(self) -> None:
+        while True:
+            try:
+                conn, _ = await self._loop.sock_accept(self._sock)
+            except (OSError, asyncio.CancelledError):
+                break
+            conn.setblocking(False)
+            # Single consumer: replace any prior writer (a reconnecting --inner).
+            _reader, writer = await asyncio.open_connection(sock=conn)
+            self._writer = writer
+
+    async def _drain_loop(self) -> None:
+        while True:
+            try:
+                stream, payload = await self._queue.get()
+            except asyncio.CancelledError:
+                break
+            if stream is None:                      # sentinel: flush done, close client
+                await self._close_writer()
+                continue
+            w = self._writer
+            if w is None:
+                continue                            # no client yet: bytes already recorded
+            try:
+                w.write(echo_encode_frame(stream, payload))
+                await w.drain()
+            except (OSError, ConnectionError):
+                self._writer = None
+
+    async def _close_writer(self) -> None:
+        w = self._writer
+        if w is not None:
+            try:
+                if w.can_write_eof(): w.write_eof()
+                await w.drain()
+            except (OSError, ConnectionError):
+                pass
+            try: w.close()
+            except OSError: pass
+            self._writer = None
+
+    def flush_and_close(self) -> None:
+        """Both sinks released (child exited): drain the queue to the client, then EOF so
+        --inner reads all remaining bytes before exiting. Idempotent."""
+        if self._closing: return
+        self._closing = True
+        # A None-stream sentinel ordered AFTER all queued frames triggers the half-close
+        # once the drain task has flushed everything ahead of it.
+        try: asyncio.run_coroutine_threadsafe(
+                self._queue.put((None, b"")), self._loop)
+        except RuntimeError: pass
+
+    def stop(self) -> None:
+        self._closing = True
+        for t in (self._accept_task, self._drain_task):
+            if t is not None: t.cancel()
+        if self._writer is not None:
+            try: self._writer.close()
+            except OSError: pass
+            self._writer = None
+        try:
+            if self._sock is not None: self._sock.close()
+        except OSError: pass
+        try: os.unlink(self.sock_path)
+        except FileNotFoundError: pass
+
+
 def _host_pid_from_pidfd(pidfd: int) -> int:
     """Resolve a pidfd to a HOST-namespace pid by parsing /proc/self/fdinfo/<pidfd>.
 
@@ -9648,8 +10098,9 @@ def run_on_untrusted(argv, files, timeout=10, out_cap=256 * 1024, on_spawn=None)
 #:
 #: The command [b]must[/] follow [cyan]--[/]. Flags go before it (a bare [cyan]slopbox ls[/] is rejected).
 #:   [cyan]-n[/]        enable outbound networking via mitmproxy (default: off — loopback only)
-#:   [cyan]-t[/]        trace processes: also capture each writer's full environment, not just
-#:             its pid/exe/argv (provenance is always captured; [cyan]-t[/] adds the env)
+#:   [cyan]-e[/]        also capture each writer's full environment, not just its pid/exe/argv
+#:             (provenance is always captured; [cyan]-e[/] adds the env)
+#:   [cyan]-t[/]        pass stdout/stderr straight through (no capture; default is to capture them)
 #:   [cyan]-d[/]        direct host access — no overlay, no capture (for trusted commands)
 #:   [cyan]-w HOST[/]   pre-allow HOST for this session (repeatable)
 #:   [cyan]-C DIR[/]    working directory inside the slopbox (default: current directory)
@@ -9664,7 +10115,8 @@ def run_on_untrusted(argv, files, timeout=10, out_cap=256 * 1024, on_spawn=None)
 #:   [cyan]slopbox -n -- curl https://example.com[/]  (with network approval)
 #:   [cyan]slopbox WORK -n -- make[/]                (named WORK box, with network)
 #:   [cyan]slopbox WORK -- make test[/]              (re-runs the same WORK box)
-def cmd_run(cmd, net, trace, direct, session_whitelist, chdir, reuse_sid=None) -> int:
+def cmd_run(cmd, net, env_capture, direct, session_whitelist, chdir, reuse_sid=None,
+            capture=True) -> int:
     if not cmd:
         print("slopbox: no command given", file=sys.stderr); return 2
 
@@ -9733,11 +10185,14 @@ def cmd_run(cmd, net, trace, direct, session_whitelist, chdir, reuse_sid=None) -
     # We send our own pidfd alongside the JSON so the UI can derive our HOST pid
     # via /proc/self/fdinfo (the codebase's universal identity path) instead of
     # SO_PEERCRED.  Works for both top-level runners and nested-box runners.
+    # Capture stdout/stderr unless -t (passthrough) or -d (direct: no overlay → no
+    # sinks). Mutually exclusive with -t by construction (caller passes capture=not -t).
+    want_capture = bool(capture) and not direct
     ack = register_request(_ctrl_sock, type="register", session_id=sid,
                            cmd=list(cmd), prov=self_prov, root_tgid=os.getpid(),
                            session_whitelist=session_whitelist, want_rerun=rerun,
-                           want_net=net, want_trace=trace, want_direct=direct,
-                           **_extra_reg)
+                           want_net=net, want_env=env_capture, want_direct=direct,
+                           want_capture=want_capture, **_extra_reg)
     if not ack or not ack.get("ok") or not ack.get("mount"):
         print("slopbox: could not start slopbox"
               f"{(' — ' + ack['error']) if ack and ack.get('error') else ''}.",
@@ -9754,11 +10209,16 @@ def cmd_run(cmd, net, trace, direct, session_whitelist, chdir, reuse_sid=None) -
     # unregister this session; in-box code never sees it.
     owner_token = ack.get("owner_token", "")
     relay_path = ack.get("relay", "")            # this box's own FD relay socket
+    # Capture mode: the UI confirms it set up sinks + echo. echo_path is the per-session
+    # echo socket --inner reads live output from. Both live in the chan dir.
+    capture_on = bool(ack.get("capture")) and want_capture
+    echo_path = ack.get("echo", "") if capture_on else ""
 
     # Diagnostics go to stderr (never stdout) and only ever before/after the
     # child runs, so the wrapped command's stdout stays clean.
-    flags = ",".join(f for f, on in (("net", net), ("trace", trace),
-                                     ("direct", direct)) if on) or "isolated"
+    flags = ",".join(f for f, on in (("net", net), ("env", env_capture),
+                                     ("direct", direct),
+                                     ("capture", want_capture)) if on) or "isolated"
     print(f"slopbox: {sid}  ({flags}, UI connected"
           f"{'' if can_net else ' → no network'})", file=sys.stderr)
     print(f"  overlay root: {box_root}", file=sys.stderr)
@@ -9883,6 +10343,11 @@ def cmd_run(cmd, net, trace, direct, session_whitelist, chdir, reuse_sid=None) -
                 "--chdir", chdir or os.getcwd()]
         if bwrap_supports("--as-pid-1"):
             args += ["--as-pid-1"]
+        # Capture mode needs the chan dir (holding echo.sock) bound in even when the box
+        # is NOT networked — echo.sock lives alongside relay.sock in relay_dir(sid).
+        if capture_on and echo_path and not (can_net and chan):
+            chan_dir = os.path.dirname(echo_path)
+            args += ["--bind", chan_dir, chan_dir]
         if can_net and chan:
             # bind ONLY this box's relay-socket directory in (holds nothing but the
             # per-session relay.sock) so the forwarder can reach its own relay — and
@@ -9907,9 +10372,12 @@ def cmd_run(cmd, net, trace, direct, session_whitelist, chdir, reuse_sid=None) -
             # node merges NODE_EXTRA_CA_CERTS with its built-in roots, so it only
             # needs the addition, not the whole bundle.
             args += ["--setenv", "NODE_EXTRA_CA_CERTS", str(_ca)]
-        # run our own --inner, which starts the forwarder then execs cmd
+        # run our own --inner, which starts the forwarder then execs cmd. In capture mode
+        # pass --echo so --inner points the child's stdout/stderr at the sink files and
+        # replays the echoed bytes onto the real terminal.
+        inner_extra = ["--echo", echo_path] if (capture_on and echo_path) else []
         args += ["--", sys.executable, find_self(), "--inner",
-                 "--channel", chan, "--", *cmd]
+                 "--channel", chan, *inner_extra, "--", *cmd]
 
         proc = subprocess.Popen(args, preexec_fn=os.setpgrp,
                                 pass_fds=popen_pass_fds)
@@ -12188,7 +12656,7 @@ def _make_ui_app():
             env=self.sup.process_env(sid, pid)
             t.append("── environment ──\n", style="dim")
             if not env:
-                t.append("(none captured — run with -t to record the environment)\n",
+                t.append("(none captured — run with -e to record the environment)\n",
                          style="dim")
             for k in sorted(env):
                 t.append(k, style="cyan"); t.append("="+env[k]+"\n")
@@ -12483,8 +12951,9 @@ _USAGE = ("slopbox                         start the UI\n"
           "       slopbox rename NEWNAME          rename the selected box\n"
           "       slopbox NAME [SUBCOMMAND]       select box NAME, then run SUBCOMMAND\n"
           "                                       (e.g. slopbox BOB patch · slopbox BOB -- ls)\n"
-          "       slopbox [NAME] [-n] [-t] [-d] [-w HOST]... [-C DIR] -- CMD [ARGS...]\n"
-          "         -n  networking via mitmproxy   -t  process tracing\n"
+          "       slopbox [NAME] [-n] [-e] [-t] [-d] [-w HOST]... [-C DIR] -- CMD [ARGS...]\n"
+          "         -n  networking via mitmproxy   -e  capture writers' environment\n"
+          "         -t  pass stdout/stderr straight through (no capture)\n"
           "         -d  direct host access (no capture)\n"
           "         a NAME is CAPS/digits/'-', starts with a letter, no trailing '-'")
 
@@ -12500,11 +12969,12 @@ def main() -> int:
     if argv and argv[0] == "--inner":
         ap = argparse.ArgumentParser(prog="slopbox --inner")
         ap.add_argument("--channel", default="")
+        ap.add_argument("--echo", default="")     # capture: echo.sock for live replay
         ap.add_argument("cmd", nargs=argparse.REMAINDER)
         ns = ap.parse_args(argv[1:])
         cmd = ns.cmd
         if cmd and cmd[0] == "--": cmd = cmd[1:]
-        return run_inner(ns.channel, cmd)
+        return run_inner(ns.channel, cmd, echo_path=ns.echo)
 
     if not argv:
         return run_ui()
@@ -12565,7 +13035,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(prog="slopbox", add_help=False, usage=_USAGE)
     ap.add_argument("-w", dest="session_whitelist", action="append", default=[], metavar="HOST")
     ap.add_argument("-n", dest="net", action="store_true")
-    ap.add_argument("-t", dest="trace", action="store_true")
+    ap.add_argument("-e", dest="env_capture", action="store_true")  # capture writers' env
+    ap.add_argument("-t", dest="passthrough_tty", action="store_true")  # NO stdout/err capture
     ap.add_argument("-d", dest="direct", action="store_true")
     ap.add_argument("-C", dest="chdir", default=None)
     try:
@@ -12574,8 +13045,11 @@ def main() -> int:
         return 2
     if not cmd:
         print("slopbox: no command after `--`.", file=sys.stderr); return 2
-    return cmd_run(cmd, ns.net, ns.trace, ns.direct, ns.session_whitelist, ns.chdir,
-                   reuse_sid=target)
+    # -t (pass stdout/stderr straight through like before) and capture (the new
+    # default) are mutually exclusive; -e (env capture) is independent of both.
+    return cmd_run(cmd, ns.net, ns.env_capture, ns.direct, ns.session_whitelist,
+                   ns.chdir, reuse_sid=target,
+                   capture=not ns.passthrough_tty)
 
 
 if __name__ == "__main__":
