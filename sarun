@@ -676,9 +676,10 @@ def run_inner(channel_path: str, cmd: list) -> int:
 #:   [cyan]cname:PATTERN[/]  match any name in the DNS CNAME/alias chain
 #:   [cyan]url:PREFIX[/]     match http(s) URLs by exact value or prefix
 #: Add [cyan]:PORT[/] to a host pattern to restrict it to one port (e.g. [cyan]host:api.github.com:443[/]).
-#: A rule may also be limited to some boxes with a [cyan][BOXGLOB][/] prefix — a glob over the box's
-#: hierarchical name, e.g. [cyan][backend-*] deny host:*[/] or [cyan][A.B*] allow host:api.test[/]; no
-#: prefix means every box (the same box-scope field file rules use).
+#: A rule is an action over one or more [b]clauses[/] joined with [cyan]and[/]/[cyan]or[/], each optionally
+#: [cyan]not[/]-negated, so one rule can require several things at once, e.g.
+#: [cyan]deny host:api.* and not box:trusted[/]. The [cyan]box:GLOB[/] clause matches the box's hierarchical
+#: name (same globs as paths), so a rule can apply only in some boxes.
 #: When no rule matches you are prompted, and choose a [b]scope[/]: [b]once[/] (this request only),
 #: [b]session[/] (a rule that lasts until the box exits), or [b]permanent[/] (saved to the rules file,
 #: see §15). Edit the saved ruleset any time in the Net rules pane ([cyan]w[/]); order matters.
@@ -687,7 +688,11 @@ def run_inner(channel_path: str, cmd: list) -> int:
 #  Rules
 # ════════════════════════════════════════════════════════════════════════════
 
-RULE_KINDS = ("host", "ip", "cname", "url")
+# Match kinds. 'box' (a glob over the box's hierarchical name) is shared by both
+# domains; the rest are domain-specific. Each domain's editor offers its own set.
+NET_KINDS  = ("host", "ip", "cname", "url", "box")
+FILE_KINDS = ("path", "box")
+RULE_KINDS = ("host", "ip", "cname", "url", "path", "box")
 
 
 def _host_glob(pat: str, name: str) -> bool:
@@ -730,69 +735,58 @@ def _glob_match(pat: str, s: str) -> bool:
         return False
 
 
-def _split_box(line: str) -> "tuple[str, str]":
-    """Peel an optional leading box scope off a rule line: `[BOXGLOB] rest` → (glob,
-    rest). Recognised only when a `[...]` group sits at the very start and its closing
-    bracket is followed by a SPACE then non-empty content — exactly the form to_line()
-    emits. That space requirement leaves a bare bracket pattern untouched: an IPv6 host
-    literal (`[::1]`, `[::1]:8080`) or a char-class glob (`[abc]*.txt`) has no `'] '`,
-    and a char-class inside the scope itself (`[back[12]] allow …`) closes at the first
-    bracket a space follows. Returns ("", line) when there is no scope."""
-    s = line.strip()
-    if not s.startswith("["):
-        return "", s
-    cut = s.find("] ")                            # scope ends at the first ']' a space follows
-    if cut <= 0:
-        return "", s
-    rest = s[cut + 2:].strip()
-    if not rest:
-        return "", s
-    return s[1:cut].strip(), rest
+@dataclass
+class Match:
+    """The ATOMIC predicate — one kind + its pattern — and the only thing an object
+    knows how to test against itself. The leaf of a rule's match expression; the
+    and/or/not/enabled composition over a list of these lives generically on the rule
+    (Clause + eval_clauses), and what each kind means is decided solely by the target
+    (ConnTarget/PathTarget.match_one). 'box' is just another kind: a glob over the
+    box's hierarchical display name, so a single rule can require both a connection
+    facet AND a box."""
+    kind: str
+    pattern: str
 
 
 @dataclass
-class Match:
-    """THE single search/match struct every rule domain embeds. `kind` selects which
-    facet of a target to test — 'host'/'ip'/'cname'/'url' for a connection, 'path' for
-    a file change; `pattern` is the per-kind needle; `box` is an optional glob over the
-    box's hierarchical display name ('' = every box), matched with the same wcmatch
-    engine as file globs so a rule can be scoped to just some boxes. Targets implement
-    `matches(Match)` (see ConnTarget / PathTarget); the box gate is the shared first
-    step, so common logic lives here, kind-specific logic lives on each target."""
-    kind: str
-    pattern: str
-    box: str = ""
-
-    def box_ok(self, box_name: str) -> bool:
-        return (not self.box) or _glob_match(self.box, box_name or "")
-
-    def to_suffix(self) -> str:
-        return f"[{self.box}] " if self.box else ""
+class Clause:
+    """One line of a rule's match list: a Match plus how it composes. `join` folds it
+    into the running result (left to right — the first enabled clause seeds it, its
+    join ignored); `negate` flips this one predicate; `enabled` skips it while keeping
+    it for round-trip, so a condition can be toggled off without deleting it."""
+    match: Match
+    join: str = "and"          # "and" | "or"
+    negate: bool = False
+    enabled: bool = True
 
 
-def _conn_kind_match(kind, pattern, host, port, url, ips, cnames) -> bool:
-    """Kind-specific connection test (no box gate) — host/ip/cname/url. Shared by the
-    network ConnTarget and anywhere a single connection rule is evaluated."""
-    k, p = kind, pattern
-    if k == "host":
-        # optional :port suffix (but not for bare IPv6 literals)
-        if ":" in p and p.rpartition(":")[2].isdigit() and not p.startswith("["):
-            h, _, pp = p.rpartition(":")
-            return _host_glob(h, host) and int(pp) == port
-        return _host_glob(p, host)
-    if k == "ip":
-        return any(_ip_match(p, ip) for ip in ips)
-    if k == "cname":
-        return any(_host_glob(p, c) for c in cnames)
-    if k == "url":
-        return bool(url) and (url == p or url.startswith(p))
-    return False
+def eval_clauses(target, clauses) -> bool:
+    """Generic, TARGET-AGNOSTIC boolean fold over a rule's clause list. Each enabled
+    clause asks the target one yes/no question (target.match_one), optionally negates
+    it, and folds it into the accumulator with its and/or join — left to right, no
+    precedence (what the flat clause-list UI shows is what you get). A rule with no
+    enabled clause matches nothing (False), never everything."""
+    acc = None
+    for c in clauses:
+        if not c.enabled:
+            continue
+        v = target.match_one(c.match)
+        if c.negate:
+            v = not v
+        if acc is None:
+            acc = v
+        elif c.join == "or":
+            acc = acc or v
+        else:
+            acc = acc and v
+    return bool(acc)
 
 
 @dataclass
 class ConnTarget:
-    """A network request under evaluation. Implements the generic match convention:
-    does THIS connection satisfy a Match? Box gate first, then the kind facet."""
+    """A network request under evaluation. Knows how to test ONE Match against itself
+    (match_one) for each connection kind — host/ip/cname/url — plus the shared 'box'
+    kind. The and/or/not composition is not its concern (see eval_clauses)."""
     host: str
     port: int
     url: "str | None" = None
@@ -800,60 +794,134 @@ class ConnTarget:
     cnames: tuple = ()
     box: str = ""
 
-    def matches(self, m: Match) -> bool:
-        return m.box_ok(self.box) and _conn_kind_match(
-            m.kind, m.pattern, self.host, self.port, self.url, self.ips, self.cnames)
+    def match_one(self, m: Match) -> bool:
+        k, p = m.kind, m.pattern
+        if k == "host":
+            # optional :port suffix (but not for bare IPv6 literals)
+            if ":" in p and p.rpartition(":")[2].isdigit() and not p.startswith("["):
+                h, _, pp = p.rpartition(":")
+                return _host_glob(h, self.host) and int(pp) == self.port
+            return _host_glob(p, self.host)
+        if k == "ip":
+            return any(_ip_match(p, ip) for ip in self.ips)
+        if k == "cname":
+            return any(_host_glob(p, c) for c in self.cnames)
+        if k == "url":
+            return bool(self.url) and (self.url == p or self.url.startswith(p))
+        if k == "box":
+            return _glob_match(p, self.box)
+        return False
 
 
 @dataclass
 class PathTarget:
-    """A changed path under evaluation. The file-domain counterpart of ConnTarget."""
+    """A changed path under evaluation — the file-domain counterpart of ConnTarget.
+    Tests the 'path' kind against its rel, plus the shared 'box' kind."""
     rel: str
     box: str = ""
 
-    def matches(self, m: Match) -> bool:
-        return m.box_ok(self.box) and m.kind == "path" and _path_match(m.pattern, self.rel)
+    def match_one(self, m: Match) -> bool:
+        if m.kind == "path":
+            return _path_match(m.pattern, self.rel)
+        if m.kind == "box":
+            return _glob_match(m.pattern, self.box)
+        return False
 
 
 @dataclass
-class Rule:
-    action: str            # "allow" | "deny"
-    kind: str              # one of RULE_KINDS
-    pattern: str
-    box: str = ""          # optional box-name glob scope ('' = every box)
+class _RuleBase:
+    """A rule = an action + an ordered list of Clauses (the and/or/not/enabled match
+    expression). The boolean composition is generic here; subclasses only declare their
+    domain vocabulary — valid actions/kinds, the default kind for a bare pattern, and
+    which kind renders without its `kind:` prefix on disk. Line grammar:
 
-    @property
-    def match(self) -> Match:
-        return Match(self.kind, self.pattern, self.box)
+        ACTION [off] [not] PRED [and|or [off] [not] PRED]...
 
-    def matches(self, host, port, url, ips=(), cnames=(), box="") -> bool:
-        return ConnTarget(host, port, url, ips, cnames, box).matches(self.match)
+    where PRED is `kind:pattern` (or a bare pattern → the default kind). A one-predicate
+    rule reads naturally — `allow host:x`, `discard **/*.log` — and a multi-condition
+    rule chains clauses: `deny host:api.* and not box:trusted`."""
+    action: str
+    clauses: list                       # list[Clause]
+    # ── domain vocabulary: plain class constants (NOT dataclass fields) ──
+    _ACTIONS = ()                        # valid actions
+    _KINDS = ()                          # recognised kinds
+    _DEFAULT_KIND = ""                   # a bare pattern parses to this kind
+    _DEFAULT_ACTION = None               # bare line (no verb) action, or None=required
+    _BARE_KIND = None                    # this kind renders without a `kind:` prefix
+
+    def matches(self, target) -> bool:
+        return eval_clauses(target, self.clauses)
+
+    @classmethod
+    def single(cls, action: str, kind: str, pattern: str) -> "_RuleBase":
+        """A one-predicate rule — the common case (and what parse builds for a legacy
+        single-field line)."""
+        return cls(action, [Clause(Match(kind, pattern))])
 
     def to_line(self) -> str:
-        return f"{self.match.to_suffix()}{self.action} {self.kind}:{self.pattern}"
+        out = [self.action]
+        for n, c in enumerate(self.clauses):
+            seg = []
+            if n: seg.append(c.join)
+            if not c.enabled: seg.append("off")
+            if c.negate: seg.append("not")
+            k = c.match.kind
+            seg.append(c.match.pattern if k == self._BARE_KIND
+                       else f"{k}:{c.match.pattern}")
+            out.append(" ".join(seg))
+        return " ".join(out)
 
-    @staticmethod
-    def parse(line: str) -> "Rule | None":
+    @classmethod
+    def _parse_clauses(cls, s: str) -> list:
+        toks = s.split()
+        clauses = []; i = 0; join = "and"
+        while i < len(toks):
+            if clauses and toks[i].lower() in ("and", "or"):
+                join = toks[i].lower(); i += 1
+            off = neg = False
+            while i < len(toks) and toks[i].lower() in ("off", "not"):
+                if toks[i].lower() == "off": off = True
+                else: neg = True
+                i += 1
+            if i >= len(toks): break
+            pred = toks[i]; i += 1
+            kind, sep, pat = pred.partition(":")
+            if sep and kind.lower() in cls._KINDS:
+                kind = kind.lower()
+            else:
+                kind = cls._DEFAULT_KIND; pat = pred
+            if not pat: continue
+            clauses.append(Clause(Match(kind, pat),
+                                  join=(join if clauses else "and"),
+                                  negate=neg, enabled=not off))
+            join = "and"
+        return clauses
+
+    @classmethod
+    def parse(cls, line: str) -> "_RuleBase | None":
         s = line.strip()
         if not s or s.startswith("#"):
             return None
-        box, s = _split_box(s)
-        action = "allow"
-        # explicit verb, or legacy "!" deny prefix
-        low = s.lower()
-        if low.startswith("allow ") or low.startswith("deny "):
-            verb, _, rest = s.partition(" ")
+        verb, _, rest = s.partition(" ")
+        if verb.lower() in cls._ACTIONS:
             action = verb.lower(); s = rest.strip()
-        elif s.startswith("!"):
-            action = "deny"; s = s[1:].strip()
-        kind = "host"
-        if ":" in s:
-            maybe, _, rest = s.partition(":")
-            if maybe.lower() in RULE_KINDS:
-                kind = maybe.lower(); s = rest.strip()
-        if not s:
+        elif cls._DEFAULT_ACTION is not None:
+            action = cls._DEFAULT_ACTION                # bare pattern → default action
+        else:
+            return None                                 # action required (file domain)
+        clauses = cls._parse_clauses(s)
+        if not clauses:
             return None
-        return Rule(action=action, kind=kind, pattern=s, box=box)
+        return cls(action, clauses)
+
+
+@dataclass
+class Rule(_RuleBase):
+    _ACTIONS = ("allow", "deny")
+    _KINDS = NET_KINDS
+    _DEFAULT_KIND = "host"
+    _DEFAULT_ACTION = "allow"
+    _BARE_KIND = None
 
 
 class _RuleListBase:
@@ -887,11 +955,12 @@ class Rules(_RuleListBase):
     _elem_class = Rule
 
     def needs_dns(self) -> bool:
-        return any(r.kind in ("ip", "cname") for r in self.rules)
+        return any(c.match.kind in ("ip", "cname")
+                   for r in self.rules for c in r.clauses)
     def decide(self, host, port, url=None, ips=(), cnames=(), box="") -> "str | None":
         target = ConnTarget(host, port, url, ips, cnames, box)
         for r in self.rules:
-            if target.matches(r.match):
+            if r.matches(target):
                 return r.action
         return None
 
@@ -934,10 +1003,10 @@ class Rules(_RuleListBase):
 #: [cyan]@(a|b)[/] / [cyan]!(x)[/] groups, [cyan]{a,b}[/] brace expansion. Matching includes dotfiles (a leading [cyan]*[/]
 #: matches [cyan].bashrc[/]). A pattern with no leading [cyan]/[/] matches at any depth; a leading [cyan]/[/] anchors
 #: at the filesystem root.
-#: [b]Box scope:[/] a rule may be limited to some boxes by prefixing it with [cyan][BOXGLOB][/] — a glob
-#: (same wildcards) over the box's hierarchical name, e.g. [cyan][backend-*] discard **/*.log[/] or
-#: [cyan][A.B*] passthrough secret.txt[/]. No prefix means every box. The form's [b]box scope[/] field
-#: sets it; blank = all boxes.
+#: [b]Clauses:[/] a rule's action applies over one or more clauses joined with [cyan]and[/]/[cyan]or[/] (each
+#: optionally [cyan]not[/]-negated), e.g. [cyan]discard **/*.log and box:backend-*[/]. The [cyan]box:GLOB[/] clause
+#: (same wildcards) matches the box's hierarchical name, so a rule can apply only in some boxes;
+#: with no box clause it applies in every box.
 #
 # Patterns are extended shell globs (bash-style) over the change's absolute path,
 # via wcmatch with GLOBSTAR + EXTGLOB + BRACE:
@@ -962,32 +1031,15 @@ def _path_match(pat: str, rel: str) -> bool:
 FILE_ACTIONS = ("apply", "discard", "passthrough")
 
 @dataclass
-class FileRule:
-    action: str            # "apply" | "discard" | "passthrough"
-    pattern: str
-    box: str = ""          # optional box-name glob scope ('' = every box)
-
-    @property
-    def match(self) -> Match:
-        return Match("path", self.pattern, self.box)
-
-    def matches(self, rel: str, box: str = "") -> bool:
-        return PathTarget(rel, box).matches(self.match)
-
-    def to_line(self) -> str:
-        return f"{self.match.to_suffix()}{self.action} {self.pattern}"
-
-    @staticmethod
-    def parse(line: str) -> "FileRule | None":
-        s = line.strip()
-        if not s or s.startswith("#"):
-            return None
-        box, s = _split_box(s)
-        verb, _, rest = s.partition(" ")
-        action = verb.lower(); pat = rest.strip()
-        if action not in FILE_ACTIONS or not pat:
-            return None
-        return FileRule(action=action, pattern=pat, box=box)
+class FileRule(_RuleBase):
+    """A file rule: apply/discard/passthrough over a path glob, optionally box-scoped.
+    Same clause machinery as a net Rule; only the vocabulary differs. The 'path' kind
+    renders bare (`discard **/*.log`); box renders explicit (`... and box:A.B*`)."""
+    _ACTIONS = FILE_ACTIONS
+    _KINDS = FILE_KINDS
+    _DEFAULT_KIND = "path"
+    _DEFAULT_ACTION = None              # an explicit action is required
+    _BARE_KIND = "path"
 
 
 class FileRules(_RuleListBase):
@@ -998,7 +1050,7 @@ class FileRules(_RuleListBase):
     def decide(self, rel: str, box: str = "") -> "str | None":
         target = PathTarget(rel, box)
         for r in self.rules:
-            if target.matches(r.match):
+            if r.matches(target):
                 return r.action
         return None
 
@@ -6779,16 +6831,16 @@ class NetworkPolicy:
     def decide(self, s: Session, host: str, port: int,
                url: str = None) -> "str | None":
         need_dns = self.rules.needs_dns() or any(
-            r.kind in ("ip", "cname") for r in s.sess_rules)
+            c.match.kind in ("ip", "cname") for r in s.sess_rules for c in r.clauses)
         ips, cnames = self._resolve(host) if need_dns else ((), ())
         try: box = self._box_path(s.box_id)
         except Exception: box = ""
         target = ConnTarget(host, port, url, ips, cnames, box)
-        # session rules first (temporary overrides), then the permanent ruleset;
-        # each evaluated top-to-bottom, first match wins. A rule whose box scope
-        # doesn't match this box is skipped (target.matches gates on box first).
+        # session rules first (temporary overrides), then the permanent ruleset; each
+        # evaluated top-to-bottom, first match wins. A rule with a box clause that this
+        # box doesn't satisfy simply doesn't match (its clauses fold to False).
         for r in s.sess_rules:
-            if target.matches(r.match):
+            if r.matches(target):
                 return r.action
         return self.rules.decide(host, port, url, ips, cnames, box)
 
@@ -6827,8 +6879,8 @@ class NetworkPolicy:
         at_top = result.get("at_top", False)
         box = (result.get("box") or "").strip()
         if scope in ("session", "permanent"):
-            prefix = f"[{box}] " if box else ""
-            rule = Rule.parse(f"{prefix}{action} {spec}")
+            line = f"{action} {spec}" + (f" and box:{box}" if box else "")
+            rule = Rule.parse(line)
             if rule:
                 if scope == "session":
                     s.sess_rules.insert(0 if at_top else len(s.sess_rules), rule)
@@ -7354,7 +7406,7 @@ class Supervisor:
             try: s.run_pidfd = os.dup(_rfd)
             except OSError: s.run_pidfd = -1
         for h in msg.get("session_whitelist", []):
-            s.sess_rules.append(Rule("allow", "host", h))
+            s.sess_rules.append(Rule.single("allow", "host", h))
         self.sessions[sid] = s
         # Now that the box's name + parent are recorded, cache its (and any descendant's)
         # display name into the overlay so file rules can be box-scoped from first write.
@@ -9210,28 +9262,42 @@ def _make_ui_app():
         BINDINGS=[("escape","cancel","")]
         _ACTIONS={"net":("allow","deny"),
                   "file":("apply","discard","passthrough")}
+        _KINDS={"net":NET_KINDS, "file":FILE_KINDS}
         def __init__(self, domain, rule=None, title=None):
             super().__init__()
             self.domain=domain; self.rule=rule
             self._title=title or (" Net rule" if domain=="net" else " File rule")
+        def _seed(self):
+            # Prefill the single-condition form from an existing rule: its first
+            # non-box clause is the kind/pattern, a box clause (if any) the box scope.
+            dk="host" if self.domain=="net" else "path"
+            action=self._ACTIONS[self.domain][0]; kind=dk; pat=""; box=""
+            r=self.rule
+            if r:
+                action=r.action
+                for c in r.clauses:
+                    if c.match.kind=="box": box=c.match.pattern
+                    elif not pat: kind, pat = c.match.kind, c.match.pattern
+            return action, kind, pat, box
         def compose(self):
-            r=self.rule; acts=self._ACTIONS[self.domain]
+            acts=self._ACTIONS[self.domain]; kinds=self._KINDS[self.domain]
+            action,kind,pat,box=self._seed()
             with Vertical(id="rule-box"):
                 yield Label(self._title, id="rule-title")
                 yield Label("[dim]action[/]")
                 yield Select([(a,a) for a in acts], id="rf-action", allow_blank=False,
-                             value=(r.action if r else acts[0]))
+                             value=action)
                 if self.domain=="net":
                     yield Label("[dim]match[/]")
-                    yield Select([(k,k) for k in RULE_KINDS], id="rf-kind",
-                                 allow_blank=False, value=(r.kind if r else "host"))
+                    yield Select([(k,k) for k in kinds if k!="box"], id="rf-kind",
+                                 allow_blank=False, value=(kind if kind!="box" else "host"))
                 yield Label("[dim]pattern[/]")
-                yield Input(value=(r.pattern if r else ""), id="rf-pat",
+                yield Input(value=pat, id="rf-pat",
                             placeholder=("host[:PORT] · ip/CIDR · cname · url-prefix"
                                          if self.domain=="net"
                                          else "path glob, e.g. **/*.log or src/**"))
                 yield Label("[dim]box scope — glob over the box name (blank = every box)[/]")
-                yield Input(value=(r.box if r else ""), id="rf-box",
+                yield Input(value=box, id="rf-box",
                             placeholder="e.g. backend-*  or  A.B*  (blank = all boxes)")
                 yield Label(self._help())
                 with Horizontal(id="rule-btns"):
@@ -9252,10 +9318,11 @@ def _make_ui_app():
             if not pat: return None
             box=self.query_one("#rf-box",Input).value.strip()
             action=self.query_one("#rf-action",Select).value
-            if self.domain=="net":
-                kind=self.query_one("#rf-kind",Select).value
-                return Rule(action, kind, pat, box).to_line()
-            return FileRule(action, pat, box).to_line()
+            cls=Rule if self.domain=="net" else FileRule
+            kind=self.query_one("#rf-kind",Select).value if self.domain=="net" else "path"
+            rule=cls.single(action, kind, pat)
+            if box: rule.clauses.append(Clause(Match("box", box)))
+            return rule.to_line()
         def _save(self):
             line=self._line()
             if line: self.dismiss(line)
@@ -10191,6 +10258,33 @@ def _make_ui_app():
                 t.append(e["path"]+"\n", style="red" if stale else "")
             d.update(t)
 
+        def _clause_detail(self, r, acol):
+            # Generic, domain-agnostic rule view: the action, then one line per clause
+            # with its join / not / off markers — the same boolean expression the form
+            # edits and to_line() serialises.
+            t=Text()
+            t.append(r.action.upper()+"\n", style=acol)
+            kind_help={"host":"request hostname (* / ? wildcards; *.x also matches x; optional :PORT)",
+                       "ip":"resolved IP — literal address or CIDR (e.g. 10.0.0.0/8)",
+                       "cname":"any name in the DNS CNAME/alias chain",
+                       "url":"http(s) URL by exact value or prefix",
+                       "path":"changed path (extended glob: * ** ? @(a|b) {a,b}; bare = any depth)",
+                       "box":"the box's hierarchical name (same globs as paths)"}
+            for n,c in enumerate(r.clauses):
+                lead=""
+                if n: lead+=c.join+" "
+                if not c.enabled: lead+="off "
+                if c.negate: lead+="not "
+                t.append("  "+lead, style="dim")
+                t.append(f"{c.match.kind}:{c.match.pattern}\n",
+                         style="dim" if not c.enabled else "")
+            t.append("\n")
+            kinds=[c.match.kind for c in r.clauses]
+            for k in dict.fromkeys(kinds):
+                t.append(f"{k:6} ", style="cyan")
+                t.append(kind_help.get(k,"")+"\n", style="dim")
+            return t
+
         def _update_rule_detail(self):
             d=self.query_one("#rule-detail",Static)
             if self.view=="net":
@@ -10198,45 +10292,18 @@ def _make_ui_app():
                 i=self.query_one("#w-list",ListView).index
                 if i is None or not (0<=i<len(rules)):
                     d.update(Text("(no rule — connections fall through to a prompt)", style="dim")); return
-                r=rules[i]; t=Text()
-                t.append(("ALLOW" if r.action=="allow" else "DENY")+"\n",
-                         style="green bold" if r.action=="allow" else "red bold")
-                t.append("kind     ", style="dim"); t.append(r.kind+"\n")
-                t.append("pattern  ", style="dim"); t.append(r.pattern+"\n")
-                t.append("box      ", style="dim")
-                t.append((r.box+"  (only in matching boxes)") if r.box
-                         else "any box\n", style="" if r.box else "dim")
-                t.append("\n" if r.box else "\n")
-                help={"host":"Match the request's hostname. * and ? wildcards; "
-                              "*.example.com also matches example.com. Optional :PORT.",
-                      "ip":"Match a resolved IP — a literal address or a CIDR network "
-                           "(e.g. 10.0.0.0/8, ::1).",
-                      "cname":"Match any name in the DNS CNAME/alias chain (wildcards ok).",
-                      "url":"Match http(s) URLs by exact value or prefix."}.get(r.kind,"")
-                t.append(help, style="dim"); d.update(t)
+                r=rules[i]
+                acol="green bold" if r.action=="allow" else "red bold"
+                d.update(self._clause_detail(r, acol))
             else:
                 rules=self.frules_store.rules
                 i=self.query_one("#r-list",ListView).index
                 if i is None or not (0<=i<len(rules)):
                     d.update(Text("(no rule — changes are kept for review)", style="dim")); return
-                r=rules[i]; t=Text()
+                r=rules[i]
                 acol={"apply":"green bold","discard":"red bold",
                       "passthrough":"cyan bold"}.get(r.action,"bold")
-                t.append(r.action.upper()+"\n", style=acol)
-                t.append("glob     ", style="dim"); t.append(r.pattern+"\n")
-                t.append("box      ", style="dim")
-                t.append((r.box+"  (only in matching boxes)\n") if r.box
-                         else "any box\n", style="" if r.box else "dim")
-                t.append("\n")
-                t.append(r.action, style="bold")
-                expl={"apply":" writes the change to the host during capture.",
-                      "discard":" drops the change during capture.",
-                      "passthrough":" acts directly on the real host and captures "
-                                    "nothing for this path."}.get(r.action,"")
-                t.append(expl+"\n", style="dim")
-                t.append("* in a segment · ** across dirs · @(a|b) !(x) {a,b} · "
-                         "bare name = any depth · leading / = anchored", style="dim")
-                d.update(t)
+                d.update(self._clause_detail(r, acol))
 
         def _refresh_rules(self):
             lv=self.query_one("#w-list",ListView)
@@ -10245,8 +10312,8 @@ def _make_ui_app():
             for r in self.rules_store.rules:
                 col="red" if r.action=="deny" else "green"
                 sign="−" if r.action=="deny" else "+"
-                scope=f"[{r.box}] " if r.box else ""
-                lv.append(ListItem(Label(Text(f"{sign} {scope}{r.kind}:{r.pattern}", style=col))))
+                body=" ".join(r.to_line().split()[1:])    # drop the action word (shown by sign/colour)
+                lv.append(ListItem(Label(Text(f"{sign} {body}", style=col))))
             n=len(self.rules_store.rules)
             if idx is not None and n: lv.index=min(idx, n-1)
 
@@ -10280,8 +10347,8 @@ def _make_ui_app():
             _sign={"discard":"−","apply":"+","passthrough":"→"}
             for r in self.frules_store.rules:
                 col=_col.get(r.action,"green"); sign=_sign.get(r.action,"+")
-                scope=f"[{r.box}] " if r.box else ""
-                lv.append(ListItem(Label(Text(f"{sign} {scope}{r.action} {r.pattern}", style=col))))
+                body=" ".join(r.to_line().split()[1:])    # clauses, sans the action word
+                lv.append(ListItem(Label(Text(f"{sign} {r.action} {body}", style=col))))
             n=len(self.frules_store.rules)
             if idx is not None and n: lv.index=min(idx, n-1)
 

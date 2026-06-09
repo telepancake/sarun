@@ -602,7 +602,7 @@ def test_passthrough_kicks_up_to_parent():
         # Inject a FileRules with one passthrough rule directly into the session dict.
         fr = m.FileRules.__new__(m.FileRules)
         fr.path = None
-        fr.rules = [m.FileRule(action="passthrough", pattern="pt_only.txt")]
+        fr.rules = [m.FileRule.single("passthrough", "path", "pt_only.txt")]
         mount.ops.sessions[csid2]["frules"] = fr
         proot2 = mnt / psid2; croot2 = mnt / csid2
         r = sh(croot2, "echo per-file > pt_only.txt && cat pt_only.txt")

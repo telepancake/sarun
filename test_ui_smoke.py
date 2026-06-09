@@ -30,14 +30,14 @@ async def drive(m):
             await pilot.press(key); await pilot.pause()
             check(app.view==name, f"view '{name}' selected via key '{key}'")
         # add a network rule via the store + refresh
-        app.rules_store.insert(m.Rule("allow","host","example.com"))
+        app.rules_store.insert(m.Rule.single("allow","host","example.com"))
         app._refresh_rules(); await pilot.pause()
-        check(any(r.pattern=="example.com" for r in app.rules_store.rules),
+        check(any(r.clauses[0].match.pattern=="example.com" for r in app.rules_store.rules),
               "network rule added")
         # add a file rule
-        app.frules_store.insert(m.FileRule("discard","*.log"))
+        app.frules_store.insert(m.FileRule.single("discard","path","*.log"))
         app._refresh_file_rules(); await pilot.pause()
-        check(any(r.pattern=="*.log" for r in app.frules_store.rules),
+        check(any(r.clauses[0].match.pattern=="*.log" for r in app.frules_store.rules),
               "file rule added")
         # the mount should have come up
         check(app.overlay_mount.ops is not None, "overlay mount ops object created")
