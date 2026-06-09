@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Engine-level tests for the multiplexed pyfuse3 overlay.
 
-Run with the venv python (has pyfuse3+trio):
-    /home/user/venv/bin/python test_overlay_engine.py
+Run via uv (installs pyfuse3+trio; first run also builds the patched pyfuse3):
+    uv run --with pytest --with "pyfuse3>=3.2" --with "trio>=0.22" \
+      pytest -q -p no:cacheprovider test_overlay_engine.py
 
 Self-safety: every mount is at an isolated temp point, exercised via
 timeout-wrapped child commands, and lazy-unmounted in a finally block, leaving a
@@ -652,6 +653,19 @@ def test_wbuf_small_new_file():
         r2 = fx.sh("printf 'short\\n' > wbuf_test.txt && cat wbuf_test.txt")
         check(r2.returncode == 0 and r2.stdout.encode() == short,
               "wbuf small: O_TRUNC rewrite via open() reads back correctly")
+        # Wait for the rewrite's release/eviction to land before inspecting the row (same
+        # async-release sync point as test_wbuf_create_buffers). Poll on the CONTENT, not
+        # just non-NULL: the row may still hold the first write's bytes until the second
+        # eviction completes, which under suite load lags sh() returning.
+        import zlib as _zl
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            _r = fx.index.file_row("wbuf_test.txt")
+            if _r is not None and _r[4] is not None:
+                _b = bytes(_r[4])
+                if (_b if len(_b) == _r[2] else _zl.decompress(_b)) == short:
+                    break
+            time.sleep(0.05)
         rid2 = fx.index.row_id("wbuf_test.txt")
         check(rid2 is not None, "wbuf small: row still present after rewrite")
         bp = m.blob_path(fx.index.box_id, rid2)
@@ -901,6 +915,17 @@ def test_wbuf_create_buffers():
         fx.start()
         r = fx.sh("echo hi > created.txt")          # create() path (new file)
         check(r.returncode == 0, "create new file via create()")
+        # close() triggers the FUSE release that deflates the RAM buffer into the sqlar
+        # row, but release runs on the UI's FUSE loop AFTER the shell process exits — so
+        # sh() can return before eviction lands. The window widens under suite load (the
+        # FUSE loop is busy serving other boxes), which is the lone source of this test's
+        # flakiness. Wait for the row to fill rather than racing the single check below.
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            _r = fx.index.file_row("created.txt")
+            if _r is not None and _r[4] is not None:
+                break
+            time.sleep(0.05)
         rid = fx.index.row_id("created.txt")
         check(rid is not None and fx.index.kind_of("created.txt") == "file",
               "created file is tracked as a file")
