@@ -7516,8 +7516,16 @@ class Supervisor:
     def processes_live(self, sid) -> "list | None":
         """The live, bounded ACTIVE SET for a running box (htop-style), decorated by
         the live Index from its in-memory caches — O(active set), no full-table query.
-        None if the box has no live Index (finished/discovered): the UI then renders
-        the cached full `processes(sid)` history instead."""
+        None once the box is no longer running (its runner root is gone, i.e. zero
+        running processes) OR has no live Index: the UI then renders the cached full
+        `processes(sid)` history instead. Keying the live/finished switch on runner-root
+        liveness — the same signal the changes and flows panes use — means all three
+        live panes flip to the complete record at the same instant the box stops,
+        rather than the proc pane briefly showing an empty active set until teardown
+        drops the Index."""
+        s = self.sessions.get(sid)
+        if s is not None and not _box_running(s):
+            return None                      # zero running processes: show full history
         idx = self.indexes.get(sid)
         if idx is None: return None
         return idx.live_processes()
