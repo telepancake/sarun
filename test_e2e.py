@@ -269,12 +269,18 @@ def run_nested_e2e(tmp):
         #
         # We pass the XDG env into the nested invocation explicitly so the nested
         # runner finds the same UI socket as the parent runner.
+        # The nested child prints a UNIQUE marker to stdout (captured); we assert that
+        # marker (a) chains all the way up to the TOP-LEVEL runner's stdout, (b) is
+        # recorded in the CHILD box's outputs (recorded once at the origin), and (c) is
+        # NOT in the PARENT box's outputs (the mute signal stops the parent re-recording
+        # the echoed child bytes when they travel up through the parent's sinks).
+        marker = "NESTED-ECHO-MARKER-4b9f1e"
         nested_cmd = (
             f"XDG_STATE_HOME={e['XDG_STATE_HOME']!r} "
             f"XDG_RUNTIME_DIR={e['XDG_RUNTIME_DIR']!r} "
             f"{PYBIN} {SARUN} -- "
             "bash -c 'cat /parent_sentinel.txt > /child_proof.txt && "
-            "echo nested-ok >> /child_proof.txt'"
+            f"echo nested-ok >> /child_proof.txt && echo {marker}'"
         )
         parent_script = (
             "set -e; "
@@ -290,6 +296,11 @@ def run_nested_e2e(tmp):
               f"(got {r.returncode}: {stderr.strip()[-400:]})")
         check("UI connected" in stderr,
               "nested-e2e: parent runner reports UI connected")
+        # (a) the nested child's marker chained up through the parent box to the
+        #     top-level runner's OWN stdout (ECHO frames at every level).
+        check(marker in r.stdout,
+              f"nested-e2e: nested child's marker reached the top-level runner's stdout "
+              f"(echo chains up; stdout tail={r.stdout.strip()[-200:]!r})")
 
         # The UI's sqlar output will include TWO sessions (parent + child) after both
         # finish. Poll for two *.sqlar files.
@@ -331,6 +342,41 @@ def run_nested_e2e(tmp):
         check(b"nested-ok" in child_content,
               f"nested-e2e: child_proof contains child's own line "
               f"(got {child_content!r})")
+
+        # (b)+(c) MUTE correctness. Identify THIS run's parent/child sqlars by content
+        # (the state dir may also hold leftover boxes from earlier suites in the same
+        # tmp): the CHILD wrote child_proof.txt; the PARENT wrote parent_sentinel.txt.
+        def _has_file(sp, name):
+            try:
+                return name in {n for n, _md, _mt, _sz in m.sqlar_list(sp)}
+            except Exception:
+                return False
+        def _outputs_blob(sp):
+            rows = m.outputs_list(sp)
+            return b"\n".join(bytes((m.outputs_get(sp, r["id"]) or {}).get("content")
+                                    or b"") for r in rows)
+        child_sp = next((sp for sp in sqlars if _has_file(sp, "child_proof.txt")), None)
+        parent_sp = next((sp for sp in sqlars
+                          if _has_file(sp, "parent_sentinel.txt")
+                          and not _has_file(sp, "child_proof.txt")), None)
+        check(child_sp is not None and parent_sp is not None,
+              "nested-e2e: identified both the child (child_proof.txt) and parent "
+              "(parent_sentinel.txt) sqlar of THIS run")
+        if child_sp is not None:
+            child_out = _outputs_blob(child_sp)
+            check(marker.encode() in child_out,
+                  f"nested-e2e: (b) the marker IS recorded in the CHILD box's outputs "
+                  f"(recorded once at origin)")
+        if parent_sp is not None:
+            parent_out = _outputs_blob(parent_sp)
+            check(marker.encode() not in parent_out,
+                  f"nested-e2e: (c) the marker is NOT in the PARENT box's outputs "
+                  f"(mute stops the parent re-recording the echoed child bytes)")
+            # The parent's outputs DO still hold the nested runner's own cmd_run
+            # diagnostics ("slopbox: N ...") — a different pid, recorded normally.
+            check(b"slopbox:" in parent_out,
+                  f"nested-e2e: (c') the parent's outputs still hold the nested runner's "
+                  f"own diagnostics (a different, un-muted pid)")
 
         # Verify stderr mentions TWO slopbox registrations (parent + child).
         check(stderr.count("overlay root:") >= 2,

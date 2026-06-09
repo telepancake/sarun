@@ -307,7 +307,7 @@ def test_catch_all_unmapped_closed():
 
 # ── UI-side relay meta JSON parse (proxy vs direct) ─────────────────────────
 def _parse_relay_meta(msg: bytes):
-    """Replicates the parse logic in RelayServer._handle so it can be unit-tested
+    """Replicates the parse logic in relay_handle_fds so it can be unit-tested
     without an event loop. Kept structurally identical (proxy fail-safe + direct)."""
     kind, dest = "proxy", None
     if msg and msg not in (b"\x00",):

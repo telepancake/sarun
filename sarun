@@ -18,7 +18,8 @@ slopbox — run an untrusted process in an unprivileged bwrap slopbox.
 
 Network model: the slopbox's network namespace has NO route to the internet —
 only loopback. The box runs three in-netns rendezvous services, all forwarding
-over the per-box relay socket to the UI's in-process mitmproxy:
+over the box's ONE muxed connection to the UI (RELAY frames) to the UI's
+in-process mitmproxy:
 
   • HTTP proxy on 127.0.0.1:8080 — proxy-AWARE clients set HTTP_PROXY and
     connect here; each accepted FD is handed to the UI via SCM_RIGHTS.
@@ -61,8 +62,9 @@ two hidden FUSE sink files (`.slopbox-stdout` / `.slopbox-stderr`) at the overla
 root so every write is attributed per-write to its actual writer — even across a
 fork — via `ctx.pid` in the FUSE write handler (surfaced by a small patch to
 pyfuse3; see section 0 below). Each write is stored as one row in the `outputs`
-table (stream 0=stdout, 1=stderr) and simultaneously enqueued onto a per-session
-echo socket so the user sees output live on the real terminal. Use `-t` to
+table (stream 0=stdout, 1=stderr) and simultaneously framed back over the box's
+ONE muxed connection (ECHO frames) so the user sees output live on the real
+terminal (for a nested box this chains up through every ancestor). Use `-t` to
 pass stdout/stderr straight through with no capture; use `-d` to skip the overlay
 entirely. The outputs pane (`o`) reviews every recorded write. `-e` additionally
 records each writer's full environment (off by default; provenance is always
@@ -405,8 +407,8 @@ except Exception:
 #   7866   NetworkPolicy
 #   7998   Supervisor
 #   9088   In-process mitmproxy: drive one connection per passed FD
-#   9347   Control + FD-channel socket server (inside the UI)
-#   9453   Output capture echo channel (UI → --inner live replay)
+#   9347   Muxed box channel: framing + RELAY receive (inside the UI)
+#   9453   Output capture echo stream (ECHO frames on the box's muxed connection)
 #   9907   CA generation
 #   9959   Runner — `slopbox CMD [ARGS...]`
 #  10469   UI — `slopbox`
@@ -570,7 +572,7 @@ def box_ctime(box_id) -> float:
 
 # The internal identity of a box is its stable integer box_id, minted eagerly at
 # creation. As a path component it is str(box_id): it names live/<box_id>,
-# <mnt>/<box_id>, <box_id>.sqlar, the per-session relay socket dir, and the pool
+# <mnt>/<box_id>, <box_id>.sqlar, and the pool
 # dir. It is never derived from a name and never changes (a rename is a meta-only
 # label write). Any id that arrives as a path component MUST be validated as a plain
 # decimal string before use.
@@ -620,20 +622,11 @@ def valid_box_id(box_id: "str | None") -> bool:
     # path component / teardown key — NOT a user-facing name (see valid_name).
     return bool(isinstance(box_id, str) and BOX_ID_RE.match(box_id))
 
-def relay_dir(box_id) -> Path:
-    """The per-session directory that holds ONLY this box's relay socket. Bound into
-    exactly this box (and no other), so an FD arriving on its relay socket is always
-    gated as this box_id — the box cannot choose another session's rules."""
-    return live_dir(box_id) / "chan"
-
-def relay_sock_path(box_id) -> str:
-    return str(relay_dir(box_id) / "relay.sock")
-
-def echo_sock_path(box_id) -> str:
-    """The per-session echo socket, alongside relay.sock in the chan dir (which is
-    bind-mounted into the box). The UI's EchoServer listens here; --inner connects
-    to receive captured stdout/stderr bytes and replay them on the real terminal."""
-    return str(relay_dir(box_id) / "echo.sock")
+# There is exactly ONE socket: ui.sock (sock_path()). A box runner opens a single
+# persistent connection to it, does the register handshake, then keeps that SAME
+# connection as the muxed box channel (RELAY frames inner→UI, ECHO frames UI→inner,
+# MUTE/UNMUTE frames inner→UI). Connection-close is the box's teardown signal. No
+# per-session relay.sock / echo.sock / chan dir exist any more.
 
 # Hidden capture-sink files at the box root: the child's stdout/stderr are pointed at
 # these O_WRONLY so every write flows through FUSE (direct_io=True on open, so no
@@ -729,14 +722,6 @@ async def aw_recv(reader: asyncio.StreamReader) -> "dict | None":
     except (json.JSONDecodeError, asyncio.IncompleteReadError, OSError):
         return None
 
-def sync_send(sock_path: str, timeout: float = 5.0, **msg: Any) -> None:
-    try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-            s.settimeout(timeout); s.connect(sock_path)
-            s.sendall((json.dumps(msg) + "\n").encode())
-    except OSError:
-        pass
-
 def sync_request(sock_path: str, timeout: float = 30.0, **msg: Any) -> "dict | None":
     """Send one control message and wait for a single newline-JSON reply. Used by the
     runner to register a box and block until the UI has created live/<box_id> and
@@ -750,40 +735,53 @@ def sync_request(sock_path: str, timeout: float = 30.0, **msg: Any) -> "dict | N
     except (OSError, json.JSONDecodeError):
         return None
 
-def register_request(sock_path: str, timeout: float = 30.0, **msg: Any) -> "dict | None":
-    """Like sync_request but carries the caller's own pidfd over SCM_RIGHTS so the
-    UI can derive the runner's HOST-namespace pid from /proc/self/fdinfo without
-    relying on SO_PEERCRED.  Falls back to a plain sendall (no FD) if pidfd_open is
-    unavailable (Python < 3.9, kernel ENOSYS, or any OSError) — the UI then gets
-    peer_pid=0 and treats this as a top-level runner.
+def register_open(sock_path: str, timeout: float = 30.0,
+                  **msg: Any) -> "tuple[socket.socket, dict] | None":
+    """Open the ONE persistent box↔UI connection and do the register handshake on it.
 
-    Returns the ack dict (the mount path + owner token), or None on failure. A nested
-    box does NOT receive any fd here: it roots bwrap by binding the parent-exposed
-    synthetic path /<KIDS_DIR>/<sid> (see the runner's NESTED LAUNCH comment)."""
+    Carries the caller's own pidfd over SCM_RIGHTS so the UI derives the runner's
+    HOST-namespace pid from /proc/self/fdinfo (not SO_PEERCRED). Falls back to a plain
+    sendall (no FD) if pidfd_open is unavailable — the UI then gets peer_pid=0 and treats
+    this as a top-level runner.
+
+    Returns (conn, ack) on success — the SAME connection becomes the box's muxed channel
+    (the runner hands it to --inner via --conn-fd). Returns None on any failure. The ack
+    is the single newline-JSON reply (mount path + owner token + sid). Reads exactly the
+    ack line (one byte at a time) so no later frame bytes are consumed. A nested box does
+    NOT receive any fd here: it roots bwrap by binding the parent-exposed synthetic path
+    /<KIDS_DIR>/<sid> (see the runner's NESTED LAUNCH comment)."""
     pidfd = -1
     try:
         pidfd = os.pidfd_open(os.getpid())
     except (OSError, AttributeError):
         pass
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-            s.settimeout(timeout); s.connect(sock_path)
-            payload = (json.dumps(msg) + "\n").encode()
-            if pidfd >= 0:
-                s.sendmsg([payload],
-                          [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
-                            array.array("i", [pidfd]).tobytes())])
-            else:
-                s.sendall(payload)
-            buf = b""
-            while b"\n" not in buf:
-                chunk = s.recv(65536)
-                if not chunk:
-                    break
-                buf += chunk
-            line = buf.split(b"\n", 1)[0]
-            return json.loads(line.decode()) if line.strip() else None
+        s.settimeout(timeout); s.connect(sock_path)
+        payload = (json.dumps(msg) + "\n").encode()
+        if pidfd >= 0:
+            s.sendmsg([payload],
+                      [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
+                        array.array("i", [pidfd]).tobytes())])
+        else:
+            s.sendall(payload)
+        buf = b""
+        while b"\n" not in buf:
+            chunk = s.recv(1)            # one byte at a time: never read past the ack line
+            if not chunk:
+                break
+            buf += chunk
+        line = buf.split(b"\n", 1)[0]
+        ack = json.loads(line.decode()) if line.strip() else None
+        if not ack:
+            try: s.close()
+            except OSError: pass
+            return None
+        s.settimeout(None)
+        return s, ack
     except (OSError, json.JSONDecodeError):
+        try: s.close()
+        except OSError: pass
         return None
     finally:
         if pidfd >= 0:
@@ -816,8 +814,8 @@ def ui_is_running(sock_path: str) -> bool:
 #  Inner forwarder — `slopbox --inner` (runs as pid-1-ish inside the slopbox)
 # ════════════════════════════════════════════════════════════════════════════
 #
-# Runs three forwarding services inside the box's netns, all funnelling into the
-# same per-box relay socket (a Unix socket bind-mounted into the slopbox):
+# Runs three forwarding services inside the box's netns, all funnelling RELAY frames
+# into the box's ONE muxed connection to the UI (--conn-fd, inherited from the runner):
 #   • Proxy listener on 127.0.0.1:INNER_PROXY_PORT — proxy-aware clients (HTTP_PROXY).
 #   • DNS resolver on INNER_DNS_ADDR:53 — synthetic-IP allocator for proxy-unaware clients.
 #   • Catch-all listeners on 0.0.0.0:80/443 — intercept connections to synthetic IPs.
@@ -972,10 +970,40 @@ def _dns_handle_packet(pkt: bytes, dns: SyntheticDNS) -> "bytes | None":
     return _dns_build_response(pkt, txid, rcode=0)
 
 
-def run_inner(channel_path: str, cmd: list, echo_path: str = "",
+def run_inner(conn_fd: int, cmd: list, net: bool = False,
               capture: bool = False) -> int:
+    """In-box pid-1-ish process. `conn_fd` is the ONE inherited connection to the UI
+    (ui.sock), already past the register handshake (the runner did that, then handed us
+    this fd). We mux over it: RELAY frames out (FD passing for caught connections),
+    ECHO/ECHO_DONE frames in (live echo replayed to our real fd 1/2), MUTE/UNMUTE frames
+    out (bracket the echo readback so an ancestor doesn't re-record it). Closing the
+    connection (on our exit) is the box's teardown signal to the UI."""
     stop = threading.Event()
     dns = SyntheticDNS()
+
+    # The single UI channel. -1 means no UI connection (shouldn't happen for a launched
+    # box, but keep the forwarders/echo inert rather than crash).
+    chan = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM,
+                         fileno=conn_fd) if conn_fd >= 0 else None
+    chan_lock = threading.Lock()        # serialize concurrent sends on the one socket
+
+    def _send_frame(ftype: int, payload: bytes = b"", fds: "list | None" = None) -> None:
+        """Send one framed message on the muxed UI connection, optionally attaching
+        SCM_RIGHTS fds to the same sendmsg (so the receiver pairs them with this frame).
+        Serialized under chan_lock; best-effort (a dead channel just drops)."""
+        if chan is None:
+            return
+        frame = encode_frame(ftype, payload)
+        try:
+            with chan_lock:
+                if fds:
+                    chan.sendmsg([frame],
+                                 [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
+                                   array.array("i", fds).tobytes())])
+                else:
+                    chan.sendall(frame)
+        except OSError:
+            pass
 
     def _peer_pidfd(conn: socket.socket) -> int:
         """A pidfd for the connecting in-box workload process, or -1.
@@ -1004,36 +1032,26 @@ def run_inner(channel_path: str, cmd: list, echo_path: str = "",
             return -1
 
     def forward_one(conn: socket.socket, meta: "dict | None" = None) -> None:
-        """Hand `conn` (+ a pidfd for the connecting workload) to the per-box relay.
+        """Hand `conn` (+ a pidfd for the connecting workload) to the UI as a RELAY frame
+        on the ONE muxed connection.
 
         `meta` is the small JSON header the UI reads to learn the connection's KIND:
           - None / {"kind":"proxy"}  → proxy-AWARE path (HTTP_PROXY client; the relay
             drives a regular HttpProxy layer, destination from the client's request).
           - {"kind":"direct","host":..,"port":..,"scheme":..} → proxy-UNAWARE path
             (catch-all forwarder; the relay drives a reverse-proxy layer to that host).
-        Both paths share this one sendmsg(json, SCM_RIGHTS([conn_fd, pidfd]))."""
+        We send a RELAY frame whose payload is the meta JSON and whose sendmsg carries
+        SCM_RIGHTS [conn_fd] or [conn_fd, pidfd]. The UI gates the FD as THIS box (the
+        session is fixed by which connection the frame arrived on; we never send a sid —
+        it is never trusted from inside a box). The pidfd lets the UI derive the
+        connecting workload's HOST pid for provenance."""
         pidfd = _peer_pidfd(conn)
         if meta is None:
             meta = {"kind": "proxy"}
         try:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as ch:
-                ch.connect(channel_path)
-                # The relay socket is per-session and bound into ONLY this box, so the
-                # UI derives the session from which socket the FD arrived on. We send
-                # the request socket (index 0) and, if we could open one, a pidfd for
-                # the connecting workload process (index 1) over SCM_RIGHTS. The JSON
-                # payload carries only the intended-destination metadata, never any
-                # process fields (the pidfd IS the process channel) and never a
-                # session_id (the UI never trusts a sid from inside a box).
-                fds = [conn.fileno()] if pidfd < 0 else [conn.fileno(), pidfd]
-                ch.sendmsg(
-                    [json.dumps(meta).encode()],
-                    [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
-                      array.array("i", fds).tobytes())],
-                )
+            fds = [conn.fileno()] if pidfd < 0 else [conn.fileno(), pidfd]
+            _send_frame(FRAME_RELAY, json.dumps(meta).encode(), fds=fds)
             # The UI now owns dups of the fds we sent; we can close ours.
-        except OSError:
-            pass
         finally:
             if pidfd >= 0:
                 try: os.close(pidfd)
@@ -1125,8 +1143,9 @@ def run_inner(channel_path: str, cmd: list, echo_path: str = "",
         forward_one(conn, {"kind": "direct", "host": domain,
                            "port": port, "scheme": scheme})
 
-    # Only run the forwarders if a channel exists (i.e. networked + UI present).
-    if channel_path and os.path.exists(os.path.dirname(channel_path) or "/"):
+    # Only run the network forwarders for a networked box (they relay caught connections
+    # to the UI as RELAY frames). A non-networked box has loopback only and no gating.
+    if net and chan is not None:
         threading.Thread(target=listener, daemon=True).start()
         threading.Thread(target=dns_server, daemon=True).start()
         threading.Thread(target=catch_all,
@@ -1134,27 +1153,51 @@ def run_inner(channel_path: str, cmd: list, echo_path: str = "",
         threading.Thread(target=catch_all,
                          args=(INNER_HTTPS_PORT, "https"), daemon=True).start()
 
+    # ── inbound demux: ECHO frames replay live; ECHO_DONE ends the echo window ───
+    # The UI streams the box's own captured stdout/stderr back as ECHO frames on the SAME
+    # muxed connection; we replay each to OUR real fd 1/2 (our inherited terminal = the
+    # box's terminal; for a NESTED box those fds are the parent box's FUSE sinks, so the
+    # output chains UPWARD automatically — and the parent is told to MUTE us so it never
+    # re-records it). ECHO_DONE marks that all captured bytes have been framed.
+    echo_done = threading.Event()
+    if chan is not None:
+        def _chan_reader():
+            buf = b""
+            real = {0: 1, 1: 2}
+            try:
+                while True:
+                    chunk = chan.recv(65536)
+                    if not chunk:
+                        break                          # EOF: UI side closed
+                    buf += chunk
+                    frames, buf = decode_frames(buf)
+                    for ftype, payload in frames:
+                        if ftype == FRAME_ECHO and payload:
+                            stream = payload[0]
+                            fd = real.get(stream, 1)
+                            try: os.write(fd, payload[1:])
+                            except OSError: pass
+                        elif ftype == FRAME_ECHO_DONE:
+                            echo_done.set()
+            except OSError:
+                pass
+            finally:
+                echo_done.set()
+        threading.Thread(target=_chan_reader, daemon=True).start()
+
     # Run the real command as a foreground job *inside* this PID namespace. We are
     # PID 1 here, so the process-group ids we put on the controlling terminal are
     # namespace-local — which is what lets an interactive job-control shell
     # (bash/dash) save and restore the terminal's foreground group without hitting
     # "Cannot set tty process group (No such process)". The command gets its own
     # process group and the terminal handed to it; restored when it exits.
-    # ── capture mode: child stdout/stderr → sink files; echo replays live ────────
+    # ── capture mode: child stdout/stderr → sink files ───────────────────────────
     # The sinks are hidden files at the box ROOT ('/'); opening them O_WRONLY and using
     # them as the child's stdout/stderr makes every write flow THROUGH the FUSE layer
-    # (so the UI records it with the writer's ctx.pid). A reader thread decodes the echo
-    # frames the UI streams back and writes each payload to OUR real fd 1/2, so the user
-    # sees output live. stdin stays INHERITED (unchanged).
-    #
-    # RECORDING and LIVE ECHO are decoupled: `capture` opens the sinks (the sinks are
-    # FUSE files at the box root, so they work even for a NESTED box whose root IS the
-    # UI's mount). Live echo additionally needs echo.sock, which lives in the UI's
-    # live/<sid>/chan dir — a path a nested (sandboxed) runner cannot reach. So a nested
-    # box records output but gets no live replay; `echo_path` is empty in that case.
+    # (so the UI records it with the writer's ctx.pid, and echoes it back to us). stdin
+    # stays INHERITED. The sinks are FUSE files at the box root, so they work even for a
+    # NESTED box whose root IS the UI's mount — capture + echo work at every level.
     out_fd = err_fd = -1
-    echo_conn = None
-    echo_done = threading.Event()
     if capture:
         try:
             out_fd = os.open("/" + SINK_STDOUT_REL, os.O_WRONLY)
@@ -1166,34 +1209,23 @@ def run_inner(channel_path: str, cmd: list, echo_path: str = "",
                     try: os.close(fd)
                     except OSError: pass
             out_fd = err_fd = -1
-        if out_fd >= 0 and echo_path:
-            try:
-                echo_conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                echo_conn.connect(echo_path)
-            except OSError:
-                echo_conn = None       # no live replay; the box still records output
-            if echo_conn is not None:
-                def _echo_reader(conn):
-                    # Decode framed (stream, payload) and replay to the real terminal.
-                    buf = b""
-                    real = {0: 1, 1: 2}
-                    try:
-                        while True:
-                            chunk = conn.recv(65536)
-                            if not chunk:
-                                break                  # EOF: UI half-closed after flush
-                            buf += chunk
-                            frames, buf = echo_decode(buf)
-                            for stream, payload in frames:
-                                fd = real.get(stream, 1)
-                                try: os.write(fd, payload)
-                                except OSError: pass
-                    except OSError:
-                        pass
-                    finally:
-                        echo_done.set()
-                threading.Thread(target=_echo_reader, args=(echo_conn,),
-                                 daemon=True).start()
+
+    # MUTE: tell the UI to NOT record writes by THIS --inner process (only echo them) for
+    # the duration of the child. For a nested box our echo-readback writes hit the parent
+    # box's sinks; muting our host pid stops the parent re-recording the child's output
+    # (already recorded once at the origin box). At the top level we write to a real
+    # terminal, so MUTE is a harmless no-op. Sent BEFORE the child can produce a byte that
+    # travels child→sink→UI→ECHO→us→parent-sink. We pass a pidfd of ourselves; the UI
+    # resolves our HOST pid via the same /proc/self/fdinfo path it uses everywhere.
+    if capture and chan is not None:
+        try:
+            self_pidfd = os.pidfd_open(os.getpid())
+        except (OSError, AttributeError):
+            self_pidfd = -1
+        if self_pidfd >= 0:
+            _send_frame(FRAME_MUTE, b"", fds=[self_pidfd])
+            try: os.close(self_pidfd)
+            except OSError: pass
 
     tty_fd = next((fd for fd in (0, 1, 2) if os.isatty(fd)), None)
     old_fg = None
@@ -1227,16 +1259,19 @@ def run_inner(channel_path: str, cmd: list, echo_path: str = "",
         proc.terminate()
         code = proc.wait()
     # Close our copies of the sink fds so the FUSE `release` fires; that makes the UI
-    # flush the echo queue and half-close echo.sock. Then wait for the reader to drain
-    # all remaining bytes to the real terminal (so trailing output is never truncated).
+    # flush the echo queue and send ECHO_DONE. Then wait for the reader to drain all
+    # remaining ECHO frames to the real terminal (so trailing output is never truncated).
     for fd in (out_fd, err_fd):
         if fd >= 0:
             try: os.close(fd)
             except OSError: pass
-    if echo_conn is not None:
+    if capture and chan is not None:
         echo_done.wait(timeout=5.0)
-        try: echo_conn.close()
-        except OSError: pass
+        # UNMUTE: the echo readback window is over (ECHO_DONE drained). Any of our OWN
+        # post-child output from here on should be recorded again. Sent before we print
+        # anything else; brackets exactly the child's echo window. (Connection-close
+        # below also removes our pid from the muted set, so this is belt-and-braces.)
+        _send_frame(FRAME_UNMUTE)
     if tty_fd is not None:
         if old_fg is not None:
             try: os.tcsetpgrp(tty_fd, old_fg)
@@ -1245,7 +1280,26 @@ def run_inner(channel_path: str, cmd: list, echo_path: str = "",
             try: signal.signal(signal.SIGTTOU, old_ttou)
             except (OSError, ValueError): pass
     stop.set()
-    return code or 0
+    # Close the muxed connection: this is the box's teardown signal to the UI (EOF →
+    # consolidate + remove from the live set), replacing the old explicit unregister.
+    # shutdown(SHUT_RDWR) first so the UI sees EOF immediately AND the _chan_reader
+    # thread's blocking recv returns cleanly (rather than racing the bare close).
+    if chan is not None:
+        try: chan.shutdown(socket.SHUT_RDWR)
+        except OSError: pass
+        try: chan.close()
+        except OSError: pass
+    # Hard-exit: --inner is the box's throwaway pid-1. Its daemon threads (the network
+    # forwarders, the channel reader) may still be in blocking socket calls; letting the
+    # normal interpreter shutdown run alongside them has been observed to crash (SIGBUS)
+    # on a closed-fd socket during teardown. We've already done every cleanup that matters
+    # (terminal restored, conn closed → UI teardown), so terminate immediately after
+    # flushing our own streams. Only ever reached in the real box pid-1 process.
+    try: sys.stdout.flush()
+    except Exception: pass
+    try: sys.stderr.flush()
+    except Exception: pass
+    os._exit(code or 0)
 
 
 #: [b]13 · Network allow/deny rules[/]
@@ -3139,8 +3193,8 @@ class Index:
 
     def process_from_prov(self, prov: dict, root: bool = False) -> "int | None":
         """Insert/dedup a process row from a provenance dict (tgid/start/ppid/exe/argv/
-        env, all HOST-namespace — resolved by RelayServer from the --inner pidfd via host
-        /proc, consistent with the FUSE path) and return its row id. Returns None if no
+        env, all HOST-namespace — resolved by relay_handle_fds from the --inner pidfd via
+        host /proc, consistent with the FUSE path) and return its row id. Returns None if no
         tgid was supplied. Identity is (tgid,start): a reused pid with a new start_time is
         a NEW row, never a dedup into the prior incarnation. The parent is recorded FIRST
         (so parent_id is the parent's CURRENT incarnation ROW id, not a pid); the PPid
@@ -3875,10 +3929,11 @@ def _build_overlay_ops():
             return bool(s and rel in s["sinks"])
 
         def set_echo_queue(self, sid: str, enqueue, flush=None) -> None:
-            """Attach the per-session echo enqueue callable (EchoServer.enqueue) and an
-            optional flush callable (EchoServer.flush_and_close). The sink write handler
-            calls enqueue to stream captured bytes; release calls flush when the last
-            sink closes, so --inner drains trailing output before exiting."""
+            """Attach the per-session echo enqueue callable (EchoStream.enqueue) and an
+            optional flush callable (EchoStream.flush_and_close). The sink write handler
+            calls enqueue to stream captured bytes as ECHO frames on the box's muxed
+            connection; release calls flush when the last sink closes, so --inner drains
+            trailing output (ending with ECHO_DONE) before exiting."""
             self._echo_enqueue[sid] = enqueue
             if flush is not None: self._echo_flush[sid] = flush
 
@@ -5122,19 +5177,41 @@ def _build_overlay_ops():
             if sink is not None:
                 sid, _rel, stream = sink
                 data = bytes(buf)
-                # PER-WRITE attribution: resolve this exact write's pid → process row.
-                wid = self._index(sid).writer_for(ctx.pid)
-                self._index(sid).add_output(wid, stream, data)
-                # Live echo: enqueue onto the per-session bounded queue and AWAIT it, so a
-                # slow consumer backpressures just this request (the .result() blocks in a
-                # trio worker thread, suspending this coroutine — other requests proceed).
+                # MUTE: if the writer's HOST pid is in the global muted set, this write is
+                # a nested box's echo readback travelling UP through an ancestor sink (the
+                # parent box's --inner replaying a child's output to its own fd 1/2). Echo
+                # it onward (so it keeps propagating up) but do NOT record it — it was
+                # already recorded once at the origin box. ctx.pid is a host-ns pid here
+                # (the FUSE daemon = UI is in the host ns); compare by tgid.
+                muted = _MUTED_HOST_PIDS and tgid_of(ctx.pid) in _MUTED_HOST_PIDS
+                if not muted:
+                    # PER-WRITE attribution: resolve this exact write's pid → process row.
+                    wid = self._index(sid).writer_for(ctx.pid)
+                    self._index(sid).add_output(wid, stream, data)
+                # Live echo: enqueue onto the per-session bounded queue and, for an ORIGIN
+                # (un-muted) write, AWAIT it so a slow consumer backpressures just this
+                # request (the .result() blocks in a trio worker thread, suspending this
+                # coroutine — other requests proceed).
+                #
+                # A MUTED write is echo readback travelling UP through an ancestor sink: it
+                # is itself driven by a descendant box's echo reader writing to this sink.
+                # We must NOT block it on backpressure — doing so couples this sink's queue
+                # to the descendant's reader and closes a cross-level dependency cycle
+                # (descendant reader → this sink write → this queue full → waits on this
+                # drain → which needs the descendant to keep reading → deadlock). So for a
+                # muted write we enqueue fire-and-forget (the EchoStream drops oldest when
+                # full): the readback keeps propagating up, never blocking. The origin box
+                # already recorded these bytes; only LIVE visibility is best-effort here.
                 enq = self._echo_enqueue.get(sid)
                 if enq is not None:
-                    fut = enq(stream, data)
-                    try:
-                        await trio.to_thread.run_sync(fut.result)
-                    except Exception:
-                        pass                        # echo best-effort; the row is durable
+                    if muted:
+                        enq(stream, data, block=False)   # fire-and-forget, never blocks
+                    else:
+                        fut = enq(stream, data)
+                        try:
+                            await trio.to_thread.run_sync(fut.result)
+                        except Exception:
+                            pass                    # echo best-effort; the row is durable
                 return len(buf)                     # never stored as file bytes
             # Captured write: splice into the handle's backing.
             wb = self._wbuf.get(fh)
@@ -8021,8 +8098,8 @@ class Supervisor:
     EVERY method here runs on the UI process's one asyncio main-loop thread. Two
     callers reach it, both on that loop:
 
-      • the mitmproxy/relay path — the _GatingAddon coroutines and RelayServer
-        await `self.policy.approval_request`/`self.policy.precheck` and call
+      • the mitmproxy/relay path — the _GatingAddon coroutines and the box-channel
+        RELAY reader await `self.policy.approval_request`/`self.policy.precheck` and call
         `note_traffic`/`log_flow` (and the per-connection relay handlers feed the
         ProxyEngine) — all from the asyncio loop the
         ChannelServer/ProxyEngine/relays run on;
@@ -8067,14 +8144,13 @@ class Supervisor:
         self._open_flows: dict = {}
         self.review = ChangeReview(self) # change-review model (owns consolidation memo)
         self.on_event = lambda ev: None
-        # HIGH-1: per-session owner tokens + relay sockets. A box can reach only its
-        # own relay socket and never the control socket, so it cannot register/unregister
-        # any session, nor gate its traffic as another sid.
+        # HIGH-1: per-session owner tokens, returned to the runner. CLI teardown ops
+        # (drop) present it; a box's own persistent connection closing is the box's
+        # teardown signal (no token needed there — the connection IS the proof).
         self._owner_tokens: dict = {}     # sid -> random token (kept OUTSIDE the box)
-        self._relays: dict = {}           # sid -> RelayServer
-        self._echoes: dict = {}           # sid -> EchoServer (capture-mode live echo)
-        self._relay_loop = None           # asyncio loop the relays run on
-        self._relay_engine = None         # ProxyEngine relays hand FDs to
+        self._echoes: dict = {}           # sid -> EchoStream (capture-mode live echo)
+        self._relay_loop = None           # asyncio loop the box channels run on
+        self._relay_engine = None         # ProxyEngine RELAY frames hand FDs to
         self.sessions.update(discover_sessions())
         # Auto-name counter: a single UI-process integer, seeded once at startup from the
         # highest existing A<n> label, used-then-incremented for each box that launches
@@ -8240,47 +8316,22 @@ class Supervisor:
         return None
 
     def attach_relay_factory(self, loop, engine) -> None:
-        """Called by the ChannelServer once its asyncio loop is up; lets register()
-        spin up a per-session RelayServer for each networked box."""
+        """Called by the ChannelServer once its asyncio loop is up; gives register() the
+        loop + engine the box channels mux their RELAY frames into."""
         self._relay_loop = loop
         self._relay_engine = engine
 
-    def _start_relay(self, sid: str) -> "str | None":
-        """Create + start this box's own relay socket; return its path (to bind into
-        only that box). None if no relay machinery is attached (e.g. offline tests)."""
-        if self._relay_loop is None or self._relay_engine is None:
-            return None
-        self._stop_relay(sid)
-        path = relay_sock_path(sid)
-        rs = RelayServer(self._relay_engine, sid, path, self._relay_loop)
-        try:
-            rs.start()
-        except OSError as e:
-            print(f"slopbox(ui): relay socket for {sid} failed: {e}", file=sys.stderr)
-            return None
-        self._relays[sid] = rs
-        return path
-
-    def _stop_relay(self, sid: str) -> None:
-        rs = self._relays.pop(sid, None)
-        if rs is not None:
-            try: rs.stop()
-            except Exception: pass
-
-    def _start_echo(self, sid: str) -> "EchoServer | None":
-        """Create + start this box's echo server on echo_sock_path(sid) (alongside the
-        relay socket in the chan dir, bind-mounted into the box). None if no asyncio loop
-        is attached (offline tests / no relay machinery), in which case capture still
-        records to the table — only the live replay is absent."""
+    def _start_echo(self, sid: str) -> "EchoStream | None":
+        """Create + start this box's socketless EchoStream (the drain task framing
+        captured bytes as ECHO frames). None if no asyncio loop is attached (offline
+        tests), in which case capture still records to the table — only live replay is
+        absent. The writer is wired later by the ChannelServer once the box's muxed
+        connection is up (attach_box_channel)."""
         if self._relay_loop is None:
             return None
         self._stop_echo(sid)
-        es = EchoServer(sid, echo_sock_path(sid), self._relay_loop)
-        try:
-            es.start()
-        except OSError as e:
-            print(f"slopbox(ui): echo socket for {sid} failed: {e}", file=sys.stderr)
-            return None
+        es = EchoStream(sid, self._relay_loop)
+        es.start()
         self._echoes[sid] = es
         return es
 
@@ -8290,9 +8341,21 @@ class Supervisor:
             try: es.stop()
             except Exception: pass
 
+    def attach_box_channel(self, sid: str, writer) -> None:
+        """Wire the box's muxed-connection StreamWriter into its EchoStream so captured
+        bytes flow back as ECHO frames. No-op if the box has no EchoStream (not capturing,
+        or no loop attached)."""
+        es = self._echoes.get(sid)
+        if es is not None:
+            es.set_writer(writer)
+
+    def detach_box_channel(self, sid: str) -> None:
+        """The box's muxed connection is closing: stop using its writer for echo."""
+        es = self._echoes.get(sid)
+        if es is not None:
+            es.set_writer(None)
+
     def stop_all_relays(self) -> None:
-        for sid in list(self._relays):
-            self._stop_relay(sid)
         for sid in list(self._echoes):
             self._stop_echo(sid)
 
@@ -8559,15 +8622,16 @@ class Supervisor:
         self._refresh_box_paths()
         self.review._consolidated.discard(sid)
         # HIGH-1: mint an owner token kept OUTSIDE the box (returned to the runner
-        # only). unregister/drop must present it, so no box can tear down a session.
+        # only). The CLI drop op presents it; a box tears itself down by closing its own
+        # muxed connection (which carries the same token), so no box can tear down
+        # ANOTHER session — it has only its own connection.
         token = uuid.uuid4().hex
         self._owner_tokens[sid] = token
-        # HIGH-1: a networked box gets its OWN relay socket, bound into only that box.
-        relay = self._start_relay(sid) if net else None
         # Capture mode (default; suppressed by -t): expose the two hidden sink files at
         # the box root so the child's stdout/stderr write THROUGH the FUSE layer (giving
-        # us per-write ctx.pid attribution), and start the echo server that streams the
-        # captured bytes back to --inner for live display on the real terminal.
+        # us per-write ctx.pid attribution), and start the EchoStream that frames the
+        # captured bytes as ECHO frames on the box's muxed connection (writer wired by the
+        # ChannelServer once that connection is serving — attach_box_channel).
         echo = None
         if want_capture and self.mount is not None and self.mount.ops is not None:
             self.mount.ops.add_sink(sid, SINK_STDOUT_REL, 0)
@@ -8576,18 +8640,14 @@ class Supervisor:
             if echo is not None:
                 self.mount.ops.set_echo_queue(sid, echo.enqueue, echo.flush_and_close)
         self._emit(type="session_added", session=s.to_dict())
+        # ONE socket: the runner already holds the connection it registered on; that
+        # SAME connection becomes the box's muxed channel (RELAY/ECHO/MUTE). No relay or
+        # echo socket path is advertised — there are none. NESTED LAUNCH: a nested runner
+        # roots bwrap by binding the parent-exposed /<KIDS_DIR>/<sid> overlay root; the
+        # bind-mounted ui.sock at UI_SOCK_INBOX carries its channel.
         ack = dict(ok=True, mount=box_root, shm_dir=str(backing), net=net,
                    owner_token=token, box_id=int(sid), session_id=sid, name=name,
                    capture=want_capture)
-        if relay is not None:
-            ack["relay"] = relay
-        # Advertise echo.sock only if its server actually started (else the runner skips
-        # live replay; capture still records every write through the sinks).
-        if echo is not None:
-            ack["echo"] = echo_sock_path(sid)
-        # NESTED LAUNCH: nothing extra to send. A nested runner roots bwrap by binding
-        # the parent-exposed synthetic path /<KIDS_DIR>/<sid> (the child's overlay root,
-        # served by the same FUSE mount and reachable inside the parent). No fd-passing.
         return ack
 
     def _owns(self, msg: dict, sid: str) -> bool:
@@ -8631,8 +8691,8 @@ class Supervisor:
 
     def _teardown_prep(self, msg: dict):
         """Loop/thread-side teardown setup, shared by sync + async unregister: validate,
-        check the owner token, stop the relay, then remove the box from the live mount
-        set (this DETACHES it from the FUSE serve thread, so its live Index becomes
+        check the owner token, stop the echo stream, then remove the box from the live
+        mount set (this DETACHES it from the FUSE serve thread, so its live Index becomes
         QUIESCENT — the single writer is done with it) and pop the Index handle. Returns
         (sid, s, index, backing, reported_status) or None to abort."""
         sid = msg.get("session_id")
@@ -8642,7 +8702,6 @@ class Supervisor:
             print(f"slopbox(ui): rejected unregister of {sid} (bad owner token)",
                   file=sys.stderr)
             return None
-        self._stop_relay(sid)
         self._stop_echo(sid)
         self._owner_tokens.pop(sid, None)
         s = self.sessions.get(sid)
@@ -8744,7 +8803,6 @@ class Supervisor:
             print(f"slopbox(ui): rejected remove of {sid} (bad owner token)",
                   file=sys.stderr)
             return
-        self._stop_relay(sid)
         self._stop_echo(sid)
         self._owner_tokens.pop(sid, None)
         _s = self.sessions.pop(sid, None)
@@ -8815,7 +8873,7 @@ class Supervisor:
     def log_flow(self, sid, fl: dict) -> None:
         """Persist one completed request/response into the box's single sqlar `flows`
         table. fl['prov'] = {tgid,ppid,exe,argv,env} holds the originating workload
-        process's HOST-namespace provenance (resolved by RelayServer from the --inner
+        process's HOST-namespace provenance (resolved by relay_handle_fds from the --inner
         pidfd); tag the flow with that process's process-table id, inserting the
         process+env row keyed by the host tgid.
         Routes the write through the live Index (the single writer, under its lock) so
@@ -9116,7 +9174,7 @@ VERSION = "0.1.0"
 # session id even when many run concurrently.
 _CURRENT_BOX_ID: "contextvars.ContextVar[str]" = contextvars.ContextVar(
     "slopbox_box_id", default="")
-# Per-connection originating workload-process provenance (set by RelayServer after
+# Per-connection originating workload-process provenance (set by relay_handle_fds after
 # resolving the pidfd --inner sent to a HOST-namespace pid and reading host /proc).
 # Keys: tgid/ppid/exe/argv/env, all HOST-namespace — the same invariant the FUSE
 # file-op path holds. {"tgid":0} if unknown (no pidfd, or the peer was already gone).
@@ -9361,212 +9419,214 @@ class ProxyEngine:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  Control + FD-channel socket server (inside the UI)
+#  Muxed box channel: RELAY receive + the one socket server (inside the UI)
 # ════════════════════════════════════════════════════════════════════════════
 
-class RelayServer:
-    """A per-session FD relay. One of these is created by the Supervisor for each
-    networked box; it listens on that box's OWN relay socket (relay_sock_path(box_id),
-    bound into only that box). Every FD that arrives here is gated as `box_id` — the
-    sender cannot choose another session's rules, because there is no box_id in the
-    message and this loop is hard-bound to one box_id. This socket carries FD messages
-    ONLY: it never accepts a register/unregister/control message, so untrusted in-box
-    code that can reach it can do nothing but hand us its own connections."""
-    def __init__(self, engine: "ProxyEngine", box_id: str, sock_path: str,
-                 loop: asyncio.AbstractEventLoop):
-        self.engine = engine; self.box_id = box_id; self.sock_path = sock_path
-        self._loop = loop; self._sock = None; self._task = None
-
-    def start(self) -> None:
-        try: os.makedirs(os.path.dirname(self.sock_path), mode=0o700, exist_ok=True)
-        except OSError: pass
-        try: os.unlink(self.sock_path)
-        except FileNotFoundError: pass
-        self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self._sock.bind(self.sock_path)
-        try: os.chmod(self.sock_path, 0o600)
-        except OSError: pass
-        self._sock.listen(64)
-        self._sock.setblocking(False)
-        self._task = asyncio.create_task(self._accept_loop())
-
-    async def _accept_loop(self) -> None:
-        while True:
-            try:
-                conn, _ = await self._loop.sock_accept(self._sock)
-            except (OSError, asyncio.CancelledError):
-                break
-            asyncio.create_task(self._handle(conn))
-
-    async def _handle(self, conn: socket.socket) -> None:
-        conn.setblocking(False)
+def _parse_relay_meta(payload: bytes) -> "tuple[str, tuple | None]":
+    """Parse a RELAY frame's meta JSON into (kind, dest). The JSON names the connection's
+    KIND and, for the direct path, the intended host/port/scheme. An empty/garbage
+    payload is treated as a proxy connection (fail-safe)."""
+    kind, dest = "proxy", None
+    if payload:
         try:
-            msg, anc, _flags, _addr = await self._loop.run_in_executor(
-                None, _recvmsg_blocking, conn)
-            fds = []
-            for lvl, typ, data in anc:
-                if lvl == socket.SOL_SOCKET and typ == socket.SCM_RIGHTS:
-                    a = array.array("i"); a.frombytes(data); fds.extend(a.tolist())
-            conn.close()
-            # --inner's payload is a small JSON header naming the connection's KIND and,
-            # for the direct path, the intended host/port/scheme. An empty payload or a
-            # legacy b"\x00" is treated as a proxy connection (fail-safe).
+            meta = json.loads(payload.decode())
+            if isinstance(meta, dict) and meta.get("kind") == "direct":
+                kind = "direct"
+                dest = (str(meta.get("host", "")), int(meta.get("port", 0)),
+                        str(meta.get("scheme", "https")))
+        except (ValueError, TypeError, UnicodeDecodeError):
             kind, dest = "proxy", None
-            if msg and msg not in (b"\x00",):
-                try:
-                    meta = json.loads(msg.decode())
-                    if isinstance(meta, dict) and meta.get("kind") == "direct":
-                        kind = "direct"
-                        dest = (str(meta.get("host", "")), int(meta.get("port", 0)),
-                                str(meta.get("scheme", "https")))
-                except (ValueError, TypeError, UnicodeDecodeError):
-                    kind, dest = "proxy", None
-            # The ancillary fd array from --inner is [request_socket] or
-            # [request_socket, pidfd]: index 0 is always the connection socket the
-            # engine drives; index 1, if present, is a pidfd for the connecting in-box
-            # workload process. The payload carries no process fields — the pidfd is
-            # the channel. The box_id is NEVER taken from the message; it is THIS relay's.
-            pidfd = fds[1] if len(fds) > 1 else -1
-            for extra in fds[2:]:
-                try: os.close(extra)
-                except OSError: pass
-            if fds:
-                # Derive the HOST-namespace pid from the pidfd (its fdinfo reports the
-                # pid in OUR — the UI's host — namespace), then read provenance with
-                # the same host-side read_provenance() the FUSE path uses. Every tgid
-                # we persist is thus a HOST pid; a dead/missing peer → untagged flow.
-                prov = {"tgid": 0}
-                if pidfd >= 0:
-                    host_pid = _host_pid_from_pidfd(pidfd)
-                    if host_pid > 0:
-                        info = read_provenance(host_pid, full_env=True)
-                        ppid_tgid = tgid_of(info["ppid"]) if info.get("ppid") else 0
-                        prov = {"tgid": tgid_of(host_pid),
-                                "start_time": info.get("start_time") or 0,
-                                "ppid": ppid_tgid, "parent_pid": info.get("ppid") or 0,
-                                "exe": info["exe"], "argv": info["argv"],
-                                "env": info["env"]}
-                    try: os.close(pidfd)
-                    except OSError: pass
-                _CURRENT_PROV.set(prov)
-                _CURRENT_DEST.set(dest)
-                await self.engine.handle_fd(fds[0], self.box_id, kind=kind, dest=dest)
-        except (OSError, asyncio.CancelledError):
-            try: conn.close()
-            except OSError: pass
+    return kind, dest
 
-    def stop(self) -> None:
-        if self._task is not None:
-            self._task.cancel()
-        try:
-            if self._sock is not None: self._sock.close()
-        except OSError:
-            pass
-        try: os.unlink(self.sock_path)
-        except FileNotFoundError: pass
+
+async def relay_handle_fds(engine: "ProxyEngine", box_id: str, fds: list,
+                           payload: bytes) -> None:
+    """Gate one caught connection for `box_id` — the receive side of a RELAY frame.
+
+    `fds` is the SCM_RIGHTS array that rode the frame: index 0 is ALWAYS the connection
+    socket the engine drives; index 1, if present, is a pidfd for the connecting in-box
+    workload process. `payload` is the meta JSON (no process fields, no sid — the box_id
+    is fixed by which CONNECTION the frame arrived on, never trusted from the box).
+
+    Derives the HOST-namespace pid from the pidfd (its fdinfo reports the pid in OUR —
+    the UI's host — namespace), then reads provenance with the same host-side
+    read_provenance() the FUSE path uses, so every persisted tgid is a HOST pid; a
+    dead/missing peer → untagged flow. Folds in the per-conn dest for the direct path."""
+    kind, dest = _parse_relay_meta(payload)
+    pidfd = fds[1] if len(fds) > 1 else -1
+    for extra in fds[2:]:
+        try: os.close(extra)
+        except OSError: pass
+    if not fds:
+        return
+    prov = {"tgid": 0}
+    if pidfd >= 0:
+        host_pid = _host_pid_from_pidfd(pidfd)
+        if host_pid > 0:
+            info = read_provenance(host_pid, full_env=True)
+            ppid_tgid = tgid_of(info["ppid"]) if info.get("ppid") else 0
+            prov = {"tgid": tgid_of(host_pid),
+                    "start_time": info.get("start_time") or 0,
+                    "ppid": ppid_tgid, "parent_pid": info.get("ppid") or 0,
+                    "exe": info["exe"], "argv": info["argv"],
+                    "env": info["env"]}
+        try: os.close(pidfd)
+        except OSError: pass
+    _CURRENT_PROV.set(prov)
+    _CURRENT_DEST.set(dest)
+    await engine.handle_fd(fds[0], box_id, kind=kind, dest=dest)
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  Output capture echo channel (UI → --inner live replay)
+#  Muxed box channel framing (the ONE box↔UI connection)
 # ════════════════════════════════════════════════════════════════════════════
-# When a box runs in capture mode (the default; -t opts out), its child's stdout/
-# stderr are pointed at the two hidden FUSE sink files. The sink write() handler
-# records every write to the `outputs` table (attributed per-write via ctx.pid) AND
-# enqueues (stream, bytes) onto a per-session bounded queue. A per-session drain task
-# frames those onto echo.sock, where --inner (inside the box) reads them and replays
-# each payload to the REAL fd 1/2 so the user sees output live. The bounded queue +
-# `await put` applies BACKPRESSURE to the one slow FUSE write (suspending just that
-# trio request) without blocking the event loop or other requests.
+# After the register handshake, the box runner's single connection to ui.sock carries
+# length-prefixed typed frames so FD passing and byte streams coexist on one stream:
 #
-# Flush ordering: when the child's last sink fd closes (FUSE release), the FUSE ops
-# layer calls flush_and_close(), which enqueues a None sentinel AFTER all already-
-# queued frames. The drain task processes the sentinel last, half-closes the socket
-# (write_eof), then --inner's reader thread sees EOF and drains the remaining bytes
-# before echo_done fires — so trailing output is never truncated even if the child
-# exits immediately after its last write.
+#     [4-byte big-endian total-len][1-byte type][payload]
+#
+# total-len counts the type byte + payload (not the 4-byte prefix). Frame types:
+#   RELAY     (inner→UI)  payload = meta JSON {kind,host,port,scheme}; the sendmsg
+#                         carrying this frame attaches SCM_RIGHTS [conn_fd] or
+#                         [conn_fd, pidfd] for the caught connection + its workload.
+#   ECHO      (UI→inner)  payload = [1-byte stream][bytes]; replayed to --inner's real
+#                         fd 1/2 for live, upward visibility.
+#   ECHO_DONE (UI→inner)  empty payload; flush-complete marker — all captured bytes for
+#                         this box have been framed; --inner may now close the conn.
+#   MUTE      (inner→UI)  the sendmsg attaches SCM_RIGHTS [pidfd] of --inner ITSELF;
+#                         the UI resolves --inner's HOST pid and adds it to a global
+#                         muted set: writes by that pid are echoed but NOT recorded.
+#   UNMUTE    (inner→UI)  empty payload; the UI removes --inner's pid from the set.
+#
+# RELAY replaces the per-connection connect() to a relay socket; ECHO/ECHO_DONE replace
+# the echo socket; MUTE/UNMUTE bracket the upward-echo window so nested readback is
+# never re-recorded at an ancestor. Connection-close is the box's teardown signal.
 
-# Wire frame: [stream:1][len:4 big-endian][payload]. Module-level codec so it is
-# unit-testable without a socket.
-def echo_encode_frame(stream: int, payload: bytes) -> bytes:
-    return bytes([stream & 0xFF]) + struct.pack("!I", len(payload)) + payload
+FRAME_RELAY = 1
+FRAME_ECHO = 2
+FRAME_ECHO_DONE = 3
+FRAME_MUTE = 4
+FRAME_UNMUTE = 5
 
-def echo_decode(buf: bytes) -> "tuple[list, bytes]":
+def encode_frame(ftype: int, payload: bytes = b"") -> bytes:
+    """Encode one typed frame: [total-len:4 BE][type:1][payload]. total-len counts the
+    type byte + payload. Module-level + pure so it is unit-testable without a socket."""
+    return struct.pack("!I", 1 + len(payload)) + bytes([ftype & 0xFF]) + payload
+
+def decode_frames(buf: bytes) -> "tuple[list, bytes]":
     """Decode as many whole frames as `buf` holds. Returns (frames, remainder) where
-    frames is [(stream, payload)] and remainder is the trailing partial frame (carry it
+    frames is [(ftype, payload)] and remainder is the trailing partial frame (carry it
     into the next call). Pure: a stream reader feeds bytes in and re-feeds the
     remainder, so a frame split across reads reassembles."""
     out = []
     i = 0
     n = len(buf)
-    while n - i >= 5:
-        stream = buf[i]
-        (plen,) = struct.unpack("!I", buf[i + 1:i + 5])
-        if n - (i + 5) < plen:
-            break                                  # partial payload: stop, keep remainder
-        out.append((stream, buf[i + 5:i + 5 + plen]))
-        i += 5 + plen
+    while n - i >= 4:
+        (tot,) = struct.unpack("!I", buf[i:i + 4])
+        if n - (i + 4) < tot:
+            break                                  # partial frame: stop, keep remainder
+        ftype = buf[i + 4]
+        payload = buf[i + 5:i + 4 + tot]
+        out.append((ftype, payload))
+        i += 4 + tot
     return out, buf[i:]
+
+def echo_payload(stream: int, data: bytes) -> bytes:
+    """Body of an ECHO frame: [stream:1][bytes]. stream 0=stdout, 1=stderr."""
+    return bytes([stream & 0xFF]) + data
+
+
+# Globally muted HOST pids: writes whose ctx.pid (host pid) is in this set are echoed
+# upward but NOT recorded (no add_output). A MUTE frame adds --inner's own host pid;
+# UNMUTE / connection-close removes it. GIL-atomic set ops; written by the UI asyncio
+# thread, read by the FUSE trio write-handler — both via the GIL, no extra lock needed.
+_MUTED_HOST_PIDS: set = set()
 
 
 _ECHO_QUEUE_MAX = 256       # bounded: a slow echo consumer backpressures one FUSE write
 
 
-class EchoServer:
-    """Per-session UI-side echo endpoint. Listens on echo_sock_path(sid); the sink
-    write() handler calls enqueue((stream, bytes)) (awaitable, bounded → backpressure);
-    a drain task frames the queued bytes to the single connected --inner client. On
-    close (both sinks released at child exit) the queue is flushed and the connection is
-    closed half-way so --inner drains remaining bytes (no truncation), then EOF.
+class _ConnWriter:
+    """A minimal write-only, loop-confined framed writer over a raw non-blocking socket.
 
-    Robust if --inner never connects or drops early: enqueue never blocks forever — when
-    no client is attached we keep at most _ECHO_QUEUE_MAX frames and drop the oldest, so
-    the table still records every write and the sink writes never deadlock."""
-    def __init__(self, sid: str, sock_path: str, loop: asyncio.AbstractEventLoop):
-        self.sid = sid; self.sock_path = sock_path; self._loop = loop
-        self._sock = None; self._accept_task = None; self._drain_task = None
+    The box's muxed connection is read via recvmsg (FD passing) on the asyncio loop; we
+    must NOT layer an asyncio StreamReader/transport over the SAME socket (its reader
+    would steal the inbound RELAY/MUTE frames). So ECHO/ECHO_DONE frames are written here
+    with a plain non-blocking send + add_writer backpressure, all on the loop thread —
+    interleaving cleanly with the recvmsg read loop on the same fd (full-duplex)."""
+    def __init__(self, conn: socket.socket, loop: asyncio.AbstractEventLoop):
+        self._conn = conn; self._loop = loop; self._buf = bytearray()
+
+    def write(self, data: bytes) -> None:
+        self._buf += data
+
+    async def drain(self) -> None:
+        while self._buf:
+            try:
+                n = self._conn.send(self._buf)
+                del self._buf[:n]
+            except (BlockingIOError, InterruptedError):
+                fut = self._loop.create_future()
+                fd = self._conn.fileno()
+                self._loop.add_writer(fd, lambda: fut.done() or fut.set_result(None))
+                try:
+                    await fut
+                finally:
+                    try: self._loop.remove_writer(fd)
+                    except (OSError, ValueError): pass
+            except OSError as e:
+                raise ConnectionError(str(e))
+
+    def close(self) -> None:
+        self._buf.clear()
+
+
+class EchoStream:
+    """Per-session UI-side echo source — socketless. The sink write() handler calls
+    enqueue((stream, bytes)) (awaitable, bounded → backpressure); a drain task frames
+    the queued bytes as ECHO frames onto the box's ONE muxed connection (set via
+    set_writer once the register handshake on that connection finishes). On close (both
+    sinks released at child exit) the queue is flushed and an ECHO_DONE frame is written
+    so --inner stops and closes the connection (no truncation).
+
+    Robust if the writer is never attached or drops early: enqueue never blocks forever —
+    when no writer is attached we keep at most _ECHO_QUEUE_MAX frames and drop the oldest,
+    so the table still records every write and the sink writes never deadlock."""
+    def __init__(self, sid: str, loop: asyncio.AbstractEventLoop):
+        self.sid = sid; self._loop = loop
+        self._drain_task = None
         self._queue: "asyncio.Queue" = asyncio.Queue(maxsize=_ECHO_QUEUE_MAX)
         self._writer: "asyncio.StreamWriter | None" = None
         self._closing = False
 
     def start(self) -> None:
-        try: os.makedirs(os.path.dirname(self.sock_path), mode=0o700, exist_ok=True)
-        except OSError: pass
-        try: os.unlink(self.sock_path)
-        except FileNotFoundError: pass
-        self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self._sock.bind(self.sock_path)
-        try: os.chmod(self.sock_path, 0o600)
-        except OSError: pass
-        self._sock.listen(1)
-        self._sock.setblocking(False)
-        self._accept_task = asyncio.create_task(self._accept_loop())
         self._drain_task = asyncio.create_task(self._drain_loop())
 
-    def enqueue(self, stream: int, payload: bytes) -> "asyncio.Future":
+    def set_writer(self, writer: "asyncio.StreamWriter | None") -> None:
+        """Attach the box connection's StreamWriter (the muxed channel). ECHO/ECHO_DONE
+        frames are written to it; serialized via the same writer the RELAY/teardown side
+        already owns, so the drain task is the only ECHO producer."""
+        self._writer = writer
+
+    def enqueue(self, stream: int, payload: bytes,
+                block: bool = True) -> "asyncio.Future":
         """Schedule (stream, payload) onto the bounded queue from ANOTHER thread (the
         FUSE serve/trio thread). Returns a concurrent.futures.Future the caller awaits
         (off the asyncio loop) so a full queue applies backpressure to that one write.
-        Never deadlocks: if the queue is full and no client is attached, the oldest frame
-        is dropped so the put completes — the table already has the bytes."""
+
+        Never deadlocks: when no writer is attached the oldest frame is dropped on a full
+        queue (the table already has the bytes). With block=False (used for MUTED readback
+        writes — see the FUSE write handler) we ALSO drop-oldest on a full queue even with
+        a writer attached, so the put can never block: a muted readback write must never
+        wait on this drain, or a descendant box's echo reader and this queue deadlock."""
         async def _put():
             if self._closing:
                 return
-            if self._writer is None and self._queue.full():
-                try: self._queue.get_nowait()      # no consumer: drop oldest, never block
+            if (self._writer is None or not block) and self._queue.full():
+                try: self._queue.get_nowait()      # drop oldest, never block
                 except asyncio.QueueEmpty: pass
             await self._queue.put((stream, payload))
         return asyncio.run_coroutine_threadsafe(_put(), self._loop)
-
-    async def _accept_loop(self) -> None:
-        while True:
-            try:
-                conn, _ = await self._loop.sock_accept(self._sock)
-            except (OSError, asyncio.CancelledError):
-                break
-            conn.setblocking(False)
-            # Single consumer: replace any prior writer (a reconnecting --inner).
-            _reader, writer = await asyncio.open_connection(sock=conn)
-            self._writer = writer
 
     async def _drain_loop(self) -> None:
         while True:
@@ -9574,36 +9634,29 @@ class EchoServer:
                 stream, payload = await self._queue.get()
             except asyncio.CancelledError:
                 break
-            if stream is None:                      # sentinel: flush done, close client
-                await self._close_writer()
-                continue
             w = self._writer
+            if stream is None:                      # sentinel: flush done, send ECHO_DONE
+                if w is not None:
+                    try:
+                        w.write(encode_frame(FRAME_ECHO_DONE))
+                        await w.drain()
+                    except (OSError, ConnectionError):
+                        self._writer = None
+                continue
             if w is None:
-                continue                            # no client yet: bytes already recorded
+                continue                            # no writer yet: bytes already recorded
             try:
-                w.write(echo_encode_frame(stream, payload))
+                w.write(encode_frame(FRAME_ECHO, echo_payload(stream, payload)))
                 await w.drain()
             except (OSError, ConnectionError):
                 self._writer = None
 
-    async def _close_writer(self) -> None:
-        w = self._writer
-        if w is not None:
-            try:
-                if w.can_write_eof(): w.write_eof()
-                await w.drain()
-            except (OSError, ConnectionError):
-                pass
-            try: w.close()
-            except OSError: pass
-            self._writer = None
-
     def flush_and_close(self) -> None:
-        """Both sinks released (child exited): drain the queue to the client, then EOF so
-        --inner reads all remaining bytes before exiting. Idempotent."""
+        """Both sinks released (child exited): drain the queue to the box conn, then send
+        ECHO_DONE so --inner reads all remaining bytes before closing. Idempotent."""
         if self._closing: return
         self._closing = True
-        # A None-stream sentinel ordered AFTER all queued frames triggers the half-close
+        # A None-stream sentinel ordered AFTER all queued frames triggers the ECHO_DONE
         # once the drain task has flushed everything ahead of it.
         try: asyncio.run_coroutine_threadsafe(
                 self._queue.put((None, b"")), self._loop)
@@ -9611,17 +9664,9 @@ class EchoServer:
 
     def stop(self) -> None:
         self._closing = True
-        for t in (self._accept_task, self._drain_task):
-            if t is not None: t.cancel()
-        if self._writer is not None:
-            try: self._writer.close()
-            except OSError: pass
-            self._writer = None
-        try:
-            if self._sock is not None: self._sock.close()
-        except OSError: pass
-        try: os.unlink(self.sock_path)
-        except FileNotFoundError: pass
+        if self._drain_task is not None:
+            self._drain_task.cancel()
+        self._writer = None
 
 
 def _host_pid_from_pidfd(pidfd: int) -> int:
@@ -9715,10 +9760,24 @@ def _derive_parent_sid(peer_pid: int, sup: "Supervisor") -> "str | None":
 
 class ChannelServer:
     """
-    The UI control socket (ui.sock). It carries control messages ONLY (register /
-    unregister / remove): newline JSON, no FDs. This socket is NEVER bind-mounted
-    into a sandbox, so untrusted in-box code cannot reach it. FD relay for networked
-    boxes happens on per-session RelayServer sockets instead (see RelayServer).
+    The UI socket (ui.sock) — the ONE socket. It serves two connection shapes:
+
+      • CLI control ops (patch/apply/discard/select/rename/remove): a one-shot
+        request/response over a short-lived connection (newline JSON, no persistent
+        channel). These come from separate runner processes; the connection closes
+        after the reply.
+
+      • A BOX runner's persistent connection: the register handshake (recvmsg JSON +
+        the runner's pidfd, JSON ack) followed by the MUXED box channel on the SAME
+        connection — RELAY frames inner→UI (FD passing), ECHO/ECHO_DONE frames UI→inner
+        (live echo), MUTE/UNMUTE frames inner→UI (nested-echo mute). Connection-close is
+        the box's teardown signal (it runs the consolidate the old unregister did).
+
+    ui.sock IS bind-mounted into boxes (read-only at UI_SOCK_INBOX) so a nested runner
+    can reach it. A box never registers/unregisters another session: the box_id a RELAY
+    frame is gated as is fixed by which CONNECTION it arrived on (bound to the minted sid
+    at register), never trusted from inside the box; teardown needs no owner token (the
+    box's own connection closing IS the signal).
     """
     def __init__(self, sup: Supervisor, engine: "ProxyEngine", sock_path: str):
         self.sup = sup; self.engine = engine; self.sock_path = sock_path
@@ -9782,11 +9841,11 @@ class ChannelServer:
             except OSError: pass
             return
         try:
-            # Control client: each line is JSON.  The control socket accepts a
-            # single pidfd on the register connection (used above to derive peer_pid);
-            # subsequent lines carry no FDs.  A register message produces a reply
-            # (the mount path + owner token) written back on the same connection so
-            # the runner can block on it.
+            # Control client: each line is JSON.  The first (and only, for a box) line
+            # may carry the runner's pidfd (used above to derive peer_pid).  A `register`
+            # produces a reply (mount path + owner token) AND then converts THIS same
+            # connection into the box's muxed channel — we serve it and return.  All
+            # other (CLI control) messages are one-shot request/response.
             while True:
                 if b"\n" in buf:
                     line, buf = buf.split(b"\n", 1)
@@ -9799,6 +9858,14 @@ class ChannelServer:
                                     None, _send_reply, conn, reply)
                             except OSError:
                                 pass
+                            # A successful register converts this connection into the box
+                            # channel: serve the mux, then run teardown on close.
+                            if (self._is_register(line) and reply.get("ok")
+                                    and reply.get("session_id")):
+                                await self._serve_box_channel(
+                                    conn, reply["session_id"], reply.get("owner_token", ""),
+                                    buf)
+                                return
                     continue
                 more = await self._loop.sock_recv(conn, 4096)
                 if not more:
@@ -9825,6 +9892,121 @@ class ChannelServer:
             try: conn.close()
             except OSError: pass
 
+    @staticmethod
+    def _is_register(line: bytes) -> bool:
+        try:
+            return json.loads(line.decode()).get("type") == "register"
+        except (json.JSONDecodeError, AttributeError):
+            return False
+
+    async def _recvmsg_ready(self, conn: socket.socket) -> "tuple[bytes, list]":
+        """Await readability on `conn` via add_reader, then ONE non-blocking recvmsg.
+        Returns (data, ancillary). (b"", []) on EOF. Raises OSError on a real error.
+        Holds no thread — the read stays on the asyncio loop, so per-box channels never
+        consume default-executor workers (which register/consolidate/_send_reply need)."""
+        while True:
+            try:
+                data, anc, _flags, _addr = conn.recvmsg(
+                    65536, socket.CMSG_SPACE(4 * 16))
+                return data, anc
+            except (BlockingIOError, InterruptedError):
+                pass
+            fut = self._loop.create_future()
+            fd = conn.fileno()
+            self._loop.add_reader(fd, lambda: fut.done() or fut.set_result(None))
+            try:
+                await fut
+            finally:
+                try: self._loop.remove_reader(fd)
+                except (OSError, ValueError): pass
+
+    async def _serve_box_channel(self, conn: socket.socket, sid: str,
+                                 owner_token: str, leftover: bytes) -> None:
+        """Serve the box's ONE muxed connection after a successful register. Reads
+        length-prefixed typed frames (RELAY/MUTE/UNMUTE inner→UI) pairing SCM_RIGHTS fds
+        with the frame they rode in on, and lets the box's EchoStream write ECHO/ECHO_DONE
+        frames out on the same connection. On EOF/close (box pid 1 exited) it runs the box
+        teardown the old unregister used to trigger. `leftover` is any bytes already read
+        past the register line (normally empty)."""
+        # Wire the EchoStream's writer to this connection so captured bytes flow as ECHO
+        # frames back to --inner. A write-only _ConnWriter over the SAME raw socket: we do
+        # NOT layer an asyncio StreamReader here, because the inbound RELAY/MUTE frames are
+        # read via recvmsg below on this same fd and a transport's reader would steal them.
+        conn.setblocking(False)
+        writer = _ConnWriter(conn, self._loop)
+        # Pids THIS connection added to the global muted set, so close removes exactly them.
+        muted_here: set = set()
+        try:
+            self.sup.attach_box_channel(sid, writer)
+            buf = leftover
+            # Queue of SCM_RIGHTS fd-arrays in arrival order. --inner serializes its sends
+            # and sends each FD-bearing frame (RELAY/MUTE) as exactly one sendmsg, so the
+            # Nth received fd-array pairs with the Nth FD-bearing frame decoded.
+            pending_fds: list = []
+            while True:
+                # Read frames via NON-BLOCKING recvmsg gated on socket readiness
+                # (add_reader). Crucially this holds NO executor thread for the box's
+                # whole lifetime — a per-box blocking recvmsg in the shared default
+                # executor would, with enough live boxes, starve the pool that register /
+                # consolidate / _send_reply also use (a deadlock observed under load,
+                # especially with nested boxes). add_reader keeps the read on the loop.
+                try:
+                    data, anc = await self._recvmsg_ready(conn)
+                except OSError:
+                    break
+                if not data and not anc:
+                    break                            # EOF: box pid 1 exited
+                for lvl, typ, adata in anc:
+                    if lvl == socket.SOL_SOCKET and typ == socket.SCM_RIGHTS:
+                        a = array.array("i"); a.frombytes(adata)
+                        pending_fds.append(a.tolist())
+                buf += data
+                frames, buf = decode_frames(buf)
+                for ftype, payload in frames:
+                    if ftype == FRAME_RELAY:
+                        fds = pending_fds.pop(0) if pending_fds else []
+                        # Drive each caught connection in its OWN task: relay_handle_fds
+                        # awaits the whole proxied exchange, so awaiting it inline would
+                        # block the reader from accepting the box's NEXT connection (a
+                        # deadlock when one request can't complete until another is read).
+                        # Each task gets its own contextvar copy (per-connection prov/dest).
+                        asyncio.create_task(
+                            relay_handle_fds(self.engine, sid, fds, payload))
+                    elif ftype == FRAME_MUTE:
+                        fds = pending_fds.pop(0) if pending_fds else []
+                        host_pid = _host_pid_from_pidfd(fds[0]) if fds else 0
+                        for fd in fds:
+                            try: os.close(fd)
+                            except OSError: pass
+                        if host_pid > 0:
+                            _MUTED_HOST_PIDS.add(host_pid)
+                            muted_here.add(host_pid)
+                    elif ftype == FRAME_UNMUTE:
+                        for hp in list(muted_here):
+                            _MUTED_HOST_PIDS.discard(hp)
+                        muted_here.clear()
+                if len(buf) > 1 << 20:               # 1 MiB cap on a partial frame
+                    break
+        except (OSError, asyncio.CancelledError):
+            pass
+        finally:
+            for hp in muted_here:
+                _MUTED_HOST_PIDS.discard(hp)
+            self.sup.detach_box_channel(sid)
+            if writer is not None:
+                # RuntimeError too: a test loop may be closing under us; in production
+                # the loop runs forever so this is only ever a clean transport close.
+                try: writer.close()
+                except (OSError, RuntimeError): pass
+            # Teardown: the box's pid 1 closing the connection IS the unregister signal.
+            try:
+                await self.sup.unregister_async(
+                    dict(session_id=sid, owner_token=owner_token, status="finished"),
+                    self._loop)
+            except Exception as e:
+                print(f"slopbox(ui): box-channel teardown of {sid} failed: {e}",
+                      file=sys.stderr)
+
     async def _dispatch_control(self, line: bytes, peer_pid: int = 0,
                                peer_pidfd: int = -1) -> "dict | None":
         try: msg = json.loads(line.decode())
@@ -9843,12 +10025,6 @@ class ChannelServer:
                 return self.sup.register(msg)          # acks with the mount path
             except Exception as e:
                 return dict(ok=False, error=str(e))
-        elif t == "unregister":
-            await self.sup.unregister_async(msg, self._loop)
-            return None   # fire-and-forget; no reply
-        elif t == "remove":
-            self.sup.drop(msg)
-            return None   # fire-and-forget; no reply
         elif t == "select":
             # `slopbox NAME …`: select a box by sid/NAME (and move the UI cursor).
             return self.sup.select(msg.get("sid"))
@@ -10224,31 +10400,35 @@ def cmd_run(cmd, net, env_capture, direct, session_whitelist, chdir, reuse_sid=N
     # Capture stdout/stderr unless -t (passthrough) or -d (direct: no overlay → no
     # sinks). Mutually exclusive with -t by construction (caller passes capture=not -t).
     want_capture = bool(capture) and not direct
-    ack = register_request(_ctrl_sock, type="register", session_id=sid,
+    # Open the ONE persistent connection and do the register handshake on it; the SAME
+    # connection becomes the box's muxed channel (we hand its fd to --inner via --conn-fd).
+    opened = register_open(_ctrl_sock, type="register", session_id=sid,
                            cmd=list(cmd), prov=self_prov, root_tgid=os.getpid(),
                            session_whitelist=session_whitelist, want_rerun=rerun,
                            want_net=net, want_env=env_capture, want_direct=direct,
                            want_capture=want_capture, **_extra_reg)
+    ack = opened[1] if opened else None
+    ui_conn = opened[0] if opened else None
     if not ack or not ack.get("ok") or not ack.get("mount"):
+        if ui_conn is not None:
+            try: ui_conn.close()
+            except OSError: pass
         print("slopbox: could not start slopbox"
               f"{(' — ' + ack['error']) if ack and ack.get('error') else ''}.",
               file=sys.stderr)
         return 1
     box_root = ack["mount"]                      # <mnt>/<box_id>
     # The UI minted the box_id; the mount subfolder IS str(box_id). Use it as the
-    # teardown/relay key (unregister uses this exact key).
+    # teardown key.
     sid = Path(box_root).name
     # For shm_dir, prefer the ack value (UI tells us the real backing path).
     shm_dir = ack.get("shm_dir", str(live_dir(sid)))
     can_net = net and bool(ack.get("net")) and ca_cert_path().exists()
-    # The owner token is held HERE, in the runner (outside the box). Only we can
-    # unregister this session; in-box code never sees it.
-    owner_token = ack.get("owner_token", "")
-    relay_path = ack.get("relay", "")            # this box's own FD relay socket
-    # Capture mode: the UI confirms it set up sinks + echo. echo_path is the per-session
-    # echo socket --inner reads live output from. Both live in the chan dir.
+    # Box teardown happens when --inner closes the muxed connection (the UI detects EOF on
+    # the ONE connection and consolidates), so the runner no longer needs the owner token
+    # for the box's own lifetime — the connection IS the proof. (CLI control ops still use
+    # it via their own short request/response connections.)
     capture_on = bool(ack.get("capture")) and want_capture
-    echo_path = ack.get("echo", "") if capture_on else ""
 
     # Diagnostics go to stderr (never stdout) and only ever before/after the
     # child runs, so the wrapped command's stdout stays clean.
@@ -10271,11 +10451,6 @@ def cmd_run(cmd, net, env_capture, direct, session_whitelist, chdir, reuse_sid=N
     code = 1
 
     try:
-        # The inner forwarder needs this box's OWN relay socket bound in (never the
-        # UI control socket). We bind only the relay socket's dedicated directory, so
-        # the box can reach nothing but its own per-session FD relay.
-        chan = relay_path if (can_net and relay_path) else ""
-
         # bwrap security boundary: the box's overlay root is bind-mounted as its root
         # (own pid/ipc/uts/net namespaces, runs as you). The bind-as-root confines the
         # box to its own subtree; it cannot reach <mnt>/ or a sibling's overlay.
@@ -10301,7 +10476,12 @@ def cmd_run(cmd, net, env_capture, direct, session_whitelist, chdir, reuse_sid=N
             bind_root_args = ["--bind", f"/{KIDS_DIR}/{sid}", "/"]
         else:
             bind_root_args = ["--bind", str(box_root), "/"]
-        popen_pass_fds: tuple = ()
+        # The ONE muxed connection is passed live into the sandbox: mark it inheritable
+        # and hand its fd number to --inner. bwrap maps pass_fds fds down unchanged
+        # (no --as-pid-1 fd remap of pass_fds), so the in-box fd number == ours.
+        conn_fd = ui_conn.fileno()
+        os.set_inheritable(conn_fd, True)
+        popen_pass_fds: tuple = (conn_fd,)
         # When nested (inside a parent box), the host sock_path() isn't accessible;
         # the UI socket is already visible at UI_SOCK_INBOX inside the box, so
         # bind-mount UI_SOCK_INBOX → UI_SOCK_INBOX (forwarding it to the child box).
@@ -10388,24 +10568,10 @@ def cmd_run(cmd, net, env_capture, direct, session_whitelist, chdir, reuse_sid=N
                 "--chdir", chdir or os.getcwd()]
         if bwrap_supports("--as-pid-1"):
             args += ["--as-pid-1"]
-        # Capture mode needs the chan dir (holding echo.sock) bound in even when the box
-        # is NOT networked — echo.sock lives alongside relay.sock in relay_dir(sid). But a
-        # NESTED box runs inside its parent's sandbox (with --tmpfs /tmp and no bind of the
-        # UI's live/ tree), so that host dir is unreachable: bind only if it actually
-        # exists here, otherwise drop live echo (the FUSE sinks still record output).
-        if capture_on and echo_path and not (can_net and chan):
-            chan_dir = os.path.dirname(echo_path)
-            if os.path.isdir(chan_dir):
-                args += ["--bind", chan_dir, chan_dir]
-            else:
-                echo_path = ""   # nested/sandboxed runner: record-only, no live replay
-        if can_net and chan:
-            # bind ONLY this box's relay-socket directory in (holds nothing but the
-            # per-session relay.sock) so the forwarder can reach its own relay — and
-            # nothing else under the runtime dir (not the control socket, not live/,
-            # not <mnt>/).
-            chan_dir = os.path.dirname(chan)
-            args += ["--bind", chan_dir, chan_dir]
+        if can_net:
+            # Networking is funneled through the ONE muxed connection (RELAY frames), so
+            # there is NO per-box relay/echo socket or chan dir to bind any more. We only
+            # need the CA + proxy env so in-box clients trust + reach the in-box forwarders.
             _ca = ca_cert_path()
             args += ["--ro-bind", str(_ca), str(_ca)]
             proxy = f"http://127.0.0.1:{INNER_PROXY_PORT}"
@@ -10423,21 +10589,25 @@ def cmd_run(cmd, net, env_capture, direct, session_whitelist, chdir, reuse_sid=N
             # node merges NODE_EXTRA_CA_CERTS with its built-in roots, so it only
             # needs the addition, not the whole bundle.
             args += ["--setenv", "NODE_EXTRA_CA_CERTS", str(_ca)]
-        # run our own --inner, which starts the forwarder then execs cmd. In capture mode
-        # pass --capture so --inner points the child's stdout/stderr at the sink files;
-        # add --echo only when echo.sock is reachable (dropped for nested boxes) so the
-        # echoed bytes are also replayed onto the real terminal.
+        # run our own --inner: it muxes over --conn-fd (the inherited UI connection),
+        # runs the network forwarders if --net, points the child's stdout/stderr at the
+        # FUSE sinks if --capture (and replays the UI's echoed bytes back to its terminal),
+        # then execs cmd. ALL of relay + echo + mute ride that one fd.
         inner_extra = []
+        if can_net:
+            inner_extra += ["--net"]
         if capture_on:
             inner_extra += ["--capture"]
-            if echo_path:
-                inner_extra += ["--echo", echo_path]
         args += ["--", sys.executable, find_self(), "--inner",
-                 "--channel", chan, *inner_extra, "--", *cmd]
+                 "--conn-fd", str(conn_fd), *inner_extra, "--", *cmd]
 
         proc = subprocess.Popen(args, preexec_fn=os.setpgrp,
                                 pass_fds=popen_pass_fds)
         launched = True
+        # Close OUR copy of the muxed-connection fd: --inner (box pid 1) is now the sole
+        # holder, so its exit closes the connection → UI sees EOF → box teardown.
+        try: ui_conn.close()
+        except OSError: pass
         try: os.setpgid(proc.pid, proc.pid)
         except OSError: pass
 
@@ -10451,6 +10621,11 @@ def cmd_run(cmd, net, env_capture, direct, session_whitelist, chdir, reuse_sid=N
 
         code = proc.wait()
     finally:
+        # If bwrap never launched, --inner never inherited the connection, so close OUR
+        # copy here so the UI still sees EOF and tears the just-created session down.
+        if not launched:
+            try: ui_conn.close()
+            except OSError: pass
         # Restore terminal foreground before we print anything else, so our own
         # output never races the child's or trips SIGTTOU.
         if tty_fd is not None and old_fg_pgrp is not None:
@@ -10460,12 +10635,11 @@ def cmd_run(cmd, net, env_capture, direct, session_whitelist, chdir, reuse_sid=N
             try: signal.signal(signal.SIGTTOU, old_ttou)
             except (OSError, ValueError): pass
 
-    # Tell the UI we exited. The UI runs consolidate() on live/<sid>, removes
-    # <mnt>/<sid> from the live set, and deletes live/<sid>. (The runner does NOT
-    # consolidate: the UI owns the index/mount and the only live index handle.)
-    sync_send(_ctrl_sock, type="unregister", session_id=sid, owner_token=owner_token,
-              status="finished" if launched else "error",
-              exit_code=(code or 0) if launched else 1)
+    # No explicit unregister: the box's teardown is driven by the UI seeing EOF on the
+    # ONE muxed connection when --inner (box pid 1) exits and closes it. The UI then runs
+    # consolidate() on live/<sid>, removes <mnt>/<sid> from the live set, and deletes
+    # live/<sid>. If bwrap never launched, our register-time connection close (above)
+    # still signals EOF, so the UI tears the just-created session down the same way.
     print(f"slopbox: {sid} exited ({code if launched else 1}). "
           f"Review changes in the UI.", file=sys.stderr)
     return (code or 0) if launched else 1
@@ -13226,17 +13400,18 @@ _USAGE = ("slopbox                         start the UI\n"
 def main() -> int:
     argv = sys.argv[1:]
 
-    # inner mode: slopbox --inner --channel PATH -- CMD...
+    # inner mode: slopbox --inner --conn-fd N [--net] [--capture] -- CMD...
+    # --conn-fd N is the inherited single muxed connection to the UI (post-handshake).
     if argv and argv[0] == "--inner":
         ap = argparse.ArgumentParser(prog="slopbox --inner")
-        ap.add_argument("--channel", default="")
+        ap.add_argument("--conn-fd", dest="conn_fd", type=int, default=-1)
+        ap.add_argument("--net", action="store_true")      # run the network forwarders
         ap.add_argument("--capture", action="store_true")  # redirect stdout/stderr → sinks
-        ap.add_argument("--echo", default="")     # capture: echo.sock for live replay
         ap.add_argument("cmd", nargs=argparse.REMAINDER)
         ns = ap.parse_args(argv[1:])
         cmd = ns.cmd
         if cmd and cmd[0] == "--": cmd = cmd[1:]
-        return run_inner(ns.channel, cmd, echo_path=ns.echo, capture=ns.capture)
+        return run_inner(ns.conn_fd, cmd, net=ns.net, capture=ns.capture)
 
     if not argv:
         return run_ui()

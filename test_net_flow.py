@@ -10,7 +10,7 @@ Coverage, all against the box's SINGLE <sid>.sqlar:
   A. a live HTTP request, proxied through the in-process engine, lands a flow row
      (correct host/port/status/action).
   B. the pidfd -> host-pid -> read_provenance -> _CURRENT_PROV/log_flow chain (the
-     EXACT chain RelayServer._handle runs) tags a flow with the HOST pid of a real
+     EXACT chain relay_handle_fds runs) tags a flow with the HOST pid of a real
      local child process, plus its real exe/argv/env -- no box-namespace pid is ever
      persisted.
   C. dedup: two flows from one process share one process+env row.
@@ -83,7 +83,7 @@ def _mk_supervisor(sid, tracing):
 
 
 def _resolve_prov_via_pidfd(pidfd: int) -> dict:
-    """Run the EXACT host-pid resolution RelayServer._handle does for a pidfd:
+    """Run the EXACT host-pid resolution relay_handle_fds does for a pidfd:
     pidfd -> /proc/self/fdinfo Pid (host namespace) -> read_provenance(host_pid) ->
     prov dict (host tgid/ppid/exe/argv/env). {"tgid":0} if the peer is gone."""
     prov = {"tgid": 0}

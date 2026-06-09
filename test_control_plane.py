@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 """Regression tests for the HIGH control-plane findings.
 
-HIGH-1: untrusted in-box code (reaching only a box's relay socket) must NOT be able
-        to (a) unregister another session, (b) register a new one, or (c) gate its
-        traffic as another sid — the sid in an FD message is ignored and derived from
-        which per-session relay socket the FD arrived on, gated by an owner token.
+HIGH-1: untrusted in-box code (reaching only its box's ONE muxed connection) must NOT
+        be able to (a) unregister another session, (b) register a new one, or (c) gate
+        its traffic as another sid — the sid in a RELAY frame is ignored and derived
+        from which CONNECTION the frame arrived on (bound to the minted sid at register).
 HIGH-2: register() rejects a session_id that isn't the one legitimate shape (so a
         traversal sid such as "../foo" or "a/b" creates no directory anywhere).
 
-    /home/user/venv/bin/python test_control_plane.py
+    uv run --with pyfuse3 --with trio pytest test_control_plane.py
 
-Self-safety: an isolated XDG temp tree; no real overlay mount; relay sockets are
-closed in finally.
+Self-safety: an isolated XDG temp tree; no real overlay mount; sockets closed in finally.
 """
 import asyncio, os, socket, sys, tempfile, shutil, array, json, threading
 from pathlib import Path
@@ -68,23 +67,7 @@ def test_sid_validation_rejects_traversal():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-# ── HIGH-1: relay socket gates by socket, not by message sid ────────────────
-
-def _shutdown_loop(loop, rs, thread):
-    """Stop a RelayServer + its asyncio loop and join the loop thread, so no pending
-    task is GC'd noisily after the test returns."""
-    def _close():
-        try:
-            if rs is not None: rs.stop()
-        except Exception: pass
-        loop.stop()
-    try: loop.call_soon_threadsafe(_close)
-    except Exception: pass
-    if thread is not None:
-        thread.join(timeout=5)
-    try: loop.close()
-    except Exception: pass
-
+# ── HIGH-1: RELAY frames gate by CONNECTION (sid), not by message body ──────
 
 class _RecordingEngine:
     """Stand-in ProxyEngine that just records (sid) it was asked to gate an FD as."""
@@ -102,136 +85,89 @@ class _RecordingEngine:
         self.done.set()
 
 
-def test_relay_fd_gated_by_socket_not_message():
-    tmp = Path(tempfile.mkdtemp(prefix="cp-"))
-    _redirect_state(tmp)
-    rs = None; t = None
+def _run_relay(eng, sid, fds, payload):
+    """Drive relay_handle_fds(eng, sid, fds, payload) to completion on a throwaway loop."""
     loop = asyncio.new_event_loop()
     try:
-        m.ensure_dirs()
-        sid_a = "20260604-000000_111"
-        os.makedirs(m.relay_dir(sid_a), mode=0o700, exist_ok=True)
-        eng = _RecordingEngine()
-        path = m.relay_sock_path(sid_a)
-
-        # run the loop in a thread so we can drive a blocking client from the main one
-        ready = threading.Event()
-        def run_loop():
-            asyncio.set_event_loop(loop)
-            nonlocal rs
-            rs = m.RelayServer(eng, sid_a, path, loop)
-            # start() calls asyncio.create_task(), which needs a RUNNING loop — in
-            # production register() runs it on the live relay loop. Mirror that: boot it
-            # as the loop's first callback, then signal ready once the socket is bound.
-            def _boot(): rs.start(); ready.set()
-            loop.call_soon(_boot)
-            loop.run_forever()
-        t = threading.Thread(target=run_loop, daemon=True); t.start()
-        ready.wait(5)
-
-        # a box on relay A sends an FD with a SPOOFED sid for another session
-        s0, s1 = socket.socketpair()
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
-            c.connect(path)
-            c.sendmsg([json.dumps({"session_id": "20260604-000000_999"}).encode()],
-                      [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
-                        array.array("i", [s0.fileno()]).tobytes())])
-        s0.close(); s1.close()
-
-        check(eng.done.wait(5), "relay: FD was handed to the engine")
-        check(eng.calls == [sid_a],
-              f"relay: FD gated as the relay's own sid, NOT the spoofed one "
-              f"(got {eng.calls})")
+        loop.run_until_complete(m.relay_handle_fds(eng, sid, fds, payload))
     finally:
-        _shutdown_loop(loop, rs, t)
-        shutil.rmtree(tmp, ignore_errors=True)
+        loop.close()
 
 
-def test_relay_socket_does_not_dispatch_control():
-    """A control JSON line sent to a relay socket (the only socket a box can reach)
-    must NOT unregister/register anything: relay sockets handle FD messages only and
-    never call the control dispatcher."""
-    tmp = Path(tempfile.mkdtemp(prefix="cp-"))
-    _redirect_state(tmp)
-    rs = None; t = None
-    loop = asyncio.new_event_loop()
-    try:
-        m.ensure_dirs()
-        sid_a = "20260604-000000_111"
-        os.makedirs(m.relay_dir(sid_a), mode=0o700, exist_ok=True)
-        eng = _RecordingEngine()
-        path = m.relay_sock_path(sid_a)
-        ready = threading.Event()
-        def run_loop():
-            asyncio.set_event_loop(loop)
-            nonlocal rs
-            rs = m.RelayServer(eng, sid_a, path, loop)
-            def _boot(): rs.start(); ready.set()
-            loop.call_soon(_boot)
-            loop.run_forever()
-        t = threading.Thread(target=run_loop, daemon=True); t.start()
-        ready.wait(5)
+def test_relay_fd_gated_by_connection_not_message():
+    """relay_handle_fds gates the FD as the sid bound to the CONNECTION it arrived on —
+    the meta payload carries no sid, so an in-box program cannot pick another session."""
+    sid_a = "111"
+    eng = _RecordingEngine()
+    s0, s1 = socket.socketpair()
+    # The meta JSON has no sid field at all (we never trust one); only proxy/direct kind.
+    _run_relay(eng, sid_a, [os.dup(s0.fileno())],
+               json.dumps({"kind": "proxy"}).encode())
+    s0.close(); s1.close()
+    check(eng.calls == [sid_a],
+          f"relay: FD gated as the bound connection's sid (got {eng.calls})")
 
-        # send a control message (no FD) to the relay socket
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
-            c.connect(path)
-            c.sendall((json.dumps(
-                {"type": "unregister", "session_id": "20260604-000000_999"})
-                + "\n").encode())
-            import time; time.sleep(0.5)
 
-        check(eng.calls == [],
-              "relay: a control line produced NO gating call (no FD => ignored)")
-        # the RelayServer exposes no control entrypoint at all
-        check(not hasattr(rs, "_dispatch_control"),
-              "relay: RelayServer has no control dispatcher")
-    finally:
-        _shutdown_loop(loop, rs, t)
-        shutil.rmtree(tmp, ignore_errors=True)
+def test_relay_empty_fds_is_noop():
+    """A RELAY frame with NO ancillary FD does nothing (never calls the engine) — the
+    box-channel reader only gates real connection FDs, never control."""
+    eng = _RecordingEngine()
+    _run_relay(eng, "111", [], json.dumps({"kind": "proxy"}).encode())
+    check(eng.calls == [], "relay: no-FD frame produces no gating call")
+    # relay_handle_fds is the ONLY receive entrypoint; there is no control dispatcher
+    # reachable from a RELAY frame.
+    check(callable(getattr(m, "relay_handle_fds", None)),
+          "relay: relay_handle_fds is the single FD-gating entrypoint")
 
 
 def test_relay_direct_meta_sets_kind_and_dest():
-    """A direct-path FD (JSON meta {kind:direct,host,port,scheme}) is gated as the
-    relay's sid AND carries the intended destination through to handle_fd, while a
-    proxy/empty payload stays kind=proxy. This is the UI receive side of the
-    synthetic-IP forwarder protocol."""
+    """A direct-path RELAY frame (meta {kind:direct,host,port,scheme}) is gated as the
+    connection's sid AND carries the intended destination through to handle_fd; a
+    proxy/empty payload stays kind=proxy. The UI receive side of the synthetic-IP path."""
+    sid_a = "111"
+    eng = _RecordingEngine()
+    s0, s1 = socket.socketpair()
+    _run_relay(eng, sid_a, [os.dup(s0.fileno())],
+               json.dumps({"kind": "direct", "host": "api.example.com",
+                           "port": 443, "scheme": "https"}).encode())
+    s0.close(); s1.close()
+    check(eng.calls == [sid_a], "relay(direct): gated as the connection's sid")
+    check(eng.kinds == ["direct"], "relay(direct): kind propagated as direct")
+    check(eng.dests == [("api.example.com", 443, "https")],
+          f"relay(direct): dest propagated (got {eng.dests})")
+
+
+def test_relay_meta_parse():
+    """_parse_relay_meta maps the meta JSON to (kind, dest); empty/garbage => proxy."""
+    check(m._parse_relay_meta(b"") == ("proxy", None), "empty meta => proxy")
+    check(m._parse_relay_meta(b"not json") == ("proxy", None), "garbage meta => proxy")
+    check(m._parse_relay_meta(b'{"kind":"proxy"}') == ("proxy", None),
+          "explicit proxy meta => proxy, no dest")
+    k, d = m._parse_relay_meta(
+        b'{"kind":"direct","host":"h","port":80,"scheme":"http"}')
+    check(k == "direct" and d == ("h", 80, "http"), "direct meta => (host,port,scheme)")
+
+
+def test_register_net_no_socket_advertised():
+    """register(want_net=True) NO LONGER creates any per-session relay/echo socket: the
+    ack advertises neither `relay` nor `echo` (those sockets are gone — networking rides
+    the ONE muxed connection as RELAY frames)."""
     tmp = Path(tempfile.mkdtemp(prefix="cp-"))
     _redirect_state(tmp)
-    rs = None; t = None
-    loop = asyncio.new_event_loop()
     try:
         m.ensure_dirs()
-        sid_a = "20260604-000000_111"
-        os.makedirs(m.relay_dir(sid_a), mode=0o700, exist_ok=True)
-        eng = _RecordingEngine()
-        path = m.relay_sock_path(sid_a)
-        ready = threading.Event()
-        def run_loop():
-            asyncio.set_event_loop(loop)
-            nonlocal rs
-            rs = m.RelayServer(eng, sid_a, path, loop)
-            def _boot(): rs.start(); ready.set()
-            loop.call_soon(_boot)
-            loop.run_forever()
-        t = threading.Thread(target=run_loop, daemon=True); t.start()
-        ready.wait(5)
-
-        s0, s1 = socket.socketpair()
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
-            c.connect(path)
-            c.sendmsg([json.dumps({"kind": "direct", "host": "api.example.com",
-                                   "port": 443, "scheme": "https"}).encode()],
-                      [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
-                        array.array("i", [s0.fileno()]).tobytes())])
-        s0.close(); s1.close()
-
-        check(eng.done.wait(5), "relay(direct): FD handed to the engine")
-        check(eng.calls == [sid_a], "relay(direct): still gated as the relay's own sid")
-        check(eng.kinds == ["direct"], "relay(direct): kind propagated as direct")
-        check(eng.dests == [("api.example.com", 443, "https")],
-              f"relay(direct): dest propagated (got {eng.dests})")
+        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
+        ack = sup.register(dict(session_id="NETBOX", cmd=["true"], want_net=True))
+        check(ack.get("ok") is True, "register(want_net) ok")
+        check(ack.get("net") is True, "register(want_net): net flag set in ack")
+        check("relay" not in ack, "register(want_net): NO relay socket advertised")
+        check("echo" not in ack, "register(want_net): NO echo socket advertised")
+        # No relay/echo helper symbols remain on the module.
+        check(not hasattr(m, "relay_sock_path") and not hasattr(m, "echo_sock_path")
+              and not hasattr(m, "RelayServer") and not hasattr(m, "EchoServer")
+              and not hasattr(m, "relay_dir"),
+              "no relay_sock_path/echo_sock_path/RelayServer/EchoServer/relay_dir remain")
     finally:
-        _shutdown_loop(loop, rs, t)
         shutil.rmtree(tmp, ignore_errors=True)
 
 
@@ -284,69 +220,6 @@ def test_owner_token_required_for_teardown():
         check(sid not in sup.sessions or not sup.sessions[sid].live,
               "unregister WITH the right token tears the session down")
     finally:
-        shutil.rmtree(tmp, ignore_errors=True)
-
-
-def test_register_net_wires_a_per_session_relay():
-    """register(want_net=True) with a relay factory attached creates THIS box's own
-    relay socket and returns its path; an FD sent there is gated as that sid."""
-    tmp = Path(tempfile.mkdtemp(prefix="cp-"))
-    _redirect_state(tmp)
-    rs_loop = asyncio.new_event_loop()
-    t = None
-    try:
-        m.ensure_dirs()
-        eng = _RecordingEngine()
-        ready = threading.Event()
-        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
-        def run_loop():
-            asyncio.set_event_loop(rs_loop)
-            sup.attach_relay_factory(rs_loop, eng)
-            ready.set(); rs_loop.run_forever()
-        t = threading.Thread(target=run_loop, daemon=True); t.start()
-        ready.wait(5)
-
-        # register must run on the relay loop's thread (it touches the loop)
-        box = {}
-        ev = threading.Event()
-        def do_reg():
-            box["ack"] = sup.register(dict(session_id="NETBOX", cmd=["true"], want_net=True))
-            ev.set()
-        rs_loop.call_soon_threadsafe(do_reg); ev.wait(5)
-        ack = box["ack"]
-        check(ack.get("ok") is True, "register(want_net) ok")
-        sid = ack["session_id"]   # the box's key str(box_id)
-        relay = ack.get("relay")
-        check(bool(relay) and Path(relay).exists(),
-              "register(want_net): a per-session relay socket exists")
-        check(relay == m.relay_sock_path(sid),
-              "register(want_net): relay socket is under this session's dir")
-
-        # an FD to that relay is gated as sid (regardless of message content)
-        s0, s1 = socket.socketpair()
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
-            c.connect(relay)
-            c.sendmsg([b"\x00"],
-                      [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
-                        array.array("i", [s0.fileno()]).tobytes())])
-        s0.close(); s1.close()
-        check(eng.done.wait(5) and eng.calls == [sid],
-              f"register(want_net): FD on the relay is gated as {sid} (got {eng.calls})")
-
-        # teardown stops + removes the relay socket
-        ev2 = threading.Event()
-        def do_unreg():
-            sup.unregister(dict(session_id=sid, owner_token=ack["owner_token"]))
-            ev2.set()
-        rs_loop.call_soon_threadsafe(do_unreg); ev2.wait(5)
-        check(not Path(relay).exists(),
-              "unregister: the per-session relay socket is removed")
-    finally:
-        try: rs_loop.call_soon_threadsafe(rs_loop.stop)
-        except Exception: pass
-        if t is not None: t.join(timeout=5)
-        try: rs_loop.close()
-        except Exception: pass
         shutil.rmtree(tmp, ignore_errors=True)
 
 
@@ -682,40 +555,46 @@ def test_channel_server_pidfd_register():
 
         pidfd = os.pidfd_open(os.getpid())
         ack = None
+        # KEEP the connection OPEN after register: that SAME connection IS the box's
+        # muxed channel now. Closing it is the teardown signal (EOF → unregister), so we
+        # must hold it open while we assert the session is live, then close it at the end.
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-                s.settimeout(10.0)
-                s.connect(sock_path)
-                s.sendmsg([payload],
-                          [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
-                            array.array("i", [pidfd]).tobytes())])
-                buf = b""
-                while b"\n" not in buf:
-                    chunk = s.recv(4096)
-                    if not chunk: break
-                    buf += chunk
-                line = buf.split(b"\n", 1)[0]
-                ack = json.loads(line.decode()) if line.strip() else None
+            s.settimeout(10.0)
+            s.connect(sock_path)
+            s.sendmsg([payload],
+                      [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
+                        array.array("i", [pidfd]).tobytes())])
+            buf = b""
+            while b"\n" not in buf:
+                chunk = s.recv(4096)
+                if not chunk: break
+                buf += chunk
+            line = buf.split(b"\n", 1)[0]
+            ack = json.loads(line.decode()) if line.strip() else None
+
+            check(ack is not None, "channel-server: register with pidfd got a reply")
+            check(ack and ack.get("ok") is True,
+                  f"channel-server: register ack ok=True (got {ack!r})")
+            check(ack and bool(ack.get("owner_token")),
+                  "channel-server: register ack includes an owner_token")
+
+            # Session is live in the supervisor (keyed by the minted box_id), while the
+            # box's muxed connection is still open.
+            sid = ack.get("session_id") if ack else None
+            check(sid in sup.sessions and sup.sessions[sid].live,
+                  "channel-server: session is live after pidfd-register")
+
+            # _derive_parent_sid with our own pid returns None (no session has us as
+            # ancestor) — just verify it doesn't crash and returns None for this case.
+            result = m._derive_parent_sid(os.getpid(), sup)
+            check(result is None or isinstance(result, str),
+                  f"channel-server: _derive_parent_sid ok (got {result!r})")
         finally:
             try: os.close(pidfd)
             except OSError: pass
-
-        check(ack is not None, "channel-server: register with pidfd got a reply")
-        check(ack and ack.get("ok") is True,
-              f"channel-server: register ack ok=True (got {ack!r})")
-        check(ack and bool(ack.get("owner_token")),
-              "channel-server: register ack includes an owner_token")
-
-        # Session is live in the supervisor (keyed by the minted box_id)
-        sid = ack.get("session_id") if ack else None
-        check(sid in sup.sessions and sup.sessions[sid].live,
-              "channel-server: session is live after pidfd-register")
-
-        # _derive_parent_sid with our own pid returns None (no session has us as ancestor)
-        # — the test just verifies it doesn't crash and returns None for this case.
-        result = m._derive_parent_sid(os.getpid(), sup)
-        check(result is None or isinstance(result, str),
-              f"channel-server: _derive_parent_sid ok (got {result!r})")
+            try: s.close()       # close the muxed connection → box teardown (EOF)
+            except OSError: pass
 
     finally:
         try: cs_loop.call_soon_threadsafe(cs_loop.stop)
@@ -1661,11 +1540,12 @@ def test_dissolve_live_descendant_allowed():
 
 if __name__ == "__main__":
     for t in (test_sid_validation_rejects_traversal,
-              test_relay_fd_gated_by_socket_not_message,
-              test_relay_socket_does_not_dispatch_control,
+              test_relay_fd_gated_by_connection_not_message,
+              test_relay_empty_fds_is_noop,
               test_relay_direct_meta_sets_kind_and_dest,
+              test_relay_meta_parse,
               test_owner_token_required_for_teardown,
-              test_register_net_wires_a_per_session_relay,
+              test_register_net_no_socket_advertised,
               test_box_cannot_register_or_unregister_a_foreign_session,
               test_command_is_the_root_process_row,
               test_dash_dash_required_and_flag_parsing,

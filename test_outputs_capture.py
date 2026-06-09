@@ -2,18 +2,20 @@
 """Backend tests for stdout/stderr capture.
 
 Three layers:
-  1. echo framing codec — encode→decode round-trip + partial-frame reassembly
-     (pure, no socket).
+  1. muxed-channel frame codec — encode→decode round-trip (incl. RELAY/ECHO/
+     ECHO_DONE/MUTE/UNMUTE types) + partial-frame reassembly (pure, no socket).
   2. outputs_* sqlar readers — add/list/get/has against a throwaway db.
   3. REAL FUSE integration — mount the multiplexed overlay, register a capture
      session so the two sink files exist, open a sink and write to it FROM THIS
      PROCESS, and assert an `outputs` row was recorded whose process_id resolves
      to this process and whose stream/content match. This proves per-write
      attribution end-to-end through the patched pyfuse3 (the write handler's
-     ctx.pid is the real writer's pid).
+     ctx.pid is the real writer's pid). A second FUSE case adds THIS process's pid
+     to the global muted set and asserts a muted write is NOT recorded.
 
-The full bwrap run_inner↔echo path (child stdout/stderr → sinks, live replay over
-echo.sock) is exercised only by the excluded e2e suite — it needs a real box.
+The full bwrap run_inner↔channel path (child stdout/stderr → sinks, ECHO frames
+replayed, MUTE/UNMUTE bracketing) is exercised only by the excluded e2e suite — it
+needs a real box.
 
     uv run --with pyfuse3 --with trio pytest test_outputs_capture.py
 """
@@ -40,32 +42,44 @@ def check(cond, msg):
         _fails.append(msg)
 
 
-# ── 1. echo framing codec ────────────────────────────────────────────────────
-def test_echo_framing_roundtrip():
-    frames = [(0, b"hello"), (1, b"err out"), (0, b""), (0, b"\x00\x01\x02\xff")]
-    buf = b"".join(m.echo_encode_frame(s, p) for s, p in frames)
-    got, rem = m.echo_decode(buf)
-    check(got == frames, "encode→decode round-trips every (stream, payload)")
+# ── 1. muxed-channel frame codec ─────────────────────────────────────────────
+def test_frame_codec_roundtrip():
+    # All five frame types, including empty payloads and binary, round-trip.
+    frames = [
+        (m.FRAME_RELAY, b'{"kind":"direct","host":"x","port":443,"scheme":"https"}'),
+        (m.FRAME_ECHO, m.echo_payload(0, b"hello")),
+        (m.FRAME_ECHO, m.echo_payload(1, b"\x00\x01\x02\xff")),
+        (m.FRAME_ECHO_DONE, b""),
+        (m.FRAME_MUTE, b""),
+        (m.FRAME_UNMUTE, b""),
+    ]
+    buf = b"".join(m.encode_frame(t, p) for t, p in frames)
+    got, rem = m.decode_frames(buf)
+    check(got == frames, "encode→decode round-trips every (type, payload)")
     check(rem == b"", "no remainder when buffer ends on a frame boundary")
+    p = m.echo_payload(1, b"abc")
+    check(p[0] == 1 and p[1:] == b"abc", "echo_payload encodes [stream][bytes]")
 
 
-def test_echo_framing_partial_reassembly():
-    frames = [(0, b"chunk-one"), (1, b"chunk-two-longer")]
-    full = b"".join(m.echo_encode_frame(s, p) for s, p in frames)
+def test_frame_codec_partial_reassembly():
+    frames = [(m.FRAME_ECHO, m.echo_payload(0, b"chunk-one")),
+              (m.FRAME_RELAY, b'{"kind":"proxy"}')]
+    full = b"".join(m.encode_frame(t, p) for t, p in frames)
     # Feed the stream one byte at a time; a frame split across reads must reassemble.
     out = []
     carry = b""
     for i in range(len(full)):
         carry += full[i:i + 1]
-        got, carry = m.echo_decode(carry)
+        got, carry = m.decode_frames(carry)
         out.extend(got)
     check(out == frames, "byte-at-a-time feed reassembles split frames")
     check(carry == b"", "no leftover after the last full frame")
 
     # A truncated trailing frame is held as remainder, not mis-decoded.
-    got, rem = m.echo_decode(full[:-3])
+    f0 = m.encode_frame(*frames[0])
+    got, rem = m.decode_frames(full[:-3])
     check(got == frames[:1], "first whole frame decoded; partial second withheld")
-    check(rem == full[len(m.echo_encode_frame(*frames[0])):-3],
+    check(rem == full[len(f0):-3],
           "the partial second frame is returned verbatim as remainder")
 
 
@@ -165,12 +179,48 @@ def test_sink_write_records_attributed_output():
         shutil.rmtree(tmproot, ignore_errors=True)
 
 
+def test_muted_sink_write_not_recorded():
+    """A write whose host pid is in the global muted set is NOT recorded (no outputs
+    row) even though it still flows through the sink — this is the nested-echo mute:
+    readback travelling up an ancestor sink is echoed onward but not re-recorded."""
+    extsuite.require_fuse()
+    tmproot = tempfile.mkdtemp(prefix="outputs-mute-")
+    os.environ["XDG_STATE_HOME"] = os.path.join(tmproot, "state")
+    os.environ["XDG_RUNTIME_DIR"] = os.path.join(tmproot, "run")
+    os.makedirs(os.environ["XDG_STATE_HOME"], exist_ok=True)
+    os.makedirs(os.environ["XDG_RUNTIME_DIR"], exist_ok=True)
+    mount = m.OverlayMount(m.mnt_point(), lower="/")
+    if not mount.start():
+        shutil.rmtree(tmproot, ignore_errors=True)
+        raise RuntimeError(f"overlay mount failed: {mount._start_error}")
+    m._MUTED_HOST_PIDS.add(os.getpid())
+    try:
+        sid = str(m.mint_box_id())
+        backing = m.live_dir(sid)
+        (backing / "up").mkdir(parents=True, exist_ok=True)
+        index = m.Index(backing)
+        mount.add_session(sid, backing / "up", index)
+        mount.ops.add_sink(sid, m.SINK_STDOUT_REL, 0)
+        box_root = m.mnt_point() / sid
+        with open(box_root / m.SINK_STDOUT_REL, "wb", buffering=0) as f:
+            f.write(b"muted output should NOT be recorded\n")
+        rows = m.outputs_list(m.sqlar_path(sid))
+        check(rows == [] or len(rows) == 0,
+              "a muted writer's sink write is NOT recorded in outputs")
+    finally:
+        m._MUTED_HOST_PIDS.discard(os.getpid())
+        try: mount.stop()
+        except Exception: pass
+        shutil.rmtree(tmproot, ignore_errors=True)
+
+
 if __name__ == "__main__":
-    tests = [test_echo_framing_roundtrip, test_echo_framing_partial_reassembly,
+    tests = [test_frame_codec_roundtrip, test_frame_codec_partial_reassembly,
              test_outputs_readers]
     try:
         extsuite.require_fuse()
         tests.append(test_sink_write_records_attributed_output)
+        tests.append(test_muted_sink_write_not_recorded)
     except extsuite._Skip as e:
         print(f"  skip  FUSE integration ({e})")
     for t in tests:
