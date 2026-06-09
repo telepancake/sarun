@@ -10422,6 +10422,7 @@ def cmd_run(cmd, net, env_capture, direct, session_whitelist, chdir, reuse_sid=N
 #:   [cyan]c[/]  Changes    — the file tree the box wrote; [cyan]↵[/] on a file shows its diff
 #:   [cyan]t[/]  Network    — the connections the box made and whether each was allowed
 #:   [cyan]p[/]  Processes  — the box's process tree
+#:   [cyan]o[/]  Output     — the box's captured stdout/stderr outputs; the whole stream, the selected write marked
 #:   [cyan]w[/]  Net rules  — the saved allow/deny ruleset
 #:   [cyan]f[/]  File rules — the saved apply/discard/passthrough ruleset
 #: While a box is [b]running[/], these three panes show only what is [b]live right now[/] — the
@@ -10429,16 +10430,17 @@ def cmd_run(cmd, net, env_capture, direct, session_whitelist, chdir, reuse_sid=N
 #: running — each entry dropping off as it finishes. The complete record (every file it
 #: wrote, every connection it made, the full process tree) appears once the box exits.
 #:
-#: [b]Filter a list[/] ([cyan]/[/]):  in the Changes, Network and Processes panes, [cyan]/[/] opens a
-#: filter editor — the same and/or/not clause rows as the rule forms — and keeps only the
+#: [b]Filter a list[/] ([cyan]/[/]):  in the Changes, Network, Processes and Output panes, [cyan]/[/] opens
+#: a filter editor — the same and/or/not clause rows as the rule forms — and keeps only the
 #: entries that match (paths/process facets for changes, host/ip/cname/url for network,
-#: process facets for procs). Press [cyan]/[/] again to clear it. The active filter shows in the
-#: bottom bar.
-#: [b]Follow the trail[/] ([cyan]c[/] / [cyan]t[/] / [cyan]p[/] across these three panes):  the view keys also
+#: process facets for procs and for output). Press [cyan]/[/] again to clear it. The active filter
+#: shows in the bottom bar. In the Output pane the right side concatenates only the writes
+#: that survive the filter.
+#: [b]Follow the trail[/] ([cyan]c[/] / [cyan]t[/] / [cyan]p[/] / [cyan]o[/] across these panes):  the view keys also
 #: cross-navigate WITH an automatic filter — from a change, [cyan]p[/] shows exactly the
 #: process(es) that wrote it; from a flow, [cyan]p[/] shows the process that made it; from a
-#: process, [cyan]c[/] / [cyan]t[/] show exactly its changes / connections. [cyan]esc[/] (or [cyan]/[/]) returns to the
-#: full list.
+#: process, [cyan]c[/] / [cyan]t[/] / [cyan]o[/] show exactly its changes / connections / output, and from an output
+#: write, [cyan]p[/] shows the writing process. [cyan]esc[/] (or [cyan]/[/]) returns to the full list.
 #:
 #: [b]Boxes pane:[/]  [cyan]k[/] kill a running box · [cyan]d[/] delete a box and its overlay · [cyan]n[/] rename it.
 #: [b]Changes pane:[/]  [cyan]a[/] apply the selected file · [cyan]A[/] apply all · [cyan]x[/] discard the file ·
@@ -10955,6 +10957,7 @@ def _make_ui_app():
         #status { height:1; background:$surface; color:$text-muted; padding:0 1; }
         DataTable { height:1fr; } ListView { height:1fr; }
         #flow-wrap { height:1fr; } #flow-detail { height:auto; padding:0 1; }
+        #out-wrap { height:1fr; } #out-detail { height:auto; padding:0 1; }
         #cd-info { height:auto; padding:0 1; background:$panel; }
         #confirm-box { width:64; height:auto; padding:1 2; background:$surface; border:tall $error; }
         #confirm-msg { margin-bottom:1; } #confirm-btns { height:3; }
@@ -10975,26 +10978,31 @@ def _make_ui_app():
         # The left-hand view is switched among these sources; the right pane
         # shows the matching detail. Approvals are not a view — they arrive as a
         # transient top banner with global keys, so they never steal the cursor.
-        VIEWS=("boxes","changes","netlog","procs","net","file")
+        VIEWS=("boxes","changes","netlog","procs","outputs","net","file")
         VIEW_TITLE={"boxes":"Slopboxes","changes":"Changes","netlog":"Network",
-                    "procs":"Processes","net":"Net rules","file":"File rules"}
+                    "procs":"Processes","outputs":"Output",
+                    "net":"Net rules","file":"File rules"}
         LEFT={"boxes":"#s-tab","changes":"#cf-tab","netlog":"#nf-tab",
-              "procs":"#pr-tab","net":"#w-list","file":"#r-list"}
+              "procs":"#pr-tab","outputs":"#out-tab","net":"#w-list","file":"#r-list"}
         RIGHT={"boxes":"#box-wrap","changes":"#cd-log","netlog":"#flow-wrap",
-               "procs":"#proc-wrap","net":"#rule-detail","file":"#rule-detail"}
+               "procs":"#proc-wrap","outputs":"#out-wrap",
+               "net":"#rule-detail","file":"#rule-detail"}
         # One direct key per list (shown — and highlighted for the current one — in
         # the bottom key bar). No tab strip: the active view is the lit-up key.
         VIEW_KEY={"boxes":"b","changes":"c","netlog":"t","procs":"p",
-                  "net":"w","file":"f"}
-        # The three filterable list views and the user Match kinds '/' offers for each
-        # (always WITHOUT the internal "ids" kind — that's built only by c/t/p navigation).
-        FILTERABLE={"changes":FILE_KINDS, "netlog":NET_KINDS, "procs":SUBJECT_KINDS}
-        FILTER_DEFAULT={"changes":"path", "netlog":"host", "procs":"exe"}
+                  "outputs":"o","net":"w","file":"f"}
+        # The filterable list views and the user Match kinds '/' offers for each
+        # (always WITHOUT the internal "ids" kind — that's built only by c/t/p/o navigation).
+        FILTERABLE={"changes":FILE_KINDS, "netlog":NET_KINDS, "procs":SUBJECT_KINDS,
+                    "outputs":SUBJECT_KINDS}
+        FILTER_DEFAULT={"changes":"path", "netlog":"host", "procs":"exe",
+                        "outputs":"exe"}
         BINDINGS=[
             Binding("b","view_boxes","boxes"),
             Binding("c","view_changes","changes"),
             Binding("t","view_netlog","network"),
             Binding("p","view_procs","processes"),
+            Binding("o","view_outputs","outputs"),
             Binding("w","view_net","net rules"),
             Binding("f","view_file","file rules"),
             Binding("/","filter","filter"),
@@ -11041,6 +11049,9 @@ def _make_ui_app():
             # never re-sorts). _ch_conn = connector row keys the cursor skips.
             self._ch_rows=[]; self._ch_conn=set()
             self._nf_flows=[]
+            # Outputs pane: the current filtered list of captured-write rows (id order)
+            # and the id-set key its table was last reconciled to (skip no-op reloads).
+            self._out_rows=[]; self._out_key=None
             self._last_loaded_sid=None  # guard against reload on re-highlight
             # Live boxes: per-sid incremental change map {rel -> {path,kind,size}},
             # seeded once then folded from the enriched FUSE event stream — never
@@ -11093,6 +11104,7 @@ def _make_ui_app():
                     yield ChangesTable(id="cf-tab", cursor_type="row")
                     yield NetTable(id="nf-tab", cursor_type="row")
                     yield NetTable(id="pr-tab", cursor_type="row")
+                    yield NetTable(id="out-tab", cursor_type="row")
                     yield RulesList(id="w-list")
                     yield FileRulesList(id="r-list")
                 with Vertical(id="right"):
@@ -11105,6 +11117,8 @@ def _make_ui_app():
                         yield Static("", id="flow-detail")
                     with VerticalScroll(id="proc-wrap"):
                         yield Static("", id="proc-detail")
+                    with VerticalScroll(id="out-wrap"):
+                        yield Static("", id="out-detail")
                     yield Static("", id="rule-detail")
             yield Static("", id="c-bar")
             yield Static("", id="status")
@@ -11118,6 +11132,8 @@ def _make_ui_app():
             self.query_one("#cf-tab",DataTable).add_columns("","Path","Size")
             self.query_one("#pr-tab",DataTable).add_columns(
                 "TGID","PPID","Exe","Argv")
+            self.query_one("#out-tab",DataTable).add_columns(
+                "Time","Stream","Process","Bytes")
             loop=asyncio.get_running_loop()
             # ensure_ca_cert may block up to ~5 s (polling for mitmdump to write
             # the CA cert file); run it in a thread-pool executor so it does not
@@ -11529,6 +11545,8 @@ def _make_ui_app():
                 _g(lambda: self._load_flows(self._sel_sid))
             if self.view=="procs" and self._sel_sid:
                 _g(lambda: self._load_procs(self._sel_sid))
+            if self.view=="outputs" and self._sel_sid:
+                _g(lambda: self._load_outputs(self._sel_sid))
             if self.view=="boxes":
                 _g(self._update_box_detail)
             _g(self._cbar)    # keep the dirty/count indicator current
@@ -11556,6 +11574,8 @@ def _make_ui_app():
                 self._load_flows(self._sel_sid, force=True)
             if v=="procs" and self._sel_sid:
                 self._load_procs(self._sel_sid, force=True)
+            if v=="outputs" and self._sel_sid:
+                self._load_outputs(self._sel_sid, force=True)
             self._update_right()
             try: self.query_one(self.LEFT[v]).focus()
             except Exception: pass
@@ -11564,6 +11584,7 @@ def _make_ui_app():
         def action_view_changes(self): self._nav("changes")
         def action_view_procs(self): self._nav("procs")
         def action_view_netlog(self): self._nav("netlog")
+        def action_view_outputs(self): self._nav("outputs")
         def action_view_net(self): self._set_view("net")
         def action_view_file(self): self._set_view("file")
 
@@ -11608,8 +11629,12 @@ def _make_ui_app():
                 f=self.sup.flow_detail(sid, fid) or self.sup.open_flow_detail(sid, fid)
                 pid=f.get("process_id") if f else None
                 return [pid] if pid is not None else None
-            if src=="procs" and dest in ("changes","netlog"):
-                pid=self._sel_proc()                       # → this proc's changes / flows
+            if src=="procs" and dest in ("changes","netlog","outputs"):
+                pid=self._sel_proc()                       # → this proc's changes / flows / output
+                return [pid] if pid is not None else None
+            if src=="outputs" and dest=="procs":
+                oid=self._sel_output()                     # → the write's process
+                pid=self._output_pid(oid)
                 return [pid] if pid is not None else None
             return None
 
@@ -11648,6 +11673,7 @@ def _make_ui_app():
             if v=="changes": self._load_changes(self._sel_sid, force=True)
             elif v=="netlog": self._load_flows(self._sel_sid, force=True)
             elif v=="procs": self._load_procs(self._sel_sid, force=True)
+            elif v=="outputs": self._load_outputs(self._sel_sid, force=True)
 
         def _filter_clauses(self, v):
             """The active clause list for view `v`, or None when its filter is off — what
@@ -11703,6 +11729,24 @@ def _make_ui_app():
                     out.append((rid, exe, cwd, argv))
             return out
 
+        def _filter_outputs(self, sid, rows):
+            """Keep only output entries matching the outputs filter. Each entry's target
+            tests the WRITING process's box/exe/cwd/arg (resolved from its process_id via
+            proc_prov), plus the internal "ids" kind vs the entry's own process_id — so a
+            process→outputs navigation can pin the pane to one process's writes. Mirrors
+            _filter_flows; the concatenated right pane reflects only the surviving set."""
+            clauses=self._filter_clauses("outputs")
+            if not clauses: return rows
+            box=self._box_name_for(sid)
+            out=[]
+            for r in rows:
+                pid=r.get("process_id")
+                subj=_subject_of(box, self.sup.proc_prov(sid, pid) if pid is not None else None)
+                tgt=ProcFilterTarget(pid if pid is not None else 0, subj)
+                if eval_clauses(tgt, clauses):
+                    out.append(r)
+            return out
+
         def _box_name_for(self, sid):
             # The box's dotted display name (for the shared box: filter kind).
             s=self.sessions.get(sid)
@@ -11716,11 +11760,12 @@ def _make_ui_app():
             "changes":"📁 FILES   [dim]+ new · ~ mod · - del · [/][reverse red]![/][dim] stale[/]",
             "netlog":"🌐 CONNECTIONS   [dim]✓ allowed · ✗ denied · ↑ req · ↓ resp[/]",
             "procs":"⚙ PROCESSES   [dim]tgid · ppid · exe · argv[/]",
+            "outputs":"▌ OUTPUT   [dim]stdout/stderr writes · selected marked in the stream[/]",
             "net":"✓ NETWORK RULES   [dim]top → bottom, first match wins[/]",
             "file":"✓ FILE RULES   [dim]top → bottom, first match wins[/]"}
         _RIGHT_HDR={
             "boxes":"≣ DETAIL","changes":"≡ DIFF","netlog":"≡ REQUEST · RESPONSE",
-            "procs":"≡ ENVIRONMENT",
+            "procs":"≡ ENVIRONMENT","outputs":"≡ STDOUT · STDERR",
             "net":"⛁ WHAT IT MATCHES","file":"⛁ WHAT IT MATCHES"}
         _ACTS={
             "boxes":[("↵","review"),("k","kill"),("d","delete")],
@@ -11728,6 +11773,7 @@ def _make_ui_app():
                        ("X","disc all")],
             "netlog":[("↑/↓","browse")],
             "procs":[("↑/↓","browse")],
+            "outputs":[("↑/↓","browse")],
             "net":[("↵/e","edit"),("d","remove"),("^↑/^↓","move")],
             "file":[("a","add"),("↵/e","edit"),("d","remove"),("^↑/^↓","move")]}
 
@@ -11768,6 +11814,7 @@ def _make_ui_app():
             if self.view=="boxes": self._update_box_detail()
             elif self.view=="netlog": self._update_flow_detail()
             elif self.view=="procs": self._update_proc_detail()
+            elif self.view=="outputs": self._update_output_detail()
             elif self.view in ("net","file"): self._update_rule_detail()
 
         def _notify(self, title, body):
@@ -12516,6 +12563,143 @@ def _make_ui_app():
             try: return t.coordinate_to_cell_key((t.cursor_row,0)).row_key.value
             except Exception: return None
 
+        # ════════════════════════════════════════════════════════════════════
+        #  outputs pane (the box's captured stdout/stderr writes)
+        # ════════════════════════════════════════════════════════════════════
+        # A LIST of per-write entries on the left; on the right the WHOLE listed
+        # (search-filtered) output stream CONCATENATED in id order, with the
+        # currently-selected entry's lines marked in the left margin — so a single
+        # write is located within the surrounding stream. Outputs grow during a run
+        # (like flows), so the live tick reloads this pane too.
+        _OUT_CAP=8000        # max chars rendered into the right pane (windowed on selection)
+
+        def _proc_pid_map(self, sid):
+            """{process ROW id -> (exe, tgid)} for the box, merging the persisted process
+            table (works live AND finished) with the live Index's RAM mirror (so a still-
+            running box whose rows aren't flushed yet still resolves). Used to render the
+            outputs list's "Process" column (exe basename + pid) from each entry's
+            process_id."""
+            out={}
+            try:
+                for p in self.sup.processes(sid):
+                    rid,tgid,exe=p[0],p[1],p[4]   # (id,tgid,ppid,parent_id,exe,argv)
+                    out[rid]=(exe or "", tgid)
+            except Exception: pass
+            # Live rows not yet in the persisted table: fill from the Index mirror.
+            for r in (self._out_rows or []):
+                pid=r.get("process_id")
+                if pid is None or pid in out: continue
+                info=self.sup.proc_info(sid, pid)
+                if info is not None:
+                    out[pid]=(info[3] or "", info[0])   # (tgid,ppid,parent,exe,argv)
+            return out
+
+        def _load_outputs(self, sid, force=False):
+            # Read every captured write, apply the '/' filter (the right pane reflects only
+            # the surviving set), then reconcile #out-tab in place so the cursor/scroll
+            # survive the steady append of new writes during a run.
+            rows=self.sup.outputs(sid)
+            rows=self._filter_outputs(sid, rows)
+            self._out_rows=rows
+            def _key(rs): return tuple(r["id"] for r in rs)
+            # Key on the exact id set: the filtered list can shrink as well as grow.
+            if not force and _key(rows)==getattr(self,"_out_key",None):
+                self._update_output_detail(); return
+            self._out_key=_key(rows)
+            pmap=self._proc_pid_map(sid)
+            def row(r):
+                stream=r.get("stream",0)
+                stc="red" if stream==1 else ""
+                exe,tgid=pmap.get(r.get("process_id"), ("", None))
+                base=(exe.rsplit("/",1)[-1] or exe or "?") if exe else "?"
+                proc=f"{base}·{tgid}" if tgid is not None else base
+                return (r["id"], [
+                    Text(time.strftime("%H:%M:%S", time.localtime(r["ts"]))),
+                    Text("err" if stream==1 else "out", style=stc),
+                    Text(proc[:20], style="cyan"),
+                    fmt_bytes(r.get("len",0))])
+            self._sync_table(self.query_one("#out-tab",DataTable), [row(r) for r in rows])
+            self._update_output_detail()
+
+        def _out_decode(self, blob) -> str:
+            # Decode captured bytes for DISPLAY: UTF-8 first, then a lossless binary
+            # fallback (latin-1 never raises) — the same utf-8-then-binary approach the
+            # flow body uses, minus the http content-encoding step (raw writes aren't
+            # gzip/multipart).
+            if not blob: return ""
+            raw=bytes(blob)
+            try: return raw.decode("utf-8")
+            except UnicodeDecodeError: return raw.decode("latin-1")
+
+        def _update_output_detail(self):
+            d=self.query_one("#out-detail",Static)
+            sid=self._sel_sid
+            rows=self._out_rows or []
+            if not sid or not rows:
+                d.update(Text("(no output)", style="dim")); return
+            sel=self._sel_output()
+            # Pull each listed entry's content (in id order) and split into lines tagged
+            # with the owning entry's id + stream — the unit the margin/style apply to.
+            segs=[]   # (oid, stream, text)
+            for r in rows:
+                det=self.sup.output_detail(sid, r["id"])
+                if not det: continue
+                segs.append((r["id"], r.get("stream",0), self._out_decode(det.get("content"))))
+            full="".join(s[2] for s in segs)
+            # CAP: concatenated output can be huge. Keep a window of _OUT_CAP chars centred
+            # on the selected entry so the selection is always on-screen; note any elision.
+            total=len(full)
+            # Char offset where the selected entry's text begins (for windowing).
+            sel_off=0; acc=0
+            for oid,_st,txt in segs:
+                if oid==sel: sel_off=acc
+                acc+=len(txt)
+            start=0; end=total
+            if total>self._OUT_CAP:
+                half=self._OUT_CAP//2
+                start=max(0, sel_off-half); end=min(total, start+self._OUT_CAP)
+                start=max(0, end-self._OUT_CAP)
+            t=Text()
+            if start>0:
+                t.append(f"  … {fmt_bytes(start)} earlier\n", style="dim")
+            # Walk the concatenated stream line-by-line within [start,end), prefixing each
+            # line with a gutter marker for the SELECTED entry and styling stderr dim-red.
+            pos=0
+            for oid,stream,txt in segs:
+                seg_start=pos; seg_end=pos+len(txt); pos=seg_end
+                if seg_end<=start or seg_start>=end: continue
+                vis=txt[max(0,start-seg_start): len(txt)-max(0,seg_end-end)]
+                is_sel=(oid==sel)
+                # stderr reads dim-red; the selected write's lines are bold over a faint
+                # band so the whole write stands out within the surrounding stream.
+                line_style=" ".join(filter(None, [
+                    "red" if stream==1 else "", "bold" if is_sel else "",
+                    "on grey23" if is_sel else ""])) or None
+                gutter="▌ " if is_sel else "  "
+                # Render per visual line so the gutter marks every line of the selection.
+                lines=vis.split("\n")
+                for i,ln in enumerate(lines):
+                    last=(i==len(lines)-1)
+                    if not ln and last and i>0: break   # trailing newline: no empty extra line
+                    t.append(gutter, style="yellow bold" if is_sel else "dim")
+                    t.append(ln, style=line_style)
+                    t.append("\n")
+            if end<total:
+                t.append(f"  … {fmt_bytes(total-end)} more\n", style="dim")
+            d.update(t)
+
+        def _sel_output(self):
+            t=self.query_one("#out-tab",DataTable)
+            if not t.row_count: return None
+            try: return t.coordinate_to_cell_key((t.cursor_row,0)).row_key.value
+            except Exception: return None
+
+        def _output_pid(self, oid):
+            # The process_id the listed entry `oid` was attributed to (for outputs→procs nav).
+            if oid is None: return None
+            r=next((x for x in (self._out_rows or []) if x["id"]==oid), None)
+            return r.get("process_id") if r else None
+
         # ── processes pane (the selected box's process table) ────────────────
         def _load_procs(self, sid, force=False):
             # LIVE box: the Index's bounded active set (htop-style), O(active set), no
@@ -12698,6 +12882,10 @@ def _make_ui_app():
         @on(DataTable.RowHighlighted, "#nf-tab")
         def _nc(self, ev):
             if self.view=="netlog": self._update_flow_detail()
+
+        @on(DataTable.RowHighlighted, "#out-tab")
+        def _oc(self, ev):
+            if self.view=="outputs": self._update_output_detail()
 
         @on(DataTable.RowSelected, "#cf-tab")
         def _f_open(self, ev):
