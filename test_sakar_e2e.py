@@ -122,15 +122,49 @@ class ServerContext:
         return flows[-1] if flows else None
 
     def run_box(self, cmd: list, extra_env: "dict | None" = None,
-                timeout: int = TIMEOUT) -> subprocess.CompletedProcess:
-        """Run `sakar -- cmd` against this server."""
+                timeout: int = TIMEOUT, run_as: "tuple | None" = None,
+                python: "str | None" = None) -> subprocess.CompletedProcess:
+        """Run `sakar -- cmd` against this server.
+
+        run_as=(uid, gid): drop the box launcher to that uid/gid via a preexec, so the
+        unprivileged user-namespace runner can be exercised from a root test process.
+        python: interpreter for the box (default sys.executable). Pass a world-readable
+        system python when dropping privileges, since the uv interpreter lives in the
+        root user's cache; the box/inner path is stdlib-only, so any 3.11+ works."""
         env = dict(self._env_obj)
         if extra_env:
             env.update(extra_env)
-        full_cmd = [sys.executable, SAKAR, "--"] + cmd
+        preexec = None
+        if run_as is not None:
+            uid, gid = run_as
+            env["HOME"] = "/tmp"
+            def preexec():
+                os.setgid(gid)
+                try:
+                    import pwd
+                    os.initgroups(pwd.getpwuid(uid).pw_name, gid)
+                except (KeyError, OSError):
+                    pass
+                os.setuid(uid)
+        full_cmd = [python or sys.executable, SAKAR, "--"] + cmd
         return subprocess.run(
             full_cmd, env=env, capture_output=True, timeout=timeout,
-            text=True)
+            text=True, preexec_fn=preexec)
+
+    def make_box_paths_accessible(self) -> None:
+        """Loosen perms so a dropped (non-root) box launcher can reach the control
+        socket and CA cert. Test-only: the real server keeps the socket at 0600."""
+        root = Path(self._tmpdir)
+        for p in [root, *root.rglob("*")]:
+            try:
+                os.chmod(p, 0o755 if p.is_dir() else 0o644)
+            except OSError:
+                pass
+        try:
+            os.chmod(self.sp, 0o666)
+        except OSError:
+            pass
+
 
     def __exit__(self, *_):
         if self.proc:
@@ -266,32 +300,73 @@ def test_flow_file(ctx: ServerContext):
         print("    PASS (fallback): flows file non-empty", flush=True)
 
 
-def test_userns_runner_privileged_ports(ctx: ServerContext):
-    """Force the unprivileged-user-namespace runner and prove the in-box forwarders
-    can still bind the privileged ports 53/80/443.
+def _pick_unprivileged_ids() -> "tuple | None":
+    """A non-root (uid, gid) the test can drop the box launcher to, or None."""
+    import pwd
+    best = None
+    for p in pwd.getpwall():
+        if 1000 <= p.pw_uid < 60000:
+            return (p.pw_uid, p.pw_gid)
+    try:
+        nb = pwd.getpwnam("nobody")
+        if nb.pw_uid != 0:
+            best = (nb.pw_uid, nb.pw_gid)
+    except KeyError:
+        pass
+    return best
 
-    This path is NOT taken when sakar runs with ambient CAP_SYS_ADMIN/CAP_NET_ADMIN
-    (the usual root/CI case picks the 'ambient' runner), so without forcing it the
-    entire userns branch — including how CAP_NET_BIND_SERVICE reaches the inner — is
-    never exercised. The regression it guards: the cap was granted but did not survive
-    the inner's execve under a non-root uid mapping, so every privileged bind failed
-    with 'sakar(inner): cannot listen :443: Permission denied' and the box had no
-    working network. We drive the proxy-UNAWARE path (DNS + catch-all on :53/:80/:443)
-    so the privileged binds are actually load-bearing for the fetch to succeed."""
-    print("  test: forced-userns runner binds privileged ports ...", flush=True)
+
+def test_userns_runner_privileged_ports(ctx: ServerContext):
+    """The unprivileged user-namespace runner must bind the privileged forwarder ports
+    (53/80/443) WITHOUT being uid 0, and the box must keep the caller's real uid.
+
+    This is the path a non-root user gets (root takes the 'ambient' runner), so we run
+    the box as a genuinely non-root user — dropping privileges if the test itself is
+    root. It guards two regressions at once:
+      * caps that don't survive the inner's execve  -> 'cannot listen :443: Permission
+        denied' and no box network; and
+      * the uid-0 'fix' for that, which made the box run as root and breaks tools that
+        refuse to build as root.
+    We drive the proxy-UNAWARE path (DNS + catch-all on :53/:80/:443) so the privileged
+    binds are load-bearing, and assert the box reports the caller's uid (not 0)."""
+    print("  test: unprivileged-userns runner binds privileged ports (non-root) ...",
+          flush=True)
+    run_as = None
+    python = None
+    expect_uid = os.getuid()
+    if os.getuid() == 0:
+        ids = _pick_unprivileged_ids()
+        if ids is None:
+            print("    SKIP: no unprivileged uid available to drop to", flush=True)
+            return
+        run_as, expect_uid = ids, ids[0]
+        if not os.path.exists("/usr/bin/python3"):
+            print("    SKIP: no world-readable system python3 to run the dropped box",
+                  flush=True)
+            return
+        python = "/usr/bin/python3"
+        ctx.make_box_paths_accessible()
+
     r = ctx.run_box(
-        ["curl", "-sS", "--noproxy", "*", "--max-time", "30", "https://example.com/"],
-        extra_env={"SAKAR_FORCE_USERNS": "1"}, timeout=60)
+        ["bash", "-lc",
+         "echo BOXUID=$(id -u); curl -sS --noproxy '*' --max-time 30 "
+         "-o /dev/null -w 'HTTP=%{http_code}\\n' http://example.com/ || echo CURLFAIL"],
+        run_as=run_as, python=python, timeout=90)
     if "cannot create the runner sandbox" in r.stderr:
         print("    SKIP: unprivileged user namespaces unavailable on this host",
               flush=True)
         return
-    assert "cannot listen" not in r.stderr and "cannot bind DNS" not in r.stderr, \
-        f"userns runner could not bind privileged ports:\n{r.stderr[:400]}"
-    assert r.returncode == 0 and (
-        "example" in r.stdout.lower() or "<html" in r.stdout.lower()), \
-        f"forced-userns fetch failed rc={r.returncode}\nstderr:{r.stderr[:300]}"
-    print("    PASS: forced-userns runner reached example.com via DNS+catch-all",
+    for bad in ("cannot listen", "cannot bind DNS",
+                "cannot set up box network namespace"):
+        assert bad not in r.stderr, \
+            f"userns runner failed to set up box networking ({bad!r}):\n{r.stderr[:500]}"
+    assert f"BOXUID={expect_uid}" in r.stdout, (
+        f"box did not run as the caller's uid {expect_uid} (regressed to uid 0?):\n"
+        f"stdout: {r.stdout[:300]}")
+    assert "HTTP=200" in r.stdout, (
+        f"proxy-unaware fetch through the userns box failed:\n"
+        f"stdout: {r.stdout[:300]}\nstderr: {r.stderr[:300]}")
+    print(f"    PASS: userns runner bound :53/:80/:443 as uid {expect_uid} (not root)",
           flush=True)
 
 

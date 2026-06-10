@@ -32,6 +32,8 @@ import array
 import asyncio
 import contextlib
 import contextvars
+import ctypes
+import fcntl
 import fnmatch
 import json
 import os
@@ -715,6 +717,74 @@ def _userns_runner_works() -> bool:
         _USERNS_RUNNER_WORKS = False
     return _USERNS_RUNNER_WORKS
 
+# Linux unshare(2) flags and the ioctl bits for bringing loopback up by hand.
+_CLONE_NEWUSER = 0x10000000
+_CLONE_NEWNET  = 0x40000000
+_SIOCGIFFLAGS  = 0x8913
+_SIOCSIFFLAGS  = 0x8914
+_IFF_UP        = 0x1
+
+def _write_proc(path: str, data: str) -> None:
+    """Write `data` to a /proc file in a single write() (uid_map/sysctl require it)."""
+    fd = os.open(path, os.O_WRONLY)
+    try:
+        os.write(fd, data.encode())
+    finally:
+        os.close(fd)
+
+def _bring_up_loopback() -> None:
+    """Set 'lo' UP in the current netns via ioctl (a fresh netns starts with it down,
+    and we don't want to depend on the `ip` binary existing in the box)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        flags = struct.unpack("16sh",
+                              fcntl.ioctl(s, _SIOCGIFFLAGS,
+                                          struct.pack("16sh", b"lo", 0)))[1]
+        fcntl.ioctl(s, _SIOCSIFFLAGS, struct.pack("16sh", b"lo", flags | _IFF_UP))
+    finally:
+        s.close()
+
+def _enter_owned_netns() -> None:
+    """Give this (single-threaded) box process a network namespace it OWNS, so it can
+    bind the privileged forwarder ports (53/80/443) while keeping the caller's real uid.
+
+    Under the unprivileged user-namespace runner the inner process arrives as the
+    caller's real uid with no capabilities. Rather than run as uid 0 (which only ever
+    mattered as a way to keep caps across execve, and which breaks tools that refuse to
+    build as root), we:
+
+      1. unshare(CLONE_NEWUSER) and install an *identity* uid/gid map. Identity is the
+         one mapping the kernel always lets a process write for itself, so our apparent
+         and effective uid/gid are unchanged (still the caller's) — but we now hold a
+         full capability set *inside the new user namespace*.
+      2. unshare(CLONE_NEWNET): a fresh netns owned by that user namespace, so we hold
+         CAP_NET_ADMIN over it.
+      3. Lower net.ipv4.ip_unprivileged_port_start to 0 — the privileged-port check is
+         per-netns and capability-based, so with the floor at 0 binding 53/80/443 needs
+         no capability and no uid 0 at all.
+      4. Bring loopback up (a new netns starts with lo down; in-box clients dial 127.x).
+
+    Nothing in the box runs as uid 0: the bind is gated on a capability we hold in a
+    namespace we own, not on the apparent uid."""
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    uid, gid = os.getuid(), os.getgid()
+    if libc.unshare(_CLONE_NEWUSER) != 0:
+        e = ctypes.get_errno()
+        raise OSError(e, f"unshare(CLONE_NEWUSER): {os.strerror(e)}")
+    _write_proc("/proc/self/setgroups", "deny")
+    _write_proc("/proc/self/uid_map", f"{uid} {uid} 1")
+    _write_proc("/proc/self/gid_map", f"{gid} {gid} 1")
+    if libc.unshare(_CLONE_NEWNET) != 0:
+        e = ctypes.get_errno()
+        raise OSError(e, f"unshare(CLONE_NEWNET): {os.strerror(e)}")
+    # Best-effort: if the floor can't be lowered we still hold CAP_NET_BIND_SERVICE in
+    # this user namespace, so the privileged binds below succeed on the capability anyway.
+    try:
+        _write_proc("/proc/sys/net/ipv4/ip_unprivileged_port_start", "0")
+    except OSError:
+        pass
+    _bring_up_loopback()
+
 # ════════════════════════════════════════════════════════════════════════════
 #  Server: control socket + box registry + mitmproxy
 # ════════════════════════════════════════════════════════════════════════════
@@ -945,8 +1015,19 @@ def _terminal_foreground_guard(tty_fd: "int | None"):
 #  Inner runner (in-box pid-1 — spawned by bwrap from cmd_run)
 # ════════════════════════════════════════════════════════════════════════════
 
-def run_inner(conn_fd: int, cmd: list) -> int:
+def run_inner(conn_fd: int, cmd: list, own_netns: bool = False) -> int:
     """In-box pid-1-ish process. Sets up network forwarders, then execs cmd."""
+    # Userns runner: claim a user+net namespace we own BEFORE spawning any threads
+    # (unshare(CLONE_NEWUSER) requires a single-threaded process), so the forwarders
+    # can bind the privileged ports at the caller's real uid. See _enter_owned_netns.
+    if own_netns:
+        try:
+            _enter_owned_netns()
+        except OSError as e:
+            print(f"sakar(inner): cannot set up box network namespace: {e}",
+                  file=sys.stderr)
+            return 1
+
     stop = threading.Event()
     dns = SyntheticDNS()
 
@@ -1260,24 +1341,18 @@ def cmd_run(cmd: list) -> int:
         unshare_args = ["--unshare-pid", "--unshare-ipc", "--unshare-uts",
                         "--unshare-net"]
         if _runner_mode == "userns":
-            # Map the caller to uid/gid 0 inside the new user namespace. This is NOT
-            # for privilege — uid 0 here maps back to the caller's real uid on the
-            # host, so it grants nothing extra — it is what makes --cap-add survive.
-            # bwrap grants CAP_NET_BIND_SERVICE so the in-box forwarders can bind
-            # 53/80/443, but a capability only survives execve(2) of the inner runner
-            # if the process is euid 0 *or* the cap was placed in the ambient set.
-            # Older bwrap builds don't populate the ambient set, so with the default
-            # (non-root) uid mapping the cap is wiped on exec and every privileged
-            # bind fails with EACCES ("cannot listen :443: Permission denied"). euid 0
-            # preserves permitted/effective caps across exec unconditionally, with no
-            # dependence on the bwrap version — and it matches ambient mode, where the
-            # box already runs as root.
-            unshare_args += ["--unshare-user", "--uid", "0", "--gid", "0"]
+            # Default (identity) uid/gid mapping: the box keeps the caller's real uid.
+            # The inner runner then carves out its own user+net namespace to bind the
+            # privileged forwarder ports — see _enter_owned_netns and --own-netns below.
+            unshare_args.append("--unshare-user")
 
-        # Caps: ambient keeps SYS_ADMIN+NET_ADMIN+NET_BIND_SERVICE; userns drops ALL
-        # + adds only NET_BIND_SERVICE (the in-box forwarders need it for ports 53/80/443).
+        # Caps. Ambient mode has real CAP_SYS_ADMIN/NET_ADMIN on the host, so the box
+        # runs privileged (the caller is already root there) and the forwarders bind
+        # 53/80/443 directly. Userns mode drops everything: the inner runner gains the
+        # one capability it needs (over a netns it owns) from its own user namespace,
+        # at the caller's real uid — no host caps and no uid 0 required.
         if _runner_mode == "userns":
-            cap_args = ["--cap-drop", "ALL", "--cap-add", "CAP_NET_BIND_SERVICE"]
+            cap_args = ["--cap-drop", "ALL"]
         else:
             cap_args = ["--cap-drop", "ALL",
                         "--cap-add", "CAP_SYS_ADMIN",
@@ -1323,8 +1398,12 @@ def cmd_run(cmd: list) -> int:
             args += ["--setenv", var, ca_env_target]
         args += ["--setenv", "NODE_EXTRA_CA_CERTS", str(_ca)]
 
+        # In userns mode the inner runner sets up its own user+net namespace so it can
+        # bind the privileged forwarder ports at the caller's real uid (see
+        # _enter_owned_netns). Ambient mode already has the host caps + bwrap's netns.
+        inner_flags = ["--own-netns"] if _runner_mode == "userns" else []
         args += ["--", sys.executable, find_self(), "--inner",
-                 "--conn-fd", str(conn_fd), "--", *cmd]
+                 "--conn-fd", str(conn_fd), *inner_flags, "--", *cmd]
 
         proc = subprocess.Popen(args, preexec_fn=os.setpgrp,
                                 pass_fds=popen_pass_fds)
@@ -1397,22 +1476,26 @@ def main() -> int:
         # Usage: --inner --conn-fd N -- CMD...
         remaining = args[1:]
         conn_fd = -1
+        own_netns = False
         cmd: list = []
         i = 0
         while i < len(remaining):
             if remaining[i] == "--conn-fd" and i + 1 < len(remaining):
                 conn_fd = int(remaining[i + 1])
                 i += 2
+            elif remaining[i] == "--own-netns":
+                own_netns = True
+                i += 1
             elif remaining[i] == "--":
                 cmd = remaining[i + 1:]
                 break
             else:
                 i += 1
         if conn_fd < 0 or not cmd:
-            print("sakar --inner: usage: --inner --conn-fd N -- CMD...",
+            print("sakar --inner: usage: --inner --conn-fd N [--own-netns] -- CMD...",
                   file=sys.stderr)
             return 2
-        return run_inner(conn_fd, cmd) or 0
+        return run_inner(conn_fd, cmd, own_netns=own_netns) or 0
 
     if args[0] == "--":
         # Runner mode: sakar -- CMD [ARGS...]
