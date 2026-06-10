@@ -266,6 +266,35 @@ def test_flow_file(ctx: ServerContext):
         print("    PASS (fallback): flows file non-empty", flush=True)
 
 
+def test_userns_runner_privileged_ports(ctx: ServerContext):
+    """Force the unprivileged-user-namespace runner and prove the in-box forwarders
+    can still bind the privileged ports 53/80/443.
+
+    This path is NOT taken when sakar runs with ambient CAP_SYS_ADMIN/CAP_NET_ADMIN
+    (the usual root/CI case picks the 'ambient' runner), so without forcing it the
+    entire userns branch — including how CAP_NET_BIND_SERVICE reaches the inner — is
+    never exercised. The regression it guards: the cap was granted but did not survive
+    the inner's execve under a non-root uid mapping, so every privileged bind failed
+    with 'sakar(inner): cannot listen :443: Permission denied' and the box had no
+    working network. We drive the proxy-UNAWARE path (DNS + catch-all on :53/:80/:443)
+    so the privileged binds are actually load-bearing for the fetch to succeed."""
+    print("  test: forced-userns runner binds privileged ports ...", flush=True)
+    r = ctx.run_box(
+        ["curl", "-sS", "--noproxy", "*", "--max-time", "30", "https://example.com/"],
+        extra_env={"SAKAR_FORCE_USERNS": "1"}, timeout=60)
+    if "cannot create the runner sandbox" in r.stderr:
+        print("    SKIP: unprivileged user namespaces unavailable on this host",
+              flush=True)
+        return
+    assert "cannot listen" not in r.stderr and "cannot bind DNS" not in r.stderr, \
+        f"userns runner could not bind privileged ports:\n{r.stderr[:400]}"
+    assert r.returncode == 0 and (
+        "example" in r.stdout.lower() or "<html" in r.stdout.lower()), \
+        f"forced-userns fetch failed rc={r.returncode}\nstderr:{r.stderr[:300]}"
+    print("    PASS: forced-userns runner reached example.com via DNS+catch-all",
+          flush=True)
+
+
 # ════════════════════════════════════════════════════════════════════════════
 #  Main
 # ════════════════════════════════════════════════════════════════════════════
@@ -284,6 +313,7 @@ def run_all() -> bool:
             ("proxy_unaware_curl", test_proxy_unaware_curl),
             ("os_truststore_client", test_os_truststore_client),
             ("denied_host", test_denied_host),
+            ("userns_runner_privileged_ports", test_userns_runner_privileged_ports),
         ]
 
         for name, fn in tests:
