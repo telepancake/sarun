@@ -647,6 +647,27 @@ def ensure_ca_cert() -> "Path | None":
 def find_self() -> str:
     return os.path.abspath(sys.argv[0])
 
+def _resolv_conf_bind_args(resolv_src: str,
+                           link_path: str = "/etc/resolv.conf") -> list:
+    """bwrap args that point the box's /etc/resolv.conf at resolv_src.
+
+    On most systemd hosts /etc/resolv.conf is a symlink
+    (-> /run/systemd/resolve/stub-resolv.conf). We lay a fresh tmpfs over /run, so
+    that symlink's target directory no longer exists inside the box. Binding
+    straight onto "/etc/resolv.conf" makes the *kernel* follow the trailing symlink
+    when it creates the mountpoint (you cannot mount onto a symlink — the target
+    path is always resolved with LOOKUP_FOLLOW), so the bind lands in the empty
+    tmpfs and fails: "Can't create file at /etc/resolv.conf: No such file or
+    directory". We sidestep that by resolving the link ourselves, host-side, and
+    binding onto the concrete real target — recreating its parent dir in the tmpfs
+    with --dir — rather than relying on bwrap to chase a symlink at mount time. The
+    /etc/resolv.conf symlink is left untouched and resolves naturally to the file
+    we bound. For a plain-file resolv.conf, realpath() returns it unchanged and
+    "--dir <parent>" is a harmless no-op on the already-present directory.
+    """
+    dest = os.path.realpath(link_path)
+    return ["--dir", os.path.dirname(dest), "--ro-bind", resolv_src, dest]
+
 _BWRAP_HELP = None
 def bwrap_supports(flag: str) -> bool:
     global _BWRAP_HELP
@@ -1255,13 +1276,15 @@ def cmd_run(cmd: list) -> int:
         # sakar's job is network isolation only, not filesystem isolation.
         bind_root_args = ["--dev-bind", "/", "/"]
 
+        # Point the box's resolver at our synthetic DNS (see _resolv_conf_bind_args).
+        resolv_args = _resolv_conf_bind_args(resolv_tmp_path)
+
         args = ["bwrap",
                 *bind_root_args,
                 "--proc", "/proc", "--dev", "/dev",
                 "--ro-bind-try", "/sys", "/sys",
                 "--tmpfs", "/tmp", "--tmpfs", "/run",
-                # Point /etc/resolv.conf at our synthetic DNS resolver.
-                "--ro-bind", resolv_tmp_path, "/etc/resolv.conf",
+                *resolv_args,
                 *unshare_args,
                 *cap_args, "--die-with-parent",
                 "--chdir", os.getcwd()]

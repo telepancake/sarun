@@ -379,6 +379,42 @@ def test_augment_bundle_does_not_fuse_pem_blocks():
 
 
 # ════════════════════════════════════════════════════════════════════════════
+#  resolv.conf bind args  (regression: systemd-resolved symlink + tmpfs /run)
+# ════════════════════════════════════════════════════════════════════════════
+
+def test_resolv_bind_plain_file(tmp_path):
+    # A regular-file resolv.conf binds straight onto itself; --dir is its own parent.
+    rc = tmp_path / "resolv.conf"; rc.write_text("nameserver 8.8.8.8\n")
+    src = tmp_path / "sakar-resolv.conf"; src.write_text("nameserver 10.0.0.53\n")
+    args = _sakar._resolv_conf_bind_args(str(src), link_path=str(rc))
+    assert args == ["--dir", str(tmp_path), "--ro-bind", str(src), str(rc)]
+
+def test_resolv_bind_follows_symlink_host_side(tmp_path):
+    # systemd-resolved layout: /etc/resolv.conf -> /run/systemd/resolve/stub-resolv.conf.
+    # The args must target the *resolved* real file (not the symlink path), and --dir
+    # its parent so it can be recreated inside the fresh tmpfs over /run. Binding onto
+    # the symlink path itself is what produced "Can't create file at /etc/resolv.conf".
+    real_dir = tmp_path / "run" / "systemd" / "resolve"
+    real_dir.mkdir(parents=True)
+    target = real_dir / "stub-resolv.conf"; target.write_text("nameserver 127.0.0.53\n")
+    link = tmp_path / "resolv.conf"; link.symlink_to(target)
+    src = tmp_path / "sakar-resolv.conf"; src.write_text("nameserver 10.0.0.53\n")
+    args = _sakar._resolv_conf_bind_args(str(src), link_path=str(link))
+    assert args == ["--dir", str(real_dir), "--ro-bind", str(src), str(target)]
+    # Crucially the bind target is NOT the symlink path (the old, broken behavior).
+    assert str(link) not in args
+
+def test_resolv_bind_dangling_symlink(tmp_path):
+    # Even if the resolver daemon isn't running (target file absent), realpath still
+    # resolves the path so we recreate the dir and bind — no crash, no symlink chase.
+    target = tmp_path / "run" / "systemd" / "resolve" / "stub-resolv.conf"
+    link = tmp_path / "resolv.conf"; link.symlink_to(target)  # target does not exist
+    src = tmp_path / "sakar-resolv.conf"; src.write_text("nameserver 10.0.0.53\n")
+    args = _sakar._resolv_conf_bind_args(str(src), link_path=str(link))
+    assert args == ["--dir", str(target.parent), "--ro-bind", str(src), str(target)]
+
+
+# ════════════════════════════════════════════════════════════════════════════
 #  Standalone runner
 # ════════════════════════════════════════════════════════════════════════════
 
