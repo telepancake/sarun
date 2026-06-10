@@ -14,19 +14,29 @@ TEMP dir as `$XDG_STATE_HOME` so every session is isolated on disk.
 
 Covered:
   1. Filename grammar + alphabetical==turn ordering; non-conforming files ignored.
-  2. Append: a new `0020.assistant` is created with the raw reply; the prompt
-     contains only the real prior turns (no invented messages).
+  2. Append: a new `0020-<id>.assistant` is created with the raw reply; the prompt
+     contains only the real prior turns (no invented messages), each with the
+     injected turn-id header.
   3. Continue/regenerate: a trailing assistant turn is rewritten in place (no new
-     file) and excluded from the prompt.
+     file) and excluded from the prompt; its slug/id is stable across regenerations.
   4. Numbering with slugs: highest+10 across slugged files.
   5. Roles/order: a system+user+assistant history is sent in order with roles.
   6. Streaming: multi-chunk content reassembles on disk and the server saw
      `stream:true`.
   7. Empty/missing session: raises and writes no files.
+  8. Slug assignment + rename: slug-less turns get a generated slug on disk.
+  9. Existing slug preserved as-is (user label becomes turn-id verbatim).
+ 10. Injected header on the wire: every message carries {"turn-id": "<id>"}\n.
+ 11. Files stay raw: no turn file on disk contains "turn-id" after generation.
+ 12. Generated assistant turn gets a slug matching ^[a-z]{5}$.
+ 13. Uniqueness: pairwise-distinct ids across a session with many slug-less turns.
+ 14. Regenerate keeps id stable: second generate does not change the tail's slug.
 
 Dual style: standalone (`./test_oaita.py` → `ALL PASS`) and pytest-compatible.
 """
+import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -84,6 +94,21 @@ class Session:
         )
 
 
+# ── helpers ──────────────────────────────────────────────────────────────────
+_ID_RE = re.compile(r"^[a-z]{5}$")
+
+
+def _id_from_name(name: str) -> str | None:
+    """Extract the slug from a turn filename, e.g. '0020-xqvmb.assistant' → 'xqvmb'."""
+    mo = re.match(r"^\d+-([^.]+)\.", name)
+    return mo.group(1) if mo else None
+
+
+def _header_for(slug: str) -> str:
+    """The expected injected header line for a given slug."""
+    return json.dumps({"turn-id": slug}) + "\n"
+
+
 # ── 1. filename grammar + ordering ───────────────────────────────────────────
 def test_grammar_and_ordering():
     t1 = oaita.parse_turn(Path("0010.user"))
@@ -127,18 +152,37 @@ def test_append_creates_assistant_turn():
         s.srv.enqueue(CannedChat(content="hi there"))
         produced = s.generate(name)
         folder = oaita.session_dir(name)
-        target = folder / "0020.assistant"
+
+        # The produced path should be 0020-<5-letter-id>.assistant.
         check("a single turn produced", len(produced) == 1)
-        check("produced path is 0020.assistant", produced[0] == target)
-        check("0020.assistant file exists", target.is_file())
+        target = produced[0]
+        check("produced file is in session folder", target.parent == folder)
+        tname = target.name
+        check("produced filename matches 0020-<id>.assistant pattern",
+              bool(re.match(r"^0020-[a-z]{5}\.assistant$", tname)))
+        check("produced file exists", target.is_file())
         check("content is exactly the raw reply (no JSON/wrapping)",
               target.read_text() == "hi there")
-        names = sorted(p.name for p in folder.iterdir())
-        check("exactly 0010.user + 0020.assistant on disk",
-              names == ["0010.user", "0020.assistant"])
+
+        # Disk should hold: 0010-<id>.user (renamed) + 0020-<id>.assistant
+        files = sorted(p.name for p in folder.iterdir())
+        check("exactly two turn files on disk", len(files) == 2)
+        check("first file is 0010-<id>.user",
+              bool(re.match(r"^0010-[a-z]{5}\.user$", files[0])))
+        check("second file is 0020-<id>.assistant",
+              bool(re.match(r"^0020-[a-z]{5}\.assistant$", files[1])))
+        check("original 0010.user no longer exists",
+              not (folder / "0010.user").exists())
+
+        # The prompt sent to the server must carry the id-header.
         req = s.srv.requests[-1]
-        check("prompt did not invent extra turns",
-              req.messages == [{"role": "user", "content": "hello"}])
+        check("prompt has exactly one message", len(req.messages) == 1)
+        user_slug = _id_from_name(files[0])
+        expected_content = _header_for(user_slug) + "hello"
+        check("user message carries injected turn-id header",
+              req.messages[0]["content"] == expected_content)
+        check("user message role is correct",
+              req.messages[0]["role"] == "user")
     finally:
         s.close()
 
@@ -153,17 +197,31 @@ def test_regenerate_in_place():
         s.srv.enqueue(CannedChat(content="regenerated"))
         produced = s.generate(name)
         folder = oaita.session_dir(name)
-        target = folder / "0020.assistant"
-        check("no new file created (regenerate in place)",
-              produced == [target])
-        names = sorted(p.name for p in folder.iterdir())
-        check("still exactly 0010.user + 0020.assistant",
-              names == ["0010.user", "0020.assistant"])
-        check("0020.assistant rewritten to new content",
+
+        # Both turns get slugs; the old slug-less 0020.assistant is renamed.
+        files = sorted(p.name for p in folder.iterdir())
+        check("exactly two turn files on disk after regen", len(files) == 2)
+        check("user turn has slug", bool(re.match(r"^0010-[a-z]{5}\.user$", files[0])))
+        check("assistant turn has slug",
+              bool(re.match(r"^0020-[a-z]{5}\.assistant$", files[1])))
+        check("original slug-less 0020.assistant gone",
+              not (folder / "0020.assistant").exists())
+
+        # produced[0] should point at the (renamed) assistant file.
+        target = produced[0]
+        check("no new file created (regenerate in place)", produced == [target])
+        check("produced path matches the renamed assistant file",
+              target.name == files[1])
+        check("0020-<id>.assistant rewritten to new content",
               target.read_text() == "regenerated")
+
+        # Prompt was sent with only the user turn (assistant excluded).
         req = s.srv.requests[-1]
         check("prompt EXCLUDED the trailing assistant turn",
-              req.messages == [{"role": "user", "content": "hello"}])
+              len(req.messages) == 1 and req.messages[0]["role"] == "user")
+        user_slug = _id_from_name(files[0])
+        check("user message carries injected turn-id header",
+              req.messages[0]["content"] == _header_for(user_slug) + "hello")
     finally:
         s.close()
 
@@ -177,11 +235,14 @@ def test_numbering_with_slugs():
         s.write_turn(name, "0020-q.user", "what is 2+2?")
         s.srv.enqueue(CannedChat(content="4"))
         produced = s.generate(name)
-        target = oaita.session_dir(name) / "0030.assistant"
-        check("appends 0030.assistant (highest+10 across slugged files)",
-              produced == [target] and target.is_file())
-        check("appended assistant has no slug",
-              target.name == "0030.assistant")
+        folder = oaita.session_dir(name)
+        tname = produced[0].name
+        check("appended turn is 0030-<id>.assistant (highest+10)",
+              bool(re.match(r"^0030-[a-z]{5}\.assistant$", tname)))
+        check("file exists on disk", produced[0].is_file())
+        # User-authored slugs must survive intact.
+        check("0010-greet.user kept its slug", (folder / "0010-greet.user").exists())
+        check("0020-q.user kept its slug", (folder / "0020-q.user").exists())
     finally:
         s.close()
 
@@ -197,11 +258,20 @@ def test_roles_and_order():
         # Last turn is assistant → regenerate; prompt = system + user.
         s.srv.enqueue(CannedChat(content="pong2"))
         s.generate(name)
+        folder = oaita.session_dir(name)
         req = s.srv.requests[-1]
+        # After slug assignment the files are e.g. 0010-<id>.system, 0020-<id>.user.
+        files = sorted(p.name for p in folder.iterdir())
+        sys_name = next(f for f in files if f.endswith(".system"))
+        usr_name = next(f for f in files if f.endswith(".user"))
+        sys_slug = _id_from_name(sys_name)
+        usr_slug = _id_from_name(usr_name)
         check("history sent in order with correct roles",
               req.messages == [
-                  {"role": "system", "content": "be terse"},
-                  {"role": "user", "content": "ping"},
+                  {"role": "system",
+                   "content": _header_for(sys_slug) + "be terse"},
+                  {"role": "user",
+                   "content": _header_for(usr_slug) + "ping"},
               ])
     finally:
         s.close()
@@ -216,6 +286,7 @@ def test_streaming_reassembles():
         full = "once upon a time there was a tiny client"
         s.srv.enqueue(CannedChat(content=full, n_content_chunks=7))
         produced = s.generate(name)
+        # File on disk must be the raw reply — no header.
         check("streamed content reassembles exactly on disk",
               produced[0].read_text() == full)
         check("server saw stream:true",
@@ -253,6 +324,180 @@ def test_empty_and_missing_session():
         s.close()
 
 
+# ── 8. slug assignment + rename ──────────────────────────────────────────────
+def test_slug_assignment_and_rename():
+    """A slug-less 0010.user is renamed to 0010-<id>.user on disk."""
+    s = Session()
+    try:
+        name = "rename"
+        s.write_turn(name, "0010.user", "hello")
+        s.srv.enqueue(CannedChat(content="hi"))
+        s.generate(name)
+        folder = oaita.session_dir(name)
+        files = sorted(p.name for p in folder.iterdir())
+        user_files = [f for f in files if f.endswith(".user")]
+        check("exactly one user file on disk", len(user_files) == 1)
+        check("original 0010.user no longer exists",
+              not (folder / "0010.user").exists())
+        uf = user_files[0]
+        slug = _id_from_name(uf)
+        check("renamed user file matches 0010-<id>.user",
+              bool(re.match(r"^0010-[a-z]{5}\.user$", uf)))
+        check("extracted slug matches [a-z]{5}",
+              slug is not None and bool(_ID_RE.match(slug)))
+        # File content must still be the raw original text.
+        check("renamed file still holds raw content",
+              (folder / uf).read_text() == "hello")
+    finally:
+        s.close()
+
+
+# ── 9. existing slug preserved as turn-id ────────────────────────────────────
+def test_existing_slug_preserved():
+    """A pre-slugged file keeps its slug; the injected header uses it verbatim."""
+    s = Session()
+    try:
+        name = "keepslug"
+        s.write_turn(name, "0010-greet.user", "hello")
+        s.srv.enqueue(CannedChat(content="hi"))
+        s.generate(name)
+        folder = oaita.session_dir(name)
+        # The file must not have been renamed.
+        check("0010-greet.user still exists (not renamed)",
+              (folder / "0010-greet.user").exists())
+        req = s.srv.requests[-1]
+        check("prompt has one message", len(req.messages) == 1)
+        # The header must be exactly {"turn-id": "greet"}\n.
+        expected = '{"turn-id": "greet"}\nhello'
+        check("injected header uses slug verbatim as turn-id",
+              req.messages[0]["content"] == expected)
+    finally:
+        s.close()
+
+
+# ── 10. injected header on the wire for every message ────────────────────────
+def test_header_injected_on_wire():
+    """Every sent message has {"turn-id": "<id>"}\n prepended; files stay raw."""
+    s = Session()
+    try:
+        name = "wire"
+        s.write_turn(name, "0010.system", "be helpful")
+        s.write_turn(name, "0020.user", "hello world")
+        s.srv.enqueue(CannedChat(content="reply"))
+        s.generate(name)
+        folder = oaita.session_dir(name)
+        req = s.srv.requests[-1]
+        check("two messages sent to server", len(req.messages) == 2)
+        for msg in req.messages:
+            content = msg["content"]
+            check(f"message role={msg['role']!r} has turn-id header line",
+                  content.startswith('{"turn-id": "') and "\n" in content)
+            # The header must be valid JSON with exactly the key "turn-id".
+            header_line, raw = content.split("\n", 1)
+            parsed = json.loads(header_line)
+            check(f"role={msg['role']!r} header parses to dict with turn-id key",
+                  isinstance(parsed, dict) and "turn-id" in parsed)
+            check(f"role={msg['role']!r} turn-id value matches [a-z]{{5}}",
+                  bool(_ID_RE.match(parsed["turn-id"])))
+        # Files on disk must NOT contain "turn-id".
+        for p in folder.iterdir():
+            if p.is_file() and oaita.parse_turn(p) is not None:
+                check(f"file {p.name} does not contain 'turn-id' on disk",
+                      "turn-id" not in p.read_text())
+    finally:
+        s.close()
+
+
+# ── 11. files stay raw ───────────────────────────────────────────────────────
+def test_files_stay_raw():
+    """After generation, NO turn file on disk contains the string 'turn-id'."""
+    s = Session()
+    try:
+        name = "raw"
+        s.write_turn(name, "0010.user", "ping")
+        reply = "pong"
+        s.srv.enqueue(CannedChat(content=reply))
+        produced = s.generate(name)
+        folder = oaita.session_dir(name)
+        # The generated assistant file must be exactly the raw model reply.
+        check("generated assistant file contains exactly the raw reply",
+              produced[0].read_text() == reply)
+        # No turn file anywhere should hold the header text.
+        for p in folder.iterdir():
+            if p.is_file():
+                check(f"file {p.name} contains no 'turn-id' substring",
+                      "turn-id" not in p.read_text())
+    finally:
+        s.close()
+
+
+# ── 12. generated assistant turn gets a slug ─────────────────────────────────
+def test_generated_assistant_has_slug():
+    """The appended assistant turn file matches ^0020-[a-z]{5}\\.assistant$."""
+    s = Session()
+    try:
+        name = "aslug"
+        s.write_turn(name, "0010-hi.user", "hello")
+        s.srv.enqueue(CannedChat(content="world"))
+        produced = s.generate(name)
+        check("produced assistant matches 0020-<id>.assistant",
+              bool(re.match(r"^0020-[a-z]{5}\.assistant$", produced[0].name)))
+    finally:
+        s.close()
+
+
+# ── 13. uniqueness across many slug-less turns ───────────────────────────────
+def test_uniqueness_of_generated_ids():
+    """Pairwise-distinct ids when a session has several slug-less turns."""
+    s = Session()
+    try:
+        name = "unique"
+        # Write 5 slug-less turns (all user so there is no trailing assistant).
+        for i in range(1, 6):
+            s.write_turn(name, f"{i*10:04d}.user", f"turn {i}")
+        s.srv.enqueue(CannedChat(content="done"))
+        s.generate(name)
+        folder = oaita.session_dir(name)
+        files = sorted(p.name for p in folder.iterdir()
+                       if oaita.parse_turn(p) is not None)
+        slugs = [_id_from_name(f) for f in files]
+        check("all 6 turns have slugs (5 user + 1 assistant)",
+              len(slugs) == 6 and all(s is not None for s in slugs))
+        check("all slugs are distinct", len(set(slugs)) == len(slugs))
+        check("all slugs match [a-z]{5}",
+              all(_ID_RE.match(sl) for sl in slugs if sl))
+    finally:
+        s.close()
+
+
+# ── 14. regenerate keeps id stable ───────────────────────────────────────────
+def test_regenerate_keeps_id_stable():
+    """A second generate on an already-slugged assistant tail keeps the same id."""
+    s = Session()
+    try:
+        name = "stable"
+        s.write_turn(name, "0010-hi.user", "hello")
+        # Pre-write a slugged assistant tail.
+        s.write_turn(name, "0020-oldid.assistant", "stale")
+        s.srv.enqueue(CannedChat(content="fresh"))
+        produced = s.generate(name)
+        folder = oaita.session_dir(name)
+        # The tail's filename must not have changed.
+        check("regenerated file keeps original slug 'oldid'",
+              produced[0].name == "0020-oldid.assistant")
+        check("file still exists with same name",
+              (folder / "0020-oldid.assistant").exists())
+        check("content overwritten to new reply",
+              produced[0].read_text() == "fresh")
+        # And a second regeneration still keeps it.
+        s.srv.enqueue(CannedChat(content="fresher"))
+        produced2 = s.generate(name)
+        check("second regeneration still uses oldid slug",
+              produced2[0].name == "0020-oldid.assistant")
+    finally:
+        s.close()
+
+
 # ── standalone runner ────────────────────────────────────────────────────────
 if __name__ == "__main__":
     tests = [
@@ -263,6 +508,13 @@ if __name__ == "__main__":
         test_roles_and_order,
         test_streaming_reassembles,
         test_empty_and_missing_session,
+        test_slug_assignment_and_rename,
+        test_existing_slug_preserved,
+        test_header_injected_on_wire,
+        test_files_stay_raw,
+        test_generated_assistant_has_slug,
+        test_uniqueness_of_generated_ids,
+        test_regenerate_keeps_id_stable,
     ]
     for t in tests:
         try:

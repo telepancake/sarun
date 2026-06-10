@@ -20,8 +20,9 @@ FILENAME encodes ordering and type:
   • ``NNNN`` — a zero-padded (width 4) integer that orders turns like BASIC line
     numbers. Files are sorted ALPHABETICALLY, and the zero-padding makes the
     alphabetical order identical to the numeric order.
-  • optional ``-slug`` — a human label (e.g. ``0010-greet.user``); generated
-    turns get no slug, but BOTH ``0010.user`` and ``0010-greet.user`` parse.
+  • optional ``-slug`` — a human label (e.g. ``0010-greet.user``); the slug IS
+    the turn-id — a stable identifier injected into the sent context so the
+    model can reference individual turns by id.
   • ``<type>`` — the extension IS the turn type, mapped to an OpenAI chat role:
     ``.system`` / ``.user`` / ``.assistant`` (also ``.developer`` / ``.tool``).
     A file whose name does not match the grammar is NOT a turn and is ignored.
@@ -38,13 +39,18 @@ persists it, CONTINUE-OR-APPEND:
     is (re)generated IN PLACE; the prompt is every turn EXCEPT that last one.
     This is what makes an interrupted ``gen`` resumable — the partial assistant
     turn already on disk is regenerated, never duplicated.
-  • Otherwise a NEW ``NNNN.assistant`` turn is appended (highest+10); the prompt
-    is ALL existing turns.
+  • Otherwise a NEW ``NNNN-<id>.assistant`` turn is appended (highest+10); the
+    prompt is ALL existing turns.
 
 Either way the reply is streamed (``stream=True``) and written INCREMENTALLY to
 the target file (write+flush per delta) while echoing live to stdout, so an
 interrupt mid-stream leaves the partial text on disk for the next ``gen`` to
 resume from.
+
+Turn-id metadata is INJECTED into the sent context (never written to files):
+every message's content is prefixed with ``{"turn-id": "<id>"}\\n`` so the
+model can reference turns by their stable slug-ids. Files on disk always hold
+raw content only — the header is synthesised at send time from the filename.
 
 The model name comes from ``--model`` or ``$OAITA_MODEL``. The base URL / api
 key come from ``--base-url`` / ``--api-key`` or, when unset, the SDK's
@@ -56,10 +62,12 @@ the configured base_url — no phone-home).
 Sections:
     1 · Imports & session paths
     2 · Turn model (filename grammar, ordering, numbering)
-    3 · Client / config layer
-    4 · gen: prompt assembly + streamed persistence
-    5 · CLI (argparse) & entry points
-    6 · __main__
+    3 · Turn-id generation & slug assignment
+    4 · Client / config layer
+    5 · gen: prompt assembly + streamed persistence
+    6 · CLI (argparse) & entry points
+    7 · TODO
+    8 · __main__
 """
 
 from __future__ import annotations
@@ -68,10 +76,13 @@ from __future__ import annotations
 #  1 · Imports & session paths
 # ════════════════════════════════════════════════════════════════════════════
 import argparse
+import json
 import os
 import re
+import secrets
+import string
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import openai
@@ -126,9 +137,25 @@ class Turn:
         """The raw file text — exactly the turn content, nothing stripped."""
         return self.path.read_text(encoding="utf-8")
 
-    def message(self) -> dict:
-        """The OpenAI chat message ``{"role": ..., "content": <raw text>}``."""
-        return {"role": self.role, "content": self.read()}
+    def message(self, *, inject_id: bool = True) -> dict:
+        """The OpenAI chat message ``{"role": ..., "content": ...}``.
+
+        When ``inject_id`` is True (the default for API sends) the content is
+        prefixed with the turn-id meta line::
+
+            {"turn-id": "<slug>"}\\n<raw text>
+
+        This lets the model reference turns by stable id without ever writing
+        the header into the on-disk turn file.  Pass ``inject_id=False`` to get
+        the raw content (e.g. when reading back what is actually on disk).
+        """
+        raw = self.read()
+        if inject_id and self.slug is not None:
+            header = json.dumps({"turn-id": self.slug}) + "\n"
+            content = header + raw
+        else:
+            content = raw
+        return {"role": self.role, "content": content}
 
 
 def parse_turn(path: Path) -> Turn | None:
@@ -180,7 +207,73 @@ def turn_filename(number: int, type: str, slug: str | None = None) -> str:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  3 · Client / config layer
+#  3 · Turn-id generation & slug assignment
+# ════════════════════════════════════════════════════════════════════════════
+# Turn-ids are 5 lowercase ASCII letters chosen via the `secrets` module.
+# Rationale: exactly reproducible by the model (it can re-state "xqvmb" in
+# a reply), visually distinct from the zero-padded NNNN line numbers (no
+# digits), and collision probability is negligible (26^5 = 11 878 576 for
+# sessions whose turn counts fit in a hand).
+#   TODO: revisit the turn-id form for LLM-friendliness —
+#     • token efficiency: 5 lower-ascii chars may span 1–3 tokens; consider
+#       numeric ids (fewer tokens, but harder to distinguish from NNNN),
+#       base32 (uppercase noise), CJK / emoji (compact but hard to type), or
+#       4-char ids (smaller space, fewer tokens).
+#     • exact-reproduction reliability: letters-only IDs are simpler for a
+#       model to reproduce verbatim than mixed alphanumeric.
+#     • KV-cache note: re-sending a freshly generated turn with its prepended
+#       id-header diverges from the generation-time KV cache, so the tail is
+#       recomputed each gen. This is accepted cost on local inference; could
+#       later be avoided by emitting the id-header DURING generation (so the
+#       cached context already contains it).
+_ID_CHARS = string.ascii_lowercase
+_ID_LEN = 5
+
+
+def new_turn_id(existing: set[str]) -> str:
+    """Generate a fresh unique 5-char lowercase turn-id not already in ``existing``.
+
+    Uses ``secrets.choice`` for unpredictability (overkill for ids but avoids
+    predictable alphabetical sequences that could confuse collision avoidance).
+    Retries on collision — the probability of needing even one retry is ~1 in
+    11 878 576 / len(existing), so this loop is essentially always one iteration.
+    """
+    while True:
+        candidate = "".join(secrets.choice(_ID_CHARS) for _ in range(_ID_LEN))
+        if candidate not in existing:
+            return candidate
+
+
+def assign_slugs(turns: list[Turn]) -> list[Turn]:
+    """Ensure every turn has a slug, renaming slug-less files on disk in place.
+
+    Turns that already have a slug keep it unchanged — user-authored labels are
+    the turn-ids verbatim. For turns without a slug a fresh unique id is
+    generated, the file is renamed (``Path.rename``), and the in-memory Turn is
+    updated to reflect the new path and slug.
+
+    Returns the updated list (same order; ``frozen=True`` dataclasses replaced
+    via ``dataclasses.replace``).
+    """
+    existing_slugs: set[str] = {t.slug for t in turns if t.slug is not None}
+    updated: list[Turn] = []
+    for turn in turns:
+        if turn.slug is not None:
+            # Already has a slug — keep it as-is.
+            updated.append(turn)
+        else:
+            # Generate a fresh id, rename the file, update the in-memory turn.
+            new_id = new_turn_id(existing_slugs)
+            existing_slugs.add(new_id)
+            new_name = turn_filename(turn.number, turn.type, new_id)
+            new_path = turn.path.parent / new_name
+            turn.path.rename(new_path)
+            updated.append(replace(turn, slug=new_id, path=new_path))
+    return updated
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  4 · Client / config layer
 # ════════════════════════════════════════════════════════════════════════════
 def make_client(
     base_url: str | None = None,
@@ -226,21 +319,27 @@ def stream_deltas(stream):
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  4 · gen: prompt assembly + streamed persistence
+#  5 · gen: prompt assembly + streamed persistence
 # ════════════════════════════════════════════════════════════════════════════
-def plan_generation(turns: list[Turn], folder: Path):
+def plan_generation(turns: list[Turn], folder: Path, existing_slugs: set[str]):
     """Decide the prompt turns and the write-target path for a generation.
 
     Returns ``(prompt_turns, target_path, is_regenerate)``:
       • If the last turn is an assistant turn → regenerate it in place; the
-        prompt is every turn EXCEPT that last one.
-      • Otherwise → append a new ``NNNN.assistant`` turn (highest+10); the
+        prompt is every turn EXCEPT that last one. The tail turn is guaranteed
+        to already have a slug (``assign_slugs`` was called first).
+      • Otherwise → append a new ``NNNN-<id>.assistant`` turn (highest+10); the
         prompt is ALL existing turns.
+
+    ``existing_slugs`` is the current set of known slugs; a new id is drawn
+    from outside it and added to the set in place.
     """
     if turns and turns[-1].type == "assistant":
         return turns[:-1], turns[-1].path, True
     number = next_number(turns)
-    target = folder / turn_filename(number, "assistant")
+    new_id = new_turn_id(existing_slugs)
+    existing_slugs.add(new_id)
+    target = folder / turn_filename(number, "assistant", new_id)
     return turns, target, False
 
 
@@ -254,6 +353,11 @@ def generate(
     echo=None,
 ) -> list[Path]:
     """Generate the assistant reply for session ``name`` and persist it.
+
+    Before building the prompt, every existing turn that lacks a slug is
+    renamed on disk to carry a freshly generated unique turn-id; the slug IS
+    the turn-id.  The id-header (``{"turn-id": "<id>"}\\n``) is then injected
+    into each message's content at send time — files remain raw.
 
     Streams the model's reply, writing each delta to the target file (flushed
     per delta, so an interrupt leaves resumable partial text) and echoing it
@@ -271,8 +375,21 @@ def generate(
             f"oaita: session {name!r} has no turns to generate from "
             f"(folder: {folder})")
 
-    prompt_turns, target, is_regenerate = plan_generation(turns, folder)
-    messages = [t.message() for t in prompt_turns]
+    # Ensure every turn has a slug (= its stable turn-id) BEFORE planning.
+    # Slug-less files are renamed on disk; turns with existing slugs keep them.
+    turns = assign_slugs(turns)
+
+    # Collect the full slug set AFTER assignment so plan_generation can draw a
+    # fresh id for the new assistant turn without colliding.
+    existing_slugs: set[str] = {t.slug for t in turns if t.slug is not None}
+
+    prompt_turns, target, is_regenerate = plan_generation(
+        turns, folder, existing_slugs)
+
+    # Build the messages list with per-turn id-headers injected into content.
+    # The headers are synthesised from filenames — they are never written to
+    # the turn files themselves.
+    messages = [t.message(inject_id=True) for t in prompt_turns]
 
     if client is None:
         client = make_client(base_url=base_url, api_key=api_key)
@@ -304,7 +421,7 @@ def generate(
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  5 · CLI (argparse) & entry points
+#  6 · CLI (argparse) & entry points
 # ════════════════════════════════════════════════════════════════════════════
 def build_parser() -> argparse.ArgumentParser:
     """Build the argparse CLI. Structured so new subcommands drop in trivially."""
@@ -352,7 +469,29 @@ def main(argv=None) -> int:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  6 · __main__
+#  7 · TODO
+# ════════════════════════════════════════════════════════════════════════════
+# Turn-id form — revisit for LLM-friendliness:
+#   • Token efficiency: 5 lower-ascii chars ("xqvmb") typically span 1–3
+#     tokens depending on the tokeniser; numeric ids are fewer tokens but
+#     harder to distinguish from the NNNN line numbers; alternatives to
+#     consider: 4-char lowercase (smaller space, fewer tokens), base32
+#     (uppercase, 8 chars), CJK / emoji (very compact but non-typeable),
+#     short numeric with a non-numeric prefix ("t042").
+#   • Exact-reproduction reliability: letters-only IDs are simpler for a
+#     model to reproduce verbatim than mixed alphanumeric or symbol sequences.
+#   • Distinctness from line numbers: the current all-lowercase alphabet
+#     already satisfies this; a numeric id would require a prefix to keep
+#     them distinguishable.
+#   • KV-cache divergence: re-sending a freshly generated turn with its
+#     prepended id-header diverges from the generation-time KV cache, so the
+#     tail is recomputed each gen. Accepted cost on local inference; could
+#     later be avoided by emitting the id-header DURING generation (so the
+#     cached prefix already contains it and is reusable on subsequent calls).
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  8 · __main__
 # ════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     sys.exit(main())
