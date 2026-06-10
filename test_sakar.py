@@ -182,8 +182,8 @@ def test_policy_deny_over_allow(tmp_path):
     p = _sakar.Policy()
     with mock.patch.object(_sakar, "deny_file", return_value=deny), \
          mock.patch.object(_sakar, "allow_file", return_value=allow):
-        assert p.precheck("1", "bad.evil.com", 443) == "deny"
-        assert p.precheck("1", "example.com", 443) == "allow"
+        assert p.precheck("bad.evil.com") == "deny"
+        assert p.precheck("example.com") == "allow"
 
 
 def test_policy_wildcard_matching(tmp_path):
@@ -196,11 +196,11 @@ def test_policy_wildcard_matching(tmp_path):
     p = _sakar.Policy()
     with mock.patch.object(_sakar, "deny_file", return_value=deny), \
          mock.patch.object(_sakar, "allow_file", return_value=allow):
-        assert p.precheck("1", "sub.blocked.org", 80) == "deny"
-        assert p.precheck("1", "blocked.org", 80) is None   # no wildcard match
-        assert p.precheck("1", "sub.allowed.net", 443) == "allow"
-        assert p.precheck("1", "specific.host.com", 443) == "allow"
-        assert p.precheck("1", "unknown.example.com", 443) is None
+        assert p.precheck("sub.blocked.org") == "deny"
+        assert p.precheck("blocked.org") is None   # no wildcard match
+        assert p.precheck("sub.allowed.net") == "allow"
+        assert p.precheck("specific.host.com") == "allow"
+        assert p.precheck("unknown.example.com") is None
 
 
 def test_policy_non_tty_fails_closed(monkeypatch):

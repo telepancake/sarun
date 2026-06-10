@@ -6,15 +6,16 @@
 # ]
 # ///
 """
-sakar — network-intercepting sandbox. Splits the network-interception half of sarun
-into a standalone tool.
+sakar — a network-intercepting sandbox. Runs a command in a loopback-only network
+namespace whose only egress is sakar's own in-process mitmproxy, so every outbound
+connection can be gated against a policy and recorded.
 
     sakar                   start the server (foreground; Ctrl-C to stop)
     sakar -- CMD [ARGS...]  run CMD in a network namespace whose only connectivity
                             is via sakar's mitmproxy (server must be running first)
     sakar --inner ...       in-box pid-1 runner (spawned by bwrap; not for direct use)
 
-Network model (identical to sarun's net path):
+Network model:
   The box has loopback only. Three in-box rendezvous services forward connections to
   the server's in-process mitmproxy via the box's ONE muxed unix-socket connection:
     • HTTP proxy on 127.0.0.1:8080 — proxy-AWARE clients set HTTP_PROXY here
@@ -29,6 +30,7 @@ Flows: written as mitmproxy native .mitm files to state_home().
 from __future__ import annotations
 import array
 import asyncio
+import contextlib
 import contextvars
 import fnmatch
 import json
@@ -84,7 +86,7 @@ def _ensure_dirs() -> None:
         p.mkdir(parents=True, exist_ok=True)
 
 # ════════════════════════════════════════════════════════════════════════════
-#  In-box port constants (copied from sarun)
+#  In-box port constants
 # ════════════════════════════════════════════════════════════════════════════
 
 INNER_PROXY_PORT = 8080
@@ -94,10 +96,16 @@ INNER_HTTP_PORT = 80
 INNER_HTTPS_PORT = 443
 
 # ════════════════════════════════════════════════════════════════════════════
-#  Frame encode/decode (RELAY only; ECHO/MUTE removed)
+#  Frame encode/decode (one frame type: RELAY)
 # ════════════════════════════════════════════════════════════════════════════
 
 FRAME_RELAY = 1
+
+# Max ancillary FDs accepted per recvmsg (CMSG space sizing) and the muxed-socket
+# limits, kept in sync between the send and receive sides.
+MAX_FDS_PER_MSG = 16
+MAX_FRAME_BUFFER = 1 << 20   # 1 MiB cap on buffered-but-unparsed frame bytes
+RECV_CHUNK = 65536           # bytes per recvmsg from the muxed channel
 
 def encode_frame(ftype: int, payload: bytes = b"") -> bytes:
     """Encode one typed frame: [total-len:4 BE][type:1][payload]. total-len counts the
@@ -121,7 +129,7 @@ def decode_frames(buf: bytes) -> "tuple[list, bytes]":
     return out, buf[i:]
 
 # ════════════════════════════════════════════════════════════════════════════
-#  Synthetic DNS (copied verbatim from sarun lines 836-971)
+#  Synthetic DNS — stable 127/8 IPs for proxy-unaware clients
 # ════════════════════════════════════════════════════════════════════════════
 
 class SyntheticDNS:
@@ -209,7 +217,10 @@ def _dns_build_response(pkt: bytes, txid: int, *, rcode: int = 0,
     question = pkt[12:qend]
     ancount = 1 if a_ip is not None else 0
     rd = pkt[2] & 0x01 if len(pkt) > 2 else 0
-    flags = 0x8000 | (0x0400) | (rd << 8) | (rcode & 0x0F)
+    # DNS header flags: QR=1 (response) | AA=1 (authoritative), the request's RD bit
+    # echoed back (rd << 8), and the rcode in the low nibble.
+    QR, AA = 0x8000, 0x0400
+    flags = QR | AA | (rd << 8) | (rcode & 0x0F)
     header = struct.pack("!HHHHHH", txid, flags, 1, ancount, 0, 0)
     out = header + question
     if a_ip is not None:
@@ -235,7 +246,7 @@ def _dns_handle_packet(pkt: bytes, dns: SyntheticDNS) -> "bytes | None":
     return _dns_build_response(pkt, txid, rcode=0)
 
 # ════════════════════════════════════════════════════════════════════════════
-#  Provenance helpers (minimal — enough for informative prompts)
+#  Process provenance — identify the in-box process behind a connection (for the prompt)
 # ════════════════════════════════════════════════════════════════════════════
 
 _PROV_ENV_KEYS = ("USER", "PWD", "SSH_CONNECTION", "TERM", "_")
@@ -267,7 +278,7 @@ def _parse_proc_stat(pid: int) -> "tuple[int, int]":
     except (OSError, ValueError):
         return 0, 0
 
-def read_provenance(pid: int, full_env: bool = False) -> dict:
+def read_provenance(pid: int) -> dict:
     """Best-effort process provenance from /proc/<pid>. Never raises."""
     info = dict(pid=int(pid), ppid=0, exe="", cwd="", argv=[], env={}, start_time=0)
     base = f"/proc/{pid}"
@@ -291,14 +302,18 @@ def read_provenance(pid: int, full_env: bool = False) -> dict:
             if b"=" not in kv: continue
             k, _, v = kv.partition(b"=")
             ks = k.decode("utf-8", "surrogateescape")
-            if full_env or ks in _PROV_ENV_KEYS:
+            if ks in _PROV_ENV_KEYS:
                 env[ks] = v.decode("utf-8", "surrogateescape")
         info["env"] = env
     except OSError: pass
     return info
 
 def _host_pid_from_pidfd(pidfd: int) -> int:
-    """Resolve a pidfd to a HOST-namespace pid via /proc/self/fdinfo/<pidfd>."""
+    """Resolve a pidfd to a HOST-namespace pid via /proc/self/fdinfo/<pidfd>.
+
+    The connecting process lives in the box's PID namespace, so its in-box pid is
+    meaningless to the server. The pidfd (sent alongside the connection) resolves to
+    the process's HOST pid, which we can read /proc for to name it in the prompt."""
     try:
         with open(f"/proc/self/fdinfo/{pidfd}", "rb") as f:
             for line in f:
@@ -358,8 +373,7 @@ class Policy:
     def _reload(self) -> "tuple[list[str], list[str]]":
         return _load_patterns(deny_file()), _load_patterns(allow_file())
 
-    def precheck(self, box_id: str, host: str, port: int, url: str = "",
-                 proc: "dict | None" = None) -> "str | None":
+    def precheck(self, host: str) -> "str | None":
         """Quick file-only check (no prompt). Returns 'deny', 'allow', or None (prompt)."""
         deny_pats, allow_pats = self._reload()
         if _matches_any(host, deny_pats):
@@ -421,6 +435,11 @@ class Policy:
 #  Mitmproxy contextvars (per-connection)
 # ════════════════════════════════════════════════════════════════════════════
 
+# Mitmproxy invokes its addon hooks (request/response/http_connect) with only the
+# flow; there is no way to thread this connection's box id, requester provenance, and
+# intended destination through those signatures. We stash them in contextvars set just
+# before handle_client(). Each relayed connection runs in its own task, so the values
+# stay isolated per connection.
 _CURRENT_BOX_ID: "contextvars.ContextVar[str]" = contextvars.ContextVar(
     "sakar_box_id", default="")
 _CURRENT_PROV: "contextvars.ContextVar[dict]" = contextvars.ContextVar(
@@ -429,15 +448,14 @@ _CURRENT_DEST: "contextvars.ContextVar[tuple | None]" = contextvars.ContextVar(
     "sakar_dest", default=None)
 
 # ════════════════════════════════════════════════════════════════════════════
-#  GatingAddon (simplified from sarun — no sqlar, no Supervisor)
+#  GatingAddon — gate each connection through Policy
 # ════════════════════════════════════════════════════════════════════════════
 
 class _GatingAddon:
     """Mitmproxy addon: gate each connection via Policy; log to stdout."""
 
-    def __init__(self, policy: Policy, server: "Server"):
+    def __init__(self, policy: Policy):
         self.policy = policy
-        self.server = server
 
     def _normalize_direct_host(self, flow) -> bool:
         dest = _CURRENT_DEST.get()
@@ -478,9 +496,7 @@ class _GatingAddon:
             await self._gate(flow, "http", url)
         elif flow.metadata.get("sakar_connect_gated"):
             # Already gated at CONNECT; only enforce deny at URL level (no double-prompt).
-            if self.policy.precheck(_CURRENT_BOX_ID.get(), flow.request.host,
-                                    flow.request.port, url,
-                                    proc=_CURRENT_PROV.get()) == "deny":
+            if self.policy.precheck(flow.request.host) == "deny":
                 self._deny(flow)
         else:
             # Direct https (reverse mode, no CONNECT): gate once here.
@@ -502,16 +518,15 @@ class _GatingAddon:
               flush=True)
 
 # ════════════════════════════════════════════════════════════════════════════
-#  ProxyEngine (adapted from sarun lines 9314-9418)
+#  ProxyEngine — drive one mitmproxy session per relayed connection
 # ════════════════════════════════════════════════════════════════════════════
 
 class ProxyEngine:
     """Drive one mitmproxy connection per passed FD."""
 
-    def __init__(self, policy: Policy, server: "Server",
+    def __init__(self, policy: Policy,
                  loop: asyncio.AbstractEventLoop, flows_path: str):
         self.policy = policy
-        self.server = server
         self.loop = loop
         self._master = None
         self._opts = None
@@ -525,7 +540,7 @@ class ProxyEngine:
             opts = moptions.Options()
             master = Master(opts, event_loop=loop)
             master.addons.add(*addons.default_addons())
-            master.addons.add(_GatingAddon(policy, server))
+            master.addons.add(_GatingAddon(policy))
             opts.update(confdir=str(mitm_confdir()), server=False,
                         save_stream_file=flows_path)
             master.addons.trigger(mhooks.ConfigureHook(set(opts.keys())))
@@ -573,6 +588,11 @@ class ProxyEngine:
 
         _CURRENT_BOX_ID.set(box_id)
         _CURRENT_DEST.set(dest)
+        # kind="proxy": from a proxy-aware client (HTTP CONNECT / absolute-URI on the
+        # in-box :8080 proxy) — mitmproxy runs in regular HttpProxy mode and learns the
+        # destination from the request. kind="direct": from a catch-all-intercepted
+        # connection (proxy-unaware client that dialed a synthetic IP) where we already
+        # know host/port/scheme, so mitmproxy runs in ReverseProxy mode toward that dest.
         if kind == "direct":
             host, port, scheme = dest
             mode = self._reverse_mode(scheme, host, port)
@@ -592,7 +612,7 @@ class ProxyEngine:
             except Exception: pass
 
 # ════════════════════════════════════════════════════════════════════════════
-#  Relay frame parsing (adapted from sarun)
+#  Relay frame parsing
 # ════════════════════════════════════════════════════════════════════════════
 
 def _parse_relay_meta(payload: bytes) -> "tuple[str, tuple | None]":
@@ -614,6 +634,8 @@ async def relay_handle_fds(engine: ProxyEngine, box_id: str, fds: list,
     """Gate one caught connection — receive side of a RELAY frame."""
     kind, dest = _parse_relay_meta(payload)
     pidfd = fds[1] if len(fds) > 1 else -1
+    # A RELAY frame carries the connection FD and optionally its pidfd. The box is the
+    # untrusted party, so defensively close any extra FDs a misbehaving box might send.
     for extra in fds[2:]:
         try: os.close(extra)
         except OSError: pass
@@ -623,7 +645,7 @@ async def relay_handle_fds(engine: ProxyEngine, box_id: str, fds: list,
     if pidfd >= 0:
         host_pid = _host_pid_from_pidfd(pidfd)
         if host_pid > 0:
-            info = read_provenance(host_pid, full_env=False)
+            info = read_provenance(host_pid)
             prov = {"tgid": tgid_of(host_pid),
                     "start_time": info.get("start_time") or 0,
                     "ppid": info.get("ppid") or 0,
@@ -635,7 +657,7 @@ async def relay_handle_fds(engine: ProxyEngine, box_id: str, fds: list,
     await engine.handle_fd(fds[0], box_id, kind=kind, dest=dest)
 
 # ════════════════════════════════════════════════════════════════════════════
-#  CA generation (adapted from sarun)
+#  CA generation
 # ════════════════════════════════════════════════════════════════════════════
 
 SYSTEM_CA_FILES = (
@@ -674,7 +696,7 @@ def ensure_ca_cert() -> "Path | None":
     return _ca
 
 # ════════════════════════════════════════════════════════════════════════════
-#  Runner-mode detection (copied from sarun lines 10162-10229)
+#  Runner-mode detection (ambient caps vs. user namespace)
 # ════════════════════════════════════════════════════════════════════════════
 
 def find_self() -> str:
@@ -754,7 +776,7 @@ class Server:
                       file=sys.stderr)
                 sys.exit(1)
 
-        self._engine = ProxyEngine(self._policy, self, self._loop, flows_path)
+        self._engine = ProxyEngine(self._policy, self._loop, flows_path)
         if not self._engine.ready:
             print("sakar: FATAL: mitmproxy engine failed to start", file=sys.stderr)
             sys.exit(1)
@@ -783,11 +805,14 @@ class Server:
             asyncio.create_task(self._handle(conn))
 
     async def _recvmsg_ready(self, conn: socket.socket) -> "tuple[bytes, list]":
-        """Await readability then ONE non-blocking recvmsg."""
+        """Await readability then ONE non-blocking recvmsg.
+
+        recvmsg (not recv) so we receive the SCM_RIGHTS connection FDs that ride
+        alongside each RELAY frame's bytes."""
         while True:
             try:
                 data, anc, _flags, _addr = conn.recvmsg(
-                    65536, socket.CMSG_SPACE(4 * 16))
+                    RECV_CHUNK, socket.CMSG_SPACE(4 * MAX_FDS_PER_MSG))
                 return data, anc
             except (BlockingIOError, InterruptedError):
                 pass
@@ -805,7 +830,8 @@ class Server:
         _peer_pid = 0
         buf = b""
         try:
-            # First read: recvmsg to capture optional pidfd from runner
+            # First read uses recvmsg so we can capture the launcher's pidfd (sent with
+            # the register line) and name the box's owning process for the log/prompt.
             _data, _anc, _flags, _addr = await self._loop.run_in_executor(
                 None, self._recvmsg_blocking, conn)
             buf = _data
@@ -835,7 +861,7 @@ class Server:
                     line, buf = buf.split(b"\n", 1)
                     if line.strip():
                         reply, box_id_from_register = await self._dispatch(
-                            line, _peer_pid, _pidfd)
+                            line, _peer_pid)
                         if reply is not None:
                             try:
                                 await self._loop.run_in_executor(
@@ -851,7 +877,7 @@ class Server:
                 more = await self._loop.sock_recv(conn, 4096)
                 if not more:
                     break
-                if len(buf) + len(more) > 1 << 20:
+                if len(buf) + len(more) > MAX_FRAME_BUFFER:
                     break
                 buf += more
         except (OSError, asyncio.CancelledError):
@@ -867,7 +893,7 @@ class Server:
     def _recvmsg_blocking(conn: socket.socket):
         conn.settimeout(30)
         try:
-            return conn.recvmsg(65536, socket.CMSG_SPACE(4 * 16))
+            return conn.recvmsg(RECV_CHUNK, socket.CMSG_SPACE(4 * MAX_FDS_PER_MSG))
         finally:
             conn.setblocking(False)
 
@@ -880,8 +906,7 @@ class Server:
         finally:
             conn.setblocking(False)
 
-    async def _dispatch(self, line: bytes, peer_pid: int,
-                        peer_pidfd: int) -> "tuple[dict | None, str | None]":
+    async def _dispatch(self, line: bytes, peer_pid: int) -> "tuple[dict | None, str | None]":
         """Returns (reply, box_id_if_register)."""
         try:
             msg = json.loads(line.decode())
@@ -895,7 +920,7 @@ class Server:
             box_id = str(self._box_counter)
             prov = {}
             if peer_pid > 0:
-                prov = read_provenance(peer_pid, full_env=False)
+                prov = read_provenance(peer_pid)
             self._boxes[box_id] = {"prov": prov, "counters": {}}
             exe = prov.get("exe", "?")
             argv = prov.get("argv", [])
@@ -928,13 +953,70 @@ class Server:
                         fds = pending_fds.pop(0) if pending_fds else []
                         asyncio.create_task(
                             relay_handle_fds(self._engine, box_id, fds, payload))
-                if len(buf) > 1 << 20:
+                if len(buf) > MAX_FRAME_BUFFER:
                     break
         except (OSError, asyncio.CancelledError):
             pass
         finally:
+            # Any connection FDs received but not yet matched to a RELAY frame (e.g.
+            # on EOF mid-frame or buffer overflow) would otherwise leak; close them.
+            for leftover_fds in pending_fds:
+                for fd in leftover_fds:
+                    try: os.close(fd)
+                    except OSError: pass
             self._boxes.pop(box_id, None)
             print(f"[box {box_id}] exited", flush=True)
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Shared child-process supervision (used by both run_inner and cmd_run)
+# ════════════════════════════════════════════════════════════════════════════
+
+def _controlling_tty_fd() -> "int | None":
+    """The first of stdin/stdout/stderr that is a tty, or None if none is."""
+    return next((fd for fd in (0, 1, 2) if os.isatty(fd)), None)
+
+def _forward_signals_to_pgrp(pid: int) -> None:
+    """Install SIGTERM/SIGINT handlers that forward to the child's process group.
+
+    Both the launcher (cmd_run) and the in-box runner (run_inner) put the child in
+    its own process group and want a signal aimed at us to take the whole group down,
+    falling back to a single-process terminate() if the group kill fails."""
+    def _sig(_s, _f):
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except OSError:
+            try: os.kill(pid, signal.SIGTERM)
+            except OSError: pass
+    signal.signal(signal.SIGTERM, _sig)
+    signal.signal(signal.SIGINT, _sig)
+
+
+@contextlib.contextmanager
+def _terminal_foreground_guard(tty_fd: "int | None"):
+    """Save the terminal's foreground process group and SIGTTOU disposition on entry,
+    restore both on exit.
+
+    Both cmd_run and run_inner put the child in its own process group; while it runs
+    the child (run_inner) or bwrap (cmd_run) may become the terminal's foreground
+    group. On teardown we must hand the terminal back to whoever held it before, and
+    we ignore SIGTTOU meanwhile so our own tcsetpgrp calls don't stop us. Yields the
+    saved foreground pgrp (or None) so callers that reassign it can read the original."""
+    old_fg = None
+    old_ttou = None
+    if tty_fd is not None:
+        old_ttou = signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+        try: old_fg = os.tcgetpgrp(tty_fd)
+        except OSError: old_fg = None
+    try:
+        yield old_fg
+    finally:
+        if tty_fd is not None and old_fg is not None:
+            try: os.tcsetpgrp(tty_fd, old_fg)
+            except OSError: pass
+        if old_ttou is not None:
+            try: signal.signal(signal.SIGTTOU, old_ttou)
+            except (OSError, ValueError): pass
+
 
 # ════════════════════════════════════════════════════════════════════════════
 #  Inner runner (in-box pid-1 — spawned by bwrap from cmd_run)
@@ -945,13 +1027,23 @@ def run_inner(conn_fd: int, cmd: list) -> int:
     stop = threading.Event()
     dns = SyntheticDNS()
 
-    chan = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM,
-                         fileno=conn_fd) if conn_fd >= 0 else None
+    # The box has no route to the internet; its only egress is this one muxed unix
+    # socket to the server. Rather than copy bytes in-box (and re-implement TLS/HTTP),
+    # each forwarder hands the raw accepted connection FD to the server over SCM_RIGHTS
+    # so the server's mitmproxy drives the connection host-side. All connections share
+    # this single socket, each framed as a RELAY carrying its FD(s).
+    chan = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM, fileno=conn_fd)
     chan_lock = threading.Lock()
 
-    def _send_frame(ftype: int, payload: bytes = b"", fds: "list | None" = None) -> None:
-        if chan is None:
-            return
+    def _close_channel() -> None:
+        """Shut down + close the muxed socket. The half-close is the teardown signal:
+        the server sees EOF on this connection and tears the box down."""
+        try: chan.shutdown(socket.SHUT_RDWR)
+        except OSError: pass
+        try: chan.close()
+        except OSError: pass
+
+    def _send_frame(ftype: int, payload: bytes, fds: "list | None" = None) -> None:
         frame = encode_frame(ftype, payload)
         try:
             with chan_lock:
@@ -965,7 +1057,13 @@ def run_inner(conn_fd: int, cmd: list) -> int:
             pass
 
     def _peer_pidfd(conn: socket.socket) -> int:
-        """Pidfd for the connecting in-box workload, or -1."""
+        """Pidfd for the connecting in-box workload, or -1.
+
+        The connecting process lives in the box's PID namespace, so its pid is
+        meaningless to the server. We send this pidfd alongside the connection in the
+        RELAY frame; the server resolves it to a HOST-namespace pid (read via
+        /proc/self/fdinfo) so the approval prompt can name which process (exe/argv)
+        wants the connection."""
         try:
             creds = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
                                     struct.calcsize("3i"))
@@ -992,14 +1090,17 @@ def run_inner(conn_fd: int, cmd: list) -> int:
                 except OSError: pass
             conn.close()
 
-    def listener() -> None:
+    def _tcp_accept_loop(bind_ip: str, port: int, on_conn) -> None:
+        """Bind a TCP listener and hand each accepted connection to on_conn on its own
+        daemon thread, until `stop` is set. Shared by the proxy listener and the
+        catch-all listeners (they differ only in bind address and per-conn handler)."""
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
-            srv.bind(("127.0.0.1", INNER_PROXY_PORT))
+            srv.bind((bind_ip, port))
             srv.listen(64)
         except OSError as e:
-            print(f"sakar(inner): cannot listen: {e}", file=sys.stderr)
+            print(f"sakar(inner): cannot listen :{port}: {e}", file=sys.stderr)
             return
         srv.settimeout(0.5)
         while not stop.is_set():
@@ -1009,7 +1110,7 @@ def run_inner(conn_fd: int, cmd: list) -> int:
                 continue
             except OSError:
                 break
-            threading.Thread(target=forward_one, args=(conn,), daemon=True).start()
+            threading.Thread(target=on_conn, args=(conn,), daemon=True).start()
         srv.close()
 
     def dns_server() -> None:
@@ -1036,118 +1137,77 @@ def run_inner(conn_fd: int, cmd: list) -> int:
                 pass
         srv.close()
 
-    def catch_all(port: int, scheme: str) -> None:
-        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            srv.bind(("0.0.0.0", port))
-            srv.listen(64)
-        except OSError as e:
-            print(f"sakar(inner): cannot listen :{port}: {e}", file=sys.stderr)
-            return
-        srv.settimeout(0.5)
-        while not stop.is_set():
-            try:
-                conn, _ = srv.accept()
-            except socket.timeout:
-                continue
-            except OSError:
-                break
-            threading.Thread(target=_handle_catch_all,
-                             args=(conn, port, scheme), daemon=True).start()
-        srv.close()
-
     def _handle_catch_all(conn: socket.socket, port: int, scheme: str) -> None:
         try:
             dest_ip = conn.getsockname()[0]
         except OSError:
             conn.close(); return
+        # Reverse the synthetic IP the resolver handed out back to its domain. A
+        # 127/8 dest we never handed out means the client dialed an address we did
+        # not authorize (e.g. a hardcoded direct IP); we fail closed and refuse it
+        # rather than guess a destination.
         domain = dns.domain_for(dest_ip)
         if domain is None:
             conn.close(); return
         forward_one(conn, {"kind": "direct", "host": domain,
                            "port": port, "scheme": scheme})
 
+    def catch_all(port: int, scheme: str) -> None:
+        _tcp_accept_loop("0.0.0.0", port,
+                         lambda conn: _handle_catch_all(conn, port, scheme))
+
     # Always run the network forwarders (sakar boxes are always networked).
-    if chan is not None:
-        threading.Thread(target=listener, daemon=True).start()
-        threading.Thread(target=dns_server, daemon=True).start()
-        threading.Thread(target=catch_all,
-                         args=(INNER_HTTP_PORT, "http"), daemon=True).start()
-        threading.Thread(target=catch_all,
-                         args=(INNER_HTTPS_PORT, "https"), daemon=True).start()
+    # Proxy listener on 127.0.0.1:8080 forwards each connection as-is (proxy-aware);
+    # the catch-all listeners reverse the synthetic dest IP first (proxy-unaware).
+    threading.Thread(
+        target=lambda: _tcp_accept_loop("127.0.0.1", INNER_PROXY_PORT, forward_one),
+        daemon=True).start()
+    threading.Thread(target=dns_server, daemon=True).start()
+    threading.Thread(target=catch_all,
+                     args=(INNER_HTTP_PORT, "http"), daemon=True).start()
+    threading.Thread(target=catch_all,
+                     args=(INNER_HTTPS_PORT, "https"), daemon=True).start()
 
     # Run the command as a child process (NOT os.execvp — that would replace this
     # process and kill the forwarder threads, which must stay alive while the child
     # runs). This --inner process stays alive as pid-1 until the child exits, then
     # signals teardown by closing the muxed connection.
-    tty_fd = next((fd for fd in (0, 1, 2) if os.isatty(fd)), None)
-    old_fg = None
-    old_ttou = None
-    if tty_fd is not None:
-        old_ttou = signal.signal(signal.SIGTTOU, signal.SIG_IGN)
-        try: old_fg = os.tcgetpgrp(tty_fd)
-        except OSError: old_fg = None
-
     try:
         proc = subprocess.Popen(cmd, preexec_fn=os.setpgrp)
     except FileNotFoundError:
         print(f"sakar(inner): command not found: {cmd[0]}", file=sys.stderr)
         stop.set()
-        if chan is not None:
-            try: chan.shutdown(socket.SHUT_RDWR)
-            except OSError: pass
-            try: chan.close()
-            except OSError: pass
+        _close_channel()
         os._exit(127)
-        return 127
     except OSError as e:
         print(f"sakar(inner): exec failed: {e}", file=sys.stderr)
         stop.set()
-        if chan is not None:
-            try: chan.shutdown(socket.SHUT_RDWR)
-            except OSError: pass
-            try: chan.close()
-            except OSError: pass
+        _close_channel()
         os._exit(1)
-        return 1
 
-    try: os.setpgid(proc.pid, proc.pid)
-    except OSError: pass
-    if tty_fd is not None:
-        try: os.tcsetpgrp(tty_fd, proc.pid)
+    tty_fd = _controlling_tty_fd()
+    with _terminal_foreground_guard(tty_fd):
+        try: os.setpgid(proc.pid, proc.pid)
         except OSError: pass
-
-    def _sig(_s, _f):
-        try: os.killpg(proc.pid, signal.SIGTERM)
-        except OSError:
-            try: proc.terminate()
+        if tty_fd is not None:
+            # Hand the terminal foreground to the child so it can read stdin / get
+            # job-control signals. (The launcher does NOT do this — it stays
+            # foreground itself.)
+            try: os.tcsetpgrp(tty_fd, proc.pid)
             except OSError: pass
-    signal.signal(signal.SIGTERM, _sig)
-    signal.signal(signal.SIGINT, _sig)
 
-    try:
-        code = proc.wait()
-    except KeyboardInterrupt:
-        proc.terminate()
-        code = proc.wait()
+        _forward_signals_to_pgrp(proc.pid)
 
-    stop.set()
+        try:
+            code = proc.wait()
+        except KeyboardInterrupt:
+            proc.terminate()
+            code = proc.wait()
 
-    if tty_fd is not None:
-        if old_fg is not None:
-            try: os.tcsetpgrp(tty_fd, old_fg)
-            except OSError: pass
-        if old_ttou is not None:
-            try: signal.signal(signal.SIGTTOU, old_ttou)
-            except (OSError, ValueError): pass
+        stop.set()
 
     # Close the muxed connection: EOF → server sees box exited → teardown.
-    if chan is not None:
-        try: chan.shutdown(socket.SHUT_RDWR)
-        except OSError: pass
-        try: chan.close()
-        except OSError: pass
+    _close_channel()
 
     # Hard-exit: --inner is pid-1 in the box. Daemon threads may still be in
     # blocking calls; normal interpreter shutdown races them. We've done cleanup.
@@ -1156,7 +1216,6 @@ def run_inner(conn_fd: int, cmd: list) -> int:
     try: sys.stderr.flush()
     except Exception: pass
     os._exit(code or 0)
-    return code or 0
 
 # ════════════════════════════════════════════════════════════════════════════
 #  cmd_run: `sakar -- CMD [ARGS...]`
@@ -1193,40 +1252,35 @@ def cmd_run(cmd: list) -> int:
     except (OSError, AttributeError):
         pass
 
-    ui_conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv_conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
-        ui_conn.settimeout(30)
-        ui_conn.connect(sp)
-        self_prov = read_provenance(os.getpid(), full_env=False)
-        payload = (json.dumps({
-            "type": "register",
-            "cmd": list(cmd),
-            "prov": self_prov,
-            "root_tgid": os.getpid(),
-        }) + "\n").encode()
+        srv_conn.settimeout(30)
+        srv_conn.connect(sp)
+        # The server identifies us by the pidfd sent below (it recomputes our
+        # provenance host-side); the register line itself carries no payload.
+        payload = (json.dumps({"type": "register"}) + "\n").encode()
         if pidfd >= 0:
-            ui_conn.sendmsg([payload],
+            srv_conn.sendmsg([payload],
                             [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
                               array.array("i", [pidfd]).tobytes())])
         else:
-            ui_conn.sendall(payload)
-        # Read exactly the ack line.
+            srv_conn.sendall(payload)
         buf = b""
         while b"\n" not in buf:
-            chunk = ui_conn.recv(1)
+            chunk = srv_conn.recv(1)
             if not chunk:
                 break
             buf += chunk
         line = buf.split(b"\n", 1)[0]
         ack = json.loads(line.decode()) if line.strip() else None
         if not ack or not ack.get("ok"):
-            ui_conn.close()
+            srv_conn.close()
             print("sakar: register failed", file=sys.stderr)
             return 1
         box_id = ack.get("box_id", "?")
-        ui_conn.settimeout(None)
+        srv_conn.settimeout(None)
     except (OSError, json.JSONDecodeError) as e:
-        try: ui_conn.close()
+        try: srv_conn.close()
         except OSError: pass
         print(f"sakar: connection failed: {e}", file=sys.stderr)
         return 1
@@ -1237,7 +1291,7 @@ def cmd_run(cmd: list) -> int:
 
     _ca = ca_cert_path()
     if not _ca.exists():
-        ui_conn.close()
+        srv_conn.close()
         print("sakar: CA cert not found (is the server running and initialized?)",
               file=sys.stderr)
         return 1
@@ -1245,23 +1299,17 @@ def cmd_run(cmd: list) -> int:
     # Write a temp resolv.conf pointing to our synthetic DNS resolver.
     resolv_tmp = tempfile.NamedTemporaryFile(
         prefix="sakar-resolv-", suffix=".conf", delete=False, mode="w")
-    resolv_tmp.write("nameserver 127.0.0.53\n")
+    resolv_tmp.write(f"nameserver {INNER_DNS_ADDR}\n")
     resolv_tmp.close()
     resolv_tmp_path = resolv_tmp.name
 
-    tty_fd = next((fd for fd in (0, 1, 2) if os.isatty(fd)), None)
-    old_fg_pgrp = None
-    old_ttou = None
-    if tty_fd is not None:
-        try: old_fg_pgrp = os.tcgetpgrp(tty_fd)
-        except OSError: old_fg_pgrp = None
-        old_ttou = signal.signal(signal.SIGTTOU, signal.SIG_IGN)
-
+    tty_fd = _controlling_tty_fd()
     launched = False
     code = 1
 
-    try:
-        conn_fd = ui_conn.fileno()
+    with _terminal_foreground_guard(tty_fd):
+      try:
+        conn_fd = srv_conn.fileno()
         os.set_inheritable(conn_fd, True)
         popen_pass_fds: tuple = (conn_fd,)
 
@@ -1277,7 +1325,10 @@ def cmd_run(cmd: list) -> int:
             print(
                 "sakar: cannot create the runner sandbox.\n"
                 "  No ambient CAP_SYS_ADMIN/CAP_NET_ADMIN and unprivileged user\n"
-                "  namespaces are unavailable. See sarun docs for remediation.",
+                "  namespaces are unavailable. To fix, either enable unprivileged\n"
+                "  user namespaces (sysctl kernel.unprivileged_userns_clone=1, or\n"
+                "  on Debian/Ubuntu kernel.apparmor_restrict_unprivileged_userns=0)\n"
+                "  or run sakar with ambient CAP_SYS_ADMIN+CAP_NET_ADMIN.",
                 file=sys.stderr)
             return 4
 
@@ -1333,32 +1384,20 @@ def cmd_run(cmd: list) -> int:
                                 pass_fds=popen_pass_fds)
         launched = True
         # Close OUR copy — --inner is now the sole holder; its exit → EOF → teardown.
-        try: ui_conn.close()
+        try: srv_conn.close()
         except OSError: pass
         try: os.setpgid(proc.pid, proc.pid)
         except OSError: pass
 
-        def _sig(_s, _f):
-            try: os.killpg(proc.pid, signal.SIGTERM)
-            except OSError:
-                try: proc.terminate()
-                except OSError: pass
-        signal.signal(signal.SIGTERM, _sig)
-        signal.signal(signal.SIGINT, _sig)
+        _forward_signals_to_pgrp(proc.pid)
 
         code = proc.wait()
-    finally:
+      finally:
         try: os.unlink(resolv_tmp_path)
         except OSError: pass
         if not launched:
-            try: ui_conn.close()
+            try: srv_conn.close()
             except OSError: pass
-        if tty_fd is not None and old_fg_pgrp is not None:
-            try: os.tcsetpgrp(tty_fd, old_fg_pgrp)
-            except OSError: pass
-        if old_ttou is not None:
-            try: signal.signal(signal.SIGTTOU, old_ttou)
-            except (OSError, ValueError): pass
 
     print(f"sakar: [box {box_id}] exited ({code if launched else 1}).",
           file=sys.stderr)
