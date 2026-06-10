@@ -1,0 +1,1442 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#   "mitmproxy>=11",
+# ]
+# ///
+"""
+sakar — network-intercepting sandbox. Splits the network-interception half of sarun
+into a standalone tool.
+
+    sakar                   start the server (foreground; Ctrl-C to stop)
+    sakar -- CMD [ARGS...]  run CMD in a network namespace whose only connectivity
+                            is via sakar's mitmproxy (server must be running first)
+    sakar --inner ...       in-box pid-1 runner (spawned by bwrap; not for direct use)
+
+Network model (identical to sarun's net path):
+  The box has loopback only. Three in-box rendezvous services forward connections to
+  the server's in-process mitmproxy via the box's ONE muxed unix-socket connection:
+    • HTTP proxy on 127.0.0.1:8080 — proxy-AWARE clients set HTTP_PROXY here
+    • DNS resolver on 127.0.0.53:53 — synthetic 127/8 IPs for proxy-UNAWARE clients
+    • Catch-all TCP on :80/:443 — clients dialing a synthetic IP get intercepted
+
+Filesystem: passthrough (--dev-bind / /). sakar's job is network isolation only.
+Policy: deny/allow wildcard files in config_home(); interactive prompt for unknowns.
+Flows: written as mitmproxy native .mitm files to state_home().
+"""
+
+from __future__ import annotations
+import array
+import asyncio
+import contextvars
+import fnmatch
+import json
+import os
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from datetime import datetime
+from pathlib import Path
+
+# ════════════════════════════════════════════════════════════════════════════
+#  XDG paths (under "sakar")
+# ════════════════════════════════════════════════════════════════════════════
+
+def data_home() -> Path:
+    base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    return Path(base) / "sakar"
+
+def config_home() -> Path:
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return Path(base) / "sakar"
+
+def state_home() -> Path:
+    base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    return Path(base) / "sakar"
+
+def runtime_home() -> Path:
+    base = os.environ.get("XDG_RUNTIME_DIR")
+    return Path(base) / "sakar" if base else data_home()
+
+def sock_path() -> str:
+    return str(runtime_home() / "sakar.sock")
+
+def mitm_confdir() -> Path:
+    return data_home() / "mitmproxy"
+
+def ca_cert_path() -> Path:
+    return mitm_confdir() / "mitmproxy-ca-cert.pem"
+
+def deny_file() -> Path:
+    return config_home() / "deny"
+
+def allow_file() -> Path:
+    return config_home() / "allow"
+
+def _ensure_dirs() -> None:
+    for p in (data_home(), config_home(), runtime_home(), mitm_confdir(), state_home()):
+        p.mkdir(parents=True, exist_ok=True)
+
+# ════════════════════════════════════════════════════════════════════════════
+#  In-box port constants (copied from sarun)
+# ════════════════════════════════════════════════════════════════════════════
+
+INNER_PROXY_PORT = 8080
+INNER_DNS_ADDR = "127.0.0.53"
+INNER_DNS_PORT = 53
+INNER_HTTP_PORT = 80
+INNER_HTTPS_PORT = 443
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Frame encode/decode (RELAY only; ECHO/MUTE removed)
+# ════════════════════════════════════════════════════════════════════════════
+
+FRAME_RELAY = 1
+
+def encode_frame(ftype: int, payload: bytes = b"") -> bytes:
+    """Encode one typed frame: [total-len:4 BE][type:1][payload]. total-len counts the
+    type byte + payload. Module-level + pure so it is unit-testable without a socket."""
+    return struct.pack("!I", 1 + len(payload)) + bytes([ftype & 0xFF]) + payload
+
+def decode_frames(buf: bytes) -> "tuple[list, bytes]":
+    """Decode as many whole frames as `buf` holds. Returns (frames, remainder) where
+    frames is [(ftype, payload)] and remainder is the trailing partial frame."""
+    out = []
+    i = 0
+    n = len(buf)
+    while n - i >= 4:
+        (tot,) = struct.unpack("!I", buf[i:i + 4])
+        if n - (i + 4) < tot:
+            break
+        ftype = buf[i + 4]
+        payload = buf[i + 5:i + 4 + tot]
+        out.append((ftype, payload))
+        i += 4 + tot
+    return out, buf[i:]
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Synthetic DNS (copied verbatim from sarun lines 836-971)
+# ════════════════════════════════════════════════════════════════════════════
+
+class SyntheticDNS:
+    """Allocates stable synthetic 127/8 IPv4 addresses for domains and reverses them.
+
+    Pool: 127.0.0.0/8 minus the two reserved rendezvous IPs (127.0.0.1 = inner proxy
+    listener, 127.0.0.53 = this resolver) and the broadcast-ish 127.0.0.0. Same domain
+    always maps to the same IP (dedup, so a chatty resolver can't exhaust the pool);
+    pool exhaustion raises so the caller can answer SERVFAIL."""
+
+    _LO_NET = 0x7F000000
+    _LO_BCAST = 0x7FFFFFFF
+    _RESERVED = frozenset({0x7F000000, 0x7F000001, 0x7F000035})  # .0, proxy .1, dns .53
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._by_domain: dict[str, str] = {}
+        self._by_ip: dict[str, str] = {}
+        self._next = self._LO_NET + 2
+
+    def ip_for(self, domain: str) -> str:
+        """Stable synthetic IP for `domain`. Raises RuntimeError on pool exhaustion."""
+        domain = domain.lower().rstrip(".")
+        with self._lock:
+            ip = self._by_domain.get(domain)
+            if ip is not None:
+                return ip
+            n = self._next
+            while n < self._LO_BCAST:
+                if n not in self._RESERVED:
+                    ipstr = socket.inet_ntoa(struct.pack("!I", n))
+                    self._next = n + 1
+                    self._by_domain[domain] = ipstr
+                    self._by_ip[ipstr] = domain
+                    return ipstr
+                n += 1
+            raise RuntimeError("synthetic 127/8 pool exhausted")
+
+    def domain_for(self, ip: str) -> "str | None":
+        """Reverse lookup for the forwarders; None if `ip` was never handed out."""
+        return self._by_ip.get(ip)
+
+
+_DNS_QTYPE_A = 1
+_DNS_QTYPE_AAAA = 28
+
+
+def _dns_parse_question(pkt: bytes) -> "tuple[int, str, int] | None":
+    """Return (txid, qname, qtype) for the first question, or None if malformed."""
+    try:
+        if len(pkt) < 12:
+            return None
+        txid, _flags, qdcount = struct.unpack("!HHH", pkt[:6])
+        if qdcount < 1:
+            return None
+        pos = 12
+        labels = []
+        while True:
+            if pos >= len(pkt):
+                return None
+            ln = pkt[pos]; pos += 1
+            if ln == 0:
+                break
+            if ln & 0xC0:
+                return None
+            if pos + ln > len(pkt):
+                return None
+            labels.append(pkt[pos:pos + ln].decode("latin-1"))
+            pos += ln
+        if pos + 4 > len(pkt):
+            return None
+        qtype, _qclass = struct.unpack("!HH", pkt[pos:pos + 4])
+        return txid, ".".join(labels), qtype
+    except (struct.error, UnicodeError, IndexError):
+        return None
+
+
+def _dns_build_response(pkt: bytes, txid: int, *, rcode: int = 0,
+                        a_ip: "str | None" = None, ttl: int = 30) -> bytes:
+    """Build a response echoing the query's question section."""
+    pos = 12
+    while pos < len(pkt) and pkt[pos] != 0:
+        pos += 1 + pkt[pos]
+    qend = pos + 1 + 4
+    question = pkt[12:qend]
+    ancount = 1 if a_ip is not None else 0
+    rd = pkt[2] & 0x01 if len(pkt) > 2 else 0
+    flags = 0x8000 | (0x0400) | (rd << 8) | (rcode & 0x0F)
+    header = struct.pack("!HHHHHH", txid, flags, 1, ancount, 0, 0)
+    out = header + question
+    if a_ip is not None:
+        out += struct.pack("!HHHIH", 0xC00C, _DNS_QTYPE_A, 1, ttl, 4)
+        out += socket.inet_aton(a_ip)
+    return out
+
+
+def _dns_handle_packet(pkt: bytes, dns: SyntheticDNS) -> "bytes | None":
+    """Pure function: query bytes → response bytes (or None to drop malformed packet)."""
+    q = _dns_parse_question(pkt)
+    if q is None:
+        return None
+    txid, qname, qtype = q
+    if qtype == _DNS_QTYPE_A:
+        if not qname:
+            return _dns_build_response(pkt, txid, rcode=0)
+        try:
+            ip = dns.ip_for(qname)
+        except RuntimeError:
+            return _dns_build_response(pkt, txid, rcode=2)
+        return _dns_build_response(pkt, txid, a_ip=ip)
+    return _dns_build_response(pkt, txid, rcode=0)
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Provenance helpers (minimal — enough for informative prompts)
+# ════════════════════════════════════════════════════════════════════════════
+
+_PROV_ENV_KEYS = ("USER", "PWD", "SSH_CONNECTION", "TERM", "_")
+
+def _proc_status_field(pid: int, field: str) -> "int | None":
+    """One integer field (e.g. Tgid, PPid) from /proc/<pid>/status."""
+    try:
+        with open(f"/proc/{pid}/status", "rb") as f:
+            for ln in f:
+                if ln.startswith(field.encode() + b":"):
+                    return int(ln.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+def tgid_of(pid: int) -> int:
+    t = _proc_status_field(pid, "Tgid")
+    return t if t is not None else int(pid)
+
+def _parse_proc_stat(pid: int) -> "tuple[int, int]":
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            st = f.read()
+        rp = st.rfind(b")")
+        rest = st[rp + 2:].split() if rp >= 0 else []
+        ppid = int(rest[1]) if len(rest) >= 2 else 0
+        start_time = int(rest[19]) if len(rest) >= 20 else 0
+        return ppid, start_time
+    except (OSError, ValueError):
+        return 0, 0
+
+def read_provenance(pid: int, full_env: bool = False) -> dict:
+    """Best-effort process provenance from /proc/<pid>. Never raises."""
+    info = dict(pid=int(pid), ppid=0, exe="", cwd="", argv=[], env={}, start_time=0)
+    base = f"/proc/{pid}"
+    try:
+        with open(f"{base}/cmdline", "rb") as f:
+            raw = f.read()
+        info["argv"] = [p.decode("utf-8", "surrogateescape")
+                        for p in raw.split(b"\x00") if p]
+    except OSError: pass
+    try: info["exe"] = os.readlink(f"{base}/exe")
+    except OSError: pass
+    try: info["cwd"] = os.readlink(f"{base}/cwd")
+    except OSError: pass
+    ppid, start_time = _parse_proc_stat(pid)
+    info["ppid"] = ppid; info["start_time"] = start_time
+    try:
+        with open(f"{base}/environ", "rb") as f:
+            env_raw = f.read()
+        env = {}
+        for kv in env_raw.split(b"\x00"):
+            if b"=" not in kv: continue
+            k, _, v = kv.partition(b"=")
+            ks = k.decode("utf-8", "surrogateescape")
+            if full_env or ks in _PROV_ENV_KEYS:
+                env[ks] = v.decode("utf-8", "surrogateescape")
+        info["env"] = env
+    except OSError: pass
+    return info
+
+def _host_pid_from_pidfd(pidfd: int) -> int:
+    """Resolve a pidfd to a HOST-namespace pid via /proc/self/fdinfo/<pidfd>."""
+    try:
+        with open(f"/proc/self/fdinfo/{pidfd}", "rb") as f:
+            for line in f:
+                if line.startswith(b"Pid:"):
+                    rest = line.split(b":", 1)[1].split()
+                    return int(rest[0]) if rest else 0
+    except (OSError, ValueError, IndexError):
+        return 0
+    return 0
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Policy: deny/allow wildcard files + interactive prompt
+# ════════════════════════════════════════════════════════════════════════════
+
+def _load_patterns(path: Path) -> list[str]:
+    """Load wildcard patterns from a file; ignore #-comments and blank lines."""
+    patterns = []
+    try:
+        for line in path.read_text().splitlines():
+            line = line.split("#", 1)[0].strip()
+            if line:
+                patterns.append(line.lower())
+    except OSError:
+        pass
+    return patterns
+
+def _matches_any(host: str, patterns: list[str]) -> bool:
+    h = host.lower()
+    return any(fnmatch.fnmatch(h, p) for p in patterns)
+
+def _append_to_file(path: Path, line: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a") as f:
+        f.write(line + "\n")
+
+def _notify(title: str, body: str) -> None:
+    """Best-effort desktop notification — swallow all errors."""
+    try:
+        if sys.platform == "darwin":
+            subprocess.run(
+                ["osascript", "-e",
+                 f'display notification "{body}" with title "{title}"'],
+                timeout=2, capture_output=True)
+        else:
+            subprocess.run(["notify-send", title, body],
+                           timeout=2, capture_output=True)
+    except Exception:
+        pass
+
+
+class Policy:
+    """File-based allow/deny policy with interactive terminal prompt."""
+
+    def __init__(self):
+        self._lock = asyncio.Lock()
+
+    def _reload(self) -> "tuple[list[str], list[str]]":
+        return _load_patterns(deny_file()), _load_patterns(allow_file())
+
+    def precheck(self, box_id: str, host: str, port: int, url: str = "",
+                 proc: "dict | None" = None) -> "str | None":
+        """Quick file-only check (no prompt). Returns 'deny', 'allow', or None (prompt)."""
+        deny_pats, allow_pats = self._reload()
+        if _matches_any(host, deny_pats):
+            return "deny"
+        if _matches_any(host, allow_pats):
+            return "allow"
+        return None
+
+    async def decide(self, box_id: str, host: str, port: int, scheme: str,
+                     url: str = "", proc: "dict | None" = None) -> dict:
+        """Full policy decision: file check then optional interactive prompt."""
+        deny_pats, allow_pats = self._reload()
+        if _matches_any(host, deny_pats):
+            return {"action": "deny"}
+        if _matches_any(host, allow_pats):
+            return {"action": "allow"}
+
+        # Unknown host — prompt (or fail closed if non-interactive)
+        if not sys.stdin.isatty():
+            return {"action": "deny"}
+
+        loop = asyncio.get_running_loop()
+
+        def _prompt() -> str:
+            exe = (proc or {}).get("exe", "?")
+            argv = (proc or {}).get("argv", [])
+            short_argv = " ".join(argv[:4]) if argv else ""
+            dest_str = f"{scheme}://{host}:{port}"
+            if url:
+                dest_str += f"  ({url})"
+            _notify(f"sakar [box {box_id}]", f"Allow {dest_str}?")
+            print(f"\n[box {box_id}] Connection request", file=sys.stderr)
+            print(f"  process: {exe}  {short_argv}", file=sys.stderr)
+            print(f"  dest:    {dest_str}", file=sys.stderr)
+            print("  [y]es once / [n]o once / [a]llow+save / [d]eny+save [n]: ",
+                  end="", flush=True, file=sys.stderr)
+            try:
+                ans = input().strip().lower()
+            except EOFError:
+                ans = ""
+            return ans
+
+        async with self._lock:
+            ans = await loop.run_in_executor(None, _prompt)
+
+        if ans == "y":
+            return {"action": "allow"}
+        elif ans == "a":
+            _append_to_file(allow_file(), host.lower())
+            return {"action": "allow"}
+        elif ans == "d":
+            _append_to_file(deny_file(), host.lower())
+            return {"action": "deny"}
+        else:
+            # "n", empty, or anything else → deny (fail closed)
+            return {"action": "deny"}
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Mitmproxy contextvars (per-connection)
+# ════════════════════════════════════════════════════════════════════════════
+
+_CURRENT_BOX_ID: "contextvars.ContextVar[str]" = contextvars.ContextVar(
+    "sakar_box_id", default="")
+_CURRENT_PROV: "contextvars.ContextVar[dict]" = contextvars.ContextVar(
+    "sakar_prov", default={"tgid": 0})
+_CURRENT_DEST: "contextvars.ContextVar[tuple | None]" = contextvars.ContextVar(
+    "sakar_dest", default=None)
+
+# ════════════════════════════════════════════════════════════════════════════
+#  GatingAddon (simplified from sarun — no sqlar, no Supervisor)
+# ════════════════════════════════════════════════════════════════════════════
+
+class _GatingAddon:
+    """Mitmproxy addon: gate each connection via Policy; log to stdout."""
+
+    def __init__(self, policy: Policy, server: "Server"):
+        self.policy = policy
+        self.server = server
+
+    def _normalize_direct_host(self, flow) -> bool:
+        dest = _CURRENT_DEST.get()
+        if dest is None:
+            return True
+        host, port, _scheme = dest
+        if not host:
+            return False
+        if flow.request.host != host:
+            flow.request.host = host
+        return True
+
+    def _deny(self, flow):
+        from mitmproxy import http
+        flow.metadata["sakar_denied"] = True
+        flow.response = http.Response.make(
+            403, b"sakar: denied\n", {"Content-Type": "text/plain"})
+
+    async def _gate(self, flow, scheme: str, url: str = "") -> None:
+        res = await self.policy.decide(
+            _CURRENT_BOX_ID.get(), flow.request.host, flow.request.port, scheme, url,
+            proc=_CURRENT_PROV.get())
+        if res.get("action") != "allow":
+            self._deny(flow)
+
+    async def http_connect(self, flow):
+        if not self._normalize_direct_host(flow):
+            self._deny(flow); return
+        flow.metadata["sakar_connect_gated"] = True
+        await self._gate(flow, "https")
+
+    async def request(self, flow):
+        if not self._normalize_direct_host(flow):
+            self._deny(flow)
+            return
+        url = flow.request.pretty_url
+        if flow.request.scheme == "http":
+            await self._gate(flow, "http", url)
+        elif flow.metadata.get("sakar_connect_gated"):
+            # Already gated at CONNECT; only enforce deny at URL level (no double-prompt).
+            if self.policy.precheck(_CURRENT_BOX_ID.get(), flow.request.host,
+                                    flow.request.port, url,
+                                    proc=_CURRENT_PROV.get()) == "deny":
+                self._deny(flow)
+        else:
+            # Direct https (reverse mode, no CONNECT): gate once here.
+            await self._gate(flow, "https", url)
+
+    def response(self, flow):
+        req, resp = flow.request, flow.response
+        denied = bool(flow.metadata.get("sakar_denied"))
+        action = "deny" if denied else "allow"
+        box_id = _CURRENT_BOX_ID.get()
+        status = resp.status_code if resp else 0
+        resp_len = len(resp.content or b"") if resp else 0
+        print(f"[box {box_id}] {action} {req.method} {req.pretty_url} {status} {resp_len}b",
+              flush=True)
+
+    def error(self, flow):
+        box_id = _CURRENT_BOX_ID.get()
+        print(f"[box {box_id}] error {flow.request.pretty_url if flow.request else '?'}",
+              flush=True)
+
+# ════════════════════════════════════════════════════════════════════════════
+#  ProxyEngine (adapted from sarun lines 9314-9418)
+# ════════════════════════════════════════════════════════════════════════════
+
+class ProxyEngine:
+    """Drive one mitmproxy connection per passed FD."""
+
+    def __init__(self, policy: Policy, server: "Server",
+                 loop: asyncio.AbstractEventLoop, flows_path: str):
+        self.policy = policy
+        self.server = server
+        self.loop = loop
+        self._master = None
+        self._opts = None
+        self._mode = None
+        self._reverse_cache: dict = {}
+        self._ready = False
+        try:
+            from mitmproxy import options as moptions, addons, hooks as mhooks
+            from mitmproxy.master import Master
+            from mitmproxy.proxy import mode_specs
+            opts = moptions.Options()
+            master = Master(opts, event_loop=loop)
+            master.addons.add(*addons.default_addons())
+            master.addons.add(_GatingAddon(policy, server))
+            opts.update(confdir=str(mitm_confdir()), server=False,
+                        save_stream_file=flows_path)
+            master.addons.trigger(mhooks.ConfigureHook(set(opts.keys())))
+            self._master = master
+            self._opts = opts
+            self._mode = mode_specs.ProxyMode.parse("regular")
+            self._ready = True
+        except Exception as e:
+            print(f"sakar: mitmproxy unavailable: {e}", file=sys.stderr)
+
+    @property
+    def ready(self) -> bool:
+        return self._ready
+
+    def _reverse_mode(self, scheme: str, host: str, port: int):
+        from mitmproxy.proxy import mode_specs
+        key = f"reverse:{scheme}://{host}:{port}"
+        m = self._reverse_cache.get(key)
+        if m is None:
+            m = mode_specs.ProxyMode.parse(key)
+            self._reverse_cache[key] = m
+        return m
+
+    async def handle_fd(self, fd: int, box_id: str, *, kind: str = "proxy",
+                        dest: "tuple | None" = None) -> None:
+        if not self._ready:
+            try: os.close(fd)
+            except OSError: pass
+            return
+        if kind == "direct" and (not dest or not dest[0]):
+            try: os.close(fd)
+            except OSError: pass
+            return
+        from mitmproxy.proxy.mode_servers import ProxyConnectionHandler
+        from mitmproxy.proxy import layers
+
+        sock = socket.socket(fileno=fd)
+        sock.setblocking(False)
+        try:
+            reader, writer = await asyncio.open_connection(sock=sock)
+        except OSError:
+            try: sock.close()
+            except OSError: pass
+            return
+
+        _CURRENT_BOX_ID.set(box_id)
+        _CURRENT_DEST.set(dest)
+        if kind == "direct":
+            host, port, scheme = dest
+            mode = self._reverse_mode(scheme, host, port)
+            handler = ProxyConnectionHandler(
+                self._master, reader, writer, self._opts, mode)
+            handler.layer = layers.modes.ReverseProxy(handler.layer.context)
+        else:
+            handler = ProxyConnectionHandler(
+                self._master, reader, writer, self._opts, self._mode)
+            handler.layer = layers.modes.HttpProxy(handler.layer.context)
+        try:
+            await handler.handle_client()
+        except Exception:
+            pass
+        finally:
+            try: writer.close()
+            except Exception: pass
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Relay frame parsing (adapted from sarun)
+# ════════════════════════════════════════════════════════════════════════════
+
+def _parse_relay_meta(payload: bytes) -> "tuple[str, tuple | None]":
+    kind, dest = "proxy", None
+    if payload:
+        try:
+            meta = json.loads(payload.decode())
+            if isinstance(meta, dict) and meta.get("kind") == "direct":
+                kind = "direct"
+                dest = (str(meta.get("host", "")), int(meta.get("port", 0)),
+                        str(meta.get("scheme", "https")))
+        except (ValueError, TypeError, UnicodeDecodeError):
+            kind, dest = "proxy", None
+    return kind, dest
+
+
+async def relay_handle_fds(engine: ProxyEngine, box_id: str, fds: list,
+                           payload: bytes) -> None:
+    """Gate one caught connection — receive side of a RELAY frame."""
+    kind, dest = _parse_relay_meta(payload)
+    pidfd = fds[1] if len(fds) > 1 else -1
+    for extra in fds[2:]:
+        try: os.close(extra)
+        except OSError: pass
+    if not fds:
+        return
+    prov = {"tgid": 0}
+    if pidfd >= 0:
+        host_pid = _host_pid_from_pidfd(pidfd)
+        if host_pid > 0:
+            info = read_provenance(host_pid, full_env=False)
+            prov = {"tgid": tgid_of(host_pid),
+                    "start_time": info.get("start_time") or 0,
+                    "ppid": info.get("ppid") or 0,
+                    "exe": info["exe"], "argv": info["argv"]}
+        try: os.close(pidfd)
+        except OSError: pass
+    _CURRENT_PROV.set(prov)
+    _CURRENT_DEST.set(dest)
+    await engine.handle_fd(fds[0], box_id, kind=kind, dest=dest)
+
+# ════════════════════════════════════════════════════════════════════════════
+#  CA generation (adapted from sarun)
+# ════════════════════════════════════════════════════════════════════════════
+
+SYSTEM_CA_FILES = (
+    "/etc/ssl/certs/ca-certificates.crt",
+    "/etc/pki/tls/certs/ca-bundle.crt",
+    "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+    "/etc/ssl/cert.pem",
+    "/etc/ssl/ca-bundle.pem",
+)
+
+def primary_ca_path() -> "str | None":
+    for f in SYSTEM_CA_FILES:
+        if Path(f).is_file(): return f
+    return None
+
+def ensure_ca_cert() -> "Path | None":
+    """Generate the mitmproxy CA cert if not already present.
+
+    Uses mitmproxy.certs.CertStore.from_store() directly — no subprocess,
+    no event loop required. Works in the uv-script env where mitmdump is not
+    in PATH.
+    """
+    _ca = ca_cert_path()
+    if _ca.exists(): return _ca
+    _cd = mitm_confdir()
+    _cd.mkdir(parents=True, exist_ok=True)
+    try:
+        from mitmproxy.certs import CertStore
+        CertStore.from_store(_cd, "mitmproxy", 2048)
+    except Exception as e:
+        print(f"sakar: ensure_ca_cert: error generating CA: {e}", file=sys.stderr)
+    if not _ca.exists():
+        print("sakar: ensure_ca_cert: CA cert still not present after init",
+              file=sys.stderr)
+        return None
+    return _ca
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Runner-mode detection (copied from sarun lines 10162-10229)
+# ════════════════════════════════════════════════════════════════════════════
+
+def find_self() -> str:
+    return os.path.abspath(sys.argv[0])
+
+_BWRAP_HELP = None
+def bwrap_supports(flag: str) -> bool:
+    global _BWRAP_HELP
+    if _BWRAP_HELP is None:
+        try:
+            r = subprocess.run(["bwrap", "--help"], capture_output=True,
+                               text=True, timeout=5)
+            _BWRAP_HELP = r.stdout + r.stderr
+        except Exception:
+            _BWRAP_HELP = ""
+    return flag in _BWRAP_HELP
+
+def _capeff_has_caps(capeff_hex: str) -> bool:
+    try:
+        bits = int(capeff_hex, 16)
+    except (ValueError, TypeError):
+        return False
+    CAP_NET_ADMIN = 12
+    CAP_SYS_ADMIN = 21
+    return bool(bits & (1 << CAP_SYS_ADMIN)) and bool(bits & (1 << CAP_NET_ADMIN))
+
+def _have_ambient_caps() -> bool:
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("CapEff:"):
+                    return _capeff_has_caps(line.split(":", 1)[1].strip())
+    except OSError:
+        return False
+    return False
+
+_USERNS_RUNNER_WORKS = None
+def _userns_runner_works() -> bool:
+    global _USERNS_RUNNER_WORKS
+    if _USERNS_RUNNER_WORKS is not None:
+        return _USERNS_RUNNER_WORKS
+    try:
+        r = subprocess.run(
+            ["bwrap", "--unshare-user", "--unshare-net", "--dev-bind", "/", "/",
+             "--cap-add", "CAP_SYS_ADMIN", "--cap-add", "CAP_NET_ADMIN",
+             "--", "/bin/true"],
+            capture_output=True, timeout=15)
+        _USERNS_RUNNER_WORKS = (r.returncode == 0)
+    except Exception:
+        _USERNS_RUNNER_WORKS = False
+    return _USERNS_RUNNER_WORKS
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Server: control socket + box registry + mitmproxy
+# ════════════════════════════════════════════════════════════════════════════
+
+class Server:
+    """Accept box connections, register them, serve RELAY frames to ProxyEngine."""
+
+    def __init__(self):
+        self._boxes: dict[str, dict] = {}   # box_id -> {prov, counters}
+        self._box_counter = 0
+        self._policy = Policy()
+        self._engine: "ProxyEngine | None" = None
+        self._loop: "asyncio.AbstractEventLoop | None" = None
+        self._sock: "socket.socket | None" = None
+        self._flows_path: str = ""
+
+    async def start(self, flows_path: str) -> None:
+        self._loop = asyncio.get_running_loop()
+        self._flows_path = flows_path
+
+        if not ca_cert_path().exists():
+            print("sakar: CA cert not found; generating...", file=sys.stderr)
+            if ensure_ca_cert() is None:
+                print("sakar: FATAL: cannot generate CA cert; is mitmproxy installed?",
+                      file=sys.stderr)
+                sys.exit(1)
+
+        self._engine = ProxyEngine(self._policy, self, self._loop, flows_path)
+        if not self._engine.ready:
+            print("sakar: FATAL: mitmproxy engine failed to start", file=sys.stderr)
+            sys.exit(1)
+
+        sp = sock_path()
+        try: os.unlink(sp)
+        except FileNotFoundError: pass
+        self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._sock.bind(sp)
+        os.chmod(sp, 0o600)
+        self._sock.listen(128)
+        self._sock.setblocking(False)
+
+        print(f"sakar: listening on {sp}", flush=True)
+        print(f"sakar: flows → {flows_path}", flush=True)
+        print(f"sakar: CA cert → {ca_cert_path()}", flush=True)
+
+        await self._accept_loop()
+
+    async def _accept_loop(self) -> None:
+        while True:
+            try:
+                conn, _ = await self._loop.sock_accept(self._sock)
+            except (OSError, asyncio.CancelledError):
+                break
+            asyncio.create_task(self._handle(conn))
+
+    async def _recvmsg_ready(self, conn: socket.socket) -> "tuple[bytes, list]":
+        """Await readability then ONE non-blocking recvmsg."""
+        while True:
+            try:
+                data, anc, _flags, _addr = conn.recvmsg(
+                    65536, socket.CMSG_SPACE(4 * 16))
+                return data, anc
+            except (BlockingIOError, InterruptedError):
+                pass
+            fut = self._loop.create_future()
+            fd = conn.fileno()
+            self._loop.add_reader(fd, lambda: fut.done() or fut.set_result(None))
+            try:
+                await fut
+            finally:
+                try: self._loop.remove_reader(fd)
+                except (OSError, ValueError): pass
+
+    async def _handle(self, conn: socket.socket) -> None:
+        _pidfd = -1
+        _peer_pid = 0
+        buf = b""
+        try:
+            # First read: recvmsg to capture optional pidfd from runner
+            _data, _anc, _flags, _addr = await self._loop.run_in_executor(
+                None, self._recvmsg_blocking, conn)
+            buf = _data
+            for lvl, typ, data in _anc:
+                if lvl == socket.SOL_SOCKET and typ == socket.SCM_RIGHTS:
+                    a = array.array("i"); a.frombytes(data)
+                    fds = a.tolist()
+                    if fds:
+                        _pidfd = fds[0]
+                    for extra in fds[1:]:
+                        try: os.close(extra)
+                        except OSError: pass
+            if _pidfd >= 0:
+                _peer_pid = _host_pid_from_pidfd(_pidfd)
+        except (OSError, asyncio.CancelledError):
+            if _pidfd >= 0:
+                try: os.close(_pidfd)
+                except OSError: pass
+            try: conn.close()
+            except OSError: pass
+            return
+
+        box_id = None
+        try:
+            while True:
+                if b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    if line.strip():
+                        reply, box_id_from_register = await self._dispatch(
+                            line, _peer_pid, _pidfd)
+                        if reply is not None:
+                            try:
+                                await self._loop.run_in_executor(
+                                    None, self._send_reply, conn, reply)
+                            except OSError:
+                                pass
+                            if box_id_from_register and reply.get("ok"):
+                                box_id = box_id_from_register
+                                conn.setblocking(False)
+                                await self._serve_box(conn, box_id, buf)
+                                return
+                    continue
+                more = await self._loop.sock_recv(conn, 4096)
+                if not more:
+                    break
+                if len(buf) + len(more) > 1 << 20:
+                    break
+                buf += more
+        except (OSError, asyncio.CancelledError):
+            pass
+        finally:
+            if _pidfd >= 0:
+                try: os.close(_pidfd)
+                except OSError: pass
+            try: conn.close()
+            except OSError: pass
+
+    @staticmethod
+    def _recvmsg_blocking(conn: socket.socket):
+        conn.settimeout(30)
+        try:
+            return conn.recvmsg(65536, socket.CMSG_SPACE(4 * 16))
+        finally:
+            conn.setblocking(False)
+
+    @staticmethod
+    def _send_reply(conn: socket.socket, reply: dict) -> None:
+        payload = (json.dumps(reply) + "\n").encode()
+        conn.setblocking(True)
+        try:
+            conn.sendall(payload)
+        finally:
+            conn.setblocking(False)
+
+    async def _dispatch(self, line: bytes, peer_pid: int,
+                        peer_pidfd: int) -> "tuple[dict | None, str | None]":
+        """Returns (reply, box_id_if_register)."""
+        try:
+            msg = json.loads(line.decode())
+        except json.JSONDecodeError:
+            return None, None
+        t = msg.get("type")
+        if t == "ping":
+            return {"ok": True}, None
+        elif t == "register":
+            self._box_counter += 1
+            box_id = str(self._box_counter)
+            prov = {}
+            if peer_pid > 0:
+                prov = read_provenance(peer_pid, full_env=False)
+            self._boxes[box_id] = {"prov": prov, "counters": {}}
+            exe = prov.get("exe", "?")
+            argv = prov.get("argv", [])
+            short = " ".join(argv[:3]) if argv else ""
+            print(f"[box {box_id}] started  {exe} {short}", flush=True)
+            return {"ok": True, "box_id": box_id}, box_id
+        return None, None
+
+    async def _serve_box(self, conn: socket.socket, box_id: str,
+                         leftover: bytes) -> None:
+        """Serve the box's muxed channel: read RELAY frames, schedule engine tasks."""
+        pending_fds: list = []
+        buf = leftover
+        try:
+            while True:
+                try:
+                    data, anc = await self._recvmsg_ready(conn)
+                except OSError:
+                    break
+                if not data and not anc:
+                    break   # EOF: box exited
+                for lvl, typ, adata in anc:
+                    if lvl == socket.SOL_SOCKET and typ == socket.SCM_RIGHTS:
+                        a = array.array("i"); a.frombytes(adata)
+                        pending_fds.append(a.tolist())
+                buf += data
+                frames, buf = decode_frames(buf)
+                for ftype, payload in frames:
+                    if ftype == FRAME_RELAY:
+                        fds = pending_fds.pop(0) if pending_fds else []
+                        asyncio.create_task(
+                            relay_handle_fds(self._engine, box_id, fds, payload))
+                if len(buf) > 1 << 20:
+                    break
+        except (OSError, asyncio.CancelledError):
+            pass
+        finally:
+            self._boxes.pop(box_id, None)
+            print(f"[box {box_id}] exited", flush=True)
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Inner runner (in-box pid-1 — spawned by bwrap from cmd_run)
+# ════════════════════════════════════════════════════════════════════════════
+
+def run_inner(conn_fd: int, cmd: list) -> int:
+    """In-box pid-1-ish process. Sets up network forwarders, then execs cmd."""
+    stop = threading.Event()
+    dns = SyntheticDNS()
+
+    chan = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM,
+                         fileno=conn_fd) if conn_fd >= 0 else None
+    chan_lock = threading.Lock()
+
+    def _send_frame(ftype: int, payload: bytes = b"", fds: "list | None" = None) -> None:
+        if chan is None:
+            return
+        frame = encode_frame(ftype, payload)
+        try:
+            with chan_lock:
+                if fds:
+                    chan.sendmsg([frame],
+                                 [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
+                                   array.array("i", fds).tobytes())])
+                else:
+                    chan.sendall(frame)
+        except OSError:
+            pass
+
+    def _peer_pidfd(conn: socket.socket) -> int:
+        """Pidfd for the connecting in-box workload, or -1."""
+        try:
+            creds = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
+                                    struct.calcsize("3i"))
+            pid, _uid, _gid = struct.unpack("3i", creds)
+        except OSError:
+            return -1
+        if pid <= 0:
+            return -1
+        try:
+            return os.pidfd_open(pid, 0)
+        except (OSError, AttributeError):
+            return -1
+
+    def forward_one(conn: socket.socket, meta: "dict | None" = None) -> None:
+        pidfd = _peer_pidfd(conn)
+        if meta is None:
+            meta = {"kind": "proxy"}
+        try:
+            fds = [conn.fileno()] if pidfd < 0 else [conn.fileno(), pidfd]
+            _send_frame(FRAME_RELAY, json.dumps(meta).encode(), fds=fds)
+        finally:
+            if pidfd >= 0:
+                try: os.close(pidfd)
+                except OSError: pass
+            conn.close()
+
+    def listener() -> None:
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            srv.bind(("127.0.0.1", INNER_PROXY_PORT))
+            srv.listen(64)
+        except OSError as e:
+            print(f"sakar(inner): cannot listen: {e}", file=sys.stderr)
+            return
+        srv.settimeout(0.5)
+        while not stop.is_set():
+            try:
+                conn, _ = srv.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            threading.Thread(target=forward_one, args=(conn,), daemon=True).start()
+        srv.close()
+
+    def dns_server() -> None:
+        srv = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            srv.bind((INNER_DNS_ADDR, INNER_DNS_PORT))
+        except OSError as e:
+            print(f"sakar(inner): cannot bind DNS: {e}", file=sys.stderr)
+            return
+        srv.settimeout(0.5)
+        while not stop.is_set():
+            try:
+                pkt, addr = srv.recvfrom(4096)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            try:
+                resp = _dns_handle_packet(pkt, dns)
+                if resp is not None:
+                    srv.sendto(resp, addr)
+            except OSError:
+                pass
+        srv.close()
+
+    def catch_all(port: int, scheme: str) -> None:
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            srv.bind(("0.0.0.0", port))
+            srv.listen(64)
+        except OSError as e:
+            print(f"sakar(inner): cannot listen :{port}: {e}", file=sys.stderr)
+            return
+        srv.settimeout(0.5)
+        while not stop.is_set():
+            try:
+                conn, _ = srv.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            threading.Thread(target=_handle_catch_all,
+                             args=(conn, port, scheme), daemon=True).start()
+        srv.close()
+
+    def _handle_catch_all(conn: socket.socket, port: int, scheme: str) -> None:
+        try:
+            dest_ip = conn.getsockname()[0]
+        except OSError:
+            conn.close(); return
+        domain = dns.domain_for(dest_ip)
+        if domain is None:
+            conn.close(); return
+        forward_one(conn, {"kind": "direct", "host": domain,
+                           "port": port, "scheme": scheme})
+
+    # Always run the network forwarders (sakar boxes are always networked).
+    if chan is not None:
+        threading.Thread(target=listener, daemon=True).start()
+        threading.Thread(target=dns_server, daemon=True).start()
+        threading.Thread(target=catch_all,
+                         args=(INNER_HTTP_PORT, "http"), daemon=True).start()
+        threading.Thread(target=catch_all,
+                         args=(INNER_HTTPS_PORT, "https"), daemon=True).start()
+
+    # Run the command as a child process (NOT os.execvp — that would replace this
+    # process and kill the forwarder threads, which must stay alive while the child
+    # runs). This --inner process stays alive as pid-1 until the child exits, then
+    # signals teardown by closing the muxed connection.
+    tty_fd = next((fd for fd in (0, 1, 2) if os.isatty(fd)), None)
+    old_fg = None
+    old_ttou = None
+    if tty_fd is not None:
+        old_ttou = signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+        try: old_fg = os.tcgetpgrp(tty_fd)
+        except OSError: old_fg = None
+
+    try:
+        proc = subprocess.Popen(cmd, preexec_fn=os.setpgrp)
+    except FileNotFoundError:
+        print(f"sakar(inner): command not found: {cmd[0]}", file=sys.stderr)
+        stop.set()
+        if chan is not None:
+            try: chan.shutdown(socket.SHUT_RDWR)
+            except OSError: pass
+            try: chan.close()
+            except OSError: pass
+        os._exit(127)
+        return 127
+    except OSError as e:
+        print(f"sakar(inner): exec failed: {e}", file=sys.stderr)
+        stop.set()
+        if chan is not None:
+            try: chan.shutdown(socket.SHUT_RDWR)
+            except OSError: pass
+            try: chan.close()
+            except OSError: pass
+        os._exit(1)
+        return 1
+
+    try: os.setpgid(proc.pid, proc.pid)
+    except OSError: pass
+    if tty_fd is not None:
+        try: os.tcsetpgrp(tty_fd, proc.pid)
+        except OSError: pass
+
+    def _sig(_s, _f):
+        try: os.killpg(proc.pid, signal.SIGTERM)
+        except OSError:
+            try: proc.terminate()
+            except OSError: pass
+    signal.signal(signal.SIGTERM, _sig)
+    signal.signal(signal.SIGINT, _sig)
+
+    try:
+        code = proc.wait()
+    except KeyboardInterrupt:
+        proc.terminate()
+        code = proc.wait()
+
+    stop.set()
+
+    if tty_fd is not None:
+        if old_fg is not None:
+            try: os.tcsetpgrp(tty_fd, old_fg)
+            except OSError: pass
+        if old_ttou is not None:
+            try: signal.signal(signal.SIGTTOU, old_ttou)
+            except (OSError, ValueError): pass
+
+    # Close the muxed connection: EOF → server sees box exited → teardown.
+    if chan is not None:
+        try: chan.shutdown(socket.SHUT_RDWR)
+        except OSError: pass
+        try: chan.close()
+        except OSError: pass
+
+    # Hard-exit: --inner is pid-1 in the box. Daemon threads may still be in
+    # blocking calls; normal interpreter shutdown races them. We've done cleanup.
+    try: sys.stdout.flush()
+    except Exception: pass
+    try: sys.stderr.flush()
+    except Exception: pass
+    os._exit(code or 0)
+    return code or 0
+
+# ════════════════════════════════════════════════════════════════════════════
+#  cmd_run: `sakar -- CMD [ARGS...]`
+# ════════════════════════════════════════════════════════════════════════════
+
+def cmd_run(cmd: list) -> int:
+    """Connect to the running sakar server and run CMD in an intercepted netns."""
+    if not cmd:
+        print("sakar: no command given", file=sys.stderr); return 2
+
+    sp = sock_path()
+
+    # Fail fast if server not running.
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(2.0)
+            s.connect(sp)
+            ping = (json.dumps({"type": "ping"}) + "\n").encode()
+            s.sendall(ping)
+            line = s.makefile("rb").readline()
+            ack = json.loads(line.decode()) if line.strip() else None
+            if not ack or not ack.get("ok"):
+                raise OSError("bad ping reply")
+    except (OSError, json.JSONDecodeError):
+        print(f"sakar: server not running.\n"
+              f"  Start sakar first:  sakar\n"
+              f"  (expected socket: {sp})", file=sys.stderr)
+        return 3
+
+    # Open ONE persistent connection for the register handshake + muxed channel.
+    pidfd = -1
+    try:
+        pidfd = os.pidfd_open(os.getpid())
+    except (OSError, AttributeError):
+        pass
+
+    ui_conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        ui_conn.settimeout(30)
+        ui_conn.connect(sp)
+        self_prov = read_provenance(os.getpid(), full_env=False)
+        payload = (json.dumps({
+            "type": "register",
+            "cmd": list(cmd),
+            "prov": self_prov,
+            "root_tgid": os.getpid(),
+        }) + "\n").encode()
+        if pidfd >= 0:
+            ui_conn.sendmsg([payload],
+                            [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
+                              array.array("i", [pidfd]).tobytes())])
+        else:
+            ui_conn.sendall(payload)
+        # Read exactly the ack line.
+        buf = b""
+        while b"\n" not in buf:
+            chunk = ui_conn.recv(1)
+            if not chunk:
+                break
+            buf += chunk
+        line = buf.split(b"\n", 1)[0]
+        ack = json.loads(line.decode()) if line.strip() else None
+        if not ack or not ack.get("ok"):
+            ui_conn.close()
+            print("sakar: register failed", file=sys.stderr)
+            return 1
+        box_id = ack.get("box_id", "?")
+        ui_conn.settimeout(None)
+    except (OSError, json.JSONDecodeError) as e:
+        try: ui_conn.close()
+        except OSError: pass
+        print(f"sakar: connection failed: {e}", file=sys.stderr)
+        return 1
+    finally:
+        if pidfd >= 0:
+            try: os.close(pidfd)
+            except OSError: pass
+
+    _ca = ca_cert_path()
+    if not _ca.exists():
+        ui_conn.close()
+        print("sakar: CA cert not found (is the server running and initialized?)",
+              file=sys.stderr)
+        return 1
+
+    # Write a temp resolv.conf pointing to our synthetic DNS resolver.
+    resolv_tmp = tempfile.NamedTemporaryFile(
+        prefix="sakar-resolv-", suffix=".conf", delete=False, mode="w")
+    resolv_tmp.write("nameserver 127.0.0.53\n")
+    resolv_tmp.close()
+    resolv_tmp_path = resolv_tmp.name
+
+    tty_fd = next((fd for fd in (0, 1, 2) if os.isatty(fd)), None)
+    old_fg_pgrp = None
+    old_ttou = None
+    if tty_fd is not None:
+        try: old_fg_pgrp = os.tcgetpgrp(tty_fd)
+        except OSError: old_fg_pgrp = None
+        old_ttou = signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+
+    launched = False
+    code = 1
+
+    try:
+        conn_fd = ui_conn.fileno()
+        os.set_inheritable(conn_fd, True)
+        popen_pass_fds: tuple = (conn_fd,)
+
+        # ── runner mode ───────────────────────────────────────────────────
+        # Need CAP_SYS_ADMIN (unshare) + CAP_NET_ADMIN (loopback) + CAP_NET_BIND_SERVICE
+        # (bind privileged ports 53/80/443 inside the box's netns).
+        _force_userns = os.environ.get("SAKAR_FORCE_USERNS") == "1"
+        if not _force_userns and _have_ambient_caps():
+            _runner_mode = "ambient"
+        elif _userns_runner_works():
+            _runner_mode = "userns"
+        else:
+            print(
+                "sakar: cannot create the runner sandbox.\n"
+                "  No ambient CAP_SYS_ADMIN/CAP_NET_ADMIN and unprivileged user\n"
+                "  namespaces are unavailable. See sarun docs for remediation.",
+                file=sys.stderr)
+            return 4
+
+        unshare_args = ["--unshare-pid", "--unshare-ipc", "--unshare-uts",
+                        "--unshare-net"]
+        if _runner_mode == "userns":
+            unshare_args.append("--unshare-user")
+
+        # Caps: ambient keeps SYS_ADMIN+NET_ADMIN+NET_BIND_SERVICE; userns drops ALL
+        # + adds only NET_BIND_SERVICE (the in-box forwarders need it for ports 53/80/443).
+        if _runner_mode == "userns":
+            cap_args = ["--cap-drop", "ALL", "--cap-add", "CAP_NET_BIND_SERVICE"]
+        else:
+            cap_args = ["--cap-drop", "ALL",
+                        "--cap-add", "CAP_SYS_ADMIN",
+                        "--cap-add", "CAP_NET_ADMIN",
+                        "--cap-add", "CAP_NET_BIND_SERVICE"]
+
+        # sakar leaves the filesystem alone — passthrough root (--dev-bind / /).
+        # sakar's job is network isolation only, not filesystem isolation.
+        bind_root_args = ["--dev-bind", "/", "/"]
+
+        args = ["bwrap",
+                *bind_root_args,
+                "--proc", "/proc", "--dev", "/dev",
+                "--ro-bind-try", "/sys", "/sys",
+                "--tmpfs", "/tmp", "--tmpfs", "/run",
+                # Point /etc/resolv.conf at our synthetic DNS resolver.
+                "--ro-bind", resolv_tmp_path, "/etc/resolv.conf",
+                *unshare_args,
+                *cap_args, "--die-with-parent",
+                "--chdir", os.getcwd()]
+
+        if bwrap_supports("--as-pid-1"):
+            args += ["--as-pid-1"]
+
+        # CA + proxy env so in-box clients trust and reach the in-box forwarders.
+        args += ["--ro-bind", str(_ca), str(_ca)]
+        proxy = f"http://127.0.0.1:{INNER_PROXY_PORT}"
+        for var in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
+            args += ["--setenv", var, proxy]
+        # Point CA bundle env vars at the bare CA cert (no overlay virtual bundle).
+        cafile = str(_ca)
+        for var in ("REQUESTS_CA_BUNDLE", "SSL_CERT_FILE",
+                    "CURL_CA_BUNDLE", "GIT_SSL_CAINFO"):
+            args += ["--setenv", var, cafile]
+        args += ["--setenv", "NODE_EXTRA_CA_CERTS", str(_ca)]
+
+        args += ["--", sys.executable, find_self(), "--inner",
+                 "--conn-fd", str(conn_fd), "--", *cmd]
+
+        proc = subprocess.Popen(args, preexec_fn=os.setpgrp,
+                                pass_fds=popen_pass_fds)
+        launched = True
+        # Close OUR copy — --inner is now the sole holder; its exit → EOF → teardown.
+        try: ui_conn.close()
+        except OSError: pass
+        try: os.setpgid(proc.pid, proc.pid)
+        except OSError: pass
+
+        def _sig(_s, _f):
+            try: os.killpg(proc.pid, signal.SIGTERM)
+            except OSError:
+                try: proc.terminate()
+                except OSError: pass
+        signal.signal(signal.SIGTERM, _sig)
+        signal.signal(signal.SIGINT, _sig)
+
+        code = proc.wait()
+    finally:
+        try: os.unlink(resolv_tmp_path)
+        except OSError: pass
+        if not launched:
+            try: ui_conn.close()
+            except OSError: pass
+        if tty_fd is not None and old_fg_pgrp is not None:
+            try: os.tcsetpgrp(tty_fd, old_fg_pgrp)
+            except OSError: pass
+        if old_ttou is not None:
+            try: signal.signal(signal.SIGTTOU, old_ttou)
+            except (OSError, ValueError): pass
+
+    print(f"sakar: [box {box_id}] exited ({code if launched else 1}).",
+          file=sys.stderr)
+    return (code or 0) if launched else 1
+
+# ════════════════════════════════════════════════════════════════════════════
+#  main() dispatch
+# ════════════════════════════════════════════════════════════════════════════
+
+_USAGE = """\
+sakar — network-intercepting sandbox
+
+Usage:
+  sakar                   start the server (foreground; Ctrl-C to stop)
+  sakar -- CMD [ARGS...]  run CMD in an intercepted network namespace
+  sakar -h / --help       show this help
+
+The server must be running before `sakar -- CMD` is used. The server writes
+captured flows to ~/.local/state/sakar/flows-YYYYMMDD-HHMMSS.mitm (openable
+with `mitmproxy -r FILE`).
+
+Policy files (one domain wildcard per line, # comments ignored):
+  allow: ~/.config/sakar/allow
+  deny:  ~/.config/sakar/deny
+"""
+
+def main() -> int:
+    args = sys.argv[1:]
+
+    if not args:
+        # Server mode.
+        _ensure_dirs()
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        flows_path = str(state_home() / f"flows-{ts}.mitm")
+        server = Server()
+        try:
+            asyncio.run(server.start(flows_path))
+        except KeyboardInterrupt:
+            print("\nsakar: server stopped.", file=sys.stderr)
+        return 0
+
+    if args[0] in ("-h", "--help"):
+        print(_USAGE)
+        return 0
+
+    if args[0] == "--inner":
+        # In-box pid-1 runner.
+        # Usage: --inner --conn-fd N -- CMD...
+        remaining = args[1:]
+        conn_fd = -1
+        cmd: list = []
+        i = 0
+        while i < len(remaining):
+            if remaining[i] == "--conn-fd" and i + 1 < len(remaining):
+                conn_fd = int(remaining[i + 1])
+                i += 2
+            elif remaining[i] == "--":
+                cmd = remaining[i + 1:]
+                break
+            else:
+                i += 1
+        if conn_fd < 0 or not cmd:
+            print("sakar --inner: usage: --inner --conn-fd N -- CMD...",
+                  file=sys.stderr)
+            return 2
+        return run_inner(conn_fd, cmd) or 0
+
+    if args[0] == "--":
+        # Runner mode: sakar -- CMD [ARGS...]
+        cmd = args[1:]
+        if not cmd:
+            print("sakar: no command after --", file=sys.stderr)
+            return 2
+        return cmd_run(cmd)
+
+    print(f"sakar: unrecognized argument: {args[0]!r}\n{_USAGE}", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
