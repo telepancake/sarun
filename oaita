@@ -70,15 +70,16 @@ the configured base_url — no phone-home).
     oaita gen <name> [--model M] [--base-url URL] [--api-key KEY]
                      [--tool-context NAME] [--capabilities TEXT]
 
-Tool calling is ALWAYS on: a normal context is given ONE meta-tool, ``act``.
-When the model "calls" it, oaita does NOT execute anything — it STITCHES the call
-into a separate, persistent inner session and ``gen``s that to produce the
-result, which is fed back as the tool result. Each ``act`` call is thus a
-re-addressable recursive sub-agent (continue it later via ``follow_up``). The
-single generation path streams content to disk as usual and dispatches a
-sub-agent only if the reply turns out to be a tool call; the inner/leaf context
-is run with no tools (until MCP wires real ones in). Intended for tool-capable
-models only.
+Tool calling is ALWAYS on, and ``gen`` is ONE step: a normal context is given ONE
+meta-tool, ``act``, and the model does a single generation. If it does not call
+``act``, the streamed reply IS the answer. If it calls ``act`` (oaita executes
+nothing itself), each call is evaluated by STITCHING it into a separate,
+persistent inner session and ``gen``ing that to produce the result, appended as a
+``.tool`` turn — then ``gen`` STOPS. It does NOT auto-continue the main model; you
+run ``gen`` again to let it react (the result lives in the files). Each ``act``
+call is a re-addressable recursive sub-agent (continue it later via
+``follow_up``). The inner/leaf context is run with no tools (until MCP wires real
+ones in). Intended for tool-capable models only.
 
 Sections:
     1 · Imports & session paths
@@ -684,7 +685,6 @@ def generate(
     tools: list | None = None,
     tool_context: str | None = None,
     capabilities: str | None = None,
-    max_tool_iters: int = 8,
 ) -> list[Path]:
     """Generate the assistant reply for ``name`` and persist it.
 
@@ -708,20 +708,23 @@ def generate(
     stripped before storing; a valid, unique id it chose is adopted as the slug
     on an appended turn.
 
-    TOOL CALLING is ALWAYS on: a normal context (``tools=None``) is given exactly
-    ONE meta-tool, ``act``, and runs a bounded recursive-sub-agent loop. When the
-    model calls ``act``, the call is stitched into a persistent inner session and
-    `gen`d to produce the result (fed back as a ``.tool`` turn); each call is a
-    re-addressable sub-agent (continue it via ``follow_up``). The inner/leaf
-    context is invoked with ``tools=[]`` so it answers directly (until MCP wires
-    real tools in) and the loop terminates on its first pass. ``tool_context``
+    TOOL CALLING is ALWAYS on, and ``gen`` is ONE step. A normal context
+    (``tools=None``) is given exactly ONE meta-tool, ``act``, and the model does
+    a single generation. If it does NOT call ``act``, the streamed reply is the
+    final answer and that one turn is returned. If it DOES call ``act`` (possibly
+    several at once), each call is evaluated — stitched into a persistent inner
+    session and ``gen``d (the leaf, run with ``tools=[]`` so it answers directly
+    until MCP wires real tools in) — and its result appended as a ``.tool`` turn;
+    then ``gen`` STOPS and returns the call+result turns. It does NOT
+    auto-continue the main model: to let it react to a result, run ``gen`` again
+    (the result now lives in the context files). Each ``act`` call is a
+    re-addressable sub-agent (continue it via ``follow_up``). ``tool_context``
     names a fixed (cacheable) tool-description session stitched before each inner
-    call; ``capabilities`` overrides ``DEFAULT_CAPABILITIES``; ``max_tool_iters``
-    bounds the loop.
+    call; ``capabilities`` overrides ``DEFAULT_CAPABILITIES``.
 
-    Returns the list of turn files written across the loop, in order. Raises
-    ``SystemExit`` on an invalid name or an empty stitched context — no empty
-    files are created.
+    Returns the turn files this step wrote, in order (one assistant turn for a
+    plain reply; otherwise the call+result turn(s)). Raises ``SystemExit`` on an
+    invalid name or an empty stitched context — no empty files are created.
     """
     model = resolve_model(model)
     if client is None:
@@ -733,8 +736,8 @@ def generate(
 
     # The normal context ALWAYS carries the single `act` meta-tool. The inner
     # leaf execution context is called with tools=[] so it answers directly —
-    # offering no tool makes the loop below terminate on its first pass — which
-    # is exactly where real MCP tools will plug in later.
+    # offering no tool means it can't call anything — which is exactly where
+    # real MCP tools will plug in later.
     if tools is None:
         tools = [meta_tool(
             capabilities if capabilities is not None else DEFAULT_CAPABILITIES)]
@@ -745,36 +748,42 @@ def generate(
     def silent(_text: str):
         return None
 
+    # ONE main-model generation per `gen` (no outer agent loop).
+    ctx = prepare_context(name)
+    ctx.target_folder.mkdir(parents=True, exist_ok=True)
+    stream = client.chat.completions.create(
+        model=model, messages=ctx.messages, tools=tools_param, stream=True)
+    resp = stream_to_file(stream, ctx.target, echo)
+
+    if not resp.tool_calls:
+        # Plain reply: the streamed content is the final answer, already on disk.
+        # Strip an imitated id-header and adopt a valid model-chosen id on append.
+        return [_finalize_answer(ctx.target, ctx)]
+
+    # The model called the tool(s). Evaluate EACH call (a sub-agent), append its
+    # result, then STOP — we do NOT re-run the main model. The user drives the
+    # next step by running `gen` again (the result is now in the context files).
     produced: list[Path] = []
-    for _ in range(max_tool_iters):
-        ctx = prepare_context(name)
-        ctx.target_folder.mkdir(parents=True, exist_ok=True)
-        stream = client.chat.completions.create(
-            model=model, messages=ctx.messages, tools=tools_param, stream=True)
-        resp = stream_to_file(stream, ctx.target, echo)
-
-        if not resp.tool_calls:
-            # FINAL answer: the streamed content is already on disk. Strip an
-            # imitated id-header and adopt a valid model-chosen id on append.
-            produced.append(_finalize_answer(ctx.target, ctx))
-            return produced
-
-        # A tool call → run a sub-agent (the FIRST call). Repurpose the
-        # just-streamed target as the OUTER tool-call turn; its content becomes
-        # the raw request (overwriting any streamed preamble).
-        call = resp.tool_calls[0]
+    for i, call in enumerate(resp.tool_calls):
         request, data, follow_up = _parse_act_arguments(call.arguments)
-        call_turn = ctx.target
-        call_slug = parse_turn(call_turn).slug
+        if i == 0:
+            # The first call repurposes the just-streamed target turn; its
+            # content becomes the raw request (overwriting any streamed preamble).
+            call_turn = ctx.target
+            call_turn.write_text(request, encoding="utf-8")
+        else:
+            # Further parallel calls each append their own assistant turn.
+            slug = new_turn_id({t.slug for t in load_turns(target_seg) if t.slug})
+            call_turn = append_raw_turn(
+                target_seg, "assistant", request, slug=slug)
         # New call → the inner session IS this turn's id (handle == turn-id); a
         # follow_up continues the referenced existing sub-agent instead.
+        call_slug = parse_turn(call_turn).slug
         innerid = follow_up if (follow_up and _NAME_RE.match(follow_up)) \
             else call_slug
-        call_turn.write_text(request, encoding="utf-8")
         produced.append(call_turn)
 
-        # Seed/append the inner session, then run it as a LEAF: tools=[] (no
-        # recursion — it answers directly until MCP wires real tools in).
+        # Seed/append the inner session, then evaluate it as a LEAF (tools=[]).
         inner_user = request if not data else f"{request}\n\n{data}"
         append_raw_turn(innerid, "user", inner_user)
         stitch_spec = f"{tool_context}.{innerid}" if tool_context else innerid
@@ -788,13 +797,6 @@ def generate(
         produced.append(append_raw_turn(
             target_seg, "tool", result, slug=new_turn_id(outer_slugs)))
 
-    # Loop hit the cap while still calling tools — persist a terminal note.
-    ctx = prepare_context(target_seg)
-    ctx.target_folder.mkdir(parents=True, exist_ok=True)
-    note = f"[oaita: stopped after {max_tool_iters} tool iterations]"
-    ctx.target.write_text(note, encoding="utf-8")
-    echo(note)
-    produced.append(ctx.target)
     return produced
 
 

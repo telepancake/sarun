@@ -44,9 +44,9 @@ Covered:
  24. Name validation: non-alnum, empty segments, and duplicate segments raise.
  25. Turn-ids stay unique across stitched sessions.
  26. Collision guard fires on a pre-existing duplicate turn-id across sessions.
- 27. Tool calling happy path: act call → inner sub-agent gen → .tool result →
-     final answer; outer turns user/assistant/tool/assistant, inner session named
-     after the call slug holds the request + result; returned paths match.
+ 27. Tool calling happy path: act call → inner sub-agent gen → .tool result; gen
+     STOPS (turns user/assistant/tool), inner session named after the call slug
+     holds the request + result; returned paths match.
  28. Capabilities surfaced: the advertised single tool is `act` and its
      description embeds the (custom or default) capabilities string.
  29. tool_context stitched: the inner gen's prompt prepends the tool-description
@@ -54,8 +54,8 @@ Covered:
  30. Follow-up: follow_up continues the existing sub-agent (appends user+assistant
      to it, not duplicated) and yields a new outer .tool result turn.
  31. Always-on: the `act` tool is offered by default; a plain reply is one turn.
- 32. Iteration cap: an always-calling model terminates the loop within the cap,
-     leaving a final assistant turn and ≤ cap tool-result turns.
+ 32. gen stops at the tool result (no auto-continuation); a second gen reacts.
+ 33. Several act calls in one model output are all evaluated, then gen stops.
 
 Dual style: standalone (`./test_oaita.py` → `ALL PASS`) and pytest-compatible.
 """
@@ -792,24 +792,21 @@ def test_tools_happy_path():
     s = Session()
     try:
         s.write_turn("conv", "0010.user", "please do X")
-        # (a) outer model calls act; (b) inner produces the result; (c) outer
-        # gives a final answer with no tool_calls.
+        # The model calls act; the inner sub-agent produces the result; `gen`
+        # then STOPS (it does not auto-continue the main model).
         s.srv.enqueue(CannedChat(
             tool_calls=[("act", '{"request": "search the thing"}', "call_1")]))
         s.srv.enqueue(CannedChat(content="THE RESULT"))
-        s.srv.enqueue(CannedChat(content="final answer"))
         produced = s.generate("conv")
         conv = oaita.session_dir("conv")
 
-        check("outer turn types are user, assistant, tool, assistant",
-              _types_in_order(conv) == ["user", "assistant", "tool", "assistant"])
+        check("gen stops at the tool result: turns are user, assistant, tool",
+              _types_in_order(conv) == ["user", "assistant", "tool"])
         contents = _contents_in_order(conv)
         check("outer tool-call turn content is the raw request",
               contents[1] == "search the thing")
         check("outer .tool turn content is exactly the inner result",
               contents[2] == "THE RESULT")
-        check("outer final answer content is the model's final reply",
-              contents[3] == "final answer")
 
         # The tool-call turn's slug names the inner sub-agent session.
         callfile = sorted(p.name for p in conv.iterdir()
@@ -824,8 +821,8 @@ def test_tools_happy_path():
         check("inner user turn is the request", icontents[0] == "search the thing")
         check("inner assistant turn is the result", icontents[1] == "THE RESULT")
 
-        # Returned list = produced outer turns in order (call, result, final).
-        check("returned list matches produced outer turns in order",
+        # Returned list = the call + result turns this step wrote, in order.
+        check("returned list is the call + result turns in order",
               [p.name for p in produced] ==
               sorted(p.name for p in conv.iterdir()
                      if oaita.parse_turn(p) is not None)[1:])
@@ -867,10 +864,9 @@ def test_tools_tool_context_stitched():
         s.srv.enqueue(CannedChat(
             tool_calls=[("act", '{"request": "use a tool"}', "call_1")]))
         s.srv.enqueue(CannedChat(content="inner result"))  # inner gen
-        s.srv.enqueue(CannedChat(content="final"))         # outer final
         s.generate("conv", tool_context="tooldesc")
 
-        # Requests captured: outer#1, inner (tooldesc.<id>), outer#2.
+        # Requests captured: outer (the act call), then inner (tooldesc.<id>).
         # The INNER call is the one whose first message is the tooldesc system.
         inner_req = next(
             r for r in s.srv.requests
@@ -894,7 +890,6 @@ def test_tools_follow_up():
         s.srv.enqueue(CannedChat(
             tool_calls=[("act", '{"request": "search the thing"}', "call_1")]))
         s.srv.enqueue(CannedChat(content="RESULT1"))
-        s.srv.enqueue(CannedChat(content="ok so far"))
         s.generate("conv")
         conv = oaita.session_dir("conv")
         callfile = sorted(p.name for p in conv.iterdir()
@@ -906,7 +901,6 @@ def test_tools_follow_up():
             "act", json.dumps({"request": "and also Y", "follow_up": handle}),
             "call_2")]))
         s.srv.enqueue(CannedChat(content="RESULT2"))
-        s.srv.enqueue(CannedChat(content="done"))
         s.generate("conv")
 
         inner = oaita.session_dir(handle)
@@ -946,31 +940,65 @@ def test_tools_always_on_plain_reply():
         s.close()
 
 
-# ── 32. iteration cap terminates the loop ────────────────────────────────────
-def test_tools_iteration_cap():
+# ── 32. gen stops at the tool result; the user drives the next step ──────────
+def test_tools_stops_after_result():
     s = Session()
     try:
-        s.write_turn("conv", "0010.user", "loop forever")
-        cap = 3
-        # The model "always" calls the tool: enqueue enough call+inner-result
-        # pairs to exceed the cap, plus a final answer the loop never reaches.
-        for i in range(cap + 2):
-            s.srv.enqueue(CannedChat(
-                tool_calls=[("act", '{"request": "again"}', f"c{i}")]))
-            s.srv.enqueue(CannedChat(content=f"inner {i}"))
-        s.srv.enqueue(CannedChat(content="would-be final"))
-        produced = s.generate("conv", max_tool_iters=cap)
+        s.write_turn("conv", "0010.user", "what is X")
+        s.srv.enqueue(CannedChat(
+            tool_calls=[("act", '{"request": "look up X"}', "c1")]))
+        s.srv.enqueue(CannedChat(content="X is 42"))  # inner sub-agent result
+        produced = s.generate("conv")
         conv = oaita.session_dir("conv")
-        tool_turns = [p for p in conv.iterdir() if p.name.endswith(".tool")]
-        check("tool-result turns do not exceed the cap",
-              len(tool_turns) <= cap)
-        check("loop terminated with a final assistant turn",
-              _types_in_order(conv)[-1] == "assistant")
-        check("final assistant turn notes the cap was hit",
-              str(cap) in _contents_in_order(conv)[-1].lower()
-              or "iter" in _contents_in_order(conv)[-1].lower())
-        check("a bounded, non-empty list of turns was produced",
-              0 < len(produced) <= 2 * cap + 1)
+
+        check("gen stops at the tool result (turns: user, assistant, tool)",
+              _types_in_order(conv) == ["user", "assistant", "tool"])
+        check("exactly the call + result were produced", len(produced) == 2)
+        # No auto-continuation: exactly one OUTER request + one INNER request.
+        # A re-run of the main model would show up as a 3rd captured request.
+        check("no auto-continuation: exactly two model requests made",
+              len(s.srv.requests) == 2)
+
+        # The user drives the next step: a second gen now reacts to the result.
+        s.srv.enqueue(CannedChat(content="The answer is 42."))
+        produced2 = s.generate("conv")
+        check("second gen appends one synthesised assistant turn",
+              len(produced2) == 1 and produced2[0].name.endswith(".assistant"))
+        check("synthesis (reacting to the result) is the new tail",
+              _contents_in_order(conv)[-1] == "The answer is 42.")
+    finally:
+        s.close()
+
+
+# ── 33. several act calls in one model output are all evaluated, then stop ────
+def test_tools_multiple_calls_one_gen():
+    s = Session()
+    try:
+        s.write_turn("conv", "0010.user", "do A and B")
+        s.srv.enqueue(CannedChat(tool_calls=[
+            ("act", '{"request": "do A"}', "cA"),
+            ("act", '{"request": "do B"}', "cB"),
+        ]))
+        s.srv.enqueue(CannedChat(content="result A"))  # inner for call A
+        s.srv.enqueue(CannedChat(content="result B"))  # inner for call B
+        produced = s.generate("conv")
+        conv = oaita.session_dir("conv")
+
+        check("both calls evaluated then stop: assistant,tool,assistant,tool",
+              _types_in_order(conv)[1:] ==
+              ["assistant", "tool", "assistant", "tool"])
+        contents = _contents_in_order(conv)
+        check("call A request + result recorded",
+              contents[1] == "do A" and contents[2] == "result A")
+        check("call B request + result recorded",
+              contents[3] == "do B" and contents[4] == "result B")
+        check("four turns produced (two call+result pairs)", len(produced) == 4)
+
+        callslugs = [_id_from_name(p.name) for p in sorted(conv.iterdir())
+                     if p.name.endswith(".assistant")]
+        check("two distinct sub-agent sessions exist, one per call",
+              len(set(callslugs)) == 2
+              and all(oaita.session_dir(h).is_dir() for h in callslugs))
     finally:
         s.close()
 
@@ -1009,7 +1037,8 @@ if __name__ == "__main__":
         test_tools_tool_context_stitched,
         test_tools_follow_up,
         test_tools_always_on_plain_reply,
-        test_tools_iteration_cap,
+        test_tools_stops_after_result,
+        test_tools_multiple_calls_one_gen,
     ]
     for t in tests:
         try:
