@@ -1260,7 +1260,19 @@ def cmd_run(cmd: list) -> int:
         unshare_args = ["--unshare-pid", "--unshare-ipc", "--unshare-uts",
                         "--unshare-net"]
         if _runner_mode == "userns":
-            unshare_args.append("--unshare-user")
+            # Map the caller to uid/gid 0 inside the new user namespace. This is NOT
+            # for privilege — uid 0 here maps back to the caller's real uid on the
+            # host, so it grants nothing extra — it is what makes --cap-add survive.
+            # bwrap grants CAP_NET_BIND_SERVICE so the in-box forwarders can bind
+            # 53/80/443, but a capability only survives execve(2) of the inner runner
+            # if the process is euid 0 *or* the cap was placed in the ambient set.
+            # Older bwrap builds don't populate the ambient set, so with the default
+            # (non-root) uid mapping the cap is wiped on exec and every privileged
+            # bind fails with EACCES ("cannot listen :443: Permission denied"). euid 0
+            # preserves permitted/effective caps across exec unconditionally, with no
+            # dependence on the bwrap version — and it matches ambient mode, where the
+            # box already runs as root.
+            unshare_args += ["--unshare-user", "--uid", "0", "--gid", "0"]
 
         # Caps: ambient keeps SYS_ADMIN+NET_ADMIN+NET_BIND_SERVICE; userns drops ALL
         # + adds only NET_BIND_SERVICE (the in-box forwarders need it for ports 53/80/443).
