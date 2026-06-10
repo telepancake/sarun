@@ -2,8 +2,8 @@
 """Backend tests for stdout/stderr capture.
 
 Three layers:
-  1. muxed-channel frame codec — encode→decode round-trip (incl. RELAY/ECHO/
-     ECHO_DONE/MUTE/UNMUTE types) + partial-frame reassembly (pure, no socket).
+  1. muxed-channel frame codec — encode→decode round-trip (ECHO/ECHO_DONE/MUTE/
+     UNMUTE types) + partial-frame reassembly (pure, no socket).
   2. outputs_* sqlar readers — add/list/get/has against a throwaway db.
   3. REAL FUSE integration — mount the multiplexed overlay, register a capture
      session so the two sink files exist, open a sink and write to it FROM THIS
@@ -44,9 +44,8 @@ def check(cond, msg):
 
 # ── 1. muxed-channel frame codec ─────────────────────────────────────────────
 def test_frame_codec_roundtrip():
-    # All five frame types, including empty payloads and binary, round-trip.
+    # All frame types, including empty payloads and binary, round-trip.
     frames = [
-        (m.FRAME_RELAY, b'{"kind":"direct","host":"x","port":443,"scheme":"https"}'),
         (m.FRAME_ECHO, m.echo_payload(0, b"hello")),
         (m.FRAME_ECHO, m.echo_payload(1, b"\x00\x01\x02\xff")),
         (m.FRAME_ECHO_DONE, b""),
@@ -63,7 +62,7 @@ def test_frame_codec_roundtrip():
 
 def test_frame_codec_partial_reassembly():
     frames = [(m.FRAME_ECHO, m.echo_payload(0, b"chunk-one")),
-              (m.FRAME_RELAY, b'{"kind":"proxy"}')]
+              (m.FRAME_MUTE, b"")]
     full = b"".join(m.encode_frame(t, p) for t, p in frames)
     # Feed the stream one byte at a time; a frame split across reads must reassemble.
     out = []

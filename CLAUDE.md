@@ -18,6 +18,15 @@ block. **`uv` installs every dependency automatically on first run.** You do
 not pip-install anything, you do not need a venv, you do not "set up the
 environment." You just run it.
 
+`sarun` is **filesystem/proc only**: it sandboxes a command over a copy-on-write
+overlay of your filesystem, captures its writes/processes/output for review, and
+applies/discards them. **Boxes run in the HOST network namespace** (normal
+connectivity — no proxy, no gating, no DNS spoofing, no per-write network
+policy). The only network-isolated piece is the untrusted binary viewer
+(`run_on_untrusted`, used to render box-produced bytes), which runs under bwrap
+`--unshare-all`. **Network interception lives in a separate tool, `sakar`** (with
+its own `test_sakar*.py`) — do NOT touch `sakar` when working on `sarun`.
+
 ## Run the app
 ```
 ./sarun -h            # or:  uv run --script sarun -h
@@ -34,14 +43,17 @@ is not a hang.
 ## Run the tests
 Each `test_*.py` is standalone (repo `check()/_fails` + `__main__` style) AND
 pytest-compatible. The dependency list each file needs is in its module
-docstring. The whole suite:
+docstring. `sarun` no longer depends on mitmproxy. The whole suite (the
+`sakar*` tests and `test_pjdfstest.py` are excluded — `sakar` is the separate
+network tool with its own deps):
 ```
 uv run --with pytest --with pytest-timeout --with "textual>=0.60" \
-  --with "mitmproxy>=11" --with "wcmatch>=8.4" --with "pyfuse3>=3.2" \
+  --with "wcmatch>=8.4" --with "pyfuse3>=3.2" \
   --with "trio>=0.22" --with "python-magic>=0.4" \
-  pytest -q -p no:cacheprovider --ignore=test_e2e.py
+  pytest -q -p no:cacheprovider --ignore=test_e2e.py \
+  --ignore=test_sakar.py --ignore=test_sakar_e2e.py --ignore=test_pjdfstest.py
 ```
-Expected today: **150 passed, 1 skipped**. A single file:
+Expected today: **115 passed**. A single file:
 ```
 uv run --with pytest --with "pyfuse3>=3.2" --with "trio>=0.22" \
   pytest -q -p no:cacheprovider test_outputs_capture.py
@@ -55,17 +67,15 @@ test that somehow ran on stock pyfuse3 would fail loudly — by design.
 
 ## e2e tests (`test_e2e.py`)
 End-to-end: launches the real headless UI + real `sarun -- cmd` boxes (basic,
-nested, named, forced-userns, synthetic-DNS interception, stdout/stderr
-capture). bwrap, FUSE mounts, and outbound network ALL work in this sandbox —
-so these really run here. Has a uv shebang; run it directly:
+nested, named, forced-userns, stdout/stderr capture). bwrap and FUSE mounts work
+in this sandbox — so these really run here. Has a uv shebang; run it directly:
 ```
 ./test_e2e.py            # or  uv run test_e2e.py
 ```
 Expected: `E2E PASS` (one NOTE-skip: nested-inside-userns isn't exercisable as
 root). The test process runs under uv (deps for its in-process SourceFileLoader)
 and the box/UI subprocesses reuse that same interpreter via `sys.executable` —
-there is NO hardcoded venv. Takes a few minutes (real boxes); the DNS suite
-needs outbound network (it hits example.com through the proxy).
+there is NO hardcoded venv. Takes a few minutes (real boxes).
 
 ## Branch / workflow
 Develop on the branch you were told to; commit with clear messages; push only

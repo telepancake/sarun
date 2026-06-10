@@ -2,7 +2,8 @@
 """Headless UI smoke: drive the Textual app with app.run_test(), confirm all five
 views render, rules/file-rules edit, and the overlay mount comes up and tears down
 cleanly. Run:
-    /home/user/venv/bin/python test_ui_smoke.py
+    uv run --with "textual>=0.60" --with "pyfuse3>=3.2" --with "trio>=0.22" \
+      --with "wcmatch>=8.4" --with "python-magic>=0.4" python test_ui_smoke.py
 
 Self-safety: XDG dirs are redirected to a temp tree so the real config/state is
 untouched; the overlay mounts at the temp runtime mnt and is lazy-unmounted on exit.
@@ -25,15 +26,10 @@ async def drive(m):
     async with app.run_test() as pilot:
         await pilot.pause()
         # cycle through the five views
-        for key, name in (("b","boxes"),("c","changes"),("t","netlog"),
-                          ("w","net"),("f","file")):
+        for key, name in (("b","boxes"),("c","changes"),("p","procs"),
+                          ("o","outputs"),("f","file")):
             await pilot.press(key); await pilot.pause()
             check(app.view==name, f"view '{name}' selected via key '{key}'")
-        # add a network rule via the store + refresh
-        app.rules_store.insert(m.Rule.single("allow","host","example.com"))
-        app._refresh_rules(); await pilot.pause()
-        check(any(r.clauses[0].match.pattern=="example.com" for r in app.rules_store.rules),
-              "network rule added")
         # add a file rule
         app.frules_store.insert(m.FileRule.single("discard","path","*.log"))
         app._refresh_file_rules(); await pilot.pause()

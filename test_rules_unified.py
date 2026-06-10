@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --with pytest --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["textual>=0.60","mitmproxy>=11","wcmatch>=8.4","pyfuse3>=3.2",
+# dependencies = ["textual>=0.60","wcmatch>=8.4","pyfuse3>=3.2",
 #                 "trio>=0.22","python-magic>=0.4"]
 # ///
 """Tests for the unified rule model: an atomic Match(kind, pattern), a generic
@@ -9,11 +9,11 @@ and/or/not/enabled fold over a Clause list, and targets that only know how to te
 single Match. Covers three layers:
 
   1. the model — Match/Clause/eval_clauses, target.match_one, parse/to_line round-trips
-     (incl. multi-clause and/or/not/off and the box kind), and Rules/FileRules.decide;
+     (incl. multi-clause and/or/not/off and the box kind), and FileRules.decide;
   2. evaluation against a LIVE box — a box-scoped file passthrough rule over a real
-     overlay mount, and a multi-clause net rule through a real Supervisor/policy;
+     overlay mount;
   3. the UI — the reusable ClauseList editor (add/remove rows, per-row kind/and-or/
-     not/enabled) building a rule in a running app, and an approval saving a box rule.
+     not/enabled) building a file rule in a running app.
 
 Run standalone (uv provisions deps):  ./test_rules_unified.py
 """
@@ -32,65 +32,52 @@ def check(cond, msg):
 
 # ── 1 · model ────────────────────────────────────────────────────────────────
 def test_model():
-    R, F, Match, Clause = m.Rule, m.FileRule, m.Match, m.Clause
+    F, Match, Clause = m.FileRule, m.Match, m.Clause
 
     # atomic predicates + generic targets (each target tests ONE Match)
     subj = m.Subject(box="backend-1", exe="/usr/bin/curl", cwd="/home/u",
                      argv=("curl", "--insecure", "https://x"))
-    ct = m.ConnTarget("api.example.com", 443, "http://api.example.com/x",
-                      ("10.0.0.1",), ("cdn.example.com",), subj)
-    check(ct.match_one(Match("host", "*.example.com")) is True, "ConnTarget host")
-    check(ct.match_one(Match("ip", "10.0.0.0/8")) is True, "ConnTarget ip/CIDR")
-    check(ct.match_one(Match("cname", "cdn.*")) is True, "ConnTarget cname")
-    check(ct.match_one(Match("url", "http://api.example.com/")) is True, "ConnTarget url prefix")
-    check(ct.match_one(Match("box", "backend-*")) is True, "ConnTarget box")
-    check(ct.match_one(Match("path", "x")) is False, "ConnTarget ignores path kind")
-    # shared process facets (exe/cwd/arg) — same on both targets
-    check(ct.match_one(Match("exe", "curl")) is True, "process exe: bare matches basename (path glob)")
-    check(ct.match_one(Match("exe", "/usr/bin/curl")) is True, "process exe: absolute anchors")
-    check(ct.match_one(Match("exe", "wget")) is False, "process exe: non-match")
-    check(ct.match_one(Match("cwd", "/home/*")) is True, "process cwd")
-    check(ct.match_one(Match("arg", "--insecure")) is True, "process arg: any argv element")
-    check(ct.match_one(Match("arg", "--quiet")) is False, "process arg: non-match")
+    # shared process facets (exe/cwd/arg) on the file target
     pt = m.PathTarget("etc/secret/key", m.Subject(box="A.B", exe="/bin/sh", argv=("sh",)))
     check(pt.match_one(Match("path", "**/secret/**")) is True, "PathTarget path")
     check(pt.match_one(Match("box", "A.*")) is True, "PathTarget box")
     check(pt.match_one(Match("exe", "sh")) is True, "PathTarget shares the exe facet")
-    check(pt.match_one(Match("host", "x")) is False, "PathTarget ignores host kind")
+    pt2 = m.PathTarget("a/b", subj)
+    check(pt2.match_one(Match("exe", "curl")) is True, "process exe: bare matches basename (path glob)")
+    check(pt2.match_one(Match("exe", "/usr/bin/curl")) is True, "process exe: absolute anchors")
+    check(pt2.match_one(Match("exe", "wget")) is False, "process exe: non-match")
+    check(pt2.match_one(Match("cwd", "/home/*")) is True, "process cwd")
+    check(pt2.match_one(Match("arg", "--insecure")) is True, "process arg: any argv element")
+    check(pt2.match_one(Match("arg", "--quiet")) is False, "process arg: non-match")
 
     # generic and/or/not/enabled fold (target-agnostic)
     T = lambda v: types.SimpleNamespace(match_one=lambda mm, _v=v: _v.get(mm.kind, False))
     cl = lambda kind, join="and", negate=False, enabled=True: Clause(Match(kind, "*"), join, negate, enabled)
-    check(m.eval_clauses(T({"host": True, "box": True}), [cl("host"), cl("box")]) is True, "fold: A and B")
-    check(m.eval_clauses(T({"host": True, "box": False}), [cl("host"), cl("box")]) is False, "fold: A and not-B")
-    check(m.eval_clauses(T({"host": True, "box": False}), [cl("host"), cl("box", join="or")]) is True, "fold: A or B")
-    check(m.eval_clauses(T({"box": True}), [cl("host"), cl("box", negate=True)]) is False, "fold: not negates")
-    check(m.eval_clauses(T({"host": True, "box": False}),
-                         [cl("host"), cl("box", enabled=False)]) is True, "fold: disabled clause skipped")
+    check(m.eval_clauses(T({"path": True, "box": True}), [cl("path"), cl("box")]) is True, "fold: A and B")
+    check(m.eval_clauses(T({"path": True, "box": False}), [cl("path"), cl("box")]) is False, "fold: A and not-B")
+    check(m.eval_clauses(T({"path": True, "box": False}), [cl("path"), cl("box", join="or")]) is True, "fold: A or B")
+    check(m.eval_clauses(T({"box": True}), [cl("path"), cl("box", negate=True)]) is False, "fold: not negates")
+    check(m.eval_clauses(T({"path": True, "box": False}),
+                         [cl("path"), cl("box", enabled=False)]) is True, "fold: disabled clause skipped")
     check(m.eval_clauses(T({}), []) is False, "fold: no enabled clauses -> matches nothing")
 
     # parse / to_line round-trips
-    r = R.parse("allow host:example.com")
-    check(len(r.clauses) == 1 and r.clauses[0].match.kind == "host"
-          and r.clauses[0].match.pattern == "example.com", "net: single clause parses")
-    check(r.to_line() == "allow host:example.com", "net: single clause round-trips")
     check(F.parse("discard **/*.log").to_line() == "discard **/*.log", "file: path renders bare")
     check(F.parse("discard **/*.log").clauses[0].match.kind == "path", "file: bare pattern -> path kind")
 
-    multi = "deny host:api.* and not box:trusted or url:http://x/"
-    rr = R.parse(multi)
-    check([(c.match.kind, c.join, c.negate) for c in rr.clauses]
-          == [("host", "and", False), ("box", "and", True), ("url", "or", False)],
-          "net: multi-clause and/not/or parsed")
-    check(rr.to_line() == multi, "net: multi-clause round-trips")
     fp = F.parse("apply off box:x and path:y")
     check(fp.clauses[0].enabled is False, "file: 'off' disables a clause")
     check(fp.to_line() == "apply off box:x and y", "file: disabled clause + bare path render")
     check(F.parse(fp.to_line()).to_line() == fp.to_line(), "file: to_line is idempotent")
 
-    # file rules require an explicit action; net defaults to allow for a bare pattern
+    multi = "apply path:a/* and not box:trusted or y"
+    fm = F.parse(multi)
+    check([(c.match.kind, c.join, c.negate) for c in fm.clauses]
+          == [("path", "and", False), ("box", "and", True), ("path", "or", False)],
+          "file: multi-clause and/not/or parsed")
+
+    # file rules require an explicit action for a bare pattern
     check(F.parse("**/*.log") is None, "file: bare pattern with no action -> rejected")
-    check(R.parse("example.com").to_line() == "allow host:example.com", "net: bare pattern -> allow host")
     hp = F.parse("discard host:foo")
     check(hp.clauses[0].match.kind == "path" and hp.clauses[0].match.pattern == "host:foo",
           "file: 'host:' is not a file kind -> treated as a literal path")
@@ -98,22 +85,11 @@ def test_model():
     # decide threads the box; multiple conditions are ANDed within one rule
     d = Path(tempfile.mkdtemp())
     try:
-        nr = R.parse("deny host:x.test and box:backend-*")
-        rules = m.Rules(d / "n"); rules.rules = [nr, R.parse("allow host:*")]
-        check(rules.decide("x.test", 443, box="backend-1") == "deny", "net decide: host AND box both match")
-        check(rules.decide("x.test", 443, box="frontend") == "allow", "net decide: box fails -> falls through")
         fr = m.FileRules(d / "f")
         fr.rules = [F.parse("passthrough secret.txt and box:A.*"), F.parse("discard *")]
         check(fr.decide("secret.txt", box="A.B") == "passthrough", "file decide: path AND box")
         check(fr.decide("secret.txt") == "discard", "file decide: no box -> scoped rule skipped")
-        # process facets thread through decide() — net matches the flow's process,
-        # file matches the writing process.
-        pr = m.Rules(d / "p")
-        pr.rules = [R.parse("deny host:* and exe:**/curl"), R.parse("allow host:*")]
-        check(pr.decide("x", 443, proc={"exe": "/usr/bin/curl"}) == "deny",
-              "net decide: matches the flow's process exe")
-        check(pr.decide("x", 443, proc={"exe": "/usr/bin/wget"}) == "allow",
-              "net decide: other exe falls through")
+        # process facets thread through decide() — file matches the writing process.
         fpr = m.FileRules(d / "fp")
         fpr.rules = [F.parse("passthrough *.key and arg:--export")]
         check(fpr.decide("a.key", proc={"argv": ["gpg", "--export"]}) == "passthrough",
@@ -137,7 +113,7 @@ def test_filter_targets():
     check(m._ids_of("5,x,7") == {5, 7}, "_ids_of skips non-numeric tokens")
     check(m._ids_of("") == set() and m._ids_of(None) == set(), "_ids_of empty -> empty set")
     # "ids" is INTERNAL — never offered as a user kind.
-    for kinds in (m.NET_KINDS, m.FILE_KINDS, m.SUBJECT_KINDS, m.RULE_KINDS):
+    for kinds in (m.FILE_KINDS, m.SUBJECT_KINDS):
         check("ids" not in kinds, f"'ids' absent from {kinds!r}")
 
     subj = m.Subject(box="backend-1", exe="/usr/bin/curl", cwd="/home/u",
@@ -154,15 +130,6 @@ def test_filter_targets():
     check(m.PathTarget("a", subj).match_one(Match("ids", "5")) is False,
           "PathTarget with no ids never matches the ids kind")
 
-    # Flow entry: host/url + facets + ids = {process_id}.
-    ct = m.ConnTarget("api.example.com", 443, "http://api.example.com/x",
-                      subject=subj, ids=(7,))
-    check(ct.match_one(Match("host", "*.example.com")) is True, "ConnTarget host")
-    check(ct.match_one(Match("url", "http://api.example.com/")) is True, "ConnTarget url")
-    check(ct.match_one(Match("exe", "**/curl")) is True, "ConnTarget exe facet")
-    check(ct.match_one(Match("ids", "7,8")) is True, "ConnTarget ids: process_id matches")
-    check(ct.match_one(Match("ids", "8")) is False, "ConnTarget ids: other id -> False")
-
     # Process entry: shared facets + ids = {own row id}.
     prt = m.ProcFilterTarget(7, subj)
     check(prt.match_one(Match("exe", "/usr/bin/curl")) is True, "ProcFilterTarget exe")
@@ -171,7 +138,6 @@ def test_filter_targets():
     check(prt.match_one(Match("box", "backend-*")) is True, "ProcFilterTarget box")
     check(prt.match_one(Match("ids", "5,7")) is True, "ProcFilterTarget ids: own row matches")
     check(prt.match_one(Match("ids", "5,8")) is False, "ProcFilterTarget ids: own row absent -> False")
-    check(prt.match_one(Match("host", "x")) is False, "ProcFilterTarget ignores net kinds")
 
     # eval_clauses folds an ids clause exactly like any other (used for navigation).
     Clause = m.Clause
@@ -212,44 +178,13 @@ def test_live_box_scope():
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
         except Exception: pass
         index.close()
-
-    rules = m.Rules(tmp / "netrules")
-    rules.rules = [m.Rule.parse("deny host:blocked.test and box:ALPHA*"),
-                   m.Rule.parse("allow host:*")]
-    sup = m.Supervisor(rules)
-    def mk(s, name, parent=None):
-        sess = m.Session(session_id=s, box_id=int(s), name=name, cmd=["x"],
-                         shm_dir=str(tmp / "live" / s), live=True, parent_box_id=parent)
-        sup.sessions[s] = sess; return sess
-    a = mk("10", "ALPHA"); b = mk("20", "BETA"); child = mk("11", "CHILD", parent=10)
-    check(sup.display_path(11) == "ALPHA.CHILD", "net: nested display path")
-    check(sup.policy.decide(a, "blocked.test", 443) == "deny", "net: host AND box deny in ALPHA")
-    check(sup.policy.decide(child, "blocked.test", 443) == "deny", "net: applies in descendant ALPHA.CHILD")
-    check(sup.policy.decide(b, "blocked.test", 443) == "allow", "net: box clause excludes BETA")
     shutil.rmtree(tmp, ignore_errors=True)
 
 
-# ── 3 · UI form + approval ───────────────────────────────────────────────────
+# ── 3 · UI form ──────────────────────────────────────────────────────────────
 def _freevar(fn, name):
     fv = fn.__code__.co_freevars
     return fn.__closure__[fv.index(name)].cell_contents if name in fv else None
-
-def test_approval_box_rule():
-    # A connection approval can save a box-scoped rule (the box rides in as a clause).
-    d = Path(tempfile.mkdtemp()); rules = m.Rules(d / "netrules"); pol = m.NetworkPolicy(rules)
-    async def drive():
-        sess = types.SimpleNamespace(box_id=1, sess_rules=[])
-        pol._resolve_session = lambda sid: sess
-        fut = asyncio.ensure_future(pol.approval_request("1", "h.test", 443, "https"))
-        await asyncio.sleep(0.05)
-        rid = next(iter(pol.pending))
-        pol.resolve(rid, "deny", "permanent", spec="host:h.test", box="backend-*")
-        await fut
-    asyncio.run(drive())
-    check([r.to_line() for r in rules.rules] == ["deny host:h.test and box:backend-*"],
-          "approval: saves a box-scoped rule")
-    shutil.rmtree(d, ignore_errors=True)
-
 
 def test_process_facet_live():
     """End to end: a real write records the path's FIRST writer; a passthrough rule with
@@ -315,7 +250,7 @@ def test_clause_list_editor():
         app = App()
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.pause()
-            modal = RuleFormModal("file")
+            modal = RuleFormModal()
             app.push_screen(modal, lambda r: None)
             await pilot.pause(); await pilot.pause()
             cl = modal.query_one("#rf-clauses")
@@ -344,15 +279,6 @@ def test_clause_list_editor():
             await pilot.pause()
             check(modal._build() is None, "a rule with no live condition is refused")
             modal.dismiss(None); await pilot.pause()
-            net = RuleFormModal("net"); app.push_screen(net, lambda r: None)
-            await pilot.pause(); await pilot.pause()
-            r0 = net.query(".clause-row")[0]
-            r0.query_one("#cl-kind", Select).value = "host"
-            r0.query_one("#cl-pat", Input).value = "api.test"
-            await pilot.pause()
-            nr = net._build()
-            check(type(nr).__name__ == "Rule" and nr.to_line() == "allow host:api.test",
-                  "the same editor builds a net Rule")
     asyncio.run(drive())
 
 
@@ -470,34 +396,34 @@ def test_list_filtering():
 
 
 def test_nav_ids():
-    """The c/t/p cross-navigation resolver builds the right "ids" filter: changes→procs
-    pins to the change's first+last writer, netlog→procs to the flow's process, and
-    procs→changes/netlog to the selected process row. Tested at the resolver level
-    (_nav_ids) with the selection getters + supervisor stubbed."""
+    """The c/p/o cross-navigation resolver builds the right "ids" filter: changes→procs
+    pins to the change's first+last writer, and procs→changes/outputs to the selected
+    process row. Tested at the resolver level (_nav_ids) with the selection getters +
+    supervisor stubbed."""
     import types as _t
     App = m._make_ui_app()
     app = App.__new__(App)               # no Textual mount: exercise pure logic
     app.view = ""; app._sel_sid = "1"
     sup = _t.SimpleNamespace(
-        first_writer_id=lambda s, rel: 5, writer_id=lambda s, rel: 7,
-        flow_detail=lambda s, fid: {"process_id": 9}, open_flow_detail=lambda s, fid: None)
+        first_writer_id=lambda s, rel: 5, writer_id=lambda s, rel: 7)
     app.sup = sup
     app._sel_path = lambda: "a/b.txt"
-    app._sel_flow = lambda: 3
     app._sel_proc = lambda: 42
+    app._sel_output = lambda: 3
+    app._output_pid = lambda oid: 9
 
     app.view = "changes"
     check(app._nav_ids("changes", "procs") == [5, 7],
           "changes→procs: first + last writer ids")
     sup.first_writer_id = lambda s, rel: 7   # first==last: de-duped to one
     check(app._nav_ids("changes", "procs") == [7], "changes→procs: dedups equal writers")
-    app.view = "netlog"
-    check(app._nav_ids("netlog", "procs") == [9], "netlog→procs: flow's process_id")
     app.view = "procs"
     check(app._nav_ids("procs", "changes") == [42], "procs→changes: selected proc row")
-    check(app._nav_ids("procs", "netlog") == [42], "procs→netlog: selected proc row")
+    check(app._nav_ids("procs", "outputs") == [42], "procs→outputs: selected proc row")
+    app.view = "outputs"
+    check(app._nav_ids("outputs", "procs") == [9], "outputs→procs: write's process")
     # transitions that don't auto-filter
-    check(app._nav_ids("changes", "netlog") is None, "changes→netlog: no auto-filter")
+    check(app._nav_ids("changes", "outputs") is None, "changes→outputs: no auto-filter")
     check(app._nav_ids("procs", "procs") is None, "same-view: no auto-filter")
     app._sel_sid = None
     check(app._nav_ids("changes", "procs") is None, "no selected box: no filter")
@@ -586,7 +512,7 @@ def test_process_identity():
 
 
 def main():
-    for fn in (test_model, test_filter_targets, test_live_box_scope, test_approval_box_rule,
+    for fn in (test_model, test_filter_targets, test_live_box_scope,
                test_process_facet_live, test_process_identity, test_clause_list_editor,
                test_list_filtering, test_nav_ids):
         print(f"== {fn.__name__} ==")

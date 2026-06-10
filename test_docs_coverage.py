@@ -43,7 +43,7 @@ for sc in subcmds:
 
 print("== CLI flags (from argparse add_argument) ==")
 flags = sorted(set(re.findall(r'ap\.add_argument\("(-[a-zA-Z])"', src)))
-assert {"-n", "-t", "-d", "-w", "-C"} <= set(flags), flags
+assert {"-t", "-d", "-C"} <= set(flags), flags
 for fl in flags:
     need(fl, label=f"flag '{fl}' documented", ci=False)
 need("--", label="`--` command separator documented", ci=False)
@@ -59,12 +59,10 @@ CONCEPTS = [
     "nest", "PARENT.CHILD",
     # capture model
     "copy-on-write", "overlay", "provenance", "direct",
-    # network rule kinds + scopes
-    "host:", "ip:", "cname:", "url:", "once", "session", "permanent",
     # file-rule actions
     "passthrough",
     # on-disk rule files users can edit
-    "netrules", "filerules",
+    "filerules",
 ]
 for c in CONCEPTS:
     # PARENT.CHILD is the only case-sensitive token here.
