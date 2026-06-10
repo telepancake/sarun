@@ -1320,10 +1320,12 @@ def cmd_run(cmd: list) -> int:
         popen_pass_fds: tuple = (conn_fd,)
 
         # ── runner mode ───────────────────────────────────────────────────
-        # Need CAP_SYS_ADMIN (unshare) + CAP_NET_ADMIN (loopback) + CAP_NET_BIND_SERVICE
-        # (bind privileged ports 53/80/443 inside the box's netns).
-        _force_userns = os.environ.get("SAKAR_FORCE_USERNS") == "1"
-        if not _force_userns and _have_ambient_caps():
+        # Pick automatically. With real CAP_SYS_ADMIN+CAP_NET_ADMIN on the host we run
+        # the box privileged ("ambient"); otherwise we use an unprivileged user
+        # namespace ("userns"), which needs no host privilege and keeps the caller's
+        # uid. (Running as root naturally lands on "ambient"; a normal user lands on
+        # "userns" — no override knob, the environment decides.)
+        if _have_ambient_caps():
             _runner_mode = "ambient"
         elif _userns_runner_works():
             _runner_mode = "userns"
