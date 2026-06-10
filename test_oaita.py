@@ -37,6 +37,13 @@ Covered:
  17. Append rejects a duplicate model id, keeping the generated one (still strips).
  18. Append rejects an invalid (non-slug) model id, keeping the generated one.
  19. Regenerate strips an emitted header but holds the tail's id stable.
+ 20. Name stitching: 'a.b.c' prepends a,b and infers/writes in the last (c).
+ 21. Stitch into an empty target session (reply becomes its first turn).
+ 22. Reordering segments reorders the prepended context.
+ 23. Regenerate-in-place touches only the target segment's tail.
+ 24. Name validation: non-alnum, empty segments, and duplicate segments raise.
+ 25. Turn-ids stay unique across stitched sessions.
+ 26. Collision guard fires on a pre-existing duplicate turn-id across sessions.
 
 Dual style: standalone (`./test_oaita.py` → `ALL PASS`) and pytest-compatible.
 """
@@ -308,15 +315,15 @@ def test_empty_and_missing_session():
         # Missing folder entirely.
         raised = False
         try:
-            s.generate("does-not-exist")
+            s.generate("doesnotexist")
         except SystemExit:
             raised = True
         check("missing session raises non-zero (SystemExit)", raised)
         check("no folder created for missing session",
-              not oaita.session_dir("does-not-exist").exists())
+              not oaita.session_dir("doesnotexist").exists())
 
         # Folder exists but holds only a non-turn file → still empty of turns.
-        name = "only-junk"
+        name = "onlyjunk"
         s.write_turn(name, "notes.txt", "not a turn")
         raised2 = False
         try:
@@ -601,6 +608,157 @@ def test_regenerate_strips_but_keeps_stable_id():
         s.close()
 
 
+# ── 20. name stitching: prepend earlier segments, infer in the last ─────────
+def _bodies(messages):
+    """Strip the injected turn-id header line from each message, leaving body."""
+    return [m["content"].split("\n", 1)[1] for m in messages]
+
+
+def test_stitch_prepends_and_targets_last():
+    s = Session()
+    try:
+        s.write_turn("sys", "0010.system", "be terse")
+        s.write_turn("conv", "0010.user", "hi")
+        s.srv.enqueue(CannedChat(content="hello!"))
+        produced = s.generate("sys.conv")  # infer in conv
+        conv, sysd = oaita.session_dir("conv"), oaita.session_dir("sys")
+        check("reply written into the target (last) segment folder",
+              produced[0].parent == conv)
+        check("reply is 0020-<id>.assistant within conv",
+              bool(re.match(r"^0020-[a-z]{5}\.assistant$", produced[0].name)))
+        check("reply stored raw", produced[0].read_text() == "hello!")
+        sys_files = sorted(p.name for p in sysd.iterdir())
+        check("prepended 'sys' session is NOT written to",
+              not any(f.endswith(".assistant") for f in sys_files))
+        req = s.srv.requests[-1]
+        sys_slug = _id_from_name(next(p.name for p in sysd.iterdir()))
+        usr_slug = _id_from_name(
+            next(p.name for p in conv.iterdir() if p.name.endswith(".user")))
+        check("stitched prompt is [sys.system, conv.user] in order",
+              req.messages == [
+                  {"role": "system",
+                   "content": _header_for(sys_slug) + "be terse"},
+                  {"role": "user", "content": _header_for(usr_slug) + "hi"},
+              ])
+    finally:
+        s.close()
+
+
+# ── 21. stitch into an empty target session ──────────────────────────────────
+def test_stitch_into_empty_target():
+    s = Session()
+    try:
+        s.write_turn("skill", "0010.user", "use this skill")
+        s.srv.enqueue(CannedChat(content="ok"))
+        produced = s.generate("skill.fresh")  # 'fresh' has no turns yet
+        fresh = oaita.session_dir("fresh")
+        check("reply created as the first turn of the empty target",
+              produced[0].parent == fresh and
+              bool(re.match(r"^0010-[a-z]{5}\.assistant$", produced[0].name)))
+        req = s.srv.requests[-1]
+        check("prompt is just the prepended skill turn",
+              len(req.messages) == 1 and _bodies(req.messages) == ["use this skill"])
+    finally:
+        s.close()
+
+
+# ── 22. reordering segments changes context order ────────────────────────────
+def test_stitch_reorder_changes_context_order():
+    s = Session()
+    try:
+        s.write_turn("xxx", "0010.user", "from X")
+        s.write_turn("yyy", "0010.user", "from Y")
+        s.write_turn("ttt", "0010.user", "go")
+        s.srv.enqueue(CannedChat(content="r1"))
+        s.generate("xxx.yyy.ttt")
+        check("x.y.t context order is [X, Y, go]",
+              _bodies(s.srv.requests[-1].messages) == ["from X", "from Y", "go"])
+        # ttt now ends with an assistant turn → regenerated in place; reorder x/y.
+        s.srv.enqueue(CannedChat(content="r2"))
+        s.generate("yyy.xxx.ttt")
+        check("y.x.t context order is [Y, X, go] (target tail excluded)",
+              _bodies(s.srv.requests[-1].messages) == ["from Y", "from X", "go"])
+    finally:
+        s.close()
+
+
+# ── 23. regenerate touches ONLY the target segment's tail ────────────────────
+def test_stitch_regenerate_only_target_tail():
+    s = Session()
+    try:
+        s.write_turn("sys", "0010.system", "sys prompt")
+        s.write_turn("conv", "0010.user", "q")
+        s.write_turn("conv", "0020.assistant", "old answer")
+        s.srv.enqueue(CannedChat(content="new answer"))
+        produced = s.generate("sys.conv")
+        conv = oaita.session_dir("conv")
+        files = sorted(p.name for p in conv.iterdir())
+        check("conv still has exactly 2 turns (regenerated in place)",
+              len(files) == 2)
+        check("target tail rewritten to new content",
+              produced[0].read_text() == "new answer")
+        req = s.srv.requests[-1]
+        check("prompt is [system, user]; target assistant tail excluded",
+              [m["role"] for m in req.messages] == ["system", "user"])
+        check("prompt bodies are the prepended sys prompt then the user q",
+              _bodies(req.messages) == ["sys prompt", "q"])
+    finally:
+        s.close()
+
+
+# ── 24. name validation: bad chars, empty segments, duplicates ───────────────
+def test_name_validation():
+    s = Session()
+    try:
+        for bad in ["bad-name", "a..b", "a.", ".b", "a b", "a.a", ""]:
+            raised = False
+            try:
+                s.generate(bad)
+            except SystemExit:
+                raised = True
+            check(f"invalid/duplicate spec {bad!r} raises SystemExit", raised)
+    finally:
+        s.close()
+
+
+# ── 25. turn-ids stay unique across stitched sessions ────────────────────────
+def test_stitch_cross_segment_unique_ids():
+    s = Session()
+    try:
+        for i in range(1, 4):
+            s.write_turn("alpha", f"{i*10:04d}.user", f"a{i}")
+        for i in range(1, 4):
+            s.write_turn("beta", f"{i*10:04d}.user", f"b{i}")
+        s.srv.enqueue(CannedChat(content="done"))
+        s.generate("alpha.beta")  # assistant appended in beta
+        slugs = []
+        for seg in ("alpha", "beta"):
+            for p in oaita.session_dir(seg).iterdir():
+                if oaita.parse_turn(p) is not None:
+                    slugs.append(_id_from_name(p.name))
+        check("all 7 turn-ids present (3 + 3 + 1 generated)", len(slugs) == 7)
+        check("turn-ids are distinct across both stitched sessions",
+              len(set(slugs)) == len(slugs))
+    finally:
+        s.close()
+
+
+# ── 26. collision guard fires on a pre-existing cross-session duplicate ──────
+def test_stitch_turn_id_collision_guard():
+    s = Session()
+    try:
+        s.write_turn("one", "0010-dup.user", "x")
+        s.write_turn("two", "0010-dup.user", "y")
+        raised = False
+        try:
+            s.generate("one.two")
+        except SystemExit:
+            raised = True
+        check("duplicate turn-id across stitched sessions raises", raised)
+    finally:
+        s.close()
+
+
 # ── standalone runner ────────────────────────────────────────────────────────
 if __name__ == "__main__":
     tests = [
@@ -623,6 +781,13 @@ if __name__ == "__main__":
         test_append_rejects_duplicate_id,
         test_append_rejects_invalid_id,
         test_regenerate_strips_but_keeps_stable_id,
+        test_stitch_prepends_and_targets_last,
+        test_stitch_into_empty_target,
+        test_stitch_reorder_changes_context_order,
+        test_stitch_regenerate_only_target_tail,
+        test_name_validation,
+        test_stitch_cross_segment_unique_ids,
+        test_stitch_turn_id_collision_guard,
     ]
     for t in tests:
         try:

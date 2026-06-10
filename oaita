@@ -54,6 +54,14 @@ raw content only — the header is synthesised at send time from the filename. I
 the model echoes such a header back atop its reply, it is stripped before the
 turn is stored (and a valid, unique id the model chose is adopted as the slug).
 
+Name stitching: a session name is letters and digits only, and a dot-stitched
+spec ``a.b.c`` means inference happens in ``c`` (the reply is written there)
+while ``a`` then ``b`` are PREPENDED to the context. This is composition, not
+hierarchy — next round the caller may write ``c.d.a`` — and is how
+sub-conversations, reusable "skills", and system prompts are mixed in. Every
+referenced session is loaded and slug-assigned, turn-ids stay unique across the
+whole stitched context, and only the target (last) segment is ever written.
+
 The model name comes from ``--model`` or ``$OAITA_MODEL``. The base URL / api
 key come from ``--base-url`` / ``--api-key`` or, when unset, the SDK's
 ``OPENAI_BASE_URL`` / ``OPENAI_API_KEY`` env vars (the SDK only ever contacts
@@ -107,6 +115,41 @@ def state_home() -> Path:
 def session_dir(name: str) -> Path:
     """The folder holding one named session's turn files."""
     return state_home() / name
+
+
+# A session name is letters and digits ONLY — so the '.' that stitches names
+# together (see parse_stitch) is always an unambiguous separator, never part of
+# a name.
+_NAME_RE = re.compile(r"^[A-Za-z0-9]+$")
+
+
+def validate_session_name(name: str) -> str:
+    """Return ``name`` if it is a valid session name, else raise ``SystemExit``."""
+    if not _NAME_RE.match(name):
+        raise SystemExit(
+            f"oaita: invalid session name {name!r} — names may contain only "
+            f"letters and digits (the '.' in a stitch spec separates names)")
+    return name
+
+
+def parse_stitch(spec: str) -> list[str]:
+    """Split a dot-stitched name spec into its segment names, in order.
+
+    ``"a.b.c"`` → ``["a", "b", "c"]``: inference happens in the LAST segment
+    (``c``), while the earlier segments (``a``, ``b``) are PREPENDED to the
+    context. This is composition, NOT hierarchy — the caller may write the same
+    names in any order next round (``"c.d.a"``). A bare ``"a"`` is a one-segment
+    spec (a single session). Every segment must be a valid session name, and a
+    session may not appear more than once (that would duplicate its turn-ids).
+    """
+    segments = spec.split(".")
+    for seg in segments:
+        validate_session_name(seg)
+    if len(set(segments)) != len(segments):
+        raise SystemExit(
+            f"oaita: a session may not appear more than once in a stitch "
+            f"spec: {spec!r}")
+    return segments
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -246,7 +289,8 @@ def new_turn_id(existing: set[str]) -> str:
             return candidate
 
 
-def assign_slugs(turns: list[Turn]) -> list[Turn]:
+def assign_slugs(turns: list[Turn],
+                 existing_slugs: set[str] | None = None) -> list[Turn]:
     """Ensure every turn has a slug, renaming slug-less files on disk in place.
 
     Turns that already have a slug keep it unchanged — user-authored labels are
@@ -254,14 +298,21 @@ def assign_slugs(turns: list[Turn]) -> list[Turn]:
     generated, the file is renamed (``Path.rename``), and the in-memory Turn is
     updated to reflect the new path and slug.
 
+    ``existing_slugs`` is an optional SHARED set of ids to avoid (mutated in
+    place as ids are assigned). Passing one lets a stitched generation keep
+    turn-ids unique across SEVERAL sessions; when omitted the set is derived
+    from ``turns`` alone (single-session behaviour).
+
     Returns the updated list (same order; ``frozen=True`` dataclasses replaced
     via ``dataclasses.replace``).
     """
-    existing_slugs: set[str] = {t.slug for t in turns if t.slug is not None}
+    if existing_slugs is None:
+        existing_slugs = {t.slug for t in turns if t.slug is not None}
     updated: list[Turn] = []
     for turn in turns:
         if turn.slug is not None:
-            # Already has a slug — keep it as-is.
+            # Already has a slug — keep it, but make sure the shared set knows.
+            existing_slugs.add(turn.slug)
             updated.append(turn)
         else:
             # Generate a fresh id, rename the file, update the in-memory turn.
@@ -272,6 +323,23 @@ def assign_slugs(turns: list[Turn]) -> list[Turn]:
             turn.path.rename(new_path)
             updated.append(replace(turn, slug=new_id, path=new_path))
     return updated
+
+
+def check_unique_turn_ids(turns: list[Turn]) -> None:
+    """Raise ``SystemExit`` if two turns in the sent context share a turn-id.
+
+    Turn-ids must be unique across the WHOLE stitched context so the model can
+    reference any turn unambiguously. New ids are drawn collision-free, so this
+    only ever fires on pre-existing duplicates (e.g. two hand-authored turns
+    with the same slug, possibly in different stitched sessions).
+    """
+    seen: dict[str, Path] = {}
+    for t in turns:
+        if t.slug in seen:
+            raise SystemExit(
+                f"oaita: turn-id collision {t.slug!r} — used by both "
+                f"{seen[t.slug]} and {t.path}; rename one of the turns")
+        seen[t.slug] = t.path
 
 
 # A model that sees every turn begin with a {"turn-id": "..."} header tends to
@@ -384,7 +452,12 @@ def generate(
     client: openai.OpenAI | None = None,
     echo=None,
 ) -> list[Path]:
-    """Generate the assistant reply for session ``name`` and persist it.
+    """Generate the assistant reply for ``name`` and persist it.
+
+    ``name`` is a session name, or a dot-stitched spec ``"a.b.c"``: inference
+    happens in the LAST segment (and its file is written there), while the
+    earlier segments are prepended to the context in order. Every referenced
+    session is loaded and slug-assigned; only the target segment is written.
 
     Before building the prompt, every existing turn that lacks a slug is
     renamed on disk to carry a freshly generated unique turn-id; the slug IS
@@ -400,27 +473,45 @@ def generate(
     live via ``echo`` (defaults to writing stdout). Returns the list of turn
     files written/updated.
 
-    Raises ``SystemExit`` (non-zero) if the session has no turns at all — no
-    empty files are created.
+    Raises ``SystemExit`` (non-zero) on an invalid name, or if the stitched
+    context has no turns at all — no empty files are created.
     """
     model = resolve_model(model)
-    folder = session_dir(name)
-    turns = load_turns(name)
-    if not turns:
+
+    # A name may be a dot-stitched spec "a.b.c": inference happens in the LAST
+    # segment, while the earlier segments are PREPENDED to the context
+    # (composition, not hierarchy — the order is whatever the caller wrote and
+    # may differ next round). A bare "a" is a single-segment spec.
+    segments = parse_stitch(name)
+    target_seg = segments[-1]
+    target_folder = session_dir(target_seg)
+
+    # Load every segment, then assign slugs across ALL of them from ONE shared
+    # id set, so turn-ids are unique across the whole stitched context. Slug-less
+    # files are renamed on disk in every referenced session (target or prepended).
+    existing_slugs: set[str] = set()
+    seg_turns: dict[str, list[Turn]] = {}
+    for seg in segments:
+        seg_turns[seg] = load_turns(seg)
+        existing_slugs |= {t.slug for t in seg_turns[seg] if t.slug is not None}
+    for seg in segments:
+        seg_turns[seg] = assign_slugs(seg_turns[seg], existing_slugs)
+
+    # The write target and the regenerate-in-place decision concern ONLY the
+    # last (target) segment; prepended segments are always context, never written.
+    tgt_turns = seg_turns[target_seg]
+    prompt_tail, target, is_regenerate = plan_generation(
+        tgt_turns, target_folder, existing_slugs)
+    prepended = [t for seg in segments[:-1] for t in seg_turns[seg]]
+    prompt_turns = prepended + prompt_tail
+
+    if not prompt_turns:
         raise SystemExit(
-            f"oaita: session {name!r} has no turns to generate from "
-            f"(folder: {folder})")
+            f"oaita: nothing to generate from for {name!r} — no turns across "
+            f"the stitched context")
 
-    # Ensure every turn has a slug (= its stable turn-id) BEFORE planning.
-    # Slug-less files are renamed on disk; turns with existing slugs keep them.
-    turns = assign_slugs(turns)
-
-    # Collect the full slug set AFTER assignment so plan_generation can draw a
-    # fresh id for the new assistant turn without colliding.
-    existing_slugs: set[str] = {t.slug for t in turns if t.slug is not None}
-
-    prompt_turns, target, is_regenerate = plan_generation(
-        turns, folder, existing_slugs)
+    # Turn-ids must be unique across the whole sent context.
+    check_unique_turn_ids(prompt_turns)
 
     # Build the messages list with per-turn id-headers injected into content.
     # The headers are synthesised from filenames — they are never written to
@@ -434,7 +525,7 @@ def generate(
             sys.stdout.write(text)
             sys.stdout.flush()
 
-    folder.mkdir(parents=True, exist_ok=True)
+    target_folder.mkdir(parents=True, exist_ok=True)
     stream = client.chat.completions.create(
         model=model, messages=messages, stream=True)
 
@@ -490,7 +581,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     gen = sub.add_parser(
         "gen", help="generate the assistant reply for a session")
-    gen.add_argument("name", help="session name (folder under oaita state)")
+    gen.add_argument(
+        "name",
+        help="session name, or a dot-stitched spec 'a.b.c' — infer in the last "
+             "segment; earlier segments are prepended as context")
     gen.add_argument("--model", default=None,
                      help="model name (else $OAITA_MODEL)")
     gen.add_argument("--base-url", default=None,
