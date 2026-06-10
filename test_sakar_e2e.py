@@ -28,6 +28,23 @@ from pathlib import Path
 SAKAR = str(Path(__file__).parent / "sakar")
 TIMEOUT = 120  # seconds for each test
 
+_USE_DEFAULT = object()  # sentinel: "use the context's default box identity"
+
+
+def _pick_unprivileged_ids() -> "tuple | None":
+    """A non-root (uid, gid) the harness can drop a box to, or None."""
+    import pwd
+    for p in pwd.getpwall():
+        if 1000 <= p.pw_uid < 60000:
+            return (p.pw_uid, p.pw_gid)
+    try:
+        nb = pwd.getpwnam("nobody")
+        if nb.pw_uid != 0:
+            return (nb.pw_uid, nb.pw_gid)
+    except KeyError:
+        pass
+    return None
+
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 def _sock_path():
@@ -68,6 +85,13 @@ class ServerContext:
         self.proc = None
         self.sp = _sock_path()
         self.flows_path = None
+        # If the test harness is root, run the BOXES as an unprivileged user so sakar
+        # takes the user-namespace runner (the path a normal user gets) — root would
+        # otherwise always exercise the privileged 'ambient' runner. The server itself
+        # stays on the uv interpreter (it needs mitmproxy); the box/inner path is
+        # stdlib-only, so a dropped box runs fine under the system python.
+        self.box_run_as = None
+        self.box_python = None
 
     def __enter__(self):
         # Override XDG dirs to a temp location so tests are isolated.
@@ -112,6 +136,20 @@ class ServerContext:
         # We'll derive it ourselves since we can't easily read stdout non-blocking.
         state_dir = Path(self._tmpdir) / "state" / "sakar"
         self._state_dir = state_dir
+
+        # Decide how boxes run. As root, drop them to a normal user (the realistic,
+        # previously-broken userns path); as non-root, run them as ourselves.
+        if os.getuid() == 0:
+            ids = _pick_unprivileged_ids()
+            if ids is not None and os.path.exists("/usr/bin/python3"):
+                self.box_run_as = ids
+                self.box_python = "/usr/bin/python3"
+                self.make_box_paths_accessible()
+                print(f"  (harness is root → running boxes as unprivileged uid "
+                      f"{ids[0]}, exercising the userns runner)", flush=True)
+            else:
+                print("  (harness is root and cannot drop privileges → boxes run "
+                      "as root via the ambient runner)", flush=True)
         return self
 
     def get_flows_path(self) -> "Path | None":
@@ -122,15 +160,21 @@ class ServerContext:
         return flows[-1] if flows else None
 
     def run_box(self, cmd: list, extra_env: "dict | None" = None,
-                timeout: int = TIMEOUT, run_as: "tuple | None" = None,
-                python: "str | None" = None) -> subprocess.CompletedProcess:
+                timeout: int = TIMEOUT, run_as: "object" = _USE_DEFAULT,
+                python: "object" = _USE_DEFAULT) -> subprocess.CompletedProcess:
         """Run `sakar -- cmd` against this server.
 
-        run_as=(uid, gid): drop the box launcher to that uid/gid via a preexec, so the
-        unprivileged user-namespace runner can be exercised from a root test process.
-        python: interpreter for the box (default sys.executable). Pass a world-readable
-        system python when dropping privileges, since the uv interpreter lives in the
-        root user's cache; the box/inner path is stdlib-only, so any 3.11+ works."""
+        By default the box runs with this context's box identity (dropped to an
+        unprivileged uid when the harness is root — see __enter__). Pass run_as=None to
+        force running as the harness's own uid (used to exercise the ambient runner as
+        root); pass an explicit (uid, gid) to drop to a specific user.
+        python: interpreter for the box; the box/inner path is stdlib-only, so the
+        world-readable system python is used for dropped boxes (the uv interpreter
+        lives in root's cache and a non-root box can't exec it)."""
+        if run_as is _USE_DEFAULT:
+            run_as = self.box_run_as
+        if python is _USE_DEFAULT:
+            python = self.box_python
         env = dict(self._env_obj)
         if extra_env:
             env.update(extra_env)
@@ -300,58 +344,28 @@ def test_flow_file(ctx: ServerContext):
         print("    PASS (fallback): flows file non-empty", flush=True)
 
 
-def _pick_unprivileged_ids() -> "tuple | None":
-    """A non-root (uid, gid) the test can drop the box launcher to, or None."""
-    import pwd
-    best = None
-    for p in pwd.getpwall():
-        if 1000 <= p.pw_uid < 60000:
-            return (p.pw_uid, p.pw_gid)
-    try:
-        nb = pwd.getpwnam("nobody")
-        if nb.pw_uid != 0:
-            best = (nb.pw_uid, nb.pw_gid)
-    except KeyError:
-        pass
-    return best
+def test_userns_runner_keeps_uid(ctx: ServerContext):
+    """The box must keep the caller's real uid (never silently become root), while the
+    in-box forwarders still bind the privileged ports 53/80/443.
 
-
-def test_userns_runner_privileged_ports(ctx: ServerContext):
-    """The unprivileged user-namespace runner must bind the privileged forwarder ports
-    (53/80/443) WITHOUT being uid 0, and the box must keep the caller's real uid.
-
-    This is the path a non-root user gets (root takes the 'ambient' runner), so we run
-    the box as a genuinely non-root user — dropping privileges if the test itself is
-    root. It guards two regressions at once:
-      * caps that don't survive the inner's execve  -> 'cannot listen :443: Permission
-        denied' and no box network; and
-      * the uid-0 'fix' for that, which made the box run as root and breaks tools that
-        refuse to build as root.
-    We drive the proxy-UNAWARE path (DNS + catch-all on :53/:80/:443) so the privileged
-    binds are load-bearing, and assert the box reports the caller's uid (not 0)."""
-    print("  test: unprivileged-userns runner binds privileged ports (non-root) ...",
+    When the harness is root the context already runs boxes as an unprivileged user
+    (the userns runner); when it's non-root every box is the userns runner anyway. Here
+    we just pin the invariant: drive the proxy-UNAWARE path (DNS + catch-all on the
+    privileged ports, so the binds are load-bearing) and assert the box reports a
+    non-root uid. Guards both the original 'cannot listen :443: Permission denied'
+    breakage and the uid-0 'fix' that made boxes run as root."""
+    print("  test: userns box keeps the caller's uid (binds 53/80/443, not root) ...",
           flush=True)
-    run_as = None
-    python = None
-    expect_uid = os.getuid()
-    if os.getuid() == 0:
-        ids = _pick_unprivileged_ids()
-        if ids is None:
-            print("    SKIP: no unprivileged uid available to drop to", flush=True)
-            return
-        run_as, expect_uid = ids, ids[0]
-        if not os.path.exists("/usr/bin/python3"):
-            print("    SKIP: no world-readable system python3 to run the dropped box",
-                  flush=True)
-            return
-        python = "/usr/bin/python3"
-        ctx.make_box_paths_accessible()
-
+    if ctx.box_run_as is None and os.getuid() == 0:
+        print("    SKIP: harness is root and could not drop to an unprivileged user",
+              flush=True)
+        return
+    expect_uid = ctx.box_run_as[0] if ctx.box_run_as else os.getuid()
     r = ctx.run_box(
         ["bash", "-lc",
          "echo BOXUID=$(id -u); curl -sS --noproxy '*' --max-time 30 "
          "-o /dev/null -w 'HTTP=%{http_code}\\n' http://example.com/ || echo CURLFAIL"],
-        run_as=run_as, python=python, timeout=90)
+        timeout=90)
     if "cannot create the runner sandbox" in r.stderr:
         print("    SKIP: unprivileged user namespaces unavailable on this host",
               flush=True)
@@ -360,14 +374,40 @@ def test_userns_runner_privileged_ports(ctx: ServerContext):
                 "cannot set up box network namespace"):
         assert bad not in r.stderr, \
             f"userns runner failed to set up box networking ({bad!r}):\n{r.stderr[:500]}"
+    assert "BOXUID=0" not in r.stdout, \
+        f"box ran as root — it must keep the caller's uid:\n{r.stdout[:300]}"
     assert f"BOXUID={expect_uid}" in r.stdout, (
-        f"box did not run as the caller's uid {expect_uid} (regressed to uid 0?):\n"
-        f"stdout: {r.stdout[:300]}")
+        f"box did not run as the caller's uid {expect_uid}:\n{r.stdout[:300]}")
     assert "HTTP=200" in r.stdout, (
         f"proxy-unaware fetch through the userns box failed:\n"
         f"stdout: {r.stdout[:300]}\nstderr: {r.stderr[:300]}")
-    print(f"    PASS: userns runner bound :53/:80/:443 as uid {expect_uid} (not root)",
+    print(f"    PASS: userns box bound :53/:80/:443 as uid {expect_uid} (not root)",
           flush=True)
+
+
+def test_ambient_runner_as_root(ctx: ServerContext):
+    """The privileged 'ambient' runner: only reachable when we actually have host caps,
+    so run a box WITHOUT dropping privileges (run_as=None). Skipped unless the harness
+    is root, since a normal user can't exercise this path."""
+    print("  test: ambient runner (root, no privilege drop) ...", flush=True)
+    if os.getuid() != 0:
+        print("    SKIP: not root; ambient runner needs host CAP_SYS_ADMIN/NET_ADMIN",
+              flush=True)
+        return
+    r = ctx.run_box(
+        ["bash", "-lc",
+         "echo BOXUID=$(id -u); curl -sS --noproxy '*' --max-time 30 "
+         "-o /dev/null -w 'HTTP=%{http_code}\\n' http://example.com/ || echo CURLFAIL"],
+        run_as=None, python=sys.executable, timeout=90)
+    for bad in ("cannot listen", "cannot bind DNS"):
+        assert bad not in r.stderr, \
+            f"ambient runner failed to bind privileged ports ({bad!r}):\n{r.stderr[:500]}"
+    assert "BOXUID=0" in r.stdout, \
+        f"ambient runner box expected to run as root:\n{r.stdout[:300]}"
+    assert "HTTP=200" in r.stdout, (
+        f"proxy-unaware fetch through the ambient box failed:\n"
+        f"stdout: {r.stdout[:300]}\nstderr: {r.stderr[:300]}")
+    print("    PASS: ambient runner bound :53/:80/:443 as root", flush=True)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -388,7 +428,8 @@ def run_all() -> bool:
             ("proxy_unaware_curl", test_proxy_unaware_curl),
             ("os_truststore_client", test_os_truststore_client),
             ("denied_host", test_denied_host),
-            ("userns_runner_privileged_ports", test_userns_runner_privileged_ports),
+            ("userns_runner_keeps_uid", test_userns_runner_keeps_uid),
+            ("ambient_runner_as_root", test_ambient_runner_as_root),
         ]
 
         for name, fn in tests:
