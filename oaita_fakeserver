@@ -51,6 +51,7 @@ from __future__ import annotations
 #  1 · Imports & small helpers
 # ════════════════════════════════════════════════════════════════════════════
 import json
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -468,6 +469,21 @@ class _Handler(BaseHTTPRequestHandler):
 # ════════════════════════════════════════════════════════════════════════════
 #  5 · The server
 # ════════════════════════════════════════════════════════════════════════════
+class _QuietHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer that swallows benign client-disconnect noise.
+
+    A streaming client (e.g. the openai SDK) routinely closes its keep-alive
+    socket the instant it has consumed the stream; the server's pending read
+    then raises ConnectionResetError/BrokenPipeError. That is expected, not a
+    server bug, so we drop those instead of dumping a traceback to stderr.
+    """
+
+    def handle_error(self, request, client_address):
+        if isinstance(sys.exc_info()[1], (ConnectionResetError, BrokenPipeError)):
+            return
+        super().handle_error(request, client_address)
+
+
 class FakeOpenAIServer:
     """A threaded fake OpenAI server with an enqueue/capture contract."""
 
@@ -487,7 +503,7 @@ class FakeOpenAIServer:
     def start(self) -> "FakeOpenAIServer":
         if self._httpd is not None:
             return self
-        httpd = ThreadingHTTPServer((self.host, self._want_port), _Handler)
+        httpd = _QuietHTTPServer((self.host, self._want_port), _Handler)
         httpd.fake = self                 # type: ignore[attr-defined]
         httpd.daemon_threads = True
         self.port = httpd.server_address[1]
