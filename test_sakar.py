@@ -323,6 +323,46 @@ def test_frame_round_trip_large():
 
 
 # ════════════════════════════════════════════════════════════════════════════
+#  Process identity + relay meta (the connecting process shown in the prompt)
+# ════════════════════════════════════════════════════════════════════════════
+
+def test_read_peer_ident_self():
+    info = _sakar.read_peer_ident(os.getpid())
+    assert info["exe"] and "/" in info["exe"]          # readlink of /proc/self/exe
+    assert isinstance(info["argv"], list) and info["argv"]
+
+def test_read_peer_ident_dead_pid_is_empty():
+    # A pid that doesn't exist degrades gracefully, never raises.
+    info = _sakar.read_peer_ident(2 ** 31 - 1)
+    assert info == {"exe": "", "argv": []}
+
+def test_parse_relay_meta_proxy_default():
+    kind, dest, proc = _sakar._parse_relay_meta(b"")
+    assert kind == "proxy" and dest is None and proc == {}
+
+def test_parse_relay_meta_carries_proc():
+    payload = json.dumps({"kind": "proxy",
+                          "proc": {"exe": "/usr/bin/curl",
+                                   "argv": ["curl", "https://x"]}}).encode()
+    kind, dest, proc = _sakar._parse_relay_meta(payload)
+    assert kind == "proxy" and dest is None
+    assert proc["exe"] == "/usr/bin/curl" and proc["argv"][0] == "curl"
+
+def test_parse_relay_meta_direct_dest_and_proc():
+    payload = json.dumps({"kind": "direct", "host": "example.com", "port": 443,
+                          "scheme": "https",
+                          "proc": {"exe": "/bin/wget", "argv": ["wget"]}}).encode()
+    kind, dest, proc = _sakar._parse_relay_meta(payload)
+    assert kind == "direct"
+    assert dest == ("example.com", 443, "https")
+    assert proc["exe"] == "/bin/wget"
+
+def test_parse_relay_meta_malformed_fails_safe():
+    kind, dest, proc = _sakar._parse_relay_meta(b"\xff\xff not json")
+    assert kind == "proxy" and dest is None and proc == {}
+
+
+# ════════════════════════════════════════════════════════════════════════════
 #  Standalone runner
 # ════════════════════════════════════════════════════════════════════════════
 

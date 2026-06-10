@@ -246,83 +246,24 @@ def _dns_handle_packet(pkt: bytes, dns: SyntheticDNS) -> "bytes | None":
     return _dns_build_response(pkt, txid, rcode=0)
 
 # ════════════════════════════════════════════════════════════════════════════
-#  Process provenance — identify the in-box process behind a connection (for the prompt)
+#  Process identity — what's behind a connection, for the approval prompt
 # ════════════════════════════════════════════════════════════════════════════
 
-_PROV_ENV_KEYS = ("USER", "PWD", "SSH_CONNECTION", "TERM", "_")
+def read_peer_ident(pid: int) -> dict:
+    """Best-effort {exe, argv} of the in-box process `pid`, read from /proc.
 
-def _proc_status_field(pid: int, field: str) -> "int | None":
-    """One integer field (e.g. Tgid, PPid) from /proc/<pid>/status."""
+    The in-box runner shares the box's PID namespace, so it can read the connecting
+    process's /proc directly to label the connection in the approval prompt (e.g.
+    "curl https://…"). Never raises; absent fields come back empty."""
+    info = {"exe": "", "argv": []}
     try:
-        with open(f"/proc/{pid}/status", "rb") as f:
-            for ln in f:
-                if ln.startswith(field.encode() + b":"):
-                    return int(ln.split()[1])
-    except (OSError, ValueError, IndexError):
-        pass
-    return None
-
-def tgid_of(pid: int) -> int:
-    t = _proc_status_field(pid, "Tgid")
-    return t if t is not None else int(pid)
-
-def _parse_proc_stat(pid: int) -> "tuple[int, int]":
-    try:
-        with open(f"/proc/{pid}/stat", "rb") as f:
-            st = f.read()
-        rp = st.rfind(b")")
-        rest = st[rp + 2:].split() if rp >= 0 else []
-        ppid = int(rest[1]) if len(rest) >= 2 else 0
-        start_time = int(rest[19]) if len(rest) >= 20 else 0
-        return ppid, start_time
-    except (OSError, ValueError):
-        return 0, 0
-
-def read_provenance(pid: int) -> dict:
-    """Best-effort process provenance from /proc/<pid>. Never raises."""
-    info = dict(pid=int(pid), ppid=0, exe="", cwd="", argv=[], env={}, start_time=0)
-    base = f"/proc/{pid}"
-    try:
-        with open(f"{base}/cmdline", "rb") as f:
-            raw = f.read()
-        info["argv"] = [p.decode("utf-8", "surrogateescape")
-                        for p in raw.split(b"\x00") if p]
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            info["argv"] = [p.decode("utf-8", "surrogateescape")
+                            for p in f.read().split(b"\x00") if p]
     except OSError: pass
-    try: info["exe"] = os.readlink(f"{base}/exe")
-    except OSError: pass
-    try: info["cwd"] = os.readlink(f"{base}/cwd")
-    except OSError: pass
-    ppid, start_time = _parse_proc_stat(pid)
-    info["ppid"] = ppid; info["start_time"] = start_time
-    try:
-        with open(f"{base}/environ", "rb") as f:
-            env_raw = f.read()
-        env = {}
-        for kv in env_raw.split(b"\x00"):
-            if b"=" not in kv: continue
-            k, _, v = kv.partition(b"=")
-            ks = k.decode("utf-8", "surrogateescape")
-            if ks in _PROV_ENV_KEYS:
-                env[ks] = v.decode("utf-8", "surrogateescape")
-        info["env"] = env
+    try: info["exe"] = os.readlink(f"/proc/{pid}/exe")
     except OSError: pass
     return info
-
-def _host_pid_from_pidfd(pidfd: int) -> int:
-    """Resolve a pidfd to a HOST-namespace pid via /proc/self/fdinfo/<pidfd>.
-
-    The connecting process lives in the box's PID namespace, so its in-box pid is
-    meaningless to the server. The pidfd (sent alongside the connection) resolves to
-    the process's HOST pid, which we can read /proc for to name it in the prompt."""
-    try:
-        with open(f"/proc/self/fdinfo/{pidfd}", "rb") as f:
-            for line in f:
-                if line.startswith(b"Pid:"):
-                    rest = line.split(b":", 1)[1].split()
-                    return int(rest[0]) if rest else 0
-    except (OSError, ValueError, IndexError):
-        return 0
-    return 0
 
 # ════════════════════════════════════════════════════════════════════════════
 #  Policy: deny/allow wildcard files + interactive prompt
@@ -443,7 +384,7 @@ class Policy:
 _CURRENT_BOX_ID: "contextvars.ContextVar[str]" = contextvars.ContextVar(
     "sakar_box_id", default="")
 _CURRENT_PROV: "contextvars.ContextVar[dict]" = contextvars.ContextVar(
-    "sakar_prov", default={"tgid": 0})
+    "sakar_prov", default={})
 _CURRENT_DEST: "contextvars.ContextVar[tuple | None]" = contextvars.ContextVar(
     "sakar_dest", default=None)
 
@@ -615,44 +556,38 @@ class ProxyEngine:
 #  Relay frame parsing
 # ════════════════════════════════════════════════════════════════════════════
 
-def _parse_relay_meta(payload: bytes) -> "tuple[str, tuple | None]":
-    kind, dest = "proxy", None
+def _parse_relay_meta(payload: bytes) -> "tuple[str, tuple | None, dict]":
+    """Parse a RELAY frame's meta JSON → (kind, dest, proc). `kind` is 'proxy' (the
+    client named the destination, regular proxy) or 'direct' (catch-all already knows
+    host/port/scheme, reverse proxy). `proc` is the connecting process's {exe, argv},
+    read box-side by the runner, shown in the approval prompt."""
+    kind, dest, proc = "proxy", None, {}
     if payload:
         try:
             meta = json.loads(payload.decode())
-            if isinstance(meta, dict) and meta.get("kind") == "direct":
-                kind = "direct"
-                dest = (str(meta.get("host", "")), int(meta.get("port", 0)),
-                        str(meta.get("scheme", "https")))
+            if isinstance(meta, dict):
+                if isinstance(meta.get("proc"), dict):
+                    proc = meta["proc"]
+                if meta.get("kind") == "direct":
+                    kind = "direct"
+                    dest = (str(meta.get("host", "")), int(meta.get("port", 0)),
+                            str(meta.get("scheme", "https")))
         except (ValueError, TypeError, UnicodeDecodeError):
-            kind, dest = "proxy", None
-    return kind, dest
+            kind, dest, proc = "proxy", None, {}
+    return kind, dest, proc
 
 
 async def relay_handle_fds(engine: ProxyEngine, box_id: str, fds: list,
                            payload: bytes) -> None:
-    """Gate one caught connection — receive side of a RELAY frame."""
-    kind, dest = _parse_relay_meta(payload)
-    pidfd = fds[1] if len(fds) > 1 else -1
-    # A RELAY frame carries the connection FD and optionally its pidfd. The box is the
-    # untrusted party, so defensively close any extra FDs a misbehaving box might send.
-    for extra in fds[2:]:
-        try: os.close(extra)
-        except OSError: pass
+    """Gate one caught connection — receive side of a RELAY frame. `fds` is the single
+    relayed connection FD; the box is untrusted, so close any extras it slipped in."""
     if not fds:
         return
-    prov = {"tgid": 0}
-    if pidfd >= 0:
-        host_pid = _host_pid_from_pidfd(pidfd)
-        if host_pid > 0:
-            info = read_provenance(host_pid)
-            prov = {"tgid": tgid_of(host_pid),
-                    "start_time": info.get("start_time") or 0,
-                    "ppid": info.get("ppid") or 0,
-                    "exe": info["exe"], "argv": info["argv"]}
-        try: os.close(pidfd)
+    for extra in fds[1:]:
+        try: os.close(extra)
         except OSError: pass
-    _CURRENT_PROV.set(prov)
+    kind, dest, proc = _parse_relay_meta(payload)
+    _CURRENT_PROV.set(proc)
     _CURRENT_DEST.set(dest)
     await engine.handle_fd(fds[0], box_id, kind=kind, dest=dest)
 
@@ -826,51 +761,24 @@ class Server:
                 except (OSError, ValueError): pass
 
     async def _handle(self, conn: socket.socket) -> None:
-        _pidfd = -1
-        _peer_pid = 0
+        # Control phase: newline-JSON only (ping / register), no ancillary FDs — so a
+        # plain async read suffices. On register the SAME connection becomes the box's
+        # muxed channel, served by _serve_box, where the relayed connection FDs arrive.
+        conn.setblocking(False)
         buf = b""
-        try:
-            # First read uses recvmsg so we can capture the launcher's pidfd (sent with
-            # the register line) and name the box's owning process for the log/prompt.
-            _data, _anc, _flags, _addr = await self._loop.run_in_executor(
-                None, self._recvmsg_blocking, conn)
-            buf = _data
-            for lvl, typ, data in _anc:
-                if lvl == socket.SOL_SOCKET and typ == socket.SCM_RIGHTS:
-                    a = array.array("i"); a.frombytes(data)
-                    fds = a.tolist()
-                    if fds:
-                        _pidfd = fds[0]
-                    for extra in fds[1:]:
-                        try: os.close(extra)
-                        except OSError: pass
-            if _pidfd >= 0:
-                _peer_pid = _host_pid_from_pidfd(_pidfd)
-        except (OSError, asyncio.CancelledError):
-            if _pidfd >= 0:
-                try: os.close(_pidfd)
-                except OSError: pass
-            try: conn.close()
-            except OSError: pass
-            return
-
-        box_id = None
         try:
             while True:
                 if b"\n" in buf:
                     line, buf = buf.split(b"\n", 1)
                     if line.strip():
-                        reply, box_id_from_register = await self._dispatch(
-                            line, _peer_pid)
+                        reply, box_id = await self._dispatch(line)
                         if reply is not None:
                             try:
                                 await self._loop.run_in_executor(
                                     None, self._send_reply, conn, reply)
                             except OSError:
                                 pass
-                            if box_id_from_register and reply.get("ok"):
-                                box_id = box_id_from_register
-                                conn.setblocking(False)
+                            if box_id and reply.get("ok"):
                                 await self._serve_box(conn, box_id, buf)
                                 return
                     continue
@@ -883,19 +791,8 @@ class Server:
         except (OSError, asyncio.CancelledError):
             pass
         finally:
-            if _pidfd >= 0:
-                try: os.close(_pidfd)
-                except OSError: pass
             try: conn.close()
             except OSError: pass
-
-    @staticmethod
-    def _recvmsg_blocking(conn: socket.socket):
-        conn.settimeout(30)
-        try:
-            return conn.recvmsg(RECV_CHUNK, socket.CMSG_SPACE(4 * MAX_FDS_PER_MSG))
-        finally:
-            conn.setblocking(False)
 
     @staticmethod
     def _send_reply(conn: socket.socket, reply: dict) -> None:
@@ -906,7 +803,7 @@ class Server:
         finally:
             conn.setblocking(False)
 
-    async def _dispatch(self, line: bytes, peer_pid: int) -> "tuple[dict | None, str | None]":
+    async def _dispatch(self, line: bytes) -> "tuple[dict | None, str | None]":
         """Returns (reply, box_id_if_register)."""
         try:
             msg = json.loads(line.decode())
@@ -918,14 +815,9 @@ class Server:
         elif t == "register":
             self._box_counter += 1
             box_id = str(self._box_counter)
-            prov = {}
-            if peer_pid > 0:
-                prov = read_provenance(peer_pid)
-            self._boxes[box_id] = {"prov": prov, "counters": {}}
-            exe = prov.get("exe", "?")
-            argv = prov.get("argv", [])
-            short = " ".join(argv[:3]) if argv else ""
-            print(f"[box {box_id}] started  {exe} {short}", flush=True)
+            cmd = msg.get("cmd") if isinstance(msg.get("cmd"), list) else []
+            self._boxes[box_id] = {"cmd": cmd}
+            print(f"[box {box_id}] started  {' '.join(cmd)}", flush=True)
             return {"ok": True, "box_id": box_id}, box_id
         return None, None
 
@@ -1056,38 +948,29 @@ def run_inner(conn_fd: int, cmd: list) -> int:
         except OSError:
             pass
 
-    def _peer_pidfd(conn: socket.socket) -> int:
-        """Pidfd for the connecting in-box workload, or -1.
+    def _peer_ident(conn: socket.socket) -> dict:
+        """{exe, argv} of the in-box process that opened `conn`, for the prompt.
 
-        The connecting process lives in the box's PID namespace, so its pid is
-        meaningless to the server. We send this pidfd alongside the connection in the
-        RELAY frame; the server resolves it to a HOST-namespace pid (read via
-        /proc/self/fdinfo) so the approval prompt can name which process (exe/argv)
-        wants the connection."""
+        SO_PEERCRED gives the kernel's view of the peer's pid in our (the box's) PID
+        namespace; we read its /proc directly — same namespace, no translation needed.
+        {} if the peer is already gone."""
         try:
             creds = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
                                     struct.calcsize("3i"))
             pid, _uid, _gid = struct.unpack("3i", creds)
         except OSError:
-            return -1
-        if pid <= 0:
-            return -1
-        try:
-            return os.pidfd_open(pid, 0)
-        except (OSError, AttributeError):
-            return -1
+            return {}
+        return read_peer_ident(pid) if pid > 0 else {}
 
     def forward_one(conn: socket.socket, meta: "dict | None" = None) -> None:
-        pidfd = _peer_pidfd(conn)
-        if meta is None:
-            meta = {"kind": "proxy"}
+        """Hand the raw connection FD to the server as a RELAY frame. The meta JSON
+        carries the connection's kind/destination plus the connecting process's
+        {exe, argv} (read here, box-side) so the server can name it in the prompt."""
+        meta = dict(meta) if meta else {"kind": "proxy"}
+        meta["proc"] = _peer_ident(conn)
         try:
-            fds = [conn.fileno()] if pidfd < 0 else [conn.fileno(), pidfd]
-            _send_frame(FRAME_RELAY, json.dumps(meta).encode(), fds=fds)
+            _send_frame(FRAME_RELAY, json.dumps(meta).encode(), fds=[conn.fileno()])
         finally:
-            if pidfd >= 0:
-                try: os.close(pidfd)
-                except OSError: pass
             conn.close()
 
     def _tcp_accept_loop(bind_ip: str, port: int, on_conn) -> None:
@@ -1246,25 +1129,14 @@ def cmd_run(cmd: list) -> int:
         return 3
 
     # Open ONE persistent connection for the register handshake + muxed channel.
-    pidfd = -1
-    try:
-        pidfd = os.pidfd_open(os.getpid())
-    except (OSError, AttributeError):
-        pass
-
     srv_conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         srv_conn.settimeout(30)
         srv_conn.connect(sp)
-        # The server identifies us by the pidfd sent below (it recomputes our
-        # provenance host-side); the register line itself carries no payload.
-        payload = (json.dumps({"type": "register"}) + "\n").encode()
-        if pidfd >= 0:
-            srv_conn.sendmsg([payload],
-                            [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
-                              array.array("i", [pidfd]).tobytes())])
-        else:
-            srv_conn.sendall(payload)
+        # Register names the box by the command it runs (for the server's log); the
+        # per-connection prompts name the actual connecting process, read box-side.
+        payload = (json.dumps({"type": "register", "cmd": list(cmd)}) + "\n").encode()
+        srv_conn.sendall(payload)
         buf = b""
         while b"\n" not in buf:
             chunk = srv_conn.recv(1)
@@ -1284,10 +1156,6 @@ def cmd_run(cmd: list) -> int:
         except OSError: pass
         print(f"sakar: connection failed: {e}", file=sys.stderr)
         return 1
-    finally:
-        if pidfd >= 0:
-            try: os.close(pidfd)
-            except OSError: pass
 
     _ca = ca_cert_path()
     if not _ca.exists():
