@@ -118,8 +118,8 @@ from __future__ import annotations
 # `~/.cache/sarun/pyfuse3-<ver>-pidwrite-<patchhash>` and add < 1 ms.
 # The patch hash in the cache name means a changed patch builds a fresh dir.
 #
-# Bootstrap is skipped only for `--inner` (the in-sandbox network forwarder,
-# which never uses pyfuse3 and runs where no build toolchain or network exists).
+# Bootstrap is skipped only for `--inner` (the in-sandbox runner, which never
+# uses pyfuse3 and runs where no build toolchain exists).
 import hashlib as _bootstrap_hashlib
 import os as _bootstrap_os
 import sys as _bootstrap_sys
@@ -300,8 +300,8 @@ def _ensure_patched_pyfuse3():
 
 
 # Skip the bootstrap (and the pyfuse3 import/assert) for the in-sandbox `--inner`
-# forwarder: it never uses pyfuse3 and runs where no build toolchain/network
-# exists. Every other entry path (UI, runner, tests via SourceFileLoader, `-h`)
+# runner: it never uses pyfuse3 and runs where no build toolchain exists.
+# Every other entry path (UI, runner, tests via SourceFileLoader, `-h`)
 # loads the patched build and asserts it below.
 if "--inner" not in _bootstrap_sys.argv:
     _ensure_patched_pyfuse3()
@@ -323,21 +323,16 @@ import array
 import asyncio
 import collections
 import base64
-import contextvars
 import difflib
 import errno
 import fcntl
-import fnmatch
 import functools
 import heapq as _heapq
-import ipaddress
 import itertools
-import gzip
 import hashlib
 import json
 import os
 import queue
-import quopri
 import re
 import resource
 import select
@@ -369,29 +364,28 @@ except Exception:
 
 # TABLE OF CONTENTS — regenerate with: grep -n "^#  [A-Z0-9]" sarun
 #
-#    115   0 · Patched pyfuse3 bootstrap (MANDATORY — runs before any `import pyfuse3`)
-#    470   Paths
-#    713   Wire protocol (control messages: newline JSON; FD messages: SCM_RIGHTS)
-#    810   Inner forwarder — `slopbox --inner` (runs as pid-1-ish inside the slopbox)
-#   1257   Rules
-#   1648   File rules — apply / discard a change by path glob (first match wins)
-#   1721   Patch codec & tree utilities
-#   1930   Sqlar — the single per-box database (index + at-rest archive)
-#   2567   Session model & box metadata helpers
-#   2779   Overlay engine — pyfuse3 copy-on-write overlay, multiplexed per box
-#   6103   Overlay mount manager — OverlayMount (trio thread) + Session model & discovery
-#   6707   ChangeSource (abstract interface)
-#   6847   LiveUpper & SqlarArchive (change substrate implementations)
-#   7123   ChangeReview
-#   7998   Supervisor
-#   9347   Muxed box channel: framing (inside the UI)
-#   9453   Output capture echo stream (ECHO frames on the box's muxed connection)
-#   9959   Runner — `slopbox CMD [ARGS...]`
-#  10469   UI — `slopbox`
-#  13062   CLI commands
-#  13173   Entry
-#  13271   User's manual — the standalone onboarding docs (shown first in the UI)
-#  13330   TODO — deferred follow-ups (read me)
+#     99   0 · Patched pyfuse3 bootstrap (MANDATORY — runs before any `import pyfuse3`)
+#    452   Paths
+#    656   Wire protocol (control messages: newline JSON; FD messages: SCM_RIGHTS)
+#    744   Inner runner — `slopbox --inner` (runs as pid-1-ish inside the slopbox)
+#    937   Rules
+#   1248   File rules — apply / discard a change by path glob (first match wins)
+#   1321   Patch codec & tree utilities
+#   1530   Sqlar — the single per-box database (index + at-rest archive)
+#   1977   Session model & box metadata helpers
+#   2193   Overlay engine — pyfuse3 copy-on-write overlay, multiplexed per box
+#   5466   Overlay mount manager — OverlayMount (trio thread) + Session model & discovery
+#   6047   ChangeSource (abstract interface)
+#   6180   LiveUpper & SqlarArchive (change substrate implementations)
+#   6456   ChangeReview
+#   7200   Supervisor
+#   8153   Muxed box channel framing (the ONE box↔UI connection)
+#   8766   Runner — `slopbox CMD [ARGS...]`
+#   9248   UI — `slopbox`
+#  11480   CLI commands
+#  11590   Entry
+#  11687   User's manual — the standalone onboarding docs (shown first in the UI)
+#  11746   TODO — deferred follow-ups (read me)
 #
 # NOTE: update line numbers here whenever sections change.
 
@@ -399,7 +393,7 @@ except Exception:
 # document; collect_docs() gathers them and the right pane shows them when no box is
 # selected. Keep each block next to the relevant code — but the pane order is NOT
 # source order: every block's title starts with a section number (e.g.
-# `[b]10 · Network model[/]`) and collect_docs sorts by it, so the reading order is
+# `[b]10 · Controlling boxes from the command line[/]`) and collect_docs sorts by it, so the reading order is
 # deliberate no matter where in the file a block physically lives. Numbers 1–5 are the
 # standalone User's manual (parked in its own section near the end of the file); 6+ are
 # the per-topic reference blocks that sit beside their code. Renumber a title to move
@@ -599,9 +593,9 @@ def valid_box_id(box_id: "str | None") -> bool:
 
 # There is exactly ONE socket: ui.sock (sock_path()). A box runner opens a single
 # persistent connection to it, does the register handshake, then keeps that SAME
-# connection as the muxed box channel (RELAY frames inner→UI, ECHO frames UI→inner,
-# MUTE/UNMUTE frames inner→UI). Connection-close is the box's teardown signal. No
-# per-session relay.sock / echo.sock / chan dir exist any more.
+# connection as the muxed box channel (ECHO frames UI→inner, MUTE/UNMUTE frames
+# inner→UI). Connection-close is the box's teardown signal. No per-session
+# echo.sock / chan dir exist any more.
 
 # Hidden capture-sink files at the box root: the child's stdout/stderr are pointed at
 # these O_WRONLY so every write flows through FUSE (direct_io=True on open, so no
@@ -926,8 +920,8 @@ def run_inner(conn_fd: int, cmd: list, capture: bool = False) -> int:
         except OSError: pass
         try: chan.close()
         except OSError: pass
-    # Hard-exit: --inner is the box's throwaway pid-1. Its daemon threads (the network
-    # forwarders, the channel reader) may still be in blocking socket calls; letting the
+    # Hard-exit: --inner is the box's throwaway pid-1. Its daemon thread (the channel
+    # reader) may still be in a blocking socket call; letting the
     # normal interpreter shutdown run alongside them has been observed to crash (SIGBUS)
     # on a closed-fd socket during teardown. We've already done every cleanup that matters
     # (terminal restored, conn closed → UI teardown), so terminate immediately after
@@ -1069,7 +1063,7 @@ def _ids_of(pattern: str) -> "set[int]":
 def _clauses_expr(clauses) -> str:
     """A short, human-readable rendering of a Clause list (the '/' filter expression for
     the bottom bar) — kind:pattern segments joined by each clause's and/or, with off/not
-    prefixes. Same grammar as _RuleBase.to_line minus the action."""
+    prefixes. Same grammar as FileRule.to_line minus the action."""
     seg = []
     for n, c in enumerate(clauses):
         parts = ([c.join] if n else []) + (["off"] if not c.enabled else []) \
@@ -1111,34 +1105,30 @@ class ProcFilterTarget:
         return _subject_match(m, self.subject)
 
 
+FILE_ACTIONS = ("apply", "discard", "passthrough")
+
+
 @dataclass
-class _RuleBase:
-    """A rule = an action + an ordered list of Clauses (the and/or/not/enabled match
-    expression). The boolean composition is generic here; subclasses only declare their
-    domain vocabulary — valid actions/kinds, the default kind for a bare pattern, and
-    which kind renders without its `kind:` prefix on disk. Line grammar:
+class FileRule:
+    """A file rule = an action (apply/discard/passthrough) + an ordered list of Clauses
+    (the and/or/not/enabled match expression). Line grammar:
 
         ACTION [off] [not] PRED [and|or [off] [not] PRED]...
 
-    where PRED is `kind:pattern` (or a bare pattern → the default kind). A one-predicate
-    rule reads naturally — `discard **/*.log` — and a multi-condition
-    rule chains clauses: `discard **/*.log and not box:trusted`."""
+    where PRED is `kind:pattern` (or a bare pattern → the `path` kind, which is also the
+    one kind that renders without its `kind:` prefix on disk). A one-predicate rule reads
+    naturally — `discard **/*.log` — and a multi-condition rule chains clauses:
+    `discard **/*.log and not box:trusted`. An explicit action is always required."""
     action: str
     clauses: list                       # list[Clause]
-    # ── domain vocabulary: plain class constants (NOT dataclass fields) ──
-    _ACTIONS = ()                        # valid actions
-    _KINDS = ()                          # recognised kinds
-    _DEFAULT_KIND = ""                   # a bare pattern parses to this kind
-    _DEFAULT_ACTION = None               # bare line (no verb) action, or None=required
-    _BARE_KIND = None                    # this kind renders without a `kind:` prefix
 
     def matches(self, target) -> bool:
         return eval_clauses(target, self.clauses)
 
     @classmethod
-    def single(cls, action: str, kind: str, pattern: str) -> "_RuleBase":
-        """A one-predicate rule — the common case (and what parse builds for a legacy
-        single-field line)."""
+    def single(cls, action: str, kind: str, pattern: str) -> "FileRule":
+        """A one-predicate rule — the common case (and what parse builds for a
+        single-predicate line)."""
         return cls(action, [Clause(Match(kind, pattern))])
 
     def to_line(self) -> str:
@@ -1149,13 +1139,13 @@ class _RuleBase:
             if not c.enabled: seg.append("off")
             if c.negate: seg.append("not")
             k = c.match.kind
-            seg.append(c.match.pattern if k == self._BARE_KIND
+            seg.append(c.match.pattern if k == "path"      # the 'path' kind renders bare
                        else f"{k}:{c.match.pattern}")
             out.append(" ".join(seg))
         return " ".join(out)
 
-    @classmethod
-    def _parse_clauses(cls, s: str) -> list:
+    @staticmethod
+    def _parse_clauses(s: str) -> list:
         toks = s.split()
         clauses = []; i = 0; join = "and"
         while i < len(toks):
@@ -1169,10 +1159,10 @@ class _RuleBase:
             if i >= len(toks): break
             pred = toks[i]; i += 1
             kind, sep, pat = pred.partition(":")
-            if sep and kind.lower() in cls._KINDS:
+            if sep and kind.lower() in FILE_KINDS:
                 kind = kind.lower()
             else:
-                kind = cls._DEFAULT_KIND; pat = pred
+                kind = "path"; pat = pred                # bare pattern → path kind
             if not pat: continue
             clauses.append(Clause(Match(kind, pat),
                                   join=(join if clauses else "and"),
@@ -1181,52 +1171,18 @@ class _RuleBase:
         return clauses
 
     @classmethod
-    def parse(cls, line: str) -> "_RuleBase | None":
+    def parse(cls, line: str) -> "FileRule | None":
         s = line.strip()
         if not s or s.startswith("#"):
             return None
         verb, _, rest = s.partition(" ")
-        if verb.lower() in cls._ACTIONS:
-            action = verb.lower(); s = rest.strip()
-        elif cls._DEFAULT_ACTION is not None:
-            action = cls._DEFAULT_ACTION                # bare pattern → default action
-        else:
-            return None                                 # action required (file domain)
+        if verb.lower() not in FILE_ACTIONS:
+            return None                                 # an explicit action is required
+        action = verb.lower(); s = rest.strip()
         clauses = cls._parse_clauses(s)
         if not clauses:
             return None
         return cls(action, clauses)
-
-
-class _RuleListBase:
-    """Shared ordered-rule-list machinery for FileRules.
-    Subclasses supply _elem_class (a type with parse/to_line) and decide()."""
-    _elem_class: type
-
-    def __init__(self, path: Path):
-        self.path = path; self.rules: list = []; self.load()
-    def load(self) -> None:
-        try: text = self.path.read_text()
-        except OSError: text = ""
-        self.rules = [r for r in (self._elem_class.parse(ln) for ln in text.splitlines()) if r]
-    def save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text("".join(r.to_line() + "\n" for r in self.rules))
-    def insert(self, rule, at_top: bool = False) -> None:
-        self.rules.insert(0 if at_top else len(self.rules), rule); self.save()
-    def remove_at(self, i: int) -> None:
-        if 0 <= i < len(self.rules): del self.rules[i]; self.save()
-    def move(self, i: int, delta: int) -> int:
-        j = i + delta
-        if 0 <= i < len(self.rules) and 0 <= j < len(self.rules):
-            self.rules[i], self.rules[j] = self.rules[j], self.rules[i]
-            self.save(); return j
-        return i
-    def needs_proc(self) -> bool:
-        """True if any rule tests a process facet — lets a hot caller skip resolving the
-        triggering process's provenance when no rule would use it."""
-        return any(c.match.kind in ("exe", "cwd", "arg")
-                   for r in self.rules for c in r.clauses)
 
 
 #: [b]9 · Reviewing & removing changes — apply, discard, delete, kill[/]
@@ -1293,24 +1249,34 @@ def _path_match(pat: str, rel: str) -> bool:
     return _glob_match(pat, s)
 
 
-FILE_ACTIONS = ("apply", "discard", "passthrough")
+class FileRules:
+    """An ordered apply/discard/passthrough rule list (FileRule), persisted one rule per
+    line and evaluated top-to-bottom — first match wins."""
 
-@dataclass
-class FileRule(_RuleBase):
-    """A file rule: apply/discard/passthrough over a path glob, optionally box-scoped.
-    The 'path' kind renders bare (`discard **/*.log`); box renders explicit
-    (`... and box:A.B*`)."""
-    _ACTIONS = FILE_ACTIONS
-    _KINDS = FILE_KINDS
-    _DEFAULT_KIND = "path"
-    _DEFAULT_ACTION = None              # an explicit action is required
-    _BARE_KIND = "path"
-
-
-class FileRules(_RuleListBase):
-    """An ordered apply/discard rule list, evaluated top-to-bottom — first match
-    wins."""
-    _elem_class = FileRule
+    def __init__(self, path: Path):
+        self.path = path; self.rules: list = []; self.load()
+    def load(self) -> None:
+        try: text = self.path.read_text()
+        except OSError: text = ""
+        self.rules = [r for r in (FileRule.parse(ln) for ln in text.splitlines()) if r]
+    def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text("".join(r.to_line() + "\n" for r in self.rules))
+    def insert(self, rule, at_top: bool = False) -> None:
+        self.rules.insert(0 if at_top else len(self.rules), rule); self.save()
+    def remove_at(self, i: int) -> None:
+        if 0 <= i < len(self.rules): del self.rules[i]; self.save()
+    def move(self, i: int, delta: int) -> int:
+        j = i + delta
+        if 0 <= i < len(self.rules) and 0 <= j < len(self.rules):
+            self.rules[i], self.rules[j] = self.rules[j], self.rules[i]
+            self.save(); return j
+        return i
+    def needs_proc(self) -> bool:
+        """True if any rule tests a process facet — lets a hot caller skip resolving the
+        triggering process's provenance when no rule would use it."""
+        return any(c.match.kind in ("exe", "cwd", "arg")
+                   for r in self.rules for c in r.clauses)
 
     def decide(self, rel: str, box: str = "", proc=None) -> "str | None":
         target = PathTarget(rel, _subject_of(box, proc))
@@ -2390,7 +2356,7 @@ class Index:
         self._prov_cache: dict = {}       # host pid -> provenance dict (hot-path cache)
         self._prov_by_proc: dict = {}     # process.id -> provenance dict
         # Live "active set": tgid -> last-seen monotonic, stamped every time the FUSE
-        # serve thread or the relay path records/sees a tgid (in-memory only, NOT
+        # serve thread or the echo/channel path records/sees a tgid (in-memory only, NOT
         # persisted — the persistent `process` table keeps the full history). Reads
         # come from the UI thread; the dict is GIL-atomic like the other RAM mirrors.
         self._active: dict = {}           # tgid -> last-seen monotonic
@@ -2505,7 +2471,7 @@ class Index:
         """Re-stamp a tgid in the active set (last-seen monotonic) and keep the set
         bounded: when it crosses the cap, drop the oldest-seen dead entries so RAM
         stays bounded even if the proc pane is never opened to drive retirement.
-        Serve/relay-thread write; GIL-atomic dict ops (Index threading contract)."""
+        Serve/echo-thread write; GIL-atomic dict ops (Index threading contract)."""
         now = time.monotonic()
         self._active[tgid] = now
         if len(self._active) > _ACTIVE_CAP:
@@ -2675,7 +2641,7 @@ class Index:
         [(id, tgid, ppid, parent_id, exe, argv-list, alive, dead)] with alive=True /
         dead=False for every row: a tgid that kill(0) reports gone is dropped from the
         active set immediately (no "recently finished" grace), the same display rule the
-        live changes/flows panes use. The active set is tgid-keyed for liveness probing,
+        live changes/outputs panes use. The active set is tgid-keyed for liveness probing,
         but display/tree linkage is by row id (PID-reuse proof). The persistent `process`
         table keeps the full history. UI-thread read of the GIL-atomic dicts (contract)."""
         out = []
@@ -3017,7 +2983,7 @@ class DirHandle:
 # ── MultiplexOverlayFs (pyfuse3 FUSE operations) ────────────────────────────
 def _build_overlay_ops():
     """Build the MultiplexOverlayFs class. Imports pyfuse3 lazily so that importing
-    this module (e.g. the --inner forwarder, or offline tests) does not require
+    this module (e.g. the --inner runner, or offline tests) does not require
     pyfuse3/trio. Returns the class."""
     import pyfuse3
     import trio
@@ -7245,7 +7211,7 @@ class Supervisor:
         # teardown signal (no token needed there — the connection IS the proof).
         self._owner_tokens: dict = {}     # sid -> random token (kept OUTSIDE the box)
         self._echoes: dict = {}           # sid -> EchoStream (capture-mode live echo)
-        self._relay_loop = None           # asyncio loop the box channels run on
+        self._echo_loop = None            # asyncio loop the box channels run on
         self.sessions.update(discover_sessions())
         # Auto-name counter: a single UI-process integer, seeded once at startup from the
         # highest existing A<n> label, used-then-incremented for each box that launches
@@ -7413,7 +7379,7 @@ class Supervisor:
     def attach_loop(self, loop) -> None:
         """Called by the ChannelServer once its asyncio loop is up; gives the box
         EchoStreams the loop they frame captured output onto."""
-        self._relay_loop = loop
+        self._echo_loop = loop
 
     def _start_echo(self, sid: str) -> "EchoStream | None":
         """Create + start this box's socketless EchoStream (the drain task framing
@@ -7421,10 +7387,10 @@ class Supervisor:
         tests), in which case capture still records to the table — only live replay is
         absent. The writer is wired later by the ChannelServer once the box's muxed
         connection is up (attach_box_channel)."""
-        if self._relay_loop is None:
+        if self._echo_loop is None:
             return None
         self._stop_echo(sid)
-        es = EchoStream(sid, self._relay_loop)
+        es = EchoStream(sid, self._echo_loop)
         es.start()
         self._echoes[sid] = es
         return es
@@ -7449,7 +7415,7 @@ class Supervisor:
         if es is not None:
             es.set_writer(None)
 
-    def stop_all_relays(self) -> None:
+    def stop_all_echoes(self) -> None:
         for sid in list(self._echoes):
             self._stop_echo(sid)
 
@@ -7727,7 +7693,7 @@ class Supervisor:
 
     def unregister(self, msg: dict) -> None:
         """Synchronous teardown: the fold runs inline on the CALLING thread. Used by
-        non-UI callers (control-plane tests, a relay-loop caller) where blocking that
+        non-UI callers (control-plane tests, an echo-loop caller) where blocking that
         thread is fine. The interactive UI must NOT use this — `_dispatch_control`
         calls unregister_async, which folds OFF the loop (awaited) so the UI never
         freezes. Both share the same prep/fold/post helpers, so the resulting sqlar is
@@ -7944,7 +7910,7 @@ class Supervisor:
         None once the box is no longer running (its runner root is gone, i.e. zero
         running processes) OR has no live Index: the UI then renders the cached full
         `processes(sid)` history instead. Keying the live/finished switch on runner-root
-        liveness — the same signal the changes and flows panes use — means all three
+        liveness — the same signal the changes, processes, and outputs panes use — means all three
         live panes flip to the complete record at the same instant the box stops,
         rather than the proc pane briefly showing an empty active set until teardown
         drops the Index."""
@@ -8225,7 +8191,7 @@ class _ConnWriter:
 
     The box's muxed connection is read via recvmsg (FD passing) on the asyncio loop; we
     must NOT layer an asyncio StreamReader/transport over the SAME socket (its reader
-    would steal the inbound RELAY/MUTE frames). So ECHO/ECHO_DONE frames are written here
+    would steal the inbound MUTE/UNMUTE frames). So ECHO/ECHO_DONE frames are written here
     with a plain non-blocking send + add_writer backpressure, all on the loop thread —
     interleaving cleanly with the recvmsg read loop on the same fd (full-duplex)."""
     def __init__(self, conn: socket.socket, loop: asyncio.AbstractEventLoop):
@@ -8278,7 +8244,7 @@ class EchoStream:
 
     def set_writer(self, writer: "asyncio.StreamWriter | None") -> None:
         """Attach the box connection's StreamWriter (the muxed channel). ECHO/ECHO_DONE
-        frames are written to it; serialized via the same writer the RELAY/teardown side
+        frames are written to it; serialized via the same writer the teardown side
         already owns, so the drain task is the only ECHO producer."""
         self._writer = writer
 
@@ -8756,7 +8722,7 @@ class ChannelServer:
         if getattr(self, "_task", None):
             self._task.cancel()
         try:
-            self.sup.stop_all_relays()
+            self.sup.stop_all_echoes()
         except Exception:
             pass
         if self._sock is not None:
@@ -9214,7 +9180,7 @@ def cmd_run(cmd, env_capture, direct, chdir, reuse_sid=None,
 
 
 #: [b]8 · The UI — panes and keys[/]
-#: The UI has two panels: a left list and a right detail. Seven keys switch the view; each
+#: The UI has two panels: a left list and a right detail. Five keys switch the view; each
 #: pane then has its own keys (shown live in the bottom bar). [cyan]esc[/] goes back, [cyan]q[/] quits.
 #:   [cyan]b[/]  Boxes      — all slopboxes; [cyan]↵[/] reviews the selected box's changes
 #:   [cyan]c[/]  Changes    — the file tree the box wrote; [cyan]↵[/] on a file shows its diff
@@ -9590,7 +9556,7 @@ def _make_ui_app():
         def action_delete(self): self.app.action_delete()
         def action_rename(self): self.app.action_rename()
 
-    class NetTable(DataTable):
+    class RowsTable(DataTable):
         # Read-only list table (procs / outputs): a record, nothing to accept or reject.
         pass
 
@@ -9806,8 +9772,8 @@ def _make_ui_app():
                     yield Static("", id="left-title", classes="pt")
                     yield SessionTable(id="s-tab", cursor_type="row")
                     yield ChangesTable(id="cf-tab", cursor_type="row")
-                    yield NetTable(id="pr-tab", cursor_type="row")
-                    yield NetTable(id="out-tab", cursor_type="row")
+                    yield RowsTable(id="pr-tab", cursor_type="row")
+                    yield RowsTable(id="out-tab", cursor_type="row")
                     yield FileRulesList(id="r-list")
                 with Vertical(id="right"):
                     yield Static("", id="right-title", classes="pt")
@@ -11034,7 +11000,7 @@ def _make_ui_app():
         # (search-filtered) output stream CONCATENATED in id order, with the
         # currently-selected entry's lines marked in the left margin — so a single
         # write is located within the surrounding stream. Outputs grow during a run
-        # (like flows), so the live tick reloads this pane too.
+        # (like the other live panes), so the live tick reloads this pane too.
         _OUT_CAP=8000        # max chars rendered into the right pane (windowed on selection)
 
         def _proc_pid_map(self, sid):
