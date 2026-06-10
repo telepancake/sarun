@@ -33,8 +33,7 @@ async def drive():
     UI = m._make_ui_app()
     # neutralise the real startup: no overlay mount, no server, no timers.
     async def _noop_mount(self):
-        self.query_one("#s-tab").add_columns("F","Name","PID","Cmd","✓","✗","↑","↓","Age")
-        self.query_one("#nf-tab").add_columns("Time","","Method","Host","St","↑","↓")
+        self.query_one("#s-tab").add_columns("F","Name","PID","Cmd","Age")
         self.query_one("#cf-tab").add_columns("","Path","Size")
         self.query_one("#pr-tab").add_columns("TGID","PPID","Exe","Argv")
         self._set_view("boxes")

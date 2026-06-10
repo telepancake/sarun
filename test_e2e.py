@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#   "textual>=0.60", "mitmproxy>=11", "wcmatch>=8.4",
+#   "textual>=0.60", "wcmatch>=8.4",
 #   "pyfuse3>=3.2", "trio>=0.22", "python-magic>=0.4",
 # ]
 # ///
@@ -122,7 +122,7 @@ def run_with_ui(tmp):
             f"rm -f /{victim}; "                            # delete a host file (overlay)
             "true")
         r = subprocess.run(
-            [PYBIN, SARUN, "-n", "--", "bash", "-c", script],
+            [PYBIN, SARUN, "--", "bash", "-c", script],
             env=e, capture_output=True, text=True, timeout=120)
         check(r.returncode == 0, f"slopbox run exited 0 (got {r.returncode}: {r.stderr.strip()[-300:]})")
         check("UI connected" in r.stderr, "runner reports the UI connected")
@@ -169,8 +169,8 @@ def run_with_ui(tmp):
             check(len(prov) >= 1, "provenance table populated in the one db")
             if prov:
                 check(all(int(p[1]) > 0 for p in prov), "every provenance row has a pid")
-            check({"sqlar","provenance","process","env","flows"} <= tables,
-                  "the one db carries all concept tables (sqlar/provenance/process/env/flows)")
+            check({"sqlar","provenance","process","env"} <= tables,
+                  "the one db carries all concept tables (sqlar/provenance/process/env)")
 
         # backing live/<sid> is gone (consolidated + cleaned). Poll: the unregister
         # handler removes the backing right AFTER writing the stores, so the stores
@@ -550,7 +550,7 @@ def run_forced_userns_e2e(tmp):
 
         # Part 1: a simple box write captured through the --unshare-user path.
         r = subprocess.run(
-            [PYBIN, SARUN, "-n", "--", "bash", "-c",
+            [PYBIN, SARUN, "--", "bash", "-c",
              "echo userns-capture > /userns_proof.txt"],
             env=e, capture_output=True, text=True, timeout=120)
         check(r.returncode == 0,
@@ -674,14 +674,6 @@ def _launch_ui(tmp, e):
     return ui, sock, mnt
 
 
-def _seed_allow_all(e):
-    """Pre-seed a permanent allow-all netrule so the headless UI never blocks on a
-    no-match prompt (there is no human to answer one in an e2e run)."""
-    cfg = Path(e["XDG_CONFIG_HOME"]) / "slopbox"
-    cfg.mkdir(parents=True, exist_ok=True)
-    (cfg / "netrules").write_text("allow host:*\n")
-
-
 def _kill_ui(ui, mnt):
     try:
         ui.send_signal(signal.SIGINT); ui.wait(timeout=10)
@@ -704,67 +696,6 @@ def _box_sqlar(e, timeout=20):
         if sqlars: return sqlars[0]
         time.sleep(0.3)
     return None
-
-
-def run_dns_e2e(tmp):
-    """Proxy-UNAWARE network interception (the synthetic-DNS path). A program that does
-    its OWN DNS and connects to an IP never sees HTTP_PROXY, so it must be caught a
-    different way: the box's /etc/resolv.conf points at the in-box resolver
-    (127.0.0.53:53), which answers every A query with a stable synthetic 127/8 IP; the
-    catch-all listeners on :80/:443 recover the dialed synthetic IP via getsockname(),
-    map it back to the domain, and relay it. Those are PRIVILEGED ports bound inside a
-    cap-dropped box — they need CAP_NET_BIND_SERVICE, without which the whole mechanism
-    silently fails (EACCES on bind). This test is the regression guard for that."""
-    import re, sqlite3
-    m = SourceFileLoader("slopbox", SARUN).load_module()
-    e = env_for(tmp); _seed_allow_all(e)
-    ui, sock, mnt = _launch_ui(tmp, e)
-    try:
-        script = (
-            "echo '--- libc resolution ---'; "
-            "python3 -c 'import socket; print(\"RESOLVED\", socket.gethostbyname(\"example.com\"))' "
-            "|| echo resolve-failed; "
-            "echo '--- proxy-unaware http (catch-all) ---'; "
-            "curl --noproxy '*' -s -o /dev/null "
-            "-w 'CATCHALL_CODE=%{http_code} REMOTE=%{remote_ip}\\n' --max-time 15 http://example.com/ "
-            "|| echo catchall-failed; "
-            "echo '--- direct dial to an unallocated synthetic IP must be blocked ---'; "
-            "curl --noproxy '*' -s -o /dev/null -w 'BLOCKED_CODE=%{http_code}\\n' "
-            "--max-time 6 http://127.0.0.231/ ; echo \"BLOCKED_RC=$?\"")
-        r = subprocess.run([PYBIN, SARUN, "-n", "--", "bash", "-c", script],
-                           env=e, capture_output=True, text=True, timeout=120)
-        out = r.stdout
-        check(r.returncode == 0,
-              f"dns-e2e: box run exited 0 (got {r.returncode}: {r.stderr.strip()[-200:]})")
-        # 1. libc getaddrinfo returns a synthetic 127/8 IP (resolv.conf → in-box resolver)
-        mo = re.search(r"RESOLVED (\d+\.\d+\.\d+\.\d+)", out)
-        check(mo is not None and mo.group(1).startswith("127."),
-              f"dns-e2e: libc resolution returns a synthetic 127/8 IP "
-              f"(got {mo.group(1) if mo else 'none'})")
-        # 2. the proxy-unaware curl was intercepted by the catch-all (dialed a 127/8
-        #    synthetic IP) and reached upstream through the relay → mitmproxy
-        mo2 = re.search(r"CATCHALL_CODE=(\d+) REMOTE=(\S+)", out)
-        check(mo2 is not None and mo2.group(1) not in ("000", "") and mo2.group(2).startswith("127."),
-              f"dns-e2e: proxy-unaware http intercepted via catch-all + synthetic IP "
-              f"(got {mo2.group(0) if mo2 else 'none'})")
-        # 3. a direct dial to a synthetic IP we never handed out is BLOCKED — the
-        #    catch-all maps it to no domain and closes it (the exclusion security property)
-        check("BLOCKED_CODE=000" in out and "BLOCKED_RC=0" not in out,
-              f"dns-e2e: direct dial to an unallocated synthetic IP is blocked "
-              f"(got {[ln for ln in out.splitlines() if 'BLOCKED' in ln]})")
-        # 4. the interception is recorded as a flow naming the real domain
-        sp = _box_sqlar(e)
-        flows = []
-        if sp:
-            c = sqlite3.connect(str(sp))
-            try: flows = c.execute("SELECT host,port,scheme,status FROM flows").fetchall()
-            except sqlite3.Error: flows = []
-            finally: c.close()
-        check(any(f[0] == "example.com" and f[1] == 80 for f in flows),
-              f"dns-e2e: the intercepted connection is logged as a flow for the domain "
-              f"(got {flows})")
-    finally:
-        _kill_ui(ui, mnt)
 
 
 def run_capture_e2e(tmp):
@@ -831,8 +762,6 @@ def main():
         run_named_box_e2e(tmp)
         print("\n== forced-userns e2e (unprivileged --unshare-user runner) ==")
         run_forced_userns_e2e(Path(tempfile.mkdtemp(prefix="e2e-userns-")))
-        print("\n== synthetic-DNS e2e (proxy-unaware interception) ==")
-        run_dns_e2e(Path(tempfile.mkdtemp(prefix="e2e-dns-")))
         print("\n== stdout/stderr capture e2e ==")
         run_capture_e2e(Path(tempfile.mkdtemp(prefix="e2e-cap-")))
     except Exception as ex:

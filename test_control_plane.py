@@ -48,7 +48,7 @@ def test_sid_validation_rejects_traversal():
 
         # register() never uses session_id as a path component (it mints box_id). A
         # traversal/garbage NAME is rejected as an invalid NAME and creates nothing.
-        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
+        sup = m.Supervisor(mount=_FakeMount())
         outside = tmp / "PWNED"
         ack = sup.register(dict(session_id=f"../../{outside.name}", cmd=["true"]))
         check(ack.get("ok") is False, "register: traversal name rejected (ok False)")
@@ -66,109 +66,6 @@ def test_sid_validation_rejects_traversal():
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
-
-# ── HIGH-1: RELAY frames gate by CONNECTION (sid), not by message body ──────
-
-class _RecordingEngine:
-    """Stand-in ProxyEngine that just records (sid) it was asked to gate an FD as."""
-    def __init__(self):
-        self.calls = []      # list of sids
-        self.kinds = []      # list of connection kinds (proxy/direct)
-        self.dests = []      # list of intended destinations (None for proxy)
-        self.done = threading.Event()
-    async def handle_fd(self, fd, box_id, *, kind="proxy", dest=None):
-        self.calls.append(box_id)
-        self.kinds.append(kind)
-        self.dests.append(dest)
-        try: os.close(fd)
-        except OSError: pass
-        self.done.set()
-
-
-def _run_relay(eng, sid, fds, payload):
-    """Drive relay_handle_fds(eng, sid, fds, payload) to completion on a throwaway loop."""
-    loop = asyncio.new_event_loop()
-    try:
-        loop.run_until_complete(m.relay_handle_fds(eng, sid, fds, payload))
-    finally:
-        loop.close()
-
-
-def test_relay_fd_gated_by_connection_not_message():
-    """relay_handle_fds gates the FD as the sid bound to the CONNECTION it arrived on —
-    the meta payload carries no sid, so an in-box program cannot pick another session."""
-    sid_a = "111"
-    eng = _RecordingEngine()
-    s0, s1 = socket.socketpair()
-    # The meta JSON has no sid field at all (we never trust one); only proxy/direct kind.
-    _run_relay(eng, sid_a, [os.dup(s0.fileno())],
-               json.dumps({"kind": "proxy"}).encode())
-    s0.close(); s1.close()
-    check(eng.calls == [sid_a],
-          f"relay: FD gated as the bound connection's sid (got {eng.calls})")
-
-
-def test_relay_empty_fds_is_noop():
-    """A RELAY frame with NO ancillary FD does nothing (never calls the engine) — the
-    box-channel reader only gates real connection FDs, never control."""
-    eng = _RecordingEngine()
-    _run_relay(eng, "111", [], json.dumps({"kind": "proxy"}).encode())
-    check(eng.calls == [], "relay: no-FD frame produces no gating call")
-    # relay_handle_fds is the ONLY receive entrypoint; there is no control dispatcher
-    # reachable from a RELAY frame.
-    check(callable(getattr(m, "relay_handle_fds", None)),
-          "relay: relay_handle_fds is the single FD-gating entrypoint")
-
-
-def test_relay_direct_meta_sets_kind_and_dest():
-    """A direct-path RELAY frame (meta {kind:direct,host,port,scheme}) is gated as the
-    connection's sid AND carries the intended destination through to handle_fd; a
-    proxy/empty payload stays kind=proxy. The UI receive side of the synthetic-IP path."""
-    sid_a = "111"
-    eng = _RecordingEngine()
-    s0, s1 = socket.socketpair()
-    _run_relay(eng, sid_a, [os.dup(s0.fileno())],
-               json.dumps({"kind": "direct", "host": "api.example.com",
-                           "port": 443, "scheme": "https"}).encode())
-    s0.close(); s1.close()
-    check(eng.calls == [sid_a], "relay(direct): gated as the connection's sid")
-    check(eng.kinds == ["direct"], "relay(direct): kind propagated as direct")
-    check(eng.dests == [("api.example.com", 443, "https")],
-          f"relay(direct): dest propagated (got {eng.dests})")
-
-
-def test_relay_meta_parse():
-    """_parse_relay_meta maps the meta JSON to (kind, dest); empty/garbage => proxy."""
-    check(m._parse_relay_meta(b"") == ("proxy", None), "empty meta => proxy")
-    check(m._parse_relay_meta(b"not json") == ("proxy", None), "garbage meta => proxy")
-    check(m._parse_relay_meta(b'{"kind":"proxy"}') == ("proxy", None),
-          "explicit proxy meta => proxy, no dest")
-    k, d = m._parse_relay_meta(
-        b'{"kind":"direct","host":"h","port":80,"scheme":"http"}')
-    check(k == "direct" and d == ("h", 80, "http"), "direct meta => (host,port,scheme)")
-
-
-def test_register_net_no_socket_advertised():
-    """register(want_net=True) NO LONGER creates any per-session relay/echo socket: the
-    ack advertises neither `relay` nor `echo` (those sockets are gone — networking rides
-    the ONE muxed connection as RELAY frames)."""
-    tmp = Path(tempfile.mkdtemp(prefix="cp-"))
-    _redirect_state(tmp)
-    try:
-        m.ensure_dirs()
-        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
-        ack = sup.register(dict(session_id="NETBOX", cmd=["true"], want_net=True))
-        check(ack.get("ok") is True, "register(want_net) ok")
-        check(ack.get("net") is True, "register(want_net): net flag set in ack")
-        check("relay" not in ack, "register(want_net): NO relay socket advertised")
-        check("echo" not in ack, "register(want_net): NO echo socket advertised")
-        # No relay/echo helper symbols remain on the module.
-        check(not hasattr(m, "relay_sock_path") and not hasattr(m, "echo_sock_path")
-              and not hasattr(m, "RelayServer") and not hasattr(m, "EchoServer")
-              and not hasattr(m, "relay_dir"),
-              "no relay_sock_path/echo_sock_path/RelayServer/EchoServer/relay_dir remain")
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
 
 
 # ── HIGH-1: owner token gates unregister/drop ───────────────────────────────
@@ -188,7 +85,6 @@ class _FakeMount:
         try: (m.mnt_point() / str(sid)).mkdir(parents=True, exist_ok=True)
         except Exception: pass
     def remove_session(self, sid): self.ops.remove_session(sid)
-    def add_ca_spoof(self, *a, **k): pass
     def set_parent(self, sid, parent): pass
 
 
@@ -197,8 +93,8 @@ def test_owner_token_required_for_teardown():
     _redirect_state(tmp)
     try:
         m.ensure_dirs()
-        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
-        ack = sup.register(dict(session_id="TOKBOX", cmd=["true"], want_net=False))
+        sup = m.Supervisor(mount=_FakeMount())
+        ack = sup.register(dict(session_id="TOKBOX", cmd=["true"]))
         check(ack.get("ok") is True, "register: a valid box registers")
         sid = ack["session_id"]
         token = ack.get("owner_token")
@@ -230,7 +126,7 @@ def test_box_cannot_register_or_unregister_a_foreign_session():
     _redirect_state(tmp)
     try:
         m.ensure_dirs()
-        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
+        sup = m.Supervisor(mount=_FakeMount())
         ra = sup.register(dict(session_id="ABOX", cmd=["true"]))
         rb = sup.register(dict(session_id="BBOX", cmd=["true"]))
         a, b = ra["session_id"], rb["session_id"]
@@ -261,7 +157,7 @@ def test_command_is_the_root_process_row():
               and not hasattr(m, "CMD_XATTR"),
               "no set/get_cmd_xattr / CMD_XATTR symbols remain")
 
-        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
+        sup = m.Supervisor(mount=_FakeMount())
         root_pid = 4242                        # the runner's host pid (kernel-derived)
         cmd = ["echo", "hello world"]
         prov = dict(ppid=7, exe="/usr/bin/echo", env={"FOO": "bar"})
@@ -321,9 +217,9 @@ def _run_main(argv, **patches):
 
 def test_dash_dash_required_and_flag_parsing():
     seen = {}
-    def fake_run(cmd, net, env_capture, direct, wl, chdir, reuse_sid=None,
+    def fake_run(cmd, env_capture, direct, chdir, reuse_sid=None,
                  capture=True):
-        seen.update(cmd=cmd, net=net, env_capture=env_capture, direct=direct, wl=wl,
+        seen.update(cmd=cmd, env_capture=env_capture, direct=direct,
                     chdir=chdir, reuse_sid=reuse_sid, capture=capture)
         return 0
 
@@ -333,12 +229,12 @@ def test_dash_dash_required_and_flag_parsing():
     check("ls" in err, "error suggests the corrected `slopbox -- ls`")
     check(not seen, "cmd_run not called when `--` is missing")
 
-    # defaults: net/env/direct off; capture ON (the new default, no -t).
+    # defaults: env/direct off; capture ON (the new default, no -t).
     seen.clear()
     rc, _ = _run_main(["--", "echo", "hi"], cmd_run=fake_run)
     check(seen.get("cmd") == ["echo", "hi"], "command parsed after `--`")
-    check(seen.get("net") is False and seen.get("env_capture") is False
-          and seen.get("direct") is False, "default run: net/env/direct off")
+    check(seen.get("env_capture") is False and seen.get("direct") is False,
+          "default run: env/direct off")
     check(seen.get("capture") is True, "default run captures stdout/stderr")
 
     # -t now means passthrough: capture OFF.
@@ -346,14 +242,13 @@ def test_dash_dash_required_and_flag_parsing():
     rc, _ = _run_main(["-t", "--", "echo", "hi"], cmd_run=fake_run)
     check(seen.get("capture") is False, "-t disables capture (passthrough)")
 
-    # -n/-e/-d, combinable, before `--`. -e is env capture (independent).
+    # -e/-d, combinable, before `--`. -e is env capture (independent).
     seen.clear()
-    rc, _ = _run_main(["-n", "-e", "-d", "-w", "ex.com", "--", "ls", "-la"],
+    rc, _ = _run_main(["-e", "-d", "--", "ls", "-la"],
                       cmd_run=fake_run)
-    check(seen.get("net") and seen.get("env_capture") and seen.get("direct"),
-          "-n/-e/-d are independent and combinable")
+    check(seen.get("env_capture") and seen.get("direct"),
+          "-e/-d are independent and combinable")
     check(seen.get("cmd") == ["ls", "-la"], "flags before `--`, args (incl. -la) after")
-    check(seen.get("wl") == ["ex.com"], "-w whitelist parsed")
 
 
 def test_single_ui_instance_refused():
@@ -392,7 +287,7 @@ def test_derive_parent_sid_owner_discovery():
     pidfd_a = os.pidfd_open(os.getppid())   # live: our parent is alive for the test
     try:
         m.ensure_dirs()
-        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
+        sup = m.Supervisor(mount=_FakeMount())
 
         my_pid  = os.getpid()
         my_ppid = os.getppid()
@@ -442,7 +337,7 @@ def test_derive_parent_sid_owner_discovery():
               "derive: pid=-1 → None")
 
         # An empty supervisor (no sessions) → always None.
-        sup_empty = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
+        sup_empty = m.Supervisor(mount=_FakeMount())
         check(m._derive_parent_sid(my_pid, sup_empty) is None,
               "derive: no live sessions → None")
 
@@ -462,7 +357,7 @@ def test_register_parent_body_field_not_honoured():
     _redirect_state(tmp)
     try:
         m.ensure_dirs()
-        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
+        sup = m.Supervisor(mount=_FakeMount())
 
         ack_p = sup.register(dict(session_id="PARENTBOX", cmd=["true"]))
         sid_parent = ack_p["session_id"]
@@ -498,7 +393,7 @@ def test_register_no_parent_is_top_level():
     _redirect_state(tmp)
     try:
         m.ensure_dirs()
-        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
+        sup = m.Supervisor(mount=_FakeMount())
         # No _derived_parent_sid key → top-level
         ack = sup.register(dict(session_id="TOPBOX", cmd=["true"]))
         check(ack.get("ok") is True, "top-level: register ok with no parent")
@@ -525,8 +420,7 @@ def test_channel_server_pidfd_register():
     cs_thread = None
     try:
         m.ensure_dirs()
-        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
-        eng = _RecordingEngine()
+        sup = m.Supervisor(mount=_FakeMount())
         sock_path = str(tmp / "ctrl.sock")
 
         ready = threading.Event()
@@ -534,7 +428,7 @@ def test_channel_server_pidfd_register():
         def run_loop():
             nonlocal cs
             asyncio.set_event_loop(cs_loop)
-            cs = m.ChannelServer(sup, eng, sock_path)
+            cs = m.ChannelServer(sup, sock_path)
             cs_loop.run_until_complete(cs.start())
             ready.set()
             cs_loop.run_forever()
@@ -550,7 +444,7 @@ def test_channel_server_pidfd_register():
               f"_host_pid_from_pidfd returns our own pid (got {derived_pid})")
 
         # Send a register message with our own pidfd over SCM_RIGHTS
-        msg = dict(type="register", session_id="CSBOX", cmd=["true"], want_net=False)
+        msg = dict(type="register", session_id="CSBOX", cmd=["true"])
         payload = (json.dumps(msg) + "\n").encode()
 
         pidfd = os.pidfd_open(os.getpid())
@@ -616,7 +510,7 @@ def test_apply_kick_up_live_parent():
     _redirect_state(tmp)
     try:
         m.ensure_dirs()
-        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
+        sup = m.Supervisor(mount=_FakeMount())
 
         # Register parent + child LIVE: supply a live pidfd so _box_running() is True
         # and apply() takes the LiveUpper path (operates on the in-RAM Index). Without
@@ -699,7 +593,7 @@ def test_apply_root_box_still_writes_host():
     _redirect_state(tmp)
     try:
         m.ensure_dirs()
-        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
+        sup = m.Supervisor(mount=_FakeMount())
         ack = sup.register(dict(session_id="ROOT", cmd=["root"]))
         sid = ack["session_id"]
         check(sup.sessions[sid].parent_box_id is None,
@@ -719,7 +613,7 @@ def test_apply_kick_up_finished_parent():
     _redirect_state(tmp)
     try:
         m.ensure_dirs()
-        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
+        sup = m.Supervisor(mount=_FakeMount())
 
         # Register parent then child.
         ack_p = sup.register(dict(session_id="PARENT", cmd=["parent"]))
@@ -821,8 +715,7 @@ def test_register_reply_fd_nested_box():
         # finds it (getpid()'s PPid chain includes getppid()).
         pidfd_parent = os.pidfd_open(os.getppid())   # live for the whole test
         try:
-            sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
-            eng = _RecordingEngine()
+            sup = m.Supervisor(mount=_FakeMount())
             sock_path = str(tmp / "ctrl_replyfd.sock")
 
             ready = threading.Event()
@@ -830,7 +723,7 @@ def test_register_reply_fd_nested_box():
             def run_loop():
                 nonlocal cs
                 asyncio.set_event_loop(cs_loop)
-                cs = m.ChannelServer(sup, eng, sock_path)
+                cs = m.ChannelServer(sup, sock_path)
                 cs_loop.run_until_complete(cs.start())
                 ready.set()
                 cs_loop.run_forever()
@@ -852,8 +745,7 @@ def test_register_reply_fd_nested_box():
 
             # Send the child register (kernel-derived parent = our process ancestry).
             # _FakeMount.add_session creates the minted box_root so register's os.open works.
-            msg = dict(type="register", session_id="CHILD", cmd=["child"],
-                       want_net=False)
+            msg = dict(type="register", session_id="CHILD", cmd=["child"])
             payload = (json.dumps(msg) + "\n").encode()
             own_pidfd = os.pidfd_open(os.getpid())
             child_mount_fd = -1
@@ -935,8 +827,7 @@ def test_register_reply_fd_toplevel_no_fd():
     try:
         m.ensure_dirs()
         # Empty supervisor — no sessions → _derive_parent_sid always returns None.
-        sup2 = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
-        eng2 = _RecordingEngine()
+        sup2 = m.Supervisor(mount=_FakeMount())
         sock2 = str(tmp / "ctrl_top.sock")
 
         ready2 = threading.Event()
@@ -944,7 +835,7 @@ def test_register_reply_fd_toplevel_no_fd():
         def run_loop2():
             nonlocal cs2
             asyncio.set_event_loop(cs2_loop)
-            cs2 = m.ChannelServer(sup2, eng2, sock2)
+            cs2 = m.ChannelServer(sup2, sock2)
             cs2_loop.run_until_complete(cs2.start())
             ready2.set()
             cs2_loop.run_forever()
@@ -952,7 +843,7 @@ def test_register_reply_fd_toplevel_no_fd():
         cs2_thread.start()
         check(ready2.wait(5), "reply-fd-top: loop started")
 
-        msg_top = dict(type="register", session_id="TOPBOX", cmd=["top"], want_net=False)
+        msg_top = dict(type="register", session_id="TOPBOX", cmd=["top"])
         payload_top = (json.dumps(msg_top) + "\n").encode()
         own_pidfd2 = os.pidfd_open(os.getpid())
         top_fd = -1
@@ -1030,7 +921,7 @@ def test_host_register_top_level_name():
     _redirect_state(tmp)
     try:
         m.ensure_dirs()
-        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
+        sup = m.Supervisor(mount=_FakeMount())
         ack = sup.register(dict(session_id="ALPHA", cmd=["true"]))
         check(ack.get("ok") is True, "host-tl: register A ok")
         sid = ack["session_id"]
@@ -1050,7 +941,7 @@ def test_host_register_dotted_child():
     _redirect_state(tmp)
     try:
         m.ensure_dirs()
-        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
+        sup = m.Supervisor(mount=_FakeMount())
         # Create parent A first.
         ack_a = sup.register(dict(session_id="ALPHA", cmd=["true"]))
         check(ack_a.get("ok") is True, "host-child: ALPHA registers ok")
@@ -1076,7 +967,7 @@ def test_host_register_dotted_child_finished_parent():
     _redirect_state(tmp)
     try:
         m.ensure_dirs()
-        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
+        sup = m.Supervisor(mount=_FakeMount())
         # Write a finished parent box on disk (numeric box_id stem, name meta='ALPHA')
         # AFTER the Supervisor is created so it is not a live session.
         pbid = m.mint_box_id()
@@ -1099,7 +990,7 @@ def test_host_register_dotted_parent_not_existing():
     _redirect_state(tmp)
     try:
         m.ensure_dirs()
-        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
+        sup = m.Supervisor(mount=_FakeMount())
         ack = sup.register(dict(session_id="ALPHA.BETA", cmd=["true"]))
         check(ack.get("ok") is False, "host-nopar: rejected (ok False)")
         check("ALPHA" in (ack.get("error") or ""),
@@ -1116,7 +1007,7 @@ def test_inbox_register_relname():
     _redirect_state(tmp)
     try:
         m.ensure_dirs()
-        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
+        sup = m.Supervisor(mount=_FakeMount())
         # Register the parent (enclosing) box.
         ack_a = sup.register(dict(session_id="ALPHA", cmd=["parent"]))
         check(ack_a.get("ok") is True, "inbox: ALPHA registers ok")
@@ -1146,7 +1037,7 @@ def test_inbox_relname_with_dot_rejected():
     _redirect_state(tmp)
     try:
         m.ensure_dirs()
-        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
+        sup = m.Supervisor(mount=_FakeMount())
         ack_a = sup.register(dict(session_id="ALPHA", cmd=["parent"]))
 
         for bad_relname in ("A.B", "../ESCAPE", "/ESCAPE", "A/B"):
@@ -1167,7 +1058,7 @@ def test_inbox_relname_empty_default():
     _redirect_state(tmp)
     try:
         m.ensure_dirs()
-        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
+        sup = m.Supervisor(mount=_FakeMount())
         ack_a = sup.register(dict(session_id="ALPHA", cmd=["parent"]))
         check(ack_a.get("ok") is True, "inbox-default: ALPHA registers ok")
         sid_a = ack_a["session_id"]
@@ -1195,7 +1086,7 @@ def test_inbox_trust_kernel_parent_not_body():
     _redirect_state(tmp)
     try:
         m.ensure_dirs()
-        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
+        sup = m.Supervisor(mount=_FakeMount())
         # Two parent boxes: ALPHA (live) and EVIL (live).
         a = sup.register(dict(session_id="ALPHA", cmd=["alpha"]))["session_id"]
         e = sup.register(dict(session_id="EVIL", cmd=["evil"]))["session_id"]
@@ -1225,7 +1116,7 @@ def test_default_named_box_age_from_ctime():
     _redirect_state(tmp)
     try:
         m.ensure_dirs()
-        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
+        sup = m.Supervisor(mount=_FakeMount())
         ack = sup.register(dict(session_id="MYBOX", cmd=["true"]))
         check(ack.get("ok") is True, "age: MYBOX registers ok")
         s = sup.sessions[ack["session_id"]]
@@ -1242,7 +1133,7 @@ def test_dotted_path_safety():
     _redirect_state(tmp)
     try:
         m.ensure_dirs()
-        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
+        sup = m.Supervisor(mount=_FakeMount())
         bad_names = [
             "../ESCAPE",
             "A/B",
@@ -1273,7 +1164,7 @@ def test_rename_is_meta_only_label_write():
     _redirect_state(tmp)
     try:
         m.ensure_dirs()
-        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
+        sup = m.Supervisor(mount=_FakeMount())
         ack = sup.register(dict(session_id="ALPHA", cmd=["true"]))
         check(ack.get("ok") is True, "rename: ALPHA registers")
         sid = ack["session_id"]
@@ -1404,7 +1295,7 @@ def test_dissolve_happy_path():
     _redirect_state(tmp)
     try:
         m.ensure_dirs()
-        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
+        sup = m.Supervisor(mount=_FakeMount())
         # Tree: A(1) ← B(2) ← C(3) ← D(4)
         _make_finished_box(sup, "1", name="A")
         _make_finished_box(sup, "2", name="B", parent=1)
@@ -1446,7 +1337,7 @@ def test_dissolve_nonempty_finalizes_copydown():
     _redirect_state(tmp)
     try:
         m.ensure_dirs()
-        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
+        sup = m.Supervisor(mount=_FakeMount())
         _make_finished_box(sup, "1", name="A")
         _make_finished_box(sup, "2", name="B", parent=1, with_content=True)  # 'proof.txt'
         _make_finished_box(sup, "3", name="C", parent=2)                     # inherits
@@ -1471,7 +1362,7 @@ def test_dissolve_top_level_child_becomes_top_level():
     _redirect_state(tmp)
     try:
         m.ensure_dirs()
-        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
+        sup = m.Supervisor(mount=_FakeMount())
         _make_finished_box(sup, "1", name="A")                 # top-level
         _make_finished_box(sup, "2", name="C", parent=1, with_content=True)
 
@@ -1494,7 +1385,7 @@ def test_dissolve_refused_when_target_live():
     _redirect_state(tmp)
     try:
         m.ensure_dirs()
-        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
+        sup = m.Supervisor(mount=_FakeMount())
         _make_finished_box(sup, "1", name="A")
         _make_finished_box(sup, "2", name="B", parent=1)
         # Make B itself appear live.
@@ -1520,7 +1411,7 @@ def test_dissolve_live_descendant_allowed():
     _redirect_state(tmp)
     try:
         m.ensure_dirs()
-        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
+        sup = m.Supervisor(mount=_FakeMount())
         _make_finished_box(sup, "1", name="A")
         _make_finished_box(sup, "2", name="B", parent=1)
         _make_finished_box(sup, "3", name="C", parent=2, with_content=True)
@@ -1540,12 +1431,7 @@ def test_dissolve_live_descendant_allowed():
 
 if __name__ == "__main__":
     for t in (test_sid_validation_rejects_traversal,
-              test_relay_fd_gated_by_connection_not_message,
-              test_relay_empty_fds_is_noop,
-              test_relay_direct_meta_sets_kind_and_dest,
-              test_relay_meta_parse,
               test_owner_token_required_for_teardown,
-              test_register_net_no_socket_advertised,
               test_box_cannot_register_or_unregister_a_foreign_session,
               test_command_is_the_root_process_row,
               test_dash_dash_required_and_flag_parsing,

@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --with pytest --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["textual>=0.60","mitmproxy>=11","wcmatch>=8.4","pyfuse3>=3.2",
+# dependencies = ["textual>=0.60","wcmatch>=8.4","pyfuse3>=3.2",
 #                 "trio>=0.22","python-magic>=0.4"]
 # ///
 """Pilot test for the OUTPUTS pane (the `o` view).
@@ -56,7 +56,7 @@ def _seed_box(sid, writes, procs):
         idx.add_output(row_ids[pidx], stream, content)
     idx.close()
 
-    sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=None)
+    sup = m.Supervisor(mount=None)
     sup.sessions[sid] = m.Session(
         session_id=sid, box_id=int(sid), cmd=["sh"],
         live=False, shm_dir=str(backing))
@@ -82,8 +82,7 @@ async def drive(m):
     app = UI()
     # Swap in our pre-seeded Supervisor + add the columns on_mount normally would.
     async def _noop_mount(self):
-        self.query_one("#s-tab").add_columns("F","Name","PID","Cmd","✓","✗","↑","↓","Age")
-        self.query_one("#nf-tab").add_columns("Time","","Method","Host","St","↑","↓")
+        self.query_one("#s-tab").add_columns("F","Name","PID","Cmd","Age")
         self.query_one("#cf-tab").add_columns("","Path","Size")
         self.query_one("#pr-tab").add_columns("TGID","PPID","Exe","Argv")
         self.query_one("#out-tab").add_columns("Time","Stream","Process","Bytes")

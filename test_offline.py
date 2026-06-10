@@ -2,7 +2,8 @@
 """Offline tests (no FUSE mount, no UI event loop) for the SINGLE per-instance db:
 NULL-blob-then-consolidate lifecycle, process/env dedup, file->process tagging, and
 Supervisor change accounting. Run:
-    /home/user/venv/bin/python test_offline.py
+    uv run --with "pyfuse3>=3.2" --with "trio>=0.22" --with "wcmatch>=8.4" \
+      --with "python-magic>=0.4" python test_offline.py
 """
 import os, sys, tempfile, shutil, sqlite3, json, stat as stat_mod, time
 from pathlib import Path
@@ -264,7 +265,7 @@ def test_process_table_is_one_connected_tree():
 
 
 def test_supervisor_no_mount_register_fails_closed():
-    sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=None)
+    sup = m.Supervisor(mount=None)
     ack = sup.register(dict(session_id="BOX", cmd=["true"]))
     check(ack.get("ok") is False, "register without a mount fails closed (no ok)")
     check("error" in ack, "register failure carries an error message")
@@ -361,7 +362,7 @@ def test_finalize_apply_promotes_to_parent():
     _redirect_state(tmp)
     orig_load = m.load_file_rules
     try:
-        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=None)
+        sup = m.Supervisor(mount=None)
         parent_sid, child_sid = "10", "11"
         m._sqlar_open(m.sqlar_path(parent_sid)).close()
         sup.sessions[parent_sid] = m.Session(session_id=parent_sid, box_id=10,
@@ -397,7 +398,7 @@ def test_finalize_apply_writes_host_for_root():
     host_path = Path("/") / host_rel
     try:
         host_path.unlink(missing_ok=True)
-        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=None)
+        sup = m.Supervisor(mount=None)
         sid = "302"; content = b"root apply test\n"
         _finish_box_with_file(sup, sid, host_rel, content, parent=None)
 
@@ -424,7 +425,7 @@ def test_finalize_discard_copies_down_to_children():
     _redirect_state(tmp)
     orig_load = m.load_file_rules
     try:
-        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=None)
+        sup = m.Supervisor(mount=None)
         b = "20"; child_inherits = "21"; child_owns = "22"
         rel = "etc/shared.conf"; b_content = b"from B\n"; d_content = b"D's own\n"
         # B has the file; B.C does NOT (inherits it); B.D HAS its own copy.
@@ -582,7 +583,7 @@ def test_consolidate_size_based_placement():
 
         # ── SqlarArchive.entries() reports the real size for the resident row ────
         # Build a minimal Supervisor just to host a ChangeReview / SqlarArchive.
-        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=None)
+        sup = m.Supervisor(mount=None)
         arch = m.SqlarArchive(sup.review, sid)
         ent = {e["path"]: e for e in arch.entries()}
         check(ent.get("var/big.bin", {}).get("size") == len(big),

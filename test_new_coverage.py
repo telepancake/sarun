@@ -3,14 +3,13 @@
 
 Tests added:
   1. Index case-sensitive subtree isolation (prune_subtree / reparent)
-  2. NetworkPolicy approval_request — TIMEOUT, DENY, ALLOW-PERMANENT
-  3. File-rule passthrough dispatch (engine-level via MountFixture)
-  4. ChangeReview apply_hunk / discard_hunk (unit-level)
-  5. e2e box rename (inline, no UI process needed)
-  6. HTTPS/CONNECT through proxy — skipped (requires real TLS plumbing)
+  2. File-rule passthrough dispatch (engine-level via MountFixture)
+  3. ChangeReview apply_hunk / discard_hunk (unit-level)
+  4. e2e box rename (inline, no UI process needed)
 
 Run with:
-    /home/user/venv/bin/python -m pytest test_new_coverage.py -q
+    uv run --with pytest --with "pyfuse3>=3.2" --with "trio>=0.22" \
+      --with "wcmatch>=8.4" --with "python-magic>=0.4" -m pytest test_new_coverage.py -q
 """
 import asyncio
 import os
@@ -125,158 +124,6 @@ def test_index_case_only_sibling_reparent():
                 f"reparent: no spurious {upper_rel!r} from case-sibling rename"
 
         idx.close()
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
-
-
-# ════════════════════════════════════════════════════════════════════════════
-#  Test 2: NetworkPolicy approval_request — unit-level (asyncio, no real UI)
-# ════════════════════════════════════════════════════════════════════════════
-
-def _make_empty_rules(tmp_dir):
-    """Create a fresh Rules object backed by a temp file (no pre-existing rules)."""
-    rules_file = tmp_dir / "rules.txt"
-    rules_file.write_text("")   # ensure file exists but is empty
-    return m.Rules(rules_file)
-
-
-def test_network_policy_timeout_deny_and_late_resolve_harmless():
-    """TIMEOUT: approval_request with no resolver times out, returns deny, and a late
-    resolve() afterward is a harmless no-op (the pending entry is gone and the late
-    resolve neither raises nor wrongly takes effect).
-
-    The 300-second timeout is monkeypatched to 0.01 s so the test is instant.
-    """
-    import asyncio
-
-    tmp = Path(tempfile.mkdtemp(prefix="np-timeout-"))
-    try:
-        async def _run():
-            rules = _make_empty_rules(tmp)
-            sessions = {}
-            sess = m.Session(session_id="10", box_id=10, cmd=["sh"])
-            sessions["10"] = sess
-            policy = m.NetworkPolicy(
-                rules,
-                resolve_session=sessions.get,
-                record=lambda *a, **k: None,
-                emit=lambda **ev: None,
-            )
-
-            # Monkeypatch the timeout so the test doesn't wait 300 s.
-            import asyncio as _asyncio
-            orig_wait_for = _asyncio.wait_for
-            async def fast_wait_for(coro, timeout=None):
-                return await orig_wait_for(coro, timeout=0.01)
-            _asyncio.wait_for = fast_wait_for
-            try:
-                result = await policy.approval_request("10", "example.com", 80, "http")
-            finally:
-                _asyncio.wait_for = orig_wait_for
-
-            # Outcome must be deny (the default on timeout).
-            assert result["action"] == "deny", \
-                f"timeout: expected deny, got {result['action']!r}"
-
-            # pending must be empty now (the entry is removed after timeout).
-            assert policy.pending == {}, \
-                f"timeout: pending must be empty after timeout (got {policy.pending})"
-
-            # A late resolve for the (now-gone) rid must be a no-op.
-            # We construct the rid the policy would have used: "<sid[:8]>-1"
-            rid = "10-1"
-            try:
-                policy.resolve(rid, "allow", "once")  # must not raise
-            except Exception as exc:
-                raise AssertionError(f"late resolve raised unexpectedly: {exc}")
-
-            # Still no pending, still deny from the already-returned result.
-            assert policy.pending == {}, \
-                "late resolve: pending must still be empty"
-            assert result["action"] == "deny", \
-                "late resolve must not retroactively change the already-returned result"
-
-        asyncio.run(_run())
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
-
-
-def test_network_policy_explicit_deny():
-    """DENY: approval_request resolved via resolve(deny) returns action=deny."""
-    tmp = Path(tempfile.mkdtemp(prefix="np-deny-"))
-    try:
-        async def _run():
-            rules = _make_empty_rules(tmp)
-            sessions = {}
-            sess = m.Session(session_id="20", box_id=20, cmd=["sh"])
-            sessions["20"] = sess
-            policy = m.NetworkPolicy(
-                rules,
-                resolve_session=sessions.get,
-                record=lambda *a, **k: None,
-                emit=lambda **ev: None,
-            )
-
-            # Run approval_request in a background task and resolve it immediately.
-            async def _resolve_after_tick():
-                # One tick so the approval_request reaches the await.
-                await asyncio.sleep(0)
-                rid = "20-1"
-                policy.resolve(rid, "deny", "once")
-
-            task = asyncio.ensure_future(policy.approval_request(
-                "20", "badhost.local", 443, "https"))
-            await _resolve_after_tick()
-            result = await task
-
-            assert result["action"] == "deny", \
-                f"explicit deny: expected deny, got {result['action']!r}"
-            assert policy.pending == {}, "deny: pending cleared"
-
-        asyncio.run(_run())
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
-
-
-def test_network_policy_allow_permanent_adds_rule():
-    """ALLOW with PERMANENT scope: approval_request resolved with scope=permanent adds
-    a permanent rule to the ruleset."""
-    tmp = Path(tempfile.mkdtemp(prefix="np-perm-"))
-    try:
-        async def _run():
-            rules = _make_empty_rules(tmp)
-            sessions = {}
-            sess = m.Session(session_id="30", box_id=30, cmd=["sh"])
-            sessions["30"] = sess
-            emitted = []
-            policy = m.NetworkPolicy(
-                rules,
-                resolve_session=sessions.get,
-                record=lambda *a, **k: None,
-                emit=lambda **ev: emitted.append(ev),
-            )
-
-            async def _resolve_after_tick():
-                await asyncio.sleep(0)
-                rid = "30-1"
-                policy.resolve(rid, "allow", "permanent", spec="host:good.example.com")
-
-            task = asyncio.ensure_future(policy.approval_request(
-                "30", "good.example.com", 443, "https"))
-            await _resolve_after_tick()
-            result = await task
-
-            assert result["action"] == "allow", \
-                f"permanent allow: expected allow, got {result['action']!r}"
-            # A permanent rule must have been inserted into the ruleset.
-            rule_lines = [r.to_line() for r in rules.rules]
-            assert any("allow" in rl and "good.example.com" in rl for rl in rule_lines), \
-                f"permanent allow: no rule added to ruleset (got {rule_lines!r})"
-            # rules_updated event must have been emitted.
-            assert any(ev.get("type") == "rules_updated" for ev in emitted), \
-                f"permanent allow: no rules_updated event emitted (got {emitted!r})"
-
-        asyncio.run(_run())
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -434,7 +281,7 @@ def test_change_review_apply_hunk_and_discard_hunk():
         idx.close()
 
         # ── Wire a minimal Supervisor so ChangeReview can read the box ─────
-        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=None)
+        sup = m.Supervisor(mount=None)
         sup.sessions[sid] = m.Session(
             session_id=sid, box_id=int(sid), cmd=["sh"],
             live=False, shm_dir=str(backing))
@@ -526,12 +373,11 @@ def test_box_rename_label_only():
             try: (m.mnt_point() / str(sid)).mkdir(parents=True, exist_ok=True)
             except Exception: pass
         def remove_session(self, sid): self.ops.remove_session(sid)
-        def add_ca_spoof(self, *a, **k): pass
         def set_parent(self, sid, parent): pass
 
     try:
         m.ensure_dirs()
-        sup = m.Supervisor(m.Rules(Path("/nonexistent")), mount=_FakeMount())
+        sup = m.Supervisor(mount=_FakeMount())
 
         # Register a named box.
         ack = sup.register(dict(session_id="OLDNAME", cmd=["true"]))
@@ -590,30 +436,6 @@ def test_box_rename_label_only():
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  Test 6: HTTPS/CONNECT proxy gate — SKIPPED
-# ════════════════════════════════════════════════════════════════════════════
-
-def test_https_connect_proxy_gate_skipped():
-    """HTTPS/CONNECT through the proxy gate (_GatingAddon.http_connect / TLS tunnel).
-
-    SKIPPED: exercising this path requires:
-      1. A real mitmproxy ProxyServer instance with a running asyncio event loop.
-      2. A live TLS certificate (mitmproxy's CA or a self-signed one) installed in a
-         test trust store, so an HTTPS client can complete the handshake.
-      3. A real TCP connection to a target HTTPS server (or a local TLS echo server).
-    None of these are feasible without significant test infrastructure (a real
-    network-available HTTPS endpoint or a local TLS server, mitmproxy's CA plumbing,
-    and a correctly wired ProxyEngine).  The existing net-flow tests in test_net_flow.py
-    cover the HTTP non-TLS gating path.  The TLS path would require the scaffolding
-    described above.
-    """
-    import pytest
-    pytest.skip(
-        "HTTPS/CONNECT requires real TLS plumbing (mitmproxy CA, live TLS endpoint, "
-        "running ProxyServer + event loop). Infrastructure not available in this env.")
-
-
-# ════════════════════════════════════════════════════════════════════════════
 
 def test_fmt_bytes_is_module_level():
     """Regression guard: fmt_bytes must be a MODULE-LEVEL function. It was once
@@ -636,16 +458,14 @@ def test_fmt_bytes_is_module_level():
 # ════════════════════════════════════════════════════════════════════════════
 
 def test_capeff_has_caps_parses_known_hex():
-    """_capeff_has_caps must require BOTH CAP_SYS_ADMIN (bit 21) and
-    CAP_NET_ADMIN (bit 12)."""
+    """_capeff_has_caps requires CAP_SYS_ADMIN (bit 21). Boxes now run in the host
+    network namespace, so CAP_NET_ADMIN is no longer needed."""
     CAP_NET_ADMIN = 1 << 12
     CAP_SYS_ADMIN = 1 << 21
-    both = CAP_NET_ADMIN | CAP_SYS_ADMIN
-    assert m._capeff_has_caps(format(both, "x")) is True
-    # A full set (all 64 bits) trivially includes both.
+    assert m._capeff_has_caps(format(CAP_SYS_ADMIN, "x")) is True
+    # A full set (all 64 bits) trivially includes it.
     assert m._capeff_has_caps("0000003fffffffff") is True
-    # Only one of the two → False.
-    assert m._capeff_has_caps(format(CAP_SYS_ADMIN, "x")) is False
+    # CAP_NET_ADMIN alone is not enough.
     assert m._capeff_has_caps(format(CAP_NET_ADMIN, "x")) is False
     # Empty / no caps → False.
     assert m._capeff_has_caps("0000000000000000") is False
@@ -655,11 +475,10 @@ def test_capeff_has_caps_parses_known_hex():
 
 
 def test_have_ambient_caps_reflects_status_file(tmp_path, monkeypatch):
-    """_have_ambient_caps parses CapEff from /proc/self/status; True when both
-    caps present, False when absent, False when the file is unreadable."""
-    CAP_NET_ADMIN = 1 << 12
+    """_have_ambient_caps parses CapEff from /proc/self/status; True when
+    CAP_SYS_ADMIN present, False when absent, False when the file is unreadable."""
     CAP_SYS_ADMIN = 1 << 21
-    both = format(CAP_NET_ADMIN | CAP_SYS_ADMIN, "016x")
+    both = format(CAP_SYS_ADMIN, "016x")
     none = "0000000000000000"
 
     real_open = open
