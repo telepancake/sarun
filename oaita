@@ -68,13 +68,17 @@ key come from ``--base-url`` / ``--api-key`` or, when unset, the SDK's
 the configured base_url — no phone-home).
 
     oaita gen <name> [--model M] [--base-url URL] [--api-key KEY]
-                     [--tools [--tool-context NAME] [--capabilities TEXT]]
+                     [--tool-context NAME] [--capabilities TEXT]
 
-Tool calling (opt-in via ``--tools`` / ``generate(..., tools=True)``) exposes ONE
-meta-tool, ``act``: when the model "calls" it, oaita does NOT execute anything —
-it STITCHES the call into a separate, persistent inner session and ``gen``s that
-to produce the result, which is fed back as the tool result. Each ``act`` call is
-thus a re-addressable recursive sub-agent (continue it later via ``follow_up``).
+Tool calling is ALWAYS on: a normal context is given ONE meta-tool, ``act``.
+When the model "calls" it, oaita does NOT execute anything — it STITCHES the call
+into a separate, persistent inner session and ``gen``s that to produce the
+result, which is fed back as the tool result. Each ``act`` call is thus a
+re-addressable recursive sub-agent (continue it later via ``follow_up``). The
+single generation path streams content to disk as usual and dispatches a
+sub-agent only if the reply turns out to be a tool call; the inner/leaf context
+is run with no tools (until MCP wires real ones in). Intended for tool-capable
+models only.
 
 Sections:
     1 · Imports & session paths
@@ -412,20 +416,6 @@ def resolve_model(model: str | None) -> str:
     return chosen
 
 
-def stream_deltas(stream):
-    """Yield successive text-content deltas from a streaming SDK response.
-
-    Mirrors the assembly idea in oaita_fakeclient, but yields each delta so the
-    consumer can write it to a file + stdout instead of buffering the whole reply.
-    """
-    for chunk in stream:
-        if not chunk.choices:
-            continue
-        delta = chunk.choices[0].delta
-        if delta.content:
-            yield delta.content
-
-
 # ════════════════════════════════════════════════════════════════════════════
 #  4b · Tool calling: the `act` meta-tool + streamed tool-call assembly
 # ════════════════════════════════════════════════════════════════════════════
@@ -515,47 +505,52 @@ class _AssembledToolCall:
     arguments: str
 
 
-def assemble_response(stream) -> AssembledResponse:
-    """Consume a streaming SDK response and assemble content + tool_calls.
+def stream_to_file(stream, target: Path, echo) -> AssembledResponse:
+    """Stream a chat-completion reply to ``target`` while collecting tool calls.
 
-    Reproduces the assembly idea from ``oaita_fakeclient.assemble_stream``:
-    concatenate ``delta.content``; accumulate ``delta.tool_calls`` fragments by
-    their ``index`` (concatenate ``function.arguments``, take the first non-null
-    ``id`` / ``function.name``); capture the terminal ``finish_reason``.
+    Content deltas are written to ``target`` and flushed PER DELTA (so an
+    interrupt mid-stream leaves resumable partial text on disk) and echoed live
+    via ``echo``. Tool-call fragments are accumulated by ``index`` in the SAME
+    pass — you learn a reply is a tool call from ``delta.tool_calls`` as it
+    arrives, with no need to buffer the whole thing. Returns the assembled
+    response; ``target`` already holds the streamed content on return (empty for
+    a pure tool call).
     """
     content_parts: list[str] = []
     tc_acc: dict[int, dict] = {}
     finish_reason: str | None = None
 
-    for chunk in stream:
-        if not chunk.choices:
-            continue
-        choice = chunk.choices[0]
-        delta = choice.delta
-        if delta.content:
-            content_parts.append(delta.content)
-        if delta.tool_calls:
-            for tc_delta in delta.tool_calls:
-                idx = tc_delta.index
-                acc = tc_acc.setdefault(
-                    idx, {"id": None, "name": None, "arguments": ""})
-                if tc_delta.id:
-                    acc["id"] = tc_delta.id
-                fn = tc_delta.function
-                if fn:
-                    if fn.name:
-                        acc["name"] = fn.name
-                    if fn.arguments:
-                        acc["arguments"] += fn.arguments
-        if choice.finish_reason:
-            finish_reason = choice.finish_reason
+    with open(target, "w", encoding="utf-8") as f:
+        f.truncate(0)
+        for chunk in stream:
+            if not chunk.choices:
+                continue
+            choice = chunk.choices[0]
+            delta = choice.delta
+            if delta.content:
+                f.write(delta.content)
+                f.flush()
+                echo(delta.content)
+                content_parts.append(delta.content)
+            if delta.tool_calls:
+                for tc_delta in delta.tool_calls:
+                    acc = tc_acc.setdefault(
+                        tc_delta.index, {"id": None, "name": None, "arguments": ""})
+                    if tc_delta.id:
+                        acc["id"] = tc_delta.id
+                    fn = tc_delta.function
+                    if fn:
+                        if fn.name:
+                            acc["name"] = fn.name
+                        if fn.arguments:
+                            acc["arguments"] += fn.arguments
+            if choice.finish_reason:
+                finish_reason = choice.finish_reason
 
     tool_calls = [
         _AssembledToolCall(
-            id=tc_acc[i]["id"],
-            name=tc_acc[i]["name"],
-            arguments=tc_acc[i]["arguments"],
-        )
+            id=tc_acc[i]["id"], name=tc_acc[i]["name"],
+            arguments=tc_acc[i]["arguments"])
         for i in sorted(tc_acc)
     ]
     return AssembledResponse(
@@ -686,7 +681,7 @@ def generate(
     api_key: str | None = None,
     client: openai.OpenAI | None = None,
     echo=None,
-    tools: bool = False,
+    tools: list | None = None,
     tool_context: str | None = None,
     capabilities: str | None = None,
     max_tool_iters: int = 8,
@@ -707,21 +702,26 @@ def generate(
     its reply, that line is stripped before the turn is stored; for a newly
     appended turn a valid, unique id the model chose is adopted as the slug.
 
-    Streams the model's reply, writing each delta to the target file (flushed
-    per delta, so an interrupt leaves resumable partial text) and echoing it
-    live via ``echo`` (defaults to writing stdout). Returns the list of turn
-    files written/updated.
+    The reply is streamed to the target file (flushed per delta, so an interrupt
+    leaves resumable partial text) and echoed live via ``echo`` (defaults to
+    stdout). If the model imitates the id-header atop its reply, that line is
+    stripped before storing; a valid, unique id it chose is adopted as the slug
+    on an appended turn.
 
-    TOOL CALLING (opt-in via ``tools=True``) exposes ONE meta-tool, ``act``, and
-    runs a bounded recursive-sub-agent loop instead of a single shot — see
-    ``_generate_with_tools``. ``tool_context`` names a session of (fixed) tool
-    descriptions stitched before each per-call inner session; ``capabilities``
-    overrides ``DEFAULT_CAPABILITIES`` in the ``act`` description;
-    ``max_tool_iters`` bounds the loop. When ``tools=False`` (the default) the
-    behaviour is EXACTLY as before — no ``tools`` param is sent.
+    TOOL CALLING is ALWAYS on: a normal context (``tools=None``) is given exactly
+    ONE meta-tool, ``act``, and runs a bounded recursive-sub-agent loop. When the
+    model calls ``act``, the call is stitched into a persistent inner session and
+    `gen`d to produce the result (fed back as a ``.tool`` turn); each call is a
+    re-addressable sub-agent (continue it via ``follow_up``). The inner/leaf
+    context is invoked with ``tools=[]`` so it answers directly (until MCP wires
+    real tools in) and the loop terminates on its first pass. ``tool_context``
+    names a fixed (cacheable) tool-description session stitched before each inner
+    call; ``capabilities`` overrides ``DEFAULT_CAPABILITIES``; ``max_tool_iters``
+    bounds the loop.
 
-    Raises ``SystemExit`` (non-zero) on an invalid name, or if the stitched
-    context has no turns at all — no empty files are created.
+    Returns the list of turn files written across the loop, in order. Raises
+    ``SystemExit`` on an invalid name or an empty stitched context — no empty
+    files are created.
     """
     model = resolve_model(model)
     if client is None:
@@ -731,37 +731,81 @@ def generate(
             sys.stdout.write(text)
             sys.stdout.flush()
 
-    if tools:
-        return _generate_with_tools(
-            name, model=model, client=client, echo=echo,
-            base_url=base_url, api_key=api_key,
-            tool_context=tool_context, capabilities=capabilities,
-            max_tool_iters=max_tool_iters)
+    # The normal context ALWAYS carries the single `act` meta-tool. The inner
+    # leaf execution context is called with tools=[] so it answers directly —
+    # offering no tool makes the loop below terminate on its first pass — which
+    # is exactly where real MCP tools will plug in later.
+    if tools is None:
+        tools = [meta_tool(
+            capabilities if capabilities is not None else DEFAULT_CAPABILITIES)]
+    tools_param = tools or None
 
-    ctx = prepare_context(name)
-    target = ctx.target
+    target_seg = parse_stitch(name)[-1]
 
-    ctx.target_folder.mkdir(parents=True, exist_ok=True)
-    stream = client.chat.completions.create(
-        model=model, messages=ctx.messages, stream=True)
+    def silent(_text: str):
+        return None
 
-    # A single generation can persist MORE than one turn (the tooled path does).
-    # On this non-tooled path it produces exactly the streamed assistant turn.
     produced: list[Path] = []
+    for _ in range(max_tool_iters):
+        ctx = prepare_context(name)
+        ctx.target_folder.mkdir(parents=True, exist_ok=True)
+        stream = client.chat.completions.create(
+            model=model, messages=ctx.messages, tools=tools_param, stream=True)
+        resp = stream_to_file(stream, ctx.target, echo)
 
-    # Stream the assistant content incrementally onto the target file. Truncate
-    # first so a regenerated turn replaces (never appends to) its prior text.
-    with open(target, "w", encoding="utf-8") as f:
-        f.truncate(0)
-        for delta in stream_deltas(stream):
-            f.write(delta)
-            f.flush()
-            echo(delta)
+        if not resp.tool_calls:
+            # FINAL answer: the streamed content is already on disk. Strip an
+            # imitated id-header and adopt a valid model-chosen id on append.
+            produced.append(_finalize_answer(ctx.target, ctx))
+            return produced
 
-    # Absorb a turn-id header the model imitated atop its reply: strip it so the
-    # stored turn stays raw. For a freshly appended turn, let the id the model
-    # chose stick if it is a valid, session-unique slug (rename the file to it);
-    # a regenerated turn keeps its stable id so existing references survive.
+        # A tool call → run a sub-agent (the FIRST call). Repurpose the
+        # just-streamed target as the OUTER tool-call turn; its content becomes
+        # the raw request (overwriting any streamed preamble).
+        call = resp.tool_calls[0]
+        request, data, follow_up = _parse_act_arguments(call.arguments)
+        call_turn = ctx.target
+        call_slug = parse_turn(call_turn).slug
+        # New call → the inner session IS this turn's id (handle == turn-id); a
+        # follow_up continues the referenced existing sub-agent instead.
+        innerid = follow_up if (follow_up and _NAME_RE.match(follow_up)) \
+            else call_slug
+        call_turn.write_text(request, encoding="utf-8")
+        produced.append(call_turn)
+
+        # Seed/append the inner session, then run it as a LEAF: tools=[] (no
+        # recursion — it answers directly until MCP wires real tools in).
+        inner_user = request if not data else f"{request}\n\n{data}"
+        append_raw_turn(innerid, "user", inner_user)
+        stitch_spec = f"{tool_context}.{innerid}" if tool_context else innerid
+        inner = generate(
+            stitch_spec, model=model, base_url=base_url, api_key=api_key,
+            client=client, echo=silent, tools=[])
+        result = inner[-1].read_text(encoding="utf-8")
+
+        # Persist the OUTER tool-result turn (type tool, fresh unique slug).
+        outer_slugs = {t.slug for t in load_turns(target_seg) if t.slug}
+        produced.append(append_raw_turn(
+            target_seg, "tool", result, slug=new_turn_id(outer_slugs)))
+
+    # Loop hit the cap while still calling tools — persist a terminal note.
+    ctx = prepare_context(target_seg)
+    ctx.target_folder.mkdir(parents=True, exist_ok=True)
+    note = f"[oaita: stopped after {max_tool_iters} tool iterations]"
+    ctx.target.write_text(note, encoding="utf-8")
+    echo(note)
+    produced.append(ctx.target)
+    return produced
+
+
+def _finalize_answer(target: Path, ctx: _PreparedContext) -> Path:
+    """Finalise a streamed FINAL answer already written to ``target``.
+
+    The reply's content is on disk (streamed there by ``stream_to_file``). Strip
+    an id-header the model imitated atop it (keeping the file raw) and, on an
+    appended turn, adopt a valid, session-unique id the model chose as the slug
+    (renaming the file). Returns the (possibly renamed) path.
+    """
     body = target.read_text(encoding="utf-8")
     emitted_id, stripped = strip_emitted_turn_id(body)
     if emitted_id is not None:
@@ -774,147 +818,7 @@ def generate(
                     tgt.number, tgt.type, emitted_id)
                 if adopted != target:
                     target.rename(adopted)
-                    ctx.existing_slugs.discard(tgt.slug)
-                    ctx.existing_slugs.add(emitted_id)
-                    target = adopted
-    produced.append(target)
-
-    return produced
-
-
-def _assembled_for(name: str, client, model, *, tools_param) -> AssembledResponse:
-    """Build the outer prompt for ``name`` and return the assembled response.
-
-    Reuses ``prepare_context`` (the same load → assign-slugs → stitch →
-    uniqueness → inject-headers pipeline the non-tooled path uses), then calls
-    the model WITH ``tools=tools_param`` and BUFFERS the streamed reply via
-    ``assemble_response`` (content + tool_calls + finish_reason). This is the
-    tooled path's per-iteration shared front half — no streaming-to-disk here
-    (a documented stage-1 simplification).
-    """
-    ctx = prepare_context(name)
-    stream = client.chat.completions.create(
-        model=model, messages=ctx.messages, stream=True, tools=tools_param)
-    return assemble_response(stream)
-
-
-def _generate_with_tools(
-    name: str,
-    *,
-    model: str,
-    client,
-    echo,
-    base_url: str | None,
-    api_key: str | None,
-    tool_context: str | None,
-    capabilities: str | None,
-    max_tool_iters: int,
-) -> list[Path]:
-    """Bounded recursive-sub-agent loop for the tooled (``tools=True``) path.
-
-    Each iteration re-builds the OUTER prompt for ``name`` (the session grows on
-    disk between passes) and calls the model with the single ``act`` meta-tool.
-    A reply with NO tool_calls is the FINAL answer — persisted as the next
-    ``.assistant`` turn and the loop stops. A reply WITH a tool_call stitches the
-    call into a persistent inner session (a re-addressable sub-agent), `gen`s
-    that inner context plainly (tools=False — no recursion yet), and feeds the
-    result back as a ``.tool`` turn; the loop continues so the call+result turns
-    re-enter the outer context as messages.
-
-    Returns every outer turn path produced across the loop, in order. A silent
-    ``echo`` is used for the inner generations so only the outer reply surfaces.
-    """
-    target_seg = parse_stitch(name)[-1]
-    caps = capabilities if capabilities is not None else DEFAULT_CAPABILITIES
-    tools_param = [meta_tool(caps)]
-
-    def silent(_text: str):
-        return None
-
-    produced: list[Path] = []
-
-    for _ in range(max_tool_iters):
-        resp = _assembled_for(name, client, model, tools_param=tools_param)
-
-        if not resp.tool_calls:
-            # FINAL answer: persist via the same plan the non-tooled path uses
-            # (append-or-regenerate the target segment's tail) and stop.
-            produced.append(_persist_final(target_seg, resp.content, echo))
-            return produced
-
-        # A tool call → run a sub-agent. Use the FIRST call.
-        call = resp.tool_calls[0]
-        request, data, follow_up = _parse_act_arguments(call.arguments)
-
-        # The outer session's slug set guards new inner-id minting.
-        outer_slugs = {t.slug for t in load_turns(target_seg) if t.slug}
-
-        if follow_up and _NAME_RE.match(follow_up):
-            # Continue an existing sub-agent; its inner-id is already taken so
-            # the outer tool-call turn gets a FRESH slug.
-            innerid = follow_up
-            call_slug = new_turn_id(outer_slugs)
-        else:
-            # A NEW sub-agent: the inner-id IS the outer tool-call turn's slug,
-            # so the sub-agent handle == that turn's turn-id.
-            innerid = new_turn_id(outer_slugs)
-            call_slug = innerid
-
-        # Persist the OUTER tool-call turn (content = raw request text).
-        produced.append(
-            append_raw_turn(target_seg, "assistant", request, slug=call_slug))
-
-        # Seed/append the INNER session with the request (+ data if given).
-        inner_user = request if not data else f"{request}\n\n{data}"
-        append_raw_turn(innerid, "user", inner_user)
-
-        # Run the inner generation plainly (tools=False — no recursion yet),
-        # stitching the fixed tool-description context before it if configured.
-        stitch_spec = f"{tool_context}.{innerid}" if tool_context else innerid
-        inner = generate(
-            stitch_spec, model=model, base_url=base_url, api_key=api_key,
-            client=client, echo=silent)
-        result = inner[-1].read_text(encoding="utf-8")
-
-        # Persist the OUTER tool-result turn (type tool, fresh unique slug).
-        outer_slugs2 = {t.slug for t in load_turns(target_seg) if t.slug}
-        produced.append(append_raw_turn(
-            target_seg, "tool", result, slug=new_turn_id(outer_slugs2)))
-
-    # Loop hit the cap while still wanting tools — persist a final note and stop.
-    produced.append(_persist_final(
-        target_seg,
-        f"[oaita: stopped after {max_tool_iters} tool iterations]",
-        echo))
-    return produced
-
-
-def _persist_final(target_seg: str, content: str, echo) -> Path:
-    """Persist a buffered FINAL assistant answer to the target session.
-
-    Reuses ``prepare_context``'s plan (append a new ``.assistant`` turn, or
-    regenerate the tail in place) so the tooled path's final write is identical
-    to the non-tooled one — minus streaming (the content is already buffered).
-    Echoes the content, strips an imitated id-header, and adopts a valid unique
-    model-chosen id on append (mirroring the non-tooled path).
-    """
-    ctx = prepare_context(target_seg)
-    target = ctx.target
-    ctx.target_folder.mkdir(parents=True, exist_ok=True)
-
-    emitted_id, body = strip_emitted_turn_id(content)
-    target.write_text(body, encoding="utf-8")
-    echo(body)
-
-    if emitted_id is not None and not ctx.is_regenerate:
-        tgt = parse_turn(target)
-        others = ctx.existing_slugs - {tgt.slug}
-        if _ADOPTABLE_SLUG_RE.match(emitted_id) and emitted_id not in others:
-            adopted = target.parent / turn_filename(
-                tgt.number, tgt.type, emitted_id)
-            if adopted != target:
-                target.rename(adopted)
-                target = adopted
+                    return adopted
     return target
 
 
@@ -967,9 +871,6 @@ def build_parser() -> argparse.ArgumentParser:
     gen.add_argument("--api-key", default=None,
                      help="API key (else $OPENAI_API_KEY)")
     gen.add_argument(
-        "--tools", action="store_true",
-        help="enable the recursive-sub-agent `act` meta-tool (off by default)")
-    gen.add_argument(
         "--tool-context", default=None, metavar="NAME",
         help="session of fixed tool descriptions stitched before each "
              "per-call inner sub-agent context")
@@ -988,7 +889,6 @@ def _cmd_gen(args) -> int:
         model=args.model,
         base_url=args.base_url,
         api_key=args.api_key,
-        tools=args.tools,
         tool_context=args.tool_context,
         capabilities=args.capabilities,
     )
@@ -1039,10 +939,9 @@ def main(argv=None) -> int:
 #     `.tool` files and relies on the turn-id system (not `tool_call_id`) to
 #     thread call↔result. A strict-server adapter would need to synthesise the
 #     assistant `tool_calls`/`tool_call_id` envelope at send time.
-#   • No streaming-to-disk resumability on the tooled path: the tooled loop
-#     BUFFERS each model reply (assemble_response) rather than writing deltas as
-#     they arrive, so an interrupt mid-iteration is not resumable the way the
-#     non-tooled path is. A documented stage-1 simplification.
+#   • A turn that EMITS a tool call streams any preamble content to its target
+#     and then overwrites it with the request; the preamble (if any) is dropped.
+#     Fine for now — revisit if models routinely narrate before calling `act`.
 #   • Cross-conversation inner-id collision: inner sub-agent sessions are GLOBAL
 #     by turn-id (a session named after the call's slug). Two different outer
 #     conversations that mint the same inner-id would share one inner session.

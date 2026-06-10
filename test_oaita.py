@@ -53,7 +53,7 @@ Covered:
      system turn before the inner user turn.
  30. Follow-up: follow_up continues the existing sub-agent (appends user+assistant
      to it, not duplicated) and yields a new outer .tool result turn.
- 31. Default off: no `tools` param sent and exactly one assistant turn produced.
+ 31. Always-on: the `act` tool is offered by default; a plain reply is one turn.
  32. Iteration cap: an always-calling model terminates the loop within the cap,
      leaving a final assistant turn and ≤ cap tool-result turns.
 
@@ -798,7 +798,7 @@ def test_tools_happy_path():
             tool_calls=[("act", '{"request": "search the thing"}', "call_1")]))
         s.srv.enqueue(CannedChat(content="THE RESULT"))
         s.srv.enqueue(CannedChat(content="final answer"))
-        produced = s.generate("conv", tools=True)
+        produced = s.generate("conv")
         conv = oaita.session_dir("conv")
 
         check("outer turn types are user, assistant, tool, assistant",
@@ -839,7 +839,7 @@ def test_tools_capabilities_surfaced():
     try:
         s.write_turn("conv", "0010.user", "do X")
         s.srv.enqueue(CannedChat(content="answer"))  # no tool call → one shot
-        s.generate("conv", tools=True, capabilities="bespoke power")
+        s.generate("conv", capabilities="bespoke power")
         tools = s.srv.requests[-1].json.get("tools")
         check("a single tool advertised", isinstance(tools, list) and len(tools) == 1)
         fn = tools[0]["function"]
@@ -850,7 +850,7 @@ def test_tools_capabilities_surfaced():
         # And the default capabilities surface when none is passed.
         s.srv.enqueue(CannedChat(content="answer2"))
         s.write_turn("conv2", "0010.user", "do Y")
-        s.generate("conv2", tools=True)
+        s.generate("conv2")
         fn2 = s.srv.requests[-1].json["tools"][0]["function"]
         check("default capabilities embedded when none passed",
               oaita.DEFAULT_CAPABILITIES in fn2["description"])
@@ -868,7 +868,7 @@ def test_tools_tool_context_stitched():
             tool_calls=[("act", '{"request": "use a tool"}', "call_1")]))
         s.srv.enqueue(CannedChat(content="inner result"))  # inner gen
         s.srv.enqueue(CannedChat(content="final"))         # outer final
-        s.generate("conv", tools=True, tool_context="tooldesc")
+        s.generate("conv", tool_context="tooldesc")
 
         # Requests captured: outer#1, inner (tooldesc.<id>), outer#2.
         # The INNER call is the one whose first message is the tooldesc system.
@@ -895,7 +895,7 @@ def test_tools_follow_up():
             tool_calls=[("act", '{"request": "search the thing"}', "call_1")]))
         s.srv.enqueue(CannedChat(content="RESULT1"))
         s.srv.enqueue(CannedChat(content="ok so far"))
-        s.generate("conv", tools=True)
+        s.generate("conv")
         conv = oaita.session_dir("conv")
         callfile = sorted(p.name for p in conv.iterdir()
                           if p.name.endswith(".assistant"))[0]
@@ -907,7 +907,7 @@ def test_tools_follow_up():
             "call_2")]))
         s.srv.enqueue(CannedChat(content="RESULT2"))
         s.srv.enqueue(CannedChat(content="done"))
-        s.generate("conv", tools=True)
+        s.generate("conv")
 
         inner = oaita.session_dir(handle)
         check("inner H now has two user + two assistant turns",
@@ -930,18 +930,18 @@ def test_tools_follow_up():
         s.close()
 
 
-# ── 31. default off: no tools sent, single assistant turn ────────────────────
-def test_tools_default_off():
+# ── 31. always-on: the `act` tool is offered by default; plain reply is 1 turn ─
+def test_tools_always_on_plain_reply():
     s = Session()
     try:
         s.write_turn("conv", "0010.user", "hi")
         s.srv.enqueue(CannedChat(content="plain reply"))
-        produced = s.generate("conv")  # no tools=True
-        check("no tools param sent by default",
-              s.srv.requests[-1].json.get("tools") is None)
-        check("exactly one assistant turn produced", len(produced) == 1)
-        check("produced turn is an assistant turn",
-              produced[0].name.endswith(".assistant"))
+        produced = s.generate("conv")  # no flag — act is always offered
+        check("the act tool IS offered by default (always-on)",
+              s.srv.requests[-1].json["tools"][0]["function"]["name"] == "act")
+        check("a content-only reply yields exactly one assistant turn",
+              len(produced) == 1 and produced[0].name.endswith(".assistant"))
+        check("plain reply stored raw", produced[0].read_text() == "plain reply")
     finally:
         s.close()
 
@@ -959,7 +959,7 @@ def test_tools_iteration_cap():
                 tool_calls=[("act", '{"request": "again"}', f"c{i}")]))
             s.srv.enqueue(CannedChat(content=f"inner {i}"))
         s.srv.enqueue(CannedChat(content="would-be final"))
-        produced = s.generate("conv", tools=True, max_tool_iters=cap)
+        produced = s.generate("conv", max_tool_iters=cap)
         conv = oaita.session_dir("conv")
         tool_turns = [p for p in conv.iterdir() if p.name.endswith(".tool")]
         check("tool-result turns do not exceed the cap",
@@ -1008,7 +1008,7 @@ if __name__ == "__main__":
         test_tools_capabilities_surfaced,
         test_tools_tool_context_stitched,
         test_tools_follow_up,
-        test_tools_default_off,
+        test_tools_always_on_plain_reply,
         test_tools_iteration_cap,
     ]
     for t in tests:
