@@ -31,6 +31,12 @@ Covered:
  12. Generated assistant turn gets a slug matching ^[a-z]{5}$.
  13. Uniqueness: pairwise-distinct ids across a session with many slug-less turns.
  14. Regenerate keeps id stable: second generate does not change the tail's slug.
+ 15. Sloppy parsing of a model-emitted turn-id header (pure function): quote/
+     key/whitespace variants stripped; non-leading headers left alone.
+ 16. Append adopts a valid, unique model-emitted id (and strips the header).
+ 17. Append rejects a duplicate model id, keeping the generated one (still strips).
+ 18. Append rejects an invalid (non-slug) model id, keeping the generated one.
+ 19. Regenerate strips an emitted header but holds the tail's id stable.
 
 Dual style: standalone (`./test_oaita.py` → `ALL PASS`) and pytest-compatible.
 """
@@ -498,6 +504,103 @@ def test_regenerate_keeps_id_stable():
         s.close()
 
 
+# ── 15. sloppy parsing of a model-emitted turn-id header (pure function) ─────
+def test_strip_emitted_header_unit():
+    f = oaita.strip_emitted_turn_id
+    check("canonical header stripped, id captured",
+          f('{"turn-id": "abcde"}\nbody') == ("abcde", "body"))
+    check("no-space-after-colon variant stripped",
+          f('{"turn-id":"abcde"}\nbody') == ("abcde", "body"))
+    check("single-quoted variant stripped",
+          f("{'turn-id': 'abcde'}\nbody") == ("abcde", "body"))
+    check("underscore key (turn_id) variant stripped",
+          f('{"turn_id": "abcde"}\nbody') == ("abcde", "body"))
+    check("extra inner whitespace tolerated",
+          f('{ "turn-id" : "abcde" }\nbody') == ("abcde", "body"))
+    check("leading blank line before header tolerated",
+          f('\n{"turn-id": "abcde"}\nbody') == ("abcde", "body"))
+    check("header with no trailing newline / no body",
+          f('{"turn-id": "abcde"}') == ("abcde", ""))
+    check("only the first line is stripped; multi-line body preserved",
+          f('{"turn-id": "abcde"}\nl1\nl2') == ("abcde", "l1\nl2"))
+    check("plain content is unchanged",
+          f("just a normal reply") == (None, "just a normal reply"))
+    check("a header NOT at the start is not stripped",
+          f('hi\n{"turn-id": "abcde"}\n') == (None, 'hi\n{"turn-id": "abcde"}\n'))
+
+
+# ── 16. append: a valid, unique model id is adopted; header stripped ─────────
+def test_append_adopts_model_id():
+    s = Session()
+    try:
+        name = "adopt"
+        s.write_turn(name, "0010-hi.user", "hello")
+        # The model imitates the header and picks a valid, unique id.
+        s.srv.enqueue(CannedChat(content='{"turn-id": "kitty"}\nthe real body'))
+        produced = s.generate(name)
+        folder = oaita.session_dir(name)
+        check("header stripped from the stored file (raw body only)",
+              produced[0].read_text() == "the real body")
+        check("model's chosen id adopted as the slug",
+              produced[0].name == "0020-kitty.assistant")
+        check("no 'turn-id' persisted to disk",
+              all("turn-id" not in p.read_text()
+                  for p in folder.iterdir() if p.is_file()))
+    finally:
+        s.close()
+
+
+# ── 17. append: a duplicate model id is rejected; generated id kept ──────────
+def test_append_rejects_duplicate_id():
+    s = Session()
+    try:
+        name = "dup"
+        s.write_turn(name, "0010-dupid.user", "hello")
+        s.srv.enqueue(CannedChat(content='{"turn-id": "dupid"}\nbody'))
+        produced = s.generate(name)
+        check("header stripped even when the id is rejected",
+              produced[0].read_text() == "body")
+        check("colliding id NOT adopted; a generated 5-letter id is used",
+              bool(re.match(r"^0020-[a-z]{5}\.assistant$", produced[0].name))
+              and produced[0].name != "0020-dupid.assistant")
+    finally:
+        s.close()
+
+
+# ── 18. append: an invalid (non-slug) model id is rejected; generated kept ───
+def test_append_rejects_invalid_id():
+    s = Session()
+    try:
+        name = "invalid"
+        s.write_turn(name, "0010-hi.user", "hello")
+        # 'has space' and 'a.b' are not adoptable slugs (space / dot).
+        s.srv.enqueue(CannedChat(content='{"turn-id": "has space"}\nbody'))
+        produced = s.generate(name)
+        check("header stripped even when the id is invalid",
+              produced[0].read_text() == "body")
+        check("invalid id NOT adopted; a generated 5-letter id is used",
+              bool(re.match(r"^0020-[a-z]{5}\.assistant$", produced[0].name)))
+    finally:
+        s.close()
+
+
+# ── 19. regenerate: header stripped, but the stable id is NOT changed ────────
+def test_regenerate_strips_but_keeps_stable_id():
+    s = Session()
+    try:
+        name = "regenstrip"
+        s.write_turn(name, "0010-hi.user", "hello")
+        s.write_turn(name, "0020-oldid.assistant", "stale")
+        s.srv.enqueue(CannedChat(content='{"turn-id": "newid"}\nregen body'))
+        produced = s.generate(name)
+        check("regenerated turn keeps its stable id (model id NOT adopted)",
+              produced[0].name == "0020-oldid.assistant")
+        check("header stripped from the regenerated turn",
+              produced[0].read_text() == "regen body")
+    finally:
+        s.close()
+
+
 # ── standalone runner ────────────────────────────────────────────────────────
 if __name__ == "__main__":
     tests = [
@@ -515,6 +618,11 @@ if __name__ == "__main__":
         test_generated_assistant_has_slug,
         test_uniqueness_of_generated_ids,
         test_regenerate_keeps_id_stable,
+        test_strip_emitted_header_unit,
+        test_append_adopts_model_id,
+        test_append_rejects_duplicate_id,
+        test_append_rejects_invalid_id,
+        test_regenerate_strips_but_keeps_stable_id,
     ]
     for t in tests:
         try:

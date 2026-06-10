@@ -50,7 +50,9 @@ resume from.
 Turn-id metadata is INJECTED into the sent context (never written to files):
 every message's content is prefixed with ``{"turn-id": "<id>"}\\n`` so the
 model can reference turns by their stable slug-ids. Files on disk always hold
-raw content only — the header is synthesised at send time from the filename.
+raw content only — the header is synthesised at send time from the filename. If
+the model echoes such a header back atop its reply, it is stripped before the
+turn is stored (and a valid, unique id the model chose is adopted as the slug).
 
 The model name comes from ``--model`` or ``$OAITA_MODEL``. The base URL / api
 key come from ``--base-url`` / ``--api-key`` or, when unset, the SDK's
@@ -272,6 +274,36 @@ def assign_slugs(turns: list[Turn]) -> list[Turn]:
     return updated
 
 
+# A model that sees every turn begin with a {"turn-id": "..."} header tends to
+# imitate it and emit one at the top of its own reply. We strip that mimic so
+# the stored turn stays raw — and, for a newly appended turn, adopt the id the
+# model chose when it is a valid, session-unique slug. Parsing is deliberately
+# SLOPPY: tolerate ' or " quotes, turn-id / turn_id, inner whitespace, and a
+# missing trailing newline.
+_EMITTED_ID_RE = re.compile(
+    r"""^\s*\{\s*['"]turn[-_ ]?id['"]\s*:\s*['"](?P<id>[^'"]*)['"]\s*\}[ \t]*(?:\r?\n|$)""",
+    re.IGNORECASE,
+)
+# An id we are willing to adopt from the model: filename-safe, dot-free (the
+# slug grammar forbids dots in a slug), non-empty, length-bounded.
+_ADOPTABLE_SLUG_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def strip_emitted_turn_id(content: str) -> tuple[str | None, str]:
+    """Sloppily strip a leading ``{"turn-id": "..."}`` header the model imitated.
+
+    Returns ``(emitted_id, body)``. If ``content`` does not start with a
+    turn-id-looking header, returns ``(None, content)`` unchanged. Otherwise the
+    header line and its trailing newline are removed from ``body``, and
+    ``emitted_id`` is the captured value verbatim (it may be empty or not
+    slug-valid — the caller decides whether to adopt it).
+    """
+    mo = _EMITTED_ID_RE.match(content)
+    if mo is None:
+        return None, content
+    return mo.group("id"), content[mo.end():]
+
+
 # ════════════════════════════════════════════════════════════════════════════
 #  4 · Client / config layer
 # ════════════════════════════════════════════════════════════════════════════
@@ -359,6 +391,10 @@ def generate(
     the turn-id.  The id-header (``{"turn-id": "<id>"}\\n``) is then injected
     into each message's content at send time — files remain raw.
 
+    If the model imitates the header and emits a ``{"turn-id": ...}`` line atop
+    its reply, that line is stripped before the turn is stored; for a newly
+    appended turn a valid, unique id the model chose is adopted as the slug.
+
     Streams the model's reply, writing each delta to the target file (flushed
     per delta, so an interrupt leaves resumable partial text) and echoing it
     live via ``echo`` (defaults to writing stdout). Returns the list of turn
@@ -415,6 +451,26 @@ def generate(
             f.write(delta)
             f.flush()
             echo(delta)
+
+    # Absorb a turn-id header the model imitated atop its reply: strip it so the
+    # stored turn stays raw. For a freshly appended turn, let the id the model
+    # chose stick if it is a valid, session-unique slug (rename the file to it);
+    # a regenerated turn keeps its stable id so existing references survive.
+    body = target.read_text(encoding="utf-8")
+    emitted_id, stripped = strip_emitted_turn_id(body)
+    if emitted_id is not None:
+        target.write_text(stripped, encoding="utf-8")
+        if not is_regenerate:
+            tgt = parse_turn(target)
+            others = existing_slugs - {tgt.slug}
+            if _ADOPTABLE_SLUG_RE.match(emitted_id) and emitted_id not in others:
+                adopted = target.parent / turn_filename(
+                    tgt.number, tgt.type, emitted_id)
+                if adopted != target:
+                    target.rename(adopted)
+                    existing_slugs.discard(tgt.slug)
+                    existing_slugs.add(emitted_id)
+                    target = adopted
     produced.append(target)
 
     return produced
