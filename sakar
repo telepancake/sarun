@@ -595,6 +595,9 @@ async def relay_handle_fds(engine: ProxyEngine, box_id: str, fds: list,
 #  CA generation
 # ════════════════════════════════════════════════════════════════════════════
 
+# Canonical OS CA-bundle locations across distros. For each that exists, sakar binds
+# an AUGMENTED copy (these roots + our proxy CA) over it inside the box, so clients
+# that read the OS trust store trust the proxy with no per-tool configuration.
 SYSTEM_CA_FILES = (
     "/etc/ssl/certs/ca-certificates.crt",
     "/etc/pki/tls/certs/ca-bundle.crt",
@@ -604,9 +607,16 @@ SYSTEM_CA_FILES = (
 )
 
 def primary_ca_path() -> "str | None":
+    """First OS CA bundle that exists (what the in-box CA-bundle env vars point at)."""
     for f in SYSTEM_CA_FILES:
         if Path(f).is_file(): return f
     return None
+
+def _augment_bundle(system_pem: bytes, ca_pem: bytes) -> bytes:
+    """A CA bundle = the OS roots followed by our proxy CA, so a client validating
+    against it trusts both real sites and the proxy's minted certs. Each block is
+    stripped so the END of one PEM and the BEGIN of the next sit on their own lines."""
+    return system_pem.strip() + b"\n" + ca_pem.strip() + b"\n"
 
 def ensure_ca_cert() -> "Path | None":
     """Generate the mitmproxy CA cert if not already present.
@@ -1171,6 +1181,32 @@ def cmd_run(cmd: list) -> int:
     resolv_tmp.close()
     resolv_tmp_path = resolv_tmp.name
 
+    # Build an augmented CA bundle (OS roots + our proxy CA) for every distinct OS
+    # trust-store file that exists; bound over those paths below so clients that read
+    # the OS store trust the proxy without any env var. One temp per distinct bundle
+    # (deduped by realpath so a symlinked path isn't bound twice); cleaned up in finally.
+    ca_pem = _ca.read_bytes()
+    ca_bundle_binds: list = []      # (in-box target path, host temp file)
+    ca_bundle_tmps: list = []       # temp files to unlink on exit
+    _seen_ca: set = set()
+    for _f in SYSTEM_CA_FILES:
+        try:
+            if not Path(_f).is_file():
+                continue
+            _rp = os.path.realpath(_f)
+            if _rp in _seen_ca:
+                continue
+            _seen_ca.add(_rp)
+            _tf = tempfile.NamedTemporaryFile(prefix="sakar-cabundle-",
+                                              suffix=".pem", delete=False)
+            _tf.write(_augment_bundle(Path(_rp).read_bytes(), ca_pem))
+            _tf.close()
+            ca_bundle_tmps.append(_tf.name)
+            ca_bundle_binds.append((_rp, _tf.name))
+        except OSError:
+            continue
+    ca_env_target = primary_ca_path() or str(_ca)   # in-box: now augmented
+
     tty_fd = _controlling_tty_fd()
     launched = False
     code = 1
@@ -1233,16 +1269,23 @@ def cmd_run(cmd: list) -> int:
         if bwrap_supports("--as-pid-1"):
             args += ["--as-pid-1"]
 
-        # CA + proxy env so in-box clients trust and reach the in-box forwarders.
+        # Make in-box clients trust the proxy's CA, three complementary ways so we
+        # don't depend on any one tool's convention:
+        #   (a) bind the bare CA at its own path (NODE_EXTRA_CA_CERTS points there);
+        #   (b) bind the augmented OS bundles over the OS trust store, so anything
+        #       reading /etc/ssl/... trusts the proxy with no env var; and
+        #   (c) point the common CA-bundle env vars at the (now-augmented) OS bundle.
+        # (Tools with their own store — Java cacerts, NSS — read none of these and are
+        # out of scope, as they were under any file-based scheme.)
         args += ["--ro-bind", str(_ca), str(_ca)]
+        for _rp, _tmp in ca_bundle_binds:
+            args += ["--ro-bind", _tmp, _rp]
         proxy = f"http://127.0.0.1:{INNER_PROXY_PORT}"
         for var in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
             args += ["--setenv", var, proxy]
-        # Point CA bundle env vars at the bare CA cert (no overlay virtual bundle).
-        cafile = str(_ca)
         for var in ("REQUESTS_CA_BUNDLE", "SSL_CERT_FILE",
                     "CURL_CA_BUNDLE", "GIT_SSL_CAINFO"):
-            args += ["--setenv", var, cafile]
+            args += ["--setenv", var, ca_env_target]
         args += ["--setenv", "NODE_EXTRA_CA_CERTS", str(_ca)]
 
         args += ["--", sys.executable, find_self(), "--inner",
@@ -1263,6 +1306,9 @@ def cmd_run(cmd: list) -> int:
       finally:
         try: os.unlink(resolv_tmp_path)
         except OSError: pass
+        for _t in ca_bundle_tmps:
+            try: os.unlink(_t)
+            except OSError: pass
         if not launched:
             try: srv_conn.close()
             except OSError: pass

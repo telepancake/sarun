@@ -363,6 +363,22 @@ def test_parse_relay_meta_malformed_fails_safe():
 
 
 # ════════════════════════════════════════════════════════════════════════════
+#  CA bundle augmentation (OS roots + proxy CA, bound over the OS trust store)
+# ════════════════════════════════════════════════════════════════════════════
+
+def test_augment_bundle_concatenates_roots_then_ca():
+    out = _sakar._augment_bundle(b"-----SYS ROOTS-----", b"-----PROXY CA-----")
+    # OS roots first, our CA after, each on its own line, single trailing newline.
+    assert out == b"-----SYS ROOTS-----\n-----PROXY CA-----\n"
+
+def test_augment_bundle_does_not_fuse_pem_blocks():
+    # Trailing/leading whitespace must not glue the END of one PEM to the BEGIN of
+    # the next (which would make the combined block unparseable).
+    out = _sakar._augment_bundle(b"AAA\n\n  ", b"\nBBB\n")
+    assert out == b"AAA\nBBB\n"
+
+
+# ════════════════════════════════════════════════════════════════════════════
 #  Standalone runner
 # ════════════════════════════════════════════════════════════════════════════
 

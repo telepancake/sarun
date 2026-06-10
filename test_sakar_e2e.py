@@ -188,6 +188,29 @@ def test_proxy_unaware_curl(ctx: ServerContext):
     print("    PASS: proxy-unaware curl succeeded", flush=True)
 
 
+def test_os_truststore_client(ctx: ServerContext):
+    """A client that ignores the CA-bundle env vars and reads ONLY the OS trust store
+    must still trust the proxy — proving the augmented OS bundle is bound into the box,
+    not just advertised via env vars. We strip the CA env vars so curl falls back to
+    /etc/ssl/certs."""
+    print("  test: OS-trust-store client (CA env vars stripped) ...", flush=True)
+    r = ctx.run_box(
+        ["env", "-u", "SSL_CERT_FILE", "-u", "SSL_CERT_DIR", "-u", "CURL_CA_BUNDLE",
+         "-u", "REQUESTS_CA_BUNDLE", "-u", "GIT_SSL_CAINFO",
+         "curl", "-sS", "--noproxy", "*", "--max-time", "30", "https://example.com/"],
+        timeout=60)
+    # A cert-verification failure (curl exit 60, "certificate" in stderr) would mean the
+    # OS store was NOT augmented. Any HTTP response — even a transient upstream 502 from
+    # the environment's egress — means the TLS handshake to the proxy succeeded, i.e. the
+    # OS store trusts our CA. So we assert "no cert error", not a specific body.
+    if r.returncode != 0:
+        print(f"    curl stderr: {r.stderr[:500]}", flush=True)
+    assert r.returncode == 0 and "certificate" not in r.stderr.lower(), (
+        f"OS-trust-store client failed cert verification (rc={r.returncode}); the "
+        f"augmented OS bundle is not trusted in-box.\nstderr: {r.stderr[:300]}")
+    print("    PASS: OS-trust-store client trusts the proxy CA", flush=True)
+
+
 def test_denied_host(ctx: ServerContext):
     """curl to a denied host should get a 403 or connection failure."""
     print("  test: denied host returns 403 / fails ...", flush=True)
@@ -259,6 +282,7 @@ def run_all() -> bool:
         tests = [
             ("proxy_aware_curl", test_proxy_aware_curl),
             ("proxy_unaware_curl", test_proxy_unaware_curl),
+            ("os_truststore_client", test_os_truststore_client),
             ("denied_host", test_denied_host),
         ]
 
