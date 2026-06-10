@@ -1,0 +1,358 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#   "openai>=1.30",
+# ]
+# ///
+"""
+oaita — a tiny, resumable OpenAI chat client backed by a folder of turn files.
+
+A SESSION is a named folder under ``$XDG_STATE_HOME/oaita/<name>/`` (fallback
+``~/.local/state/oaita/<name>/``). There is NO database, NO JSON, NO hidden
+state — the entire conversation context is just the FILES in that folder.
+
+Each file is the raw text of ONE conversation turn (nothing wrapping it). The
+FILENAME encodes ordering and type:
+
+    NNNN[-slug].<type>
+
+  • ``NNNN`` — a zero-padded (width 4) integer that orders turns like BASIC line
+    numbers. Files are sorted ALPHABETICALLY, and the zero-padding makes the
+    alphabetical order identical to the numeric order.
+  • optional ``-slug`` — a human label (e.g. ``0010-greet.user``); generated
+    turns get no slug, but BOTH ``0010.user`` and ``0010-greet.user`` parse.
+  • ``<type>`` — the extension IS the turn type, mapped to an OpenAI chat role:
+    ``.system`` / ``.user`` / ``.assistant`` (also ``.developer`` / ``.tool``).
+    A file whose name does not match the grammar is NOT a turn and is ignored.
+
+Turns are numbered on a STEP-10 grid (0010, 0020, 0030 …) so the trailing zero
+leaves room to hand-insert 0011–0019 later. The next generated turn's number is
+``(highest existing) + 10`` (or ``0010`` if the session has none). Existing
+numbers are preserved — the client never renumbers files you placed by hand.
+
+The ``gen`` command produces the assistant's reply for the current context and
+persists it, CONTINUE-OR-APPEND:
+
+  • If the LAST turn is an ``.assistant`` turn, that file is the write target and
+    is (re)generated IN PLACE; the prompt is every turn EXCEPT that last one.
+    This is what makes an interrupted ``gen`` resumable — the partial assistant
+    turn already on disk is regenerated, never duplicated.
+  • Otherwise a NEW ``NNNN.assistant`` turn is appended (highest+10); the prompt
+    is ALL existing turns.
+
+Either way the reply is streamed (``stream=True``) and written INCREMENTALLY to
+the target file (write+flush per delta) while echoing live to stdout, so an
+interrupt mid-stream leaves the partial text on disk for the next ``gen`` to
+resume from.
+
+The model name comes from ``--model`` or ``$OAITA_MODEL``. The base URL / api
+key come from ``--base-url`` / ``--api-key`` or, when unset, the SDK's
+``OPENAI_BASE_URL`` / ``OPENAI_API_KEY`` env vars (the SDK only ever contacts
+the configured base_url — no phone-home).
+
+    oaita gen <name> [--model M] [--base-url URL] [--api-key KEY]
+
+Sections:
+    1 · Imports & session paths
+    2 · Turn model (filename grammar, ordering, numbering)
+    3 · Client / config layer
+    4 · gen: prompt assembly + streamed persistence
+    5 · CLI (argparse) & entry points
+    6 · __main__
+"""
+
+from __future__ import annotations
+
+# ════════════════════════════════════════════════════════════════════════════
+#  1 · Imports & session paths
+# ════════════════════════════════════════════════════════════════════════════
+import argparse
+import os
+import re
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+import openai
+
+# Roles a turn-file extension may map to. The extension IS the role name.
+TURN_TYPES = ("system", "developer", "user", "assistant", "tool")
+
+# Numbering grid: zero-padded width, and the step between generated turns.
+NUM_WIDTH = 4
+NUM_STEP = 10
+
+
+def state_home() -> Path:
+    """Root of all oaita state: ``$XDG_STATE_HOME/oaita`` (fallback ~/.local)."""
+    xdg = os.environ.get("XDG_STATE_HOME")
+    base = Path(xdg) if xdg else Path.home() / ".local" / "state"
+    return base / "oaita"
+
+
+def session_dir(name: str) -> Path:
+    """The folder holding one named session's turn files."""
+    return state_home() / name
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  2 · Turn model (filename grammar, ordering, numbering)
+# ════════════════════════════════════════════════════════════════════════════
+# Grammar:  NNNN[-slug].<type>
+#   NNNN  — one or more digits (zero-padded in practice).
+#   -slug — optional human label; anything but a dot, after a single hyphen.
+#   type  — one of TURN_TYPES (the extension), and nothing after it.
+_TURN_RE = re.compile(
+    r"^(?P<num>\d+)(?:-(?P<slug>[^.]+))?\.(?P<type>" +
+    "|".join(TURN_TYPES) + r")$"
+)
+
+
+@dataclass(frozen=True)
+class Turn:
+    """One parsed turn file. ``path`` is the file; ``content`` is read lazily."""
+    number: int
+    slug: str | None
+    type: str
+    path: Path
+
+    @property
+    def role(self) -> str:
+        """The OpenAI chat role for this turn (identical to its type)."""
+        return self.type
+
+    def read(self) -> str:
+        """The raw file text — exactly the turn content, nothing stripped."""
+        return self.path.read_text(encoding="utf-8")
+
+    def message(self) -> dict:
+        """The OpenAI chat message ``{"role": ..., "content": <raw text>}``."""
+        return {"role": self.role, "content": self.read()}
+
+
+def parse_turn(path: Path) -> Turn | None:
+    """Parse one filename into a Turn, or None if it is not a turn file."""
+    mo = _TURN_RE.match(path.name)
+    if mo is None:
+        return None
+    return Turn(
+        number=int(mo.group("num")),
+        slug=mo.group("slug"),
+        type=mo.group("type"),
+        path=path,
+    )
+
+
+def load_turns(name: str) -> list[Turn]:
+    """All turn files of a session, in turn order.
+
+    Files are sorted ALPHABETICALLY by filename; zero-padding makes that order
+    identical to numeric order. Non-conforming files are ignored. A missing
+    session folder simply yields an empty list.
+    """
+    folder = session_dir(name)
+    if not folder.is_dir():
+        return []
+    turns = []
+    for path in sorted(folder.iterdir(), key=lambda p: p.name):
+        if not path.is_file():
+            continue
+        turn = parse_turn(path)
+        if turn is not None:
+            turns.append(turn)
+    return turns
+
+
+def next_number(turns: list[Turn]) -> int:
+    """The number for the next appended turn: highest existing + STEP (or STEP)."""
+    if not turns:
+        return NUM_STEP
+    return max(t.number for t in turns) + NUM_STEP
+
+
+def turn_filename(number: int, type: str, slug: str | None = None) -> str:
+    """Render a turn filename ``NNNN[-slug].<type>`` on the zero-padded grid."""
+    stem = f"{number:0{NUM_WIDTH}d}"
+    if slug:
+        stem += f"-{slug}"
+    return f"{stem}.{type}"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  3 · Client / config layer
+# ════════════════════════════════════════════════════════════════════════════
+def make_client(
+    base_url: str | None = None,
+    api_key: str | None = None,
+    max_retries: int = 2,
+    timeout: float = 60.0,
+) -> openai.OpenAI:
+    """Return a configured ``openai.OpenAI`` client.
+
+    When ``base_url`` / ``api_key`` are None the SDK reads ``OPENAI_BASE_URL`` /
+    ``OPENAI_API_KEY`` from the environment. The SDK only ever contacts the
+    configured ``base_url`` — there is no phone-home to real OpenAI.
+    """
+    kwargs: dict = {"max_retries": max_retries, "timeout": timeout}
+    if base_url is not None:
+        kwargs["base_url"] = base_url
+    if api_key is not None:
+        kwargs["api_key"] = api_key
+    return openai.OpenAI(**kwargs)
+
+
+def resolve_model(model: str | None) -> str:
+    """The model name from ``--model`` or ``$OAITA_MODEL``; error if neither."""
+    chosen = model or os.environ.get("OAITA_MODEL")
+    if not chosen:
+        raise SystemExit(
+            "oaita: no model set — pass --model NAME or set $OAITA_MODEL")
+    return chosen
+
+
+def stream_deltas(stream):
+    """Yield successive text-content deltas from a streaming SDK response.
+
+    Mirrors the assembly idea in oaita_fakeclient, but yields each delta so the
+    consumer can write it to a file + stdout instead of buffering the whole reply.
+    """
+    for chunk in stream:
+        if not chunk.choices:
+            continue
+        delta = chunk.choices[0].delta
+        if delta.content:
+            yield delta.content
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  4 · gen: prompt assembly + streamed persistence
+# ════════════════════════════════════════════════════════════════════════════
+def plan_generation(turns: list[Turn], folder: Path):
+    """Decide the prompt turns and the write-target path for a generation.
+
+    Returns ``(prompt_turns, target_path, is_regenerate)``:
+      • If the last turn is an assistant turn → regenerate it in place; the
+        prompt is every turn EXCEPT that last one.
+      • Otherwise → append a new ``NNNN.assistant`` turn (highest+10); the
+        prompt is ALL existing turns.
+    """
+    if turns and turns[-1].type == "assistant":
+        return turns[:-1], turns[-1].path, True
+    number = next_number(turns)
+    target = folder / turn_filename(number, "assistant")
+    return turns, target, False
+
+
+def generate(
+    name: str,
+    *,
+    model: str,
+    base_url: str | None = None,
+    api_key: str | None = None,
+    client: openai.OpenAI | None = None,
+    echo=None,
+) -> list[Path]:
+    """Generate the assistant reply for session ``name`` and persist it.
+
+    Streams the model's reply, writing each delta to the target file (flushed
+    per delta, so an interrupt leaves resumable partial text) and echoing it
+    live via ``echo`` (defaults to writing stdout). Returns the list of turn
+    files written/updated.
+
+    Raises ``SystemExit`` (non-zero) if the session has no turns at all — no
+    empty files are created.
+    """
+    model = resolve_model(model)
+    folder = session_dir(name)
+    turns = load_turns(name)
+    if not turns:
+        raise SystemExit(
+            f"oaita: session {name!r} has no turns to generate from "
+            f"(folder: {folder})")
+
+    prompt_turns, target, is_regenerate = plan_generation(turns, folder)
+    messages = [t.message() for t in prompt_turns]
+
+    if client is None:
+        client = make_client(base_url=base_url, api_key=api_key)
+    if echo is None:
+        def echo(text: str):
+            sys.stdout.write(text)
+            sys.stdout.flush()
+
+    folder.mkdir(parents=True, exist_ok=True)
+    stream = client.chat.completions.create(
+        model=model, messages=messages, stream=True)
+
+    # A single generation can persist MORE than one turn (future tool-call
+    # turns). For now it produces exactly the streamed assistant turn; the
+    # produced-turns list is the clean seam for that future expansion.
+    produced: list[Path] = []
+
+    # Stream the assistant content incrementally onto the target file. Truncate
+    # first so a regenerated turn replaces (never appends to) its prior text.
+    with open(target, "w", encoding="utf-8") as f:
+        f.truncate(0)
+        for delta in stream_deltas(stream):
+            f.write(delta)
+            f.flush()
+            echo(delta)
+    produced.append(target)
+
+    return produced
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  5 · CLI (argparse) & entry points
+# ════════════════════════════════════════════════════════════════════════════
+def build_parser() -> argparse.ArgumentParser:
+    """Build the argparse CLI. Structured so new subcommands drop in trivially."""
+    parser = argparse.ArgumentParser(
+        prog="oaita",
+        description="A resumable OpenAI chat client backed by a folder of "
+                    "turn files.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    gen = sub.add_parser(
+        "gen", help="generate the assistant reply for a session")
+    gen.add_argument("name", help="session name (folder under oaita state)")
+    gen.add_argument("--model", default=None,
+                     help="model name (else $OAITA_MODEL)")
+    gen.add_argument("--base-url", default=None,
+                     help="OpenAI base URL (else $OPENAI_BASE_URL)")
+    gen.add_argument("--api-key", default=None,
+                     help="API key (else $OPENAI_API_KEY)")
+    gen.set_defaults(func=_cmd_gen)
+    return parser
+
+
+def _cmd_gen(args) -> int:
+    """Handler for ``oaita gen``."""
+    produced = generate(
+        args.name,
+        model=args.model,
+        base_url=args.base_url,
+        api_key=args.api_key,
+    )
+    # The reply was already echoed live; finish the line for a clean terminal.
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+    for path in produced:
+        print(f"oaita: wrote {path}", file=sys.stderr)
+    return 0
+
+
+def main(argv=None) -> int:
+    """CLI entry point. Returns a process exit code."""
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  6 · __main__
+# ════════════════════════════════════════════════════════════════════════════
+if __name__ == "__main__":
+    sys.exit(main())
