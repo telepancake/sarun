@@ -13,16 +13,20 @@ A SESSION is a named folder under ``$XDG_STATE_HOME/oaita/<name>/`` (fallback
 state — the entire conversation context is just the FILES in that folder.
 
 Each file is the raw text of ONE conversation turn (nothing wrapping it). The
-FILENAME encodes ordering and type:
+FILENAME encodes ordering, identity, provenance and meta:
 
-    NNNN[-slug].<type>
+    NNNN[-turnid[-from]].<flags>.<type>
 
   • ``NNNN`` — a zero-padded (width 4) integer that orders turns like BASIC line
     numbers. Files are sorted ALPHABETICALLY, and the zero-padding makes the
     alphabetical order identical to the numeric order.
-  • optional ``-slug`` — a human label (e.g. ``0010-greet.user``); the slug IS
-    the turn-id — a stable identifier injected into the sent context so the
-    model can reference individual turns by id.
+  • optional ``-turnid`` — ``[a-z0-9]+``; the turn-id — a stable identifier
+    injected into the sent context so the model can reference individual turns.
+  • optional ``-from`` — a session name: the sender that POSTED this turn into
+    the folder (cross-context writes only; absent for the session's own turns).
+  • optional ``.<flags>`` — single-char turn meta: ``p`` partial (needs
+    extension), ``i`` no-header (suppress the injected id line), ``c`` tool
+    call (assistant turn holding a tool-call envelope).
   • ``<type>`` — the extension IS the turn type, mapped to an OpenAI chat role:
     ``.system`` / ``.user`` / ``.assistant`` (also ``.developer`` / ``.tool``).
     A file whose name does not match the grammar is NOT a turn and is ignored.
@@ -169,13 +173,24 @@ def parse_stitch(spec: str) -> list[str]:
 # ════════════════════════════════════════════════════════════════════════════
 #  2 · Turn model (filename grammar, ordering, numbering)
 # ════════════════════════════════════════════════════════════════════════════
-# Grammar:  NNNN[-slug].<type>
-#   NNNN  — one or more digits (zero-padded in practice).
-#   -slug — optional human label; anything but a dot, after a single hyphen.
-#   type  — one of TURN_TYPES (the extension), and nothing after it.
+# Grammar:  NNNN[-turnid[-from]].<flags>.<type>
+#   NNNN   — one or more digits (zero-padded in practice).
+#   turnid — optional turn-id, [a-z0-9]+ (no dash: '-' separates the fields).
+#   from   — optional sender, a session name ([A-Za-z0-9]+): the session that
+#            WROTE this turn into the folder. Absent for the session's own
+#            turns; present exactly when call/run machinery posted it
+#            cross-context. `from` implies a turnid (positional 2nd field).
+#   flags  — optional dotted segment of single-char turn meta:
+#              p — partial: needs extension (e.g. interrupted stream, no EOS);
+#              i — no turn-id header: suppress header injection for this turn;
+#              c — tool call: an assistant turn holding a tool-call envelope.
+#   type   — one of TURN_TYPES (the extension), and nothing after it.
+_FLAG_CHARS = "pic"
 _TURN_RE = re.compile(
-    r"^(?P<num>\d+)(?:-(?P<slug>[^.]+))?\.(?P<type>" +
-    "|".join(TURN_TYPES) + r")$"
+    r"^(?P<num>\d+)"
+    r"(?:-(?P<turnid>[a-z0-9]+)(?:-(?P<sender>[A-Za-z0-9]+))?)?"
+    r"(?:\.(?P<flags>[" + _FLAG_CHARS + r"]+))?"
+    r"\.(?P<type>" + "|".join(TURN_TYPES) + r")$"
 )
 
 
@@ -186,6 +201,8 @@ class Turn:
     slug: str | None
     type: str
     path: Path
+    sender: str | None = None
+    flags: str = ""
 
     @property
     def role(self) -> str:
@@ -204,14 +221,18 @@ class Turn:
 
             {"turn-id": "<slug>"}\\n<raw text>
 
-        This lets the model reference turns by stable id without ever writing
-        the header into the on-disk turn file.  Pass ``inject_id=False`` to get
-        the raw content (e.g. when reading back what is actually on disk).
+        plus a ``"from"`` key when the filename carries a sender — so the model
+        sees who posted the turn and can target that sender in its commands.
+        The ``i`` flag suppresses the header for this turn entirely. Files on
+        disk never hold the header — it is synthesised here from the filename.
+        Pass ``inject_id=False`` to get the raw content.
         """
         raw = self.read()
-        if inject_id and self.slug is not None:
-            header = json.dumps({"turn-id": self.slug}) + "\n"
-            content = header + raw
+        if inject_id and self.slug is not None and "i" not in self.flags:
+            hdr: dict = {"turn-id": self.slug}
+            if self.sender is not None:
+                hdr["from"] = self.sender
+            content = json.dumps(hdr) + "\n" + raw
         else:
             content = raw
         return {"role": self.role, "content": content}
@@ -224,9 +245,11 @@ def parse_turn(path: Path) -> Turn | None:
         return None
     return Turn(
         number=int(mo.group("num")),
-        slug=mo.group("slug"),
+        slug=mo.group("turnid"),
         type=mo.group("type"),
         path=path,
+        sender=mo.group("sender"),
+        flags=mo.group("flags") or "",
     )
 
 
@@ -257,11 +280,22 @@ def next_number(turns: list[Turn]) -> int:
     return max(t.number for t in turns) + NUM_STEP
 
 
-def turn_filename(number: int, type: str, slug: str | None = None) -> str:
-    """Render a turn filename ``NNNN[-slug].<type>`` on the zero-padded grid."""
+def turn_filename(number: int, type: str, slug: str | None = None,
+                  sender: str | None = None, flags: str = "") -> str:
+    """Render ``NNNN[-turnid[-from]].<flags>.<type>`` on the zero-padded grid.
+
+    ``sender`` requires ``slug`` (the grammar's 2nd dash-field is always the
+    turn-id, so a sender cannot be encoded without one).
+    """
+    if sender and not slug:
+        raise ValueError("turn_filename: sender requires a turn-id slug")
     stem = f"{number:0{NUM_WIDTH}d}"
     if slug:
         stem += f"-{slug}"
+    if sender:
+        stem += f"-{sender}"
+    if flags:
+        stem += f".{flags}"
     return f"{stem}.{type}"
 
 
@@ -362,7 +396,9 @@ def assign_slugs(turns: list[Turn],
             new_id = new_turn_id(
                 existing_slugs, slot=f"{turn.path.parent.name}/{turn.number}")
             existing_slugs.add(new_id)
-            new_name = turn_filename(turn.number, turn.type, new_id)
+            # A slug-less turn cannot carry a sender (grammar); keep its flags.
+            new_name = turn_filename(turn.number, turn.type, new_id,
+                                     flags=turn.flags)
             new_path = turn.path.parent / new_name
             turn.path.rename(new_path)
             updated.append(replace(turn, slug=new_id, path=new_path))
@@ -393,12 +429,17 @@ def check_unique_turn_ids(turns: list[Turn]) -> None:
 # SLOPPY: tolerate ' or " quotes, turn-id / turn_id, inner whitespace, and a
 # missing trailing newline.
 _EMITTED_ID_RE = re.compile(
-    r"""^\s*\{\s*['"]turn[-_ ]?id['"]\s*:\s*['"](?P<id>[^'"]*)['"]\s*\}[ \t]*(?:\r?\n|$)""",
+    r"""^\s*\{\s*['"]turn[-_ ]?id['"]\s*:\s*['"](?P<id>[^'"]*)['"]\s*"""
+    r"""(?:,\s*['"]from['"]\s*:\s*['"][^'"]*['"]\s*)?"""
+    r"""\}[ \t]*(?:\r?\n|$)""",
     re.IGNORECASE,
 )
-# An id we are willing to adopt from the model: filename-safe, dot-free (the
-# slug grammar forbids dots in a slug), non-empty, length-bounded.
-_ADOPTABLE_SLUG_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+# An id we are willing to adopt from the model: must fit the turnid grammar
+# field ([a-z0-9], no dash — dash separates filename fields), length-bounded.
+# A model-imitated "from" is NEVER adopted: sender identity is harness-assigned
+# provenance, not a label the model may choose (it is matched above only to be
+# stripped).
+_ADOPTABLE_SLUG_RE = re.compile(r"^[a-z0-9]{1,64}$")
 
 
 def strip_emitted_turn_id(content: str) -> tuple[str | None, str]:
@@ -686,21 +727,24 @@ def prepare_context(name: str) -> _PreparedContext:
 
 
 def append_raw_turn(name: str, type: str, content: str,
-                    slug: str | None = None) -> Path:
+                    slug: str | None = None, sender: str | None = None,
+                    flags: str = "") -> Path:
     """Append a raw turn of ``type`` (role) + ``content`` to session ``name``.
 
     Numbers it via the session's own ``next_number`` (highest+10), writes the
     raw text verbatim (no id-header — headers are injected only at send time),
     and returns the written path. ``slug`` becomes the turn-id when given (the
-    caller is responsible for its uniqueness). Creates the folder if new.
+    caller is responsible for its uniqueness); ``sender`` records WHO posted
+    the turn (cross-context writes only — requires ``slug``); ``flags`` are
+    the single-char turn meta. Creates the folder if new.
 
-    This is the shared write primitive the tooled loop uses for the outer
-    tool-call turn, the tool-result turn, and any inner seed turn.
+    This is the shared write primitive for tool-call turns, tool-result turns,
+    and inner sub-agent seed turns.
     """
     folder = session_dir(name)
     folder.mkdir(parents=True, exist_ok=True)
     number = next_number(load_turns(name))
-    path = folder / turn_filename(number, type, slug)
+    path = folder / turn_filename(number, type, slug, sender=sender, flags=flags)
     path.write_text(content, encoding="utf-8")
     return path
 
@@ -853,7 +897,7 @@ def _finalize_answer(target: Path, ctx: _PreparedContext) -> Path:
             others = ctx.existing_slugs - {tgt.slug}
             if _ADOPTABLE_SLUG_RE.match(emitted_id) and emitted_id not in others:
                 adopted = target.parent / turn_filename(
-                    tgt.number, tgt.type, emitted_id)
+                    tgt.number, tgt.type, emitted_id, flags=tgt.flags)
                 if adopted != target:
                     target.rename(adopted)
                     return adopted

@@ -125,8 +125,8 @@ _ID_RE = re.compile(r"^[a-z]{5}$")
 
 
 def _id_from_name(name: str) -> str | None:
-    """Extract the slug from a turn filename, e.g. '0020-xqvmb.assistant' → 'xqvmb'."""
-    mo = re.match(r"^\d+-([^.]+)\.", name)
+    """Extract the turnid from a filename, e.g. '0020-xqvmb-SND.p.assistant' → 'xqvmb'."""
+    mo = re.match(r"^\d+-([a-z0-9]+)", name)
     return mo.group(1) if mo else None
 
 
@@ -149,6 +149,35 @@ def test_grammar_and_ordering():
           oaita.parse_turn(Path("notes.txt")) is None)
     check("0010.bogus (bad type) is not a turn",
           oaita.parse_turn(Path("0010.bogus")) is None)
+
+    # Extended grammar: sender + flags fields.
+    t3 = oaita.parse_turn(Path("0030-abcde-MAIN.tool"))
+    check("turnid-from parses to (slug='abcde', sender='MAIN')",
+          t3 is not None and (t3.slug, t3.sender, t3.flags) ==
+          ("abcde", "MAIN", ""))
+    t4 = oaita.parse_turn(Path("0040-abcde.p.assistant"))
+    check("p flag parses (partial assistant)",
+          t4 is not None and (t4.slug, t4.sender, t4.flags) ==
+          ("abcde", None, "p"))
+    t5 = oaita.parse_turn(Path("0050-abcde-sub1.pi.user"))
+    check("combined flags + sender parse",
+          t5 is not None and (t5.slug, t5.sender, t5.flags) ==
+          ("abcde", "sub1", "pi"))
+    check("unknown flag chars → not a turn (ignored)",
+          oaita.parse_turn(Path("0060-abcde.zz.user")) is None)
+    check("uppercase turnid → not a turn (turnid is [a-z0-9])",
+          oaita.parse_turn(Path("0070-ABCDE.user")) is None)
+    check("flags without slug parse too",
+          oaita.parse_turn(Path("0080.p.assistant")).flags == "p")
+    check("turn_filename round-trips sender+flags",
+          oaita.turn_filename(30, "tool", "abcde", sender="MAIN", flags="p")
+          == "0030-abcde-MAIN.p.tool")
+    raised = False
+    try:
+        oaita.turn_filename(30, "tool", None, sender="MAIN")
+    except ValueError:
+        raised = True
+    check("sender without slug is rejected", raised)
 
     s = Session()
     try:
@@ -547,6 +576,30 @@ def test_strip_emitted_header_unit():
           f("just a normal reply") == (None, "just a normal reply"))
     check("a header NOT at the start is not stripped",
           f('hi\n{"turn-id": "abcde"}\n') == (None, 'hi\n{"turn-id": "abcde"}\n'))
+    check("a from-bearing header is stripped (from never adopted)",
+          f('{"turn-id": "abcde", "from": "MAIN"}\nbody') == ("abcde", "body"))
+
+
+# ── 15b. from + flags surface in the injected header / suppress it ───────────
+def test_header_from_and_iflag():
+    s = Session()
+    try:
+        name = "fromhdr"
+        s.write_turn(name, "0010-seed1-OTHER.user", "posted by OTHER")
+        s.write_turn(name, "0020-quiet1.i.user", "no header for me")
+        s.write_turn(name, "0030-mine1.user", "own turn")
+        s.srv.enqueue(CannedChat(content="ok"))
+        s.generate(name)
+        msgs = s.srv.requests[-1].messages
+        check("sender surfaces as from in the injected header",
+              msgs[0]["content"] ==
+              '{"turn-id": "seed1", "from": "OTHER"}\nposted by OTHER')
+        check("i flag suppresses the header entirely",
+              msgs[1]["content"] == "no header for me")
+        check("own turn header has no from key",
+              msgs[2]["content"] == '{"turn-id": "mine1"}\nown turn')
+    finally:
+        s.close()
 
 
 # ── 16. append: a valid, unique model id is adopted; header stripped ─────────
@@ -1060,6 +1113,7 @@ if __name__ == "__main__":
         test_uniqueness_of_generated_ids,
         test_regenerate_keeps_id_stable,
         test_strip_emitted_header_unit,
+        test_header_from_and_iflag,
         test_append_adopts_model_id,
         test_append_rejects_duplicate_id,
         test_append_rejects_invalid_id,
