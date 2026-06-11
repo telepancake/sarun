@@ -4998,8 +4998,20 @@ def _build_overlay_ops():
                 return self._entry(inode, st)
             # Dir/symlink returned early above; only regular files reach here.
             upath = self._backing_path(sid, rel) or self._upper_path(sid, rel)
+            self._apply_setattr_fields(upath, attr, fields)
+            st = os.lstat(upath)
+            idx.set_entry(rel, "file", st.st_mode, wid, "setattr")
+            self._notify(sid, rel, "modified")
+            return self._entry(inode, st)
+
+        def _apply_setattr_fields(self, upath, attr, fields, is_link=False):
+            """Apply the requested stat fields to upath, no-follow throughout.
+            Shared by the overlay and host-passthrough setattr branches.
+            truncate/chmod need an fd so they are skipped for symlinks; chown/utime
+            have real no-follow variants (lchown / utimensat AT_SYMLINK_NOFOLLOW)
+            and act on the link itself, never the target."""
             try:
-                if fields.update_size or fields.update_mode:
+                if (fields.update_size or fields.update_mode) and not is_link:
                     # Open O_RDWR only when truncating. A mode-only change must NOT
                     # require write access to the contents: chmod of a read-only file
                     # is legal (fchmod only needs ownership), so open O_RDONLY there.
@@ -5026,10 +5038,6 @@ def _build_overlay_ops():
                     os.utime(upath, ns=(atime_ns, mtime_ns), follow_symlinks=False)
             except OSError as e:
                 raise pyfuse3.FUSEError(e.errno or errno.EIO)
-            st = os.lstat(upath)
-            idx.set_entry(rel, "file", st.st_mode, wid, "setattr")
-            self._notify(sid, rel, "modified")
-            return self._entry(inode, st)
 
         async def setattr(self, inode, attr, fields, fh, ctx):
             key = self._key(inode)
@@ -5050,33 +5058,7 @@ def _build_overlay_ops():
                     if not os.path.lexists(upath):
                         raise pyfuse3.FUSEError(errno.ENOENT)
                     is_link = stat_mod.S_ISLNK(os.lstat(upath).st_mode)
-                    try:
-                        if (fields.update_size or fields.update_mode) and not is_link:
-                            # O_RDWR only when truncating; a mode-only change must not
-                            # demand write access (chmod of a read-only file is legal).
-                            oflags = os.O_RDWR if fields.update_size else os.O_RDONLY
-                            fd = os.open(upath, oflags | os.O_NOFOLLOW)
-                            try:
-                                if fields.update_size: os.ftruncate(fd, attr.st_size)
-                                if fields.update_mode:
-                                    os.fchmod(fd, stat_mod.S_IMODE(attr.st_mode))
-                            finally:
-                                os.close(fd)
-                        # chown/utime have real no-follow variants (lchown / utimensat
-                        # AT_SYMLINK_NOFOLLOW): they act on the link itself, never target.
-                        if fields.update_uid or fields.update_gid:
-                            uid = attr.st_uid if fields.update_uid else -1
-                            gid = attr.st_gid if fields.update_gid else -1
-                            os.chown(upath, uid, gid, follow_symlinks=False)
-                        if fields.update_mtime or fields.update_atime:
-                            st0 = os.lstat(upath)
-                            atime_ns = (attr.st_atime_ns if fields.update_atime
-                                        else st0.st_atime_ns)
-                            mtime_ns = (attr.st_mtime_ns if fields.update_mtime
-                                        else st0.st_mtime_ns)
-                            os.utime(upath, ns=(atime_ns, mtime_ns), follow_symlinks=False)
-                    except OSError as e:
-                        raise pyfuse3.FUSEError(e.errno or errno.EIO)
+                    self._apply_setattr_fields(upath, attr, fields, is_link=is_link)
                     return self._entry(inode, os.lstat(upath))
                 return self._setattr_overlay(sid, rel, inode, attr, fields, ctx)
             finally:
