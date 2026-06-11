@@ -938,8 +938,8 @@ def test_tools_capabilities_surfaced():
         s.generate("conv", capabilities="bespoke power")
         tools = s.srv.requests[-1].json.get("tools")
         by_name = {t["function"]["name"]: t["function"] for t in tools}
-        check("the registry tools are advertised (act + shell)",
-              set(by_name) == {"act", "shell"})
+        check("the registry tools are advertised (act, shell, inspect, delete)",
+              set(by_name) == {"act", "shell", "inspect", "delete"})
         check("custom capabilities embedded in the act description",
               "bespoke power" in by_name["act"]["description"])
         check("shell schema requires the script param",
@@ -1348,6 +1348,126 @@ def test_summarize_patch_unit():
     check("file count stated", out.startswith("2 file(s) changed"))
 
 
+# ── 36c. inspect: directory listing + summary fuse + errors (units) ──────────
+def test_inspect_path():
+    s = Session()
+    try:
+        d = s.tmp / "work"
+        d.mkdir()
+        (d / "a.txt").write_text("x")
+        (d / "sub").mkdir()
+        out = oaita.inspect_path(str(d))
+        check("directory listing names entries with kinds",
+              "file\ta.txt" in out and "dir\tsub" in out
+              and "(2 entries)" in out)
+        check("a regular file reports its size",
+              oaita.inspect_path(str(d / "a.txt")).endswith("file, 1 bytes"))
+        check("missing path is an error",
+              oaita.inspect_path(str(d / "nope")).startswith("error:"))
+
+        # The summary fuse trips past INSPECT_MAX_ENTRIES.
+        big = s.tmp / "big"
+        big.mkdir()
+        for i in range(oaita.INSPECT_MAX_ENTRIES + 5):
+            (big / f"f{i:04d}").write_text("")
+        summ = oaita.inspect_path(str(big))
+        check("a huge listing is summarized, not enumerated",
+              "summarized" in summ and "file(s)" in summ
+              and "f0001" not in summ)
+    finally:
+        s.close()
+
+
+def test_inspect_tool_call():
+    s = Session()
+    try:
+        d = s.tmp / "ws"
+        d.mkdir()
+        (d / "one.py").write_text("print(1)\n")
+        s.write_turn("conv", "0010.user", "what is here")
+        s.srv.enqueue(CannedChat(tool_calls=[
+            ("inspect", json.dumps({"path": str(d)}), "c1")]))
+        s.generate("conv")
+        res = s.call("conv")            # inspect is harness-native, no executor
+        check("inspect tool result lists the directory",
+              "file\tone.py" in res[0].read_text())
+        check("inspect result has no from-sender",
+              oaita.parse_turn(res[0]).sender is None)
+    finally:
+        s.close()
+
+
+# ── 36d. delete: rollback+annotation, session drop, errors (units) ───────────
+def test_delete_rollback_and_session():
+    s = Session()
+    try:
+        # Rollback collapses a messy tail into one annotation turn.
+        for n, (typ, body) in enumerate([
+                ("user", "do it"), ("assistant", "attempt one"),
+                ("tool", "oops"), ("assistant", "attempt two")], start=1):
+            s.write_turn("roll", f"{n*10:04d}-t{n}.{typ}", body)
+        out = oaita.apply_delete("roll", turn_id="t2",
+                                 annotation="the clean result")
+        types = [oaita.parse_turn(p).type
+                 for p in sorted(oaita.session_dir("roll").iterdir())]
+        check("rollback removed everything from the turn-id onward",
+              types == ["user", "assistant"])
+        bodies = [p.read_text() for p in sorted(oaita.session_dir("roll").iterdir())]
+        check("the annotation replaced the collapsed turns",
+              bodies == ["do it", "the clean result"])
+        check("rollback summary counts removed turns",
+              "rolled back 3 turn(s)" in out and "collapsed" in out)
+        check("missing turn-id is an error",
+              oaita.apply_delete("roll", turn_id="nope").startswith("error:"))
+
+        # Session drop removes the folder wholesale; an executor box is discarded.
+        s.write_turn("victim", "0010.user", "hi")
+        class Spy:
+            def __init__(self): self.discarded = []
+            def discard_box(self, box): self.discarded.append(box)
+        spy = Spy()
+        out2 = oaita.apply_delete("anyseg", session="victim", executor=spy)
+        check("session delete removed the folder",
+              not oaita.session_dir("victim").exists())
+        check("the session's box was discarded via the executor",
+              spy.discarded == ["OAITA-VICTIM"])
+        check("deleting a missing session is an error",
+              oaita.apply_delete("x", session="ghost").startswith("error:"))
+        check("delete with neither turn_id nor session is an error",
+              oaita.apply_delete("x").startswith("error:"))
+    finally:
+        s.close()
+
+
+# ── 36e. depth cap: act refuses 'too deep' and flattens its blurb ────────────
+def test_depth_cap():
+    s = Session()
+    try:
+        # At the cap, the act tool is still offered but flattened.
+        deep = oaita.registry_tools(depth=oaita.MAX_DEPTH)
+        act_desc = next(t["function"]["description"] for t in deep
+                        if t["function"]["name"] == "act")
+        check("act blurb flattens to 'too deep' at the cap",
+              "too deep" in act_desc.lower() or "exhausted" in act_desc.lower())
+
+        # And a call made at the cap returns the refusal, runs no sub-agent.
+        s.write_turn("conv", "0010.user", "delegate forever")
+        s.srv.enqueue(CannedChat(tool_calls=[
+            ("act", json.dumps({"request": "go deeper"}), "c1")]))
+        s.generate("conv")
+        res = oaita.evaluate_call(
+            "conv", model="test-model", base_url=s.srv.base_url,
+            api_key="k", echo=lambda _t: None, depth=oaita.MAX_DEPTH)
+        check("act at the cap returns 'too deep'",
+              "too deep" in res[0].read_text())
+        check("no sub-agent session was created at the cap",
+              not any(d.name not in ("conv",)
+                      and (d / "0010-c1.user").exists()
+                      for d in oaita.state_home().iterdir() if d.is_dir()))
+    finally:
+        s.close()
+
+
 # ── 37. add_turn: stdin-to-turn convenience, defaults and overrides ──────────
 def test_add_turn():
     import io
@@ -1435,6 +1555,10 @@ if __name__ == "__main__":
         test_call_id_adoption,
         test_shell_tool,
         test_summarize_patch_unit,
+        test_inspect_path,
+        test_inspect_tool_call,
+        test_delete_rollback_and_session,
+        test_depth_cap,
         test_deterministic_ids_with_seed,
         test_add_turn,
     ]

@@ -16,11 +16,20 @@ CLI client for OpenAI-compatible chat APIs, depends on `sarun`.
 - Send-time adapter: answered tool calls replay in NATIVE provider form
   (assistant.tool_calls + matching tool_call_id, content = id-header only);
   files keep the envelope. Kills the envelope-as-prose imitation wart.
-- Tool registry (two-faced rows) + the `shell` tool: script runs in the
-  session's ONE persistent sarun box (OAITA-<SESSION>) behind an executor
-  interface — SarunExecutor (sarun BOX -- sh -c …; changes via sarun BOX
-  patch → per-file +/- summary), FakeExecutor in tests, executor-less mode
-  returns an error result. CLI: --sarun / --no-sandbox.
+- Tool registry (two-faced rows): `act`, `shell`, `inspect`, `delete`.
+  - `shell` runs in the session's ONE persistent sarun box (OAITA-<SESSION>)
+    behind an executor interface — SarunExecutor (sarun BOX -- sh -c …; changes
+    via sarun BOX patch → per-file +/- summary), FakeExecutor in tests,
+    executor-less → error result. CLI: --sarun / --no-sandbox.
+  - `inspect` lists structure at a path (harness-native; directory entries,
+    summary fuse past a cap). `delete` rolls back/collapses a context to one
+    annotation turn, or drops a spent sub-agent session (+ discards its box).
+- Sub-agents are now TOOL-CAPABLE: an `act` leaf is run-to-completion one depth
+  deeper (it can shell/inspect/delete/delegate), capped at MAX_DEPTH (`act`
+  returns "too deep" past the cap).
+- Narration kept: a reply with prose AND tool calls now keeps the prose as its
+  own clean assistant turn before the c-turns (running tallies survive instead
+  of being overwritten by the envelope).
 - `test_oaita.py` (42), `test_oaita_fakeapi.py` (9), `test_oaita_scenarios.py`
   (8 scripted scenarios incl. CLI-subprocess + fix-the-build shell arc), and
   `test_oaita_e2e.py` — the shell tool against a REAL bwrap+FUSE box (real
@@ -139,8 +148,14 @@ CLI client for OpenAI-compatible chat APIs, depends on `sarun`.
   recoverable pairing (explicit per-result reference) only if it bites.
 - **rerolling a bad call = delete the c-turn file by hand.** gen's refusal is
   right, but a "discard call" gesture belongs with the delete tool.
-- **leaf is tools=[]** — sub-agents cannot themselves act yet; flipping that on
-  is trivial (tools=None + depth env var) and is when the depth cap gets built.
+- ~~leaf is tools=[]~~ — FIXED: sub-agents are tool-capable, run-to-completion
+  one depth deeper, capped at MAX_DEPTH (act → "too deep").
+- **spent sub-agent sessions leak.** Each `act` mints a persistent session
+  folder (re-addressable for follow-ups), and nobody garbage-collects them — a
+  fan-out over N files leaves N orphan sessions. `delete(session=…)` exists but
+  the caller must remember to use it (scenario 9 deliberately doesn't, to show
+  the leak). Open: lifecycle policy — auto-drop on parent settle? a sweep
+  command? mark-and-keep only those a follow-up referenced?
 - **run interleaves all streams on one stdout** (outer + every leaf). Cosmetic;
   the files are the record.
 - **keep nondeterminism out of file contents** — the byte-replay scenario only

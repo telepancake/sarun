@@ -87,11 +87,14 @@ the configured base_url — no phone-home).
     oaita gen <name> [--model M] [--base-url URL] [--api-key KEY]
                      [--tool-context NAME] [--capabilities TEXT]
 
-Tool calling is ALWAYS on: a normal context is given ONE meta-tool, ``act``.
-Each ``act`` call is a re-addressable recursive sub-agent (continue it later
-via ``follow_up`` or by targeting the result's ``from`` sender). The inner/leaf
-context is run with no tools (until MCP wires real ones in). Intended for
-tool-capable models only.
+Tool calling is ALWAYS on. The registry is: ``act`` (delegate to a sub-agent),
+``shell`` (run a script in the session's sandbox box), ``inspect`` (list the
+structure at a path), ``delete`` (roll back / collapse this context, or drop a
+spent sub-agent session). Each ``act`` call is a re-addressable recursive
+sub-agent that is itself TOOL-CAPABLE and run to completion one depth deeper
+(continue it later via ``follow_up`` or by targeting the result's ``from``
+sender). Delegation is capped at ``MAX_DEPTH`` — past it ``act`` returns
+"too deep". Intended for tool-capable models only.
 
     oaita gen  <name> [--model M] [--base-url URL] [--api-key KEY]
                       [--capabilities TEXT]
@@ -123,6 +126,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import string
 import sys
 from dataclasses import dataclass, replace
@@ -520,24 +524,37 @@ META_TOOL_NAME = "act"
 
 # The capabilities blurb embedded verbatim in the `act` description; override
 # per call via generate(..., capabilities=...).
-DEFAULT_CAPABILITIES = "general assistance (no external tools wired yet)"
+DEFAULT_CAPABILITIES = "general assistance (shell, inspect, delegation)"
+
+# Delegation depth: a top-level conversation is depth 0; each `act` sub-agent
+# is one deeper. At MAX_DEPTH the `act` tool stays VISIBLE but refuses with a
+# flat "too deep" — the model is told delegation exists, just exhausted, so it
+# does the work itself rather than spinning. Override via $OAITA_MAX_DEPTH.
+MAX_DEPTH = int(os.environ.get("OAITA_MAX_DEPTH") or 3)
 
 
-def meta_tool(capabilities: str) -> dict:
-    """Build the OpenAI tool/function schema for the single ``act`` meta-tool.
+def meta_tool(capabilities: str, *, exhausted: bool = False) -> dict:
+    """Build the OpenAI tool/function schema for the ``act`` meta-tool.
 
     The model uses its capabilities by DESCRIBING what it wants: a
     natural-language ``request`` plus any ``data`` to operate on. Setting
     ``follow_up`` to a previous ``act`` call's turn-id continues that sub-agent
     instead of starting a fresh one. ``capabilities`` is embedded verbatim into
     the description so the model knows what it can ask for.
+
+    ``exhausted`` (at the depth cap) swaps in flatter, less-encouraging text:
+    the tool is still offered, but a call will come back "too deep".
     """
-    description = (
-        "Use your capabilities by describing what you want. Put a "
-        "natural-language description in `request` and any data in `data`. "
-        f"Your capabilities: {capabilities}. To follow up on an earlier "
-        "result, set `follow_up` to that call's turn-id."
-    )
+    if exhausted:
+        description = (
+            "Delegation depth is exhausted here. You can still call this, but "
+            "it will return 'too deep' — so just do the task yourself.")
+    else:
+        description = (
+            "Use your capabilities by describing what you want. Put a "
+            "natural-language description in `request` and any data in `data`. "
+            f"Your capabilities: {capabilities}. To follow up on an earlier "
+            "result, set `follow_up` to that call's turn-id.")
     return {
         "type": "function",
         "function": {
@@ -592,10 +609,16 @@ class ToolSpec:
                              "parameters": self.parameters}}
 
 
-def tool_registry(capabilities: str | None = None) -> dict[str, ToolSpec]:
-    """The v1 tool rows: ``act`` (delegate) and ``shell`` (sandboxed script)."""
+def tool_registry(capabilities: str | None = None,
+                  depth: int = 0) -> dict[str, ToolSpec]:
+    """The v1 tool rows: ``act``, ``shell``, ``inspect``, ``delete``.
+
+    ``depth`` (this context's delegation depth) flattens ``act`` to its
+    exhausted form at ``MAX_DEPTH`` — the row stays so the model still sees
+    the capability, but a call returns "too deep".
+    """
     caps = capabilities if capabilities is not None else DEFAULT_CAPABILITIES
-    act = meta_tool(caps)["function"]
+    act = meta_tool(caps, exhausted=depth >= MAX_DEPTH)["function"]
     return {
         META_TOOL_NAME: ToolSpec(
             name=META_TOOL_NAME,
@@ -621,12 +644,61 @@ def tool_registry(capabilities: str | None = None) -> dict[str, ToolSpec]:
                 "required": ["script"],
             },
         ),
+        "inspect": ToolSpec(
+            name="inspect",
+            description=(
+                "List the structure of the thing at `path`: a directory's "
+                "entries (name + kind). A huge listing is summarized to fit. "
+                "Read a specific entry by inspecting its deeper path."),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Filesystem path to inspect.",
+                    },
+                },
+                "required": ["path"],
+            },
+        ),
+        "delete": ToolSpec(
+            name="delete",
+            description=(
+                "Tidy your own context. Give a `turn-id` to ROLL BACK: every "
+                "turn from it onward is removed; if you also give `annotation` "
+                "text, one clean assistant turn with that text replaces them — "
+                "collapsing a messy string of attempts into the result. Give "
+                "a `session` name instead to delete a finished sub-agent "
+                "session entirely."),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "turn_id": {
+                        "type": "string",
+                        "description": "Turn-id to roll back to (inclusive).",
+                    },
+                    "annotation": {
+                        "type": "string",
+                        "description": "Replacement assistant-turn text for a "
+                                       "rollback.",
+                    },
+                    "session": {
+                        "type": "string",
+                        "description": "A sub-agent session name to delete "
+                                       "wholesale (instead of a rollback).",
+                    },
+                },
+                "required": [],
+            },
+        ),
     }
 
 
-def registry_tools(capabilities: str | None = None) -> list[dict]:
-    """The outward tools array for the API (all registry rows)."""
-    return [spec.schema() for spec in tool_registry(capabilities).values()]
+def registry_tools(capabilities: str | None = None,
+                   depth: int = 0) -> list[dict]:
+    """The outward tools array for the API (all registry rows at ``depth``)."""
+    return [spec.schema()
+            for spec in tool_registry(capabilities, depth).values()]
 
 
 # ── Executors — where `shell` scripts actually run ───────────────────────────
@@ -702,12 +774,105 @@ class SarunExecutor:
         return ExecResult(output=output.strip("\n"), changes=changes,
                           exit_code=proc.returncode)
 
+    def discard_box(self, box: str) -> None:
+        """Discard a box's staged changes and remove it (best-effort)."""
+        import subprocess
+        subprocess.run([*self._argv, box, "discard"],
+                       capture_output=True, text=True)
+
 
 def render_shell_result(r: ExecResult) -> str:
     """The model-facing text of one shell run's ``.tool`` result turn."""
     parts = [f"exit {r.exit_code}", r.output]
     parts.append(r.changes if r.changes else "[no file changes]")
     return "\n".join(p for p in parts if p != "")
+
+
+# ── inspect — structure of the thing at a path ───────────────────────────────
+INSPECT_MAX_ENTRIES = 200          # past this, summarize instead of enumerate
+
+
+def _entry_kind(p: Path) -> str:
+    if p.is_symlink():
+        return "symlink"
+    if p.is_dir():
+        return "dir"
+    if p.is_file():
+        return "file"
+    return "other"
+
+
+def inspect_path(path: str) -> str:
+    """List the structure at ``path``. v1: a directory's entries (name + kind).
+
+    A listing larger than ``INSPECT_MAX_ENTRIES`` is SUMMARIZED to per-kind
+    counts (the degenerate-case fuse — "15086 files" beats dumping them); the
+    model digs into any subpath with another inspect. A regular file reports
+    its size (structural decode lands later); a missing path is an error.
+    """
+    p = Path(path).expanduser()
+    if not p.exists():
+        return f"error: no such path {path!r}"
+    if p.is_dir():
+        entries = sorted(p.iterdir(), key=lambda q: q.name)
+        if len(entries) > INSPECT_MAX_ENTRIES:
+            counts: dict[str, int] = {}
+            for e in entries:
+                counts[_entry_kind(e)] = counts.get(_entry_kind(e), 0) + 1
+            summary = ", ".join(f"{n} {k}(s)" for k, n in sorted(counts.items()))
+            return f"{path} (summarized — {len(entries)} entries): {summary}"
+        lines = [f"{_entry_kind(e)}\t{e.name}" for e in entries]
+        return f"{path} ({len(entries)} entries):\n" + "\n".join(lines)
+    return f"{path}: file, {p.stat().st_size} bytes"
+
+
+# ── delete — roll back / collapse, or drop a finished sub-agent session ──────
+def apply_delete(target_seg: str, *, turn_id: str | None = None,
+                 annotation: str | None = None,
+                 session: str | None = None,
+                 executor=None) -> str:
+    """Apply a ``delete`` call to ``target_seg``; return a model-facing summary.
+
+    ROLLBACK (``turn_id``): every turn from that id onward (by grid number) is
+    removed, and if ``annotation`` is given a single clean assistant turn with
+    that text replaces them — collapsing a messy string of attempts into the
+    kept result. (Attachment dirs of the removed turns go too.)
+
+    SESSION (``session``): delete that sub-agent session's folder wholesale and
+    discard its sandbox box. For tidying re-addressable sub-agents once their
+    result is banked.
+    """
+    if session is not None:
+        if not _NAME_RE.match(session):
+            return f"error: invalid session name {session!r}"
+        folder = session_dir(session)
+        if not folder.is_dir():
+            return f"error: no session {session!r} to delete"
+        shutil.rmtree(folder, ignore_errors=True)
+        if executor is not None and hasattr(executor, "discard_box"):
+            executor.discard_box(box_name(session))
+        return f"deleted session {session!r}"
+
+    if turn_id is None:
+        return "error: delete needs a turn_id (rollback) or session (drop)"
+    turns = load_turns(target_seg)
+    match = next((t for t in turns if t.slug == turn_id), None)
+    if match is None:
+        return f"error: no turn {turn_id!r} in this context"
+    removed = [t for t in turns if t.number >= match.number]
+    for t in removed:
+        t.path.unlink(missing_ok=True)
+        att = t.path.parent / t.path.name.split(".")[0]
+        if att.is_dir():
+            shutil.rmtree(att, ignore_errors=True)
+    note = ""
+    if annotation:
+        kept = load_turns(target_seg)
+        slug = new_turn_id({t.slug for t in kept if t.slug},
+                           slot=f"{target_seg}/{match.number}")
+        append_raw_turn(target_seg, "assistant", annotation, slug=slug)
+        note = f"; collapsed into assistant turn {slug!r}"
+    return f"rolled back {len(removed)} turn(s) from {turn_id!r}{note}"
 
 
 @dataclass
@@ -1134,6 +1299,7 @@ def generate(
     echo=None,
     tools: list | None = None,
     capabilities: str | None = None,
+    depth: int = 0,
 ) -> list[Path]:
     """ONE model generation for ``name``, persisted. Nothing more.
 
@@ -1167,12 +1333,11 @@ def generate(
             sys.stdout.write(text)
             sys.stdout.flush()
 
-    # The normal context ALWAYS carries the registry tools (act + shell). The
-    # inner leaf execution context is called with tools=[] so it answers
-    # directly — offering no tool means it can't call anything — which is
-    # exactly where real MCP tools will plug in later.
+    # The normal context carries the registry tools for THIS depth (act flips
+    # to its "too deep" form at MAX_DEPTH). tools=[] forces a tool-free leaf
+    # (used for a deliberately non-acting context); tools=<list> overrides.
     if tools is None:
-        tools = registry_tools(capabilities)
+        tools = registry_tools(capabilities, depth)
     tools_param = tools or None
 
     target_seg = parse_stitch(name)[-1]
@@ -1196,23 +1361,32 @@ def generate(
     # (the envelope is the turn's raw content), then STOP. Nothing is evaluated
     # here — `call` does that, one call at a time.
     produced: list[Path] = []
+    # NARRATION: a reply may carry prose AND tool calls (a running tally before
+    # the next step). Keep it — finalize the streamed content as its own clean
+    # assistant turn, so the commentary survives instead of being overwritten
+    # by the envelope. The c-turns are then all appended after it. (Empty
+    # narration → the first call repurposes the streamed target, as before.)
+    repurpose = ctx.target
+    if resp.content.strip():
+        produced.append(_finalize_answer(ctx.target, ctx))
+        repurpose = None
     for i, call in enumerate(resp.tool_calls):
         envelope = _call_envelope(call.name, call.arguments)
-        if i == 0:
-            # The first call repurposes the just-streamed target turn: envelope
-            # replaces any streamed preamble; rename p→c. A model-chosen
-            # call_<id> in our shape is adopted as the slug (the tool-blob
-            # analogue of prose header adoption), else the minted slug stays.
-            tgt = parse_turn(ctx.target)
-            ctx.target.write_text(envelope, encoding="utf-8")
+        if repurpose is not None and i == 0:
+            # Repurpose the just-streamed (empty) target turn: write the
+            # envelope, rename p→c. A model-chosen call_<id> in our shape is
+            # adopted as the slug (the tool-blob analogue of prose header
+            # adoption), else the minted slug stays.
+            tgt = parse_turn(repurpose)
+            repurpose.write_text(envelope, encoding="utf-8")
             slug = adopt_call_id(call.id, ctx.existing_slugs - {tgt.slug}) \
                 or tgt.slug
-            cpath = ctx.target.parent / turn_filename(
+            cpath = repurpose.parent / turn_filename(
                 tgt.number, "assistant", slug, sender=tgt.sender, flags="c")
-            if cpath != ctx.target:
-                ctx.target.rename(cpath)
+            if cpath != repurpose:
+                repurpose.rename(cpath)
         else:
-            # Further parallel calls each append their own c-flagged turn.
+            # Append a fresh c-flagged turn (parallel call, or narration kept).
             cur = load_turns(target_seg)
             taken = {t.slug for t in cur if t.slug} | ctx.existing_slugs
             slug = adopt_call_id(call.id, taken) or new_turn_id(
@@ -1233,6 +1407,7 @@ def evaluate_call(
     echo=None,
     tool_context: str | None = None,
     executor=None,
+    depth: int = 0,
 ) -> list[Path]:
     """Evaluate the FIRST unanswered tool call of ``name``'s target segment.
 
@@ -1240,14 +1415,19 @@ def evaluate_call(
 
     ``act``: the inner sub-agent session is the call's turn-id (or the call's
     ``follow_up`` target), the request is posted into it as a user turn with
-    ``from=<outer segment>``, the inner session is ``gen``'d as a leaf
-    (``tools=[]``; ``tool_context`` is stitched in front when given), and the
-    inner answer is posted back as a ``.tool`` result turn with
-    ``from=<inner session>`` — the address for follow-ups.
+    ``from=<outer segment>``, and the inner session is RUN TO COMPLETION one
+    depth deeper (tool-capable — it can shell, inspect, delete, even delegate
+    again until ``MAX_DEPTH``). Its final clean assistant turn is posted back
+    as a ``.tool`` result with ``from=<inner session>`` — the follow-up
+    address. At ``MAX_DEPTH`` ``act`` refuses with "too deep" instead.
 
     ``shell``: the script runs via ``executor`` in the session's persistent
     box (``box_name(target_seg)``); the result turn is the captured output +
     staged-change summary. No executor configured → an error-text result.
+
+    ``inspect``: list the structure at a path. ``delete``: roll back / collapse
+    this context, or drop a sub-agent session. Both are harness-native and act
+    on ``target_seg`` directly.
 
     An unknown tool name also yields an error-text result turn (the loop keeps
     moving; the model sees the error). Returns the written result turn
@@ -1273,6 +1453,7 @@ def evaluate_call(
     tool, arguments = _parse_call_envelope(call_turn.read())
 
     sender: str | None = None
+    rolled_back = False
     if tool == "shell":
         script = _parse_shell_arguments(arguments)
         if executor is None:
@@ -1281,9 +1462,23 @@ def evaluate_call(
         else:
             result = render_shell_result(
                 executor.run_script(script, box=box_name(target_seg)))
+    elif tool == "inspect":
+        result = inspect_path(_parse_inspect_arguments(arguments))
+    elif tool == "delete":
+        tid, annotation, sess = _parse_delete_arguments(arguments)
+        # A self-rollback removes the delete CALL turn itself, so it does NOT
+        # produce a paired .tool result — the rewritten context IS the answer.
+        rolled_back = sess is None and tid is not None
+        result = apply_delete(target_seg, turn_id=tid, annotation=annotation,
+                              session=sess, executor=executor)
+        if rolled_back:
+            return []
     elif tool != META_TOOL_NAME:
         known = ", ".join(repr(k) for k in tool_registry())
         result = f"error: unknown tool {tool!r} — available: {known}"
+    elif depth >= MAX_DEPTH:
+        result = ("too deep: delegation depth is exhausted — do this "
+                  "yourself rather than delegating further")
     else:
         request, data, follow_up = _parse_act_arguments(arguments)
         # New call → the inner session IS this turn's id; follow_up continues
@@ -1297,9 +1492,11 @@ def evaluate_call(
         append_raw_turn(innerid, "user", inner_user,
                         slug=inner_slug, sender=target_seg)
         stitch_spec = f"{tool_context}.{innerid}" if tool_context else innerid
-        inner = generate(stitch_spec, model=model, client=client,
-                         echo=echo, tools=[])
-        result = inner[-1].read_text(encoding="utf-8")
+        # Tool-capable sub-agent, one depth deeper: run it to completion.
+        run_to_completion(stitch_spec, model=model, client=client,
+                          echo=echo, tool_context=tool_context,
+                          executor=executor, depth=depth + 1)
+        result = load_turns(innerid)[-1].read()
         sender = innerid
 
     cur = load_turns(target_seg)
@@ -1321,6 +1518,7 @@ def run_to_completion(
     capabilities: str | None = None,
     executor=None,
     max_steps: int = 32,
+    depth: int = 0,
 ) -> list[Path]:
     """Drive ``name`` until its tail is a CLEAN assistant turn (the answer).
 
@@ -1328,6 +1526,7 @@ def run_to_completion(
     otherwise (no clean assistant tail yet, or a partial one) → ``generate``.
     The primitives stay one-step and individually re-runnable; this loop is
     the only driver. Already-settled contexts return immediately ([]).
+    ``depth`` is this context's delegation depth (sub-agents run deeper).
 
     Bounded by ``max_steps`` (raises ``SystemExit`` when exceeded — partial
     progress is all on disk, a later run resumes exactly where it stopped).
@@ -1342,13 +1541,13 @@ def run_to_completion(
         if pending_calls(turns):
             produced += evaluate_call(name, model=model, client=client,
                                       echo=echo, tool_context=tool_context,
-                                      executor=executor)
+                                      executor=executor, depth=depth)
             continue
         if (turns and turns[-1].type == "assistant"
                 and "p" not in turns[-1].flags and "c" not in turns[-1].flags):
             return produced
         produced += generate(name, model=model, client=client, echo=echo,
-                             capabilities=capabilities)
+                             capabilities=capabilities, depth=depth)
     raise SystemExit(
         f"oaita: run {name!r} did not settle within {max_steps} steps — "
         f"progress is on disk; run again to continue")
@@ -1396,6 +1595,31 @@ def _parse_shell_arguments(arguments: str) -> str:
         if isinstance(script, str) and script:
             return script
     return arguments
+
+
+def _parse_inspect_arguments(arguments: str) -> str:
+    """Parse an ``inspect`` call into the path (tolerant — raw text if dirty)."""
+    try:
+        obj = json.loads(arguments)
+    except (ValueError, TypeError):
+        obj = None
+    if isinstance(obj, dict) and isinstance(obj.get("path"), str):
+        return obj["path"]
+    return arguments.strip()
+
+
+def _parse_delete_arguments(arguments: str):
+    """Parse a ``delete`` call into (turn_id, annotation, session)."""
+    try:
+        obj = json.loads(arguments)
+    except (ValueError, TypeError):
+        obj = None
+    if not isinstance(obj, dict):
+        return None, None, None
+    def s(key):
+        v = obj.get(key)
+        return v if isinstance(v, str) and v else None
+    return s("turn_id"), s("annotation"), s("session")
 
 
 def _parse_act_arguments(arguments: str) -> tuple[str, str | None, str | None]:

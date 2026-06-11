@@ -133,6 +133,46 @@ def act_call(request, **extra):
     return CannedChat(tool_calls=[("act", json.dumps(args), "call_x")])
 
 
+def _last(req):
+    """The content of the last message in a captured request ('' if none)."""
+    msgs = req.messages or []
+    c = msgs[-1].get("content") if msgs else None
+    return c if isinstance(c, str) else ""
+
+
+def _has_tool(req, name):
+    """True if any message in the request is a native tool_call for `name`."""
+    for m in req.messages or []:
+        for tc in m.get("tool_calls") or []:
+            if tc.get("function", {}).get("name") == name:
+                return True
+    return False
+
+
+class WcExecutor:
+    """A tiny real-ish executor that understands the two wc invocations the
+    line-counting sub-agents try: `wc --lines=PATH` (bogus → GNU-style error)
+    and `wc -l < PATH` (correct → the real line count of the real file)."""
+
+    def __init__(self, workdir):
+        self.workdir = Path(workdir)
+        self.bad_calls = 0
+        self.good_calls = 0
+
+    def run_script(self, script, box):
+        if "--lines=" in script:
+            self.bad_calls += 1
+            return oaita.ExecResult(
+                output="wc: unrecognized option '--lines='", exit_code=1)
+        if script.startswith("wc -l < "):
+            self.good_calls += 1
+            path = Path(script.split("< ", 1)[1].strip())
+            n = path.read_text().count("\n")
+            return oaita.ExecResult(output=str(n), exit_code=0)
+        return oaita.ExecResult(output=f"sh: unsupported: {script}",
+                                exit_code=127)
+
+
 # ── scenario 1+2: delegation arc, then sender-targeted follow-up ─────────────
 def _script_delegation(srv):
     """The expect script for the round-1 delegation arc (used twice: by the
@@ -193,12 +233,10 @@ def test_scenario_delegation_and_follow_up():
         reqs = st.srv.requests
         check("S1: exactly three model requests (gen, leaf, gen)",
               len(reqs) == 3)
-        check("S1: outer gens advertise the registry; the leaf advertises "
-              "nothing",
-              reqs[0].tools
-              and {t["function"]["name"] for t in reqs[0].tools}
-              == {"act", "shell"}
-              and reqs[2].tools and reqs[1].tools is None)
+        check("S1: every gen advertises the full registry (sub-agents are "
+              "tool-capable too)",
+              all(r.tools and {t["function"]["name"] for t in r.tools}
+                  == {"act", "shell", "inspect", "delete"} for r in reqs))
         # The synthesis prompt narrates the call: assistant turn = envelope
         # JSON as content, tool turn with the from-bearing header.
         synth = reqs[2].messages
@@ -251,7 +289,7 @@ def test_scenario_delegation_and_follow_up():
         # Leaf request for round 2 saw the WHOLE researcher history.
         leaf2 = next(r for r in st.srv.requests
                      if r.messages and "GPLv2 vs GPLv3?"
-                     in r.messages[-1]["content"] and r.tools is None)
+                     in r.messages[-1]["content"])
         check("S2: leaf prompt carried the researcher's round-1 history",
               "MIT is permissive; GPL is copyleft." in
               "".join(m["content"] for m in leaf2.messages))
@@ -488,6 +526,126 @@ def test_scenario_sarun_executor_wiring():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+# ── scenario 9: count lines across a directory — the full multi-agent arc ────
+def test_scenario_count_lines_across_dir():
+    """The big one. Main inspects a directory, delegates each file to a tool-
+    capable sub-agent that fumbles `wc`, recovers, then COLLAPSES its messy
+    attempt log into one clean annotation via `delete` rollback; that clean
+    turn rides back up as the tool result and kicks the parent forward; main
+    keeps a running tally and — deliberately — never deletes the spent
+    sub-agent sessions (the leak wart, observed)."""
+    st = Stage(seed="count")
+    try:
+        # A real directory of real files (inspect is harness-native).
+        work = st.tmp / "src"
+        work.mkdir()
+        (work / "a.txt").write_text("l1\nl2\nl3\n")          # 3 lines
+        (work / "b.txt").write_text("only one line\n")        # 1 line
+
+        st.write_turn("tally", "0010.user",
+                      f"Count the lines in every file under {work}.")
+
+        # ── main's reasoning, keyed on what it has just seen ──
+        # 1. first sees the task → inspect the directory.
+        st.srv.expect(f"Count the lines in every file under {work}.",
+                      CannedChat(tool_calls=[
+                          ("inspect", json.dumps({"path": str(work)}), "c0")]))
+        # 2. sees the listing → delegate a.txt (with a tally preamble: 0 so far).
+        st.srv.expect(lambda r: _last(r).startswith(f"{work} (2 entries)"),
+                      CannedChat(
+                          content="0 lines so far. Counting a.txt.",
+                          tool_calls=[("act", json.dumps(
+                              {"request": f"count lines in {work}/a.txt"}),
+                              "call_filea")]))
+        # 3. sees a.txt's result (3) → tally 3, delegate b.txt.
+        st.srv.expect(lambda r: "a.txt has 3 lines" in _last(r),
+                      CannedChat(
+                          content="3 lines so far. Counting b.txt.",
+                          tool_calls=[("act", json.dumps(
+                              {"request": f"count lines in {work}/b.txt"}),
+                              "call_fileb")]))
+        # 4. sees b.txt's result (1) → final clean answer (no more calls).
+        st.srv.expect(lambda r: "b.txt has 1 line" in _last(r),
+                      CannedChat(content="Total: 4 lines (a.txt 3, b.txt 1)."))
+
+        # ── each sub-agent: wrong wc, error, right wc, then collapse ──
+        # The sub-agent first runs a broken wc, sees the error, re-runs it
+        # correctly, then deletes its own call-chain into a clean annotation.
+        for fid, fname, nlines, line_word in (
+                ("filea", "a.txt", 3, "lines"),
+                ("fileb", "b.txt", 1, "line")):
+            st.srv.expect(lambda r, fn=fname: f"count lines in {work}/{fn}"
+                          in _last(r) and not _has_tool(r, "shell"),
+                          CannedChat(tool_calls=[("shell", json.dumps(
+                              {"script": f"wc --lines={work}/{fname}"}),
+                              f"call_{fid}1")]))
+            # sees the wc error → run it correctly.
+            st.srv.expect(lambda r, fn=fname: "unrecognized option" in _last(r),
+                          CannedChat(tool_calls=[("shell", json.dumps(
+                              {"script": f"wc -l < {work}/{fname}"}),
+                              f"call_{fid}2")]))
+            # sees the correct count → collapse the whole mess into one note,
+            # rolling back to the FIRST (broken) shell call turn.
+            st.srv.expect(lambda r, n=nlines: f"exit 0\n{n}" in _last(r),
+                          CannedChat(tool_calls=[("delete", json.dumps(
+                              {"turn_id": f"{fid}1",
+                               "annotation": f"{fname} has {nlines} "
+                                             f"{line_word}."}),
+                              f"call_{fid}d")]))
+
+        # A scripted executor that knows wc: wrong args → error, right → count.
+        ex = WcExecutor(work)
+        produced = st.run("tally", executor=ex, max_steps=40)
+
+        # ── main settled with the running tally visible ──
+        main = turns_of("tally")
+        types = [t.type for t in main]
+        check("S9: main ran inspect, two delegations, and tallied",
+              types == ["user",
+                        "assistant",            # inspect call (c)
+                        "tool",                 # listing
+                        "assistant",            # "0 lines so far" narration
+                        "assistant",            # act a.txt (c)
+                        "tool",                 # a.txt result
+                        "assistant",            # "3 lines so far" narration
+                        "assistant",            # act b.txt (c)
+                        "tool",                 # b.txt result
+                        "assistant"])           # final total
+        narrations = [t.read() for t in main
+                      if t.type == "assistant" and "c" not in t.flags]
+        check("S9: the running tally is preserved each step (not overwritten)",
+              narrations == ["0 lines so far. Counting a.txt.",
+                             "3 lines so far. Counting b.txt.",
+                             "Total: 4 lines (a.txt 3, b.txt 1)."])
+        # The two delegation RESULTS are the sub-agents' collapsed annotations.
+        results = [t.read() for t in main if t.type == "tool"]
+        check("S9: a.txt sub-agent returned the clean collapsed annotation",
+              "a.txt has 3 lines." in results)
+        check("S9: b.txt sub-agent returned the clean collapsed annotation",
+              "b.txt has 1 line." in results)
+
+        # ── each sub-agent collapsed its messy attempt log ──
+        sub_a = turns_of("filea")
+        check("S9: sub-agent a collapsed to seed-user + ONE clean annotation",
+              [t.type for t in sub_a] == ["user", "assistant"]
+              and sub_a[-1].read() == "a.txt has 3 lines."
+              and sub_a[-1].flags == "")
+        check("S9: the broken-wc attempt turns are GONE after rollback",
+              not any("wc --lines" in t.read() for t in sub_a))
+        check("S9: sub-agent seed carries from=<main>", sub_a[0].sender == "tally")
+
+        # ── the leak wart: spent sub-agent sessions were never cleaned up ──
+        sibling = {d.name for d in oaita.state_home().iterdir() if d.is_dir()}
+        check("S9: WART — spent sub-agent sessions leak (main never deletes)",
+              {"filea", "fileb"} <= sibling)
+
+        # ── the wc executor really saw both the wrong and right invocations ──
+        check("S9: each sub-agent fumbled wc then fixed it (real tool error)",
+              ex.bad_calls == 2 and ex.good_calls == 2)
+    finally:
+        st.close()
+
+
 # ── standalone runner ────────────────────────────────────────────────────────
 if __name__ == "__main__":
     tests = [
@@ -498,6 +656,7 @@ if __name__ == "__main__":
         test_scenario_cli_subprocess,
         test_scenario_shell_fix_build,
         test_scenario_sarun_executor_wiring,
+        test_scenario_count_lines_across_dir,
     ]
     for t in tests:
         print(f"\n── {t.__name__} ──")
