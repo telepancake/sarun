@@ -1058,6 +1058,43 @@ def test_wbuf_periodic_flush():
         fx.stop()
 
 
+def test_self_paths_hidden():
+    # sarun's own host dirs (data/config/state/runtime homes — the runtime home
+    # contains the FUSE mountpoint itself) must be invisible THROUGH the
+    # overlay: lookup ENOENTs, readdir omits them, and creating/shadowing them
+    # is denied — while their siblings stay fully visible. This is what lets
+    # the box see the rest of /run etc. without being able to re-enter the
+    # overlay or touch the capture machinery (replaces the old blanket
+    # "--tmpfs /run").
+    fx = MountFixture()
+    old_env = {k: os.environ.get(k) for k in ("XDG_DATA_HOME", "XDG_RUNTIME_DIR")}
+    try:
+        data = fx.tmp / "xdg-data"; (data / "slopbox").mkdir(parents=True)
+        (data / "slopbox" / "secret.sqlar").write_text("capture machinery")
+        (data / "visible.txt").write_text("sibling")
+        rt = fx.tmp / "xdg-rt"; (rt / "slopbox" / "mnt").mkdir(parents=True)
+        os.environ["XDG_DATA_HOME"] = str(data)
+        os.environ["XDG_RUNTIME_DIR"] = str(rt)
+        fx.start(lower="/")
+        base = str(fx.root) + str(fx.tmp)   # the host temp tree, via the overlay
+        r = fx.sh(f"ls {base}/xdg-data")
+        check(r.returncode == 0 and "visible.txt" in r.stdout
+              and "slopbox" not in r.stdout,
+              "self-hide: readdir omits slopbox data dir, sibling listed")
+        r = fx.sh(f"cat {base}/xdg-data/slopbox/secret.sqlar")
+        check(r.returncode != 0, "self-hide: lookup inside hidden dir fails")
+        r = fx.sh(f"ls {base}/xdg-rt")
+        check(r.returncode == 0 and "slopbox" not in r.stdout,
+              "self-hide: readdir omits slopbox runtime dir (mountpoint home)")
+        r = fx.sh(f"mkdir {base}/xdg-rt/slopbox")
+        check(r.returncode != 0, "self-hide: shadowing a hidden dir is denied")
+    finally:
+        fx.stop()
+        for k, v in old_env.items():
+            if v is None: os.environ.pop(k, None)
+            else: os.environ[k] = v
+
+
 if __name__ == "__main__":
     for t in (test_readthrough_and_create, test_copyup_modify,
               test_otrunc_rewrite_shorter, test_delete_whiteout,
@@ -1073,7 +1110,7 @@ if __name__ == "__main__":
               test_wbuf_stat_coherence, test_wbuf_existing_file_preserve,
               test_wbuf_spill, test_wbuf_create_buffers,
               test_terminated_parent_reads,
-              test_wbuf_periodic_flush):
+              test_wbuf_periodic_flush, test_self_paths_hidden):
         print(f"\n== {t.__name__} ==")
         try:
             t()
