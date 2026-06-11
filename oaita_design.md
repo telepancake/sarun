@@ -4,7 +4,17 @@ CLI client for OpenAI-compatible chat APIs, depends on `sarun`.
 
 **Built (on the branch, tested):**
 - `oaita_fakeserver` / `oaita_fakeclient` / `test_oaita_fakeapi.py` — canned-response
-  test rig (zero-dep server, openai-SDK client).
+  test rig (zero-dep server, openai-SDK client). Expect-mode: `srv.expect(matcher,
+  response)` rules answer by request MATCH (string = substring of last message, or
+  callable), before the queue; responses may be callables (templating).
+- `oaita` core: turn files (grammar below incl. flags + from), gen/call/run split,
+  `add` (stdin → turn file), turn-id injection + header absorb, name stitching,
+  `act` sub-agents with from-routing.
+- Deterministic ids: `$OAITA_ID_SEED` makes each generated id a hash of its
+  (session, NNNN) slot — same folder + seed = identical filenames. Tests pin
+  exact trees; a replay scenario byte-compares two from-scratch runs.
+- `test_oaita.py` (38), `test_oaita_fakeapi.py` (9), `test_oaita_scenarios.py`
+  (6 scripted end-to-end scenarios incl. CLI-subprocess).
 
 ## Core model
 
@@ -20,8 +30,13 @@ CLI client for OpenAI-compatible chat APIs, depends on `sarun`.
     present exactly when call/run machinery posts a turn cross-context. `from`
     implies a turnid (harness assigns one when posting).
   - `<flags>` is additional meta about the turn.
-    - `p` for partial (needs to be extended. For example, no EOS yet)
+    - `p` for partial (needs to be extended. For example, no EOS yet). gen streams
+      into a p-flagged target and drops the flag on clean completion, so an
+      interrupt leaves a resumable partial; a CLEAN assistant tail is never
+      rewritten (gen after it appends).
     - `i` for "no turn id header". suppresses turn id prefix processing described in next section.
+    - `c` for "tool call": an assistant turn holding a `{"tool", "arguments"}`
+      envelope, written by gen, evaluated by call.
   - `<type>` extension is the role (`system`/`user`/`assistant`/`tool`/…).
 - Context is rebuilt from the files every step, without any additional hidden state.
 
@@ -65,11 +80,16 @@ CLI client for OpenAI-compatible chat APIs, depends on `sarun`.
 
 - One model generation per `oaita gen`.
 - the streamed reply is the answer (one turn).
+- tool call(s) in the reply are PERSISTED as c-flagged turns, never evaluated;
+  gen refuses to run while a call is unanswered (the prompt would mislead).
 
 ## call subcommand
 
-- evaluate tool call from the last turn.
-- if tool call has produced reply, write it in a follow-up turn.
+- evaluate tool call from the last turn. ONE call per invocation; in the
+  trailing call/result block, pairing is positional (k-th result ↔ k-th call).
+- if tool call has produced reply, write it in a follow-up turn. The result
+  turn carries from=<inner session>; the inner seed carries from=<outer> —
+  both ends know whom to address.
 - reply can be deferred, such as when subagent is invoked in a "blocking" manner
 
 ## run subcommand
@@ -79,6 +99,12 @@ CLI client for OpenAI-compatible chat APIs, depends on `sarun`.
 - tool calls are processed using call.
 - if assistant turn causes tool reply to another context, it is written there.
 
+## add subcommand
+
+- stdin → one turn file. Defaults: next grid number, generated turn-id, type
+  user, session $OAITA_SESSION/'default'; all overridable (--type --id --from
+  --flags --number). Unbuffered copy; written path on stdout.
+
 ## Tools
 
 - run process in sarun sandbox. reports either completion (if short lived), or informs that process is running in background. background processes can be inspected, but completion automatically posts completion turn into the session that ran the process.
@@ -87,6 +113,33 @@ CLI client for OpenAI-compatible chat APIs, depends on `sarun`.
 - replace contents of thing refered to by a path obtained from inspect. harness makes sure current content of the thing matches previous content that was returned by read in this session, and reports confilct error unless forced by the tool call to ignore. fake "/before" and "/after" paths can be used to insert element into sequeces before or after another element
 - apply or discard changes made by process. sarun sandbox stays around after process completion and can be used to run follow up process, or inspected to look at changes it has made to files. these changes can be either applied (whole, per file, per hunk), or discarded.
 - delete process. if running, terminates (including nested processes). optionally rollback up to provided turn-id and replace or augment contents of that turn with provided text. this allow long string of attempts to be collapsed by model into single clean invocation with an annotation.
+
+## warts found while scripting scenarios
+
+- **context replay is a narrative, not native tool format.** A c-turn is re-sent
+  as a plain assistant message whose content is the envelope JSON, and the result
+  as role:tool without tool_call_id. Lenient servers accept it, but a model that
+  keeps SEEING envelope-JSON-as-content may start WRITING envelope JSON as
+  content instead of emitting native tool-call tokens — the exact failure
+  run-to-reply was rejected for. Fix is a SEND-TIME adapter (synthesize
+  assistant.tool_calls + matching tool_call_id from the c-turn + its result);
+  files stay as they are. Probably next.
+- **big tool params will bloat the envelope.** Fine for act's one-line requests;
+  `replace(path, newcontent)` as JSON-in-a-turn is awful. Resolution: big params
+  go in the call turn's ATTACHMENT dir, envelope references them. (Attachments
+  pull double duty.)
+- **positional pairing is fragile under hand-editing** — delete one result file
+  and later pairings in the block shift. Accepted cost of files-as-database;
+  recoverable pairing (explicit per-result reference) only if it bites.
+- **rerolling a bad call = delete the c-turn file by hand.** gen's refusal is
+  right, but a "discard call" gesture belongs with the delete tool.
+- **leaf is tools=[]** — sub-agents cannot themselves act yet; flipping that on
+  is trivial (tools=None + depth env var) and is when the depth cap gets built.
+- **run interleaves all streams on one stdout** (outer + every leaf). Cosmetic;
+  the files are the record.
+- **keep nondeterminism out of file contents** — the byte-replay scenario only
+  holds because no timestamps/randomness ever land in a turn file. Invariant
+  worth keeping on purpose.
 
 ## what is sarun (already made and working)
 
