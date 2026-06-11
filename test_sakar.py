@@ -413,6 +413,24 @@ def test_resolv_bind_dangling_symlink(tmp_path):
     args = _sakar._resolv_conf_bind_args(str(src), link_path=str(link))
     assert args == ["--dir", str(target.parent), "--ro-bind", str(src), str(target)]
 
+def test_resolv_bind_multi_hop_through_run(tmp_path):
+    # toolbox/flatpak layout: /etc/resolv.conf -> /run/host/etc/resolv.conf ->
+    # .../stub-resolv.conf. The *intermediate* hop lives under /run, which we
+    # replace with a fresh tmpfs inside the box — so following the whole chain
+    # (realpath) lands on a final target whose path is unreachable, and DNS dies.
+    # We must bind at the FIRST hop, the path /etc/resolv.conf actually points at.
+    first_hop = tmp_path / "run" / "host" / "etc" / "resolv.conf"
+    final = tmp_path / "run" / "systemd" / "resolve" / "stub-resolv.conf"
+    final.parent.mkdir(parents=True); final.write_text("nameserver 127.0.0.53\n")
+    first_hop.parent.mkdir(parents=True); first_hop.symlink_to(final)
+    link = tmp_path / "resolv.conf"; link.symlink_to(first_hop)
+    src = tmp_path / "sakar-resolv.conf"; src.write_text("nameserver 10.0.0.53\n")
+    args = _sakar._resolv_conf_bind_args(str(src), link_path=str(link))
+    assert args == ["--dir", str(first_hop.parent),
+                    "--ro-bind", str(src), str(first_hop)]
+    # NOT the final target (the old realpath behavior, unreachable in-box).
+    assert str(final) not in args
+
 
 # ════════════════════════════════════════════════════════════════════════════
 #  Standalone runner

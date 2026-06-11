@@ -661,13 +661,26 @@ def _resolv_conf_bind_args(resolv_src: str,
     path is always resolved with LOOKUP_FOLLOW), so the bind lands in the empty
     tmpfs and fails: "Can't create file at /etc/resolv.conf: No such file or
     directory". We sidestep that by resolving the link ourselves, host-side, and
-    binding onto the concrete real target — recreating its parent dir in the tmpfs
-    with --dir — rather than relying on bwrap to chase a symlink at mount time. The
-    /etc/resolv.conf symlink is left untouched and resolves naturally to the file
-    we bound. For a plain-file resolv.conf, realpath() returns it unchanged and
-    "--dir <parent>" is a harmless no-op on the already-present directory.
+    binding a *regular* file onto the target it points at — recreating that
+    target's parent dir in the tmpfs with --dir.
+
+    Crucially we follow only a SINGLE hop (os.readlink), not the whole chain
+    (os.path.realpath). The regular file we bind terminates the chain, so further
+    hops don't matter — and chasing them is actively harmful: a toolbox/flatpak
+    host has /etc/resolv.conf -> /run/host/etc/resolv.conf -> .../stub-resolv.conf,
+    where the *intermediate* hop lives under /run. realpath jumps to the final
+    target, but inside the box that intermediate /run/host path is gone (we tmpfs
+    /run), so the symlink dead-ends and DNS breaks. Binding at the first hop
+    instead replaces /run/host/etc/resolv.conf directly, which is exactly what the
+    box's /etc/resolv.conf points at. For a plain-file resolv.conf, readlink raises
+    and we bind onto the file itself; "--dir <parent>" is then a harmless no-op.
     """
-    dest = os.path.realpath(link_path)
+    try:
+        target = os.readlink(link_path)
+    except OSError:
+        dest = link_path        # not a symlink (plain file, or absent)
+    else:
+        dest = os.path.normpath(os.path.join(os.path.dirname(link_path), target))
     return ["--dir", os.path.dirname(dest), "--ro-bind", resolv_src, dest]
 
 _BWRAP_HELP = None
