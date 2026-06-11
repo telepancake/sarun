@@ -1003,6 +1003,45 @@ def test_tools_multiple_calls_one_gen():
         s.close()
 
 
+# ── 34. deterministic turn-ids under $OAITA_ID_SEED ──────────────────────────
+def test_deterministic_ids_with_seed():
+    """Same folder state + same seed → identical ids; seed change → different;
+    collisions probe deterministically (uniqueness from `existing`, not luck)."""
+    def run_once(seed):
+        s = Session()
+        os.environ["OAITA_ID_SEED"] = seed
+        try:
+            name = "det"
+            s.write_turn(name, "0010.user", "hello")
+            s.srv.enqueue(CannedChat(content="hi"))
+            s.generate(name)
+            return sorted(p.name for p in oaita.session_dir(name).iterdir())
+        finally:
+            os.environ.pop("OAITA_ID_SEED", None)
+            s.close()
+
+    a, b, c = run_once("s1"), run_once("s1"), run_once("s2")
+    check("same seed reproduces the exact same filenames", a == b)
+    check("a different seed yields different ids", a != c)
+    check("deterministic ids still match the id shape",
+          all(_ID_RE.match(_id_from_name(f)) for f in a))
+
+    # Pure-function probe: an occupied slot's first candidate forces probe #1,
+    # and the result is itself stable.
+    os.environ["OAITA_ID_SEED"] = "s1"
+    try:
+        first = oaita.new_turn_id(set(), slot="det/10")
+        probed = oaita.new_turn_id({first}, slot="det/10")
+        probed2 = oaita.new_turn_id({first}, slot="det/10")
+        check("collision probes to a new id", probed != first)
+        check("the probed id is itself deterministic", probed == probed2)
+        no_slot = oaita.new_turn_id({first})
+        check("no slot falls back to the random path (valid, unique id)",
+              bool(_ID_RE.match(no_slot)) and no_slot != first)
+    finally:
+        os.environ.pop("OAITA_ID_SEED", None)
+
+
 # ── standalone runner ────────────────────────────────────────────────────────
 if __name__ == "__main__":
     tests = [
@@ -1039,6 +1078,7 @@ if __name__ == "__main__":
         test_tools_always_on_plain_reply,
         test_tools_stops_after_result,
         test_tools_multiple_calls_one_gen,
+        test_deterministic_ids_with_seed,
     ]
     for t in tests:
         try:

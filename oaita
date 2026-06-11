@@ -99,6 +99,7 @@ from __future__ import annotations
 #  1 · Imports & session paths
 # ════════════════════════════════════════════════════════════════════════════
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -288,14 +289,42 @@ _ID_CHARS = string.ascii_lowercase
 _ID_LEN = 5
 
 
-def new_turn_id(existing: set[str]) -> str:
+def _id_from_hash(material: str) -> str:
+    """Map arbitrary seed material to one candidate id (5 chars of _ID_CHARS)."""
+    v = int.from_bytes(
+        hashlib.blake2b(material.encode(), digest_size=8).digest(), "big")
+    chars = []
+    for _ in range(_ID_LEN):
+        v, r = divmod(v, len(_ID_CHARS))
+        chars.append(_ID_CHARS[r])
+    return "".join(chars)
+
+
+def new_turn_id(existing: set[str], slot: str | None = None) -> str:
     """Generate a fresh unique 5-char lowercase turn-id not already in ``existing``.
 
-    Uses ``secrets.choice`` for unpredictability (overkill for ids but avoids
-    predictable alphabetical sequences that could confuse collision avoidance).
-    Retries on collision — the probability of needing even one retry is ~1 in
-    11 878 576 / len(existing), so this loop is essentially always one iteration.
+    Normal mode uses ``secrets.choice`` (unpredictability is overkill for ids
+    but avoids predictable alphabetical sequences).
+
+    Deterministic mode: when ``$OAITA_ID_SEED`` is set AND ``slot`` is given,
+    the id is ``hash(seed:slot:probe)``. ``slot`` is the turn's stable
+    coordinate — ``"<session>/<NNNN>"`` — so the same folder state under the
+    same seed always yields the same ids, which is what lets expect-style tests
+    pin exact filenames in their assertions.
+
+    Either way, uniqueness comes from probing against ``existing`` (open
+    addressing — the deterministic path bumps the probe counter, the random
+    path redraws), never from improbability. The id length only governs probe
+    count, and the namespace (26^5) is far larger than any real session.
     """
+    seed = os.environ.get("OAITA_ID_SEED")
+    if seed is not None and slot is not None:
+        probe = 0
+        while True:
+            candidate = _id_from_hash(f"{seed}:{slot}:{probe}")
+            if candidate not in existing:
+                return candidate
+            probe += 1
     while True:
         candidate = "".join(secrets.choice(_ID_CHARS) for _ in range(_ID_LEN))
         if candidate not in existing:
@@ -329,7 +358,9 @@ def assign_slugs(turns: list[Turn],
             updated.append(turn)
         else:
             # Generate a fresh id, rename the file, update the in-memory turn.
-            new_id = new_turn_id(existing_slugs)
+            # Slot = session/NNNN, the turn's stable coordinate (deterministic mode).
+            new_id = new_turn_id(
+                existing_slugs, slot=f"{turn.path.parent.name}/{turn.number}")
             existing_slugs.add(new_id)
             new_name = turn_filename(turn.number, turn.type, new_id)
             new_path = turn.path.parent / new_name
@@ -580,7 +611,7 @@ def plan_generation(turns: list[Turn], folder: Path, existing_slugs: set[str]):
     if turns and turns[-1].type == "assistant":
         return turns[:-1], turns[-1].path, True
     number = next_number(turns)
-    new_id = new_turn_id(existing_slugs)
+    new_id = new_turn_id(existing_slugs, slot=f"{folder.name}/{number}")
     existing_slugs.add(new_id)
     target = folder / turn_filename(number, "assistant", new_id)
     return turns, target, False
@@ -773,7 +804,9 @@ def generate(
             call_turn.write_text(request, encoding="utf-8")
         else:
             # Further parallel calls each append their own assistant turn.
-            slug = new_turn_id({t.slug for t in load_turns(target_seg) if t.slug})
+            cur = load_turns(target_seg)
+            slug = new_turn_id({t.slug for t in cur if t.slug},
+                               slot=f"{target_seg}/{next_number(cur)}")
             call_turn = append_raw_turn(
                 target_seg, "assistant", request, slug=slug)
         # New call → the inner session IS this turn's id (handle == turn-id); a
@@ -793,9 +826,12 @@ def generate(
         result = inner[-1].read_text(encoding="utf-8")
 
         # Persist the OUTER tool-result turn (type tool, fresh unique slug).
-        outer_slugs = {t.slug for t in load_turns(target_seg) if t.slug}
+        cur = load_turns(target_seg)
+        outer_slugs = {t.slug for t in cur if t.slug}
         produced.append(append_raw_turn(
-            target_seg, "tool", result, slug=new_turn_id(outer_slugs)))
+            target_seg, "tool", result,
+            slug=new_turn_id(outer_slugs,
+                             slot=f"{target_seg}/{next_number(cur)}")))
 
     return produced
 
