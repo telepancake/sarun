@@ -70,3 +70,5 @@ CLI client for OpenAI-compatible chat APIs, depends on `sarun`.
 - filesystem change tracking,
 - nesting (box in box),
 - apply or discard a box's accumulated changes.
+- boxes run in the HOST network namespace (network gating moved to a separate
+  `sakar` tool), so an in-box oaita reaches a localhost LLM endpoint directly.
