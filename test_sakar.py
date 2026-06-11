@@ -433,6 +433,41 @@ def test_resolv_bind_multi_hop_through_run(tmp_path):
 
 
 # ════════════════════════════════════════════════════════════════════════════
+#  runtime-dir bind args  (regression: tmpfs /run hid /run/user/<uid> sockets)
+# ════════════════════════════════════════════════════════════════════════════
+
+def test_runtime_dir_bind_xdg_and_conventional(tmp_path, monkeypatch):
+    # XDG_RUNTIME_DIR points somewhere custom: it gets bound back over the
+    # fresh tmpfs, and the conventional /run/user/<uid> is bound too if the
+    # host actually has it.
+    xdg = tmp_path / "rt"; xdg.mkdir()
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(xdg))
+    args = _sakar._runtime_dir_bind_args()
+    assert args[:3] == ["--bind-try", str(xdg), str(xdg)]
+    conventional = f"/run/user/{os.getuid()}"
+    if os.path.isdir(conventional):
+        assert args[3:] == ["--bind-try", conventional, conventional]
+    else:
+        assert args[3:] == []
+
+def test_runtime_dir_bind_dedupes(monkeypatch):
+    # XDG_RUNTIME_DIR == /run/user/<uid> must not produce two bind pairs for
+    # the same path. (count is 2 because each bind names the path twice:
+    # "--bind-try SRC DEST"; absent dir → no bind at all.)
+    conventional = f"/run/user/{os.getuid()}"
+    monkeypatch.setenv("XDG_RUNTIME_DIR", conventional)
+    args = _sakar._runtime_dir_bind_args()
+    assert args.count(conventional) == (2 if os.path.isdir(conventional) else 0)
+
+def test_runtime_dir_bind_skips_missing(monkeypatch, tmp_path):
+    # A nonexistent XDG_RUNTIME_DIR contributes nothing — no dangling binds.
+    missing = str(tmp_path / "nope")
+    monkeypatch.setenv("XDG_RUNTIME_DIR", missing)
+    args = _sakar._runtime_dir_bind_args()
+    assert missing not in args
+
+
+# ════════════════════════════════════════════════════════════════════════════
 #  Standalone runner
 # ════════════════════════════════════════════════════════════════════════════
 

@@ -683,6 +683,34 @@ def _resolv_conf_bind_args(resolv_src: str,
         dest = os.path.normpath(os.path.join(os.path.dirname(link_path), target))
     return ["--dir", os.path.dirname(dest), "--ro-bind", resolv_src, dest]
 
+def _runtime_dir_bind_args() -> list:
+    """bwrap args that bind the caller's runtime dir(s) back into the box.
+
+    We lay a fresh tmpfs over /run, which also hides /run/user/<uid> — the
+    XDG runtime dir where named unix sockets live (ssh-agent, gpg-agent, the
+    user D-Bus, wayland, rootless podman/docker...). Those are filesystem
+    objects, not network endpoints; sakar isolates the *network* only, so
+    tools that talk over named unix sockets must keep working. Bind the
+    caller's runtime dir back over the tmpfs. The bind comes AFTER the
+    "--tmpfs /run" in the arg list — bwrap applies mounts in order.
+
+    Both XDG_RUNTIME_DIR (which may point elsewhere, e.g. under a tmpfs'd
+    /tmp) and the conventional /run/user/<uid> are bound when they exist;
+    --bind-try keeps a racing teardown of either dir from aborting the box.
+    """
+    candidates = []
+    xdg = os.environ.get("XDG_RUNTIME_DIR")
+    if xdg:
+        candidates.append(os.path.normpath(xdg))
+    conventional = f"/run/user/{os.getuid()}"
+    if conventional not in candidates:
+        candidates.append(conventional)
+    args: list = []
+    for d in candidates:
+        if os.path.isdir(d):
+            args += ["--bind-try", d, d]
+    return args
+
 _BWRAP_HELP = None
 def bwrap_supports(flag: str) -> bool:
     global _BWRAP_HELP
@@ -1386,6 +1414,7 @@ def cmd_run(cmd: list) -> int:
                 "--proc", "/proc", "--dev", "/dev",
                 "--ro-bind-try", "/sys", "/sys",
                 "--tmpfs", "/tmp", "--tmpfs", "/run",
+                *_runtime_dir_bind_args(),
                 *resolv_args,
                 *unshare_args,
                 *cap_args, "--die-with-parent",
