@@ -11,23 +11,49 @@ CLI client for OpenAI-compatible chat APIs, depends on `sarun`.
 - A session is a folder: `$XDG_STATE_HOME/oaita/<name>/`.
 - <name> is `[A-Za-z0-9]+`
 - One file = one turn. File content is the raw turn text. Turns are ordered alphabetically by file name.
-- Filename `NNNN[-turnid].<flags>.<type>`:
+- Filename `NNNN[-turnid[-from]].<flags>.<type>`:
   - `NNNN` zero-padded, automatic step 10 numbers so insert is easy;
-  - `turnid` alphanumerical turn-id. Auto-assigned if missing. Unique across all sessions.
+  - `turnid` turn-id, `[a-z0-9]+` (no dash — dash separates fields). Auto-assigned
+    if missing. Unique across all sessions.
+  - `from` optional sender: the session name that wrote this turn into the folder.
+    Absent for turns from the session itself (own assistant output, operator input);
+    present exactly when call/run machinery posts a turn cross-context. `from`
+    implies a turnid (harness assigns one when posting).
   - `<flags>` is additional meta about the turn.
     - `p` for partial (needs to be extended. For example, no EOS yet)
     - `i` for "no turn id header". suppresses turn id prefix processing described in next section.
   - `<type>` extension is the role (`system`/`user`/`assistant`/`tool`/…).
 - Context is rebuilt from the files every step, without any additional hidden state.
 
+## Turn attachments
+
+- A turn may have a parallel dir `NNNN-turnid/` next to its file: files the user
+  attached, items unpacked by `inspect` (e.g. a member pulled out of an archive —
+  no virtual filesystem in the harness), full outputs of tool runs.
+- Turn text carries the LLM-facing snippet; the attachment dir carries the full
+  payload (also what a UI shows). This IS the tool-result split.
+- Addressed through the turn-id: `inspect <turnid>` lists turn content +
+  attachments; `read <turnid>/build.log`. Ids are globally unique, so no session
+  prefix needed even across stitched contexts.
+- Lifecycle is the turn's: slug assignment renames file and dir together;
+  regenerate-in-place wipes the dir; deleting the turn deletes the dir.
+- Attachments are NOT sent in context — the model pulls them via inspect/read.
+
 ## Turn-ids
 
-- Purpose: let the model reference / edit its own context
+- Purpose: let the model reference / edit its own context, and see who said what
 - At send time each message's content is prefixed with
-  `{"turn-id":"<id>"}\n`. Files stay raw; header is synthesized from the filename.
-- Generated turns get a fresh unique id, 5 lowercase letters currently.
+  `{"turn-id":"<id>"}\n` — plus `"from":"<name>"` when the filename carries a
+  sender. Files stay raw; header is synthesized from the filename.
+- Generated turns get a fresh unique id, 5 lowercase letters currently. Collisions
+  are handled by probing against the set of known ids, so the short length is a
+  readability choice, not a correctness limit.
 - If the model generates a turn-id header atop its reply (by following example it sees), strip it
 - use the generated turn-id if it is unique and valid. otherwise, make new and replace generated turn-id in this turn's text with new one.
+- a model-emitted `from` is always stripped, never adopted: sender identity is
+  harness-assigned provenance, not a label the model may choose.
+- `from` lets the model target senders in its commands — e.g. follow-up to the
+  context that posted a result, or address the context that started this subagent.
 
 ## Name stitching
 
