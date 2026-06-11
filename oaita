@@ -734,7 +734,7 @@ def prepare_context(name: str) -> _PreparedContext:
             f"the stitched context")
 
     check_unique_turn_ids(prompt_turns)
-    messages = [t.message(inject_id=True) for t in prompt_turns]
+    messages = build_messages(prompt_turns)
     return _PreparedContext(
         segments=segments,
         target_seg=target_seg,
@@ -768,6 +768,81 @@ def append_raw_turn(name: str, type: str, content: str,
     path = folder / turn_filename(number, type, slug, sender=sender, flags=flags)
     path.write_text(content, encoding="utf-8")
     return path
+
+
+def build_messages(turns: list[Turn]) -> list[dict]:
+    """The OpenAI messages array for a turn sequence — NATIVE tool-call form.
+
+    Plain turns pass through ``Turn.message()``. A ``c``-flagged call turn that
+    HAS a paired result is lifted into the provider's native shape — an
+    assistant message carrying ``tool_calls`` (id ``call_<turn-id>``) with the
+    id-header as its content — and its ``.tool`` result gets the matching
+    ``tool_call_id``. This is SEND-TIME ONLY: files keep the envelope. Without
+    it the model keeps seeing envelope-JSON-as-content and starts WRITING
+    envelope JSON as content instead of emitting native tool-call tokens.
+
+    Pairing is positional per maximal call/result block (same rule as
+    ``pending_calls``). An UNANSWERED call inside the history (possible in a
+    prepended stitched segment) stays in narrative form — an assistant
+    ``tool_calls`` message with no result would be rejected by strict
+    providers. A stray ``.tool`` turn with no preceding call self-pairs on its
+    own turn-id.
+    """
+    # Pass 1: positional pairing inside each maximal (c-call | tool) block.
+    call_of_result: dict[int, Turn] = {}     # index of tool turn -> call turn
+    answered: set[int] = set()               # indices of c-turns with a result
+    block_calls: list[tuple[int, Turn]] = []
+    block_results: list[int] = []
+
+    def flush_block():
+        for k, ridx in enumerate(block_results):
+            if k < len(block_calls):
+                cidx, cturn = block_calls[k]
+                call_of_result[ridx] = cturn
+                answered.add(cidx)
+        block_calls.clear()
+        block_results.clear()
+
+    for i, t in enumerate(turns):
+        if t.type == "assistant" and "c" in t.flags:
+            block_calls.append((i, t))
+        elif t.type == "tool":
+            block_results.append(i)
+        else:
+            flush_block()
+    flush_block()
+
+    # Pass 2: build the messages.
+    msgs: list[dict] = []
+    for i, t in enumerate(turns):
+        if i in answered:
+            tool, args = _parse_call_envelope(t.read())
+            # Content carries ONLY the id-header (the envelope moves into the
+            # native tool_calls field); synthesized from the filename, exactly
+            # as Turn.message() would.
+            hdr = None
+            if t.slug is not None and "i" not in t.flags:
+                h: dict = {"turn-id": t.slug}
+                if t.sender is not None:
+                    h["from"] = t.sender
+                hdr = json.dumps(h) + "\n"
+            msgs.append({
+                "role": "assistant",
+                "content": hdr,
+                "tool_calls": [{
+                    "id": f"call_{t.slug}",
+                    "type": "function",
+                    "function": {"name": tool, "arguments": args},
+                }],
+            })
+        elif t.type == "tool":
+            m = t.message()
+            paired = call_of_result.get(i)
+            m["tool_call_id"] = f"call_{(paired or t).slug}"
+            msgs.append(m)
+        else:
+            msgs.append(t.message())
+    return msgs
 
 
 def pending_calls(turns: list[Turn]) -> list[Turn]:
