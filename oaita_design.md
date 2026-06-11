@@ -13,8 +13,18 @@ CLI client for OpenAI-compatible chat APIs, depends on `sarun`.
 - Deterministic ids: `$OAITA_ID_SEED` makes each generated id a hash of its
   (session, NNNN) slot — same folder + seed = identical filenames. Tests pin
   exact trees; a replay scenario byte-compares two from-scratch runs.
-- `test_oaita.py` (38), `test_oaita_fakeapi.py` (9), `test_oaita_scenarios.py`
-  (6 scripted end-to-end scenarios incl. CLI-subprocess).
+- Send-time adapter: answered tool calls replay in NATIVE provider form
+  (assistant.tool_calls + matching tool_call_id, content = id-header only);
+  files keep the envelope. Kills the envelope-as-prose imitation wart.
+- Tool registry (two-faced rows) + the `shell` tool: script runs in the
+  session's ONE persistent sarun box (OAITA-<SESSION>) behind an executor
+  interface — SarunExecutor (sarun BOX -- sh -c …; changes via sarun BOX
+  patch → per-file +/- summary), FakeExecutor in tests, executor-less mode
+  returns an error result. CLI: --sarun / --no-sandbox.
+- `test_oaita.py` (42), `test_oaita_fakeapi.py` (9), `test_oaita_scenarios.py`
+  (8 scripted scenarios incl. CLI-subprocess + fix-the-build shell arc), and
+  `test_oaita_e2e.py` — the shell tool against a REAL bwrap+FUSE box (real
+  headless UI, staged write, host untouched). E2E PASS.
 
 ## Core model
 
@@ -116,14 +126,10 @@ CLI client for OpenAI-compatible chat APIs, depends on `sarun`.
 
 ## warts found while scripting scenarios
 
-- **context replay is a narrative, not native tool format.** A c-turn is re-sent
-  as a plain assistant message whose content is the envelope JSON, and the result
-  as role:tool without tool_call_id. Lenient servers accept it, but a model that
-  keeps SEEING envelope-JSON-as-content may start WRITING envelope JSON as
-  content instead of emitting native tool-call tokens — the exact failure
-  run-to-reply was rejected for. Fix is a SEND-TIME adapter (synthesize
-  assistant.tool_calls + matching tool_call_id from the c-turn + its result);
-  files stay as they are. Probably next.
+- ~~context replay is a narrative, not native tool format~~ — FIXED: send-time
+  adapter (build_messages). Unanswered mid-history calls still replay as
+  narrative (a dangling tool_calls would be rejected); only an edge via
+  stitched prepends.
 - **big tool params will bloat the envelope.** Fine for act's one-line requests;
   `replace(path, newcontent)` as JSON-in-a-turn is awful. Resolution: big params
   go in the call turn's ATTACHMENT dir, envelope references them. (Attachments
