@@ -37,16 +37,20 @@ from pathlib import Path
 
 import openai
 
-# ── load both app modules via SourceFileLoader ────────────────────────────────
+# ── load both app modules via SourceFileLoader (ONCE per process: re-loading
+# an already-imported module forks class identities across test files) ────────
 _HERE = Path(__file__).resolve().parent
 
-_srv_loader = importlib.machinery.SourceFileLoader(
-    "oaita_fakeserver", str(_HERE / "oaita_fakeserver"))
-_srv = _srv_loader.load_module()
 
-_cli_loader = importlib.machinery.SourceFileLoader(
-    "oaita_fakeclient", str(_HERE / "oaita_fakeclient"))
-_cli = _cli_loader.load_module()
+def _load(name: str):
+    if name in sys.modules:
+        return sys.modules[name]
+    return importlib.machinery.SourceFileLoader(
+        name, str(_HERE / name)).load_module()
+
+
+_srv = _load("oaita_fakeserver")
+_cli = _load("oaita_fakeclient")
 
 FakeOpenAIServer = _srv.FakeOpenAIServer
 CannedChat       = _srv.CannedChat

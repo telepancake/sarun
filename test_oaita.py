@@ -73,9 +73,20 @@ from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-oaita = SourceFileLoader("oaita", str(HERE / "oaita")).load_module()
-fakeserver = SourceFileLoader(
-    "oaita_fakeserver", str(HERE / "oaita_fakeserver")).load_module()
+
+
+def _load(name: str):
+    """Load an extensionless module ONCE per process. load_module() RE-EXECUTES
+    an already-loaded module (reload semantics), which forks class identities
+    when several test files load the same module — isinstance checks then fail
+    across files in a combined pytest run. Reuse sys.modules instead."""
+    if name in sys.modules:
+        return sys.modules[name]
+    return SourceFileLoader(name, str(HERE / name)).load_module()
+
+
+oaita = _load("oaita")
+fakeserver = _load("oaita_fakeserver")
 
 CannedChat = fakeserver.CannedChat
 
