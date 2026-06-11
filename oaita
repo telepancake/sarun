@@ -915,13 +915,17 @@ def append_raw_turn(name: str, type: str, content: str,
 def build_messages(turns: list[Turn]) -> list[dict]:
     """The OpenAI messages array for a turn sequence — NATIVE tool-call form.
 
-    Plain turns pass through ``Turn.message()``. A ``c``-flagged call turn that
-    HAS a paired result is lifted into the provider's native shape — an
-    assistant message carrying ``tool_calls`` (id ``call_<turn-id>``) with the
-    id-header as its content — and its ``.tool`` result gets the matching
-    ``tool_call_id``. This is SEND-TIME ONLY: files keep the envelope. Without
-    it the model keeps seeing envelope-JSON-as-content and starts WRITING
-    envelope JSON as content instead of emitting native tool-call tokens.
+    Plain (free-prose) turns pass through ``Turn.message()`` and get the
+    id-header. A ``c``-flagged call turn that HAS a paired result is lifted
+    into the provider's native shape — an assistant message carrying
+    ``tool_calls`` with id ``call_<turn-id>`` and NO content — and its
+    ``.tool`` result gets the matching ``tool_call_id`` and a RAW payload (no
+    injected header: call/result messages live inside template-special
+    regions where models expect pure payloads; their turn-id rides the native
+    tool_call_id channel instead). This is SEND-TIME ONLY: files keep the
+    envelope. Without it the model keeps seeing envelope-JSON-as-content and
+    starts WRITING envelope JSON as content instead of emitting native
+    tool-call tokens.
 
     Pairing is positional per maximal call/result block (same rule as
     ``pending_calls``). An UNANSWERED call inside the history (possible in a
@@ -954,23 +958,20 @@ def build_messages(turns: list[Turn]) -> list[dict]:
             flush_block()
     flush_block()
 
-    # Pass 2: build the messages.
+    # Pass 2: build the messages. ID-HEADERS GO ON FREE-PROSE TURNS ONLY:
+    # call and result messages live in template-special regions (tool-call /
+    # tool-response token wrapping; models are trained on PURE payloads
+    # there), so they carry no injected header — their turn-id rides the
+    # NATIVE id channel instead (tool_call_id = call_<turn-id>, which is also
+    # everything follow_up needs). A result's from-sender stays filename-only
+    # (harness/UI-visible, not on the wire).
     msgs: list[dict] = []
     for i, t in enumerate(turns):
         if i in answered:
             tool, args = _parse_call_envelope(t.read())
-            # Content carries ONLY the id-header (the envelope moves into the
-            # native tool_calls field); synthesized from the filename, exactly
-            # as Turn.message() would.
-            hdr = None
-            if t.slug is not None and "i" not in t.flags:
-                h: dict = {"turn-id": t.slug}
-                if t.sender is not None:
-                    h["from"] = t.sender
-                hdr = json.dumps(h) + "\n"
             msgs.append({
                 "role": "assistant",
-                "content": hdr,
+                "content": None,
                 "tool_calls": [{
                     "id": f"call_{t.slug}",
                     "type": "function",
@@ -978,7 +979,7 @@ def build_messages(turns: list[Turn]) -> list[dict]:
                 }],
             })
         elif t.type == "tool":
-            m = t.message()
+            m = t.message(inject_id=False)
             paired = call_of_result.get(i)
             m["tool_call_id"] = f"call_{(paired or t).slug}"
             msgs.append(m)
@@ -1006,6 +1007,25 @@ def pending_calls(turns: list[Turn]) -> list[Turn]:
     calls = [t for t in block if t.type == "assistant"]
     n_results = sum(1 for t in block if t.type == "tool")
     return calls[n_results:]
+
+
+# Replayed calls carry their turn-id as tool_call_id = call_<turn-id>, so a
+# model following the convention emits e.g. call_fetchinfo for its NEXT call —
+# the tool-blob analogue of imitating the prose id-header. Adopt such an id
+# (strip the call_ prefix) when it looks like one of OURS: starts with a
+# letter, >=4 chars, [a-z0-9], unique. Provider/template junk (call_0,
+# call_1, random uppercase blobs) fails the gate and a fresh id is minted.
+_ADOPTABLE_CALL_ID_RE = re.compile(r"^[a-z][a-z0-9]{3,63}$")
+
+
+def adopt_call_id(wire_id: str | None, taken: set[str]) -> str | None:
+    """The turn-id extracted from a model-emitted tool_call id, if adoptable."""
+    if not wire_id:
+        return None
+    cand = wire_id[5:] if wire_id.startswith("call_") else wire_id
+    if _ADOPTABLE_CALL_ID_RE.match(cand) and cand not in taken:
+        return cand
+    return None
 
 
 def _call_envelope(name: str | None, arguments: str) -> str:
@@ -1180,19 +1200,23 @@ def generate(
         envelope = _call_envelope(call.name, call.arguments)
         if i == 0:
             # The first call repurposes the just-streamed target turn: envelope
-            # replaces any streamed preamble; rename p→c (same slug).
+            # replaces any streamed preamble; rename p→c. A model-chosen
+            # call_<id> in our shape is adopted as the slug (the tool-blob
+            # analogue of prose header adoption), else the minted slug stays.
             tgt = parse_turn(ctx.target)
             ctx.target.write_text(envelope, encoding="utf-8")
+            slug = adopt_call_id(call.id, ctx.existing_slugs - {tgt.slug}) \
+                or tgt.slug
             cpath = ctx.target.parent / turn_filename(
-                tgt.number, "assistant", tgt.slug, sender=tgt.sender, flags="c")
+                tgt.number, "assistant", slug, sender=tgt.sender, flags="c")
             if cpath != ctx.target:
                 ctx.target.rename(cpath)
         else:
             # Further parallel calls each append their own c-flagged turn.
             cur = load_turns(target_seg)
-            slug = new_turn_id(
-                {t.slug for t in cur if t.slug} | ctx.existing_slugs,
-                slot=f"{target_seg}/{next_number(cur)}")
+            taken = {t.slug for t in cur if t.slug} | ctx.existing_slugs
+            slug = adopt_call_id(call.id, taken) or new_turn_id(
+                taken, slot=f"{target_seg}/{next_number(cur)}")
             cpath = append_raw_turn(
                 target_seg, "assistant", envelope, slug=slug, flags="c")
         produced.append(cpath)

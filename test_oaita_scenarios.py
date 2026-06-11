@@ -205,22 +205,23 @@ def test_scenario_delegation_and_follow_up():
         check("S1: synthesis prompt is user, assistant, tool",
               [m["role"] for m in synth] == ["user", "assistant", "tool"])
         # The call replays in NATIVE tool-call form (send-time adapter): the
-        # envelope rides in tool_calls, the content is the id-header only, and
-        # the result carries the matching tool_call_id.
+        # envelope rides in tool_calls; call/result messages carry NO injected
+        # header (template-special regions stay pure payloads) — the turn-id
+        # rides the native tool_call_id channel instead.
         tcs = synth[1].get("tool_calls")
         check("S1: call turn replays as native assistant.tool_calls",
               tcs and tcs[0]["function"]["name"] == "act"
               and json.loads(tcs[0]["function"]["arguments"])["request"]
               == "research MIT vs GPL differences"
               and tcs[0]["id"] == f"call_{call_t.slug}")
-        check("S1: native call message content is the id-header only",
-              synth[1]["content"] == '{"turn-id": "%s"}\n' % call_t.slug)
+        check("S1: native call message content is empty (no header bait)",
+              synth[1]["content"] is None)
         check("S1: result message carries the matching tool_call_id",
               synth[2].get("tool_call_id") == f"call_{call_t.slug}")
-        check("S1: tool result message carries from=<inner> in its header",
-              synth[2]["content"].startswith(
-                  '{"turn-id": "%s", "from": "%s"}\n'
-                  % (result_t.slug, innerid)))
+        check("S1: tool result payload is RAW (no injected header)",
+              synth[2]["content"] == "MIT is permissive; GPL is copyleft.")
+        check("S1: free-prose turns still carry their headers",
+              synth[0]["content"].startswith('{"turn-id": "'))
 
         # ── round 2: follow up the SAME researcher by its from-address ──
         st.write_turn("main", "0050.user",

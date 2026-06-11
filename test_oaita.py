@@ -1228,6 +1228,52 @@ def test_deterministic_ids_with_seed():
         os.environ.pop("OAITA_ID_SEED", None)
 
 
+# ── 36a. call-id adoption: the tool-blob analogue of header adoption ─────────
+def test_call_id_adoption():
+    s = Session()
+    try:
+        # A conventional model-chosen id (call_<ours-shaped>) is adopted.
+        s.write_turn("conv", "0010.user", "do X")
+        s.srv.enqueue(CannedChat(tool_calls=[
+            ("act", '{"request": "r1"}', "call_fetchinfo")]))
+        produced = s.generate("conv")
+        check("call_<id> in our shape is adopted as the call's turn-id",
+              oaita.parse_turn(produced[0]).slug == "fetchinfo")
+        s.srv.enqueue(CannedChat(content="ok"))
+        s.call("conv")
+        check("the adopted id names the inner sub-agent session",
+              oaita.session_dir("fetchinfo").is_dir())
+
+        # Junk ids (provider counters, uppercase blobs) are NOT adopted.
+        for junk in ("call_0", "call_1", "chatcmpl-tool-9XYZ", "call_AbCd"):
+            nm = f"j{abs(hash(junk)) % 1000}"
+            s.write_turn(nm, "0010.user", "go")
+            s.srv.enqueue(CannedChat(tool_calls=[
+                ("act", '{"request": "r"}', junk)]))
+            p = s.generate(nm)
+            check(f"junk id {junk!r} not adopted (fresh 5-letter id minted)",
+                  bool(re.match(r"^[a-z]{5}$", oaita.parse_turn(p[0]).slug)))
+
+        # A duplicate of an existing turn-id is NOT adopted.
+        s.write_turn("dupc", "0010-fetch1.user", "go")
+        s.srv.enqueue(CannedChat(tool_calls=[
+            ("act", '{"request": "r"}', "call_fetch1")]))
+        p = s.generate("dupc")
+        check("colliding call id not adopted",
+              oaita.parse_turn(p[0]).slug != "fetch1")
+
+        # The unit gate, directly.
+        f = oaita.adopt_call_id
+        check("prefix stripped and adopted", f("call_kitty", set()) == "kitty")
+        check("bare id (no prefix) accepted", f("kitty", set()) == "kitty")
+        check("too short / digit-led / empty rejected",
+              f("call_abc", set()) is None and f("call_1abc", set()) is None
+              and f("", set()) is None and f(None, set()) is None)
+        check("taken id rejected", f("call_kitty", {"kitty"}) is None)
+    finally:
+        s.close()
+
+
 # ── 36b. the shell tool: executor interface, box naming, error mode ──────────
 class FakeExecutor:
     """Scripted stand-in for SarunExecutor: canned results + a call log."""
@@ -1386,6 +1432,7 @@ if __name__ == "__main__":
         test_tools_multiple_calls_one_gen,
         test_pending_calls_unit,
         test_run_to_completion,
+        test_call_id_adoption,
         test_shell_tool,
         test_summarize_patch_unit,
         test_deterministic_ids_with_seed,
