@@ -17,8 +17,9 @@ Covered:
   2. Append: a new `0020-<id>.assistant` is created with the raw reply; the prompt
      contains only the real prior turns (no invented messages), each with the
      injected turn-id header.
-  3. Continue/regenerate: a trailing assistant turn is rewritten in place (no new
-     file) and excluded from the prompt; its slug/id is stable across regenerations.
+  3. Continue/regenerate: a trailing PARTIAL (`p`-flagged) assistant turn is
+     rewritten in place (no new file) and excluded from the prompt; its slug/id
+     is stable; the p flag is dropped on completion. A clean tail appends.
   4. Numbering with slugs: highest+10 across slugged files.
   5. Roles/order: a system+user+assistant history is sent in order with roles.
   6. Streaming: multi-chunk content reassembles on disk and the server saw
@@ -44,18 +45,21 @@ Covered:
  24. Name validation: non-alnum, empty segments, and duplicate segments raise.
  25. Turn-ids stay unique across stitched sessions.
  26. Collision guard fires on a pre-existing duplicate turn-id across sessions.
- 27. Tool calling happy path: act call → inner sub-agent gen → .tool result; gen
-     STOPS (turns user/assistant/tool), inner session named after the call slug
-     holds the request + result; returned paths match.
+ 27. Tool calling happy path: gen persists the act call as a c-flagged envelope
+     turn and STOPS; `call` evaluates it in the inner sub-agent session; the
+     result turn carries from=<inner>, the inner seed carries from=<outer>.
  28. Capabilities surfaced: the advertised single tool is `act` and its
      description embeds the (custom or default) capabilities string.
  29. tool_context stitched: the inner gen's prompt prepends the tool-description
      system turn before the inner user turn.
  30. Follow-up: follow_up continues the existing sub-agent (appends user+assistant
-     to it, not duplicated) and yields a new outer .tool result turn.
+     to it, not duplicated); the result's from-sender is the followed session.
  31. Always-on: the `act` tool is offered by default; a plain reply is one turn.
- 32. gen stops at the tool result (no auto-continuation); a second gen reacts.
- 33. Several act calls in one model output are all evaluated, then gen stops.
+ 32. gen refuses while a call is pending; `call` evaluates one; gen then reacts.
+ 33. Several act calls in one gen → several c-turns; `call` evaluates one per
+     invocation; positional pairing routes each result to its call.
+ 35. pending_calls pairing rules (pure function).
+ 36. run drives gen → call → gen to a clean assistant tail, then no-ops.
 
 Dual style: standalone (`./test_oaita.py` → `ALL PASS`) and pytest-compatible.
 """
@@ -118,6 +122,16 @@ class Session:
             echo=lambda _text: None,
             **kw,
         )
+
+    def call(self, name, **kw):
+        return oaita.evaluate_call(
+            name, model="test-model", base_url=self.srv.base_url,
+            api_key="test-key", echo=lambda _text: None, **kw)
+
+    def run(self, name, **kw):
+        return oaita.run_to_completion(
+            name, model="test-model", base_url=self.srv.base_url,
+            api_key="test-key", echo=lambda _text: None, **kw)
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -242,25 +256,25 @@ def test_append_creates_assistant_turn():
         s.close()
 
 
-# ── 3. continue / regenerate in place ────────────────────────────────────────
+# ── 3. continue / regenerate in place (a `p`-flagged partial tail) ───────────
 def test_regenerate_in_place():
     s = Session()
     try:
         name = "regen"
         s.write_turn(name, "0010.user", "hello")
-        s.write_turn(name, "0020.assistant", "stale partial")
+        s.write_turn(name, "0020.p.assistant", "stale partial")  # interrupted
         s.srv.enqueue(CannedChat(content="regenerated"))
         produced = s.generate(name)
         folder = oaita.session_dir(name)
 
-        # Both turns get slugs; the old slug-less 0020.assistant is renamed.
+        # Both turns get slugs; the partial is regenerated and loses its p flag.
         files = sorted(p.name for p in folder.iterdir())
         check("exactly two turn files on disk after regen", len(files) == 2)
         check("user turn has slug", bool(re.match(r"^0010-[a-z]{5}\.user$", files[0])))
-        check("assistant turn has slug",
+        check("assistant turn has slug and dropped the p flag",
               bool(re.match(r"^0020-[a-z]{5}\.assistant$", files[1])))
-        check("original slug-less 0020.assistant gone",
-              not (folder / "0020.assistant").exists())
+        check("original slug-less 0020.p.assistant gone",
+              not (folder / "0020.p.assistant").exists())
 
         # produced[0] should point at the (renamed) assistant file.
         target = produced[0]
@@ -309,8 +323,8 @@ def test_roles_and_order():
         name = "roles"
         s.write_turn(name, "0010.system", "be terse")
         s.write_turn(name, "0020.user", "ping")
-        s.write_turn(name, "0030.assistant", "pong")
-        # Last turn is assistant → regenerate; prompt = system + user.
+        s.write_turn(name, "0030.p.assistant", "pong")
+        # Last turn is a PARTIAL assistant → regenerate; prompt = system + user.
         s.srv.enqueue(CannedChat(content="pong2"))
         s.generate(name)
         folder = oaita.session_dir(name)
@@ -525,30 +539,37 @@ def test_uniqueness_of_generated_ids():
         s.close()
 
 
-# ── 14. regenerate keeps id stable ───────────────────────────────────────────
+# ── 14. regenerate keeps id stable; a CLEAN tail is never rewritten ──────────
 def test_regenerate_keeps_id_stable():
-    """A second generate on an already-slugged assistant tail keeps the same id."""
+    """Regenerating a partial keeps its id (p dropped); a clean assistant tail
+    is a finished answer — gen after it APPENDS, never rewrites."""
     s = Session()
     try:
         name = "stable"
         s.write_turn(name, "0010-hi.user", "hello")
-        # Pre-write a slugged assistant tail.
-        s.write_turn(name, "0020-oldid.assistant", "stale")
+        # Pre-write a slugged PARTIAL assistant tail.
+        s.write_turn(name, "0020-oldid.p.assistant", "stale")
         s.srv.enqueue(CannedChat(content="fresh"))
         produced = s.generate(name)
         folder = oaita.session_dir(name)
-        # The tail's filename must not have changed.
-        check("regenerated file keeps original slug 'oldid'",
+        # Same slug, p flag dropped on completion.
+        check("regenerated file keeps original slug 'oldid' (p dropped)",
               produced[0].name == "0020-oldid.assistant")
-        check("file still exists with same name",
-              (folder / "0020-oldid.assistant").exists())
+        check("the p-flagged name is gone",
+              not (folder / "0020-oldid.p.assistant").exists())
         check("content overwritten to new reply",
               produced[0].read_text() == "fresh")
-        # And a second regeneration still keeps it.
-        s.srv.enqueue(CannedChat(content="fresher"))
+        # The tail is now CLEAN → a further gen appends; oldid stays untouched.
+        s.srv.enqueue(CannedChat(content="more"))
         produced2 = s.generate(name)
-        check("second regeneration still uses oldid slug",
-              produced2[0].name == "0020-oldid.assistant")
+        check("gen after a clean tail APPENDS a new 0030 turn",
+              bool(re.match(r"^0030-[a-z]{5}\.assistant$", produced2[0].name)))
+        check("the clean tail was not rewritten",
+              (folder / "0020-oldid.assistant").read_text() == "fresh")
+        # The appended generation's prompt INCLUDED the clean assistant turn.
+        req = s.srv.requests[-1]
+        check("clean assistant tail included in the follow-on prompt",
+              [m["role"] for m in req.messages] == ["user", "assistant"])
     finally:
         s.close()
 
@@ -663,7 +684,7 @@ def test_regenerate_strips_but_keeps_stable_id():
     try:
         name = "regenstrip"
         s.write_turn(name, "0010-hi.user", "hello")
-        s.write_turn(name, "0020-oldid.assistant", "stale")
+        s.write_turn(name, "0020-oldid.p.assistant", "stale")
         s.srv.enqueue(CannedChat(content='{"turn-id": "newid"}\nregen body'))
         produced = s.generate(name)
         check("regenerated turn keeps its stable id (model id NOT adopted)",
@@ -739,11 +760,13 @@ def test_stitch_reorder_changes_context_order():
         s.generate("xxx.yyy.ttt")
         check("x.y.t context order is [X, Y, go]",
               _bodies(s.srv.requests[-1].messages) == ["from X", "from Y", "go"])
-        # ttt now ends with an assistant turn → regenerated in place; reorder x/y.
+        # ttt now ends with a CLEAN assistant turn (kept); reorder x/y — the
+        # next gen appends, so the prompt includes the r1 tail.
         s.srv.enqueue(CannedChat(content="r2"))
         s.generate("yyy.xxx.ttt")
-        check("y.x.t context order is [Y, X, go] (target tail excluded)",
-              _bodies(s.srv.requests[-1].messages) == ["from Y", "from X", "go"])
+        check("y.x.t context order is [Y, X, go, r1]",
+              _bodies(s.srv.requests[-1].messages) ==
+              ["from Y", "from X", "go", "r1"])
     finally:
         s.close()
 
@@ -754,7 +777,7 @@ def test_stitch_regenerate_only_target_tail():
     try:
         s.write_turn("sys", "0010.system", "sys prompt")
         s.write_turn("conv", "0010.user", "q")
-        s.write_turn("conv", "0020.assistant", "old answer")
+        s.write_turn("conv", "0020.p.assistant", "old answer")
         s.srv.enqueue(CannedChat(content="new answer"))
         produced = s.generate("sys.conv")
         conv = oaita.session_dir("conv")
@@ -840,31 +863,41 @@ def _contents_in_order(folder):
             if oaita.parse_turn(p) is not None]
 
 
-# ── 27. tool calling happy path ──────────────────────────────────────────────
+# ── 27. tool calling happy path: gen persists the call, `call` evaluates ─────
 def test_tools_happy_path():
     s = Session()
     try:
         s.write_turn("conv", "0010.user", "please do X")
-        # The model calls act; the inner sub-agent produces the result; `gen`
-        # then STOPS (it does not auto-continue the main model).
+        # gen: the model calls act → ONE c-flagged call turn persisted, nothing
+        # evaluated, exactly one wire request.
         s.srv.enqueue(CannedChat(
             tool_calls=[("act", '{"request": "search the thing"}', "call_1")]))
-        s.srv.enqueue(CannedChat(content="THE RESULT"))
         produced = s.generate("conv")
         conv = oaita.session_dir("conv")
+        check("gen persisted the call and STOPPED: turns are user, assistant",
+              _types_in_order(conv) == ["user", "assistant"])
+        check("gen made exactly one wire request", len(s.srv.requests) == 1)
+        check("gen returned the single call turn", len(produced) == 1)
+        call_turn = oaita.parse_turn(produced[0])
+        check("the call turn carries the c flag", call_turn.flags == "c")
+        env = json.loads(produced[0].read_text())
+        check("call turn content is the envelope (tool + parsed arguments)",
+              env == {"tool": "act",
+                      "arguments": {"request": "search the thing"}})
 
-        check("gen stops at the tool result: turns are user, assistant, tool",
+        # call: evaluates the pending call in the inner sub-agent session.
+        s.srv.enqueue(CannedChat(content="THE RESULT"))
+        res = s.call("conv")
+        check("call wrote exactly the result turn", len(res) == 1)
+        check("turns now user, assistant(call), tool",
               _types_in_order(conv) == ["user", "assistant", "tool"])
-        contents = _contents_in_order(conv)
-        check("outer tool-call turn content is the raw request",
-              contents[1] == "search the thing")
-        check("outer .tool turn content is exactly the inner result",
-              contents[2] == "THE RESULT")
+        result_turn = oaita.parse_turn(res[0])
+        check("result content is exactly the inner answer",
+              res[0].read_text() == "THE RESULT")
+        handle = call_turn.slug
+        check("result turn's from-sender is the inner session (the call's id)",
+              result_turn.sender == handle)
 
-        # The tool-call turn's slug names the inner sub-agent session.
-        callfile = sorted(p.name for p in conv.iterdir()
-                          if p.name.endswith(".assistant"))[0]
-        handle = _id_from_name(callfile)
         inner = oaita.session_dir(handle)
         check("inner sub-agent session exists named after the call slug",
               inner.is_dir())
@@ -873,12 +906,14 @@ def test_tools_happy_path():
         icontents = _contents_in_order(inner)
         check("inner user turn is the request", icontents[0] == "search the thing")
         check("inner assistant turn is the result", icontents[1] == "THE RESULT")
-
-        # Returned list = the call + result turns this step wrote, in order.
-        check("returned list is the call + result turns in order",
-              [p.name for p in produced] ==
-              sorted(p.name for p in conv.iterdir()
-                     if oaita.parse_turn(p) is not None)[1:])
+        inner_user = [oaita.parse_turn(p) for p in sorted(inner.iterdir())
+                      if p.name.endswith(".user")][0]
+        check("inner seed turn's from-sender is the OUTER session",
+              inner_user.sender == "conv")
+        # The inner gen saw the from-bearing header on the wire.
+        inner_req = s.srv.requests[-1]
+        check("inner prompt's user turn carries from=conv in its header",
+              '"from": "conv"' in inner_req.messages[0]["content"])
     finally:
         s.close()
 
@@ -916,11 +951,11 @@ def test_tools_tool_context_stitched():
         s.write_turn("tooldesc", "0010.system", "ALL TOOLS HERE")
         s.srv.enqueue(CannedChat(
             tool_calls=[("act", '{"request": "use a tool"}', "call_1")]))
+        s.generate("conv")
         s.srv.enqueue(CannedChat(content="inner result"))  # inner gen
-        s.generate("conv", tool_context="tooldesc")
+        s.call("conv", tool_context="tooldesc")
 
-        # Requests captured: outer (the act call), then inner (tooldesc.<id>).
-        # The INNER call is the one whose first message is the tooldesc system.
+        # The INNER request is the one whose first message is the tooldesc system.
         inner_req = next(
             r for r in s.srv.requests
             if r.messages and r.messages[0]["role"] == "system"
@@ -939,22 +974,24 @@ def test_tools_follow_up():
     s = Session()
     try:
         s.write_turn("conv", "0010.user", "please do X")
-        # First happy-path call producing sub-agent H.
+        # First round: call producing sub-agent H.
         s.srv.enqueue(CannedChat(
             tool_calls=[("act", '{"request": "search the thing"}', "call_1")]))
-        s.srv.enqueue(CannedChat(content="RESULT1"))
         s.generate("conv")
         conv = oaita.session_dir("conv")
+        s.srv.enqueue(CannedChat(content="RESULT1"))
+        s.call("conv")
         callfile = sorted(p.name for p in conv.iterdir()
                           if p.name.endswith(".assistant"))[0]
         handle = _id_from_name(callfile)
 
-        # Second round: the model follows up on H.
+        # Second round: the model follows up on H (the result's from-sender).
         s.srv.enqueue(CannedChat(tool_calls=[(
             "act", json.dumps({"request": "and also Y", "follow_up": handle}),
             "call_2")]))
-        s.srv.enqueue(CannedChat(content="RESULT2"))
         s.generate("conv")
+        s.srv.enqueue(CannedChat(content="RESULT2"))
+        res2 = s.call("conv")
 
         inner = oaita.session_dir(handle)
         check("inner H now has two user + two assistant turns",
@@ -965,10 +1002,11 @@ def test_tools_follow_up():
               icontents[2] == "and also Y")
         check("new inner assistant turn is RESULT2", icontents[3] == "RESULT2")
 
-        # A NEW outer .tool turn holds RESULT2; inner was NOT duplicated.
-        tool_contents = [p.read_text() for p in conv.iterdir()
-                         if p.name.endswith(".tool")]
-        check("a new outer .tool turn holds RESULT2", "RESULT2" in tool_contents)
+        # A NEW outer .tool turn holds RESULT2, from=H; inner NOT duplicated.
+        check("a new outer .tool turn holds RESULT2",
+              res2[0].read_text() == "RESULT2")
+        check("the follow-up result's from-sender is H (not the new call id)",
+              oaita.parse_turn(res2[0]).sender == handle)
         sibling_dirs = [d.name for d in oaita.state_home().iterdir()
                         if d.is_dir()]
         check("the inner session was not duplicated",
@@ -993,29 +1031,38 @@ def test_tools_always_on_plain_reply():
         s.close()
 
 
-# ── 32. gen stops at the tool result; the user drives the next step ──────────
+# ── 32. gen refuses a pending call; call evaluates; the caller drives ─────────
 def test_tools_stops_after_result():
     s = Session()
     try:
         s.write_turn("conv", "0010.user", "what is X")
         s.srv.enqueue(CannedChat(
             tool_calls=[("act", '{"request": "look up X"}', "c1")]))
-        s.srv.enqueue(CannedChat(content="X is 42"))  # inner sub-agent result
         produced = s.generate("conv")
         conv = oaita.session_dir("conv")
+        check("gen persisted ONE call turn and made ONE request",
+              len(produced) == 1 and len(s.srv.requests) == 1)
 
-        check("gen stops at the tool result (turns: user, assistant, tool)",
+        # gen REFUSES to run while the call is unanswered.
+        raised = False
+        try:
+            s.generate("conv")
+        except SystemExit:
+            raised = True
+        check("gen refuses while a call is pending", raised)
+
+        # call evaluates it (one inner request).
+        s.srv.enqueue(CannedChat(content="X is 42"))
+        s.call("conv")
+        check("turns now user, assistant(call), tool",
               _types_in_order(conv) == ["user", "assistant", "tool"])
-        check("exactly the call + result were produced", len(produced) == 2)
-        # No auto-continuation: exactly one OUTER request + one INNER request.
-        # A re-run of the main model would show up as a 3rd captured request.
-        check("no auto-continuation: exactly two model requests made",
+        check("call made exactly one further request",
               len(s.srv.requests) == 2)
 
-        # The user drives the next step: a second gen now reacts to the result.
+        # The caller drives the next step: gen now reacts to the result.
         s.srv.enqueue(CannedChat(content="The answer is 42."))
         produced2 = s.generate("conv")
-        check("second gen appends one synthesised assistant turn",
+        check("next gen appends one synthesised assistant turn",
               len(produced2) == 1 and produced2[0].name.endswith(".assistant"))
         check("synthesis (reacting to the result) is the new tail",
               _contents_in_order(conv)[-1] == "The answer is 42.")
@@ -1023,7 +1070,7 @@ def test_tools_stops_after_result():
         s.close()
 
 
-# ── 33. several act calls in one model output are all evaluated, then stop ────
+# ── 33. several act calls in one gen; calls evaluate in order ─────────────────
 def test_tools_multiple_calls_one_gen():
     s = Session()
     try:
@@ -1032,26 +1079,97 @@ def test_tools_multiple_calls_one_gen():
             ("act", '{"request": "do A"}', "cA"),
             ("act", '{"request": "do B"}', "cB"),
         ]))
-        s.srv.enqueue(CannedChat(content="result A"))  # inner for call A
-        s.srv.enqueue(CannedChat(content="result B"))  # inner for call B
         produced = s.generate("conv")
         conv = oaita.session_dir("conv")
+        check("gen persisted BOTH calls as c-turns (one wire request)",
+              len(produced) == 2 and len(s.srv.requests) == 1
+              and _types_in_order(conv) == ["user", "assistant", "assistant"])
+        check("both call turns carry the c flag",
+              all("c" in oaita.parse_turn(p).flags for p in produced))
 
-        check("both calls evaluated then stop: assistant,tool,assistant,tool",
-              _types_in_order(conv)[1:] ==
-              ["assistant", "tool", "assistant", "tool"])
-        contents = _contents_in_order(conv)
-        check("call A request + result recorded",
-              contents[1] == "do A" and contents[2] == "result A")
-        check("call B request + result recorded",
-              contents[3] == "do B" and contents[4] == "result B")
-        check("four turns produced (two call+result pairs)", len(produced) == 4)
-
-        callslugs = [_id_from_name(p.name) for p in sorted(conv.iterdir())
-                     if p.name.endswith(".assistant")]
+        # Evaluate one call per `call` invocation; pairing is positional.
+        s.srv.enqueue(CannedChat(content="result A"))
+        resA = s.call("conv")
+        s.srv.enqueue(CannedChat(content="result B"))
+        resB = s.call("conv")
+        check("results landed in call order",
+              resA[0].read_text() == "result A"
+              and resB[0].read_text() == "result B")
+        check("turn shape: user, call, call, tool, tool",
+              _types_in_order(conv) ==
+              ["user", "assistant", "assistant", "tool", "tool"])
+        slugA, slugB = (_id_from_name(p.name) for p in produced)
+        check("result A's sender is call A's id; B's is B's",
+              oaita.parse_turn(resA[0]).sender == slugA
+              and oaita.parse_turn(resB[0]).sender == slugB)
         check("two distinct sub-agent sessions exist, one per call",
-              len(set(callslugs)) == 2
-              and all(oaita.session_dir(h).is_dir() for h in callslugs))
+              slugA != slugB
+              and oaita.session_dir(slugA).is_dir()
+              and oaita.session_dir(slugB).is_dir())
+        check("inner sessions hold their own requests",
+              _contents_in_order(oaita.session_dir(slugA))[0] == "do A"
+              and _contents_in_order(oaita.session_dir(slugB))[0] == "do B")
+
+        # No pending call remains.
+        raised = False
+        try:
+            s.call("conv")
+        except SystemExit:
+            raised = True
+        check("a third call raises (nothing pending)", raised)
+    finally:
+        s.close()
+
+
+# ── 35. pending_calls pairing (pure function) ─────────────────────────────────
+def test_pending_calls_unit():
+    def turn(num, type, flags=""):
+        return oaita.Turn(number=num, slug=f"t{num:02d}", type=type,
+                          path=Path(f"{num:04d}-t{num:02d}.{type}"), flags=flags)
+
+    f = oaita.pending_calls
+    check("no turns → no pending", f([]) == [])
+    check("plain tail → no pending", f([turn(10, "user")]) == [])
+    one = [turn(10, "user"), turn(20, "assistant", flags="c")]
+    check("one unanswered call pending", [t.number for t in f(one)] == [20])
+    answered = one + [turn(30, "tool")]
+    check("answered call → nothing pending", f(answered) == [])
+    two = [turn(10, "user"), turn(20, "assistant", flags="c"),
+           turn(30, "assistant", flags="c")]
+    check("two calls, no results → both pending, in order",
+          [t.number for t in f(two)] == [20, 30])
+    check("two calls, one result → second pending (positional pairing)",
+          [t.number for t in f(two + [turn(40, "tool")])] == [30])
+    older = [turn(10, "assistant", flags="c"), turn(20, "user"),
+             turn(30, "assistant", flags="c")]
+    check("the block stops at a non-call/result turn (old calls settled)",
+          [t.number for t in f(older)] == [30])
+    clean = [turn(10, "user"), turn(20, "assistant")]
+    check("a clean assistant tail is not a call", f(clean) == [])
+
+
+# ── 36. run drives gen → call → gen to a clean answer ─────────────────────────
+def test_run_to_completion():
+    s = Session()
+    try:
+        s.write_turn("conv", "0010.user", "what is X")
+        s.srv.enqueue(CannedChat(
+            tool_calls=[("act", '{"request": "look up X"}', "c1")]))
+        s.srv.enqueue(CannedChat(content="X is 42"))          # inner leaf
+        s.srv.enqueue(CannedChat(content="The answer is 42."))  # synthesis
+        produced = s.run("conv")
+        conv = oaita.session_dir("conv")
+        check("run settled: user, call, tool, assistant",
+              _types_in_order(conv) == ["user", "assistant", "tool", "assistant"])
+        check("the final tail is the clean synthesised answer",
+              _contents_in_order(conv)[-1] == "The answer is 42.")
+        check("exactly three wire requests (gen, inner, gen)",
+              len(s.srv.requests) == 3)
+        check("run produced call, result, answer (3 written turns)",
+              len(produced) == 3)
+        # A settled context is a no-op.
+        check("run on a settled context does nothing", s.run("conv") == [])
+        check("no extra requests for the no-op", len(s.srv.requests) == 3)
     finally:
         s.close()
 
@@ -1132,6 +1250,8 @@ if __name__ == "__main__":
         test_tools_always_on_plain_reply,
         test_tools_stops_after_result,
         test_tools_multiple_calls_one_gen,
+        test_pending_calls_unit,
+        test_run_to_completion,
         test_deterministic_ids_with_seed,
     ]
     for t in tests:

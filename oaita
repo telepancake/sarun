@@ -36,20 +36,33 @@ leaves room to hand-insert 0011–0019 later. The next generated turn's number i
 ``(highest existing) + 10`` (or ``0010`` if the session has none). Existing
 numbers are preserved — the client never renumbers files you placed by hand.
 
-The ``gen`` command produces the assistant's reply for the current context and
-persists it, CONTINUE-OR-APPEND:
+The ``gen`` command is ONE model generation, persisted:
 
-  • If the LAST turn is an ``.assistant`` turn, that file is the write target and
-    is (re)generated IN PLACE; the prompt is every turn EXCEPT that last one.
-    This is what makes an interrupted ``gen`` resumable — the partial assistant
-    turn already on disk is regenerated, never duplicated.
-  • Otherwise a NEW ``NNNN-<id>.assistant`` turn is appended (highest+10); the
-    prompt is ALL existing turns.
+  • If the LAST turn is a PARTIAL assistant turn (the ``p`` flag), that file is
+    the write target and is (re)generated IN PLACE; the prompt is every turn
+    EXCEPT that last one. This is what makes an interrupted ``gen`` resumable.
+  • Otherwise a NEW ``NNNN-<id>.p.assistant`` turn is appended (highest+10);
+    the prompt is ALL existing turns. A CLEAN assistant tail is a finished
+    answer — gen after it appends a further turn, it never rewrites it.
 
-Either way the reply is streamed (``stream=True``) and written INCREMENTALLY to
-the target file (write+flush per delta) while echoing live to stdout, so an
-interrupt mid-stream leaves the partial text on disk for the next ``gen`` to
-resume from.
+The reply is streamed (``stream=True``) and written INCREMENTALLY to the
+``p``-flagged target (write+flush per delta) while echoing live to stdout; an
+interrupt mid-stream leaves the partial text on disk WITH the ``p`` flag for
+the next ``gen`` to resume from. On clean completion the ``p`` flag is dropped
+(rename). If the model answers with tool call(s) instead, each call is
+persisted as a ``c``-flagged assistant turn holding a small JSON envelope
+(``{"tool": ..., "arguments": ...}``) — and gen STOPS without evaluating them.
+
+The ``call`` command evaluates ONE unanswered tool call (the first, in the
+trailing call/result block — pairing is positional): an ``act`` call is
+stitched into its persistent inner sub-agent session (seed user turn posted
+with ``from=<outer>``), the inner session is ``gen``'d as a leaf, and the
+answer comes back as a ``.tool`` result turn posted with ``from=<inner>`` — so
+the model can target that sender for follow-ups.
+
+The ``run`` command is the run-to-completion loop: evaluate pending calls
+(``call``), otherwise generate (``gen``), until the tail is a clean assistant
+turn. The primitives stay one-step; ``run`` is the only driver.
 
 Turn-id metadata is INJECTED into the sent context (never written to files):
 every message's content is prefixed with ``{"turn-id": "<id>"}\\n`` so the
@@ -74,16 +87,16 @@ the configured base_url — no phone-home).
     oaita gen <name> [--model M] [--base-url URL] [--api-key KEY]
                      [--tool-context NAME] [--capabilities TEXT]
 
-Tool calling is ALWAYS on, and ``gen`` is ONE step: a normal context is given ONE
-meta-tool, ``act``, and the model does a single generation. If it does not call
-``act``, the streamed reply IS the answer. If it calls ``act`` (oaita executes
-nothing itself), each call is evaluated by STITCHING it into a separate,
-persistent inner session and ``gen``ing that to produce the result, appended as a
-``.tool`` turn — then ``gen`` STOPS. It does NOT auto-continue the main model; you
-run ``gen`` again to let it react (the result lives in the files). Each ``act``
-call is a re-addressable recursive sub-agent (continue it later via
-``follow_up``). The inner/leaf context is run with no tools (until MCP wires real
-ones in). Intended for tool-capable models only.
+Tool calling is ALWAYS on: a normal context is given ONE meta-tool, ``act``.
+Each ``act`` call is a re-addressable recursive sub-agent (continue it later
+via ``follow_up`` or by targeting the result's ``from`` sender). The inner/leaf
+context is run with no tools (until MCP wires real ones in). Intended for
+tool-capable models only.
+
+    oaita gen  <name> [--model M] [--base-url URL] [--api-key KEY]
+                      [--capabilities TEXT]
+    oaita call <name> [--tool-context NAME] [...]
+    oaita run  <name> [--max-steps N] [...]
 
 Sections:
     1 · Imports & session paths
@@ -91,7 +104,7 @@ Sections:
     3 · Turn-id generation & slug assignment
     4 · Client / config layer
     4b · Tool calling: the `act` meta-tool + streamed tool-call assembly
-    5 · gen: prompt assembly + streamed persistence
+    5 · gen / call / run: the one-step primitives + the driver loop
     6 · CLI (argparse) & entry points
     7 · TODO
     8 · __main__
@@ -494,12 +507,13 @@ def resolve_model(model: str | None) -> str:
 # ════════════════════════════════════════════════════════════════════════════
 # Tool calling in oaita is RECURSIVE SUB-AGENTS, not real execution. The
 # user-facing context is given exactly ONE tool — `act` — and when the model
-# "calls" it, oaita does not run anything external: it stitches the call into a
-# separate, persistent inner session and `gen`s THAT to produce the result,
-# which is fed back as the tool result. Because each inner context is just a
-# session addressed by its turn-id, every `act` call is a re-addressable
-# sub-agent (continue it later via `follow_up`). This is opt-in (tools=True);
-# default behaviour is untouched.
+# "calls" it, oaita does not run anything external: `evaluate_call` stitches
+# the call into a separate, persistent inner session and `gen`s THAT to produce
+# the result, which is posted back as the tool result (from=<inner session>).
+# Because each inner context is just a session addressed by its turn-id, every
+# `act` call is a re-addressable sub-agent (continue it later via `follow_up`
+# or by targeting the result's sender). Always on; gen persists calls, `call`
+# evaluates them, `run` loops.
 META_TOOL_NAME = "act"
 
 # The capabilities blurb embedded verbatim in the `act` description; override
@@ -634,27 +648,32 @@ def stream_to_file(stream, target: Path, echo) -> AssembledResponse:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  5 · gen: prompt assembly + streamed persistence
+#  5 · gen / call / run: the one-step primitives + the driver loop
 # ════════════════════════════════════════════════════════════════════════════
 def plan_generation(turns: list[Turn], folder: Path, existing_slugs: set[str]):
     """Decide the prompt turns and the write-target path for a generation.
 
     Returns ``(prompt_turns, target_path, is_regenerate)``:
-      • If the last turn is an assistant turn → regenerate it in place; the
-        prompt is every turn EXCEPT that last one. The tail turn is guaranteed
-        to already have a slug (``assign_slugs`` was called first).
-      • Otherwise → append a new ``NNNN-<id>.assistant`` turn (highest+10); the
-        prompt is ALL existing turns.
+      • If the last turn is a PARTIAL assistant turn (``p`` flag) → regenerate
+        it in place; the prompt is every turn EXCEPT that last one. The tail is
+        guaranteed to already have a slug (``assign_slugs`` was called first).
+      • Otherwise → append a new ``NNNN-<id>.p.assistant`` turn (highest+10);
+        the prompt is ALL existing turns. A clean assistant tail is a finished
+        answer and is never rewritten.
+
+    Either way the target carries the ``p`` flag while it streams; the flag is
+    dropped (rename) when the generation completes cleanly, so an interrupt
+    leaves a ``p``-marked partial for the next gen to resume.
 
     ``existing_slugs`` is the current set of known slugs; a new id is drawn
     from outside it and added to the set in place.
     """
-    if turns and turns[-1].type == "assistant":
+    if turns and turns[-1].type == "assistant" and "p" in turns[-1].flags:
         return turns[:-1], turns[-1].path, True
     number = next_number(turns)
     new_id = new_turn_id(existing_slugs, slot=f"{folder.name}/{number}")
     existing_slugs.add(new_id)
-    target = folder / turn_filename(number, "assistant", new_id)
+    target = folder / turn_filename(number, "assistant", new_id, flags="p")
     return turns, target, False
 
 
@@ -749,6 +768,64 @@ def append_raw_turn(name: str, type: str, content: str,
     return path
 
 
+def pending_calls(turns: list[Turn]) -> list[Turn]:
+    """The UNANSWERED tool-call turns in the trailing call/result block.
+
+    The trailing block is the maximal run of ``c``-flagged assistant turns and
+    ``.tool`` result turns at the end of the session. Pairing is POSITIONAL:
+    the k-th result in the block answers the k-th call (parallel calls are
+    written in order and their results are appended in order). Anything before
+    the block is settled history and never re-examined.
+    """
+    block: list[Turn] = []
+    for t in reversed(turns):
+        if t.type == "tool" or (t.type == "assistant" and "c" in t.flags):
+            block.append(t)
+        else:
+            break
+    block.reverse()
+    calls = [t for t in block if t.type == "assistant"]
+    n_results = sum(1 for t in block if t.type == "tool")
+    return calls[n_results:]
+
+
+def _call_envelope(name: str | None, arguments: str) -> str:
+    """Render one wire tool call as the raw content of a ``c``-flagged turn.
+
+    ``{"tool": <name>, "arguments": <parsed-or-raw>}`` — arguments are embedded
+    as a JSON object when they parse (model-readable on the next gen), else as
+    the verbatim string. The provider's ``tool_call.id`` is deliberately NOT
+    kept: the turn-id system replaces it (pairing is positional).
+    """
+    try:
+        args = json.loads(arguments)
+    except (ValueError, TypeError):
+        args = None
+    if not isinstance(args, (dict, list)):
+        args = arguments
+    return json.dumps({"tool": name or META_TOOL_NAME, "arguments": args})
+
+
+def _parse_call_envelope(content: str) -> tuple[str, str]:
+    """Parse a call turn's content back into ``(tool_name, arguments_str)``.
+
+    Tolerant: content that is not a ``{"tool": ...}`` envelope (hand-authored
+    call turns, junk) is treated as an ``act`` request verbatim.
+    """
+    try:
+        obj = json.loads(content)
+    except (ValueError, TypeError):
+        obj = None
+    if not isinstance(obj, dict) or "tool" not in obj:
+        return META_TOOL_NAME, content
+    args = obj.get("arguments")
+    if isinstance(args, dict):
+        args = json.dumps(args)
+    elif not isinstance(args, str):
+        args = ""
+    return str(obj["tool"]), args
+
+
 def generate(
     name: str,
     *,
@@ -758,48 +835,31 @@ def generate(
     client: openai.OpenAI | None = None,
     echo=None,
     tools: list | None = None,
-    tool_context: str | None = None,
     capabilities: str | None = None,
 ) -> list[Path]:
-    """Generate the assistant reply for ``name`` and persist it.
+    """ONE model generation for ``name``, persisted. Nothing more.
 
     ``name`` is a session name, or a dot-stitched spec ``"a.b.c"``: inference
     happens in the LAST segment (and its file is written there), while the
     earlier segments are prepended to the context in order. Every referenced
     session is loaded and slug-assigned; only the target segment is written.
 
-    Before building the prompt, every existing turn that lacks a slug is
-    renamed on disk to carry a freshly generated unique turn-id; the slug IS
-    the turn-id.  The id-header (``{"turn-id": "<id>"}\\n``) is then injected
-    into each message's content at send time — files remain raw.
+    The reply is streamed to a ``p``-flagged target file (flushed per delta, so
+    an interrupt leaves a resumable partial) and echoed live via ``echo``
+    (defaults to stdout). On clean completion the ``p`` flag is dropped; an
+    imitated id-header is stripped, and on an appended turn a valid unique id
+    the model chose is adopted as the slug.
 
-    If the model imitates the header and emits a ``{"turn-id": ...}`` line atop
-    its reply, that line is stripped before the turn is stored; for a newly
-    appended turn a valid, unique id the model chose is adopted as the slug.
+    TOOL CALLING is always on (``tools=None`` → the single ``act`` meta-tool;
+    ``capabilities`` overrides the blurb; ``tools=[]`` → a leaf that can only
+    answer). If the model answers with tool call(s), each is PERSISTED as a
+    ``c``-flagged assistant turn holding its envelope — and gen STOPS without
+    evaluating anything. Evaluation is ``evaluate_call`` / ``oaita call``;
+    looping is ``run_to_completion`` / ``oaita run``. gen REFUSES to run while
+    an unanswered call is pending (the context would mislead the model).
 
-    The reply is streamed to the target file (flushed per delta, so an interrupt
-    leaves resumable partial text) and echoed live via ``echo`` (defaults to
-    stdout). If the model imitates the id-header atop its reply, that line is
-    stripped before storing; a valid, unique id it chose is adopted as the slug
-    on an appended turn.
-
-    TOOL CALLING is ALWAYS on, and ``gen`` is ONE step. A normal context
-    (``tools=None``) is given exactly ONE meta-tool, ``act``, and the model does
-    a single generation. If it does NOT call ``act``, the streamed reply is the
-    final answer and that one turn is returned. If it DOES call ``act`` (possibly
-    several at once), each call is evaluated — stitched into a persistent inner
-    session and ``gen``d (the leaf, run with ``tools=[]`` so it answers directly
-    until MCP wires real tools in) — and its result appended as a ``.tool`` turn;
-    then ``gen`` STOPS and returns the call+result turns. It does NOT
-    auto-continue the main model: to let it react to a result, run ``gen`` again
-    (the result now lives in the context files). Each ``act`` call is a
-    re-addressable sub-agent (continue it via ``follow_up``). ``tool_context``
-    names a fixed (cacheable) tool-description session stitched before each inner
-    call; ``capabilities`` overrides ``DEFAULT_CAPABILITIES``.
-
-    Returns the turn files this step wrote, in order (one assistant turn for a
-    plain reply; otherwise the call+result turn(s)). Raises ``SystemExit`` on an
-    invalid name or an empty stitched context — no empty files are created.
+    Returns the turn files this step wrote, in order. Raises ``SystemExit`` on
+    an invalid name or an empty stitched context — no empty files are created.
     """
     model = resolve_model(model)
     if client is None:
@@ -819,11 +879,12 @@ def generate(
     tools_param = tools or None
 
     target_seg = parse_stitch(name)[-1]
+    if pending_calls(load_turns(target_seg)):
+        raise SystemExit(
+            f"oaita: {target_seg!r} has an unanswered tool call — evaluate it "
+            f"first (`oaita call {name}`), or drive with `oaita run {name}`")
 
-    def silent(_text: str):
-        return None
-
-    # ONE main-model generation per `gen` (no outer agent loop).
+    # ONE main-model generation per `gen` (no agent loop anywhere in here).
     ctx = prepare_context(name)
     ctx.target_folder.mkdir(parents=True, exist_ok=True)
     stream = client.chat.completions.create(
@@ -832,76 +893,176 @@ def generate(
 
     if not resp.tool_calls:
         # Plain reply: the streamed content is the final answer, already on disk.
-        # Strip an imitated id-header and adopt a valid model-chosen id on append.
         return [_finalize_answer(ctx.target, ctx)]
 
-    # The model called the tool(s). Evaluate EACH call (a sub-agent), append its
-    # result, then STOP — we do NOT re-run the main model. The user drives the
-    # next step by running `gen` again (the result is now in the context files).
+    # The model called tool(s): persist each call as a c-flagged assistant turn
+    # (the envelope is the turn's raw content), then STOP. Nothing is evaluated
+    # here — `call` does that, one call at a time.
     produced: list[Path] = []
     for i, call in enumerate(resp.tool_calls):
-        request, data, follow_up = _parse_act_arguments(call.arguments)
+        envelope = _call_envelope(call.name, call.arguments)
         if i == 0:
-            # The first call repurposes the just-streamed target turn; its
-            # content becomes the raw request (overwriting any streamed preamble).
-            call_turn = ctx.target
-            call_turn.write_text(request, encoding="utf-8")
+            # The first call repurposes the just-streamed target turn: envelope
+            # replaces any streamed preamble; rename p→c (same slug).
+            tgt = parse_turn(ctx.target)
+            ctx.target.write_text(envelope, encoding="utf-8")
+            cpath = ctx.target.parent / turn_filename(
+                tgt.number, "assistant", tgt.slug, sender=tgt.sender, flags="c")
+            if cpath != ctx.target:
+                ctx.target.rename(cpath)
         else:
-            # Further parallel calls each append their own assistant turn.
+            # Further parallel calls each append their own c-flagged turn.
             cur = load_turns(target_seg)
-            slug = new_turn_id({t.slug for t in cur if t.slug},
-                               slot=f"{target_seg}/{next_number(cur)}")
-            call_turn = append_raw_turn(
-                target_seg, "assistant", request, slug=slug)
-        # New call → the inner session IS this turn's id (handle == turn-id); a
-        # follow_up continues the referenced existing sub-agent instead.
-        call_slug = parse_turn(call_turn).slug
-        innerid = follow_up if (follow_up and _NAME_RE.match(follow_up)) \
-            else call_slug
-        produced.append(call_turn)
-
-        # Seed/append the inner session, then evaluate it as a LEAF (tools=[]).
-        inner_user = request if not data else f"{request}\n\n{data}"
-        append_raw_turn(innerid, "user", inner_user)
-        stitch_spec = f"{tool_context}.{innerid}" if tool_context else innerid
-        inner = generate(
-            stitch_spec, model=model, base_url=base_url, api_key=api_key,
-            client=client, echo=silent, tools=[])
-        result = inner[-1].read_text(encoding="utf-8")
-
-        # Persist the OUTER tool-result turn (type tool, fresh unique slug).
-        cur = load_turns(target_seg)
-        outer_slugs = {t.slug for t in cur if t.slug}
-        produced.append(append_raw_turn(
-            target_seg, "tool", result,
-            slug=new_turn_id(outer_slugs,
-                             slot=f"{target_seg}/{next_number(cur)}")))
-
+            slug = new_turn_id(
+                {t.slug for t in cur if t.slug} | ctx.existing_slugs,
+                slot=f"{target_seg}/{next_number(cur)}")
+            cpath = append_raw_turn(
+                target_seg, "assistant", envelope, slug=slug, flags="c")
+        produced.append(cpath)
     return produced
+
+
+def evaluate_call(
+    name: str,
+    *,
+    model: str,
+    base_url: str | None = None,
+    api_key: str | None = None,
+    client: openai.OpenAI | None = None,
+    echo=None,
+    tool_context: str | None = None,
+) -> list[Path]:
+    """Evaluate the FIRST unanswered tool call of ``name``'s target segment.
+
+    ONE call per invocation — repetition is ``run_to_completion``'s job. For an
+    ``act`` call: the inner sub-agent session is the call's turn-id (or the
+    call's ``follow_up`` target), the request is posted into it as a user turn
+    with ``from=<outer segment>``, the inner session is ``gen``'d as a leaf
+    (``tools=[]``; ``tool_context`` is stitched in front when given), and the
+    inner answer is posted back as a ``.tool`` result turn with
+    ``from=<inner session>`` — the address for follow-ups. An unknown tool
+    name yields an error-text result turn (the loop keeps moving; the model
+    sees the error).
+
+    Returns the written result turn ``[path]``. Raises ``SystemExit`` when no
+    call is pending.
+    """
+    model = resolve_model(model)
+    if client is None:
+        client = make_client(base_url=base_url, api_key=api_key)
+    segments = parse_stitch(name)
+    target_seg = segments[-1]
+
+    # Slug pool spans the whole stitch so a result id cannot collide with a
+    # prepended segment's id (the next gen enforces uniqueness across them).
+    pool: set[str] = set()
+    for seg in segments:
+        pool |= {t.slug for t in load_turns(seg) if t.slug}
+    turns = assign_slugs(load_turns(target_seg), pool)
+
+    pend = pending_calls(turns)
+    if not pend:
+        raise SystemExit(f"oaita: no unanswered tool call in {target_seg!r}")
+    call_turn = pend[0]
+    tool, arguments = _parse_call_envelope(call_turn.read())
+
+    sender: str | None = None
+    if tool != META_TOOL_NAME:
+        result = (f"error: unknown tool {tool!r} — only "
+                  f"{META_TOOL_NAME!r} is available")
+    else:
+        request, data, follow_up = _parse_act_arguments(arguments)
+        # New call → the inner session IS this turn's id; follow_up continues
+        # the referenced existing sub-agent instead.
+        innerid = follow_up if (follow_up and _NAME_RE.match(follow_up)) \
+            else call_turn.slug
+        inner_user = request if not data else f"{request}\n\n{data}"
+        inner_cur = load_turns(innerid)
+        inner_slug = new_turn_id({t.slug for t in inner_cur if t.slug},
+                                 slot=f"{innerid}/{next_number(inner_cur)}")
+        append_raw_turn(innerid, "user", inner_user,
+                        slug=inner_slug, sender=target_seg)
+        stitch_spec = f"{tool_context}.{innerid}" if tool_context else innerid
+        inner = generate(stitch_spec, model=model, client=client,
+                         echo=echo, tools=[])
+        result = inner[-1].read_text(encoding="utf-8")
+        sender = innerid
+
+    cur = load_turns(target_seg)
+    pool |= {t.slug for t in cur if t.slug}
+    slug = new_turn_id(pool, slot=f"{target_seg}/{next_number(cur)}")
+    return [append_raw_turn(target_seg, "tool", result,
+                            slug=slug, sender=sender)]
+
+
+def run_to_completion(
+    name: str,
+    *,
+    model: str,
+    base_url: str | None = None,
+    api_key: str | None = None,
+    client: openai.OpenAI | None = None,
+    echo=None,
+    tool_context: str | None = None,
+    capabilities: str | None = None,
+    max_steps: int = 32,
+) -> list[Path]:
+    """Drive ``name`` until its tail is a CLEAN assistant turn (the answer).
+
+    Each step is one primitive: an unanswered call → ``evaluate_call``;
+    otherwise (no clean assistant tail yet, or a partial one) → ``generate``.
+    The primitives stay one-step and individually re-runnable; this loop is
+    the only driver. Already-settled contexts return immediately ([]).
+
+    Bounded by ``max_steps`` (raises ``SystemExit`` when exceeded — partial
+    progress is all on disk, a later run resumes exactly where it stopped).
+    """
+    model = resolve_model(model)
+    if client is None:
+        client = make_client(base_url=base_url, api_key=api_key)
+    target_seg = parse_stitch(name)[-1]
+    produced: list[Path] = []
+    for _ in range(max_steps):
+        turns = load_turns(target_seg)
+        if pending_calls(turns):
+            produced += evaluate_call(name, model=model, client=client,
+                                      echo=echo, tool_context=tool_context)
+            continue
+        if (turns and turns[-1].type == "assistant"
+                and "p" not in turns[-1].flags and "c" not in turns[-1].flags):
+            return produced
+        produced += generate(name, model=model, client=client, echo=echo,
+                             capabilities=capabilities)
+    raise SystemExit(
+        f"oaita: run {name!r} did not settle within {max_steps} steps — "
+        f"progress is on disk; run again to continue")
 
 
 def _finalize_answer(target: Path, ctx: _PreparedContext) -> Path:
     """Finalise a streamed FINAL answer already written to ``target``.
 
-    The reply's content is on disk (streamed there by ``stream_to_file``). Strip
-    an id-header the model imitated atop it (keeping the file raw) and, on an
-    appended turn, adopt a valid, session-unique id the model chose as the slug
-    (renaming the file). Returns the (possibly renamed) path.
+    The reply's content is on disk (streamed there by ``stream_to_file``).
+    Strip an id-header the model imitated atop it (keeping the file raw); on an
+    appended turn adopt a valid, unique id the model chose as the slug. Either
+    way drop the ``p`` (streaming/partial) flag — the turn is now complete.
+    Returns the final (possibly renamed) path.
     """
     body = target.read_text(encoding="utf-8")
     emitted_id, stripped = strip_emitted_turn_id(body)
     if emitted_id is not None:
         target.write_text(stripped, encoding="utf-8")
-        if not ctx.is_regenerate:
-            tgt = parse_turn(target)
-            others = ctx.existing_slugs - {tgt.slug}
-            if _ADOPTABLE_SLUG_RE.match(emitted_id) and emitted_id not in others:
-                adopted = target.parent / turn_filename(
-                    tgt.number, tgt.type, emitted_id, flags=tgt.flags)
-                if adopted != target:
-                    target.rename(adopted)
-                    return adopted
-    return target
+    tgt = parse_turn(target)
+    slug = tgt.slug
+    if (emitted_id is not None and not ctx.is_regenerate
+            and _ADOPTABLE_SLUG_RE.match(emitted_id)
+            and emitted_id not in (ctx.existing_slugs - {tgt.slug})):
+        slug = emitted_id
+    final = target.parent / turn_filename(
+        tgt.number, tgt.type, slug, sender=tgt.sender,
+        flags=tgt.flags.replace("p", ""))
+    if final != target:
+        target.rename(final)
+    return final
 
 
 def _parse_act_arguments(arguments: str) -> tuple[str, str | None, str | None]:
@@ -940,46 +1101,77 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
+    def common(p, tool_ctx=False, caps=False):
+        p.add_argument(
+            "name",
+            help="session name, or a dot-stitched spec 'a.b.c' — act on the "
+                 "last segment; earlier segments are prepended as context")
+        p.add_argument("--model", default=None,
+                       help="model name (else $OAITA_MODEL)")
+        p.add_argument("--base-url", default=None,
+                       help="OpenAI base URL (else $OPENAI_BASE_URL)")
+        p.add_argument("--api-key", default=None,
+                       help="API key (else $OPENAI_API_KEY)")
+        if tool_ctx:
+            p.add_argument(
+                "--tool-context", default=None, metavar="NAME",
+                help="session of fixed tool descriptions stitched before each "
+                     "inner sub-agent context")
+        if caps:
+            p.add_argument(
+                "--capabilities", default=None, metavar="TEXT",
+                help="capabilities blurb embedded in the `act` tool "
+                     "description (overrides the default)")
+
     gen = sub.add_parser(
-        "gen", help="generate the assistant reply for a session")
-    gen.add_argument(
-        "name",
-        help="session name, or a dot-stitched spec 'a.b.c' — infer in the last "
-             "segment; earlier segments are prepended as context")
-    gen.add_argument("--model", default=None,
-                     help="model name (else $OAITA_MODEL)")
-    gen.add_argument("--base-url", default=None,
-                     help="OpenAI base URL (else $OPENAI_BASE_URL)")
-    gen.add_argument("--api-key", default=None,
-                     help="API key (else $OPENAI_API_KEY)")
-    gen.add_argument(
-        "--tool-context", default=None, metavar="NAME",
-        help="session of fixed tool descriptions stitched before each "
-             "per-call inner sub-agent context")
-    gen.add_argument(
-        "--capabilities", default=None, metavar="TEXT",
-        help="capabilities blurb embedded in the `act` tool description "
-             "(overrides the default)")
+        "gen", help="ONE model generation (a reply, or persisted tool calls)")
+    common(gen, caps=True)
     gen.set_defaults(func=_cmd_gen)
+
+    call = sub.add_parser(
+        "call", help="evaluate the first unanswered tool call (one call)")
+    common(call, tool_ctx=True)
+    call.set_defaults(func=_cmd_call)
+
+    run = sub.add_parser(
+        "run", help="drive gen/call until the tail is a clean assistant turn")
+    common(run, tool_ctx=True, caps=True)
+    run.add_argument("--max-steps", type=int, default=32, metavar="N",
+                     help="abort (progress kept on disk) after N steps")
+    run.set_defaults(func=_cmd_run)
     return parser
 
 
-def _cmd_gen(args) -> int:
-    """Handler for ``oaita gen``."""
-    produced = generate(
-        args.name,
-        model=args.model,
-        base_url=args.base_url,
-        api_key=args.api_key,
-        tool_context=args.tool_context,
-        capabilities=args.capabilities,
-    )
+def _report(produced) -> int:
+    """Shared tail for the subcommand handlers: newline + written-files list."""
     # The reply was already echoed live; finish the line for a clean terminal.
     sys.stdout.write("\n")
     sys.stdout.flush()
     for path in produced:
         print(f"oaita: wrote {path}", file=sys.stderr)
     return 0
+
+
+def _cmd_gen(args) -> int:
+    """Handler for ``oaita gen``."""
+    return _report(generate(
+        args.name, model=args.model, base_url=args.base_url,
+        api_key=args.api_key, capabilities=args.capabilities))
+
+
+def _cmd_call(args) -> int:
+    """Handler for ``oaita call``."""
+    return _report(evaluate_call(
+        args.name, model=args.model, base_url=args.base_url,
+        api_key=args.api_key, tool_context=args.tool_context))
+
+
+def _cmd_run(args) -> int:
+    """Handler for ``oaita run``."""
+    return _report(run_to_completion(
+        args.name, model=args.model, base_url=args.base_url,
+        api_key=args.api_key, tool_context=args.tool_context,
+        capabilities=args.capabilities, max_steps=args.max_steps))
 
 
 def main(argv=None) -> int:
