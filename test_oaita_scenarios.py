@@ -193,8 +193,11 @@ def test_scenario_delegation_and_follow_up():
         reqs = st.srv.requests
         check("S1: exactly three model requests (gen, leaf, gen)",
               len(reqs) == 3)
-        check("S1: outer gens advertise act; the leaf advertises nothing",
-              reqs[0].tools and reqs[0].tools[0]["function"]["name"] == "act"
+        check("S1: outer gens advertise the registry; the leaf advertises "
+              "nothing",
+              reqs[0].tools
+              and {t["function"]["name"] for t in reqs[0].tools}
+              == {"act", "shell"}
               and reqs[2].tools and reqs[1].tools is None)
         # The synthesis prompt narrates the call: assistant turn = envelope
         # JSON as content, tool turn with the from-bearing header.
@@ -385,6 +388,105 @@ def test_scenario_cli_subprocess():
         st.close()
 
 
+# ── scenario 7: fix-the-build arc with the shell tool ────────────────────────
+class FakeExecutor:
+    """Scripted executor: canned ExecResults + a call log (mirrors the one in
+    test_oaita; duplicated to keep each test file self-contained)."""
+
+    def __init__(self):
+        self.calls = []
+        self.queue = []
+
+    def stage(self, output, changes="", exit_code=0):
+        self.queue.append(oaita.ExecResult(
+            output=output, changes=changes, exit_code=exit_code))
+        return self
+
+    def run_script(self, script, box):
+        self.calls.append((script, box))
+        return self.queue.pop(0)
+
+
+def test_scenario_shell_fix_build():
+    st = Stage()
+    try:
+        st.write_turn("build", "0010.user", "the build is broken, fix it")
+        st.srv.expect("the build is broken",
+                      CannedChat(tool_calls=[
+                          ("shell", '{"script": "make"}', "c1")]))
+        # The model reads the failure, edits, re-runs — keyed on result text.
+        st.srv.expect("missing semicolon",
+                      CannedChat(tool_calls=[(
+                          "shell",
+                          '{"script": "sed -i \'7s/$/;/\' main.c && make"}',
+                          "c2")]))
+        st.srv.expect("main.c: +1 -1",
+                      CannedChat(content="Fixed: line 7 lacked a semicolon. "
+                                         "Build passes; the edit is staged "
+                                         "in the box."))
+        ex = (FakeExecutor()
+              .stage("main.c:7: error: missing semicolon", exit_code=2)
+              .stage("cc -o app main.c\nok",
+                     changes="1 file(s) changed (staged in the box):\n"
+                             "main.c: +1 -1"))
+        st.run("build", executor=ex)
+
+        turns = turns_of("build")
+        check("S7: arc is user, shell, result, shell, result, answer",
+              [t.type for t in turns] ==
+              ["user", "assistant", "tool", "assistant", "tool", "assistant"])
+        check("S7: both runs landed in the session's ONE persistent box",
+              [c[1] for c in ex.calls] == ["OAITA-BUILD", "OAITA-BUILD"])
+        check("S7: the second script reacted to the first failure",
+              "sed -i" in ex.calls[1][0])
+        check("S7: failure result carried the compiler error",
+              "missing semicolon" in turns[2].read())
+        check("S7: success result carried the staged-change summary",
+              "main.c: +1 -1" in turns[4].read())
+        check("S7: the model's answer mentions the staged state",
+              "staged in the box" in turns[5].read())
+        # The second gen's prompt replayed the SHELL call natively too.
+        second_gen = st.srv.requests[2]
+        tcs = [m.get("tool_calls") for m in second_gen.messages
+               if m.get("tool_calls")]
+        check("S7: shell calls replay as native tool_calls",
+              tcs and tcs[0][0]["function"]["name"] == "shell")
+    finally:
+        st.close()
+
+
+# ── scenario 8: SarunExecutor wiring against a stub sarun binary ─────────────
+def test_scenario_sarun_executor_wiring():
+    """SarunExecutor drives the real subprocess protocol: `sarun BOX -- sh -c
+    SCRIPT`, then `sarun BOX patch`. A stub sarun records argv and plays a
+    canned patch, so this verifies the wiring without a UI."""
+    tmp = Path(tempfile.mkdtemp(prefix="oaita-stub-"))
+    try:
+        stub = tmp / "sarun"
+        log = tmp / "argv.log"
+        stub.write_text(
+            "#!/bin/sh\n"
+            f"echo \"$@\" >> {log}\n"
+            "if [ \"$2\" = patch ]; then\n"
+            "  printf -- '--- a/f.txt\\n+++ b/f.txt\\n@@\\n+x\\n'\n"
+            "else\n"
+            "  echo 'script output here'\n"
+            "fi\n")
+        stub.chmod(0o755)
+        ex = oaita.SarunExecutor(str(stub))
+        r = ex.run_script("echo hi", box="OAITA-DEMO")
+        calls = log.read_text().splitlines()
+        check("S8: run invoked `sarun BOX -- sh -c SCRIPT`",
+              calls[0] == "OAITA-DEMO -- sh -c echo hi")
+        check("S8: then asked for the box patch",
+              calls[1] == "OAITA-DEMO patch")
+        check("S8: output captured", "script output here" in r.output)
+        check("S8: patch summarized", "f.txt: +1 -0" in r.changes)
+        check("S8: exit code propagated", r.exit_code == 0)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 # ── standalone runner ────────────────────────────────────────────────────────
 if __name__ == "__main__":
     tests = [
@@ -393,6 +495,8 @@ if __name__ == "__main__":
         test_scenario_parallel_fanout,
         test_scenario_determinism_replay,
         test_scenario_cli_subprocess,
+        test_scenario_shell_fix_build,
+        test_scenario_sarun_executor_wiring,
     ]
     for t in tests:
         print(f"\n── {t.__name__} ──")

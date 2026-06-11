@@ -568,6 +568,146 @@ def meta_tool(capabilities: str) -> dict:
     }
 
 
+# ── Tool registry ─────────────────────────────────────────────────────────────
+# Each tool is one declarative row, two-faced:
+#   outward — the function schema the provider sees (name/description/params);
+#   inward  — how `evaluate_call` runs it, tagged by run_location:
+#     "in-box"  — runs against the conversation's sarun box (arbitrary scripts
+#                 are ONLY ever this kind);
+#     "manager" — operates ON the box itself (apply/discard… — fixed,
+#                 parameterized templates, never free-form). Not wired yet.
+@dataclass(frozen=True)
+class ToolSpec:
+    """One registry row: the outward schema + the inward run-location meta."""
+    name: str
+    description: str
+    parameters: dict
+    run_location: str = "in-box"
+
+    def schema(self) -> dict:
+        """The OpenAI tools-array entry for this row."""
+        return {"type": "function",
+                "function": {"name": self.name,
+                             "description": self.description,
+                             "parameters": self.parameters}}
+
+
+def tool_registry(capabilities: str | None = None) -> dict[str, ToolSpec]:
+    """The v1 tool rows: ``act`` (delegate) and ``shell`` (sandboxed script)."""
+    caps = capabilities if capabilities is not None else DEFAULT_CAPABILITIES
+    act = meta_tool(caps)["function"]
+    return {
+        META_TOOL_NAME: ToolSpec(
+            name=META_TOOL_NAME,
+            description=act["description"],
+            parameters=act["parameters"],
+        ),
+        "shell": ToolSpec(
+            name="shell",
+            description=(
+                "Run a shell script in this conversation's persistent sandbox "
+                "box. The script is executed with `sh -c`; stdout/stderr are "
+                "captured and returned, followed by a summary of any file "
+                "changes the run staged in the box (changes stay STAGED until "
+                "resolved — they do not touch the host)."),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "script": {
+                        "type": "string",
+                        "description": "The shell script to run (no shebang).",
+                    },
+                },
+                "required": ["script"],
+            },
+        ),
+    }
+
+
+def registry_tools(capabilities: str | None = None) -> list[dict]:
+    """The outward tools array for the API (all registry rows)."""
+    return [spec.schema() for spec in tool_registry(capabilities).values()]
+
+
+# ── Executors — where `shell` scripts actually run ───────────────────────────
+@dataclass
+class ExecResult:
+    """What a shell run came back with: captured output, a human-readable
+    change summary ('' when the run touched no files), and the exit code."""
+    output: str
+    changes: str = ""
+    exit_code: int = 0
+
+
+def summarize_patch(patch: str) -> str:
+    """A terse, model-facing summary of a unified diff: per-file +/- counts."""
+    files: list[tuple[str, int, int]] = []
+    name, plus, minus = None, 0, 0
+    for line in patch.splitlines():
+        if line.startswith("+++ "):
+            if name is not None:
+                files.append((name, plus, minus))
+            name = line[4:].split("\t")[0]
+            name = name[2:] if name.startswith(("a/", "b/")) else name
+            plus = minus = 0
+        elif line.startswith("+") and not line.startswith("+++"):
+            plus += 1
+        elif line.startswith("-") and not line.startswith("---"):
+            minus += 1
+    if name is not None:
+        files.append((name, plus, minus))
+    if not files:
+        return ""
+    lines = [f"{n}: +{p} -{m}" for n, p, m in files]
+    return f"{len(files)} file(s) changed (staged in the box):\n" + \
+        "\n".join(lines)
+
+
+def box_name(target_seg: str) -> str:
+    """The sarun box a session's shell runs share: ``OAITA-<SESSION>``.
+
+    One persistent box per session segment: follow-up shell calls land in the
+    same box (sarun reruns a named box), so state accumulates until the box's
+    changes are applied or discarded. The prefix keeps the box a valid sarun
+    NAME (CAPS, starts with a letter) for any session name.
+    """
+    return f"OAITA-{target_seg.upper()}"
+
+
+class SarunExecutor:
+    """Run scripts in a sarun box via the sarun CLI; changes via ``patch``.
+
+    Requires a running sarun UI (sarun's own requirement). Output is whatever
+    the runner echoed (sarun captures and re-echoes the box's stdout/stderr);
+    the change summary is computed from ``sarun <box> patch``.
+    """
+
+    def __init__(self, sarun: str | None = None):
+        if sarun is None:
+            sibling = Path(__file__).resolve().parent / "sarun"
+            sarun = str(sibling) if sibling.exists() else "sarun"
+        self.sarun = sarun
+
+    def run_script(self, script: str, box: str) -> ExecResult:
+        import subprocess
+        proc = subprocess.run(
+            [self.sarun, box, "--", "sh", "-c", script],
+            capture_output=True, text=True)
+        output = proc.stdout + (("\n" + proc.stderr) if proc.stderr else "")
+        patch = subprocess.run(
+            [self.sarun, box, "patch"], capture_output=True, text=True)
+        changes = summarize_patch(patch.stdout) if patch.returncode == 0 else ""
+        return ExecResult(output=output.strip("\n"), changes=changes,
+                          exit_code=proc.returncode)
+
+
+def render_shell_result(r: ExecResult) -> str:
+    """The model-facing text of one shell run's ``.tool`` result turn."""
+    parts = [f"exit {r.exit_code}", r.output]
+    parts.append(r.changes if r.changes else "[no file changes]")
+    return "\n".join(p for p in parts if p != "")
+
+
 @dataclass
 class AssembledResponse:
     """The assembled result of consuming a streaming chat-completion response.
@@ -1005,13 +1145,12 @@ def generate(
             sys.stdout.write(text)
             sys.stdout.flush()
 
-    # The normal context ALWAYS carries the single `act` meta-tool. The inner
-    # leaf execution context is called with tools=[] so it answers directly —
-    # offering no tool means it can't call anything — which is exactly where
-    # real MCP tools will plug in later.
+    # The normal context ALWAYS carries the registry tools (act + shell). The
+    # inner leaf execution context is called with tools=[] so it answers
+    # directly — offering no tool means it can't call anything — which is
+    # exactly where real MCP tools will plug in later.
     if tools is None:
-        tools = [meta_tool(
-            capabilities if capabilities is not None else DEFAULT_CAPABILITIES)]
+        tools = registry_tools(capabilities)
     tools_param = tools or None
 
     target_seg = parse_stitch(name)[-1]
@@ -1067,21 +1206,26 @@ def evaluate_call(
     client: openai.OpenAI | None = None,
     echo=None,
     tool_context: str | None = None,
+    executor=None,
 ) -> list[Path]:
     """Evaluate the FIRST unanswered tool call of ``name``'s target segment.
 
-    ONE call per invocation — repetition is ``run_to_completion``'s job. For an
-    ``act`` call: the inner sub-agent session is the call's turn-id (or the
-    call's ``follow_up`` target), the request is posted into it as a user turn
-    with ``from=<outer segment>``, the inner session is ``gen``'d as a leaf
+    ONE call per invocation — repetition is ``run_to_completion``'s job.
+
+    ``act``: the inner sub-agent session is the call's turn-id (or the call's
+    ``follow_up`` target), the request is posted into it as a user turn with
+    ``from=<outer segment>``, the inner session is ``gen``'d as a leaf
     (``tools=[]``; ``tool_context`` is stitched in front when given), and the
     inner answer is posted back as a ``.tool`` result turn with
-    ``from=<inner session>`` — the address for follow-ups. An unknown tool
-    name yields an error-text result turn (the loop keeps moving; the model
-    sees the error).
+    ``from=<inner session>`` — the address for follow-ups.
 
-    Returns the written result turn ``[path]``. Raises ``SystemExit`` when no
-    call is pending.
+    ``shell``: the script runs via ``executor`` in the session's persistent
+    box (``box_name(target_seg)``); the result turn is the captured output +
+    staged-change summary. No executor configured → an error-text result.
+
+    An unknown tool name also yields an error-text result turn (the loop keeps
+    moving; the model sees the error). Returns the written result turn
+    ``[path]``. Raises ``SystemExit`` when no call is pending.
     """
     model = resolve_model(model)
     if client is None:
@@ -1103,9 +1247,17 @@ def evaluate_call(
     tool, arguments = _parse_call_envelope(call_turn.read())
 
     sender: str | None = None
-    if tool != META_TOOL_NAME:
-        result = (f"error: unknown tool {tool!r} — only "
-                  f"{META_TOOL_NAME!r} is available")
+    if tool == "shell":
+        script = _parse_shell_arguments(arguments)
+        if executor is None:
+            result = ("error: no executor configured — shell needs sarun "
+                      "(its UI running); the script was NOT run")
+        else:
+            result = render_shell_result(
+                executor.run_script(script, box=box_name(target_seg)))
+    elif tool != META_TOOL_NAME:
+        known = ", ".join(repr(k) for k in tool_registry())
+        result = f"error: unknown tool {tool!r} — available: {known}"
     else:
         request, data, follow_up = _parse_act_arguments(arguments)
         # New call → the inner session IS this turn's id; follow_up continues
@@ -1141,6 +1293,7 @@ def run_to_completion(
     echo=None,
     tool_context: str | None = None,
     capabilities: str | None = None,
+    executor=None,
     max_steps: int = 32,
 ) -> list[Path]:
     """Drive ``name`` until its tail is a CLEAN assistant turn (the answer).
@@ -1162,7 +1315,8 @@ def run_to_completion(
         turns = load_turns(target_seg)
         if pending_calls(turns):
             produced += evaluate_call(name, model=model, client=client,
-                                      echo=echo, tool_context=tool_context)
+                                      echo=echo, tool_context=tool_context,
+                                      executor=executor)
             continue
         if (turns and turns[-1].type == "assistant"
                 and "p" not in turns[-1].flags and "c" not in turns[-1].flags):
@@ -1199,6 +1353,23 @@ def _finalize_answer(target: Path, ctx: _PreparedContext) -> Path:
     if final != target:
         target.rename(final)
     return final
+
+
+def _parse_shell_arguments(arguments: str) -> str:
+    """Parse a ``shell`` call's arguments into the script text.
+
+    Tolerant like ``_parse_act_arguments``: a missing/dirty arguments string
+    (or one without a usable ``script``) is treated as the script verbatim.
+    """
+    try:
+        obj = json.loads(arguments)
+    except (ValueError, TypeError):
+        obj = None
+    if isinstance(obj, dict):
+        script = obj.get("script")
+        if isinstance(script, str) and script:
+            return script
+    return arguments
 
 
 def _parse_act_arguments(arguments: str) -> tuple[str, str | None, str | None]:
@@ -1253,6 +1424,14 @@ def build_parser() -> argparse.ArgumentParser:
                 "--tool-context", default=None, metavar="NAME",
                 help="session of fixed tool descriptions stitched before each "
                      "inner sub-agent context")
+            p.add_argument(
+                "--sarun", default=None, metavar="PATH",
+                help="sarun executable for the shell tool (default: the "
+                     "sibling ./sarun, else 'sarun' on PATH)")
+            p.add_argument(
+                "--no-sandbox", action="store_true",
+                help="run with NO shell executor (shell calls return an "
+                     "error result instead of executing)")
         if caps:
             p.add_argument(
                 "--capabilities", default=None, metavar="TEXT",
@@ -1313,11 +1492,19 @@ def _cmd_gen(args) -> int:
         api_key=args.api_key, capabilities=args.capabilities))
 
 
+def _executor_from(args):
+    """The shell executor the CLI flags select (None = error-result mode)."""
+    if args.no_sandbox:
+        return None
+    return SarunExecutor(args.sarun)
+
+
 def _cmd_call(args) -> int:
     """Handler for ``oaita call``."""
     return _report(evaluate_call(
         args.name, model=args.model, base_url=args.base_url,
-        api_key=args.api_key, tool_context=args.tool_context))
+        api_key=args.api_key, tool_context=args.tool_context,
+        executor=_executor_from(args)))
 
 
 def _cmd_run(args) -> int:
@@ -1325,7 +1512,8 @@ def _cmd_run(args) -> int:
     return _report(run_to_completion(
         args.name, model=args.model, base_url=args.base_url,
         api_key=args.api_key, tool_context=args.tool_context,
-        capabilities=args.capabilities, max_steps=args.max_steps))
+        capabilities=args.capabilities, max_steps=args.max_steps,
+        executor=_executor_from(args)))
 
 
 def _cmd_add(args) -> int:

@@ -937,19 +937,22 @@ def test_tools_capabilities_surfaced():
         s.srv.enqueue(CannedChat(content="answer"))  # no tool call → one shot
         s.generate("conv", capabilities="bespoke power")
         tools = s.srv.requests[-1].json.get("tools")
-        check("a single tool advertised", isinstance(tools, list) and len(tools) == 1)
-        fn = tools[0]["function"]
-        check("the tool function name is 'act'", fn["name"] == "act")
-        check("custom capabilities embedded in the description",
-              "bespoke power" in fn["description"])
+        by_name = {t["function"]["name"]: t["function"] for t in tools}
+        check("the registry tools are advertised (act + shell)",
+              set(by_name) == {"act", "shell"})
+        check("custom capabilities embedded in the act description",
+              "bespoke power" in by_name["act"]["description"])
+        check("shell schema requires the script param",
+              by_name["shell"]["parameters"]["required"] == ["script"])
 
         # And the default capabilities surface when none is passed.
         s.srv.enqueue(CannedChat(content="answer2"))
         s.write_turn("conv2", "0010.user", "do Y")
         s.generate("conv2")
-        fn2 = s.srv.requests[-1].json["tools"][0]["function"]
+        fns = {t["function"]["name"]: t["function"]
+               for t in s.srv.requests[-1].json["tools"]}
         check("default capabilities embedded when none passed",
-              oaita.DEFAULT_CAPABILITIES in fn2["description"])
+              oaita.DEFAULT_CAPABILITIES in fns["act"]["description"])
     finally:
         s.close()
 
@@ -1034,7 +1037,8 @@ def test_tools_always_on_plain_reply():
         s.srv.enqueue(CannedChat(content="plain reply"))
         produced = s.generate("conv")  # no flag — act is always offered
         check("the act tool IS offered by default (always-on)",
-              s.srv.requests[-1].json["tools"][0]["function"]["name"] == "act")
+              "act" in [t["function"]["name"]
+                        for t in s.srv.requests[-1].json["tools"]])
         check("a content-only reply yields exactly one assistant turn",
               len(produced) == 1 and produced[0].name.endswith(".assistant"))
         check("plain reply stored raw", produced[0].read_text() == "plain reply")
@@ -1224,6 +1228,80 @@ def test_deterministic_ids_with_seed():
         os.environ.pop("OAITA_ID_SEED", None)
 
 
+# ── 36b. the shell tool: executor interface, box naming, error mode ──────────
+class FakeExecutor:
+    """Scripted stand-in for SarunExecutor: canned results + a call log."""
+
+    def __init__(self):
+        self.calls = []
+        self.queue = []
+
+    def stage(self, output, changes="", exit_code=0):
+        self.queue.append(oaita.ExecResult(
+            output=output, changes=changes, exit_code=exit_code))
+        return self
+
+    def run_script(self, script, box):
+        self.calls.append((script, box))
+        return self.queue.pop(0)
+
+
+def test_shell_tool():
+    s = Session()
+    try:
+        s.write_turn("conv", "0010.user", "fix the build")
+        s.srv.enqueue(CannedChat(tool_calls=[
+            ("shell", '{"script": "make 2>&1 | tail -3"}', "c1")]))
+        s.generate("conv")
+        ex = FakeExecutor().stage(
+            "cc -o app main.c\nmain.c:7: error: missing ;",
+            changes="1 file(s) changed (staged in the box):\nbuild.log: +3 -0",
+            exit_code=2)
+        res = s.call("conv", executor=ex)
+        check("the executor received the script and the session box",
+              ex.calls == [("make 2>&1 | tail -3", "OAITA-CONV")])
+        body = res[0].read_text()
+        check("result carries exit code, output and change summary",
+              body.startswith("exit 2\n") and "missing ;" in body
+              and "build.log: +3 -0" in body)
+        check("a shell result has no from-sender (no sub-session)",
+              oaita.parse_turn(res[0]).sender is None)
+
+        # A second shell call reuses the SAME persistent box.
+        s.srv.enqueue(CannedChat(tool_calls=[
+            ("shell", '{"script": "ls"}', "c2")]))
+        s.generate("conv")
+        ex.stage("README", changes="")
+        res2 = s.call("conv", executor=ex)
+        check("follow-up shell call lands in the same box",
+              ex.calls[-1][1] == "OAITA-CONV")
+        check("a clean run reports no file changes",
+              "[no file changes]" in res2[0].read_text())
+
+        # No executor → an error result, and the loop keeps moving.
+        s.srv.enqueue(CannedChat(tool_calls=[
+            ("shell", '{"script": "rm -rf /"}', "c3")]))
+        s.generate("conv")
+        res3 = s.call("conv")          # executor=None
+        check("no executor → error-text result; nothing was run",
+              res3[0].read_text().startswith("error: no executor")
+              and len(ex.calls) == 2)
+    finally:
+        s.close()
+
+
+def test_summarize_patch_unit():
+    f = oaita.summarize_patch
+    check("empty patch → no summary", f("") == "")
+    patch = ("--- a/x.py\n+++ b/x.py\n@@ -1,2 +1,3 @@\n line\n+added\n"
+             "+added2\n-gone\n"
+             "--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1 @@\n+hello\n")
+    out = f(patch)
+    check("per-file counts summarized",
+          "x.py: +2 -1" in out and "new.txt: +1 -0" in out)
+    check("file count stated", out.startswith("2 file(s) changed"))
+
+
 # ── 37. add_turn: stdin-to-turn convenience, defaults and overrides ──────────
 def test_add_turn():
     import io
@@ -1308,6 +1386,8 @@ if __name__ == "__main__":
         test_tools_multiple_calls_one_gen,
         test_pending_calls_unit,
         test_run_to_completion,
+        test_shell_tool,
+        test_summarize_patch_unit,
         test_deterministic_ids_with_seed,
         test_add_turn,
     ]
