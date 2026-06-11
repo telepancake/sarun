@@ -335,14 +335,24 @@ def test_scenario_determinism_replay():
 def test_scenario_cli_subprocess():
     st = Stage(seed="cli")
     try:
-        st.write_turn("clidemo", "0010.user",
-                      "Compare MIT and GPL for our parser; "
-                      "delegate the license research.")
-        _script_delegation(st.srv)
         env = dict(os.environ,
                    OPENAI_BASE_URL=st.srv.base_url,
                    OPENAI_API_KEY="test-key",
                    OAITA_MODEL="test-model")
+        # Seed the session through the real `oaita add` (stdin → turn file).
+        added = subprocess.run(
+            [sys.executable, str(HERE / "oaita"), "add", "clidemo"],
+            input="Compare MIT and GPL for our parser; "
+                  "delegate the license research.",
+            capture_output=True, text=True, timeout=60, env=env)
+        check("S6: `oaita add` exits 0 and prints the turn path",
+              added.returncode == 0
+              and added.stdout.strip().endswith(".user"))
+        added_path = Path(added.stdout.strip())
+        check("S6: the added turn holds stdin verbatim",
+              added_path.read_text(encoding="utf-8").endswith(
+                  "delegate the license research."))
+        _script_delegation(st.srv)
         proc = subprocess.run(
             [sys.executable, str(HERE / "oaita"), "run", "clidemo",
              "--max-steps", "8"],

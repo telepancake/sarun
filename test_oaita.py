@@ -1224,6 +1224,51 @@ def test_deterministic_ids_with_seed():
         os.environ.pop("OAITA_ID_SEED", None)
 
 
+# ── 37. add_turn: stdin-to-turn convenience, defaults and overrides ──────────
+def test_add_turn():
+    import io
+    s = Session()
+    try:
+        # All defaults: type user, next number, generated slug.
+        p1 = oaita.add_turn("addsess", source=io.BytesIO(b"hello there"))
+        check("default add is 0010-<id>.user",
+              bool(re.match(r"^0010-[a-z]{5}\.user$", p1.name)))
+        check("content copied verbatim", p1.read_text() == "hello there")
+
+        # Defaults stack on the grid: next add lands at 0020.
+        p2 = oaita.add_turn("addsess", source=io.BytesIO(b"again"))
+        check("second add is 0020-<id>.user",
+              bool(re.match(r"^0020-[a-z]{5}\.user$", p2.name)))
+
+        # Everything overridden, incl. insertion between 10 and 20.
+        p3 = oaita.add_turn(
+            "addsess", type="system", slug="rules", sender="OTHER",
+            flags="i", number=15, source=io.BytesIO(b"be terse"))
+        check("overridden add renders every field",
+              p3.name == "0015-rules-OTHER.i.system")
+        check("inserted turn sorts between its neighbours",
+              [t.number for t in oaita.load_turns("addsess")] == [10, 15, 20])
+
+        # Stitch spec targets the LAST segment.
+        p4 = oaita.add_turn("addsess.tail", source=io.BytesIO(b"x"))
+        check("stitch spec adds to the last segment",
+              p4.parent.name == "tail")
+
+        # Refusals: bad type / slug / sender / flags, and overwrite.
+        for kw in (dict(type="bogus"), dict(slug="UPPER"),
+                   dict(sender="not.aname"), dict(flags="zq"),
+                   dict(slug="rules", number=15, type="system",
+                        sender="OTHER", flags="i")):  # exact existing path
+            raised = False
+            try:
+                oaita.add_turn("addsess", source=io.BytesIO(b""), **kw)
+            except SystemExit:
+                raised = True
+            check(f"add_turn rejects {kw}", raised)
+    finally:
+        s.close()
+
+
 # ── standalone runner ────────────────────────────────────────────────────────
 if __name__ == "__main__":
     tests = [
@@ -1264,6 +1309,7 @@ if __name__ == "__main__":
         test_pending_calls_unit,
         test_run_to_completion,
         test_deterministic_ids_with_seed,
+        test_add_turn,
     ]
     for t in tests:
         try:

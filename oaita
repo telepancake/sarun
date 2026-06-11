@@ -97,6 +97,8 @@ tool-capable models only.
                       [--capabilities TEXT]
     oaita call <name> [--tool-context NAME] [...]
     oaita run  <name> [--max-steps N] [...]
+    oaita add  [name] [--type ROLE] [--id TURNID] [--from NAME]
+                      [--flags FLAGS] [--number N]      (stdin → turn file)
 
 Sections:
     1 · Imports & session paths
@@ -826,6 +828,65 @@ def _parse_call_envelope(content: str) -> tuple[str, str]:
     return str(obj["tool"]), args
 
 
+def add_turn(
+    name: str,
+    *,
+    type: str = "user",
+    slug: str | None = None,
+    sender: str | None = None,
+    flags: str = "",
+    number: int | None = None,
+    source=None,
+) -> Path:
+    """Add ONE turn to session ``name``, content streamed from ``source``.
+
+    The convenience entry the ``add`` subcommand wraps: everything defaults —
+    next grid number, a fresh generated turn-id, type ``user`` — and everything
+    can be overridden. ``source`` is a binary file object (default: stdin);
+    its bytes are copied to the turn file unbuffered, so a slow interactive
+    stdin appears in the file as it is typed. ``name`` may be a stitch spec;
+    the turn is added to the LAST segment (where gen would write).
+
+    Validates the pieces against the filename grammar (turnid ``[a-z0-9]+``,
+    sender a session name, flags from the known set) and refuses to overwrite
+    an existing file. Returns the written path.
+    """
+    target_seg = parse_stitch(name)[-1]
+    if type not in TURN_TYPES:
+        raise SystemExit(f"oaita: invalid turn type {type!r} — "
+                         f"one of {', '.join(TURN_TYPES)}")
+    if slug is not None and not re.fullmatch(r"[a-z0-9]+", slug):
+        raise SystemExit(f"oaita: invalid turn-id {slug!r} — [a-z0-9]+ only")
+    if sender is not None and not _NAME_RE.match(sender):
+        raise SystemExit(f"oaita: invalid sender {sender!r} — a session name")
+    if any(ch not in _FLAG_CHARS for ch in flags):
+        raise SystemExit(f"oaita: invalid flags {flags!r} — "
+                         f"chars from {_FLAG_CHARS!r}")
+    folder = session_dir(target_seg)
+    folder.mkdir(parents=True, exist_ok=True)
+    turns = load_turns(target_seg)
+    if number is None:
+        number = next_number(turns)
+    if slug is None:
+        slug = new_turn_id({t.slug for t in turns if t.slug},
+                           slot=f"{target_seg}/{number}")
+    path = folder / turn_filename(number, type, slug, sender=sender,
+                                  flags=flags)
+    if path.exists():
+        raise SystemExit(f"oaita: {path} already exists")
+    if source is None:
+        source = sys.stdin.buffer
+    # Unbuffered copy: each read lands in the file immediately, so the session
+    # folder is live even while an interactive stdin is still being typed.
+    with open(path, "wb", buffering=0) as f:
+        while True:
+            chunk = source.read(1 << 16)
+            if not chunk:
+                break
+            f.write(chunk)
+    return path
+
+
 def generate(
     name: str,
     *,
@@ -1139,6 +1200,24 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--max-steps", type=int, default=32, metavar="N",
                      help="abort (progress kept on disk) after N steps")
     run.set_defaults(func=_cmd_run)
+
+    add = sub.add_parser(
+        "add", help="add one turn to a session, content copied from stdin")
+    add.add_argument(
+        "name", nargs="?", default=None,
+        help="session name (or stitch spec — the turn goes to the last "
+             "segment); default $OAITA_SESSION, else 'default'")
+    add.add_argument("--type", default="user", metavar="ROLE",
+                     help="turn type / role (default: user)")
+    add.add_argument("--id", dest="slug", default=None, metavar="TURNID",
+                     help="turn-id ([a-z0-9]+; default: generated)")
+    add.add_argument("--from", dest="sender", default=None, metavar="NAME",
+                     help="sender session name (default: none — own turn)")
+    add.add_argument("--flags", default="", metavar="FLAGS",
+                     help="turn flags, e.g. 'p' or 'i' (default: none)")
+    add.add_argument("--number", type=int, default=None, metavar="N",
+                     help="grid number (default: highest+10)")
+    add.set_defaults(func=_cmd_add)
     return parser
 
 
@@ -1172,6 +1251,15 @@ def _cmd_run(args) -> int:
         args.name, model=args.model, base_url=args.base_url,
         api_key=args.api_key, tool_context=args.tool_context,
         capabilities=args.capabilities, max_steps=args.max_steps))
+
+
+def _cmd_add(args) -> int:
+    """Handler for ``oaita add``: stdin → one turn file; path on stdout."""
+    name = args.name or os.environ.get("OAITA_SESSION") or "default"
+    path = add_turn(name, type=args.type, slug=args.slug, sender=args.sender,
+                    flags=args.flags, number=args.number)
+    print(path)
+    return 0
 
 
 def main(argv=None) -> int:
