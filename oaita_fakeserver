@@ -267,6 +267,30 @@ def _coerce(item):
     raise TypeError(f"cannot enqueue {type(item).__name__}: {item!r}")
 
 
+@dataclass
+class _Expectation:
+    """One expect-mode rule: a request matcher + the response it supplies.
+
+    ``matcher`` is a callable(CapturedRequest) -> bool, or a plain string —
+    shorthand for "substring of the LAST message's content" (the most common
+    thing a scripted scenario keys on). ``response`` is anything ``enqueue``
+    accepts, or a callable(CapturedRequest) -> such-a-value for request-derived
+    templating. ``once`` rules are consumed by their first match; persistent
+    rules (``once=False``) keep answering.
+    """
+    matcher: object
+    response: object
+    once: bool = True
+    matched: int = 0
+
+    def hit(self, req: "CapturedRequest") -> bool:
+        if callable(self.matcher):
+            return bool(self.matcher(req))
+        msgs = req.messages or []
+        last = msgs[-1].get("content") if msgs else None
+        return isinstance(last, str) and str(self.matcher) in last
+
+
 # ════════════════════════════════════════════════════════════════════════════
 #  3 · Request capture
 # ════════════════════════════════════════════════════════════════════════════
@@ -389,12 +413,13 @@ class _Handler(BaseHTTPRequestHandler):
 
     # --- route: POST /v1/chat/completions ---------------------------------
     def _handle_chat(self, req: CapturedRequest):
-        canned = self.fake._next_canned()
+        canned = self.fake._next_canned(req)
         if canned is None:
             return self._send_error_envelope(
                 500,
-                "oaita_fakeserver: no canned response was enqueued for this "
-                "chat request (enqueue one, or pass default=...)",
+                "oaita_fakeserver: no expectation matched and no canned "
+                "response was enqueued for this chat request (expect/enqueue "
+                "one, or pass default=...)",
                 "fake_empty_queue",
             )
 
@@ -438,7 +463,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     # --- route: POST /v1/completions (legacy text completion) -------------
     def _handle_legacy_completions(self, req: CapturedRequest):
-        canned = self.fake._next_canned()
+        canned = self.fake._next_canned(req)
         if canned is None:
             return self._send_error_envelope(
                 500,
@@ -493,6 +518,7 @@ class FakeOpenAIServer:
         self.default = default
         self.models = ["test-model"]
         self._queue: list = []
+        self._expectations: list[_Expectation] = []
         self.requests: list[CapturedRequest] = []
         self._lock = threading.Lock()
         self._httpd: ThreadingHTTPServer | None = None
@@ -548,20 +574,50 @@ class FakeOpenAIServer:
     def enqueue_chat(self, **kwargs) -> "FakeOpenAIServer":
         return self.enqueue(CannedChat(**kwargs))
 
-    def _next_canned(self):
-        """Pop the next canned response (FIFO), or fall back to `default`.
+    def expect(self, matcher, response, once: bool = True) -> "FakeOpenAIServer":
+        """Register an expect-mode rule: when ``matcher`` matches an incoming
+        chat request, ``response`` answers it.
 
-        Returns None only when the queue is empty AND no `default` is set,
-        which the handler renders as a loud 500 — enforcing the exact-control
-        contract. A `default` is coerced just like an enqueued value (str ->
-        CannedChat, dict -> CannedRaw, or a Canned* instance passed through).
+        Rules are checked IN REGISTRATION ORDER, BEFORE the FIFO queue; the
+        first matching rule wins. ``matcher`` is a callable(CapturedRequest)
+        -> bool, or a string (substring match against the LAST message's
+        content). ``response`` is anything ``enqueue`` accepts, or a
+        callable(CapturedRequest) -> such-a-value (request-derived templating).
+        ``once=True`` (default) consumes the rule on first match — an ordered
+        expect-script; ``once=False`` keeps it active. An unmatched request
+        falls through to the queue, then ``default``, then the loud 500.
         """
+        self._expectations.append(_Expectation(matcher, response, once))
+        return self
+
+    def _next_canned(self, req: "CapturedRequest | None" = None):
+        """The response for one request: expectations, then queue, then default.
+
+        Returns None only when nothing matches, the queue is empty AND no
+        `default` is set, which the handler renders as a loud 500 — enforcing
+        the exact-control contract. A response value is coerced just like an
+        enqueued value (str -> CannedChat, dict -> CannedRaw, Canned* as-is);
+        a callable response is called with the request first.
+        """
+        resp = None
         with self._lock:
-            if self._queue:
+            if req is not None:
+                for exp in self._expectations:
+                    if exp.once and exp.matched:
+                        continue
+                    if exp.hit(req):
+                        exp.matched += 1
+                        resp = exp.response
+                        break
+            if resp is None and self._queue:
                 return self._queue.pop(0)
-        if self.default is not None:
-            return _coerce(self.default)
-        return None
+        if resp is None:
+            resp = self.default
+        if resp is None:
+            return None
+        if callable(resp):
+            resp = resp(req)
+        return _coerce(resp)
 
     def _record(self, req: CapturedRequest):
         with self._lock:
@@ -570,6 +626,7 @@ class FakeOpenAIServer:
     def reset(self):
         with self._lock:
             self._queue.clear()
+            self._expectations.clear()
             self.requests.clear()
 
 

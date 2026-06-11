@@ -18,6 +18,8 @@ Covers:
   6. Error injection — BadRequestError (400) + RateLimitError (429)
   7. Empty queue → InternalServerError (500)
   8. Extra kwargs passthrough (temperature)
+  9. Expect-mode: match-and-respond rules (string/callable matchers, once
+     consumption, templated responses, queue fallthrough, reset)
 
 Run standalone:
     ./test_oaita_fakeapi.py
@@ -287,6 +289,67 @@ def test_extra_passthrough():
 
 
 # ════════════════════════════════════════════════════════════════════════════
+#  9 · Expect-mode: match-and-respond rules
+# ════════════════════════════════════════════════════════════════════════════
+def test_expect_mode():
+    """expect() rules answer by match, not arrival order; once-consumption;
+    callable responses template off the request; fallthrough to the queue."""
+    with FakeOpenAIServer() as srv:
+        client = make_client(srv.base_url)
+        # Registration order ≠ arrival order: rules answer whichever request
+        # MATCHES, so a scenario script needn't predict the exact call order.
+        srv.expect("alpha topic", CannedChat(content="ALPHA"))
+        srv.expect("beta topic", CannedChat(content="BETA"))
+        r1 = send(client, CannedPrompt(user="please cover beta topic"))
+        r2 = send(client, CannedPrompt(user="now the alpha topic"))
+        check("string matcher answers by content, not order",
+              r1.choices[0].message.content == "BETA"
+              and r2.choices[0].message.content == "ALPHA")
+
+        # once=True rules are consumed: a repeat falls through (here: queue).
+        srv.enqueue(CannedChat(content="FROM QUEUE"))
+        r3 = send(client, CannedPrompt(user="alpha topic again"))
+        check("a consumed once-rule falls through to the queue",
+              r3.choices[0].message.content == "FROM QUEUE")
+
+        # Persistent rule (once=False) keeps answering.
+        srv.expect("evergreen", CannedChat(content="STILL HERE"), once=False)
+        a = send(client, CannedPrompt(user="evergreen 1"))
+        b = send(client, CannedPrompt(user="evergreen 2"))
+        check("once=False rule answers repeatedly",
+              a.choices[0].message.content == "STILL HERE"
+              and b.choices[0].message.content == "STILL HERE")
+
+        # Callable matcher + callable response (request-derived templating).
+        srv.expect(lambda req: req.json.get("temperature") == 0.7,
+                   lambda req: CannedChat(
+                       content=f"temp was {req.json['temperature']}"))
+        c = send(client, CannedPrompt(user="anything",
+                                      extra={"temperature": 0.7}))
+        check("callable matcher + templated response work",
+              c.choices[0].message.content == "temp was 0.7")
+
+        # No match, empty queue → the loud 500 (exact-control contract kept).
+        raised = None
+        try:
+            send(client, CannedPrompt(user="nothing matches this"))
+        except Exception as exc:
+            raised = exc
+        check("unmatched request still raises the loud 500",
+              getattr(raised, "status_code", None) == 500)
+
+        # reset() clears the rules too.
+        srv.reset()
+        raised2 = None
+        try:
+            send(client, CannedPrompt(user="evergreen 3"))
+        except Exception as exc:
+            raised2 = exc
+        check("reset() clears expectations",
+              getattr(raised2, "status_code", None) == 500)
+
+
+# ════════════════════════════════════════════════════════════════════════════
 #  __main__
 # ════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
@@ -299,6 +362,7 @@ if __name__ == "__main__":
         test_error_injection,
         test_empty_queue,
         test_extra_passthrough,
+        test_expect_mode,
     ]
     for t in tests:
         print(f"\n── {t.__name__} ──")
