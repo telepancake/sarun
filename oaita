@@ -682,20 +682,22 @@ class SarunExecutor:
     the change summary is computed from ``sarun <box> patch``.
     """
 
-    def __init__(self, sarun: str | None = None):
+    def __init__(self, sarun=None):
         if sarun is None:
             sibling = Path(__file__).resolve().parent / "sarun"
             sarun = str(sibling) if sibling.exists() else "sarun"
-        self.sarun = sarun
+        # A string is the executable; a sequence is a full argv prefix (e.g.
+        # ["/deps/python", "/path/sarun"] to skip per-call uv resolution).
+        self._argv = [sarun] if isinstance(sarun, str) else list(sarun)
 
     def run_script(self, script: str, box: str) -> ExecResult:
         import subprocess
         proc = subprocess.run(
-            [self.sarun, box, "--", "sh", "-c", script],
+            [*self._argv, box, "--", "sh", "-c", script],
             capture_output=True, text=True)
         output = proc.stdout + (("\n" + proc.stderr) if proc.stderr else "")
         patch = subprocess.run(
-            [self.sarun, box, "patch"], capture_output=True, text=True)
+            [*self._argv, box, "patch"], capture_output=True, text=True)
         changes = summarize_patch(patch.stdout) if patch.returncode == 0 else ""
         return ExecResult(output=output.strip("\n"), changes=changes,
                           exit_code=proc.returncode)
