@@ -609,7 +609,45 @@ def mnt_point() -> Path:
     <mnt>/<box_id>. Empty at rest."""
     return runtime_home() / "mnt"
 
-UI_SOCK_INBOX  = "/run/slopbox/ui.sock"                  # fixed in-box path for the above
+# Fixed in-box path for the bind-mounted UI control socket. It lives under the
+# box's PRIVATE /tmp tmpfs (not /run): /run is no longer masked — it shows
+# through the overlay like the rest of the host — so a mountpoint there would
+# be created THROUGH the overlay and show up as a captured change in every box.
+# The /tmp tmpfs is per box and invisible to capture, so bwrap's mountpoint
+# creation lands nowhere reviewable.
+UI_SOCK_INBOX  = "/tmp/.slopbox/ui.sock"
+
+def _box_runtime_binds() -> list:
+    """bwrap args giving boxes REAL access to the user runtime dir.
+
+    /run shows through the overlay like the rest of the host (the old blanket
+    "--tmpfs /run" is gone — sarun's own dirs are hidden by the overlay itself,
+    see _self_rels). That is right for files (resolv.conf, /run/host, pid
+    files...) but not sufficient for unix sockets: a socket inode served by
+    FUSE is a fresh inode nobody listens on, so connect() through the overlay
+    dead-ends. Tools that talk to ssh-agent/gpg-agent/the user D-Bus/rootless
+    podman need the REAL /run/user/<uid>, so bind it over the overlay
+    (passthrough — writes there are volatile runtime state, not reviewable
+    changes). sarun's own runtime dir (control socket, blob staging, the FUSE
+    mountpoint itself!) lives inside it; mask it with an empty tmpfs so a box
+    cannot re-enter its own overlay or sarun's machinery through the real bind.
+    """
+    dirs = []
+    xdg = os.environ.get("XDG_RUNTIME_DIR")
+    if xdg:
+        dirs.append(os.path.realpath(xdg))
+    conventional = f"/run/user/{os.getuid()}"
+    if conventional not in dirs:
+        dirs.append(conventional)
+    own = os.path.realpath(runtime_home())
+    args: list = []
+    for d in dirs:
+        if not os.path.isdir(d):
+            continue
+        args += ["--bind-try", d, d]
+        if own == d or own.startswith(d + "/"):
+            args += ["--tmpfs", own]
+    return args
 
 # NESTED LAUNCH: each box's FUSE root carries a hidden synthetic directory listing
 # the box's live child boxes, each entry routing to that child's own overlay root
@@ -3051,6 +3089,26 @@ def _build_overlay_ops():
             # base is detached and its Index closed.
             self._base_sessions: dict = {}    # sid -> True (membership flag)
             self._base_children: dict = {}    # base_sid -> set of child sids
+            # sarun's OWN host dirs, as overlay-relative paths, hidden from every
+            # box. The FUSE mountpoint (under runtime_home) would re-enter this very
+            # filesystem if a box resolved a path through it, and the data/state/
+            # config dirs ARE the capture machinery (sqlar mirrors, blob pool, file
+            # rules) — a box reading or writing them through its own overlay could
+            # deadlock the serve loop or rewrite its own captured history. Hiding
+            # just these four roots hides their whole subtrees: kernel path
+            # resolution is component-wise, so nothing below an ENOENT'd dir is
+            # reachable. This is the targeted replacement for the old blanket
+            # "--tmpfs /run" in the box, which hid ALL of host /run (resolv.conf,
+            # /run/host, agent sockets...) just to mask one mountpoint.
+            self._self_rels: set = set()
+            _base = "" if self.lower_root == "/" else self.lower_root
+            for _own in (data_home(), config_home(), state_home(), runtime_home()):
+                _rp = os.path.realpath(_own)
+                if _base and not _rp.startswith(_base + "/"):
+                    continue
+                _rel = _rp[len(_base):].lstrip("/")
+                if _rel:
+                    self._self_rels.add(_rel)
 
         # ── session registry ────────────────────────────────────────────────
         def add_session(self, sid: str, up: Path, index: "Index",
@@ -3911,6 +3969,8 @@ def _build_overlay_ops():
                 return self._synth_dir_attrs(ino)
             if sid not in self.sessions:
                 return self._neg_entry()
+            if rel in self._self_rels:                  # sarun's own dirs: invisible
+                return self._neg_entry()
             if self._is_sink(sid, rel):
                 ino = self._ino_for(sid, rel)
                 self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
@@ -3982,6 +4042,8 @@ def _build_overlay_ops():
             out = []
             for name in sorted(names):
                 childrel = (rel + "/" + name) if rel else name
+                if childrel in self._self_rels:         # sarun's own dirs: invisible
+                    continue
                 layer, _ap, st = self._resolve_st(sid, childrel)
                 if layer in ("absent", "whiteout"): continue
                 ino = self._ino_for(sid, childrel)
@@ -4621,6 +4683,8 @@ def _build_overlay_ops():
                 raise pyfuse3.FUSEError(errno.EPERM)
             sid, rel = self._child_key(pkey, name)
             if sid not in self.sessions: raise pyfuse3.FUSEError(errno.ENOENT)
+            if rel in self._self_rels:      # cannot touch sarun's own (hidden) dirs
+                raise pyfuse3.FUSEError(errno.EACCES)
             wid = self._index(sid).writer_for(ctx.pid)
             if policy_check(sid, self._index(sid).provenance_of(ctx.pid),
                             rel, op) == "deny":
@@ -4764,6 +4828,8 @@ def _build_overlay_ops():
                 raise pyfuse3.FUSEError(errno.EPERM)
             sid, rel = self._child_key(pkey, name)
             if sid not in self.sessions: raise pyfuse3.FUSEError(errno.ENOENT)
+            if rel in self._self_rels:      # cannot touch sarun's own (hidden) dirs
+                raise pyfuse3.FUSEError(errno.EACCES)
             wid = self._index(sid).writer_for(ctx.pid)
             if policy_check(sid, self._index(sid).provenance_of(ctx.pid),
                             rel, "unlink") == "deny":
@@ -4814,6 +4880,8 @@ def _build_overlay_ops():
                 raise pyfuse3.FUSEError(errno.EPERM)
             sid, rel = self._child_key(pkey, name)
             if sid not in self.sessions: raise pyfuse3.FUSEError(errno.ENOENT)
+            if rel in self._self_rels:      # cannot touch sarun's own (hidden) dirs
+                raise pyfuse3.FUSEError(errno.EACCES)
             wid = self._index(sid).writer_for(ctx.pid)
             if policy_check(sid, self._index(sid).provenance_of(ctx.pid),
                             rel, "rmdir") == "deny":
@@ -5211,6 +5279,8 @@ def _build_overlay_ops():
             sid_n, rel_n = self._child_key(pkn, name_new)
             if sid_o != sid_n or sid_o not in self.sessions:
                 raise pyfuse3.FUSEError(errno.EXDEV)
+            if rel_o in self._self_rels or rel_n in self._self_rels:
+                raise pyfuse3.FUSEError(errno.EACCES)  # sarun's own (hidden) dirs
             sid = sid_o
             if policy_check(sid, self._index(sid).provenance_of(ctx.pid),
                             rel_o, "rename") == "deny":
@@ -9118,7 +9188,8 @@ def cmd_run(cmd, env_capture, direct, chdir, reuse_sid=None,
                 *bind_root_args,
                 "--proc", "/proc", "--dev", "/dev",
                 "--ro-bind-try", "/sys", "/sys",
-                "--tmpfs", "/tmp", "--tmpfs", "/run",
+                "--tmpfs", "/tmp",
+                *_box_runtime_binds(),
                 "--ro-bind", _ui_sock_src, UI_SOCK_INBOX,
                 *unshare_args,
                 *cap_args, "--die-with-parent",
