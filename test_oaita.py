@@ -896,35 +896,52 @@ def test_tools_happy_path():
               env == {"tool": "act",
                       "arguments": {"request": "search the thing"}})
 
-        # call: evaluates the pending call in the inner sub-agent session.
-        s.srv.enqueue(CannedChat(content="THE RESULT"))
-        res = s.call("conv")
+        # call: seeds the sub-agent session, runs it AS A PROCESS IN A BOX
+        # via the executor, and reports its staged final turn — no in-process
+        # recursion, no extra wire request from THIS process.
+        ex = FakeExecutor().stage("THE RESULT")
+        res = s.call("conv", executor=ex)
         check("call wrote exactly the result turn", len(res) == 1)
         check("turns now user, assistant(call), tool",
               _types_in_order(conv) == ["user", "assistant", "tool"])
+        check("call made NO model request itself (the boxed process does)",
+              len(s.srv.requests) == 1)
         result_turn = oaita.parse_turn(res[0])
-        check("result content is exactly the inner answer",
+        check("result is the report of the sub-agent's staged final turn",
               res[0].read_text() == "THE RESULT")
         handle = call_turn.slug
         check("result turn's from-sender is the inner session (the call's id)",
               result_turn.sender == handle)
 
+        # The executor was asked to run `oaita run <innerid>` in the
+        # sub-agent's OWN box, then read the tail through the staged view.
+        script, box = ex.calls[0]
+        check("act ran `oaita run` on the inner session in its box",
+              f"run {handle} " in script and box == f"OAITA-{handle.upper()}")
+        check("the result is read via `oaita tail` through the box",
+              f"tail {handle}" in script)
+        check("the sub-agent runs one depth deeper", "OAITA_DEPTH=1" in script)
+
+        # The seed user turn was posted into the inner session by the caller.
         inner = oaita.session_dir(handle)
         check("inner sub-agent session exists named after the call slug",
               inner.is_dir())
-        check("inner session has a .user(request) then .assistant(result)",
-              _types_in_order(inner) == ["user", "assistant"])
-        icontents = _contents_in_order(inner)
-        check("inner user turn is the request", icontents[0] == "search the thing")
-        check("inner assistant turn is the result", icontents[1] == "THE RESULT")
+        check("inner session holds the seed user turn",
+              _types_in_order(inner) == ["user"]
+              and _contents_in_order(inner)[0] == "search the thing")
         inner_user = [oaita.parse_turn(p) for p in sorted(inner.iterdir())
                       if p.name.endswith(".user")][0]
         check("inner seed turn's from-sender is the OUTER session",
               inner_user.sender == "conv")
-        # The inner gen saw the from-bearing header on the wire.
-        inner_req = s.srv.requests[-1]
-        check("inner prompt's user turn carries from=conv in its header",
-              '"from": "conv"' in inner_req.messages[0]["content"])
+
+        # Without an executor, act reports the error and runs nothing.
+        s.write_turn("noex", "0010.user", "go")
+        s.srv.enqueue(CannedChat(
+            tool_calls=[("act", '{"request": "x"}', "c9")]))
+        s.generate("noex")
+        res2 = s.call("noex")
+        check("act without an executor → error result, nothing run",
+              res2[0].read_text().startswith("error: no executor"))
     finally:
         s.close()
 
@@ -938,8 +955,9 @@ def test_tools_capabilities_surfaced():
         s.generate("conv", capabilities="bespoke power")
         tools = s.srv.requests[-1].json.get("tools")
         by_name = {t["function"]["name"]: t["function"] for t in tools}
-        check("the registry tools are advertised (act, shell, inspect, delete)",
-              set(by_name) == {"act", "shell", "inspect", "delete"})
+        check("the registry tools are advertised",
+              set(by_name) == {"act", "shell", "inspect", "delete",
+                               "apply", "reject"})
         check("custom capabilities embedded in the act description",
               "bespoke power" in by_name["act"]["description"])
         check("shell schema requires the script param",
@@ -965,20 +983,16 @@ def test_tools_tool_context_stitched():
         s.write_turn("tooldesc", "0010.system", "ALL TOOLS HERE")
         s.srv.enqueue(CannedChat(
             tool_calls=[("act", '{"request": "use a tool"}', "call_1")]))
-        s.generate("conv")
-        s.srv.enqueue(CannedChat(content="inner result"))  # inner gen
-        s.call("conv", tool_context="tooldesc")
-
-        # The INNER request is the one whose first message is the tooldesc system.
-        inner_req = next(
-            r for r in s.srv.requests
-            if r.messages and r.messages[0]["role"] == "system"
-            and r.messages[0]["content"].split("\n", 1)[1] == "ALL TOOLS HERE")
-        roles = [m["role"] for m in inner_req.messages]
-        check("inner call prepends the tooldesc system before the user turn",
-              roles == ["system", "user"])
-        check("inner call's user turn is the request",
-              inner_req.messages[1]["content"].split("\n", 1)[1] == "use a tool")
+        produced = s.generate("conv")
+        handle = oaita.parse_turn(produced[0]).slug
+        ex = FakeExecutor().stage("inner result")
+        s.call("conv", tool_context="tooldesc", executor=ex)
+        # The boxed sub-agent is run on the STITCHED spec (tooldesc prepended).
+        script, _box = ex.calls[0]
+        check("the boxed run uses the stitched tooldesc.<innerid> spec",
+              f"run tooldesc.{handle} " in script)
+        check("the tail still reads the bare inner session",
+              f"tail {handle}" in script)
     finally:
         s.close()
 
@@ -993,8 +1007,8 @@ def test_tools_follow_up():
             tool_calls=[("act", '{"request": "search the thing"}', "call_1")]))
         s.generate("conv")
         conv = oaita.session_dir("conv")
-        s.srv.enqueue(CannedChat(content="RESULT1"))
-        s.call("conv")
+        ex = FakeExecutor().stage("RESULT1")
+        s.call("conv", executor=ex)
         callfile = sorted(p.name for p in conv.iterdir()
                           if p.name.endswith(".assistant"))[0]
         handle = _id_from_name(callfile)
@@ -1004,19 +1018,17 @@ def test_tools_follow_up():
             "act", json.dumps({"request": "and also Y", "follow_up": handle}),
             "call_2")]))
         s.generate("conv")
-        s.srv.enqueue(CannedChat(content="RESULT2"))
-        res2 = s.call("conv")
+        ex.stage("RESULT2")
+        res2 = s.call("conv", executor=ex)
 
         inner = oaita.session_dir(handle)
-        check("inner H now has two user + two assistant turns",
-              _types_in_order(inner) ==
-              ["user", "assistant", "user", "assistant"])
-        icontents = _contents_in_order(inner)
-        check("appended follow-up user turn is 'and also Y'",
-              icontents[2] == "and also Y")
-        check("new inner assistant turn is RESULT2", icontents[3] == "RESULT2")
-
-        # A NEW outer .tool turn holds RESULT2, from=H; inner NOT duplicated.
+        check("BOTH seed turns landed in H (continued, not duplicated)",
+              _types_in_order(inner) == ["user", "user"]
+              and _contents_in_order(inner) == ["search the thing",
+                                                "and also Y"])
+        check("both boxed runs targeted H's session and H's box",
+              all(f"run {handle} " in sc and box == f"OAITA-{handle.upper()}"
+                  for sc, box in ex.calls))
         check("a new outer .tool turn holds RESULT2",
               res2[0].read_text() == "RESULT2")
         check("the follow-up result's from-sender is H (not the new call id)",
@@ -1066,13 +1078,12 @@ def test_tools_stops_after_result():
             raised = True
         check("gen refuses while a call is pending", raised)
 
-        # call evaluates it (one inner request).
-        s.srv.enqueue(CannedChat(content="X is 42"))
-        s.call("conv")
+        # call evaluates it (boxed process via the executor; no model request).
+        s.call("conv", executor=FakeExecutor().stage("X is 42"))
         check("turns now user, assistant(call), tool",
               _types_in_order(conv) == ["user", "assistant", "tool"])
-        check("call made exactly one further request",
-              len(s.srv.requests) == 2)
+        check("call made no model request of its own",
+              len(s.srv.requests) == 1)
 
         # The caller drives the next step: gen now reacts to the result.
         s.srv.enqueue(CannedChat(content="The answer is 42."))
@@ -1103,10 +1114,9 @@ def test_tools_multiple_calls_one_gen():
               all("c" in oaita.parse_turn(p).flags for p in produced))
 
         # Evaluate one call per `call` invocation; pairing is positional.
-        s.srv.enqueue(CannedChat(content="result A"))
-        resA = s.call("conv")
-        s.srv.enqueue(CannedChat(content="result B"))
-        resB = s.call("conv")
+        ex = FakeExecutor().stage("result A").stage("result B")
+        resA = s.call("conv", executor=ex)
+        resB = s.call("conv", executor=ex)
         check("results landed in call order",
               resA[0].read_text() == "result A"
               and resB[0].read_text() == "result B")
@@ -1170,21 +1180,21 @@ def test_run_to_completion():
         s.write_turn("conv", "0010.user", "what is X")
         s.srv.enqueue(CannedChat(
             tool_calls=[("act", '{"request": "look up X"}', "c1")]))
-        s.srv.enqueue(CannedChat(content="X is 42"))          # inner leaf
         s.srv.enqueue(CannedChat(content="The answer is 42."))  # synthesis
-        produced = s.run("conv")
+        ex = FakeExecutor().stage("X is 42")                    # boxed sub-agent
+        produced = s.run("conv", executor=ex)
         conv = oaita.session_dir("conv")
         check("run settled: user, call, tool, assistant",
               _types_in_order(conv) == ["user", "assistant", "tool", "assistant"])
         check("the final tail is the clean synthesised answer",
               _contents_in_order(conv)[-1] == "The answer is 42.")
-        check("exactly three wire requests (gen, inner, gen)",
-              len(s.srv.requests) == 3)
+        check("two wire requests from THIS process (sub-agent is a boxed run)",
+              len(s.srv.requests) == 2 and len(ex.calls) == 1)
         check("run produced call, result, answer (3 written turns)",
               len(produced) == 3)
         # A settled context is a no-op.
         check("run on a settled context does nothing", s.run("conv") == [])
-        check("no extra requests for the no-op", len(s.srv.requests) == 3)
+        check("no extra requests for the no-op", len(s.srv.requests) == 2)
     finally:
         s.close()
 
@@ -1281,6 +1291,7 @@ class FakeExecutor:
     def __init__(self):
         self.calls = []
         self.queue = []
+        self.resolved = []           # ("apply"|"discard", box)
 
     def stage(self, output, changes="", exit_code=0):
         self.queue.append(oaita.ExecResult(
@@ -1290,6 +1301,59 @@ class FakeExecutor:
     def run_script(self, script, box):
         self.calls.append((script, box))
         return self.queue.pop(0)
+
+    def apply_box(self, box):
+        self.resolved.append(("apply", box))
+        return f"applied box {box}"
+
+    def discard_box(self, box):
+        self.resolved.append(("discard", box))
+        return f"discarded box {box}"
+
+
+def test_apply_reject_tools():
+    """apply/reject resolve a sub-agent's STAGED box — the only gate; the
+    result report never commits anything by itself."""
+    s = Session()
+    try:
+        s.write_turn("conv", "0010.user", "do X then keep it")
+        s.srv.enqueue(CannedChat(
+            tool_calls=[("act", '{"request": "edit stuff"}', "call_editx")]))
+        s.generate("conv")
+        ex = FakeExecutor().stage(
+            "done editing", changes="1 file(s) changed (staged in the box):\n"
+                                    "f.txt: +2 -0")
+        res = s.call("conv", executor=ex)
+        check("act result reports staged changes WITHOUT applying",
+              "f.txt: +2 -0" in res[0].read_text() and ex.resolved == [])
+
+        # The model reviews and applies — by the sub-agent id it saw in from.
+        handle = oaita.parse_turn(res[0]).sender
+        s.srv.enqueue(CannedChat(tool_calls=[
+            ("apply", json.dumps({"target": handle}), "c2")]))
+        s.generate("conv")
+        res2 = s.call("conv", executor=ex)
+        check("apply resolved exactly the sub-agent's box",
+              ex.resolved == [("apply", f"OAITA-{handle.upper()}")])
+        check("apply's result reports the resolution",
+              res2[0].read_text() == f"applied box OAITA-{handle.upper()}")
+
+        # And reject discards a (second) sub-agent's box.
+        s.srv.enqueue(CannedChat(
+            tool_calls=[("act", '{"request": "try stuff"}', "call_tryit")]))
+        s.generate("conv")
+        ex.stage("attempt done", changes="1 file(s) changed:\nbad.txt: +9 -0")
+        s.call("conv", executor=ex)
+        s.srv.enqueue(CannedChat(tool_calls=[
+            ("reject", json.dumps({"target": "tryit"}), "c4")]))
+        s.generate("conv")
+        res3 = s.call("conv", executor=ex)
+        check("reject discarded the second box, first stayed applied",
+              ex.resolved[-1] == ("discard", "OAITA-TRYIT"))
+        check("reject's result reports the discard",
+              "discarded box OAITA-TRYIT" in res3[0].read_text())
+    finally:
+        s.close()
 
 
 def test_shell_tool():
@@ -1554,6 +1618,7 @@ if __name__ == "__main__":
         test_run_to_completion,
         test_call_id_adoption,
         test_shell_tool,
+        test_apply_reject_tools,
         test_summarize_patch_unit,
         test_inspect_path,
         test_inspect_tool_call,

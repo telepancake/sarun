@@ -126,6 +126,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import shutil
 import string
 import sys
@@ -661,6 +662,48 @@ def tool_registry(capabilities: str | None = None,
                 "required": ["path"],
             },
         ),
+        "apply": ToolSpec(
+            name="apply",
+            description=(
+                "APPLY a sub-agent's staged changes: fold everything its "
+                "sandbox box accumulated (files, session edits) into this "
+                "plane, then remove the box. `target` is the sub-agent id "
+                "(the from-sender of its result turn). Review the change "
+                "summary first — applying is the commit."),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "Sub-agent session id whose box to "
+                                       "apply.",
+                    },
+                },
+                "required": ["target"],
+            },
+            run_location="manager",
+        ),
+        "reject": ToolSpec(
+            name="reject",
+            description=(
+                "REJECT a sub-agent's staged changes: discard everything its "
+                "sandbox box accumulated and remove the box. `target` is the "
+                "sub-agent id (the from-sender of its result turn). Its "
+                "result text stays in this conversation; only the staged "
+                "changes vanish."),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "Sub-agent session id whose box to "
+                                       "discard.",
+                    },
+                },
+                "required": ["target"],
+            },
+            run_location="manager",
+        ),
         "delete": ToolSpec(
             name="delete",
             description=(
@@ -774,11 +817,84 @@ class SarunExecutor:
         return ExecResult(output=output.strip("\n"), changes=changes,
                           exit_code=proc.returncode)
 
-    def discard_box(self, box: str) -> None:
-        """Discard a box's staged changes and remove it (best-effort)."""
+    def discard_box(self, box: str) -> str:
+        """Discard a box's staged changes and remove it. Returns CLI output."""
         import subprocess
-        subprocess.run([*self._argv, box, "discard"],
-                       capture_output=True, text=True)
+        r = subprocess.run([*self._argv, box, "discard"],
+                           capture_output=True, text=True)
+        return (r.stdout + r.stderr).strip() or f"discarded box {box}"
+
+    def apply_box(self, box: str) -> str:
+        """Apply a box's staged changes to its parent plane, remove the box."""
+        import subprocess
+        r = subprocess.run([*self._argv, box, "apply"],
+                           capture_output=True, text=True)
+        return (r.stdout + r.stderr).strip() or f"applied box {box}"
+
+
+class LocalExecutor:
+    """NO SANDBOX, NO GATE: scripts run directly on the host via ``sh -c``.
+
+    A testing / no-sarun stand-in (select with ``$OAITA_EXECUTOR=local``).
+    Every write is immediately live — there is nothing staged, so apply and
+    reject are no-ops that say so. The transactional gate lives in sarun
+    boxes; this class exists so the rest of oaita can be exercised without
+    one, not as a safe substitute.
+    """
+
+    def run_script(self, script: str, box: str) -> ExecResult:
+        import subprocess
+        proc = subprocess.run(["sh", "-c", script],
+                              capture_output=True, text=True)
+        output = proc.stdout + (("\n" + proc.stderr) if proc.stderr else "")
+        return ExecResult(output=output.strip("\n"), changes="",
+                          exit_code=proc.returncode)
+
+    def discard_box(self, box: str) -> str:
+        return (f"no sandbox: {box} was never staged — its writes are "
+                f"already live and cannot be discarded")
+
+    def apply_box(self, box: str) -> str:
+        return f"no sandbox: {box} had nothing staged — writes were live"
+
+
+# The absolute path of THIS oaita — what act scripts invoke inside a box (the
+# box overlays the host filesystem, so the same path resolves in-box).
+OAITA_PATH = Path(__file__).resolve()
+
+
+def act_script(stitch_spec: str, innerid: str, depth: int) -> str:
+    """The in-box script one ``act`` call runs.
+
+    Runs the sub-agent to completion (its stream is on disk; stdout noise is
+    dropped) and then prints the FINAL turn through the box's staged view via
+    ``oaita tail`` — a sub-agent that collapsed itself with ``delete`` streams
+    nothing, so the on-disk tail is the only truthful answer channel. Depth
+    rides ``$OAITA_DEPTH`` so the sub-agent's own ``act`` knows how deep it is.
+    """
+    # $OAITA_CMD overrides how the sub-process invokes oaita (e.g. a
+    # deps-equipped interpreter in tests, skipping per-spawn uv resolution);
+    # default is this file's own path (the box overlays the host, so the uv
+    # shebang resolves in-box too).
+    oaita = os.environ.get("OAITA_CMD") or shlex.quote(str(OAITA_PATH))
+    return (f"OAITA_DEPTH={depth} {oaita} run {stitch_spec} "
+            f">/dev/null 2>&1 && {oaita} tail {innerid}")
+
+
+def render_act_result(r: ExecResult) -> str:
+    """The model-facing text of one act run's ``.tool`` result turn.
+
+    The sub-agent's final turn (read through the box), then the box's staged
+    change summary — a REPORT of staged state, never an application of it.
+    The caller resolves the box with apply/reject.
+    """
+    parts = []
+    if r.exit_code != 0:
+        parts.append(f"(sub-agent run exited {r.exit_code})")
+    parts.append(r.output)
+    if r.changes:
+        parts.append(r.changes)
+    return "\n".join(p for p in parts if p != "")
 
 
 def render_shell_result(r: ExecResult) -> str:
@@ -1414,16 +1530,22 @@ def evaluate_call(
     ONE call per invocation — repetition is ``run_to_completion``'s job.
 
     ``act``: the inner sub-agent session is the call's turn-id (or the call's
-    ``follow_up`` target), the request is posted into it as a user turn with
-    ``from=<outer segment>``, and the inner session is RUN TO COMPLETION one
-    depth deeper (tool-capable — it can shell, inspect, delete, even delegate
-    again until ``MAX_DEPTH``). Its final clean assistant turn is posted back
-    as a ``.tool`` result with ``from=<inner session>`` — the follow-up
-    address. At ``MAX_DEPTH`` ``act`` refuses with "too deep" instead.
+    ``follow_up`` target); the request is posted into it as a user turn with
+    ``from=<outer segment>``, and the sub-agent runs as ``oaita run`` — a
+    PROCESS IN A BOX (``OAITA-<innerid>``), one depth deeper via
+    ``$OAITA_DEPTH``, tool-capable, never an in-process recursion. ALL its
+    writes (own turns, edits to any session, file changes) STAGE in that box.
+    The ``.tool`` result (``from=<inner session>``) is a REPORT read through
+    the staged view — the sub-agent's final turn via ``oaita tail`` plus the
+    change summary; reporting commits nothing. The caller resolves the box
+    with ``apply`` / ``reject``. At ``MAX_DEPTH`` ``act`` refuses "too deep".
 
     ``shell``: the script runs via ``executor`` in the session's persistent
     box (``box_name(target_seg)``); the result turn is the captured output +
     staged-change summary. No executor configured → an error-text result.
+
+    ``apply`` / ``reject`` (manager-level): fold or discard a sub-agent's
+    staged box — the ONLY gate; nothing ever auto-applies.
 
     ``inspect``: list the structure at a path. ``delete``: roll back / collapse
     this context, or drop a sub-agent session. Both are harness-native and act
@@ -1473,6 +1595,19 @@ def evaluate_call(
                               session=sess, executor=executor)
         if rolled_back:
             return []
+    elif tool in ("apply", "reject"):
+        # Manager-level: resolve a sub-agent's STAGED box — the only place
+        # its accumulated writes (files AND session edits) become real or
+        # vanish. Always caller-driven; nothing ever auto-applies.
+        target = _parse_target_argument(arguments)
+        if target is None:
+            result = f"error: {tool} needs a target sub-agent id"
+        elif executor is None:
+            result = "error: no executor configured — nothing is staged"
+        elif tool == "apply":
+            result = executor.apply_box(box_name(target))
+        else:
+            result = executor.discard_box(box_name(target))
     elif tool != META_TOOL_NAME:
         known = ", ".join(repr(k) for k in tool_registry())
         result = f"error: unknown tool {tool!r} — available: {known}"
@@ -1491,13 +1626,24 @@ def evaluate_call(
                                  slot=f"{innerid}/{next_number(inner_cur)}")
         append_raw_turn(innerid, "user", inner_user,
                         slug=inner_slug, sender=target_seg)
-        stitch_spec = f"{tool_context}.{innerid}" if tool_context else innerid
-        # Tool-capable sub-agent, one depth deeper: run it to completion.
-        run_to_completion(stitch_spec, model=model, client=client,
-                          echo=echo, tool_context=tool_context,
-                          executor=executor, depth=depth + 1)
-        result = load_turns(innerid)[-1].read()
-        sender = innerid
+        if executor is None:
+            result = ("error: no executor configured — act runs the "
+                      "sub-agent in a sandbox box; nothing was run")
+        else:
+            # The sub-agent is a PROCESS IN A BOX, never an in-process
+            # recursion: `oaita run` inside box OAITA-<innerid>, where ALL
+            # its writes — its own turns, edits to ANY session, file changes
+            # — stage until this caller applies or rejects the box. The
+            # result below is a REPORT read through the staged view (the
+            # sub-agent's final turn via `oaita tail`, + change summary);
+            # reporting commits nothing.
+            stitch_spec = f"{tool_context}.{innerid}" if tool_context \
+                else innerid
+            r = executor.run_script(
+                act_script(stitch_spec, innerid, depth + 1),
+                box=box_name(innerid))
+            result = render_act_result(r)
+            sender = innerid
 
     cur = load_turns(target_seg)
     pool |= {t.slug for t in cur if t.slug}
@@ -1608,6 +1754,18 @@ def _parse_inspect_arguments(arguments: str) -> str:
     return arguments.strip()
 
 
+def _parse_target_argument(arguments: str) -> str | None:
+    """Parse an ``apply``/``reject`` call into the target sub-agent id."""
+    try:
+        obj = json.loads(arguments)
+    except (ValueError, TypeError):
+        obj = None
+    if isinstance(obj, dict) and isinstance(obj.get("target"), str) \
+            and obj["target"]:
+        return obj["target"]
+    return arguments.strip() or None
+
+
 def _parse_delete_arguments(arguments: str):
     """Parse a ``delete`` call into (turn_id, annotation, session)."""
     try:
@@ -1705,6 +1863,12 @@ def build_parser() -> argparse.ArgumentParser:
                      help="abort (progress kept on disk) after N steps")
     run.set_defaults(func=_cmd_run)
 
+    tail = sub.add_parser(
+        "tail", help="print the LAST turn's raw content (the settled answer)")
+    tail.add_argument("name", help="session name (or stitch spec — reads the "
+                                   "last segment)")
+    tail.set_defaults(func=_cmd_tail)
+
     add = sub.add_parser(
         "add", help="add one turn to a session, content copied from stdin")
     add.add_argument(
@@ -1739,14 +1903,26 @@ def _cmd_gen(args) -> int:
     """Handler for ``oaita gen``."""
     return _report(generate(
         args.name, model=args.model, base_url=args.base_url,
-        api_key=args.api_key, capabilities=args.capabilities))
+        api_key=args.api_key, capabilities=args.capabilities,
+        depth=_depth_from_env()))
 
 
 def _executor_from(args):
-    """The shell executor the CLI flags select (None = error-result mode)."""
+    """The executor the CLI selects: --no-sandbox → None (error-result mode);
+    $OAITA_EXECUTOR=local → LocalExecutor (UNGATED — testing); else sarun."""
     if args.no_sandbox:
         return None
+    if os.environ.get("OAITA_EXECUTOR") == "local":
+        return LocalExecutor()
     return SarunExecutor(args.sarun)
+
+
+def _depth_from_env() -> int:
+    """This process's delegation depth (act scripts export $OAITA_DEPTH)."""
+    try:
+        return int(os.environ.get("OAITA_DEPTH") or 0)
+    except ValueError:
+        return 0
 
 
 def _cmd_call(args) -> int:
@@ -1754,7 +1930,7 @@ def _cmd_call(args) -> int:
     return _report(evaluate_call(
         args.name, model=args.model, base_url=args.base_url,
         api_key=args.api_key, tool_context=args.tool_context,
-        executor=_executor_from(args)))
+        executor=_executor_from(args), depth=_depth_from_env()))
 
 
 def _cmd_run(args) -> int:
@@ -1763,7 +1939,18 @@ def _cmd_run(args) -> int:
         args.name, model=args.model, base_url=args.base_url,
         api_key=args.api_key, tool_context=args.tool_context,
         capabilities=args.capabilities, max_steps=args.max_steps,
-        executor=_executor_from(args)))
+        executor=_executor_from(args), depth=_depth_from_env()))
+
+
+def _cmd_tail(args) -> int:
+    """Handler for ``oaita tail``: last turn's raw content on stdout."""
+    target_seg = parse_stitch(args.name)[-1]
+    turns = load_turns(target_seg)
+    if not turns:
+        print(f"oaita: no turns in {target_seg!r}", file=sys.stderr)
+        return 1
+    sys.stdout.write(turns[-1].read())
+    return 0
 
 
 def _cmd_add(args) -> int:

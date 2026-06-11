@@ -24,9 +24,24 @@ CLI client for OpenAI-compatible chat APIs, depends on `sarun`.
   - `inspect` lists structure at a path (harness-native; directory entries,
     summary fuse past a cap). `delete` rolls back/collapses a context to one
     annotation turn, or drops a spent sub-agent session (+ discards its box).
-- Sub-agents are now TOOL-CAPABLE: an `act` leaf is run-to-completion one depth
-  deeper (it can shell/inspect/delete/delegate), capped at MAX_DEPTH (`act`
-  returns "too deep" past the cap).
+- Sub-agents are PROCESSES IN BOXES, never in-process recursion: `act` seeds
+  the inner session, then runs `oaita run <spec>` via the executor in box
+  OAITA-<innerid> (depth rides $OAITA_DEPTH; capped at MAX_DEPTH → "too
+  deep"). ALL the sub-agent's writes — its turns, edits to ANY session, file
+  changes — STAGE in its box.
+- The tool result is a REPORT of staged state, never an application of it:
+  the sub-agent's final turn read through the box (`oaita tail` in-box — a
+  self-collapsed agent streams nothing; the on-disk tail is the only truthful
+  channel) + the change summary. The caller reviews and resolves with the
+  `apply` / `reject` tools (manager-level rows → sarun BOX apply/discard).
+  Nothing EVER auto-applies: sessions are flat and any session can write any
+  other, so an unreviewed box could rewrite the caller's own context — the
+  box-apply gate is the only thing standing in the way, and it is always
+  caller-driven.
+- Boxes are the tree (ownership + apply/discard gate, all sarun); sessions
+  stay flat and gateless. The gate between sessions IS the box apply.
+- LocalExecutor ($OAITA_EXECUTOR=local): ungated subprocess stand-in for
+  tests/no-sarun — explicitly NOT a safe substitute, the gate lives in sarun.
 - Narration kept: a reply with prose AND tool calls now keeps the prose as its
   own clean assistant turn before the c-turns (running tallies survive instead
   of being overwritten by the envelope).

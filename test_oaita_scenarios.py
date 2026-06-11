@@ -75,22 +75,36 @@ def check(msg, cond):
 
 # ── fixtures ─────────────────────────────────────────────────────────────────
 class Stage:
-    """A throwaway $XDG_STATE_HOME + live fake server + pinned id seed."""
+    """A throwaway $XDG_STATE_HOME + live fake server + pinned id seed.
+
+    Also exports the model/server config and $OAITA_EXECUTOR=local into the
+    environment, because act sub-agents are real `oaita run` SUBPROCESSES now
+    (LocalExecutor: ungated stand-in for a sarun box) — they read everything
+    from env and answer against the same fake server."""
+
+    _ENV = ("XDG_STATE_HOME", "OAITA_ID_SEED", "OPENAI_BASE_URL",
+            "OPENAI_API_KEY", "OAITA_MODEL", "OAITA_EXECUTOR", "OAITA_CMD")
 
     def __init__(self, seed="scenario"):
         self.tmp = Path(tempfile.mkdtemp(prefix="oaita-scen-"))
-        self._prev_xdg = os.environ.get("XDG_STATE_HOME")
-        self._prev_seed = os.environ.get("OAITA_ID_SEED")
-        os.environ["XDG_STATE_HOME"] = str(self.tmp / "state")
-        os.environ["OAITA_ID_SEED"] = seed
+        self._prev = {k: os.environ.get(k) for k in self._ENV}
         self.srv = fakeserver.FakeOpenAIServer().start()
+        os.environ.update(
+            XDG_STATE_HOME=str(self.tmp / "state"),
+            OAITA_ID_SEED=seed,
+            OPENAI_BASE_URL=self.srv.base_url,
+            OPENAI_API_KEY="test-key",
+            OAITA_MODEL="test-model",
+            OAITA_EXECUTOR="local",
+            # Sub-processes reuse THIS deps-equipped interpreter (no uv spawn).
+            OAITA_CMD=f"{sys.executable} {HERE / 'oaita'}",
+        )
 
     def close(self):
         try:
             self.srv.stop()
         finally:
-            for key, prev in (("XDG_STATE_HOME", self._prev_xdg),
-                              ("OAITA_ID_SEED", self._prev_seed)):
+            for key, prev in self._prev.items():
                 if prev is None:
                     os.environ.pop(key, None)
                 else:
@@ -149,30 +163,6 @@ def _has_tool(req, name):
     return False
 
 
-class WcExecutor:
-    """A tiny real-ish executor that understands the two wc invocations the
-    line-counting sub-agents try: `wc --lines=PATH` (bogus → GNU-style error)
-    and `wc -l < PATH` (correct → the real line count of the real file)."""
-
-    def __init__(self, workdir):
-        self.workdir = Path(workdir)
-        self.bad_calls = 0
-        self.good_calls = 0
-
-    def run_script(self, script, box):
-        if "--lines=" in script:
-            self.bad_calls += 1
-            return oaita.ExecResult(
-                output="wc: unrecognized option '--lines='", exit_code=1)
-        if script.startswith("wc -l < "):
-            self.good_calls += 1
-            path = Path(script.split("< ", 1)[1].strip())
-            n = path.read_text().count("\n")
-            return oaita.ExecResult(output=str(n), exit_code=0)
-        return oaita.ExecResult(output=f"sh: unsupported: {script}",
-                                exit_code=127)
-
-
 # ── scenario 1+2: delegation arc, then sender-targeted follow-up ─────────────
 def _script_delegation(srv):
     """The expect script for the round-1 delegation arc (used twice: by the
@@ -191,7 +181,9 @@ def _play_delegation(st):
                   "Compare MIT and GPL for our parser; "
                   "delegate the license research.")
     _script_delegation(st.srv)
-    return st.run("main")
+    # LocalExecutor: the sub-agent is a REAL `oaita run` subprocess answering
+    # against the same fake server (ungated stand-in for a sarun box).
+    return st.run("main", executor=oaita.LocalExecutor())
 
 
 def test_scenario_delegation_and_follow_up():
@@ -233,10 +225,11 @@ def test_scenario_delegation_and_follow_up():
         reqs = st.srv.requests
         check("S1: exactly three model requests (gen, leaf, gen)",
               len(reqs) == 3)
-        check("S1: every gen advertises the full registry (sub-agents are "
-              "tool-capable too)",
+        check("S1: every gen advertises the full registry (incl. the boxed "
+              "sub-agent's own, from its subprocess)",
               all(r.tools and {t["function"]["name"] for t in r.tools}
-                  == {"act", "shell", "inspect", "delete"} for r in reqs))
+                  == {"act", "shell", "inspect", "delete", "apply", "reject"}
+                  for r in reqs))
         # The synthesis prompt narrates the call: assistant turn = envelope
         # JSON as content, tool turn with the from-bearing header.
         synth = reqs[2].messages
@@ -270,7 +263,7 @@ def test_scenario_delegation_and_follow_up():
                       CannedChat(content="v3 adds patent clauses."))
         st.srv.expect("v3 adds patent clauses",
                       CannedChat(content="GPLv3 then."))
-        st.run("main")
+        st.run("main", executor=oaita.LocalExecutor())
 
         inner2 = turns_of(innerid)
         check("S2: the SAME inner session continued (4 turns, no duplicate)",
@@ -340,7 +333,7 @@ def test_scenario_parallel_fanout():
         st.srv.expect("bwrap version?", CannedChat(content="bwrap 0.8.0"))
         st.srv.expect("bwrap 0.8.0",
                       CannedChat(content="pyfuse3 3.4.2, bwrap 0.8.0."))
-        st.run("fan")
+        st.run("fan", executor=oaita.LocalExecutor())
 
         turns = turns_of("fan")
         check("S4: shape is user, call, call, result, result, answer",
@@ -577,10 +570,12 @@ def test_scenario_count_lines_across_dir():
             st.srv.expect(lambda r, fn=fname: f"count lines in {work}/{fn}"
                           in _last(r) and not _has_tool(r, "shell"),
                           CannedChat(tool_calls=[("shell", json.dumps(
-                              {"script": f"wc --lines={work}/{fname}"}),
+                              {"script": f"wc --count-lines {work}/{fname}"}),
                               f"call_{fid}1")]))
-            # sees the wc error → run it correctly.
-            st.srv.expect(lambda r, fn=fname: "unrecognized option" in _last(r),
+            # sees the REAL wc error → run it correctly.
+            st.srv.expect(lambda r, fn=fname: "unrecognized option" in _last(r)
+                          and fn in " ".join(
+                              m.get("content") or "" for m in r.messages),
                           CannedChat(tool_calls=[("shell", json.dumps(
                               {"script": f"wc -l < {work}/{fname}"}),
                               f"call_{fid}2")]))
@@ -593,9 +588,11 @@ def test_scenario_count_lines_across_dir():
                                              f"{line_word}."}),
                               f"call_{fid}d")]))
 
-        # A scripted executor that knows wc: wrong args → error, right → count.
-        ex = WcExecutor(work)
-        produced = st.run("tally", executor=ex, max_steps=40)
+        # LocalExecutor end to end: the sub-agents are real `oaita run`
+        # subprocesses, and their wc invocations hit the REAL wc binary —
+        # the fumbled flag really errors, the fixed one really counts.
+        produced = st.run("tally", executor=oaita.LocalExecutor(),
+                          max_steps=40)
 
         # ── main settled with the running tally visible ──
         main = turns_of("tally")
@@ -640,8 +637,9 @@ def test_scenario_count_lines_across_dir():
               {"filea", "fileb"} <= sibling)
 
         # ── the wc executor really saw both the wrong and right invocations ──
-        check("S9: each sub-agent fumbled wc then fixed it (real tool error)",
-              ex.bad_calls == 2 and ex.good_calls == 2)
+        check("S9: every scripted model step fired — incl. both real-wc "
+              "fumble-and-fix paths",
+              all(e.matched for e in st.srv._expectations))
     finally:
         st.close()
 
