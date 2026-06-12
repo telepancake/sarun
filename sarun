@@ -1782,16 +1782,30 @@ def _sqlar_put_tombstone(conn, name) -> None:
                  " mtime=excluded.mtime, sz=excluded.sz, data=excluded.data",
                  (name, stat_mod.S_IFCHR, 0, 0, None))
 
-def sqlar_list(path) -> list:
-    """[(name, mode, mtime, sz)] sorted by name; [] if there is no archive.
-    mtime is integer NANOSECONDS (st_mtime_ns)."""
+def _sqlar_fetchone(path, sql, params=()):
+    """One read-only SELECT against an archive on disk: fetchone() result, or None
+    if the archive is missing or the query errors. Opens/closes its own handle —
+    the shared scaffolding for all the standalone sqlar reader helpers below."""
+    path = Path(path)
+    if not path.exists(): return None
+    conn = _sqlar_open(path)
+    try: return conn.execute(sql, params).fetchone()
+    except sqlite3.Error: return None
+    finally: conn.close()
+
+def _sqlar_fetchall(path, sql, params=()) -> list:
+    """fetchall() counterpart of _sqlar_fetchone; [] when missing or errored."""
     path = Path(path)
     if not path.exists(): return []
     conn = _sqlar_open(path)
-    try: return conn.execute("SELECT name,mode,mtime,sz FROM sqlar "
-                             "ORDER BY name").fetchall()
+    try: return conn.execute(sql, params).fetchall()
     except sqlite3.Error: return []
     finally: conn.close()
+
+def sqlar_list(path) -> list:
+    """[(name, mode, mtime, sz)] sorted by name; [] if there is no archive.
+    mtime is integer NANOSECONDS (st_mtime_ns)."""
+    return _sqlar_fetchall(path, "SELECT name,mode,mtime,sz FROM sqlar ORDER BY name")
 
 def sqlar_mode(path, name) -> "int | None":
     return sqlar_mode_mtime(path, name)[0]
@@ -1802,25 +1816,11 @@ def sqlar_mtime(path, name) -> "int | None":
 
 def sqlar_nonempty(path) -> bool:
     """True if the sqlar has at least one entry — cheaper than fetching all rows."""
-    path = Path(path)
-    if not path.exists(): return False
-    conn = _sqlar_open(path)
-    try:
-        row = conn.execute("SELECT 1 FROM sqlar LIMIT 1").fetchone()
-    except sqlite3.Error: row = None
-    finally: conn.close()
-    return row is not None
+    return _sqlar_fetchone(path, "SELECT 1 FROM sqlar LIMIT 1") is not None
 
 def sqlar_mode_mtime(path, name) -> "tuple[int, int] | tuple[None, None]":
     """Fetch mode AND mtime in a single SELECT — use at call sites that need both."""
-    path = Path(path)
-    if not path.exists(): return None, None
-    conn = _sqlar_open(path)
-    try:
-        row = conn.execute("SELECT mode, mtime FROM sqlar WHERE name=?",
-                           (name,)).fetchone()
-    except sqlite3.Error: row = None
-    finally: conn.close()
+    row = _sqlar_fetchone(path, "SELECT mode, mtime FROM sqlar WHERE name=?", (name,))
     return (row[0], row[1]) if row else (None, None)
 
 def box_id_of_sqlar(path) -> "int | None":
@@ -1833,14 +1833,8 @@ def sqlar_content(path, name) -> "bytes | None":
     missing or a tombstone. Reads EITHER rest form: an evicted/folded row (bytes
     compressed in `data`) or a permanently-resident row (data NULL; bytes in the pool
     blob at blob_path(box_id, rowid) — the uncompressed file on disk)."""
-    path = Path(path)
-    if not path.exists(): return None
-    conn = _sqlar_open(path)
-    try:
-        row = conn.execute("SELECT rowid,sz,data FROM sqlar WHERE name=?",
-                           (name,)).fetchone()
-    except sqlite3.Error: row = None
-    finally: conn.close()
+    row = _sqlar_fetchone(path, "SELECT rowid,sz,data FROM sqlar WHERE name=?",
+                          (name,))
     if not row: return None
     rowid, sz, data = row
     if data is not None:
@@ -1961,12 +1955,8 @@ def outputs_get(path, oid) -> "dict | None":
         conn.close()
 
 def has_outputs(path) -> bool:
-    path = Path(path)
-    if not path.exists(): return False
-    conn = _sqlar_open(path)
-    try: return bool(conn.execute("SELECT EXISTS(SELECT 1 FROM outputs)").fetchone()[0])
-    except sqlite3.Error: return False
-    finally: conn.close()
+    row = _sqlar_fetchone(path, "SELECT EXISTS(SELECT 1 FROM outputs)")
+    return bool(row and row[0])
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1979,14 +1969,8 @@ def process_list(path) -> list:
     """[(id, tgid, ppid, parent_id, exe, argv-list)] for the box's process table.
     `parent_id` is the parent's process-table ROW id (the structural link; NULL for a
     root/unknown parent); `ppid` is the parent's pid number, for display only."""
-    path = Path(path)
-    if not path.exists(): return []
-    conn = _sqlar_open(path)
-    try:
-        rows = conn.execute("SELECT id,tgid,ppid,parent_id,exe,argv FROM process "
-                            "ORDER BY id").fetchall()
-    except sqlite3.Error: return []
-    finally: conn.close()
+    rows = _sqlar_fetchall(path, "SELECT id,tgid,ppid,parent_id,exe,argv FROM process"
+                                 " ORDER BY id")
     out = []
     for pid, tgid, ppid, parent_id, exe, argv in rows:
         try: av = json.loads(argv) if argv else []
@@ -1997,13 +1981,7 @@ def process_list(path) -> list:
 def sqlar_meta_get(path, key: str) -> "str | None":
     """Read one small per-box meta string (e.g. the box's display `name`) from a
     sqlar on disk. None if absent."""
-    path = Path(path)
-    if not path.exists(): return None
-    conn = _sqlar_open(path)
-    try:
-        row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
-    except sqlite3.Error: row = None
-    finally: conn.close()
+    row = _sqlar_fetchone(path, "SELECT value FROM meta WHERE key=?", (key,))
     return row[0] if row else None
 
 def sqlar_meta_set(path, key: str, value: str) -> None:
@@ -2068,50 +2046,25 @@ def process_roots(path) -> set:
     """The box's hierarchy-root ROW ids (process.root=1) read from a sqlar on disk —
     the finished-box counterpart to Index.roots(). Row ids (not tgids) so the proc tree
     links structurally, PID-reuse proof."""
-    path = Path(path)
-    if not path.exists(): return set()
-    conn = _sqlar_open(path)
-    try:
-        return {r[0] for r in conn.execute("SELECT id FROM process WHERE root=1")}
-    except sqlite3.Error: return set()
-    finally: conn.close()
+    return {r[0] for r in _sqlar_fetchall(path, "SELECT id FROM process WHERE root=1")}
 
 def sqlar_writer_id(path, rel) -> "int | None":
     """The process-table row id that LAST wrote `rel` (the sqlar `last_writer` tag),
     or None. Finished-box path: read straight from the consolidated single sqlar."""
-    path = Path(path)
-    if not path.exists(): return None
-    conn = _sqlar_open(path)
-    try:
-        row = conn.execute("SELECT last_writer FROM sqlar WHERE name=?",
-                            (rel,)).fetchone()
-    except sqlite3.Error: row = None
-    finally: conn.close()
+    row = _sqlar_fetchone(path, "SELECT last_writer FROM sqlar WHERE name=?", (rel,))
     return row[0] if row and row[0] is not None else None
 
 def sqlar_first_writer_id(path, rel) -> "int | None":
     """The process-table row id of the FIRST process to write `rel` (the sqlar `writer`
     tag), or None — the first-writer counterpart of sqlar_writer_id. Finished-box read."""
-    path = Path(path)
-    if not path.exists(): return None
-    conn = _sqlar_open(path)
-    try:
-        row = conn.execute("SELECT writer FROM sqlar WHERE name=?", (rel,)).fetchone()
-    except sqlite3.Error: row = None
-    finally: conn.close()
+    row = _sqlar_fetchone(path, "SELECT writer FROM sqlar WHERE name=?", (rel,))
     return row[0] if row and row[0] is not None else None
 
 def sqlar_proc_prov(path, proc_id) -> "dict | None":
     """Provenance (exe/cwd/argv) of ONE process row, read from a finished box's sqlar.
     None if the row id isn't recorded. Used to build the procs-pane filter Subject."""
-    path = Path(path)
-    if not path.exists(): return None
-    conn = _sqlar_open(path)
-    try:
-        w = conn.execute("SELECT exe,cwd,argv FROM process WHERE id=?",
-                         (proc_id,)).fetchone()
-    except sqlite3.Error: w = None
-    finally: conn.close()
+    w = _sqlar_fetchone(path, "SELECT exe,cwd,argv FROM process WHERE id=?",
+                        (proc_id,))
     if not w: return None
     try: argv = json.loads(w[2]) if w[2] else []
     except (ValueError, TypeError): argv = []
@@ -2121,16 +2074,11 @@ def sqlar_first_writer_prov(path, rel) -> "dict | None":
     """Provenance (exe/cwd/argv) of the FIRST process to write `rel`, read from a
     stopped box's single sqlar (the `writer` tag → process row). Used to match a file
     rule's process facets at delete/finalize time. None if no writer is recorded."""
-    path = Path(path)
-    if not path.exists(): return None
-    conn = _sqlar_open(path)
-    try:
-        w = conn.execute(
-            "SELECT process.tgid, process.ppid, process.exe, process.cwd, process.argv"
-            " FROM sqlar JOIN process ON sqlar.writer=process.id"
-            " WHERE sqlar.name=?", (rel,)).fetchone()
-    except sqlite3.Error: w = None
-    finally: conn.close()
+    w = _sqlar_fetchone(
+        path,
+        "SELECT process.tgid, process.ppid, process.exe, process.cwd, process.argv"
+        " FROM sqlar JOIN process ON sqlar.writer=process.id"
+        " WHERE sqlar.name=?", (rel,))
     if not w: return None
     try: argv = json.loads(w[4]) if w[4] else []
     except (ValueError, TypeError): argv = []
@@ -2138,15 +2086,9 @@ def sqlar_first_writer_prov(path, rel) -> "dict | None":
 
 def process_env(path, proc_id) -> dict:
     """The deduped environment for one process row (resolved via env_id)."""
-    path = Path(path)
-    if not path.exists(): return {}
-    conn = _sqlar_open(path)
-    try:
-        row = conn.execute(
-            "SELECT env.env FROM process JOIN env ON process.env_id=env.id"
-            " WHERE process.id=?", (proc_id,)).fetchone()
-    except sqlite3.Error: row = None
-    finally: conn.close()
+    row = _sqlar_fetchone(path,
+                          "SELECT env.env FROM process JOIN env ON process.env_id=env.id"
+                          " WHERE process.id=?", (proc_id,))
     if not row or not row[0]: return {}
     try: return json.loads(row[0])
     except (ValueError, TypeError): return {}
@@ -2156,14 +2098,8 @@ def root_cmd(sid: str) -> list:
     id) in <sid>.sqlar. [] if no such row exists. The persisted single source of truth,
     surviving after the runner exits; a re-run box has several roots — this is the
     original launch's command."""
-    path = sqlar_path(sid)
-    if not path.exists(): return []
-    conn = _sqlar_open(path)
-    try:
-        row = conn.execute("SELECT argv FROM process WHERE root=1"
-                           " ORDER BY id LIMIT 1").fetchone()
-    except sqlite3.Error: row = None
-    finally: conn.close()
+    row = _sqlar_fetchone(sqlar_path(sid), "SELECT argv FROM process WHERE root=1"
+                                           " ORDER BY id LIMIT 1")
     if not row or not row[0]: return []
     try: return list(json.loads(row[0]))
     except (ValueError, TypeError): return []
