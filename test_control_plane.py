@@ -1429,6 +1429,91 @@ def test_dissolve_live_descendant_allowed():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_remote_ui_control_plane():
+    """The remote-UI surface (engine/UI split): the wire codec round-trips every
+    payload shape; RemoteSupervisor/RemoteReview answer whitelisted verbs over a
+    REAL ChannelServer socket; non-whitelisted verbs are refused; `subscribe`
+    converts the connection into a live event feed."""
+    # 1. codec round-trip (pure function, no server needed)
+    v = {"a": [1, (2, 3), b"\x00\xff", {1: "x"}, {"s", "t"}], "p": Path("/tmp")}
+    enc = json.loads(json.dumps(m.wire_encode(v)))
+    dec = m.wire_decode(enc)
+    check(dec["a"][1] == [2, 3] and dec["a"][2] == b"\x00\xff"
+          and dec["a"][3] == {1: "x"} and dec["a"][4] == {"s", "t"}
+          and dec["p"] == "/tmp",
+          "remote-ui: wire codec round-trips bytes/tuples/sets/int-keyed dicts")
+
+    tmp = Path(tempfile.mkdtemp(prefix="cp-rui-"))
+    _redirect_state(tmp)
+    cs_loop = asyncio.new_event_loop()
+    try:
+        m.ensure_dirs()
+        # A finished box on disk: one captured file + one process row, so the
+        # data verbs have something real to answer with.
+        sid = "7001"
+        backing = m.live_dir(sid); (backing / "up").mkdir(parents=True)
+        idx = m.Index(backing)
+        wid = idx.writer_for(os.getpid())
+        idx.set_entry("afile.txt", "file", 0o100644, wid, "create")
+        bp = m.blob_path(idx.box_id, idx.row_id("afile.txt"))
+        bp.parent.mkdir(parents=True, exist_ok=True); bp.write_bytes(b"remote!\n")
+        m.consolidate(str(backing), sid, index=idx)
+        idx.close()
+
+        sup = m.Supervisor(mount=_FakeMount())   # discovers 7001 from disk
+        sock_path = str(tmp / "ctrl.sock")
+        ready = threading.Event(); cs = None
+        def run_loop():
+            nonlocal cs
+            asyncio.set_event_loop(cs_loop)
+            cs = m.ChannelServer(sup, sock_path)
+            cs_loop.run_until_complete(cs.start())
+            ready.set()
+            cs_loop.run_forever()
+        threading.Thread(target=run_loop, daemon=True).start()
+        check(ready.wait(5), "remote-ui: server loop started")
+
+        rsup = m.RemoteSupervisor(sock_path)
+        sd = rsup.session_dicts()
+        check(any(d.get("session_id") == sid for d in sd),
+              "remote-ui: session_dicts sees the on-disk box over the wire")
+        check(sid in rsup.sessions, "remote-ui: .sessions facade keyed by sid")
+        procs = rsup.processes(sid)
+        check(procs and any(p[0] == wid for p in procs),
+              "remote-ui: processes(sid) returns the writer's process row")
+        ents = rsup.review.session_changes(sid)
+        check(any(e.get("path") == "afile.txt" for e in ents),
+              "remote-ui: review.session_changes returns the captured change")
+        check(rsup.review._live(sid) is False,
+              "remote-ui: review_live: a finished box is not live")
+        st = rsup.review._state()
+        check(st["consolidating"] == [] and sid not in st["consolidating"],
+              "remote-ui: review_state reports no fold in progress")
+        check(sid not in rsup.review._consolidating,
+              "remote-ui: _consolidating set-view answers membership")
+        try:
+            rsup._rpc("register")             # NOT whitelisted as a ui verb
+            check(False, "remote-ui: non-whitelisted verb must raise")
+        except m.RemoteError:
+            check(True, "remote-ui: non-whitelisted verb is refused")
+
+        # 2. subscribe: ack, then a broadcast event arrives as a JSON line.
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sc:
+            sc.settimeout(5); sc.connect(sock_path)
+            sc.sendall(b'{"type":"subscribe"}\n')
+            f = sc.makefile("rb")
+            ack = json.loads(f.readline())
+            check(ack.get("ok") is True, "remote-ui: subscribe acked")
+            cs_loop.call_soon_threadsafe(
+                cs.broadcast, dict(type="ping", n=42))
+            ev = json.loads(f.readline())
+            check(ev.get("type") == "ping" and ev.get("n") == 42,
+                  "remote-ui: broadcast event arrives on the subscribed conn")
+    finally:
+        cs_loop.call_soon_threadsafe(cs_loop.stop)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     for t in (test_sid_validation_rejects_traversal,
               test_owner_token_required_for_teardown,
@@ -1466,7 +1551,9 @@ if __name__ == "__main__":
               test_dissolve_nonempty_finalizes_copydown,
               test_dissolve_top_level_child_becomes_top_level,
               test_dissolve_refused_when_target_live,
-              test_dissolve_live_descendant_allowed):
+              test_dissolve_live_descendant_allowed,
+              # Engine/UI split: the remote-UI control-plane surface
+              test_remote_ui_control_plane):
         print(f"\n== {t.__name__} ==")
         try:
             t()

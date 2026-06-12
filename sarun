@@ -7401,6 +7401,24 @@ class Supervisor:
             bid = int(p)
         return ".".join(reversed(parts))
 
+    def session_dicts(self) -> list:
+        """Every session as a plain dict (to_dict + display 'path') — the UI's
+        startup snapshot, JSON-safe so the remote UI gets the same thing over
+        the wire that the embedded UI builds locally."""
+        out = []
+        for s in self.sessions.values():
+            d = s.to_dict()
+            d["path"] = self.display_path(s.session_id)
+            out.append(d)
+        return out
+
+    def open_files(self, sid) -> list:
+        """The box's currently-OPEN captured-write files [(rel, size), …] — the
+        UI's live 'open files' view, delegated to the overlay ops (verb-shaped
+        so the remote UI can ask for it without touching the mount object)."""
+        if self.mount is None or self.mount.ops is None: return []
+        return self.mount.ops.open_files(sid)
+
     def _refresh_box_paths(self) -> None:
         """Push every LIVE box's current display name into the overlay's session dicts,
         so the FUSE serve thread can gate file rules by box name with a plain dict read.
@@ -8477,6 +8495,39 @@ def _derive_parent_sid(peer_pid: int, sup: "Supervisor") -> "str | None":
     return None
 
 
+# ── wire codec — JSON-safe encoding for control-plane payloads ───────────────
+# The remote UI calls Supervisor/ChangeReview verbs over the control socket; the
+# results carry bytes (file content, diff lines), tuples, sets and Paths. Encode
+# them losslessly into JSON: bytes -> {"__b": b64}, set -> {"__s": [...]},
+# non-str-keyed dict -> {"__d": [[k,v],...]}; tuples flatten to lists (callers
+# index/iterate — none round-trip tuple identity).
+def wire_encode(o):
+    if isinstance(o, (bytes, bytearray, memoryview)):
+        return {"__b": base64.b64encode(bytes(o)).decode()}
+    if isinstance(o, (list, tuple)):
+        return [wire_encode(x) for x in o]
+    if isinstance(o, (set, frozenset)):
+        return {"__s": [wire_encode(x) for x in sorted(o, key=repr)]}
+    if isinstance(o, dict):
+        if all(isinstance(k, str) for k in o):
+            return {k: wire_encode(v) for k, v in o.items()}
+        return {"__d": [[wire_encode(k), wire_encode(v)] for k, v in o.items()]}
+    if isinstance(o, Path):
+        return str(o)
+    return o            # int / float / str / bool / None
+
+def wire_decode(o):
+    if isinstance(o, list):
+        return [wire_decode(x) for x in o]
+    if isinstance(o, dict):
+        if set(o) == {"__b"}: return base64.b64decode(o["__b"])
+        if set(o) == {"__s"}: return {wire_decode(x) for x in o["__s"]}
+        if set(o) == {"__d"}:
+            return {wire_decode(k): wire_decode(v) for k, v in o["__d"]}
+        return {k: wire_decode(v) for k, v in o.items()}
+    return o
+
+
 class ChannelServer:
     """
     The UI socket (ui.sock) — the ONE socket. It serves two connection shapes:
@@ -8498,9 +8549,58 @@ class ChannelServer:
     the box; teardown needs no owner token (the box's own connection closing IS the
     signal).
     """
+    # Verbs the remote UI may call ({"type":"ui","verb":...,"args":[...]}) —
+    # plain synchronous Supervisor/ChangeReview methods, loop-confined like every
+    # other control op. Anything not listed here is refused (closed surface).
+    _SUP_VERBS = frozenset((
+        "session_dicts", "display_path", "resolve_box", "select",
+        "processes", "processes_live", "proc_prov", "proc_info", "proc_roots",
+        "process_env", "writer_id", "first_writer_id", "first_writer_prov",
+        "outputs", "output_detail", "open_files",
+        "kill", "dissolve", "rename", "rescan", "delete"))
+    _REVIEW_VERBS = frozenset((
+        "session_changes", "hunks", "apply", "discard", "apply_hunk",
+        "discard_hunk", "decorate", "change_mode", "patch_text",
+        "invalidate_consolidation", "invalidate_struct"))
+
     def __init__(self, sup: Supervisor, sock_path: str):
         self.sup = sup; self.sock_path = sock_path
         self._sock = None
+        self._subscribers: dict = {}      # conn -> outbox asyncio.Queue
+        self._struct_jobs: dict = {}      # job_id -> (job, [spawned Popen,...])
+        self._next_job = 1
+
+    # ── engine→client event stream ───────────────────────────────────────────
+    def broadcast(self, ev: dict) -> None:
+        """Push one event (session lifecycle / overlay FUSE event) to every
+        subscribed client as a JSON line. Loop-confined (called via sup.on_event
+        and the engine's overlay drain). Each subscriber has an outbox queue and
+        a pump task (partial-send-safe); a stalled one (full outbox) is dropped."""
+        if not self._subscribers: return
+        try: data = (json.dumps(wire_encode(ev)) + "\n").encode()
+        except (TypeError, ValueError): return
+        for conn, q in list(self._subscribers.items()):
+            if q.qsize() > 10000:
+                self._drop_subscriber(conn); continue
+            q.put_nowait(data)
+
+    def _drop_subscriber(self, conn) -> None:
+        q = self._subscribers.pop(conn, None)
+        if q is not None: q.put_nowait(None)        # wake the pump to exit
+
+    async def _pump_events(self, conn) -> None:
+        q = self._subscribers.get(conn)
+        try:
+            while True:
+                data = await q.get()
+                if data is None: break
+                await self._loop.sock_sendall(conn, data)
+        except (OSError, asyncio.CancelledError):
+            pass
+        finally:
+            self._subscribers.pop(conn, None)
+            try: conn.close()
+            except OSError: pass
 
     async def start(self) -> None:
         try: os.unlink(self.sock_path)
@@ -8532,6 +8632,7 @@ class ChannelServer:
         # and are handled normally — peer_pid stays 0 for those.
         _peer_pid = 0
         _pidfd = -1          # kept open until after _dispatch_control (register dups it)
+        _adopted = False     # True once a subscribe pump owns this conn
         buf = b""
         try:
             _data, _anc, _flags, _addr = await self._loop.run_in_executor(
@@ -8585,6 +8686,14 @@ class ChannelServer:
                                     conn, reply["session_id"], reply.get("owner_token", ""),
                                     buf)
                                 return
+                            # A subscribe converts this connection into a one-way
+                            # event feed owned by its pump task (which closes it —
+                            # _adopted keeps _handle's finally from closing it too).
+                            if reply.get("_subscribe"):
+                                _adopted = True
+                                self._subscribers[conn] = asyncio.Queue()
+                                asyncio.ensure_future(self._pump_events(conn))
+                                return
                     continue
                 more = await self._loop.sock_recv(conn, 4096)
                 if not more:
@@ -8608,8 +8717,9 @@ class ChannelServer:
             if _pidfd >= 0:
                 try: os.close(_pidfd)
                 except OSError: pass
-            try: conn.close()
-            except OSError: pass
+            if not _adopted:
+                try: conn.close()
+                except OSError: pass
 
     @staticmethod
     def _is_register(line: bytes) -> bool:
@@ -8774,10 +8884,114 @@ class ChannelServer:
                 return dict(ok=True, count=n, sid=sid, errors=res.get("errors", []))
             except Exception as e:
                 return dict(ok=False, error=str(e))
+        elif t == "subscribe":
+            # Remote-UI event stream: ack, then _handle converts THIS connection
+            # into a one-way event feed (see the _subscribe marker handling).
+            return dict(ok=True, _subscribe=True)
+        elif t == "ui":
+            return await self._dispatch_ui(msg)
         else:
             # Unrecognized message type: reply with an explicit error rather than
             # silently dropping the connection so protocol mismatches are visible.
             return dict(ok=False, error=f"unknown control type {t!r}")
+
+    async def _dispatch_ui(self, msg: dict) -> dict:
+        """Remote-UI verb call: {"type":"ui","verb":V,"args":[...],"kw":{...}}.
+        Plain verbs map to whitelisted Supervisor / ChangeReview methods (sync,
+        loop-confined). The slow/stateful ones (consolidate, structural diff)
+        get explicit handling: executor for the slow halves, a server-side job
+        registry for struct jobs (their payloads carry raw file bytes — they
+        never cross the wire; the client holds an opaque job id)."""
+        verb = msg.get("verb") or ""
+        args = wire_decode(msg.get("args") or [])
+        kw = {k: wire_decode(v) for k, v in (msg.get("kw") or {}).items()}
+        try:
+            if verb == "review_state":
+                rv = self.sup.review
+                return dict(ok=True, r=wire_encode(dict(
+                    consolidating=sorted(rv._consolidating),
+                    consolidated=sorted(rv._consolidated),
+                    selected=self.sup.selected_sid)))
+            if verb == "review_live":
+                return dict(ok=True, r=self.sup.review._live(*args))
+            if verb == "consolidate_start":
+                # Remote counterpart of the UI's _maybe_start_consolidate: prep on
+                # the loop, fold in the engine's executor, progress/done/failed as
+                # broadcast events. Returns True if a fold is running (caller shows
+                # a placeholder, gated by review_state), False if nothing to do.
+                sid = args[0]
+                rv = self.sup.review
+                if sid in rv._consolidating:
+                    return dict(ok=True, r=True)
+                prep = rv._consolidate_prep(sid)
+                if prep is None:
+                    return dict(ok=True, r=False)
+                rv._consolidating.add(sid)
+                loop = self._loop
+
+                def prog(done, total):
+                    loop.call_soon_threadsafe(self.broadcast, dict(
+                        type="consolidate_progress", sid=sid,
+                        done=done, total=total))
+
+                async def run_fold():
+                    try:
+                        await loop.run_in_executor(
+                            None, lambda: consolidate(prep["shm_dir"], sid,
+                                                      progress=prog))
+                    except Exception as e:
+                        rv._consolidating.discard(sid)
+                        rv._consolidated.discard(sid)
+                        self.broadcast(dict(type="consolidate_failed", sid=sid,
+                                            error=str(e)))
+                        return
+                    rv._consolidate_finish(sid)
+                    rv._consolidating.discard(sid)
+                    self.broadcast(dict(type="consolidate_done", sid=sid))
+
+                asyncio.ensure_future(run_fold())
+                return dict(ok=True, r=True)
+            if verb == "consolidate":
+                # The slow deflate fold, engine-side, off the loop (same path the
+                # CLI patch/apply use); the client blocks on the reply.
+                await self.sup.consolidate_in_executor(self._loop, args[0])
+                return dict(ok=True, r=None)
+            if verb == "struct_quick":
+                lines, job = self.sup.review.structural_diff_quick(*args)
+                jid = None
+                if job is not None:
+                    jid = self._next_job; self._next_job += 1
+                    self._struct_jobs[jid] = (job, [])
+                return dict(ok=True, r=wire_encode(dict(lines=lines, job=jid)))
+            if verb == "struct_finish":
+                ent = self._struct_jobs.get(args[0])
+                if ent is None:
+                    return dict(ok=False, error="unknown struct job")
+                job, procs = ent
+                res = await self._loop.run_in_executor(
+                    None, lambda: self.sup.review.structural_diff_finish(
+                        job, on_spawn=procs.append))
+                self._struct_jobs.pop(args[0], None)
+                return dict(ok=True, r=wire_encode(res))
+            if verb == "struct_cancel":
+                ent = self._struct_jobs.pop(args[0], None)
+                if ent is not None:
+                    for p in ent[1]:
+                        try: p.kill()
+                        except Exception: pass
+                return dict(ok=True, r=None)
+            if verb.startswith("review."):
+                v = verb[len("review."):]
+                if v not in self._REVIEW_VERBS:
+                    return dict(ok=False, error=f"unknown verb {verb!r}")
+                fn = getattr(self.sup.review, v)
+            elif verb in self._SUP_VERBS:
+                fn = getattr(self.sup, verb)
+            else:
+                return dict(ok=False, error=f"unknown verb {verb!r}")
+            return dict(ok=True, r=wire_encode(fn(*args, **kw)))
+        except Exception as e:
+            return dict(ok=False, error=f"{type(e).__name__}: {e}")
 
     async def _resolve_and_consolidate(self, msg: dict) -> "tuple[str | None, dict | None]":
         """Resolve the target sid from msg (explicit 'sid' field or the UI selection),
@@ -8800,6 +9014,8 @@ class ChannelServer:
     async def stop(self) -> None:
         if getattr(self, "_task", None):
             self._task.cancel()
+        for conn in list(self._subscribers):
+            self._drop_subscriber(conn)
         try:
             self.sup.stop_all_echoes()
         except Exception:
@@ -8816,6 +9032,125 @@ class ChannelServer:
 # ════════════════════════════════════════════════════════════════════════════
 #  Runner — `slopbox CMD [ARGS...]`
 # ════════════════════════════════════════════════════════════════════════════
+
+# ── remote client proxies — the UI's view of an engine across the socket ────
+class RemoteError(RuntimeError):
+    """A remote verb call failed: engine unreachable or the verb errored."""
+
+
+class _RemoteSet:
+    """Read-only set view over an engine-side set (review._consolidating /
+    _consolidated), re-fetched per access. The UI only reads these remotely —
+    mutations happen engine-side (consolidate_start / its completion)."""
+    __slots__ = ("_fetch",)
+    def __init__(self, fetch): self._fetch = fetch
+    def __contains__(self, x): return x in self._fetch()
+    def __iter__(self): return iter(self._fetch())
+    def __bool__(self): return bool(self._fetch())
+    def __len__(self): return len(self._fetch())
+    def discard(self, x): pass        # engine owns membership; remote no-op
+
+
+class RemoteReview:
+    """Client facade for ChangeReview: whitelisted verbs become RPCs; the
+    consolidation flow maps to consolidate_start + review_state + events; the
+    structural diff's quick/finish split maps to the server-side job registry
+    (job payloads carry raw file bytes and never cross the wire)."""
+    def __init__(self, rsup: "RemoteSupervisor"):
+        self._s = rsup
+
+    def __getattr__(self, name):
+        if name in ChannelServer._REVIEW_VERBS:
+            return lambda *a, **k: self._s._rpc(f"review.{name}", *a, **k)
+        raise AttributeError(name)
+
+    # decorate/change_mode accept a local ChangeSource via source= in embedded
+    # mode; remotely the engine resolves its own source — drop the kwarg.
+    def decorate(self, sid, rel, source=None) -> dict:
+        return self._s._rpc("review.decorate", sid, rel)
+
+    def change_mode(self, sid, rel, source=None):
+        return self._s._rpc("review.change_mode", sid, rel)
+
+    def _live(self, sid) -> bool:
+        return self._s._rpc("review_live", sid)
+
+    def _state(self) -> dict:
+        return self._s._rpc("review_state")
+
+    @property
+    def _consolidating(self):
+        return _RemoteSet(lambda: set(self._state()["consolidating"]))
+
+    @property
+    def _consolidated(self):
+        return _RemoteSet(lambda: set(self._state()["consolidated"]))
+
+    def consolidate_start(self, sid) -> bool:
+        return self._s._rpc("consolidate_start", sid)
+
+    def structural_diff_quick(self, sid, rel) -> tuple:
+        r = self._s._rpc("struct_quick", sid, rel)
+        lines = [tuple(x) for x in r["lines"]]
+        return (lines, r["job"])          # job: opaque id or None
+
+    def structural_diff_finish(self, job, on_spawn=None) -> dict:
+        # on_spawn is the embedded UI's cancel hook; remote cancel goes through
+        # struct_cancel(job id) instead.
+        return self._s._rpc("struct_finish", job)
+
+    def struct_cancel(self, job) -> None:
+        try: self._s._rpc("struct_cancel", job)
+        except RemoteError: pass
+
+
+class RemoteSupervisor:
+    """Client-side Supervisor facade: every whitelisted verb is an RPC to the
+    running engine over the control socket. Each call opens its own short-lived
+    connection (sync_request), so it is thread-safe — UI worker threads can call
+    it exactly like the embedded Supervisor."""
+    def __init__(self, sock: "str | None" = None):
+        self.sock = sock or sock_path()
+        self.review = RemoteReview(self)
+        self.on_event = lambda ev: None   # fed by the subscription reader
+        self.mount = None                 # no local mount in remote mode
+        self._selected = None
+
+    def _rpc(self, verb, *args, **kw):
+        rep = sync_request(self.sock, type="ui", verb=verb,
+                           args=[wire_encode(a) for a in args],
+                           kw={k: wire_encode(v) for k, v in kw.items()})
+        if not rep:
+            raise RemoteError(f"engine unreachable ({verb})")
+        if not rep.get("ok"):
+            raise RemoteError(rep.get("error") or verb)
+        return wire_decode(rep.get("r"))
+
+    def __getattr__(self, name):
+        if name in ChannelServer._SUP_VERBS:
+            return lambda *a, **k: self._rpc(name, *a, **k)
+        raise AttributeError(name)
+
+    @property
+    def selected_sid(self):
+        return self._selected
+
+    @selected_sid.setter
+    def selected_sid(self, sid):
+        self._selected = sid
+        if sid is not None:
+            try: self._rpc("select", sid)
+            except RemoteError: pass
+
+    @property
+    def sessions(self) -> dict:
+        """Embedded-shape compatibility: {sid: dict} (values are plain dicts,
+        which is what the UI renders from anyway)."""
+        return {d["session_id"]: d for d in self._rpc("session_dicts")}
+
+    async def sweep_orphans(self, loop=None) -> None:
+        return None                       # the engine swept at ITS startup
+
 
 def find_self() -> str: return os.path.abspath(sys.argv[0])
 
@@ -11599,6 +11934,9 @@ def run_engine() -> int:
         except Exception: pass
         server = ChannelServer(sup, sock_path())
         await server.start()
+        # Remote UIs subscribe over the socket: forward session lifecycle events
+        # to them (the embedded UI gets these via its own on_event hook).
+        sup.on_event = server.broadcast
         msg = f"slopbox engine: listening · {sock_path()}"
         if mount_ok:
             msg += f"  ·  overlay {mnt_point()}"
@@ -11611,12 +11949,16 @@ def run_engine() -> int:
             try: loop.add_signal_handler(s, stop.set)
             except (NotImplementedError, OSError): pass
         # The UI drains the overlay's FUSE event queue every tick (it feeds the
-        # live changes pane). Headless there is no consumer: drain and drop so
-        # the queue can't grow without bound under a chatty box.
+        # live changes pane). Headless, forward each event to any subscribed
+        # remote UI (wrapped as type=overlay) — and always drain, subscribers
+        # or not, so the queue can't grow without bound under a chatty box.
         async def drain_events():
             while True:
                 try:
-                    while True: mount.event_q.get_nowait()
+                    while True:
+                        ev = mount.event_q.get_nowait()
+                        if server._subscribers:
+                            server.broadcast(dict(type="overlay", ev=ev))
                 except queue.Empty: pass
                 await asyncio.sleep(0.5)
         drainer = asyncio.ensure_future(drain_events())
