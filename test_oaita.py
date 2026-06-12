@@ -957,7 +957,7 @@ def test_tools_capabilities_surfaced():
         by_name = {t["function"]["name"]: t["function"] for t in tools}
         check("the registry tools are advertised",
               set(by_name) == {"act", "shell", "inspect", "read",
-                               "delete", "apply", "reject"})
+                               "backtrack", "delete", "apply", "reject"})
         check("custom capabilities embedded in the act description",
               "bespoke power" in by_name["act"]["description"])
         check("shell schema requires the script param",
@@ -1648,44 +1648,114 @@ def test_inspect_tool_call():
         s.close()
 
 
-# ── 36d. delete: rollback+annotation, session drop, errors (units) ───────────
-def test_delete_rollback_and_session():
+# ── 36d. backtrack (the rollback gesture) + delete (session GC) ──────────────
+def test_backtrack_rollback():
     s = Session()
     try:
-        # Rollback collapses a messy tail into one annotation turn.
+        # final=True collapses a messy tail into one CLEAN answer turn.
         for n, (typ, body) in enumerate([
                 ("user", "do it"), ("assistant", "attempt one"),
                 ("tool", "oops"), ("assistant", "attempt two")], start=1):
             s.write_turn("roll", f"{n*10:04d}-t{n}.{typ}", body)
-        out = oaita.apply_delete("roll", turn_id="t2",
-                                 annotation="the clean result")
-        types = [oaita.parse_turn(p).type
-                 for p in sorted(oaita.session_dir("roll").iterdir())]
-        check("rollback removed everything from the turn-id onward",
-              types == ["user", "assistant"])
-        bodies = [p.read_text() for p in sorted(oaita.session_dir("roll").iterdir())]
-        check("the annotation replaced the collapsed turns",
-              bodies == ["do it", "the clean result"])
+        out = oaita.apply_backtrack("roll", turn_id="t2",
+                                    summary="the clean result", final=True)
+        kept = oaita.load_turns("roll")
+        check("final backtrack removed everything from the turn-id onward",
+              [t.type for t in kept] == ["user", "assistant"])
+        check("the summary replaced the collapsed turns, as a CLEAN turn",
+              kept[-1].read() == "the clean result" and kept[-1].flags == "")
         check("rollback summary counts removed turns",
-              "rolled back 3 turn(s)" in out and "collapsed" in out)
+              "rewound 3 turn(s)" in out and "answer" in out)
         check("missing turn-id is an error",
-              oaita.apply_delete("roll", turn_id="nope").startswith("error:"))
+              oaita.apply_backtrack("roll", turn_id="nope", summary="x")
+              .startswith("error:"))
 
-        # Session drop removes the folder wholesale; an executor box is discarded.
+        # Default: a b-flagged WAYPOINT — run does not settle on it.
+        for n, (typ, body) in enumerate([
+                ("user", "try stuff"), ("assistant", "dead end one"),
+                ("assistant", "dead end two")], start=1):
+            s.write_turn("way", f"{n*10:04d}-w{n}.{typ}", body)
+        oaita.apply_backtrack("way", turn_id="w2",
+                              summary="tried X; dead end: Y")
+        kept = oaita.load_turns("way")
+        check("waypoint backtrack keeps the prefix and plants a b-turn",
+              [t.type for t in kept] == ["user", "assistant"]
+              and kept[-1].flags == "b"
+              and kept[-1].read() == "tried X; dead end: Y")
+
+        # inclusive=False keeps the named turn and discards what follows.
+        for n, (typ, body) in enumerate([
+                ("user", "go"), ("assistant", "keep me"),
+                ("assistant", "drop me")], start=1):
+            s.write_turn("excl", f"{n*10:04d}-e{n}.{typ}", body)
+        oaita.apply_backtrack("excl", turn_id="e2", summary="moving on",
+                              inclusive=False)
+        kept = oaita.load_turns("excl")
+        check("exclusive backtrack keeps the named turn",
+              [t.read() for t in kept] == ["go", "keep me", "moving on"])
+    finally:
+        s.close()
+
+
+def test_backtrack_in_run_continues():
+    """The whole point of the waypoint: run does NOT settle on it — the next
+    step generates from the rewound context (delete's annotation used to end
+    the run; backtrack(final=true) still does)."""
+    s = Session()
+    try:
+        s.write_turn("conv", "0010.user", "solve it")
+        # 1. a doomed attempt; 2. its sad result arrives; 3. the model
+        # backtracks over the attempt with a waypoint; 4. generation
+        # CONTINUES from the rewound context and answers off the waypoint.
+        s.srv.expect("solve it",
+                     CannedChat(tool_calls=[
+                         ("shell", '{"script": "frobnicate"}', "c1")]))
+        # The waypoint targets the persisted call turn's id — discovered at
+        # reply time via a callable response (request-derived templating).
+        s.srv.expect("not found",
+                     lambda req: CannedChat(tool_calls=[("backtrack",
+                         json.dumps({"turn_id": next(
+                             t.slug for t in oaita.load_turns("conv")
+                             if "c" in t.flags),
+                             "summary": "tried frobnicate; not installed."}),
+                         "c2")]))
+        s.srv.expect("tried frobnicate; not installed.",
+                     CannedChat(content="Answer: do it by hand."))
+        ex = FakeExecutor().stage("sh: frobnicate: not found", exit_code=127)
+
+        s.run("conv", executor=ex, max_steps=8)
+        turns = oaita.load_turns("conv")
+        check("run continued through the waypoint to a final answer",
+              [t.type for t in turns] == ["user", "assistant", "assistant"]
+              and turns[-1].read() == "Answer: do it by hand.")
+        check("the waypoint is the b-flagged middle turn",
+              turns[1].flags == "b"
+              and turns[1].read() == "tried frobnicate; not installed.")
+        check("the doomed attempt (call + result) is gone",
+              not any("frobnicate" in t.read() for t in turns
+                      if "c" in t.flags))
+    finally:
+        s.close()
+
+
+def test_delete_session():
+    s = Session()
+    try:
+        # Session drop removes the folder wholesale; the box is discarded.
         s.write_turn("victim", "0010.user", "hi")
         class Spy:
             def __init__(self): self.discarded = []
             def discard_box(self, box): self.discarded.append(box)
         spy = Spy()
-        out2 = oaita.apply_delete("anyseg", session="victim", executor=spy)
+        oaita.apply_delete("victim", executor=spy)
         check("session delete removed the folder",
               not oaita.session_dir("victim").exists())
         check("the session's box was discarded via the executor",
               spy.discarded == ["OAITA-VICTIM"])
         check("deleting a missing session is an error",
-              oaita.apply_delete("x", session="ghost").startswith("error:"))
-        check("delete with neither turn_id nor session is an error",
-              oaita.apply_delete("x").startswith("error:"))
+              oaita.apply_delete("ghost").startswith("error:"))
+        check("delete without a session is an error",
+              oaita.apply_delete(None).startswith("error:"))
     finally:
         s.close()
 
@@ -1845,7 +1915,9 @@ if __name__ == "__main__":
         test_read_tool,
         test_shell_discard_readonly,
         test_inspect_tool_call,
-        test_delete_rollback_and_session,
+        test_backtrack_rollback,
+        test_backtrack_in_run_continues,
+        test_delete_session,
         test_depth_cap,
         test_deterministic_ids_with_seed,
         test_add_turn,

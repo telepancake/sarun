@@ -26,7 +26,9 @@ FILENAME encodes ordering, identity, provenance and meta:
     the folder (cross-context writes only; absent for the session's own turns).
   • optional ``.<flags>`` — single-char turn meta: ``p`` partial (needs
     extension), ``i`` no-header (suppress the injected id line), ``c`` tool
-    call (assistant turn holding a tool-call envelope).
+    call (assistant turn holding a tool-call envelope), ``b`` backtrack
+    waypoint (a condensed record of a discarded branch — NOT a finished
+    answer; ``run`` continues past it).
   • ``<type>`` — the extension IS the turn type, mapped to an OpenAI chat role:
     ``.system`` / ``.user`` / ``.assistant`` (also ``.developer`` / ``.tool``).
     A file whose name does not match the grammar is NOT a turn and is ignored.
@@ -203,9 +205,11 @@ def parse_stitch(spec: str) -> list[str]:
 #   flags  — optional dotted segment of single-char turn meta:
 #              p — partial: needs extension (e.g. interrupted stream, no EOS);
 #              i — no turn-id header: suppress header injection for this turn;
-#              c — tool call: an assistant turn holding a tool-call envelope.
+#              c — tool call: an assistant turn holding a tool-call envelope;
+#              b — backtrack waypoint: a condensed record of a discarded
+#                  branch, NOT a finished answer — run continues past it.
 #   type   — one of TURN_TYPES (the extension), and nothing after it.
-_FLAG_CHARS = "pic"
+_FLAG_CHARS = "picb"
 _TURN_RE = re.compile(
     r"^(?P<num>\d+)"
     r"(?:-(?P<turnid>[a-z0-9]+)(?:-(?P<sender>[A-Za-z0-9]+))?)?"
@@ -741,34 +745,64 @@ def tool_registry(capabilities: str | None = None,
             },
             run_location="manager",
         ),
-        "delete": ToolSpec(
-            name="delete",
+        "backtrack": ToolSpec(
+            name="backtrack",
             description=(
-                "Tidy your own context. Give a `turn-id` to ROLL BACK: every "
-                "turn from it onward is removed; if you also give `annotation` "
-                "text, one clean assistant turn with that text replaces them — "
-                "collapsing a messy string of attempts into the result. Give "
-                "a `session` name instead to delete a finished sub-agent "
-                "session entirely."),
+                "Rewind this conversation: discard every turn from `turn_id` "
+                "onward (this very call included; inclusive=false keeps the "
+                "named turn itself) and put `summary` — your condensed "
+                "record of the discarded branch, e.g. \"tried X; dead end: "
+                "Y\" — in its place. By default the summary is a WAYPOINT "
+                "and work CONTINUES from the rewound context (shed a failed "
+                "approach, compact a stretch you no longer need verbatim); "
+                "with final=true it is your FINISHED ANSWER and the run "
+                "settles on it (collapse a messy arc into the clean result)."),
             parameters={
                 "type": "object",
                 "properties": {
                     "turn_id": {
                         "type": "string",
-                        "description": "Turn-id to roll back to (inclusive).",
+                        "description": "Rewind point: turns from here onward "
+                                       "are discarded.",
                     },
-                    "annotation": {
+                    "summary": {
                         "type": "string",
-                        "description": "Replacement assistant-turn text for a "
-                                       "rollback.",
+                        "description": "The condensed record of the "
+                                       "discarded branch — all that is "
+                                       "carried forward.",
                     },
-                    "session": {
-                        "type": "string",
-                        "description": "A sub-agent session name to delete "
-                                       "wholesale (instead of a rollback).",
+                    "inclusive": {
+                        "type": "boolean",
+                        "description": "Default true: the named turn is "
+                                       "discarded too. False keeps it and "
+                                       "discards only what follows.",
+                    },
+                    "final": {
+                        "type": "boolean",
+                        "description": "Default false: the summary is a "
+                                       "waypoint and you keep working. True: "
+                                       "the summary is your finished answer.",
                     },
                 },
-                "required": [],
+                "required": ["turn_id", "summary"],
+            },
+        ),
+        "delete": ToolSpec(
+            name="delete",
+            description=(
+                "Delete a finished sub-agent session entirely (its turns and "
+                "its sandbox box) once its result is banked. For rewinding "
+                "your OWN context, use backtrack."),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "session": {
+                        "type": "string",
+                        "description": "The sub-agent session name to "
+                                       "delete.",
+                    },
+                },
+                "required": ["session"],
             },
         ),
     }
@@ -1334,53 +1368,76 @@ def read_path(path: str, *, turns=None) -> str:
     return "\n".join(lines[a - 1:b])
 
 
-# ── delete — roll back / collapse, or drop a finished sub-agent session ──────
-def apply_delete(target_seg: str, *, turn_id: str | None = None,
-                 annotation: str | None = None,
-                 session: str | None = None,
-                 executor=None) -> str:
-    """Apply a ``delete`` call to ``target_seg``; return a model-facing summary.
-
-    ROLLBACK (``turn_id``): every turn from that id onward (by grid number) is
-    removed, and if ``annotation`` is given a single clean assistant turn with
-    that text replaces them — collapsing a messy string of attempts into the
-    kept result. (Attachment dirs of the removed turns go too.)
-
-    SESSION (``session``): delete that sub-agent session's folder wholesale and
-    discard its sandbox box. For tidying re-addressable sub-agents once their
-    result is banked.
-    """
-    if session is not None:
-        if not _NAME_RE.match(session):
-            return f"error: invalid session name {session!r}"
-        folder = session_dir(session)
-        if not folder.is_dir():
-            return f"error: no session {session!r} to delete"
-        shutil.rmtree(folder, ignore_errors=True)
-        if executor is not None and hasattr(executor, "discard_box"):
-            executor.discard_box(box_name(session))
-        return f"deleted session {session!r}"
-
-    if turn_id is None:
-        return "error: delete needs a turn_id (rollback) or session (drop)"
-    turns = load_turns(target_seg)
-    match = next((t for t in turns if t.slug == turn_id), None)
-    if match is None:
-        return f"error: no turn {turn_id!r} in this context"
-    removed = [t for t in turns if t.number >= match.number]
+# ── delete / backtrack — the two rollback gestures ───────────────────────────
+def _remove_turn_files(removed: list) -> None:
+    """Unlink turn files together with their attachment dirs."""
     for t in removed:
         t.path.unlink(missing_ok=True)
         att = t.path.parent / t.path.name.split(".")[0]
         if att.is_dir():
             shutil.rmtree(att, ignore_errors=True)
-    note = ""
-    if annotation:
-        kept = load_turns(target_seg)
-        slug = new_turn_id({t.slug for t in kept if t.slug},
-                           slot=f"{target_seg}/{match.number}")
-        append_raw_turn(target_seg, "assistant", annotation, slug=slug)
-        note = f"; collapsed into assistant turn {slug!r}"
-    return f"rolled back {len(removed)} turn(s) from {turn_id!r}{note}"
+
+
+def apply_backtrack(target_seg: str, *, turn_id: str, summary: str,
+                    inclusive: bool = True, final: bool = False,
+                    call_number: int | None = None) -> str:
+    """Rewind ``target_seg`` to ``turn_id`` and plant ``summary`` — THE
+    rollback gesture (delete keeps only session GC).
+
+    Every turn from the match onward is removed (only those after it with
+    ``inclusive=False``) — plus the in-flight backtrack call turn itself
+    (``call_number``), which never survives its own rewind. The summary is
+    appended as the model's own assistant turn:
+
+      • default: a ``b``-flagged WAYPOINT — the condensed record of a
+        discarded branch ("tried X; dead end because Y"). The ``b`` flag is
+        the whole trick: a waypoint tail does not settle ``run`` the way a
+        clean answer does, so generation continues from the rewound context.
+      • ``final=True``: a CLEAN turn — the collapse gesture; the summary IS
+        the finished answer and the run settles on it.
+
+    This makes compaction expressible as an ordinary TOOL CALL instead of
+    harness magic: the model rewinds its own session and carries forward
+    only the summary. (Box apply could not do this — the tool-result turns
+    the CALLER wrote outside the box are not the box's to delete.)
+    """
+    turns = load_turns(target_seg)
+    match = next((t for t in turns if t.slug == turn_id), None)
+    if match is None:
+        return f"error: no turn {turn_id!r} in this context"
+    removed = [t for t in turns
+               if t.number > match.number
+               or (inclusive and t.number == match.number)
+               or (call_number is not None and t.number >= call_number)]
+    _remove_turn_files(removed)
+    kept = load_turns(target_seg)
+    slug = new_turn_id({t.slug for t in kept if t.slug},
+                       slot=f"{target_seg}/{next_number(kept)}")
+    append_raw_turn(target_seg, "assistant", summary, slug=slug,
+                    flags="" if final else "b")
+    kind = "answer" if final else "waypoint"
+    return (f"rewound {len(removed)} turn(s) to {turn_id!r} "
+            f"({'inclusive' if inclusive else 'exclusive'}); {kind} "
+            f"{slug!r} planted")
+
+
+def apply_delete(session: str | None, *, executor=None) -> str:
+    """Delete a sub-agent ``session`` wholesale: its folder and its sandbox
+    box. For tidying re-addressable sub-agents once their result is banked.
+    (Rewinding one's OWN context is ``apply_backtrack`` — delete keeps only
+    the session-GC half, which is not a rewind at all.)
+    """
+    if session is None:
+        return "error: delete needs a session name"
+    if not _NAME_RE.match(session):
+        return f"error: invalid session name {session!r}"
+    folder = session_dir(session)
+    if not folder.is_dir():
+        return f"error: no session {session!r} to delete"
+    shutil.rmtree(folder, ignore_errors=True)
+    if executor is not None and hasattr(executor, "discard_box"):
+        executor.discard_box(box_name(session))
+    return f"deleted session {session!r}"
 
 
 @dataclass
@@ -1942,8 +1999,10 @@ def evaluate_call(
     ``inspect`` / ``read``: harness-native locator lookups (paged + keyed —
     page keys resolve against this session's own previous result turns; the
     ``box:`` locators reach a box's staged diff through the executor).
-    ``delete``: roll back / collapse this context, or drop a sub-agent
-    session. These act on ``target_seg`` directly.
+    ``backtrack``: rewind ``target_seg`` to a turn-id and plant the summary
+    (waypoint by default — run continues; ``final`` settles); on success the
+    call turn itself is rewound away, so no ``.tool`` result is written.
+    ``delete``: drop a spent sub-agent session (+ its box).
 
     An unknown tool name also yields an error-text result turn (the loop keeps
     moving; the model sees the error). Returns the written result turn
@@ -1992,14 +2051,26 @@ def evaluate_call(
     elif tool == "read":
         result = read_path(_parse_inspect_arguments(arguments), turns=turns)
     elif tool == "delete":
-        tid, annotation, sess = _parse_delete_arguments(arguments)
-        # A self-rollback removes the delete CALL turn itself, so it does NOT
-        # produce a paired .tool result — the rewritten context IS the answer.
-        rolled_back = sess is None and tid is not None
-        result = apply_delete(target_seg, turn_id=tid, annotation=annotation,
-                              session=sess, executor=executor)
-        if rolled_back:
-            return []
+        result = apply_delete(_parse_delete_arguments(arguments),
+                              executor=executor)
+    elif tool == "backtrack":
+        tid, summary, inclusive, final = _parse_backtrack_arguments(arguments)
+        if tid is None or not summary:
+            result = ("error: backtrack needs turn_id and summary (the "
+                      "condensed record of the discarded branch)")
+        else:
+            result = apply_backtrack(target_seg, turn_id=tid,
+                                     summary=summary, inclusive=inclusive,
+                                     final=final,
+                                     call_number=call_turn.number)
+            # On success the call turn itself was rewound away and the
+            # summary is the new tail — there is no call left to answer, so
+            # no .tool result. A b-flagged waypoint tail makes run's next
+            # step a generation; a final tail settles it. A FAILED backtrack
+            # left the call pending: fall through and answer it with the
+            # error (else the loop would re-evaluate it forever).
+            if not result.startswith("error:"):
+                return []
     elif tool in ("apply", "reject"):
         # Manager-level: resolve a sub-agent's STAGED box — the only place
         # its accumulated writes (files AND session edits) become real or
@@ -2099,7 +2170,9 @@ def run_to_completion(
                                       executor=executor, depth=depth)
             continue
         if (turns and turns[-1].type == "assistant"
-                and "p" not in turns[-1].flags and "c" not in turns[-1].flags):
+                and not set("pcb") & set(turns[-1].flags)):
+            # A clean assistant tail is the answer — but a p (unfinished),
+            # c (unevaluated call) or b (backtrack waypoint) tail keeps going.
             return produced
         produced += generate(name, model=model, client=client, echo=echo,
                              capabilities=capabilities, depth=depth)
@@ -2176,18 +2249,33 @@ def _parse_target_argument(arguments: str) -> str | None:
     return arguments.strip() or None
 
 
-def _parse_delete_arguments(arguments: str):
-    """Parse a ``delete`` call into (turn_id, annotation, session)."""
+def _parse_delete_arguments(arguments: str) -> str | None:
+    """Parse a ``delete`` call into the session name (or None)."""
+    try:
+        obj = json.loads(arguments)
+    except (ValueError, TypeError):
+        obj = None
+    if isinstance(obj, dict) and isinstance(obj.get("session"), str) \
+            and obj["session"]:
+        return obj["session"]
+    return arguments.strip() or None
+
+
+def _parse_backtrack_arguments(arguments: str):
+    """Parse a ``backtrack`` call into (turn_id, summary, inclusive, final)."""
     try:
         obj = json.loads(arguments)
     except (ValueError, TypeError):
         obj = None
     if not isinstance(obj, dict):
-        return None, None, None
+        return None, None, True, False
     def s(key):
         v = obj.get(key)
         return v if isinstance(v, str) and v else None
-    return s("turn_id"), s("annotation"), s("session")
+    inclusive = obj.get("inclusive")
+    return (s("turn_id"), s("summary"),
+            True if inclusive is None else bool(inclusive),
+            bool(obj.get("final")))
 
 
 def _parse_act_arguments(arguments: str) -> tuple[str, str | None, str | None]:

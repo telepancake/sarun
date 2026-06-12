@@ -523,7 +523,7 @@ def test_scenario_sarun_executor_wiring():
 def test_scenario_count_lines_across_dir():
     """The big one. Main inspects a directory, delegates each file to a tool-
     capable sub-agent that fumbles `wc`, recovers, then COLLAPSES its messy
-    attempt log into one clean annotation via `delete` rollback; that clean
+    attempt log into one clean answer via `backtrack(final=true)`; that clean
     turn rides back up as the tool result and kicks the parent forward; main
     keeps a running tally and — deliberately — never deletes the spent
     sub-agent sessions (the leak wart, observed)."""
@@ -579,13 +579,13 @@ def test_scenario_count_lines_across_dir():
                           CannedChat(tool_calls=[("shell", json.dumps(
                               {"script": f"wc -l < {work}/{fname}"}),
                               f"call_{fid}2")]))
-            # sees the correct count → collapse the whole mess into one note,
-            # rolling back to the FIRST (broken) shell call turn.
+            # sees the correct count → collapse the whole mess into one
+            # FINAL answer, rewinding to the FIRST (broken) shell call turn.
             st.srv.expect(lambda r, n=nlines: f"exit 0\n{n}" in _last(r),
-                          CannedChat(tool_calls=[("delete", json.dumps(
-                              {"turn_id": f"{fid}1",
-                               "annotation": f"{fname} has {nlines} "
-                                             f"{line_word}."}),
+                          CannedChat(tool_calls=[("backtrack", json.dumps(
+                              {"turn_id": f"{fid}1", "final": True,
+                               "summary": f"{fname} has {nlines} "
+                                          f"{line_word}."}),
                               f"call_{fid}d")]))
 
         # LocalExecutor end to end: the sub-agents are real `oaita run`
@@ -644,6 +644,71 @@ def test_scenario_count_lines_across_dir():
         st.close()
 
 
+# ── scenario 10: in-context compaction via backtrack — context SHRINKS ───────
+def test_scenario_compaction_via_backtrack():
+    """Compaction as an ordinary tool call, no harness magic: mid-task the
+    model rewinds its own done-and-banked stretch (two measurement arcs) into
+    one waypoint, then KEEPS WORKING — and the next request's context really
+    is smaller: the raw outputs are gone, only the waypoint rides forward.
+    This is the second mechanism next to boxes: a boxed compactor could
+    rewrite session files, but the tool-result turns the CALLER wrote outside
+    the box are not the box's to delete — backtrack is."""
+    st = Stage(seed="compact")
+    try:
+        st.write_turn("job", "0010.user",
+                      "Measure A, B and C; report the total.")
+
+        # 1-2. two real measurement arcs (LocalExecutor → real sh).
+        st.srv.expect("Measure A, B and C",
+                      CannedChat(tool_calls=[("shell", json.dumps(
+                          {"script": "echo A=5"}), "call_measa")]))
+        st.srv.expect(lambda r: "A=5" in _last(r),
+                      CannedChat(tool_calls=[("shell", json.dumps(
+                          {"script": "echo B=7"}), "call_measb")]))
+        # 3. both banked → COMPACT: rewind to the first call turn (its slug
+        #    is the adopted wire id), carry only the waypoint summary.
+        st.srv.expect(lambda r: "B=7" in _last(r),
+                      CannedChat(tool_calls=[("backtrack", json.dumps(
+                          {"turn_id": "measa",
+                           "summary": "Done: two measurements banked, "
+                                      "partial sum 12."}), "call_compact")]))
+        # 4. the waypoint is now the tail → proceed with C.
+        st.srv.expect("partial sum 12",
+                      CannedChat(tool_calls=[("shell", json.dumps(
+                          {"script": "echo C=2"}), "call_measc")]))
+        # 5. C banked → the finished answer.
+        st.srv.expect(lambda r: "C=2" in _last(r),
+                      CannedChat(content="Total: 14 (partial 12 + C 2)."))
+
+        st.run("job", executor=oaita.LocalExecutor(), max_steps=12)
+
+        turns = turns_of("job")
+        check("S10: settled tree is user, waypoint, C-call, result, answer",
+              [t.type for t in turns] ==
+              ["user", "assistant", "assistant", "tool", "assistant"]
+              and turns[1].flags == "b" and "c" in turns[2].flags)
+        check("S10: the waypoint carries the compacted record",
+              turns[1].read() == "Done: two measurements banked, "
+                                 "partial sum 12.")
+        check("S10: the final answer used the waypoint",
+              turns[-1].read() == "Total: 14 (partial 12 + C 2).")
+
+        # The compaction POINT: the post-compaction request really shrank —
+        # the A/B arcs (calls and raw outputs) are no longer in the context.
+        post = st.srv.requests[3]
+        sent = " ".join(m.get("content") or "" for m in post.messages)
+        check("S10: the post-compaction context no longer carries raw A/B",
+              "A=5" not in sent and "B=7" not in sent
+              and "partial sum 12" in sent)
+        check("S10: the post-compaction prompt is exactly 2 messages "
+              "(the user task + the waypoint)",
+              len(post.messages) == 2)
+        check("S10: every scripted step fired",
+              all(e.matched for e in st.srv._expectations))
+    finally:
+        st.close()
+
+
 # ── standalone runner ────────────────────────────────────────────────────────
 if __name__ == "__main__":
     tests = [
@@ -655,6 +720,7 @@ if __name__ == "__main__":
         test_scenario_shell_fix_build,
         test_scenario_sarun_executor_wiring,
         test_scenario_count_lines_across_dir,
+        test_scenario_compaction_via_backtrack,
     ]
     for t in tests:
         print(f"\n── {t.__name__} ──")

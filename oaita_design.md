@@ -66,6 +66,20 @@ CLI client for OpenAI-compatible chat APIs, depends on `sarun`.
 - shell(discard=true) = read-only shell: the script runs in a throwaway
   box (OAITA-<SESSION>-PEEK) discarded right after — output comes back,
   nothing stays staged anywhere.
+- `backtrack(turn_id, summary, inclusive?, final?)` — the SECOND mechanism
+  next to boxes, and THE rollback gesture: discard every turn from turn_id
+  onward (exclusive keeps it; the in-flight call turn never survives its own
+  rewind) and plant the summary as the model's own turn. Default: a
+  `b`-flagged WAYPOINT — run does NOT settle on it, generation continues
+  from the rewound context (shed a failed branch, compact a banked stretch:
+  scenario 10 proves the post-compaction prompt really shrank). final=true:
+  a clean turn — the collapse-into-answer gesture (scenario 9). Needed
+  because box-apply can't express this: tool-result turns the CALLER wrote
+  outside the box are not the box's to delete — compaction stays an ordinary
+  tool call, not harness magic.
+- `delete` is now ONLY session GC (drop a spent sub-agent + its box); its
+  old rollback/annotation half merged into backtrack(final=true). The `b`
+  flag joined the filename grammar (waypoint ≠ answer).
 - Narration kept: a reply with prose AND tool calls now keeps the prose as its
   own clean assistant turn before the c-turns (running tallies survive instead
   of being overwritten by the envelope).
@@ -95,6 +109,9 @@ CLI client for OpenAI-compatible chat APIs, depends on `sarun`.
     - `i` for "no turn id header". suppresses turn id prefix processing described in next section.
     - `c` for "tool call": an assistant turn holding a `{"tool", "arguments"}`
       envelope, written by gen, evaluated by call.
+    - `b` for "backtrack waypoint": an assistant turn that is the condensed
+      record of a discarded branch, NOT a finished answer — run continues
+      past it (gen appends after it; only `p` regenerates in place).
   - `<type>` extension is the role (`system`/`user`/`assistant`/`tool`/…).
 - Context is rebuilt from the files every step, without any additional hidden state.
 
@@ -185,8 +202,8 @@ CLI client for OpenAI-compatible chat APIs, depends on `sarun`.
 - **positional pairing is fragile under hand-editing** — delete one result file
   and later pairings in the block shift. Accepted cost of files-as-database;
   recoverable pairing (explicit per-result reference) only if it bites.
-- **rerolling a bad call = delete the c-turn file by hand.** gen's refusal is
-  right, but a "discard call" gesture belongs with the delete tool.
+- ~~rerolling a bad call = delete the c-turn file by hand~~ — FIXED by
+  backtrack: target the bad c-turn, leave a waypoint, keep going.
 - ~~leaf is tools=[]~~ — FIXED: sub-agents are tool-capable, run-to-completion
   one depth deeper, capped at MAX_DEPTH (act → "too deep").
 - **spent sub-agent sessions leak.** Each `act` mints a persistent session
