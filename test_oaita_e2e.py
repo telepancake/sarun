@@ -156,7 +156,123 @@ def e2e_shell_in_real_box():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def e2e_act_in_real_box():
+    """act's full path against a REAL box: the sub-agent is `oaita run` running
+    INSIDE a sarun box, reaching the fake server over the host netns, its answer
+    read back through `oaita tail`-in-box. Proves env propagation into the box,
+    that the sub-agent's writes STAGE (host sees only the seed until apply), and
+    that applying the box folds them up."""
+    # NOTE: under /var/tmp, not /tmp — the box masks /tmp with a fresh tmpfs,
+    # so a state tree there would be invisible to the in-box sub-agent. A real
+    # $XDG_STATE_HOME (~/.local/state, under $HOME) is likewise un-masked, so
+    # this mirrors real use rather than working around it.
+    tmp = Path(tempfile.mkdtemp(prefix="oaita-e2e-act-", dir="/var/tmp"))
+    os.environ["XDG_STATE_HOME"] = str(tmp / "state")
+    os.environ["XDG_RUNTIME_DIR"] = str(tmp / "run")
+    os.environ["XDG_CONFIG_HOME"] = str(tmp / "config")
+    os.environ["XDG_DATA_HOME"] = str(tmp / "data")
+    os.environ["OAITA_ID_SEED"] = "e2e-act"
+    os.environ.setdefault("TERM", "dumb")
+    os.environ["TEXTUAL"] = ""
+
+    oaita = SourceFileLoader("oaita", str(HERE / "oaita")).load_module()
+    fakeserver = SourceFileLoader(
+        "oaita_fakeserver", str(HERE / "oaita_fakeserver")).load_module()
+
+    # The sub-agent subprocess (inside the box) reads ALL of this from the
+    # environment — which bwrap inherits (no --clearenv on the box runner).
+    srv = fakeserver.FakeOpenAIServer().start()
+    os.environ["OPENAI_BASE_URL"] = srv.base_url
+    os.environ["OPENAI_API_KEY"] = "k"
+    os.environ["OAITA_MODEL"] = "test-model"
+    os.environ["OAITA_CMD"] = f"{PYBIN} {HERE / 'oaita'}"   # skip per-box uv
+
+    sock = str(Path(os.environ["XDG_RUNTIME_DIR"]) / "slopbox" / "ui.sock")
+    harness = tmp / "ui_harness.py"
+    harness.write_text(
+        "from importlib.machinery import SourceFileLoader\n"
+        f"m = SourceFileLoader('slopbox', {SARUN!r}).load_module()\n"
+        "m.ensure_dirs()\n"
+        "app = m._make_ui_app()()\n"
+        "app.run(headless=True)\n")
+    ui = subprocess.Popen([PYBIN, str(harness)],
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    executor = oaita.SarunExecutor([PYBIN, SARUN])
+    box = None
+    try:
+        check("act: real sarun UI came up", wait_socket(sock, 90))
+
+        oaita.add_turn("main", source=__import__("io").BytesIO(
+            b"delegate: greet the sandbox"))
+        greeting = "HELLO FROM INSIDE THE BOX"
+        srv.expect("delegate: greet the sandbox",
+                   fakeserver.CannedChat(tool_calls=[(
+                       "act", json.dumps({"request": "say a greeting"}),
+                       "call_greeter")]))
+        srv.expect("say a greeting",            # the sub-agent, in its box
+                   fakeserver.CannedChat(content=greeting))
+        srv.expect(greeting,                    # main reacting to the result
+                   fakeserver.CannedChat(content="Greeting delegated and received."))
+
+        produced = oaita.run_to_completion(
+            "main", model="test-model", base_url=srv.base_url, api_key="k",
+            echo=lambda _t: None, executor=executor, max_steps=8)
+
+        main = oaita.load_turns("main")
+        check("act: main settled — user, call, result, answer",
+              [t.type for t in main] ==
+              ["user", "assistant", "tool", "assistant"])
+        innerid = main[1].slug
+        box = oaita.box_name(innerid)
+        check("act: the .tool result carries the sub-agent's in-box answer",
+              greeting in main[2].read())
+        check("act: result's from-sender is the sub-agent session",
+              main[2].sender == innerid)
+        check("act: main reacted to the delegated greeting",
+              main[3].read() == "Greeting delegated and received.")
+        check("act: run produced call, result, answer", len(produced) == 3)
+
+        # The gate: the sub-agent's reply was STAGED in its box — on the HOST
+        # the inner session still holds ONLY the seed the parent wrote.
+        host_inner = oaita.load_turns(innerid)
+        check("act: host sees ONLY the seed (sub-agent writes are staged)",
+              [t.type for t in host_inner] == ["user"]
+              and host_inner[0].read() == "say a greeting")
+
+        # And the box's patch shows the staged session writes as added files.
+        patch = subprocess.run([PYBIN, SARUN, box, "patch"],
+                               capture_output=True, text=True, timeout=60)
+        check("act: the box patch shows the sub-agent's staged turn file(s)",
+              patch.returncode == 0
+              and f"/oaita/{innerid}/" in patch.stdout
+              and greeting in patch.stdout)
+
+        # Apply the box → the sub-agent's turns fold up onto the host.
+        executor.apply_box(box)
+        box = None                              # consumed by apply
+        folded = oaita.load_turns(innerid)
+        check("act: applying the box folds the sub-agent's answer onto the host",
+              [t.type for t in folded] == ["user", "assistant"]
+              and folded[-1].read() == greeting)
+    finally:
+        if box is not None:
+            subprocess.run([PYBIN, SARUN, box, "discard"],
+                           capture_output=True, timeout=60)
+        srv.stop()
+        ui.terminate()
+        try:
+            ui.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            ui.kill()
+        subprocess.run(["umount", "-l",
+                        str(Path(os.environ["XDG_RUNTIME_DIR"])
+                            / "slopbox" / "mnt")],
+                       capture_output=True)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     e2e_shell_in_real_box()
+    e2e_act_in_real_box()
     print("\n" + ("E2E PASS" if not _fails else f"{len(_fails)} FAILURE(S)"))
     sys.exit(1 if _fails else 0)
