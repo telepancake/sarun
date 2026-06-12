@@ -196,3 +196,20 @@ git status, 5 000 tracked files, back-to-back runs: warm 0.079 s → 0.058 s
 (cold 0.59 s → 0.44 s). Runs spaced past the 1 s attr TTL are unchanged
 (~0.41 s) — those are bounded by the lookup/getattr storm, which is the
 single-trio-thread per-op tax above, not readdir.
+
+## Comparing timings across revisions
+
+The microbenchmarks behind the numbers above are committed as
+`bench/workloads.py` (git-status / exec-storm / file-churn through the real
+overlay vs native-under-bwrap, plus the remote-UI rpc round-trip). To compare
+any two revisions, run the SAME harness on the SAME box:
+
+    bench/workloads.py                              # current tree
+    git show <rev>:sarun > /tmp/sarun_old
+    SARUN_PATH=/tmp/sarun_old bench/workloads.py    # the old revision
+
+Trust per-op overhead (µs/op) across machines and runs; treat A/B ratios as
+box-local (the native baseline jitters, the additive FUSE cost doesn't).
+Reference run, dev container 2026-06-14 (post dir-listing cache + engine/UI
+split): git-status 89 µs/op cold · 0.058 s warm; exec-storm 1.7×;
+file-churn 3.4×; rpc 0.35 ms/verb.
