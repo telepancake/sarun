@@ -747,6 +747,66 @@ def run_capture_e2e(tmp):
         _kill_ui(ui, mnt)
 
 
+def run_engine_e2e(tmp):
+    """Headless engine mode (`slopbox engine`): no UI process at all. A box runs
+    against it, its writes are captured, patch/discard work over the socket, a
+    second instance is refused, and SIGTERM tears down cleanly (socket gone,
+    overlay unmounted)."""
+    e = env_for(tmp)
+    sock = str(Path(e["XDG_RUNTIME_DIR"]) / "slopbox" / "ui.sock")
+    mnt = Path(e["XDG_RUNTIME_DIR"]) / "slopbox" / "mnt"
+    eng = subprocess.Popen([PYBIN, SARUN, "engine"], env=e,
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    try:
+        if not wait_socket(sock, 30):
+            out = b""
+            try: out = eng.stdout.read(4000) if eng.stdout else b""
+            except Exception: pass
+            raise RuntimeError("engine socket never appeared. Output:\n"
+                               + out.decode(errors="replace"))
+
+        r = subprocess.run([PYBIN, SARUN, "engine"], env=e,
+                           capture_output=True, text=True, timeout=30)
+        check(r.returncode != 0 and "already running" in r.stderr,
+              "engine-e2e: a second engine instance is refused")
+
+        r = subprocess.run(
+            [PYBIN, SARUN, "ENGBOX", "--",
+             "sh", "-c", "echo engine-proof > /root/e2e_engine_proof.txt"],
+            env=e, capture_output=True, text=True, timeout=120)
+        check(r.returncode == 0,
+              f"engine-e2e: box run against headless engine exited 0 "
+              f"(got {r.returncode}: {r.stderr[-300:]})")
+        check(not Path("/root/e2e_engine_proof.txt").exists(),
+              "engine-e2e: host untouched (write captured in the overlay)")
+
+        r = subprocess.run([PYBIN, SARUN, "ENGBOX", "patch"], env=e,
+                           capture_output=True, text=True, timeout=60)
+        check(r.returncode == 0 and "engine-proof" in r.stdout,
+              "engine-e2e: `patch` over the socket prints the captured change")
+
+        r = subprocess.run([PYBIN, SARUN, "ENGBOX", "discard"], env=e,
+                           capture_output=True, text=True, timeout=60)
+        check(r.returncode == 0 and "removed" in r.stdout,
+              "engine-e2e: `discard` consumes the box")
+
+        eng.send_signal(signal.SIGTERM)
+        try: eng.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            eng.kill(); eng.wait(timeout=10)
+        check(eng.returncode == 0, "engine-e2e: SIGTERM exits 0")
+        check(not Path(sock).exists() or not wait_socket(sock, 1),
+              "engine-e2e: control socket gone after shutdown")
+        with open("/proc/mounts") as f:
+            check(str(mnt) not in f.read(),
+                  "engine-e2e: overlay unmounted after engine exit")
+    finally:
+        if eng.poll() is None:
+            eng.kill()
+            try: eng.wait(timeout=10)
+            except Exception: pass
+
+
 def main():
     tmp = Path(tempfile.mkdtemp(prefix="e2e-"))
     try:
@@ -764,6 +824,8 @@ def main():
         run_forced_userns_e2e(Path(tempfile.mkdtemp(prefix="e2e-userns-")))
         print("\n== stdout/stderr capture e2e ==")
         run_capture_e2e(Path(tempfile.mkdtemp(prefix="e2e-cap-")))
+        print("\n== headless engine e2e (`slopbox engine`, no UI) ==")
+        run_engine_e2e(Path(tempfile.mkdtemp(prefix="e2e-eng-")))
     except Exception as ex:
         import traceback; traceback.print_exc(); _fails.append(str(ex))
     finally:
