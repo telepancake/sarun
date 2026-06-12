@@ -1794,25 +1794,11 @@ def sqlar_list(path) -> list:
     finally: conn.close()
 
 def sqlar_mode(path, name) -> "int | None":
-    path = Path(path)
-    if not path.exists(): return None
-    conn = _sqlar_open(path)
-    try:
-        row = conn.execute("SELECT mode FROM sqlar WHERE name=?", (name,)).fetchone()
-    except sqlite3.Error: row = None
-    finally: conn.close()
-    return row[0] if row else None
+    return sqlar_mode_mtime(path, name)[0]
 
 def sqlar_mtime(path, name) -> "int | None":
     """Stored mtime as integer NANOSECONDS (st_mtime_ns), or None if missing."""
-    path = Path(path)
-    if not path.exists(): return None
-    conn = _sqlar_open(path)
-    try:
-        row = conn.execute("SELECT mtime FROM sqlar WHERE name=?", (name,)).fetchone()
-    except sqlite3.Error: row = None
-    finally: conn.close()
-    return row[0] if row else None
+    return sqlar_mode_mtime(path, name)[1]
 
 def sqlar_nonempty(path) -> bool:
     """True if the sqlar has at least one entry — cheaper than fetching all rows."""
@@ -2898,21 +2884,19 @@ class Index:
         tag), or None. Keys the proc pane → used to focus the writer when jumping to
         procs. UI-thread read of the single sqlar handle: take _lock so it never races
         the serve thread's writes on the shared connection (Index threading contract)."""
-        try:
-            with self._lock:
-                row = self._db.execute(
-                    "SELECT last_writer FROM sqlar WHERE name=?", (path,)).fetchone()
-        except sqlite3.Error: return None
-        return row[0] if row and row[0] is not None else None
+        return self._writer_id_col(path, "last_writer")
 
     def first_writer_id_for(self, path: str) -> "int | None":
         """The process-table row id that FIRST wrote `path` (the sqlar `writer` tag), or
         None — the first-writer counterpart of writer_id_for, used to pin the procs pane
         to a change's writers. UI-thread read under _lock (Index threading contract)."""
+        return self._writer_id_col(path, "writer")
+
+    def _writer_id_col(self, path: str, col: str) -> "int | None":
         try:
             with self._lock:
                 row = self._db.execute(
-                    "SELECT writer FROM sqlar WHERE name=?", (path,)).fetchone()
+                    f"SELECT {col} FROM sqlar WHERE name=?", (path,)).fetchone()
         except sqlite3.Error: return None
         return row[0] if row and row[0] is not None else None
 
@@ -3820,6 +3804,10 @@ def _build_overlay_ops():
             return True
 
         # ── attr construction ────────────────────────────────────────────────
+        def _ref(self, ino: int) -> None:
+            """Bump the kernel lookup count for `ino` (paired with forget)."""
+            self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
+
         def _entry(self, ino: int, st) -> "pyfuse3.EntryAttributes":
             a = pyfuse3.EntryAttributes()
             a.st_ino = ino
@@ -3945,12 +3933,12 @@ def _build_overlay_ops():
                 if prel == KIDS_DIR:
                     if psid in self.sessions and name in self._live_children(psid):
                         ino = self._ino_for(name, "")
-                        self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
+                        self._ref(ino)
                         return self._synth_dir_attrs(ino)
                     return self._neg_entry()
                 if prel == "" and name == KIDS_DIR and psid in self.sessions:
                     ino = self._ino_for(psid, KIDS_DIR)
-                    self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
+                    self._ref(ino)
                     return self._synth_dir_attrs(ino)
             if name == ".":
                 ckey = pkey
@@ -3965,7 +3953,7 @@ def _build_overlay_ops():
                 if sid not in self.sessions:
                     return self._neg_entry()
                 ino = self._ino_for(sid, "")
-                self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
+                self._ref(ino)
                 return self._synth_dir_attrs(ino)
             if sid not in self.sessions:
                 return self._neg_entry()
@@ -3973,13 +3961,13 @@ def _build_overlay_ops():
                 return self._neg_entry()
             if self._is_sink(sid, rel):
                 ino = self._ino_for(sid, rel)
-                self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
+                self._ref(ino)
                 return self._sink_attrs(ino)
             layer, _ap, st = self._resolve_st(sid, rel)
             if layer in ("absent", "whiteout"):
                 return self._neg_entry()
             ino = self._ino_for(sid, rel)
-            self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
+            self._ref(ino)
             return self._entry(ino, st)
 
         async def getattr(self, inode, ctx=None):
@@ -4705,7 +4693,7 @@ def _build_overlay_ops():
                     raise pyfuse3.FUSEError(e.errno or errno.EIO)
                 st = os.fstat(fd)
                 ino = self._ino_for(sid, rel)
-                self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
+                self._ref(ino)
                 with self._lock:
                     nfh = self._next_fh; self._next_fh += 1
                     self._fd_table[nfh] = fd
@@ -4728,7 +4716,7 @@ def _build_overlay_ops():
                 self._wbuf[nfh] = wb
                 self._wbuf_key[(sid, rel)] = nfh
                 ino = self._ino_for(sid, rel)
-                self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
+                self._ref(ino)
                 st = self._buffer_stat(sid, rel)
                 if st is None:                    # rare: create() over an existing file
                     _l, _a, st = self._resolve_st(sid, rel)
@@ -4744,7 +4732,7 @@ def _build_overlay_ops():
                 except OSError as e:
                     raise pyfuse3.FUSEError(e.errno or errno.EIO)
                 ino = self._ino_for(sid, rel)
-                self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
+                self._ref(ino)
                 return self._entry(ino, os.lstat(host))
             def upper_op(sid, rel, upath, wid, idx):
                 if idx.kind_of(rel) == "whiteout":
@@ -4754,7 +4742,7 @@ def _build_overlay_ops():
                 idx.set_entry(rel, "dir", dmode, wid, "mkdir", opaque=opaque,
                               mtime_ns=time.time_ns())
                 ino = self._ino_for(sid, rel)
-                self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
+                self._ref(ino)
                 st = self._synth_dir_stat(dmode, idx.row_mtime(rel))
                 return self._entry(ino, st)
             return self._mutate(parent_inode, name, ctx, "mkdir", host_op, upper_op)
@@ -4768,7 +4756,7 @@ def _build_overlay_ops():
                 except OSError as e:
                     raise pyfuse3.FUSEError(e.errno or errno.EIO)
                 ino = self._ino_for(sid, rel)
-                self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
+                self._ref(ino)
                 return self._entry(ino, os.lstat(host))
             def upper_op(sid, rel, upath, wid, idx):
                 # Symlink lives ONLY in the row (target + mode + mtime) — no on-disk
@@ -4786,15 +4774,12 @@ def _build_overlay_ops():
                 idx.set_entry(rel, "symlink", stat_mod.S_IFLNK | 0o777, wid, "symlink",
                               target=tgt, mtime_ns=mt)
                 ino = self._ino_for(sid, rel)
-                self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
+                self._ref(ino)
                 st = self._synth_link_stat(len(tgt), idx.row_mtime(rel))
                 return self._entry(ino, st)
             return self._mutate(parent_inode, name, ctx, "symlink", host_op, upper_op)
 
         # ── unlink / rmdir ───────────────────────────────────────────────────
-        def _merged_children(self, sid: str, rel: str) -> list:
-            return [n for n, _k, _a in self._scan_dir(sid, rel)]
-
         def _unlink_overlay(self, sid: str, rel: str, wid) -> None:
             """Overlay (captured) unlink for sid. Removes the backing artifact and
             updates the index. Used directly and as the kick-up target."""
@@ -4854,7 +4839,7 @@ def _build_overlay_ops():
 
         def _rmdir_overlay(self, sid: str, rel: str, wid) -> None:
             """Overlay (captured) rmdir for sid. Used directly and as kick-up target."""
-            if self._merged_children(sid, rel):
+            if self._scan_dir(sid, rel):     # any merged child ⇒ not empty
                 raise pyfuse3.FUSEError(errno.ENOTEMPTY)
             idx = self._index(sid)
             # Dir lives only in the mirror — no on-disk artifact to rmdir.
@@ -4989,11 +4974,12 @@ def _build_overlay_ops():
                 new_mt = (attr.st_mtime_ns if fields.update_mtime else cur_mt)
                 # symlink: keep its target row data (set_entry target=None preserves it).
                 idx.set_entry(rel, k, new_mode, wid, "setattr", mtime_ns=new_mt)
+                # set_entry just stored mtime=new_mt — no need to re-read the row.
                 if k == "dir":
-                    st = self._synth_dir_stat(new_mode, idx.row_mtime(rel))
+                    st = self._synth_dir_stat(new_mode, int(new_mt))
                 else:
                     tgt = idx.symlink_target(rel) or b""
-                    st = self._synth_link_stat(len(tgt), idx.row_mtime(rel))
+                    st = self._synth_link_stat(len(tgt), int(new_mt))
                 self._notify(sid, rel, "modified")
                 return self._entry(inode, st)
             # Dir/symlink returned early above; only regular files reach here.
@@ -5377,7 +5363,7 @@ def _build_overlay_ops():
                         pass
             except OSError as e:
                 raise pyfuse3.FUSEError(e.errno or errno.EIO)
-            self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
+            self._ref(ino)
             self._notify(sid, rel_n, "created")
             # Symlink dst has no on-disk artifact: stat it via the mirror.
             _l, _ap, st_n = self._resolve_st(sid, rel_n)
@@ -5422,7 +5408,7 @@ def _build_overlay_ops():
                     except OSError as e:
                         raise pyfuse3.FUSEError(e.errno or errno.EIO)
                     ino = self._ino_for(sid, rel_n)
-                    self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
+                    self._ref(ino)
                     return self._entry(ino, os.lstat(hn))
                 ino = self._ino_for(sid, rel_n)
                 return self._link_overlay(sid, rel_src, rel_n, st, ino, ctx)
