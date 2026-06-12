@@ -240,3 +240,29 @@ at -j1 → 4.28× at -j8 (and worsens with core count). This is the strongest
 measured argument for moving the serving loop out of single-threaded Python —
 free-threaded CPython, multiple FUSE worker threads in C, or a compiled
 engine — none of which the per-op micro-optimizations above address.
+
+## Addendum: Rust engine milestone 1 — the scaling proof
+
+Decision: the engine is being rewritten as a separate, statically-linkable
+Rust program (engine/), with the Python UI as a socket client (the protocol
+boundary, namespaces and black-box tests from the engine/UI split are the
+prerequisites). Milestone 1 is a multithreaded read-only passthrough
+filesystem (fuser 0.17, n_threads dispatch) — no overlay, no capture — built
+to measure the serving-loop ceiling before porting semantics.
+
+bench/parallel_metadata.py, 4 concurrent cold git-status walks (5 000 files
+each, fresh mount = cold caches), this 4-core box:
+
+    native            0.013 s   (warm reference)
+    rust  1 thread    0.212 s
+    rust  8 threads   0.144 s
+    python overlay    1.692 s
+
+Rust is ~8× faster than the Python engine single-threaded (per-op cost) and
+~12× with threaded dispatch. Honest caveat: m1 does none of the overlay
+merge/whiteout/capture checks the Python per-op path performs, so part of the
+8× is missing feature weight, not language — the fuse-overlayfs comparison
+(32 vs 95 µs/op, both full overlays) suggests the durable language factor is
+~3×, with the rest from threading and the not-yet-ported logic. Next
+milestones: control socket + namespace layout, then the overlay/capture
+semantics ported against the existing black-box test suite.
