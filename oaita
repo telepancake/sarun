@@ -612,7 +612,8 @@ class ToolSpec:
 
 def tool_registry(capabilities: str | None = None,
                   depth: int = 0) -> dict[str, ToolSpec]:
-    """The v1 tool rows: ``act``, ``shell``, ``inspect``, ``delete``.
+    """The v1 tool rows: ``act``, ``shell``, ``inspect``, ``read``,
+    ``apply``, ``reject``, ``delete``.
 
     ``depth`` (this context's delegation depth) flattens ``act`` to its
     exhausted form at ``MAX_DEPTH`` — the row stays so the model still sees
@@ -633,13 +634,22 @@ def tool_registry(capabilities: str | None = None,
                 "box. The script is executed with `sh -c`; stdout/stderr are "
                 "captured and returned, followed by a summary of any file "
                 "changes the run staged in the box (changes stay STAGED until "
-                "resolved — they do not touch the host)."),
+                "resolved — they do not touch the host). Set `discard` true "
+                "for a read-only look: the script runs in a throwaway box "
+                "discarded right after — output comes back, nothing stays "
+                "staged."),
             parameters={
                 "type": "object",
                 "properties": {
                     "script": {
                         "type": "string",
                         "description": "The shell script to run (no shebang).",
+                    },
+                    "discard": {
+                        "type": "boolean",
+                        "description": "Run read-only: a throwaway box, "
+                                       "discarded after the run. Default "
+                                       "false (the persistent box).",
                     },
                 },
                 "required": ["script"],
@@ -648,15 +658,42 @@ def tool_registry(capabilities: str | None = None,
         "inspect": ToolSpec(
             name="inspect",
             description=(
-                "List the structure of the thing at `path`: a directory's "
-                "entries (name + kind). A huge listing is summarized to fit. "
-                "Read a specific entry by inspecting its deeper path."),
+                "Page through the structure of the thing at `path`: a "
+                "directory (entries, kind + name), a text file (numbered "
+                "lines), or box:<sub-agent id> — its STAGED change set "
+                "(box:<id>/<file> pages that file's staged diff; this is the "
+                "one thing shell cannot show). Append \"lines A..B\" / "
+                "\"entries A..B\" or \"around N\" to a path to jump. A "
+                "reduced page ends with a cursor footer; continue it by "
+                "calling inspect with just next, previous, first or last."),
             parameters={
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Filesystem path to inspect.",
+                        "description": "Locator: path | path lines A..B | "
+                                       "path around N | box:<id>[/<file>] | "
+                                       "next | previous | first | last.",
+                    },
+                },
+                "required": ["path"],
+            },
+        ),
+        "read": ToolSpec(
+            name="read",
+            description=(
+                "The RAW text of a file or slice — exactly the content, no "
+                "line numbers, no framing; use after inspect to quote "
+                "precisely. `path` takes inspect's locators: a file path, "
+                "optionally with \"lines A..B\" or \"around N\", or a page "
+                "key (next/previous/first/last) returning the last paged "
+                "window raw."),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Locator (inspect's grammar).",
                     },
                 },
                 "required": ["path"],
@@ -896,11 +933,17 @@ class SarunExecutor:
             [*self._argv, box, "--", "sh", "-c", script],
             capture_output=True, text=True)
         output = proc.stdout + (("\n" + proc.stderr) if proc.stderr else "")
-        patch = subprocess.run(
-            [*self._argv, box, "patch"], capture_output=True, text=True)
-        changes = summarize_patch(patch.stdout) if patch.returncode == 0 else ""
-        return ExecResult(output=output.strip("\n"), changes=changes,
+        return ExecResult(output=output.strip("\n"),
+                          changes=summarize_patch(self.patch_text(box)),
                           exit_code=proc.returncode)
+
+    def patch_text(self, box: str) -> str:
+        """The box's full staged unified diff (``sarun BOX patch``) — what
+        inspect's ``box:`` locators page through."""
+        import subprocess
+        r = subprocess.run([*self._argv, box, "patch"],
+                           capture_output=True, text=True)
+        return r.stdout if r.returncode == 0 else ""
 
     def discard_box(self, box: str) -> str:
         """Discard a box's staged changes and remove it. Returns CLI output."""
@@ -934,6 +977,9 @@ class LocalExecutor:
         output = proc.stdout + (("\n" + proc.stderr) if proc.stderr else "")
         return ExecResult(output=output.strip("\n"), changes="",
                           exit_code=proc.returncode)
+
+    def patch_text(self, box: str) -> str:
+        return ""                       # nothing is ever staged here
 
     def discard_box(self, box: str) -> str:
         return (f"no sandbox: {box} was never staged — its writes are "
@@ -997,8 +1043,107 @@ def render_shell_result(r: ExecResult) -> str:
     return "\n".join(p for p in parts if p != "")
 
 
-# ── inspect — structure of the thing at a path ───────────────────────────────
-INSPECT_MAX_ENTRIES = 200          # past this, summarize instead of enumerate
+# ── inspect — paged, keyed structure of the thing at a locator ───────────────
+# The reduction ladder is the inspect protocol: a result that didn't fit
+# arrives REDUCED, and every reduced result ends with a CURSOR FOOTER naming
+# the target, the shown window, and the keys that un-reduce it one level.
+# The page keys (next / previous / first / last) are resolved by re-reading
+# the most recent footer among this session's own result turns — the context
+# IS the cursor; the harness keeps no hidden state.
+INSPECT_BUDGET = RESULT_BUDGET // 2
+AROUND_SPAN = 10                   # "around N" shows N ± AROUND_SPAN
+
+_PAGE_KEYS = ("next", "previous", "first", "last")
+_FOOTER_RE = re.compile(
+    r'\[inspect (?P<target>"(?:[^"\\]|\\.)*") '
+    r'(?P<unit>lines|entries) (?P<a>\d+)\.\.(?P<b>\d+) of (?P<n>\d+)')
+_RANGE_RE = re.compile(
+    r"^(?P<path>.+?)\s+(?:lines|entries)\s+(?P<a>\d+)\.\.(?P<b>\d+)\s*$")
+_AROUND_RE = re.compile(
+    r"^(?P<path>.+?)\s+around(?:\s+line)?\s+(?P<n>\d+)\s*$")
+
+
+def _footer(target: str, unit: str, a: int, b: int, n: int) -> str:
+    """The cursor footer: machine-parseable by ``_FOOTER_RE`` (the harness
+    reads its own previous output to resolve page keys) AND the model-facing
+    key legend ("…" stands for the quoted target)."""
+    return (f"[inspect {json.dumps(target)} {unit} {a}..{b} of {n} — keys: "
+            f'next, previous, first, last, "… {unit} A..B", "… around N"]')
+
+
+def _last_cursor(turns):
+    """The most recent cursor footer among ``turns``'s tool results, as
+    ``(target, a, b, n)`` — or None when nothing paged yet."""
+    for t in reversed(turns or []):
+        if t.type != "tool":
+            continue
+        last = None
+        for m in _FOOTER_RE.finditer(t.read()):
+            last = m
+        if last is not None:
+            return (json.loads(last["target"]), int(last["a"]),
+                    int(last["b"]), int(last["n"]))
+    return None
+
+
+def _resolve_locator(path: str, turns):
+    """Resolve a locator into ``((target, window), error)``.
+
+    ``window`` is a 1-based inclusive ``(a, b)`` or None (from the start).
+    Forms: a page key (resolved against the last cursor footer), a target
+    with a ``lines A..B`` / ``entries A..B`` / ``around N`` suffix, or a
+    bare target.
+    """
+    key = path.strip()
+    if key in _PAGE_KEYS:
+        cur = _last_cursor(turns)
+        if cur is None:
+            return None, (f"error: {key!r} continues a paged inspect, and "
+                          f"nothing was paged yet — inspect a target first")
+        target, a, b, n = cur
+        span = max(b - a + 1, 1)
+        if key == "next":
+            if b >= n:
+                return None, f"error: already at the end of {target!r}"
+            return (target, (b + 1, min(b + span, n))), None
+        if key == "previous":
+            if a <= 1:
+                return None, f"error: already at the start of {target!r}"
+            return (target, (max(1, a - span), a - 1)), None
+        if key == "first":
+            return (target, (1, span)), None
+        return (target, (max(1, n - span + 1), n)), None
+    m = _RANGE_RE.match(key)
+    if m:
+        a, b = int(m["a"]), int(m["b"])
+        return (m["path"], (min(a, b), max(a, b))), None
+    m = _AROUND_RE.match(key)
+    if m:
+        c = int(m["n"])
+        return (m["path"], (max(1, c - AROUND_SPAN), c + AROUND_SPAN)), None
+    return (key, None), None
+
+
+def _build_page(rows: list[str], window, *, budget: int):
+    """The window of ``rows`` that fits ``budget``: ``(shown, a, b)``.
+
+    ``a`` is the requested start (clamped into range); ``b`` is where the
+    budget actually ran out — the footer reports the truth, so a follow-up
+    ``next`` continues seamlessly even when the asked range didn't fit.
+    At least one row is always shown (the chokepoint clamps pathology).
+    """
+    n = len(rows)
+    a = 1 if window is None else max(1, min(window[0], n))
+    b_cap = n if window is None else min(window[1], n)
+    shown, used, i = [], 0, a
+    while i <= b_cap:
+        r = rows[i - 1]
+        if shown and used + len(r) + 1 > budget:
+            break
+        shown.append(r)
+        used += len(r) + 1
+        i += 1
+    return shown, a, i - 1
 
 
 def _entry_kind(p: Path) -> str:
@@ -1011,28 +1156,182 @@ def _entry_kind(p: Path) -> str:
     return "other"
 
 
-def inspect_path(path: str) -> str:
-    """List the structure at ``path``. v1: a directory's entries (name + kind).
+def _inspect_dir(p: Path, target: str, window) -> str:
+    entries = sorted(p.iterdir(), key=lambda q: q.name)
+    n = len(entries)
+    if n == 0:
+        return f"{target} (0 entries)"
+    rows = [f"{_entry_kind(e)}\t{e.name}" for e in entries]
+    shown, a, b = _build_page(rows, window,
+                              budget=INSPECT_BUDGET - 256)
+    if a == 1 and b == n:
+        return f"{target} ({n} entries):\n" + "\n".join(shown)
+    counts: dict[str, int] = {}
+    for e in entries:
+        counts[_entry_kind(e)] = counts.get(_entry_kind(e), 0) + 1
+    summary = ", ".join(f"{c} {k}(s)" for k, c in sorted(counts.items()))
+    return (f"{target} ({n} entries — {summary}; showing {a}..{b}):\n"
+            + "\n".join(shown) + "\n"
+            + _footer(target, "entries", a, b, n))
 
-    A listing larger than ``INSPECT_MAX_ENTRIES`` is SUMMARIZED to per-kind
-    counts (the degenerate-case fuse — "15086 files" beats dumping them); the
-    model digs into any subpath with another inspect. A regular file reports
-    its size (structural decode lands later); a missing path is an error.
+
+def _inspect_file(p: Path, target: str, window) -> str:
+    size = p.stat().st_size
+    data = p.read_bytes()
+    if b"\0" in data[:4096]:
+        return f"{target}: binary file, {size} bytes"
+    lines = data.decode("utf-8", errors="replace").split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()                       # the trailing newline is not a line
+    n = len(lines)
+    head = f"{target}: file, {size} bytes, {n} lines"
+    if n == 0:
+        return head
+    rows = [f"{i}\t{ln}" for i, ln in enumerate(lines, 1)]
+    shown, a, b = _build_page(rows, window,
+                              budget=INSPECT_BUDGET - 256)
+    if a == 1 and b == n:
+        return f"{head}:\n" + "\n".join(shown)
+    return (f"{head} (showing {a}..{b}):\n" + "\n".join(shown) + "\n"
+            + _footer(target, "lines", a, b, n))
+
+
+def _patch_files(patch: str) -> list:
+    """Split a unified diff into ordered ``(rel, body_lines, plus, minus)``
+    sections — the drillable innards of a box's staged change set."""
+    files: list = []
+    name, body, plus, minus = None, [], 0, 0
+    pending_minus = None
+    for line in patch.splitlines():
+        if line.startswith("--- "):
+            pending_minus = line          # belongs to the NEXT +++ section
+            continue
+        if line.startswith("+++ "):
+            if name is not None:
+                files.append((name, body, plus, minus))
+            raw = line[4:].split("\t")[0]
+            name = raw[2:] if raw.startswith(("a/", "b/")) else raw
+            body = ([pending_minus] if pending_minus else []) + [line]
+            plus = minus = 0
+            pending_minus = None
+            continue
+        if name is not None:
+            body.append(line)
+            if line.startswith("+"):
+                plus += 1
+            elif line.startswith("-"):
+                minus += 1
+    if name is not None:
+        files.append((name, body, plus, minus))
+    return files
+
+
+def _inspect_box(target: str, window, executor) -> str:
+    """Inspect a box's INNARDS — its staged change set. This is the one thing
+    shell cannot show (staged diffs ARE the results of shells); the harness
+    reaches it natively through the executor (``sarun BOX patch``).
+
+    ``box:<id>`` lists the staged files (keyed by path — drill with
+    ``box:<id>/<file>``); ``box:<id>/<file>`` pages that file's staged diff.
     """
-    p = Path(path).expanduser()
+    if executor is None or not hasattr(executor, "patch_text"):
+        return ("error: inspecting a box needs the sandbox executor "
+                "(none configured)")
+    spec = target[len("box:"):]
+    seg, _, rel = spec.partition("/")
+    if not seg:
+        return "error: empty box locator — use box:<sub-agent id>[/<file>]"
+    box = seg if seg.upper().startswith("OAITA-") else box_name(seg)
+    files = _patch_files(executor.patch_text(box))
+    if not rel:
+        n = len(files)
+        if n == 0:
+            return f"{target}: nothing staged in box {box}"
+        rows = [f"{nm}: +{p} -{m}" for nm, _b, p, m in files]
+        shown, a, b = _build_page(rows, window,
+                                  budget=INSPECT_BUDGET - 256)
+        partial = not (a == 1 and b == n)
+        win = f"; showing {a}..{b}" if partial else ""
+        out = (f'{target} — {n} staged file(s) in box {box} '
+               f'(drill with "{target}/<file>"{win}):\n' + "\n".join(shown))
+        if partial:
+            out += "\n" + _footer(target, "entries", a, b, n)
+        return out
+    sect = next((f for f in files if f[0] == rel), None)
+    if sect is None:
+        staged = ", ".join(f[0] for f in files[:10]) or "nothing"
+        return (f"error: no staged change for {rel!r} in box {box} — "
+                f"staged: {staged}")
+    _nm, body, plus, minus = sect
+    rows = [f"{i}\t{ln}" for i, ln in enumerate(body, 1)]
+    n = len(rows)
+    shown, a, b = _build_page(rows, window,
+                              budget=INSPECT_BUDGET - 256)
+    partial = not (a == 1 and b == n)
+    win = f" (showing {a}..{b})" if partial else ""
+    out = (f"{target}: staged diff, +{plus} -{minus}, {n} diff lines{win}:\n"
+           + "\n".join(shown))
+    if partial:
+        out += "\n" + _footer(target, "lines", a, b, n)
+    return out
+
+
+def inspect_path(path: str, *, turns=None, executor=None) -> str:
+    """Page through the structure of the thing at a locator.
+
+    Targets: a directory (entries, kind + name), a text file (numbered
+    lines), ``box:<id>[/<file>]`` (a box's staged change set — see
+    ``_inspect_box``). Suffixes ``lines A..B`` / ``entries A..B`` /
+    ``around N`` jump; bare page keys (next/previous/first/last) continue
+    the most recent paged result (``turns`` is the cursor source). Every
+    reduced page ends with the footer that names the keys.
+    """
+    loc, err = _resolve_locator(path, turns)
+    if err is not None:
+        return err
+    target, window = loc
+    if target.startswith("box:"):
+        return _inspect_box(target, window, executor)
+    p = Path(target).expanduser()
     if not p.exists():
-        return f"error: no such path {path!r}"
+        return f"error: no such path {target!r}"
     if p.is_dir():
-        entries = sorted(p.iterdir(), key=lambda q: q.name)
-        if len(entries) > INSPECT_MAX_ENTRIES:
-            counts: dict[str, int] = {}
-            for e in entries:
-                counts[_entry_kind(e)] = counts.get(_entry_kind(e), 0) + 1
-            summary = ", ".join(f"{n} {k}(s)" for k, n in sorted(counts.items()))
-            return f"{path} (summarized — {len(entries)} entries): {summary}"
-        lines = [f"{_entry_kind(e)}\t{e.name}" for e in entries]
-        return f"{path} ({len(entries)} entries):\n" + "\n".join(lines)
-    return f"{path}: file, {p.stat().st_size} bytes"
+        return _inspect_dir(p, target, window)
+    if p.is_file():
+        return _inspect_file(p, target, window)
+    return f"{target}: {_entry_kind(p)}"
+
+
+def read_path(path: str, *, turns=None) -> str:
+    """The RAW text of a file or slice — exactly the content, no numbering,
+    no framing — for quoting precisely (and, later, for replace's
+    read-before-write contract). Locators are inspect's, including page keys
+    (``read("next")`` returns the last paged window raw). Box locators are
+    refused: a box's staged FILE content is readable with shell IN that box
+    (the overlay shows it); the diff itself is inspect's domain.
+    """
+    loc, err = _resolve_locator(path, turns)
+    if err is not None:
+        return err
+    target, window = loc
+    if target.startswith("box:"):
+        return ("error: read is for file content — read a box's staged file "
+                "with shell in that box (cat); inspect shows its diff")
+    p = Path(target).expanduser()
+    if not p.is_file():
+        return f"error: not a file: {target!r}"
+    data = p.read_bytes()
+    if b"\0" in data[:4096]:
+        return f"error: binary file, {len(data)} bytes — not text"
+    text = data.decode("utf-8", errors="replace")
+    if window is None:
+        return text
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    a = max(1, min(window[0], len(lines)))
+    b = min(window[1], len(lines))
+    return "\n".join(lines[a - 1:b])
 
 
 # ── delete — roll back / collapse, or drop a finished sub-agent session ──────
@@ -1640,9 +1939,11 @@ def evaluate_call(
     ``apply`` / ``reject`` (manager-level): fold or discard a sub-agent's
     staged box — the ONLY gate; nothing ever auto-applies.
 
-    ``inspect``: list the structure at a path. ``delete``: roll back / collapse
-    this context, or drop a sub-agent session. Both are harness-native and act
-    on ``target_seg`` directly.
+    ``inspect`` / ``read``: harness-native locator lookups (paged + keyed —
+    page keys resolve against this session's own previous result turns; the
+    ``box:`` locators reach a box's staged diff through the executor).
+    ``delete``: roll back / collapse this context, or drop a sub-agent
+    session. These act on ``target_seg`` directly.
 
     An unknown tool name also yields an error-text result turn (the loop keeps
     moving; the model sees the error). Returns the written result turn
@@ -1670,15 +1971,26 @@ def evaluate_call(
     sender: str | None = None
     rolled_back = False
     if tool == "shell":
-        script = _parse_shell_arguments(arguments)
+        script, peek = _parse_shell_arguments(arguments)
         if executor is None:
             result = ("error: no executor configured — shell needs sarun "
                       "(its UI running); the script was NOT run")
+        elif peek:
+            # Read-only shell: a throwaway box, discarded right after — the
+            # output comes back, nothing stays staged anywhere.
+            scratch = box_name(target_seg) + "-PEEK"
+            r = executor.run_script(script, box=scratch)
+            executor.discard_box(scratch)
+            r.changes = "[throwaway box discarded — nothing stays staged]"
+            result = render_shell_result(r)
         else:
             result = render_shell_result(
                 executor.run_script(script, box=box_name(target_seg)))
     elif tool == "inspect":
-        result = inspect_path(_parse_inspect_arguments(arguments))
+        result = inspect_path(_parse_inspect_arguments(arguments),
+                              turns=turns, executor=executor)
+    elif tool == "read":
+        result = read_path(_parse_inspect_arguments(arguments), turns=turns)
     elif tool == "delete":
         tid, annotation, sess = _parse_delete_arguments(arguments)
         # A self-rollback removes the delete CALL turn itself, so it does NOT
@@ -1823,11 +2135,12 @@ def _finalize_answer(target: Path, ctx: _PreparedContext) -> Path:
     return final
 
 
-def _parse_shell_arguments(arguments: str) -> str:
-    """Parse a ``shell`` call's arguments into the script text.
+def _parse_shell_arguments(arguments: str) -> tuple[str, bool]:
+    """Parse a ``shell`` call's arguments into ``(script, discard)``.
 
     Tolerant like ``_parse_act_arguments``: a missing/dirty arguments string
-    (or one without a usable ``script``) is treated as the script verbatim.
+    (or one without a usable ``script``) is treated as the script verbatim
+    (with ``discard`` False).
     """
     try:
         obj = json.loads(arguments)
@@ -1836,8 +2149,8 @@ def _parse_shell_arguments(arguments: str) -> str:
     if isinstance(obj, dict):
         script = obj.get("script")
         if isinstance(script, str) and script:
-            return script
-    return arguments
+            return script, bool(obj.get("discard"))
+    return arguments, False
 
 
 def _parse_inspect_arguments(arguments: str) -> str:

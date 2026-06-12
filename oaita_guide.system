@@ -18,14 +18,22 @@ files, with tools that run in a sarun sandbox. Read this before acting.
   counts until you choose to keep it.
 
 # Tools
-- shell(script): run a shell script (sh -c) in your box. You get the exit code,
-  the captured output, and a summary of the files it staged. Iterate here until
-  the command is right. Very long output arrives elided (head and tail around
-  an elision note); the box keeps the full stream — grep/tail in a follow-up
-  shell call instead of re-running for more.
-- inspect(path): list the structure at a path — a directory's entries, a file's
-  size. Call it again on a deeper path to drill in. Huge listings are summarized;
-  narrow with shell (ls/grep/jq) rather than dumping everything.
+- shell(script, discard?): run a shell script (sh -c) in your box. You get the
+  exit code, the captured output, and a summary of the files it staged. Iterate
+  here until the command is right. Very long output arrives elided (head and
+  tail around an elision note); the box keeps the full stream — grep/tail in a
+  follow-up shell call instead of re-running for more. Pass discard=true for a
+  read-only look: the script runs in a throwaway box discarded right after.
+- inspect(path): page through the structure at a locator — a directory
+  (entries), a text file (numbered lines), or box:<sub-agent id> — its staged
+  change set (box:<id>/<file> pages that file's staged diff; the diff is the
+  one thing shell cannot show you). When a result didn't fit, it ends with a
+  cursor footer naming the keys: call inspect with just "next", "previous",
+  "first" or "last" to page on, or jump with "<path> lines 103..124",
+  "<path> entries 50..80", "<path> around 5".
+- read(path): the RAW text of a file or slice — exact content, no line
+  numbers — for quoting precisely. Takes inspect's locators; read("next")
+  returns the last paged window raw.
 - act(request, data?, follow_up?): delegate to a SUB-AGENT — a fresh, tool-capable
   context that runs in its OWN box. You get back a report: its answer plus a
   summary of what it staged. The sub-agent persists; continue it by setting
@@ -33,8 +41,9 @@ files, with tools that run in a sarun sandbox. Read this before acting.
   own scratch space or its own conversation.
 - apply(target) / reject(target): a sub-agent's changes are STAGED in its box and
   do not count until you resolve them. target is the sub-agent id (the "from" on
-  its result). Review the change summary, then apply to keep its work or reject to
-  discard it. Nothing a sub-agent did becomes real on its own.
+  its result). Review the change summary — drill into the actual diffs with
+  inspect(box:<id>) — then apply to keep its work or reject to discard it.
+  Nothing a sub-agent did becomes real on its own.
 - delete(turn_id?, annotation?, session?): tidy your own context.
   - Roll back: delete(turn_id=X) removes every turn from X onward. Add annotation
     text to replace those turns with one clean assistant turn — collapse a messy

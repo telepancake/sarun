@@ -956,8 +956,8 @@ def test_tools_capabilities_surfaced():
         tools = s.srv.requests[-1].json.get("tools")
         by_name = {t["function"]["name"]: t["function"] for t in tools}
         check("the registry tools are advertised",
-              set(by_name) == {"act", "shell", "inspect", "delete",
-                               "apply", "reject"})
+              set(by_name) == {"act", "shell", "inspect", "read",
+                               "delete", "apply", "reject"})
         check("custom capabilities embedded in the act description",
               "bespoke power" in by_name["act"]["description"])
         check("shell schema requires the script param",
@@ -1292,6 +1292,7 @@ class FakeExecutor:
         self.calls = []
         self.queue = []
         self.resolved = []           # ("apply"|"discard", box)
+        self.patches = {}            # box → staged unified diff text
 
     def stage(self, output, changes="", exit_code=0):
         self.queue.append(oaita.ExecResult(
@@ -1301,6 +1302,9 @@ class FakeExecutor:
     def run_script(self, script, box):
         self.calls.append((script, box))
         return self.queue.pop(0)
+
+    def patch_text(self, box):
+        return self.patches.get(box, "")
 
     def apply_box(self, box):
         self.resolved.append(("apply", box))
@@ -1465,7 +1469,7 @@ def test_result_budget_chokepoint():
         s.close()
 
 
-# ── 36c. inspect: directory listing + summary fuse + errors (units) ──────────
+# ── 36c. inspect: directory listing + paging fuse + errors (units) ───────────
 def test_inspect_path():
     s = Session()
     try:
@@ -1477,20 +1481,150 @@ def test_inspect_path():
         check("directory listing names entries with kinds",
               "file\ta.txt" in out and "dir\tsub" in out
               and "(2 entries)" in out)
-        check("a regular file reports its size",
-              oaita.inspect_path(str(d / "a.txt")).endswith("file, 1 bytes"))
+        fout = oaita.inspect_path(str(d / "a.txt"))
+        check("a file shows size, line count and numbered content",
+              "file, 1 bytes, 1 lines" in fout and "1\tx" in fout)
         check("missing path is an error",
               oaita.inspect_path(str(d / "nope")).startswith("error:"))
 
-        # The summary fuse trips past INSPECT_MAX_ENTRIES.
+        # An over-budget listing becomes a PAGE with a cursor footer.
         big = s.tmp / "big"
         big.mkdir()
-        for i in range(oaita.INSPECT_MAX_ENTRIES + 5):
-            (big / f"f{i:04d}").write_text("")
+        for i in range(600):
+            (big / f"f{i:04d}.dat").write_text("")
         summ = oaita.inspect_path(str(big))
-        check("a huge listing is summarized, not enumerated",
-              "summarized" in summ and "file(s)" in summ
-              and "f0001" not in summ)
+        check("a huge listing is paged: kind counts, page 1, cursor footer",
+              "600 entries — 600 file(s); showing 1.." in summ
+              and "f0000.dat" in summ and "f0599.dat" not in summ
+              and "[inspect " in summ and "next" in summ)
+    finally:
+        s.close()
+
+
+# ── 36c2. inspect locators: ranges, page keys, box innards; read ─────────────
+def test_inspect_file_ranges():
+    s = Session()
+    try:
+        f = s.tmp / "code.py"
+        f.write_text("".join(f"line{i}\n" for i in range(1, 31)))
+        out = oaita.inspect_path(str(f))
+        check("a small file shows numbered lines in full, no footer",
+              "1\tline1" in out and "30\tline30" in out
+              and "[inspect" not in out and "30 lines" in out)
+        sl = oaita.inspect_path(f"{f} lines 10..12")
+        check("an explicit range shows exactly that window",
+              "10\tline10" in sl and "12\tline12" in sl
+              and "9\tline9" not in sl and "13\tline13" not in sl)
+        check("the range result carries a parseable cursor footer",
+              "lines 10..12 of 30" in sl)
+        ar = oaita.inspect_path(f"{f} around line 5")
+        check("around N centers a window on the line",
+              "5\tline5" in ar and "1\tline1" in ar and "15\tline15" in ar
+              and "16\tline16" not in ar)
+    finally:
+        s.close()
+
+
+def test_inspect_page_keys_stateful():
+    """next/previous/first/last resolve against the LAST cursor footer among
+    the session's own result turns — the context is the cursor."""
+    s = Session()
+    try:
+        big = s.tmp / "big"
+        big.mkdir()
+        for i in range(600):
+            (big / f"entry-{i:04d}.dat").write_text("")
+        s.write_turn("conv", "0010.user", "look around")
+        s.srv.enqueue(CannedChat(tool_calls=[
+            ("inspect", json.dumps({"path": str(big)}), "c1")]))
+        s.generate("conv")
+        r1 = s.call("conv")[0].read_text()
+        m = None
+        for m in oaita._FOOTER_RE.finditer(r1):
+            pass
+        check("page 1 is reduced and ends with a parseable cursor",
+              m is not None and int(m["a"]) == 1
+              and "entry-0000.dat" in r1 and "entry-0599.dat" not in r1)
+        b1 = int(m["b"])
+
+        s.srv.enqueue(CannedChat(tool_calls=[
+            ("inspect", json.dumps({"path": "next"}), "c2")]))
+        s.generate("conv")
+        r2 = s.call("conv")[0].read_text()
+        check("'next' resumes exactly where the previous result stopped",
+              f"showing {b1 + 1}.." in r2
+              and f"entry-{b1:04d}.dat" in r2)
+
+        s.srv.enqueue(CannedChat(tool_calls=[
+            ("inspect", json.dumps({"path": "last"}), "c3")]))
+        s.generate("conv")
+        r3 = s.call("conv")[0].read_text()
+        check("'last' jumps to the final page", "entry-0599.dat" in r3)
+
+        check("a page key with no paged history is an explicit error",
+              oaita.inspect_path("next").startswith("error:"))
+    finally:
+        s.close()
+
+
+def test_inspect_box_innards():
+    ex = FakeExecutor()
+    ex.patches["OAITA-SUB1"] = (
+        "--- a/src/app.py\n+++ b/src/app.py\n@@ -1,2 +1,2 @@\n"
+        "-old\n+new\n keep\n"
+        "--- /dev/null\n+++ b/notes.txt\n@@ -0,0 +1 @@\n+hello\n")
+    over = oaita.inspect_path("box:sub1", executor=ex)
+    check("box overview lists staged files keyed by path",
+          "src/app.py: +1 -1" in over and "notes.txt: +1 -0" in over
+          and 'drill with "box:sub1/<file>"' in over)
+    drill = oaita.inspect_path("box:sub1/src/app.py", executor=ex)
+    check("box file drill pages that file's staged diff",
+          "+new" in drill and "-old" in drill
+          and "staged diff, +1 -1" in drill and "hello" not in drill)
+    check("a clean box says nothing is staged",
+          "nothing staged" in oaita.inspect_path("box:other", executor=ex))
+    check("box inspect without an executor is an explicit error",
+          oaita.inspect_path("box:sub1").startswith("error:"))
+    check("read refuses box locators, pointing at shell",
+          oaita.read_path("box:sub1/src/app.py").startswith("error:"))
+
+
+def test_read_tool():
+    s = Session()
+    try:
+        f = s.tmp / "doc.txt"
+        f.write_text("alpha\nbeta\ngamma\n")
+        check("read returns the raw content, no framing",
+              oaita.read_path(str(f)) == "alpha\nbeta\ngamma\n")
+        check("a lines slice is raw, no numbering",
+              oaita.read_path(f"{f} lines 2..3") == "beta\ngamma")
+        s.write_turn("conv", "0010.user", "quote it")
+        s.srv.enqueue(CannedChat(tool_calls=[
+            ("read", json.dumps({"path": f"{f} lines 2..2"}), "c1")]))
+        s.generate("conv")
+        check("the read tool result is the raw slice",
+              s.call("conv")[0].read_text() == "beta")
+    finally:
+        s.close()
+
+
+def test_shell_discard_readonly():
+    s = Session()
+    try:
+        s.write_turn("conv", "0010.user", "peek at the logs")
+        s.srv.enqueue(CannedChat(tool_calls=[
+            ("shell", '{"script": "tail log", "discard": true}', "c1")]))
+        s.generate("conv")
+        ex = FakeExecutor().stage("last line", changes="should-not-show")
+        res = s.call("conv", executor=ex)
+        check("a discard shell runs in a throwaway -PEEK box",
+              ex.calls == [("tail log", "OAITA-CONV-PEEK")])
+        check("the throwaway box is discarded right after the run",
+              ex.resolved == [("discard", "OAITA-CONV-PEEK")])
+        body = res[0].read_text()
+        check("the result reports the output and that nothing stays staged",
+              "last line" in body and "nothing stays staged" in body
+              and "should-not-show" not in body)
     finally:
         s.close()
 
@@ -1649,11 +1783,12 @@ def test_guide_dot_prepends():
               and "sarun sandbox" in ctx.messages[0]["content"])
         check("the task's own user turn follows it",
               ctx.messages[-1]["content"].endswith("do the thing"))
-        # The guide names every real tool (guards against drift).
-        for tool in ("shell", "inspect", "act", "apply", "reject", "delete"):
+        # The guide names every real tool (drift-proof: straight off the
+        # registry, so adding a tool without teaching it fails here).
+        for tool in oaita.tool_registry():
             check(f"guide documents the {tool!r} tool", tool in guide)
         check("guide does not invent a tool we don't have",
-              "read(" not in guide and "write(" not in guide)
+              "write(" not in guide and "replace(" not in guide)
     finally:
         s.close()
 
@@ -1704,6 +1839,11 @@ if __name__ == "__main__":
         test_result_budget_ladders,
         test_result_budget_chokepoint,
         test_inspect_path,
+        test_inspect_file_ranges,
+        test_inspect_page_keys_stateful,
+        test_inspect_box_innards,
+        test_read_tool,
+        test_shell_discard_readonly,
         test_inspect_tool_call,
         test_delete_rollback_and_session,
         test_depth_cap,

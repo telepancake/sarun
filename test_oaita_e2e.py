@@ -140,6 +140,16 @@ def e2e_shell_in_real_box():
                                capture_output=True, text=True, timeout=60)
         check("`sarun OAITA-E2E patch` returns the staged diff",
               patch.returncode == 0 and "+staged" in patch.stdout)
+
+        # And inspect's box: locators reach those innards natively — the
+        # staged change set is the one thing a shell cannot show.
+        over = oaita.inspect_path("box:e2e", executor=executor)
+        check("inspect box:<id> lists the REAL staged change set",
+              "oaita-e2e-proof.txt: +1 -0" in over)
+        rel = oaita._patch_files(executor.patch_text("OAITA-E2E"))[0][0]
+        drill = oaita.inspect_path(f"box:e2e/{rel}", executor=executor)
+        check("inspect box:<id>/<file> pages the staged diff itself",
+              "+staged" in drill and "staged diff, +1 -0" in drill)
     finally:
         subprocess.run([PYBIN, SARUN, "OAITA-E2E", "discard"],
                        capture_output=True, timeout=60)

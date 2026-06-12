@@ -48,6 +48,24 @@ CLI client for OpenAI-compatible chat APIs, depends on `sarun`.
   an elision note → clamped head; changes per-file → per-directory rollup →
   totals line. Final clamp at the evaluate_call chokepoint covers every tool.
   Nothing is lost: sarun keeps the full stream and full diff in the box.
+- inspect is PAGED and KEYED — the reduction ladder IS the inspect protocol:
+  every reduced result ends with a cursor footer (quoted target + window +
+  key legend) that the harness itself re-parses. Page keys next / previous /
+  first / last resolve against the most recent footer among the session's own
+  result turns — the context IS the cursor, no hidden state. Jump keys:
+  "<path> lines A..B" / "entries A..B" / "around N". Files page as numbered
+  lines; dirs as kind+name entries (with per-kind counts in the paged header).
+- inspect reaches box INNARDS natively: box:<id> lists the staged change set
+  (keyed by path), box:<id>/<file> pages that file's staged diff — the one
+  thing shell cannot show, since staged diffs ARE the results of shells
+  (executor.patch_text → sarun BOX patch). Proven against a real box in e2e.
+- `read` tool: the RAW text of a file/slice (no numbering, no framing) for
+  precise quoting — same locator grammar incl. page keys (read("next")
+  returns the last paged window raw). Box locators refused: staged FILE
+  content is shell-in-that-box's job; the diff is inspect's.
+- shell(discard=true) = read-only shell: the script runs in a throwaway
+  box (OAITA-<SESSION>-PEEK) discarded right after — output comes back,
+  nothing stays staged anywhere.
 - Narration kept: a reply with prose AND tool calls now keeps the prose as its
   own clean assistant turn before the c-turns (running tallies survive instead
   of being overwritten by the envelope).
@@ -177,6 +195,12 @@ CLI client for OpenAI-compatible chat APIs, depends on `sarun`.
   the caller must remember to use it (scenario 9 deliberately doesn't, to show
   the leak). Open: lifecycle policy — auto-drop on parent settle? a sweep
   command? mark-and-keep only those a follow-up referenced?
+- **a box's captured OUTPUTS aren't inspectable from outside yet.** The other
+  half of a box's innards — per-process stdout/stderr in the sqlar `outputs`
+  table — has no control-socket verb (only `patch` exists), so inspect's box:
+  locators stop at the change set. Needs a small sarun socket verb (`outputs`),
+  then box:<id> grows an outputs branch. Until then the bounded head inlined
+  in the .tool turn is all the caller sees of a sub-agent's stream.
 - **run interleaves all streams on one stdout** (outer + every leaf). Cosmetic;
   the files are the record.
 - **keep nondeterminism out of file contents** — the byte-replay scenario only

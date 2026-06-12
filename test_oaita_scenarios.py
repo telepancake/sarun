@@ -228,7 +228,7 @@ def test_scenario_delegation_and_follow_up():
         check("S1: every gen advertises the full registry (incl. the boxed "
               "sub-agent's own, from its subprocess)",
               all(r.tools and {t["function"]["name"] for t in r.tools}
-                  == {"act", "shell", "inspect", "delete", "apply", "reject"}
+                  == set(oaita.tool_registry())
                   for r in reqs))
         # The synthesis prompt narrates the call: assistant turn = envelope
         # JSON as content, tool turn with the from-bearing header.
