@@ -2333,6 +2333,14 @@ class Index:
         self._kinds: dict = {}
         self._opaque: set = set()
         self._targets: dict = {}          # rel -> symlink target bytes (RAM mirror)
+        # Dir-listing cache validity (see _scan_dir_cached): per-PARENT-dir
+        # generation counters bumped by every mirror mutation under that dir,
+        # plus a global epoch for subtree ops (prune_subtree/reparent) that
+        # touch many dirs at once. Per-dir scope matters: git-status-style
+        # workloads write .git/* every run — that must not invalidate the
+        # cached listings of unrelated directories.
+        self._dir_gens: dict = {}
+        self.mirror_epoch = 0
         self._lock = self._dbh.lock       # the db's shared lock (SQLite + mirror)
         self._load_mirror()
         # Stable pool id == the box's identity == the backing dir / sqlar stem.
@@ -2377,6 +2385,20 @@ class Index:
         return int(mode)
 
     # ── fast RAM accessors (hot path) ───────────────────────────────────────
+    def _bump_dir(self, path: str, also_self: bool = False) -> None:
+        """Invalidate the cached listing of `path`'s parent dir (the listing the
+        mutation changes). also_self: the mutation altered `path`'s OWN listing
+        too (its opaque flag). Called under _lock by the mirror mutators."""
+        p = path.rsplit("/", 1)[0] if "/" in path else ""
+        self._dir_gens[p] = self._dir_gens.get(p, 0) + 1
+        if also_self:
+            self._dir_gens[path] = self._dir_gens.get(path, 0) + 1
+
+    def dirlist_gen(self, rel: str) -> tuple:
+        """The dir-listing validity stamp for dir `rel`: (global epoch, this
+        dir's mutation count). GIL-atomic read — see _scan_dir_cached."""
+        return (self.mirror_epoch, self._dir_gens.get(rel, 0))
+
     def has_overlay_state(self) -> bool:
         return bool(self._whiteouts or self._kinds or self._opaque)
 
@@ -2669,6 +2691,7 @@ class Index:
                   detail: str = "", opaque=None, target=None,
                   mtime_ns=None) -> None:
         with self._lock:
+            self._bump_dir(path, also_self=opaque is not None)
             self._upsert(path, self._row_mode(kind, mode), writer_id, opaque)
             if kind == "symlink" and target is not None:
                 # Put the target into the row IMMEDIATELY (deflated, sz=len) so the
@@ -2703,6 +2726,7 @@ class Index:
 
     def del_entry(self, path, op: str = "del", writer_id=None) -> None:
         with self._lock:
+            self._bump_dir(path)
             self._db.execute("DELETE FROM sqlar WHERE name=?", (path,))
             self._db.commit()
             self._whiteouts.discard(path); self._kinds.pop(path, None)
@@ -2720,6 +2744,7 @@ class Index:
         Deletes any pre-existing row at `new`, then renames `old`->>`new` in-place.
         Updates the RAM mirror accordingly."""
         with self._lock:
+            self._bump_dir(old); self._bump_dir(new)
             # drop any pre-existing entry at the destination
             self._db.execute("DELETE FROM sqlar WHERE name=?", (new,))
             # rename in-place (rowid preserved)
@@ -2750,6 +2775,7 @@ class Index:
         pref = prefix + "/"
         pref_hi = pref[:-1] + chr(ord(pref[-1]) + 1)  # prefix range upper bound
         with self._lock:
+            self.mirror_epoch += 1
             # Free the pool blobs of any file rows under the prefix before dropping the
             # rows — otherwise the bytes leak (the row that named them is gone).
             for rid, mode in self._db.execute(
@@ -2775,6 +2801,7 @@ class Index:
         oldp = old + "/"; newp = new + "/"
         oldp_hi = oldp[:-1] + chr(ord(oldp[-1]) + 1)  # prefix range upper bound
         with self._lock:
+            self.mirror_epoch += 1
             rows = self._db.execute(
                 "SELECT rowid, name, mode, opaque FROM sqlar"
                 " WHERE name >= ? AND name < ?",
@@ -2912,6 +2939,7 @@ class Index:
         `data` is already deflated (raw-or-zlib per _sqlar_deflate); `sz` is the
         uncompressed length."""
         with self._lock:
+            self._bump_dir(rel)
             # _upsert ensures the row exists + updates mode/writer mirror.
             self._upsert(rel, mode, writer_id, None)
             self._db.execute(
@@ -2985,6 +3013,8 @@ def _build_overlay_ops():
             self._echo_enqueue: dict = {} # sid -> callable(stream, bytes)->cf.Future
             self._echo_flush: dict = {}   # sid -> callable() flush+half-close the echo
             self._dir_snaps: dict = {}    # fh -> DirHandle(inode, snapshot)
+            # (sid, rel) -> (validity token, entries) — see _scan_dir_cached.
+            self._dirlist_cache: dict = {}
             self._next_fh = 1
             # auto_cache bookkeeping: inode -> (size, mtime_ns) last handed to the
             # kernel page cache on a read-only open. Drives _autocache's invalidation.
@@ -3074,6 +3104,8 @@ def _build_overlay_ops():
         def remove_session(self, sid: str) -> None:
             with self._lock:
                 self.sessions.pop(sid, None)
+                for k in [k for k in self._dirlist_cache if k[0] == sid]:
+                    del self._dirlist_cache[k]
                 dead = [ino for ino, key in self._ino_to_key.items()
                         if key and key[0] == sid]
                 for ino in dead:
@@ -3290,7 +3322,7 @@ def _build_overlay_ops():
             real host directory."""
             p = self._parent(sid)
             if p is not None:
-                return {n: "lower" for n, _k, _a in self._scan_dir(p, rel)}
+                return {n: "lower" for n, _k, _a, _ap in self._scan_dir(p, rel)}
             out = {}
             try:
                 with os.scandir(self._lower_path(rel)) as it:
@@ -3968,11 +4000,69 @@ def _build_overlay_ops():
                 childrel = (rel + "/" + name) if rel else name
                 if childrel in self._self_rels:         # sarun's own dirs: invisible
                     continue
-                layer, _ap, st = self._resolve_st(sid, childrel)
+                layer, ap, st = self._resolve_st(sid, childrel)
                 if layer in ("absent", "whiteout"): continue
                 ino = self._ino_for(sid, childrel)
-                out.append((name, (sid, childrel), self._entry(ino, st)))
+                # ap is the entry's real on-disk backing (host file or pool blob)
+                # when it has one, None for synthetic rows — the dir-listing
+                # cache's revalidation handle.
+                out.append((name, (sid, childrel), self._entry(ino, st), ap))
             return out
+
+        def _scan_dir_cached(self, sid: str, rel: str) -> list:
+            """[(name, attrs)] for readdir, through a per-dir snapshot cache.
+
+            The kernel never caches FUSE directory listings, so without this every
+            readdir rebuilds the merged scan from scratch (a stat storm: git
+            status's untracked walk, shell globs, …). Validity token: (host dir
+            mtime_ns, Index.dirlist_gen(rel)) — the host dir mtime moves on any
+            lower name add/remove, the per-dir gen on any overlay mutation under
+            THIS dir (writes elsewhere don't invalidate it). Attrs are NEVER
+            served stale: on a hit every disk-backed entry is re-lstated (one
+            syscall) and its cached EntryAttributes reused only if the stat is
+            byte-identical; synthetic entries re-resolve through the RAM mirror.
+            Nested boxes (lower = parent's merged view, no single host dir to
+            version-stamp) bypass the cache."""
+            if self._parent(sid) is not None:
+                return [(n, a) for n, _k, a, _ap in self._scan_dir(sid, rel)]
+            try:
+                dmt = os.lstat(self._lower_path(rel)).st_mtime_ns
+            except OSError:
+                dmt = None
+            token = (dmt, self._index(sid).dirlist_gen(rel))
+            ck = (sid, rel)
+            hit = self._dirlist_cache.get(ck)
+            if hit is not None and hit[0] == token:
+                entries = hit[1]
+                out = []
+                for i, (name, childrel, attrs, ap) in enumerate(entries):
+                    st = None
+                    if ap is not None:
+                        try: st = os.lstat(ap)
+                        except OSError: st = None
+                        if (st is not None
+                                and st.st_mode == attrs.st_mode
+                                and st.st_size == attrs.st_size
+                                and st.st_mtime_ns == attrs.st_mtime_ns
+                                and st.st_ctime_ns == attrs.st_ctime_ns):
+                            out.append((name, attrs))
+                            continue
+                    if st is None:
+                        layer, ap, st = self._resolve_st(sid, childrel)
+                        if layer in ("absent", "whiteout"):
+                            out = None      # entry vanished under an unchanged
+                            break           # token (rename race): rebuild fully
+                    attrs = self._entry(attrs.st_ino, st)
+                    entries[i] = (name, childrel, attrs, ap)
+                    out.append((name, attrs))
+                if out is not None:
+                    return out
+            scan = self._scan_dir(sid, rel)
+            entries = [(name, key[1], attrs, ap) for name, key, attrs, ap in scan]
+            if len(self._dirlist_cache) > 4096:     # crude cap; refilled on demand
+                self._dirlist_cache.clear()
+            self._dirlist_cache[ck] = (token, entries)
+            return [(name, attrs) for name, _cr, attrs, _ap in entries]
 
         async def opendir(self, inode, ctx):
             with self._lock:
@@ -4000,8 +4090,7 @@ def _build_overlay_ops():
                         snap = [(c, self._synth_dir_attrs(self._ino_for(c, "")))
                                 for c in self._live_children(sid)]
                     elif sid in self.sessions:
-                        snap = [(name, attrs)
-                                for name, _k, attrs in self._scan_dir(sid, rel)]
+                        snap = self._scan_dir_cached(sid, rel)
                     else:
                         snap = []
                 if dh is None:
@@ -5076,7 +5165,7 @@ def _build_overlay_ops():
         def _materialize_tree(self, sid: str, rel: str, wid) -> None:
             """Walk the merged view of rel and copy every entry into the upper."""
             self._copyup_one(sid, rel, wid)
-            for name, _k, _a in self._scan_dir(sid, rel):
+            for name, _k, _a, _ap in self._scan_dir(sid, rel):
                 child = (rel + "/" + name) if rel else name
                 layer, _ap, st = self._resolve_st(sid, child)
                 if layer in ("absent", "whiteout"): continue

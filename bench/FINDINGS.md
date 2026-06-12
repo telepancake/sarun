@@ -173,3 +173,26 @@ ops. Reducing it would mean changes of a different character (e.g. servicing FUS
 on multiple OS threads, or shrinking per-op Python work) and a separate round of
 measurement — the `keep_cache` change is the single highest-leverage, lowest-risk
 win and stands on its own.
+
+## Addendum: the readdir snapshot cache (dir-listing cache)
+
+The kernel never caches FUSE directory listings, so readdir-heavy workloads
+(git status's untracked walk: one readdir per directory, every run) rebuilt the
+merged scan from scratch each time — for each entry: a layer resolution, a host
+lstat, and a fresh `EntryAttributes` (~14 µs/entry of mostly Python object
+churn, ~85% of warm `git status` overhead; verified by `showUntrackedFiles=no`
+collapsing the warm ratio from 7× to 1.9×).
+
+`_scan_dir_cached` now snapshots each directory's merged listing, validated by
+`(host dir mtime_ns, Index.dirlist_gen(rel))`. The gen is **per directory**
+(plus a global epoch for prune/reparent): git writes `.git/index` every run, and
+a global counter would invalidate every cached listing on any write anywhere —
+measured as exactly zero cache hits. Coherence: a hit re-lstats every
+disk-backed entry and reuses the cached `EntryAttributes` only when the stat is
+byte-identical (synthetic entries re-resolve through the RAM mirror), so attrs
+are never served staler than one fresh lstat — same doctrine as `_autocache`.
+
+git status, 5 000 tracked files, back-to-back runs: warm 0.079 s → 0.058 s
+(cold 0.59 s → 0.44 s). Runs spaced past the 1 s attr TTL are unchanged
+(~0.41 s) — those are bounded by the lookup/getattr storm, which is the
+single-trio-thread per-op tax above, not readdir.
