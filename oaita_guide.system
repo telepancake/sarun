@@ -20,7 +20,9 @@ files, with tools that run in a sarun sandbox. Read this before acting.
 # Tools
 - shell(script): run a shell script (sh -c) in your box. You get the exit code,
   the captured output, and a summary of the files it staged. Iterate here until
-  the command is right.
+  the command is right. Very long output arrives elided (head and tail around
+  an elision note); the box keeps the full stream — grep/tail in a follow-up
+  shell call instead of re-running for more.
 - inspect(path): list the structure at a path — a directory's entries, a file's
   size. Call it again on a deeper path to drill in. Huge listings are summarized;
   narrow with shell (ls/grep/jq) rather than dumping everything.

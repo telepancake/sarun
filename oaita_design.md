@@ -42,6 +42,12 @@ CLI client for OpenAI-compatible chat APIs, depends on `sarun`.
   stay flat and gateless. The gate between sessions IS the box apply.
 - LocalExecutor ($OAITA_EXECUTOR=local): ungated subprocess stand-in for
   tests/no-sarun — explicitly NOT a safe substitute, the gate lives in sarun.
+- Result budget: a `.tool` turn NEVER exceeds RESULT_BUDGET (8 KiB) chars.
+  No knob yet (later feature); the invariant is a ladder of increasingly
+  terse renderings tried until one fits: output verbatim → head+tail around
+  an elision note → clamped head; changes per-file → per-directory rollup →
+  totals line. Final clamp at the evaluate_call chokepoint covers every tool.
+  Nothing is lost: sarun keeps the full stream and full diff in the box.
 - Narration kept: a reply with prose AND tool calls now keeps the prose as its
   own clean assistant turn before the c-turns (running tallies survive instead
   of being overwritten by the envelope).

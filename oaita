@@ -754,8 +754,70 @@ class ExecResult:
     exit_code: int = 0
 
 
-def summarize_patch(patch: str) -> str:
-    """A terse, model-facing summary of a unified diff: per-file +/- counts."""
+# ── Result budget — a hard ceiling and ladders of terser renderings ──────────
+# A tool-result turn's text NEVER exceeds RESULT_BUDGET characters. There is
+# no configurable knob yet (later feature); what exists is the invariant: each
+# component is rendered down a ladder, verbose → terse, until it fits, and the
+# last rung always fits by construction. Nothing is lost by eliding — sarun
+# captures the full stream and the full diff in the box; the result turn is
+# the model-facing snippet, the box is the payload.
+RESULT_BUDGET = 8192
+CHANGES_BUDGET = RESULT_BUDGET // 4
+
+
+def fit(renderings, budget: int) -> str:
+    """First rendering (given verbose → terse) that fits ``budget``.
+
+    Renderings may be strings or zero-arg callables (terse rungs aren't built
+    unless needed). The final rung is clamped, so the return NEVER exceeds
+    ``budget`` even if every rung was too big.
+    """
+    text = ""
+    for r in renderings:
+        text = r() if callable(r) else r
+        if len(text) <= budget:
+            return text
+    return text[:budget]
+
+
+def fit_output(output: str, budget: int) -> str:
+    """Captured process output fit to ``budget``: verbatim → head + tail
+    around an elision note → a clamped head (one enormous line defeats the
+    line ladder). The elided middle isn't lost — the box's output capture
+    holds the full stream."""
+    if len(output) <= budget:
+        return output
+    if budget <= 192:                       # no room for a ladder, just clamp
+        return output[:max(budget, 0)]
+    lines = output.split("\n")
+    room = budget - 96                      # reserved for the elision note
+    head_budget = room * 2 // 3
+    head, used = [], 0
+    for ln in lines:
+        if used + len(ln) + 1 > head_budget:
+            break
+        head.append(ln)
+        used += len(ln) + 1
+    tail, used = [], 0
+    for ln in reversed(lines[len(head):]):
+        if used + len(ln) + 1 > room - head_budget:
+            break
+        tail.append(ln)
+        used += len(ln) + 1
+    tail.reverse()
+    elided = len(lines) - len(head) - len(tail)
+    note = (f"[… {elided} of {len(lines)} lines elided — "
+            f"the full output is captured in the box …]")
+    text = "\n".join([*head, note, *tail])
+    if (head or tail) and len(text) <= budget:
+        return text
+    return output[:budget - len(note) - 1] + "\n" + note
+
+
+def summarize_patch(patch: str, budget: int = CHANGES_BUDGET) -> str:
+    """A model-facing summary of a unified diff, fit to ``budget`` down a
+    ladder: per-file +/- counts → per-directory rollup → one totals line.
+    The full diff stays queryable in the box (``sarun BOX patch``)."""
     files: list[tuple[str, int, int]] = []
     name, plus, minus = None, 0, 0
     for line in patch.splitlines():
@@ -773,9 +835,32 @@ def summarize_patch(patch: str) -> str:
         files.append((name, plus, minus))
     if not files:
         return ""
-    lines = [f"{n}: +{p} -{m}" for n, p, m in files]
-    return f"{len(files)} file(s) changed (staged in the box):\n" + \
-        "\n".join(lines)
+    head = f"{len(files)} file(s) changed (staged in the box):"
+
+    def per_file():
+        return head + "\n" + "\n".join(
+            f"{n}: +{p} -{m}" for n, p, m in files)
+
+    def per_dir():
+        groups: dict[str, list[int]] = {}
+        for n, p, m in files:
+            d = n.rsplit("/", 1)[0] if "/" in n else "."
+            g = groups.setdefault(d, [0, 0, 0])
+            g[0] += 1
+            g[1] += p
+            g[2] += m
+        return head + "\n" + "\n".join(
+            f"{d}/: {c} file(s) +{p} -{m}"
+            for d, (c, p, m) in groups.items())
+
+    def totals():
+        return (f"{len(files)} file(s) changed: "
+                f"+{sum(p for _, p, _ in files)} "
+                f"-{sum(m for _, _, m in files)} "
+                f"(staged in the box — the list was too long to inline; "
+                f"query the box's patch)")
+
+    return fit([per_file, per_dir, totals], budget)
 
 
 def box_name(target_seg: str) -> str:
@@ -886,21 +971,29 @@ def render_act_result(r: ExecResult) -> str:
 
     The sub-agent's final turn (read through the box), then the box's staged
     change summary — a REPORT of staged state, never an application of it.
-    The caller resolves the box with apply/reject.
+    The caller resolves the box with apply/reject. Never exceeds
+    ``RESULT_BUDGET``: changes are pre-fit by ``summarize_patch``; the output
+    gets whatever room the rest leaves.
     """
     parts = []
     if r.exit_code != 0:
         parts.append(f"(sub-agent run exited {r.exit_code})")
-    parts.append(r.output)
-    if r.changes:
-        parts.append(r.changes)
+    changes = fit([r.changes], CHANGES_BUDGET) if r.changes else ""
+    room = RESULT_BUDGET - sum(len(p) + 1 for p in parts) - len(changes) - 1
+    parts.append(fit_output(r.output, room))
+    if changes:
+        parts.append(changes)
     return "\n".join(p for p in parts if p != "")
 
 
 def render_shell_result(r: ExecResult) -> str:
-    """The model-facing text of one shell run's ``.tool`` result turn."""
-    parts = [f"exit {r.exit_code}", r.output]
-    parts.append(r.changes if r.changes else "[no file changes]")
+    """The model-facing text of one shell run's ``.tool`` result turn.
+    Never exceeds ``RESULT_BUDGET`` (same budget split as act results)."""
+    frame = f"exit {r.exit_code}"
+    changes = fit([r.changes], CHANGES_BUDGET) if r.changes \
+        else "[no file changes]"
+    room = RESULT_BUDGET - len(frame) - len(changes) - 2
+    parts = [frame, fit_output(r.output, room), changes]
     return "\n".join(p for p in parts if p != "")
 
 
@@ -1648,7 +1741,11 @@ def evaluate_call(
     cur = load_turns(target_seg)
     pool |= {t.slug for t in cur if t.slug}
     slug = new_turn_id(pool, slot=f"{target_seg}/{next_number(cur)}")
-    return [append_raw_turn(target_seg, "tool", result,
+    # The never-exceed invariant lives HERE, the one place every tool's text
+    # becomes a turn: whatever a renderer (or an executor's raw CLI echo, or
+    # inspect) produced, the written result fits RESULT_BUDGET.
+    return [append_raw_turn(target_seg, "tool", fit_output(result,
+                                                           RESULT_BUDGET),
                             slug=slug, sender=sender)]
 
 

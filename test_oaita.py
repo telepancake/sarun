@@ -1412,6 +1412,59 @@ def test_summarize_patch_unit():
     check("file count stated", out.startswith("2 file(s) changed"))
 
 
+# ── 36b2. result budget: the hard ceiling and the rendering ladders ──────────
+def test_result_budget_ladders():
+    check("short output passes through verbatim",
+          oaita.fit_output("hello", 100) == "hello")
+    big = "\n".join(f"line {i:06d}" for i in range(5000))
+    out = oaita.fit_output(big, 2000)
+    check("long output never exceeds its budget", len(out) <= 2000)
+    check("head and tail survive around the elision note",
+          out.startswith("line 000000") and out.endswith("line 004999")
+          and "lines elided" in out and "captured in the box" in out)
+    clamped = oaita.fit_output("x" * 10000, 2000)
+    check("one enormous line falls to the clamped-head rung",
+          len(clamped) <= 2000 and clamped.startswith("x")
+          and "elided" in clamped)
+
+    # summarize_patch descends per-file → per-dir → totals as budget shrinks.
+    patch = "".join(
+        f"--- a/src/d{i % 40}/m{i}.py\n+++ b/src/d{i % 40}/m{i}.py\n"
+        f"@@\n+x\n-y\n"
+        for i in range(300))
+    full = oaita.summarize_patch(patch, budget=1 << 20)
+    check("a roomy budget enumerates per-file", "src/d0/m0.py: +1 -1" in full)
+    rolled = oaita.summarize_patch(patch, budget=1500)
+    check("a tight budget rolls files up per directory",
+          "src/d0/: 8 file(s) +8 -8" in rolled and len(rolled) <= 1500)
+    totals = oaita.summarize_patch(patch, budget=120)
+    check("a tiny budget keeps only the totals line",
+          totals.startswith("300 file(s) changed: +300 -300")
+          and len(totals) <= 120)
+    check("the default changes budget already rolls 300 files up",
+          len(oaita.summarize_patch(patch)) <= oaita.CHANGES_BUDGET)
+
+
+def test_result_budget_chokepoint():
+    s = Session()
+    try:
+        s.write_turn("conv", "0010.user", "flood me")
+        s.srv.enqueue(CannedChat(tool_calls=[
+            ("shell", '{"script": "yes spam | head -100000"}', "c1")]))
+        s.generate("conv")
+        ex = FakeExecutor().stage("spam\n" * 100_000, changes="", exit_code=0)
+        res = s.call("conv", executor=ex)
+        body = res[0].read_text()
+        check("a megabyte of output lands as a BOUNDED result turn",
+              len(body) <= oaita.RESULT_BUDGET)
+        check("the bounded turn still frames the run",
+              body.startswith("exit 0") and "[no file changes]" in body)
+        check("the elision points back at the box's full capture",
+              "captured in the box" in body)
+    finally:
+        s.close()
+
+
 # ── 36c. inspect: directory listing + summary fuse + errors (units) ──────────
 def test_inspect_path():
     s = Session()
@@ -1648,6 +1701,8 @@ if __name__ == "__main__":
         test_shell_tool,
         test_apply_reject_tools,
         test_summarize_patch_unit,
+        test_result_budget_ladders,
+        test_result_budget_chokepoint,
         test_inspect_path,
         test_inspect_tool_call,
         test_delete_rollback_and_session,
