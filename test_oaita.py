@@ -1577,6 +1577,34 @@ def test_add_turn():
         s.close()
 
 
+# ── 38. the canned guide installs and dot-prepends as a system turn ──────────
+def test_guide_dot_prepends():
+    s = Session()
+    try:
+        guide = (HERE / "oaita_guide.system").read_text(encoding="utf-8")
+        check("the guide file exists and is non-trivial", len(guide) > 200)
+        # Install exactly as `oaita add guide --type system < oaita_guide.system`.
+        import io
+        p = oaita.add_turn("guide", type="system",
+                           source=io.BytesIO(guide.encode()))
+        check("guide installs as a .system turn", p.name.endswith(".system"))
+
+        s.write_turn("task", "0010.user", "do the thing")
+        ctx = oaita.prepare_context("guide.task")
+        check("dot-prepended, the guide is the FIRST message",
+              ctx.messages[0]["role"] == "system"
+              and "sarun sandbox" in ctx.messages[0]["content"])
+        check("the task's own user turn follows it",
+              ctx.messages[-1]["content"].endswith("do the thing"))
+        # The guide names every real tool (guards against drift).
+        for tool in ("shell", "inspect", "act", "apply", "reject", "delete"):
+            check(f"guide documents the {tool!r} tool", tool in guide)
+        check("guide does not invent a tool we don't have",
+              "read(" not in guide and "write(" not in guide)
+    finally:
+        s.close()
+
+
 # ── standalone runner ────────────────────────────────────────────────────────
 if __name__ == "__main__":
     tests = [
@@ -1626,6 +1654,7 @@ if __name__ == "__main__":
         test_depth_cap,
         test_deterministic_ids_with_seed,
         test_add_turn,
+        test_guide_dot_prepends,
     ]
     for t in tests:
         try:
