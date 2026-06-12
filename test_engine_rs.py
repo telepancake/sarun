@@ -126,6 +126,60 @@ def main():
             check(ev.get("type") == "pong",
                   "engine-rs: broadcast event arrives on the subscribed conn")
 
+        # ── m3a: the overlay core — capture through <mnt>/<box_id> ──────────
+        rep = m.sync_request(sock, type="ui", verb="box_new", args=[])
+        check(rep and rep.get("ok"), "engine-rs: box_new answers")
+        bsid = rep["r"]["sid"]; root = Path(rep["r"]["root"])
+        check(root.is_dir(), "engine-rs: box root appears under the mount")
+
+        host_keep = Path("/root/m3a_keep.txt")
+        host_gone = Path("/root/m3a_gone.txt")
+        host_keep.write_bytes(b"lower\n")
+        host_gone.write_bytes(b"victim\n")
+        try:
+            # lazy capture: an O_RDWR open with NO write must record nothing
+            with open(root / "root/m3a_keep.txt", "r+b"):
+                pass
+            sp = m.sqlar_path(bsid)
+            check("root/m3a_keep.txt" not in {n for n, *_ in m.sqlar_list(sp)},
+                  "engine-rs: writable open with no write captures NOTHING (D3)")
+
+            # create a new file; append to a host file (copy-up); rm a host file
+            (root / "root/m3a_new.txt").write_bytes(b"made in rust\n")
+            with open(root / "root/m3a_keep.txt", "ab") as f:
+                f.write(b"upper\n")
+            (root / "root/m3a_gone.txt").unlink()
+            (root / "root/m3a_dir").mkdir()
+
+            # the box view merges; the HOST is untouched
+            check((root / "root/m3a_keep.txt").read_bytes() == b"lower\nupper\n",
+                  "engine-rs: append copy-up reads back merged through the box")
+            check(not (root / "root/m3a_gone.txt").exists(),
+                  "engine-rs: unlinked host file is hidden in the box view")
+            names = {p.name for p in (root / "root").iterdir()}
+            check("m3a_gone.txt" not in names and "m3a_new.txt" in names,
+                  "engine-rs: readdir merges upper and hides whiteouts")
+            check(host_keep.read_bytes() == b"lower\n" and host_gone.exists(),
+                  "engine-rs: the real host is untouched by any of it")
+
+            # the PYTHON readers verify the capture (same sqlar+pool layout)
+            rows = {n: mode for n, mode, *_ in m.sqlar_list(sp)}
+            check(m.sqlar_content(sp, "root/m3a_new.txt") == b"made in rust\n",
+                  "engine-rs: python sqlar_content reads the rust pool blob")
+            check(m.sqlar_content(sp, "root/m3a_keep.txt") == b"lower\nupper\n",
+                  "engine-rs: copy-up blob carries lower+upper bytes")
+            check(stat_mod.S_ISCHR(rows.get("root/m3a_gone.txt", 0)),
+                  "engine-rs: deletion is a python-readable tombstone")
+            check(stat_mod.S_ISDIR(rows.get("root/m3a_dir", 0)),
+                  "engine-rs: mkdir captured as a dir row")
+            wid2 = m.sqlar_writer_id(sp, "root/m3a_new.txt")
+            prov = m.sqlar_proc_prov(sp, wid2) if wid2 else None
+            check(prov is not None and prov.get("exe"),
+                  "engine-rs: writer provenance recorded and python-readable")
+        finally:
+            host_keep.unlink(missing_ok=True)
+            host_gone.unlink(missing_ok=True)
+
         eng.terminate()
         try: eng.wait(timeout=10)
         except subprocess.TimeoutExpired:

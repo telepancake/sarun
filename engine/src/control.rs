@@ -24,6 +24,7 @@ use crate::discover;
 pub struct Shared {
     pub selected: Option<String>,
     pub subscribers: Vec<UnixStream>,
+    pub overlay: Option<crate::overlay::Overlay>,
 }
 
 pub type State = Arc<Mutex<Shared>>;
@@ -156,6 +157,32 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
         "ping" => {
             broadcast(state, &json!({"type": "pong"}));
             json!("pong")
+        }
+        "box_new" => {
+            // m3a: create a box and expose <mnt>/<id> — the overlay-core path
+            // (the full runner register handshake is m3b).
+            let ov = state.lock().unwrap().overlay.clone();
+            let Some(ov) = ov else {
+                return json!({"ok": false, "error": "overlay not mounted"});
+            };
+            let id = boxes.keys().max().copied().unwrap_or(0) + 1;
+            match crate::capture::BoxState::create(id) {
+                Ok(b) => {
+                    ov.add_box(std::sync::Arc::new(b));
+                    json!({"sid": id.to_string(),
+                           "root": crate::paths::mnt_point().join(id.to_string())
+                                   .to_string_lossy()})
+                }
+                Err(e) => return json!({"ok": false,
+                                        "error": format!("box_new: {e}")}),
+            }
+        }
+        "box_drop" => {
+            let ov = state.lock().unwrap().overlay.clone();
+            if let (Some(ov), Some(id)) = (ov, arg_sid(args)) {
+                ov.remove_box(id);
+            }
+            json!({"ok": true})
         }
         other => {
             return json!({"ok": false, "error": format!("unknown verb '{other}'")});

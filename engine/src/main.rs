@@ -43,8 +43,10 @@ use fuser::ReplyEntry;
 use fuser::ReplyOpen;
 use fuser::Request;
 
+mod capture;
 mod control;
 mod discover;
+mod overlay;
 mod paths;
 
 const TTL: Duration = Duration::from_secs(1);
@@ -331,15 +333,35 @@ fn serve() -> i32 {
         libc::signal(libc::SIGTERM, on_term as libc::sighandler_t);
         libc::signal(libc::SIGINT, on_term as libc::sighandler_t);
     }
+    // Mount the multi-box overlay at the instance mountpoint (threads = cores).
+    let mnt = paths::mnt_point();
+    let ov = overlay::Overlay::new(PathBuf::from("/"));
+    let mut cfg = Config::default();
+    cfg.mount_options = vec![MountOption::FSName("sarun-rs".into())];
+    let n = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    cfg.n_threads = Some(n);
+    cfg.clone_fd = n > 1;
+    let session = match fuser::spawn_mount2(ov.clone(),
+                                            &mnt, &cfg) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            eprintln!("sarun-engine: overlay mount FAILED: {e} — boxes cannot run");
+            None
+        }
+    };
     let state: control::State = Default::default();
-    println!("sarun-engine: listening · {}", sock.display());
-    match control::serve(state, &sock) {
+    state.lock().unwrap().overlay = Some(ov.clone());
+    println!("sarun-engine: listening · {}  ·  overlay {}",
+             sock.display(), mnt.display());
+    let rc = match control::serve(state, &sock) {
         Ok(()) => 0,
         Err(e) => {
             eprintln!("sarun-engine: serve failed: {e}");
             1
         }
-    }
+    };
+    drop(session); // unmount
+    rc
 }
 
 fn main() {
