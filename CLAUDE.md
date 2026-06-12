@@ -36,9 +36,15 @@ its own `test_sakar*.py`) — do NOT touch `sakar` when working on `sarun`.
 First run also **builds a patched pyfuse3** (see section 0 of `sarun`):
 downloads a pinned sdist, applies an embedded patch, compiles it into
 `~/.cache/sarun/…`. That takes ~25 s ONCE (needs network + a C toolchain:
-gcc, pkg-config, libfuse3 dev headers — all present here), then it is cached
-and every later run is ~0.4 s. Do not be surprised by the first-run pause; it
-is not a hang.
+gcc, pkg-config, libfuse3 dev headers), then it is cached and every later run
+is ~0.4 s. Do not be surprised by the first-run pause; it is not a hang.
+
+Some fresh containers are missing the system packages. If the pyfuse3 build
+fails with `Package 'fuse3' … not found`, or boxes die with
+`FileNotFoundError: 'bwrap'`, install them first:
+```
+apt-get install -y libfuse3-dev fuse3 pkg-config bubblewrap
+```
 
 ## Run the tests
 Each `test_*.py` is standalone (repo `check()/_fails` + `__main__` style) AND
