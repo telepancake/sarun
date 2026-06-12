@@ -69,6 +69,7 @@ import re
 import shutil
 import sys
 import tempfile
+import time
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
@@ -1835,6 +1836,86 @@ def test_add_turn():
 
 
 # ── 38. the canned guide installs and dot-prepends as a system turn ──────────
+# ── 38. trace: the flight recorder that escapes the box ──────────────────────
+def test_trace_capture():
+    s = Session()
+    col = oaita.TraceCollector("127.0.0.1:0").start()
+    os.environ["OAITA_TRACE"] = col.endpoint
+    try:
+        s.write_turn("conv", "0010.user", "do the thing")
+        s.srv.expect("do the thing",
+                     CannedChat(tool_calls=[
+                         ("shell", '{"script": "make it so"}', "c1")]))
+        s.srv.expect("engaged", CannedChat(content="Done."))
+        ex = FakeExecutor().stage("engaged")
+        s.run("conv", executor=ex, max_steps=6)
+
+        deadline = time.time() + 5
+        want = ("run.start", "gen.request", "gen.reply", "call.eval",
+                "call.result", "gen.request", "gen.reply", "run.settled")
+        while time.time() < deadline and len(col.events) < len(want):
+            time.sleep(0.05)
+        names = [e["event"] for e in col.events]
+        check("the whole arc streams to the collector, in order",
+              names == list(want))
+        check("every event carries ts, pid and depth",
+              all({"ts", "pid", "depth"} <= set(e) for e in col.events))
+        req = col.events[1]
+        check("gen.request carries the FULL prompt (testcase fodder)",
+              any("do the thing" in (m.get("content") or "")
+                  for m in req["messages"])
+              and "shell" in req["tools"])
+        check("call.eval carries the tool and its raw arguments",
+              col.events[3]["tool"] == "shell"
+              and "make it so" in col.events[3]["arguments"])
+        check("call.result carries the rendered result",
+              "engaged" in col.events[4]["result"])
+        check("run.settled carries the final answer",
+              col.events[-1]["answer"] == "Done.")
+        check("the human rendering is one line per event",
+              "\n" not in oaita.render_trace(col.events[1]))
+    finally:
+        os.environ.pop("OAITA_TRACE", None)
+        col.stop()
+        s.close()
+
+
+def test_trace_never_breaks_the_run():
+    s = Session()
+    os.environ["OAITA_TRACE"] = "127.0.0.1:1"      # nothing listens there
+    try:
+        s.write_turn("conv", "0010.user", "hello")
+        s.srv.enqueue(CannedChat(content="hi"))
+        produced = s.run("conv", max_steps=4)
+        check("a dead trace endpoint is a silent no-op — the run completed",
+              len(produced) == 1
+              and oaita.load_turns("conv")[-1].read() == "hi")
+    finally:
+        os.environ.pop("OAITA_TRACE", None)
+        s.close()
+
+
+# ── 39. a length-cut reply stays a truthful partial ───────────────────────────
+def test_length_truncation_keeps_partial():
+    s = Session()
+    try:
+        s.write_turn("conv", "0010.user", "write an epic")
+        s.srv.enqueue(CannedChat(content="Once upon a",
+                                 finish_reason="length"))
+        produced = s.generate("conv")
+        tail = oaita.load_turns("conv")[-1]
+        check("a length-cut reply keeps its p flag (resumable, not 'done')",
+              "p" in tail.flags and tail.read() == "Once upon a")
+        # And a clean finish drops it, as ever.
+        s.srv.enqueue(CannedChat(content="Once upon a time. The end."))
+        s.generate("conv")
+        tail = oaita.load_turns("conv")[-1]
+        check("the regenerated turn completes IN PLACE and is clean",
+              tail.flags == "" and tail.read().endswith("The end."))
+    finally:
+        s.close()
+
+
 def test_guide_dot_prepends():
     s = Session()
     try:
@@ -1921,6 +2002,9 @@ if __name__ == "__main__":
         test_depth_cap,
         test_deterministic_ids_with_seed,
         test_add_turn,
+        test_trace_capture,
+        test_trace_never_breaks_the_run,
+        test_length_truncation_keeps_partial,
         test_guide_dot_prepends,
     ]
     for t in tests:

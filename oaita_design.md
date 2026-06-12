@@ -80,6 +80,44 @@ CLI client for OpenAI-compatible chat APIs, depends on `sarun`.
 - `delete` is now ONLY session GC (drop a spent sub-agent + its box); its
   old rollback/annotation half merged into backtrack(final=true). The `b`
   flag joined the filename grammar (waypoint ≠ answer).
+- TRACE — the flight recorder that escapes the box. `$OAITA_TRACE` names a
+  socket endpoint (`@name` abstract unix / `host:port` TCP — boxes share the
+  host netns, so both cross the overlay; the filesystem deliberately can't:
+  a box's writes are staged, gone on reject) and every oaita process — host
+  run AND in-box sub-agents — streams newline-JSON events to it: run.start,
+  gen.request (FULL prompt + tool names), gen.reply, call.eval, call.result,
+  exec.run/done, run.settled. Best-effort: no endpoint or dead collector →
+  silent no-op, never affects the run. `oaita trace [@oaita] [--jsonl FILE]`
+  is the collector: one human line per event live, full raw records to the
+  JSONL — the replayable record (gen.request/gen.reply pairs convert
+  straight into fakeserver expect-scripts → new testcases). Scenario 11
+  proves two processes (outer + subprocess sub-agent, depth 0 and 1) report
+  to one collector.
+- finish_reason="length" no longer lies: a token-cut reply KEEPS its `p`
+  flag (truthful resumable partial) instead of being banked as a finished
+  answer — run regenerates it and visibly exhausts max_steps rather than
+  quietly shipping half a thought upward.
+
+## Running locally (against a real endpoint)
+
+```sh
+./sarun                              # terminal 1: the UI = the box gate
+./oaita trace --jsonl /tmp/oaita.jsonl   # terminal 2: the flight recorder
+
+# terminal 3:
+export OPENAI_BASE_URL=http://127.0.0.1:8080/v1   # llama.cpp/vllm/ollama…
+export OPENAI_API_KEY=unused
+export OAITA_MODEL=whatever-the-server-serves
+export OAITA_TRACE=@oaita
+./oaita add guide --type system < oaita_guide.system   # once
+echo "your task here" | ./oaita add job
+./oaita run guide.job
+```
+
+Boxes appear in the sarun UI as OAITA-*; review/apply/discard there too.
+`OAITA_EXECUTOR=local` skips sarun entirely (UNGATED — trial runs only).
+Interrupting a run is safe: state is the files; rerun resumes. The trace
+JSONL is the record for debugging and for minting new expect-script tests.
 - Narration kept: a reply with prose AND tool calls now keeps the prose as its
   own clean assistant turn before the c-turns (running tallies survive instead
   of being overwritten by the envelope).

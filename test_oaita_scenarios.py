@@ -46,6 +46,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
@@ -709,6 +710,46 @@ def test_scenario_compaction_via_backtrack():
         st.close()
 
 
+# ── scenario 11: the trace crosses the process boundary ──────────────────────
+def test_scenario_trace_across_processes():
+    """The flight recorder's reason to exist: a delegation arc where the
+    sub-agent is a REAL `oaita run` subprocess, and BOTH processes stream to
+    the one collector ($OAITA_TRACE rides the environment — exactly how it
+    rides into a sarun box, which inherits env and shares the host netns)."""
+    st = Stage(seed="traced")
+    col = oaita.TraceCollector("127.0.0.1:0").start()
+    os.environ["OAITA_TRACE"] = col.endpoint
+    try:
+        _play_delegation(st)
+
+        deadline = time.time() + 10
+        while time.time() < deadline and not any(
+                e["event"] == "run.settled" and e.get("depth") == 0
+                for e in col.events):
+            time.sleep(0.05)
+        pids = {e["pid"] for e in col.events}
+        check("S11: at least two PROCESSES reported to the one collector",
+              len(pids) >= 2)
+        check("S11: the sub-agent's events arrive at depth 1",
+              any(e.get("depth") == 1 and e["event"] == "gen.request"
+                  for e in col.events))
+        check("S11: the outer arc settled at depth 0",
+              any(e["event"] == "run.settled" and e.get("depth") == 0
+                  and e.get("answer") == "Use MIT for the parser."
+                  for e in col.events))
+        inner = [e for e in col.events if e.get("depth") == 1]
+        check("S11: the inner generation is fully visible from outside "
+              "(prompt and reply) without touching its files",
+              any(e["event"] == "gen.request"
+                  and any("research MIT vs GPL" in (m.get("content") or "")
+                          for m in e.get("messages", [])) for e in inner)
+              and any(e["event"] == "run.settled" for e in inner))
+    finally:
+        os.environ.pop("OAITA_TRACE", None)
+        col.stop()
+        st.close()
+
+
 # ── standalone runner ────────────────────────────────────────────────────────
 if __name__ == "__main__":
     tests = [
@@ -721,6 +762,7 @@ if __name__ == "__main__":
         test_scenario_sarun_executor_wiring,
         test_scenario_count_lines_across_dir,
         test_scenario_compaction_via_backtrack,
+        test_scenario_trace_across_processes,
     ]
     for t in tests:
         print(f"\n── {t.__name__} ──")

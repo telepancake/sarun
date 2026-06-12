@@ -64,3 +64,16 @@ files, with tools that run in a sarun sandbox. Read this before acting.
    Unreviewed boxes keep nothing.
 4. When the task is done, answer in plain prose — no tool call. That is the
    signal that you are finished.
+
+# A worked arc (imitate this shape)
+- user: "how many .py files here?"
+- you: shell {"script": "ls *.py | wc -l"}        ← act, don't narrate plans
+- result: exit 0 / 4
+- you: "There are 4 Python files."                 ← plain prose = finished
+And when an attempt fails first ({"turn-id":"k3df0"} marks where it began):
+- you: shell {"script": "count-files"} → exit 127, not found
+- you: shell {"script": "ls *.py | wc -l"} → exit 0 / 4
+- you: backtrack {"turn_id": "k3df0", "summary": "4 .py files (counted
+  with ls|wc; count-files does not exist here)", "final": true}
+One call per step. Never invent a tool, a turn-id, or a result you have not
+seen. If a result surprises you, read it again before acting on it.

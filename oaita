@@ -130,8 +130,11 @@ import re
 import secrets
 import shlex
 import shutil
+import socket
 import string
 import sys
+import threading
+import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -934,6 +937,135 @@ def summarize_patch(patch: str, budget: int = CHANGES_BUDGET) -> str:
     return fit([per_file, per_dir, totals], budget)
 
 
+# ── trace — a flight recorder that escapes the box ───────────────────────────
+# $OAITA_TRACE names a collector endpoint that EVERY oaita process — the host
+# run and every sub-agent inside a box — streams newline-JSON events to. The
+# filesystem is exactly the wrong channel for this: a box's writes are STAGED
+# (invisible until apply, gone on reject), which is the whole point of the
+# sandbox and the antithesis of a trace. Sockets escape the overlay: boxes
+# run in the HOST network namespace, so TCP and Linux ABSTRACT unix sockets
+# (no filesystem path at all) cross it untouched. Endpoint forms:
+#   @name      → abstract AF_UNIX "name" (recommended: no fs, netns-wide)
+#   host:port  → TCP (127.0.0.1 when host is empty)
+#   /path      → filesystem AF_UNIX (host-side only; masked inside boxes)
+# Emission is best-effort and NEVER affects the run: no endpoint → no-op; a
+# connect/send failure silently disables tracing for this process. Events
+# carry ts/pid/depth so interleaved multi-process streams reassemble.
+
+_trace_state = {"endpoint": None, "sock": None}
+
+
+def _trace_addr(endpoint: str):
+    """An endpoint string → ``(address_family, connect/bind address)``."""
+    if endpoint.startswith("@"):
+        return socket.AF_UNIX, "\0" + endpoint[1:]
+    if ":" in endpoint:
+        host, _, port = endpoint.rpartition(":")
+        return socket.AF_INET, (host or "127.0.0.1", int(port))
+    return socket.AF_UNIX, endpoint
+
+
+def trace_event(event: str, **fields) -> None:
+    """Emit one trace event to ``$OAITA_TRACE`` (silent no-op without it)."""
+    endpoint = os.environ.get("OAITA_TRACE")
+    if not endpoint:
+        return
+    st = _trace_state
+    if st["endpoint"] != endpoint:            # first use, or env changed
+        st["endpoint"], st["sock"] = endpoint, None
+        try:
+            fam, addr = _trace_addr(endpoint)
+            s = socket.socket(fam, socket.SOCK_STREAM)
+            s.settimeout(5.0)
+            s.connect(addr)
+            st["sock"] = s
+        except (OSError, ValueError):
+            st["sock"] = None
+    if st["sock"] is None:
+        return
+    rec = {"ts": round(time.time(), 3), "pid": os.getpid(),
+           "depth": _depth_from_env(), "event": event, **fields}
+    try:
+        st["sock"].sendall(json.dumps(rec).encode("utf-8") + b"\n")
+    except OSError:
+        try:
+            st["sock"].close()
+        except OSError:
+            pass
+        st["sock"] = None                     # disabled until env changes
+
+
+class TraceCollector:
+    """Bind a trace endpoint and collect newline-JSON events from any number
+    of concurrent emitters. ``oaita trace`` wraps this with printing; tests
+    assert on ``.events`` directly.
+    """
+
+    def __init__(self, endpoint: str, on_event=None):
+        self.endpoint = endpoint
+        self.on_event = on_event
+        self.events: list[dict] = []
+        self._lock = threading.Lock()
+        self._srv = None
+
+    def start(self) -> "TraceCollector":
+        fam, addr = _trace_addr(self.endpoint)
+        self._srv = socket.socket(fam, socket.SOCK_STREAM)
+        if fam == socket.AF_INET:
+            self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._srv.bind(addr)
+        if fam == socket.AF_INET:
+            host, port = self._srv.getsockname()[:2]
+            self.endpoint = f"{host}:{port}"   # resolves a port-0 bind
+        self._srv.listen(64)
+        threading.Thread(target=self._accept, daemon=True).start()
+        return self
+
+    def _accept(self):
+        while True:
+            try:
+                conn, _ = self._srv.accept()
+            except OSError:
+                return                          # collector stopped
+            threading.Thread(target=self._reader, args=(conn,),
+                             daemon=True).start()
+
+    def _reader(self, conn):
+        with conn, conn.makefile("rb") as f:
+            for line in f:
+                try:
+                    rec = json.loads(line.decode("utf-8"))
+                except (ValueError, UnicodeDecodeError):
+                    continue
+                with self._lock:
+                    self.events.append(rec)
+                if self.on_event is not None:
+                    self.on_event(rec)
+
+    def stop(self):
+        if self._srv is not None:
+            try:
+                self._srv.close()
+            except OSError:
+                pass
+
+
+def render_trace(rec: dict) -> str:
+    """One human line per event: pid, depth-indent, event, clipped fields."""
+    bits = []
+    for k, v in rec.items():
+        if k in ("ts", "pid", "depth", "event"):
+            continue
+        s = v if isinstance(v, str) else json.dumps(v)
+        s = s.replace("\n", "\\n")
+        if len(s) > 120:
+            s = s[:120] + "…"
+        bits.append(f"{k}={s}")
+    indent = "  " * int(rec.get("depth") or 0)
+    return (f"{rec.get('pid', '?'):>7} {indent}{rec.get('event', '?')} "
+            + " ".join(bits))
+
+
 def box_name(target_seg: str) -> str:
     """The sarun box a session's shell runs share: ``OAITA-<SESSION>``.
 
@@ -963,13 +1095,17 @@ class SarunExecutor:
 
     def run_script(self, script: str, box: str) -> ExecResult:
         import subprocess
+        trace_event("exec.run", box=box, script=script)
         proc = subprocess.run(
             [*self._argv, box, "--", "sh", "-c", script],
             capture_output=True, text=True)
         output = proc.stdout + (("\n" + proc.stderr) if proc.stderr else "")
-        return ExecResult(output=output.strip("\n"),
-                          changes=summarize_patch(self.patch_text(box)),
-                          exit_code=proc.returncode)
+        r = ExecResult(output=output.strip("\n"),
+                       changes=summarize_patch(self.patch_text(box)),
+                       exit_code=proc.returncode)
+        trace_event("exec.done", box=box, exit_code=r.exit_code,
+                    output=r.output, changes=r.changes)
+        return r
 
     def patch_text(self, box: str) -> str:
         """The box's full staged unified diff (``sarun BOX patch``) — what
@@ -1006,9 +1142,12 @@ class LocalExecutor:
 
     def run_script(self, script: str, box: str) -> ExecResult:
         import subprocess
+        trace_event("exec.run", box=box, script=script, sandbox=False)
         proc = subprocess.run(["sh", "-c", script],
                               capture_output=True, text=True)
         output = proc.stdout + (("\n" + proc.stderr) if proc.stderr else "")
+        trace_event("exec.done", box=box, exit_code=proc.returncode,
+                    output=output.strip("\n"))
         return ExecResult(output=output.strip("\n"), changes="",
                           exit_code=proc.returncode)
 
@@ -1914,11 +2053,25 @@ def generate(
     # ONE main-model generation per `gen` (no agent loop anywhere in here).
     ctx = prepare_context(name)
     ctx.target_folder.mkdir(parents=True, exist_ok=True)
+    trace_event("gen.request", session=target_seg, spec=name, model=model,
+                messages=ctx.messages,
+                tools=[t["function"]["name"] for t in (tools_param or [])])
     stream = client.chat.completions.create(
         model=model, messages=ctx.messages, tools=tools_param, stream=True)
     resp = stream_to_file(stream, ctx.target, echo)
+    trace_event("gen.reply", session=target_seg, content=resp.content,
+                finish_reason=resp.finish_reason,
+                tool_calls=[{"name": c.name, "arguments": c.arguments,
+                             "id": c.id} for c in resp.tool_calls])
 
     if not resp.tool_calls:
+        if resp.finish_reason == "length":
+            # The reply was CUT OFF (token cap), not finished — keep the
+            # p-flagged partial on disk. A truthful resumable tail beats a
+            # silently truncated "answer" a parent would bank as final;
+            # run will regenerate it (and visibly fail max_steps rather
+            # than quietly ship half a thought).
+            return [ctx.target]
         # Plain reply: the streamed content is the final answer, already on disk.
         return [_finalize_answer(ctx.target, ctx)]
 
@@ -2026,6 +2179,8 @@ def evaluate_call(
         raise SystemExit(f"oaita: no unanswered tool call in {target_seg!r}")
     call_turn = pend[0]
     tool, arguments = _parse_call_envelope(call_turn.read())
+    trace_event("call.eval", session=target_seg, turn=call_turn.slug,
+                tool=tool, arguments=arguments)
 
     sender: str | None = None
     rolled_back = False
@@ -2070,6 +2225,8 @@ def evaluate_call(
             # left the call pending: fall through and answer it with the
             # error (else the loop would re-evaluate it forever).
             if not result.startswith("error:"):
+                trace_event("call.result", session=target_seg, tool=tool,
+                            result=result, rewound=True)
                 return []
     elif tool in ("apply", "reject"):
         # Manager-level: resolve a sub-agent's STAGED box — the only place
@@ -2127,8 +2284,10 @@ def evaluate_call(
     # The never-exceed invariant lives HERE, the one place every tool's text
     # becomes a turn: whatever a renderer (or an executor's raw CLI echo, or
     # inspect) produced, the written result fits RESULT_BUDGET.
-    return [append_raw_turn(target_seg, "tool", fit_output(result,
-                                                           RESULT_BUDGET),
+    result = fit_output(result, RESULT_BUDGET)
+    trace_event("call.result", session=target_seg, tool=tool, result=result,
+                sender=sender)
+    return [append_raw_turn(target_seg, "tool", result,
                             slug=slug, sender=sender)]
 
 
@@ -2161,6 +2320,7 @@ def run_to_completion(
     if client is None:
         client = make_client(base_url=base_url, api_key=api_key)
     target_seg = parse_stitch(name)[-1]
+    trace_event("run.start", session=target_seg, spec=name)
     produced: list[Path] = []
     for _ in range(max_steps):
         turns = load_turns(target_seg)
@@ -2173,6 +2333,8 @@ def run_to_completion(
                 and not set("pcb") & set(turns[-1].flags)):
             # A clean assistant tail is the answer — but a p (unfinished),
             # c (unevaluated call) or b (backtrack waypoint) tail keeps going.
+            trace_event("run.settled", session=target_seg,
+                        answer=turns[-1].read())
             return produced
         produced += generate(name, model=model, client=client, echo=echo,
                              capabilities=capabilities, depth=depth)
@@ -2384,6 +2546,18 @@ def build_parser() -> argparse.ArgumentParser:
     add.add_argument("--number", type=int, default=None, metavar="N",
                      help="grid number (default: highest+10)")
     add.set_defaults(func=_cmd_add)
+
+    trace = sub.add_parser(
+        "trace", help="run the trace collector (the flight recorder every "
+                      "$OAITA_TRACE-carrying process reports to)")
+    trace.add_argument(
+        "endpoint", nargs="?", default="@oaita",
+        help="endpoint to listen on: @name (abstract unix, default @oaita), "
+             "host:port (TCP), or /path (filesystem unix socket)")
+    trace.add_argument("--jsonl", default=None, metavar="FILE",
+                       help="also append every raw event to FILE (the "
+                            "replayable record — testcase fodder)")
+    trace.set_defaults(func=_cmd_trace)
     return parser
 
 
@@ -2458,6 +2632,32 @@ def _cmd_add(args) -> int:
                     flags=args.flags, number=args.number)
     print(path)
     return 0
+
+
+def _cmd_trace(args) -> int:
+    """Handler for ``oaita trace``: print one line per event as it arrives;
+    with ``--jsonl`` also append the raw record (full payloads, no clipping)
+    — the file a session can later be replayed / turned into tests from."""
+    sink = open(args.jsonl, "a", encoding="utf-8") if args.jsonl else None
+
+    def on_event(rec: dict):
+        print(render_trace(rec), flush=True)
+        if sink is not None:
+            sink.write(json.dumps(rec) + "\n")
+            sink.flush()
+
+    col = TraceCollector(args.endpoint, on_event=on_event).start()
+    print(f"oaita: tracing on {col.endpoint} — export "
+          f"OAITA_TRACE={col.endpoint} (Ctrl-C to stop)", file=sys.stderr)
+    try:
+        while True:
+            time.sleep(3600)
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        col.stop()
+        if sink is not None:
+            sink.close()
 
 
 def main(argv=None) -> int:
