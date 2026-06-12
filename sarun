@@ -8672,6 +8672,19 @@ class ChannelServer:
                     if line.strip():
                         reply = await self._dispatch_control(line, _peer_pid,
                                                              peer_pidfd=_pidfd)
+                        # A subscribe converts this connection into a one-way
+                        # event feed owned by its pump task (which closes it —
+                        # _adopted keeps _handle's finally from closing it too).
+                        # Register BEFORE the ack goes out (the ack is simply the
+                        # outbox's first item) so an event broadcast right after
+                        # the client sees the ack can never be lost to the race.
+                        if reply is not None and reply.get("_subscribe"):
+                            _adopted = True
+                            q = asyncio.Queue()
+                            q.put_nowait((json.dumps(reply) + "\n").encode())
+                            self._subscribers[conn] = q
+                            asyncio.ensure_future(self._pump_events(conn))
+                            return
                         if reply is not None:
                             try:
                                 await self._loop.run_in_executor(
@@ -8685,14 +8698,6 @@ class ChannelServer:
                                 await self._serve_box_channel(
                                     conn, reply["session_id"], reply.get("owner_token", ""),
                                     buf)
-                                return
-                            # A subscribe converts this connection into a one-way
-                            # event feed owned by its pump task (which closes it —
-                            # _adopted keeps _handle's finally from closing it too).
-                            if reply.get("_subscribe"):
-                                _adopted = True
-                                self._subscribers[conn] = asyncio.Queue()
-                                asyncio.ensure_future(self._pump_events(conn))
                                 return
                     continue
                 more = await self._loop.sock_recv(conn, 4096)
