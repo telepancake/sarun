@@ -689,6 +689,37 @@ def test_synthetic_kids_dir_routing():
     asyncio.run(run())
 
 
+def test_namespace_paths():
+    """--ns / $SLOPBOX_NS must namespace EVERY instance root — socket, mountpoint,
+    state (boxes), data, config (file rules) — so two instances never collide; ""
+    is the default instance with the historical paths."""
+    tmp = Path(tempfile.mkdtemp(prefix="ofl-"))
+    _redirect_state(tmp)
+    old = os.environ.pop("SLOPBOX_NS", None)
+    try:
+        roots = lambda: {str(p) for p in (m.state_home(), m.data_home(),
+                                          m.config_home(), m.runtime_home(),
+                                          m.mnt_point(), Path(m.sock_path()),
+                                          m.file_rules_file())}
+        base = roots()
+        check(all("slopbox" in p and "slopbox.A" not in p for p in base),
+              "ns: default instance uses the plain 'slopbox' roots")
+        os.environ["SLOPBOX_NS"] = "A"
+        nsa = roots()
+        check(all("slopbox.A" in p for p in nsa),
+              "ns: SLOPBOX_NS=A namespaces every root (socket/mnt/state/data/config)")
+        check(not (base & nsa), "ns: default and namespaced roots are fully disjoint")
+        os.environ["SLOPBOX_NS"] = "B"
+        check(not (nsa & roots()), "ns: two namespaces are disjoint from each other")
+        for bad in ("", ".", "a/b", "-x", "x" * 40):
+            check(not m.valid_namespace(bad), f"ns: rejects invalid name {bad!r}")
+        check(m.valid_namespace("ci-7_B"), "ns: accepts letters/digits/_/-")
+    finally:
+        if old is None: os.environ.pop("SLOPBOX_NS", None)
+        else: os.environ["SLOPBOX_NS"] = old
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_dirlist_cache_coherence():
     """The readdir snapshot cache (_scan_dir_cached) must speed up repeat listings
     WITHOUT ever serving stale data. Cases: (1) repeat listing is a cache hit with
@@ -768,7 +799,8 @@ if __name__ == "__main__":
               test_promote_into_parent_unit,
               test_collect_docs,
               test_synthetic_kids_dir_routing,
-              test_dirlist_cache_coherence):
+              test_dirlist_cache_coherence,
+              test_namespace_paths):
         print(f"\n== {t.__name__} ==")
         try:
             t()

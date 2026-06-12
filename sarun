@@ -467,17 +467,33 @@ def collect_docs() -> str:
 # touched (under the slopboxed HOME) would be captured by the overlay and show up
 # as a bogus "change". Real directory creation is deferred to ensure_dirs(),
 # called only by the UI and the runner.
+def namespace() -> str:
+    """The instance namespace, from $SLOPBOX_NS (set by the `--ns` CLI flag, or
+    inherited: a box's processes get the runner's environment, so a nested runner
+    lands in its parent's namespace by default). "" = the default instance."""
+    return os.environ.get("SLOPBOX_NS", "")
+
+def valid_namespace(ns: str) -> bool:
+    return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,32}", ns))
+
+def _app_dir() -> str:
+    """The per-instance app dirname: every storage/config/runtime root (and thus
+    the control socket, mountpoint, state, pool, rules) hangs off this one name,
+    so two namespaces are fully independent instances on the same system."""
+    ns = namespace()
+    return f"slopbox.{ns}" if ns else "slopbox"
+
 def data_home() -> Path:
     base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
-    return Path(base) / "slopbox"
+    return Path(base) / _app_dir()
 
 def config_home() -> Path:
     base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
-    return Path(base) / "slopbox"
+    return Path(base) / _app_dir()
 
 def runtime_home() -> Path:
     base = os.environ.get("XDG_RUNTIME_DIR")
-    return Path(base) / "slopbox" if base else data_home()
+    return Path(base) / _app_dir() if base else data_home()
 
 def live_home() -> Path:
     """Root of per-box backing dirs: live/<box_id>/up is the discovery sentinel (an
@@ -529,7 +545,7 @@ def blob_path(box_id: int, row_id: int) -> Path:
 
 def state_home() -> Path:
     base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
-    return Path(base) / "slopbox"
+    return Path(base) / _app_dir()
 
 def box_ctime(box_id) -> float:
     """A box's age anchor: the ctime of its on-disk identity — the sqlar if present,
@@ -11532,6 +11548,13 @@ def _make_ui_app():
 #: existing box the NAME must exist; for a [cyan]-- CMD[/] run a new NAME is created instead (§6).
 #: Examples:  [cyan]slopbox WORK patch > work.diff[/]   ·   [cyan]slopbox WORK apply[/]   ·   [cyan]slopbox A1 discard[/]
 #:
+#: [b]Namespaces:[/] [cyan]slopbox --ns NAME …[/] (any subcommand) selects an independent INSTANCE:
+#: its own control socket, mountpoint, boxes, state and file rules — so two slopbox
+#: instances can work on the same system without touching each other. The namespace is
+#: carried in [cyan]$SLOPBOX_NS[/] (the flag just sets it), and a box's processes inherit it —
+#: so a [b]nested[/] runner defaults to its parent's namespace automatically; pass [cyan]--ns[/] to
+#: override. No flag and no env = the default instance.
+#:
 #: [b]Headless:[/] [cyan]slopbox engine[/] runs the engine alone — the overlay mount and the
 #: control socket, no UI. Boxes ([cyan]slopbox -- CMD[/]) and all the subcommands above work
 #: against it identically; interactive review needs the UI instead. The UI embeds this
@@ -11674,7 +11697,8 @@ def cmd_rename(target, new_name) -> int:
     return 0
 
 
-_USAGE = ("slopbox                         start the UI\n"
+_USAGE = ("slopbox [--ns NAME] ...         select instance namespace (see below)\n"
+          "       slopbox                         start the UI\n"
           "       slopbox engine                  run headless (no UI): mount + control\n"
           "                                       socket only; boxes and patch/apply/\n"
           "                                       discard/rename work against it\n"
@@ -11697,6 +11721,23 @@ _USAGE = ("slopbox                         start the UI\n"
 
 def main() -> int:
     argv = sys.argv[1:]
+
+    # --ns NAME: select the instance namespace FIRST (before any path is built).
+    # Exported via the environment so every child (runner --inner, the box's
+    # processes, a nested runner inside the box) inherits it — a nested runner
+    # therefore defaults to its parent's namespace; --ns overrides.
+    if argv and (argv[0] == "--ns" or argv[0].startswith("--ns=")):
+        if argv[0] == "--ns":
+            if len(argv) < 2:
+                print("slopbox: --ns needs a name", file=sys.stderr); return 2
+            ns, argv = argv[1], argv[2:]
+        else:
+            ns, argv = argv[0][len("--ns="):], argv[1:]
+        if not valid_namespace(ns):
+            print("slopbox: invalid namespace (letters/digits/_/-, "
+                  "starts alphanumeric, max 33 chars)", file=sys.stderr)
+            return 2
+        os.environ["SLOPBOX_NS"] = ns
 
     # inner mode: slopbox --inner --conn-fd N [--capture] -- CMD...
     # --conn-fd N is the inherited single muxed connection to the UI (post-handshake).
