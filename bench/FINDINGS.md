@@ -228,3 +228,15 @@ git-status cold 104 → 86 µs/op (−17%), warm 0.064 → 0.058 s. exec-storm a
 file-churn unchanged — they are bounded by exec/copy-up and the capture write
 path (provenance + sqlite per write), not attribute construction; batching
 THAT write path is the next rung on the ladder.
+
+## Addendum: parallel builds — the single-thread serving ceiling
+
+All numbers above are SERIAL workloads. `bench/parallel_build.py` compiles a
+200-file C project with make -j1 vs -j8, native vs overlay (same bwrap). On a
+4-core box: native scales 4.0× with -j8; the overlay scales only 1.9×, because
+every FUSE request from all compiler processes is served by the ONE trio
+thread under the GIL. The overlay tax therefore GROWS with parallelism: 2.05×
+at -j1 → 4.28× at -j8 (and worsens with core count). This is the strongest
+measured argument for moving the serving loop out of single-threaded Python —
+free-threaded CPython, multiple FUSE worker threads in C, or a compiled
+engine — none of which the per-op micro-optimizations above address.
