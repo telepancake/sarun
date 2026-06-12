@@ -42,12 +42,18 @@ is at rest the moment it exits. Compression is delegated to the host fs if
 wanted. Known cost: tiny-file-heavy boxes pay inodes + block slack; the
 page-aligned arena (D6) is the contingency if that ever measures as pain.
 
-## D5 · FUSE passthrough backing fds (kernel 6.9+, fuser opened_passthrough)
-Because bytes are always real files (D4), both read and write paths may
-register backing fds and let the kernel move data with the daemon out of the
-loop. Accepted trade: provenance coarsens from per-write to per-OPEN
-(ctx.pid at open/close) — sufficient for the first/last-writer attribution
-the product actually displays. Fallback to daemon-served IO on older kernels.
+## D5 · FUSE passthrough backing fds — READ-ONLY opens only
+Because bytes are always real files (D4), read-only opens may register
+backing fds (kernel 6.9+, fuser opened_passthrough) and let the kernel serve
+reads with the daemon out of the loop — where the measured pain lives (build
+read storms). WRITE opens stay daemon-served: per-WRITE ctx.pid attribution
+is load-bearing, not a nicety — the common fork-after-open case (`sh -c
+'cmd > out'`: the SHELL opens, the child writes through the inherited fd)
+means per-open attribution would credit half a build's outputs to /bin/sh,
+and the writer/last_writer tags that file rules match against only mean
+anything if each write is attributed through shared fds. (This per-write pid
+is the entire reason the old engine patched pyfuse3; fuser exposes it
+natively via Request::pid.) Fallback to daemon-served reads on older kernels.
 
 ## D6 · Storage for the index (OPEN: rusqlite vs redb)
 The index (paths, modes, whiteouts, writers, process/provenance/env/outputs)
