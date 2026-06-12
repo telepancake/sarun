@@ -59,7 +59,7 @@ uv run --with pytest --with pytest-timeout --with "textual>=0.60" \
   pytest -q -p no:cacheprovider --ignore=test_e2e.py \
   --ignore=test_sakar.py --ignore=test_sakar_e2e.py --ignore=test_pjdfstest.py
 ```
-Expected today: **120 passed**. A single file:
+Expected today: **121 passed** (test_engine_rs self-skips without cargo). A single file:
 ```
 uv run --with pytest --with "pyfuse3>=3.2" --with "trio>=0.22" \
   pytest -q -p no:cacheprovider test_outputs_capture.py

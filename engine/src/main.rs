@@ -43,6 +43,10 @@ use fuser::ReplyEntry;
 use fuser::ReplyOpen;
 use fuser::Request;
 
+mod control;
+mod discover;
+mod paths;
+
 const TTL: Duration = Duration::from_secs(1);
 
 #[derive(Default)]
@@ -293,8 +297,56 @@ impl Filesystem for Passthrough {
     }
 }
 
+// m2 `serve` mode: the control socket at the instance's namespaced path,
+// speaking the Python ChannelServer's protocol (single-instance guard, ui
+// verbs over on-disk box discovery, subscribe event feed). No boxes yet —
+// register is refused politely; the overlay arrives at m3.
+static SOCK_FOR_SIGNAL: std::sync::OnceLock<std::ffi::CString> =
+    std::sync::OnceLock::new();
+
+extern "C" fn on_term(_sig: i32) {
+    // async-signal-safe teardown: drop the socket, exit clean.
+    if let Some(p) = SOCK_FOR_SIGNAL.get() {
+        unsafe { libc::unlink(p.as_ptr()) };
+    }
+    unsafe { libc::_exit(0) };
+}
+
+fn serve() -> i32 {
+    if let Err(e) = paths::ensure_dirs() {
+        eprintln!("sarun-engine: cannot create instance dirs: {e}");
+        return 1;
+    }
+    let sock = paths::sock_path();
+    // Single-instance guard, same semantics as the Python engine/UI: a live
+    // socket means an instance is running; a dead file is stale and replaced.
+    if std::os::unix::net::UnixStream::connect(&sock).is_ok() {
+        eprintln!("sarun-engine: an engine/UI is already running \
+                   (control socket {}).", sock.display());
+        return 4;
+    }
+    let c = std::ffi::CString::new(sock.as_os_str().as_encoded_bytes()).unwrap();
+    let _ = SOCK_FOR_SIGNAL.set(c);
+    unsafe {
+        libc::signal(libc::SIGTERM, on_term as libc::sighandler_t);
+        libc::signal(libc::SIGINT, on_term as libc::sighandler_t);
+    }
+    let state: control::State = Default::default();
+    println!("sarun-engine: listening · {}", sock.display());
+    match control::serve(state, &sock) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("sarun-engine: serve failed: {e}");
+            1
+        }
+    }
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
+    if std::env::args().nth(1).as_deref() == Some("serve") {
+        std::process::exit(serve());
+    }
     let mut mountpoint = None;
     let mut lower = PathBuf::from("/");
     let mut threads = 1usize;
