@@ -27,12 +27,20 @@ may change freely: there are no users to migrate (D8).
   (fetch-or-build the engine binary, hash-keyed cache — the same mechanism
   that builds patched pyfuse3 today). The pyfuse3 patch dies at m3.
 
-## D3 · Writes are writes
-No write buffers, no buffer→row reconciliation. Open-for-write creates/clones
-a real upper blob file; the box's writes are pwrites to it (ordinary file
-semantics by construction). Capture is bookkeeping (who opened, when closed,
-final stat) — never a reimplementation of file behavior. This is the direct
-fix for the old engine's wbuf bug class.
+## D3 · Writes are writes — and capture is LAZY (first-write, not open)
+No write buffers, no buffer→row reconciliation. But ALL capture cost
+(copy-up/blob creation, row creation, provenance) is deferred to the FIRST
+actual write op, never paid at open: builds open masses of files writably
+(O_RDWR locking patterns, archive updates) without writing a byte, and
+at-open capture made the old engine slog — first-write deferral was its
+load-bearing perf hack and is inherited here as a rule. A writable open
+serves reads from the lower file until the first write arrives; that write
+triggers copy-up, after which the box's writes are pwrites to the real blob
+(ordinary file semantics by construction). Capture is bookkeeping — never a
+reimplementation of file behavior. Bonus the same mechanism buys: first-write
+ctx.pid attribution is correct through inherited fds (fork-after-open / shell
+redirects), see D5. This is the direct fix for the old engine's wbuf bug
+class without losing its one good perf property.
 
 ## D4 · Uniform blob-per-file rest form
 EVERY non-empty regular file's bytes live in a separate blob file under the
