@@ -10106,7 +10106,7 @@ def _make_ui_app():
             Binding("q","quit","quit")]
         sessions=reactive({}, layout=True)
 
-        def __init__(self):
+        def __init__(self, remote: bool = False, engine_proc=None):
             super().__init__()
             # Snappy, not dial-up: disable smooth-scroll/other animation so
             # PgUp/PgDn jump a page instantly instead of re-compositing the whole
@@ -10120,12 +10120,24 @@ def _make_ui_app():
             self._view_filters={v:{"clauses":[], "on":False, "generated":False}
                            for v in self.FILTERABLE}
             self.frules_store=FileRules(file_rules_file())
-            # The UI owns the single pyfuse3 overlay mount (started in on_mount on a
-            # dedicated trio thread). The Supervisor drives it as boxes come and go.
+            # remote=False: this process IS the engine — it owns the single pyfuse3
+            # overlay mount (started in on_mount on a dedicated trio thread) and the
+            # control server; the Supervisor drives the mount as boxes come and go.
+            # remote=True (`slopbox attach`): the engine runs in ANOTHER process;
+            # self.sup is a RemoteSupervisor (RPC facade over the control socket),
+            # there is no local mount/server, and events arrive over a subscribe
+            # connection instead of direct callbacks. engine_proc: the engine
+            # subprocess if `attach` auto-spawned one (terminated on UI exit).
             # NB: not `self.mount` — that would shadow textual App.mount().
-            self.overlay_mount=OverlayMount(mnt_point(), lower="/")
-            self.sup=Supervisor(mount=self.overlay_mount)
-            self.sup.on_event=self._on_evt
+            self.remote=remote
+            self._engine_proc=engine_proc
+            if remote:
+                self.overlay_mount=None
+                self.sup=RemoteSupervisor()
+            else:
+                self.overlay_mount=OverlayMount(mnt_point(), lower="/")
+                self.sup=Supervisor(mount=self.overlay_mount)
+                self.sup.on_event=self._on_evt
             self.server=None
             self._sel_sid=None
             self._ch_entries=[]
@@ -10214,33 +10226,70 @@ def _make_ui_app():
             self.query_one("#out-tab",DataTable).add_columns(
                 "Time","Stream","Process","Bytes")
             loop=asyncio.get_running_loop()
-            # Start the single pyfuse3 overlay mount on its dedicated trio thread.
-            # Until it is up, no slopbox can run (it has nowhere to bind its root).
-            mount_ok=self.overlay_mount.start()
-            # A prior crash may have left orphaned live/<sid> backings: fold them
-            # off the loop so startup stays responsive behind a big orphan.
-            try: await self.sup.sweep_orphans(loop)
-            except Exception: pass
-            self.server=ChannelServer(self.sup, sock_path())
-            await self.server.start()
-            msg = f"listening · {sock_path()}"
-            if mount_ok:
-                msg += f"  ·  overlay {mnt_point()}"
+            if self.remote:
+                # Attached client: the engine (mount + server + sweep) lives in
+                # another process; subscribe to its event stream instead.
+                self._sub_task=asyncio.ensure_future(self._subscribe_events())
+                msg=f"attached · {sock_path()}"
             else:
-                err=getattr(self.overlay_mount,"_start_error",None)
-                msg += f"  [red](overlay mount FAILED: {err} — slopboxes cannot run)[/]"
+                # Start the single pyfuse3 overlay mount on its dedicated trio thread.
+                # Until it is up, no slopbox can run (it has nowhere to bind its root).
+                mount_ok=self.overlay_mount.start()
+                # A prior crash may have left orphaned live/<sid> backings: fold them
+                # off the loop so startup stays responsive behind a big orphan.
+                try: await self.sup.sweep_orphans(loop)
+                except Exception: pass
+                self.server=ChannelServer(self.sup, sock_path())
+                await self.server.start()
+                msg = f"listening · {sock_path()}"
+                if mount_ok:
+                    msg += f"  ·  overlay {mnt_point()}"
+                else:
+                    err=getattr(self.overlay_mount,"_start_error",None)
+                    msg += f"  [red](overlay mount FAILED: {err} — slopboxes cannot run)[/]"
             self._status(msg)
             self._refresh_file_rules()
-            for s in self.sup.sessions.values():
-                d=s.to_dict(); d["path"]=self.sup.display_path(s.session_id)
-                self.sessions={**self.sessions, s.session_id:d}
+            for d in self.sup.session_dicts():
+                self.sessions={**self.sessions, d["session_id"]:d}
             self._rebuild_sessions()
             self._set_view("boxes")           # shows only the slopbox list + detail
             self.set_interval(3, self._tick)
             # Live feedback: drain the overlay's thread-safe event queue often so the
             # Changes view updates as the box writes (event-driven, not by polling).
-            # The serving thread enqueues; we apply on the UI thread.
-            self.set_interval(0.3, self._drain_overlay_events)
+            # The serving thread enqueues; we apply on the UI thread. (Remote: the
+            # subscribe stream delivers these instead.)
+            if not self.remote:
+                self.set_interval(0.3, self._drain_overlay_events)
+
+        async def _subscribe_events(self):
+            """Attached-mode event pump: one persistent subscribe connection; every
+            JSON line is routed the same way the embedded UI's callbacks would be —
+            overlay FUSE events into the live-changes fold, consolidation progress
+            into the cons bar, everything else through _apply_evt."""
+            try:
+                reader,writer=await asyncio.open_unix_connection(sock_path())
+                writer.write(b'{"type":"subscribe"}\n'); await writer.drain()
+                await reader.readline()                  # the ack
+                while True:
+                    line=await reader.readline()
+                    if not line: break
+                    try: ev=wire_decode(json.loads(line))
+                    except (ValueError, TypeError): continue
+                    t=ev.get("type")
+                    if t=="overlay":
+                        self._apply_overlay_ev(ev.get("ev") or {})
+                    elif t=="consolidate_progress":
+                        self._cons_progress_update(ev["sid"],ev["done"],ev["total"])
+                    elif t=="consolidate_done":
+                        self._consolidate_done(ev["sid"])
+                    elif t=="consolidate_failed":
+                        self._consolidate_failed(ev["sid"],ev.get("error",""))
+                    else:
+                        self._apply_evt(ev)
+            except (OSError,asyncio.CancelledError):
+                pass
+            except Exception as e:
+                self._status(Text(f"event stream lost: {e}",style="red"))
 
         # ── off-loop consolidation (folding a finished box's overlay → sqlar) ──
         def _is_consolidating(self, sid):
@@ -10255,6 +10304,13 @@ def _make_ui_app():
             against a second worker for the same sid."""
             review=self.sup.review
             if sid in review._consolidating: return True
+            if self.remote:
+                # Engine-side fold: consolidate_start preps + runs it in the
+                # ENGINE's executor; progress/done/failed arrive as events.
+                if not review.consolidate_start(sid): return False
+                self._cons_progress[sid]=(0,0)
+                self._render_cons_bar()
+                return True
             args=review._consolidate_prep(sid)        # loop-thread: marks + drops Index
             if args is None: return False             # nothing to fold
             review._consolidating.add(sid)
@@ -10289,9 +10345,11 @@ def _make_ui_app():
         def _consolidate_done(self, sid):
             # LOOP thread (marshaled): finish registry bookkeeping, clear the in-progress
             # flag, and refresh whatever pane is showing this box so the now-consolidated
-            # change set renders in place of the placeholder.
-            self.sup.review._consolidate_finish(sid)
-            self.sup.review._consolidating.discard(sid)
+            # change set renders in place of the placeholder. (Remote: the engine
+            # already ran finish/discard — only the UI-side caches need clearing.)
+            if not self.remote:
+                self.sup.review._consolidate_finish(sid)
+                self.sup.review._consolidating.discard(sid)
             self._cons_progress.pop(sid, None)
             self._fin_changes.pop(sid, None)   # force a fresh read of the folded sqlar
             self._ch_decor.pop(sid, None)
@@ -10304,9 +10362,10 @@ def _make_ui_app():
         def _consolidate_failed(self, sid, err):
             # LOOP thread (marshaled): don't wedge the box forever — drop the flags and
             # surface the error. (prep already added it to _consolidated; clearing that
-            # too lets a later view retry the fold.)
-            self.sup.review._consolidating.discard(sid)
-            self.sup.review._consolidated.discard(sid)
+            # too lets a later view retry the fold. Remote: the engine cleared both.)
+            if not self.remote:
+                self.sup.review._consolidating.discard(sid)
+                self.sup.review._consolidated.discard(sid)
             self._cons_progress.pop(sid, None)
             self._render_cons_bar()
             self._status(Text(f"consolidate {sid[:8]} failed: {err}", style="red"))
@@ -10359,7 +10418,7 @@ def _make_ui_app():
             shown once the box finishes."""
             out=[]
             try:
-                for rel,size in self.overlay_mount.open_files(sid):
+                for rel,size in self.sup.open_files(sid):
                     rel=rel.lstrip("/")
                     host=Path("/")/rel
                     kind="modified" if (host.exists() or host.is_symlink()) else "created"
@@ -10430,6 +10489,17 @@ def _make_ui_app():
             self._ch_decor.pop(sid, None)
             self.sup.review.invalidate_struct(sid)
 
+        def _apply_overlay_ev(self, ev):
+            """Fold ONE overlay FUSE event into the live map and refresh the pane —
+            the attached-mode (subscribe stream) counterpart of one drain step."""
+            if ev.get("type")!="overlay_changed" or not ev.get("sid"): return
+            sid=ev["sid"]
+            self._fold_event(sid, ev.get("rel"), ev.get("op"))
+            if self.view=="changes" and self._sel_sid==sid:
+                self._load_changes(sid)
+            if self.view=="boxes" and self._sel_sid==sid:
+                self._update_box_detail()
+
         def _drain_overlay_events(self):
             # Live proc pruning runs on THIS reliable 0.3s cadence (not the 3s
             # _tick, which can be starved): re-poll the active set every tick the
@@ -10461,6 +10531,16 @@ def _make_ui_app():
         async def on_unmount(self):
             try: self._cancel_struct()    # kill any in-flight structural parser
             except Exception: pass
+            if self.remote:
+                t=getattr(self,"_sub_task",None)
+                if t is not None: t.cancel()
+                # If `attach` auto-spawned the engine, this UI owns its lifetime:
+                # terminate it (boxes torn down, overlay unmounted — the embedded
+                # UI's quit semantics). An adopted pre-existing engine stays up.
+                if self._engine_proc is not None:
+                    try: self._engine_proc.terminate()
+                    except Exception: pass
+                return
             if self.server: await self.server.stop()
             # Tear down the single overlay mount; lazy-unmount fallback keeps the
             # mount table clean even if a handler is wedged.
@@ -11131,7 +11211,8 @@ def _make_ui_app():
                 if e["kind"]=="deleted":
                     cache[rel]=dict(is_text=False, stale=False, kind="deleted")
                 else:
-                    if src is None: src=self.sup.review._source(sid)
+                    if src is None and not self.remote:
+                        src=self.sup.review._source(sid)   # remote: engine resolves
                     try: cache[rel]=self.sup.review.decorate(sid, rel, source=src)
                     except Exception: cache[rel]=dict(is_text=False, stale=False, kind=e["kind"])
                 cells=self._ch_cells(e, depth)
@@ -11200,6 +11281,10 @@ def _make_ui_app():
                 except Exception:
                     try: proc.kill()
                     except Exception: pass
+            if self.remote and self._struct_job is not None:
+                # Engine-side parsers: kill them via their job id.
+                try: self.sup.review.struct_cancel(self._struct_job)
+                except Exception: pass
             self._struct_job=None
 
         def _stop_struct_spin(self):
@@ -11892,9 +11977,15 @@ def _make_ui_app():
 #:
 #: [b]Headless:[/] [cyan]slopbox engine[/] runs the engine alone — the overlay mount and the
 #: control socket, no UI. Boxes ([cyan]slopbox -- CMD[/]) and all the subcommands above work
-#: against it identically; interactive review needs the UI instead. The UI embeds this
-#: same engine, so only one of the two may run at a time. Stop it with Ctrl-C (SIGTERM
-#: also works); boxes are torn down and the overlay is unmounted on exit.
+#: against it identically. The plain UI embeds this same engine, so only one of the two
+#: may run at a time. Stop it with Ctrl-C (SIGTERM also works); boxes are torn down and
+#: the overlay is unmounted on exit.
+#:
+#: [b]Attach:[/] [cyan]slopbox attach[/] runs the SAME interactive UI as a pure client of a running
+#: engine: every pane reads, and every action acts, over the control socket — nothing is
+#: mounted in the UI process. If no engine is up, attach spawns a headless one and owns
+#: it (quitting the UI stops it, like the embedded UI); attaching to an engine that was
+#: already running leaves it running when you quit.
 def run_ui() -> int:
     # A single UI instance only: if one is already running its control socket
     # answers, so refuse a second.
@@ -11976,6 +12067,40 @@ def run_engine() -> int:
         except Exception: pass
 
 
+def run_attach() -> int:
+    """Remote UI (`slopbox attach`): the full Textual UI as a pure CLIENT of a
+    running engine — every read/action goes over the control socket, no mount or
+    server in this process. If no engine is running, auto-spawn a headless one
+    first; an auto-spawned engine is OWNED by this UI (terminated when it exits,
+    matching the embedded UI's quit semantics), while a pre-existing engine is
+    merely attached to and left running."""
+    ensure_dirs()
+    proc = None
+    if not ui_is_running(sock_path()):
+        log = data_home() / "engine.log"
+        lf = open(log, "ab")
+        try:
+            proc = subprocess.Popen([sys.executable, find_self(), "engine"],
+                                    stdout=lf, stderr=subprocess.STDOUT,
+                                    start_new_session=True)
+        finally:
+            lf.close()
+        deadline = time.time() + 60
+        while time.time() < deadline and not ui_is_running(sock_path()):
+            if proc.poll() is not None:
+                print(f"slopbox: engine failed to start (log: {log})",
+                      file=sys.stderr)
+                return 4
+            time.sleep(0.2)
+        if not ui_is_running(sock_path()):
+            try: proc.terminate()
+            except Exception: pass
+            print(f"slopbox: engine never came up (log: {log})", file=sys.stderr)
+            return 4
+    _make_ui_app()(remote=True, engine_proc=proc).run()
+    return 0
+
+
 def cmd_patch(target=None) -> int:
     """Print the unified patch for a slopbox to stdout, by asking the running UI over
     the control socket. `target` (an sid/NAME) selects the box; None = the UI's
@@ -12041,6 +12166,8 @@ def cmd_rename(target, new_name) -> int:
 
 _USAGE = ("slopbox [--ns NAME] ...         select instance namespace (see below)\n"
           "       slopbox                         start the UI\n"
+          "       slopbox attach                  UI as a CLIENT of a running engine\n"
+          "                                       (auto-spawns one if none is up)\n"
           "       slopbox engine                  run headless (no UI): mount + control\n"
           "                                       socket only; boxes and patch/apply/\n"
           "                                       discard/rename work against it\n"
@@ -12102,6 +12229,10 @@ def main() -> int:
     # Headless mode: the engine (mount + control socket) without the UI.
     if argv[0] == "engine":
         return run_engine()
+
+    # Remote UI: attach to a running engine (auto-spawning one if needed).
+    if argv[0] == "attach":
+        return run_attach()
 
     # An optional leading box NAME (dotted or single segment, all-CAPS) selects that
     # box; the rest of the line then applies to it. `slopbox BOB patch`,
