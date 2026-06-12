@@ -213,3 +213,18 @@ box-local (the native baseline jitters, the additive FUSE cost doesn't).
 Reference run, dev container 2026-06-14 (post dir-listing cache + engine/UI
 split): git-status 89 µs/op cold · 0.058 s warm; exec-storm 1.7×;
 file-churn 3.4×; rpc 0.35 ms/verb.
+
+## Addendum: batch attr/readdir helpers in the pyfuse3 patch
+
+The per-entry Python cost of the metadata path was dominated by struct
+ceremony: 13 interpreted property assignments to build each EntryAttributes,
+plus one readdir_reply call per entry. The embedded pyfuse3 patch now adds
+`entry_attributes_fast()` (fills the whole fuse_entry_param in one C call) and
+`readdir_reply_batch()` (packs a listing slice into the kernel buffer in one
+call per directory); `_entry()` and `readdir()` use them.
+
+Measured with bench/workloads.py, same box, SARUN_PATH=previous revision:
+git-status cold 104 → 86 µs/op (−17%), warm 0.064 → 0.058 s. exec-storm and
+file-churn unchanged — they are bounded by exec/copy-up and the capture write
+path (provenance + sqlite per write), not attribute construction; batching
+THAT write path is the next rung on the ladder.

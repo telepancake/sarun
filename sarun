@@ -138,6 +138,10 @@ _PYFUSE3_SDIST_SHA256 = (
 # The patch, embedded as exact (old -> new) source edits applied programmatically
 # to the extracted sdist. handlers.pxi: thread the request context into both
 # write entry points; _pyfuse3.py: add the required `ctx` param to Operations.write.
+# __init__.pyx: two batch helpers for the metadata hot path —
+# entry_attributes_fast() builds a fully-populated EntryAttributes in ONE C call
+# (vs 13 interpreted property assignments per entry), and readdir_reply_batch()
+# packs a whole listing slice into the kernel buffer in one call per directory.
 _PYFUSE3_PATCH = (
     ("src/pyfuse3/handlers.pxi",
      "async def fuse_write_async (_Container c, pbuf):\n"
@@ -168,6 +172,89 @@ _PYFUSE3_PATCH = (
     ("src/pyfuse3/_pyfuse3.py",
      "    async def write(self, fh: FileHandleT, off: int, buf: bytes) -> int:",
      "    async def write(self, fh: FileHandleT, off: int, buf: bytes, ctx) -> int:"),
+    ("src/pyfuse3/__init__.pyx",
+     "    cname = PyBytes_AsString(name)\n"
+     "    len_ = fuse_add_direntry_plus(token.req, token.buf, token.size,\n"
+     "                                  cname, &attr.fuse_param, next_id)\n"
+     "    if len_ > token.size:\n"
+     "        return False\n"
+     "\n"
+     "    token.size -= len_\n"
+     "    token.buf = &token.buf[len_]\n"
+     "    return True\n",
+     "    cname = PyBytes_AsString(name)\n"
+     "    len_ = fuse_add_direntry_plus(token.req, token.buf, token.size,\n"
+     "                                  cname, &attr.fuse_param, next_id)\n"
+     "    if len_ > token.size:\n"
+     "        return False\n"
+     "\n"
+     "    token.size -= len_\n"
+     "    token.buf = &token.buf[len_]\n"
+     "    return True\n"
+     "\n"
+     "\n"
+     "def entry_attributes_fast(unsigned long long ino, unsigned int mode,\n"
+     "                          unsigned long nlink, unsigned int uid,\n"
+     "                          unsigned int gid, unsigned long long rdev,\n"
+     "                          long long size, long long atime_ns,\n"
+     "                          long long mtime_ns, long long ctime_ns,\n"
+     "                          double attr_timeout, double entry_timeout):\n"
+     "    '''Build a fully-populated EntryAttributes in ONE call (sarun patch).\n"
+     "\n"
+     "    Equivalent to constructing EntryAttributes() and assigning every field\n"
+     "    through its property, but the unbox-and-store loop runs in C: one\n"
+     "    boundary crossing per entry instead of thirteen. st_blksize is fixed\n"
+     "    at 512 and st_blocks derived from size (the convention the caller\n"
+     "    used anyway).'''\n"
+     "    cdef EntryAttributes ent = EntryAttributes.__new__(EntryAttributes)\n"
+     "    ent.fuse_param.ino = ino\n"
+     "    ent.attr.st_ino = ino\n"
+     "    ent.fuse_param.attr_timeout = attr_timeout\n"
+     "    ent.fuse_param.entry_timeout = entry_timeout\n"
+     "    ent.attr.st_mode = mode\n"
+     "    ent.attr.st_nlink = nlink\n"
+     "    ent.attr.st_uid = uid\n"
+     "    ent.attr.st_gid = gid\n"
+     "    ent.attr.st_rdev = rdev\n"
+     "    ent.attr.st_size = size\n"
+     "    ent.attr.st_blksize = 512\n"
+     "    ent.attr.st_blocks = (size + 511) // 512\n"
+     "    ent.attr.st_atime = atime_ns // _NANOS_PER_SEC\n"
+     "    SET_ATIME_NS(ent.attr, atime_ns % _NANOS_PER_SEC)\n"
+     "    ent.attr.st_mtime = mtime_ns // _NANOS_PER_SEC\n"
+     "    SET_MTIME_NS(ent.attr, mtime_ns % _NANOS_PER_SEC)\n"
+     "    ent.attr.st_ctime = ctime_ns // _NANOS_PER_SEC\n"
+     "    SET_CTIME_NS(ent.attr, ctime_ns % _NANOS_PER_SEC)\n"
+     "    return ent\n"
+     "\n"
+     "\n"
+     "def readdir_reply_batch(ReaddirToken token, items):\n"
+     "    '''Report MANY directory entries in one call (sarun patch).\n"
+     "\n"
+     "    *items* is a sequence of (name: bytes, EntryAttributes, next_id)\n"
+     "    triples. Packs entries into the kernel buffer until it fills; returns\n"
+     "    the number accepted (== len(items) when everything fit). Semantics\n"
+     "    per entry are identical to readdir_reply().'''\n"
+     "    cdef char *cname\n"
+     "    cdef EntryAttributes attr\n"
+     "    cdef off_t next_id\n"
+     "    cdef size_t len_\n"
+     "    cdef int n = 0\n"
+     "    if token.buf_start == NULL:\n"
+     "        token.buf_start = <char*> calloc_or_raise(token.size, sizeof(char))\n"
+     "        token.buf = token.buf_start\n"
+     "    for name, a, nid in items:\n"
+     "        attr = <EntryAttributes?> a\n"
+     "        next_id = nid\n"
+     "        cname = PyBytes_AsString(name)\n"
+     "        len_ = fuse_add_direntry_plus(token.req, token.buf, token.size,\n"
+     "                                      cname, &attr.fuse_param, next_id)\n"
+     "        if len_ > token.size:\n"
+     "            return n\n"
+     "        token.size -= len_\n"
+     "        token.buf = &token.buf[len_]\n"
+     "        n += 1\n"
+     "    return n\n"),
 )
 
 # Short, stable identity of the patch so the cache key changes if the patch does.
@@ -310,11 +397,14 @@ if "--inner" not in _bootstrap_sys.argv:
     # Hard assertion: refuse to run on stock pyfuse3. The patched build's
     # Operations.write carries a `ctx` parameter; stock does not.
     if "ctx" not in _bootstrap_inspect.signature(
-            pyfuse3.Operations.write).parameters:
+            pyfuse3.Operations.write).parameters or \
+            not hasattr(pyfuse3, "entry_attributes_fast") or \
+            not hasattr(pyfuse3, "readdir_reply_batch"):
         raise SystemExit(
             "FATAL: active pyfuse3 is NOT the patched build (Operations.write "
-            "lacks `ctx`). The patched pyfuse3 (which surfaces the writer pid on "
-            f"FUSE write) is mandatory. Its cache is {_pyfuse3_cache_dir()}; "
+            "lacks `ctx`, or the batch attr/readdir helpers are missing). The "
+            "patched pyfuse3 (which surfaces the writer pid on FUSE write) is "
+            f"mandatory. Its cache is {_pyfuse3_cache_dir()}; "
             "delete it to force a clean rebuild.")
 
 import abc
@@ -3793,22 +3883,14 @@ def _build_overlay_ops():
             self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
 
         def _entry(self, ino: int, st) -> "pyfuse3.EntryAttributes":
-            a = pyfuse3.EntryAttributes()
-            a.st_ino = ino
-            a.st_mode = st.st_mode
-            a.st_nlink = st.st_nlink
-            a.st_uid = self.squash_uid
-            a.st_gid = self.squash_gid
-            a.st_rdev = getattr(st, "st_rdev", 0)
-            a.st_size = st.st_size
-            a.st_blksize = 512
-            a.st_blocks = (st.st_size + 511) // 512
-            a.st_atime_ns = getattr(st, "st_atime_ns", 0)
-            a.st_mtime_ns = getattr(st, "st_mtime_ns", 0)
-            a.st_ctime_ns = getattr(st, "st_ctime_ns", 0)
-            a.attr_timeout = ATTR_TIMEOUT
-            a.entry_timeout = ENTRY_TIMEOUT
-            return a
+            # One C call fills the whole struct (patched-pyfuse3 helper) — the
+            # field-by-field property version cost ~13 interpreted assignments
+            # per entry, the bulk of readdir/lookup's per-entry Python time.
+            return pyfuse3.entry_attributes_fast(
+                ino, st.st_mode, st.st_nlink, self.squash_uid, self.squash_gid,
+                getattr(st, "st_rdev", 0), st.st_size,
+                getattr(st, "st_atime_ns", 0), getattr(st, "st_mtime_ns", 0),
+                getattr(st, "st_ctime_ns", 0), ATTR_TIMEOUT, ENTRY_TIMEOUT)
 
         def _synth_dir_attrs(self, ino: int) -> "pyfuse3.EntryAttributes":
             a = pyfuse3.EntryAttributes()
@@ -4112,11 +4194,12 @@ def _build_overlay_ops():
                 if dh is None:
                     dh = DirHandle(inode=inode); self._dir_snaps[fh] = dh
                 dh.snapshot = snap
-            for i in range(start_id, len(snap)):
-                name, attrs = snap[i]
-                if not pyfuse3.readdir_reply(
-                        token, os.fsencode(name), attrs, i + 1):
-                    break
+            # One C call packs the whole slice into the kernel buffer (patched-
+            # pyfuse3 helper) — vs one readdir_reply crossing per entry.
+            pyfuse3.readdir_reply_batch(
+                token, [(os.fsencode(name), attrs, i + 1)
+                        for i, (name, attrs) in enumerate(snap[start_id:],
+                                                          start_id)])
 
         async def releasedir(self, fh):
             self._dir_snaps.pop(fh, None)
