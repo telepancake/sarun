@@ -11882,12 +11882,14 @@ def _make_ui_app():
 
         @on(DataTable.RowHighlighted, "#s-tab")
         def _sc(self, ev):
+            if not self.is_running: return   # late event during app teardown
             if ev.row_key and ev.row_key.value:
                 sid=ev.row_key.value
                 self._sel_sid=sid
                 if sid!=self._last_loaded_sid:
                     self._last_loaded_sid=sid
-                    self._load_changes(sid, force=True)
+                    try: self._load_changes(sid, force=True)
+                    except Exception: return  # widgets mid-unmount: stale event
                 if self.view=="boxes": self._update_box_detail()
 
         @on(DataTable.RowSelected, "#s-tab")
