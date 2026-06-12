@@ -187,6 +187,32 @@ impl BoxState {
         self.kinds.write().unwrap().insert(rel.to_string(), Entry::Whiteout);
     }
 
+    pub fn set_meta(&self, key: &str, value: &str) {
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute(
+            "INSERT INTO meta(key,value) VALUES(?1,?2)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![key, value],
+        );
+    }
+
+    /// The box's ROOT process row (root=1): the runner itself, provenance from
+    /// the register message body (tgid/exe/cwd/argv).
+    pub fn root_process(&self, prov: &serde_json::Value) {
+        let g = |k: &str| prov.get(k).and_then(|v| v.as_str()).unwrap_or("");
+        let tgid = prov.get("tgid").and_then(|v| v.as_i64())
+            .or_else(|| prov.get("pid").and_then(|v| v.as_i64())).unwrap_or(0);
+        let ppid = prov.get("ppid").and_then(|v| v.as_i64()).unwrap_or(0);
+        let argv = prov.get("argv").cloned()
+            .unwrap_or(serde_json::Value::Array(vec![]));
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute(
+            "INSERT OR IGNORE INTO process(tgid,start,ppid,parent_id,exe,cwd,argv,root)
+             VALUES(?1,0,?2,NULL,?3,?4,?5,1)",
+            params![tgid, ppid, g("exe"), g("cwd"), argv.to_string()],
+        );
+    }
+
     /// Drop a row entirely (an upper-only file was unlinked: nothing to white
     /// out, the change simply un-happens). Removes the blob too.
     pub fn drop_row(&self, rel: &str) {

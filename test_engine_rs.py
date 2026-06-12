@@ -107,8 +107,11 @@ def main():
         except m.RemoteError as e:
             check("unknown verb" in str(e), "engine-rs: unknown verb refused")
         rep = m.sync_request(sock, type="register", session_id="X", cmd=["true"])
-        check(rep is not None and rep.get("ok") is False,
-              "engine-rs: register refused politely (m2: no boxes yet)")
+        check(rep is not None and rep.get("ok") is True and rep.get("mount"),
+              "engine-rs: register acks with the mount bind target")
+        check("_box_sid" not in (rep or {}),
+              "engine-rs: internal markers never reach the wire")
+        time.sleep(0.5)   # sync_request closed the conn: teardown should fire
         rep = m.sync_request(sock, type="nonsense")
         check(rep is not None and rep.get("ok") is False
               and "unknown control type" in (rep.get("error") or ""),
@@ -179,6 +182,41 @@ def main():
         finally:
             host_keep.unlink(missing_ok=True)
             host_gone.unlink(missing_ok=True)
+
+        # ── m3b: the REAL python runner (bwrap + --inner) against rust ──────
+        victim = Path("/root/m3b_victim.txt")
+        out_host = Path("/root/m3b_out.txt")
+        victim.write_bytes(b"v\n"); out_host.unlink(missing_ok=True)
+        try:
+            r = subprocess.run(
+                [sys.executable, SARUN, "RSE2E", "--", "sh", "-c",
+                 "echo rust-box > /root/m3b_out.txt && rm /root/m3b_victim.txt"],
+                capture_output=True, text=True, timeout=120)
+            check(r.returncode == 0,
+                  f"engine-rs: python runner exits 0 against rust engine "
+                  f"(got {r.returncode}: {r.stderr[-300:]})")
+            check(not out_host.exists() and victim.exists(),
+                  "engine-rs: box writes captured, host untouched")
+            sp2 = max(Path(os.environ["XDG_STATE_HOME"])
+                      .joinpath("slopbox.RS").glob("*.sqlar"),
+                      key=lambda p: int(p.stem))
+            check(m.sqlar_meta_get(sp2, "name") == "RSE2E",
+                  "engine-rs: runner-supplied NAME recorded in meta")
+            check(m.sqlar_content(sp2, "root/m3b_out.txt") == b"rust-box\n",
+                  "engine-rs: box-run output captured, python-readable")
+            rows2 = {n: mode for n, mode, *_ in m.sqlar_list(sp2)}
+            check(stat_mod.S_ISCHR(rows2.get("root/m3b_victim.txt", 0)),
+                  "engine-rs: box-run deletion is a tombstone")
+            check(bool(m.root_cmd(sp2.stem)),
+                  "engine-rs: root process row records the runner's argv")
+            mnt_names = {p.name for p in
+                         (Path(os.environ["XDG_RUNTIME_DIR"]) / "slopbox.RS"
+                          / "mnt").iterdir()}
+            check(sp2.stem not in mnt_names,
+                  "engine-rs: box gone from the mount after teardown (conn EOF)")
+        finally:
+            victim.unlink(missing_ok=True)
+            out_host.unlink(missing_ok=True)
 
         eng.terminate()
         try: eng.wait(timeout=10)

@@ -83,8 +83,7 @@ fn dispatch(state: &State, msg: &Value) -> Value {
     let t = msg.get("type").and_then(Value::as_str).unwrap_or("");
     match t {
         "subscribe" => json!({"ok": true, "_subscribe": true}),
-        "register" => json!({"ok": false,
-                             "error": "engine m2: boxes not yet supported"}),
+        "register" => register(state, msg),
         "select" => {
             let sid = msg.get("sid").and_then(Value::as_str).map(String::from);
             let boxes = discover::discover();
@@ -105,8 +104,7 @@ fn dispatch(state: &State, msg: &Value) -> Value {
 }
 
 fn resolve(boxes: &std::collections::BTreeMap<i64, discover::Box_>,
-           ident: &str) -> Option<i64> {
-    if let Ok(id) = ident.parse::<i64>() {
+           ident: &str) -> Option<i64> {    if let Ok(id) = ident.parse::<i64>() {
         if boxes.contains_key(&id) {
             return Some(id);
         }
@@ -118,6 +116,62 @@ fn resolve(boxes: &std::collections::BTreeMap<i64, discover::Box_>,
 
 fn arg_sid(args: &[Value]) -> Option<i64> {
     args.first()?.as_str()?.parse().ok()
+}
+
+/// The runner register handshake (m3b). Mints a box_id, creates the backing
+/// sentinel (live/<id>/up) and the box's sqlar (root process row from the
+/// message's prov), registers the box on the overlay, and acks with the
+/// <mnt>/<id> bind target. The SAME connection becomes the box channel —
+/// its EOF (handled by the caller via the _box_sid marker) is teardown.
+/// Honest m3b limits: capture mode is downgraded in the ack (no sink files /
+/// echo frames yet — the runner then behaves as -t passthrough), and nested
+/// (relname) registration is refused.
+fn register(state: &State, msg: &Value) -> Value {
+    let ov = state.lock().unwrap().overlay.clone();
+    let Some(ov) = ov else {
+        return json!({"ok": false, "error": "overlay mount is not available"});
+    };
+    if msg.get("relname").is_some() {
+        return json!({"ok": false,
+                      "error": "engine m3b: nested boxes not yet supported"});
+    }
+    let boxes = discover::discover();
+    let live_max = ov.box_ids().into_iter().max().unwrap_or(0);
+    let id = boxes.keys().max().copied().unwrap_or(0).max(live_max) + 1;
+    // NAME: the runner-supplied session_id is only a NAME candidate.
+    let want = msg.get("session_id").and_then(Value::as_str).unwrap_or("");
+    let valid = !want.is_empty()
+        && want.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+        && want.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()
+                            || c == '-')
+        && !want.ends_with('-');
+    let name = if valid { want.to_string() } else { format!("A{id}") };
+    let backing = crate::paths::live_home().join(id.to_string());
+    if let Err(e) = std::fs::create_dir_all(backing.join("up")) {
+        return json!({"ok": false, "error": format!("backing: {e}")});
+    }
+    let b = match crate::capture::BoxState::create(id) {
+        Ok(b) => b,
+        Err(e) => return json!({"ok": false, "error": format!("sqlar: {e}")}),
+    };
+    b.set_meta("name", &name);
+    if let Some(prov) = msg.get("prov") {
+        b.root_process(prov);
+    }
+    ov.add_box(std::sync::Arc::new(b));
+    let root = crate::paths::mnt_point().join(id.to_string());
+    json!({
+        "ok": true, "mount": root.to_string_lossy(),
+        "shm_dir": backing.to_string_lossy(),
+        "owner_token": format!("{:032x}", std::process::id() as u128
+                               ^ (id as u128) << 64
+                               ^ std::time::SystemTime::now()
+                                 .duration_since(std::time::UNIX_EPOCH)
+                                 .map(|d| d.as_nanos()).unwrap_or(0)),
+        "box_id": id, "session_id": id.to_string(), "name": name,
+        "capture": false,             // m3b: echo/sinks not yet — runner runs -t-style
+        "_box_sid": id,               // caller marker: this conn is now the box channel
+    })
 }
 
 fn dispatch_ui(state: &State, msg: &Value) -> Value {
@@ -209,10 +263,32 @@ fn handle(state: State, conn: UnixStream) {
             continue;
         }
         let Ok(msg) = serde_json::from_str::<Value>(&line) else { return };
-        let reply = dispatch(&state, &msg);
+        let mut reply = dispatch(&state, &msg);
         let subscribe = reply.get("_subscribe").and_then(Value::as_bool)
             .unwrap_or(false);
+        let box_sid = reply.as_object_mut()
+            .and_then(|o| o.remove("_box_sid"))
+            .and_then(|v| v.as_i64());
         if writer.write_all(format!("{reply}\n").as_bytes()).is_err() {
+            return;
+        }
+        if let Some(id) = box_sid {
+            // This connection IS the box's channel now: hold it open (frames
+            // are ignored in m3b — no echo yet); EOF is the teardown signal.
+            let mut sink = [0u8; 4096];
+            loop {
+                use std::io::Read;
+                match reader.read(&mut sink) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+            let ov = state.lock().unwrap().overlay.clone();
+            if let Some(ov) = ov {
+                ov.remove_box(id);
+            }
+            broadcast(&state, &json!({"type": "session_removed",
+                                      "session_id": id.to_string()}));
             return;
         }
         if subscribe {

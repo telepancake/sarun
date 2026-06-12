@@ -147,6 +147,10 @@ impl Overlay {
         self.inner.boxes.write().unwrap().remove(&id);
     }
 
+    pub fn box_ids(&self) -> Vec<i64> {
+        self.inner.boxes.read().unwrap().keys().copied().collect()
+    }
+
     fn box_of(&self, id: i64) -> Option<Arc<BoxState>> {
         self.inner.boxes.read().unwrap().get(&id).cloned()
     }
