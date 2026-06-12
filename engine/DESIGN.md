@@ -39,8 +39,13 @@ EVERY non-empty regular file's bytes live in a separate blob file under the
 box's blob dir (sharded). No inline-in-DB tier, no size threshold, no
 evicted/resident duality — and therefore NO consolidate phase: a finished box
 is at rest the moment it exits. Compression is delegated to the host fs if
-wanted. Known cost: tiny-file-heavy boxes pay inodes + block slack; the
-page-aligned arena (D6) is the contingency if that ever measures as pain.
+wanted. NOTE: blob storage is not overhead relative to the workload — a box
+holding 100k tiny files costs the same inodes/slack the workload would have
+cost the host unboxed; the box is the output in escrow. Apply can therefore
+be a rename/reflink of the blob into place. The only residual is that
+long-KEPT boxes are uncompressed at rest (the old deflate tier's one real
+service) — a filesystem-level concern, not an engine one. The page-aligned
+arena (D6) remains a contingency, now with even less motivation.
 
 ## D5 · FUSE passthrough backing fds — READ-ONLY opens only
 Because bytes are always real files (D4), read-only opens may register
