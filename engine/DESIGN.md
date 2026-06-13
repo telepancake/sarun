@@ -89,6 +89,15 @@ the protocol is the only contract, terminal-emulation crates (vt100/termwiz)
 cover the PTY-pane feature, and ratatui's TestBackend covers headless golden
 tests. The PTY/tmux feature (engine-held PTYs over the existing mux frames)
 slots naturally after m3.
+VERIFIED (ptyspike/): the full stack — portable-pty 0.9 (spawn on a PTY) ->
+vt100 0.16 (emulate to a screen grid) -> tui-term 0.3 (ratatui widget) ->
+ratatui 0.30 TestBackend — drives a real child process and renders it
+HEADLESSLY, with escape-sequence emulation and the input direction both
+proven. So the m5 UI half is de-risked (Zellij/wezterm use the same stack);
+the remaining unknowns are engine-side (PTY allocation + bidirectional mux
+frames, which depend on capture mode being ported — currently downgraded
+since m3b). Order: finish engine port -> Rust mux/capture -> PTY boxes ->
+ratatui client with tui-term panes. Building the pane before the client = twice.
 
 ## D8 · No migration obligations
 Zero users: compatibility choices are scaffolding for OUR transition (keep
