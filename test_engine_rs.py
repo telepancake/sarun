@@ -183,6 +183,29 @@ def main():
             check(m.sqlar_content(sp, "root/m3a_renamed.txt") == b"made in rust\n",
                   "engine-rs: renamed row keeps its blob (python-readable)")
 
+            # review verbs over the wire (read-only, against the Rust engine)
+            rsup = m.RemoteSupervisor(sock)
+            changes = rsup.review.session_changes(bsid)
+            paths_seen = {e["path"]: e["kind"] for e in changes}
+            check(paths_seen.get("root/m3a_renamed.txt") == "changed",
+                  "engine-rs: review.session_changes lists a file change")
+            check(paths_seen.get("root/m3a_gone.txt") == "deleted",
+                  "engine-rs: session_changes reports a deletion as 'deleted'")
+            # hunks of an append-modified text file
+            h = rsup.review.hunks(bsid, "root/m3a_keep.txt")
+            check(h.get("is_text") is True and h.get("hunks"),
+                  "engine-rs: review.hunks returns a text diff")
+            alllines = [tag for hk in h["hunks"] for tag, _ in hk["lines"]]
+            check("+" in alllines,
+                  "engine-rs: the diff has an added line (the appended 'upper')")
+            hk0 = h["hunks"][0]["lines"]
+            check(any(t == "+" and "upper" in txt for t, txt in hk0),
+                  "engine-rs: added line content is the appended bytes")
+            # hunks of a newly-created file (no lower): all-added
+            h2 = rsup.review.hunks(bsid, "root/m3a_renamed.txt")
+            check(h2.get("is_text") is True,
+                  "engine-rs: hunks of a created text file is a text diff")
+
             wid2 = m.sqlar_writer_id(sp, "root/m3a_renamed.txt")
             prov = m.sqlar_proc_prov(sp, wid2) if wid2 else None
             check(prov is not None and prov.get("exe"),

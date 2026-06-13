@@ -208,6 +208,17 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
             "selected": state.lock().unwrap().selected,
         }),
         "review_live" => json!(false),
+        "review.session_changes" => match arg_sid(args) {
+            Some(id) => crate::review::session_changes(id),
+            None => json!([]),
+        },
+        "review.hunks" => {
+            match (arg_sid(args), args.get(1).and_then(Value::as_str)) {
+                (Some(id), Some(rel)) => crate::review::hunks(id, rel),
+                _ => json!({"is_text": false, "hunks": [],
+                            "diff": {"kind": "error", "error": "bad args"}}),
+            }
+        }
         "ping" => {
             broadcast(state, &json!({"type": "pong"}));
             json!("pong")
