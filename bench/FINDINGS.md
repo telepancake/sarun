@@ -286,3 +286,29 @@ This is the whole thesis confirmed end to end: serial per-op cost is similar
 faster in absolute terms and 1.9x native — hitting m1's predicted target. The
 gap widens with core count; on a build farm it is the difference between
 "usable" and "why is my 32-core box idle".
+
+## Addendum: per-op overhead isolated (correcting the ~3x estimate)
+
+The graduation benchmark above measures the THREADING axis (parallel scaling).
+This isolates the other axis — SERIAL per-op cost — with a single cold
+git-status walk (one process, one in-flight request, so n_threads is
+irrelevant). bench/perop_overlay.py, ~5200 metadata ops:
+
+    native   10 ms
+    python  475 ms    89 us/op
+    rust    118 ms    21 us/op
+
+Python's 89 us/op reproduces workloads.py's earlier 86-104 (methodology
+consistent — not a fresh-baseline artifact). The measured serial language/
+logic factor is therefore ~4.3x, NOT the ~3x estimated earlier from the
+fuse-overlayfs ratio; that guess was low and is retracted. The Rust full
+overlay (21 us/op) sits below the fuse-overlayfs reference (~32 us/op), though
+that cross-tool number is loose.
+
+The two wins are independent and must not be conflated:
+  - per-op (~4.3x lower): helps METADATA-bound work (git, find, stat storms).
+  - core scaling (GIL ceiling removed): helps PARALLEL work (builds).
+A compute-bound build shows almost none of the per-op win serially (the -j1
+build was only 1.07x apart — FUSE is a thin slice next to cc), and almost all
+of its -j8 win (2.25x) is the threading axis. A pure-metadata workload shows
+the full 4.3x serially.
