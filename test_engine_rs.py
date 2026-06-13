@@ -437,6 +437,25 @@ def main():
                   "engine-rs: discard did NOT write the dropped file to the host")
             check(not m.sqlar_path(rid).exists(),
                   "engine-rs: emptied box reaped (sqlar gone) after apply+discard")
+
+            # apply-side metadata fidelity: mode + mtime restored to the host
+            fid = "9101"
+            fbk = m.live_dir(fid); (fbk / "up").mkdir(parents=True)
+            fix = m.Index(fbk); fw = fix.writer_for(os.getpid())
+            fix.set_entry("root/m3fid.txt", "file", stat_mod.S_IFREG | 0o751, fw, "create")
+            fbp = m.blob_path(fix.box_id, fix.row_id("root/m3fid.txt"))
+            fbp.parent.mkdir(parents=True, exist_ok=True); fbp.write_bytes(b"fid\n")
+            m.consolidate(str(fbk), fid, index=fix); fix.close()
+            shutil.rmtree(fbk, ignore_errors=True)
+            fhost = Path("/root/m3fid.txt"); fhost.unlink(missing_ok=True)
+            try:
+                m.sync_request(sock, type="ui", verb="review.apply",
+                               args=[fid, ["root/m3fid.txt"]])
+                import stat as _st3
+                check(fhost.exists() and _st3.S_IMODE(fhost.stat().st_mode) == 0o751,
+                      "engine-rs: apply restores the captured mode to the host")
+            finally:
+                fhost.unlink(missing_ok=True)
         finally:
             for p in (av, dv, drp): p.unlink(missing_ok=True)
 

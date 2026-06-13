@@ -167,17 +167,56 @@ fn consume(conn: &Connection, id: i64, rel: &str, rowid: i64) {
     let _ = std::fs::remove_file(blob_path(id, rowid));
 }
 
+const S_IFIFO: u32 = 0o010000;
+const S_IFBLK: u32 = 0o060000;
+
+fn restore_metadata(conn: &Connection, rel: &str, host: &Path, mtime_ns: i64) {
+    let c = std::ffi::CString::new(host.as_os_str().as_bytes()).unwrap();
+    // mtime (atime = mtime): drives downstream make/rebuild decisions.
+    if mtime_ns > 0 {
+        let ts = libc::timespec {
+            tv_sec: mtime_ns.div_euclid(1_000_000_000),
+            tv_nsec: mtime_ns.rem_euclid(1_000_000_000),
+        };
+        let times = [ts, ts];
+        unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(),
+                                 libc::AT_SYMLINK_NOFOLLOW); }
+    }
+    // owner (best-effort; lchown EPERMs for an unprivileged host user — ignored).
+    if let Ok((uid, gid)) = conn.query_row(
+        "SELECT uid,gid FROM ownership WHERE name=?1", [rel],
+        |r| Ok((r.get::<_,i64>(0)? as u32, r.get::<_,i64>(1)? as u32))) {
+        unsafe { libc::lchown(c.as_ptr(), uid, gid); }
+    }
+    // xattrs.
+    if let Ok(mut st) = conn.prepare("SELECT key,value FROM xattr WHERE name=?1") {
+        if let Ok(rows) = st.query_map([rel], |r|
+            Ok((r.get::<_,String>(0)?, r.get::<_,Vec<u8>>(1)?))) {
+            for (k, v) in rows.flatten() {
+                if let Ok(ck) = std::ffi::CString::new(k) {
+                    unsafe { libc::lsetxattr(c.as_ptr(), ck.as_ptr(),
+                        v.as_ptr().cast(), v.len(), 0); }
+                }
+            }
+        }
+    }
+}
+
 fn materialize(conn: &Connection, id: i64, rel: &str) -> Result<(), String> {
     let (rowid, mode, data) = row_of(conn, rel).ok_or("not in archive")?;
+    let mtime_ns: i64 = conn.query_row("SELECT mtime FROM sqlar WHERE name=?1", [rel],
+                                       |r| r.get(0)).unwrap_or(0);
     let host = Path::new("/").join(rel);
     let is_symlink = host.symlink_metadata().map(|m| m.file_type().is_symlink())
         .unwrap_or(false);
     if mode & S_IFMT == S_IFCHR {
+        // char-device row == deletion tombstone (the Python convention).
         if host.is_dir() && !is_symlink {
             std::fs::remove_dir_all(&host).map_err(|e| e.to_string())?;
         } else if host.exists() || is_symlink {
             std::fs::remove_file(&host).map_err(|e| e.to_string())?;
         }
+        return Ok(());
     } else if mode & S_IFMT == S_IFLNK {
         let tgt = data.ok_or("symlink row has no target")?;
         if host.exists() || is_symlink { let _ = std::fs::remove_file(&host); }
@@ -186,6 +225,18 @@ fn materialize(conn: &Connection, id: i64, rel: &str) -> Result<(), String> {
         std::os::unix::fs::symlink(t, &host).map_err(|e| e.to_string())?;
     } else if mode & S_IFMT == 0o040000 {
         std::fs::create_dir_all(&host).map_err(|e| e.to_string())?;
+        let _ = std::fs::set_permissions(&host,
+            std::fs::Permissions::from_mode(mode & 0o7777));
+    } else if mode & S_IFMT == S_IFIFO || mode & S_IFMT == S_IFBLK {
+        // fifo / block device: recreate the node on the host.
+        if host.exists() || is_symlink { let _ = std::fs::remove_file(&host); }
+        if let Some(p) = host.parent() { let _ = std::fs::create_dir_all(p); }
+        let rdev: i64 = conn.query_row("SELECT dev FROM rdev WHERE name=?1", [rel],
+                                       |r| r.get(0)).unwrap_or(0);
+        let c = std::ffi::CString::new(host.as_os_str().as_bytes()).unwrap();
+        if unsafe { libc::mknod(c.as_ptr(), mode, rdev as libc::dev_t) } != 0 {
+            return Err("mknod failed".into());
+        }
     } else {
         if is_symlink { return Err("refusing to write through a symlink".into()); }
         if let Some(p) = host.parent() { let _ = std::fs::create_dir_all(p); }
@@ -197,6 +248,7 @@ fn materialize(conn: &Connection, id: i64, rel: &str) -> Result<(), String> {
         let _ = std::fs::set_permissions(&host,
             std::fs::Permissions::from_mode(mode & 0o7777));
     }
+    restore_metadata(conn, rel, &host, mtime_ns);
     Ok(())
 }
 
