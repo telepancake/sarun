@@ -249,6 +249,44 @@ def main():
             victim.unlink(missing_ok=True)
             out_host.unlink(missing_ok=True)
 
+        # ── apply / discard on a FINISHED box (host-mutating review actions) ─
+        av = Path("/root/m3rev_new.txt"); dv = Path("/root/m3rev_del.txt")
+        drp = Path("/root/m3rev_drop.txt")
+        av.unlink(missing_ok=True); drp.unlink(missing_ok=True)
+        dv.write_bytes(b"to be deleted\n")
+        try:
+            rid = "9100"
+            bk = m.live_dir(rid); (bk / "up").mkdir(parents=True)
+            ix = m.Index(bk); w = ix.writer_for(os.getpid())
+            for rel, content in (("root/m3rev_new.txt", b"applied!\n"),
+                                 ("root/m3rev_drop.txt", b"discard me\n")):
+                ix.set_entry(rel, "file", stat_mod.S_IFREG | 0o644, w, "create")
+                bp = m.blob_path(ix.box_id, ix.row_id(rel))
+                bp.parent.mkdir(parents=True, exist_ok=True); bp.write_bytes(content)
+            ix.set_entry("root/m3rev_del.txt", "whiteout", 0, w, "unlink")
+            m.consolidate(str(bk), rid, index=ix); ix.close()
+            shutil.rmtree(bk, ignore_errors=True)
+
+            ra = m.sync_request(sock, type="ui", verb="review.apply",
+                                args=[rid, ["root/m3rev_new.txt", "root/m3rev_del.txt"]])
+            applied = ra["r"]["applied"]
+            check("root/m3rev_new.txt" in applied and "root/m3rev_del.txt" in applied,
+                  "engine-rs: review.apply reports both paths applied")
+            check(av.read_bytes() == b"applied!\n",
+                  "engine-rs: apply WROTE the created file to the host")
+            check(not dv.exists(),
+                  "engine-rs: apply REMOVED the host file the box tombstoned")
+            rd = m.sync_request(sock, type="ui", verb="review.discard",
+                                args=[rid, ["root/m3rev_drop.txt"]])
+            check("root/m3rev_drop.txt" in rd["r"]["discarded"],
+                  "engine-rs: review.discard reports the path discarded")
+            check(not drp.exists(),
+                  "engine-rs: discard did NOT write the dropped file to the host")
+            check(not m.sqlar_path(rid).exists(),
+                  "engine-rs: emptied box reaped (sqlar gone) after apply+discard")
+        finally:
+            for p in (av, dv, drp): p.unlink(missing_ok=True)
+
         eng.terminate()
         try: eng.wait(timeout=10)
         except subprocess.TimeoutExpired:

@@ -6,6 +6,7 @@
 // apply/discard (host-mutating, need live-connection ownership routing) and
 // the structural-diff job path are deferred to a later milestone.
 
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -144,4 +145,101 @@ pub fn hunks(id: i64, rel: &str) -> Value {
         hunks.push(json!({"index": gi, "lines": lines}));
     }
     json!({"is_text": true, "hunks": hunks})
+}
+
+// ── host-mutating review actions (top-level boxes; nested promotion deferred) ──
+use std::os::unix::fs::PermissionsExt;
+use std::time::Duration;
+
+fn open_rw(id: i64) -> Option<Connection> {
+    let c = Connection::open(sqlar_path(id)).ok()?;
+    c.busy_timeout(Duration::from_secs(3)).ok()?;
+    Some(c)
+}
+
+fn row_of(conn: &Connection, rel: &str) -> Option<(i64, u32, Option<Vec<u8>>)> {
+    conn.query_row("SELECT rowid,mode,data FROM sqlar WHERE name=?1", [rel],
+                   |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as u32, r.get(2)?))).ok()
+}
+
+fn consume(conn: &Connection, id: i64, rel: &str, rowid: i64) {
+    let _ = conn.execute("DELETE FROM sqlar WHERE name=?1", [rel]);
+    let _ = std::fs::remove_file(blob_path(id, rowid));
+}
+
+fn materialize(conn: &Connection, id: i64, rel: &str) -> Result<(), String> {
+    let (rowid, mode, data) = row_of(conn, rel).ok_or("not in archive")?;
+    let host = Path::new("/").join(rel);
+    let is_symlink = host.symlink_metadata().map(|m| m.file_type().is_symlink())
+        .unwrap_or(false);
+    if mode & S_IFMT == S_IFCHR {
+        if host.is_dir() && !is_symlink {
+            std::fs::remove_dir_all(&host).map_err(|e| e.to_string())?;
+        } else if host.exists() || is_symlink {
+            std::fs::remove_file(&host).map_err(|e| e.to_string())?;
+        }
+    } else if mode & S_IFMT == S_IFLNK {
+        let tgt = data.ok_or("symlink row has no target")?;
+        if host.exists() || is_symlink { let _ = std::fs::remove_file(&host); }
+        if let Some(p) = host.parent() { let _ = std::fs::create_dir_all(p); }
+        let t = std::ffi::OsStr::from_bytes(&tgt);
+        std::os::unix::fs::symlink(t, &host).map_err(|e| e.to_string())?;
+    } else if mode & S_IFMT == 0o040000 {
+        std::fs::create_dir_all(&host).map_err(|e| e.to_string())?;
+    } else {
+        if is_symlink { return Err("refusing to write through a symlink".into()); }
+        if let Some(p) = host.parent() { let _ = std::fs::create_dir_all(p); }
+        let bytes = match data {
+            Some(d) => d,
+            None => std::fs::read(blob_path(id, rowid)).map_err(|e| e.to_string())?,
+        };
+        std::fs::write(&host, &bytes).map_err(|e| e.to_string())?;
+        let _ = std::fs::set_permissions(&host,
+            std::fs::Permissions::from_mode(mode & 0o7777));
+    }
+    Ok(())
+}
+
+fn paths_arg(id: i64, paths: &Value) -> Vec<String> {
+    if let Some(arr) = paths.as_array() {
+        return arr.iter().filter_map(|v| v.as_str().map(String::from)).collect();
+    }
+    session_changes(id).as_array().map(|a| a.iter()
+        .filter_map(|e| e.get("path").and_then(Value::as_str).map(String::from))
+        .collect()).unwrap_or_default()
+}
+
+pub fn apply(id: i64, paths: &Value) -> Value {
+    let Some(conn) = open_rw(id) else {
+        return json!({"applied": [], "errors": [{"path": "", "error": "no archive"}]});
+    };
+    let mut applied = vec![];
+    let mut errors = vec![];
+    for rel in paths_arg(id, paths) {
+        let rel = rel.trim_start_matches('/').to_string();
+        match materialize(&conn, id, &rel) {
+            Ok(()) => {
+                if let Some((rowid, _, _)) = row_of(&conn, &rel) {
+                    consume(&conn, id, &rel, rowid);
+                }
+                applied.push(Value::String(rel));
+            }
+            Err(e) => errors.push(json!({"path": rel, "error": e})),
+        }
+    }
+    json!({"applied": applied, "errors": errors})
+}
+
+pub fn discard(id: i64, paths: &Value) -> Value {
+    let mut discarded = vec![];
+    if let Some(conn) = open_rw(id) {
+        for rel in paths_arg(id, paths) {
+            let rel = rel.trim_start_matches('/').to_string();
+            if let Some((rowid, _, _)) = row_of(&conn, &rel) {
+                consume(&conn, id, &rel, rowid);
+                discarded.push(Value::String(rel));
+            }
+        }
+    }
+    json!({"discarded": discarded, "errors": []})
 }

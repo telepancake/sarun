@@ -118,6 +118,23 @@ fn arg_sid(args: &[Value]) -> Option<i64> {
     args.first()?.as_str()?.parse().ok()
 }
 
+/// After apply/discard, if the box has no remaining changes, remove it from the
+/// overlay (live) and delete its now-empty sqlar — the "reap empty" behaviour.
+fn drop_if_empty(state: &State, id: i64) {
+    if crate::review::session_changes(id).as_array().map(|a| a.is_empty())
+        .unwrap_or(false) {
+        if let Some(ov) = state.lock().unwrap().overlay.clone() {
+            ov.remove_box(id);
+        }
+        let _ = std::fs::remove_file(crate::paths::state_home()
+            .join(format!("{id}.sqlar")));
+        let _ = std::fs::remove_dir_all(crate::paths::live_home()
+            .join(id.to_string()));
+        broadcast(state, &json!({"type": "session_removed",
+                                 "session_id": id.to_string()}));
+    }
+}
+
 /// The runner register handshake (m3b). Mints a box_id, creates the backing
 /// sentinel (live/<id>/up) and the box's sqlar (root process row from the
 /// message's prov), registers the box on the overlay, and acks with the
@@ -219,6 +236,16 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
                             "diff": {"kind": "error", "error": "bad args"}}),
             }
         }
+        "review.apply" => match arg_sid(args) {
+            Some(id) => { let r = crate::review::apply(id,
+                args.get(1).unwrap_or(&Value::Null)); drop_if_empty(state, id); r }
+            None => json!({"applied": [], "errors": []}),
+        },
+        "review.discard" => match arg_sid(args) {
+            Some(id) => { let r = crate::review::discard(id,
+                args.get(1).unwrap_or(&Value::Null)); drop_if_empty(state, id); r }
+            None => json!({"discarded": [], "errors": []}),
+        },
         "ping" => {
             broadcast(state, &json!({"type": "pong"}));
             json!("pong")
