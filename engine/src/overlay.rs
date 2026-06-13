@@ -134,6 +134,7 @@ enum Layer {
     UpperFile { rowid: i64, mode: u32 },
     UpperDir { mode: u32, mtime_ns: i64 },
     UpperSymlink { target: PathBuf },
+    UpperSpecial { mode: u32, rdev: u64 },
     Lower,
 }
 
@@ -225,6 +226,7 @@ impl Overlay {
             Some(Entry::File { rowid, mode }) => Layer::UpperFile { rowid, mode },
             Some(Entry::Dir { mode, mtime_ns }) => Layer::UpperDir { mode, mtime_ns },
             Some(Entry::Symlink { target }) => Layer::UpperSymlink { target },
+            Some(Entry::Special { mode, rdev }) => Layer::UpperSpecial { mode, rdev },
             None => {
                 if self.host(rel).symlink_metadata().is_ok() {
                     Layer::Lower
@@ -306,6 +308,13 @@ impl Overlay {
             Layer::UpperSymlink { target } =>
                 Some(self.synth_link_attr(
                     ino, target.as_os_str().as_encoded_bytes().len() as u64)),
+            Layer::UpperSpecial { mode, rdev } => {
+                let mut a = self.synth_file_attr(ino);
+                a.kind = kind_of_mode(mode);
+                a.perm = (mode & 0o7777) as u16;
+                a.rdev = rdev as u32;
+                Some(a)
+            }
         }
     }
 
@@ -584,8 +593,8 @@ impl Filesystem for Overlay {
     }
 
     fn setattr(&self, req: &Request, ino: INodeNo, mode: Option<u32>,
-               _uid: Option<u32>, _gid: Option<u32>, size: Option<u64>,
-               _atime: Option<TimeOrNow>, _mtime: Option<TimeOrNow>,
+               uid: Option<u32>, gid: Option<u32>, size: Option<u64>,
+               _atime: Option<TimeOrNow>, mtime: Option<TimeOrNow>,
                _ctime: Option<SystemTime>, _fh: Option<FileHandle>,
                _crtime: Option<SystemTime>, _chgtime: Option<SystemTime>,
                _bkuptime: Option<SystemTime>, _flags: Option<fuser::BsdFileFlags>,
@@ -625,6 +634,40 @@ impl Filesystem for Overlay {
                     }
                 }
                 Layer::Absent => {}
+                Layer::UpperSpecial { .. } => {}
+            }
+        }
+        // chown: stored for apply-time host restoration (the box squashes to one
+        // uid in-namespace, so it has no in-box effect — but we record fidelity).
+        if uid.is_some() || gid.is_some() {
+            if !matches!(self.layer(&b, &rel), Layer::Absent) {
+                if matches!(self.layer(&b, &rel), Layer::Lower)
+                    && !self.host(&rel).is_dir() {
+                    let _ = self.copy_up(&b, &rel, req.pid());
+                }
+                let cur = b.owner_of(&rel).unwrap_or((0, 0));
+                b.set_owner(&rel, uid.unwrap_or(cur.0), gid.unwrap_or(cur.1));
+            }
+        }
+        // utimes: record mtime. A file's getattr reads its BLOB's metadata, so
+        // set the blob's mtime too; dirs/symlinks read the row, so set_mtime.
+        if let Some(t) = mtime {
+            let st = match t {
+                TimeOrNow::SpecificTime(s) => s,
+                TimeOrNow::Now => SystemTime::now(),
+            };
+            let ns = st.duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as i64)
+                .unwrap_or(0);
+            if matches!(self.layer(&b, &rel), Layer::Lower)
+                && !self.host(&rel).is_dir() {
+                let _ = self.copy_up(&b, &rel, req.pid());
+            }
+            b.set_mtime(&rel, ns);
+            if let Layer::UpperFile { rowid, .. } = self.layer(&b, &rel) {
+                if let Ok(f) = OpenOptions::new().write(true)
+                    .open(blob_path(bid, rowid)) {
+                    let _ = f.set_modified(st);
+                }
             }
         }
         match self.attr_of(&b, u64::from(ino), &rel) {
@@ -675,6 +718,152 @@ impl Filesystem for Overlay {
             Generation(0));
     }
 
+    fn mknod(&self, req: &Request, parent: INodeNo, name: &OsStr, mode: u32,
+             _umask: u32, rdev: u32, reply: ReplyEntry) {
+        let Some((bid, prel)) = self.key_of(parent) else {
+            return reply.error(Errno::ENOENT);
+        };
+        if bid == 0 { return reply.error(Errno::EPERM); }
+        let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
+        let Some(name) = name.to_str() else { return reply.error(Errno::EINVAL) };
+        let rel = if prel.is_empty() { name.to_string() }
+                  else { format!("{prel}/{name}") };
+        match mode & libc::S_IFMT {
+            libc::S_IFREG => {
+                // mknod of a regular file = create an empty file.
+                let writer = b.writer_for(req.pid());
+                let rowid = b.ensure_file_row(&rel, mode, writer);
+                let bp = blob_path(bid, rowid);
+                if let Some(p) = bp.parent() { let _ = std::fs::create_dir_all(p); }
+                let _ = File::create(&bp);
+            }
+            libc::S_IFIFO | libc::S_IFCHR | libc::S_IFBLK | libc::S_IFSOCK =>
+                b.set_special(&rel, mode, rdev as u64, b.writer_for(req.pid())),
+            _ => return reply.error(Errno::EINVAL),
+        }
+        let ino = self.ino_for(&(bid, rel.clone()));
+        match self.attr_of(&b, ino, &rel) {
+            Some(a) => reply.entry(&TTL, &a, Generation(0)),
+            None => reply.error(Errno::EIO),
+        }
+    }
+
+    fn link(&self, req: &Request, ino: INodeNo, newparent: INodeNo,
+            newname: &OsStr, reply: ReplyEntry) {
+        // Hardlink as copy-up: a new row backed by a fresh copy of the source
+        // bytes. Not true inode sharing (nlink stays 1), but it stops the EPERM
+        // that breaks git clone --local / ccache — they get a working second
+        // name. Same approximation the Python engine's _link_overlay makes.
+        let (Some((sbid, srel)), Some((nbid, nprel))) =
+            (self.key_of(ino), self.key_of(newparent)) else {
+            return reply.error(Errno::ENOENT);
+        };
+        if sbid != nbid || sbid == 0 { return reply.error(Errno::EXDEV); }
+        let Some(b) = self.box_of(sbid) else { return reply.error(Errno::ENOENT) };
+        let Some(name) = newname.to_str() else { return reply.error(Errno::EINVAL) };
+        let nrel = if nprel.is_empty() { name.to_string() }
+                   else { format!("{nprel}/{name}") };
+        // materialise source bytes into the new name's blob.
+        if self.copy_up(&b, &srel, req.pid()).is_err() {
+            return reply.error(Errno::EIO);
+        }
+        let src_rowid = match self.layer(&b, &srel) {
+            Layer::UpperFile { rowid, .. } => rowid,
+            _ => return reply.error(Errno::EPERM), // only files link here
+        };
+        let writer = b.writer_for(req.pid());
+        let nrow = b.ensure_file_row(&nrel, 0o100644, writer);
+        let dst = blob_path(sbid, nrow);
+        if let Some(p) = dst.parent() { let _ = std::fs::create_dir_all(p); }
+        if std::fs::copy(blob_path(sbid, src_rowid), &dst).is_err() {
+            return reply.error(Errno::EIO);
+        }
+        let ino2 = self.ino_for(&(sbid, nrel.clone()));
+        match self.attr_of(&b, ino2, &nrel) {
+            Some(a) => reply.entry(&TTL, &a, Generation(0)),
+            None => reply.error(Errno::EIO),
+        }
+    }
+
+    fn fallocate(&self, req: &Request, ino: INodeNo, _fh: FileHandle,
+                 offset: u64, length: u64, _mode: i32, reply: ReplyEmpty) {
+        let Some((bid, rel)) = self.key_of(ino) else {
+            return reply.error(Errno::ENOENT);
+        };
+        let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
+        let f = match self.layer(&b, &rel) {
+            Layer::UpperFile { rowid, .. } =>
+                OpenOptions::new().write(true).open(blob_path(bid, rowid)).ok(),
+            Layer::Lower => self.copy_up(&b, &rel, req.pid()).ok(),
+            _ => None,
+        };
+        let Some(f) = f else { return reply.error(Errno::EIO) };
+        // grow the file to offset+length if needed (the common posix_fallocate
+        // preallocate path); never shrink.
+        let want = offset + length;
+        if let Ok(md) = f.metadata() {
+            if md.len() < want && f.set_len(want).is_err() {
+                return reply.error(Errno::EIO);
+            }
+        }
+        reply.ok();
+    }
+
+    fn setxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, value: &[u8],
+                _flags: i32, _position: u32, reply: ReplyEmpty) {
+        let Some((bid, rel)) = self.key_of(ino) else {
+            return reply.error(Errno::ENOENT);
+        };
+        let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
+        if let Some(k) = name.to_str() { b.set_xattr(&rel, k, value); }
+        reply.ok();
+    }
+
+    fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, size: u32,
+                reply: fuser::ReplyXattr) {
+        let Some((bid, rel)) = self.key_of(ino) else {
+            return reply.error(Errno::ENOENT);
+        };
+        let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
+        let v = name.to_str().and_then(|k| b.get_xattr(&rel, k));
+        match v {
+            Some(val) => {
+                if size == 0 { reply.size(val.len() as u32); }
+                else if (size as usize) < val.len() { reply.error(Errno::ERANGE); }
+                else { reply.data(&val); }
+            }
+            None => reply.error(Errno::ENODATA),
+        }
+    }
+
+    fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32,
+                 reply: fuser::ReplyXattr) {
+        let Some((bid, rel)) = self.key_of(ino) else {
+            return reply.error(Errno::ENOENT);
+        };
+        let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
+        let mut buf = Vec::new();
+        for k in b.list_xattr(&rel) {
+            buf.extend_from_slice(k.as_bytes());
+            buf.push(0);
+        }
+        if size == 0 { reply.size(buf.len() as u32); }
+        else if (size as usize) < buf.len() { reply.error(Errno::ERANGE); }
+        else { reply.data(&buf); }
+    }
+
+    fn removexattr(&self, _req: &Request, ino: INodeNo, name: &OsStr,
+                   reply: ReplyEmpty) {
+        let Some((bid, rel)) = self.key_of(ino) else {
+            return reply.error(Errno::ENOENT);
+        };
+        let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
+        match name.to_str() {
+            Some(k) if b.remove_xattr(&rel, k) => reply.ok(),
+            _ => reply.error(Errno::ENODATA),
+        }
+    }
+
     fn unlink(&self, req: &Request, parent: INodeNo, name: &OsStr,
               reply: ReplyEmpty) {
         let Some((bid, prel)) = self.key_of(parent) else {
@@ -689,7 +878,8 @@ impl Filesystem for Overlay {
         match b.entry(&rel) {
             Some(Entry::Whiteout) | None if !lower_exists =>
                 return reply.error(Errno::ENOENT),
-            Some(Entry::File { .. }) | Some(Entry::Symlink { .. }) => {
+            Some(Entry::File { .. }) | Some(Entry::Symlink { .. })
+            | Some(Entry::Special { .. }) => {
                 b.drop_row(&rel);
                 if lower_exists {
                     b.set_whiteout(&rel, writer);
@@ -803,7 +993,8 @@ impl Filesystem for Overlay {
                 b.rename_row(&rel_o, &rel_n);
                 b.set_whiteout(&rel_o, writer); // lower still shows through old name
             }
-            Layer::UpperFile { .. } | Layer::UpperSymlink { .. } => {
+            Layer::UpperFile { .. } | Layer::UpperSymlink { .. }
+            | Layer::UpperSpecial { .. } => {
                 b.rename_row(&rel_o, &rel_n);
                 if lower_o { b.set_whiteout(&rel_o, writer); }
             }

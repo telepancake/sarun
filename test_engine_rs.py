@@ -270,6 +270,59 @@ def main():
         finally:
             rv.unlink(missing_ok=True)
 
+        # ── FUSE-op cluster: utimes, chown, mkfifo, link, fallocate, xattr ──
+        rep = m.sync_request(sock, type="ui", verb="box_new", args=[])
+        oproot = Path(rep["r"]["root"]); opsid = rep["r"]["sid"]
+        opsp = m.sqlar_path(opsid)
+        (oproot / "root").mkdir(exist_ok=True)
+        import stat as _st2
+        # utimes: set mtime, read it back
+        tf = oproot / "root/m3t.txt"; tf.write_bytes(b"t\n")
+        os.utime(tf, (1000000, 1000000))
+        check(int(tf.stat().st_mtime) == 1000000,
+              "engine-rs: utimes sets mtime (drives make rebuilds)")
+        # mkfifo
+        try:
+            os.mkfifo(oproot / "root/m3fifo")
+            check(_st2.S_ISFIFO((oproot / "root/m3fifo").stat().st_mode),
+                  "engine-rs: mkfifo creates a FIFO in the box")
+            check(_st2.S_ISFIFO(m.sqlar_mode(opsp, "root/m3fifo") or 0),
+                  "engine-rs: FIFO captured as a special row (python-readable)")
+        except OSError as e:
+            check(False, f"engine-rs: mkfifo failed: {e}")
+        # hardlink (git clone --local / ccache path)
+        lf = oproot / "root/m3link_src.txt"; lf.write_bytes(b"linkme\n")
+        try:
+            os.link(lf, oproot / "root/m3link_dst.txt")
+            check((oproot / "root/m3link_dst.txt").read_bytes() == b"linkme\n",
+                  "engine-rs: hardlink (copy-up approx) gives a working 2nd name")
+        except OSError as e:
+            check(False, f"engine-rs: link failed: {e}")
+        # fallocate
+        bigf = oproot / "root/m3big"
+        with open(bigf, "wb") as fh:
+            try:
+                os.posix_fallocate(fh.fileno(), 0, 65536)
+                check(bigf.stat().st_size == 65536,
+                      "engine-rs: fallocate preallocates the requested size")
+            except OSError as e:
+                check(False, f"engine-rs: fallocate failed: {e}")
+        # xattr round-trip
+        xf = oproot / "root/m3x.txt"; xf.write_bytes(b"x\n")
+        try:
+            os.setxattr(xf, "user.test", b"hello")
+            check(os.getxattr(xf, "user.test") == b"hello",
+                  "engine-rs: xattr set/get round-trips")
+            check("user.test" in [a.decode() if isinstance(a, bytes) else a
+                                  for a in os.listxattr(xf)],
+                  "engine-rs: xattr listed")
+            os.removexattr(xf, "user.test")
+            check("user.test" not in [a.decode() if isinstance(a, bytes) else a
+                                      for a in os.listxattr(xf)],
+                  "engine-rs: xattr removed")
+        except OSError as e:
+            check(False, f"engine-rs: xattr failed: {e}")
+
         # ── capture: box stdout/stderr -> outputs table (fully-Rust box) ────
         r = subprocess.run(
             [str(BIN), "run", "CAPBOX", "--", "sh", "-c",

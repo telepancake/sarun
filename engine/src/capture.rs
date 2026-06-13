@@ -32,6 +32,11 @@ CREATE TABLE IF NOT EXISTS process(id INTEGER PRIMARY KEY AUTOINCREMENT,
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS outputs(id INTEGER PRIMARY KEY AUTOINCREMENT,
  ts REAL, process_id INT, stream INT, content BLOB);
+-- Rust-engine extensions (additive; the Python readers ignore them):
+CREATE TABLE IF NOT EXISTS xattr(name TEXT, key TEXT, value BLOB,
+ PRIMARY KEY(name,key));
+CREATE TABLE IF NOT EXISTS ownership(name TEXT PRIMARY KEY, uid INT, gid INT);
+CREATE TABLE IF NOT EXISTS rdev(name TEXT PRIMARY KEY, dev INT);
 ";
 
 #[derive(Clone)]
@@ -39,6 +44,7 @@ pub enum Entry {
     File { rowid: i64, mode: u32 },
     Dir { mode: u32, mtime_ns: i64 },
     Symlink { target: PathBuf },
+    Special { mode: u32, rdev: u64 },  // fifo / char / block device
     Whiteout,
 }
 
@@ -161,6 +167,84 @@ impl BoxState {
                 _ => {}
             }
         }
+    }
+
+    /// utimes: store the row's mtime (ns). Files/dirs/symlinks all keep mtime
+    /// in the sqlar row, so this is a single UPDATE + mirror touch for dirs.
+    pub fn set_mtime(&self, rel: &str, mtime_ns: i64) {
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute("UPDATE sqlar SET mtime=?2 WHERE name=?1",
+                             rusqlite::params![rel, mtime_ns]);
+        if let Some(Entry::Dir { mtime_ns: m, .. }) =
+            self.kinds.write().unwrap().get_mut(rel) {
+            *m = mtime_ns;
+        }
+    }
+
+    /// chown: stored in a side table (the box squashes to one uid in-namespace,
+    /// so this is fidelity for apply-time host restoration, not an in-box uid).
+    pub fn set_owner(&self, rel: &str, uid: u32, gid: u32) {
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute(
+            "INSERT INTO ownership(name,uid,gid) VALUES(?1,?2,?3)
+             ON CONFLICT(name) DO UPDATE SET uid=excluded.uid, gid=excluded.gid",
+            rusqlite::params![rel, uid, gid]);
+    }
+
+    pub fn owner_of(&self, rel: &str) -> Option<(u32, u32)> {
+        self.conn.lock().unwrap().query_row(
+            "SELECT uid,gid FROM ownership WHERE name=?1", [rel],
+            |r| Ok((r.get::<_, i64>(0)? as u32, r.get::<_, i64>(1)? as u32))).ok()
+    }
+
+    // ── xattr (side table; the box's processes get real getfattr/setfattr) ──
+    pub fn set_xattr(&self, rel: &str, key: &str, value: &[u8]) {
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute(
+            "INSERT INTO xattr(name,key,value) VALUES(?1,?2,?3)
+             ON CONFLICT(name,key) DO UPDATE SET value=excluded.value",
+            rusqlite::params![rel, key, value]);
+    }
+    pub fn get_xattr(&self, rel: &str, key: &str) -> Option<Vec<u8>> {
+        self.conn.lock().unwrap().query_row(
+            "SELECT value FROM xattr WHERE name=?1 AND key=?2",
+            rusqlite::params![rel, key], |r| r.get(0)).ok()
+    }
+    pub fn list_xattr(&self, rel: &str) -> Vec<String> {
+        let conn = self.conn.lock().unwrap();
+        let mut out = vec![];
+        if let Ok(mut st) = conn.prepare("SELECT key FROM xattr WHERE name=?1") {
+            if let Ok(it) = st.query_map([rel], |r| r.get::<_, String>(0)) {
+                out = it.flatten().collect();
+            }
+        }
+        out
+    }
+    pub fn remove_xattr(&self, rel: &str, key: &str) -> bool {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM xattr WHERE name=?1 AND key=?2",
+                     rusqlite::params![rel, key]).map(|n| n > 0).unwrap_or(false)
+    }
+
+    /// mknod/mkfifo: a special-file row (mode carries S_IFIFO/S_IFCHR/S_IFBLK);
+    /// char/block rdev goes in the side table.
+    pub fn set_special(&self, rel: &str, mode: u32, rdev: u64, writer: i64) {
+        {
+            let conn = self.conn.lock().unwrap();
+            let _ = conn.execute(
+                "INSERT INTO sqlar(name,mode,mtime,sz,data,writer,last_writer)
+                 VALUES(?1,?2,?3,0,NULL,?4,?4)
+                 ON CONFLICT(name) DO UPDATE SET mode=excluded.mode",
+                rusqlite::params![rel, mode, now_ns(), writer]);
+            if rdev != 0 {
+                let _ = conn.execute(
+                    "INSERT INTO rdev(name,dev) VALUES(?1,?2)
+                     ON CONFLICT(name) DO UPDATE SET dev=excluded.dev",
+                    rusqlite::params![rel, rdev as i64]);
+            }
+        }
+        self.kinds.write().unwrap()
+            .insert(rel.to_string(), Entry::Special { mode, rdev });
     }
 
     pub fn set_dir(&self, rel: &str, mode: u32, writer: i64) {
