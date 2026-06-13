@@ -105,40 +105,53 @@ what lets existing tests run; discard when the behavioral suite covers the
 ground), never obligations. The wire protocol is kept because our own tests
 and UI speak it — the moment that stops being worth it, it too can change.
 
-## D9 · Three execution layers; brush as an in-box shell (FUTURE, post-port)
+## D9 · Three complementary execution modes (FUSE always; PTY and brush as toggles)
 
-sarun needs both: PTY mode (interactive tty boxes) and the headless FUSE
-capture mode (provenance). brush (brush-core/brush-parser, embeddable Rust
-bash-compatible shell — verified to resolve as a library) is a proposed THIRD
-layer, not a replacement for either:
+These are not alternatives — sarun wants all three, composed:
 
-  - PTY layer    — interactive boxes (ptyspike stack); engine-held PTYs.
-  - FUSE layer   — captures the syscalls of ARBITRARY spawned binaries
-                   (cc/ld/python). LOAD-BEARING; brush cannot replace it,
-                   because brush only sees what brush itself runs.
-  - brush layer  — when the box's shell IS our instrumented brush, we know
-                   command / Makefile-line / pipeline-stage for each spawn:
-                   SEMANTIC provenance above pid attribution. Enriches the
-                   existing process table (argv already stored) with the
-                   shell context that spawned each pid.
+  - FUSE capture — ALWAYS on. Captures the syscalls of arbitrary spawned
+    binaries (cc/ld/python); it is the only layer that sees them. The base.
+  - PTY mode — toggle, for interactive tty boxes (ptyspike stack; engine-held
+    PTYs). Off → today's headless captured stdout/stderr.
+  - brush shell — toggle, for the box's shell being our embedded brush
+    (brush-core/brush-parser, verified embeddable). Sits ABOVE FUSE: it adds
+    semantic context FUSE can't recover, and removes the sh-storm FUSE would
+    otherwise have to capture. Independent of the other two.
+
+What brush actually knows (precise — earlier draft overclaimed "Makefile
+line", which is FALSE: make execs `sh -c '<recipe text>'`, the shell never
+sees the Makefile or a line number). brush knows, for what IT runs: the exact
+command string, and its internal structure — pipeline stages, redirections,
+subshells, builtin-vs-exec'd-binary. Source LINE NUMBERS only when brush
+interprets a script directly (a `configure` run, `brush ./x.sh`) — NOT for
+make recipes, which arrive as bare recipe text. This still enriches the
+process table (which already stores argv) with the shell-level command and
+redirect structure that spawned each pid — a real step above raw pid+argv.
 
 Performance: brush attacks ONLY the sh-storm. configure runs millions of
 builtins (test/[/expr/echo/cd) — in-process brush forks for none; /bin/sh
 forks+execs+dynlinks bash for each. Compilers still fork/exec (the bulk of
-build CPU) and are untouched. So: large win on configure-shaped workloads,
-modest on compile-bound ones. Not "crazy", but real and measurable — quantify
-against the exec-storm/parallel-build benchmarks before committing.
+build CPU) and are untouched. Large win on configure-shaped workloads, modest
+on compile-bound ones. Quantify against the exec-storm/parallel-build
+benchmarks before committing; do not call it "crazy" unmeasured.
 
-Hard constraints:
+Design constraints:
+  - The brush shell is an EXPLICIT per-box toggle, orthogonal to the existing
+    box-mode flags (-t passthrough/no-capture, -d direct, -e record-env). NO
+    silent magnitude-fallback to /bin/sh: if you select the builtin shell you
+    GET the builtin shell, and a construct it doesn't implement is a VISIBLE
+    error on a box you chose to run that way — never a quiet downgrade that
+    leaves you unsure which shell (and which visibility/perf) you got. This
+    bounds brush's compat target to "good enough for opted-in workloads", not
+    "universal /bin/sh" (the autoconf tarpit). Default off → real /bin/sh.
   - Lives in the IN-BOX runner (the --inner shim), linked as a library, NOT in
     the engine process (the box must stay bwrap-isolated; brush in the engine
-    address space breaches the sandbox). It reports semantic-provenance frames
+    address space breaches the sandbox). Reports semantic-provenance frames
     over the box channel that already exists.
-  - To catch make's per-recipe `sh -c`, brush must be what /bin/sh RESOLVES TO
-    in the box's overlay view (the overlay can serve that virtual mapping).
-  - Shell-compat is the overlay-semantics tarpit again: real configure scripts
-    are the spec, and a FALLBACK to exec'ing the real /bin/sh when brush can't
-    handle a construct is mandatory — which caps the win at best-effort.
+  - To catch make's per-recipe `sh -c` when the toggle is on, brush is what
+    /bin/sh RESOLVES TO in the box's overlay view (the overlay serves that
+    virtual mapping) — scoped to that box, not the host.
+
 
 Ordering: strictly after the engine port + Rust capture/mux are done. This is a
 visibility/perf enhancement on a working base, not a milestone dependency.
