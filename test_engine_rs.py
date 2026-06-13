@@ -358,6 +358,37 @@ def main():
         check(_st.S_IMODE(m.sqlar_mode(cbsp, "root/m3chmod.txt") or 0) == 0o755,
               "engine-rs: chmod recorded in the sqlar row (python-readable)")
 
+        # ── proc/output detail verbs (proc pane + cross-pane jumps) ─────────
+        wid_rs = rsup.writer_id(sid, "rs.txt")
+        check(wid_rs is not None,
+              "engine-rs: writer_id resolves the file's writer row")
+        check(rsup.first_writer_id(sid, "rs.txt") is not None,
+              "engine-rs: first_writer_id resolves")
+        pinfo = rsup.proc_info(sid, wid_rs)
+        check(pinfo is not None and len(pinfo) == 5,
+              "engine-rs: proc_info returns (tgid,ppid,parent_id,exe,argv)")
+        pprov = rsup.proc_prov(sid, wid_rs)
+        check(isinstance(pprov, dict) and "exe" in pprov,
+              "engine-rs: proc_prov returns the provenance dict")
+        check(isinstance(rsup.proc_roots(sid), (list, set)),
+              "engine-rs: proc_roots returns the root row ids")
+        fwp = rsup.first_writer_prov(sid, "rs.txt")
+        check(fwp is None or isinstance(fwp, dict),
+              "engine-rs: first_writer_prov answers")
+        # output_detail content round-trips as real bytes (capture box capsid)
+        od_list = m.sync_request(sock, type="ui", verb="outputs", args=[capsid])["r"]
+        if od_list:
+            det = rsup.review and None
+            d = rsup._rpc("output_detail", capsid, od_list[0]["id"])
+            check(isinstance(d, dict) and isinstance(d.get("content"), bytes),
+                  "engine-rs: output_detail content decodes to real bytes")
+        # delete: reap a box on demand
+        rep2 = m.sync_request(sock, type="ui", verb="box_new", args=[])
+        delid = rep2["r"]["sid"]
+        m.sync_request(sock, type="ui", verb="delete", args=[delid])
+        check(not m.sqlar_path(delid).exists(),
+              "engine-rs: delete reaps the box (sqlar gone)")
+
         # ── CLI verbs via the REAL slopbox CLI against the Rust engine ──────
         env = dict(os.environ)
         r = subprocess.run([sys.executable, SARUN, "RSBOX", "patch"],

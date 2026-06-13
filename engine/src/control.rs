@@ -180,20 +180,27 @@ fn arg_sid(args: &[Value]) -> Option<i64> {
     args.first()?.as_str()?.parse().ok()
 }
 
-/// After apply/discard, if the box has no remaining changes, remove it from the
-/// overlay (live) and delete its now-empty sqlar — the "reap empty" behaviour.
+/// Unconditionally remove a box: drop it from the overlay, delete its sqlar +
+/// backing + pool blobs, broadcast session_removed. The `delete` verb's body.
+fn reap(state: &State, id: i64) {
+    if let Some(ov) = state.lock().unwrap().overlay.clone() {
+        ov.remove_box(id);
+    }
+    let _ = std::fs::remove_file(crate::paths::state_home()
+        .join(format!("{id}.sqlar")));
+    let _ = std::fs::remove_dir_all(crate::paths::live_home()
+        .join(id.to_string()));
+    let _ = std::fs::remove_dir_all(crate::paths::live_home()
+        .join("blob").join(id.to_string()));
+    broadcast(state, &json!({"type": "session_removed",
+                             "session_id": id.to_string()}));
+}
+
+/// After apply/discard, reap the box if it has no remaining changes.
 fn drop_if_empty(state: &State, id: i64) {
     if crate::review::session_changes(id).as_array().map(|a| a.is_empty())
         .unwrap_or(false) {
-        if let Some(ov) = state.lock().unwrap().overlay.clone() {
-            ov.remove_box(id);
-        }
-        let _ = std::fs::remove_file(crate::paths::state_home()
-            .join(format!("{id}.sqlar")));
-        let _ = std::fs::remove_dir_all(crate::paths::live_home()
-            .join(id.to_string()));
-        broadcast(state, &json!({"type": "session_removed",
-                                 "session_id": id.to_string()}));
+        reap(state, id);
     }
 }
 
@@ -283,6 +290,40 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
         "outputs" => match arg_sid(args) {
             Some(id) => discover::outputs(id),
             None => json!([]),
+        },
+        "output_detail" => match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
+            (Some(id), Some(oid)) => discover::output_detail(id, oid),
+            _ => Value::Null,
+        },
+        "processes_live" => Value::Null,  // finished-style: UI falls back to processes()
+        "proc_info" => match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
+            (Some(id), Some(rid)) => discover::proc_info(id, rid),
+            _ => Value::Null,
+        },
+        "proc_prov" => match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
+            (Some(id), Some(rid)) => discover::proc_prov(id, rid),
+            _ => Value::Null,
+        },
+        "proc_roots" => match arg_sid(args) {
+            Some(id) => discover::proc_roots(id), None => json!([]),
+        },
+        "process_env" => match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
+            (Some(id), Some(rid)) => discover::process_env(id, rid),
+            _ => json!({}),
+        },
+        "writer_id" => match (arg_sid(args), args.get(1).and_then(Value::as_str)) {
+            (Some(id), Some(rel)) => discover::writer_id(id, rel), _ => Value::Null,
+        },
+        "first_writer_id" => match (arg_sid(args), args.get(1).and_then(Value::as_str)) {
+            (Some(id), Some(rel)) => discover::first_writer_id(id, rel), _ => Value::Null,
+        },
+        "first_writer_prov" => match (arg_sid(args), args.get(1).and_then(Value::as_str)) {
+            (Some(id), Some(rel)) => discover::first_writer_prov(id, rel), _ => Value::Null,
+        },
+        "rescan" => json!(null),   // discovery is always fresh; nothing to do
+        "delete" => match arg_sid(args) {
+            Some(id) => { reap(state, id); json!({"ok": true, "sid": id.to_string()}) }
+            None => json!({"ok": false}),
         },
         "open_files" => json!([]),
         "review_state" => json!({

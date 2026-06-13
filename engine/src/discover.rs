@@ -179,3 +179,99 @@ pub fn outputs(box_id: i64) -> Value {
     }
     Value::Array(rows)
 }
+
+fn open_ro(box_id: i64) -> Option<rusqlite::Connection> {
+    rusqlite::Connection::open_with_flags(
+        sqlar_path(box_id), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).ok()
+}
+
+/// (tgid, ppid, parent_id, exe, argv) for one process row — the proc-tree
+/// connector resolver. None if the row id isn't recorded.
+pub fn proc_info(box_id: i64, row_id: i64) -> Value {
+    let Some(c) = open_ro(box_id) else { return Value::Null };
+    c.query_row("SELECT tgid,ppid,parent_id,exe,argv FROM process WHERE id=?1",
+                [row_id], |r| {
+        let argv: Option<String> = r.get(4)?;
+        Ok(json!([r.get::<_,Option<i64>>(0)?, r.get::<_,Option<i64>>(1)?,
+                  r.get::<_,Option<i64>>(2)?,
+                  r.get::<_,Option<String>>(3)?.unwrap_or_default(),
+                  argv.and_then(|s| serde_json::from_str::<Value>(&s).ok())
+                      .unwrap_or_else(|| json!([]))]))
+    }).unwrap_or(Value::Null)
+}
+
+/// Provenance dict {exe,cwd,argv} of one process row — the procs-pane filter.
+pub fn proc_prov(box_id: i64, row_id: i64) -> Value {
+    let Some(c) = open_ro(box_id) else { return Value::Null };
+    c.query_row("SELECT exe,cwd,argv FROM process WHERE id=?1", [row_id], |r| {
+        let argv: Option<String> = r.get(2)?;
+        Ok(json!({"exe": r.get::<_,Option<String>>(0)?.unwrap_or_default(),
+                  "cwd": r.get::<_,Option<String>>(1)?.unwrap_or_default(),
+                  "argv": argv.and_then(|s| serde_json::from_str::<Value>(&s).ok())
+                      .unwrap_or_else(|| json!([]))}))
+    }).unwrap_or(Value::Null)
+}
+
+/// Hierarchy-root row ids (process.root=1) — the proc-tree walk boundary.
+pub fn proc_roots(box_id: i64) -> Value {
+    let Some(c) = open_ro(box_id) else { return json!([]) };
+    let mut out = vec![];
+    if let Ok(mut st) = c.prepare("SELECT id FROM process WHERE root=1") {
+        if let Ok(it) = st.query_map([], |r| r.get::<_, i64>(0)) {
+            out = it.flatten().map(Value::from).collect();
+        }
+    }
+    Value::Array(out)
+}
+
+fn writer_col(box_id: i64, rel: &str, col: &str) -> Value {
+    let Some(c) = open_ro(box_id) else { return Value::Null };
+    let rel = rel.trim_start_matches('/');
+    c.query_row(&format!("SELECT {col} FROM sqlar WHERE name=?1"), [rel],
+                |r| r.get::<_, Option<i64>>(0))
+        .ok().flatten().map(Value::from).unwrap_or(Value::Null)
+}
+pub fn writer_id(box_id: i64, rel: &str) -> Value { writer_col(box_id, rel, "last_writer") }
+pub fn first_writer_id(box_id: i64, rel: &str) -> Value { writer_col(box_id, rel, "writer") }
+
+/// Provenance {pid,ppid,exe,cwd,argv} of the FIRST writer of `rel`.
+pub fn first_writer_prov(box_id: i64, rel: &str) -> Value {
+    let Some(c) = open_ro(box_id) else { return Value::Null };
+    let rel = rel.trim_start_matches('/');
+    c.query_row("SELECT process.tgid,process.ppid,process.exe,process.cwd,process.argv \
+                 FROM sqlar JOIN process ON sqlar.writer=process.id WHERE sqlar.name=?1",
+                [rel], |r| {
+        let argv: Option<String> = r.get(4)?;
+        Ok(json!({"pid": r.get::<_,Option<i64>>(0)?, "ppid": r.get::<_,Option<i64>>(1)?,
+                  "exe": r.get::<_,Option<String>>(2)?.unwrap_or_default(),
+                  "cwd": r.get::<_,Option<String>>(3)?.unwrap_or_default(),
+                  "argv": argv.and_then(|s| serde_json::from_str::<Value>(&s).ok())
+                      .unwrap_or_else(|| json!([]))}))
+    }).unwrap_or(Value::Null)
+}
+
+/// One captured output row WITH its content (bytes → {"__b": base64} so the
+/// Python wire_decode hands the UI real bytes).
+pub fn output_detail(box_id: i64, oid: i64) -> Value {
+    use base64::Engine as _;
+    let Some(c) = open_ro(box_id) else { return Value::Null };
+    c.query_row("SELECT id,ts,process_id,stream,content FROM outputs WHERE id=?1",
+                [oid], |r| {
+        let content: Option<Vec<u8>> = r.get(4)?;
+        let b64 = base64::engine::general_purpose::STANDARD
+            .encode(content.unwrap_or_default());
+        Ok(json!({"id": r.get::<_,i64>(0)?, "ts": r.get::<_,f64>(1)?,
+                  "process_id": r.get::<_,Option<i64>>(2)?,
+                  "stream": r.get::<_,i64>(3)?, "content": {"__b": b64}}))
+    }).unwrap_or(Value::Null)
+}
+
+/// The deduped environment of one process row (env table via env_id), or {}.
+pub fn process_env(box_id: i64, proc_id: i64) -> Value {
+    let Some(c) = open_ro(box_id) else { return json!({}) };
+    c.query_row("SELECT env.env FROM process JOIN env ON process.env_id=env.id \
+                 WHERE process.id=?1", [proc_id], |r| r.get::<_, Option<String>>(0))
+        .ok().flatten()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .unwrap_or_else(|| json!({}))
+}
