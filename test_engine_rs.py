@@ -249,6 +249,27 @@ def main():
             victim.unlink(missing_ok=True)
             out_host.unlink(missing_ok=True)
 
+        # ── fully-Rust box: Rust runner -> Rust engine -> Rust inner ────────
+        rv = Path("/root/m3rust_box.txt"); rv.unlink(missing_ok=True)
+        try:
+            r = subprocess.run(
+                [str(BIN), "run", "ALLRUST", "--", "sh", "-c",
+                 "echo all-rust > /root/m3rust_box.txt"],
+                capture_output=True, text=True, timeout=60)
+            check(r.returncode == 0,
+                  f"engine-rs: `sarun-engine run` (Rust runner) exits 0 "
+                  f"(got {r.returncode}: {r.stderr[-200:]})")
+            check(not rv.exists(),
+                  "engine-rs: fully-Rust box write captured, host untouched")
+            sp3 = max(Path(os.environ["XDG_STATE_HOME"]).joinpath("slopbox.RS")
+                      .glob("*.sqlar"), key=lambda p: int(p.stem))
+            check(m.sqlar_content(sp3, "root/m3rust_box.txt") == b"all-rust\n",
+                  "engine-rs: fully-Rust box output captured, python-readable")
+            check(m.sqlar_meta_get(sp3, "name") == "ALLRUST",
+                  "engine-rs: Rust runner's NAME recorded (no Python in the path)")
+        finally:
+            rv.unlink(missing_ok=True)
+
         # ── CLI verbs via the REAL slopbox CLI against the Rust engine ──────
         env = dict(os.environ)
         r = subprocess.run([sys.executable, SARUN, "RSBOX", "patch"],

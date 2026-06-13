@@ -49,6 +49,7 @@ mod discover;
 mod overlay;
 mod paths;
 mod review;
+mod runner;
 
 const TTL: Duration = Duration::from_secs(1);
 
@@ -366,10 +367,36 @@ fn serve() -> i32 {
 }
 
 fn main() {
-    let mut args = std::env::args().skip(1);
-    if std::env::args().nth(1).as_deref() == Some("serve") {
-        std::process::exit(serve());
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    match argv.first().map(String::as_str) {
+        Some("serve") => std::process::exit(serve()),
+        Some("run") => {
+            // run [NAME] -- CMD...
+            let rest = &argv[1..];
+            let sep = rest.iter().position(|a| a == "--");
+            let (pre, cmd) = match sep {
+                Some(i) => (&rest[..i], rest[i + 1..].to_vec()),
+                None => (rest, vec![]),
+            };
+            let name = pre.first().cloned();
+            std::process::exit(runner::run(name, cmd));
+        }
+        Some("inner") => {
+            // inner --conn-fd N -- CMD...
+            let rest = &argv[1..];
+            let mut conn_fd = -1;
+            let mut i = 0;
+            while i < rest.len() {
+                if rest[i] == "--conn-fd" && i + 1 < rest.len() {
+                    conn_fd = rest[i + 1].parse().unwrap_or(-1); i += 2;
+                } else if rest[i] == "--" { i += 1; break; }
+                else { i += 1; }
+            }
+            std::process::exit(runner::inner(conn_fd, rest[i..].to_vec()));
+        }
+        _ => {}
     }
+    let mut args = std::env::args().skip(1);
     let mut mountpoint = None;
     let mut lower = PathBuf::from("/");
     let mut threads = 1usize;
