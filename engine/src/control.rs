@@ -334,6 +334,22 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
                                         "error": format!("box_new: {e}")}),
             }
         }
+        "struct_quick" => {
+            match (arg_sid(args), args.get(1).and_then(Value::as_str)) {
+                (Some(id), Some(rel)) => crate::review::struct_quick(id, rel),
+                _ => json!({"lines": [["err", "bad args"]], "job": Value::Null}),
+            }
+        }
+        "struct_finish" => match args.first().and_then(Value::as_i64) {
+            Some(job) => crate::review::struct_finish(job),
+            None => json!({"lines": [["err", "bad job"]]}),
+        },
+        "struct_cancel" => {
+            if let Some(job) = args.first().and_then(Value::as_i64) {
+                crate::review::struct_cancel(job);
+            }
+            return json!({"ok": true, "r": Value::Null});
+        }
         "box_drop" => {
             let ov = state.lock().unwrap().overlay.clone();
             if let (Some(ov), Some(id)) = (ov, arg_sid(args)) {

@@ -274,3 +274,267 @@ pub fn patch_text(id: i64) -> Vec<u8> {
     }
     out.into_bytes()
 }
+
+// ── structural diff (binary detail pane) ────────────────────────────────────
+// Mirrors the Python ChangeReview.structural_diff_{quick,finish}: sniff the
+// type of a binary change's bytes, pick a differ argv template (readelf -Wa for
+// ELF, ar/unzip/tar for other recognized types), run that differ on the base
+// and current bytes INSIDE a locked-down bwrap sandbox, and return a unified
+// diff of the two textual dumps. The quick verb returns the type line(s) + the
+// header immediately plus a job id; the finish verb runs the (heavy, sandboxed)
+// dump synchronously in its handler thread and returns the full line list.
+// Wire shapes match what the Python RemoteReview expects:
+//   struct_quick  -> {"lines": [[style,text],...], "job": <id|null>}
+//   struct_finish -> {"lines": [[style,text],...]}
+// where each tuple is a 2-element JSON array [style, text].
+
+use std::collections::HashMap;
+use std::sync::Mutex as StdMutex;
+use std::sync::OnceLock;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+
+const STRUCT_MAX: usize = 4 * 1024 * 1024;
+const SANDBOX_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+struct StructJob {
+    argv: Vec<String>,
+    base: Vec<u8>,
+    cur: Vec<u8>,
+    head: Vec<Value>,
+}
+
+fn job_registry() -> &'static StdMutex<HashMap<i64, StructJob>> {
+    static REG: OnceLock<StdMutex<HashMap<i64, StructJob>>> = OnceLock::new();
+    REG.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+fn next_id() -> u64 {
+    static N: AtomicU64 = AtomicU64::new(1);
+    N.fetch_add(1, Ordering::Relaxed)
+}
+
+fn pair(style: &str, text: &str) -> Value {
+    json!([style, text])
+}
+
+/// Best-effort type sniff. Read the common magic numbers directly (no libmagic
+/// dependency); fall back to `file --brief` for anything else. Produces strings
+/// `differ_for` matches against ("ELF", "ar archive", …).
+fn struct_type(data: &[u8]) -> String {
+    if data.len() >= 4 && &data[..4] == b"\x7fELF" {
+        return "ELF binary".to_string();
+    }
+    if data.len() >= 8 && &data[..8] == b"!<arch>\n" {
+        return "current ar archive".to_string();
+    }
+    if data.len() >= 2 && &data[..2] == b"PK" {
+        return "Zip archive data".to_string();
+    }
+    if data.len() >= 2 && &data[..2] == b"\x1f\x8b" {
+        return "gzip compressed data".to_string();
+    }
+    if let Some(t) = file_type(&data[..data.len().min(65536)]) {
+        if !t.is_empty() {
+            return t;
+        }
+    }
+    "data".to_string()
+}
+
+/// Shell out to `file --brief` on the leading bytes (best-effort fallback).
+fn file_type(data: &[u8]) -> Option<String> {
+    let tmp = scratch_file("sniff", data).ok()?;
+    let out = std::process::Command::new("file")
+        .arg("--brief").arg(&tmp).output().ok();
+    let _ = std::fs::remove_file(&tmp);
+    let out = out?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Pick (argv_template, label) for a recognized binary type, else None.
+/// `{in}` is the placeholder for the input path inside the sandbox. Mirrors the
+/// Python differ_for choices for the tools available here.
+fn differ_for(mtype: &str, data: &[u8]) -> Option<(Vec<String>, String)> {
+    if data.is_empty() {
+        return None;
+    }
+    let mt = mtype.to_lowercase();
+    let v = |parts: &[&str]| parts.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    if mt.contains("elf") {
+        return Some((v(&["readelf", "-Wa", "{in}"]), "ELF (readelf -Wa)".into()));
+    }
+    if mt.contains("ar archive") {
+        return Some((v(&["ar", "t", "{in}"]), "ar archive (ar t)".into()));
+    }
+    if mt.contains("zip archive") || &data[..data.len().min(2)] == b"PK" {
+        return Some((v(&["unzip", "-l", "{in}"]), "zip (unzip -l)".into()));
+    }
+    if mt.contains("tar archive") || mt.contains("gzip compressed")
+        || mt.contains("bzip2") || mt.contains("xz compressed") {
+        return Some((v(&["tar", "-tvf", "{in}"]), "tar (tar -tvf)".into()));
+    }
+    None
+}
+
+/// FAST half: type line(s) + differ selection. Returns the wire dict
+/// {"lines": [...], "job": <id|null>}. When `job` is null the lines are the
+/// complete result (unrecognized type or over the size cap). Never panics.
+pub fn struct_quick(id: i64, rel: &str) -> Value {
+    let rel = rel.trim_start_matches('/');
+    let base = lower_bytes(rel);
+    let cur = current_bytes(id, rel).unwrap_or_default();
+    let mut lines: Vec<Value> = vec![];
+    if !base.is_empty() && !cur.is_empty() {
+        lines.push(pair("type", &format!("type (base): {}", struct_type(&base))));
+        lines.push(pair("type", &format!("type (current): {}", struct_type(&cur))));
+    } else {
+        let sniff = if cur.is_empty() { &base } else { &cur };
+        lines.push(pair("type", &format!("type: {}", struct_type(sniff))));
+    }
+    let sniff = if cur.is_empty() { base.clone() } else { cur.clone() };
+    let Some((argv, label)) = differ_for(&struct_type(&sniff), &sniff) else {
+        return json!({"lines": lines, "job": Value::Null});
+    };
+    lines.push(pair("hdr", &format!("\u{2500}\u{2500} structural diff \u{b7} {label} \u{2500}\u{2500}")));
+    if base.len() > STRUCT_MAX || cur.len() > STRUCT_MAX {
+        lines.push(pair("dim", &format!("(skipped: file exceeds {STRUCT_MAX} bytes)")));
+        return json!({"lines": lines, "job": Value::Null});
+    }
+    let jid = next_id() as i64;
+    job_registry().lock().unwrap().insert(jid, StructJob {
+        argv, base, cur, head: lines.clone(),
+    });
+    json!({"lines": lines, "job": jid})
+}
+
+/// SLOW half: run the sandboxed dump(s) for `job` and build the unified
+/// structural diff. Returns {"lines": [...]}. Never panics.
+pub fn struct_finish(job_id: i64) -> Value {
+    let Some(job) = job_registry().lock().unwrap().remove(&job_id) else {
+        return json!({"lines": [["err", "unknown struct job"]]});
+    };
+    let mut lines = job.head.clone();
+    let dump = |data: &[u8]| -> String {
+        if data.is_empty() {
+            return String::new();
+        }
+        match run_on_untrusted(&job.argv, data) {
+            Ok(out) => out,
+            Err(e) => format!("<parser error: {e}>"),
+        }
+    };
+    if !job.base.is_empty() && !job.cur.is_empty() {
+        let bd = dump(&job.base);
+        let cd = dump(&job.cur);
+        let diff = TextDiff::from_lines(&bd, &cd);
+        let bl: Vec<&str> = diff.iter_old_slices()
+            .map(|s| s.trim_end_matches(['\r', '\n'])).collect();
+        let cl: Vec<&str> = diff.iter_new_slices()
+            .map(|s| s.trim_end_matches(['\r', '\n'])).collect();
+        let mut any = false;
+        for group in diff.grouped_ops(3) {
+            if group.is_empty() { continue; }
+            let (_, a0, _) = group[0].as_tag_tuple();
+            let (_, alast, blast) = group[group.len() - 1].as_tag_tuple();
+            let (_, _, b0) = group[0].as_tag_tuple();
+            lines.push(pair("@", &format!("@@ -{},{} +{},{} @@",
+                a0.start + 1, alast.end - a0.start, b0.start + 1, blast.end - b0.start)));
+            any = true;
+            for op in &group {
+                let (tag, orange, nrange) = op.as_tag_tuple();
+                match tag {
+                    DiffTag::Equal => for k in orange { lines.push(pair(" ", bl[k])); },
+                    _ => {
+                        for k in orange { lines.push(pair("-", bl[k])); }
+                        for k in nrange { lines.push(pair("+", cl[k])); }
+                    }
+                }
+            }
+        }
+        if !any {
+            lines.push(pair("dim", "(structural dumps identical)"));
+        }
+    } else {
+        let which_side = if job.cur.is_empty() { "base" } else { "current" };
+        lines.push(pair("dim", &format!("({which_side} only)")));
+        let data = if job.cur.is_empty() { &job.base } else { &job.cur };
+        for ln in dump(data).split('\n') {
+            lines.push(pair(" ", ln.trim_end_matches('\r')));
+        }
+    }
+    json!({"lines": lines})
+}
+
+pub fn struct_cancel(job_id: i64) {
+    job_registry().lock().unwrap().remove(&job_id);
+}
+
+/// Write `data` to a uniquely-named scratch file under the system temp dir.
+fn scratch_file(tag: &str, data: &[u8]) -> std::io::Result<PathBuf> {
+    let dir = std::env::temp_dir();
+    let p = dir.join(format!("sarun-ut-{tag}-{}-{}", std::process::id(), next_id()));
+    std::fs::write(&p, data)?;
+    Ok(p)
+}
+
+/// Run `argv` (with a {in} placeholder) over untrusted `data` inside a throwaway
+/// bwrap, as the Python run_on_untrusted does: the bytes go to a temp dir that
+/// is ro-bound into a `--unshare-*` / `--cap-drop ALL` / `--die-with-parent`
+/// sandbox with `/` mounted read-only, and {in} resolves to the path inside.
+/// If bwrap is unavailable, runs the differ directly on the host temp file
+/// (noted in any error). Output is capped at 256 KiB. Never panics.
+fn run_on_untrusted(argv: &[String], data: &[u8]) -> Result<String, String> {
+    // A dedicated dir so we can ro-bind exactly the input into the sandbox.
+    let dir = std::env::temp_dir()
+        .join(format!("sarun-utd-{}-{}", std::process::id(), next_id()));
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let host_in = dir.join("in");
+    let res = (|| {
+        std::fs::write(&host_in, data).map_err(|e| e.to_string())?;
+        let inside_dir = "/tmp/ut";
+        let inside_in = format!("{inside_dir}/in");
+        let is_in = |a: &str| a.starts_with('{') && a.ends_with('}')
+            && &a[1..a.len() - 1] == "in";
+        let out = if which("bwrap") {
+            let mut cmd = std::process::Command::new("bwrap");
+            cmd.args(["--unshare-pid", "--unshare-ipc", "--unshare-uts",
+                      "--unshare-net", "--die-with-parent", "--new-session",
+                      "--cap-drop", "ALL", "--ro-bind", "/", "/",
+                      "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]);
+            cmd.arg("--ro-bind").arg(&dir).arg(inside_dir);
+            cmd.args(["--chdir", inside_dir, "--clearenv",
+                      "--setenv", "PATH", SANDBOX_PATH, "--"]);
+            cmd.args(argv.iter().map(|a| if is_in(a) { inside_in.clone() }
+                                       else { a.clone() }));
+            cmd.stdin(std::process::Stdio::null());
+            cmd.output().map_err(|e| format!("spawn failed: {e}"))?
+        } else {
+            let real: Vec<String> = argv.iter().map(|a| if is_in(a) {
+                host_in.to_string_lossy().into_owned() } else { a.clone() }).collect();
+            std::process::Command::new(&real[0]).args(&real[1..])
+                .stdin(std::process::Stdio::null())
+                .output().map_err(|e| format!("spawn failed (no bwrap): {e}"))?
+        };
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let capped: String = stdout.chars().take(256 * 1024).collect();
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr);
+            let msg: String = err.trim().chars().take(2000).collect();
+            return Err(if msg.is_empty() {
+                format!("exit {:?}", out.status.code()) } else { msg });
+        }
+        Ok(capped)
+    })();
+    let _ = std::fs::remove_dir_all(&dir);
+    res
+}
+
+fn which(prog: &str) -> bool {
+    std::env::var_os("PATH").map(|paths| {
+        std::env::split_paths(&paths).any(|p| p.join(prog).is_file())
+    }).unwrap_or(false)
+}
