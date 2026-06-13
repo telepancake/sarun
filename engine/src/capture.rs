@@ -213,6 +213,56 @@ impl BoxState {
         );
     }
 
+    /// Move the upper row old->new (reusing the blob — rowid is stable, so the
+    /// pool file at blob_path(id,rowid) stays put). Drops any pre-existing new
+    /// row first. Mirror updated to match. The caller decides whether to white
+    /// out `old` afterwards (it does when a lower file shows through there).
+    pub fn rename_row(&self, old: &str, new: &str) {
+        let entry = self.kinds.read().unwrap().get(old).cloned();
+        let Some(entry) = entry else { return };
+        {
+            let conn = self.conn.lock().unwrap();
+            let _ = conn.execute("DELETE FROM sqlar WHERE name=?1", [new]);
+            let _ = conn.execute("UPDATE sqlar SET name=?2 WHERE name=?1",
+                                 params![old, new]);
+        }
+        let mut k = self.kinds.write().unwrap();
+        k.remove(old);
+        k.insert(new.to_string(), entry);
+    }
+
+    /// Move a whole subtree old/ -> new/ in place (UPDATE name, rowids — and
+    /// thus blob addresses — preserved). Used for directory rename.
+    pub fn reparent(&self, old: &str, new: &str) {
+        let op = format!("{old}/");
+        let conn = self.conn.lock().unwrap();
+        let names: Vec<String> = {
+            let mut st = match conn.prepare(
+                "SELECT name FROM sqlar WHERE name=?1 OR name LIKE ?2") {
+                Ok(s) => s, Err(_) => return,
+            };
+            let like = format!("{op}%");
+            let it = st.query_map(params![old, like], |r| r.get::<_, String>(0));
+            match it { Ok(it) => it.flatten().collect(), Err(_) => return }
+        };
+        for name in &names {
+            let nn = if name == old { new.to_string() }
+                     else { format!("{new}/{}", &name[op.len()..]) };
+            let _ = conn.execute("DELETE FROM sqlar WHERE name=?1", [&nn]);
+            let _ = conn.execute("UPDATE sqlar SET name=?2 WHERE name=?1",
+                                 params![name, nn]);
+        }
+        drop(conn);
+        let mut k = self.kinds.write().unwrap();
+        for name in names {
+            let nn = if name == old { new.to_string() }
+                     else { format!("{new}/{}", &name[op.len()..]) };
+            if let Some(e) = k.remove(&name) {
+                k.insert(nn, e);
+            }
+        }
+    }
+
     /// Drop a row entirely (an upper-only file was unlinked: nothing to white
     /// out, the change simply un-happens). Removes the blob too.
     pub fn drop_row(&self, rel: &str) {

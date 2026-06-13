@@ -175,7 +175,15 @@ def main():
                   "engine-rs: deletion is a python-readable tombstone")
             check(stat_mod.S_ISDIR(rows.get("root/m3a_dir", 0)),
                   "engine-rs: mkdir captured as a dir row")
-            wid2 = m.sqlar_writer_id(sp, "root/m3a_new.txt")
+            # rename (mv): the build-critical atomic case
+            (root / "root/m3a_new.txt").rename(root / "root/m3a_renamed.txt")
+            check((root / "root/m3a_renamed.txt").read_bytes() == b"made in rust\n"
+                  and not (root / "root/m3a_new.txt").exists(),
+                  "engine-rs: rename moves the file in the box view")
+            check(m.sqlar_content(sp, "root/m3a_renamed.txt") == b"made in rust\n",
+                  "engine-rs: renamed row keeps its blob (python-readable)")
+
+            wid2 = m.sqlar_writer_id(sp, "root/m3a_renamed.txt")
             prov = m.sqlar_proc_prov(sp, wid2) if wid2 else None
             check(prov is not None and prov.get("exe"),
                   "engine-rs: writer provenance recorded and python-readable")

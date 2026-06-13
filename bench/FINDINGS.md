@@ -266,3 +266,23 @@ merge/whiteout/capture checks the Python per-op path performs, so part of the
 ~3×, with the rest from threading and the not-yet-ported logic. Next
 milestones: control socket + namespace layout, then the overlay/capture
 semantics ported against the existing black-box test suite.
+
+## Addendum: m3c graduation — the Rust overlay breaks the GIL ceiling
+
+With the FULL capturing overlay (copy-up + rows + provenance, not the m1
+passthrough), bench/parallel_build_rs.py builds a 200-file C project through
+native / the Python engine / the Rust engine, on this 4-core box:
+
+    make build (best of 2)   -j1      -j8    scaling
+    native                  3.21s    0.81s    4.0x
+    python overlay          7.07s    3.47s    2.0x   (GIL wall)
+    rust overlay            6.59s    1.54s    4.3x   (full cores)
+
+    overlay/native at -j8:  python 4.3x   rust 1.9x
+
+This is the whole thesis confirmed end to end: serial per-op cost is similar
+(-j1: 6.6 vs 7.1s), but the Python engine's single trio thread caps scaling at
+2x while the Rust engine scales with cores (4.3x), so at -j8 Rust is 2.25x
+faster in absolute terms and 1.9x native — hitting m1's predicted target. The
+gap widens with core count; on a build farm it is the difference between
+"usable" and "why is my 32-core box idle".

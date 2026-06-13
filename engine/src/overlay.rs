@@ -151,6 +151,33 @@ impl Overlay {
         self.inner.boxes.read().unwrap().keys().copied().collect()
     }
 
+    /// On rename, the kernel keeps the cached inode and moves its dentry; our
+    /// ino->key map must follow, for `rel_o` and the whole subtree under it,
+    /// or a getattr on the cached inode resolves the stale (now-absent) path.
+    fn remap_inode_subtree(&self, bid: i64, rel_o: &str, rel_n: &str) {
+        let oldp = format!("{rel_o}/");
+        let mut k2i = self.inner.key_to_ino.write().unwrap();
+        let mut i2k = self.inner.ino_to_key.write().unwrap();
+        let moves: Vec<(String, String)> = k2i.keys()
+            .filter(|(b, _)| *b == bid)
+            .filter_map(|(_, rel)| {
+                if rel == rel_o {
+                    Some((rel.clone(), rel_n.to_string()))
+                } else if let Some(tail) = rel.strip_prefix(&oldp) {
+                    Some((rel.clone(), format!("{rel_n}/{tail}")))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for (old, new) in moves {
+            if let Some(ino) = k2i.remove(&(bid, old)) {
+                k2i.insert((bid, new.clone()), ino);
+                i2k.insert(ino, (bid, new));
+            }
+        }
+    }
+
     fn box_of(&self, id: i64) -> Option<Arc<BoxState>> {
         self.inner.boxes.read().unwrap().get(&id).cloned()
     }
@@ -634,6 +661,50 @@ impl Filesystem for Overlay {
         if self.host(&rel).is_dir() {
             b.set_whiteout(&rel, writer);
         }
+        reply.ok();
+    }
+
+    fn rename(&self, req: &Request, parent: INodeNo, name: &OsStr,
+              newparent: INodeNo, newname: &OsStr, _flags: fuser::RenameFlags,
+              reply: ReplyEmpty) {
+        let (Some((bo, po)), Some((bn, pn))) =
+            (self.key_of(parent), self.key_of(newparent)) else {
+            return reply.error(Errno::EACCES);
+        };
+        if bo == 0 || bn == 0 || bo != bn {
+            return reply.error(Errno::EXDEV); // no cross-box / root rename
+        }
+        let Some(b) = self.box_of(bo) else { return reply.error(Errno::ENOENT) };
+        let (Some(no), Some(nn)) = (name.to_str(), newname.to_str()) else {
+            return reply.error(Errno::EINVAL);
+        };
+        let join = |p: &str, n: &str| if p.is_empty() { n.to_string() }
+                                      else { format!("{p}/{n}") };
+        let rel_o = join(&po, no);
+        let rel_n = join(&pn, nn);
+        let writer = b.writer_for(req.pid());
+        let lower_o = self.host(&rel_o).symlink_metadata().is_ok();
+        match self.layer(&b, &rel_o) {
+            Layer::Absent => return reply.error(Errno::ENOENT),
+            Layer::UpperDir { .. } => {
+                b.reparent(&rel_o, &rel_n);
+                if self.host(&rel_o).is_dir() { b.set_whiteout(&rel_o, writer); }
+            }
+            Layer::Lower => {
+                // copy-up the source to a real upper row, then move it.
+                match self.copy_up(&b, &rel_o, req.pid()) {
+                    Ok(_) => {}
+                    Err(_) => return reply.error(Errno::EIO),
+                }
+                b.rename_row(&rel_o, &rel_n);
+                b.set_whiteout(&rel_o, writer); // lower still shows through old name
+            }
+            Layer::UpperFile { .. } | Layer::UpperSymlink { .. } => {
+                b.rename_row(&rel_o, &rel_n);
+                if lower_o { b.set_whiteout(&rel_o, writer); }
+            }
+        }
+        self.remap_inode_subtree(bo, &rel_o, &rel_n);
         reply.ok();
     }
 
