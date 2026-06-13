@@ -664,6 +664,52 @@ impl Filesystem for Overlay {
         reply.ok();
     }
 
+    // Safe no-op/durability ops real programs call — ENOSYS here (the fuser
+    // default) makes fsync()/access() fail spuriously. Backing fds are real
+    // files, so an fsync on them is genuine; flush/access just succeed.
+    fn flush(&self, _req: &Request, _ino: INodeNo, fh: FileHandle,
+             _lock_owner: LockOwner, reply: ReplyEmpty) {
+        if let Some(h) = self.inner.fhs.read().unwrap().get(&u64::from(fh)) {
+            if let Some(f) = h.lock().unwrap().inner.file.as_ref() {
+                let _ = f.sync_all();
+            }
+        }
+        reply.ok();
+    }
+
+    fn fsync(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, _datasync: bool,
+             reply: ReplyEmpty) {
+        if let Some(h) = self.inner.fhs.read().unwrap().get(&u64::from(fh)) {
+            if let Some(f) = h.lock().unwrap().inner.file.as_ref() {
+                let _ = f.sync_all();
+            }
+        }
+        reply.ok();
+    }
+
+    fn fsyncdir(&self, _req: &Request, _ino: INodeNo, _fh: FileHandle,
+                _datasync: bool, reply: ReplyEmpty) {
+        reply.ok();
+    }
+
+    fn access(&self, _req: &Request, _ino: INodeNo, _mask: fuser::AccessFlags, reply: ReplyEmpty) {
+        reply.ok(); // permission is enforced by the box's bwrap uid, not here
+    }
+
+    fn statfs(&self, _req: &Request, _ino: INodeNo, reply: fuser::ReplyStatfs) {
+        // Report the lower filesystem's real numbers (df, build free-space checks).
+        let c = std::ffi::CString::new(self.inner.lower.as_os_str()
+            .as_encoded_bytes()).unwrap();
+        let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statvfs(c.as_ptr(), &mut s) } == 0 {
+            reply.statfs(s.f_blocks as u64, s.f_bfree as u64, s.f_bavail as u64,
+                         s.f_files as u64, s.f_ffree as u64, s.f_bsize as u32,
+                         255, s.f_frsize as u32);
+        } else {
+            reply.statfs(0, 0, 0, 0, 0, 512, 255, 0);
+        }
+    }
+
     fn rename(&self, req: &Request, parent: INodeNo, name: &OsStr,
               newparent: INodeNo, newname: &OsStr, _flags: fuser::RenameFlags,
               reply: ReplyEmpty) {
