@@ -1,3 +1,4 @@
+use base64::Engine as _;
 // Control socket — newline-JSON request/reply on a unix socket, speaking the
 // SAME protocol as the Python ChannelServer: {"type":"ui","verb":...} verb
 // calls, {"type":"subscribe"} converting the connection into a one-way event
@@ -98,6 +99,67 @@ fn dispatch(state: &State, msg: &Value) -> Value {
             }
         }
         "ui" => dispatch_ui(state, msg),
+        "patch" => {
+            let boxes = discover::discover();
+            match msg.get("sid").and_then(Value::as_str)
+                .and_then(|s| resolve(&boxes, s)) {
+                Some(id) => {
+                    let data = crate::review::patch_text(id);
+                    json!({"ok": true, "patch":
+                        base64::engine::general_purpose::STANDARD.encode(&data)})
+                }
+                None => json!({"ok": false, "error": "no slopbox"}),
+            }
+        }
+        "apply" | "discard" => {
+            let boxes = discover::discover();
+            match msg.get("sid").and_then(Value::as_str)
+                .and_then(|s| resolve(&boxes, s)) {
+                Some(id) => {
+                    let all = Value::Null; // CLI applies/discards the whole box
+                    let (r, n) = if t == "apply" {
+                        let r = crate::review::apply(id, &all);
+                        let n = r.get("applied").and_then(Value::as_array)
+                            .map(|a| a.len()).unwrap_or(0);
+                        (r, n)
+                    } else {
+                        let r = crate::review::discard(id, &all);
+                        let n = r.get("discarded").and_then(Value::as_array)
+                            .map(|a| a.len()).unwrap_or(0);
+                        (r, n)
+                    };
+                    drop_if_empty(state, id);
+                    json!({"ok": true, "count": n, "sid": id.to_string(),
+                           "errors": r.get("errors").cloned()
+                               .unwrap_or(json!([]))})
+                }
+                None => json!({"ok": false, "error": "no slopbox"}),
+            }
+        }
+        "rename" => {
+            let boxes = discover::discover();
+            let newname = msg.get("name").and_then(Value::as_str).unwrap_or("");
+            match msg.get("sid").and_then(Value::as_str)
+                .and_then(|s| resolve(&boxes, s)) {
+                Some(id) => {
+                    let old = discover::display_path(&boxes, id);
+                    if let Some(ov) = state.lock().unwrap().overlay.clone() {
+                        let _ = ov; // live-box meta is the disk sqlar either way
+                    }
+                    if let Some(c) = rusqlite::Connection::open(
+                        crate::paths::state_home().join(format!("{id}.sqlar"))).ok() {
+                        let _ = c.execute(
+                            "INSERT INTO meta(key,value) VALUES('name',?1)
+                             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                            [newname]);
+                    }
+                    broadcast(state, &json!({"type": "session_renamed",
+                        "session_id": id.to_string(), "name": newname}));
+                    json!({"ok": true, "old": old, "name": newname})
+                }
+                None => json!({"ok": false, "error": "no slopbox"}),
+            }
+        }
         other => json!({"ok": false,
                         "error": format!("unknown control type '{other}'")}),
     }

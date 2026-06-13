@@ -243,3 +243,34 @@ pub fn discard(id: i64, paths: &Value) -> Value {
     }
     json!({"discarded": discarded, "errors": []})
 }
+
+/// Unified diff for the whole box (the `patch` CLI verb). Per changed path: a
+/// git-style ---/+++ header and the text hunks, or a one-line note for
+/// binary/symlink/deleted. Best-effort, human-facing.
+pub fn patch_text(id: i64) -> Vec<u8> {
+    let mut out = String::new();
+    let changes = session_changes(id);
+    for e in changes.as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
+        let rel = e.get("path").and_then(Value::as_str).unwrap_or("");
+        let h = hunks(id, rel);
+        if h.get("is_text").and_then(Value::as_bool) == Some(true) {
+            out.push_str(&format!("--- a/{rel}\n+++ b/{rel}\n"));
+            for hk in h.get("hunks").and_then(Value::as_array).unwrap_or(&vec![]) {
+                for line in hk.get("lines").and_then(Value::as_array)
+                    .unwrap_or(&vec![]) {
+                    if let Some(pair) = line.as_array() {
+                        let tag = pair[0].as_str().unwrap_or(" ");
+                        let txt = pair[1].as_str().unwrap_or("");
+                        let pre = if tag == "hdr" { "" } else { tag };
+                        out.push_str(&format!("{pre}{txt}\n"));
+                    }
+                }
+            }
+        } else {
+            let kind = h.get("diff").and_then(|d| d.get("kind"))
+                .and_then(Value::as_str).unwrap_or("changed");
+            out.push_str(&format!("--- a/{rel}\n+++ b/{rel}\n# {kind} (non-text)\n"));
+        }
+    }
+    out.into_bytes()
+}

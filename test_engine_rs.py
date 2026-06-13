@@ -249,6 +249,19 @@ def main():
             victim.unlink(missing_ok=True)
             out_host.unlink(missing_ok=True)
 
+        # ── CLI verbs via the REAL slopbox CLI against the Rust engine ──────
+        env = dict(os.environ)
+        r = subprocess.run([sys.executable, SARUN, "RSBOX", "patch"],
+                           env=env, capture_output=True, text=True, timeout=30)
+        check(r.returncode == 0 and "rust!" in r.stdout,
+              "engine-rs: `slopbox RSBOX patch` prints the diff via the Rust engine")
+        r = subprocess.run([sys.executable, SARUN, "RSBOX", "rename", "RENAMED2"],
+                           env=env, capture_output=True, text=True, timeout=30)
+        check(r.returncode == 0 and "RENAMED2" in r.stdout,
+              "engine-rs: `slopbox RSBOX rename` works via the Rust engine")
+        check(m.sqlar_meta_get(m.sqlar_path(sid), "name") == "RENAMED2",
+              "engine-rs: rename persisted the new NAME to meta")
+
         # ── apply / discard on a FINISHED box (host-mutating review actions) ─
         av = Path("/root/m3rev_new.txt"); dv = Path("/root/m3rev_del.txt")
         drp = Path("/root/m3rev_drop.txt")
