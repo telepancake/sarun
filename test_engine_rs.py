@@ -459,6 +459,26 @@ def main():
         finally:
             for p in (av, dv, drp): p.unlink(missing_ok=True)
 
+        # ── nested KIDS_DIR routing: /<parent>/.slopbox-kids/<child> ────────
+        pp = m.sync_request(sock, type="ui", verb="box_new", args=[])["r"]["sid"]
+        cc = m.sync_request(sock, type="ui", verb="box_new", args=[pp])["r"]["sid"]
+        proot = Path(os.environ["XDG_RUNTIME_DIR"]) / "slopbox.RS" / "mnt" / pp
+        kids = proot / ".slopbox-kids"
+        check(kids.is_dir(), "engine-rs: KIDS_DIR resolves at a box root")
+        check(cc in [p.name for p in kids.iterdir()],
+              "engine-rs: the live child is listed under KIDS_DIR")
+        # routing: the child's root via KIDS_DIR is the SAME view as <mnt>/<child>
+        (Path(os.environ["XDG_RUNTIME_DIR"]) / "slopbox.RS" / "mnt" / cc / "root")\
+            .mkdir(exist_ok=True)
+        (Path(os.environ["XDG_RUNTIME_DIR"]) / "slopbox.RS" / "mnt" / cc
+         / "root/kidtest.txt").write_bytes(b"kid\n")
+        check((kids / cc / "root/kidtest.txt").read_bytes() == b"kid\n",
+              "engine-rs: KIDS_DIR/<child> routes to the child's real overlay view")
+        check(".slopbox-kids" not in [p.name for p in proot.iterdir()],
+              "engine-rs: KIDS_DIR is hidden from the box-root readdir")
+        m.sync_request(sock, type="ui", verb="delete", args=[cc])
+        m.sync_request(sock, type="ui", verb="delete", args=[pp])
+
         # ── dissolve: reap a box, reparent its children to its parent ───────
         # parent box P (id pa) with child C (parent=pa); dissolve P -> C top-level
         rep_p = m.sync_request(sock, type="ui", verb="box_new", args=[])

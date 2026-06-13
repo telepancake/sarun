@@ -120,6 +120,10 @@ struct FhInner {
 // They resolve by exact lookup but are never listed in readdir.
 const SINK_STDOUT: &str = ".slopbox-stdout";
 const SINK_STDERR: &str = ".slopbox-stderr";
+// Hidden synthetic dir at each box root listing the box's live children, each
+// routing to that child's real overlay-root inode (the nested-launch bind
+// target). Reachable by explicit lookup; never listed in the box-root readdir.
+const KIDS_DIR: &str = ".slopbox-kids";
 
 fn sink_stream(rel: &str) -> Option<i32> {
     match rel {
@@ -165,6 +169,12 @@ impl Overlay {
 
     pub fn box_ids(&self) -> Vec<i64> {
         self.inner.boxes.read().unwrap().keys().copied().collect()
+    }
+
+    /// Live child box ids of `bid` (their parent() == bid) — KIDS_DIR entries.
+    fn children_of_box(&self, bid: i64) -> Vec<i64> {
+        self.inner.boxes.read().unwrap().values()
+            .filter(|c| c.parent() == Some(bid)).map(|c| c.id).collect()
     }
 
     /// On rename, the kernel keeps the cached inode and moves its dentry; our
@@ -394,6 +404,23 @@ impl Filesystem for Overlay {
                                Generation(0));
         }
         let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
+        // The hidden synthetic KIDS_DIR at a box root, and routing through it to
+        // a live child's REAL overlay-root inode (nested-launch bind target).
+        if prel.is_empty() && name == KIDS_DIR {
+            let ino = self.ino_for(&(bid, KIDS_DIR.to_string()));
+            return reply.entry(&TTL, &self.synth_dir_attr(ino, 0o40755, 0),
+                               Generation(0));
+        }
+        if prel == KIDS_DIR {
+            if let Ok(cid) = name.parse::<i64>() {
+                if self.box_of(cid).and_then(|c| c.parent()) == Some(bid) {
+                    let cino = self.ino_for(&(cid, String::new()));
+                    return reply.entry(&TTL,
+                        &self.synth_dir_attr(cino, 0o40755, 0), Generation(0));
+                }
+            }
+            return reply.error(Errno::ENOENT);
+        }
         let rel = if prel.is_empty() { name.to_string() }
                   else { format!("{prel}/{name}") };
         let ino = self.ino_for(&(bid, rel.clone()));
@@ -411,7 +438,7 @@ impl Filesystem for Overlay {
         let Some((bid, rel)) = self.key_of(ino) else {
             return reply.error(Errno::ENOENT);
         };
-        if bid == 0 || rel.is_empty() {
+        if bid == 0 || rel.is_empty() || rel == KIDS_DIR {
             return reply.attr(&TTL, &self.synth_dir_attr(u64::from(ino), 0o40755, 0));
         }
         if sink_stream(&rel).is_some() {
@@ -1019,6 +1046,15 @@ impl Filesystem for Overlay {
             }
             return reply.ok();
         }
+        if rel == KIDS_DIR {
+            for (i, cid) in self.children_of_box(bid).into_iter().enumerate() {
+                if (i as u64) < offset { continue; }
+                let cino = self.ino_for(&(cid, String::new()));
+                if reply.add(INodeNo(cino), (i + 1) as u64, FileType::Directory,
+                             cid.to_string()) { break; }
+            }
+            return reply.ok();
+        }
         let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
         for (i, (name, kind, cino, _)) in
             self.scan_dir(&b, &rel, false).into_iter().enumerate() {
@@ -1044,6 +1080,16 @@ impl Filesystem for Overlay {
                              &TTL, &a, Generation(0)) {
                     break;
                 }
+            }
+            return reply.ok();
+        }
+        if rel == KIDS_DIR {
+            for (i, cid) in self.children_of_box(bid).into_iter().enumerate() {
+                if (i as u64) < offset { continue; }
+                let cino = self.ino_for(&(cid, String::new()));
+                let a = self.synth_dir_attr(cino, 0o40755, 0);
+                if reply.add(INodeNo(cino), (i + 1) as u64, cid.to_string(),
+                             &TTL, &a, Generation(0)) { break; }
             }
             return reply.ok();
         }

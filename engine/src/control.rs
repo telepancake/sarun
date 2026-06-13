@@ -423,8 +423,15 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
                 return json!({"ok": false, "error": "overlay not mounted"});
             };
             let id = boxes.keys().max().copied().unwrap_or(0) + 1;
+            // optional parent arg (args[0]) — nests the new box for KIDS_DIR.
+            let parent = args.first().and_then(Value::as_str)
+                .and_then(|s| s.parse::<i64>().ok());
             match crate::capture::BoxState::create(id) {
                 Ok(b) => {
+                    b.set_parent(parent);
+                    if let Some(p) = parent {
+                        b.set_meta("parent_box_id", &p.to_string());
+                    }
                     ov.add_box(std::sync::Arc::new(b));
                     json!({"sid": id.to_string(),
                            "root": crate::paths::mnt_point().join(id.to_string())

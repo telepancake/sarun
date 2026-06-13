@@ -53,6 +53,18 @@ pub struct BoxState {
     pub conn: Mutex<Connection>,
     pub kinds: RwLock<HashMap<String, Entry>>,
     procs: Mutex<HashMap<u32, i64>>, // tgid -> process row id
+    parent: std::sync::atomic::AtomicI64, // 0 = top-level; else parent box_id
+}
+
+impl BoxState {
+    pub fn set_parent(&self, p: Option<i64>) {
+        self.parent.store(p.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+    }
+    pub fn parent(&self) -> Option<i64> {
+        match self.parent.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => None, p => Some(p),
+        }
+    }
 }
 
 pub fn blob_path(box_id: i64, rowid: i64) -> PathBuf {
@@ -82,6 +94,7 @@ impl BoxState {
             conn: Mutex::new(conn),
             kinds: RwLock::new(HashMap::new()),
             procs: Mutex::new(HashMap::new()),
+            parent: std::sync::atomic::AtomicI64::new(0),
         })
     }
 
