@@ -160,3 +160,22 @@ pub fn processes(box_id: i64) -> Value {
     }
     Value::Array(rows)
 }
+
+pub fn outputs(box_id: i64) -> Value {
+    let db = sqlar_path(box_id);
+    let Ok(conn) = rusqlite::Connection::open_with_flags(
+        &db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) else {
+        return json!([]);
+    };
+    let mut rows = vec![];
+    if let Ok(mut st) = conn.prepare(
+        "SELECT id,ts,process_id,stream,length(content) FROM outputs ORDER BY id") {
+        let it = st.query_map([], |r| Ok(json!({
+            "id": r.get::<_, i64>(0)?, "ts": r.get::<_, f64>(1)?,
+            "process_id": r.get::<_, Option<i64>>(2)?,
+            "stream": r.get::<_, i64>(3)?, "len": r.get::<_, i64>(4)?,
+        })));
+        if let Ok(it) = it { for row in it.flatten() { rows.push(row); } }
+    }
+    Value::Array(rows)
+}

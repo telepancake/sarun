@@ -112,6 +112,21 @@ struct FhInner {
     upper: bool,
     dirty: bool,
     last_pid: u32,
+    sink: Option<i32>, // Some(stream) → writes go to the outputs table, not a blob
+}
+
+// Reserved box-root paths: the box's stdout/stderr write THROUGH these, and the
+// overlay routes the bytes to the outputs table (per-write pid attribution).
+// They resolve by exact lookup but are never listed in readdir.
+const SINK_STDOUT: &str = ".slopbox-stdout";
+const SINK_STDERR: &str = ".slopbox-stderr";
+
+fn sink_stream(rel: &str) -> Option<i32> {
+    match rel {
+        SINK_STDOUT => Some(0),
+        SINK_STDERR => Some(1),
+        _ => None,
+    }
 }
 
 enum Layer {
@@ -255,6 +270,15 @@ impl Overlay {
         }
     }
 
+    fn synth_file_attr(&self, ino: u64) -> FileAttr {
+        FileAttr {
+            ino: INodeNo(ino), size: 0, blocks: 0,
+            atime: UNIX_EPOCH, mtime: UNIX_EPOCH, ctime: UNIX_EPOCH,
+            crtime: UNIX_EPOCH, kind: FileType::RegularFile,
+            perm: 0o666, nlink: 1, uid: 0, gid: 0, rdev: 0, blksize: 512, flags: 0,
+        }
+    }
+
     fn synth_link_attr(&self, ino: u64, len: u64) -> FileAttr {
         FileAttr {
             ino: INodeNo(ino), size: len, blocks: 0,
@@ -364,6 +388,9 @@ impl Filesystem for Overlay {
         let rel = if prel.is_empty() { name.to_string() }
                   else { format!("{prel}/{name}") };
         let ino = self.ino_for(&(bid, rel.clone()));
+        if prel.is_empty() && sink_stream(&rel).is_some() {
+            return reply.entry(&TTL, &self.synth_file_attr(ino), Generation(0));
+        }
         match self.attr_of(&b, ino, &rel) {
             Some(a) => reply.entry(&TTL, &a, Generation(0)),
             None => reply.error(Errno::ENOENT),
@@ -377,6 +404,9 @@ impl Filesystem for Overlay {
         };
         if bid == 0 || rel.is_empty() {
             return reply.attr(&TTL, &self.synth_dir_attr(u64::from(ino), 0o40755, 0));
+        }
+        if sink_stream(&rel).is_some() {
+            return reply.attr(&TTL, &self.synth_file_attr(u64::from(ino)));
         }
         let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
         match self.attr_of(&b, u64::from(ino), &rel) {
@@ -406,6 +436,14 @@ impl Filesystem for Overlay {
             return reply.error(Errno::ENOENT);
         };
         let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
+        if let Some(stream) = sink_stream(&rel) {
+            // stdout/stderr sink: a write-only channel into the outputs table.
+            let n = self.reg_fh(FhInner {
+                box_id: bid, rel, file: None, upper: false, dirty: false,
+                last_pid: req.pid(), sink: Some(stream),
+            });
+            return reply.opened(FileHandle(n), FopenFlags::empty());
+        }
         let want_write = !matches!(flags.acc_mode(),
                                    fuser::OpenAccMode::O_RDONLY);
         let (file, upper) = match self.layer(&b, &rel) {
@@ -425,7 +463,7 @@ impl Filesystem for Overlay {
             _ => return reply.error(Errno::ENOENT),
         };
         let n = self.reg_fh(FhInner {
-            box_id: bid, rel, file, upper, dirty: false, last_pid: req.pid(),
+            box_id: bid, rel, file, upper, dirty: false, last_pid: req.pid(), sink: None,
         });
         reply.opened(FileHandle(n), FopenFlags::FOPEN_KEEP_CACHE);
     }
@@ -461,7 +499,7 @@ impl Filesystem for Overlay {
         attr.perm = (mode & 0o7777) as u16;
         let n = self.reg_fh(FhInner {
             box_id: bid, rel, file: Some(f), upper: true,
-            dirty: true, last_pid: req.pid(),
+            dirty: true, last_pid: req.pid(), sink: None,
         });
         reply.created(&TTL, &attr, Generation(0), FileHandle(n),
                       FopenFlags::empty());
@@ -492,6 +530,14 @@ impl Filesystem for Overlay {
             return reply.error(Errno::EBADF);
         };
         let mut h = h.lock().unwrap();
+        if let Some(stream) = h.inner.sink {
+            // stdout/stderr sink: bytes go to the outputs table, attributed to
+            // the writing process — never a file change.
+            if let Some(b) = self.box_of(h.inner.box_id) {
+                b.add_output(stream, req.pid(), data);
+            }
+            return reply.written(data.len() as u32);
+        }
         if !h.inner.upper {
             // D3: the FIRST write triggers copy-up + row + provenance.
             let Some(b) = self.box_of(h.inner.box_id) else {
@@ -561,13 +607,25 @@ impl Filesystem for Overlay {
                 return reply.error(Errno::EIO);
             }
         }
-        if let (Some(m), Some(Entry::File { rowid, mode: _ })) =
-            (mode, b.entry(&rel)) {
-            // chmod on a captured file: update the row's mode (blob perms are
-            // an artifact, the row is the truth).
+        if let Some(m) = mode {
+            // chmod: the row's mode is the truth (blob perms are an artifact).
+            // Files and dirs both; a still-lower target is copied up / captured
+            // first so the mode change has a row to live on.
+            let perm = m & 0o7777;
             let writer = b.writer_for(req.pid());
-            b.ensure_file_row(&rel, m, writer);
-            let _ = rowid;
+            match self.layer(&b, &rel) {
+                Layer::UpperFile { .. } => b.set_mode(&rel, 0o100000 | perm),
+                Layer::UpperDir { .. } => b.set_mode(&rel, 0o040000 | perm),
+                Layer::UpperSymlink { .. } => {}   // symlink mode is ignored
+                Layer::Lower => {
+                    if self.host(&rel).is_dir() {
+                        b.set_dir(&rel, perm, writer);
+                    } else if self.copy_up(&b, &rel, req.pid()).is_ok() {
+                        b.set_mode(&rel, 0o100000 | perm);
+                    }
+                }
+                Layer::Absent => {}
+            }
         }
         match self.attr_of(&b, u64::from(ino), &rel) {
             Some(a) => reply.attr(&TTL, &a),

@@ -270,6 +270,41 @@ def main():
         finally:
             rv.unlink(missing_ok=True)
 
+        # ── capture: box stdout/stderr -> outputs table (fully-Rust box) ────
+        r = subprocess.run(
+            [str(BIN), "run", "CAPBOX", "--", "sh", "-c",
+             "echo to-stdout; echo to-stderr 1>&2"],
+            capture_output=True, text=True, timeout=60)
+        check(r.returncode == 0, "engine-rs: capture box exits 0")
+        check("to-stdout" in r.stdout,
+              "engine-rs: stdout teed live to the runner's terminal")
+        spc = max(Path(os.environ["XDG_STATE_HOME"]).joinpath("slopbox.RS")
+                  .glob("*.sqlar"), key=lambda p: int(p.stem))
+        capsid = spc.stem
+        outs = m.sync_request(sock, type="ui", verb="outputs", args=[capsid])["r"]
+        streams = {o["stream"] for o in outs}
+        check(0 in streams and 1 in streams,
+              "engine-rs: both stdout(0) and stderr(1) captured to outputs table")
+        check(any(o["len"] > 0 for o in outs),
+              "engine-rs: captured output has content")
+
+        # ── chmod correctness (the P0 bug the audit found) ──────────────────
+        rep = m.sync_request(sock, type="ui", verb="box_new", args=[])
+        cbsid = rep["r"]["cbroot"] if "cbroot" in rep["r"] else rep["r"]["sid"]
+        cbroot = Path(rep["r"]["root"])
+        (cbroot / "root").mkdir(exist_ok=True)
+        f = cbroot / "root/m3chmod.txt"; f.write_bytes(b"x\n")
+        os.chmod(f, 0o600)
+        import stat as _st
+        check(_st.S_IMODE(f.stat().st_mode) == 0o600,
+              "engine-rs: chmod on a created file persists (P0 fix)")
+        os.chmod(f, 0o755)
+        check(_st.S_IMODE(f.stat().st_mode) == 0o755,
+              "engine-rs: chmod can change mode again")
+        cbsp = m.sqlar_path(rep["r"]["sid"])
+        check(_st.S_IMODE(m.sqlar_mode(cbsp, "root/m3chmod.txt") or 0) == 0o755,
+              "engine-rs: chmod recorded in the sqlar row (python-readable)")
+
         # ── CLI verbs via the REAL slopbox CLI against the Rust engine ──────
         env = dict(os.environ)
         r = subprocess.run([sys.executable, SARUN, "RSBOX", "patch"],

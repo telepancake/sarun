@@ -385,14 +385,16 @@ fn main() {
             // inner --conn-fd N -- CMD...
             let rest = &argv[1..];
             let mut conn_fd = -1;
+            let mut capture = false;
             let mut i = 0;
             while i < rest.len() {
                 if rest[i] == "--conn-fd" && i + 1 < rest.len() {
                     conn_fd = rest[i + 1].parse().unwrap_or(-1); i += 2;
-                } else if rest[i] == "--" { i += 1; break; }
+                } else if rest[i] == "--capture" { capture = true; i += 1; }
+                else if rest[i] == "--" { i += 1; break; }
                 else { i += 1; }
             }
-            std::process::exit(runner::inner(conn_fd, rest[i..].to_vec()));
+            std::process::exit(runner::inner(conn_fd, capture, rest[i..].to_vec()));
         }
         _ => {}
     }

@@ -280,7 +280,10 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
             Some(id) => discover::processes(id),
             None => json!([]),
         },
-        "outputs" => json!([]),
+        "outputs" => match arg_sid(args) {
+            Some(id) => discover::outputs(id),
+            None => json!([]),
+        },
         "open_files" => json!([]),
         "review_state" => json!({
             "consolidating": [], "consolidated": [],

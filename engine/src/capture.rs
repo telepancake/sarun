@@ -145,6 +145,24 @@ impl BoxState {
         );
     }
 
+    /// Apply a new mode to an existing file/dir row (chmod). The audit found
+    /// the old path silently no-op'd: ensure_file_row early-returns for an
+    /// existing row and never ran its mode UPDATE. This is the explicit fix.
+    pub fn set_mode(&self, rel: &str, full_mode: u32) {
+        {
+            let conn = self.conn.lock().unwrap();
+            let _ = conn.execute("UPDATE sqlar SET mode=?2 WHERE name=?1",
+                                 params![rel, full_mode]);
+        }
+        if let Some(e) = self.kinds.write().unwrap().get_mut(rel) {
+            match e {
+                Entry::File { mode, .. } => *mode = full_mode,
+                Entry::Dir { mode, .. } => *mode = full_mode,
+                _ => {}
+            }
+        }
+    }
+
     pub fn set_dir(&self, rel: &str, mode: u32, writer: i64) {
         let m = mode | 0o040000;
         let conn = self.conn.lock().unwrap();
@@ -185,6 +203,19 @@ impl BoxState {
         );
         drop(conn);
         self.kinds.write().unwrap().insert(rel.to_string(), Entry::Whiteout);
+    }
+
+    /// Append one captured stdout/stderr write to the outputs table, attributed
+    /// to the writing process (stream 0=stdout, 1=stderr).
+    pub fn add_output(&self, stream: i32, pid: u32, content: &[u8]) {
+        let writer = self.writer_for(pid);
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64()).unwrap_or(0.0);
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute(
+            "INSERT INTO outputs(ts,process_id,stream,content) VALUES(?1,?2,?3,?4)",
+            rusqlite::params![ts, writer, stream, content]);
     }
 
     pub fn set_meta(&self, key: &str, value: &str) {

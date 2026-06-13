@@ -95,7 +95,8 @@ pub fn run(name: Option<String>, cmd: Vec<String>) -> i32 {
                "--unshare-pid", "--unshare-ipc", "--unshare-uts",
                "--die-with-parent",
                "--chdir", &cwd,
-               "--", &self_exe, "inner", "--conn-fd", &fd.to_string(), "--"])
+               "--", &self_exe, "inner", "--conn-fd", &fd.to_string(),
+               "--capture", "--"])
         .args(&cmd)
         .status();
     drop(conn); // our copy; inner (in the box) is the channel's sole holder now
@@ -105,12 +106,46 @@ pub fn run(name: Option<String>, cmd: Vec<String>) -> i32 {
     }
 }
 
-pub fn inner(conn_fd: i32, cmd: Vec<String>) -> i32 {
-    // Hold the box-channel fd open across the exec (it is not CLOEXEC), so the
-    // engine sees EOF — its teardown signal — only when CMD finally exits.
+pub fn inner(conn_fd: i32, capture: bool, cmd: Vec<String>) -> i32 {
     if cmd.is_empty() { return 2; }
+    // Hold the box-channel fd open (not CLOEXEC) so the engine sees EOF — its
+    // teardown signal — only when this process (and CMD) finally exits.
     if conn_fd >= 0 { clear_cloexec(conn_fd); }
-    let err = Command::new(&cmd[0]).args(&cmd[1..]).exec();
-    eprintln!("sarun-engine inner: exec {}: {err}", cmd[0]);
-    127
+    if !capture {
+        let err = Command::new(&cmd[0]).args(&cmd[1..]).exec();
+        eprintln!("sarun-engine inner: exec {}: {err}", cmd[0]);
+        return 127;
+    }
+    // Capture: tee the child's stdout/stderr to our real fd 1/2 (live) AND to
+    // the box-root sink paths, which the overlay routes to the outputs table.
+    use std::io::Read;
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = match Command::new(&cmd[0]).args(&cmd[1..])
+        .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
+        Ok(c) => c,
+        Err(e) => { eprintln!("sarun-engine inner: spawn {}: {e}", cmd[0]); return 127; }
+    };
+    fn tee(mut src: impl Read + Send + 'static, realfd: i32, sink: &str)
+           -> std::thread::JoinHandle<()> {
+        let mut sf = std::fs::OpenOptions::new().write(true).open(sink).ok();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 65536];
+            loop {
+                match src.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        unsafe { libc::write(realfd, buf.as_ptr().cast(), n); }
+                        if let Some(f) = sf.as_mut() { let _ = f.write_all(&buf[..n]); }
+                    }
+                }
+            }
+        })
+    }
+    let so = child.stdout.take().map(|s| tee(s, 1, "/.slopbox-stdout"));
+    let se = child.stderr.take().map(|s| tee(s, 2, "/.slopbox-stderr"));
+    let code = child.wait().ok().and_then(|s| s.code()).unwrap_or(1);
+    if let Some(h) = so { let _ = h.join(); }
+    if let Some(h) = se { let _ = h.join(); }
+    code
 }
