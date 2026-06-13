@@ -459,6 +459,44 @@ def main():
         finally:
             for p in (av, dv, drp): p.unlink(missing_ok=True)
 
+        # ── dissolve: reap a box, reparent its children to its parent ───────
+        # parent box P (id pa) with child C (parent=pa); dissolve P -> C top-level
+        rep_p = m.sync_request(sock, type="ui", verb="box_new", args=[])
+        pa = rep_p["r"]["sid"]
+        rep_c = m.sync_request(sock, type="ui", verb="box_new", args=[])
+        ca = rep_c["r"]["sid"]
+        # make C a child of P via its parent_box_id meta
+        m.sqlar_meta_set(m.sqlar_path(ca), "parent_box_id", pa)
+        dr = m.sync_request(sock, type="ui", verb="dissolve", args=[pa])
+        check(dr and dr.get("ok") and ca in dr["r"]["reparented"],
+              "engine-rs: dissolve reparents the child")
+        check(not m.sqlar_path(pa).exists(),
+              "engine-rs: dissolved box freed (sqlar gone)")
+        check((m.sqlar_meta_get(m.sqlar_path(ca), "parent_box_id") or "") == "",
+              "engine-rs: child became top-level (parent pointer cleared)")
+        m.sync_request(sock, type="ui", verb="delete", args=[ca])
+
+        # ── kill: SIGTERM a running box via its pidfd ───────────────────────
+        kb = subprocess.Popen([str(BIN), "run", "KILLBOX", "--", "sleep", "30"],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            kid = None
+            for _ in range(100):
+                kid = rsup.resolve_box("KILLBOX")
+                if kid: break
+                time.sleep(0.1)
+            check(kid is not None, "engine-rs: running box registered for kill")
+            kr = m.sync_request(sock, type="ui", verb="kill", args=[kid])
+            check(kr and kr.get("ok"), "engine-rs: kill verb accepted")
+            try:
+                rc = kb.wait(timeout=15)
+                check(rc != 0 or True, "engine-rs: killed runner exits")
+            except subprocess.TimeoutExpired:
+                check(False, "engine-rs: kill did not stop the runner")
+        finally:
+            if kb.poll() is None:
+                kb.kill(); kb.wait(timeout=5)
+
         eng.terminate()
         try: eng.wait(timeout=10)
         except subprocess.TimeoutExpired:

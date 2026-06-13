@@ -26,6 +26,15 @@ pub struct Shared {
     pub selected: Option<String>,
     pub subscribers: Vec<UnixStream>,
     pub overlay: Option<crate::overlay::Overlay>,
+    pub box_pids: std::collections::HashMap<i64, i32>, // box_id -> runner pidfd
+}
+
+fn pidfd_open(pid: i32) -> i32 {
+    unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as i32 }
+}
+fn pidfd_signal(pidfd: i32, sig: i32) {
+    unsafe { libc::syscall(libc::SYS_pidfd_send_signal, pidfd, sig,
+                           std::ptr::null::<libc::c_void>(), 0); }
 }
 
 pub type State = Arc<Mutex<Shared>>;
@@ -196,6 +205,37 @@ fn reap(state: &State, id: i64) {
                              "session_id": id.to_string()}));
 }
 
+/// dissolve: remove a box, re-parenting its direct children to its own parent
+/// (a meta pointer write — valid while a child is live). Refuses a running box.
+/// (Without file rules yet, the box's own changes are discarded, matching the
+/// no-rules finalize path; rule-driven apply-on-dissolve arrives with rules.)
+fn dissolve(state: &State, id: i64) -> Value {
+    if state.lock().unwrap().box_pids.contains_key(&id) {
+        return json!({"ok": false, "error": "box is running; stop it first"});
+    }
+    let boxes = discover::discover();
+    if !boxes.contains_key(&id) {
+        return json!({"ok": false, "error": "no slopbox"});
+    }
+    let new_parent = boxes.get(&id).and_then(|b| b.parent);
+    let np = new_parent.map(|p| p.to_string()).unwrap_or_default();
+    let mut reparented = vec![];
+    for (cid, cb) in &boxes {
+        if cb.parent == Some(id) {
+            if let Ok(c) = rusqlite::Connection::open(
+                crate::paths::state_home().join(format!("{cid}.sqlar"))) {
+                let _ = c.execute(
+                    "INSERT INTO meta(key,value) VALUES('parent_box_id',?1)
+                     ON CONFLICT(key) DO UPDATE SET value=excluded.value", [&np]);
+            }
+            reparented.push(Value::from(cid.to_string()));
+        }
+    }
+    reap(state, id);
+    json!({"ok": true, "reparented": reparented,
+           "new_parent": new_parent.map(|p| p.to_string())})
+}
+
 /// After apply/discard, reap the box if it has no remaining changes.
 fn drop_if_empty(state: &State, id: i64) {
     if crate::review::session_changes(id).as_array().map(|a| a.is_empty())
@@ -243,6 +283,11 @@ fn register(state: &State, msg: &Value) -> Value {
     b.set_meta("name", &name);
     if let Some(prov) = msg.get("prov") {
         b.root_process(prov);
+        // Hold a pidfd on the runner so `kill` can signal it pid-reuse-safely.
+        if let Some(tgid) = prov.get("tgid").and_then(Value::as_i64) {
+            let fd = pidfd_open(tgid as i32);
+            if fd >= 0 { state.lock().unwrap().box_pids.insert(id, fd); }
+        }
     }
     ov.add_box(std::sync::Arc::new(b));
     let root = crate::paths::mnt_point().join(id.to_string());
@@ -319,6 +364,20 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
         },
         "first_writer_prov" => match (arg_sid(args), args.get(1).and_then(Value::as_str)) {
             (Some(id), Some(rel)) => discover::first_writer_prov(id, rel), _ => Value::Null,
+        },
+        "kill" => match arg_sid(args) {
+            Some(id) => {
+                let fd = state.lock().unwrap().box_pids.get(&id).copied();
+                match fd {
+                    Some(fd) => { pidfd_signal(fd, libc::SIGTERM); json!({"ok": true}) }
+                    None => json!({"ok": false, "error": "box not running"}),
+                }
+            }
+            None => json!({"ok": false, "error": "no slopbox"}),
+        },
+        "dissolve" => match arg_sid(args) {
+            Some(id) => dissolve(state, id),
+            None => json!({"ok": false, "error": "no slopbox"}),
         },
         "rescan" => json!(null),   // discovery is always fresh; nothing to do
         "delete" => match arg_sid(args) {
@@ -446,6 +505,9 @@ fn handle(state: State, conn: UnixStream) {
             let ov = state.lock().unwrap().overlay.clone();
             if let Some(ov) = ov {
                 ov.remove_box(id);
+            }
+            if let Some(fd) = state.lock().unwrap().box_pids.remove(&id) {
+                unsafe { libc::close(fd); }
             }
             broadcast(&state, &json!({"type": "session_removed",
                                       "session_id": id.to_string()}));
