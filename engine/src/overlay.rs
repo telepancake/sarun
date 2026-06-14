@@ -688,8 +688,10 @@ impl Filesystem for Overlay {
                 _ => None,
             };
             let Some(f) = f else { return reply.error(Errno::EIO) };
-            if f.set_len(sz).is_err() {
-                return reply.error(Errno::EIO);
+            // Propagate the REAL kernel errno (EFBIG/EINVAL on an over-large
+            // truncate, etc.) — not a blanket EIO that hides it.
+            if let Err(e) = f.set_len(sz) {
+                return reply.error(Errno::from(e));
             }
         }
         if let Some(m) = mode {
@@ -713,16 +715,38 @@ impl Filesystem for Overlay {
                 Layer::UpperSpecial { .. } => {}
             }
         }
-        // chown: stored for apply-time host restoration (the box squashes to one
-        // uid in-namespace, so it has no in-box effect — but we record fidelity).
+        // chown: a regular file does a REAL chown on its backing blob and
+        // propagates the errno — the non-root engine rejecting chown-to-others
+        // with EPERM is the box's actual single-uid reality (matches the Python
+        // engine's os.chown-on-backing, and the pjdfstest permission matrices).
+        // A dir/symlink chown is an accepted no-op (no backing file to own).
+        // The side table still records the request for apply-time restoration.
         if uid.is_some() || gid.is_some() {
-            if !matches!(self.layer(&b, &rel), Layer::Absent) {
-                if matches!(self.layer(&b, &rel), Layer::Lower)
-                    && !self.host(&rel).is_dir() {
-                    let _ = self.copy_up(&b, &rel, req.pid());
+            let cur = b.owner_of(&rel).unwrap_or((u32::MAX, u32::MAX));
+            let nu = uid.unwrap_or(if cur.0 == u32::MAX { 0 } else { cur.0 });
+            let ng = gid.unwrap_or(if cur.1 == u32::MAX { 0 } else { cur.1 });
+            match self.layer(&b, &rel) {
+                Layer::Absent => return reply.error(Errno::ENOENT),
+                Layer::UpperDir { .. } | Layer::UpperSymlink { .. }
+                | Layer::UpperSpecial { .. } => b.set_owner(&rel, nu, ng),
+                Layer::Lower if self.host(&rel).is_dir() => b.set_owner(&rel, nu, ng),
+                _ => {
+                    // regular file: copy up, then real lchown on the blob.
+                    if matches!(self.layer(&b, &rel), Layer::Lower)
+                        && self.copy_up(&b, &rel, req.pid()).is_err() {
+                        return reply.error(Errno::EIO);
+                    }
+                    if let Layer::UpperFile { rowid, .. } = self.layer(&b, &rel) {
+                        let c = std::ffi::CString::new(
+                            blob_path(bid, rowid).as_os_str().as_encoded_bytes()).unwrap();
+                        let r = unsafe { libc::lchown(c.as_ptr(), nu, ng) };
+                        if r != 0 {
+                            return reply.error(Errno::from(
+                                std::io::Error::last_os_error()));
+                        }
+                    }
+                    b.set_owner(&rel, nu, ng);
                 }
-                let cur = b.owner_of(&rel).unwrap_or((0, 0));
-                b.set_owner(&rel, uid.unwrap_or(cur.0), gid.unwrap_or(cur.1));
             }
         }
         // utimes: record mtime. A file's getattr reads its BLOB's metadata, so
