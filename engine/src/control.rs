@@ -209,6 +209,12 @@ fn reap(state: &State, id: i64) {
 /// (a meta pointer write — valid while a child is live). Refuses a running box.
 /// (Without file rules yet, the box's own changes are discarded, matching the
 /// no-rules finalize path; rule-driven apply-on-dissolve arrives with rules.)
+/// dissolve: remove a box. A CHILDLESS box finalizes by rules (apply-matched to
+/// host, rest discarded) and is freed — correct and complete. A box WITH
+/// children is REFUSED: Python preserves each child's merged view by copying
+/// discarded paths DOWN into the children, which requires the nested-box
+/// read-through-parent overlay semantic that is not implemented yet. Refusing
+/// is fail-safe; silently dropping the parent would change the children's view.
 fn dissolve(state: &State, id: i64) -> Value {
     if state.lock().unwrap().box_pids.contains_key(&id) {
         return json!({"ok": false, "error": "box is running; stop it first"});
@@ -217,7 +223,11 @@ fn dissolve(state: &State, id: i64) -> Value {
     if !boxes.contains_key(&id) {
         return json!({"ok": false, "error": "no slopbox"});
     }
-    let new_parent = boxes.get(&id).and_then(|b| b.parent);
+    if boxes.values().any(|b| b.parent == Some(id)) {
+        return json!({"ok": false, "error":
+            "dissolve of a box with children needs nested copy-down \
+             (not yet implemented); dissolve/stop the children first"});
+    }
     // finalize: apply rule-matched changes to the host, discard the rest
     // (fail-closed — if applying errored, don't free the box).
     let fin = crate::review::finalize_by_rules(id);
@@ -226,22 +236,10 @@ fn dissolve(state: &State, id: i64) -> Value {
         return json!({"ok": false, "error": "finalize had errors; nothing freed",
                       "finalize_errors": fin.get("errors").cloned()});
     }
-    let np = new_parent.map(|p| p.to_string()).unwrap_or_default();
-    let mut reparented = vec![];
-    for (cid, cb) in &boxes {
-        if cb.parent == Some(id) {
-            if let Ok(c) = rusqlite::Connection::open(
-                crate::paths::state_home().join(format!("{cid}.sqlar"))) {
-                let _ = c.execute(
-                    "INSERT INTO meta(key,value) VALUES('parent_box_id',?1)
-                     ON CONFLICT(key) DO UPDATE SET value=excluded.value", [&np]);
-            }
-            reparented.push(Value::from(cid.to_string()));
-        }
-    }
     reap(state, id);
-    json!({"ok": true, "reparented": reparented,
-           "new_parent": new_parent.map(|p| p.to_string())})
+    json!({"ok": true,
+           "applied": fin.get("applied").cloned().unwrap_or(json!([])),
+           "discarded": fin.get("discarded").cloned().unwrap_or(json!([]))})
 }
 
 /// After apply/discard, reap the box if it has no remaining changes.

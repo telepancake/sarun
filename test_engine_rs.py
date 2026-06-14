@@ -518,8 +518,9 @@ def main():
         hk = Path("/root/keep.txt"); hd = Path("/root/drop.log")
         hk.unlink(missing_ok=True); hd.unlink(missing_ok=True)
         try:
-            dr2 = m.sync_request(sock, type="ui", verb="dissolve", args=[frid])
-            check(dr2 and dr2.get("ok"), "engine-rs: dissolve-with-rules succeeds")
+            dr2 = (m.sync_request(sock, type="ui", verb="dissolve", args=[frid])
+                   or {}).get("r") or {}
+            check(dr2.get("ok") is True, "engine-rs: dissolve-with-rules succeeds")
             check(hk.read_bytes() == b"keepme\n",
                   "engine-rs: file rule 'apply *.txt' wrote the host file")
             check(not hd.exists(),
@@ -530,22 +531,46 @@ def main():
             hk.unlink(missing_ok=True); hd.unlink(missing_ok=True)
             rules_f.unlink(missing_ok=True)
 
-        # ── dissolve: reap a box, reparent its children to its parent ───────
-        # parent box P (id pa) with child C (parent=pa); dissolve P -> C top-level
-        rep_p = m.sync_request(sock, type="ui", verb="box_new", args=[])
-        pa = rep_p["r"]["sid"]
-        rep_c = m.sync_request(sock, type="ui", verb="box_new", args=[])
-        ca = rep_c["r"]["sid"]
-        # make C a child of P via its parent_box_id meta
+        # ── dissolve: childless box finalizes+frees; with-children is REFUSED ─
+        # (1) childless box WITH a real change + an apply rule: finalize writes it.
+        drf = Path(os.environ["XDG_CONFIG_HOME"]) / "slopbox.RS" / "filerules"
+        drf.parent.mkdir(parents=True, exist_ok=True)
+        drf.write_text("apply **/*.keep\n")
+        m.sync_request(sock, type="ui", verb="reload_rules", args=[])
+        did = "9400"
+        dbk = m.live_dir(did); (dbk / "up").mkdir(parents=True)
+        dix = m.Index(dbk); dw = dix.writer_for(os.getpid())
+        dix.set_entry("root/dz.keep", "file", stat_mod.S_IFREG | 0o644, dw, "create")
+        dbp = m.blob_path(dix.box_id, dix.row_id("root/dz.keep"))
+        dbp.parent.mkdir(parents=True, exist_ok=True); dbp.write_bytes(b"kept\n")
+        m.consolidate(str(dbk), did, index=dix); dix.close()
+        shutil.rmtree(dbk, ignore_errors=True)
+        dzhost = Path("/root/dz.keep"); dzhost.unlink(missing_ok=True)
+        try:
+            dr = (m.sync_request(sock, type="ui", verb="dissolve", args=[did])
+                  or {}).get("r") or {}
+            check(dr.get("ok") is True, "engine-rs: dissolve of a childless box succeeds")
+            check(dzhost.read_bytes() == b"kept\n",
+                  "engine-rs: dissolve finalized the apply-matched change to the host")
+            check(not m.sqlar_path(did).exists(),
+                  "engine-rs: dissolved box freed")
+        finally:
+            dzhost.unlink(missing_ok=True)
+            drf.unlink(missing_ok=True)
+            m.sync_request(sock, type="ui", verb="reload_rules", args=[])
+        # (2) a box WITH a child is REFUSED (copy-down/nesting not implemented):
+        #     refuse fail-safe rather than silently change the child's view.
+        pa = m.sync_request(sock, type="ui", verb="box_new", args=[])["r"]["sid"]
+        ca = m.sync_request(sock, type="ui", verb="box_new", args=[])["r"]["sid"]
         m.sqlar_meta_set(m.sqlar_path(ca), "parent_box_id", pa)
-        dr = m.sync_request(sock, type="ui", verb="dissolve", args=[pa])
-        check(dr and dr.get("ok") and ca in dr["r"]["reparented"],
-              "engine-rs: dissolve reparents the child")
-        check(not m.sqlar_path(pa).exists(),
-              "engine-rs: dissolved box freed (sqlar gone)")
-        check((m.sqlar_meta_get(m.sqlar_path(ca), "parent_box_id") or "") == "",
-              "engine-rs: child became top-level (parent pointer cleared)")
+        dr2 = (m.sync_request(sock, type="ui", verb="dissolve", args=[pa])
+               or {}).get("r") or {}
+        check(dr2.get("ok") is False and "children" in (dr2.get("error") or ""),
+              "engine-rs: dissolve of a box WITH children is refused (fail-safe)")
+        check(m.sqlar_path(pa).exists(),
+              "engine-rs: refused dissolve left the parent intact")
         m.sync_request(sock, type="ui", verb="delete", args=[ca])
+        m.sync_request(sock, type="ui", verb="delete", args=[pa])
 
         # ── kill: SIGTERM a running box via its pidfd ───────────────────────
         kb = subprocess.Popen([str(BIN), "run", "KILLBOX", "--", "sleep", "30"],
@@ -557,8 +582,9 @@ def main():
                 if kid: break
                 time.sleep(0.1)
             check(kid is not None, "engine-rs: running box registered for kill")
-            kr = m.sync_request(sock, type="ui", verb="kill", args=[kid])
-            check(kr and kr.get("ok"), "engine-rs: kill verb accepted")
+            kr = (m.sync_request(sock, type="ui", verb="kill", args=[kid])
+                  or {}).get("r") or {}
+            check(kr.get("ok") is True, "engine-rs: kill verb accepted")
             try:
                 rc = kb.wait(timeout=15)
                 check(rc != 0 or True, "engine-rs: killed runner exits")
