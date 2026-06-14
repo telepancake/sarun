@@ -527,25 +527,37 @@ def main():
         finally:
             for p in (av, dv, drp): p.unlink(missing_ok=True)
 
-        # ── nested KIDS_DIR routing: /<parent>/.slopbox-kids/<child> ────────
+        # ── nested boxes: read-through-parent (the invariant the audit proved broken) ─
         pp = m.sync_request(sock, type="ui", verb="box_new", args=[])["r"]["sid"]
         cc = m.sync_request(sock, type="ui", verb="box_new", args=[pp])["r"]["sid"]
-        proot = Path(os.environ["XDG_RUNTIME_DIR"]) / "slopbox.RS" / "mnt" / pp
+        rt = Path(os.environ["XDG_RUNTIME_DIR"]) / "slopbox.RS" / "mnt"
+        proot = rt / pp; croot = rt / cc
         kids = proot / ".slopbox-kids"
         check(kids.is_dir(), "engine-rs: KIDS_DIR resolves at a box root")
         check(cc in [p.name for p in kids.iterdir()],
               "engine-rs: the live child is listed under KIDS_DIR")
-        # routing: the child's root via KIDS_DIR is the SAME view as <mnt>/<child>
-        (Path(os.environ["XDG_RUNTIME_DIR"]) / "slopbox.RS" / "mnt" / cc / "root")\
-            .mkdir(exist_ok=True)
-        (Path(os.environ["XDG_RUNTIME_DIR"]) / "slopbox.RS" / "mnt" / cc
-         / "root/kidtest.txt").write_bytes(b"kid\n")
-        check((kids / cc / "root/kidtest.txt").read_bytes() == b"kid\n",
-              "engine-rs: KIDS_DIR/<child> routes to the child's real overlay view")
+        # write a file ONLY in the parent's overlay (not on the host):
+        (proot / "root").mkdir(exist_ok=True)
+        (proot / "root/ponly.txt").write_bytes(b"from-parent\n")
+        cf = croot / "root/ponly.txt"
+        check(cf.exists() and cf.read_bytes() == b"from-parent\n",
+              "engine-rs: child READS a parent-only file THROUGH the parent overlay")
+        check("ponly.txt" in [p.name for p in (croot / "root").iterdir()],
+              "engine-rs: parent-only file appears in the child's readdir (chain merge)")
+        # child modifies it → copy-up from parent; parent must be untouched:
+        with open(cf, "ab") as f: f.write(b"child-add\n")
+        check(cf.read_bytes() == b"from-parent\nchild-add\n",
+              "engine-rs: child write copies up FROM THE PARENT (not host)")
+        check((proot / "root/ponly.txt").read_bytes() == b"from-parent\n",
+              "engine-rs: parent overlay unchanged by the child's copy-up")
+        # routing sanity: KIDS_DIR/<child> is the same view as <mnt>/<child>
+        check((kids / cc / "root/ponly.txt").read_bytes() == b"from-parent\nchild-add\n",
+              "engine-rs: KIDS_DIR/<child> routes to the child's real view")
         check(".slopbox-kids" not in [p.name for p in proot.iterdir()],
-              "engine-rs: KIDS_DIR is hidden from the box-root readdir")
+              "engine-rs: KIDS_DIR hidden from the box-root readdir")
         m.sync_request(sock, type="ui", verb="delete", args=[cc])
         m.sync_request(sock, type="ui", verb="delete", args=[pp])
+
 
         # ── file rules: dissolve finalizes by glob (apply *.txt, discard *.log) ─
         rules_f = Path(os.environ["XDG_CONFIG_HOME"]) / "slopbox.RS" / "filerules"

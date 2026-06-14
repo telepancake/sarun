@@ -137,7 +137,7 @@ fn sink_stream(rel: &str) -> Option<i32> {
 
 enum Layer {
     Absent,
-    UpperFile { rowid: i64, mode: u32 },
+    UpperFile { owner: i64, rowid: i64, mode: u32 },
     UpperDir { mode: u32, mtime_ns: i64 },
     UpperSymlink { target: PathBuf },
     UpperSpecial { mode: u32, rdev: u64 },
@@ -242,10 +242,14 @@ impl Overlay {
         if rel.is_empty() { self.inner.lower.clone() } else { self.inner.lower.join(rel) }
     }
 
+    /// A box's OWN layer for `rel` (single level, no parent walk) — used by the
+    /// WRITE paths, which operate on the box's own overlay. UpperFile.owner is
+    /// the box itself.
     fn layer(&self, b: &BoxState, rel: &str) -> Layer {
         match b.entry(rel) {
             Some(Entry::Whiteout) => Layer::Absent,
-            Some(Entry::File { rowid, mode }) => Layer::UpperFile { rowid, mode },
+            Some(Entry::File { rowid, mode }) =>
+                Layer::UpperFile { owner: b.id, rowid, mode },
             Some(Entry::Dir { mode, mtime_ns }) => Layer::UpperDir { mode, mtime_ns },
             Some(Entry::Symlink { target }) => Layer::UpperSymlink { target },
             Some(Entry::Special { mode, rdev }) => Layer::UpperSpecial { mode, rdev },
@@ -257,6 +261,36 @@ impl Overlay {
                 }
             }
         }
+    }
+
+    /// The MERGED resolution for `rel` as seen by box `bid`: the box's own entry
+    /// if any, else its parent box's overlay (recursively), the root box
+    /// bottoming out at the host. A whiteout at any level hides everything
+    /// below (parent boxes AND the host). This is the nested read-through-parent
+    /// semantic — used by every READ and existence check. UpperFile.owner names
+    /// whichever box in the chain actually holds the bytes (for blob_path).
+    fn resolve(&self, bid: i64, rel: &str) -> Layer {
+        let mut cur = Some(bid);
+        let mut seen = 0;
+        while let Some(id) = cur {
+            seen += 1;
+            if seen > 64 { break; }
+            let Some(b) = self.box_of(id) else { break };
+            match b.entry(rel) {
+                Some(Entry::Whiteout) => return Layer::Absent,
+                Some(Entry::File { rowid, mode }) =>
+                    return Layer::UpperFile { owner: id, rowid, mode },
+                Some(Entry::Dir { mode, mtime_ns }) =>
+                    return Layer::UpperDir { mode, mtime_ns },
+                Some(Entry::Symlink { target }) =>
+                    return Layer::UpperSymlink { target },
+                Some(Entry::Special { mode, rdev }) =>
+                    return Layer::UpperSpecial { mode, rdev },
+                None => cur = b.parent(),  // not in this box → try its parent
+            }
+        }
+        if self.host(rel).symlink_metadata().is_ok() { Layer::Lower }
+        else { Layer::Absent }
     }
 
     fn lower_attr(&self, ino: u64, rel: &str) -> Option<FileAttr> {
@@ -312,13 +346,14 @@ impl Overlay {
         }
     }
 
-    /// Attributes for (box, rel) through the merge, or None when absent.
+    /// Attributes for (box, rel) through the FULL merge (own → parent chain →
+    /// host), or None when absent.
     fn attr_of(&self, b: &BoxState, ino: u64, rel: &str) -> Option<FileAttr> {
-        match self.layer(b, rel) {
+        match self.resolve(b.id, rel) {
             Layer::Absent => None,
             Layer::Lower => self.lower_attr(ino, rel),
-            Layer::UpperFile { rowid, mode } => {
-                let bp = blob_path(b.id, rowid);
+            Layer::UpperFile { owner, rowid, mode } => {
+                let bp = blob_path(owner, rowid);
                 let md = bp.metadata().ok()?;
                 let mut a = self.attr_from_md(ino, &md);
                 a.perm = (mode & 0o7777) as u16;
@@ -340,22 +375,32 @@ impl Overlay {
         }
     }
 
-    /// D3: the first actual write to `rel` copies the lower bytes into a fresh
-    /// pool blob (creating the row + provenance) and returns the RW blob file.
+    /// D3: the first actual write to `rel` copies the RESOLVED lower bytes
+    /// (the parent box's version if nested, else the host file, else empty)
+    /// into a fresh pool blob in THIS box (creating the row + provenance) and
+    /// returns the RW blob file.
     fn copy_up(&self, b: &BoxState, rel: &str, pid: u32) -> std::io::Result<File> {
         let writer = b.writer_for(pid);
-        let lower_md = self.host(rel).symlink_metadata().ok();
-        let mode = lower_md.as_ref().map(|m| m.mode()).unwrap_or(0o100644);
+        // Source the lower bytes + mode from the parent-chain resolution.
+        let (src, mode): (Option<PathBuf>, u32) = match self.resolve(b.id, rel) {
+            Layer::UpperFile { owner, rowid, mode } =>
+                (Some(blob_path(owner, rowid)), mode),
+            Layer::Lower => {
+                let m = self.host(rel).symlink_metadata().map(|m| m.mode())
+                    .unwrap_or(0o100644);
+                (Some(self.host(rel)), m)
+            }
+            _ => (None, 0o100644),
+        };
         let rowid = b.ensure_file_row(rel, mode, writer);
         let bp = blob_path(b.id, rowid);
         if let Some(parent) = bp.parent() {
             std::fs::create_dir_all(parent)?;
         }
         if !bp.exists() {
-            if lower_md.is_some() {
-                std::fs::copy(self.host(rel), &bp)?;
-            } else {
-                File::create(&bp)?;
+            match src {
+                Some(s) => { std::fs::copy(&s, &bp)?; }
+                None => { File::create(&bp)?; }
             }
         }
         OpenOptions::new().read(true).write(true).open(&bp)
@@ -367,7 +412,10 @@ impl Overlay {
         n
     }
 
-    /// Merged listing of (box, rel): (name, kind, child-ino, Option<attr>).
+    /// Merged listing of (box, rel) through the FULL chain: host entries, then
+    /// each box from ROOT down to the child applied in order (so a deeper box's
+    /// whiteouts hide and its entries override shallower layers). (name, kind,
+    /// child-ino, Option<attr>).
     fn scan_dir(&self, b: &BoxState, rel: &str, plus: bool)
                 -> Vec<(String, FileType, u64, Option<FileAttr>)> {
         let mut names: BTreeMap<String, ()> = BTreeMap::new();
@@ -378,12 +426,22 @@ impl Overlay {
                 }
             }
         }
-        let (white, present) = b.children_of(rel);
-        for w in &white {
-            names.remove(w);
+        // chain of box ids, root-first.
+        let mut chain = vec![b.id];
+        let mut cur = b.parent();
+        let mut guard = 0;
+        while let Some(p) = cur {
+            guard += 1; if guard > 64 { break; }
+            chain.push(p);
+            cur = self.box_of(p).and_then(|bx| bx.parent());
         }
-        for p in present {
-            names.insert(p, ());
+        chain.reverse();
+        for id in chain {
+            if let Some(bx) = self.box_of(id) {
+                let (white, present) = bx.children_of(rel);
+                for w in &white { names.remove(w); }
+                for p in present { names.insert(p, ()); }
+            }
         }
         let mut out = vec![];
         for name in names.keys() {
@@ -468,7 +526,7 @@ impl Filesystem for Overlay {
             return reply.error(Errno::ENOENT);
         };
         let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
-        match self.layer(&b, &rel) {
+        match self.resolve(bid, &rel) {
             Layer::UpperSymlink { target } =>
                 reply.data(target.as_os_str().as_encoded_bytes()),
             Layer::Lower => match std::fs::read_link(self.host(&rel)) {
@@ -509,11 +567,16 @@ impl Filesystem for Overlay {
                 Err(_) => return reply.error(Errno::EACCES),
             }
         }
-        let (file, upper) = match self.layer(&b, &rel) {
-            Layer::UpperFile { rowid, .. } => {
-                let bp = blob_path(bid, rowid);
-                match OpenOptions::new().read(true).write(want_write).open(&bp) {
-                    Ok(f) => (Some(f), true),
+        // resolve() so a child opening a file that lives in its PARENT box (or
+        // the host) finds it. `upper` (this box owns the blob) is true ONLY when
+        // the resolved owner IS this box; a parent's file or the host file is
+        // served read-only until the first write triggers copy-up-from-parent.
+        let (file, upper) = match self.resolve(bid, &rel) {
+            Layer::UpperFile { owner, rowid, .. } => {
+                let bp = blob_path(owner, rowid);
+                let own = owner == bid;
+                match OpenOptions::new().read(true).write(want_write && own).open(&bp) {
+                    Ok(f) => (Some(f), own),
                     Err(_) => return reply.error(Errno::EIO),
                 }
             }
