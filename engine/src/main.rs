@@ -49,6 +49,7 @@ mod discover;
 mod overlay;
 mod paths;
 mod review;
+mod rules;
 mod runner;
 
 const TTL: Duration = Duration::from_secs(1);

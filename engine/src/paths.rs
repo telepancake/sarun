@@ -24,6 +24,10 @@ pub fn data_home() -> PathBuf {
     home("XDG_DATA_HOME", ".local/share").join(app_dir())
 }
 
+pub fn config_home() -> PathBuf {
+    home("XDG_CONFIG_HOME", ".config").join(app_dir())
+}
+
 pub fn runtime_home() -> PathBuf {
     match env::var("XDG_RUNTIME_DIR") {
         Ok(v) if !v.is_empty() => PathBuf::from(v).join(app_dir()),

@@ -296,6 +296,28 @@ pub fn discard(id: i64, paths: &Value) -> Value {
     json!({"discarded": discarded, "errors": []})
 }
 
+/// finalize_by_rules: split the box's changes by the file rules — apply the
+/// apply-matched paths to the host, discard everything else (the rest copies
+/// nowhere for a top-level box). Used by dissolve. Returns {applied, discarded,
+/// errors}; non-empty errors mean the caller must NOT free the box.
+pub fn finalize_by_rules(id: i64) -> Value {
+    let rules = crate::rules::Rules::load();
+    let mut apply_paths = vec![];
+    let mut discard_paths = vec![];
+    for e in session_changes(id).as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
+        let rel = e.get("path").and_then(Value::as_str).unwrap_or("").to_string();
+        match rules.decide(&rel) {
+            Some(crate::rules::Action::Apply) => apply_paths.push(Value::from(rel)),
+            _ => discard_paths.push(Value::from(rel)),  // discard / passthrough / none
+        }
+    }
+    let ar = apply(id, &Value::Array(apply_paths));
+    let dr = discard(id, &Value::Array(discard_paths));
+    json!({"applied": ar.get("applied").cloned().unwrap_or(json!([])),
+           "discarded": dr.get("discarded").cloned().unwrap_or(json!([])),
+           "errors": ar.get("errors").cloned().unwrap_or(json!([]))})
+}
+
 /// Unified diff for the whole box (the `patch` CLI verb). Per changed path: a
 /// git-style ---/+++ header and the text hunks, or a one-line note for
 /// binary/symlink/deleted. Best-effort, human-facing.

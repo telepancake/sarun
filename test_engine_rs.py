@@ -479,6 +479,35 @@ def main():
         m.sync_request(sock, type="ui", verb="delete", args=[cc])
         m.sync_request(sock, type="ui", verb="delete", args=[pp])
 
+        # ── file rules: dissolve finalizes by glob (apply *.txt, discard *.log) ─
+        rules_f = Path(os.environ["XDG_CONFIG_HOME"]) / "slopbox.RS" / "filerules"
+        rules_f.parent.mkdir(parents=True, exist_ok=True)
+        rules_f.write_text("apply **/*.txt\ndiscard **/*.log\n")
+        frid = "9300"
+        fbk2 = m.live_dir(frid); (fbk2 / "up").mkdir(parents=True)
+        fx2 = m.Index(fbk2); fw2 = fx2.writer_for(os.getpid())
+        for rel, content in (("root/keep.txt", b"keepme\n"),
+                             ("root/drop.log", b"dropme\n")):
+            fx2.set_entry(rel, "file", stat_mod.S_IFREG | 0o644, fw2, "create")
+            bp2 = m.blob_path(fx2.box_id, fx2.row_id(rel))
+            bp2.parent.mkdir(parents=True, exist_ok=True); bp2.write_bytes(content)
+        m.consolidate(str(fbk2), frid, index=fx2); fx2.close()
+        shutil.rmtree(fbk2, ignore_errors=True)
+        hk = Path("/root/keep.txt"); hd = Path("/root/drop.log")
+        hk.unlink(missing_ok=True); hd.unlink(missing_ok=True)
+        try:
+            dr2 = m.sync_request(sock, type="ui", verb="dissolve", args=[frid])
+            check(dr2 and dr2.get("ok"), "engine-rs: dissolve-with-rules succeeds")
+            check(hk.read_bytes() == b"keepme\n",
+                  "engine-rs: file rule 'apply *.txt' wrote the host file")
+            check(not hd.exists(),
+                  "engine-rs: file rule 'discard *.log' did NOT write the host")
+            check(not m.sqlar_path(frid).exists(),
+                  "engine-rs: box freed after rule-driven finalize")
+        finally:
+            hk.unlink(missing_ok=True); hd.unlink(missing_ok=True)
+            rules_f.unlink(missing_ok=True)
+
         # ── dissolve: reap a box, reparent its children to its parent ───────
         # parent box P (id pa) with child C (parent=pa); dissolve P -> C top-level
         rep_p = m.sync_request(sock, type="ui", verb="box_new", args=[])

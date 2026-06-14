@@ -218,6 +218,14 @@ fn dissolve(state: &State, id: i64) -> Value {
         return json!({"ok": false, "error": "no slopbox"});
     }
     let new_parent = boxes.get(&id).and_then(|b| b.parent);
+    // finalize: apply rule-matched changes to the host, discard the rest
+    // (fail-closed — if applying errored, don't free the box).
+    let fin = crate::review::finalize_by_rules(id);
+    if fin.get("errors").and_then(Value::as_array).map(|a| !a.is_empty())
+        .unwrap_or(false) {
+        return json!({"ok": false, "error": "finalize had errors; nothing freed",
+                      "finalize_errors": fin.get("errors").cloned()});
+    }
     let np = new_parent.map(|p| p.to_string()).unwrap_or_default();
     let mut reparented = vec![];
     for (cid, cb) in &boxes {
