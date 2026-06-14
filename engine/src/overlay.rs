@@ -99,6 +99,7 @@ struct Inner {
     next_ino: AtomicU64,
     fhs: RwLock<HashMap<u64, Mutex<Fh>>>,
     next_fh: AtomicU64,
+    rules: RwLock<crate::rules::Rules>,  // passthrough decisions (reload verb)
 }
 
 struct Fh {
@@ -113,6 +114,7 @@ struct FhInner {
     dirty: bool,
     last_pid: u32,
     sink: Option<i32>, // Some(stream) → writes go to the outputs table, not a blob
+    passthrough: bool, // writes go straight to the real host file (uncaptured)
 }
 
 // Reserved box-root paths: the box's stdout/stderr write THROUGH these, and the
@@ -156,7 +158,17 @@ impl Overlay {
             next_ino: AtomicU64::new(2),
             fhs: RwLock::new(HashMap::new()),
             next_fh: AtomicU64::new(1),
+            rules: RwLock::new(crate::rules::Rules::load()),
         }) }
+    }
+
+    pub fn reload_rules(&self) {
+        *self.inner.rules.write().unwrap() = crate::rules::Rules::load();
+    }
+
+    fn is_passthrough(&self, rel: &str) -> bool {
+        matches!(self.inner.rules.read().unwrap().decide(rel),
+                 Some(crate::rules::Action::Passthrough))
     }
 
     pub fn add_box(&self, b: Arc<BoxState>) {
@@ -476,12 +488,27 @@ impl Filesystem for Overlay {
             // stdout/stderr sink: a write-only channel into the outputs table.
             let n = self.reg_fh(FhInner {
                 box_id: bid, rel, file: None, upper: false, dirty: false,
-                last_pid: req.pid(), sink: Some(stream),
+                last_pid: req.pid(), sink: Some(stream), passthrough: false,
             });
             return reply.opened(FileHandle(n), FopenFlags::empty());
         }
         let want_write = !matches!(flags.acc_mode(),
                                    fuser::OpenAccMode::O_RDONLY);
+        if want_write && self.is_passthrough(&rel) {
+            // passthrough rule: writes go straight to the REAL host file, never
+            // captured. Open (creating) the host path directly.
+            let host = self.host(&rel);
+            if let Some(p) = host.parent() { let _ = std::fs::create_dir_all(p); }
+            match OpenOptions::new().read(true).write(true).create(true).open(&host) {
+                Ok(f) => {
+                    let n = self.reg_fh(FhInner {
+                        box_id: bid, rel, file: Some(f), upper: true, dirty: false,
+                        last_pid: req.pid(), sink: None, passthrough: true });
+                    return reply.opened(FileHandle(n), FopenFlags::empty());
+                }
+                Err(_) => return reply.error(Errno::EACCES),
+            }
+        }
         let (file, upper) = match self.layer(&b, &rel) {
             Layer::UpperFile { rowid, .. } => {
                 let bp = blob_path(bid, rowid);
@@ -499,7 +526,7 @@ impl Filesystem for Overlay {
             _ => return reply.error(Errno::ENOENT),
         };
         let n = self.reg_fh(FhInner {
-            box_id: bid, rel, file, upper, dirty: false, last_pid: req.pid(), sink: None,
+            box_id: bid, rel, file, upper, dirty: false, last_pid: req.pid(), sink: None, passthrough: false,
         });
         reply.opened(FileHandle(n), FopenFlags::FOPEN_KEEP_CACHE);
     }
@@ -516,6 +543,28 @@ impl Filesystem for Overlay {
         let Some(name) = name.to_str() else { return reply.error(Errno::EINVAL) };
         let rel = if prel.is_empty() { name.to_string() }
                   else { format!("{prel}/{name}") };
+        if self.is_passthrough(&rel) {
+            // passthrough: create the file on the REAL host, uncaptured.
+            let host = self.host(&rel);
+            if let Some(p) = host.parent() { let _ = std::fs::create_dir_all(p); }
+            match OpenOptions::new().read(true).write(true).create(true)
+                .truncate(true).open(&host) {
+                Ok(f) => {
+                    let ino = self.ino_for(&(bid, rel.clone()));
+                    let md = f.metadata().ok();
+                    let mut attr = md.map(|m| self.attr_from_md(ino, &m))
+                        .unwrap_or_else(|| self.synth_file_attr(ino));
+                    attr.kind = FileType::RegularFile;
+                    attr.perm = (mode & 0o7777) as u16;
+                    let n = self.reg_fh(FhInner {
+                        box_id: bid, rel, file: Some(f), upper: true, dirty: false,
+                        last_pid: req.pid(), sink: None, passthrough: true });
+                    return reply.created(&TTL, &attr, Generation(0),
+                                         FileHandle(n), FopenFlags::empty());
+                }
+                Err(_) => return reply.error(Errno::EACCES),
+            }
+        }
         let writer = b.writer_for(req.pid());
         let rowid = b.ensure_file_row(&rel, mode | 0o100000, writer);
         let bp = blob_path(bid, rowid);
@@ -535,7 +584,7 @@ impl Filesystem for Overlay {
         attr.perm = (mode & 0o7777) as u16;
         let n = self.reg_fh(FhInner {
             box_id: bid, rel, file: Some(f), upper: true,
-            dirty: true, last_pid: req.pid(), sink: None,
+            dirty: true, last_pid: req.pid(), sink: None, passthrough: false,
         });
         reply.created(&TTL, &attr, Generation(0), FileHandle(n),
                       FopenFlags::empty());
@@ -604,7 +653,7 @@ impl Filesystem for Overlay {
         let h = self.inner.fhs.write().unwrap().remove(&u64::from(fh));
         if let Some(h) = h {
             let h = h.into_inner().unwrap();
-            if h.inner.dirty {
+            if h.inner.dirty && !h.inner.passthrough {
                 if let Some(b) = self.box_of(h.inner.box_id) {
                     let writer = b.writer_for(h.inner.last_pid);
                     if let Some(md) = h.inner.file.as_ref()

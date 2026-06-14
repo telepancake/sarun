@@ -387,6 +387,12 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
             Some(id) => dissolve(state, id),
             None => json!({"ok": false, "error": "no slopbox"}),
         },
+        "reload_rules" => {
+            if let Some(ov) = state.lock().unwrap().overlay.clone() {
+                ov.reload_rules();
+            }
+            json!(null)
+        }
         "rescan" => json!(null),   // discovery is always fresh; nothing to do
         "delete" => match arg_sid(args) {
             Some(id) => { reap(state, id); json!({"ok": true, "sid": id.to_string()}) }

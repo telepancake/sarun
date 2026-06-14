@@ -323,6 +323,28 @@ def main():
         except OSError as e:
             check(False, f"engine-rs: xattr failed: {e}")
 
+        # ── passthrough rule: a box write goes straight to the host, uncaptured ─
+        prf = Path(os.environ["XDG_CONFIG_HOME"]) / "slopbox.RS" / "filerules"
+        prf.parent.mkdir(parents=True, exist_ok=True)
+        prf.write_text("passthrough **/m3pass.txt\n")
+        m.sync_request(sock, type="ui", verb="reload_rules", args=[])
+        phost = Path("/root/m3pass.txt"); phost.unlink(missing_ok=True)
+        try:
+            r = subprocess.run(
+                [str(BIN), "run", "PASSBOX", "--", "sh", "-c",
+                 "echo passed > /root/m3pass.txt"],
+                capture_output=True, text=True, timeout=60)
+            check(r.returncode == 0, "engine-rs: passthrough box exits 0")
+            check(phost.exists() and phost.read_bytes() == b"passed\n",
+                  "engine-rs: passthrough write went straight to the REAL host")
+            psp = max(Path(os.environ["XDG_STATE_HOME"]).joinpath("slopbox.RS")
+                      .glob("*.sqlar"), key=lambda p: int(p.stem))
+            check("root/m3pass.txt" not in {n for n, *_ in m.sqlar_list(psp)},
+                  "engine-rs: passthrough write was NOT captured in the box")
+        finally:
+            phost.unlink(missing_ok=True); prf.unlink(missing_ok=True)
+            m.sync_request(sock, type="ui", verb="reload_rules", args=[])
+
         # ── capture: box stdout/stderr -> outputs table (fully-Rust box) ────
         r = subprocess.run(
             [str(BIN), "run", "CAPBOX", "--", "sh", "-c",
