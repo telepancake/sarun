@@ -169,12 +169,20 @@ CONFIRMED:
    Rust-only extension (acceptable per D8 zero-users, but the "Python clients work
    unmodified" claim does NOT hold for owner/xattr). owner/xattr apply-restore
    remain effectively untested (chown is squashed; no setfattr probe).
- - C2 nested boxes do NOT read through the parent overlay: layer() falls through to
-   the HOST, never the parent box. KIDS_DIR only exposes a child's own root. Proven
-   by probe (child cannot see a parent-only file). The whole nested cluster
-   (read-through-parent -> copy-down -> dissolve-with-children -> nested launch ->
-   echo chaining) is the real remaining frontier; dissolve now refuses children
-   fail-safe.
+ - C2 nested boxes: read-through-parent and dissolve copy-down are now DONE.
+   resolve(bid, rel) walks the parent chain (whiteout→Absent, own entry→that,
+   else parent, root→host); attr/copy-up/readdir all use it, proven by a real
+   invariant test (child reads + copies up FROM a parent-only file). dissolve of
+   a box WITH children no longer refuses: it copies every path the parent
+   captured DOWN into each child lacking its own entry (review::copy_down_entry),
+   so the child's merged view survives the parent being freed, then re-parents
+   the children onto the dissolving box's own parent (overlay.set_box_parent +
+   sqlar meta) — tested on the finished-box path with a discard rule (the file
+   never hits the host, so only copy-down can preserve the child's view).
+   Remaining in the cluster: nested LAUNCH (runner→register with parent
+   derivation, bind /<KIDS_DIR>/<sid>) and echo chaining. Copy-down on a LIVE
+   child still goes through an on-disk RW connection that bypasses the live
+   BoxState cache (acceptable today: dissolve refuses a running child).
 
 WEAK TESTS (not proven wrong, but self-graded by shape, not Python-equality):
  - S1 hunks: NOW cross-checked against Python's _build_hunks_display byte-for-byte

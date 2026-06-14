@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use base64::Engine;
 use rusqlite::Connection;
 use rusqlite::OpenFlags;
+use rusqlite::params;
 use serde_json::Value;
 use serde_json::json;
 use similar::DiffTag;
@@ -316,6 +317,95 @@ pub fn finalize_by_rules(id: i64) -> Value {
     json!({"applied": ar.get("applied").cloned().unwrap_or(json!([])),
            "discarded": dr.get("discarded").cloned().unwrap_or(json!([])),
            "errors": ar.get("errors").cloned().unwrap_or(json!([]))})
+}
+
+/// Copy a single parent entry DOWN into a child box, but ONLY if the child has
+/// no entry of its own for that path. This preserves the child's merged view
+/// (read-through-parent) at the instant the parent is dissolved: a path the
+/// child inherited from the parent (never touched itself) would vanish once the
+/// parent is freed, so we snapshot the parent's version into the child first.
+/// If the child already has its own row for `rel` (it copied-up / wrote /
+/// whiteout'd), its view is self-contained and we leave it untouched.
+///
+/// Operates on the on-disk sqlars of both boxes (the finished-box dissolve
+/// path). Files copy the parent blob into the child's pool under a fresh rowid;
+/// symlinks/tombstones/special carry their row data + side tables.
+pub fn copy_down_entry(parent: i64, child: i64, rel: &str) -> Result<(), String> {
+    let rel = rel.trim_start_matches('/');
+    let cc = open_rw(child).ok_or("child archive unavailable")?;
+    // Child already speaks for this path — its view is self-contained.
+    let has: bool = cc.query_row("SELECT 1 FROM sqlar WHERE name=?1", [rel],
+                                 |_| Ok(())).is_ok();
+    if has {
+        return Ok(());
+    }
+    let pc = open_ro(parent).ok_or("parent archive unavailable")?;
+    let (p_rowid, mode, mtime, sz, data, opaque): (i64, i64, i64, i64, Option<Vec<u8>>, i64) = pc
+        .query_row("SELECT rowid,mode,mtime,sz,data,opaque FROM sqlar WHERE name=?1",
+                   [rel], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?,
+                                  r.get(4)?, r.get(5)?)))
+        .map_err(|_| "parent has no such entry")?;
+    // Insert the row (files keep data NULL; the bytes go to the child pool).
+    cc.execute("INSERT INTO sqlar(name,mode,mtime,sz,data,opaque) \
+                VALUES(?1,?2,?3,?4,?5,?6)",
+               params![rel, mode, mtime, sz, data, opaque])
+        .map_err(|e| e.to_string())?;
+    let new_rowid = cc.last_insert_rowid();
+    // Regular file: copy the parent's pool blob into the child's pool.
+    let is_regular = mode as u32 & S_IFMT == 0o100000;
+    if is_regular {
+        let src = blob_path(parent, p_rowid);
+        if src.exists() {
+            let dst = blob_path(child, new_rowid);
+            if let Some(p) = dst.parent() {
+                std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
+            }
+            std::fs::copy(&src, &dst).map_err(|e| e.to_string())?;
+        }
+    }
+    // Carry side-table metadata (ownership / xattr / rdev) for the path.
+    if let Ok((uid, gid)) = pc.query_row("SELECT uid,gid FROM ownership WHERE name=?1",
+        [rel], |r| Ok((r.get::<_,i64>(0)?, r.get::<_,i64>(1)?))) {
+        let _ = cc.execute("INSERT OR REPLACE INTO ownership(name,uid,gid) \
+                            VALUES(?1,?2,?3)", params![rel, uid, gid]);
+    }
+    if let Ok(dev) = pc.query_row("SELECT dev FROM rdev WHERE name=?1", [rel],
+        |r| r.get::<_,i64>(0)) {
+        let _ = cc.execute("INSERT OR REPLACE INTO rdev(name,dev) VALUES(?1,?2)",
+                           params![rel, dev]);
+    }
+    if let Ok(mut st) = pc.prepare("SELECT key,value FROM xattr WHERE name=?1") {
+        if let Ok(rows) = st.query_map([rel], |r|
+            Ok((r.get::<_,String>(0)?, r.get::<_,Vec<u8>>(1)?))) {
+            for (k, v) in rows.flatten() {
+                let _ = cc.execute("INSERT OR REPLACE INTO xattr(name,key,value) \
+                                    VALUES(?1,?2,?3)", params![rel, k, v]);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Rewrite a child box's parent pointer in its sqlar meta (the on-disk source
+/// discover() reads `parent_box_id` from). `new` = Some(grandparent) reparents;
+/// None promotes the child to top-level (deletes the key).
+pub fn set_parent_meta(child: i64, new: Option<i64>) -> Result<(), String> {
+    let cc = open_rw(child).ok_or("child archive unavailable")?;
+    match new {
+        Some(p) => cc.execute(
+            "INSERT OR REPLACE INTO meta(key,value) VALUES('parent_box_id',?1)",
+            params![p.to_string()]),
+        None => cc.execute("DELETE FROM meta WHERE key='parent_box_id'", []),
+    }.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// All changed paths a box captured (apply- and discard-bound alike) — the set
+/// a child may have inherited a view of through this box.
+pub fn changed_paths(id: i64) -> Vec<String> {
+    session_changes(id).as_array().map(|a| a.iter()
+        .filter_map(|e| e.get("path").and_then(Value::as_str).map(String::from))
+        .collect()).unwrap_or_default()
 }
 
 /// Unified diff for the whole box (the `patch` CLI verb). Per changed path: a

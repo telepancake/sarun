@@ -616,19 +616,53 @@ def main():
             dzhost.unlink(missing_ok=True)
             drf.unlink(missing_ok=True)
             m.sync_request(sock, type="ui", verb="reload_rules", args=[])
-        # (2) a box WITH a child is REFUSED (copy-down/nesting not implemented):
-        #     refuse fail-safe rather than silently change the child's view.
-        pa = m.sync_request(sock, type="ui", verb="box_new", args=[])["r"]["sid"]
-        ca = m.sync_request(sock, type="ui", verb="box_new", args=[])["r"]["sid"]
-        m.sqlar_meta_set(m.sqlar_path(ca), "parent_box_id", pa)
-        dr2 = (m.sync_request(sock, type="ui", verb="dissolve", args=[pa])
-               or {}).get("r") or {}
-        check(dr2.get("ok") is False and "children" in (dr2.get("error") or ""),
-              "engine-rs: dissolve of a box WITH children is refused (fail-safe)")
-        check(m.sqlar_path(pa).exists(),
-              "engine-rs: refused dissolve left the parent intact")
-        m.sync_request(sock, type="ui", verb="delete", args=[ca])
-        m.sync_request(sock, type="ui", verb="delete", args=[pa])
+        # (2) a box WITH children COPIES DOWN: the parent's captured view is
+        #     snapshotted into each child that lacks its own entry, so the
+        #     child STILL sees inherited paths after the parent is freed; the
+        #     children are re-parented to the parent's own parent. Built as
+        #     FINISHED boxes (the on-disk dissolve path this implements).
+        drf2 = Path(os.environ["XDG_CONFIG_HOME"]) / "slopbox.RS" / "filerules"
+        drf2.parent.mkdir(parents=True, exist_ok=True)
+        # discard rule so the inherited file is NOT applied to the host on
+        # dissolve — the ONLY way the child can keep seeing it is copy-down.
+        drf2.write_text("discard **/*.inh\n")
+        m.sync_request(sock, type="ui", verb="reload_rules", args=[])
+        pid_, cid_ = "9600", "9601"  # parent (top-level), child
+        # parent captures root/shared.inh, child has NO entry of its own.
+        pbk = m.live_dir(pid_); (pbk / "up").mkdir(parents=True)
+        pix = m.Index(pbk); pw = pix.writer_for(os.getpid())
+        pix.set_entry("root/shared.inh", "file", stat_mod.S_IFREG | 0o644, pw, "create")
+        pbp = m.blob_path(pix.box_id, pix.row_id("root/shared.inh"))
+        pbp.parent.mkdir(parents=True, exist_ok=True); pbp.write_bytes(b"inherited\n")
+        m.consolidate(str(pbk), pid_, index=pix); pix.close()
+        shutil.rmtree(pbk, ignore_errors=True)
+        cbk = m.live_dir(cid_); (cbk / "up").mkdir(parents=True)
+        cix = m.Index(cbk); m.consolidate(str(cbk), cid_, index=cix); cix.close()
+        shutil.rmtree(cbk, ignore_errors=True)
+        m.sqlar_meta_set(m.sqlar_path(cid_), "parent_box_id", pid_)
+        inhhost = Path("/root/shared.inh"); inhhost.unlink(missing_ok=True)
+        try:
+            dr2 = (m.sync_request(sock, type="ui", verb="dissolve", args=[pid_])
+                   or {}).get("r") or {}
+            check(dr2.get("ok") is True,
+                  "engine-rs: dissolve of a box WITH children succeeds (copy-down)")
+            check(int(cid_) in (dr2.get("reparented") or []),
+                  "engine-rs: dissolve reports the child as re-parented")
+            check(not m.sqlar_path(pid_).exists(),
+                  "engine-rs: dissolved parent freed")
+            check(not inhhost.exists(),
+                  "engine-rs: discard-ruled inherited file NOT applied to host")
+            # the inherited file was copied DOWN into the child's own archive:
+            check(m.sqlar_content(m.sqlar_path(cid_), "root/shared.inh") == b"inherited\n",
+                  "engine-rs: parent's file copied DOWN into the child (view preserved)")
+            # parent was top-level, so the child is promoted to top-level too:
+            check(m.sqlar_meta_get(m.sqlar_path(cid_), "parent_box_id") is None,
+                  "engine-rs: child promoted to top-level (parent's own parent)")
+        finally:
+            inhhost.unlink(missing_ok=True)
+            drf2.unlink(missing_ok=True)
+            m.sync_request(sock, type="ui", verb="reload_rules", args=[])
+            m.sync_request(sock, type="ui", verb="delete", args=[cid_])
 
         # ── kill: SIGTERM a running box via its pidfd ───────────────────────
         kb = subprocess.Popen([str(BIN), "run", "KILLBOX", "--", "sleep", "30"],

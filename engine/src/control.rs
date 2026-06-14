@@ -205,28 +205,53 @@ fn reap(state: &State, id: i64) {
                              "session_id": id.to_string()}));
 }
 
-/// dissolve: remove a box, re-parenting its direct children to its own parent
-/// (a meta pointer write — valid while a child is live). Refuses a running box.
-/// (Without file rules yet, the box's own changes are discarded, matching the
-/// no-rules finalize path; rule-driven apply-on-dissolve arrives with rules.)
-/// dissolve: remove a box. A CHILDLESS box finalizes by rules (apply-matched to
-/// host, rest discarded) and is freed — correct and complete. A box WITH
-/// children is REFUSED: Python preserves each child's merged view by copying
-/// discarded paths DOWN into the children, which requires the nested-box
-/// read-through-parent overlay semantic that is not implemented yet. Refusing
-/// is fail-safe; silently dropping the parent would change the children's view.
+/// dissolve: remove a box, finalizing its own changes by the file rules
+/// (apply-matched paths materialized to the host, the rest discarded), then
+/// freeing it. Refuses a running box.
+///
+/// A box WITH children preserves each child's merged view first: every path the
+/// parent captured (apply- and discard-bound alike) is copied DOWN into each
+/// child that has no entry of its own for it (copy_down_entry), so the child
+/// keeps reading exactly what it saw through the parent once the parent is gone.
+/// Then the children are re-parented to the dissolving box's own parent (a meta
+/// pointer write) and the parent is freed. This is the nested copy-down the
+/// earlier fail-safe refusal stood in for; it rests on the read-through-parent
+/// overlay semantic (resolve() chain walk) now in place.
 fn dissolve(state: &State, id: i64) -> Value {
     if state.lock().unwrap().box_pids.contains_key(&id) {
         return json!({"ok": false, "error": "box is running; stop it first"});
     }
     let boxes = discover::discover();
-    if !boxes.contains_key(&id) {
+    let Some(me) = boxes.get(&id) else {
         return json!({"ok": false, "error": "no slopbox"});
+    };
+    let grandparent = me.parent;
+    let children: Vec<i64> = boxes.values()
+        .filter(|b| b.parent == Some(id)).map(|b| b.box_id).collect();
+    // A live child cannot have its archive rewritten safely — refuse if any.
+    {
+        let s = state.lock().unwrap();
+        if children.iter().any(|c| s.box_pids.contains_key(c)) {
+            return json!({"ok": false, "error":
+                "a child box is running; stop it before dissolving the parent"});
+        }
     }
-    if boxes.values().any(|b| b.parent == Some(id)) {
-        return json!({"ok": false, "error":
-            "dissolve of a box with children needs nested copy-down \
-             (not yet implemented); dissolve/stop the children first"});
+    // Copy-down: snapshot this box's contributed view into each child that has
+    // no entry of its own, so dissolving the parent doesn't change what the
+    // child sees. Fail-closed: if any copy errors, free nothing.
+    let mut copied = vec![];
+    if !children.is_empty() {
+        let paths = crate::review::changed_paths(id);
+        for &child in &children {
+            for rel in &paths {
+                if let Err(e) = crate::review::copy_down_entry(id, child, rel) {
+                    return json!({"ok": false,
+                        "error": format!("copy-down to box {child} failed: {e}"),
+                        "path": rel});
+                }
+            }
+            copied.push(child);
+        }
     }
     // finalize: apply rule-matched changes to the host, discard the rest
     // (fail-closed — if applying errored, don't free the box).
@@ -236,10 +261,20 @@ fn dissolve(state: &State, id: i64) -> Value {
         return json!({"ok": false, "error": "finalize had errors; nothing freed",
                       "finalize_errors": fin.get("errors").cloned()});
     }
+    // Re-parent the children onto the dissolving box's own parent, both in the
+    // live overlay (if mounted) and persistently in each child's sqlar meta.
+    let ov = state.lock().unwrap().overlay.clone();
+    for &child in &children {
+        let _ = crate::review::set_parent_meta(child, grandparent);
+        if let Some(ov) = &ov {
+            ov.set_box_parent(child, grandparent);
+        }
+    }
     reap(state, id);
     json!({"ok": true,
            "applied": fin.get("applied").cloned().unwrap_or(json!([])),
-           "discarded": fin.get("discarded").cloned().unwrap_or(json!([]))})
+           "discarded": fin.get("discarded").cloned().unwrap_or(json!([])),
+           "reparented": children})
 }
 
 /// After apply/discard, reap the box if it has no remaining changes.

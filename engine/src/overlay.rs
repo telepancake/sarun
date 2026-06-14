@@ -183,6 +183,14 @@ impl Overlay {
         self.inner.boxes.read().unwrap().keys().copied().collect()
     }
 
+    /// Re-parent a live box (dissolve copy-down): point its resolve()/KIDS_DIR
+    /// chain at the grandparent (None = top-level). No-op if the box isn't live.
+    pub fn set_box_parent(&self, id: i64, parent: Option<i64>) {
+        if let Some(b) = self.inner.boxes.read().unwrap().get(&id) {
+            b.set_parent(parent);
+        }
+    }
+
     /// Live child box ids of `bid` (their parent() == bid) — KIDS_DIR entries.
     fn children_of_box(&self, bid: i64) -> Vec<i64> {
         self.inner.boxes.read().unwrap().values()
