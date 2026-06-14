@@ -411,6 +411,44 @@ def main():
         check(not m.sqlar_path(delid).exists(),
               "engine-rs: delete reaps the box (sqlar gone)")
 
+        # ── CROSS-ENGINE EQUALITY: Rust hunks() must MATCH Python's, byte-for-byte ─
+        # (the validation the port should have used everywhere: compare the Rust
+        # verb output to the Python engine's own functions on the SAME box, not
+        # just assert shape. A 2-hunk text change exercises grouping + headers.)
+        import difflib
+        xh = Path("/root/xeq.txt")
+        lines = [f"L{i}".encode() for i in range(40)]
+        xh.write_bytes(b"\n".join(lines) + b"\n")          # the lower (host) file
+        try:
+            xid = "9500"
+            xbk = m.live_dir(xid); (xbk / "up").mkdir(parents=True)
+            xix = m.Index(xbk); xw = xix.writer_for(os.getpid())
+            up = lines[:]; up[1] = b"EDIT-2"; up[37] = b"EDIT-38"  # two separated edits
+            upbytes = b"\n".join(up) + b"\n"
+            xix.set_entry("root/xeq.txt", "file", stat_mod.S_IFREG | 0o644, xw, "create")
+            xbp = m.blob_path(xix.box_id, xix.row_id("root/xeq.txt"))
+            xbp.parent.mkdir(parents=True, exist_ok=True); xbp.write_bytes(upbytes)
+            m.consolidate(str(xbk), xid, index=xix); xix.close()
+            shutil.rmtree(xbk, ignore_errors=True)
+            # Rust output:
+            rust_h = rsup.review.hunks(xid, "root/xeq.txt")
+            rust_hunks = [[ [t, x] for t, x in hk["lines"] ] for hk in rust_h["hunks"]]
+            # Python oracle: build hunks the way the Python engine does.
+            ll = m.ut_split(xh.read_bytes()); ul = m.ut_split(upbytes)
+            groups = list(difflib.SequenceMatcher(None, ll, ul).get_grouped_opcodes(3))
+            py = m._build_hunks_display(ll, ul, groups)
+            py_hunks = [[ [t, x] for t, x in hk["lines"] ] for hk in py]
+            check(rust_h.get("is_text") is True, "engine-rs: xeq is a text change")
+            check(len(rust_hunks) == 2,
+                  f"engine-rs: Rust produced 2 hunks (got {len(rust_hunks)})")
+            check(rust_hunks == py_hunks,
+                  "engine-rs: Rust hunks EQUAL Python's byte-for-byte (cross-engine)")
+            if rust_hunks != py_hunks:
+                print(f"   rust={rust_hunks}\n   py  ={py_hunks}")
+            m.sync_request(sock, type="ui", verb="delete", args=[xid])
+        finally:
+            xh.unlink(missing_ok=True)
+
         # ── CLI verbs via the REAL slopbox CLI against the Rust engine ──────
         env = dict(os.environ)
         r = subprocess.run([sys.executable, SARUN, "RSBOX", "patch"],
@@ -468,6 +506,12 @@ def main():
             fbp = m.blob_path(fix.box_id, fix.row_id("root/m3fid.txt"))
             fbp.parent.mkdir(parents=True, exist_ok=True); fbp.write_bytes(b"fid\n")
             m.consolidate(str(fbk), fid, index=fix); fix.close()
+            # set a known mtime on the row (base-schema column; restore must apply it)
+            import sqlite3 as _sq3
+            _c = _sq3.connect(str(m.sqlar_path(fid)))
+            _c.execute("UPDATE sqlar SET mtime=? WHERE name=?",
+                       (1234567 * 1_000_000_000, "root/m3fid.txt"))
+            _c.commit(); _c.close()
             shutil.rmtree(fbk, ignore_errors=True)
             fhost = Path("/root/m3fid.txt"); fhost.unlink(missing_ok=True)
             try:
@@ -476,6 +520,8 @@ def main():
                 import stat as _st3
                 check(fhost.exists() and _st3.S_IMODE(fhost.stat().st_mode) == 0o751,
                       "engine-rs: apply restores the captured mode to the host")
+                check(int(fhost.stat().st_mtime) == 1234567,
+                      "engine-rs: apply restores the captured mtime to the host (C1 fix)")
             finally:
                 fhost.unlink(missing_ok=True)
         finally:

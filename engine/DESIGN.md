@@ -155,3 +155,43 @@ Design constraints:
 
 Ordering: strictly after the engine port + Rust capture/mux are done. This is a
 visibility/perf enhancement on a working base, not a milestone dependency.
+
+## D10 · Known gaps from the adversarial audit (2026-06-14) — DO NOT trust green alone
+
+A skeptical re-audit (after `dissolve` was found hollow + rigged-green) classified
+the port honestly. Recorded so these aren't lost behind a passing test count:
+
+CONFIRMED:
+ - C1 apply metadata restoration: mtime restore is now tested (cross-checked) and
+   works. owner/xattr restore use Rust-ONLY side tables (xattr/ownership/rdev) that
+   the Python schema lacks — so they restore nothing for Python-written boxes and a
+   Python client won't restore them from a Rust box. This is an asymmetric,
+   Rust-only extension (acceptable per D8 zero-users, but the "Python clients work
+   unmodified" claim does NOT hold for owner/xattr). owner/xattr apply-restore
+   remain effectively untested (chown is squashed; no setfattr probe).
+ - C2 nested boxes do NOT read through the parent overlay: layer() falls through to
+   the HOST, never the parent box. KIDS_DIR only exposes a child's own root. Proven
+   by probe (child cannot see a parent-only file). The whole nested cluster
+   (read-through-parent -> copy-down -> dissolve-with-children -> nested launch ->
+   echo chaining) is the real remaining frontier; dissolve now refuses children
+   fail-safe.
+
+WEAK TESTS (not proven wrong, but self-graded by shape, not Python-equality):
+ - S1 hunks: NOW cross-checked against Python's _build_hunks_display byte-for-byte
+   on a 2-hunk change (fixed). But similar(Myers) vs difflib(Ratcliff-Obershelp)
+   can diverge on repeated/moved lines — equality holds on tested inputs only.
+   struct_finish and patch_text are still shape-only.
+ - S2 proc_info/writer_id/first_writer_id: shape-only, and tested on a single-writer
+   box where first==last (a swapped writer/last_writer mapping would pass).
+ - S3 capture provenance first-vs-last-writer: never exercised (single writer).
+ - S4 untested code: process_env, box_drop, special-node (fifo/dev) APPLY path,
+   the top-level control-type CLI variants beyond patch/rename.
+ - S5 rename of a LIVE box writes meta via raw SQL bypassing the live BoxState
+   connection — racy; only the finished-box path is tested.
+
+THE REAL FIX (methodological): self-authored conformance tests share the author's
+blind spots (dissolve proved it). The port should be re-grounded on (a) cross-engine
+EQUALITY checks against the Python functions on the same sqlar (done for hunks; do
+for proc_info/session_changes/struct/patch), and (b) the actual Python behavioral
+suite + pjdfstest run against the Rust mount — which has NEVER been done. Until then,
+treat the conformance green count as necessary, not sufficient.
