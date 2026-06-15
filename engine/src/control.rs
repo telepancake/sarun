@@ -581,6 +581,44 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
                 args.get(1).unwrap_or(&Value::Null)); drop_if_empty(state, id); r }
             None => json!({"discarded": [], "errors": []}),
         },
+        "review.patch_text" => match arg_sid(args) {
+            Some(id) => {
+                let data = crate::review::patch_text(id);
+                json!({"__b": base64::engine::general_purpose::STANDARD.encode(&data)})
+            }
+            None => json!({"__b": ""}),
+        },
+        "review.change_mode" => match (arg_sid(args), args.get(1).and_then(Value::as_str)) {
+            (Some(id), Some(rel)) => match crate::review::current_mode(id, rel) {
+                Some(m) => json!(m), None => Value::Null,
+            },
+            _ => Value::Null,
+        },
+        "review.decorate" => match (arg_sid(args), args.get(1).and_then(Value::as_str)) {
+            (Some(id), Some(rel)) => crate::review::decorate(id, rel),
+            _ => json!({"is_text": false, "stale": false, "kind": "changed"}),
+        },
+        "review.apply_hunk" => match (arg_sid(args), args.get(1).and_then(Value::as_str),
+                                      args.get(2).and_then(Value::as_i64)) {
+            (Some(id), Some(rel), Some(ix)) => {
+                let r = crate::review::apply_hunk(id, rel, ix);
+                drop_if_empty(state, id); r
+            }
+            _ => json!({"ok": false, "error": "bad args"}),
+        },
+        "review.discard_hunk" => match (arg_sid(args), args.get(1).and_then(Value::as_str),
+                                        args.get(2).and_then(Value::as_i64)) {
+            (Some(id), Some(rel), Some(ix)) => {
+                let r = crate::review::discard_hunk(id, rel, ix);
+                drop_if_empty(state, id); r
+            }
+            _ => json!({"ok": false, "error": "bad args"}),
+        },
+        // At-rest-the-instant-it-exits Rust box (DESIGN.md D4): no consolidate
+        // phase, no separate caches — these UI lifecycle pokes are vacuous, but
+        // must not return "unknown verb".
+        "consolidate_start" | "review.invalidate_consolidation"
+        | "review.invalidate_struct" => json!(null),
         "ping" => {
             broadcast(state, &json!({"type": "pong"}));
             json!("pong")
