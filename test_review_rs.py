@@ -19,7 +19,7 @@ from importlib.machinery import SourceFileLoader
 
 SARUN = "/home/user/sarun/sarun"
 CRATE = Path(__file__).resolve().parent / "engine"
-BIN = CRATE / "target/release/sarun-engine"
+BIN = CRATE / "target/release/sarun"
 
 _fails = []
 def check(cond, msg):

@@ -1076,7 +1076,6 @@ fn render_to_string(app: &App, w: u16, h: u16) -> Result<String, String> {
 
 /// Handle one keypress while a modal is open. Mirrors the Python Confirm /
 /// SearchModal / RuleFormModal interactions.
-#[cfg(not(test))]
 fn handle_modal_key(app: &mut App, code: crossterm::event::KeyCode) {
     use crossterm::event::KeyCode;
     let Some(modal) = app.modal.take() else { return };
@@ -1125,7 +1124,6 @@ fn handle_modal_key(app: &mut App, code: crossterm::event::KeyCode) {
     }
 }
 
-#[cfg(not(test))]
 fn run_interactive(sock: &str) -> Result<(), String> {
     use crossterm::event;
     use crossterm::event::Event;
@@ -1253,9 +1251,9 @@ fn run_interactive(sock: &str) -> Result<(), String> {
 
 // ── entrypoint ──────────────────────────────────────────────────────────────
 
-#[cfg(not(test))]
-fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+/// The UI role of the single `sarun` binary. `args` are the tokens after the
+/// dispatch token. Returns a process exit code (caller does `process::exit`).
+pub fn ui_main(args: &[String]) -> i32 {
     let mut once = false;
     let mut sock = String::new();
     let mut it = args.iter();
@@ -1265,13 +1263,14 @@ fn main() {
             "--sock" => sock = it.next().cloned().unwrap_or_default(),
             "-h" | "--help" => {
                 println!(
-                    "sarun-ui — Rust ratatui client for the sarun engine\n\
+                    "sarun UI — Rust ratatui client for the sarun engine\n\
                      \n\
                      usage:\n  \
-                     sarun-ui --sock PATH          interactive UI\n  \
-                     sarun-ui --once --sock PATH   render one frame and exit (headless)\n"
+                     sarun                         start engine (if needed) + interactive UI\n  \
+                     sarun attach [--sock PATH]    interactive UI against a running engine\n  \
+                     sarun --once --sock PATH      render one frame and exit (headless)\n"
                 );
-                std::process::exit(0);
+                return 0;
             }
             _ => {}
         }
@@ -1280,30 +1279,31 @@ fn main() {
         sock = std::env::var("SARUN_SOCK").unwrap_or_default();
     }
     if sock.is_empty() {
-        eprintln!("sarun-ui: no socket (pass --sock PATH or set SARUN_SOCK)");
-        std::process::exit(2);
+        sock = crate::paths::sock_path().to_string_lossy().into_owned();
+    }
+    if sock.is_empty() {
+        eprintln!("sarun: no socket (pass --sock PATH or set SARUN_SOCK)");
+        return 2;
     }
     if once {
         let app = App::new(sock);
         match render_to_string(&app, 100, 30) {
             Ok(buf) => {
                 print!("{buf}");
-                std::process::exit(0);
+                return 0;
             }
             Err(e) => {
-                eprintln!("sarun-ui: {e}");
-                std::process::exit(1);
+                eprintln!("sarun: {e}");
+                return 1;
             }
         }
     }
     if let Err(e) = run_interactive(&sock) {
-        eprintln!("sarun-ui: {e}");
-        std::process::exit(1);
+        eprintln!("sarun: {e}");
+        return 1;
     }
+    0
 }
-
-#[cfg(test)]
-fn main() {}
 
 // ── integration tests against a LIVE engine ─────────────────────────────────
 //
@@ -1336,13 +1336,13 @@ mod tests {
     }
 
     fn engine_bin() -> Option<PathBuf> {
-        // ui/ is a sibling of engine/; the release binary lives there.
+        // The single binary now lives in this crate's own target dir.
         let here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let rel = here.join("../engine/target/release/sarun-engine");
+        let rel = here.join("target/release/sarun");
         if rel.exists() {
             return Some(rel);
         }
-        let dbg = here.join("../engine/target/debug/sarun-engine");
+        let dbg = here.join("target/debug/sarun");
         dbg.exists().then_some(dbg)
     }
 

@@ -12,9 +12,10 @@ import json, os, socket, stat as stat_mod, subprocess, sys, tempfile, shutil, ti
 from pathlib import Path
 from importlib.machinery import SourceFileLoader
 
-SARUN = "/home/user/sarun/sarun"
-CRATE = Path("/home/user/sarun/engine")
-BIN = CRATE / "target/release/sarun-engine"
+_HERE = Path(__file__).resolve().parent
+SARUN = str(_HERE / "sarun")
+CRATE = _HERE / "engine"
+BIN = CRATE / "target/release/sarun"
 
 _fails = []
 def check(cond, msg):

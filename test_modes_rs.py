@@ -24,7 +24,7 @@ from importlib.machinery import SourceFileLoader
 _HERE = Path(__file__).resolve().parent
 SARUN = str(_HERE / "sarun")
 CRATE = _HERE / "engine"
-BIN = CRATE / "target/release/sarun-engine"
+BIN = CRATE / "target/release/sarun"
 
 _fails = []
 def check(cond, msg):

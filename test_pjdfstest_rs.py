@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "bench"))
 import extsuite
 from test_pjdfstest import parse_failures, GROUPS  # reuse parser + group list
 
-BIN = Path("/home/user/sarun/engine/target/release/sarun-engine")
+BIN = Path(__file__).resolve().parent / "engine/target/release/sarun"
 PYBASELINE = Path("bench/pjdfstest_baseline.txt")
 RSBASELINE = Path("bench/pjdfstest_baseline_rs.txt")
 _fails = []
