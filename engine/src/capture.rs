@@ -54,6 +54,11 @@ pub struct BoxState {
     pub kinds: RwLock<HashMap<String, Entry>>,
     procs: Mutex<HashMap<u32, i64>>, // tgid -> process row id
     parent: std::sync::atomic::AtomicI64, // 0 = top-level; else parent box_id
+    // -e env capture: record each writer's full environment (deduped in `env`).
+    env_capture: std::sync::atomic::AtomicBool,
+    // -d direct: the box has NO overlay — every write goes straight to the real
+    // host file, uncaptured (mirrors Python's whole-box passthrough=direct).
+    direct: std::sync::atomic::AtomicBool,
 }
 
 impl BoxState {
@@ -64,6 +69,50 @@ impl BoxState {
         match self.parent.load(std::sync::atomic::Ordering::Relaxed) {
             0 => None, p => Some(p),
         }
+    }
+    pub fn set_env_capture(&self, on: bool) {
+        self.env_capture.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub fn env_capture(&self) -> bool {
+        self.env_capture.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    pub fn set_direct(&self, on: bool) {
+        self.direct.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub fn direct(&self) -> bool {
+        self.direct.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Dedup the environment text (a stable JSON object string) into the `env`
+    /// table by hash (the Python `env` table dedups by sha256; the Rust readers
+    /// join on env_id, not the hash, so any stable unique key suffices) and
+    /// return its env_id. Caller holds the conn lock.
+    fn ensure_env(conn: &Connection, env_json: &str) -> Option<i64> {
+        use std::hash::Hash;
+        use std::hash::Hasher;
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        env_json.hash(&mut h);
+        let hash = format!("{:016x}", h.finish());
+        let _ = conn.execute("INSERT OR IGNORE INTO env(hash,env) VALUES(?1,?2)",
+                             params![hash, env_json]);
+        conn.query_row("SELECT id FROM env WHERE hash=?1", [hash], |r| r.get(0)).ok()
+    }
+
+    /// Read /proc/<pid>/environ and return it as a stable JSON object string
+    /// ({"VAR":"val",...}, keys sorted), matching the Python env-capture shape
+    /// (json.dumps(env, sort_keys=True)). None if unreadable. A BTreeMap gives
+    /// serde_json sorted-key output.
+    fn read_environ_json(pid: u32) -> Option<String> {
+        let raw = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+        let mut map = std::collections::BTreeMap::new();
+        for kv in raw.split(|b| *b == 0) {
+            if kv.is_empty() { continue; }
+            let s = String::from_utf8_lossy(kv);
+            if let Some((k, v)) = s.split_once('=') {
+                map.insert(k.to_string(), v.to_string());
+            }
+        }
+        serde_json::to_string(&map).ok()
     }
 }
 
@@ -95,7 +144,59 @@ impl BoxState {
             kinds: RwLock::new(HashMap::new()),
             procs: Mutex::new(HashMap::new()),
             parent: std::sync::atomic::AtomicI64::new(0),
+            env_capture: std::sync::atomic::AtomicBool::new(false),
+            direct: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Repopulate the in-RAM `kinds` mirror + the tgid->row cache from an
+    /// existing on-disk sqlar. Used on RERUN: a `run NAME` into an existing box
+    /// reopens its db, so the prior run's writes must show through and previously
+    /// recorded processes keep their row ids (so a new root is an ADDITIONAL
+    /// row, not a dedup). Mirrors the Python Index._load_mirror.
+    pub fn load_mirror(&self) {
+        let conn = self.conn.lock().unwrap();
+        let mut kinds = self.kinds.write().unwrap();
+        if let Ok(mut st) = conn.prepare("SELECT name,mode,sz,data FROM sqlar") {
+            let rows = st.query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u32,
+                    r.get::<_, i64>(2)?, r.get::<_, Option<Vec<u8>>>(3)?))
+            });
+            if let Ok(rows) = rows {
+                for row in rows.flatten() {
+                    let (name, mode, sz, data) = row;
+                    let ft = mode & 0o170000;
+                    let entry = if mode == S_IFCHR {
+                        Entry::Whiteout
+                    } else if ft == 0o120000 {
+                        let bytes = data.unwrap_or_default();
+                        let t = String::from_utf8_lossy(&bytes).into_owned();
+                        let _ = sz;
+                        Entry::Symlink { target: PathBuf::from(t) }
+                    } else if ft == 0o040000 {
+                        Entry::Dir { mode, mtime_ns: 0 }
+                    } else if ft == 0o010000 || ft == 0o060000 {
+                        Entry::Special { mode, rdev: 0 }
+                    } else {
+                        let rowid: i64 = conn.query_row(
+                            "SELECT rowid FROM sqlar WHERE name=?1", [&name],
+                            |r| r.get(0)).unwrap_or(0);
+                        Entry::File { rowid, mode }
+                    };
+                    kinds.insert(name, entry);
+                }
+            }
+        }
+        // Seed the tgid->row cache so already-recorded writers dedup correctly.
+        let mut procs = self.procs.lock().unwrap();
+        if let Ok(mut st) = conn.prepare(
+            "SELECT tgid,id FROM process WHERE start=0") {
+            if let Ok(rows) = st.query_map([], |r| {
+                Ok((r.get::<_, i64>(0)? as u32, r.get::<_, i64>(1)?))
+            }) {
+                for (tgid, rid) in rows.flatten() { procs.insert(tgid, rid); }
+            }
+        }
     }
 
     /// The process-table row for `pid`, recorded on first sight (exe/argv/cwd
@@ -117,11 +218,18 @@ impl BoxState {
             .filter(|s| !s.is_empty())
             .map(|s| String::from_utf8_lossy(s).into_owned())
             .collect();
+        // -e env capture: record this writer's environment (deduped) so the
+        // process row links to it via env_id. Read /proc/<pid>/environ now,
+        // before the lock (and before the process can exit).
+        let env_json = if self.env_capture() { Self::read_environ_json(pid) }
+                       else { None };
         let conn = self.conn.lock().unwrap();
+        let eid: Option<i64> = env_json
+            .and_then(|j| Self::ensure_env(&conn, &j));
         let _ = conn.execute(
-            "INSERT OR IGNORE INTO process(tgid,start,ppid,parent_id,exe,cwd,argv,root)
-             VALUES(?1,0,0,NULL,?2,?3,?4,0)",
-            params![pid, exe, cwd, serde_json::to_string(&argv).unwrap_or_default()],
+            "INSERT OR IGNORE INTO process(tgid,start,ppid,parent_id,exe,cwd,argv,env_id,root)
+             VALUES(?1,0,0,NULL,?2,?3,?4,?5,0)",
+            params![pid, exe, cwd, serde_json::to_string(&argv).unwrap_or_default(), eid],
         );
         let rowid: i64 = conn
             .query_row("SELECT id FROM process WHERE tgid=?1 AND start=0", [pid],
@@ -342,11 +450,25 @@ impl BoxState {
         let ppid = prov.get("ppid").and_then(|v| v.as_i64()).unwrap_or(0);
         let argv = prov.get("argv").cloned()
             .unwrap_or(serde_json::Value::Array(vec![]));
+        // -e env capture: the root's env. Prefer the env the runner sent in prov
+        // (its full HOST env — correct even for a nested runner whose tgid is a
+        // parent-namespace pid the engine can't /proc-read); else read the host
+        // tgid's /proc/<tgid>/environ.
+        let env_json = if self.env_capture() {
+            prov.get("env").and_then(|e| e.as_object()).map(|m| {
+                let bt: std::collections::BTreeMap<String, String> = m.iter()
+                    .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
+                    .collect();
+                serde_json::to_string(&bt).unwrap_or_default()
+            }).or_else(|| if tgid > 0 { Self::read_environ_json(tgid as u32) }
+                          else { None })
+        } else { None };
         let conn = self.conn.lock().unwrap();
+        let eid: Option<i64> = env_json.and_then(|j| Self::ensure_env(&conn, &j));
         let _ = conn.execute(
-            "INSERT OR IGNORE INTO process(tgid,start,ppid,parent_id,exe,cwd,argv,root)
-             VALUES(?1,0,?2,NULL,?3,?4,?5,1)",
-            params![tgid, ppid, g("exe"), g("cwd"), argv.to_string()],
+            "INSERT OR IGNORE INTO process(tgid,start,ppid,parent_id,exe,cwd,argv,env_id,root)
+             VALUES(?1,0,?2,NULL,?3,?4,?5,?6,1)",
+            params![tgid, ppid, g("exe"), g("cwd"), argv.to_string(), eid],
         );
     }
 
