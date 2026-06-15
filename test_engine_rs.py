@@ -664,6 +664,62 @@ def main():
             m.sync_request(sock, type="ui", verb="reload_rules", args=[])
             m.sync_request(sock, type="ui", verb="delete", args=[cid_])
 
+        # ── nested LAUNCH: a box run INSIDE a box parents under it ──────────
+        # Real end-to-end of the nested-launch mechanism: a top-level box runs a
+        # script that itself invokes `sarun-engine run` (the nested box). Assert
+        # the child registers parented under the enclosing box (kernel-derived
+        # from /proc ancestry) and reads a parent-only file THROUGH the child
+        # overlay (read-through-parent). Echo chaining is a separate, deferred
+        # feature — not exercised here.
+        if not m._have_ambient_caps():
+            check(True, "engine-rs: nested-launch SKIP (needs ambient caps)")
+        else:
+            binp = str(BIN)
+            nested = (f"{binp} run -- bash -c "
+                      "'cat /root/pn_sentinel.txt > /root/pn_child_proof.txt; "
+                      "echo child-ran >> /root/pn_child_proof.txt'")
+            parent_script = ("set -e; echo parent-was-here > /root/pn_sentinel.txt; "
+                             + nested)
+            pre = set(Path(os.environ["XDG_STATE_HOME"]).joinpath("slopbox.RS")
+                      .glob("*.sqlar"))
+            r = subprocess.run([str(BIN), "run", "--", "bash", "-c", parent_script],
+                               capture_output=True, text=True, timeout=120)
+            check(r.returncode == 0,
+                  f"engine-rs: nested parent+child run exited 0 "
+                  f"(got {r.returncode}: {r.stderr.strip()[-300:]})")
+            check(r.stderr.count("overlay root:") >= 2,
+                  "engine-rs: stderr shows two overlay roots (parent + nested child)")
+            # Two NEW sqlars settle at rest (parent + child).
+            state_dir = Path(os.environ["XDG_STATE_HOME"]) / "slopbox.RS"
+            deadline = time.time() + 20
+            while time.time() < deadline:
+                if len(set(state_dir.glob("*.sqlar")) - pre) >= 2: break
+                time.sleep(0.2)
+            new_sqlars = sorted(set(state_dir.glob("*.sqlar")) - pre)
+            check(len(new_sqlars) >= 2,
+                  f"engine-rs: nested run produced 2 sqlars (got {len(new_sqlars)})")
+            # Identify parent (has pn_sentinel) and child (has pn_child_proof +
+            # a parent_box_id pointing at the parent).
+            def names(sp): return {n for n, *_ in m.sqlar_list(sp)}
+            par_sp = next((sp for sp in new_sqlars
+                           if "root/pn_sentinel.txt" in names(sp)), None)
+            ch_sp = next((sp for sp in new_sqlars
+                          if "root/pn_child_proof.txt" in names(sp)), None)
+            check(par_sp is not None, "engine-rs: parent box captured its sentinel")
+            check(ch_sp is not None, "engine-rs: child box captured its proof file")
+            if par_sp and ch_sp:
+                par_id = par_sp.stem
+                check(m.sqlar_meta_get(ch_sp, "parent_box_id") == par_id,
+                      "engine-rs: nested child parented under the enclosing box "
+                      "(kernel-derived)")
+                proof = m.sqlar_content(ch_sp, "root/pn_child_proof.txt") or b""
+                check(b"parent-was-here" in proof,
+                      "engine-rs: child read the parent-only file THROUGH its overlay")
+                check(b"child-ran" in proof,
+                      "engine-rs: child's own write captured")
+            for sp in new_sqlars:
+                m.sync_request(sock, type="ui", verb="delete", args=[sp.stem])
+
         # ── kill: SIGTERM a running box via its pidfd ───────────────────────
         kb = subprocess.Popen([str(BIN), "run", "KILLBOX", "--", "sleep", "30"],
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

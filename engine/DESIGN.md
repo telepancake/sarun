@@ -179,10 +179,22 @@ CONFIRMED:
    the children onto the dissolving box's own parent (overlay.set_box_parent +
    sqlar meta) — tested on the finished-box path with a discard rule (the file
    never hits the host, so only copy-down can preserve the child's view).
-   Remaining in the cluster: nested LAUNCH (runner→register with parent
-   derivation, bind /<KIDS_DIR>/<sid>) and echo chaining. Copy-down on a LIVE
-   child still goes through an on-disk RW connection that bypasses the live
-   BoxState cache (acceptable today: dissolve refuses a running child).
+   Nested LAUNCH is now DONE too: the runner detects in-box by the presence of
+   the engine socket bind-mounted at /tmp/.slopbox/ui.sock (it forwards that
+   socket into every box), sends a single-segment `relname` plus its own pidfd
+   over SCM_RIGHTS, and roots bwrap by binding the parent-exposed
+   /<KIDS_DIR>/<id>. The engine derives the host pid from the pidfd
+   (/proc/self/fdinfo) and the enclosing box from the /proc PPid ancestry
+   (box_runpids map) — never trusting any pid/sid from the message body — then
+   parents the new box under it. Tested end-to-end (test_engine_rs nested
+   section): a box run inside a box parents under the enclosing box and reads a
+   parent-only file through read-through-parent. NOTE: the register fd-peek must
+   poll for the bytes first — a non-blocking peek races the runner's sendmsg and
+   silently drops the pidfd, which then mis-derives the parent (fixed).
+   Remaining in the cluster: echo chaining (the live-echo mux, still downgraded
+   since m3b). Copy-down on a LIVE child still goes through an on-disk RW
+   connection that bypasses the live BoxState cache (acceptable today: dissolve
+   refuses a running child).
 
 WEAK TESTS (not proven wrong, but self-graded by shape, not Python-equality):
  - S1 hunks: NOW cross-checked against Python's _build_hunks_display byte-for-byte

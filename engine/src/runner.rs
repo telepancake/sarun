@@ -1,5 +1,9 @@
-// The box runner, ported to Rust (passthrough mode; the ECHO/capture mux is a
-// follow-on). Two subcommands of the sarun-engine binary:
+// The box runner, ported to Rust (the ECHO/capture mux is a follow-on).
+// Supports NESTED launch: a `run` invoked inside a running box reaches the
+// engine via the socket bind-mounted at UI_SOCK_INBOX, registers with a
+// `relname` + its own pidfd (so the engine derives the enclosing box from the
+// /proc ancestry), and roots bwrap on the parent-exposed /<KIDS_DIR>/<id>.
+// Two subcommands of the sarun-engine binary:
 //   run [NAME] -- CMD   host side: register the box with the engine, then bwrap
 //                       CMD onto the box's overlay root, exec'ing `inner`.
 //   inner --conn-fd N -- CMD   in-box pid-1-ish shim: holds the box channel fd
@@ -19,6 +23,51 @@ use serde_json::Value;
 use serde_json::json;
 
 use crate::paths;
+
+/// The host control socket, bind-mounted read-only into every box at this fixed
+/// path so a NESTED runner (one launched inside a running box) can reach the
+/// engine. Path-presence is the sole in-box signal — no env var.
+const UI_SOCK_INBOX: &str = "/tmp/.slopbox/ui.sock";
+const KIDS_DIR: &str = ".slopbox-kids";
+
+fn pidfd_open(pid: i32) -> i32 {
+    unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as i32 }
+}
+
+/// Send one register line plus our own pidfd as SCM_RIGHTS ancillary data, so
+/// the engine derives our HOST-namespace pid from /proc/self/fdinfo/<pidfd>
+/// (the wrap-immune identity path) — correct for both top-level and nested
+/// runners, where our own getpid() is a parent-namespace pid the engine can't
+/// use. Returns false on write error.
+fn send_register(conn: &UnixStream, line: &[u8], pidfd: i32) -> bool {
+    if pidfd < 0 {
+        return conn_write_all(conn, line);
+    }
+    let mut iov = libc::iovec {
+        iov_base: line.as_ptr() as *mut libc::c_void,
+        iov_len: line.len(),
+    };
+    let mut cmsg = [0u8; 32]; // CMSG_SPACE(sizeof(i32)) rounded up
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cmsg.as_mut_ptr().cast();
+    msg.msg_controllen = unsafe { libc::CMSG_SPACE(4) } as _;
+    unsafe {
+        let c = libc::CMSG_FIRSTHDR(&msg);
+        (*c).cmsg_level = libc::SOL_SOCKET;
+        (*c).cmsg_type = libc::SCM_RIGHTS;
+        (*c).cmsg_len = libc::CMSG_LEN(4) as _;
+        std::ptr::copy_nonoverlapping(
+            (&pidfd as *const i32).cast(), libc::CMSG_DATA(c), 4);
+        libc::sendmsg(conn.as_raw_fd(), &msg, 0) >= 0
+    }
+}
+
+fn conn_write_all(conn: &UnixStream, data: &[u8]) -> bool {
+    let mut c = conn;
+    c.write_all(data).is_ok()
+}
 
 fn provenance(cmd: &[String]) -> Value {
     let exe = std::fs::read_link("/proc/self/exe")
@@ -44,7 +93,12 @@ pub fn run(name: Option<String>, cmd: Vec<String>) -> i32 {
         eprintln!("sarun-engine run: no command after --");
         return 2;
     }
-    let sock = paths::sock_path();
+    // IN-BOX vs HOST: a nested runner reaches the engine via the socket
+    // bind-mounted at UI_SOCK_INBOX; a top-level runner uses the host socket.
+    // Pure path-presence, no env var (mirrors the Python runner).
+    let in_box = std::path::Path::new(UI_SOCK_INBOX).exists();
+    let sock = if in_box { std::path::PathBuf::from(UI_SOCK_INBOX) }
+               else { paths::sock_path() };
     let mut conn = match UnixStream::connect(&sock) {
         Ok(c) => c,
         Err(_) => {
@@ -53,15 +107,25 @@ pub fn run(name: Option<String>, cmd: Vec<String>) -> i32 {
             return 3;
         }
     };
-    // register handshake (plain JSON; the engine peeks for an optional pidfd and
-    // tolerates none). The SAME connection becomes the box channel.
-    let reg = json!({"type": "register",
-                     "session_id": name.unwrap_or_default(),
-                     "cmd": cmd, "prov": provenance(&cmd)});
-    if conn.write_all(format!("{reg}\n").as_bytes()).is_err() {
+    // register handshake. We always send our own pidfd as SCM_RIGHTS so the
+    // engine can derive our HOST pid (and, for a nested box, the enclosing box
+    // from the /proc ancestry). IN-BOX sends a single-segment `relname` (never
+    // an absolute name — a box must not influence its own parent); HOST sends
+    // the optional NAME as `session_id`. The SAME connection becomes the box
+    // channel.
+    let mut reg = json!({"type": "register",
+                         "cmd": cmd, "prov": provenance(&cmd)});
+    if in_box {
+        reg["relname"] = json!(name.unwrap_or_default());
+    } else {
+        reg["session_id"] = json!(name.unwrap_or_default());
+    }
+    let pidfd = pidfd_open(std::process::id() as i32);
+    if !send_register(&conn, format!("{reg}\n").as_bytes(), pidfd) {
         eprintln!("sarun-engine: register write failed");
         return 1;
     }
+    if pidfd >= 0 { unsafe { libc::close(pidfd); } }
     let mut line = String::new();
     if BufReader::new(&conn).read_line(&mut line).is_err() {
         eprintln!("sarun-engine: register read failed");
@@ -76,10 +140,10 @@ pub fn run(name: Option<String>, cmd: Vec<String>) -> i32 {
         return 1;
     }
     let mount = ack.get("mount").and_then(Value::as_str).unwrap_or("").to_string();
-    let sid = ack.get("session_id").and_then(Value::as_str).unwrap_or("?");
+    let sid = ack.get("session_id").and_then(Value::as_str).unwrap_or("?").to_string();
     let cwd = std::env::current_dir().map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "/".into());
-    eprintln!("sarun-engine: box {sid}  (overlay root: {mount})");
+    eprintln!("sarun-engine: box {sid}  (overlay root: {mount})  UI connected");
 
     // bwrap CMD onto the box's overlay root, exec'ing our own `inner`. The box
     // channel fd is passed (CLOEXEC cleared) and held open by inner.
@@ -87,15 +151,28 @@ pub fn run(name: Option<String>, cmd: Vec<String>) -> i32 {
     clear_cloexec(fd);
     let self_exe = std::env::current_exe()
         .map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| "sarun-engine".into());
+    // Root: a top-level box binds its overlay by host path (<mnt>/<id>); a
+    // NESTED box can't reach that path inside the parent, so it binds the
+    // parent-exposed synthetic /<KIDS_DIR>/<id> (served by the same overlay,
+    // routing to this child's real root). Both bind a directory bwrap holds
+    // CAP_SYS_ADMIN over inside its own userns — no ambient caps needed.
+    let root_src = if in_box { format!("/{KIDS_DIR}/{sid}") } else { mount.clone() };
+    // Forward the engine socket into the box at the fixed inbox path so a
+    // DEEPER nested runner can reach the engine. Bound after --tmpfs /tmp so it
+    // lands on the tmpfs (bwrap creates the parent dir).
+    let sock_src = if in_box { UI_SOCK_INBOX.to_string() }
+                   else { paths::sock_path().to_string_lossy().into_owned() };
+    let fd_s = fd.to_string();
     let status = Command::new("bwrap")
-        .args(["--bind", &mount, "/",
+        .args(["--bind", &root_src, "/",
                "--proc", "/proc", "--dev", "/dev",
                "--ro-bind-try", "/sys", "/sys",
                "--tmpfs", "/tmp",
+               "--ro-bind", &sock_src, UI_SOCK_INBOX,
                "--unshare-pid", "--unshare-ipc", "--unshare-uts",
                "--die-with-parent",
                "--chdir", &cwd,
-               "--", &self_exe, "inner", "--conn-fd", &fd.to_string(),
+               "--", &self_exe, "inner", "--conn-fd", &fd_s,
                "--capture", "--"])
         .args(&cmd)
         .status();

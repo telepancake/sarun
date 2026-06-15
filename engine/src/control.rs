@@ -27,6 +27,7 @@ pub struct Shared {
     pub subscribers: Vec<UnixStream>,
     pub overlay: Option<crate::overlay::Overlay>,
     pub box_pids: std::collections::HashMap<i64, i32>, // box_id -> runner pidfd
+    pub box_runpids: std::collections::HashMap<i64, i32>, // box_id -> runner HOST pid
 }
 
 fn pidfd_open(pid: i32) -> i32 {
@@ -35,6 +36,66 @@ fn pidfd_open(pid: i32) -> i32 {
 fn pidfd_signal(pidfd: i32, sig: i32) {
     unsafe { libc::syscall(libc::SYS_pidfd_send_signal, pidfd, sig,
                            std::ptr::null::<libc::c_void>(), 0); }
+}
+
+/// The HOST-namespace pid named by `pidfd`, read from /proc/self/fdinfo/<fd>
+/// ("Pid:" line; its FIRST field is the pid in our (init) namespace). 0 on any
+/// failure. This is the wrap-immune identity path — the pidfd names one exact
+/// process incarnation, so a reused pid can never alias a finished runner.
+fn host_pid_from_pidfd(pidfd: i32) -> i32 {
+    let Ok(s) = std::fs::read_to_string(format!("/proc/self/fdinfo/{pidfd}")) else {
+        return 0;
+    };
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("Pid:") {
+            return rest.split_whitespace().next()
+                .and_then(|t| t.parse().ok()).unwrap_or(0);
+        }
+    }
+    0
+}
+
+/// PPid of `pid` from /proc/<pid>/status (host namespace); 0 if unreadable.
+fn ppid_of(pid: i32) -> i32 {
+    let Ok(s) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+        return 0;
+    };
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("PPid:") {
+            return rest.trim().parse().unwrap_or(0);
+        }
+    }
+    0
+}
+
+/// Given the connecting runner's HOST pid, walk the /proc PPid chain upward and
+/// return the box_id of the first LIVE box whose runner host pid is an ancestor
+/// — the enclosing box of a nested launch. Kernel-derived and pid-trusted: the
+/// box never supplies its own parent. None if no enclosing box is found.
+fn derive_parent_box(state: &State, host_pid: i32) -> Option<i64> {
+    let map: std::collections::HashMap<i32, i64> = {
+        let s = state.lock().unwrap();
+        s.box_runpids.iter().map(|(b, p)| (*p, *b)).collect()
+    };
+    if map.is_empty() || host_pid <= 1 {
+        return None;
+    }
+    let mut pid = host_pid;
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..64 {
+        if pid <= 1 || !seen.insert(pid) {
+            break;
+        }
+        if let Some(&b) = map.get(&pid) {
+            return Some(b);
+        }
+        let pp = ppid_of(pid);
+        if pp <= 1 {
+            break;
+        }
+        pid = pp;
+    }
+    None
 }
 
 pub type State = Arc<Mutex<Shared>>;
@@ -48,28 +109,36 @@ pub fn broadcast(state: &State, ev: &Value) {
     });
 }
 
-/// Drain any SCM_RIGHTS fds sent with the connection's first bytes (register
-/// handshakes carry a pidfd) and close them — read nothing else; the byte
-/// stream itself is consumed by the normal reader afterwards.
-fn drain_ancillary(conn: &UnixStream) {
+/// Peek any SCM_RIGHTS fds sent with the connection's first bytes (the register
+/// handshake carries the runner's pidfd). KEEP the first fd open and return it
+/// (the caller derives the runner's host pid from it and holds it for `kill`);
+/// close any extras. MSG_PEEK leaves the data bytes queued for the BufReader,
+/// and the real (no-ancillary) read later discards the duplicate fd delivery.
+fn recv_first_fd(conn: &UnixStream) -> Option<i32> {
+    // Wait (bounded) for the first bytes to arrive before peeking: the runner's
+    // sendmsg may still be in flight when we accept, and a non-blocking peek
+    // that races ahead of it would miss the pidfd — dropping a nested box's
+    // only correct host-pid source. poll for readability, then a blocking peek.
+    let fd = conn.as_raw_fd();
+    let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+    let pr = unsafe { libc::poll(&mut pfd, 1, 30_000) };
+    if pr <= 0 {
+        return None;
+    }
     let mut fdbuf = [0i32; 8];
-    let mut io = [0u8; 0];
-    let mut iov = libc::iovec { iov_base: io.as_mut_ptr().cast(), iov_len: 0 };
+    let mut io = [0u8; 1];
+    let mut iov = libc::iovec { iov_base: io.as_mut_ptr().cast(), iov_len: 1 };
     let mut cmsg = [0u8; 128];
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
     msg.msg_control = cmsg.as_mut_ptr().cast();
     msg.msg_controllen = cmsg.len();
-    let n = unsafe {
-        libc::recvmsg(conn.as_raw_fd(), &mut msg,
-                      libc::MSG_PEEK | libc::MSG_DONTWAIT)
-    };
+    let n = unsafe { libc::recvmsg(fd, &mut msg, libc::MSG_PEEK) };
     if n < 0 {
-        return;
+        return None;
     }
-    // With MSG_PEEK the fds are still delivered (and duplicated); collect and
-    // close them. The data bytes stay queued for the BufReader.
+    let mut first: Option<i32> = None;
     unsafe {
         let mut c = libc::CMSG_FIRSTHDR(&msg);
         while !c.is_null() {
@@ -81,19 +150,24 @@ fn drain_ancillary(conn: &UnixStream) {
                 for i in 0..count.min(fdbuf.len()) {
                     std::ptr::copy_nonoverlapping(
                         data.add(i * 4), (&mut fdbuf[i] as *mut i32).cast(), 4);
-                    libc::close(fdbuf[i]);
+                    if first.is_none() {
+                        first = Some(fdbuf[i]);
+                    } else {
+                        libc::close(fdbuf[i]);
+                    }
                 }
             }
             c = libc::CMSG_NXTHDR(&msg, c);
         }
     }
+    first
 }
 
 fn dispatch(state: &State, msg: &Value) -> Value {
     let t = msg.get("type").and_then(Value::as_str).unwrap_or("");
     match t {
         "subscribe" => json!({"ok": true, "_subscribe": true}),
-        "register" => register(state, msg),
+        "register" => register(state, msg, None),
         "select" => {
             let sid = msg.get("sid").and_then(Value::as_str).map(String::from);
             let boxes = discover::discover();
@@ -285,49 +359,91 @@ fn drop_if_empty(state: &State, id: i64) {
     }
 }
 
-/// The runner register handshake (m3b). Mints a box_id, creates the backing
-/// sentinel (live/<id>/up) and the box's sqlar (root process row from the
-/// message's prov), registers the box on the overlay, and acks with the
-/// <mnt>/<id> bind target. The SAME connection becomes the box channel —
-/// its EOF (handled by the caller via the _box_sid marker) is teardown.
-/// Honest m3b limits: capture mode is downgraded in the ack (no sink files /
-/// echo frames yet — the runner then behaves as -t passthrough), and nested
-/// (relname) registration is refused.
-fn register(state: &State, msg: &Value) -> Value {
+fn valid_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+        && s.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '-')
+        && !s.ends_with('-')
+}
+
+/// The runner register handshake. Mints a box_id, creates the backing sentinel
+/// (live/<id>/up) and the box's sqlar (root process row from the message's
+/// prov), registers the box on the overlay, and acks with the <mnt>/<id> bind
+/// target. The SAME connection becomes the box channel — its EOF (handled by
+/// the caller via the _box_sid marker) is teardown.
+///
+/// `peer_pidfd` is the runner's own pidfd (SCM_RIGHTS first fd): we derive its
+/// HOST pid for kill + parent derivation, and HOLD it for pid-reuse-safe kill.
+/// NESTED LAUNCH: a `relname` field means the runner is inside a box; the
+/// enclosing box is derived from the runner's /proc ancestry (never trusted
+/// from the message), and this box is parented under it. A relname with no
+/// derivable enclosing box is an error (the box's pidfd closes on the early
+/// return when the caller's loop tears down). Capture mode stays downgraded in
+/// the ack (no echo/sinks yet — runner behaves as -t passthrough).
+fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
     let ov = state.lock().unwrap().overlay.clone();
     let Some(ov) = ov else {
+        if let Some(fd) = peer_pidfd { unsafe { libc::close(fd); } }
         return json!({"ok": false, "error": "overlay mount is not available"});
     };
-    if msg.get("relname").is_some() {
-        return json!({"ok": false,
-                      "error": "engine m3b: nested boxes not yet supported"});
-    }
+    // Runner host pid: from the pidfd if sent (correct for nested runners whose
+    // own getpid() is a parent-namespace pid); else the claimed tgid (top-level).
+    let host_pid = peer_pidfd.map(host_pid_from_pidfd).filter(|p| *p > 0)
+        .or_else(|| msg.get("prov").and_then(|p| p.get("tgid"))
+                 .and_then(Value::as_i64).map(|t| t as i32))
+        .unwrap_or(0);
+    // NESTED: relname present → derive the enclosing box from /proc ancestry.
+    let relname = msg.get("relname").and_then(Value::as_str);
+    let parent: Option<i64> = if relname.is_some() {
+        match derive_parent_box(state, host_pid) {
+            Some(p) => Some(p),
+            None => {
+                if let Some(fd) = peer_pidfd { unsafe { libc::close(fd); } }
+                return json!({"ok": false,
+                    "error": "relname supplied but no enclosing box found"});
+            }
+        }
+    } else {
+        None
+    };
     let boxes = discover::discover();
     let live_max = ov.box_ids().into_iter().max().unwrap_or(0);
     let id = boxes.keys().max().copied().unwrap_or(0).max(live_max) + 1;
-    // NAME: the runner-supplied session_id is only a NAME candidate.
-    let want = msg.get("session_id").and_then(Value::as_str).unwrap_or("");
-    let valid = !want.is_empty()
-        && want.chars().next().is_some_and(|c| c.is_ascii_uppercase())
-        && want.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()
-                            || c == '-')
-        && !want.ends_with('-');
-    let name = if valid { want.to_string() } else { format!("A{id}") };
+    // NAME candidate: relname (nested) or session_id (top-level); else A<id>.
+    let want = relname.or_else(|| msg.get("session_id").and_then(Value::as_str))
+        .unwrap_or("");
+    let name = if valid_name(want) { want.to_string() } else { format!("A{id}") };
     let backing = crate::paths::live_home().join(id.to_string());
     if let Err(e) = std::fs::create_dir_all(backing.join("up")) {
+        if let Some(fd) = peer_pidfd { unsafe { libc::close(fd); } }
         return json!({"ok": false, "error": format!("backing: {e}")});
     }
     let b = match crate::capture::BoxState::create(id) {
         Ok(b) => b,
-        Err(e) => return json!({"ok": false, "error": format!("sqlar: {e}")}),
+        Err(e) => {
+            if let Some(fd) = peer_pidfd { unsafe { libc::close(fd); } }
+            return json!({"ok": false, "error": format!("sqlar: {e}")});
+        }
     };
     b.set_meta("name", &name);
+    if let Some(p) = parent {
+        b.set_parent(Some(p));
+        b.set_meta("parent_box_id", &p.to_string());
+    }
     if let Some(prov) = msg.get("prov") {
         b.root_process(prov);
+    }
+    {
+        let mut s = state.lock().unwrap();
+        if host_pid > 0 { s.box_runpids.insert(id, host_pid); }
         // Hold a pidfd on the runner so `kill` can signal it pid-reuse-safely.
-        if let Some(tgid) = prov.get("tgid").and_then(Value::as_i64) {
-            let fd = pidfd_open(tgid as i32);
-            if fd >= 0 { state.lock().unwrap().box_pids.insert(id, fd); }
+        // Prefer the runner's own pidfd (valid across pid namespaces); else open
+        // one from the claimed tgid (top-level fallback).
+        if let Some(fd) = peer_pidfd {
+            s.box_pids.insert(id, fd);
+        } else if host_pid > 0 {
+            let fd = pidfd_open(host_pid);
+            if fd >= 0 { s.box_pids.insert(id, fd); }
         }
     }
     ov.add_box(std::sync::Arc::new(b));
@@ -519,24 +635,40 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
 }
 
 fn handle(state: State, conn: UnixStream) {
-    drain_ancillary(&conn);
+    // The register handshake carries the runner's pidfd as the connection's
+    // first SCM_RIGHTS fd; keep it for host-pid derivation + kill. It belongs
+    // to the FIRST message only (a register); close it if that never comes.
+    let mut peer_pidfd = recv_first_fd(&conn);
     let mut reader = BufReader::new(match conn.try_clone() {
         Ok(c) => c,
-        Err(_) => return,
+        Err(_) => {
+            if let Some(fd) = peer_pidfd { unsafe { libc::close(fd); } }
+            return;
+        }
     });
     let mut writer = conn;
     let mut line = String::new();
     loop {
         line.clear();
         match reader.read_line(&mut line) {
-            Ok(0) | Err(_) => return,
+            Ok(0) | Err(_) => {
+                if let Some(fd) = peer_pidfd.take() { unsafe { libc::close(fd); } }
+                return;
+            }
             Ok(_) => {}
         }
         if line.trim().is_empty() {
             continue;
         }
-        let Ok(msg) = serde_json::from_str::<Value>(&line) else { return };
-        let mut reply = dispatch(&state, &msg);
+        let Ok(msg) = serde_json::from_str::<Value>(&line) else {
+            if let Some(fd) = peer_pidfd.take() { unsafe { libc::close(fd); } }
+            return;
+        };
+        let mut reply = if msg.get("type").and_then(Value::as_str) == Some("register") {
+            register(&state, &msg, peer_pidfd.take())
+        } else {
+            dispatch(&state, &msg)
+        };
         let subscribe = reply.get("_subscribe").and_then(Value::as_bool)
             .unwrap_or(false);
         let box_sid = reply.as_object_mut()
@@ -560,8 +692,12 @@ fn handle(state: State, conn: UnixStream) {
             if let Some(ov) = ov {
                 ov.remove_box(id);
             }
-            if let Some(fd) = state.lock().unwrap().box_pids.remove(&id) {
-                unsafe { libc::close(fd); }
+            {
+                let mut s = state.lock().unwrap();
+                if let Some(fd) = s.box_pids.remove(&id) {
+                    unsafe { libc::close(fd); }
+                }
+                s.box_runpids.remove(&id);
             }
             broadcast(&state, &json!({"type": "session_removed",
                                       "session_id": id.to_string()}));
