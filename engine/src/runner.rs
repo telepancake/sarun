@@ -108,8 +108,45 @@ fn clear_cloexec(fd: i32) {
     }
 }
 
+// ── tty job-control (interactive boxes) ──────────────────────────────────────
+// We are PID 1 in the box's pid namespace, so process-group ids put on the
+// controlling terminal are namespace-local — which lets a job-control shell
+// (bash/dash) save/restore the terminal's foreground group without hitting
+// "Cannot set tty process group". Mirrors the Python inner: find the tty among
+// fd 0/1/2, run the child in its OWN process group, hand it the terminal
+// foreground (SIGTTOU ignored during the handoff), and restore on exit.
+
+/// The first of fd 0/1/2 that is a tty, plus its current foreground pgrp.
+fn tty_grab() -> (Option<i32>, Option<i32>) {
+    let tty_fd = (0..3).find(|&fd| unsafe { libc::isatty(fd) } == 1);
+    let old_fg = tty_fd.and_then(|fd| {
+        let g = unsafe { libc::tcgetpgrp(fd) };
+        if g >= 0 { Some(g) } else { None }
+    });
+    (tty_fd, old_fg)
+}
+
+/// Hand the terminal foreground to `child_pid`'s group; returns the prior
+/// SIGTTOU handler to restore. No-op when there is no tty.
+fn tty_give(tty_fd: Option<i32>, child_pid: i32) -> Option<libc::sighandler_t> {
+    tty_fd.map(|fd| unsafe {
+        let old = libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+        libc::tcsetpgrp(fd, child_pid);
+        old
+    })
+}
+
+/// Restore the saved foreground pgrp + SIGTTOU handler after the child exits.
+fn tty_restore(tty_fd: Option<i32>, old_fg: Option<i32>,
+               old_ttou: Option<libc::sighandler_t>) {
+    if let Some(fd) = tty_fd {
+        if let Some(fg) = old_fg { unsafe { libc::tcsetpgrp(fd, fg); } }
+        if let Some(h) = old_ttou { unsafe { libc::signal(libc::SIGTTOU, h); } }
+    }
+}
+
 pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
-           cmd: Vec<String>) -> i32 {
+           chdir: Option<String>, cmd: Vec<String>) -> i32 {
     if cmd.is_empty() {
         eprintln!("sarun-engine run: no command after --");
         return 2;
@@ -171,8 +208,9 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
     }
     let mount = ack.get("mount").and_then(Value::as_str).unwrap_or("").to_string();
     let sid = ack.get("session_id").and_then(Value::as_str).unwrap_or("?").to_string();
-    let cwd = std::env::current_dir().map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| "/".into());
+    // -C overrides the box's working directory; else inherit ours.
+    let cwd = chdir.unwrap_or_else(|| std::env::current_dir()
+        .map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| "/".into()));
     eprintln!("sarun-engine: box {sid}  (overlay root: {mount})  UI connected");
 
     // bwrap CMD onto the box's overlay root, exec'ing our own `inner`. The box
@@ -252,9 +290,19 @@ pub fn inner(conn_fd: i32, capture: bool, cmd: Vec<String>) -> i32 {
     // teardown signal — only when this process (and CMD) finally exits.
     if conn_fd >= 0 { clear_cloexec(conn_fd); }
     if !capture || conn_fd < 0 {
-        let err = Command::new(&cmd[0]).args(&cmd[1..]).exec();
-        eprintln!("sarun-engine inner: exec {}: {err}", cmd[0]);
-        return 127;
+        // Passthrough (-t/-d): stdio is inherited. Spawn (not exec) so we can do
+        // tty job-control + restore for an interactive shell; the box channel,
+        // if any, stays held open by us until the child exits (teardown EOF).
+        let (tty_fd, old_fg) = tty_grab();
+        let mut child = match Command::new(&cmd[0]).args(&cmd[1..])
+            .process_group(0).spawn() {
+            Ok(c) => c,
+            Err(e) => { eprintln!("sarun-engine inner: spawn {}: {e}", cmd[0]); return 127; }
+        };
+        let old_ttou = tty_give(tty_fd, child.id() as i32);
+        let code = child.wait().ok().and_then(|s| s.code()).unwrap_or(1);
+        tty_restore(tty_fd, old_fg, old_ttou);
+        return code;
     }
     // Capture via the echo mux: the child's stdout/stderr ARE the box-root sink
     // files, so every write flows THROUGH the overlay (recorded with per-write
@@ -306,8 +354,12 @@ pub fn inner(conn_fd: i32, capture: bool, cmd: Vec<String>) -> i32 {
             }
         }
     });
+    // tty job-control: child in its own group, given the terminal foreground
+    // (stdin stays the inherited tty; stdout/stderr are the sinks).
+    let (tty_fd, old_fg) = tty_grab();
     let child = unsafe {
         Command::new(&cmd[0]).args(&cmd[1..])
+            .process_group(0)
             .stdout(Stdio::from_raw_fd(out.into_raw_fd()))
             .stderr(Stdio::from_raw_fd(err.into_raw_fd()))
             .spawn()
@@ -316,7 +368,9 @@ pub fn inner(conn_fd: i32, capture: bool, cmd: Vec<String>) -> i32 {
         Ok(c) => c,
         Err(e) => { eprintln!("sarun-engine inner: spawn {}: {e}", cmd[0]); return 127; }
     };
+    let old_ttou = tty_give(tty_fd, child.id() as i32);
     let code = child.wait().ok().and_then(|s| s.code()).unwrap_or(1);
+    tty_restore(tty_fd, old_fg, old_ttou);
     // The child's sink fds are now closed (it exited): the engine will frame any
     // remaining ECHO then ECHO_DONE. Wait briefly for the reader to drain so the
     // tail of the output isn't truncated, then unmute and let the channel close.

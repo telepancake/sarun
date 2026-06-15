@@ -386,16 +386,19 @@ fn main() {
             let mut passthrough = false;
             let mut direct = false;
             let mut env = false;
+            let mut chdir: Option<String> = None;
             let mut name: Option<String> = None;
-            for a in pre {
+            let mut it = pre.iter();
+            while let Some(a) = it.next() {
                 match a.as_str() {
                     "-t" => passthrough = true,
                     "-d" => direct = true,
                     "-e" => env = true,
+                    "-C" => chdir = it.next().cloned(),
                     _ => if name.is_none() { name = Some(a.clone()); },
                 }
             }
-            std::process::exit(runner::run(name, passthrough, direct, env, cmd));
+            std::process::exit(runner::run(name, passthrough, direct, env, chdir, cmd));
         }
         Some("inner") => {
             // inner --conn-fd N -- CMD...
@@ -411,6 +414,12 @@ fn main() {
                 else { i += 1; }
             }
             std::process::exit(runner::inner(conn_fd, capture, rest[i..].to_vec()));
+        }
+        // CLI conveniences mirroring `slopbox NAME <op>`: a leading all-caps
+        // (optionally dotted) box NAME selects it, and an optional op acts on it
+        // over the control socket (the verbs already exist engine-side).
+        Some(first) if control::is_box_name(first) => {
+            std::process::exit(control::cli_box_op(&argv));
         }
         _ => {}
     }

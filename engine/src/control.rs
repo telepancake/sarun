@@ -894,6 +894,77 @@ fn handle(state: State, conn: UnixStream) {
     }
 }
 
+/// A leading CLI token that names a box: all-caps start, [A-Z0-9-.] body
+/// (dots allow a nested display path A.B), no trailing '-'. Mirrors the Python
+/// `valid_dotted_name` gate that turns `slopbox NAME …` into a box op.
+pub fn is_box_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+        && s.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()
+                         || c == '-' || c == '.')
+        && !s.ends_with('-')
+}
+
+/// CLI conveniences `sarun-engine NAME [op [arg]]` — connect to the running
+/// engine's control socket and act on the named box (the verbs already exist
+/// engine-side). `NAME` alone selects; `patch` prints the unified diff; `apply`
+/// / `discard` act on the whole box; `rename NEW` renames. Mirrors the Python
+/// `slopbox NAME patch|apply|discard|rename`.
+pub fn cli_box_op(argv: &[String]) -> i32 {
+    let name = argv[0].as_str();
+    let op = argv.get(1).map(String::as_str);
+    let one = |msg: Value| -> Result<Value, String> {
+        let mut c = UnixStream::connect(crate::paths::sock_path())
+            .map_err(|_| "no engine running".to_string())?;
+        c.write_all(format!("{msg}\n").as_bytes()).map_err(|e| e.to_string())?;
+        let mut line = String::new();
+        BufReader::new(&c).read_line(&mut line).map_err(|e| e.to_string())?;
+        serde_json::from_str(&line).map_err(|e| e.to_string())
+    };
+    let report = |r: Result<Value, String>| -> i32 {
+        match r {
+            Ok(v) if v.get("ok").and_then(Value::as_bool) == Some(true) => 0,
+            Ok(v) => { eprintln!("sarun-engine: {}",
+                v.get("error").and_then(Value::as_str).unwrap_or("failed")); 1 }
+            Err(e) => { eprintln!("sarun-engine: {e}"); 1 }
+        }
+    };
+    match op {
+        None => report(one(json!({"type": "select", "sid": name}))),
+        Some("apply") | Some("discard") => {
+            let t = op.unwrap();
+            match one(json!({"type": t, "sid": name})) {
+                Ok(v) if v.get("ok").and_then(Value::as_bool) == Some(true) => {
+                    println!("{}: {} {}", name,
+                        v.get("count").and_then(Value::as_i64).unwrap_or(0), t);
+                    0
+                }
+                other => report(other),
+            }
+        }
+        Some("rename") => {
+            let new = argv.get(2).map(String::as_str).unwrap_or("");
+            report(one(json!({"type": "rename", "sid": name, "name": new})))
+        }
+        Some("patch") => {
+            match one(json!({"type": "patch", "sid": name})) {
+                Ok(v) if v.get("ok").and_then(Value::as_bool) == Some(true) => {
+                    if let Some(b64) = v.get("patch").and_then(Value::as_str) {
+                        if let Ok(bytes) = base64::engine::general_purpose::STANDARD
+                            .decode(b64) {
+                            use std::io::Write;
+                            let _ = std::io::stdout().write_all(&bytes);
+                        }
+                    }
+                    0
+                }
+                other => report(other),
+            }
+        }
+        Some(o) => { eprintln!("sarun-engine: unknown op '{o}'"); 2 }
+    }
+}
+
 pub fn serve(state: State, sock: &std::path::Path) -> std::io::Result<()> {
     let _ = std::fs::remove_file(sock);
     let listener = UnixListener::bind(sock)?;
