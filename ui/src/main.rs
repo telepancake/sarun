@@ -28,8 +28,11 @@ use std::io::BufRead;
 use std::io::BufReader;
 use std::io::Write;
 use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Duration;
+
+use base64::Engine as _;
 
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -129,6 +132,32 @@ enum Pane {
     Sessions,
     Changes,
     Hunks,
+    Processes,
+    Outputs,
+    Rules,
+    Help,
+}
+
+/// A transient modal overlaid on the main view. Mirrors the Python Textual
+/// modals: Confirm (y/n destructive), SearchModal (substring filter of the
+/// active pane), RuleFormModal (add/edit a filerules line).
+#[cfg_attr(test, allow(dead_code))]
+enum Modal {
+    /// A y/n confirmation. `action` names the destructive op to run on 'y'.
+    Confirm { prompt: String, action: ConfirmAction },
+    /// Substring filter of the focused pane; `buf` is the live query.
+    Search { buf: String },
+    /// Add or edit a file rule. `editing` is Some(index) when editing an
+    /// existing rule, None when adding. `buf` is the "<action> <glob>" line.
+    RuleForm { buf: String, editing: Option<usize> },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(test, allow(dead_code))]
+enum ConfirmAction {
+    Kill,
+    Delete,
+    Dissolve,
 }
 
 struct App {
@@ -136,12 +165,23 @@ struct App {
     sessions: Vec<Value>,
     changes: Vec<Value>,
     hunks: Value, // raw review.hunks result for the selected change
+    processes: Vec<Value>, // processes() rows: [id,tgid,ppid,parent_id,exe,argv]
+    outputs: Vec<Value>,   // outputs() rows: {id,ts,process_id,stream,len}
+    output_view: String,   // decoded bytes of the captured streams (stdout/stderr)
+    rules: Vec<String>,    // raw filerules lines (apply/discard/passthrough <glob>)
     sel_session: usize,
     sel_change: usize,
+    sel_proc: usize,
+    sel_output: usize,
+    sel_rule: usize,
     hunk_scroll: u16,
+    out_scroll: u16,
     focus: Pane,
     status: String,
     renaming: Option<String>, // Some(buffer) while editing a new name
+    modal: Option<Modal>,
+    /// Active substring filter (committed from the Search modal). Empty = none.
+    filter: String,
     #[cfg_attr(test, allow(dead_code))]
     should_quit: bool,
 }
@@ -153,16 +193,27 @@ impl App {
             sessions: vec![],
             changes: vec![],
             hunks: Value::Null,
+            processes: vec![],
+            outputs: vec![],
+            output_view: String::new(),
+            rules: vec![],
             sel_session: 0,
             sel_change: 0,
+            sel_proc: 0,
+            sel_output: 0,
+            sel_rule: 0,
             hunk_scroll: 0,
+            out_scroll: 0,
             focus: Pane::Sessions,
-            status: "ready · j/k move · Tab pane · Enter open · a apply · x discard · K kill · D delete · r rename · q quit".into(),
+            status: "ready · j/k move · b/c/p/o boxes/changes/procs/outputs · e rules · ? help · Enter open · a apply · x discard · K kill · D delete · r rename · / search · q quit".into(),
             renaming: None,
+            modal: None,
+            filter: String::new(),
             should_quit: false,
         };
         a.refresh_sessions();
         a.load_changes();
+        a.load_rules();
         a
     }
 
@@ -208,6 +259,9 @@ impl App {
             Ok(_) => {}
             Err(e) => self.status = format!("session_changes: {e}"),
         }
+        // the procs/outputs panes track the same selected box.
+        self.load_processes();
+        self.load_outputs();
     }
 
     /// Load the hunks (unified diff) for the selected change of the selected box.
@@ -220,6 +274,107 @@ impl App {
         match rpc(&self.sock, "review.hunks", json!([sid, path])) {
             Ok(v) => self.hunks = v,
             Err(e) => self.status = format!("hunks: {e}"),
+        }
+    }
+
+    /// Load the captured process tree for the selected box (rows are
+    /// [id,tgid,ppid,parent_id,exe,argv]).
+    fn load_processes(&mut self) {
+        self.processes.clear();
+        self.sel_proc = 0;
+        let Some(sid) = self.cur_sid() else { return };
+        match rpc(&self.sock, "processes", json!([sid])) {
+            Ok(Value::Array(a)) => self.processes = a,
+            Ok(_) => {}
+            Err(e) => self.status = format!("processes: {e}"),
+        }
+    }
+
+    /// Load the captured outputs index for the selected box, then fetch and
+    /// decode each row's bytes (output_detail wire-encodes them as {"__b":b64})
+    /// into a single scrollable stdout/stderr transcript.
+    fn load_outputs(&mut self) {
+        self.outputs.clear();
+        self.output_view.clear();
+        self.sel_output = 0;
+        self.out_scroll = 0;
+        let Some(sid) = self.cur_sid() else { return };
+        match rpc(&self.sock, "outputs", json!([sid])) {
+            Ok(Value::Array(a)) => self.outputs = a,
+            Ok(_) => return,
+            Err(e) => {
+                self.status = format!("outputs: {e}");
+                return;
+            }
+        }
+        let mut view = String::new();
+        for o in &self.outputs {
+            let oid = o.get("id").and_then(Value::as_i64).unwrap_or(-1);
+            let stream = o.get("stream").and_then(Value::as_i64).unwrap_or(0);
+            let tag = if stream == 1 { "err" } else { "out" };
+            if let Ok(d) = rpc(&self.sock, "output_detail", json!([sid, oid])) {
+                if let Some(b64) = d
+                    .get("content")
+                    .and_then(|c| c.get("__b"))
+                    .and_then(Value::as_str)
+                {
+                    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
+                        let text = String::from_utf8_lossy(&bytes);
+                        for chunk in text.split_inclusive('\n') {
+                            view.push_str(&format!("[{tag}] {}", chunk.trim_end_matches('\n')));
+                            view.push('\n');
+                        }
+                    }
+                }
+            }
+        }
+        self.output_view = view;
+    }
+
+    /// The on-disk filerules path for the active namespace, computed the same
+    /// way the engine's paths::config_home() does (XDG_CONFIG_HOME or
+    /// ~/.config, then slopbox[.NS]).
+    fn rules_path(&self) -> PathBuf {
+        let app_dir = match std::env::var("SLOPBOX_NS") {
+            Ok(ns) if !ns.is_empty() => format!("slopbox.{ns}"),
+            _ => "slopbox".into(),
+        };
+        let base = match std::env::var("XDG_CONFIG_HOME") {
+            Ok(v) if !v.is_empty() => PathBuf::from(v),
+            _ => PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/root".into()))
+                .join(".config"),
+        };
+        base.join(app_dir).join("filerules")
+    }
+
+    /// Read the filerules file into `self.rules` (one line per rule; blank and
+    /// comment lines are kept so an edit round-trips the file faithfully).
+    fn load_rules(&mut self) {
+        let text = std::fs::read_to_string(self.rules_path()).unwrap_or_default();
+        self.rules = text.lines().map(String::from).collect();
+        if self.sel_rule >= self.rules.len() {
+            self.sel_rule = self.rules.len().saturating_sub(1);
+        }
+    }
+
+    /// Persist `self.rules` back to disk and tell the engine to reload them.
+    fn save_rules(&mut self) {
+        let path = self.rules_path();
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let body = if self.rules.is_empty() {
+            String::new()
+        } else {
+            format!("{}\n", self.rules.join("\n"))
+        };
+        if let Err(e) = std::fs::write(&path, body) {
+            self.status = format!("write rules: {e}");
+            return;
+        }
+        match rpc(&self.sock, "reload_rules", json!([])) {
+            Ok(_) => self.status = format!("saved {} rule(s) · reloaded", self.rules.len()),
+            Err(e) => self.status = format!("reload_rules: {e}"),
         }
     }
 
@@ -241,6 +396,18 @@ impl App {
                 }
             }
             Pane::Hunks => self.hunk_scroll = self.hunk_scroll.saturating_add(1),
+            Pane::Processes => {
+                if self.sel_proc + 1 < self.visible_processes().len() {
+                    self.sel_proc += 1;
+                }
+            }
+            Pane::Outputs => self.out_scroll = self.out_scroll.saturating_add(1),
+            Pane::Rules => {
+                if self.sel_rule + 1 < self.rules.len() {
+                    self.sel_rule += 1;
+                }
+            }
+            Pane::Help => {}
         }
     }
 
@@ -260,6 +427,10 @@ impl App {
                 }
             }
             Pane::Hunks => self.hunk_scroll = self.hunk_scroll.saturating_sub(1),
+            Pane::Processes => self.sel_proc = self.sel_proc.saturating_sub(1),
+            Pane::Outputs => self.out_scroll = self.out_scroll.saturating_sub(1),
+            Pane::Rules => self.sel_rule = self.sel_rule.saturating_sub(1),
+            Pane::Help => {}
         }
     }
 
@@ -268,8 +439,24 @@ impl App {
         self.focus = match self.focus {
             Pane::Sessions => Pane::Changes,
             Pane::Changes => Pane::Hunks,
-            Pane::Hunks => Pane::Sessions,
+            Pane::Hunks => Pane::Processes,
+            Pane::Processes => Pane::Outputs,
+            Pane::Outputs => Pane::Rules,
+            Pane::Rules => Pane::Sessions,
+            Pane::Help => Pane::Sessions,
         };
+    }
+
+    /// Processes after applying the active substring filter (matches exe/argv).
+    fn visible_processes(&self) -> Vec<&Value> {
+        if self.filter.is_empty() {
+            return self.processes.iter().collect();
+        }
+        let f = self.filter.to_lowercase();
+        self.processes
+            .iter()
+            .filter(|p| proc_text(p).to_lowercase().contains(&f))
+            .collect()
     }
 
     /// Enter: open the selected row into the next pane.
@@ -283,7 +470,7 @@ impl App {
                 self.load_hunks();
                 self.focus = Pane::Hunks;
             }
-            Pane::Hunks => {}
+            Pane::Hunks | Pane::Processes | Pane::Outputs | Pane::Rules | Pane::Help => {}
         }
     }
 
@@ -351,6 +538,55 @@ impl App {
     }
 
     #[cfg_attr(test, allow(dead_code))]
+    fn dissolve(&mut self) {
+        let Some(sid) = self.cur_sid() else { return };
+        match rpc(&self.sock, "dissolve", json!([sid])) {
+            Ok(_) => self.status = format!("dissolved box {sid}"),
+            Err(e) => self.status = format!("dissolve: {e}"),
+        }
+        self.refresh_sessions();
+        self.load_changes();
+    }
+
+    /// Run the destructive op a Confirm modal was guarding (after a 'y').
+    #[cfg_attr(test, allow(dead_code))]
+    fn run_confirm(&mut self, action: ConfirmAction) {
+        match action {
+            ConfirmAction::Kill => self.kill(),
+            ConfirmAction::Delete => self.delete(),
+            ConfirmAction::Dissolve => self.dissolve(),
+        }
+    }
+
+    /// Commit the RuleForm modal buffer: append a new rule or replace an
+    /// existing one, then persist + reload.
+    #[cfg_attr(test, allow(dead_code))]
+    fn commit_rule(&mut self, buf: String, editing: Option<usize>) {
+        let line = buf.trim().to_string();
+        if line.is_empty() {
+            self.status = "empty rule discarded".into();
+            return;
+        }
+        match editing {
+            Some(i) if i < self.rules.len() => self.rules[i] = line,
+            _ => self.rules.push(line),
+        }
+        self.save_rules();
+    }
+
+    /// Delete the selected file rule and persist + reload.
+    #[cfg_attr(test, allow(dead_code))]
+    fn delete_rule(&mut self) {
+        if self.sel_rule < self.rules.len() {
+            self.rules.remove(self.sel_rule);
+            if self.sel_rule >= self.rules.len() {
+                self.sel_rule = self.rules.len().saturating_sub(1);
+            }
+            self.save_rules();
+        }
+    }
+
+    #[cfg_attr(test, allow(dead_code))]
     fn commit_rename(&mut self) {
         let Some(name) = self.renaming.take() else { return };
         let Some(sid) = self.cur_sid() else { return };
@@ -381,6 +617,18 @@ impl App {
 }
 
 // ── rendering ───────────────────────────────────────────────────────────────
+
+/// "exe argv0 argv1 …" for a processes() row [id,tgid,ppid,parent_id,exe,argv].
+fn proc_text(p: &Value) -> String {
+    let arr = p.as_array();
+    let exe = arr.and_then(|a| a.get(4)).and_then(Value::as_str).unwrap_or("");
+    let argv = arr
+        .and_then(|a| a.get(5))
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" "))
+        .unwrap_or_default();
+    format!("{exe} {argv}").trim().to_string()
+}
 
 fn title(base: &str, focused: bool) -> String {
     if focused {
@@ -517,6 +765,167 @@ fn hunk_lines(app: &App) -> Vec<Line<'static>> {
     }
 }
 
+/// PROCESSES pane: tgid · ppid · exe · argv, one row per captured process.
+fn processes_lines(app: &App) -> Vec<Line<'static>> {
+    let mut out = vec![Line::from(Span::styled(
+        format!("{:>6} {:>6}  {}", "TGID", "PPID", "EXE · ARGV"),
+        Style::default().add_modifier(Modifier::BOLD),
+    ))];
+    let vis = app.visible_processes();
+    if vis.is_empty() {
+        out.push(Line::from("(no captured processes)"));
+        return out;
+    }
+    for (i, p) in vis.iter().enumerate() {
+        let a = p.as_array();
+        let tgid = a.and_then(|x| x.get(1)).and_then(Value::as_i64).unwrap_or(0);
+        let ppid = a.and_then(|x| x.get(2)).and_then(Value::as_i64).unwrap_or(0);
+        let text = format!("{tgid:>6} {ppid:>6}  {}", proc_text(p));
+        let line = if i == app.sel_proc {
+            Line::from(Span::styled(text, Style::default().fg(Color::Black).bg(Color::Cyan)))
+        } else {
+            Line::from(text)
+        };
+        out.push(line);
+    }
+    out
+}
+
+/// OUTPUTS pane: an index header (count + per-stream byte tally) followed by the
+/// decoded stdout/stderr transcript, each line tagged [out]/[err].
+fn outputs_lines(app: &App) -> Vec<Line<'static>> {
+    let mut out = vec![];
+    let (mut nout, mut nerr) = (0i64, 0i64);
+    for o in &app.outputs {
+        let len = o.get("len").and_then(Value::as_i64).unwrap_or(0);
+        if o.get("stream").and_then(Value::as_i64).unwrap_or(0) == 1 {
+            nerr += len;
+        } else {
+            nout += len;
+        }
+    }
+    out.push(Line::from(Span::styled(
+        format!("{} write(s) · {} stdout B · {} stderr B", app.outputs.len(), nout, nerr),
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+    if app.output_view.is_empty() {
+        out.push(Line::from("(no captured output)"));
+        return out;
+    }
+    for l in app.output_view.lines() {
+        let color = if l.starts_with("[err]") { Color::Red } else { Color::Gray };
+        out.push(Line::from(Span::styled(l.to_string(), Style::default().fg(color))));
+    }
+    out
+}
+
+/// FILE RULES pane: the ordered filerules lines (first match wins).
+fn rules_lines(app: &App) -> Vec<Line<'static>> {
+    let mut out = vec![Line::from(Span::styled(
+        "apply/discard/passthrough <glob> — top → bottom, first match wins",
+        Style::default().add_modifier(Modifier::BOLD),
+    ))];
+    if app.rules.is_empty() {
+        out.push(Line::from("(no rules — press n to add)"));
+        return out;
+    }
+    for (i, r) in app.rules.iter().enumerate() {
+        let color = if r.trim_start().starts_with("discard") {
+            Color::Red
+        } else if r.trim_start().starts_with("passthrough") {
+            Color::Yellow
+        } else if r.trim_start().starts_with('#') || r.trim().is_empty() {
+            Color::DarkGray
+        } else {
+            Color::Green
+        };
+        let line = if i == app.sel_rule {
+            Line::from(Span::styled(r.clone(), Style::default().fg(Color::Black).bg(Color::Cyan)))
+        } else {
+            Line::from(Span::styled(r.clone(), Style::default().fg(color)))
+        };
+        out.push(line);
+    }
+    out
+}
+
+/// HELP pane: a static cheatsheet of the keybindings and the run→inspect→
+/// apply/discard loop.
+fn help_lines() -> Vec<Line<'static>> {
+    let h = |s: &str| Line::from(Span::styled(s.to_string(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
+    let t = |s: &str| Line::from(s.to_string());
+    vec![
+        h("sarun — sandboxed run → inspect → apply/discard"),
+        t(""),
+        t("A box runs your command over a copy-on-write overlay of the"),
+        t("filesystem. Its writes, processes, and stdout/stderr are captured"),
+        t("for review. You then apply (materialize on the host) or discard."),
+        t(""),
+        h("Panes"),
+        t("  b  boxes/sessions     c  changes (files)     (Enter→diff)"),
+        t("  p  processes          o  outputs (stdout/err)"),
+        t("  e  file rules         ?  this help            Tab cycles"),
+        t(""),
+        h("Navigation"),
+        t("  j/k or ↓/↑  move      Enter  open selection in next pane"),
+        t("  R  refresh            /      filter active pane (substring)"),
+        t(""),
+        h("Actions"),
+        t("  a  apply change/box   x  discard change/box"),
+        t("  K  kill box (y/n)     D  delete box (y/n)   X  dissolve (y/n)"),
+        t("  r  rename box"),
+        t(""),
+        h("File rules (e)"),
+        t("  n  new rule           Enter  edit selected   d  delete selected"),
+        t("  Rules are 'apply|discard|passthrough <glob>', first match wins;"),
+        t("  saving reloads them in the engine."),
+        t(""),
+        t("  q  quit"),
+    ]
+}
+
+/// Render the active modal centered over the body. Returns the area consumed.
+fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal) {
+    let w = (area.width * 7 / 10).clamp(20, area.width);
+    let hgt = 7u16.min(area.height);
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(hgt)) / 2;
+    let rect = Rect { x, y, width: w, height: hgt };
+    // clear behind the modal
+    f.render_widget(ratatui::widgets::Clear, rect);
+    let (title_s, body): (&str, Vec<Line>) = match modal {
+        Modal::Confirm { prompt, .. } => (
+            " confirm ",
+            vec![Line::from(prompt.clone()), Line::from(""), Line::from("y = yes · n / Esc = cancel")],
+        ),
+        Modal::Search { buf } => (
+            " search / filter ",
+            vec![
+                Line::from(format!("filter: {buf}_")),
+                Line::from(""),
+                Line::from("type to filter the active pane · Enter apply · Esc clear"),
+            ],
+        ),
+        Modal::RuleForm { buf, editing } => (
+            if editing.is_some() { " edit rule " } else { " new rule " },
+            vec![
+                Line::from(format!("{buf}_")),
+                Line::from(""),
+                Line::from("e.g.  discard **/*.log   ·   Enter save · Esc cancel"),
+            ],
+        ),
+    };
+    let p = Paragraph::new(Text::from(body))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+                .title(title_s.to_string()),
+        )
+        .wrap(Wrap { trim: false });
+    f.render_widget(p, rect);
+}
+
 fn draw(f: &mut ratatui::Frame, app: &App) {
     let root = Layout::default()
         .direction(Direction::Vertical)
@@ -525,34 +934,85 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     let body = root[0];
     let status_area = root[1];
 
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
-        .split(body);
+    // The Help pane takes the whole body.
+    if app.focus == Pane::Help {
+        let help = Paragraph::new(Text::from(help_lines()))
+            .block(block(title("help", true), true))
+            .wrap(Wrap { trim: false });
+        f.render_widget(help, body);
+    } else {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+            .split(body);
 
-    // left column: sessions on top, changes below
-    let left = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(cols[0]);
+        // left column: sessions on top, a context list below.
+        let left = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(cols[0]);
 
-    let sessions = Paragraph::new(Text::from(sessions_lines(app))).block(block(
-        title("sarun · boxes", app.focus == Pane::Sessions),
-        app.focus == Pane::Sessions,
-    ));
-    f.render_widget(sessions, left[0]);
+        let sessions = Paragraph::new(Text::from(sessions_lines(app))).block(block(
+            title("sarun · boxes", app.focus == Pane::Sessions),
+            app.focus == Pane::Sessions,
+        ));
+        f.render_widget(sessions, left[0]);
 
-    let changes = Paragraph::new(Text::from(changes_lines(app))).block(block(
-        title("changes", app.focus == Pane::Changes),
-        app.focus == Pane::Changes,
-    ));
-    f.render_widget(changes, left[1]);
+        // Bottom-left list + right detail depend on which pane group is focused.
+        match app.focus {
+            Pane::Processes => {
+                let procs = Paragraph::new(Text::from(processes_lines(app)))
+                    .block(block(title("PROCESSES", true), true))
+                    .wrap(Wrap { trim: false });
+                f.render_widget(procs, left[1]);
+                let detail = Paragraph::new(Text::from(proc_detail_lines(app)))
+                    .block(block(title("ENVIRONMENT · DETAIL", false), false))
+                    .wrap(Wrap { trim: false });
+                f.render_widget(detail, cols[1]);
+            }
+            Pane::Outputs => {
+                let idx = Paragraph::new(Text::from(changes_lines(app)))
+                    .block(block(title("changes", false), false));
+                f.render_widget(idx, left[1]);
+                let out = Paragraph::new(Text::from(outputs_lines(app)))
+                    .block(block(title("OUTPUT · stdout/stderr", true), true))
+                    .scroll((app.out_scroll, 0))
+                    .wrap(Wrap { trim: false });
+                f.render_widget(out, cols[1]);
+            }
+            Pane::Rules => {
+                let rules = Paragraph::new(Text::from(rules_lines(app)))
+                    .block(block(title("FILE RULES", true), true))
+                    .wrap(Wrap { trim: false });
+                f.render_widget(rules, left[1]);
+                let hint = Paragraph::new(Text::from(vec![
+                    Line::from("n new · Enter edit · d delete"),
+                    Line::from(""),
+                    Line::from(format!("file: {}", app.rules_path().display())),
+                    Line::from(""),
+                    Line::from("Rules decide each captured write: apply (keep),"),
+                    Line::from("discard (drop), or passthrough. First match wins."),
+                ]))
+                .block(block(title("WHAT IT MATCHES", false), false))
+                .wrap(Wrap { trim: false });
+                f.render_widget(hint, cols[1]);
+            }
+            _ => {
+                // Sessions / Changes / Hunks group: changes list + diff.
+                let changes = Paragraph::new(Text::from(changes_lines(app))).block(block(
+                    title("changes", app.focus == Pane::Changes),
+                    app.focus == Pane::Changes,
+                ));
+                f.render_widget(changes, left[1]);
 
-    let hunks = Paragraph::new(Text::from(hunk_lines(app)))
-        .block(block(title("diff", app.focus == Pane::Hunks), app.focus == Pane::Hunks))
-        .scroll((app.hunk_scroll, 0))
-        .wrap(Wrap { trim: false });
-    f.render_widget(hunks, cols[1]);
+                let hunks = Paragraph::new(Text::from(hunk_lines(app)))
+                    .block(block(title("diff", app.focus == Pane::Hunks), app.focus == Pane::Hunks))
+                    .scroll((app.hunk_scroll, 0))
+                    .wrap(Wrap { trim: false });
+                f.render_widget(hunks, cols[1]);
+            }
+        }
+    }
 
     let status_text = if let Some(buf) = &app.renaming {
         format!("rename -> {buf}_  (Enter to commit, Esc to cancel)")
@@ -567,6 +1027,38 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         status,
         Rect { x: status_area.x, y: status_area.y, width: status_area.width, height: 1 },
     );
+
+    if let Some(m) = &app.modal {
+        draw_modal(f, body, m);
+    }
+}
+
+/// Detail for the selected process: full exe + argv + the deduped env (via the
+/// process_env verb), keyed off the processes() row id.
+fn proc_detail_lines(app: &App) -> Vec<Line<'static>> {
+    let vis = app.visible_processes();
+    let Some(p) = vis.get(app.sel_proc) else {
+        return vec![Line::from("(no process selected)")];
+    };
+    let a = p.as_array();
+    let rid = a.and_then(|x| x.first()).and_then(Value::as_i64).unwrap_or(-1);
+    let mut out = vec![
+        Line::from(Span::styled(proc_text(p), Style::default().add_modifier(Modifier::BOLD))),
+        Line::from(""),
+    ];
+    if let (Some(sid), true) = (app.cur_sid(), rid >= 0) {
+        if let Ok(env) = rpc(&app.sock, "process_env", json!([sid, rid])) {
+            if let Some(obj) = env.as_object() {
+                if obj.is_empty() {
+                    out.push(Line::from("(no recorded environment)"));
+                }
+                for (k, v) in obj {
+                    out.push(Line::from(format!("{k}={}", v.as_str().unwrap_or(""))));
+                }
+            }
+        }
+    }
+    out
 }
 
 // ── headless one-frame render (tests / --once) ──────────────────────────────
@@ -581,6 +1073,57 @@ fn render_to_string(app: &App, w: u16, h: u16) -> Result<String, String> {
 }
 
 // ── interactive loop (real terminal) ────────────────────────────────────────
+
+/// Handle one keypress while a modal is open. Mirrors the Python Confirm /
+/// SearchModal / RuleFormModal interactions.
+#[cfg(not(test))]
+fn handle_modal_key(app: &mut App, code: crossterm::event::KeyCode) {
+    use crossterm::event::KeyCode;
+    let Some(modal) = app.modal.take() else { return };
+    match modal {
+        Modal::Confirm { prompt, action } => match code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => app.run_confirm(action),
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                app.status = "cancelled".into();
+            }
+            _ => app.modal = Some(Modal::Confirm { prompt, action }),
+        },
+        Modal::Search { mut buf } => match code {
+            KeyCode::Enter => {
+                app.filter = buf.trim().to_string();
+                app.sel_proc = 0;
+                app.status = format!("filter: '{}'", app.filter);
+            }
+            KeyCode::Esc => {
+                app.filter.clear();
+                app.sel_proc = 0;
+                app.status = "filter cleared".into();
+            }
+            KeyCode::Backspace => {
+                buf.pop();
+                app.modal = Some(Modal::Search { buf });
+            }
+            KeyCode::Char(c) => {
+                buf.push(c);
+                app.modal = Some(Modal::Search { buf });
+            }
+            _ => app.modal = Some(Modal::Search { buf }),
+        },
+        Modal::RuleForm { mut buf, editing } => match code {
+            KeyCode::Enter => app.commit_rule(buf, editing),
+            KeyCode::Esc => app.status = "rule edit cancelled".into(),
+            KeyCode::Backspace => {
+                buf.pop();
+                app.modal = Some(Modal::RuleForm { buf, editing });
+            }
+            KeyCode::Char(c) => {
+                buf.push(c);
+                app.modal = Some(Modal::RuleForm { buf, editing });
+            }
+            _ => app.modal = Some(Modal::RuleForm { buf, editing }),
+        },
+    }
+}
 
 #[cfg(not(test))]
 fn run_interactive(sock: &str) -> Result<(), String> {
@@ -619,6 +1162,11 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                 if k.kind != KeyEventKind::Press {
                     continue;
                 }
+                // modal captures keys (Confirm / Search / RuleForm).
+                if app.modal.is_some() {
+                    handle_modal_key(&mut app, k.code);
+                    continue;
+                }
                 // rename input mode captures keys
                 if let Some(buf) = app.renaming.as_mut() {
                     match k.code {
@@ -640,15 +1188,54 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                     KeyCode::Char('j') | KeyCode::Down => app.move_down(),
                     KeyCode::Char('k') | KeyCode::Up => app.move_up(),
                     KeyCode::Tab => app.next_pane(),
-                    KeyCode::Enter => app.open(),
+                    KeyCode::Enter => {
+                        if app.focus == Pane::Rules {
+                            // edit selected rule
+                            let cur = app.rules.get(app.sel_rule).cloned().unwrap_or_default();
+                            app.modal = Some(Modal::RuleForm { buf: cur, editing: Some(app.sel_rule) });
+                        } else {
+                            app.open();
+                        }
+                    }
+                    // pane switches
+                    KeyCode::Char('b') => app.focus = Pane::Sessions,
+                    KeyCode::Char('c') => app.focus = Pane::Changes,
+                    KeyCode::Char('p') => app.focus = Pane::Processes,
+                    KeyCode::Char('o') => app.focus = Pane::Outputs,
+                    KeyCode::Char('e') => app.focus = Pane::Rules,
+                    KeyCode::Char('?') => app.focus = Pane::Help,
                     KeyCode::Char('a') => app.apply(),
                     KeyCode::Char('x') => app.discard(),
-                    KeyCode::Char('K') => app.kill(),
-                    KeyCode::Char('D') => app.delete(),
+                    KeyCode::Char('K') => {
+                        app.modal = Some(Modal::Confirm {
+                            prompt: "Kill (SIGTERM) the selected box?".into(),
+                            action: ConfirmAction::Kill,
+                        })
+                    }
+                    KeyCode::Char('D') => {
+                        app.modal = Some(Modal::Confirm {
+                            prompt: "Delete the selected box and its captures?".into(),
+                            action: ConfirmAction::Delete,
+                        })
+                    }
+                    KeyCode::Char('X') => {
+                        app.modal = Some(Modal::Confirm {
+                            prompt: "Dissolve the selected box (unmount/cleanup)?".into(),
+                            action: ConfirmAction::Dissolve,
+                        })
+                    }
+                    KeyCode::Char('n') if app.focus == Pane::Rules => {
+                        app.modal = Some(Modal::RuleForm { buf: String::new(), editing: None });
+                    }
+                    KeyCode::Char('d') if app.focus == Pane::Rules => app.delete_rule(),
+                    KeyCode::Char('/') => {
+                        app.modal = Some(Modal::Search { buf: app.filter.clone() });
+                    }
                     KeyCode::Char('r') => app.renaming = Some(String::new()),
                     KeyCode::Char('R') => {
                         app.refresh_sessions();
                         app.load_changes();
+                        app.load_rules();
                         app.status = "refreshed".into();
                     }
                     _ => {}
@@ -730,13 +1317,14 @@ fn main() {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
     use std::process::Child;
     use std::process::Command;
 
     struct Engine {
         child: Child,
         sock: String,
+        ns: String,
+        xdg: PathBuf,
         _tmp: PathBuf,
     }
 
@@ -792,12 +1380,20 @@ mod tests {
                 return Some(Engine {
                     child,
                     sock: sock.to_string_lossy().into_owned(),
+                    ns: ns.clone(),
+                    xdg: xdg.clone(),
                     _tmp: tmp,
                 });
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        let mut e = Engine { child, sock: String::new(), _tmp: tmp };
+        let mut e = Engine {
+            child,
+            sock: String::new(),
+            ns: ns.clone(),
+            xdg: xdg.clone(),
+            _tmp: tmp,
+        };
         let _ = e.child.kill();
         None
     }
@@ -808,6 +1404,28 @@ mod tests {
         let sid = r.get("sid").and_then(Value::as_str).unwrap().to_string();
         let root = PathBuf::from(r.get("root").and_then(Value::as_str).unwrap());
         (sid, root)
+    }
+
+    /// Run a real command in a box against the booted engine (so there are
+    /// captured processes + outputs to show), reusing the engine's XDG env so
+    /// the runner finds the same control socket. Blocks until the box exits.
+    fn run_cmd(eng: &Engine, cmd: &[&str]) -> bool {
+        let bin = engine_bin().expect("engine bin");
+        let mut args: Vec<String> = vec!["run".into(), "--".into()];
+        args.extend(cmd.iter().map(|s| s.to_string()));
+        Command::new(&bin)
+            .args(&args)
+            .env("SLOPBOX_NS", &eng.ns)
+            .env("HOME", &eng._tmp)
+            .env("XDG_DATA_HOME", &eng.xdg)
+            .env("XDG_STATE_HOME", &eng.xdg)
+            .env("XDG_CONFIG_HOME", &eng.xdg)
+            .env("XDG_RUNTIME_DIR", &eng.xdg)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
     }
 
     #[test]
@@ -983,5 +1601,205 @@ mod tests {
         );
         assert!(host_path.exists(), "applied file should materialize on host at {host_path:?}");
         let _ = std::fs::remove_file(&host_path);
+    }
+
+    #[test]
+    fn processes_pane_shows_real_exe_and_argv() {
+        let Some(eng) = boot() else {
+            eprintln!("SKIP: engine binary missing or FUSE unavailable");
+            return;
+        };
+        // run a real command in a box; its process tree is captured.
+        if !run_cmd(&eng, &["/bin/echo", "PROC_MARKER_zzz"]) {
+            eprintln!("SKIP: could not run a box command (bwrap unavailable?)");
+            return;
+        }
+        let mut app = App::new(eng.sock.clone());
+        app.refresh_sessions();
+        // select the box that actually has captured processes.
+        let idx = (0..app.sessions.len()).find(|&i| {
+            app.sel_session = i;
+            app.load_processes();
+            !app.processes.is_empty()
+        });
+        assert!(idx.is_some(), "expected at least one box with captured processes");
+        app.focus = Pane::Processes;
+        let buf = render_to_string(&app, 160, 40).unwrap();
+        assert!(buf.contains("PROCESSES"), "processes pane title missing:\n{buf}");
+        // the real exe of the command we ran must appear.
+        assert!(
+            buf.contains("echo"),
+            "processes pane should show the real exe 'echo'; got:\n{buf}"
+        );
+        // and its argv marker.
+        assert!(
+            buf.contains("PROC_MARKER_zzz"),
+            "processes pane should show the real argv; got:\n{buf}"
+        );
+    }
+
+    #[test]
+    fn outputs_pane_shows_real_captured_bytes() {
+        let Some(eng) = boot() else {
+            eprintln!("SKIP: engine binary missing or FUSE unavailable");
+            return;
+        };
+        if !run_cmd(&eng, &["/bin/echo", "OUTPUT_MARKER_qqq"]) {
+            eprintln!("SKIP: could not run a box command (bwrap unavailable?)");
+            return;
+        }
+        let mut app = App::new(eng.sock.clone());
+        app.refresh_sessions();
+        let found = (0..app.sessions.len()).any(|i| {
+            app.sel_session = i;
+            app.load_outputs();
+            app.output_view.contains("OUTPUT_MARKER_qqq")
+        });
+        assert!(found, "expected the echoed bytes in some box's outputs; status={}", app.status);
+        app.focus = Pane::Outputs;
+        let buf = render_to_string(&app, 160, 40).unwrap();
+        assert!(buf.contains("OUTPUT"), "outputs pane title missing:\n{buf}");
+        assert!(
+            buf.contains("OUTPUT_MARKER_qqq"),
+            "outputs pane should show the captured stdout bytes; got:\n{buf}"
+        );
+    }
+
+    #[test]
+    fn rules_editor_writes_file_and_reloads() {
+        let Some(eng) = boot() else {
+            eprintln!("SKIP: engine binary missing or FUSE unavailable");
+            return;
+        };
+        let mut app = App::new(eng.sock.clone());
+        app.focus = Pane::Rules;
+        assert!(app.rules.is_empty(), "fresh instance should have no rules");
+        // add a rule the way the RuleForm modal commit does.
+        app.commit_rule("discard **/*.RULEMARKER_log".into(), None);
+        // it must have been persisted to the on-disk filerules file...
+        let on_disk = std::fs::read_to_string(app.rules_path()).unwrap_or_default();
+        assert!(
+            on_disk.contains("discard **/*.RULEMARKER_log"),
+            "rule should be persisted to {:?}; got: {on_disk:?}",
+            app.rules_path()
+        );
+        // ...reload_rules must have been called (status reflects success)...
+        assert!(
+            app.status.contains("reloaded"),
+            "save should call reload_rules; status={}",
+            app.status
+        );
+        // ...and the rules pane must render it.
+        let buf = render_to_string(&app, 160, 40).unwrap();
+        assert!(buf.contains("FILE RULES"), "rules pane title missing:\n{buf}");
+        assert!(
+            buf.contains("RULEMARKER_log"),
+            "rules pane should show the added rule; got:\n{buf}"
+        );
+
+        // edit then delete round-trips the file.
+        app.sel_rule = 0;
+        app.commit_rule("apply src/**".into(), Some(0));
+        let edited = std::fs::read_to_string(app.rules_path()).unwrap_or_default();
+        assert!(edited.contains("apply src/**"), "edit should replace the rule: {edited:?}");
+        assert!(!edited.contains("RULEMARKER_log"), "old rule should be gone: {edited:?}");
+        app.sel_rule = 0;
+        app.delete_rule();
+        let after = std::fs::read_to_string(app.rules_path()).unwrap_or_default();
+        assert!(after.trim().is_empty(), "delete should empty the file: {after:?}");
+    }
+
+    #[test]
+    fn confirm_modal_guards_destructive_delete() {
+        let Some(eng) = boot() else {
+            eprintln!("SKIP: engine binary missing or FUSE unavailable");
+            return;
+        };
+        let (sid, _root) = make_box(&eng.sock);
+        let mut app = App::new(eng.sock.clone());
+        app.refresh_sessions();
+        // open a Confirm for delete; the box must still be present.
+        app.modal = Some(Modal::Confirm {
+            prompt: "Delete?".into(),
+            action: ConfirmAction::Delete,
+        });
+        let buf = render_to_string(&app, 100, 30).unwrap();
+        assert!(buf.contains("confirm"), "confirm modal title missing:\n{buf}");
+        assert!(buf.contains("Delete?"), "confirm prompt missing:\n{buf}");
+        assert!(
+            app.sessions.iter().any(|s| s.get("session_id").and_then(Value::as_str) == Some(&sid)),
+            "box should still exist while only the modal is open"
+        );
+        // running the guarded action actually deletes it.
+        app.run_confirm(ConfirmAction::Delete);
+        assert!(
+            !app.sessions.iter().any(|s| s.get("session_id").and_then(Value::as_str) == Some(&sid)),
+            "box should be gone after the confirmed delete; status={}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn search_filter_narrows_processes_pane() {
+        let Some(eng) = boot() else {
+            eprintln!("SKIP: engine binary missing or FUSE unavailable");
+            return;
+        };
+        if !run_cmd(&eng, &["/bin/echo", "FILTER_KEEP_marker"]) {
+            eprintln!("SKIP: could not run a box command");
+            return;
+        }
+        let mut app = App::new(eng.sock.clone());
+        app.refresh_sessions();
+        let ok = (0..app.sessions.len()).any(|i| {
+            app.sel_session = i;
+            app.load_processes();
+            !app.processes.is_empty()
+        });
+        assert!(ok, "expected captured processes");
+        let total = app.processes.len();
+        // a filter that matches nothing hides every row.
+        app.filter = "NO_SUCH_PROC_zzzz".into();
+        assert!(app.visible_processes().is_empty(), "bogus filter should hide all rows");
+        // a filter on the real exe keeps the echo row.
+        app.filter = "echo".into();
+        let vis = app.visible_processes();
+        assert!(!vis.is_empty() && vis.len() <= total, "exe filter should keep ≥1, ≤all rows");
+        app.focus = Pane::Processes;
+        let buf = render_to_string(&app, 160, 40).unwrap();
+        assert!(buf.contains("echo"), "filtered processes pane should still show echo:\n{buf}");
+    }
+
+    #[test]
+    fn help_pane_lists_keybindings() {
+        // pure render; no engine needed.
+        let mut app = App {
+            sock: String::new(),
+            sessions: vec![],
+            changes: vec![],
+            hunks: Value::Null,
+            processes: vec![],
+            outputs: vec![],
+            output_view: String::new(),
+            rules: vec![],
+            sel_session: 0,
+            sel_change: 0,
+            sel_proc: 0,
+            sel_output: 0,
+            sel_rule: 0,
+            hunk_scroll: 0,
+            out_scroll: 0,
+            focus: Pane::Help,
+            status: String::new(),
+            renaming: None,
+            modal: None,
+            filter: String::new(),
+            should_quit: false,
+        };
+        app.focus = Pane::Help;
+        let buf = render_to_string(&app, 100, 40).unwrap();
+        assert!(buf.contains("help"), "help pane title missing:\n{buf}");
+        assert!(buf.contains("apply") && buf.contains("discard"), "help should mention apply/discard:\n{buf}");
+        assert!(buf.contains("processes"), "help should mention the processes pane:\n{buf}");
     }
 }
