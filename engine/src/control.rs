@@ -133,7 +133,9 @@ fn recv_first_fd(conn: &UnixStream) -> Option<i32> {
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
     msg.msg_control = cmsg.as_mut_ptr().cast();
-    msg.msg_controllen = cmsg.len();
+    // msg_controllen is socklen_t (u32) on glibc but size_t (usize) on musl;
+    // `as _` picks the field's type on each target.
+    msg.msg_controllen = cmsg.len() as _;
     let n = unsafe { libc::recvmsg(fd, &mut msg, libc::MSG_PEEK) };
     if n < 0 {
         return None;
@@ -752,7 +754,8 @@ fn recv_frame_bytes(raw: i32, buf: &mut [u8], fd: &mut Option<i32>) -> isize {
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
     msg.msg_control = cmsg.as_mut_ptr().cast();
-    msg.msg_controllen = cmsg.len();
+    // socklen_t on glibc, size_t on musl — `as _` matches the field type.
+    msg.msg_controllen = cmsg.len() as _;
     let n = unsafe { libc::recvmsg(raw, &mut msg, 0) };
     if n > 0 {
         unsafe {
