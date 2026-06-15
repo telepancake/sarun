@@ -148,6 +148,49 @@ pub fn hunks(id: i64, rel: &str) -> Value {
     json!({"is_text": true, "hunks": hunks})
 }
 
+/// st_mtime_ns stored for `rel` in the box's sqlar, or None.
+pub fn current_mtime(id: i64, rel: &str) -> Option<i64> {
+    let conn = open_ro(id)?;
+    conn.query_row("SELECT mtime FROM sqlar WHERE name=?1", [rel],
+                   |r| r.get::<_, i64>(0)).ok()
+}
+
+/// Mirror of Python ChangeReview.decorate: per-row lazy decoration for ONE
+/// changed entry — {is_text, stale, kind}. is_text = NUL-pairwise text rule,
+/// stale = host mtime newer than the stored mtime, kind refined to
+/// created/modified/deleted via a single host lstat.
+pub fn decorate(id: i64, rel: &str) -> Value {
+    let rel = rel.trim_start_matches('/');
+    let Some(mode) = current_mode(id, rel) else {
+        return json!({"is_text": false, "stale": false, "kind": "changed"});
+    };
+    let host = Path::new("/").join(rel);
+    if mode & S_IFMT == S_IFCHR {
+        return json!({"is_text": false, "stale": false, "kind": "deleted"});
+    }
+    // is_text: both base and current NUL-free, and not a symlink/tombstone.
+    let is_text = if mode & S_IFMT == S_IFLNK {
+        false
+    } else {
+        match current_bytes(id, rel) {
+            Some(cur) if !cur.contains(&0) => !lower_bytes(rel).contains(&0),
+            _ => false,
+        }
+    };
+    let hstat = host.symlink_metadata();
+    let exists = hstat.is_ok();
+    let kind = if exists { "modified" } else { "created" };
+    let mut stale = false;
+    if let Ok(md) = &hstat {
+        if let Some(cm) = current_mtime(id, rel) {
+            use std::os::unix::fs::MetadataExt;
+            let host_ns = md.mtime() * 1_000_000_000 + md.mtime_nsec();
+            stale = host_ns > cm;
+        }
+    }
+    json!({"is_text": is_text, "stale": stale, "kind": kind})
+}
+
 // ── host-mutating review actions (top-level boxes; nested promotion deferred) ──
 use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
@@ -295,6 +338,171 @@ pub fn discard(id: i64, paths: &Value) -> Value {
         }
     }
     json!({"discarded": discarded, "errors": []})
+}
+
+/// Split bytes into lines on '\n', keeping the terminator on each line (the last
+/// line keeps whatever it had). join(result) == data exactly — byte-exact splice
+/// (mirror of Python ut_split).
+fn ut_split(data: &[u8]) -> Vec<Vec<u8>> {
+    let mut out: Vec<Vec<u8>> = vec![];
+    let parts: Vec<&[u8]> = data.split(|&b| b == b'\n').collect();
+    for p in &parts[..parts.len() - 1] {
+        let mut l = p.to_vec();
+        l.push(b'\n');
+        out.push(l);
+    }
+    if let Some(last) = parts.last() {
+        if !last.is_empty() {
+            out.push(last.to_vec());
+        }
+    }
+    out
+}
+
+/// (lower byte-lines, upper byte-lines, grouped opcodes) for a text change, or
+/// None for a non-text change. Each group is a Vec of (tag, i1, i2, j1, j2),
+/// matching Python difflib.get_grouped_opcodes(3) tuple shape so the splice math
+/// (a1,a2,b1,b2 = g[0][1], g[-1][2], g[0][3], g[-1][4]) carries over verbatim.
+type Group = Vec<(DiffTag, usize, usize, usize, usize)>;
+fn hunk_groups(id: i64, rel: &str) -> Option<(Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Group>)> {
+    let rel = rel.trim_start_matches('/');
+    let mode = current_mode(id, rel)?;
+    if mode & S_IFMT == S_IFCHR || mode & S_IFMT == S_IFLNK {
+        return None;
+    }
+    let cur = current_bytes(id, rel)?;
+    if cur.contains(&0) {
+        return None;
+    }
+    let low = lower_bytes(rel);
+    if low.contains(&0) {
+        return None;
+    }
+    let ll = ut_split(&low);
+    let ul = ut_split(&cur);
+    // Group via the SAME line-diff path hunks() uses (cross-checked equal to
+    // Python difflib), then carry the indices onto the raw byte-line vectors so
+    // the splice stays byte-exact (CR/CRLF, missing final newline preserved).
+    let lo = String::from_utf8_lossy(&low).into_owned();
+    let cu = String::from_utf8_lossy(&cur).into_owned();
+    let diff = TextDiff::from_lines(&lo, &cu);
+    let mut groups = vec![];
+    for g in diff.grouped_ops(3) {
+        if g.is_empty() {
+            continue;
+        }
+        let mut group = vec![];
+        for op in &g {
+            let (tag, o, n) = op.as_tag_tuple();
+            group.push((tag, o.start, o.end, n.start, n.end));
+        }
+        groups.push(group);
+    }
+    Some((ll, ul, groups))
+}
+
+/// Write `new_lower` (a sequence of raw byte-lines) to the host at `rel`,
+/// refusing to write through a symlink. Mirror of Python _write_host_hunk.
+fn write_host_hunk(rel: &str, new_lower: &[Vec<u8>]) -> Value {
+    let host = Path::new("/").join(rel);
+    if host.symlink_metadata().map(|m| m.file_type().is_symlink()).unwrap_or(false) {
+        return json!({"ok": false, "error": "refusing to write through a symlink"});
+    }
+    if let Some(p) = host.parent() {
+        if let Err(e) = std::fs::create_dir_all(p) {
+            return json!({"ok": false, "error": e.to_string()});
+        }
+    }
+    let bytes: Vec<u8> = new_lower.concat();
+    match std::fs::write(&host, &bytes) {
+        Ok(()) => json!({"ok": true}),
+        Err(e) => json!({"ok": false, "error": e.to_string()}),
+    }
+}
+
+/// After a hunk op the diff is gone exactly when the stored current bytes equal
+/// the host's bytes; drop the row + pool blob then (mirror of SqlarSource.settle).
+fn settle(id: i64, rel: &str) {
+    let rel = rel.trim_start_matches('/');
+    let cur = current_bytes(id, rel).unwrap_or_default();
+    if cur == lower_bytes(rel) {
+        if let Some(conn) = open_rw(id) {
+            if let Some((rowid, _, _)) = row_of(&conn, rel) {
+                consume(&conn, id, rel, rowid);
+            }
+        }
+    }
+}
+
+/// Revert bytes back into the box's current state for `rel` (discard_hunk): write
+/// the new bytes inline into the sqlar row's data and drop the stale pool blob so
+/// it can't shadow the new content. Mirror of SqlarSource.write_current.
+fn write_current(id: i64, rel: &str, data: &[u8]) -> Option<Value> {
+    let rel = rel.trim_start_matches('/');
+    let conn = open_rw(id)?;
+    let rowid = match conn.execute(
+        "UPDATE sqlar SET sz=?1, data=?2 WHERE name=?3",
+        params![data.len() as i64, data, rel]) {
+        Ok(_) => row_of(&conn, rel).map(|(r, _, _)| r),
+        Err(e) => return Some(json!({"ok": false, "error": e.to_string()})),
+    };
+    if let Some(r) = rowid {
+        let _ = std::fs::remove_file(blob_path(id, r));
+    }
+    None
+}
+
+/// apply_hunk: splice ONE hunk group onto the host. The box already contains it,
+/// so that hunk simply stops being a difference. Byte-exact on raw byte-lines.
+/// Mirror of Python ChangeReview.apply_hunk; returns {ok, ...}.
+pub fn apply_hunk(id: i64, rel: &str, index: i64) -> Value {
+    let Some((ll, ul, groups)) = hunk_groups(id, rel) else {
+        return json!({"ok": false, "error": "not a text change"});
+    };
+    if index < 0 || index as usize >= groups.len() {
+        return json!({"ok": false, "error": "stale hunk"});
+    }
+    let g = &groups[index as usize];
+    let a1 = g[0].1;
+    let a2 = g[g.len() - 1].2;
+    let b1 = g[0].3;
+    let b2 = g[g.len() - 1].4;
+    let mut new_lower: Vec<Vec<u8>> = vec![];
+    new_lower.extend_from_slice(&ll[..a1]);
+    new_lower.extend_from_slice(&ul[b1..b2]);
+    new_lower.extend_from_slice(&ll[a2..]);
+    let res = write_host_hunk(rel, &new_lower);
+    if res.get("ok").and_then(Value::as_bool) != Some(true) {
+        return res;
+    }
+    settle(id, rel);
+    json!({"ok": true})
+}
+
+/// discard_hunk: revert one hunk in the box (back to the host's bytes at that
+/// range). Mirror of Python ChangeReview.discard_hunk; returns {ok, ...}.
+pub fn discard_hunk(id: i64, rel: &str, index: i64) -> Value {
+    let Some((ll, ul, groups)) = hunk_groups(id, rel) else {
+        return json!({"ok": false, "error": "not a text change"});
+    };
+    if index < 0 || index as usize >= groups.len() {
+        return json!({"ok": false, "error": "stale hunk"});
+    }
+    let g = &groups[index as usize];
+    let a1 = g[0].1;
+    let a2 = g[g.len() - 1].2;
+    let b1 = g[0].3;
+    let b2 = g[g.len() - 1].4;
+    let mut new_upper: Vec<Vec<u8>> = vec![];
+    new_upper.extend_from_slice(&ul[..b1]);
+    new_upper.extend_from_slice(&ll[a1..a2]);
+    new_upper.extend_from_slice(&ul[b2..]);
+    let bytes: Vec<u8> = new_upper.concat();
+    if let Some(err) = write_current(id, rel, &bytes) {
+        return err;
+    }
+    settle(id, rel);
+    json!({"ok": true})
 }
 
 /// finalize_by_rules: split the box's changes by the file rules — apply the
