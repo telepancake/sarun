@@ -191,6 +191,13 @@ impl Overlay {
         }
     }
 
+    /// The live BoxState for `id`, if the box is currently mounted (running).
+    /// Used to route writes (dissolve copy-down, meta) through the live
+    /// connection + RAM mirror instead of a rival on-disk handle.
+    pub fn live_box(&self, id: i64) -> Option<Arc<BoxState>> {
+        self.inner.boxes.read().unwrap().get(&id).cloned()
+    }
+
     /// Live child box ids of `bid` (their parent() == bid) — KIDS_DIR entries.
     fn children_of_box(&self, bid: i64) -> Vec<i64> {
         self.inner.boxes.read().unwrap().values()

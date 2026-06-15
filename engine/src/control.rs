@@ -226,15 +226,22 @@ fn dispatch(state: &State, msg: &Value) -> Value {
                 .and_then(|s| resolve(&boxes, s)) {
                 Some(id) => {
                     let old = discover::display_path(&boxes, id);
-                    if let Some(ov) = state.lock().unwrap().overlay.clone() {
-                        let _ = ov; // live-box meta is the disk sqlar either way
-                    }
-                    if let Some(c) = rusqlite::Connection::open(
-                        crate::paths::state_home().join(format!("{id}.sqlar"))).ok() {
-                        let _ = c.execute(
-                            "INSERT INTO meta(key,value) VALUES('name',?1)
-                             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                            [newname]);
+                    // Route the meta write through the LIVE BoxState when the box
+                    // is running (one connection — never a rival on-disk handle
+                    // racing the serve thread); otherwise write the at-rest sqlar.
+                    let live = state.lock().unwrap().overlay.clone()
+                        .and_then(|o| o.live_box(id));
+                    match live {
+                        Some(cb) => cb.set_meta("name", newname),
+                        None => {
+                            if let Ok(c) = rusqlite::Connection::open(
+                                crate::paths::state_home().join(format!("{id}.sqlar"))) {
+                                let _ = c.execute(
+                                    "INSERT INTO meta(key,value) VALUES('name',?1)
+                                     ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                                    [newname]);
+                            }
+                        }
                     }
                     broadcast(state, &json!({"type": "session_renamed",
                         "session_id": id.to_string(), "name": newname}));
@@ -287,10 +294,12 @@ fn reap(state: &State, id: i64) {
 /// parent captured (apply- and discard-bound alike) is copied DOWN into each
 /// child that has no entry of its own for it (copy_down_entry), so the child
 /// keeps reading exactly what it saw through the parent once the parent is gone.
-/// Then the children are re-parented to the dissolving box's own parent (a meta
-/// pointer write) and the parent is freed. This is the nested copy-down the
-/// earlier fail-safe refusal stood in for; it rests on the read-through-parent
-/// overlay semantic (resolve() chain walk) now in place.
+/// Then the children are re-parented to the dissolving box's own parent and the
+/// parent is freed. Children may be LIVE: copy-down and re-parent both route
+/// through the live BoxState (connection + RAM mirror) when the child is
+/// running, so a mounted FUSE view keeps serving the right bytes — no rival
+/// on-disk handle racing the serve thread. Only the dissolving box itself must
+/// be stopped (its archive is rewritten by finalize).
 fn dissolve(state: &State, id: i64) -> Value {
     if state.lock().unwrap().box_pids.contains_key(&id) {
         return json!({"ok": false, "error": "box is running; stop it first"});
@@ -302,29 +311,23 @@ fn dissolve(state: &State, id: i64) -> Value {
     let grandparent = me.parent;
     let children: Vec<i64> = boxes.values()
         .filter(|b| b.parent == Some(id)).map(|b| b.box_id).collect();
-    // A live child cannot have its archive rewritten safely — refuse if any.
-    {
-        let s = state.lock().unwrap();
-        if children.iter().any(|c| s.box_pids.contains_key(c)) {
-            return json!({"ok": false, "error":
-                "a child box is running; stop it before dissolving the parent"});
-        }
-    }
+    let ov = state.lock().unwrap().overlay.clone();
     // Copy-down: snapshot this box's contributed view into each child that has
     // no entry of its own, so dissolving the parent doesn't change what the
-    // child sees. Fail-closed: if any copy errors, free nothing.
-    let mut copied = vec![];
+    // child sees. A live child's copy-down goes through its live BoxState.
+    // Fail-closed: if any copy errors, free nothing.
     if !children.is_empty() {
         let paths = crate::review::changed_paths(id);
         for &child in &children {
+            let live = ov.as_ref().and_then(|o| o.live_box(child));
             for rel in &paths {
-                if let Err(e) = crate::review::copy_down_entry(id, child, rel) {
+                if let Err(e) = crate::review::copy_down_entry(
+                    id, child, rel, live.as_deref()) {
                     return json!({"ok": false,
                         "error": format!("copy-down to box {child} failed: {e}"),
                         "path": rel});
                 }
             }
-            copied.push(child);
         }
     }
     // finalize: apply rule-matched changes to the host, discard the rest
@@ -335,11 +338,15 @@ fn dissolve(state: &State, id: i64) -> Value {
         return json!({"ok": false, "error": "finalize had errors; nothing freed",
                       "finalize_errors": fin.get("errors").cloned()});
     }
-    // Re-parent the children onto the dissolving box's own parent, both in the
-    // live overlay (if mounted) and persistently in each child's sqlar meta.
-    let ov = state.lock().unwrap().overlay.clone();
+    // Re-parent the children onto the dissolving box's own parent. For a LIVE
+    // child write the meta through its BoxState (one connection); for one at
+    // rest write the on-disk sqlar. Also update the overlay's in-RAM parent.
     for &child in &children {
-        let _ = crate::review::set_parent_meta(child, grandparent);
+        match ov.as_ref().and_then(|o| o.live_box(child)) {
+            Some(cb) => cb.set_meta("parent_box_id",
+                &grandparent.map(|p| p.to_string()).unwrap_or_default()),
+            None => { let _ = crate::review::set_parent_meta(child, grandparent); }
+        }
         if let Some(ov) = &ov {
             ov.set_box_parent(child, grandparent);
         }

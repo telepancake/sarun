@@ -555,8 +555,47 @@ def main():
               "engine-rs: KIDS_DIR/<child> routes to the child's real view")
         check(".slopbox-kids" not in [p.name for p in proot.iterdir()],
               "engine-rs: KIDS_DIR hidden from the box-root readdir")
+        # ── dissolve with a LIVE child: copy-down routes through the live box ──
+        # A file written ONLY in the parent overlay, NEVER touched by the live
+        # child, must survive the parent's dissolve — the live copy-down writes
+        # it into the child's running BoxState (connection + RAM mirror) so the
+        # MOUNTED child view still serves it. A discard rule keeps it off the
+        # host, so only copy-down can preserve the child's view.
+        lrules = Path(os.environ["XDG_CONFIG_HOME"]) / "slopbox.RS" / "filerules"
+        lrules.parent.mkdir(parents=True, exist_ok=True)
+        lrules.write_text("discard **/*.liv\n")
+        m.sync_request(sock, type="ui", verb="reload_rules", args=[])
+        (proot / "root/inh.liv").write_bytes(b"live-inherited\n")
+        clf = croot / "root/inh.liv"
+        check(clf.exists() and clf.read_bytes() == b"live-inherited\n",
+              "engine-rs: live child reads the parent-only file before dissolve")
+        # child must NOT touch inh.liv (so it has no entry of its own).
+        dl = (m.sync_request(sock, type="ui", verb="dissolve", args=[pp])
+              or {}).get("r") or {}
+        check(dl.get("ok") is True, "engine-rs: dissolve with a LIVE child succeeds")
+        check(int(cc) in (dl.get("reparented") or []),
+              "engine-rs: live child reported re-parented")
+        # The mounted child view STILL serves the inherited bytes (copy-down hit
+        # the live BoxState, not a rival on-disk handle).
+        check(clf.exists() and clf.read_bytes() == b"live-inherited\n",
+              "engine-rs: live child STILL reads the file after the parent dissolved")
+        check(not Path("/root/inh.liv").exists(),
+              "engine-rs: discard-ruled inherited file never hit the host")
+        # The live child is now top-level; the parent's overlay root is gone.
+        check(not proot.exists() or pp not in [p.name for p in rt.iterdir()],
+              "engine-rs: dissolved parent's overlay root removed")
+        lrules.unlink(missing_ok=True)
+        m.sync_request(sock, type="ui", verb="reload_rules", args=[])
+
+        # ── live rename: meta write routes through the live BoxState ──────────
+        rnb = m.sync_request(sock, type="ui", verb="box_new", args=[])["r"]["sid"]
+        rr = m.sync_request(sock, type="rename", sid=rnb, name="RENAMED1")
+        check((rr or {}).get("ok") is True, "engine-rs: live rename accepted")
+        check(m.RemoteSupervisor(sock).display_path(rnb) == "RENAMED1",
+              "engine-rs: live rename reflected (routed through the live box)")
+        m.sync_request(sock, type="ui", verb="delete", args=[rnb])
+
         m.sync_request(sock, type="ui", verb="delete", args=[cc])
-        m.sync_request(sock, type="ui", verb="delete", args=[pp])
 
 
         # ── file rules: dissolve finalizes by glob (apply *.txt, discard *.log) ─

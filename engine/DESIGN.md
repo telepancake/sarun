@@ -191,10 +191,17 @@ CONFIRMED:
    parent-only file through read-through-parent. NOTE: the register fd-peek must
    poll for the bytes first — a non-blocking peek races the runner's sendmsg and
    silently drops the pidfd, which then mis-derives the parent (fixed).
-   Remaining in the cluster: echo chaining (the live-echo mux, still downgraded
-   since m3b). Copy-down on a LIVE child still goes through an on-disk RW
-   connection that bypasses the live BoxState cache (acceptable today: dissolve
-   refuses a running child).
+   LIVE-child copy-down is now correct too: dissolve no longer refuses a running
+   child — copy_down_entry and the re-parent meta write route through the live
+   BoxState (its one connection + RAM `kinds` mirror via overlay.live_box) when
+   the child is mounted, so the running FUSE view serves the copied-down entry
+   immediately (no rival on-disk handle racing the serve thread). Tested: a file
+   written only in the parent overlay, never touched by a LIVE child, still
+   reads through the child's mount after the parent is dissolved (discard rule,
+   so only copy-down can preserve it). The same fix retires S5: the `rename`
+   verb now writes the name meta through the live BoxState when the box is
+   running, not a second connection. Remaining in the cluster: echo chaining
+   (the live-echo mux, still downgraded since m3b).
 
 WEAK TESTS (not proven wrong, but self-graded by shape, not Python-equality):
  - S1 hunks: NOW cross-checked against Python's _build_hunks_display byte-for-byte
@@ -206,8 +213,9 @@ WEAK TESTS (not proven wrong, but self-graded by shape, not Python-equality):
  - S3 capture provenance first-vs-last-writer: never exercised (single writer).
  - S4 untested code: process_env, box_drop, special-node (fifo/dev) APPLY path,
    the top-level control-type CLI variants beyond patch/rename.
- - S5 rename of a LIVE box writes meta via raw SQL bypassing the live BoxState
-   connection — racy; only the finished-box path is tested.
+ - S5 FIXED: rename of a LIVE box (and dissolve copy-down / re-parent into a live
+   child) now route through the live BoxState's one connection + RAM mirror
+   (overlay.live_box), not a rival on-disk handle. Live paths are tested.
 
 THE REAL FIX (methodological): self-authored conformance tests share the author's
 blind spots (dissolve proved it). The port should be re-grounded on (a) cross-engine

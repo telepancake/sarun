@@ -324,6 +324,15 @@ impl BoxState {
         );
     }
 
+    /// True if this (live) box has its OWN entry for `rel` — i.e. it copied-up,
+    /// wrote, deleted, or otherwise spoke for the path itself, so its merged
+    /// view is self-contained and a parent copy-down must NOT override it. The
+    /// in-RAM `kinds` mirror is authoritative for a live box (every write
+    /// updates it in lockstep with the row).
+    pub fn has_own(&self, rel: &str) -> bool {
+        self.kinds.read().unwrap().contains_key(rel)
+    }
+
     /// The box's ROOT process row (root=1): the runner itself, provenance from
     /// the register message body (tgid/exe/cwd/argv).
     pub fn root_process(&self, prov: &serde_json::Value) {
