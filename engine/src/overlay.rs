@@ -100,6 +100,18 @@ struct Inner {
     fhs: RwLock<HashMap<u64, Mutex<Fh>>>,
     next_fh: AtomicU64,
     rules: RwLock<crate::rules::Rules>,  // passthrough decisions (reload verb)
+    // ── live echo mux (the captured-output readback channel) ──
+    // Per-box framed writer over the box's ONE muxed connection: the sink-write
+    // handler frames captured bytes as ECHO and sends them back to --inner.
+    echo: RwLock<HashMap<i64, std::sync::Arc<Mutex<std::os::unix::net::UnixStream>>>>,
+    // Per-box open-sink count: when it returns to 0 (both sinks released at child
+    // exit) the engine sends ECHO_DONE so --inner stops without truncation.
+    sink_open: Mutex<HashMap<i64, u32>>,
+    // Globally muted HOST tgids: a write whose tgid is here is echoed upward but
+    // NOT recorded — it is a nested box's echo readback travelling up through an
+    // ancestor sink, already recorded once at its origin box. A MUTE frame adds
+    // --inner's own host tgid; UNMUTE / connection-close removes it.
+    muted: RwLock<std::collections::HashSet<i32>>,
 }
 
 struct Fh {
@@ -135,6 +147,19 @@ fn sink_stream(rel: &str) -> Option<i32> {
     }
 }
 
+/// Thread-group id of `pid` from /proc/<pid>/status (so a thread's write is
+/// matched against the muted set by its process). Falls back to `pid`.
+fn tgid_of(pid: u32) -> u32 {
+    if let Ok(s) = std::fs::read_to_string(format!("/proc/{pid}/status")) {
+        for line in s.lines() {
+            if let Some(rest) = line.strip_prefix("Tgid:") {
+                if let Ok(v) = rest.trim().parse() { return v; }
+            }
+        }
+    }
+    pid
+}
+
 enum Layer {
     Absent,
     UpperFile { owner: i64, rowid: i64, mode: u32 },
@@ -159,11 +184,72 @@ impl Overlay {
             fhs: RwLock::new(HashMap::new()),
             next_fh: AtomicU64::new(1),
             rules: RwLock::new(crate::rules::Rules::load()),
+            echo: RwLock::new(HashMap::new()),
+            sink_open: Mutex::new(HashMap::new()),
+            muted: RwLock::new(std::collections::HashSet::new()),
         }) }
     }
 
     pub fn reload_rules(&self) {
         *self.inner.rules.write().unwrap() = crate::rules::Rules::load();
+    }
+
+    // ── echo mux + mute (called from control's box-channel thread) ──
+    /// Attach the box's muxed connection as its echo writer (the sink-write
+    /// handler frames ECHO onto it). Replaces any prior writer for the box.
+    pub fn set_echo(&self, id: i64,
+                    conn: std::sync::Arc<Mutex<std::os::unix::net::UnixStream>>) {
+        self.inner.echo.write().unwrap().insert(id, conn);
+    }
+    /// Drop the box's echo writer (box channel closing / teardown).
+    pub fn clear_echo(&self, id: i64) {
+        self.inner.echo.write().unwrap().remove(&id);
+        self.inner.sink_open.lock().unwrap().remove(&id);
+    }
+    pub fn mute_add(&self, host_pid: i32) {
+        if host_pid > 0 { self.inner.muted.write().unwrap().insert(host_pid); }
+    }
+    pub fn mute_remove(&self, host_pid: i32) {
+        self.inner.muted.write().unwrap().remove(&host_pid);
+    }
+    fn is_muted(&self, pid: u32) -> bool {
+        let m = self.inner.muted.read().unwrap();
+        !m.is_empty() && m.contains(&(tgid_of(pid) as i32))
+    }
+    /// Frame `data` as an ECHO for `id`'s stream and send it over the box
+    /// channel (best-effort; a dropped/blocked channel never fails a write).
+    fn echo_send(&self, id: i64, stream: i32, data: &[u8]) {
+        let conn = self.inner.echo.read().unwrap().get(&id).cloned();
+        if let Some(conn) = conn {
+            let frame = crate::frames::encode(crate::frames::FRAME_ECHO,
+                &crate::frames::echo_payload(stream as u8, data));
+            use std::io::Write;
+            let mut c = conn.lock().unwrap();
+            let _ = c.write_all(&frame);
+        }
+    }
+    /// Note a sink fd opened for `id` (capture start: out + err = 2).
+    fn note_sink_open(&self, id: i64) {
+        *self.inner.sink_open.lock().unwrap().entry(id).or_insert(0) += 1;
+    }
+    /// Note a sink fd released for `id`; when the count returns to 0 (child
+    /// exited, both sinks closed) send ECHO_DONE so --inner stops cleanly.
+    fn note_sink_release(&self, id: i64) {
+        let zero = {
+            let mut m = self.inner.sink_open.lock().unwrap();
+            if let Some(c) = m.get_mut(&id) {
+                *c = c.saturating_sub(1);
+                *c == 0
+            } else { false }
+        };
+        if zero {
+            let conn = self.inner.echo.read().unwrap().get(&id).cloned();
+            if let Some(conn) = conn {
+                let frame = crate::frames::encode(crate::frames::FRAME_ECHO_DONE, &[]);
+                use std::io::Write;
+                let _ = conn.lock().unwrap().write_all(&frame);
+            }
+        }
     }
 
     fn is_passthrough(&self, rel: &str) -> bool {
@@ -558,7 +644,10 @@ impl Filesystem for Overlay {
         };
         let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
         if let Some(stream) = sink_stream(&rel) {
-            // stdout/stderr sink: a write-only channel into the outputs table.
+            // stdout/stderr sink: a write-only channel into the outputs table
+            // (+ the live echo readback). Count it so the last release flushes
+            // ECHO_DONE.
+            self.note_sink_open(bid);
             let n = self.reg_fh(FhInner {
                 box_id: bid, rel, file: None, upper: false, dirty: false,
                 last_pid: req.pid(), sink: Some(stream), passthrough: false,
@@ -694,11 +783,21 @@ impl Filesystem for Overlay {
         };
         let mut h = h.lock().unwrap();
         if let Some(stream) = h.inner.sink {
-            // stdout/stderr sink: bytes go to the outputs table, attributed to
-            // the writing process — never a file change.
-            if let Some(b) = self.box_of(h.inner.box_id) {
-                b.add_output(stream, req.pid(), data);
+            // stdout/stderr sink. MUTE: if the writer's tgid is muted, this is a
+            // nested box's echo readback travelling UP through an ancestor sink —
+            // echo it onward so it keeps propagating, but do NOT record it (it
+            // was already captured once at the origin box). Otherwise record it
+            // with per-write pid attribution. Either way, echo it live.
+            let bid = h.inner.box_id;
+            let pid = req.pid();
+            drop(h);
+            drop(fhs);
+            if !self.is_muted(pid) {
+                if let Some(b) = self.box_of(bid) {
+                    b.add_output(stream, pid, data);
+                }
             }
+            self.echo_send(bid, stream, data);
             return reply.written(data.len() as u32);
         }
         if !h.inner.upper {
@@ -731,7 +830,12 @@ impl Filesystem for Overlay {
         let h = self.inner.fhs.write().unwrap().remove(&u64::from(fh));
         if let Some(h) = h {
             let h = h.into_inner().unwrap();
-            if h.inner.dirty && !h.inner.passthrough {
+            if h.inner.sink.is_some() {
+                // A capture sink closed (child exited / redirected fd done): when
+                // the box's last sink releases, flush ECHO_DONE so --inner stops
+                // reading without truncating still-in-flight echo bytes.
+                self.note_sink_release(h.inner.box_id);
+            } else if h.inner.dirty && !h.inner.passthrough {
                 if let Some(b) = self.box_of(h.inner.box_id) {
                     let writer = b.writer_for(h.inner.last_pid);
                     if let Some(md) = h.inner.file.as_ref()

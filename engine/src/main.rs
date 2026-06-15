@@ -46,6 +46,7 @@ use fuser::Request;
 mod capture;
 mod control;
 mod discover;
+mod frames;
 mod overlay;
 mod paths;
 mod review;

@@ -464,7 +464,7 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
                                  .duration_since(std::time::UNIX_EPOCH)
                                  .map(|d| d.as_nanos()).unwrap_or(0)),
         "box_id": id, "session_id": id.to_string(), "name": name,
-        "capture": false,             // m3b: echo/sinks not yet — runner runs -t-style
+        "capture": true,              // sinks + live echo mux active
         "_box_sid": id,               // caller marker: this conn is now the box channel
     })
 }
@@ -641,6 +641,39 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
     json!({"ok": true, "r": r})
 }
 
+/// One recvmsg on the box channel: read up to `buf` bytes and capture the first
+/// SCM_RIGHTS fd if any (a MUTE frame attaches --inner's pidfd). Returns the
+/// byte count (0 = EOF, <0 = error) and sets `*fd` to a received fd.
+fn recv_frame_bytes(raw: i32, buf: &mut [u8], fd: &mut Option<i32>) -> isize {
+    let mut iov = libc::iovec {
+        iov_base: buf.as_mut_ptr().cast(),
+        iov_len: buf.len(),
+    };
+    let mut cmsg = [0u8; 64];
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cmsg.as_mut_ptr().cast();
+    msg.msg_controllen = cmsg.len();
+    let n = unsafe { libc::recvmsg(raw, &mut msg, 0) };
+    if n > 0 {
+        unsafe {
+            let mut c = libc::CMSG_FIRSTHDR(&msg);
+            while !c.is_null() {
+                if (*c).cmsg_level == libc::SOL_SOCKET
+                    && (*c).cmsg_type == libc::SCM_RIGHTS {
+                    let mut got = 0i32;
+                    std::ptr::copy_nonoverlapping(
+                        libc::CMSG_DATA(c), (&mut got as *mut i32).cast(), 4);
+                    if fd.is_none() { *fd = Some(got); } else { libc::close(got); }
+                }
+                c = libc::CMSG_NXTHDR(&msg, c);
+            }
+        }
+    }
+    n
+}
+
 fn handle(state: State, conn: UnixStream) {
     // The register handshake carries the runner's pidfd as the connection's
     // first SCM_RIGHTS fd; keep it for host-pid derivation + kill. It belongs
@@ -685,18 +718,62 @@ fn handle(state: State, conn: UnixStream) {
             return;
         }
         if let Some(id) = box_sid {
-            // This connection IS the box's channel now: hold it open (frames
-            // are ignored in m3b — no echo yet); EOF is the teardown signal.
-            let mut sink = [0u8; 4096];
-            loop {
-                use std::io::Read;
-                match reader.read(&mut sink) {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {}
+            // This connection IS the box's muxed channel now. Register it as the
+            // echo writer (the sink-write handler frames captured bytes onto it),
+            // then read MUTE/UNMUTE frames from --inner: MUTE carries --inner's
+            // pidfd (SCM_RIGHTS) → resolve its host pid and mute it (its echo
+            // readback is not re-recorded); UNMUTE / EOF unmutes. EOF = teardown.
+            let ov = state.lock().unwrap().overlay.clone();
+            if let Some(ov) = ov.as_ref() {
+                if let Ok(w) = writer.try_clone() {
+                    ov.set_echo(id, Arc::new(Mutex::new(w)));
                 }
             }
-            let ov = state.lock().unwrap().overlay.clone();
-            if let Some(ov) = ov {
+            let raw = reader.get_ref().as_raw_fd();
+            let mut fbuf = reader.buffer().to_vec();
+            let mut pending_fd: Option<i32> = None;
+            let mut muted_pid: Option<i32> = None;
+            loop {
+                let (frames, used) = crate::frames::decode(&fbuf);
+                for (ft, _) in &frames {
+                    match *ft {
+                        crate::frames::FRAME_MUTE => {
+                            if let Some(fd) = pending_fd.take() {
+                                let hp = host_pid_from_pidfd(fd);
+                                unsafe { libc::close(fd); }
+                                if hp > 0 {
+                                    muted_pid = Some(hp);
+                                    if let Some(ov) = ov.as_ref() { ov.mute_add(hp); }
+                                }
+                            }
+                        }
+                        crate::frames::FRAME_UNMUTE => {
+                            if let (Some(hp), Some(ov)) =
+                                (muted_pid.take(), ov.as_ref()) {
+                                ov.mute_remove(hp);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                fbuf.drain(..used);
+                if frames.is_empty() {
+                    let mut tmp = [0u8; 4096];
+                    let mut fd = None;
+                    let n = recv_frame_bytes(raw, &mut tmp, &mut fd);
+                    if n <= 0 { break; }
+                    if let Some(f) = fd {
+                        if let Some(old) = pending_fd.replace(f) {
+                            unsafe { libc::close(old); }
+                        }
+                    }
+                    fbuf.extend_from_slice(&tmp[..n as usize]);
+                }
+            }
+            if let Some(fd) = pending_fd { unsafe { libc::close(fd); } }
+            if let Some(ov) = ov.as_ref() {
+                if let Some(hp) = muted_pid { ov.mute_remove(hp); }
+                ov.clear_echo(id);
                 ov.remove_box(id);
             }
             {

@@ -708,15 +708,19 @@ def main():
         # script that itself invokes `sarun-engine run` (the nested box). Assert
         # the child registers parented under the enclosing box (kernel-derived
         # from /proc ancestry) and reads a parent-only file THROUGH the child
-        # overlay (read-through-parent). Echo chaining is a separate, deferred
-        # feature — not exercised here.
+        # overlay (read-through-parent). ALSO exercises echo chaining + MUTE: the
+        # nested child prints a marker to stdout which must (a) chain UP to the
+        # top-level runner's stdout, (b) be recorded in the CHILD box's outputs,
+        # and (c) NOT be recorded in the PARENT box (the child's echo readback
+        # travels up through the parent sink MUTED, so it is never re-captured).
         if not m._have_ambient_caps():
             check(True, "engine-rs: nested-launch SKIP (needs ambient caps)")
         else:
             binp = str(BIN)
+            marker = "NESTED-ECHO-MARK-7c2a"
             nested = (f"{binp} run -- bash -c "
                       "'cat /root/pn_sentinel.txt > /root/pn_child_proof.txt; "
-                      "echo child-ran >> /root/pn_child_proof.txt'")
+                      f"echo child-ran >> /root/pn_child_proof.txt; echo {marker}'")
             parent_script = ("set -e; echo parent-was-here > /root/pn_sentinel.txt; "
                              + nested)
             pre = set(Path(os.environ["XDG_STATE_HOME"]).joinpath("slopbox.RS")
@@ -756,6 +760,27 @@ def main():
                       "engine-rs: child read the parent-only file THROUGH its overlay")
                 check(b"child-ran" in proof,
                       "engine-rs: child's own write captured")
+                # ── echo chaining + MUTE ──
+                # (a) the child's marker chained up to the top-level stdout.
+                check(marker in r.stdout,
+                      f"engine-rs: nested child's stdout marker chained UP to the "
+                      f"top-level runner (tail={r.stdout.strip()[-120:]!r})")
+                def box_out(sid):
+                    outs = (m.sync_request(sock, type="ui", verb="outputs",
+                                           args=[sid])["r"]) or []
+                    blob = b""
+                    for o in outs:
+                        d = rsup._rpc("output_detail", sid, o["id"])
+                        if isinstance(d, dict) and isinstance(d.get("content"), bytes):
+                            blob += d["content"]
+                    return blob
+                # (b) recorded ONCE, in the CHILD box (its origin).
+                check(marker.encode() in box_out(ch_sp.stem),
+                      "engine-rs: marker recorded in the CHILD box's outputs")
+                # (c) NOT recorded in the PARENT box (MUTE stopped re-capture of
+                #     the child's echo readback travelling up the parent sink).
+                check(marker.encode() not in box_out(par_id),
+                      "engine-rs: marker NOT re-recorded in the PARENT box (MUTE)")
             for sp in new_sqlars:
                 m.sync_request(sock, type="ui", verb="delete", args=[sp.stem])
 

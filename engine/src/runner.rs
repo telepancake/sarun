@@ -183,46 +183,112 @@ pub fn run(name: Option<String>, cmd: Vec<String>) -> i32 {
     }
 }
 
+/// Send one frame (optionally with our pidfd as SCM_RIGHTS) over the box channel.
+fn send_frame(conn_fd: i32, frame: &[u8], pidfd: Option<i32>) {
+    let Some(fd) = pidfd else {
+        unsafe { libc::write(conn_fd, frame.as_ptr().cast(), frame.len()); }
+        return;
+    };
+    let mut iov = libc::iovec {
+        iov_base: frame.as_ptr() as *mut libc::c_void,
+        iov_len: frame.len(),
+    };
+    let mut cmsg = [0u8; 32];
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cmsg.as_mut_ptr().cast();
+    msg.msg_controllen = unsafe { libc::CMSG_SPACE(4) } as _;
+    unsafe {
+        let c = libc::CMSG_FIRSTHDR(&msg);
+        (*c).cmsg_level = libc::SOL_SOCKET;
+        (*c).cmsg_type = libc::SCM_RIGHTS;
+        (*c).cmsg_len = libc::CMSG_LEN(4) as _;
+        std::ptr::copy_nonoverlapping((&fd as *const i32).cast(), libc::CMSG_DATA(c), 4);
+        libc::sendmsg(conn_fd, &msg, 0);
+    }
+}
+
 pub fn inner(conn_fd: i32, capture: bool, cmd: Vec<String>) -> i32 {
     if cmd.is_empty() { return 2; }
     // Hold the box-channel fd open (not CLOEXEC) so the engine sees EOF — its
     // teardown signal — only when this process (and CMD) finally exits.
     if conn_fd >= 0 { clear_cloexec(conn_fd); }
-    if !capture {
+    if !capture || conn_fd < 0 {
         let err = Command::new(&cmd[0]).args(&cmd[1..]).exec();
         eprintln!("sarun-engine inner: exec {}: {err}", cmd[0]);
         return 127;
     }
-    // Capture: tee the child's stdout/stderr to our real fd 1/2 (live) AND to
-    // the box-root sink paths, which the overlay routes to the outputs table.
-    use std::io::Read;
-    use std::io::Write;
+    // Capture via the echo mux: the child's stdout/stderr ARE the box-root sink
+    // files, so every write flows THROUGH the overlay (recorded with per-write
+    // pid attribution). The engine frames those bytes back as ECHO; we replay
+    // them to our real fd 1/2 for live, upward-chaining visibility. stdin stays
+    // inherited. A nested box's echo readback hits the PARENT sink, so we MUTE
+    // our own host pid first: the parent echoes the bytes onward but never
+    // re-records them (already captured once here, the origin box).
+    use std::os::fd::FromRawFd;
+    use std::os::fd::IntoRawFd;
     use std::process::Stdio;
-    let mut child = match Command::new(&cmd[0]).args(&cmd[1..])
-        .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
+    let out = match std::fs::OpenOptions::new().write(true).open("/.slopbox-stdout") {
+        Ok(f) => f, Err(e) => { eprintln!("inner: open stdout sink: {e}"); return 127; }
+    };
+    let err = match std::fs::OpenOptions::new().write(true).open("/.slopbox-stderr") {
+        Ok(f) => f, Err(e) => { eprintln!("inner: open stderr sink: {e}"); return 127; }
+    };
+    // MUTE: tell the engine not to RECORD writes by our host pid (only echo
+    // them) — sent before the child can emit a byte that loops back to us.
+    let pidfd = pidfd_open(std::process::id() as i32);
+    if pidfd >= 0 {
+        send_frame(conn_fd, &crate::frames::encode(crate::frames::FRAME_MUTE, &[]),
+                   Some(pidfd));
+        unsafe { libc::close(pidfd); }
+    }
+    // Reader: ECHO frames → real fd 1/2; ECHO_DONE → stop. Runs until the engine
+    // closes the channel or flags ECHO_DONE (all captured bytes framed).
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let done2 = done.clone();
+    let rfd = conn_fd;
+    let reader = std::thread::spawn(move || {
+        let mut buf: Vec<u8> = vec![];
+        let mut tmp = [0u8; 65536];
+        loop {
+            let n = unsafe { libc::read(rfd, tmp.as_mut_ptr().cast(), tmp.len()) };
+            if n <= 0 { break; }
+            buf.extend_from_slice(&tmp[..n as usize]);
+            let (frames, used) = crate::frames::decode(&buf);
+            buf.drain(..used);
+            for (ft, payload) in frames {
+                if ft == crate::frames::FRAME_ECHO && !payload.is_empty() {
+                    let realfd = if payload[0] == 1 { 2 } else { 1 };
+                    unsafe { libc::write(realfd, payload[1..].as_ptr().cast(),
+                                         payload.len() - 1); }
+                } else if ft == crate::frames::FRAME_ECHO_DONE {
+                    done2.store(true, std::sync::atomic::Ordering::SeqCst);
+                    return;
+                }
+            }
+        }
+    });
+    let child = unsafe {
+        Command::new(&cmd[0]).args(&cmd[1..])
+            .stdout(Stdio::from_raw_fd(out.into_raw_fd()))
+            .stderr(Stdio::from_raw_fd(err.into_raw_fd()))
+            .spawn()
+    };
+    let mut child = match child {
         Ok(c) => c,
         Err(e) => { eprintln!("sarun-engine inner: spawn {}: {e}", cmd[0]); return 127; }
     };
-    fn tee(mut src: impl Read + Send + 'static, realfd: i32, sink: &str)
-           -> std::thread::JoinHandle<()> {
-        let mut sf = std::fs::OpenOptions::new().write(true).open(sink).ok();
-        std::thread::spawn(move || {
-            let mut buf = [0u8; 65536];
-            loop {
-                match src.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        unsafe { libc::write(realfd, buf.as_ptr().cast(), n); }
-                        if let Some(f) = sf.as_mut() { let _ = f.write_all(&buf[..n]); }
-                    }
-                }
-            }
-        })
-    }
-    let so = child.stdout.take().map(|s| tee(s, 1, "/.slopbox-stdout"));
-    let se = child.stderr.take().map(|s| tee(s, 2, "/.slopbox-stderr"));
     let code = child.wait().ok().and_then(|s| s.code()).unwrap_or(1);
-    if let Some(h) = so { let _ = h.join(); }
-    if let Some(h) = se { let _ = h.join(); }
+    // The child's sink fds are now closed (it exited): the engine will frame any
+    // remaining ECHO then ECHO_DONE. Wait briefly for the reader to drain so the
+    // tail of the output isn't truncated, then unmute and let the channel close.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !done.load(std::sync::atomic::Ordering::SeqCst)
+        && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    send_frame(conn_fd, &crate::frames::encode(crate::frames::FRAME_UNMUTE, &[]), None);
+    let _ = reader;
     code
 }

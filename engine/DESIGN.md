@@ -200,8 +200,24 @@ CONFIRMED:
    reads through the child's mount after the parent is dissolved (discard rule,
    so only copy-down can preserve it). The same fix retires S5: the `rename`
    verb now writes the name meta through the live BoxState when the box is
-   running, not a second connection. Remaining in the cluster: echo chaining
-   (the live-echo mux, still downgraded since m3b).
+   running, not a second connection.
+
+   Echo chaining is now DONE — the nested cluster is complete. Capture switched
+   from teeing to the live-echo mux: --inner makes the box-root sink files its
+   child's stdout/stderr (every write flows through the overlay, recorded with
+   per-write pid attribution) and the engine frames those bytes back as ECHO
+   over the box's one muxed connection; --inner replays them to its real fd 1/2.
+   For a NESTED box that fd 1/2 is the parent's sink, so the child's output
+   chains UP level by level to the top-level terminal. MUTE/UNMUTE solve the
+   re-capture problem: --inner sends a MUTE frame carrying its own pidfd; the
+   engine resolves its host tgid and, while muted, ECHOes that pid's sink writes
+   onward but does NOT record them — so a child's readback passing up through an
+   ancestor sink is captured exactly once, at its origin box, never multiplied.
+   ECHO_DONE (sent when the box's last sink releases at child exit) lets --inner
+   drain the tail without truncation before closing. Tested: a nested child's
+   stdout marker chains to the top-level runner, is recorded in the CHILD box,
+   and is NOT re-recorded in the PARENT (MUTE). The PTY/tmux feature (D7/D9) now
+   has its mux foundation.
 
 WEAK TESTS (not proven wrong, but self-graded by shape, not Python-equality):
  - S1 hunks: NOW cross-checked against Python's _build_hunks_display byte-for-byte
