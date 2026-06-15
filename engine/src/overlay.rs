@@ -656,7 +656,9 @@ impl Filesystem for Overlay {
         }
         let want_write = !matches!(flags.acc_mode(),
                                    fuser::OpenAccMode::O_RDONLY);
-        if want_write && self.is_passthrough(&rel) {
+        // -d direct: the whole box is passthrough (no overlay) — writes land on
+        // the real host, uncaptured. Else a per-path passthrough file rule.
+        if want_write && (b.direct() || self.is_passthrough(&rel)) {
             // passthrough rule: writes go straight to the REAL host file, never
             // captured. Open (creating) the host path directly.
             let host = self.host(&rel);
@@ -710,8 +712,9 @@ impl Filesystem for Overlay {
         let Some(name) = name.to_str() else { return reply.error(Errno::EINVAL) };
         let rel = if prel.is_empty() { name.to_string() }
                   else { format!("{prel}/{name}") };
-        if self.is_passthrough(&rel) {
-            // passthrough: create the file on the REAL host, uncaptured.
+        if b.direct() || self.is_passthrough(&rel) {
+            // passthrough (file rule, or -d whole-box direct): create the file on
+            // the REAL host, uncaptured.
             let host = self.host(&rel);
             if let Some(p) = host.parent() { let _ = std::fs::create_dir_all(p); }
             match OpenOptions::new().read(true).write(true).create(true)

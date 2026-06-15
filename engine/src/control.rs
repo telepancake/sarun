@@ -266,6 +266,16 @@ fn resolve(boxes: &std::collections::BTreeMap<i64, discover::Box_>,
         .map(|b| b.box_id)
 }
 
+/// The box_id of the box NAMED `name` whose parent is `parent` (None=top-level),
+/// else None — the rerun/uniqueness lookup (siblings have unique NAMEs). Mirrors
+/// the Python Supervisor._find_named_child (scans discovered on-disk boxes).
+fn find_named_child(boxes: &std::collections::BTreeMap<i64, discover::Box_>,
+                    name: &str, parent: Option<i64>) -> Option<i64> {
+    boxes.values()
+        .find(|b| b.name == name && b.parent == parent)
+        .map(|b| b.box_id)
+}
+
 fn arg_sid(args: &[Value]) -> Option<i64> {
     args.first()?.as_str()?.parse().ok()
 }
@@ -399,27 +409,72 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
         .or_else(|| msg.get("prov").and_then(|p| p.get("tgid"))
                  .and_then(Value::as_i64).map(|t| t as i32))
         .unwrap_or(0);
-    // NESTED: relname present → derive the enclosing box from /proc ancestry.
+    let boxes = discover::discover();
+    // ── PARENT + NAME RESOLUTION ───────────────────────────────────────────
+    // IN-BOX (relname present): parent = kernel-derived enclosing box; the box
+    //   supplies only a single-segment relative NAME (or "" → auto A<n>).
+    // HOST (no relname): top-level by default; a supplied session_id may be a
+    //   single NAME or a dotted display path (A.B) whose prefix names the parent.
     let relname = msg.get("relname").and_then(Value::as_str);
-    let parent: Option<i64> = if relname.is_some() {
+    let mut parent: Option<i64> = None;
+    let mut name: Option<String> = None;
+    if let Some(rel) = relname {
+        if !rel.is_empty() && (!valid_name(rel) || rel.contains('.') || rel.contains('/')) {
+            if let Some(fd) = peer_pidfd { unsafe { libc::close(fd); } }
+            return json!({"ok": false,
+                "error": "invalid relname: must be a single NAME segment"});
+        }
         match derive_parent_box(state, host_pid) {
-            Some(p) => Some(p),
+            Some(p) => parent = Some(p),
             None => {
                 if let Some(fd) = peer_pidfd { unsafe { libc::close(fd); } }
                 return json!({"ok": false,
                     "error": "relname supplied but no enclosing box found"});
             }
         }
-    } else {
-        None
-    };
-    let boxes = discover::discover();
+        if !rel.is_empty() { name = Some(rel.to_string()); }
+    } else if let Some(want) = msg.get("session_id").and_then(Value::as_str)
+        .filter(|s| !s.is_empty()) {
+        if let Some((prefix, last)) = want.rsplit_once('.') {
+            // Dotted display path: parent = prefix box (must exist), NAME = last.
+            match resolve(&boxes, prefix) {
+                Some(p) => { parent = Some(p); name = Some(last.to_string()); }
+                None => {
+                    if let Some(fd) = peer_pidfd { unsafe { libc::close(fd); } }
+                    return json!({"ok": false,
+                        "error": format!("parent box '{prefix}' does not exist")});
+                }
+            }
+        } else {
+            name = Some(want.to_string());
+        }
+    }
+
+    // ── CREATE-VS-RERUN ────────────────────────────────────────────────────
+    // A named launch RERUNS the same box_id if a sibling with that NAME already
+    // exists under the resolved parent (adds another root to its process forest).
+    // An unnamed launch always CREATEs a fresh box_id. The runner's want_rerun is
+    // advisory; the authoritative decision is the name lookup (mirrors Python).
+    let mut rerun = false;
+    let mut existing_id: Option<i64> = None;
+    if let Some(ref nm) = name {
+        if let Some(eid) = find_named_child(&boxes, nm, parent) {
+            existing_id = Some(eid);
+            rerun = true;
+        }
+    }
+    if rerun && state.lock().unwrap().box_pids.contains_key(&existing_id.unwrap()) {
+        if let Some(fd) = peer_pidfd { unsafe { libc::close(fd); } }
+        return json!({"ok": false, "error": "slopbox is already running"});
+    }
     let live_max = ov.box_ids().into_iter().max().unwrap_or(0);
-    let id = boxes.keys().max().copied().unwrap_or(0).max(live_max) + 1;
-    // NAME candidate: relname (nested) or session_id (top-level); else A<id>.
-    let want = relname.or_else(|| msg.get("session_id").and_then(Value::as_str))
-        .unwrap_or("");
-    let name = if valid_name(want) { want.to_string() } else { format!("A{id}") };
+    let id = existing_id.unwrap_or_else(||
+        boxes.keys().max().copied().unwrap_or(0).max(live_max) + 1);
+    let name = name.unwrap_or_else(|| format!("A{id}"));
+    let env_capture = msg.get("want_env").and_then(Value::as_bool).unwrap_or(false);
+    let direct = msg.get("want_direct").and_then(Value::as_bool).unwrap_or(false);
+    let want_capture = msg.get("want_capture").and_then(Value::as_bool)
+        .unwrap_or(true) && !direct;
     let backing = crate::paths::live_home().join(id.to_string());
     if let Err(e) = std::fs::create_dir_all(backing.join("up")) {
         if let Some(fd) = peer_pidfd { unsafe { libc::close(fd); } }
@@ -432,6 +487,11 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
             return json!({"ok": false, "error": format!("sqlar: {e}")});
         }
     };
+    // RERUN: reopen the existing box's recorded state so prior writes show
+    // through and prior process rows keep their ids (the new root is additive).
+    if rerun { b.load_mirror(); }
+    b.set_env_capture(env_capture);
+    b.set_direct(direct);
     b.set_meta("name", &name);
     if let Some(p) = parent {
         b.set_parent(Some(p));
@@ -464,7 +524,7 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
                                  .duration_since(std::time::UNIX_EPOCH)
                                  .map(|d| d.as_nanos()).unwrap_or(0)),
         "box_id": id, "session_id": id.to_string(), "name": name,
-        "capture": true,              // sinks + live echo mux active
+        "capture": want_capture,      // sinks + live echo mux active (off for -t/-d)
         "_box_sid": id,               // caller marker: this conn is now the box channel
     })
 }

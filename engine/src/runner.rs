@@ -69,16 +69,36 @@ fn conn_write_all(conn: &UnixStream, data: &[u8]) -> bool {
     c.write_all(data).is_ok()
 }
 
-fn provenance(cmd: &[String]) -> Value {
+fn provenance(cmd: &[String], full_env: bool) -> Value {
     let exe = std::fs::read_link("/proc/self/exe")
         .map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
     let cwd = std::env::current_dir()
         .map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
-    json!({
+    let mut v = json!({
         "tgid": std::process::id(),
         "ppid": unsafe { libc::getppid() },
         "exe": exe, "cwd": cwd, "argv": cmd,
-    })
+    });
+    // -e: send our full HOST env so the box's ROOT process row has it even when
+    // the engine can't /proc-read our tgid (a nested runner). Mirrors the Python
+    // runner's read_provenance(full_env=True).
+    if full_env { v["env"] = self_environ(); }
+    v
+}
+
+/// Read /proc/self/environ as a JSON object for env capture (the runner's own
+/// HOST environment, contributed to the box's root process row under -e).
+fn self_environ() -> Value {
+    let raw = std::fs::read("/proc/self/environ").unwrap_or_default();
+    let mut map = serde_json::Map::new();
+    for kv in raw.split(|b| *b == 0) {
+        if kv.is_empty() { continue; }
+        let s = String::from_utf8_lossy(kv);
+        if let Some((k, v)) = s.split_once('=') {
+            map.insert(k.to_string(), json!(v));
+        }
+    }
+    Value::Object(map)
 }
 
 fn clear_cloexec(fd: i32) {
@@ -88,11 +108,15 @@ fn clear_cloexec(fd: i32) {
     }
 }
 
-pub fn run(name: Option<String>, cmd: Vec<String>) -> i32 {
+pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
+           cmd: Vec<String>) -> i32 {
     if cmd.is_empty() {
         eprintln!("sarun-engine run: no command after --");
         return 2;
     }
+    // -t passthrough suppresses output capture; -d direct has no overlay so no
+    // sinks either (capture = not -t and not -d, mirroring the Python runner).
+    let want_capture = !passthrough && !direct;
     // IN-BOX vs HOST: a nested runner reaches the engine via the socket
     // bind-mounted at UI_SOCK_INBOX; a top-level runner uses the host socket.
     // Pure path-presence, no env var (mirrors the Python runner).
@@ -114,7 +138,13 @@ pub fn run(name: Option<String>, cmd: Vec<String>) -> i32 {
     // the optional NAME as `session_id`. The SAME connection becomes the box
     // channel.
     let mut reg = json!({"type": "register",
-                         "cmd": cmd, "prov": provenance(&cmd)});
+                         "cmd": cmd, "prov": provenance(&cmd, env),
+                         "want_capture": want_capture,
+                         "want_direct": direct,
+                         "want_env": env,
+                         // Advisory: the engine reruns iff a sibling NAME exists.
+                         // A named launch is always rerun-eligible.
+                         "want_rerun": name.is_some()});
     if in_box {
         reg["relname"] = json!(name.unwrap_or_default());
     } else {
@@ -163,6 +193,14 @@ pub fn run(name: Option<String>, cmd: Vec<String>) -> i32 {
     let sock_src = if in_box { UI_SOCK_INBOX.to_string() }
                    else { paths::sock_path().to_string_lossy().into_owned() };
     let fd_s = fd.to_string();
+    // Honor the engine's capture decision (it downgrades for -t/-d): only pass
+    // --capture to inner when the ack confirms capture is active.
+    let capture_on = want_capture
+        && ack.get("capture").and_then(Value::as_bool).unwrap_or(false);
+    let mut inner_args: Vec<&str> = vec![
+        &self_exe, "inner", "--conn-fd", &fd_s];
+    if capture_on { inner_args.push("--capture"); }
+    inner_args.push("--");
     let status = Command::new("bwrap")
         .args(["--bind", &root_src, "/",
                "--proc", "/proc", "--dev", "/dev",
@@ -171,9 +209,8 @@ pub fn run(name: Option<String>, cmd: Vec<String>) -> i32 {
                "--ro-bind", &sock_src, UI_SOCK_INBOX,
                "--unshare-pid", "--unshare-ipc", "--unshare-uts",
                "--die-with-parent",
-               "--chdir", &cwd,
-               "--", &self_exe, "inner", "--conn-fd", &fd_s,
-               "--capture", "--"])
+               "--chdir", &cwd, "--"])
+        .args(&inner_args)
         .args(&cmd)
         .status();
     drop(conn); // our copy; inner (in the box) is the channel's sole holder now

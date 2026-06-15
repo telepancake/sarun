@@ -373,15 +373,29 @@ fn main() {
     match argv.first().map(String::as_str) {
         Some("serve") => std::process::exit(serve()),
         Some("run") => {
-            // run [NAME] -- CMD...
+            // run [-t] [-d] [-e] [NAME] -- CMD...
+            //   -t  passthrough: no stdout/stderr capture (inner just execs)
+            //   -d  direct: no overlay — writes land on the real host, uncaptured
+            //   -e  env: record each writer's full environment
             let rest = &argv[1..];
             let sep = rest.iter().position(|a| a == "--");
             let (pre, cmd) = match sep {
                 Some(i) => (&rest[..i], rest[i + 1..].to_vec()),
                 None => (rest, vec![]),
             };
-            let name = pre.first().cloned();
-            std::process::exit(runner::run(name, cmd));
+            let mut passthrough = false;
+            let mut direct = false;
+            let mut env = false;
+            let mut name: Option<String> = None;
+            for a in pre {
+                match a.as_str() {
+                    "-t" => passthrough = true,
+                    "-d" => direct = true,
+                    "-e" => env = true,
+                    _ => if name.is_none() { name = Some(a.clone()); },
+                }
+            }
+            std::process::exit(runner::run(name, passthrough, direct, env, cmd));
         }
         Some("inner") => {
             // inner --conn-fd N -- CMD...
