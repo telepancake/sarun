@@ -23,9 +23,10 @@ may change freely: there are no users to migrate (D8).
 - **m3:** overlay + capture semantics, driven black-box by the behavioral
   suite (e2e, pjdfstest, attach parity). Format-groveling Python unit tests
   are implementation tests of the OLD engine and retire with it.
-- **m4+:** musl static link; the Python file becomes UI client + bootstrap
-  (fetch-or-build the engine binary, hash-keyed cache — the same mechanism
-  that builds patched pyfuse3 today). The pyfuse3 patch dies at m3.
+- **m4+:** musl static link (the static-link half is DONE — see "m4 status"
+  below); the Python file becomes UI client + bootstrap (fetch-or-build the
+  engine binary, hash-keyed cache — the same mechanism that builds patched
+  pyfuse3 today). The pyfuse3 patch dies at m3.
 
 ## D3 · Writes are writes — and capture is LAZY (first-write, not open)
 No write buffers, no buffer→row reconciliation. But ALL capture cost
@@ -239,3 +240,36 @@ EQUALITY checks against the Python functions on the same sqlar (done for hunks; 
 for proc_info/session_changes/struct/patch), and (b) the actual Python behavioral
 suite + pjdfstest run against the Rust mount — which has NEVER been done. Until then,
 treat the conformance green count as necessary, not sufficient.
+
+## m4 status — fully-static musl binary (DONE)
+The engine builds as a fully-static x86_64 musl binary with no dynamic libc, a
+truly portable single executable. The DEFAULT `cargo build --release` is
+unchanged (dynamic glibc, what the test harness builds).
+
+Build:
+```
+rustup target add x86_64-unknown-linux-musl   # rust-std for musl
+apt-get install -y musl-tools                  # provides musl-gcc
+cd engine && cargo build --release --target x86_64-unknown-linux-musl
+```
+`engine/.cargo/config.toml` scopes the musl-only setup so the default target is
+untouched: it sets `linker = "musl-gcc"` for the musl target and
+`CC_x86_64-unknown-linux-musl = "musl-gcc"` so the `cc` crate compiles
+rusqlite's bundled SQLite C with the musl ABI (the one real sticking point —
+fuser/libc were fine). One source fix was needed for musl: `msg_controllen` is
+`socklen_t` (u32) on glibc but `size_t` (usize) on musl, so the two
+`msg.msg_controllen = cmsg.len()` assignments in `src/control.rs` now cast
+`as _` (target-correct, ABI-neutral on glibc).
+
+Proof (this machine):
+```
+$ file   target/x86_64-unknown-linux-musl/release/sarun
+… ELF 64-bit … static-pie linked … statically linked
+$ ldd    target/x86_64-unknown-linux-musl/release/sarun
+        statically linked
+```
+~4.8 MB (vs ~4.7 MB glibc dynamic). VERIFIED it still WORKS statically:
+`sarun engine` brings up its control socket and a real `sarun run -- echo …`
+box runs against it and exits 0 — FUSE mount + bwrap function under the static
+binary. Guarded by the standalone `test_musl_rs.py` (self-skips with a clear
+message when the musl target hasn't been built — never a fake pass).

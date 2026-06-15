@@ -1,0 +1,15 @@
+# musl-only config. The DEFAULT target (x86_64-unknown-linux-gnu) is untouched
+# here, so `cargo build --release` still produces the normal dynamic glibc
+# binary the test harness builds.
+#
+# For the fully-static portable build:
+#   cargo build --release --target x86_64-unknown-linux-musl
+# musl-gcc (from musl-tools) is the linker AND the C compiler used by the `cc`
+# crate to build rusqlite's bundled SQLite, so the C objects are musl-ABI and
+# the final binary has no dynamic libc ("statically linked").
+[target.x86_64-unknown-linux-musl]
+linker = "musl-gcc"
+
+[env]
+# The `cc` crate (rusqlite bundled SQLite) honors this per-target CC override.
+CC_x86_64-unknown-linux-musl = "musl-gcc"
