@@ -146,14 +146,16 @@ fn tty_restore(tty_fd: Option<i32>, old_fg: Option<i32>,
 }
 
 pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
-           chdir: Option<String>, cmd: Vec<String>) -> i32 {
+           pty: bool, chdir: Option<String>, cmd: Vec<String>) -> i32 {
     if cmd.is_empty() {
         eprintln!("sarun-engine run: no command after --");
         return 2;
     }
     // -t passthrough suppresses output capture; -d direct has no overlay so no
     // sinks either (capture = not -t and not -d, mirroring the Python runner).
-    let want_capture = !passthrough && !direct;
+    // -p PTY mode always wants its output recorded, so it forces capture on
+    // even under -t (but never under -d: there is no overlay to capture into).
+    let want_capture = (!passthrough && !direct) || (pty && !direct);
     // IN-BOX vs HOST: a nested runner reaches the engine via the socket
     // bind-mounted at UI_SOCK_INBOX; a top-level runner uses the host socket.
     // Pure path-presence, no env var (mirrors the Python runner).
@@ -238,6 +240,9 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
     let mut inner_args: Vec<&str> = vec![
         &self_exe, "inner", "--conn-fd", &fd_s];
     if capture_on { inner_args.push("--capture"); }
+    // PTY needs the capture sink files to record into; if the engine declined
+    // capture (-d) there is nothing to PTY into, so gate --pty on capture_on.
+    if pty && capture_on { inner_args.push("--pty"); }
     inner_args.push("--");
     let status = Command::new("bwrap")
         .args(["--bind", &root_src, "/",
@@ -284,11 +289,22 @@ fn send_frame(conn_fd: i32, frame: &[u8], pidfd: Option<i32>) {
     }
 }
 
-pub fn inner(conn_fd: i32, capture: bool, cmd: Vec<String>) -> i32 {
+pub fn inner(conn_fd: i32, capture: bool, pty: bool, cmd: Vec<String>) -> i32 {
     if cmd.is_empty() { return 2; }
     // Hold the box-channel fd open (not CLOEXEC) so the engine sees EOF — its
     // teardown signal — only when this process (and CMD) finally exits.
     if conn_fd >= 0 { clear_cloexec(conn_fd); }
+    // PTY mode (third path): an interactive controlling-tty box whose output is
+    // ALSO captured. Requires capture (sink files) and a real tty on our fds; a
+    // piped runner (no tty) falls back to ordinary capture so it never hangs.
+    if pty && capture && conn_fd >= 0 {
+        let have_tty = (0..3).any(|fd| unsafe { libc::isatty(fd) } == 1);
+        if have_tty {
+            return inner_pty(conn_fd, cmd);
+        }
+        eprintln!("sarun-engine inner: -p requested but no tty on stdio; \
+                   falling back to capture mode");
+    }
     if !capture || conn_fd < 0 {
         // Passthrough (-t/-d): stdio is inherited. Spawn (not exec) so we can do
         // tty job-control + restore for an interactive shell; the box channel,
@@ -304,6 +320,10 @@ pub fn inner(conn_fd: i32, capture: bool, cmd: Vec<String>) -> i32 {
         tty_restore(tty_fd, old_fg, old_ttou);
         return code;
     }
+    inner_capture(conn_fd, cmd)
+}
+
+fn inner_capture(conn_fd: i32, cmd: Vec<String>) -> i32 {
     // Capture via the echo mux: the child's stdout/stderr ARE the box-root sink
     // files, so every write flows THROUGH the overlay (recorded with per-write
     // pid attribution). The engine frames those bytes back as ECHO; we replay
@@ -381,5 +401,191 @@ pub fn inner(conn_fd: i32, capture: bool, cmd: Vec<String>) -> i32 {
     }
     send_frame(conn_fd, &crate::frames::encode(crate::frames::FRAME_UNMUTE, &[]), None);
     let _ = reader;
+    code
+}
+
+// ── PTY mode (third execution path) ──────────────────────────────────────────
+// An interactive controlling-tty box whose output is ALSO captured. We allocate
+// a pty, give the child the SLAVE as stdin/stdout/stderr + controlling terminal
+// (setsid + TIOCSCTTY in a pre_exec), put OUR real stdin into raw mode, and
+// bridge bidirectionally:
+//   real stdin  → pty master   (keystrokes reach the child)
+//   pty master  → real stdout  (live, the user sees the child's tty output)
+//               → the box stdout sink file (so it is RECORDED into outputs,
+//                 exactly like capture mode — the engine attributes the write to
+//                 us, the non-muted runner pid, then echoes it back; we DISCARD
+//                 the echo because the master already gave us the live bytes).
+// Window size is propagated initially (TIOCGWINSZ→TIOCSWINSZ) and on SIGWINCH.
+// On exit we restore termios + the terminal foreground group.
+
+static WINCH_FLAG: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+extern "C" fn on_winch(_sig: i32) {
+    WINCH_FLAG.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Read the window size of `fd` (a tty), if any.
+fn get_winsize(fd: i32) -> Option<libc::winsize> {
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    let r = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) };
+    if r == 0 { Some(ws) } else { None }
+}
+
+fn set_winsize(fd: i32, ws: &libc::winsize) {
+    unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, ws as *const libc::winsize); }
+}
+
+fn inner_pty(conn_fd: i32, cmd: Vec<String>) -> i32 {
+    use std::os::fd::FromRawFd;
+    use std::os::fd::IntoRawFd;
+    use std::process::Stdio;
+
+    // The real terminal among our fds (its size + termios we mirror/restore).
+    let real_tty = (0..3).find(|&fd| unsafe { libc::isatty(fd) } == 1).unwrap_or(0);
+
+    // Allocate the pty pair, seeding the master's window size from the real tty.
+    let mut master: i32 = -1;
+    let mut slave: i32 = -1;
+    let initial_ws = get_winsize(real_tty);
+    let ws_ptr = initial_ws.as_ref()
+        .map(|w| w as *const libc::winsize).unwrap_or(std::ptr::null());
+    let rc = unsafe {
+        libc::openpty(&mut master, &mut slave, std::ptr::null_mut(),
+                      std::ptr::null(), ws_ptr)
+    };
+    if rc != 0 {
+        eprintln!("sarun-engine inner: openpty failed — falling back to capture");
+        return inner_capture(conn_fd, cmd);
+    }
+
+    // Open the box stdout sink: bytes we write here flow through the overlay and
+    // are RECORDED (per-write pid attribution → us, the runner). The child's tty
+    // I/O goes to the master/slave, not here; we relay master→sink ourselves.
+    let sink = match std::fs::OpenOptions::new().write(true).open("/.slopbox-stdout") {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("inner: open stdout sink: {e} — falling back to capture");
+            unsafe { libc::close(master); libc::close(slave); }
+            return inner_capture(conn_fd, cmd);
+        }
+    };
+
+    // Put the real terminal into raw mode so keystrokes pass through unbuffered
+    // and unechoed (the child's tty does its own echo). Saved for restore.
+    let mut saved_termios: libc::termios = unsafe { std::mem::zeroed() };
+    let have_termios = unsafe { libc::tcgetattr(real_tty, &mut saved_termios) } == 0;
+    if have_termios {
+        let mut raw = saved_termios;
+        unsafe { libc::cfmakeraw(&mut raw); }
+        unsafe { libc::tcsetattr(real_tty, libc::TCSANOW, &raw); }
+    }
+
+    // SIGWINCH → propagate the new size to the master on the next loop tick.
+    unsafe { libc::signal(libc::SIGWINCH, on_winch as libc::sighandler_t); }
+
+    // Spawn the child with the SLAVE as stdin/stdout/stderr and as its
+    // controlling terminal: new session (setsid) + TIOCSCTTY in a pre_exec.
+    let slave_for_pre = slave;
+    let child = unsafe {
+        let mut c = Command::new(&cmd[0]);
+        c.args(&cmd[1..])
+            .stdin(Stdio::from_raw_fd(libc::dup(slave)))
+            .stdout(Stdio::from_raw_fd(libc::dup(slave)))
+            .stderr(Stdio::from_raw_fd(libc::dup(slave)));
+        c.pre_exec(move || {
+            // Own session → no controlling tty inherited; then claim the slave.
+            if libc::setsid() < 0 { return Err(std::io::Error::last_os_error()); }
+            if libc::ioctl(slave_for_pre, libc::TIOCSCTTY, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+        c.spawn()
+    };
+    let mut child = match child {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("sarun-engine inner: spawn {}: {e}", cmd[0]);
+            if have_termios { unsafe { libc::tcsetattr(real_tty, libc::TCSANOW, &saved_termios); } }
+            unsafe { libc::close(master); libc::close(slave); }
+            return 127;
+        }
+    };
+    // The child holds its own dup'd slave fds; close ours so the master sees EOF
+    // when the child exits (otherwise the master read never ends).
+    unsafe { libc::close(slave); }
+
+    // Drain the box channel (engine echoes our sink writes back as ECHO; we
+    // DISCARD them — the master is our live source). Watch for ECHO_DONE.
+    let rfd = conn_fd;
+    let drainer = std::thread::spawn(move || {
+        let mut buf: Vec<u8> = vec![];
+        let mut tmp = [0u8; 65536];
+        loop {
+            let n = unsafe { libc::read(rfd, tmp.as_mut_ptr().cast(), tmp.len()) };
+            if n <= 0 { break; }
+            buf.extend_from_slice(&tmp[..n as usize]);
+            let (frames, used) = crate::frames::decode(&buf);
+            buf.drain(..used);
+            for (ft, _payload) in frames {
+                if ft == crate::frames::FRAME_ECHO_DONE { return; }
+            }
+        }
+    });
+
+    // Bidirectional bridge. We poll master + real stdin; on master EOF the child
+    // has closed all slave fds (it has exited or is exiting). A SIGWINCH flag
+    // resize is applied on each tick. Bounded by the child's lifetime.
+    let stdin_fd = 0;
+    let mut master_eof = false;
+    while !master_eof {
+        if WINCH_FLAG.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            if let Some(ws) = get_winsize(real_tty) { set_winsize(master, &ws); }
+        }
+        let mut fds = [
+            libc::pollfd { fd: master, events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: stdin_fd, events: libc::POLLIN, revents: 0 },
+        ];
+        let pr = unsafe { libc::poll(fds.as_mut_ptr(), 2, 200) };
+        if pr < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EINTR) { continue; } // SIGWINCH
+            break;
+        }
+        // master → real stdout (live) + sink (recorded)
+        if fds[0].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+            let mut b = [0u8; 65536];
+            let n = unsafe { libc::read(master, b.as_mut_ptr().cast(), b.len()) };
+            if n <= 0 { master_eof = true; }
+            else {
+                let s = &b[..n as usize];
+                unsafe { libc::write(1, s.as_ptr().cast(), s.len()); }
+                // Recorded copy: a real write through the FUSE sink (captured).
+                let _ = (&sink).write_all(s);
+            }
+        }
+        // real stdin → master (keystrokes); EOF on stdin is fine, keep relaying
+        // master output until the child exits.
+        if fds[1].revents & libc::POLLIN != 0 {
+            let mut b = [0u8; 65536];
+            let n = unsafe { libc::read(stdin_fd, b.as_mut_ptr().cast(), b.len()) };
+            if n > 0 {
+                unsafe { libc::write(master, b.as_ptr().cast(), n as usize); }
+            }
+        }
+    }
+
+    let code = child.wait().ok().and_then(|s| s.code()).unwrap_or(1);
+    // Close the sink so the engine flushes ECHO_DONE; restore the terminal.
+    drop(sink);
+    if have_termios { unsafe { libc::tcsetattr(real_tty, libc::TCSANOW, &saved_termios); } }
+    unsafe { libc::signal(libc::SIGWINCH, libc::SIG_DFL); }
+    unsafe { libc::close(master); }
+    // Drain the channel briefly so the recorded tail isn't lost, then let it go.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !drainer.is_finished() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let _ = drainer;
     code
 }

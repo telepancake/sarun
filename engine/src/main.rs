@@ -154,6 +154,7 @@ fn main() {
             let mut passthrough = false;
             let mut direct = false;
             let mut env = false;
+            let mut pty = false;
             let mut chdir: Option<String> = None;
             let mut name: Option<String> = None;
             let mut it = pre.iter();
@@ -162,26 +163,32 @@ fn main() {
                     "-t" => passthrough = true,
                     "-d" => direct = true,
                     "-e" => env = true,
+                    // -p  PTY: run the box on an interactive pseudo-terminal
+                    //     (real tty inside the box), captured like ordinary
+                    //     capture mode. Implies capture-on; ignored under -d.
+                    "-p" => pty = true,
                     "-C" => chdir = it.next().cloned(),
                     _ => if name.is_none() { name = Some(a.clone()); },
                 }
             }
-            std::process::exit(runner::run(name, passthrough, direct, env, chdir, cmd));
+            std::process::exit(runner::run(name, passthrough, direct, env, pty, chdir, cmd));
         }
         Some("inner") => {
             // inner --conn-fd N -- CMD...
             let rest = &argv[1..];
             let mut conn_fd = -1;
             let mut capture = false;
+            let mut pty = false;
             let mut i = 0;
             while i < rest.len() {
                 if rest[i] == "--conn-fd" && i + 1 < rest.len() {
                     conn_fd = rest[i + 1].parse().unwrap_or(-1); i += 2;
                 } else if rest[i] == "--capture" { capture = true; i += 1; }
+                else if rest[i] == "--pty" { pty = true; i += 1; }
                 else if rest[i] == "--" { i += 1; break; }
                 else { i += 1; }
             }
-            std::process::exit(runner::inner(conn_fd, capture, rest[i..].to_vec()));
+            std::process::exit(runner::inner(conn_fd, capture, pty, rest[i..].to_vec()));
         }
         // CLI conveniences mirroring `slopbox NAME <op>`: a leading all-caps
         // (optionally dotted) box NAME selects it, and an optional op acts on it
