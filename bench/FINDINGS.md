@@ -173,3 +173,142 @@ ops. Reducing it would mean changes of a different character (e.g. servicing FUS
 on multiple OS threads, or shrinking per-op Python work) and a separate round of
 measurement — the `keep_cache` change is the single highest-leverage, lowest-risk
 win and stands on its own.
+
+## Addendum: the readdir snapshot cache (dir-listing cache)
+
+The kernel never caches FUSE directory listings, so readdir-heavy workloads
+(git status's untracked walk: one readdir per directory, every run) rebuilt the
+merged scan from scratch each time — for each entry: a layer resolution, a host
+lstat, and a fresh `EntryAttributes` (~14 µs/entry of mostly Python object
+churn, ~85% of warm `git status` overhead; verified by `showUntrackedFiles=no`
+collapsing the warm ratio from 7× to 1.9×).
+
+`_scan_dir_cached` now snapshots each directory's merged listing, validated by
+`(host dir mtime_ns, Index.dirlist_gen(rel))`. The gen is **per directory**
+(plus a global epoch for prune/reparent): git writes `.git/index` every run, and
+a global counter would invalidate every cached listing on any write anywhere —
+measured as exactly zero cache hits. Coherence: a hit re-lstats every
+disk-backed entry and reuses the cached `EntryAttributes` only when the stat is
+byte-identical (synthetic entries re-resolve through the RAM mirror), so attrs
+are never served staler than one fresh lstat — same doctrine as `_autocache`.
+
+git status, 5 000 tracked files, back-to-back runs: warm 0.079 s → 0.058 s
+(cold 0.59 s → 0.44 s). Runs spaced past the 1 s attr TTL are unchanged
+(~0.41 s) — those are bounded by the lookup/getattr storm, which is the
+single-trio-thread per-op tax above, not readdir.
+
+## Comparing timings across revisions
+
+The microbenchmarks behind the numbers above are committed as
+`bench/workloads.py` (git-status / exec-storm / file-churn through the real
+overlay vs native-under-bwrap, plus the remote-UI rpc round-trip). To compare
+any two revisions, run the SAME harness on the SAME box:
+
+    bench/workloads.py                              # current tree
+    git show <rev>:sarun > /tmp/sarun_old
+    SARUN_PATH=/tmp/sarun_old bench/workloads.py    # the old revision
+
+Trust per-op overhead (µs/op) across machines and runs; treat A/B ratios as
+box-local (the native baseline jitters, the additive FUSE cost doesn't).
+Reference run, dev container 2026-06-14 (post dir-listing cache + engine/UI
+split): git-status 89 µs/op cold · 0.058 s warm; exec-storm 1.7×;
+file-churn 3.4×; rpc 0.35 ms/verb.
+
+## Addendum: batch attr/readdir helpers in the pyfuse3 patch
+
+The per-entry Python cost of the metadata path was dominated by struct
+ceremony: 13 interpreted property assignments to build each EntryAttributes,
+plus one readdir_reply call per entry. The embedded pyfuse3 patch now adds
+`entry_attributes_fast()` (fills the whole fuse_entry_param in one C call) and
+`readdir_reply_batch()` (packs a listing slice into the kernel buffer in one
+call per directory); `_entry()` and `readdir()` use them.
+
+Measured with bench/workloads.py, same box, SARUN_PATH=previous revision:
+git-status cold 104 → 86 µs/op (−17%), warm 0.064 → 0.058 s. exec-storm and
+file-churn unchanged — they are bounded by exec/copy-up and the capture write
+path (provenance + sqlite per write), not attribute construction; batching
+THAT write path is the next rung on the ladder.
+
+## Addendum: parallel builds — the single-thread serving ceiling
+
+All numbers above are SERIAL workloads. `bench/parallel_build.py` compiles a
+200-file C project with make -j1 vs -j8, native vs overlay (same bwrap). On a
+4-core box: native scales 4.0× with -j8; the overlay scales only 1.9×, because
+every FUSE request from all compiler processes is served by the ONE trio
+thread under the GIL. The overlay tax therefore GROWS with parallelism: 2.05×
+at -j1 → 4.28× at -j8 (and worsens with core count). This is the strongest
+measured argument for moving the serving loop out of single-threaded Python —
+free-threaded CPython, multiple FUSE worker threads in C, or a compiled
+engine — none of which the per-op micro-optimizations above address.
+
+## Addendum: Rust engine milestone 1 — the scaling proof
+
+Decision: the engine is being rewritten as a separate, statically-linkable
+Rust program (engine/), with the Python UI as a socket client (the protocol
+boundary, namespaces and black-box tests from the engine/UI split are the
+prerequisites). Milestone 1 is a multithreaded read-only passthrough
+filesystem (fuser 0.17, n_threads dispatch) — no overlay, no capture — built
+to measure the serving-loop ceiling before porting semantics.
+
+bench/parallel_metadata.py, 4 concurrent cold git-status walks (5 000 files
+each, fresh mount = cold caches), this 4-core box:
+
+    native            0.013 s   (warm reference)
+    rust  1 thread    0.212 s
+    rust  8 threads   0.144 s
+    python overlay    1.692 s
+
+Rust is ~8× faster than the Python engine single-threaded (per-op cost) and
+~12× with threaded dispatch. Honest caveat: m1 does none of the overlay
+merge/whiteout/capture checks the Python per-op path performs, so part of the
+8× is missing feature weight, not language — the fuse-overlayfs comparison
+(32 vs 95 µs/op, both full overlays) suggests the durable language factor is
+~3×, with the rest from threading and the not-yet-ported logic. Next
+milestones: control socket + namespace layout, then the overlay/capture
+semantics ported against the existing black-box test suite.
+
+## Addendum: m3c graduation — the Rust overlay breaks the GIL ceiling
+
+With the FULL capturing overlay (copy-up + rows + provenance, not the m1
+passthrough), bench/parallel_build_rs.py builds a 200-file C project through
+native / the Python engine / the Rust engine, on this 4-core box:
+
+    make build (best of 2)   -j1      -j8    scaling
+    native                  3.21s    0.81s    4.0x
+    python overlay          7.07s    3.47s    2.0x   (GIL wall)
+    rust overlay            6.59s    1.54s    4.3x   (full cores)
+
+    overlay/native at -j8:  python 4.3x   rust 1.9x
+
+This is the whole thesis confirmed end to end: serial per-op cost is similar
+(-j1: 6.6 vs 7.1s), but the Python engine's single trio thread caps scaling at
+2x while the Rust engine scales with cores (4.3x), so at -j8 Rust is 2.25x
+faster in absolute terms and 1.9x native — hitting m1's predicted target. The
+gap widens with core count; on a build farm it is the difference between
+"usable" and "why is my 32-core box idle".
+
+## Addendum: per-op overhead isolated (correcting the ~3x estimate)
+
+The graduation benchmark above measures the THREADING axis (parallel scaling).
+This isolates the other axis — SERIAL per-op cost — with a single cold
+git-status walk (one process, one in-flight request, so n_threads is
+irrelevant). bench/perop_overlay.py, ~5200 metadata ops:
+
+    native   10 ms
+    python  475 ms    89 us/op
+    rust    118 ms    21 us/op
+
+Python's 89 us/op reproduces workloads.py's earlier 86-104 (methodology
+consistent — not a fresh-baseline artifact). The measured serial language/
+logic factor is therefore ~4.3x, NOT the ~3x estimated earlier from the
+fuse-overlayfs ratio; that guess was low and is retracted. The Rust full
+overlay (21 us/op) sits below the fuse-overlayfs reference (~32 us/op), though
+that cross-tool number is loose.
+
+The two wins are independent and must not be conflated:
+  - per-op (~4.3x lower): helps METADATA-bound work (git, find, stat storms).
+  - core scaling (GIL ceiling removed): helps PARALLEL work (builds).
+A compute-bound build shows almost none of the per-op win serially (the -j1
+build was only 1.07x apart — FUSE is a thin slice next to cc), and almost all
+of its -j8 win (2.25x) is the threading axis. A pure-metadata workload shows
+the full 4.3x serially.

@@ -138,6 +138,10 @@ _PYFUSE3_SDIST_SHA256 = (
 # The patch, embedded as exact (old -> new) source edits applied programmatically
 # to the extracted sdist. handlers.pxi: thread the request context into both
 # write entry points; _pyfuse3.py: add the required `ctx` param to Operations.write.
+# __init__.pyx: two batch helpers for the metadata hot path —
+# entry_attributes_fast() builds a fully-populated EntryAttributes in ONE C call
+# (vs 13 interpreted property assignments per entry), and readdir_reply_batch()
+# packs a whole listing slice into the kernel buffer in one call per directory.
 _PYFUSE3_PATCH = (
     ("src/pyfuse3/handlers.pxi",
      "async def fuse_write_async (_Container c, pbuf):\n"
@@ -168,6 +172,89 @@ _PYFUSE3_PATCH = (
     ("src/pyfuse3/_pyfuse3.py",
      "    async def write(self, fh: FileHandleT, off: int, buf: bytes) -> int:",
      "    async def write(self, fh: FileHandleT, off: int, buf: bytes, ctx) -> int:"),
+    ("src/pyfuse3/__init__.pyx",
+     "    cname = PyBytes_AsString(name)\n"
+     "    len_ = fuse_add_direntry_plus(token.req, token.buf, token.size,\n"
+     "                                  cname, &attr.fuse_param, next_id)\n"
+     "    if len_ > token.size:\n"
+     "        return False\n"
+     "\n"
+     "    token.size -= len_\n"
+     "    token.buf = &token.buf[len_]\n"
+     "    return True\n",
+     "    cname = PyBytes_AsString(name)\n"
+     "    len_ = fuse_add_direntry_plus(token.req, token.buf, token.size,\n"
+     "                                  cname, &attr.fuse_param, next_id)\n"
+     "    if len_ > token.size:\n"
+     "        return False\n"
+     "\n"
+     "    token.size -= len_\n"
+     "    token.buf = &token.buf[len_]\n"
+     "    return True\n"
+     "\n"
+     "\n"
+     "def entry_attributes_fast(unsigned long long ino, unsigned int mode,\n"
+     "                          unsigned long nlink, unsigned int uid,\n"
+     "                          unsigned int gid, unsigned long long rdev,\n"
+     "                          long long size, long long atime_ns,\n"
+     "                          long long mtime_ns, long long ctime_ns,\n"
+     "                          double attr_timeout, double entry_timeout):\n"
+     "    '''Build a fully-populated EntryAttributes in ONE call (sarun patch).\n"
+     "\n"
+     "    Equivalent to constructing EntryAttributes() and assigning every field\n"
+     "    through its property, but the unbox-and-store loop runs in C: one\n"
+     "    boundary crossing per entry instead of thirteen. st_blksize is fixed\n"
+     "    at 512 and st_blocks derived from size (the convention the caller\n"
+     "    used anyway).'''\n"
+     "    cdef EntryAttributes ent = EntryAttributes.__new__(EntryAttributes)\n"
+     "    ent.fuse_param.ino = ino\n"
+     "    ent.attr.st_ino = ino\n"
+     "    ent.fuse_param.attr_timeout = attr_timeout\n"
+     "    ent.fuse_param.entry_timeout = entry_timeout\n"
+     "    ent.attr.st_mode = mode\n"
+     "    ent.attr.st_nlink = nlink\n"
+     "    ent.attr.st_uid = uid\n"
+     "    ent.attr.st_gid = gid\n"
+     "    ent.attr.st_rdev = rdev\n"
+     "    ent.attr.st_size = size\n"
+     "    ent.attr.st_blksize = 512\n"
+     "    ent.attr.st_blocks = (size + 511) // 512\n"
+     "    ent.attr.st_atime = atime_ns // _NANOS_PER_SEC\n"
+     "    SET_ATIME_NS(ent.attr, atime_ns % _NANOS_PER_SEC)\n"
+     "    ent.attr.st_mtime = mtime_ns // _NANOS_PER_SEC\n"
+     "    SET_MTIME_NS(ent.attr, mtime_ns % _NANOS_PER_SEC)\n"
+     "    ent.attr.st_ctime = ctime_ns // _NANOS_PER_SEC\n"
+     "    SET_CTIME_NS(ent.attr, ctime_ns % _NANOS_PER_SEC)\n"
+     "    return ent\n"
+     "\n"
+     "\n"
+     "def readdir_reply_batch(ReaddirToken token, items):\n"
+     "    '''Report MANY directory entries in one call (sarun patch).\n"
+     "\n"
+     "    *items* is a sequence of (name: bytes, EntryAttributes, next_id)\n"
+     "    triples. Packs entries into the kernel buffer until it fills; returns\n"
+     "    the number accepted (== len(items) when everything fit). Semantics\n"
+     "    per entry are identical to readdir_reply().'''\n"
+     "    cdef char *cname\n"
+     "    cdef EntryAttributes attr\n"
+     "    cdef off_t next_id\n"
+     "    cdef size_t len_\n"
+     "    cdef int n = 0\n"
+     "    if token.buf_start == NULL:\n"
+     "        token.buf_start = <char*> calloc_or_raise(token.size, sizeof(char))\n"
+     "        token.buf = token.buf_start\n"
+     "    for name, a, nid in items:\n"
+     "        attr = <EntryAttributes?> a\n"
+     "        next_id = nid\n"
+     "        cname = PyBytes_AsString(name)\n"
+     "        len_ = fuse_add_direntry_plus(token.req, token.buf, token.size,\n"
+     "                                      cname, &attr.fuse_param, next_id)\n"
+     "        if len_ > token.size:\n"
+     "            return n\n"
+     "        token.size -= len_\n"
+     "        token.buf = &token.buf[len_]\n"
+     "        n += 1\n"
+     "    return n\n"),
 )
 
 # Short, stable identity of the patch so the cache key changes if the patch does.
@@ -310,11 +397,14 @@ if "--inner" not in _bootstrap_sys.argv:
     # Hard assertion: refuse to run on stock pyfuse3. The patched build's
     # Operations.write carries a `ctx` parameter; stock does not.
     if "ctx" not in _bootstrap_inspect.signature(
-            pyfuse3.Operations.write).parameters:
+            pyfuse3.Operations.write).parameters or \
+            not hasattr(pyfuse3, "entry_attributes_fast") or \
+            not hasattr(pyfuse3, "readdir_reply_batch"):
         raise SystemExit(
             "FATAL: active pyfuse3 is NOT the patched build (Operations.write "
-            "lacks `ctx`). The patched pyfuse3 (which surfaces the writer pid on "
-            f"FUSE write) is mandatory. Its cache is {_pyfuse3_cache_dir()}; "
+            "lacks `ctx`, or the batch attr/readdir helpers are missing). The "
+            "patched pyfuse3 (which surfaces the writer pid on FUSE write) is "
+            f"mandatory. Its cache is {_pyfuse3_cache_dir()}; "
             "delete it to force a clean rebuild.")
 
 import abc
@@ -467,17 +557,33 @@ def collect_docs() -> str:
 # touched (under the slopboxed HOME) would be captured by the overlay and show up
 # as a bogus "change". Real directory creation is deferred to ensure_dirs(),
 # called only by the UI and the runner.
+def namespace() -> str:
+    """The instance namespace, from $SLOPBOX_NS (set by the `--ns` CLI flag, or
+    inherited: a box's processes get the runner's environment, so a nested runner
+    lands in its parent's namespace by default). "" = the default instance."""
+    return os.environ.get("SLOPBOX_NS", "")
+
+def valid_namespace(ns: str) -> bool:
+    return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,32}", ns))
+
+def _app_dir() -> str:
+    """The per-instance app dirname: every storage/config/runtime root (and thus
+    the control socket, mountpoint, state, pool, rules) hangs off this one name,
+    so two namespaces are fully independent instances on the same system."""
+    ns = namespace()
+    return f"slopbox.{ns}" if ns else "slopbox"
+
 def data_home() -> Path:
     base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
-    return Path(base) / "slopbox"
+    return Path(base) / _app_dir()
 
 def config_home() -> Path:
     base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
-    return Path(base) / "slopbox"
+    return Path(base) / _app_dir()
 
 def runtime_home() -> Path:
     base = os.environ.get("XDG_RUNTIME_DIR")
-    return Path(base) / "slopbox" if base else data_home()
+    return Path(base) / _app_dir() if base else data_home()
 
 def live_home() -> Path:
     """Root of per-box backing dirs: live/<box_id>/up is the discovery sentinel (an
@@ -529,7 +635,7 @@ def blob_path(box_id: int, row_id: int) -> Path:
 
 def state_home() -> Path:
     base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
-    return Path(base) / "slopbox"
+    return Path(base) / _app_dir()
 
 def box_ctime(box_id) -> float:
     """A box's age anchor: the ctime of its on-disk identity — the sqlar if present,
@@ -1782,59 +1888,45 @@ def _sqlar_put_tombstone(conn, name) -> None:
                  " mtime=excluded.mtime, sz=excluded.sz, data=excluded.data",
                  (name, stat_mod.S_IFCHR, 0, 0, None))
 
-def sqlar_list(path) -> list:
-    """[(name, mode, mtime, sz)] sorted by name; [] if there is no archive.
-    mtime is integer NANOSECONDS (st_mtime_ns)."""
+def _sqlar_fetchone(path, sql, params=()):
+    """One read-only SELECT against an archive on disk: fetchone() result, or None
+    if the archive is missing or the query errors. Opens/closes its own handle —
+    the shared scaffolding for all the standalone sqlar reader helpers below."""
+    path = Path(path)
+    if not path.exists(): return None
+    conn = _sqlar_open(path)
+    try: return conn.execute(sql, params).fetchone()
+    except sqlite3.Error: return None
+    finally: conn.close()
+
+def _sqlar_fetchall(path, sql, params=()) -> list:
+    """fetchall() counterpart of _sqlar_fetchone; [] when missing or errored."""
     path = Path(path)
     if not path.exists(): return []
     conn = _sqlar_open(path)
-    try: return conn.execute("SELECT name,mode,mtime,sz FROM sqlar "
-                             "ORDER BY name").fetchall()
+    try: return conn.execute(sql, params).fetchall()
     except sqlite3.Error: return []
     finally: conn.close()
 
+def sqlar_list(path) -> list:
+    """[(name, mode, mtime, sz)] sorted by name; [] if there is no archive.
+    mtime is integer NANOSECONDS (st_mtime_ns)."""
+    return _sqlar_fetchall(path, "SELECT name,mode,mtime,sz FROM sqlar ORDER BY name")
+
 def sqlar_mode(path, name) -> "int | None":
-    path = Path(path)
-    if not path.exists(): return None
-    conn = _sqlar_open(path)
-    try:
-        row = conn.execute("SELECT mode FROM sqlar WHERE name=?", (name,)).fetchone()
-    except sqlite3.Error: row = None
-    finally: conn.close()
-    return row[0] if row else None
+    return sqlar_mode_mtime(path, name)[0]
 
 def sqlar_mtime(path, name) -> "int | None":
     """Stored mtime as integer NANOSECONDS (st_mtime_ns), or None if missing."""
-    path = Path(path)
-    if not path.exists(): return None
-    conn = _sqlar_open(path)
-    try:
-        row = conn.execute("SELECT mtime FROM sqlar WHERE name=?", (name,)).fetchone()
-    except sqlite3.Error: row = None
-    finally: conn.close()
-    return row[0] if row else None
+    return sqlar_mode_mtime(path, name)[1]
 
 def sqlar_nonempty(path) -> bool:
     """True if the sqlar has at least one entry — cheaper than fetching all rows."""
-    path = Path(path)
-    if not path.exists(): return False
-    conn = _sqlar_open(path)
-    try:
-        row = conn.execute("SELECT 1 FROM sqlar LIMIT 1").fetchone()
-    except sqlite3.Error: row = None
-    finally: conn.close()
-    return row is not None
+    return _sqlar_fetchone(path, "SELECT 1 FROM sqlar LIMIT 1") is not None
 
 def sqlar_mode_mtime(path, name) -> "tuple[int, int] | tuple[None, None]":
     """Fetch mode AND mtime in a single SELECT — use at call sites that need both."""
-    path = Path(path)
-    if not path.exists(): return None, None
-    conn = _sqlar_open(path)
-    try:
-        row = conn.execute("SELECT mode, mtime FROM sqlar WHERE name=?",
-                           (name,)).fetchone()
-    except sqlite3.Error: row = None
-    finally: conn.close()
+    row = _sqlar_fetchone(path, "SELECT mode, mtime FROM sqlar WHERE name=?", (name,))
     return (row[0], row[1]) if row else (None, None)
 
 def box_id_of_sqlar(path) -> "int | None":
@@ -1847,14 +1939,8 @@ def sqlar_content(path, name) -> "bytes | None":
     missing or a tombstone. Reads EITHER rest form: an evicted/folded row (bytes
     compressed in `data`) or a permanently-resident row (data NULL; bytes in the pool
     blob at blob_path(box_id, rowid) — the uncompressed file on disk)."""
-    path = Path(path)
-    if not path.exists(): return None
-    conn = _sqlar_open(path)
-    try:
-        row = conn.execute("SELECT rowid,sz,data FROM sqlar WHERE name=?",
-                           (name,)).fetchone()
-    except sqlite3.Error: row = None
-    finally: conn.close()
+    row = _sqlar_fetchone(path, "SELECT rowid,sz,data FROM sqlar WHERE name=?",
+                          (name,))
     if not row: return None
     rowid, sz, data = row
     if data is not None:
@@ -1975,12 +2061,8 @@ def outputs_get(path, oid) -> "dict | None":
         conn.close()
 
 def has_outputs(path) -> bool:
-    path = Path(path)
-    if not path.exists(): return False
-    conn = _sqlar_open(path)
-    try: return bool(conn.execute("SELECT EXISTS(SELECT 1 FROM outputs)").fetchone()[0])
-    except sqlite3.Error: return False
-    finally: conn.close()
+    row = _sqlar_fetchone(path, "SELECT EXISTS(SELECT 1 FROM outputs)")
+    return bool(row and row[0])
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1993,14 +2075,8 @@ def process_list(path) -> list:
     """[(id, tgid, ppid, parent_id, exe, argv-list)] for the box's process table.
     `parent_id` is the parent's process-table ROW id (the structural link; NULL for a
     root/unknown parent); `ppid` is the parent's pid number, for display only."""
-    path = Path(path)
-    if not path.exists(): return []
-    conn = _sqlar_open(path)
-    try:
-        rows = conn.execute("SELECT id,tgid,ppid,parent_id,exe,argv FROM process "
-                            "ORDER BY id").fetchall()
-    except sqlite3.Error: return []
-    finally: conn.close()
+    rows = _sqlar_fetchall(path, "SELECT id,tgid,ppid,parent_id,exe,argv FROM process"
+                                 " ORDER BY id")
     out = []
     for pid, tgid, ppid, parent_id, exe, argv in rows:
         try: av = json.loads(argv) if argv else []
@@ -2011,13 +2087,7 @@ def process_list(path) -> list:
 def sqlar_meta_get(path, key: str) -> "str | None":
     """Read one small per-box meta string (e.g. the box's display `name`) from a
     sqlar on disk. None if absent."""
-    path = Path(path)
-    if not path.exists(): return None
-    conn = _sqlar_open(path)
-    try:
-        row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
-    except sqlite3.Error: row = None
-    finally: conn.close()
+    row = _sqlar_fetchone(path, "SELECT value FROM meta WHERE key=?", (key,))
     return row[0] if row else None
 
 def sqlar_meta_set(path, key: str, value: str) -> None:
@@ -2082,50 +2152,25 @@ def process_roots(path) -> set:
     """The box's hierarchy-root ROW ids (process.root=1) read from a sqlar on disk —
     the finished-box counterpart to Index.roots(). Row ids (not tgids) so the proc tree
     links structurally, PID-reuse proof."""
-    path = Path(path)
-    if not path.exists(): return set()
-    conn = _sqlar_open(path)
-    try:
-        return {r[0] for r in conn.execute("SELECT id FROM process WHERE root=1")}
-    except sqlite3.Error: return set()
-    finally: conn.close()
+    return {r[0] for r in _sqlar_fetchall(path, "SELECT id FROM process WHERE root=1")}
 
 def sqlar_writer_id(path, rel) -> "int | None":
     """The process-table row id that LAST wrote `rel` (the sqlar `last_writer` tag),
     or None. Finished-box path: read straight from the consolidated single sqlar."""
-    path = Path(path)
-    if not path.exists(): return None
-    conn = _sqlar_open(path)
-    try:
-        row = conn.execute("SELECT last_writer FROM sqlar WHERE name=?",
-                            (rel,)).fetchone()
-    except sqlite3.Error: row = None
-    finally: conn.close()
+    row = _sqlar_fetchone(path, "SELECT last_writer FROM sqlar WHERE name=?", (rel,))
     return row[0] if row and row[0] is not None else None
 
 def sqlar_first_writer_id(path, rel) -> "int | None":
     """The process-table row id of the FIRST process to write `rel` (the sqlar `writer`
     tag), or None — the first-writer counterpart of sqlar_writer_id. Finished-box read."""
-    path = Path(path)
-    if not path.exists(): return None
-    conn = _sqlar_open(path)
-    try:
-        row = conn.execute("SELECT writer FROM sqlar WHERE name=?", (rel,)).fetchone()
-    except sqlite3.Error: row = None
-    finally: conn.close()
+    row = _sqlar_fetchone(path, "SELECT writer FROM sqlar WHERE name=?", (rel,))
     return row[0] if row and row[0] is not None else None
 
 def sqlar_proc_prov(path, proc_id) -> "dict | None":
     """Provenance (exe/cwd/argv) of ONE process row, read from a finished box's sqlar.
     None if the row id isn't recorded. Used to build the procs-pane filter Subject."""
-    path = Path(path)
-    if not path.exists(): return None
-    conn = _sqlar_open(path)
-    try:
-        w = conn.execute("SELECT exe,cwd,argv FROM process WHERE id=?",
-                         (proc_id,)).fetchone()
-    except sqlite3.Error: w = None
-    finally: conn.close()
+    w = _sqlar_fetchone(path, "SELECT exe,cwd,argv FROM process WHERE id=?",
+                        (proc_id,))
     if not w: return None
     try: argv = json.loads(w[2]) if w[2] else []
     except (ValueError, TypeError): argv = []
@@ -2135,16 +2180,11 @@ def sqlar_first_writer_prov(path, rel) -> "dict | None":
     """Provenance (exe/cwd/argv) of the FIRST process to write `rel`, read from a
     stopped box's single sqlar (the `writer` tag → process row). Used to match a file
     rule's process facets at delete/finalize time. None if no writer is recorded."""
-    path = Path(path)
-    if not path.exists(): return None
-    conn = _sqlar_open(path)
-    try:
-        w = conn.execute(
-            "SELECT process.tgid, process.ppid, process.exe, process.cwd, process.argv"
-            " FROM sqlar JOIN process ON sqlar.writer=process.id"
-            " WHERE sqlar.name=?", (rel,)).fetchone()
-    except sqlite3.Error: w = None
-    finally: conn.close()
+    w = _sqlar_fetchone(
+        path,
+        "SELECT process.tgid, process.ppid, process.exe, process.cwd, process.argv"
+        " FROM sqlar JOIN process ON sqlar.writer=process.id"
+        " WHERE sqlar.name=?", (rel,))
     if not w: return None
     try: argv = json.loads(w[4]) if w[4] else []
     except (ValueError, TypeError): argv = []
@@ -2152,15 +2192,9 @@ def sqlar_first_writer_prov(path, rel) -> "dict | None":
 
 def process_env(path, proc_id) -> dict:
     """The deduped environment for one process row (resolved via env_id)."""
-    path = Path(path)
-    if not path.exists(): return {}
-    conn = _sqlar_open(path)
-    try:
-        row = conn.execute(
-            "SELECT env.env FROM process JOIN env ON process.env_id=env.id"
-            " WHERE process.id=?", (proc_id,)).fetchone()
-    except sqlite3.Error: row = None
-    finally: conn.close()
+    row = _sqlar_fetchone(path,
+                          "SELECT env.env FROM process JOIN env ON process.env_id=env.id"
+                          " WHERE process.id=?", (proc_id,))
     if not row or not row[0]: return {}
     try: return json.loads(row[0])
     except (ValueError, TypeError): return {}
@@ -2170,14 +2204,8 @@ def root_cmd(sid: str) -> list:
     id) in <sid>.sqlar. [] if no such row exists. The persisted single source of truth,
     surviving after the runner exits; a re-run box has several roots — this is the
     original launch's command."""
-    path = sqlar_path(sid)
-    if not path.exists(): return []
-    conn = _sqlar_open(path)
-    try:
-        row = conn.execute("SELECT argv FROM process WHERE root=1"
-                           " ORDER BY id LIMIT 1").fetchone()
-    except sqlite3.Error: row = None
-    finally: conn.close()
+    row = _sqlar_fetchone(sqlar_path(sid), "SELECT argv FROM process WHERE root=1"
+                                           " ORDER BY id LIMIT 1")
     if not row or not row[0]: return []
     try: return list(json.loads(row[0]))
     except (ValueError, TypeError): return []
@@ -2411,6 +2439,14 @@ class Index:
         self._kinds: dict = {}
         self._opaque: set = set()
         self._targets: dict = {}          # rel -> symlink target bytes (RAM mirror)
+        # Dir-listing cache validity (see _scan_dir_cached): per-PARENT-dir
+        # generation counters bumped by every mirror mutation under that dir,
+        # plus a global epoch for subtree ops (prune_subtree/reparent) that
+        # touch many dirs at once. Per-dir scope matters: git-status-style
+        # workloads write .git/* every run — that must not invalidate the
+        # cached listings of unrelated directories.
+        self._dir_gens: dict = {}
+        self.mirror_epoch = 0
         self._lock = self._dbh.lock       # the db's shared lock (SQLite + mirror)
         self._load_mirror()
         # Stable pool id == the box's identity == the backing dir / sqlar stem.
@@ -2455,6 +2491,20 @@ class Index:
         return int(mode)
 
     # ── fast RAM accessors (hot path) ───────────────────────────────────────
+    def _bump_dir(self, path: str, also_self: bool = False) -> None:
+        """Invalidate the cached listing of `path`'s parent dir (the listing the
+        mutation changes). also_self: the mutation altered `path`'s OWN listing
+        too (its opaque flag). Called under _lock by the mirror mutators."""
+        p = path.rsplit("/", 1)[0] if "/" in path else ""
+        self._dir_gens[p] = self._dir_gens.get(p, 0) + 1
+        if also_self:
+            self._dir_gens[path] = self._dir_gens.get(path, 0) + 1
+
+    def dirlist_gen(self, rel: str) -> tuple:
+        """The dir-listing validity stamp for dir `rel`: (global epoch, this
+        dir's mutation count). GIL-atomic read — see _scan_dir_cached."""
+        return (self.mirror_epoch, self._dir_gens.get(rel, 0))
+
     def has_overlay_state(self) -> bool:
         return bool(self._whiteouts or self._kinds or self._opaque)
 
@@ -2747,6 +2797,7 @@ class Index:
                   detail: str = "", opaque=None, target=None,
                   mtime_ns=None) -> None:
         with self._lock:
+            self._bump_dir(path, also_self=opaque is not None)
             self._upsert(path, self._row_mode(kind, mode), writer_id, opaque)
             if kind == "symlink" and target is not None:
                 # Put the target into the row IMMEDIATELY (deflated, sz=len) so the
@@ -2781,6 +2832,7 @@ class Index:
 
     def del_entry(self, path, op: str = "del", writer_id=None) -> None:
         with self._lock:
+            self._bump_dir(path)
             self._db.execute("DELETE FROM sqlar WHERE name=?", (path,))
             self._db.commit()
             self._whiteouts.discard(path); self._kinds.pop(path, None)
@@ -2798,6 +2850,7 @@ class Index:
         Deletes any pre-existing row at `new`, then renames `old`->>`new` in-place.
         Updates the RAM mirror accordingly."""
         with self._lock:
+            self._bump_dir(old); self._bump_dir(new)
             # drop any pre-existing entry at the destination
             self._db.execute("DELETE FROM sqlar WHERE name=?", (new,))
             # rename in-place (rowid preserved)
@@ -2828,6 +2881,7 @@ class Index:
         pref = prefix + "/"
         pref_hi = pref[:-1] + chr(ord(pref[-1]) + 1)  # prefix range upper bound
         with self._lock:
+            self.mirror_epoch += 1
             # Free the pool blobs of any file rows under the prefix before dropping the
             # rows — otherwise the bytes leak (the row that named them is gone).
             for rid, mode in self._db.execute(
@@ -2853,6 +2907,7 @@ class Index:
         oldp = old + "/"; newp = new + "/"
         oldp_hi = oldp[:-1] + chr(ord(oldp[-1]) + 1)  # prefix range upper bound
         with self._lock:
+            self.mirror_epoch += 1
             rows = self._db.execute(
                 "SELECT rowid, name, mode, opaque FROM sqlar"
                 " WHERE name >= ? AND name < ?",
@@ -2898,21 +2953,19 @@ class Index:
         tag), or None. Keys the proc pane → used to focus the writer when jumping to
         procs. UI-thread read of the single sqlar handle: take _lock so it never races
         the serve thread's writes on the shared connection (Index threading contract)."""
-        try:
-            with self._lock:
-                row = self._db.execute(
-                    "SELECT last_writer FROM sqlar WHERE name=?", (path,)).fetchone()
-        except sqlite3.Error: return None
-        return row[0] if row and row[0] is not None else None
+        return self._writer_id_col(path, "last_writer")
 
     def first_writer_id_for(self, path: str) -> "int | None":
         """The process-table row id that FIRST wrote `path` (the sqlar `writer` tag), or
         None — the first-writer counterpart of writer_id_for, used to pin the procs pane
         to a change's writers. UI-thread read under _lock (Index threading contract)."""
+        return self._writer_id_col(path, "writer")
+
+    def _writer_id_col(self, path: str, col: str) -> "int | None":
         try:
             with self._lock:
                 row = self._db.execute(
-                    "SELECT writer FROM sqlar WHERE name=?", (path,)).fetchone()
+                    f"SELECT {col} FROM sqlar WHERE name=?", (path,)).fetchone()
         except sqlite3.Error: return None
         return row[0] if row and row[0] is not None else None
 
@@ -2992,6 +3045,7 @@ class Index:
         `data` is already deflated (raw-or-zlib per _sqlar_deflate); `sz` is the
         uncompressed length."""
         with self._lock:
+            self._bump_dir(rel)
             # _upsert ensures the row exists + updates mode/writer mirror.
             self._upsert(rel, mode, writer_id, None)
             self._db.execute(
@@ -3065,6 +3119,8 @@ def _build_overlay_ops():
             self._echo_enqueue: dict = {} # sid -> callable(stream, bytes)->cf.Future
             self._echo_flush: dict = {}   # sid -> callable() flush+half-close the echo
             self._dir_snaps: dict = {}    # fh -> DirHandle(inode, snapshot)
+            # (sid, rel) -> (validity token, entries) — see _scan_dir_cached.
+            self._dirlist_cache: dict = {}
             self._next_fh = 1
             # auto_cache bookkeeping: inode -> (size, mtime_ns) last handed to the
             # kernel page cache on a read-only open. Drives _autocache's invalidation.
@@ -3154,6 +3210,8 @@ def _build_overlay_ops():
         def remove_session(self, sid: str) -> None:
             with self._lock:
                 self.sessions.pop(sid, None)
+                for k in [k for k in self._dirlist_cache if k[0] == sid]:
+                    del self._dirlist_cache[k]
                 dead = [ino for ino, key in self._ino_to_key.items()
                         if key and key[0] == sid]
                 for ino in dead:
@@ -3370,7 +3428,7 @@ def _build_overlay_ops():
             real host directory."""
             p = self._parent(sid)
             if p is not None:
-                return {n: "lower" for n, _k, _a in self._scan_dir(p, rel)}
+                return {n: "lower" for n, _k, _a, _ap in self._scan_dir(p, rel)}
             out = {}
             try:
                 with os.scandir(self._lower_path(rel)) as it:
@@ -3820,23 +3878,19 @@ def _build_overlay_ops():
             return True
 
         # ── attr construction ────────────────────────────────────────────────
+        def _ref(self, ino: int) -> None:
+            """Bump the kernel lookup count for `ino` (paired with forget)."""
+            self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
+
         def _entry(self, ino: int, st) -> "pyfuse3.EntryAttributes":
-            a = pyfuse3.EntryAttributes()
-            a.st_ino = ino
-            a.st_mode = st.st_mode
-            a.st_nlink = st.st_nlink
-            a.st_uid = self.squash_uid
-            a.st_gid = self.squash_gid
-            a.st_rdev = getattr(st, "st_rdev", 0)
-            a.st_size = st.st_size
-            a.st_blksize = 512
-            a.st_blocks = (st.st_size + 511) // 512
-            a.st_atime_ns = getattr(st, "st_atime_ns", 0)
-            a.st_mtime_ns = getattr(st, "st_mtime_ns", 0)
-            a.st_ctime_ns = getattr(st, "st_ctime_ns", 0)
-            a.attr_timeout = ATTR_TIMEOUT
-            a.entry_timeout = ENTRY_TIMEOUT
-            return a
+            # One C call fills the whole struct (patched-pyfuse3 helper) — the
+            # field-by-field property version cost ~13 interpreted assignments
+            # per entry, the bulk of readdir/lookup's per-entry Python time.
+            return pyfuse3.entry_attributes_fast(
+                ino, st.st_mode, st.st_nlink, self.squash_uid, self.squash_gid,
+                getattr(st, "st_rdev", 0), st.st_size,
+                getattr(st, "st_atime_ns", 0), getattr(st, "st_mtime_ns", 0),
+                getattr(st, "st_ctime_ns", 0), ATTR_TIMEOUT, ENTRY_TIMEOUT)
 
         def _synth_dir_attrs(self, ino: int) -> "pyfuse3.EntryAttributes":
             a = pyfuse3.EntryAttributes()
@@ -3945,12 +3999,12 @@ def _build_overlay_ops():
                 if prel == KIDS_DIR:
                     if psid in self.sessions and name in self._live_children(psid):
                         ino = self._ino_for(name, "")
-                        self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
+                        self._ref(ino)
                         return self._synth_dir_attrs(ino)
                     return self._neg_entry()
                 if prel == "" and name == KIDS_DIR and psid in self.sessions:
                     ino = self._ino_for(psid, KIDS_DIR)
-                    self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
+                    self._ref(ino)
                     return self._synth_dir_attrs(ino)
             if name == ".":
                 ckey = pkey
@@ -3965,7 +4019,7 @@ def _build_overlay_ops():
                 if sid not in self.sessions:
                     return self._neg_entry()
                 ino = self._ino_for(sid, "")
-                self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
+                self._ref(ino)
                 return self._synth_dir_attrs(ino)
             if sid not in self.sessions:
                 return self._neg_entry()
@@ -3973,13 +4027,13 @@ def _build_overlay_ops():
                 return self._neg_entry()
             if self._is_sink(sid, rel):
                 ino = self._ino_for(sid, rel)
-                self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
+                self._ref(ino)
                 return self._sink_attrs(ino)
             layer, _ap, st = self._resolve_st(sid, rel)
             if layer in ("absent", "whiteout"):
                 return self._neg_entry()
             ino = self._ino_for(sid, rel)
-            self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
+            self._ref(ino)
             return self._entry(ino, st)
 
         async def getattr(self, inode, ctx=None):
@@ -4044,11 +4098,69 @@ def _build_overlay_ops():
                 childrel = (rel + "/" + name) if rel else name
                 if childrel in self._self_rels:         # sarun's own dirs: invisible
                     continue
-                layer, _ap, st = self._resolve_st(sid, childrel)
+                layer, ap, st = self._resolve_st(sid, childrel)
                 if layer in ("absent", "whiteout"): continue
                 ino = self._ino_for(sid, childrel)
-                out.append((name, (sid, childrel), self._entry(ino, st)))
+                # ap is the entry's real on-disk backing (host file or pool blob)
+                # when it has one, None for synthetic rows — the dir-listing
+                # cache's revalidation handle.
+                out.append((name, (sid, childrel), self._entry(ino, st), ap))
             return out
+
+        def _scan_dir_cached(self, sid: str, rel: str) -> list:
+            """[(name, attrs)] for readdir, through a per-dir snapshot cache.
+
+            The kernel never caches FUSE directory listings, so without this every
+            readdir rebuilds the merged scan from scratch (a stat storm: git
+            status's untracked walk, shell globs, …). Validity token: (host dir
+            mtime_ns, Index.dirlist_gen(rel)) — the host dir mtime moves on any
+            lower name add/remove, the per-dir gen on any overlay mutation under
+            THIS dir (writes elsewhere don't invalidate it). Attrs are NEVER
+            served stale: on a hit every disk-backed entry is re-lstated (one
+            syscall) and its cached EntryAttributes reused only if the stat is
+            byte-identical; synthetic entries re-resolve through the RAM mirror.
+            Nested boxes (lower = parent's merged view, no single host dir to
+            version-stamp) bypass the cache."""
+            if self._parent(sid) is not None:
+                return [(n, a) for n, _k, a, _ap in self._scan_dir(sid, rel)]
+            try:
+                dmt = os.lstat(self._lower_path(rel)).st_mtime_ns
+            except OSError:
+                dmt = None
+            token = (dmt, self._index(sid).dirlist_gen(rel))
+            ck = (sid, rel)
+            hit = self._dirlist_cache.get(ck)
+            if hit is not None and hit[0] == token:
+                entries = hit[1]
+                out = []
+                for i, (name, childrel, attrs, ap) in enumerate(entries):
+                    st = None
+                    if ap is not None:
+                        try: st = os.lstat(ap)
+                        except OSError: st = None
+                        if (st is not None
+                                and st.st_mode == attrs.st_mode
+                                and st.st_size == attrs.st_size
+                                and st.st_mtime_ns == attrs.st_mtime_ns
+                                and st.st_ctime_ns == attrs.st_ctime_ns):
+                            out.append((name, attrs))
+                            continue
+                    if st is None:
+                        layer, ap, st = self._resolve_st(sid, childrel)
+                        if layer in ("absent", "whiteout"):
+                            out = None      # entry vanished under an unchanged
+                            break           # token (rename race): rebuild fully
+                    attrs = self._entry(attrs.st_ino, st)
+                    entries[i] = (name, childrel, attrs, ap)
+                    out.append((name, attrs))
+                if out is not None:
+                    return out
+            scan = self._scan_dir(sid, rel)
+            entries = [(name, key[1], attrs, ap) for name, key, attrs, ap in scan]
+            if len(self._dirlist_cache) > 4096:     # crude cap; refilled on demand
+                self._dirlist_cache.clear()
+            self._dirlist_cache[ck] = (token, entries)
+            return [(name, attrs) for name, _cr, attrs, _ap in entries]
 
         async def opendir(self, inode, ctx):
             with self._lock:
@@ -4076,18 +4188,18 @@ def _build_overlay_ops():
                         snap = [(c, self._synth_dir_attrs(self._ino_for(c, "")))
                                 for c in self._live_children(sid)]
                     elif sid in self.sessions:
-                        snap = [(name, attrs)
-                                for name, _k, attrs in self._scan_dir(sid, rel)]
+                        snap = self._scan_dir_cached(sid, rel)
                     else:
                         snap = []
                 if dh is None:
                     dh = DirHandle(inode=inode); self._dir_snaps[fh] = dh
                 dh.snapshot = snap
-            for i in range(start_id, len(snap)):
-                name, attrs = snap[i]
-                if not pyfuse3.readdir_reply(
-                        token, os.fsencode(name), attrs, i + 1):
-                    break
+            # One C call packs the whole slice into the kernel buffer (patched-
+            # pyfuse3 helper) — vs one readdir_reply crossing per entry.
+            pyfuse3.readdir_reply_batch(
+                token, [(os.fsencode(name), attrs, i + 1)
+                        for i, (name, attrs) in enumerate(snap[start_id:],
+                                                          start_id)])
 
         async def releasedir(self, fh):
             self._dir_snaps.pop(fh, None)
@@ -4705,7 +4817,7 @@ def _build_overlay_ops():
                     raise pyfuse3.FUSEError(e.errno or errno.EIO)
                 st = os.fstat(fd)
                 ino = self._ino_for(sid, rel)
-                self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
+                self._ref(ino)
                 with self._lock:
                     nfh = self._next_fh; self._next_fh += 1
                     self._fd_table[nfh] = fd
@@ -4728,7 +4840,7 @@ def _build_overlay_ops():
                 self._wbuf[nfh] = wb
                 self._wbuf_key[(sid, rel)] = nfh
                 ino = self._ino_for(sid, rel)
-                self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
+                self._ref(ino)
                 st = self._buffer_stat(sid, rel)
                 if st is None:                    # rare: create() over an existing file
                     _l, _a, st = self._resolve_st(sid, rel)
@@ -4744,7 +4856,7 @@ def _build_overlay_ops():
                 except OSError as e:
                     raise pyfuse3.FUSEError(e.errno or errno.EIO)
                 ino = self._ino_for(sid, rel)
-                self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
+                self._ref(ino)
                 return self._entry(ino, os.lstat(host))
             def upper_op(sid, rel, upath, wid, idx):
                 if idx.kind_of(rel) == "whiteout":
@@ -4754,7 +4866,7 @@ def _build_overlay_ops():
                 idx.set_entry(rel, "dir", dmode, wid, "mkdir", opaque=opaque,
                               mtime_ns=time.time_ns())
                 ino = self._ino_for(sid, rel)
-                self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
+                self._ref(ino)
                 st = self._synth_dir_stat(dmode, idx.row_mtime(rel))
                 return self._entry(ino, st)
             return self._mutate(parent_inode, name, ctx, "mkdir", host_op, upper_op)
@@ -4768,7 +4880,7 @@ def _build_overlay_ops():
                 except OSError as e:
                     raise pyfuse3.FUSEError(e.errno or errno.EIO)
                 ino = self._ino_for(sid, rel)
-                self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
+                self._ref(ino)
                 return self._entry(ino, os.lstat(host))
             def upper_op(sid, rel, upath, wid, idx):
                 # Symlink lives ONLY in the row (target + mode + mtime) — no on-disk
@@ -4786,15 +4898,12 @@ def _build_overlay_ops():
                 idx.set_entry(rel, "symlink", stat_mod.S_IFLNK | 0o777, wid, "symlink",
                               target=tgt, mtime_ns=mt)
                 ino = self._ino_for(sid, rel)
-                self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
+                self._ref(ino)
                 st = self._synth_link_stat(len(tgt), idx.row_mtime(rel))
                 return self._entry(ino, st)
             return self._mutate(parent_inode, name, ctx, "symlink", host_op, upper_op)
 
         # ── unlink / rmdir ───────────────────────────────────────────────────
-        def _merged_children(self, sid: str, rel: str) -> list:
-            return [n for n, _k, _a in self._scan_dir(sid, rel)]
-
         def _unlink_overlay(self, sid: str, rel: str, wid) -> None:
             """Overlay (captured) unlink for sid. Removes the backing artifact and
             updates the index. Used directly and as the kick-up target."""
@@ -4854,7 +4963,7 @@ def _build_overlay_ops():
 
         def _rmdir_overlay(self, sid: str, rel: str, wid) -> None:
             """Overlay (captured) rmdir for sid. Used directly and as kick-up target."""
-            if self._merged_children(sid, rel):
+            if self._scan_dir(sid, rel):     # any merged child ⇒ not empty
                 raise pyfuse3.FUSEError(errno.ENOTEMPTY)
             idx = self._index(sid)
             # Dir lives only in the mirror — no on-disk artifact to rmdir.
@@ -4989,11 +5098,12 @@ def _build_overlay_ops():
                 new_mt = (attr.st_mtime_ns if fields.update_mtime else cur_mt)
                 # symlink: keep its target row data (set_entry target=None preserves it).
                 idx.set_entry(rel, k, new_mode, wid, "setattr", mtime_ns=new_mt)
+                # set_entry just stored mtime=new_mt — no need to re-read the row.
                 if k == "dir":
-                    st = self._synth_dir_stat(new_mode, idx.row_mtime(rel))
+                    st = self._synth_dir_stat(new_mode, int(new_mt))
                 else:
                     tgt = idx.symlink_target(rel) or b""
-                    st = self._synth_link_stat(len(tgt), idx.row_mtime(rel))
+                    st = self._synth_link_stat(len(tgt), int(new_mt))
                 self._notify(sid, rel, "modified")
                 return self._entry(inode, st)
             # Dir/symlink returned early above; only regular files reach here.
@@ -5154,7 +5264,7 @@ def _build_overlay_ops():
         def _materialize_tree(self, sid: str, rel: str, wid) -> None:
             """Walk the merged view of rel and copy every entry into the upper."""
             self._copyup_one(sid, rel, wid)
-            for name, _k, _a in self._scan_dir(sid, rel):
+            for name, _k, _a, _ap in self._scan_dir(sid, rel):
                 child = (rel + "/" + name) if rel else name
                 layer, _ap, st = self._resolve_st(sid, child)
                 if layer in ("absent", "whiteout"): continue
@@ -5377,7 +5487,7 @@ def _build_overlay_ops():
                         pass
             except OSError as e:
                 raise pyfuse3.FUSEError(e.errno or errno.EIO)
-            self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
+            self._ref(ino)
             self._notify(sid, rel_n, "created")
             # Symlink dst has no on-disk artifact: stat it via the mirror.
             _l, _ap, st_n = self._resolve_st(sid, rel_n)
@@ -5422,7 +5532,7 @@ def _build_overlay_ops():
                     except OSError as e:
                         raise pyfuse3.FUSEError(e.errno or errno.EIO)
                     ino = self._ino_for(sid, rel_n)
-                    self._lookup_count[ino] = self._lookup_count.get(ino, 0) + 1
+                    self._ref(ino)
                     return self._entry(ino, os.lstat(hn))
                 ino = self._ino_for(sid, rel_n)
                 return self._link_overlay(sid, rel_src, rel_n, st, ino, ctx)
@@ -7374,6 +7484,24 @@ class Supervisor:
             bid = int(p)
         return ".".join(reversed(parts))
 
+    def session_dicts(self) -> list:
+        """Every session as a plain dict (to_dict + display 'path') — the UI's
+        startup snapshot, JSON-safe so the remote UI gets the same thing over
+        the wire that the embedded UI builds locally."""
+        out = []
+        for s in self.sessions.values():
+            d = s.to_dict()
+            d["path"] = self.display_path(s.session_id)
+            out.append(d)
+        return out
+
+    def open_files(self, sid) -> list:
+        """The box's currently-OPEN captured-write files [(rel, size), …] — the
+        UI's live 'open files' view, delegated to the overlay ops (verb-shaped
+        so the remote UI can ask for it without touching the mount object)."""
+        if self.mount is None or self.mount.ops is None: return []
+        return self.mount.ops.open_files(sid)
+
     def _refresh_box_paths(self) -> None:
         """Push every LIVE box's current display name into the overlay's session dicts,
         so the FUSE serve thread can gate file rules by box name with a plain dict read.
@@ -8450,6 +8578,39 @@ def _derive_parent_sid(peer_pid: int, sup: "Supervisor") -> "str | None":
     return None
 
 
+# ── wire codec — JSON-safe encoding for control-plane payloads ───────────────
+# The remote UI calls Supervisor/ChangeReview verbs over the control socket; the
+# results carry bytes (file content, diff lines), tuples, sets and Paths. Encode
+# them losslessly into JSON: bytes -> {"__b": b64}, set -> {"__s": [...]},
+# non-str-keyed dict -> {"__d": [[k,v],...]}; tuples flatten to lists (callers
+# index/iterate — none round-trip tuple identity).
+def wire_encode(o):
+    if isinstance(o, (bytes, bytearray, memoryview)):
+        return {"__b": base64.b64encode(bytes(o)).decode()}
+    if isinstance(o, (list, tuple)):
+        return [wire_encode(x) for x in o]
+    if isinstance(o, (set, frozenset)):
+        return {"__s": [wire_encode(x) for x in sorted(o, key=repr)]}
+    if isinstance(o, dict):
+        if all(isinstance(k, str) for k in o):
+            return {k: wire_encode(v) for k, v in o.items()}
+        return {"__d": [[wire_encode(k), wire_encode(v)] for k, v in o.items()]}
+    if isinstance(o, Path):
+        return str(o)
+    return o            # int / float / str / bool / None
+
+def wire_decode(o):
+    if isinstance(o, list):
+        return [wire_decode(x) for x in o]
+    if isinstance(o, dict):
+        if set(o) == {"__b"}: return base64.b64decode(o["__b"])
+        if set(o) == {"__s"}: return {wire_decode(x) for x in o["__s"]}
+        if set(o) == {"__d"}:
+            return {wire_decode(k): wire_decode(v) for k, v in o["__d"]}
+        return {k: wire_decode(v) for k, v in o.items()}
+    return o
+
+
 class ChannelServer:
     """
     The UI socket (ui.sock) — the ONE socket. It serves two connection shapes:
@@ -8471,9 +8632,58 @@ class ChannelServer:
     the box; teardown needs no owner token (the box's own connection closing IS the
     signal).
     """
+    # Verbs the remote UI may call ({"type":"ui","verb":...,"args":[...]}) —
+    # plain synchronous Supervisor/ChangeReview methods, loop-confined like every
+    # other control op. Anything not listed here is refused (closed surface).
+    _SUP_VERBS = frozenset((
+        "session_dicts", "display_path", "resolve_box", "select",
+        "processes", "processes_live", "proc_prov", "proc_info", "proc_roots",
+        "process_env", "writer_id", "first_writer_id", "first_writer_prov",
+        "outputs", "output_detail", "open_files",
+        "kill", "dissolve", "rename", "rescan", "delete"))
+    _REVIEW_VERBS = frozenset((
+        "session_changes", "hunks", "apply", "discard", "apply_hunk",
+        "discard_hunk", "decorate", "change_mode", "patch_text",
+        "invalidate_consolidation", "invalidate_struct"))
+
     def __init__(self, sup: Supervisor, sock_path: str):
         self.sup = sup; self.sock_path = sock_path
         self._sock = None
+        self._subscribers: dict = {}      # conn -> outbox asyncio.Queue
+        self._struct_jobs: dict = {}      # job_id -> (job, [spawned Popen,...])
+        self._next_job = 1
+
+    # ── engine→client event stream ───────────────────────────────────────────
+    def broadcast(self, ev: dict) -> None:
+        """Push one event (session lifecycle / overlay FUSE event) to every
+        subscribed client as a JSON line. Loop-confined (called via sup.on_event
+        and the engine's overlay drain). Each subscriber has an outbox queue and
+        a pump task (partial-send-safe); a stalled one (full outbox) is dropped."""
+        if not self._subscribers: return
+        try: data = (json.dumps(wire_encode(ev)) + "\n").encode()
+        except (TypeError, ValueError): return
+        for conn, q in list(self._subscribers.items()):
+            if q.qsize() > 10000:
+                self._drop_subscriber(conn); continue
+            q.put_nowait(data)
+
+    def _drop_subscriber(self, conn) -> None:
+        q = self._subscribers.pop(conn, None)
+        if q is not None: q.put_nowait(None)        # wake the pump to exit
+
+    async def _pump_events(self, conn) -> None:
+        q = self._subscribers.get(conn)
+        try:
+            while True:
+                data = await q.get()
+                if data is None: break
+                await self._loop.sock_sendall(conn, data)
+        except (OSError, asyncio.CancelledError):
+            pass
+        finally:
+            self._subscribers.pop(conn, None)
+            try: conn.close()
+            except OSError: pass
 
     async def start(self) -> None:
         try: os.unlink(self.sock_path)
@@ -8505,6 +8715,7 @@ class ChannelServer:
         # and are handled normally — peer_pid stays 0 for those.
         _peer_pid = 0
         _pidfd = -1          # kept open until after _dispatch_control (register dups it)
+        _adopted = False     # True once a subscribe pump owns this conn
         buf = b""
         try:
             _data, _anc, _flags, _addr = await self._loop.run_in_executor(
@@ -8544,6 +8755,19 @@ class ChannelServer:
                     if line.strip():
                         reply = await self._dispatch_control(line, _peer_pid,
                                                              peer_pidfd=_pidfd)
+                        # A subscribe converts this connection into a one-way
+                        # event feed owned by its pump task (which closes it —
+                        # _adopted keeps _handle's finally from closing it too).
+                        # Register BEFORE the ack goes out (the ack is simply the
+                        # outbox's first item) so an event broadcast right after
+                        # the client sees the ack can never be lost to the race.
+                        if reply is not None and reply.get("_subscribe"):
+                            _adopted = True
+                            q = asyncio.Queue()
+                            q.put_nowait((json.dumps(reply) + "\n").encode())
+                            self._subscribers[conn] = q
+                            asyncio.ensure_future(self._pump_events(conn))
+                            return
                         if reply is not None:
                             try:
                                 await self._loop.run_in_executor(
@@ -8581,8 +8805,9 @@ class ChannelServer:
             if _pidfd >= 0:
                 try: os.close(_pidfd)
                 except OSError: pass
-            try: conn.close()
-            except OSError: pass
+            if not _adopted:
+                try: conn.close()
+                except OSError: pass
 
     @staticmethod
     def _is_register(line: bytes) -> bool:
@@ -8747,10 +8972,114 @@ class ChannelServer:
                 return dict(ok=True, count=n, sid=sid, errors=res.get("errors", []))
             except Exception as e:
                 return dict(ok=False, error=str(e))
+        elif t == "subscribe":
+            # Remote-UI event stream: ack, then _handle converts THIS connection
+            # into a one-way event feed (see the _subscribe marker handling).
+            return dict(ok=True, _subscribe=True)
+        elif t == "ui":
+            return await self._dispatch_ui(msg)
         else:
             # Unrecognized message type: reply with an explicit error rather than
             # silently dropping the connection so protocol mismatches are visible.
             return dict(ok=False, error=f"unknown control type {t!r}")
+
+    async def _dispatch_ui(self, msg: dict) -> dict:
+        """Remote-UI verb call: {"type":"ui","verb":V,"args":[...],"kw":{...}}.
+        Plain verbs map to whitelisted Supervisor / ChangeReview methods (sync,
+        loop-confined). The slow/stateful ones (consolidate, structural diff)
+        get explicit handling: executor for the slow halves, a server-side job
+        registry for struct jobs (their payloads carry raw file bytes — they
+        never cross the wire; the client holds an opaque job id)."""
+        verb = msg.get("verb") or ""
+        args = wire_decode(msg.get("args") or [])
+        kw = {k: wire_decode(v) for k, v in (msg.get("kw") or {}).items()}
+        try:
+            if verb == "review_state":
+                rv = self.sup.review
+                return dict(ok=True, r=wire_encode(dict(
+                    consolidating=sorted(rv._consolidating),
+                    consolidated=sorted(rv._consolidated),
+                    selected=self.sup.selected_sid)))
+            if verb == "review_live":
+                return dict(ok=True, r=self.sup.review._live(*args))
+            if verb == "consolidate_start":
+                # Remote counterpart of the UI's _maybe_start_consolidate: prep on
+                # the loop, fold in the engine's executor, progress/done/failed as
+                # broadcast events. Returns True if a fold is running (caller shows
+                # a placeholder, gated by review_state), False if nothing to do.
+                sid = args[0]
+                rv = self.sup.review
+                if sid in rv._consolidating:
+                    return dict(ok=True, r=True)
+                prep = rv._consolidate_prep(sid)
+                if prep is None:
+                    return dict(ok=True, r=False)
+                rv._consolidating.add(sid)
+                loop = self._loop
+
+                def prog(done, total):
+                    loop.call_soon_threadsafe(self.broadcast, dict(
+                        type="consolidate_progress", sid=sid,
+                        done=done, total=total))
+
+                async def run_fold():
+                    try:
+                        await loop.run_in_executor(
+                            None, lambda: consolidate(prep["shm_dir"], sid,
+                                                      progress=prog))
+                    except Exception as e:
+                        rv._consolidating.discard(sid)
+                        rv._consolidated.discard(sid)
+                        self.broadcast(dict(type="consolidate_failed", sid=sid,
+                                            error=str(e)))
+                        return
+                    rv._consolidate_finish(sid)
+                    rv._consolidating.discard(sid)
+                    self.broadcast(dict(type="consolidate_done", sid=sid))
+
+                asyncio.ensure_future(run_fold())
+                return dict(ok=True, r=True)
+            if verb == "consolidate":
+                # The slow deflate fold, engine-side, off the loop (same path the
+                # CLI patch/apply use); the client blocks on the reply.
+                await self.sup.consolidate_in_executor(self._loop, args[0])
+                return dict(ok=True, r=None)
+            if verb == "struct_quick":
+                lines, job = self.sup.review.structural_diff_quick(*args)
+                jid = None
+                if job is not None:
+                    jid = self._next_job; self._next_job += 1
+                    self._struct_jobs[jid] = (job, [])
+                return dict(ok=True, r=wire_encode(dict(lines=lines, job=jid)))
+            if verb == "struct_finish":
+                ent = self._struct_jobs.get(args[0])
+                if ent is None:
+                    return dict(ok=False, error="unknown struct job")
+                job, procs = ent
+                res = await self._loop.run_in_executor(
+                    None, lambda: self.sup.review.structural_diff_finish(
+                        job, on_spawn=procs.append))
+                self._struct_jobs.pop(args[0], None)
+                return dict(ok=True, r=wire_encode(res))
+            if verb == "struct_cancel":
+                ent = self._struct_jobs.pop(args[0], None)
+                if ent is not None:
+                    for p in ent[1]:
+                        try: p.kill()
+                        except Exception: pass
+                return dict(ok=True, r=None)
+            if verb.startswith("review."):
+                v = verb[len("review."):]
+                if v not in self._REVIEW_VERBS:
+                    return dict(ok=False, error=f"unknown verb {verb!r}")
+                fn = getattr(self.sup.review, v)
+            elif verb in self._SUP_VERBS:
+                fn = getattr(self.sup, verb)
+            else:
+                return dict(ok=False, error=f"unknown verb {verb!r}")
+            return dict(ok=True, r=wire_encode(fn(*args, **kw)))
+        except Exception as e:
+            return dict(ok=False, error=f"{type(e).__name__}: {e}")
 
     async def _resolve_and_consolidate(self, msg: dict) -> "tuple[str | None, dict | None]":
         """Resolve the target sid from msg (explicit 'sid' field or the UI selection),
@@ -8773,6 +9102,8 @@ class ChannelServer:
     async def stop(self) -> None:
         if getattr(self, "_task", None):
             self._task.cancel()
+        for conn in list(self._subscribers):
+            self._drop_subscriber(conn)
         try:
             self.sup.stop_all_echoes()
         except Exception:
@@ -8789,6 +9120,125 @@ class ChannelServer:
 # ════════════════════════════════════════════════════════════════════════════
 #  Runner — `slopbox CMD [ARGS...]`
 # ════════════════════════════════════════════════════════════════════════════
+
+# ── remote client proxies — the UI's view of an engine across the socket ────
+class RemoteError(RuntimeError):
+    """A remote verb call failed: engine unreachable or the verb errored."""
+
+
+class _RemoteSet:
+    """Read-only set view over an engine-side set (review._consolidating /
+    _consolidated), re-fetched per access. The UI only reads these remotely —
+    mutations happen engine-side (consolidate_start / its completion)."""
+    __slots__ = ("_fetch",)
+    def __init__(self, fetch): self._fetch = fetch
+    def __contains__(self, x): return x in self._fetch()
+    def __iter__(self): return iter(self._fetch())
+    def __bool__(self): return bool(self._fetch())
+    def __len__(self): return len(self._fetch())
+    def discard(self, x): pass        # engine owns membership; remote no-op
+
+
+class RemoteReview:
+    """Client facade for ChangeReview: whitelisted verbs become RPCs; the
+    consolidation flow maps to consolidate_start + review_state + events; the
+    structural diff's quick/finish split maps to the server-side job registry
+    (job payloads carry raw file bytes and never cross the wire)."""
+    def __init__(self, rsup: "RemoteSupervisor"):
+        self._s = rsup
+
+    def __getattr__(self, name):
+        if name in ChannelServer._REVIEW_VERBS:
+            return lambda *a, **k: self._s._rpc(f"review.{name}", *a, **k)
+        raise AttributeError(name)
+
+    # decorate/change_mode accept a local ChangeSource via source= in embedded
+    # mode; remotely the engine resolves its own source — drop the kwarg.
+    def decorate(self, sid, rel, source=None) -> dict:
+        return self._s._rpc("review.decorate", sid, rel)
+
+    def change_mode(self, sid, rel, source=None):
+        return self._s._rpc("review.change_mode", sid, rel)
+
+    def _live(self, sid) -> bool:
+        return self._s._rpc("review_live", sid)
+
+    def _state(self) -> dict:
+        return self._s._rpc("review_state")
+
+    @property
+    def _consolidating(self):
+        return _RemoteSet(lambda: set(self._state()["consolidating"]))
+
+    @property
+    def _consolidated(self):
+        return _RemoteSet(lambda: set(self._state()["consolidated"]))
+
+    def consolidate_start(self, sid) -> bool:
+        return self._s._rpc("consolidate_start", sid)
+
+    def structural_diff_quick(self, sid, rel) -> tuple:
+        r = self._s._rpc("struct_quick", sid, rel)
+        lines = [tuple(x) for x in r["lines"]]
+        return (lines, r["job"])          # job: opaque id or None
+
+    def structural_diff_finish(self, job, on_spawn=None) -> dict:
+        # on_spawn is the embedded UI's cancel hook; remote cancel goes through
+        # struct_cancel(job id) instead.
+        return self._s._rpc("struct_finish", job)
+
+    def struct_cancel(self, job) -> None:
+        try: self._s._rpc("struct_cancel", job)
+        except RemoteError: pass
+
+
+class RemoteSupervisor:
+    """Client-side Supervisor facade: every whitelisted verb is an RPC to the
+    running engine over the control socket. Each call opens its own short-lived
+    connection (sync_request), so it is thread-safe — UI worker threads can call
+    it exactly like the embedded Supervisor."""
+    def __init__(self, sock: "str | None" = None):
+        self.sock = sock or sock_path()
+        self.review = RemoteReview(self)
+        self.on_event = lambda ev: None   # fed by the subscription reader
+        self.mount = None                 # no local mount in remote mode
+        self._selected = None
+
+    def _rpc(self, verb, *args, **kw):
+        rep = sync_request(self.sock, type="ui", verb=verb,
+                           args=[wire_encode(a) for a in args],
+                           kw={k: wire_encode(v) for k, v in kw.items()})
+        if not rep:
+            raise RemoteError(f"engine unreachable ({verb})")
+        if not rep.get("ok"):
+            raise RemoteError(rep.get("error") or verb)
+        return wire_decode(rep.get("r"))
+
+    def __getattr__(self, name):
+        if name in ChannelServer._SUP_VERBS:
+            return lambda *a, **k: self._rpc(name, *a, **k)
+        raise AttributeError(name)
+
+    @property
+    def selected_sid(self):
+        return self._selected
+
+    @selected_sid.setter
+    def selected_sid(self, sid):
+        self._selected = sid
+        if sid is not None:
+            try: self._rpc("select", sid)
+            except RemoteError: pass
+
+    @property
+    def sessions(self) -> dict:
+        """Embedded-shape compatibility: {sid: dict} (values are plain dicts,
+        which is what the UI renders from anyway)."""
+        return {d["session_id"]: d for d in self._rpc("session_dicts")}
+
+    async def sweep_orphans(self, loop=None) -> None:
+        return None                       # the engine swept at ITS startup
+
 
 def find_self() -> str: return os.path.abspath(sys.argv[0])
 
@@ -9744,7 +10194,7 @@ def _make_ui_app():
             Binding("q","quit","quit")]
         sessions=reactive({}, layout=True)
 
-        def __init__(self):
+        def __init__(self, remote: bool = False, engine_proc=None):
             super().__init__()
             # Snappy, not dial-up: disable smooth-scroll/other animation so
             # PgUp/PgDn jump a page instantly instead of re-compositing the whole
@@ -9758,12 +10208,24 @@ def _make_ui_app():
             self._view_filters={v:{"clauses":[], "on":False, "generated":False}
                            for v in self.FILTERABLE}
             self.frules_store=FileRules(file_rules_file())
-            # The UI owns the single pyfuse3 overlay mount (started in on_mount on a
-            # dedicated trio thread). The Supervisor drives it as boxes come and go.
+            # remote=False: this process IS the engine — it owns the single pyfuse3
+            # overlay mount (started in on_mount on a dedicated trio thread) and the
+            # control server; the Supervisor drives the mount as boxes come and go.
+            # remote=True (`slopbox attach`): the engine runs in ANOTHER process;
+            # self.sup is a RemoteSupervisor (RPC facade over the control socket),
+            # there is no local mount/server, and events arrive over a subscribe
+            # connection instead of direct callbacks. engine_proc: the engine
+            # subprocess if `attach` auto-spawned one (terminated on UI exit).
             # NB: not `self.mount` — that would shadow textual App.mount().
-            self.overlay_mount=OverlayMount(mnt_point(), lower="/")
-            self.sup=Supervisor(mount=self.overlay_mount)
-            self.sup.on_event=self._on_evt
+            self.remote=remote
+            self._engine_proc=engine_proc
+            if remote:
+                self.overlay_mount=None
+                self.sup=RemoteSupervisor()
+            else:
+                self.overlay_mount=OverlayMount(mnt_point(), lower="/")
+                self.sup=Supervisor(mount=self.overlay_mount)
+                self.sup.on_event=self._on_evt
             self.server=None
             self._sel_sid=None
             self._ch_entries=[]
@@ -9852,33 +10314,70 @@ def _make_ui_app():
             self.query_one("#out-tab",DataTable).add_columns(
                 "Time","Stream","Process","Bytes")
             loop=asyncio.get_running_loop()
-            # Start the single pyfuse3 overlay mount on its dedicated trio thread.
-            # Until it is up, no slopbox can run (it has nowhere to bind its root).
-            mount_ok=self.overlay_mount.start()
-            # A prior crash may have left orphaned live/<sid> backings: fold them
-            # off the loop so startup stays responsive behind a big orphan.
-            try: await self.sup.sweep_orphans(loop)
-            except Exception: pass
-            self.server=ChannelServer(self.sup, sock_path())
-            await self.server.start()
-            msg = f"listening · {sock_path()}"
-            if mount_ok:
-                msg += f"  ·  overlay {mnt_point()}"
+            if self.remote:
+                # Attached client: the engine (mount + server + sweep) lives in
+                # another process; subscribe to its event stream instead.
+                self._sub_task=asyncio.ensure_future(self._subscribe_events())
+                msg=f"attached · {sock_path()}"
             else:
-                err=getattr(self.overlay_mount,"_start_error",None)
-                msg += f"  [red](overlay mount FAILED: {err} — slopboxes cannot run)[/]"
+                # Start the single pyfuse3 overlay mount on its dedicated trio thread.
+                # Until it is up, no slopbox can run (it has nowhere to bind its root).
+                mount_ok=self.overlay_mount.start()
+                # A prior crash may have left orphaned live/<sid> backings: fold them
+                # off the loop so startup stays responsive behind a big orphan.
+                try: await self.sup.sweep_orphans(loop)
+                except Exception: pass
+                self.server=ChannelServer(self.sup, sock_path())
+                await self.server.start()
+                msg = f"listening · {sock_path()}"
+                if mount_ok:
+                    msg += f"  ·  overlay {mnt_point()}"
+                else:
+                    err=getattr(self.overlay_mount,"_start_error",None)
+                    msg += f"  [red](overlay mount FAILED: {err} — slopboxes cannot run)[/]"
             self._status(msg)
             self._refresh_file_rules()
-            for s in self.sup.sessions.values():
-                d=s.to_dict(); d["path"]=self.sup.display_path(s.session_id)
-                self.sessions={**self.sessions, s.session_id:d}
+            for d in self.sup.session_dicts():
+                self.sessions={**self.sessions, d["session_id"]:d}
             self._rebuild_sessions()
             self._set_view("boxes")           # shows only the slopbox list + detail
             self.set_interval(3, self._tick)
             # Live feedback: drain the overlay's thread-safe event queue often so the
             # Changes view updates as the box writes (event-driven, not by polling).
-            # The serving thread enqueues; we apply on the UI thread.
-            self.set_interval(0.3, self._drain_overlay_events)
+            # The serving thread enqueues; we apply on the UI thread. (Remote: the
+            # subscribe stream delivers these instead.)
+            if not self.remote:
+                self.set_interval(0.3, self._drain_overlay_events)
+
+        async def _subscribe_events(self):
+            """Attached-mode event pump: one persistent subscribe connection; every
+            JSON line is routed the same way the embedded UI's callbacks would be —
+            overlay FUSE events into the live-changes fold, consolidation progress
+            into the cons bar, everything else through _apply_evt."""
+            try:
+                reader,writer=await asyncio.open_unix_connection(sock_path())
+                writer.write(b'{"type":"subscribe"}\n'); await writer.drain()
+                await reader.readline()                  # the ack
+                while True:
+                    line=await reader.readline()
+                    if not line: break
+                    try: ev=wire_decode(json.loads(line))
+                    except (ValueError, TypeError): continue
+                    t=ev.get("type")
+                    if t=="overlay":
+                        self._apply_overlay_ev(ev.get("ev") or {})
+                    elif t=="consolidate_progress":
+                        self._cons_progress_update(ev["sid"],ev["done"],ev["total"])
+                    elif t=="consolidate_done":
+                        self._consolidate_done(ev["sid"])
+                    elif t=="consolidate_failed":
+                        self._consolidate_failed(ev["sid"],ev.get("error",""))
+                    else:
+                        self._apply_evt(ev)
+            except (OSError,asyncio.CancelledError):
+                pass
+            except Exception as e:
+                self._status(Text(f"event stream lost: {e}",style="red"))
 
         # ── off-loop consolidation (folding a finished box's overlay → sqlar) ──
         def _is_consolidating(self, sid):
@@ -9893,6 +10392,13 @@ def _make_ui_app():
             against a second worker for the same sid."""
             review=self.sup.review
             if sid in review._consolidating: return True
+            if self.remote:
+                # Engine-side fold: consolidate_start preps + runs it in the
+                # ENGINE's executor; progress/done/failed arrive as events.
+                if not review.consolidate_start(sid): return False
+                self._cons_progress[sid]=(0,0)
+                self._render_cons_bar()
+                return True
             args=review._consolidate_prep(sid)        # loop-thread: marks + drops Index
             if args is None: return False             # nothing to fold
             review._consolidating.add(sid)
@@ -9927,9 +10433,11 @@ def _make_ui_app():
         def _consolidate_done(self, sid):
             # LOOP thread (marshaled): finish registry bookkeeping, clear the in-progress
             # flag, and refresh whatever pane is showing this box so the now-consolidated
-            # change set renders in place of the placeholder.
-            self.sup.review._consolidate_finish(sid)
-            self.sup.review._consolidating.discard(sid)
+            # change set renders in place of the placeholder. (Remote: the engine
+            # already ran finish/discard — only the UI-side caches need clearing.)
+            if not self.remote:
+                self.sup.review._consolidate_finish(sid)
+                self.sup.review._consolidating.discard(sid)
             self._cons_progress.pop(sid, None)
             self._fin_changes.pop(sid, None)   # force a fresh read of the folded sqlar
             self._ch_decor.pop(sid, None)
@@ -9942,9 +10450,10 @@ def _make_ui_app():
         def _consolidate_failed(self, sid, err):
             # LOOP thread (marshaled): don't wedge the box forever — drop the flags and
             # surface the error. (prep already added it to _consolidated; clearing that
-            # too lets a later view retry the fold.)
-            self.sup.review._consolidating.discard(sid)
-            self.sup.review._consolidated.discard(sid)
+            # too lets a later view retry the fold. Remote: the engine cleared both.)
+            if not self.remote:
+                self.sup.review._consolidating.discard(sid)
+                self.sup.review._consolidated.discard(sid)
             self._cons_progress.pop(sid, None)
             self._render_cons_bar()
             self._status(Text(f"consolidate {sid[:8]} failed: {err}", style="red"))
@@ -9997,7 +10506,7 @@ def _make_ui_app():
             shown once the box finishes."""
             out=[]
             try:
-                for rel,size in self.overlay_mount.open_files(sid):
+                for rel,size in self.sup.open_files(sid):
                     rel=rel.lstrip("/")
                     host=Path("/")/rel
                     kind="modified" if (host.exists() or host.is_symlink()) else "created"
@@ -10068,6 +10577,17 @@ def _make_ui_app():
             self._ch_decor.pop(sid, None)
             self.sup.review.invalidate_struct(sid)
 
+        def _apply_overlay_ev(self, ev):
+            """Fold ONE overlay FUSE event into the live map and refresh the pane —
+            the attached-mode (subscribe stream) counterpart of one drain step."""
+            if ev.get("type")!="overlay_changed" or not ev.get("sid"): return
+            sid=ev["sid"]
+            self._fold_event(sid, ev.get("rel"), ev.get("op"))
+            if self.view=="changes" and self._sel_sid==sid:
+                self._load_changes(sid)
+            if self.view=="boxes" and self._sel_sid==sid:
+                self._update_box_detail()
+
         def _drain_overlay_events(self):
             # Live proc pruning runs on THIS reliable 0.3s cadence (not the 3s
             # _tick, which can be starved): re-poll the active set every tick the
@@ -10099,6 +10619,16 @@ def _make_ui_app():
         async def on_unmount(self):
             try: self._cancel_struct()    # kill any in-flight structural parser
             except Exception: pass
+            if self.remote:
+                t=getattr(self,"_sub_task",None)
+                if t is not None: t.cancel()
+                # If `attach` auto-spawned the engine, this UI owns its lifetime:
+                # terminate it (boxes torn down, overlay unmounted — the embedded
+                # UI's quit semantics). An adopted pre-existing engine stays up.
+                if self._engine_proc is not None:
+                    try: self._engine_proc.terminate()
+                    except Exception: pass
+                return
             if self.server: await self.server.stop()
             # Tear down the single overlay mount; lazy-unmount fallback keeps the
             # mount table clean even if a handler is wedged.
@@ -10769,7 +11299,8 @@ def _make_ui_app():
                 if e["kind"]=="deleted":
                     cache[rel]=dict(is_text=False, stale=False, kind="deleted")
                 else:
-                    if src is None: src=self.sup.review._source(sid)
+                    if src is None and not self.remote:
+                        src=self.sup.review._source(sid)   # remote: engine resolves
                     try: cache[rel]=self.sup.review.decorate(sid, rel, source=src)
                     except Exception: cache[rel]=dict(is_text=False, stale=False, kind=e["kind"])
                 cells=self._ch_cells(e, depth)
@@ -10838,6 +11369,10 @@ def _make_ui_app():
                 except Exception:
                     try: proc.kill()
                     except Exception: pass
+            if self.remote and self._struct_job is not None:
+                # Engine-side parsers: kill them via their job id.
+                try: self.sup.review.struct_cancel(self._struct_job)
+                except Exception: pass
             self._struct_job=None
 
         def _stop_struct_spin(self):
@@ -11347,12 +11882,14 @@ def _make_ui_app():
 
         @on(DataTable.RowHighlighted, "#s-tab")
         def _sc(self, ev):
+            if not self.is_running: return   # late event during app teardown
             if ev.row_key and ev.row_key.value:
                 sid=ev.row_key.value
                 self._sel_sid=sid
                 if sid!=self._last_loaded_sid:
                     self._last_loaded_sid=sid
-                    self._load_changes(sid, force=True)
+                    try: self._load_changes(sid, force=True)
+                    except Exception: return  # widgets mid-unmount: stale event
                 if self.view=="boxes": self._update_box_detail()
 
         @on(DataTable.RowSelected, "#s-tab")
@@ -11520,6 +12057,25 @@ def _make_ui_app():
 #: Note: the command-line [cyan]apply[/]/[cyan]discard[/] remove the box unconditionally. To target an
 #: existing box the NAME must exist; for a [cyan]-- CMD[/] run a new NAME is created instead (§6).
 #: Examples:  [cyan]slopbox WORK patch > work.diff[/]   ·   [cyan]slopbox WORK apply[/]   ·   [cyan]slopbox A1 discard[/]
+#:
+#: [b]Namespaces:[/] [cyan]slopbox --ns NAME …[/] (any subcommand) selects an independent INSTANCE:
+#: its own control socket, mountpoint, boxes, state and file rules — so two slopbox
+#: instances can work on the same system without touching each other. The namespace is
+#: carried in [cyan]$SLOPBOX_NS[/] (the flag just sets it), and a box's processes inherit it —
+#: so a [b]nested[/] runner defaults to its parent's namespace automatically; pass [cyan]--ns[/] to
+#: override. No flag and no env = the default instance.
+#:
+#: [b]Headless:[/] [cyan]slopbox engine[/] runs the engine alone — the overlay mount and the
+#: control socket, no UI. Boxes ([cyan]slopbox -- CMD[/]) and all the subcommands above work
+#: against it identically. The plain UI embeds this same engine, so only one of the two
+#: may run at a time. Stop it with Ctrl-C (SIGTERM also works); boxes are torn down and
+#: the overlay is unmounted on exit.
+#:
+#: [b]Attach:[/] [cyan]slopbox attach[/] runs the SAME interactive UI as a pure client of a running
+#: engine: every pane reads, and every action acts, over the control socket — nothing is
+#: mounted in the UI process. If no engine is up, attach spawns a headless one and owns
+#: it (quitting the UI stops it, like the embedded UI); attaching to an engine that was
+#: already running leaves it running when you quit.
 def run_ui() -> int:
     # A single UI instance only: if one is already running its control socket
     # answers, so refuse a second.
@@ -11531,6 +12087,107 @@ def run_ui() -> int:
         return 4
     ensure_dirs()
     _make_ui_app()().run()
+    return 0
+
+
+def run_engine() -> int:
+    """Headless engine: the overlay mount + Supervisor + control socket, no UI.
+    Runners (`slopbox -- cmd`) and the CLI verbs (patch/apply/discard/rename)
+    work against it exactly as against the UI — the UI embeds this same engine,
+    so only one of the two may run at a time (same single-instance guard).
+    Runs until SIGINT/SIGTERM, then stops the server and unmounts."""
+    if ui_is_running(sock_path()):
+        print("slopbox: an engine/UI is already running"
+              f" (control socket {sock_path()}).\n"
+              "  Only one instance may run; use the existing one.",
+              file=sys.stderr)
+        return 4
+    ensure_dirs()
+    mount = OverlayMount(mnt_point(), lower="/")
+    mount_ok = mount.start()
+    sup = Supervisor(mount=mount)
+
+    async def amain() -> int:
+        loop = asyncio.get_running_loop()
+        # Fold any orphaned live/<sid> backings from a prior crash (same as the
+        # UI's startup sweep), off the loop so a big orphan doesn't block startup.
+        try: await sup.sweep_orphans(loop)
+        except Exception: pass
+        server = ChannelServer(sup, sock_path())
+        await server.start()
+        # Remote UIs subscribe over the socket: forward session lifecycle events
+        # to them (the embedded UI gets these via its own on_event hook).
+        sup.on_event = server.broadcast
+        msg = f"slopbox engine: listening · {sock_path()}"
+        if mount_ok:
+            msg += f"  ·  overlay {mnt_point()}"
+        else:
+            err = getattr(mount, "_start_error", None)
+            msg += f"  (overlay mount FAILED: {err} — slopboxes cannot run)"
+        print(msg, flush=True)
+        stop = asyncio.Event()
+        for s in (signal.SIGINT, signal.SIGTERM):
+            try: loop.add_signal_handler(s, stop.set)
+            except (NotImplementedError, OSError): pass
+        # The UI drains the overlay's FUSE event queue every tick (it feeds the
+        # live changes pane). Headless, forward each event to any subscribed
+        # remote UI (wrapped as type=overlay) — and always drain, subscribers
+        # or not, so the queue can't grow without bound under a chatty box.
+        async def drain_events():
+            while True:
+                try:
+                    while True:
+                        ev = mount.event_q.get_nowait()
+                        if server._subscribers:
+                            server.broadcast(dict(type="overlay", ev=ev))
+                except queue.Empty: pass
+                await asyncio.sleep(0.5)
+        drainer = asyncio.ensure_future(drain_events())
+        await stop.wait()
+        drainer.cancel()
+        await server.stop()
+        return 0
+
+    try:
+        return asyncio.run(amain())
+    finally:
+        # Same teardown as the UI's on_unmount: lazy-unmount fallback inside
+        # stop() keeps the mount table clean even if a handler is wedged.
+        try: mount.stop()
+        except Exception: pass
+
+
+def run_attach() -> int:
+    """Remote UI (`slopbox attach`): the full Textual UI as a pure CLIENT of a
+    running engine — every read/action goes over the control socket, no mount or
+    server in this process. If no engine is running, auto-spawn a headless one
+    first; an auto-spawned engine is OWNED by this UI (terminated when it exits,
+    matching the embedded UI's quit semantics), while a pre-existing engine is
+    merely attached to and left running."""
+    ensure_dirs()
+    proc = None
+    if not ui_is_running(sock_path()):
+        log = data_home() / "engine.log"
+        lf = open(log, "ab")
+        try:
+            proc = subprocess.Popen([sys.executable, find_self(), "engine"],
+                                    stdout=lf, stderr=subprocess.STDOUT,
+                                    start_new_session=True)
+        finally:
+            lf.close()
+        deadline = time.time() + 60
+        while time.time() < deadline and not ui_is_running(sock_path()):
+            if proc.poll() is not None:
+                print(f"slopbox: engine failed to start (log: {log})",
+                      file=sys.stderr)
+                return 4
+            time.sleep(0.2)
+        if not ui_is_running(sock_path()):
+            try: proc.terminate()
+            except Exception: pass
+            print(f"slopbox: engine never came up (log: {log})", file=sys.stderr)
+            return 4
+    _make_ui_app()(remote=True, engine_proc=proc).run()
     return 0
 
 
@@ -11597,7 +12254,13 @@ def cmd_rename(target, new_name) -> int:
     return 0
 
 
-_USAGE = ("slopbox                         start the UI\n"
+_USAGE = ("slopbox [--ns NAME] ...         select instance namespace (see below)\n"
+          "       slopbox                         start the UI\n"
+          "       slopbox attach                  UI as a CLIENT of a running engine\n"
+          "                                       (auto-spawns one if none is up)\n"
+          "       slopbox engine                  run headless (no UI): mount + control\n"
+          "                                       socket only; boxes and patch/apply/\n"
+          "                                       discard/rename work against it\n"
           "       slopbox patch                   print selected box's patch (stdout)\n"
           "       slopbox apply                   apply selected box's changes, remove it\n"
           "       slopbox discard                 discard selected box's changes, remove it\n"
@@ -11618,6 +12281,23 @@ _USAGE = ("slopbox                         start the UI\n"
 def main() -> int:
     argv = sys.argv[1:]
 
+    # --ns NAME: select the instance namespace FIRST (before any path is built).
+    # Exported via the environment so every child (runner --inner, the box's
+    # processes, a nested runner inside the box) inherits it — a nested runner
+    # therefore defaults to its parent's namespace; --ns overrides.
+    if argv and (argv[0] == "--ns" or argv[0].startswith("--ns=")):
+        if argv[0] == "--ns":
+            if len(argv) < 2:
+                print("slopbox: --ns needs a name", file=sys.stderr); return 2
+            ns, argv = argv[1], argv[2:]
+        else:
+            ns, argv = argv[0][len("--ns="):], argv[1:]
+        if not valid_namespace(ns):
+            print("slopbox: invalid namespace (letters/digits/_/-, "
+                  "starts alphanumeric, max 33 chars)", file=sys.stderr)
+            return 2
+        os.environ["SLOPBOX_NS"] = ns
+
     # inner mode: slopbox --inner --conn-fd N [--capture] -- CMD...
     # --conn-fd N is the inherited single muxed connection to the UI (post-handshake).
     if argv and argv[0] == "--inner":
@@ -11635,6 +12315,14 @@ def main() -> int:
 
     if argv[0] in ("-h", "--help"):
         print("usage: " + _USAGE); return 0
+
+    # Headless mode: the engine (mount + control socket) without the UI.
+    if argv[0] == "engine":
+        return run_engine()
+
+    # Remote UI: attach to a running engine (auto-spawning one if needed).
+    if argv[0] == "attach":
+        return run_attach()
 
     # An optional leading box NAME (dotted or single segment, all-CAPS) selects that
     # box; the rest of the line then applies to it. `slopbox BOB patch`,

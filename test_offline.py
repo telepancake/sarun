@@ -670,7 +670,7 @@ def test_synthetic_kids_dir_routing():
               "kids-dir: recursion — KIDS_DIR/<child>/KIDS_DIR/<grandchild> resolves")
 
         # Hidden: KIDS_DIR never appears in the box root's directory listing.
-        check(m.KIDS_DIR not in [n for n, _k, _a in fs._scan_dir("1", "")],
+        check(m.KIDS_DIR not in [n for n, _k, _a, _ap in fs._scan_dir("1", "")],
               "kids-dir: KIDS_DIR is hidden from box-root readdir")
 
         # Reserved-namespace write guard.
@@ -689,6 +689,100 @@ def test_synthetic_kids_dir_routing():
     asyncio.run(run())
 
 
+def test_namespace_paths():
+    """--ns / $SLOPBOX_NS must namespace EVERY instance root — socket, mountpoint,
+    state (boxes), data, config (file rules) — so two instances never collide; ""
+    is the default instance with the historical paths."""
+    tmp = Path(tempfile.mkdtemp(prefix="ofl-"))
+    _redirect_state(tmp)
+    old = os.environ.pop("SLOPBOX_NS", None)
+    try:
+        roots = lambda: {str(p) for p in (m.state_home(), m.data_home(),
+                                          m.config_home(), m.runtime_home(),
+                                          m.mnt_point(), Path(m.sock_path()),
+                                          m.file_rules_file())}
+        base = roots()
+        check(all("slopbox" in p and "slopbox.A" not in p for p in base),
+              "ns: default instance uses the plain 'slopbox' roots")
+        os.environ["SLOPBOX_NS"] = "A"
+        nsa = roots()
+        check(all("slopbox.A" in p for p in nsa),
+              "ns: SLOPBOX_NS=A namespaces every root (socket/mnt/state/data/config)")
+        check(not (base & nsa), "ns: default and namespaced roots are fully disjoint")
+        os.environ["SLOPBOX_NS"] = "B"
+        check(not (nsa & roots()), "ns: two namespaces are disjoint from each other")
+        for bad in ("", ".", "a/b", "-x", "x" * 40):
+            check(not m.valid_namespace(bad), f"ns: rejects invalid name {bad!r}")
+        check(m.valid_namespace("ci-7_B"), "ns: accepts letters/digits/_/-")
+    finally:
+        if old is None: os.environ.pop("SLOPBOX_NS", None)
+        else: os.environ["SLOPBOX_NS"] = old
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_dirlist_cache_coherence():
+    """The readdir snapshot cache (_scan_dir_cached) must speed up repeat listings
+    WITHOUT ever serving stale data. Cases: (1) repeat listing is a cache hit with
+    identical names; (2) a host-side content change behind the overlay's back is
+    seen immediately (attrs revalidated per entry, FINDINGS coherence case B);
+    (3) a host-side create/delete moves the dir mtime and is seen; (4) an overlay
+    write bumps mirror_gen and is seen; (5) an overlay unlink (whiteout) hides the
+    name. Skipped if pyfuse3 is unavailable."""
+    try:
+        import pyfuse3  # noqa: F401  (fs construction needs it)
+    except Exception:
+        check(True, "dircache: pyfuse3 not installed — SKIP")
+        return
+    tmp = Path(tempfile.mkdtemp(prefix="ofl-"))
+    _redirect_state(tmp)
+    lower = tmp / "lower"; lower.mkdir()
+    (lower / "a.txt").write_bytes(b"aaa")
+    (lower / "b.txt").write_bytes(b"bbb")
+    try:
+        fs = m._build_overlay_ops()(lower=str(lower))
+        sid = "1201"
+        backing = m.live_dir(sid); (backing / "up").mkdir(parents=True)
+        idx = m.Index(backing)
+        fs.add_session(sid, backing / "up", idx)
+
+        names = lambda: {n for n, _a in fs._scan_dir_cached(sid, "")}
+        check(names() == {"a.txt", "b.txt"}, "dircache: initial merged listing")
+        check((sid, "") in fs._dirlist_cache, "dircache: listing was cached")
+
+        # (1) hit: same names; (2) host content change seen through the hit.
+        os.utime(lower / "a.txt", ns=(1, 1))   # change mtime behind the overlay
+        ents = dict(fs._scan_dir_cached(sid, ""))
+        check(set(ents) == {"a.txt", "b.txt"}, "dircache: hit keeps the name set")
+        check(ents["a.txt"].st_mtime_ns == 1,
+              "dircache: host-side attr change is seen on a cache hit (no stale attrs)")
+
+        # (3) host-side create moves the dir mtime: token miss, new name appears.
+        (lower / "c.txt").write_bytes(b"ccc")
+        check(names() == {"a.txt", "b.txt", "c.txt"},
+              "dircache: host-side create invalidates via dir mtime")
+
+        # (4) overlay write bumps the PARENT dir's gen: token miss, name appears.
+        g0 = idx.dirlist_gen("")
+        idx.set_entry("newdir", "dir", stat_mod.S_IFDIR | 0o755, None, "mkdir")
+        check(idx.dirlist_gen("") > g0, "dircache: set_entry bumps the parent's gen")
+        check("newdir" in names(),
+              "dircache: overlay mkdir invalidates via the per-dir gen")
+        # …and a write in an UNRELATED dir must NOT invalidate this listing.
+        g1 = idx.dirlist_gen("")
+        idx.set_entry("newdir/inner.d", "dir", stat_mod.S_IFDIR | 0o755, None,
+                      "mkdir")
+        check(idx.dirlist_gen("") == g1,
+              "dircache: a write under another dir leaves this dir's gen alone")
+
+        # (5) overlay whiteout hides a lower name.
+        idx.set_entry("b.txt", "whiteout", 0, None, "unlink")
+        check("b.txt" not in names(),
+              "dircache: overlay whiteout invalidates and hides the lower name")
+        idx.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     for t in (test_one_db_only_and_blob_lifecycle,
               test_process_and_env_tables_dedup_and_tag,
@@ -704,7 +798,9 @@ if __name__ == "__main__":
               test_consolidate_size_based_placement,
               test_promote_into_parent_unit,
               test_collect_docs,
-              test_synthetic_kids_dir_routing):
+              test_synthetic_kids_dir_routing,
+              test_dirlist_cache_coherence,
+              test_namespace_paths):
         print(f"\n== {t.__name__} ==")
         try:
             t()

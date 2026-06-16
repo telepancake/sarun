@@ -1,0 +1,1547 @@
+// The multi-box copy-on-write overlay (m3a). One FUSE mount; the synthetic
+// root lists one <box_id> subdir per registered box; <mnt>/<box_id>/rel is a
+// merged view of lower (the host) plus that box's captured upper. Reads fall
+// through to the host; the box's writes are captured per DESIGN.md:
+//   D3 — capture is LAZY: a writable open costs nothing and serves from the
+//        lower file; the FIRST actual write triggers copy-up (+ row +
+//        provenance) and from then on writes are ordinary pwrites to the blob.
+//   D4 — every non-empty file's bytes live as a pool blob (data-NULL row);
+//        a box is at rest the moment it stops — no consolidate phase.
+// m3a scope: lookup/getattr/readdir(plus)/readlink/open/create/read/write/
+// truncate/mkdir/unlink/rmdir/symlink. rename is ENOSYS for now (m3b).
+
+use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::ffi::OsStr;
+use std::fs::File;
+use std::fs::OpenOptions;
+use std::os::unix::fs::FileExt;
+use std::os::unix::fs::MetadataExt;
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::RwLock;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
+
+use fuser::Errno;
+use fuser::FileAttr;
+use fuser::FileHandle;
+use fuser::FileType;
+use fuser::Filesystem;
+use fuser::FopenFlags;
+use fuser::Generation;
+use fuser::INodeNo;
+use fuser::LockOwner;
+use fuser::OpenFlags;
+use fuser::ReplyAttr;
+use fuser::ReplyCreate;
+use fuser::ReplyData;
+use fuser::ReplyDirectory;
+use fuser::ReplyDirectoryPlus;
+use fuser::ReplyEmpty;
+use fuser::ReplyEntry;
+use fuser::ReplyOpen;
+use fuser::ReplyWrite;
+use fuser::Request;
+use fuser::TimeOrNow;
+
+use crate::capture::BoxState;
+use crate::capture::Entry;
+use crate::capture::blob_path;
+
+const TTL: Duration = Duration::from_secs(1);
+
+fn ts(secs: i64, nanos: i64) -> SystemTime {
+    if secs >= 0 {
+        UNIX_EPOCH + Duration::new(secs as u64, nanos as u32)
+    } else {
+        UNIX_EPOCH - Duration::new((-secs) as u64, 0)
+    }
+}
+
+fn ns_ts(ns: i64) -> SystemTime {
+    ts(ns.div_euclid(1_000_000_000), ns.rem_euclid(1_000_000_000))
+}
+
+fn kind_of_mode(mode: u32) -> FileType {
+    match mode & libc::S_IFMT {
+        libc::S_IFDIR => FileType::Directory,
+        libc::S_IFLNK => FileType::Symlink,
+        libc::S_IFCHR => FileType::CharDevice,
+        libc::S_IFBLK => FileType::BlockDevice,
+        libc::S_IFIFO => FileType::NamedPipe,
+        libc::S_IFSOCK => FileType::Socket,
+        _ => FileType::RegularFile,
+    }
+}
+
+/// (box_id, rel) — "" rel is the box root; box_id 0 is the synthetic mount root.
+type Key = (i64, String);
+
+/// Clone-able handle: fuser owns one clone as the mounted filesystem, the
+/// control plane holds another to add/remove boxes. All state is behind the
+/// shared Inner.
+#[derive(Clone)]
+pub struct Overlay {
+    inner: Arc<Inner>,
+}
+
+struct Inner {
+    lower: PathBuf,
+    boxes: RwLock<BTreeMap<i64, Arc<BoxState>>>,
+    ino_to_key: RwLock<HashMap<u64, Key>>,
+    key_to_ino: RwLock<HashMap<Key, u64>>,
+    next_ino: AtomicU64,
+    fhs: RwLock<HashMap<u64, Mutex<Fh>>>,
+    next_fh: AtomicU64,
+    rules: RwLock<crate::rules::Rules>,  // passthrough decisions (reload verb)
+    // ── live echo mux (the captured-output readback channel) ──
+    // Per-box framed writer over the box's ONE muxed connection: the sink-write
+    // handler frames captured bytes as ECHO and sends them back to --inner.
+    echo: RwLock<HashMap<i64, std::sync::Arc<Mutex<std::os::unix::net::UnixStream>>>>,
+    // Per-box open-sink count: when it returns to 0 (both sinks released at child
+    // exit) the engine sends ECHO_DONE so --inner stops without truncation.
+    sink_open: Mutex<HashMap<i64, u32>>,
+    // Globally muted HOST tgids → the box id that muted tgid OWNS. A muted
+    // tgid's write to an ANCESTOR box's sink (sink box_id != its own box) is
+    // echo readback travelling up — echoed onward but NOT recorded (it was
+    // already captured once at its origin box). But a muted tgid's write to ITS
+    // OWN box's sink is FIRST-PARTY output (e.g. a brush in-process builtin like
+    // echo/printf, which writes fd 1 from the muted --inner pid) and MUST be
+    // recorded. A MUTE frame adds --inner's own host tgid mapped to its box id;
+    // UNMUTE / connection-close removes it.
+    muted: RwLock<std::collections::HashMap<i32, i64>>,
+    // D5 (rule-gated): true iff the kernel negotiated FUSE_PASSTHROUGH at init.
+    // ONLY read-only opens of `readonly`-RULED paths register backing fds; never
+    // a blind per-open guess (see DESIGN.md D5). daemon_reads counts read() ops
+    // the daemon served (test observability: stays ~0 for passthrough'd reads).
+    passthrough_ok: std::sync::atomic::AtomicBool,
+    daemon_reads: AtomicU64,
+}
+
+struct Fh {
+    inner: FhInner,
+}
+
+struct FhInner {
+    box_id: i64,
+    rel: String,
+    file: Option<File>,
+    upper: bool,
+    dirty: bool,
+    last_pid: u32,
+    sink: Option<i32>, // Some(stream) → writes go to the outputs table, not a blob
+    passthrough: bool, // writes go straight to the real host file (uncaptured)
+    // Kernel passthrough backing registration; kept alive as long as the fd
+    // (its Drop closes the registration). Only set for readonly-ruled reads.
+    _backing: Option<fuser::BackingId>,
+}
+
+// Reserved box-root paths: the box's stdout/stderr write THROUGH these, and the
+// overlay routes the bytes to the outputs table (per-write pid attribution).
+// They resolve by exact lookup but are never listed in readdir.
+const SINK_STDOUT: &str = ".slopbox-stdout";
+const SINK_STDERR: &str = ".slopbox-stderr";
+// Hidden synthetic dir at each box root listing the box's live children, each
+// routing to that child's real overlay-root inode (the nested-launch bind
+// target). Reachable by explicit lookup; never listed in the box-root readdir.
+const KIDS_DIR: &str = ".slopbox-kids";
+
+fn sink_stream(rel: &str) -> Option<i32> {
+    match rel {
+        SINK_STDOUT => Some(0),
+        SINK_STDERR => Some(1),
+        _ => None,
+    }
+}
+
+/// Thread-group id of `pid` from /proc/<pid>/status (so a thread's write is
+/// matched against the muted set by its process). Falls back to `pid`.
+fn tgid_of(pid: u32) -> u32 {
+    if let Ok(s) = std::fs::read_to_string(format!("/proc/{pid}/status")) {
+        for line in s.lines() {
+            if let Some(rest) = line.strip_prefix("Tgid:") {
+                if let Ok(v) = rest.trim().parse() { return v; }
+            }
+        }
+    }
+    pid
+}
+
+/// exe / cwd / argv of `pid` from /proc — the writer provenance a process-
+/// scoped file rule (exe:/cwd:/arg:) matches against. Empty fields on any read
+/// failure (a never-matching facet, mirroring the Python empty-Subject default).
+fn proc_facets(pid: u32) -> (String, String, Vec<String>) {
+    let rl = |which: &str| std::fs::read_link(format!("/proc/{pid}/{which}"))
+        .ok().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+    let exe = rl("exe");
+    let cwd = rl("cwd");
+    let argv = std::fs::read(format!("/proc/{pid}/cmdline")).ok()
+        .map(|b| b.split(|&c| c == 0).filter(|s| !s.is_empty())
+                  .map(|s| String::from_utf8_lossy(s).into_owned()).collect())
+        .unwrap_or_default();
+    (exe, cwd, argv)
+}
+
+enum Layer {
+    Absent,
+    UpperFile { owner: i64, rowid: i64, mode: u32 },
+    UpperDir { mode: u32, mtime_ns: i64 },
+    UpperSymlink { target: PathBuf },
+    UpperSpecial { mode: u32, rdev: u64 },
+    Lower,
+}
+
+impl Overlay {
+    pub fn new(lower: PathBuf) -> Self {
+        let mut i2k = HashMap::new();
+        i2k.insert(1u64, (0i64, String::new()));
+        let mut k2i = HashMap::new();
+        k2i.insert((0i64, String::new()), 1u64);
+        let ov = Overlay { inner: Arc::new(Inner {
+            lower,
+            boxes: RwLock::new(BTreeMap::new()),
+            ino_to_key: RwLock::new(i2k),
+            key_to_ino: RwLock::new(k2i),
+            next_ino: AtomicU64::new(2),
+            fhs: RwLock::new(HashMap::new()),
+            next_fh: AtomicU64::new(1),
+            rules: RwLock::new(crate::rules::Rules::load()),
+            echo: RwLock::new(HashMap::new()),
+            sink_open: Mutex::new(HashMap::new()),
+            muted: RwLock::new(std::collections::HashMap::new()),
+            passthrough_ok: std::sync::atomic::AtomicBool::new(false),
+            daemon_reads: AtomicU64::new(0),
+        }) };
+        // Test observability: if SARUN_STATS_FILE is set, a thread writes
+        // "passthrough=<0|1> daemon_reads=<n>" to it (survives the SIGTERM
+        // _exit teardown, which skips destroy()). No-op when unset.
+        if let Ok(path) = std::env::var("SARUN_STATS_FILE") {
+            let inner = ov.inner.clone();
+            std::thread::spawn(move || loop {
+                let line = format!("passthrough={} daemon_reads={}\n",
+                    inner.passthrough_ok.load(Ordering::Relaxed) as u8,
+                    inner.daemon_reads.load(Ordering::Relaxed));
+                let _ = std::fs::write(&path, line);
+                std::thread::sleep(Duration::from_millis(100));
+            });
+        }
+        ov
+    }
+
+
+    pub fn reload_rules(&self) {
+        *self.inner.rules.write().unwrap() = crate::rules::Rules::load();
+    }
+
+    // ── echo mux + mute (called from control's box-channel thread) ──
+    /// Attach the box's muxed connection as its echo writer (the sink-write
+    /// handler frames ECHO onto it). Replaces any prior writer for the box.
+    pub fn set_echo(&self, id: i64,
+                    conn: std::sync::Arc<Mutex<std::os::unix::net::UnixStream>>) {
+        self.inner.echo.write().unwrap().insert(id, conn);
+    }
+    /// Drop the box's echo writer (box channel closing / teardown).
+    pub fn clear_echo(&self, id: i64) {
+        self.inner.echo.write().unwrap().remove(&id);
+        self.inner.sink_open.lock().unwrap().remove(&id);
+    }
+    pub fn mute_add(&self, host_pid: i32, box_id: i64) {
+        if host_pid > 0 { self.inner.muted.write().unwrap().insert(host_pid, box_id); }
+    }
+    pub fn mute_remove(&self, host_pid: i32) {
+        self.inner.muted.write().unwrap().remove(&host_pid);
+    }
+    /// If `pid`'s tgid is muted, returns the box id that muted tgid OWNS (so the
+    /// sink-write path can tell a first-party write to its own box's sink from an
+    /// echo readback bubbling up through an ancestor sink). None if not muted.
+    fn muted_owner(&self, pid: u32) -> Option<i64> {
+        let m = self.inner.muted.read().unwrap();
+        if m.is_empty() { return None; }
+        m.get(&(tgid_of(pid) as i32)).copied()
+    }
+    /// Frame `data` as an ECHO for `id`'s stream and send it over the box
+    /// channel (best-effort; a dropped/blocked channel never fails a write).
+    fn echo_send(&self, id: i64, stream: i32, data: &[u8]) {
+        let conn = self.inner.echo.read().unwrap().get(&id).cloned();
+        if let Some(conn) = conn {
+            let frame = crate::frames::encode(crate::frames::FRAME_ECHO,
+                &crate::frames::echo_payload(stream as u8, data));
+            use std::io::Write;
+            let mut c = conn.lock().unwrap();
+            let _ = c.write_all(&frame);
+        }
+    }
+    /// Note a sink fd opened for `id` (capture start: out + err = 2).
+    fn note_sink_open(&self, id: i64) {
+        *self.inner.sink_open.lock().unwrap().entry(id).or_insert(0) += 1;
+    }
+    /// Note a sink fd released for `id`; when the count returns to 0 (child
+    /// exited, both sinks closed) send ECHO_DONE so --inner stops cleanly.
+    fn note_sink_release(&self, id: i64) {
+        let zero = {
+            let mut m = self.inner.sink_open.lock().unwrap();
+            if let Some(c) = m.get_mut(&id) {
+                *c = c.saturating_sub(1);
+                *c == 0
+            } else { false }
+        };
+        if zero {
+            let conn = self.inner.echo.read().unwrap().get(&id).cloned();
+            if let Some(conn) = conn {
+                let frame = crate::frames::encode(crate::frames::FRAME_ECHO_DONE, &[]);
+                use std::io::Write;
+                let _ = conn.lock().unwrap().write_all(&frame);
+            }
+        }
+    }
+
+    /// HOST-DIRECT WRITE routing decision: the FULL-grammar passthrough rule,
+    /// scoped by the box display name and the writing process's provenance
+    /// (exe/cwd/argv). A rule like `passthrough *.key and exe:gpg` therefore
+    /// only routes gpg's writes host-direct. The box/proc facets are resolved
+    /// only when some rule actually uses them (the common path-only case stays
+    /// fast — empty Subject, no /proc or discover work).
+    fn is_passthrough(&self, rel: &str, bid: i64, pid: u32) -> bool {
+        let rules = self.inner.rules.read().unwrap();
+        if !rules.needs_box() && !rules.needs_proc() {
+            // common case: no box/proc clauses → path-only Subject suffices.
+            return matches!(rules.decide(rel, &crate::rules::Subject::default()),
+                            Some(crate::rules::Action::Passthrough));
+        }
+        let subject = self.writer_subject(bid, pid, rules.needs_box(),
+                                          rules.needs_proc());
+        matches!(rules.decide(rel, &subject),
+                 Some(crate::rules::Action::Passthrough))
+    }
+
+    /// D5 kernel-READ-passthrough gate: PATH-ONLY passthrough match only, so a
+    /// box-/proc-scoped passthrough never enables the captured-here-but-
+    /// passthrough-there read divergence (see DESIGN.md D5 / rules.rs).
+    fn is_passthrough_read(&self, rel: &str) -> bool {
+        self.inner.rules.read().unwrap().passthrough_path_only(rel)
+    }
+
+    /// Build the rule Subject for the WRITING process `pid` in box `bid`: the
+    /// box display name (when a rule needs it) and the live process's exe/cwd/
+    /// argv read from /proc (when a rule needs them). Self-contained — no box
+    /// state required beyond the id.
+    fn writer_subject(&self, bid: i64, pid: u32, want_box: bool, want_proc: bool)
+        -> crate::rules::Subject
+    {
+        let mut s = crate::rules::Subject::default();
+        if want_box {
+            s.box_name = crate::discover::display_path(&crate::discover::discover(), bid);
+        }
+        if want_proc {
+            let (exe, cwd, argv) = proc_facets(pid);
+            s.exe = exe; s.cwd = cwd; s.argv = argv;
+        }
+        s
+    }
+
+    pub fn add_box(&self, b: Arc<BoxState>) {
+        self.inner.boxes.write().unwrap().insert(b.id, b);
+    }
+
+    pub fn remove_box(&self, id: i64) {
+        self.inner.boxes.write().unwrap().remove(&id);
+    }
+
+    pub fn box_ids(&self) -> Vec<i64> {
+        self.inner.boxes.read().unwrap().keys().copied().collect()
+    }
+
+    /// Re-parent a live box (dissolve copy-down): point its resolve()/KIDS_DIR
+    /// chain at the grandparent (None = top-level). No-op if the box isn't live.
+    pub fn set_box_parent(&self, id: i64, parent: Option<i64>) {
+        if let Some(b) = self.inner.boxes.read().unwrap().get(&id) {
+            b.set_parent(parent);
+        }
+    }
+
+    /// The live BoxState for `id`, if the box is currently mounted (running).
+    /// Used to route writes (dissolve copy-down, meta) through the live
+    /// connection + RAM mirror instead of a rival on-disk handle.
+    pub fn live_box(&self, id: i64) -> Option<Arc<BoxState>> {
+        self.inner.boxes.read().unwrap().get(&id).cloned()
+    }
+
+    /// Live child box ids of `bid` (their parent() == bid) — KIDS_DIR entries.
+    fn children_of_box(&self, bid: i64) -> Vec<i64> {
+        self.inner.boxes.read().unwrap().values()
+            .filter(|c| c.parent() == Some(bid)).map(|c| c.id).collect()
+    }
+
+    /// On rename, the kernel keeps the cached inode and moves its dentry; our
+    /// ino->key map must follow, for `rel_o` and the whole subtree under it,
+    /// or a getattr on the cached inode resolves the stale (now-absent) path.
+    fn remap_inode_subtree(&self, bid: i64, rel_o: &str, rel_n: &str) {
+        let oldp = format!("{rel_o}/");
+        let mut k2i = self.inner.key_to_ino.write().unwrap();
+        let mut i2k = self.inner.ino_to_key.write().unwrap();
+        let moves: Vec<(String, String)> = k2i.keys()
+            .filter(|(b, _)| *b == bid)
+            .filter_map(|(_, rel)| {
+                if rel == rel_o {
+                    Some((rel.clone(), rel_n.to_string()))
+                } else if let Some(tail) = rel.strip_prefix(&oldp) {
+                    Some((rel.clone(), format!("{rel_n}/{tail}")))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for (old, new) in moves {
+            if let Some(ino) = k2i.remove(&(bid, old)) {
+                k2i.insert((bid, new.clone()), ino);
+                i2k.insert(ino, (bid, new));
+            }
+        }
+    }
+
+    fn box_of(&self, id: i64) -> Option<Arc<BoxState>> {
+        self.inner.boxes.read().unwrap().get(&id).cloned()
+    }
+
+    fn key_of(&self, ino: INodeNo) -> Option<Key> {
+        self.inner.ino_to_key.read().unwrap().get(&u64::from(ino)).cloned()
+    }
+
+    fn ino_for(&self, key: &Key) -> u64 {
+        if let Some(i) = self.inner.key_to_ino.read().unwrap().get(key) {
+            return *i;
+        }
+        let mut k2i = self.inner.key_to_ino.write().unwrap();
+        if let Some(i) = k2i.get(key) {
+            return *i;
+        }
+        let i = self.inner.next_ino.fetch_add(1, Ordering::Relaxed);
+        k2i.insert(key.clone(), i);
+        self.inner.ino_to_key.write().unwrap().insert(i, key.clone());
+        i
+    }
+
+    fn host(&self, rel: &str) -> PathBuf {
+        if rel.is_empty() { self.inner.lower.clone() } else { self.inner.lower.join(rel) }
+    }
+
+    /// A box's OWN layer for `rel` (single level, no parent walk) — used by the
+    /// WRITE paths, which operate on the box's own overlay. UpperFile.owner is
+    /// the box itself.
+    fn layer(&self, b: &BoxState, rel: &str) -> Layer {
+        match b.entry(rel) {
+            Some(Entry::Whiteout) => Layer::Absent,
+            Some(Entry::File { rowid, mode }) =>
+                Layer::UpperFile { owner: b.id, rowid, mode },
+            Some(Entry::Dir { mode, mtime_ns }) => Layer::UpperDir { mode, mtime_ns },
+            Some(Entry::Symlink { target }) => Layer::UpperSymlink { target },
+            Some(Entry::Special { mode, rdev }) => Layer::UpperSpecial { mode, rdev },
+            None => {
+                if self.host(rel).symlink_metadata().is_ok() {
+                    Layer::Lower
+                } else {
+                    Layer::Absent
+                }
+            }
+        }
+    }
+
+    /// The MERGED resolution for `rel` as seen by box `bid`: the box's own entry
+    /// if any, else its parent box's overlay (recursively), the root box
+    /// bottoming out at the host. A whiteout at any level hides everything
+    /// below (parent boxes AND the host). This is the nested read-through-parent
+    /// semantic — used by every READ and existence check. UpperFile.owner names
+    /// whichever box in the chain actually holds the bytes (for blob_path).
+    fn resolve(&self, bid: i64, rel: &str) -> Layer {
+        let mut cur = Some(bid);
+        let mut seen = 0;
+        while let Some(id) = cur {
+            seen += 1;
+            if seen > 64 { break; }
+            let Some(b) = self.box_of(id) else { break };
+            match b.entry(rel) {
+                Some(Entry::Whiteout) => return Layer::Absent,
+                Some(Entry::File { rowid, mode }) =>
+                    return Layer::UpperFile { owner: id, rowid, mode },
+                Some(Entry::Dir { mode, mtime_ns }) =>
+                    return Layer::UpperDir { mode, mtime_ns },
+                Some(Entry::Symlink { target }) =>
+                    return Layer::UpperSymlink { target },
+                Some(Entry::Special { mode, rdev }) =>
+                    return Layer::UpperSpecial { mode, rdev },
+                None => cur = b.parent(),  // not in this box → try its parent
+            }
+        }
+        if self.host(rel).symlink_metadata().is_ok() { Layer::Lower }
+        else { Layer::Absent }
+    }
+
+    fn lower_attr(&self, ino: u64, rel: &str) -> Option<FileAttr> {
+        let md = self.host(rel).symlink_metadata().ok()?;
+        Some(self.attr_from_md(ino, &md))
+    }
+
+    fn attr_from_md(&self, ino: u64, md: &std::fs::Metadata) -> FileAttr {
+        FileAttr {
+            ino: INodeNo(ino),
+            size: md.size(),
+            blocks: md.blocks(),
+            atime: ts(md.atime(), md.atime_nsec()),
+            mtime: ts(md.mtime(), md.mtime_nsec()),
+            ctime: ts(md.ctime(), md.ctime_nsec()),
+            crtime: UNIX_EPOCH,
+            kind: kind_of_mode(md.mode()),
+            perm: (md.mode() & 0o7777) as u16,
+            nlink: md.nlink() as u32,
+            uid: md.uid(),
+            gid: md.gid(),
+            rdev: md.rdev() as u32,
+            blksize: 512,
+            flags: 0,
+        }
+    }
+
+    fn synth_dir_attr(&self, ino: u64, mode: u32, mtime_ns: i64) -> FileAttr {
+        FileAttr {
+            ino: INodeNo(ino), size: 0, blocks: 0,
+            atime: ns_ts(mtime_ns), mtime: ns_ts(mtime_ns), ctime: ns_ts(mtime_ns),
+            crtime: UNIX_EPOCH, kind: FileType::Directory,
+            perm: (mode & 0o7777) as u16, nlink: 2, uid: 0, gid: 0, rdev: 0,
+            blksize: 512, flags: 0,
+        }
+    }
+
+    fn synth_file_attr(&self, ino: u64) -> FileAttr {
+        FileAttr {
+            ino: INodeNo(ino), size: 0, blocks: 0,
+            atime: UNIX_EPOCH, mtime: UNIX_EPOCH, ctime: UNIX_EPOCH,
+            crtime: UNIX_EPOCH, kind: FileType::RegularFile,
+            perm: 0o666, nlink: 1, uid: 0, gid: 0, rdev: 0, blksize: 512, flags: 0,
+        }
+    }
+
+    fn synth_link_attr(&self, ino: u64, len: u64) -> FileAttr {
+        FileAttr {
+            ino: INodeNo(ino), size: len, blocks: 0,
+            atime: UNIX_EPOCH, mtime: UNIX_EPOCH, ctime: UNIX_EPOCH,
+            crtime: UNIX_EPOCH, kind: FileType::Symlink,
+            perm: 0o777, nlink: 1, uid: 0, gid: 0, rdev: 0, blksize: 512, flags: 0,
+        }
+    }
+
+    /// Attributes for (box, rel) through the FULL merge (own → parent chain →
+    /// host), or None when absent.
+    fn attr_of(&self, b: &BoxState, ino: u64, rel: &str) -> Option<FileAttr> {
+        match self.resolve(b.id, rel) {
+            Layer::Absent => None,
+            Layer::Lower => self.lower_attr(ino, rel),
+            Layer::UpperFile { owner, rowid, mode } => {
+                let bp = blob_path(owner, rowid);
+                let md = bp.metadata().ok()?;
+                let mut a = self.attr_from_md(ino, &md);
+                a.perm = (mode & 0o7777) as u16;
+                a.kind = FileType::RegularFile;
+                Some(a)
+            }
+            Layer::UpperDir { mode, mtime_ns } =>
+                Some(self.synth_dir_attr(ino, mode, mtime_ns)),
+            Layer::UpperSymlink { target } =>
+                Some(self.synth_link_attr(
+                    ino, target.as_os_str().as_encoded_bytes().len() as u64)),
+            Layer::UpperSpecial { mode, rdev } => {
+                let mut a = self.synth_file_attr(ino);
+                a.kind = kind_of_mode(mode);
+                a.perm = (mode & 0o7777) as u16;
+                a.rdev = rdev as u32;
+                Some(a)
+            }
+        }
+    }
+
+    /// D3: the first actual write to `rel` copies the RESOLVED lower bytes
+    /// (the parent box's version if nested, else the host file, else empty)
+    /// into a fresh pool blob in THIS box (creating the row + provenance) and
+    /// returns the RW blob file.
+    fn copy_up(&self, b: &BoxState, rel: &str, pid: u32) -> std::io::Result<File> {
+        let writer = b.writer_for(pid);
+        // Source the lower bytes + mode from the parent-chain resolution.
+        let (src, mode): (Option<PathBuf>, u32) = match self.resolve(b.id, rel) {
+            Layer::UpperFile { owner, rowid, mode } =>
+                (Some(blob_path(owner, rowid)), mode),
+            Layer::Lower => {
+                let m = self.host(rel).symlink_metadata().map(|m| m.mode())
+                    .unwrap_or(0o100644);
+                (Some(self.host(rel)), m)
+            }
+            _ => (None, 0o100644),
+        };
+        let rowid = b.ensure_file_row(rel, mode, writer);
+        let bp = blob_path(b.id, rowid);
+        if let Some(parent) = bp.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if !bp.exists() {
+            match src {
+                Some(s) => { std::fs::copy(&s, &bp)?; }
+                None => { File::create(&bp)?; }
+            }
+        }
+        OpenOptions::new().read(true).write(true).open(&bp)
+    }
+
+    fn reg_fh(&self, fh: FhInner) -> u64 {
+        let n = self.inner.next_fh.fetch_add(1, Ordering::Relaxed);
+        self.inner.fhs.write().unwrap().insert(n, Mutex::new(Fh { inner: fh }));
+        n
+    }
+
+    /// Merged listing of (box, rel) through the FULL chain: host entries, then
+    /// each box from ROOT down to the child applied in order (so a deeper box's
+    /// whiteouts hide and its entries override shallower layers). (name, kind,
+    /// child-ino, Option<attr>).
+    fn scan_dir(&self, b: &BoxState, rel: &str, plus: bool)
+                -> Vec<(String, FileType, u64, Option<FileAttr>)> {
+        let mut names: BTreeMap<String, ()> = BTreeMap::new();
+        if let Ok(rd) = std::fs::read_dir(self.host(rel)) {
+            for ent in rd.flatten() {
+                if let Some(n) = ent.file_name().to_str() {
+                    names.insert(n.to_string(), ());
+                }
+            }
+        }
+        // chain of box ids, root-first.
+        let mut chain = vec![b.id];
+        let mut cur = b.parent();
+        let mut guard = 0;
+        while let Some(p) = cur {
+            guard += 1; if guard > 64 { break; }
+            chain.push(p);
+            cur = self.box_of(p).and_then(|bx| bx.parent());
+        }
+        chain.reverse();
+        for id in chain {
+            if let Some(bx) = self.box_of(id) {
+                let (white, present) = bx.children_of(rel);
+                for w in &white { names.remove(w); }
+                for p in present { names.insert(p, ()); }
+            }
+        }
+        let mut out = vec![];
+        for name in names.keys() {
+            let crel = if rel.is_empty() { name.clone() }
+                       else { format!("{rel}/{name}") };
+            let cino = self.ino_for(&(b.id, crel.clone()));
+            let attr = self.attr_of(b, cino, &crel);
+            let Some(attr) = attr else { continue };
+            out.push((name.clone(), attr.kind, cino,
+                      if plus { Some(attr) } else { None }));
+        }
+        out
+    }
+}
+
+impl Filesystem for Overlay {
+    fn init(&mut self, _req: &Request,
+            config: &mut fuser::KernelConfig) -> std::io::Result<()> {
+        // Negotiate kernel FUSE_PASSTHROUGH (kernel 6.9+). WHICH opens use it is
+        // decided per-path by the `readonly` file rule — never automatically.
+        // set_max_stack_depth(2) is needed because backing files can live on a
+        // stacked fs (the container's overlayfs root). Never fail init over this.
+        let ok = config.add_capabilities(fuser::InitFlags::FUSE_PASSTHROUGH).is_ok()
+            && config.set_max_stack_depth(2).is_ok();
+        self.inner.passthrough_ok.store(ok, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+        let Some((bid, prel)) = self.key_of(parent) else {
+            return reply.error(Errno::ENOENT);
+        };
+        let Some(name) = name.to_str() else { return reply.error(Errno::ENOENT) };
+        if bid == 0 {
+            // synthetic root: entries are box ids
+            let Ok(id) = name.parse::<i64>() else { return reply.error(Errno::ENOENT) };
+            if self.box_of(id).is_none() {
+                return reply.error(Errno::ENOENT);
+            }
+            let ino = self.ino_for(&(id, String::new()));
+            return reply.entry(&TTL, &self.synth_dir_attr(ino, 0o40755, 0),
+                               Generation(0));
+        }
+        let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
+        // The hidden synthetic KIDS_DIR at a box root, and routing through it to
+        // a live child's REAL overlay-root inode (nested-launch bind target).
+        if prel.is_empty() && name == KIDS_DIR {
+            let ino = self.ino_for(&(bid, KIDS_DIR.to_string()));
+            return reply.entry(&TTL, &self.synth_dir_attr(ino, 0o40755, 0),
+                               Generation(0));
+        }
+        if prel == KIDS_DIR {
+            if let Ok(cid) = name.parse::<i64>() {
+                if self.box_of(cid).and_then(|c| c.parent()) == Some(bid) {
+                    let cino = self.ino_for(&(cid, String::new()));
+                    return reply.entry(&TTL,
+                        &self.synth_dir_attr(cino, 0o40755, 0), Generation(0));
+                }
+            }
+            return reply.error(Errno::ENOENT);
+        }
+        let rel = if prel.is_empty() { name.to_string() }
+                  else { format!("{prel}/{name}") };
+        let ino = self.ino_for(&(bid, rel.clone()));
+        if prel.is_empty() && sink_stream(&rel).is_some() {
+            return reply.entry(&TTL, &self.synth_file_attr(ino), Generation(0));
+        }
+        match self.attr_of(&b, ino, &rel) {
+            Some(a) => reply.entry(&TTL, &a, Generation(0)),
+            None => reply.error(Errno::ENOENT),
+        }
+    }
+
+    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>,
+               reply: ReplyAttr) {
+        let Some((bid, rel)) = self.key_of(ino) else {
+            return reply.error(Errno::ENOENT);
+        };
+        if bid == 0 || rel.is_empty() || rel == KIDS_DIR {
+            return reply.attr(&TTL, &self.synth_dir_attr(u64::from(ino), 0o40755, 0));
+        }
+        if sink_stream(&rel).is_some() {
+            return reply.attr(&TTL, &self.synth_file_attr(u64::from(ino)));
+        }
+        let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
+        match self.attr_of(&b, u64::from(ino), &rel) {
+            Some(a) => reply.attr(&TTL, &a),
+            None => reply.error(Errno::ENOENT),
+        }
+    }
+
+    fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
+        let Some((bid, rel)) = self.key_of(ino) else {
+            return reply.error(Errno::ENOENT);
+        };
+        let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
+        match self.resolve(bid, &rel) {
+            Layer::UpperSymlink { target } =>
+                reply.data(target.as_os_str().as_encoded_bytes()),
+            Layer::Lower => match std::fs::read_link(self.host(&rel)) {
+                Ok(t) => reply.data(t.as_os_str().as_encoded_bytes()),
+                Err(_) => reply.error(Errno::EINVAL),
+            },
+            _ => reply.error(Errno::EINVAL),
+        }
+    }
+
+    fn open(&self, req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+        let Some((bid, rel)) = self.key_of(ino) else {
+            return reply.error(Errno::ENOENT);
+        };
+        let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
+        if let Some(stream) = sink_stream(&rel) {
+            // stdout/stderr sink: a write-only channel into the outputs table
+            // (+ the live echo readback). Count it so the last release flushes
+            // ECHO_DONE.
+            self.note_sink_open(bid);
+            let n = self.reg_fh(FhInner {
+                box_id: bid, rel, file: None, upper: false, dirty: false,
+                last_pid: req.pid(), sink: Some(stream), passthrough: false, _backing: None });
+            return reply.opened(FileHandle(n), FopenFlags::empty());
+        }
+        let want_write = !matches!(flags.acc_mode(),
+                                   fuser::OpenAccMode::O_RDONLY);
+        // -d direct: the whole box is passthrough (no overlay) — writes land on
+        // the real host, uncaptured. Else a per-path passthrough file rule.
+        if want_write && (b.direct() || self.is_passthrough(&rel, bid, req.pid())) {
+            // passthrough rule: writes go straight to the REAL host file, never
+            // captured. Open (creating) the host path directly.
+            let host = self.host(&rel);
+            if let Some(p) = host.parent() { let _ = std::fs::create_dir_all(p); }
+            match OpenOptions::new().read(true).write(true).create(true).open(&host) {
+                Ok(f) => {
+                    let n = self.reg_fh(FhInner {
+                        box_id: bid, rel, file: Some(f), upper: true, dirty: false,
+                        last_pid: req.pid(), sink: None, passthrough: true, _backing: None });
+                    return reply.opened(FileHandle(n), FopenFlags::empty());
+                }
+                Err(_) => return reply.error(Errno::EACCES),
+            }
+        }
+        // resolve() so a child opening a file that lives in its PARENT box (or
+        // the host) finds it. `upper` (this box owns the blob) is true ONLY when
+        // the resolved owner IS this box; a parent's file or the host file is
+        // served read-only until the first write triggers copy-up-from-parent.
+        let (file, upper) = match self.resolve(bid, &rel) {
+            Layer::UpperFile { owner, rowid, .. } => {
+                let bp = blob_path(owner, rowid);
+                let own = owner == bid;
+                match OpenOptions::new().read(true).write(want_write && own).open(&bp) {
+                    Ok(f) => (Some(f), own),
+                    Err(_) => return reply.error(Errno::EIO),
+                }
+            }
+            Layer::Lower => match File::open(self.host(&rel)) {
+                // D3: open-for-write stays on the LOWER file (read-only) until
+                // the first write op arrives — opens are free.
+                Ok(f) => (Some(f), false),
+                Err(_) => return reply.error(Errno::EACCES),
+            },
+            _ => return reply.error(Errno::ENOENT),
+        };
+        // D5 (rule-gated): a READ-ONLY open of a HOST-DIRECT path (the existing
+        // `passthrough` file rule, or a -d direct box) gets a kernel backing fd,
+        // so the kernel serves reads with the daemon out of the loop (the build-
+        // read-storm win). The user declares these paths host-direct via the
+        // rule — never an automatic guess. Exec opens stay daemon-served (mmap of
+        // a passthrough-backed file EIOs). The kernel limit (a write-open of a
+        // file with a live passthrough read fd EIOs) is therefore SCOPED to
+        // user-declared host-direct paths, and — because passthrough rules are
+        // PATH-ONLY — those paths are host-direct in every box, so the EIO is
+        // uniform, never a captured-vs-passthrough divergence (see DESIGN.md D5).
+        const FMODE_EXEC: i32 = 0x20;
+        let is_exec = flags.0 & FMODE_EXEC != 0;
+        if !want_write && !is_exec && (b.direct() || self.is_passthrough_read(&rel))
+            && self.inner.passthrough_ok.load(Ordering::Relaxed) {
+            if let Some(f) = file.as_ref() {
+                if let Ok(backing) = reply.open_backing(f) {
+                    let n = self.reg_fh(FhInner {
+                        box_id: bid, rel, file, upper, dirty: false,
+                        last_pid: req.pid(), sink: None, passthrough: false,
+                        _backing: None });
+                    reply.opened_passthrough(FileHandle(n), FopenFlags::empty(),
+                                             &backing);
+                    if let Some(h) = self.inner.fhs.read().unwrap().get(&n) {
+                        h.lock().unwrap().inner._backing = Some(backing);
+                    }
+                    return;
+                }
+                // open_backing failed: fall through to daemon-served.
+            }
+        }
+        let n = self.reg_fh(FhInner {
+            box_id: bid, rel, file, upper, dirty: false, last_pid: req.pid(), sink: None, passthrough: false, _backing: None });
+        reply.opened(FileHandle(n), FopenFlags::FOPEN_KEEP_CACHE);
+    }
+
+    fn create(&self, req: &Request, parent: INodeNo, name: &OsStr, mode: u32,
+              _umask: u32, _flags: i32, reply: ReplyCreate) {
+        let Some((bid, prel)) = self.key_of(parent) else {
+            return reply.error(Errno::ENOENT);
+        };
+        if bid == 0 {
+            return reply.error(Errno::EPERM);
+        }
+        let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
+        let Some(name) = name.to_str() else { return reply.error(Errno::EINVAL) };
+        let rel = if prel.is_empty() { name.to_string() }
+                  else { format!("{prel}/{name}") };
+        if b.direct() || self.is_passthrough(&rel, bid, req.pid()) {
+            // passthrough (file rule, or -d whole-box direct): create the file on
+            // the REAL host, uncaptured.
+            let host = self.host(&rel);
+            if let Some(p) = host.parent() { let _ = std::fs::create_dir_all(p); }
+            match OpenOptions::new().read(true).write(true).create(true)
+                .truncate(true).open(&host) {
+                Ok(f) => {
+                    let ino = self.ino_for(&(bid, rel.clone()));
+                    let md = f.metadata().ok();
+                    let mut attr = md.map(|m| self.attr_from_md(ino, &m))
+                        .unwrap_or_else(|| self.synth_file_attr(ino));
+                    attr.kind = FileType::RegularFile;
+                    attr.perm = (mode & 0o7777) as u16;
+                    let n = self.reg_fh(FhInner {
+                        box_id: bid, rel, file: Some(f), upper: true, dirty: false,
+                        last_pid: req.pid(), sink: None, passthrough: true, _backing: None });
+                    return reply.created(&TTL, &attr, Generation(0),
+                                         FileHandle(n), FopenFlags::empty());
+                }
+                Err(_) => return reply.error(Errno::EACCES),
+            }
+        }
+        let writer = b.writer_for(req.pid());
+        let rowid = b.ensure_file_row(&rel, mode | 0o100000, writer);
+        let bp = blob_path(bid, rowid);
+        if let Some(p) = bp.parent() {
+            let _ = std::fs::create_dir_all(p);
+        }
+        let f = match OpenOptions::new().read(true).write(true).create(true)
+            .truncate(true).open(&bp) {
+            Ok(f) => f,
+            Err(_) => return reply.error(Errno::EIO),
+        };
+        let ino = self.ino_for(&(bid, rel.clone()));
+        let md = f.metadata().ok();
+        let mut attr = md.map(|m| self.attr_from_md(ino, &m))
+            .unwrap_or_else(|| self.synth_dir_attr(ino, mode, 0));
+        attr.kind = FileType::RegularFile;
+        attr.perm = (mode & 0o7777) as u16;
+        let n = self.reg_fh(FhInner {
+            box_id: bid, rel, file: Some(f), upper: true,
+            dirty: true, last_pid: req.pid(), sink: None, passthrough: false, _backing: None });
+        reply.created(&TTL, &attr, Generation(0), FileHandle(n),
+                      FopenFlags::empty());
+    }
+
+    fn read(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, offset: u64,
+            size: u32, _flags: OpenFlags, _lo: Option<LockOwner>, reply: ReplyData) {
+        // The daemon served this read (a passthrough'd read never reaches here —
+        // the kernel serves it directly). Counter is test observability.
+        self.inner.daemon_reads.fetch_add(1, Ordering::Relaxed);
+        let fhs = self.inner.fhs.read().unwrap();
+        let Some(h) = fhs.get(&u64::from(fh)) else {
+            return reply.error(Errno::EBADF);
+        };
+        let h = h.lock().unwrap();
+        let Some(f) = h.inner.file.as_ref() else {
+            return reply.error(Errno::EBADF);
+        };
+        let mut buf = vec![0u8; size as usize];
+        match f.read_at(&mut buf, offset) {
+            Ok(n) => reply.data(&buf[..n]),
+            Err(_) => reply.error(Errno::EIO),
+        }
+    }
+
+    fn write(&self, req: &Request, _ino: INodeNo, fh: FileHandle, offset: u64,
+             data: &[u8], _wf: fuser::WriteFlags, _flags: OpenFlags,
+             _lo: Option<LockOwner>, reply: ReplyWrite) {
+        let fhs = self.inner.fhs.read().unwrap();
+        let Some(h) = fhs.get(&u64::from(fh)) else {
+            return reply.error(Errno::EBADF);
+        };
+        let mut h = h.lock().unwrap();
+        if let Some(stream) = h.inner.sink {
+            // stdout/stderr sink. MUTE: a muted writer's write to an ANCESTOR
+            // box's sink (owner box != this sink's box) is a nested box's echo
+            // readback travelling UP — echo it onward so it keeps propagating,
+            // but do NOT record it (already captured once at the origin box). A
+            // muted writer's write to ITS OWN box's sink, however, is first-party
+            // output (e.g. a brush in-process builtin writing fd 1 from the muted
+            // --inner pid) and IS recorded. A non-muted writer is always
+            // recorded. Either way, echo it live.
+            let bid = h.inner.box_id;
+            let pid = req.pid();
+            drop(h);
+            drop(fhs);
+            let record = match self.muted_owner(pid) {
+                None => true,             // not muted: record
+                Some(owner) => owner == bid,  // muted: record only its own sink
+            };
+            if record {
+                if let Some(b) = self.box_of(bid) {
+                    b.add_output(stream, pid, data);
+                }
+            }
+            self.echo_send(bid, stream, data);
+            return reply.written(data.len() as u32);
+        }
+        if !h.inner.upper {
+            // D3: the FIRST write triggers copy-up + row + provenance.
+            let Some(b) = self.box_of(h.inner.box_id) else {
+                return reply.error(Errno::EIO);
+            };
+            match self.copy_up(&b, &h.inner.rel.clone(), req.pid()) {
+                Ok(f) => {
+                    h.inner.file = Some(f);
+                    h.inner.upper = true;
+                }
+                Err(_) => return reply.error(Errno::EIO),
+            }
+        }
+        h.inner.dirty = true;
+        h.inner.last_pid = req.pid();
+        let Some(f) = h.inner.file.as_ref() else {
+            return reply.error(Errno::EBADF);
+        };
+        match f.write_at(data, offset) {
+            Ok(n) => reply.written(n as u32),
+            Err(_) => reply.error(Errno::EIO),
+        }
+    }
+
+    fn release(&self, _req: &Request, _ino: INodeNo, fh: FileHandle,
+               _flags: OpenFlags, _lo: Option<LockOwner>, _flush: bool,
+               reply: ReplyEmpty) {
+        let h = self.inner.fhs.write().unwrap().remove(&u64::from(fh));
+        if let Some(h) = h {
+            let h = h.into_inner().unwrap();
+            if h.inner.sink.is_some() {
+                // A capture sink closed (child exited / redirected fd done): when
+                // the box's last sink releases, flush ECHO_DONE so --inner stops
+                // reading without truncating still-in-flight echo bytes.
+                self.note_sink_release(h.inner.box_id);
+            } else if h.inner.dirty && !h.inner.passthrough {
+                if let Some(b) = self.box_of(h.inner.box_id) {
+                    let writer = b.writer_for(h.inner.last_pid);
+                    if let Some(md) = h.inner.file.as_ref()
+                        .and_then(|f| f.metadata().ok()) {
+                        b.finalize_file(&h.inner.rel, md.size() as i64,
+                                        md.mtime() * 1_000_000_000
+                                        + md.mtime_nsec(), writer);
+                    }
+                }
+            }
+        }
+        reply.ok();
+    }
+
+    fn setattr(&self, req: &Request, ino: INodeNo, mode: Option<u32>,
+               uid: Option<u32>, gid: Option<u32>, size: Option<u64>,
+               _atime: Option<TimeOrNow>, mtime: Option<TimeOrNow>,
+               _ctime: Option<SystemTime>, _fh: Option<FileHandle>,
+               _crtime: Option<SystemTime>, _chgtime: Option<SystemTime>,
+               _bkuptime: Option<SystemTime>, _flags: Option<fuser::BsdFileFlags>,
+               reply: ReplyAttr) {
+        let Some((bid, rel)) = self.key_of(ino) else {
+            return reply.error(Errno::ENOENT);
+        };
+        let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
+        // HOST-DIRECT (passthrough file rule, or -d direct): metadata ops hit the
+        // REAL host file, never copy-up/capture — mirroring the host-direct
+        // read/write path. This is the fix for the O_TRUNC bug: the kernel
+        // delivers `> file`'s truncate as setattr(size=0); routing it through
+        // copy_up captured a spurious row AND left the host file's tail intact
+        // (the write went host-direct, the truncate went to a blob). Truncate
+        // propagates the real errno; chmod/chown/utimes are best-effort.
+        if b.direct() || self.is_passthrough(&rel, bid, req.pid()) {
+            let host = self.host(&rel);
+            let cpath = std::ffi::CString::new(host.as_os_str().as_encoded_bytes());
+            if let Some(sz) = size {
+                match OpenOptions::new().write(true).open(&host) {
+                    Ok(f) => if let Err(e) = f.set_len(sz) {
+                        return reply.error(Errno::from(e));
+                    },
+                    Err(e) => return reply.error(Errno::from(e)),
+                }
+            }
+            if let (Some(m), Ok(c)) = (mode, &cpath) {
+                unsafe { libc::chmod(c.as_ptr(), (m & 0o7777) as libc::mode_t); }
+            }
+            if (uid.is_some() || gid.is_some()) && cpath.is_ok() {
+                let c = cpath.as_ref().unwrap();
+                // uid_t (-1) == no change.
+                unsafe { libc::lchown(c.as_ptr(), uid.unwrap_or(u32::MAX),
+                                      gid.unwrap_or(u32::MAX)); }
+            }
+            if let (Some(t), Ok(c)) = (mtime, &cpath) {
+                let st = match t {
+                    TimeOrNow::SpecificTime(s) => s,
+                    TimeOrNow::Now => SystemTime::now(),
+                };
+                let d = st.duration_since(UNIX_EPOCH).unwrap_or_default();
+                let ts = libc::timespec { tv_sec: d.as_secs() as libc::time_t,
+                                          tv_nsec: d.subsec_nanos() as i64 };
+                let times = [ts, ts];
+                unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(),
+                                         times.as_ptr(), libc::AT_SYMLINK_NOFOLLOW); }
+            }
+            return match self.attr_of(&b, u64::from(ino), &rel) {
+                Some(a) => reply.attr(&TTL, &a),
+                None => reply.error(Errno::ENOENT),
+            };
+        }
+        if let Some(sz) = size {
+            // truncate: a write — copy-up if still lower, then set_len.
+            let f = match self.layer(&b, &rel) {
+                Layer::UpperFile { rowid, .. } => OpenOptions::new().write(true)
+                    .open(blob_path(bid, rowid)).ok(),
+                Layer::Lower => self.copy_up(&b, &rel, req.pid()).ok(),
+                _ => None,
+            };
+            let Some(f) = f else { return reply.error(Errno::EIO) };
+            // Propagate the REAL kernel errno (EFBIG/EINVAL on an over-large
+            // truncate, etc.) — not a blanket EIO that hides it.
+            if let Err(e) = f.set_len(sz) {
+                return reply.error(Errno::from(e));
+            }
+        }
+        if let Some(m) = mode {
+            // chmod: the row's mode is the truth (blob perms are an artifact).
+            // Files and dirs both; a still-lower target is copied up / captured
+            // first so the mode change has a row to live on.
+            let perm = m & 0o7777;
+            let writer = b.writer_for(req.pid());
+            match self.layer(&b, &rel) {
+                Layer::UpperFile { .. } => b.set_mode(&rel, 0o100000 | perm),
+                Layer::UpperDir { .. } => b.set_mode(&rel, 0o040000 | perm),
+                Layer::UpperSymlink { .. } => {}   // symlink mode is ignored
+                Layer::Lower => {
+                    if self.host(&rel).is_dir() {
+                        b.set_dir(&rel, perm, writer);
+                    } else if self.copy_up(&b, &rel, req.pid()).is_ok() {
+                        b.set_mode(&rel, 0o100000 | perm);
+                    }
+                }
+                Layer::Absent => {}
+                Layer::UpperSpecial { .. } => {}
+            }
+        }
+        // chown: a regular file does a REAL chown on its backing blob and
+        // propagates the errno — the non-root engine rejecting chown-to-others
+        // with EPERM is the box's actual single-uid reality (matches the Python
+        // engine's os.chown-on-backing, and the pjdfstest permission matrices).
+        // A dir/symlink chown is an accepted no-op (no backing file to own).
+        // The side table still records the request for apply-time restoration.
+        if uid.is_some() || gid.is_some() {
+            let cur = b.owner_of(&rel).unwrap_or((u32::MAX, u32::MAX));
+            let nu = uid.unwrap_or(if cur.0 == u32::MAX { 0 } else { cur.0 });
+            let ng = gid.unwrap_or(if cur.1 == u32::MAX { 0 } else { cur.1 });
+            match self.layer(&b, &rel) {
+                Layer::Absent => return reply.error(Errno::ENOENT),
+                Layer::UpperDir { .. } | Layer::UpperSymlink { .. }
+                | Layer::UpperSpecial { .. } => b.set_owner(&rel, nu, ng),
+                Layer::Lower if self.host(&rel).is_dir() => b.set_owner(&rel, nu, ng),
+                _ => {
+                    // regular file: copy up, then real lchown on the blob.
+                    if matches!(self.layer(&b, &rel), Layer::Lower)
+                        && self.copy_up(&b, &rel, req.pid()).is_err() {
+                        return reply.error(Errno::EIO);
+                    }
+                    if let Layer::UpperFile { rowid, .. } = self.layer(&b, &rel) {
+                        let c = std::ffi::CString::new(
+                            blob_path(bid, rowid).as_os_str().as_encoded_bytes()).unwrap();
+                        let r = unsafe { libc::lchown(c.as_ptr(), nu, ng) };
+                        if r != 0 {
+                            return reply.error(Errno::from(
+                                std::io::Error::last_os_error()));
+                        }
+                    }
+                    b.set_owner(&rel, nu, ng);
+                }
+            }
+        }
+        // utimes: record mtime. A file's getattr reads its BLOB's metadata, so
+        // set the blob's mtime too; dirs/symlinks read the row, so set_mtime.
+        if let Some(t) = mtime {
+            let st = match t {
+                TimeOrNow::SpecificTime(s) => s,
+                TimeOrNow::Now => SystemTime::now(),
+            };
+            let ns = st.duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as i64)
+                .unwrap_or(0);
+            if matches!(self.layer(&b, &rel), Layer::Lower)
+                && !self.host(&rel).is_dir() {
+                let _ = self.copy_up(&b, &rel, req.pid());
+            }
+            b.set_mtime(&rel, ns);
+            if let Layer::UpperFile { rowid, .. } = self.layer(&b, &rel) {
+                if let Ok(f) = OpenOptions::new().write(true)
+                    .open(blob_path(bid, rowid)) {
+                    let _ = f.set_modified(st);
+                }
+            }
+        }
+        match self.attr_of(&b, u64::from(ino), &rel) {
+            Some(a) => reply.attr(&TTL, &a),
+            None => reply.error(Errno::ENOENT),
+        }
+    }
+
+    fn mkdir(&self, req: &Request, parent: INodeNo, name: &OsStr, mode: u32,
+             _umask: u32, reply: ReplyEntry) {
+        let Some((bid, prel)) = self.key_of(parent) else {
+            return reply.error(Errno::ENOENT);
+        };
+        if bid == 0 {
+            return reply.error(Errno::EPERM);
+        }
+        let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
+        let Some(name) = name.to_str() else { return reply.error(Errno::EINVAL) };
+        let rel = if prel.is_empty() { name.to_string() }
+                  else { format!("{prel}/{name}") };
+        if !matches!(self.layer(&b, &rel), Layer::Absent) {
+            return reply.error(Errno::EEXIST);
+        }
+        b.set_dir(&rel, mode, b.writer_for(req.pid()));
+        let ino = self.ino_for(&(bid, rel));
+        reply.entry(&TTL, &self.synth_dir_attr(ino, mode | 0o40000, 0),
+                    Generation(0));
+    }
+
+    fn symlink(&self, req: &Request, parent: INodeNo, link_name: &OsStr,
+               target: &Path, reply: ReplyEntry) {
+        let Some((bid, prel)) = self.key_of(parent) else {
+            return reply.error(Errno::ENOENT);
+        };
+        if bid == 0 {
+            return reply.error(Errno::EPERM);
+        }
+        let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
+        let Some(name) = link_name.to_str() else {
+            return reply.error(Errno::EINVAL);
+        };
+        let rel = if prel.is_empty() { name.to_string() }
+                  else { format!("{prel}/{name}") };
+        b.set_symlink(&rel, target, b.writer_for(req.pid()));
+        let ino = self.ino_for(&(bid, rel));
+        reply.entry(&TTL, &self.synth_link_attr(
+            ino, target.as_os_str().as_encoded_bytes().len() as u64),
+            Generation(0));
+    }
+
+    fn mknod(&self, req: &Request, parent: INodeNo, name: &OsStr, mode: u32,
+             _umask: u32, rdev: u32, reply: ReplyEntry) {
+        let Some((bid, prel)) = self.key_of(parent) else {
+            return reply.error(Errno::ENOENT);
+        };
+        if bid == 0 { return reply.error(Errno::EPERM); }
+        let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
+        let Some(name) = name.to_str() else { return reply.error(Errno::EINVAL) };
+        let rel = if prel.is_empty() { name.to_string() }
+                  else { format!("{prel}/{name}") };
+        match mode & libc::S_IFMT {
+            libc::S_IFREG => {
+                // mknod of a regular file = create an empty file.
+                let writer = b.writer_for(req.pid());
+                let rowid = b.ensure_file_row(&rel, mode, writer);
+                let bp = blob_path(bid, rowid);
+                if let Some(p) = bp.parent() { let _ = std::fs::create_dir_all(p); }
+                let _ = File::create(&bp);
+            }
+            libc::S_IFIFO | libc::S_IFCHR | libc::S_IFBLK | libc::S_IFSOCK =>
+                b.set_special(&rel, mode, rdev as u64, b.writer_for(req.pid())),
+            _ => return reply.error(Errno::EINVAL),
+        }
+        let ino = self.ino_for(&(bid, rel.clone()));
+        match self.attr_of(&b, ino, &rel) {
+            Some(a) => reply.entry(&TTL, &a, Generation(0)),
+            None => reply.error(Errno::EIO),
+        }
+    }
+
+    fn link(&self, req: &Request, ino: INodeNo, newparent: INodeNo,
+            newname: &OsStr, reply: ReplyEntry) {
+        // Hardlink as copy-up: a new row backed by a fresh copy of the source
+        // bytes. Not true inode sharing (nlink stays 1), but it stops the EPERM
+        // that breaks git clone --local / ccache — they get a working second
+        // name. Same approximation the Python engine's _link_overlay makes.
+        let (Some((sbid, srel)), Some((nbid, nprel))) =
+            (self.key_of(ino), self.key_of(newparent)) else {
+            return reply.error(Errno::ENOENT);
+        };
+        if sbid != nbid || sbid == 0 { return reply.error(Errno::EXDEV); }
+        let Some(b) = self.box_of(sbid) else { return reply.error(Errno::ENOENT) };
+        let Some(name) = newname.to_str() else { return reply.error(Errno::EINVAL) };
+        let nrel = if nprel.is_empty() { name.to_string() }
+                   else { format!("{nprel}/{name}") };
+        // materialise source bytes into the new name's blob.
+        if self.copy_up(&b, &srel, req.pid()).is_err() {
+            return reply.error(Errno::EIO);
+        }
+        let src_rowid = match self.layer(&b, &srel) {
+            Layer::UpperFile { rowid, .. } => rowid,
+            _ => return reply.error(Errno::EPERM), // only files link here
+        };
+        let writer = b.writer_for(req.pid());
+        let nrow = b.ensure_file_row(&nrel, 0o100644, writer);
+        let dst = blob_path(sbid, nrow);
+        if let Some(p) = dst.parent() { let _ = std::fs::create_dir_all(p); }
+        if std::fs::copy(blob_path(sbid, src_rowid), &dst).is_err() {
+            return reply.error(Errno::EIO);
+        }
+        let ino2 = self.ino_for(&(sbid, nrel.clone()));
+        match self.attr_of(&b, ino2, &nrel) {
+            Some(a) => reply.entry(&TTL, &a, Generation(0)),
+            None => reply.error(Errno::EIO),
+        }
+    }
+
+    fn fallocate(&self, req: &Request, ino: INodeNo, _fh: FileHandle,
+                 offset: u64, length: u64, _mode: i32, reply: ReplyEmpty) {
+        let Some((bid, rel)) = self.key_of(ino) else {
+            return reply.error(Errno::ENOENT);
+        };
+        let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
+        let f = match self.layer(&b, &rel) {
+            Layer::UpperFile { rowid, .. } =>
+                OpenOptions::new().write(true).open(blob_path(bid, rowid)).ok(),
+            Layer::Lower => self.copy_up(&b, &rel, req.pid()).ok(),
+            _ => None,
+        };
+        let Some(f) = f else { return reply.error(Errno::EIO) };
+        // grow the file to offset+length if needed (the common posix_fallocate
+        // preallocate path); never shrink.
+        let want = offset + length;
+        if let Ok(md) = f.metadata() {
+            if md.len() < want && f.set_len(want).is_err() {
+                return reply.error(Errno::EIO);
+            }
+        }
+        reply.ok();
+    }
+
+    fn setxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, value: &[u8],
+                _flags: i32, _position: u32, reply: ReplyEmpty) {
+        let Some((bid, rel)) = self.key_of(ino) else {
+            return reply.error(Errno::ENOENT);
+        };
+        let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
+        if let Some(k) = name.to_str() { b.set_xattr(&rel, k, value); }
+        reply.ok();
+    }
+
+    fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, size: u32,
+                reply: fuser::ReplyXattr) {
+        let Some((bid, rel)) = self.key_of(ino) else {
+            return reply.error(Errno::ENOENT);
+        };
+        let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
+        let v = name.to_str().and_then(|k| b.get_xattr(&rel, k));
+        match v {
+            Some(val) => {
+                if size == 0 { reply.size(val.len() as u32); }
+                else if (size as usize) < val.len() { reply.error(Errno::ERANGE); }
+                else { reply.data(&val); }
+            }
+            None => reply.error(Errno::ENODATA),
+        }
+    }
+
+    fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32,
+                 reply: fuser::ReplyXattr) {
+        let Some((bid, rel)) = self.key_of(ino) else {
+            return reply.error(Errno::ENOENT);
+        };
+        let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
+        let mut buf = Vec::new();
+        for k in b.list_xattr(&rel) {
+            buf.extend_from_slice(k.as_bytes());
+            buf.push(0);
+        }
+        if size == 0 { reply.size(buf.len() as u32); }
+        else if (size as usize) < buf.len() { reply.error(Errno::ERANGE); }
+        else { reply.data(&buf); }
+    }
+
+    fn removexattr(&self, _req: &Request, ino: INodeNo, name: &OsStr,
+                   reply: ReplyEmpty) {
+        let Some((bid, rel)) = self.key_of(ino) else {
+            return reply.error(Errno::ENOENT);
+        };
+        let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
+        match name.to_str() {
+            Some(k) if b.remove_xattr(&rel, k) => reply.ok(),
+            _ => reply.error(Errno::ENODATA),
+        }
+    }
+
+    fn unlink(&self, req: &Request, parent: INodeNo, name: &OsStr,
+              reply: ReplyEmpty) {
+        let Some((bid, prel)) = self.key_of(parent) else {
+            return reply.error(Errno::ENOENT);
+        };
+        let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
+        let Some(name) = name.to_str() else { return reply.error(Errno::EINVAL) };
+        let rel = if prel.is_empty() { name.to_string() }
+                  else { format!("{prel}/{name}") };
+        let writer = b.writer_for(req.pid());
+        let lower_exists = self.host(&rel).symlink_metadata().is_ok();
+        match b.entry(&rel) {
+            Some(Entry::Whiteout) | None if !lower_exists =>
+                return reply.error(Errno::ENOENT),
+            Some(Entry::File { .. }) | Some(Entry::Symlink { .. })
+            | Some(Entry::Special { .. }) => {
+                b.drop_row(&rel);
+                if lower_exists {
+                    b.set_whiteout(&rel, writer);
+                }
+            }
+            _ => b.set_whiteout(&rel, writer),
+        }
+        reply.ok();
+    }
+
+    fn rmdir(&self, req: &Request, parent: INodeNo, name: &OsStr,
+             reply: ReplyEmpty) {
+        let Some((bid, prel)) = self.key_of(parent) else {
+            return reply.error(Errno::ENOENT);
+        };
+        let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
+        let Some(name) = name.to_str() else { return reply.error(Errno::EINVAL) };
+        let rel = if prel.is_empty() { name.to_string() }
+                  else { format!("{prel}/{name}") };
+        if !self.scan_dir(&b, &rel, false).is_empty() {
+            return reply.error(Errno::ENOTEMPTY);
+        }
+        let writer = b.writer_for(req.pid());
+        if matches!(b.entry(&rel), Some(Entry::Dir { .. })) {
+            b.drop_row(&rel);
+        }
+        if self.host(&rel).is_dir() {
+            b.set_whiteout(&rel, writer);
+        }
+        reply.ok();
+    }
+
+    // Safe no-op/durability ops real programs call — ENOSYS here (the fuser
+    // default) makes fsync()/access() fail spuriously. Backing fds are real
+    // files, so an fsync on them is genuine; flush/access just succeed.
+    fn flush(&self, _req: &Request, _ino: INodeNo, fh: FileHandle,
+             _lock_owner: LockOwner, reply: ReplyEmpty) {
+        if let Some(h) = self.inner.fhs.read().unwrap().get(&u64::from(fh)) {
+            if let Some(f) = h.lock().unwrap().inner.file.as_ref() {
+                let _ = f.sync_all();
+            }
+        }
+        reply.ok();
+    }
+
+    fn fsync(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, _datasync: bool,
+             reply: ReplyEmpty) {
+        if let Some(h) = self.inner.fhs.read().unwrap().get(&u64::from(fh)) {
+            if let Some(f) = h.lock().unwrap().inner.file.as_ref() {
+                let _ = f.sync_all();
+            }
+        }
+        reply.ok();
+    }
+
+    fn fsyncdir(&self, _req: &Request, _ino: INodeNo, _fh: FileHandle,
+                _datasync: bool, reply: ReplyEmpty) {
+        reply.ok();
+    }
+
+    fn access(&self, _req: &Request, _ino: INodeNo, _mask: fuser::AccessFlags, reply: ReplyEmpty) {
+        reply.ok(); // permission is enforced by the box's bwrap uid, not here
+    }
+
+    fn statfs(&self, _req: &Request, _ino: INodeNo, reply: fuser::ReplyStatfs) {
+        // Report the lower filesystem's real numbers (df, build free-space checks).
+        let c = std::ffi::CString::new(self.inner.lower.as_os_str()
+            .as_encoded_bytes()).unwrap();
+        let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statvfs(c.as_ptr(), &mut s) } == 0 {
+            reply.statfs(s.f_blocks as u64, s.f_bfree as u64, s.f_bavail as u64,
+                         s.f_files as u64, s.f_ffree as u64, s.f_bsize as u32,
+                         255, s.f_frsize as u32);
+        } else {
+            reply.statfs(0, 0, 0, 0, 0, 512, 255, 0);
+        }
+    }
+
+    fn rename(&self, req: &Request, parent: INodeNo, name: &OsStr,
+              newparent: INodeNo, newname: &OsStr, _flags: fuser::RenameFlags,
+              reply: ReplyEmpty) {
+        let (Some((bo, po)), Some((bn, pn))) =
+            (self.key_of(parent), self.key_of(newparent)) else {
+            return reply.error(Errno::EACCES);
+        };
+        if bo == 0 || bn == 0 || bo != bn {
+            return reply.error(Errno::EXDEV); // no cross-box / root rename
+        }
+        let Some(b) = self.box_of(bo) else { return reply.error(Errno::ENOENT) };
+        let (Some(no), Some(nn)) = (name.to_str(), newname.to_str()) else {
+            return reply.error(Errno::EINVAL);
+        };
+        let join = |p: &str, n: &str| if p.is_empty() { n.to_string() }
+                                      else { format!("{p}/{n}") };
+        let rel_o = join(&po, no);
+        let rel_n = join(&pn, nn);
+        let writer = b.writer_for(req.pid());
+        let lower_o = self.host(&rel_o).symlink_metadata().is_ok();
+        match self.layer(&b, &rel_o) {
+            Layer::Absent => return reply.error(Errno::ENOENT),
+            Layer::UpperDir { .. } => {
+                b.reparent(&rel_o, &rel_n);
+                if self.host(&rel_o).is_dir() { b.set_whiteout(&rel_o, writer); }
+            }
+            Layer::Lower => {
+                // copy-up the source to a real upper row, then move it.
+                match self.copy_up(&b, &rel_o, req.pid()) {
+                    Ok(_) => {}
+                    Err(_) => return reply.error(Errno::EIO),
+                }
+                b.rename_row(&rel_o, &rel_n);
+                b.set_whiteout(&rel_o, writer); // lower still shows through old name
+            }
+            Layer::UpperFile { .. } | Layer::UpperSymlink { .. }
+            | Layer::UpperSpecial { .. } => {
+                b.rename_row(&rel_o, &rel_n);
+                if lower_o { b.set_whiteout(&rel_o, writer); }
+            }
+        }
+        self.remap_inode_subtree(bo, &rel_o, &rel_n);
+        reply.ok();
+    }
+
+    fn readdir(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64,
+               mut reply: ReplyDirectory) {
+        let Some((bid, rel)) = self.key_of(ino) else {
+            return reply.error(Errno::ENOENT);
+        };
+        if bid == 0 {
+            for (i, id) in self.inner.boxes.read().unwrap().keys().enumerate() {
+                if (i as u64) < offset { continue; }
+                let cino = self.ino_for(&(*id, String::new()));
+                if reply.add(INodeNo(cino), (i + 1) as u64, FileType::Directory,
+                             id.to_string()) {
+                    break;
+                }
+            }
+            return reply.ok();
+        }
+        if rel == KIDS_DIR {
+            for (i, cid) in self.children_of_box(bid).into_iter().enumerate() {
+                if (i as u64) < offset { continue; }
+                let cino = self.ino_for(&(cid, String::new()));
+                if reply.add(INodeNo(cino), (i + 1) as u64, FileType::Directory,
+                             cid.to_string()) { break; }
+            }
+            return reply.ok();
+        }
+        let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
+        for (i, (name, kind, cino, _)) in
+            self.scan_dir(&b, &rel, false).into_iter().enumerate() {
+            if (i as u64) < offset { continue; }
+            if reply.add(INodeNo(cino), (i + 1) as u64, kind, name) {
+                break;
+            }
+        }
+        reply.ok();
+    }
+
+    fn readdirplus(&self, _req: &Request, ino: INodeNo, _fh: FileHandle,
+                   offset: u64, mut reply: ReplyDirectoryPlus) {
+        let Some((bid, rel)) = self.key_of(ino) else {
+            return reply.error(Errno::ENOENT);
+        };
+        if bid == 0 {
+            for (i, id) in self.inner.boxes.read().unwrap().keys().enumerate() {
+                if (i as u64) < offset { continue; }
+                let cino = self.ino_for(&(*id, String::new()));
+                let a = self.synth_dir_attr(cino, 0o40755, 0);
+                if reply.add(INodeNo(cino), (i + 1) as u64, id.to_string(),
+                             &TTL, &a, Generation(0)) {
+                    break;
+                }
+            }
+            return reply.ok();
+        }
+        if rel == KIDS_DIR {
+            for (i, cid) in self.children_of_box(bid).into_iter().enumerate() {
+                if (i as u64) < offset { continue; }
+                let cino = self.ino_for(&(cid, String::new()));
+                let a = self.synth_dir_attr(cino, 0o40755, 0);
+                if reply.add(INodeNo(cino), (i + 1) as u64, cid.to_string(),
+                             &TTL, &a, Generation(0)) { break; }
+            }
+            return reply.ok();
+        }
+        let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
+        for (i, (name, _k, cino, attr)) in
+            self.scan_dir(&b, &rel, true).into_iter().enumerate() {
+            if (i as u64) < offset { continue; }
+            let Some(a) = attr else { continue };
+            if reply.add(INodeNo(cino), (i + 1) as u64, name, &TTL, &a,
+                         Generation(0)) {
+                break;
+            }
+        }
+        reply.ok();
+    }
+}

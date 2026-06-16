@@ -36,9 +36,34 @@ its own `test_sakar*.py`) — do NOT touch `sakar` when working on `sarun`.
 First run also **builds a patched pyfuse3** (see section 0 of `sarun`):
 downloads a pinned sdist, applies an embedded patch, compiles it into
 `~/.cache/sarun/…`. That takes ~25 s ONCE (needs network + a C toolchain:
-gcc, pkg-config, libfuse3 dev headers — all present here), then it is cached
-and every later run is ~0.4 s. Do not be surprised by the first-run pause; it
-is not a hang.
+gcc, pkg-config, libfuse3 dev headers), then it is cached and every later run
+is ~0.4 s. Do not be surprised by the first-run pause; it is not a hang.
+
+Some fresh containers are missing the system packages. If the pyfuse3 build
+fails with `Package 'fuse3' … not found`, or boxes die with
+`FileNotFoundError: 'bwrap'`, install them first:
+```
+apt-get install -y libfuse3-dev fuse3 pkg-config bubblewrap
+```
+
+## The Rust engine — glibc default vs static musl
+The engine lives in `engine/` (one crate → one binary `engine/target/.../sarun`).
+The DEFAULT build is dynamic glibc and is what every test harness uses:
+```
+cd engine && cargo build --release        # -> target/release/sarun (dynamic, glibc)
+```
+For a fully-static, portable single executable (DESIGN.md m4, DONE), build the
+musl target — needs the musl rust-std + musl-gcc, both installable here:
+```
+rustup target add x86_64-unknown-linux-musl
+apt-get install -y musl-tools             # provides musl-gcc
+cd engine && cargo build --release --target x86_64-unknown-linux-musl
+file target/x86_64-unknown-linux-musl/release/sarun   # "statically linked"
+ldd  target/x86_64-unknown-linux-musl/release/sarun   # "statically linked" (no dynamic libc)
+```
+`engine/.cargo/config.toml` scopes the musl linker/CC so the default glibc
+build is untouched. `test_musl_rs.py` proves the static binary serves + runs a
+box (and self-skips cleanly if the musl target wasn't built).
 
 ## Run the tests
 Each `test_*.py` is standalone (repo `check()/_fails` + `__main__` style) AND
@@ -53,7 +78,7 @@ uv run --with pytest --with pytest-timeout --with "textual>=0.60" \
   pytest -q -p no:cacheprovider --ignore=test_e2e.py \
   --ignore=test_sakar.py --ignore=test_sakar_e2e.py --ignore=test_pjdfstest.py
 ```
-Expected today: **116 passed**. A single file:
+Expected today: **121 passed** (test_engine_rs self-skips without cargo). A single file:
 ```
 uv run --with pytest --with "pyfuse3>=3.2" --with "trio>=0.22" \
   pytest -q -p no:cacheprovider test_outputs_capture.py
