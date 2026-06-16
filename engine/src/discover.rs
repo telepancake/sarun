@@ -208,8 +208,13 @@ pub fn brushprov(box_id: i64) -> Value {
         return json!([]);
     };
     let mut rows = vec![];
-    if let Ok(mut st) = conn.prepare(
-        "SELECT id,ts,cmd,record,pipeline,spawn_ts FROM brushprov ORDER BY id") {
+    // `nested` is a Rust-engine column (D9 follow-on); a sqlar written before it
+    // existed (or by Python) lacks it — select 0 in that case so old archives
+    // still read.
+    let nested_col = if has_col(&conn, "brushprov", "nested")
+                     { "nested" } else { "0" };
+    if let Ok(mut st) = conn.prepare(&format!(
+        "SELECT id,ts,cmd,record,pipeline,spawn_ts,{nested_col} FROM brushprov ORDER BY id")) {
         let it = st.query_map([], |r| {
             let rec: String = r.get(3)?;
             Ok(json!({
@@ -218,6 +223,7 @@ pub fn brushprov(box_id: i64) -> Value {
                 "record": serde_json::from_str::<Value>(&rec).unwrap_or(Value::Null),
                 "pipeline": r.get::<_, Option<i64>>(4)?,
                 "spawn_ts": r.get::<_, Option<f64>>(5)?,
+                "nested": r.get::<_, Option<i64>>(6)?.unwrap_or(0) != 0,
             }))
         });
         if let Ok(it) = it { for row in it.flatten() { rows.push(row); } }

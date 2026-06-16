@@ -36,6 +36,24 @@ fn pidfd_open(pid: i32) -> i32 {
 
 /// pidfd_open, exposed for the brush module (same capture/MUTE wiring).
 pub fn pidfd_open_pub(pid: i32) -> i32 { pidfd_open(pid) }
+
+/// D9 nested-shell provenance: the brush-sh shim (see brush::brush_sh) sends ONE
+/// newline-terminated JSON line over the engine control socket at UI_SOCK_INBOX,
+/// carrying ITS OWN pidfd as SCM_RIGHTS so the engine resolves the enclosing box
+/// from the shim's /proc ancestry (the same identity path register uses). This
+/// is a one-shot control message — NOT a register, NOT a box channel: the engine
+/// records the recipe's brushprov rows and closes. Best-effort: any failure (no
+/// socket, send error) is swallowed so the recipe still runs unchanged. `line`
+/// must already be newline-terminated.
+pub fn send_nested_prov(line: &[u8]) {
+    let Ok(conn) = UnixStream::connect(UI_SOCK_INBOX) else { return; };
+    let pidfd = pidfd_open(std::process::id() as i32);
+    send_register(&conn, line, pidfd);
+    if pidfd >= 0 { unsafe { libc::close(pidfd); } }
+    // Drain the engine's one-line ack (best-effort) so it isn't an abrupt RST.
+    let mut s = String::new();
+    let _ = BufReader::new(&conn).read_line(&mut s);
+}
 /// send_frame, exposed for the brush module's MUTE/UNMUTE/teardown frames.
 pub fn send_frame_pub(conn_fd: i32, frame: &[u8], pidfd: Option<i32>) {
     send_frame(conn_fd, frame, pidfd)
@@ -266,18 +284,38 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
     // -b brush likewise needs the capture sinks to record provenance + writes.
     if brush && capture_on { inner_args.push("--brush"); }
     inner_args.push("--");
-    let status = Command::new("bwrap")
-        .args(["--bind", &root_src, "/",
-               "--proc", "/proc", "--dev", "/dev",
-               "--ro-bind-try", "/sys", "/sys",
-               "--tmpfs", "/tmp",
-               "--ro-bind", &sock_src, UI_SOCK_INBOX,
-               "--unshare-pid", "--unshare-ipc", "--unshare-uts",
-               "--die-with-parent",
-               "--chdir", &cwd, "--"])
-        .args(&inner_args)
-        .args(&cmd)
-        .status();
+    let mut bwrap = Command::new("bwrap");
+    bwrap.args(["--bind", &root_src, "/",
+                "--proc", "/proc", "--dev", "/dev",
+                "--ro-bind-try", "/sys", "/sys",
+                "--tmpfs", "/tmp",
+                "--ro-bind", &sock_src, UI_SOCK_INBOX]);
+    // D9 follow-on — NESTED shell provenance (brush boxes, capture on only).
+    // OBSERVE-ONLY interposition: we shadow the box's /bin/sh, /bin/bash (and
+    // /usr/bin/{sh,bash}) with the ENGINE binary, having first STASHED the REAL
+    // shells at fixed paths. The shim (brush_sh, gated on SARUN_BRUSH_SH=1)
+    // parses a nested `sh -c RECIPE`, best-effort emits the recipe's brush
+    // provenance to the engine, then execve's the REAL shell with the ORIGINAL
+    // argv — so the recipe ALWAYS runs byte-for-byte as before. The stash binds
+    // MUST precede the shadow binds (bwrap applies binds in order; the stash
+    // source resolves against the runner's current mount ns = the real host
+    // shells, BEFORE we overwrite the box's view of /bin/sh with the engine).
+    // `-try` so a missing bash is not fatal. Non-brush boxes are NOT touched.
+    if brush && capture_on {
+        bwrap.args(["--ro-bind-try", "/bin/sh", "/.slopbox-realsh",
+                    "--ro-bind-try", "/bin/bash", "/.slopbox-realbash"]);
+        bwrap.args(["--ro-bind", &self_exe, "/bin/sh",
+                    "--ro-bind-try", &self_exe, "/usr/bin/sh",
+                    "--ro-bind-try", &self_exe, "/bin/bash",
+                    "--ro-bind-try", &self_exe, "/usr/bin/bash"]);
+        bwrap.args(["--setenv", "SARUN_BRUSH_SH", "1",
+                    "--setenv", "SARUN_REALSH", "/.slopbox-realsh",
+                    "--setenv", "SARUN_REALBASH", "/.slopbox-realbash"]);
+    }
+    bwrap.args(["--unshare-pid", "--unshare-ipc", "--unshare-uts",
+                "--die-with-parent",
+                "--chdir", &cwd, "--"]);
+    let status = bwrap.args(&inner_args).args(&cmd).status();
     drop(conn); // our copy; inner (in the box) is the channel's sole holder now
     match status {
         Ok(s) => s.code().unwrap_or(1),

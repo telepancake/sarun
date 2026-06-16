@@ -190,13 +190,14 @@ def main():
               f"brush-link-rs: brushprov row reports its processes "
               f"({None if not linked else linked.get('processes')})")
 
-        # ── PART 2: /bin/sh -> brush mapping is a DOCUMENTED GAP ────────────
-        # A nested `sh -c` (the make-recipe shape) runs the HOST /bin/sh, not
-        # brush, in this cut. Assert the documented behavior: the nested write
-        # is still captured (it flows through FUSE) but there is NO brushprov
-        # pipeline whose cmd is the nested recipe — proving we did NOT fake the
-        # /bin/sh->brush remap. (When the follow-on lands, this assertion is the
-        # one to flip.)
+        # ── PART 2: /bin/sh -> brush-sh nested provenance (follow-on LANDED) ─
+        # The D9 follow-on now interposes the box's /bin/sh with the engine's
+        # brush-sh shim for -b boxes: a nested `sh -c RECIPE` (the make-recipe
+        # shape) emits the recipe's OWN brushprov row (flagged nested=1) before
+        # exec'ing the REAL /bin/sh, so the recipe still runs unchanged. Assert
+        # the nested write is captured AND a brushprov row for the inner recipe
+        # now EXISTS (the gap that used to be pinned here is closed — the deeper
+        # coverage lives in test_brush_nested_sh_rs.py).
         r = subprocess.run(
             [str(BIN), "run", "-b", "NEST", "--",
              "sh", "-c", "/bin/sh -c 'echo NESTED > /root/link_nested.txt'"],
@@ -209,16 +210,16 @@ def main():
               "brush-link-rs: nested recipe's write IS still captured (FUSE)")
         con = sqlite3.connect(f"file:{spn}?mode=ro", uri=True)
         try:
-            cmds = [c for (c,) in con.execute("SELECT cmd FROM brushprov")]
+            cmds = [c for (c, n) in con.execute("SELECT cmd, nested FROM brushprov")
+                    if n]
         finally:
             con.close()
-        # brush DID see the top-level `/bin/sh -c '...'` pipeline (that string is
-        # what brush ran), but NOT a separate brushprov for the *inner* recipe
-        # `echo NESTED > ...` — that inner sh was the host /bin/sh, unmapped.
+        # The inner recipe `echo NESTED > ...` now has its OWN brushprov row,
+        # flagged nested=1, observed by the brush-sh shim.
         inner_seen = any(c.strip().startswith("echo NESTED") for c in cmds)
-        check(not inner_seen,
-              f"brush-link-rs: GAP pinned — no brushprov for the nested recipe "
-              f"(the /bin/sh->brush remap is not wired). cmds={cmds!r}")
+        check(inner_seen,
+              f"brush-link-rs: nested recipe HAS a brushprov row (nested=1) — "
+              f"the /bin/sh->brush-sh follow-on is wired. nested cmds={cmds!r}")
     finally:
         for h in (host_out, host_nested): h.unlink(missing_ok=True)
         if eng is not None and eng.poll() is None:

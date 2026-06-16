@@ -132,7 +132,28 @@ fn ui_launch(args: &[String]) -> i32 {
 }
 
 fn main() {
+    // D9 follow-on — brush-sh shim. When a -b box shadows /bin/sh (etc.) with
+    // this engine binary, a nested `sh -c RECIPE` execs us under the original
+    // program name. Detect that BEFORE normal subcommand dispatch (argv[0]'s
+    // basename is a shell name AND SARUN_BRUSH_SH=1), emit the recipe's
+    // provenance, then exec the REAL shell with the original argv unchanged.
+    if brush::is_brush_sh_invocation() {
+        let full: Vec<String> = std::env::args().collect();
+        std::process::exit(brush::brush_sh(&full));
+    }
     let argv: Vec<String> = std::env::args().skip(1).collect();
+    // Explicit `brush-sh -- <argv...>` subcommand for DIRECT testing of the shim
+    // without the bwrap shadow binds: everything after `--` is the shell argv
+    // (argv[0] = the shell name). The env stash vars still select the real shell.
+    if argv.first().map(String::as_str) == Some("brush-sh") {
+        let rest = &argv[1..];
+        let sep = rest.iter().position(|a| a == "--");
+        let shell_argv: Vec<String> = match sep {
+            Some(i) => rest[i + 1..].to_vec(),
+            None => rest.to_vec(),
+        };
+        std::process::exit(brush::brush_sh(&shell_argv));
+    }
     match argv.first().map(String::as_str) {
         // Bare launch / explicit `attach` / `--once` headless render → UI role,
         // auto-spawning the engine when its socket is down.

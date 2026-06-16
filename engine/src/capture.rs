@@ -44,8 +44,11 @@ CREATE TABLE IF NOT EXISTS rdev(name TEXT PRIMARY KEY, dev INT);
 --   spawn_ts: the wall-clock instant brush reported right before spawning this
 --   pipeline's complete-command; the [spawn_ts, next spawn_ts) window is what a
 --   brush-descendant process's real /proc start time is bucketed into to link it.
+--   nested: 1 for a recipe a NESTED shell ran (a `sh -c` the box's command
+--   spawned, captured via the brush-sh shim) vs 0 for a TOP-LEVEL pipeline the
+--   box's own embedded brush ran. Queryable so a reader can tell the two apart.
 CREATE TABLE IF NOT EXISTS brushprov(id INTEGER PRIMARY KEY AUTOINCREMENT,
- ts REAL, cmd TEXT, record TEXT, pipeline INT, spawn_ts REAL);
+ ts REAL, cmd TEXT, record TEXT, pipeline INT, spawn_ts REAL, nested INT DEFAULT 0);
 ";
 
 #[derive(Clone)]
@@ -717,6 +720,25 @@ impl BoxState {
         let _ = conn.execute(
             "INSERT INTO brushprov(ts,cmd,record,pipeline,spawn_ts) \
              VALUES(?1,?2,?3,?4,?5)",
+            params![ts, cmd, record_json, pipeline, spawn_ts]);
+        conn.last_insert_rowid()
+    }
+
+    /// Record a NESTED-shell provenance row (a recipe a `sh -c` the box spawned
+    /// ran, observed by the brush-sh shim). Same shape as add_brushprov but with
+    /// nested=1, so a reader can distinguish it from a top-level pipeline. There
+    /// is no process↔pipeline linkage for these (the recipe's processes are
+    /// already attributed to the TOP-LEVEL pipeline by forest ancestry); this row
+    /// adds only the recipe's OWN semantic command string + structure.
+    pub fn add_brushprov_nested(&self, cmd: &str, record_json: &str, pipeline: i64,
+                                spawn_ts: f64) -> i64 {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64()).unwrap_or(0.0);
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute(
+            "INSERT INTO brushprov(ts,cmd,record,pipeline,spawn_ts,nested) \
+             VALUES(?1,?2,?3,?4,?5,1)",
             params![ts, cmd, record_json, pipeline, spawn_ts]);
         conn.last_insert_rowid()
     }

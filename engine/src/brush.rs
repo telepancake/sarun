@@ -61,6 +61,7 @@
 // follow-on adds is the recipe's OWN semantic command string.
 
 use std::os::fd::AsRawFd;
+use std::os::unix::process::CommandExt;
 
 use serde_json::json;
 use serde_json::Value;
@@ -129,7 +130,7 @@ fn shell_quote(w: &str) -> String {
 /// The per-pipeline provenance records for ONE complete-command (CompoundList).
 /// Used to emit FRAME_PROV immediately before brush runs that complete-command,
 /// so the engine's `current_pipeline` window matches real execution order.
-fn complete_command_records(complete: &brush_parser::ast::CompoundList) -> Vec<Value> {
+pub(crate) fn complete_command_records(complete: &brush_parser::ast::CompoundList) -> Vec<Value> {
     use brush_parser::ast;
     let mut out = vec![];
     // CompleteCommand = CompoundList = Vec<CompoundListItem(AndOrList, sep)>.
@@ -325,6 +326,110 @@ pub fn inner_brush(conn_fd: i32, cmd: Vec<String>) -> i32 {
         conn_fd, &crate::frames::encode(crate::frames::FRAME_UNMUTE, &[]), None);
     let _ = reader;
     code
+}
+
+// ── brush-sh shim (D9 follow-on: NESTED shell provenance) ────────────────────
+// When a -b box runs, runner::run shadows the box's /bin/sh, /usr/bin/sh,
+// /bin/bash, /usr/bin/bash with the ENGINE binary and sets SARUN_BRUSH_SH=1
+// (the real shells are stashed at /.slopbox-realsh and /.slopbox-realbash). So
+// when the box's TOP-LEVEL command — or, more interestingly, a NESTED tool like
+// `make` or a libc `system()` — exec's `/bin/sh -c RECIPE`, it lands HERE
+// instead of the real shell.
+//
+// This is OBSERVE-ONLY. We do NOT run the recipe through brush. We parse the
+// `-c` script just to emit its semantic provenance (best-effort), then we
+// execve the REAL shell with the ORIGINAL argv preserved EXACTLY (only argv[0]
+// becomes the real-shell path). The recipe therefore runs byte-for-byte as it
+// would have without us — same pid (exec replaces the image), same fds, same
+// env. On ANY parse/connect error we emit nothing and still exec the real shell;
+// the box is NEVER broken by a construct brush can't model. This is the
+// deliberate inverse of the top-level brush box's no-/bin/sh-fallback rule:
+// there brush IS the shell and an unsupported construct must be visible; here
+// the real shell is authoritative and provenance is a pure side-observation.
+
+/// True when this engine invocation should act as the brush-sh shim: the
+/// SARUN_BRUSH_SH env flag is set AND argv[0]'s basename is a shell name. main()
+/// checks this BEFORE its normal subcommand dispatch.
+pub fn is_brush_sh_invocation() -> bool {
+    if std::env::var("SARUN_BRUSH_SH").as_deref() != Ok("1") {
+        return false;
+    }
+    let arg0 = std::env::args().next().unwrap_or_default();
+    let base = std::path::Path::new(&arg0)
+        .file_name().and_then(|s| s.to_str()).unwrap_or("");
+    matches!(base, "sh" | "bash" | "dash")
+}
+
+/// The brush-sh shim entrypoint. `argv` is the FULL process argv (argv[0] is the
+/// shell name we were invoked as). Best-effort emits nested-recipe provenance,
+/// then execve's the real shell with argv unchanged (argv[0] → real-shell path).
+/// Returns 127 only if the exec itself fails (it normally never returns).
+pub fn brush_sh(argv: &[String]) -> i32 {
+    if argv.is_empty() { return 127; }
+    let arg0 = &argv[0];
+    let base = std::path::Path::new(arg0)
+        .file_name().and_then(|s| s.to_str()).unwrap_or("");
+    // Pick the matching real shell stash; fall back to the literal path only if
+    // the env var is unset (a direct `brush-sh` test invocation, say).
+    let real = if base == "bash" {
+        std::env::var("SARUN_REALBASH").unwrap_or_else(|_| "/bin/bash".to_string())
+    } else {
+        std::env::var("SARUN_REALSH").unwrap_or_else(|_| "/bin/sh".to_string())
+    };
+
+    // Find `-c` and the script that follows; emit provenance for it. Everything
+    // here is best-effort and must never abort the exec below.
+    if let Some(pos) = argv.iter().position(|a| a == "-c") {
+        if let Some(script) = argv.get(pos + 1) {
+            emit_nested_prov(script);
+        }
+    }
+
+    // Run the REAL shell with the ORIGINAL argv, only swapping argv[0] for the
+    // real-shell path. exec() replaces the process image; on success this call
+    // never returns, so the recipe runs exactly as it would have natively.
+    let err = std::process::Command::new(&real)
+        .arg0(&real)
+        .args(&argv[1..])
+        .exec();
+    // Only reached if exec failed (missing real shell, etc.).
+    eprintln!("sarun-engine brush-sh: exec real shell {real} failed: {err}");
+    127
+}
+
+/// Best-effort: parse a nested `-c` script and ship one `brush_prov_nested`
+/// control message (the per-pipeline records + our pidfd) to the engine. Any
+/// failure (parse error, no socket) is swallowed — provenance is optional.
+fn emit_nested_prov(script: &str) {
+    // sh-mode parse, matching the top-level brush box's sh_mode shell, so the
+    // grammar accepted here is the same /bin/sh-ish one.
+    let opts = brush_parser::ParserOptions { sh_mode: true,
+        ..brush_parser::ParserOptions::default() };
+    let reader = std::io::Cursor::new(script.as_bytes().to_vec());
+    let mut parser = brush_parser::Parser::new(reader, &opts);
+    let prog = match parser.parse_program() {
+        Ok(p) => p,
+        Err(_) => return, // unparseable for us → emit nothing, recipe still runs
+    };
+    let spawn_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64()).unwrap_or(0.0);
+    let mut records: Vec<Value> = vec![];
+    let mut seq = 0i64;
+    for complete in &prog.complete_commands {
+        for mut rec in complete_command_records(complete) {
+            if let Value::Object(ref mut m) = rec {
+                m.insert("seq".to_string(), json!(seq));
+                m.insert("spawn_ts".to_string(), json!(spawn_ts));
+                m.insert("nested".to_string(), json!(true));
+            }
+            records.push(rec);
+            seq += 1;
+        }
+    }
+    if records.is_empty() { return; }
+    let msg = json!({"type": "brush_prov_nested", "records": records});
+    crate::runner::send_nested_prov(format!("{msg}\n").as_bytes());
 }
 
 /// Build the brush shell, parse the script, emit one FRAME_PROV per pipeline,

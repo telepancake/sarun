@@ -135,6 +135,49 @@ fn record_brush_prov(state: &State, ov: &Option<crate::overlay::Overlay>,
                             "cmd": cmd, "record": rec}));
 }
 
+/// D9 nested-shell provenance verb. The brush-sh shim (a `sh -c RECIPE` the box
+/// spawned, exec'd as the engine binary) sends one `brush_prov_nested` message
+/// carrying ITS OWN pidfd as SCM_RIGHTS. We resolve the enclosing box from the
+/// shim's /proc ancestry — the EXACT path `register` uses for a nested box — and
+/// record each record as a NESTED brushprov row, broadcasting a `brush_prov`
+/// event per row. Best-effort: an unresolvable box or malformed message is
+/// dropped quietly (the recipe runs regardless; provenance is optional). This is
+/// a one-shot control reply — it does NOT create a box channel.
+fn brush_prov_nested(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
+    // Resolve the shim's HOST pid from its pidfd (the wrap-immune identity path),
+    // then derive the enclosing box from its /proc ancestry.
+    let host_pid = peer_pidfd.map(host_pid_from_pidfd).filter(|p| *p > 0)
+        .unwrap_or(0);
+    if let Some(fd) = peer_pidfd { unsafe { libc::close(fd); } }
+    let Some(id) = derive_parent_box(state, host_pid) else {
+        return json!({"ok": false, "error": "no enclosing box"});
+    };
+    let ov = state.lock().unwrap().overlay.clone();
+    let records = msg.get("records").and_then(Value::as_array);
+    let Some(records) = records else {
+        return json!({"ok": false, "error": "no records"});
+    };
+    let mut n = 0i64;
+    for rec in records {
+        let cmd = rec.get("cmd").and_then(Value::as_str).unwrap_or("").to_string();
+        let seq = rec.get("seq").and_then(Value::as_i64).unwrap_or(0);
+        let spawn_ts = rec.get("spawn_ts").and_then(Value::as_f64).unwrap_or(0.0);
+        let record_json = rec.to_string();
+        let mut prov_id = 0i64;
+        if let Some(ov) = ov.as_ref() {
+            if let Some(b) = ov.live_box(id) {
+                prov_id = b.add_brushprov_nested(&cmd, &record_json, seq, spawn_ts);
+            }
+        }
+        broadcast(state, &json!({"type": "brush_prov",
+                                "session_id": id.to_string(),
+                                "brushprov_id": prov_id, "seq": seq,
+                                "nested": true, "cmd": cmd, "record": rec}));
+        n += 1;
+    }
+    json!({"ok": true, "recorded": n})
+}
+
 pub fn broadcast(state: &State, ev: &Value) {
     let data = format!("{ev}\n");
     let mut s = state.lock().unwrap();
@@ -949,6 +992,12 @@ fn handle(state: State, conn: UnixStream) {
         }
         let mut reply = if msg.get("type").and_then(Value::as_str) == Some("register") {
             register(&state, &msg, peer_pidfd.take())
+        } else if msg.get("type").and_then(Value::as_str) == Some("brush_prov_nested") {
+            // D9 nested-shell provenance: a one-shot control message from the
+            // brush-sh shim, carrying its OWN pidfd (like register) so we resolve
+            // the enclosing box from /proc ancestry. NOT a box channel — record
+            // and reply once, then the connection closes. The pidfd is consumed.
+            brush_prov_nested(&state, &msg, peer_pidfd.take())
         } else {
             dispatch(&state, &msg)
         };
