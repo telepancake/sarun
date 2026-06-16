@@ -518,7 +518,7 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
         b.set_meta("parent_box_id", &p.to_string());
     }
     if let Some(prov) = msg.get("prov") {
-        b.root_process(prov);
+        b.root_process(prov, host_pid as i64);
     }
     {
         let mut s = state.lock().unwrap();

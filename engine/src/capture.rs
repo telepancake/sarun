@@ -56,7 +56,18 @@ pub struct BoxState {
     pub id: i64,
     pub conn: Mutex<Connection>,
     pub kinds: RwLock<HashMap<String, Entry>>,
-    procs: Mutex<HashMap<u32, i64>>, // tgid -> process row id
+    // Process FOREST caches (mirror the Python Index._proc_cache/_proc_current):
+    //   proc_cache:   (tgid,start) -> process row id  — incarnation identity.
+    //   proc_current: tgid -> (start, row id)         — the latest-seen incarnation,
+    //                                                    used to resolve a parent_id.
+    // A pid is reused over time; the (tgid,start) key makes a reused pid with a new
+    // start_time a NEW row, never a dedup into a stale incarnation (PID-reuse proof).
+    proc_cache: Mutex<HashMap<(u32, i64), i64>>,
+    proc_current: Mutex<HashMap<u32, (i64, i64)>>,
+    // The box's root runner tgids (the bubble-walk boundary): the host pid(s) of
+    // each `sarun -- cmd` launch into this box. A PPid chain stops when it reaches
+    // one of these (never walk above a launch into the runner's host ancestry).
+    roots: Mutex<std::collections::HashSet<u32>>,
     parent: std::sync::atomic::AtomicI64, // 0 = top-level; else parent box_id
     // -e env capture: record each writer's full environment (deduped in `env`).
     env_capture: std::sync::atomic::AtomicBool,
@@ -146,7 +157,9 @@ impl BoxState {
             id,
             conn: Mutex::new(conn),
             kinds: RwLock::new(HashMap::new()),
-            procs: Mutex::new(HashMap::new()),
+            proc_cache: Mutex::new(HashMap::new()),
+            proc_current: Mutex::new(HashMap::new()),
+            roots: Mutex::new(std::collections::HashSet::new()),
             parent: std::sync::atomic::AtomicI64::new(0),
             env_capture: std::sync::atomic::AtomicBool::new(false),
             direct: std::sync::atomic::AtomicBool::new(false),
@@ -191,57 +204,213 @@ impl BoxState {
                 }
             }
         }
-        // Seed the tgid->row cache so already-recorded writers dedup correctly.
-        let mut procs = self.procs.lock().unwrap();
+        // Repopulate the incarnation caches + hierarchy roots from any rows recorded
+        // by earlier runs of this box (rerun reopens the same db). ORDER BY id ASC so
+        // proc_current keeps the highest-id incarnation per tgid as "current".
+        let mut cache = self.proc_cache.lock().unwrap();
+        let mut current = self.proc_current.lock().unwrap();
+        let mut roots = self.roots.lock().unwrap();
         if let Ok(mut st) = conn.prepare(
-            "SELECT tgid,id FROM process WHERE start=0") {
+            "SELECT id,tgid,start,root FROM process ORDER BY id") {
             if let Ok(rows) = st.query_map([], |r| {
-                Ok((r.get::<_, i64>(0)? as u32, r.get::<_, i64>(1)?))
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)? as u32,
+                    r.get::<_, Option<i64>>(2)?.unwrap_or(0), r.get::<_, i64>(3)?))
             }) {
-                for (tgid, rid) in rows.flatten() { procs.insert(tgid, rid); }
+                for (rid, tgid, start, root) in rows.flatten() {
+                    cache.insert((tgid, start), rid);
+                    current.insert(tgid, (start, rid));
+                    if root != 0 { roots.insert(tgid); }
+                }
             }
         }
     }
 
-    /// The process-table row for `pid`, recorded on first sight (exe/argv/cwd
-    /// from /proc — per-write attribution, see D5).
-    pub fn writer_for(&self, pid: u32) -> i64 {
-        if let Some(id) = self.procs.lock().unwrap().get(&pid) {
-            return *id;
+    // ── process FOREST (mirror of the Python Index process-tree builder) ──────
+    //
+    // The capture records a CONNECTED FOREST: each writing process's row carries a
+    // `parent_id` pointing at the ROW id of its parent process's current incarnation,
+    // chained up the PPid ladder to a ROOT (the box's `sarun -- cmd` runner, root=1).
+    // Process identity is (tgid,start) — start is field 22 of /proc/<pid>/stat, so a
+    // reused pid with a new start_time is a new row, not a dedup. Caches mirror
+    // Python's _proc_cache ((tgid,start)->row) and _proc_current (tgid->latest row).
+
+    /// The thread-group id of `pid` (FUSE ctx.pid is a thread id) from
+    /// /proc/<pid>/status `Tgid:`; falls back to `pid` itself if unreadable.
+    fn tgid_of(pid: u32) -> u32 {
+        if let Ok(s) = std::fs::read_to_string(format!("/proc/{pid}/status")) {
+            for line in s.lines() {
+                if let Some(rest) = line.strip_prefix("Tgid:") {
+                    if let Ok(t) = rest.trim().parse::<u32>() { return t; }
+                }
+            }
         }
+        pid
+    }
+
+    /// (ppid, start_time) parsed from /proc/<pid>/stat. The comm field (field 2)
+    /// may contain spaces and ')' so the split is anchored after the LAST ')',
+    /// matching the Python `_parse_proc_stat`. Both 0 on any error.
+    fn parse_stat(pid: u32) -> (u32, i64) {
+        let Ok(raw) = std::fs::read(format!("/proc/{pid}/stat")) else { return (0, 0) };
+        let s = String::from_utf8_lossy(&raw);
+        let Some(rp) = s.rfind(')') else { return (0, 0) };
+        // fields after ')': field 3 (state) is rest[0]; ppid is field 4 -> rest[1];
+        // starttime is field 22 -> rest[19].
+        let rest: Vec<&str> = s[rp + 1..].split_whitespace().collect();
+        let ppid = rest.get(1).and_then(|x| x.parse::<u32>().ok()).unwrap_or(0);
+        let start = rest.get(19).and_then(|x| x.parse::<i64>().ok()).unwrap_or(0);
+        (ppid, start)
+    }
+
+    fn start_time_of(pid: u32) -> i64 { Self::parse_stat(pid).1 }
+
+    /// Best-effort provenance of a process by host pid: (tgid, start, ppid, exe,
+    /// cwd, argv). A vanished pid yields zeros/empties, never panics.
+    fn read_prov(pid: u32) -> (u32, i64, u32, String, String, Vec<String>) {
+        let tgid = Self::tgid_of(pid);
+        let (ppid, start) = Self::parse_stat(pid);
         let proc_ = |f: &str| format!("/proc/{pid}/{f}");
         let exe = std::fs::read_link(proc_("exe"))
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
+            .map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
         let cwd = std::fs::read_link(proc_("cwd"))
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
+            .map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
         let argv: Vec<String> = std::fs::read(proc_("cmdline"))
-            .unwrap_or_default()
-            .split(|b| *b == 0)
+            .unwrap_or_default().split(|b| *b == 0)
             .filter(|s| !s.is_empty())
-            .map(|s| String::from_utf8_lossy(s).into_owned())
-            .collect();
-        // -e env capture: record this writer's environment (deduped) so the
-        // process row links to it via env_id. Read /proc/<pid>/environ now,
-        // before the lock (and before the process can exit).
+            .map(|s| String::from_utf8_lossy(s).into_owned()).collect();
+        (tgid, start, ppid, exe, cwd, argv)
+    }
+
+    /// The process-table row for `pid`, recorded on first sight, with its FULL
+    /// ancestry up to the box root linked in (so the table stays one connected
+    /// forest). Returns the writer's row id.
+    pub fn writer_for(&self, pid: u32) -> i64 {
+        let (tgid, start, ppid, exe, cwd, argv) = Self::read_prov(pid);
+        if let Some(id) = self.proc_cache.lock().unwrap().get(&(tgid, start)) {
+            return *id;
+        }
+        // -e env capture: read /proc/<pid>/environ now (before any lock, before the
+        // process can exit). The pid (thread id) shares the tgid's environ.
         let env_json = if self.env_capture() { Self::read_environ_json(pid) }
                        else { None };
+        self.record_proc(tgid, start, ppid, &exe, &cwd, &argv, env_json, false)
+            .unwrap_or(tgid as i64)
+    }
+
+    /// Insert/dedup ONE process incarnation (identity (tgid,start)) and return its
+    /// row id. The parent is recorded FIRST (so parent_id is the parent's CURRENT
+    /// incarnation ROW id, never a pid), bubbling the PPid chain up to the box root
+    /// — this is what makes the table one connected forest. `root` marks an
+    /// incarnation a hierarchy root (the bubbling boundary). Mirrors the Python
+    /// `process_from_prov`. `tgid==0` yields None.
+    fn record_proc(&self, tgid: u32, start: i64, ppid: u32, exe: &str, cwd: &str,
+                   argv: &[String], env_json: Option<String>, root: bool) -> Option<i64> {
+        if tgid == 0 { return None; }
+        if let Some(rid) = self.proc_cache.lock().unwrap().get(&(tgid, start)).copied() {
+            self.proc_current.lock().unwrap().insert(tgid, (start, rid));
+            if root {
+                self.roots.lock().unwrap().insert(tgid);
+                let conn = self.conn.lock().unwrap();
+                let _ = conn.execute("UPDATE process SET root=1 WHERE id=?1", [rid]);
+            }
+            return Some(rid);
+        }
+        if root { self.roots.lock().unwrap().insert(tgid); }
+        // Resolve the parent to its CURRENT incarnation row id (NULL for a root or an
+        // unreachable parent) by recording the parent FIRST. A root is its own
+        // boundary: never walk above a launch into the runner's host ancestry.
+        let parent_id = if root { None }
+                        else { self.resolve_parent(ppid, 0, &mut std::collections::HashSet::new()) };
         let conn = self.conn.lock().unwrap();
-        let eid: Option<i64> = env_json
-            .and_then(|j| Self::ensure_env(&conn, &j));
+        let eid: Option<i64> = env_json.and_then(|j| Self::ensure_env(&conn, &j));
+        let argv_json = serde_json::to_string(&argv).unwrap_or_default();
         let _ = conn.execute(
             "INSERT OR IGNORE INTO process(tgid,start,ppid,parent_id,exe,cwd,argv,env_id,root)
-             VALUES(?1,0,0,NULL,?2,?3,?4,?5,0)",
-            params![pid, exe, cwd, serde_json::to_string(&argv).unwrap_or_default(), eid],
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![tgid, start, ppid, parent_id, exe, cwd, argv_json, eid,
+                    if root { 1 } else { 0 }],
         );
         let rowid: i64 = conn
-            .query_row("SELECT id FROM process WHERE tgid=?1 AND start=0", [pid],
-                       |r| r.get(0))
+            .query_row("SELECT id FROM process WHERE tgid=?1 AND start=?2",
+                       params![tgid, start], |r| r.get(0))
             .unwrap_or(0);
         drop(conn);
-        self.procs.lock().unwrap().insert(pid, rowid);
-        rowid
+        self.proc_cache.lock().unwrap().insert((tgid, start), rowid);
+        self.proc_current.lock().unwrap().insert(tgid, (start, rowid));
+        Some(rowid)
+    }
+
+    /// Record the parent process `ppid` (and so its whole PPid chain) and return its
+    /// CURRENT incarnation ROW id, so the per-box process table forms ONE forest
+    /// rooted at each launch and a child's parent_id is a row id (PID-reuse proof),
+    /// never a tgid. Best-effort: a failed ancestor /proc read links a minimal row
+    /// and stops. STOPS at: ppid<=1 (init), a box root (the launch boundary), a
+    /// depth/cycle cap (64 levels / seen-set). Mirrors the Python `_resolve_parent`.
+    fn resolve_parent(&self, ppid: u32, depth: u32,
+                      seen: &mut std::collections::HashSet<u32>) -> Option<i64> {
+        if ppid <= 1 { return None; }
+        let ptgid = { let t = Self::tgid_of(ppid); if t == 0 { ppid } else { t } };
+        // A box root is the bubbling boundary: its row is the top of the chain. The
+        // parent's current incarnation row id is what we link to; do not walk above.
+        if self.roots.lock().unwrap().contains(&ptgid) {
+            return self.current_row(ptgid);
+        }
+        if depth >= 64 { return self.current_row(ptgid); }
+        if seen.contains(&ptgid) { return self.current_row(ptgid); }
+        seen.insert(ptgid);
+        // Key the parent on its LIVE (tgid,start): a reused pid is a new incarnation.
+        let pstart = Self::start_time_of(ppid);
+        if pstart != 0 {
+            if let Some(rid) = self.proc_cache.lock().unwrap().get(&(ptgid, pstart)).copied() {
+                self.proc_current.lock().unwrap().insert(ptgid, (pstart, rid));
+                return Some(rid);
+            }
+        }
+        let (_t, gstart, gppid, exe, cwd, argv) = Self::read_prov(ppid);
+        let start = if gstart != 0 { gstart } else { pstart };
+        let gtgid = if gppid != 0 { Self::tgid_of(gppid) } else { 0 };
+        let env_json = if self.env_capture() { Self::read_environ_json(ppid) } else { None };
+        // Record this ancestor (recurses up via its own ppid) and return its row id.
+        // Inline the recursion through record_proc's parent resolution by recording
+        // with the resolved grandparent chain.
+        self.record_proc_with_parent(ptgid, start, gtgid, gppid, &exe, &cwd, &argv,
+                                      env_json, depth, seen)
+    }
+
+    /// record_proc variant used while bubbling: resolves the parent via the SAME
+    /// depth/seen state so the cycle/depth caps span the whole walk.
+    #[allow(clippy::too_many_arguments)]
+    fn record_proc_with_parent(&self, tgid: u32, start: i64, ppid_tgid: u32,
+                               parent_pid: u32, exe: &str, cwd: &str, argv: &[String],
+                               env_json: Option<String>, depth: u32,
+                               seen: &mut std::collections::HashSet<u32>) -> Option<i64> {
+        if tgid == 0 { return None; }
+        if let Some(rid) = self.proc_cache.lock().unwrap().get(&(tgid, start)).copied() {
+            self.proc_current.lock().unwrap().insert(tgid, (start, rid));
+            return Some(rid);
+        }
+        let parent_id = self.resolve_parent(parent_pid, depth + 1, seen);
+        let conn = self.conn.lock().unwrap();
+        let eid: Option<i64> = env_json.and_then(|j| Self::ensure_env(&conn, &j));
+        let argv_json = serde_json::to_string(&argv).unwrap_or_default();
+        let _ = conn.execute(
+            "INSERT OR IGNORE INTO process(tgid,start,ppid,parent_id,exe,cwd,argv,env_id,root)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,0)",
+            params![tgid, start, ppid_tgid, parent_id, exe, cwd, argv_json, eid],
+        );
+        let rowid: i64 = conn
+            .query_row("SELECT id FROM process WHERE tgid=?1 AND start=?2",
+                       params![tgid, start], |r| r.get(0))
+            .unwrap_or(0);
+        drop(conn);
+        self.proc_cache.lock().unwrap().insert((tgid, start), rowid);
+        self.proc_current.lock().unwrap().insert(tgid, (start, rowid));
+        Some(rowid)
+    }
+
+    /// The process-table ROW id of `tgid`'s latest-seen incarnation, or None.
+    fn current_row(&self, tgid: u32) -> Option<i64> {
+        self.proc_current.lock().unwrap().get(&tgid).map(|(_, rid)| *rid)
     }
 
     /// Upsert the file row for `rel` (data stays NULL — D4) and return its
@@ -457,15 +626,31 @@ impl BoxState {
         self.kinds.read().unwrap().contains_key(rel)
     }
 
-    /// The box's ROOT process row (root=1): the runner itself, provenance from
-    /// the register message body (tgid/exe/cwd/argv).
-    pub fn root_process(&self, prov: &serde_json::Value) {
-        let g = |k: &str| prov.get(k).and_then(|v| v.as_str()).unwrap_or("");
-        let tgid = prov.get("tgid").and_then(|v| v.as_i64())
-            .or_else(|| prov.get("pid").and_then(|v| v.as_i64())).unwrap_or(0);
-        let ppid = prov.get("ppid").and_then(|v| v.as_i64()).unwrap_or(0);
-        let argv = prov.get("argv").cloned()
-            .unwrap_or(serde_json::Value::Array(vec![]));
+    /// The box's ROOT process row (root=1): the `sarun -- cmd` runner itself, the
+    /// top of this launch's process forest and the bubble-walk boundary. Provenance
+    /// comes from the register message body (exe/cwd/argv); `host_pid` is the runner's
+    /// REAL host pid (pidfd-derived, correct even for a nested runner) — its /proc
+    /// start_time is the incarnation key so a writer bubbling up its PPid chain reaches
+    /// THIS row (matching the Python Supervisor, which records the root with the host
+    /// pid's real start_time, not 0). On RERUN a second launch adds ANOTHER root row
+    /// and its subtree, keeping the forest connected across runs.
+    pub fn root_process(&self, prov: &serde_json::Value, host_pid: i64) {
+        let g = |k: &str| prov.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+        // tgid: the real host pid when known (so /proc + the bubble chain agree),
+        // else the runner's self-reported tgid/pid from prov.
+        let tgid = if host_pid > 0 { host_pid as u32 }
+                   else {
+                       prov.get("tgid").and_then(|v| v.as_i64())
+                           .or_else(|| prov.get("pid").and_then(|v| v.as_i64()))
+                           .unwrap_or(0) as u32
+                   };
+        let ppid = prov.get("ppid").and_then(|v| v.as_i64()).unwrap_or(0) as u32;
+        // start_time identifies the incarnation; read the host pid's real start so the
+        // (tgid,start) identity matches what writers see when they bubble up to it.
+        let start = if tgid > 0 { Self::start_time_of(tgid) } else { 0 };
+        let argv: Vec<String> = prov.get("argv").and_then(|v| v.as_array())
+            .map(|a| a.iter().map(|x| x.as_str().unwrap_or("").to_string()).collect())
+            .unwrap_or_default();
         // -e env capture: the root's env. Prefer the env the runner sent in prov
         // (its full HOST env — correct even for a nested runner whose tgid is a
         // parent-namespace pid the engine can't /proc-read); else read the host
@@ -476,16 +661,11 @@ impl BoxState {
                     .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
                     .collect();
                 serde_json::to_string(&bt).unwrap_or_default()
-            }).or_else(|| if tgid > 0 { Self::read_environ_json(tgid as u32) }
+            }).or_else(|| if tgid > 0 { Self::read_environ_json(tgid) }
                           else { None })
         } else { None };
-        let conn = self.conn.lock().unwrap();
-        let eid: Option<i64> = env_json.and_then(|j| Self::ensure_env(&conn, &j));
-        let _ = conn.execute(
-            "INSERT OR IGNORE INTO process(tgid,start,ppid,parent_id,exe,cwd,argv,env_id,root)
-             VALUES(?1,0,?2,NULL,?3,?4,?5,?6,1)",
-            params![tgid, ppid, g("exe"), g("cwd"), argv.to_string(), eid],
-        );
+        self.record_proc(tgid, start, ppid, &g("exe"), &g("cwd"), &argv,
+                         env_json, true);
     }
 
     /// Move the upper row old->new (reusing the blob — rowid is stable, so the
