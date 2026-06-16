@@ -9,29 +9,6 @@
 // recover — for each command it runs, the exact command string plus its
 // parsed pipeline/redirect structure (a real step above pid+argv).
 //
-// BUILTINS (important nuance): brush-core 0.5 ships with NO builtins on its
-// own — they live in the sibling `brush-builtins` crate. We install its
-// ShMode set onto the shell so the POSIX-required builtins (`cd`, `export`,
-// `set`, `unset`, `shift`, `return`, `break`, `continue`, `eval`, `exec`,
-// `exit`, `trap`, `pwd`, `read`, `getopts`, `:`, `.`, `true`, `false`,
-// `times`, `readonly`, `alias`, `unalias`, `command`, `hash`, `type`, `jobs`,
-// `kill`, `ulimit`, `umask`, `wait`, `fc`, `fg`, `bg`, `help`, `local`) run
-// IN-PROCESS — without this step, the brush-core Shell would error on `cd`
-// and friends and D9 no-fallback would make `inner_brush` blow up on trivial
-// scripts. We deliberately do NOT pick BashMode: it would also install `echo`,
-// `printf`, `test`, `[` as in-process builtins that write through brush's
-// OpenFiles abstraction (a wrapper around fd 1/2), NOT through the literal
-// fd 1/2 we dup2'd onto the box's FUSE sinks — so their stdout would NOT be
-// captured into the box's sqlar (test_brush_rs#stdout-captured proves this).
-// Keeping `echo`/`printf`/`test`/`[` as external commands preserves the FUSE
-// capture path. EXTERNAL coreutils (cat/ls/cp/mv/rm/mkdir/head/tail/wc/…) are
-// likewise NOT in-process — the `brush-coreutils-builtins` crate needs a
-// `--invoke-bundled` re-entry protocol the host binary has to implement; we
-// have not wired that yet, so those tools still fork+exec the box's
-// filesystem binaries (and still flow through FUSE capture exactly as
-// before). A construct that brush + the ShMode builtin set cannot handle
-// remains a VISIBLE error per the D9 no-/bin/sh-fallback rule.
-//
 // Capture: brush and every binary it forks/execs (cc, ld, tr, …) inherit this
 // process's fd 1/2, which we point at the box's FUSE sink files BEFORE building
 // the shell. So all of their writes flow through the overlay and are recorded,
@@ -68,42 +45,53 @@
 //   this cut. Both are documented gaps, not silent mislinks.
 //   Readers: discover::{proc_pipeline, pipeline_procs, brushprov(.processes)}.
 //
-// NESTED-shell observation (D9 follow-on, observe-only — see brush_sh below):
-// For brush boxes the runner shadows /bin/sh, /usr/bin/sh, /bin/bash, /usr/bin/bash
-// with the engine binary (the real shells stashed at /.slopbox-realsh /
-// /.slopbox-realbash), so a tool that exec's `sh -c RECIPE` (make, libc system(),
-// configure scripts, …) lands in `brush_sh`, which parses RECIPE with
-// brush-parser, ships one `brush_prov_nested` row per pipeline over the
-// bind-mounted control socket (box resolved from the shim's pidfd ancestry —
-// same resolution `register` uses for nested boxes), THEN execve's the REAL
-// shell with the original argv. Execution is byte-identical to native; a parse
-// failure just emits nothing and still runs the recipe.
+// NESTED-shell EXECUTION (D9 follow-on — see brush_sh below):
+// For -b brush boxes the runner shadows /bin/sh, /usr/bin/sh, /bin/bash and
+// /usr/bin/bash with the engine binary itself. When any tool inside the box
+// exec's `sh -c RECIPE` (make recipes, libc `system()`, configure scripts, …)
+// it lands in `brush_sh`, which RUNS the recipe THROUGH embedded brush-core —
+// not the real /bin/sh. There is NO real-shell fallback: D9's explicit-toggle
+// rule applies — anything brush cannot parse or execute is a VISIBLE error
+// (stderr message + non-zero exit), identical to how the top-level brush body
+// already behaves. brush is NOT bash: bash-specific syntax (the constructs
+// brush-core does not implement) fails here, by design.
 //
-// What observe-only CAN see (limit, stated honestly): the SOURCE TEXT of the
-// -c script and its parsed pipeline/redirect STRUCTURE — i.e. what was asked.
-// What it CANNOT see, because everything below happens INSIDE the real shell
-// with no fork/file activity for FUSE or this parser to witness:
-//   • shell BUILTINS (cd, export, set, source, eval, exec, trap, read, [/test,
-//     declare, local, alias, printf, echo, shift, return, wait, getopts,
-//     ulimit, umask, …);
-//   • VARIABLE assignments / expansions / arithmetic / arrays;
-//   • CONTROL FLOW — if/case branches taken, for/while/until iteration counts;
-//   • FUNCTION definitions and calls;
-//   • TRAPS, signal handlers, set -e/-u behavior;
-//   • runtime REDIRECTIONS (`exec >file`), HERE-docs, here-strings, PROCESS
-//     SUBSTITUTION (`<(…)`, `>(…)`);
-//   • the RESULT of any quoting/expansion/glob (the AST has the unexpanded
-//     source, never what `$VAR` actually expanded to or what `*.o` matched).
-// External processes the recipe forks ARE still attributed to the TOP-LEVEL
-// pipeline that ran `make` via the forest-ancestry linkage above, and their
-// writes are still captured through FUSE. The nested brushprov row adds the
-// recipe's source string + pipeline structure to that — not execution
-// semantics. A real execution trace would require xtrace-fd capture
-// (BASH_XTRACEFD with `set -x` writing post-expansion lines to a dedicated fd
-// we collect into the box channel) — a separate, larger design.
+// Each nested invocation parses the script, emits one `brush_prov_nested`
+// record per pipeline over the engine control socket bind-mounted at
+// UI_SOCK_INBOX (the box is resolved from the shim's pidfd /proc ancestry —
+// the same path `register` uses for nested boxes), then runs the pipelines
+// pipeline-by-pipeline on a fresh brush sh-mode shell built with the original
+// invocation's cwd, $0 (the -c form's NAME or argv[0]'s basename) and the
+// positional parameters ($1..$N).
+//
+// Capture: the nested brush-sh shim INHERITS fd 1/2 from its caller (typically
+// make, which itself inherited the box's --inner brush's sinks). brush-core
+// writes through whatever fd 1/2 it inherits, so all of the recipe's output
+// and writes still flow through the existing capture path — there is no
+// re-redirection needed here (and we deliberately do NOT touch fd 1/2 again,
+// because the top-level inner_brush already did the right thing once).
+//
+// PROCESS LINKAGE for nested pipelines: every process a nested brush-sh
+// invocation forks is a descendant of the top-level brush --inner (the
+// brush-sh shim itself is a descendant of `make`, which is a descendant of
+// the --inner). So the existing forest-ancestry guard in finalize_brush_links
+// (capture.rs) accepts them too. We extend the engine to feed the nested
+// pipelines' out_targets into the same brush_links bucket: a nested pipeline's
+// literal `> file` writer gets stamped with the NESTED brushprov row's id,
+// while the top-level pipeline that ran `make` keeps its own (typically
+// targetless) row. Two pipelines never compete for the same literal target
+// because each file is written by exactly one pipeline.
+//
+// Brush-core coverage gaps (VERIFIED — failures listed in brush_sh comments
+// near run_brush_script, where the tests exercise them): brush-core does NOT
+// implement bash extended-test `[[ … ]]` or process substitution `<(…) / >(…)`
+// in sh-mode (both surface as visible parse or execution errors). It DOES run
+// POSIX builtins (cd, export, set, [, test, printf, echo, shift, …), variable
+// assignment + expansion, arithmetic, if/case/for/while/until control flow,
+// functions, simple traps, here-docs/here-strings and the standard one-char
+// flag set (-e/-u/-x/-o, set/unset of same).
 
 use std::os::fd::AsRawFd;
-use std::os::unix::process::CommandExt;
 
 use serde_json::json;
 use serde_json::Value;
@@ -370,24 +358,12 @@ pub fn inner_brush(conn_fd: i32, cmd: Vec<String>) -> i32 {
     code
 }
 
-// ── brush-sh shim (D9 follow-on: NESTED shell provenance) ────────────────────
+// ── brush-sh shim (D9 follow-on: NESTED shell IS brush) ──────────────────────
 // When a -b box runs, runner::run shadows the box's /bin/sh, /usr/bin/sh,
-// /bin/bash, /usr/bin/bash with the ENGINE binary and sets SARUN_BRUSH_SH=1
-// (the real shells are stashed at /.slopbox-realsh and /.slopbox-realbash). So
-// when the box's TOP-LEVEL command — or, more interestingly, a NESTED tool like
-// `make` or a libc `system()` — exec's `/bin/sh -c RECIPE`, it lands HERE
-// instead of the real shell.
-//
-// This is OBSERVE-ONLY. We do NOT run the recipe through brush. We parse the
-// `-c` script just to emit its semantic provenance (best-effort), then we
-// execve the REAL shell with the ORIGINAL argv preserved EXACTLY (only argv[0]
-// becomes the real-shell path). The recipe therefore runs byte-for-byte as it
-// would have without us — same pid (exec replaces the image), same fds, same
-// env. On ANY parse/connect error we emit nothing and still exec the real shell;
-// the box is NEVER broken by a construct brush can't model. This is the
-// deliberate inverse of the top-level brush box's no-/bin/sh-fallback rule:
-// there brush IS the shell and an unsupported construct must be visible; here
-// the real shell is authoritative and provenance is a pure side-observation.
+// /bin/bash, /usr/bin/bash with the ENGINE binary and sets SARUN_BRUSH_SH=1.
+// When the box's TOP-LEVEL command — or, more interestingly, a NESTED tool
+// like `make` or a libc `system()` — exec's `/bin/sh -c RECIPE`, it lands
+// HERE, and brush-core RUNS that recipe. No real-shell fallback exists.
 
 /// True when this engine invocation should act as the brush-sh shim: the
 /// SARUN_BRUSH_SH env flag is set AND argv[0]'s basename is a shell name. main()
@@ -402,76 +378,233 @@ pub fn is_brush_sh_invocation() -> bool {
     matches!(base, "sh" | "bash" | "dash")
 }
 
-/// The brush-sh shim entrypoint. `argv` is the FULL process argv (argv[0] is the
-/// shell name we were invoked as). Best-effort emits nested-recipe provenance,
-/// then execve's the real shell with argv unchanged (argv[0] → real-shell path).
-/// Returns 127 only if the exec itself fails (it normally never returns).
+/// The brush-sh shim entrypoint. `argv` is the FULL process argv (argv[0] is
+/// the shell name we were invoked as). Parses the `-c` form (or a script-file
+/// form), emits one nested-provenance message to the engine, then runs the
+/// script through embedded brush-core. NO real-shell fallback: a construct
+/// brush cannot run is a VISIBLE error and a non-zero exit.
 pub fn brush_sh(argv: &[String]) -> i32 {
-    if argv.is_empty() { return 127; }
+    if argv.is_empty() {
+        eprintln!("sarun-engine brush-sh: empty argv");
+        return 2;
+    }
     let arg0 = &argv[0];
     let base = std::path::Path::new(arg0)
-        .file_name().and_then(|s| s.to_str()).unwrap_or("");
-    // Pick the matching real shell stash; fall back to the literal path only if
-    // the env var is unset (a direct `brush-sh` test invocation, say).
-    let real = if base == "bash" {
-        std::env::var("SARUN_REALBASH").unwrap_or_else(|_| "/bin/bash".to_string())
-    } else {
-        std::env::var("SARUN_REALSH").unwrap_or_else(|_| "/bin/sh".to_string())
-    };
+        .file_name().and_then(|s| s.to_str()).unwrap_or("sh").to_string();
+    // We DELIBERATELY do not touch fd 1/2 here. The shim was exec'd by the
+    // box's caller (typically make / a libc system()), whose fd 1/2 are the
+    // top-level inner_brush's box-FUSE sinks — every byte brush-core (and any
+    // child it forks/execs) writes flows through that existing capture path.
+    // Re-redirecting here would double-record and stamp writes against the
+    // wrong process row. The top-level inner_brush owns capture; we don't.
 
-    // Find `-c` and the script that follows; emit provenance for it. Everything
-    // here is best-effort and must never abort the exec below.
-    if let Some(pos) = argv.iter().position(|a| a == "-c") {
-        if let Some(script) = argv.get(pos + 1) {
-            emit_nested_prov(script);
+    // Parse the leading short flags. brush-core honors -e/-u/-x and `-o NAME`
+    // (via set after build); -i/-l/--login are interactive/login forms we
+    // deliberately do NOT support inside a box — error visibly.
+    let mut idx = 1;
+    let mut set_flags: Vec<String> = vec![];   // e.g. ["-e","-u","-x"]
+    let mut set_o: Vec<String> = vec![];       // names from `-o NAME`
+    let mut unset_o: Vec<String> = vec![];     // names from `+o NAME`
+    let mut have_c = false;
+    while idx < argv.len() {
+        let a = &argv[idx];
+        if a == "--" { idx += 1; break; }
+        if a == "-c" { have_c = true; idx += 1; break; }
+        if a == "-o" || a == "+o" {
+            let Some(name) = argv.get(idx + 1) else {
+                eprintln!("sarun-engine brush-sh: {a} requires an option name");
+                return 2;
+            };
+            if a == "-o" { set_o.push(name.clone()); }
+            else { unset_o.push(name.clone()); }
+            idx += 2; continue;
+        }
+        // -i / -l / --login: out of scope inside a box.
+        if a == "-i" || a == "-l" || a == "--login" || a == "--interactive" {
+            eprintln!("sarun-engine brush-sh: {a} not supported inside a brush box");
+            return 2;
+        }
+        // A grouped short-flag bundle like -eux. Anything starting with '-' or
+        // '+' (not a lone "-" stdin marker) we treat as flags; "-" or anything
+        // else means operands begin here.
+        if a == "-" { break; }
+        if let Some(rest) = a.strip_prefix('-') {
+            // Each char must be a known POSIX-ish flag.
+            for c in rest.chars() {
+                match c {
+                    'e' | 'u' | 'x' | 'v' | 'f' | 'n' | 'h' | 'm' | 'b' | 'C' | 'a' =>
+                        set_flags.push(format!("-{c}")),
+                    'c' => { have_c = true; }
+                    _ => {
+                        eprintln!("sarun-engine brush-sh: unsupported flag -{c}");
+                        return 2;
+                    }
+                }
+            }
+            idx += 1;
+            if have_c { break; }  // -c terminates flag parse
+            continue;
+        }
+        if let Some(rest) = a.strip_prefix('+') {
+            for c in rest.chars() {
+                match c {
+                    'e' | 'u' | 'x' | 'v' | 'f' | 'n' | 'h' | 'm' | 'b' | 'C' | 'a' =>
+                        set_flags.push(format!("+{c}")),
+                    _ => {
+                        eprintln!("sarun-engine brush-sh: unsupported flag +{c}");
+                        return 2;
+                    }
+                }
+            }
+            idx += 1; continue;
+        }
+        // First non-flag operand: stop flag parsing here.
+        break;
+    }
+
+    // Discriminate forms.
+    let (script_src, dollar0, positional): (String, String, Vec<String>);
+    if have_c {
+        // `sh [-flags] -c SCRIPT [name [args...]]`
+        let Some(s) = argv.get(idx).cloned() else {
+            eprintln!("sarun-engine brush-sh: -c requires a SCRIPT argument");
+            return 2;
+        };
+        idx += 1;
+        let name = argv.get(idx).cloned().unwrap_or(base.clone());
+        let args = if idx < argv.len() { argv[idx + 1..].to_vec() } else { vec![] };
+        script_src = s;
+        dollar0 = name;
+        positional = args;
+    } else if let Some(path) = argv.get(idx).cloned() {
+        // `sh [-flags] SCRIPT [args...]` — read SCRIPT from disk.
+        let s = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("sarun-engine brush-sh: cannot read script {path}: {e}");
+                return 127;
+            }
+        };
+        script_src = s;
+        dollar0 = path.clone();
+        positional = argv[idx + 1..].to_vec();
+    } else {
+        // No -c and no script-file. We refuse to enter an interactive REPL
+        // inside a box (out of scope here).
+        eprintln!("sarun-engine brush-sh: requires -c SCRIPT or a script path \
+                   (interactive nested shell is out of scope inside a brush box)");
+        return 2;
+    }
+
+    // Run the recipe through brush-core. We surface execution + parse errors
+    // visibly; the recipe's exit code becomes ours. Per-pipeline provenance
+    // is emitted by run_brush_script BEFORE each pipeline runs (matching the
+    // top-level run_brush execution-order contract).
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build();
+    let rt = match rt {
+        Ok(rt) => rt,
+        Err(e) => { eprintln!("sarun-engine brush-sh: runtime: {e}"); return 127; }
+    };
+    rt.block_on(run_brush_script(script_src, dollar0, positional,
+                                  set_flags, set_o, unset_o))
+}
+
+/// Ship one `brush_prov_nested` control message carrying one pipeline's
+/// records (with `nested:true`) + this process's pidfd to the engine. Used by
+/// run_brush_script per-pipeline so the engine sees provenance IN EXECUTION
+/// ORDER even when the same recipe contains multiple `;`-separated commands.
+fn send_nested_pipeline_records(records: Vec<Value>) {
+    if records.is_empty() { return; }
+    let msg = json!({"type": "brush_prov_nested", "records": records});
+    crate::runner::send_nested_prov(format!("{msg}\n").as_bytes());
+}
+
+/// Build a brush sh-mode shell with the right $0/positional/cwd, apply the
+/// post-build set/+set flags, parse, and execute the script. Mirrors run_brush
+/// (which serves the top-level -b body) — same parse/execute discipline, same
+/// visible-failure rule.
+async fn run_brush_script(script: String, shell_name: String,
+                          positional: Vec<String>,
+                          set_flags: Vec<String>, set_o: Vec<String>,
+                          unset_o: Vec<String>) -> i32 {
+    // The shim INHERITS cwd from execve; brush-core defaults to $PWD/getcwd()
+    // when working_dir is unspecified, which matches that. We still pass it
+    // explicitly to be defensive against any future builder default change.
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
+    use brush_builtins::ShellBuilderExt;
+    let shell_res = brush_core::Shell::builder()
+        .sh_mode(true)
+        .default_builtins(brush_builtins::BuiltinSet::ShMode)
+        .shell_name(shell_name.clone())
+        .shell_args(positional.clone())
+        .working_dir(cwd)
+        .build().await;
+    let mut shell = match shell_res {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("sarun-engine brush-sh: brush init failed: {e}");
+            return 127;
+        }
+    };
+    // Apply -e/-u/-x/-o NAME (etc.) by running an explicit `set` command
+    // inside the shell. Failures here are visible — we never silently drop a
+    // -e flag and let a failing recipe continue.
+    if !set_flags.is_empty() || !set_o.is_empty() || !unset_o.is_empty() {
+        let mut set_cmd = String::from("set");
+        for f in &set_flags { set_cmd.push(' '); set_cmd.push_str(f); }
+        for n in &set_o    { set_cmd.push_str(" -o "); set_cmd.push_str(n); }
+        for n in &unset_o  { set_cmd.push_str(" +o "); set_cmd.push_str(n); }
+        let src = brush_core::SourceInfo {
+            source: "<brush-sh flags>".into(),
+            start: None,
+        };
+        let params0 = shell.default_exec_params();
+        if let Err(e) = shell.run_string(set_cmd.clone(), &src, &params0).await {
+            eprintln!("sarun-engine brush-sh: applying flags ({set_cmd}) failed: {e}");
+            return 2;
         }
     }
 
-    // Run the REAL shell with the ORIGINAL argv, only swapping argv[0] for the
-    // real-shell path. exec() replaces the process image; on success this call
-    // never returns, so the recipe runs exactly as it would have natively.
-    let err = std::process::Command::new(&real)
-        .arg0(&real)
-        .args(&argv[1..])
-        .exec();
-    // Only reached if exec failed (missing real shell, etc.).
-    eprintln!("sarun-engine brush-sh: exec real shell {real} failed: {err}");
-    127
-}
-
-/// Best-effort: parse a nested `-c` script and ship one `brush_prov_nested`
-/// control message (the per-pipeline records + our pidfd) to the engine. Any
-/// failure (parse error, no socket) is swallowed — provenance is optional.
-fn emit_nested_prov(script: &str) {
-    // sh-mode parse, matching the top-level brush box's sh_mode shell, so the
-    // grammar accepted here is the same /bin/sh-ish one.
-    let opts = brush_parser::ParserOptions { sh_mode: true,
-        ..brush_parser::ParserOptions::default() };
-    let reader = std::io::Cursor::new(script.as_bytes().to_vec());
-    let mut parser = brush_parser::Parser::new(reader, &opts);
-    let prog = match parser.parse_program() {
+    let prog = match shell.parse_string(script.clone()) {
         Ok(p) => p,
-        Err(_) => return, // unparseable for us → emit nothing, recipe still runs
+        Err(e) => {
+            eprintln!("sarun-engine brush-sh: cannot parse this script \
+                       (NO /bin/sh fallback): {e}");
+            return 2;
+        }
     };
-    let spawn_ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs_f64()).unwrap_or(0.0);
-    let mut records: Vec<Value> = vec![];
+    let params = shell.default_exec_params();
+    let mut last_code = 0i32;
     let mut seq = 0i64;
-    for complete in &prog.complete_commands {
-        for mut rec in complete_command_records(complete) {
+    for complete in prog.complete_commands {
+        // Emit this complete-command's per-pipeline provenance BEFORE running
+        // it, mirroring the top-level run_brush contract. We collect each
+        // pipeline's records, tag with seq/spawn_ts/nested, ship one message.
+        let spawn_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64()).unwrap_or(0.0);
+        let mut recs = vec![];
+        for mut rec in complete_command_records(&complete) {
             if let Value::Object(ref mut m) = rec {
                 m.insert("seq".to_string(), json!(seq));
                 m.insert("spawn_ts".to_string(), json!(spawn_ts));
                 m.insert("nested".to_string(), json!(true));
             }
-            records.push(rec);
+            recs.push(rec);
             seq += 1;
         }
+        send_nested_pipeline_records(recs);
+        let one = brush_parser::ast::Program { complete_commands: vec![complete] };
+        match shell.run_program(one, &params).await {
+            Ok(result) => last_code = u8::from(result.exit_code) as i32,
+            Err(e) => {
+                eprintln!("sarun-engine brush-sh: execution error \
+                           (NO /bin/sh fallback): {e}");
+                return 1;
+            }
+        }
     }
-    if records.is_empty() { return; }
-    let msg = json!({"type": "brush_prov_nested", "records": records});
-    crate::runner::send_nested_prov(format!("{msg}\n").as_bytes());
+    last_code
 }
 
 /// Build the brush shell, parse the script, emit one FRAME_PROV per pipeline,
@@ -481,42 +614,13 @@ fn emit_nested_prov(script: &str) {
 async fn run_brush(conn_fd: i32, script: String) -> i32 {
     // sh-mode brush: POSIX-ish, closest to the /bin/sh the box would otherwise
     // get, and skip rc/profile so the box's own filesystem isn't sourced.
-    //
-    // brush-core 0.5 ships with NO builtins of its own — they live in a sibling
-    // `brush-builtins` crate that the host binary must install at build time.
-    // Without this `.builtins(…)` call, `cd`, `export`, `set`, `pwd`, `read`,
-    // `eval`, `exec`, `trap`, `:`, `.`, `true`, `false`, `unset`, `shift`,
-    // `return`, `break`, `continue`, `getopts`, `times` (the 36 ShMode set) all
-    // either error out or silently do nothing — meaning even a trivial
-    // `cd /tmp; pwd` from a -b box would fail. We pick the BashMode set so the
-    // box also gets `printf`, `echo`, `test`, `[`, `let`, `source`, `declare`,
-    // `shopt`, `complete`, `dirs`, `popd`, `pushd`, `history`, `bind`, `enable`,
-    // `mapfile`, `typeset`, `caller`, `suspend`, `disown`, `logout` — sh-mode
-    // recipes in the wild routinely call `printf` and `[`, so the bash-flavor
-    // set is the closer match to what `/bin/sh -c` would have accepted. This
-    // does NOT change parser mode (still sh-mode); only which builtins exist.
-    //
-    // External coreutils (cat, ls, cp, mv, rm, mkdir, head, tail, wc, …) STILL
-    // fork+exec the box's filesystem binaries here — brush-coreutils-builtins
-    // exists but needs a `--invoke-bundled` re-entry protocol in the host
-    // binary (see its lib.rs) that we have NOT wired yet. So those tools still
-    // go through the existing FUSE capture path, exactly as before.
-    // ShMode (NOT BashMode) deliberately: BashMode would install `echo`/`printf`
-    // as in-process builtins that write through brush's OpenFiles abstraction,
-    // not the fd 1/2 we redirected onto the box's FUSE sinks — so their output
-    // would NOT be captured. ShMode keeps those as external commands (still
-    // fork+exec /bin/echo, /bin/printf), preserving the FUSE-capture path, while
-    // still giving us the POSIX builtins that MUST be in-process to be coherent
-    // (cd, export, set, unset, shift, return, break, continue, eval, exec, exit,
-    // trap, pwd, read, getopts, alias, command, hash, jobs, kill, type, ulimit,
-    // umask, wait, true, false, ., :, times, readonly, fc, fg, bg, help,
-    // unalias, local).
-    let builtins = brush_builtins::default_builtins::<
-        brush_core::extensions::DefaultShellExtensions>(
-            brush_builtins::BuiltinSet::ShMode);
+    // Default ShMode builtins are registered (cd, export, set, [, test, …) —
+    // without them brush-core ships an empty builtin table, so even POSIX
+    // builtins would surface as "command not found" from inside brush.
+    use brush_builtins::ShellBuilderExt;
     let shell_res = brush_core::Shell::builder()
         .sh_mode(true)
-        .builtins(builtins)
+        .default_builtins(brush_builtins::BuiltinSet::ShMode)
         .build().await;
     let mut shell = match shell_res {
         Ok(s) => s,

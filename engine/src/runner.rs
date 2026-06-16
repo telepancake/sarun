@@ -290,27 +290,20 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
                 "--ro-bind-try", "/sys", "/sys",
                 "--tmpfs", "/tmp",
                 "--ro-bind", &sock_src, UI_SOCK_INBOX]);
-    // D9 follow-on — NESTED shell provenance (brush boxes, capture on only).
-    // OBSERVE-ONLY interposition: we shadow the box's /bin/sh, /bin/bash (and
-    // /usr/bin/{sh,bash}) with the ENGINE binary, having first STASHED the REAL
-    // shells at fixed paths. The shim (brush_sh, gated on SARUN_BRUSH_SH=1)
-    // parses a nested `sh -c RECIPE`, best-effort emits the recipe's brush
-    // provenance to the engine, then execve's the REAL shell with the ORIGINAL
-    // argv — so the recipe ALWAYS runs byte-for-byte as before. The stash binds
-    // MUST precede the shadow binds (bwrap applies binds in order; the stash
-    // source resolves against the runner's current mount ns = the real host
-    // shells, BEFORE we overwrite the box's view of /bin/sh with the engine).
-    // `-try` so a missing bash is not fatal. Non-brush boxes are NOT touched.
+    // D9 follow-on — NESTED shell IS brush (brush boxes, capture on only).
+    // We shadow the box's /bin/sh, /bin/bash (and /usr/bin/{sh,bash}) with the
+    // ENGINE binary: the shim (brush_sh, gated on SARUN_BRUSH_SH=1) RUNS the
+    // nested `sh -c RECIPE` THROUGH embedded brush-core — there is NO real-shell
+    // fallback, no stash. A construct brush cannot run is a VISIBLE error and a
+    // non-zero exit, matching the D9 no-silent-downgrade rule that already
+    // governs the top-level brush body. Non-brush boxes are NOT touched (their
+    // /bin/sh is the real system shell).
     if brush && capture_on {
-        bwrap.args(["--ro-bind-try", "/bin/sh", "/.slopbox-realsh",
-                    "--ro-bind-try", "/bin/bash", "/.slopbox-realbash"]);
         bwrap.args(["--ro-bind", &self_exe, "/bin/sh",
                     "--ro-bind-try", &self_exe, "/usr/bin/sh",
                     "--ro-bind-try", &self_exe, "/bin/bash",
                     "--ro-bind-try", &self_exe, "/usr/bin/bash"]);
-        bwrap.args(["--setenv", "SARUN_BRUSH_SH", "1",
-                    "--setenv", "SARUN_REALSH", "/.slopbox-realsh",
-                    "--setenv", "SARUN_REALBASH", "/.slopbox-realbash"]);
+        bwrap.args(["--setenv", "SARUN_BRUSH_SH", "1"]);
     }
     bwrap.args(["--unshare-pid", "--unshare-ipc", "--unshare-uts",
                 "--die-with-parent",
