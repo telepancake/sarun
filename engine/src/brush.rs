@@ -9,6 +9,29 @@
 // recover — for each command it runs, the exact command string plus its
 // parsed pipeline/redirect structure (a real step above pid+argv).
 //
+// BUILTINS (important nuance): brush-core 0.5 ships with NO builtins on its
+// own — they live in the sibling `brush-builtins` crate. We install its
+// ShMode set onto the shell so the POSIX-required builtins (`cd`, `export`,
+// `set`, `unset`, `shift`, `return`, `break`, `continue`, `eval`, `exec`,
+// `exit`, `trap`, `pwd`, `read`, `getopts`, `:`, `.`, `true`, `false`,
+// `times`, `readonly`, `alias`, `unalias`, `command`, `hash`, `type`, `jobs`,
+// `kill`, `ulimit`, `umask`, `wait`, `fc`, `fg`, `bg`, `help`, `local`) run
+// IN-PROCESS — without this step, the brush-core Shell would error on `cd`
+// and friends and D9 no-fallback would make `inner_brush` blow up on trivial
+// scripts. We deliberately do NOT pick BashMode: it would also install `echo`,
+// `printf`, `test`, `[` as in-process builtins that write through brush's
+// OpenFiles abstraction (a wrapper around fd 1/2), NOT through the literal
+// fd 1/2 we dup2'd onto the box's FUSE sinks — so their stdout would NOT be
+// captured into the box's sqlar (test_brush_rs#stdout-captured proves this).
+// Keeping `echo`/`printf`/`test`/`[` as external commands preserves the FUSE
+// capture path. EXTERNAL coreutils (cat/ls/cp/mv/rm/mkdir/head/tail/wc/…) are
+// likewise NOT in-process — the `brush-coreutils-builtins` crate needs a
+// `--invoke-bundled` re-entry protocol the host binary has to implement; we
+// have not wired that yet, so those tools still fork+exec the box's
+// filesystem binaries (and still flow through FUSE capture exactly as
+// before). A construct that brush + the ShMode builtin set cannot handle
+// remains a VISIBLE error per the D9 no-/bin/sh-fallback rule.
+//
 // Capture: brush and every binary it forks/execs (cc, ld, tr, …) inherit this
 // process's fd 1/2, which we point at the box's FUSE sink files BEFORE building
 // the shell. So all of their writes flow through the overlay and are recorded,
@@ -458,8 +481,42 @@ fn emit_nested_prov(script: &str) {
 async fn run_brush(conn_fd: i32, script: String) -> i32 {
     // sh-mode brush: POSIX-ish, closest to the /bin/sh the box would otherwise
     // get, and skip rc/profile so the box's own filesystem isn't sourced.
+    //
+    // brush-core 0.5 ships with NO builtins of its own — they live in a sibling
+    // `brush-builtins` crate that the host binary must install at build time.
+    // Without this `.builtins(…)` call, `cd`, `export`, `set`, `pwd`, `read`,
+    // `eval`, `exec`, `trap`, `:`, `.`, `true`, `false`, `unset`, `shift`,
+    // `return`, `break`, `continue`, `getopts`, `times` (the 36 ShMode set) all
+    // either error out or silently do nothing — meaning even a trivial
+    // `cd /tmp; pwd` from a -b box would fail. We pick the BashMode set so the
+    // box also gets `printf`, `echo`, `test`, `[`, `let`, `source`, `declare`,
+    // `shopt`, `complete`, `dirs`, `popd`, `pushd`, `history`, `bind`, `enable`,
+    // `mapfile`, `typeset`, `caller`, `suspend`, `disown`, `logout` — sh-mode
+    // recipes in the wild routinely call `printf` and `[`, so the bash-flavor
+    // set is the closer match to what `/bin/sh -c` would have accepted. This
+    // does NOT change parser mode (still sh-mode); only which builtins exist.
+    //
+    // External coreutils (cat, ls, cp, mv, rm, mkdir, head, tail, wc, …) STILL
+    // fork+exec the box's filesystem binaries here — brush-coreutils-builtins
+    // exists but needs a `--invoke-bundled` re-entry protocol in the host
+    // binary (see its lib.rs) that we have NOT wired yet. So those tools still
+    // go through the existing FUSE capture path, exactly as before.
+    // ShMode (NOT BashMode) deliberately: BashMode would install `echo`/`printf`
+    // as in-process builtins that write through brush's OpenFiles abstraction,
+    // not the fd 1/2 we redirected onto the box's FUSE sinks — so their output
+    // would NOT be captured. ShMode keeps those as external commands (still
+    // fork+exec /bin/echo, /bin/printf), preserving the FUSE-capture path, while
+    // still giving us the POSIX builtins that MUST be in-process to be coherent
+    // (cd, export, set, unset, shift, return, break, continue, eval, exec, exit,
+    // trap, pwd, read, getopts, alias, command, hash, jobs, kill, type, ulimit,
+    // umask, wait, true, false, ., :, times, readonly, fc, fg, bg, help,
+    // unalias, local).
+    let builtins = brush_builtins::default_builtins::<
+        brush_core::extensions::DefaultShellExtensions>(
+            brush_builtins::BuiltinSet::ShMode);
     let shell_res = brush_core::Shell::builder()
         .sh_mode(true)
+        .builtins(builtins)
         .build().await;
     let mut shell = match shell_res {
         Ok(s) => s,
