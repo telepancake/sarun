@@ -45,20 +45,39 @@
 //   this cut. Both are documented gaps, not silent mislinks.
 //   Readers: discover::{proc_pipeline, pipeline_procs, brushprov(.processes)}.
 //
-// Scope of THIS cut (honest): brush runs the box's TOP-LEVEL command string
-// (which is the /bin/sh-resolution point for a top-level `sh -c '…'`) AND owns
-// the per-pipeline provenance + process linkage for everything it forks. The
-// in-box overlay mapping that would make a NESTED `make` recipe's own `sh -c`
-// resolve to brush (so the recipe string itself gets a FRAME_PROV) is the
-// documented follow-on (Part 2). It is NOT wired in this cut: doing it safely
-// requires intercepting /bin/sh resolution in the overlay for brush boxes only,
-// a re-entrant brush-sh engine entrypoint, and an in-box provenance-ingest
-// channel for a deep descendant that has no box-channel fd — three interacting
-// pieces whose exec semantics (shebang scripts, libc system(), brush re-entry)
-// carry real regression risk, so they are deferred rather than half-landed.
-// NOTE: even today a nested recipe's processes ARE attributed — to the
-// TOP-LEVEL pipeline that ran `make` — via the forest linkage above; what the
-// follow-on adds is the recipe's OWN semantic command string.
+// NESTED-shell observation (D9 follow-on, observe-only — see brush_sh below):
+// For brush boxes the runner shadows /bin/sh, /usr/bin/sh, /bin/bash, /usr/bin/bash
+// with the engine binary (the real shells stashed at /.slopbox-realsh /
+// /.slopbox-realbash), so a tool that exec's `sh -c RECIPE` (make, libc system(),
+// configure scripts, …) lands in `brush_sh`, which parses RECIPE with
+// brush-parser, ships one `brush_prov_nested` row per pipeline over the
+// bind-mounted control socket (box resolved from the shim's pidfd ancestry —
+// same resolution `register` uses for nested boxes), THEN execve's the REAL
+// shell with the original argv. Execution is byte-identical to native; a parse
+// failure just emits nothing and still runs the recipe.
+//
+// What observe-only CAN see (limit, stated honestly): the SOURCE TEXT of the
+// -c script and its parsed pipeline/redirect STRUCTURE — i.e. what was asked.
+// What it CANNOT see, because everything below happens INSIDE the real shell
+// with no fork/file activity for FUSE or this parser to witness:
+//   • shell BUILTINS (cd, export, set, source, eval, exec, trap, read, [/test,
+//     declare, local, alias, printf, echo, shift, return, wait, getopts,
+//     ulimit, umask, …);
+//   • VARIABLE assignments / expansions / arithmetic / arrays;
+//   • CONTROL FLOW — if/case branches taken, for/while/until iteration counts;
+//   • FUNCTION definitions and calls;
+//   • TRAPS, signal handlers, set -e/-u behavior;
+//   • runtime REDIRECTIONS (`exec >file`), HERE-docs, here-strings, PROCESS
+//     SUBSTITUTION (`<(…)`, `>(…)`);
+//   • the RESULT of any quoting/expansion/glob (the AST has the unexpanded
+//     source, never what `$VAR` actually expanded to or what `*.o` matched).
+// External processes the recipe forks ARE still attributed to the TOP-LEVEL
+// pipeline that ran `make` via the forest-ancestry linkage above, and their
+// writes are still captured through FUSE. The nested brushprov row adds the
+// recipe's source string + pipeline structure to that — not execution
+// semantics. A real execution trace would require xtrace-fd capture
+// (BASH_XTRACEFD with `set -x` writing post-expansion lines to a dedicated fd
+// we collect into the box channel) — a separate, larger design.
 
 use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
