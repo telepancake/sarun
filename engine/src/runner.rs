@@ -309,6 +309,14 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
         // ninja installed, and one path may be a symlink to the other.
         bwrap.args(["--ro-bind-try", &self_exe, "/usr/bin/ninja",
                     "--ro-bind-try", &self_exe, "/bin/ninja"]);
+        // Phase 2 — embedded make: shadow make/gmake the same way, so a -b box
+        // running `make` lands in katirun::make_main (vendored kati parses the
+        // Makefile → ninja graph in-memory, embedded n2 executes it, recipes
+        // through brush). --ro-bind-try: many boxes have only one of these paths.
+        bwrap.args(["--ro-bind-try", &self_exe, "/usr/bin/make",
+                    "--ro-bind-try", &self_exe, "/bin/make",
+                    "--ro-bind-try", &self_exe, "/usr/bin/gmake",
+                    "--ro-bind-try", &self_exe, "/bin/gmake"]);
         bwrap.args(["--setenv", "SARUN_BRUSH_SH", "1"]);
     }
     bwrap.args(["--unshare-pid", "--unshare-ipc", "--unshare-uts",

@@ -8,7 +8,9 @@ name = "sarun"
 path = "src/main.rs"
 
 [dependencies]
+anyhow = "1.0"
 base64 = "0.22.1"
+bytes = "1.10"
 brush-core = "0.5"
 brush-builtins = "0.2"
 brush-coreutils-builtins = { version = "0.1", features = ["coreutils.all"] }
@@ -16,10 +18,14 @@ brush-parser = { version = "0.4", features = ["serde"] }
 crossterm = "0.29"
 # Vendored lib-only patched fork of n2 (github.com/evmar/n2) — see vendor/n2.
 n2 = { path = "vendor/n2", default-features = false }
+# Vendored lib-only patched fork of kati (github.com/google/kati) — see
+# vendor/kati. Parses Makefiles → ninja graph for the embedded `make` path.
+kati = { path = "vendor/kati" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 fuser = "0.17.0"
 glob = "0.3.3"
 libc = "0.2.186"
+parking_lot = "0.12"
 portable-pty = "0.9"
 ratatui = "0.30.1"
 rusqlite = { version = "0.32", features = ["bundled"] }

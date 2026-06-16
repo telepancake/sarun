@@ -19,6 +19,7 @@ mod capture;
 mod control;
 mod discover;
 mod frames;
+mod katirun;
 mod n2run;
 mod overlay;
 mod paths;
@@ -149,6 +150,16 @@ fn main() {
     if n2run::is_ninja_invocation() {
         let full: Vec<String> = std::env::args().collect();
         std::process::exit(n2run::n2_main(&full));
+    }
+    // Phase 2 — embedded make. A -b box shadows make/gmake (and /usr/bin/make,
+    // /bin/make) with this engine binary; when the box runs `make`, we land HERE
+    // (argv[0] basename == "make"/"gmake" && SARUN_BRUSH_SH=1) and run vendored
+    // kati in-process to PARSE the Makefile → ninja graph, then hand that graph
+    // to the embedded n2 to EXECUTE (recipes through brush). Detected BEFORE
+    // normal dispatch, like the ninja path.
+    if katirun::is_make_invocation() {
+        let full: Vec<String> = std::env::args().collect();
+        std::process::exit(katirun::make_main(&full));
     }
     let argv: Vec<String> = std::env::args().skip(1).collect();
     // Explicit `brush-sh -- <argv...>` subcommand for DIRECT testing of the shim

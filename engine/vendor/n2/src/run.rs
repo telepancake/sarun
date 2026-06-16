@@ -266,3 +266,64 @@ pub fn run() -> anyhow::Result<i32> {
     trace::close();
     res
 }
+
+// sarun: run an ALREADY-LOADED, in-memory State (from load::read_from_content)
+// against an explicit target list, with the in-process executor forced serial
+// (-j1), exactly like run_impl's embedded path. There is no command-line parse,
+// no disk load, no build.ninja rebuild step (the make→kati→ninja graph is not
+// self-regenerating). `targets` empty → build the graph's `default` targets, or
+// every target if there are no defaults — matching `build()`'s own logic.
+pub fn run_state(state: load::State, targets: &[String]) -> anyhow::Result<i32> {
+    let dumb_console = DumbConsoleProgress::new(false);
+    let progress: &dyn Progress = &dumb_console;
+
+    let mut options = work::Options::default();
+    // In-process executor ⇒ serial, same reasoning as run_impl (recipes mutate
+    // process-global cwd/fds through embedded brush).
+    options.parallelism = if crate::process::executor().is_some() {
+        1
+    } else {
+        default_parallelism()?
+    };
+
+    let mut work = work::Work::new(
+        state.graph,
+        state.hashes,
+        state.db,
+        &options,
+        progress,
+        state.pools,
+    );
+
+    if !targets.is_empty() {
+        for name in targets {
+            let Some(target) = work.lookup(name) else {
+                return Err(anyhow::anyhow!("unknown path requested: {:?}", name));
+            };
+            work.want_file(target)?;
+        }
+    } else if !state.default.is_empty() {
+        for target in state.default {
+            work.want_file(target)?;
+        }
+    } else {
+        work.want_every_file(None)?;
+    }
+
+    let res = match trace::scope("work.run", || work.run())? {
+        false => Ok(1),
+        true => {
+            match work.tasks_run {
+                0 => println!("n2: no work to do"),
+                n => println!(
+                    "n2: ran {} task{}, now up to date",
+                    n,
+                    if n == 1 { "" } else { "s" }
+                ),
+            }
+            Ok(0)
+        }
+    };
+    trace::close();
+    res
+}

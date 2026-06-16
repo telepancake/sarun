@@ -1,0 +1,23 @@
+# sarun: vendored lib-only patched fork of kati (github.com/google/kati).
+# Upstream commit: 7eb37cd16ed29b90335983689d3c6caabc17ca70 (2026-05-26).
+# Patches are minimal and marked `// sarun:`. The [[bin]]/[[bench]] targets and
+# the tikv-jemallocator #[global_allocator] (which lived in main.rs only) are
+# dropped so none of that compiles into the engine; criterion is dropped (it
+# was a bench-only dep).
+[package]
+name = "kati"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.98"
+bytes = "1.10.1"
+env_logger = "0.11.8"
+libc = "0.2.172"
+log = "0.4.27"
+memchr = "2.7.4"
+os_pipe = "1.2.1"
+parking_lot = { version = "0.12.3" }
+
+[lib]
+path = "src-rs/lib.rs"

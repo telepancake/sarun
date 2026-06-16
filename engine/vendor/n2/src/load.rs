@@ -285,7 +285,8 @@ pub fn read(build_filename: &str) -> anyhow::Result<State> {
 }
 
 /// Parse a single file's content.
-#[cfg(test)]
+// sarun: un-gated from `#[cfg(test)]` so the embedded `make` path can parse the
+// kati-generated ninja straight from memory (no disk read). Behaviour unchanged.
 pub fn parse(name: &str, mut content: Vec<u8>) -> anyhow::Result<graph::Graph> {
     content.push(0);
     let mut loader = Loader::new();
@@ -296,4 +297,33 @@ pub fn parse(name: &str, mut content: Vec<u8>) -> anyhow::Result<graph::Graph> {
     })?;
 
     Ok(loader.graph)
+}
+
+// sarun: build a fully-runnable `State` from in-memory ninja content, with a
+// fresh in-memory (memfd) db and NO `.n2_db` file. The in-memory twin of read():
+// it parses `content` (the kati-generated ninja handed back via memfd), then
+// constructs the same State { graph, db, hashes, default, pools } read() returns
+// — so work::Work runs it exactly as a disk-loaded build. There is no disk
+// build.ninja and no .n2_db; the whole make→ninja→execute handoff stays in
+// memory, the user-mandated no-temp-file contract.
+pub fn read_from_content(name: &str, mut content: Vec<u8>) -> anyhow::Result<State> {
+    content.push(0);
+    let mut loader = Loader::new();
+    trace::scope("loader.read_content", || {
+        let mut parser = parse::Parser::new(&content);
+        loader.parse_with_parser(&mut parser, PathBuf::from(name), &[])
+    })?;
+
+    // Fresh empty in-memory db (memfd). With no prior build records every wanted
+    // target is treated as out of date this run — correct for a one-shot build.
+    let hashes = graph::Hashes::default();
+    let db = db::Writer::in_memory().map_err(|err| anyhow!("n2 in-memory db: {}", err))?;
+
+    Ok(State {
+        graph: loader.graph,
+        db,
+        hashes,
+        default: loader.default,
+        pools: loader.pools,
+    })
 }
