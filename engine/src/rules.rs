@@ -1,57 +1,317 @@
-// File rules (path-glob subset): an ordered apply/discard/passthrough rule
-// list, one per line, first match wins — the dominant real-world form
-// (`discard **/*.log`, `apply src/**`). The full Python grammar also has
-// and/or/not clauses and box:/proc: kinds matched against writer provenance;
-// those advanced clause lines are skipped here (path-only rules cover the
-// common automation). The rules file is the SAME on-disk file the UI edits.
-
-use glob::Pattern;
+// File rules — FULL parity with the Python clause grammar (sarun: Match/Clause/
+// FileRule/eval_clauses/FileRules.decide). An ordered apply/discard/passthrough
+// rule list, one rule per line, first match wins. The on-disk file is the SAME
+// one the Python UI edits, so parse/round-trip are byte-identical.
+//
+// Grammar:  ACTION [off] [not] PRED [and|or [off] [not] PRED]...
+//   PRED = kind:pattern | bare-path-glob   (kind defaults to `path`)
+//   KINDS: path (path glob), box (name glob), exe/cwd (writer path globs),
+//          arg (writer argv glob), ids (internal comma row-id set).
+//
+// Matching uses the shared extended-glob vocabulary (wcmatch GLOBSTAR | EXTGLOB
+// | BRACE | DOTGLOB), reimplemented faithfully in `glob` below so a Rust
+// decision equals the Python decision on the identical inputs.
+//
+// D5 INTERACTION (see DESIGN.md D5 and test_passthrough_rule_rs):
+//   `decide(rel, subject)` is the FULL-grammar decision used by review /
+//   dissolve-finalize and by the live host-direct WRITE routing. The kernel
+//   READ-passthrough divergence (a backing fd) is gated SEPARATELY on
+//   `passthrough_path_only(rel)` — a passthrough match whose clauses are ALL
+//   `path` kind — so a box-/proc-scoped passthrough never enables the
+//   captured-here-but-passthrough-there read divergence.
 
 use crate::paths;
 
-#[derive(Clone, Copy, PartialEq)]
+pub mod glob;
+
+// ── data model (mirrors Python Match / Clause / FileRule) ────────────────────
+
+pub const FILE_KINDS: &[&str] = &["path", "box", "exe", "cwd", "arg"];
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Action { Apply, Discard, Passthrough }
 
-pub struct Rule { pub action: Action, pub pat: Pattern }
+impl Action {
+    pub fn parse(s: &str) -> Option<Action> {
+        match s {
+            "apply" => Some(Action::Apply),
+            "discard" => Some(Action::Discard),
+            "passthrough" => Some(Action::Passthrough),
+            _ => None,
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self { Action::Apply => "apply", Action::Discard => "discard",
+                     Action::Passthrough => "passthrough" }
+    }
+}
 
-pub struct Rules { pub rules: Vec<Rule> }
+#[derive(Clone, Debug)]
+pub struct Match { pub kind: String, pub pattern: String }
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Join { And, Or }
+
+#[derive(Clone, Debug)]
+pub struct Clause {
+    pub m: Match,
+    pub join: Join,
+    pub negate: bool,
+    pub enabled: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct FileRule {
+    pub action: Action,
+    pub clauses: Vec<Clause>,
+}
+
+// ── shared glob/path matching (mirrors Python _glob_match / _path_match) ─────
+
+/// True if `s` matches the extended shell glob `pat` (GLOBSTAR|EXTGLOB|BRACE|
+/// DOTGLOB). Empty pattern → false. Mirrors Python `_glob_match`.
+pub fn glob_match(pat: &str, s: &str) -> bool {
+    let pat = pat.trim();
+    if pat.is_empty() { return false; }
+    glob::globmatch(pat, s)
+}
+
+/// Glob a change's ABSOLUTE path. A bare/relative pattern matches at any depth
+/// (`**/` prefix); a leading `/` anchors at the root. Mirrors `_path_match`.
+pub fn path_match(pat: &str, rel: &str) -> bool {
+    let pat = pat.trim();
+    if pat.is_empty() { return false; }
+    let s = format!("/{}", rel.trim_start_matches('/')); // absolute path
+    let p = if !pat.contains('/') || !pat.starts_with('/') {
+        format!("**/{pat}")                              // bare/relative → any depth
+    } else {
+        pat.to_string()
+    };
+    glob::globmatch(&p, &s)
+}
+
+// ── subject + targets (mirrors Python Subject / PathTarget / ProcFilterTarget) ─
+
+/// The box + triggering PROCESS a match is evaluated against. An empty field
+/// never matches its kind.
+#[derive(Clone, Default, Debug)]
+pub struct Subject {
+    pub box_name: String,
+    pub exe: String,
+    pub cwd: String,
+    pub argv: Vec<String>,
+}
+
+impl Subject {
+    /// match_one for the shared box/process kinds (mirrors `_subject_match`).
+    /// box/arg use the raw glob; exe/cwd use path-glob semantics.
+    fn subject_match(&self, m: &Match) -> bool {
+        match m.kind.as_str() {
+            "box" => glob_match(&m.pattern, &self.box_name),
+            "exe" => path_match(&m.pattern, &self.exe),
+            "cwd" => path_match(&m.pattern, &self.cwd),
+            "arg" => self.argv.iter().any(|a| glob_match(&m.pattern, a)),
+            _ => false,
+        }
+    }
+}
+
+/// Parse the internal "ids" pattern — comma-separated row ids — into a set.
+fn ids_of(pattern: &str) -> std::collections::HashSet<i64> {
+    pattern.split(',').filter_map(|t| t.trim().parse::<i64>().ok()).collect()
+}
+
+/// A changed path under evaluation (file-domain target, mirrors PathTarget).
+pub struct PathTarget<'a> {
+    pub rel: &'a str,
+    pub subject: Subject,
+    pub ids: Vec<i64>,
+}
+
+/// A process row under evaluation (procs-pane filter, mirrors ProcFilterTarget).
+pub struct ProcFilterTarget {
+    pub row_id: i64,
+    pub subject: Subject,
+}
+
+pub trait Target {
+    fn match_one(&self, m: &Match) -> bool;
+}
+
+impl<'a> Target for PathTarget<'a> {
+    fn match_one(&self, m: &Match) -> bool {
+        match m.kind.as_str() {
+            "path" => path_match(&m.pattern, self.rel),
+            "ids" => {
+                let want = ids_of(&m.pattern);
+                self.ids.iter().any(|i| want.contains(i))
+            }
+            _ => self.subject.subject_match(m),
+        }
+    }
+}
+
+impl Target for ProcFilterTarget {
+    fn match_one(&self, m: &Match) -> bool {
+        match m.kind.as_str() {
+            "ids" => ids_of(&m.pattern).contains(&self.row_id),
+            _ => self.subject.subject_match(m),
+        }
+    }
+}
+
+/// Generic, target-agnostic left-to-right boolean fold (mirrors `eval_clauses`).
+/// First enabled clause seeds (its join ignored); each negates then folds with
+/// and/or; disabled clauses skip; no enabled clause → false.
+pub fn eval_clauses<T: Target>(target: &T, clauses: &[Clause]) -> bool {
+    let mut acc: Option<bool> = None;
+    for c in clauses {
+        if !c.enabled { continue; }
+        let mut v = target.match_one(&c.m);
+        if c.negate { v = !v; }
+        acc = Some(match acc {
+            None => v,
+            Some(a) => match c.join { Join::Or => a || v, Join::And => a && v },
+        });
+    }
+    acc.unwrap_or(false)
+}
+
+// ── FileRule parse / to_line (mirrors Python exactly) ────────────────────────
+
+impl FileRule {
+    pub fn matches<T: Target>(&self, target: &T) -> bool {
+        eval_clauses(target, &self.clauses)
+    }
+
+    pub fn to_line(&self) -> String {
+        let mut out = vec![self.action.as_str().to_string()];
+        for (n, c) in self.clauses.iter().enumerate() {
+            let mut seg = vec![];
+            if n > 0 { seg.push(match c.join { Join::Or => "or", Join::And => "and" }.to_string()); }
+            if !c.enabled { seg.push("off".to_string()); }
+            if c.negate { seg.push("not".to_string()); }
+            if c.m.kind == "path" {
+                seg.push(c.m.pattern.clone());          // path renders bare
+            } else {
+                seg.push(format!("{}:{}", c.m.kind, c.m.pattern));
+            }
+            out.push(seg.join(" "));
+        }
+        out.join(" ")
+    }
+
+    fn parse_clauses(s: &str) -> Vec<Clause> {
+        let toks: Vec<&str> = s.split_whitespace().collect();
+        let mut clauses: Vec<Clause> = vec![];
+        let mut i = 0;
+        let mut join = Join::And;
+        while i < toks.len() {
+            if !clauses.is_empty() {
+                let lc = toks[i].to_ascii_lowercase();
+                if lc == "and" || lc == "or" {
+                    join = if lc == "or" { Join::Or } else { Join::And };
+                    i += 1;
+                }
+            }
+            let (mut off, mut neg) = (false, false);
+            while i < toks.len() {
+                let lc = toks[i].to_ascii_lowercase();
+                if lc == "off" { off = true; i += 1; }
+                else if lc == "not" { neg = true; i += 1; }
+                else { break; }
+            }
+            if i >= toks.len() { break; }
+            let pred = toks[i];
+            i += 1;
+            let (kind, pat) = match pred.split_once(':') {
+                Some((k, p)) if FILE_KINDS.contains(&k.to_ascii_lowercase().as_str()) =>
+                    (k.to_ascii_lowercase(), p.to_string()),
+                _ => ("path".to_string(), pred.to_string()), // bare → path kind
+            };
+            if pat.is_empty() { continue; }
+            clauses.push(Clause {
+                m: Match { kind, pattern: pat },
+                join: if clauses.is_empty() { Join::And } else { join },
+                negate: neg,
+                enabled: !off,
+            });
+            join = Join::And;
+        }
+        clauses
+    }
+
+    /// Parse one rule line. None for blanks, comments, or a missing/invalid
+    /// action (an explicit action is always required), or no clauses.
+    pub fn parse(line: &str) -> Option<FileRule> {
+        let s = line.trim();
+        if s.is_empty() || s.starts_with('#') { return None; }
+        let (verb, rest) = match s.split_once(' ') {
+            Some((v, r)) => (v, r),
+            None => (s, ""),
+        };
+        let action = Action::parse(&verb.to_ascii_lowercase())?;
+        let clauses = Self::parse_clauses(rest.trim());
+        if clauses.is_empty() { return None; }
+        Some(FileRule { action, clauses })
+    }
+
+    /// True iff every clause is the `path` kind — the D5-safe form a passthrough
+    /// rule must have to enable kernel read-passthrough.
+    pub fn path_only(&self) -> bool {
+        self.clauses.iter().all(|c| c.m.kind == "path")
+    }
+}
+
+// ── FileRules (mirrors Python FileRules) ─────────────────────────────────────
+
+pub struct Rules { pub rules: Vec<FileRule> }
 
 impl Rules {
     pub fn load() -> Rules {
         let text = std::fs::read_to_string(paths::config_home().join("filerules"))
             .unwrap_or_default();
-        let mut rules = vec![];
-        for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') { continue; }
-            let mut it = line.split_whitespace();
-            let Some(act) = it.next() else { continue };
-            let action = match act {
-                "apply" => Action::Apply,
-                "discard" => Action::Discard,
-                // `passthrough <glob>`: the path is HOST-DIRECT — reads served by
-                // the kernel (read-passthrough, D5), writes straight to the host,
-                // uncaptured. PATH-ONLY by construction (clause lines with ':'
-                // are skipped below): a passthrough path must be host-direct in
-                // EVERY box, never captured-here-but-passthrough-there, or a
-                // child reading through a parent's still-captured copy would hit
-                // the kernel's passthrough-vs-write EIO (see DESIGN.md D5).
-                "passthrough" => Action::Passthrough,
-                _ => continue,
-            };
-            let rest: Vec<&str> = it.collect();
-            // Skip advanced clause lines (and/or/not/off/kind:) — path-only here.
-            if rest.len() != 1 || rest[0].contains(':') { continue; }
-            if let Ok(pat) = Pattern::new(rest[0]) {
-                rules.push(Rule { action, pat });
-            }
-        }
+        Rules::parse(&text)
+    }
+
+    pub fn parse(text: &str) -> Rules {
+        let rules = text.lines().filter_map(FileRule::parse).collect();
         Rules { rules }
     }
 
-    /// First-match decision for a path (leading slash stripped), or None.
-    pub fn decide(&self, rel: &str) -> Option<Action> {
-        let rel = rel.trim_start_matches('/');
-        self.rules.iter().find(|r| r.pat.matches(rel)).map(|r| r.action)
+    /// First-match FULL-grammar decision for a path, given the box display name
+    /// and the writer's provenance (exe/cwd/argv). Mirrors `FileRules.decide`.
+    pub fn decide(&self, rel: &str, subject: &Subject) -> Option<Action> {
+        let target = PathTarget { rel, subject: subject.clone(), ids: vec![] };
+        self.rules.iter().find(|r| r.matches(&target)).map(|r| r.action)
+    }
+
+    /// PATH-ONLY passthrough decision for the D5 kernel-read-passthrough gate.
+    /// Only passthrough rules whose clauses are ALL `path` count; a box-/proc-
+    /// scoped passthrough therefore never enables read-passthrough divergence.
+    /// First matching path-only rule wins (so a higher path-only apply/discard
+    /// still shadows a lower passthrough).
+    pub fn passthrough_path_only(&self, rel: &str) -> bool {
+        let target = PathTarget { rel, subject: Subject::default(), ids: vec![] };
+        for r in &self.rules {
+            if !r.path_only() { continue; }
+            if r.matches(&target) {
+                return r.action == Action::Passthrough;
+            }
+        }
+        false
+    }
+
+    /// True if any rule tests a process facet (lets a hot caller skip resolving
+    /// the writer's provenance when no rule would use it). Mirrors needs_proc.
+    pub fn needs_proc(&self) -> bool {
+        self.rules.iter().flat_map(|r| &r.clauses)
+            .any(|c| matches!(c.m.kind.as_str(), "exe" | "cwd" | "arg"))
+    }
+
+    /// True if any rule tests the box facet.
+    pub fn needs_box(&self) -> bool {
+        self.rules.iter().flat_map(|r| &r.clauses)
+            .any(|c| c.m.kind == "box")
     }
 }

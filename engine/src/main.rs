@@ -142,6 +142,33 @@ fn main() {
             std::process::exit(ui_launch(&argv)),
         // `engine` is the headless-serve alias Python uses; `serve` still works.
         Some("engine") | Some("serve") => std::process::exit(serve()),
+        // ruletest <rulesfile> <rel> <box> <exe> <cwd> [argv...] — test hook for
+        // the clause-engine parity cross-check. Loads the rules file, builds the
+        // Subject, and prints "<action|none> pt-read:<0|1>" (the full-grammar
+        // decision + the D5 path-only-passthrough read gate).
+        Some("ruletest") => {
+            let a = &argv[1..];
+            if a.len() < 5 {
+                eprintln!("usage: ruletest <rulesfile> <rel> <box> <exe> <cwd> [argv...]");
+                std::process::exit(2);
+            }
+            let text = std::fs::read_to_string(&a[0]).unwrap_or_default();
+            let rules = rules::Rules::parse(&text);
+            let rel = &a[1];
+            let subject = rules::Subject {
+                box_name: a[2].clone(), exe: a[3].clone(), cwd: a[4].clone(),
+                argv: a[5..].to_vec(),
+            };
+            let act = match rules.decide(rel, &subject) {
+                Some(rules::Action::Apply) => "apply",
+                Some(rules::Action::Discard) => "discard",
+                Some(rules::Action::Passthrough) => "passthrough",
+                None => "none",
+            };
+            let pt_read = rules.passthrough_path_only(rel) as u8;
+            println!("{act} pt-read:{pt_read}");
+            std::process::exit(0);
+        }
         Some("run") => {
             // run [-t] [-d] [-e] [NAME] -- CMD...
             //   -t  passthrough: no stdout/stderr capture (inner just execs)

@@ -169,6 +169,21 @@ fn tgid_of(pid: u32) -> u32 {
     pid
 }
 
+/// exe / cwd / argv of `pid` from /proc — the writer provenance a process-
+/// scoped file rule (exe:/cwd:/arg:) matches against. Empty fields on any read
+/// failure (a never-matching facet, mirroring the Python empty-Subject default).
+fn proc_facets(pid: u32) -> (String, String, Vec<String>) {
+    let rl = |which: &str| std::fs::read_link(format!("/proc/{pid}/{which}"))
+        .ok().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+    let exe = rl("exe");
+    let cwd = rl("cwd");
+    let argv = std::fs::read(format!("/proc/{pid}/cmdline")).ok()
+        .map(|b| b.split(|&c| c == 0).filter(|s| !s.is_empty())
+                  .map(|s| String::from_utf8_lossy(s).into_owned()).collect())
+        .unwrap_or_default();
+    (exe, cwd, argv)
+}
+
 enum Layer {
     Absent,
     UpperFile { owner: i64, rowid: i64, mode: u32 },
@@ -278,9 +293,48 @@ impl Overlay {
         }
     }
 
-    fn is_passthrough(&self, rel: &str) -> bool {
-        matches!(self.inner.rules.read().unwrap().decide(rel),
+    /// HOST-DIRECT WRITE routing decision: the FULL-grammar passthrough rule,
+    /// scoped by the box display name and the writing process's provenance
+    /// (exe/cwd/argv). A rule like `passthrough *.key and exe:gpg` therefore
+    /// only routes gpg's writes host-direct. The box/proc facets are resolved
+    /// only when some rule actually uses them (the common path-only case stays
+    /// fast — empty Subject, no /proc or discover work).
+    fn is_passthrough(&self, rel: &str, bid: i64, pid: u32) -> bool {
+        let rules = self.inner.rules.read().unwrap();
+        if !rules.needs_box() && !rules.needs_proc() {
+            // common case: no box/proc clauses → path-only Subject suffices.
+            return matches!(rules.decide(rel, &crate::rules::Subject::default()),
+                            Some(crate::rules::Action::Passthrough));
+        }
+        let subject = self.writer_subject(bid, pid, rules.needs_box(),
+                                          rules.needs_proc());
+        matches!(rules.decide(rel, &subject),
                  Some(crate::rules::Action::Passthrough))
+    }
+
+    /// D5 kernel-READ-passthrough gate: PATH-ONLY passthrough match only, so a
+    /// box-/proc-scoped passthrough never enables the captured-here-but-
+    /// passthrough-there read divergence (see DESIGN.md D5 / rules.rs).
+    fn is_passthrough_read(&self, rel: &str) -> bool {
+        self.inner.rules.read().unwrap().passthrough_path_only(rel)
+    }
+
+    /// Build the rule Subject for the WRITING process `pid` in box `bid`: the
+    /// box display name (when a rule needs it) and the live process's exe/cwd/
+    /// argv read from /proc (when a rule needs them). Self-contained — no box
+    /// state required beyond the id.
+    fn writer_subject(&self, bid: i64, pid: u32, want_box: bool, want_proc: bool)
+        -> crate::rules::Subject
+    {
+        let mut s = crate::rules::Subject::default();
+        if want_box {
+            s.box_name = crate::discover::display_path(&crate::discover::discover(), bid);
+        }
+        if want_proc {
+            let (exe, cwd, argv) = proc_facets(pid);
+            s.exe = exe; s.cwd = cwd; s.argv = argv;
+        }
+        s
     }
 
     pub fn add_box(&self, b: Arc<BoxState>) {
@@ -695,7 +749,7 @@ impl Filesystem for Overlay {
                                    fuser::OpenAccMode::O_RDONLY);
         // -d direct: the whole box is passthrough (no overlay) — writes land on
         // the real host, uncaptured. Else a per-path passthrough file rule.
-        if want_write && (b.direct() || self.is_passthrough(&rel)) {
+        if want_write && (b.direct() || self.is_passthrough(&rel, bid, req.pid())) {
             // passthrough rule: writes go straight to the REAL host file, never
             // captured. Open (creating) the host path directly.
             let host = self.host(&rel);
@@ -743,7 +797,7 @@ impl Filesystem for Overlay {
         // uniform, never a captured-vs-passthrough divergence (see DESIGN.md D5).
         const FMODE_EXEC: i32 = 0x20;
         let is_exec = flags.0 & FMODE_EXEC != 0;
-        if !want_write && !is_exec && (b.direct() || self.is_passthrough(&rel))
+        if !want_write && !is_exec && (b.direct() || self.is_passthrough_read(&rel))
             && self.inner.passthrough_ok.load(Ordering::Relaxed) {
             if let Some(f) = file.as_ref() {
                 if let Ok(backing) = reply.open_backing(f) {
@@ -778,7 +832,7 @@ impl Filesystem for Overlay {
         let Some(name) = name.to_str() else { return reply.error(Errno::EINVAL) };
         let rel = if prel.is_empty() { name.to_string() }
                   else { format!("{prel}/{name}") };
-        if b.direct() || self.is_passthrough(&rel) {
+        if b.direct() || self.is_passthrough(&rel, bid, req.pid()) {
             // passthrough (file rule, or -d whole-box direct): create the file on
             // the REAL host, uncaptured.
             let host = self.host(&rel);
@@ -939,7 +993,7 @@ impl Filesystem for Overlay {
         // copy_up captured a spurious row AND left the host file's tail intact
         // (the write went host-direct, the truncate went to a blob). Truncate
         // propagates the real errno; chmod/chown/utimes are best-effort.
-        if b.direct() || self.is_passthrough(&rel) {
+        if b.direct() || self.is_passthrough(&rel, bid, req.pid()) {
             let host = self.host(&rel);
             let cpath = std::ffi::CString::new(host.as_os_str().as_encoded_bytes());
             if let Some(sz) = size {
