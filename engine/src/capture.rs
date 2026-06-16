@@ -737,6 +737,13 @@ impl BoxState {
         self.kinds.read().unwrap().get(rel).cloned()
     }
 
+    /// Drop `rel` from the live RAM mirror only (the on-disk row/blob is handled
+    /// by the caller). Used when a delete promotes into a parent whose lower has
+    /// nothing to shadow, so the parent's own row is removed entirely.
+    pub fn forget_kind(&self, rel: &str) {
+        self.kinds.write().unwrap().remove(rel);
+    }
+
     /// Direct overlay children of dir `rel`: (whiteout names, present names).
     pub fn children_of(&self, rel: &str) -> (Vec<String>, Vec<String>) {
         let prefix = if rel.is_empty() { String::new() } else { format!("{rel}/") };

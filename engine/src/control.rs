@@ -220,13 +220,15 @@ fn dispatch(state: &State, msg: &Value) -> Value {
                 .and_then(|s| resolve(&boxes, s)) {
                 Some(id) => {
                     let all = Value::Null; // CLI applies/discards the whole box
+                    let ctx = crate::review::NestCtx::new(
+                        state.lock().unwrap().overlay.clone());
                     let (r, n) = if t == "apply" {
-                        let r = crate::review::apply(id, &all);
+                        let r = crate::review::apply(id, &all, &ctx);
                         let n = r.get("applied").and_then(Value::as_array)
                             .map(|a| a.len()).unwrap_or(0);
                         (r, n)
                     } else {
-                        let r = crate::review::discard(id, &all);
+                        let r = crate::review::discard(id, &all, &ctx);
                         let n = r.get("discarded").and_then(Value::as_array)
                             .map(|a| a.len()).unwrap_or(0);
                         (r, n)
@@ -362,7 +364,8 @@ fn dissolve(state: &State, id: i64) -> Value {
     }
     // finalize: apply rule-matched changes to the host, discard the rest
     // (fail-closed — if applying errored, don't free the box).
-    let fin = crate::review::finalize_by_rules(id);
+    let fin = crate::review::finalize_by_rules(
+        id, &crate::review::NestCtx::new(ov.clone()));
     if fin.get("errors").and_then(Value::as_array).map(|a| !a.is_empty())
         .unwrap_or(false) {
         return json!({"ok": false, "error": "finalize had errors; nothing freed",
@@ -656,13 +659,21 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
             }
         }
         "review.apply" => match arg_sid(args) {
-            Some(id) => { let r = crate::review::apply(id,
-                args.get(1).unwrap_or(&Value::Null)); drop_if_empty(state, id); r }
+            Some(id) => {
+                let ctx = crate::review::NestCtx::new(
+                    state.lock().unwrap().overlay.clone());
+                let r = crate::review::apply(id,
+                    args.get(1).unwrap_or(&Value::Null), &ctx);
+                drop_if_empty(state, id); r }
             None => json!({"applied": [], "errors": []}),
         },
         "review.discard" => match arg_sid(args) {
-            Some(id) => { let r = crate::review::discard(id,
-                args.get(1).unwrap_or(&Value::Null)); drop_if_empty(state, id); r }
+            Some(id) => {
+                let ctx = crate::review::NestCtx::new(
+                    state.lock().unwrap().overlay.clone());
+                let r = crate::review::discard(id,
+                    args.get(1).unwrap_or(&Value::Null), &ctx);
+                drop_if_empty(state, id); r }
             None => json!({"discarded": [], "errors": []}),
         },
         "review.patch_text" => match arg_sid(args) {

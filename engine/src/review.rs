@@ -201,6 +201,48 @@ fn open_rw(id: i64) -> Option<Connection> {
     Some(c)
 }
 
+/// The nesting context for apply/discard/finalize: how to find a box's PARENT,
+/// its immediate CHILDREN, and any box's live BoxState (RAM mirror). Built from
+/// the engine's `Overlay` (live boxes) + on-disk discovery (at-rest parent/child
+/// links). When there is no overlay (a stale/non-server caller), every box is
+/// treated as at-rest and links come from the on-disk sqlar meta alone — so the
+/// nested semantics still hold for finished boxes.
+///
+/// A box's apply with a parent PROMOTES into that parent's overlay (a nested
+/// pending change); only a TOP-LEVEL box's apply reaches the real host. A
+/// discard copies each path DOWN into immediate children that inherit it before
+/// the row is dropped.
+pub struct NestCtx {
+    overlay: Option<crate::overlay::Overlay>,
+}
+
+impl NestCtx {
+    pub fn new(overlay: Option<crate::overlay::Overlay>) -> Self {
+        Self { overlay }
+    }
+
+    /// `id`'s parent box id: a live box knows its own parent(); else read the
+    /// on-disk sqlar meta.
+    fn parent_of(&self, id: i64) -> Option<i64> {
+        if let Some(cb) = self.live(id) {
+            return cb.parent();
+        }
+        crate::discover::discover().get(&id).and_then(|b| b.parent)
+    }
+
+    /// `id`'s immediate child box ids (parent_box_id == id), live + at-rest.
+    fn children_of(&self, id: i64) -> Vec<i64> {
+        crate::discover::discover().values()
+            .filter(|b| b.parent == Some(id) && b.box_id != id)
+            .map(|b| b.box_id).collect()
+    }
+
+    /// `id`'s live BoxState when the box is currently running, else None.
+    fn live(&self, id: i64) -> Option<std::sync::Arc<crate::capture::BoxState>> {
+        self.overlay.as_ref().and_then(|o| o.live_box(id))
+    }
+}
+
 fn row_of(conn: &Connection, rel: &str) -> Option<(i64, u32, Option<Vec<u8>>)> {
     conn.query_row("SELECT rowid,mode,data FROM sqlar WHERE name=?1", [rel],
                    |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as u32, r.get(2)?))).ok()
@@ -305,15 +347,31 @@ fn paths_arg(id: i64, paths: &Value) -> Vec<String> {
         .collect()).unwrap_or_default()
 }
 
-pub fn apply(id: i64, paths: &Value) -> Value {
+/// apply == PROMOTE into the parent overlay (a nested box) or WRITE the host
+/// (a top-level box). Mirror of Python ChangeReview.apply. For each path: a box
+/// WITH a parent promotes the captured change into the parent's overlay (a
+/// pending change in the parent box), routed through the parent's live BoxState
+/// when running, else its at-rest sqlar; a TOP-LEVEL box materializes the change
+/// onto the real host. On success the path is consumed from this box's archive.
+pub fn apply(id: i64, paths: &Value, ctx: &NestCtx) -> Value {
     let Some(conn) = open_rw(id) else {
         return json!({"applied": [], "errors": [{"path": "", "error": "no archive"}]});
     };
+    let parent = ctx.parent_of(id);
+    let resolve = |b: i64| ctx.live(b);
     let mut applied = vec![];
     let mut errors = vec![];
     for rel in paths_arg(id, paths) {
         let rel = rel.trim_start_matches('/').to_string();
-        match materialize(&conn, id, &rel) {
+        let result = match parent {
+            Some(p) => {
+                // Nested box: promote into the parent's overlay, not the host.
+                let plive = ctx.live(p);
+                promote_into_parent(id, p, plive.as_deref(), &rel, &resolve)
+            }
+            None => materialize(&conn, id, &rel),  // top-level: write the host
+        };
+        match result {
             Ok(()) => {
                 if let Some((rowid, _, _)) = row_of(&conn, &rel) {
                     consume(&conn, id, &rel, rowid);
@@ -326,18 +384,30 @@ pub fn apply(id: i64, paths: &Value) -> Value {
     json!({"applied": applied, "errors": errors})
 }
 
-pub fn discard(id: i64, paths: &Value) -> Value {
+/// discard == drop each change from the box WITHOUT writing the host — but first
+/// copy it DOWN into any immediate child that inherits it, so the child's merged
+/// view is unchanged. Mirror of Python ChangeReview.discard. A copy-down failure
+/// for a path leaves that path in place (errored) — the child must not lose its
+/// inherited view.
+pub fn discard(id: i64, paths: &Value, ctx: &NestCtx) -> Value {
     let mut discarded = vec![];
+    let mut errors = vec![];
+    let children = |b: i64| ctx.children_of(b);
+    let resolve = |b: i64| ctx.live(b);
     if let Some(conn) = open_rw(id) {
         for rel in paths_arg(id, paths) {
             let rel = rel.trim_start_matches('/').to_string();
+            if let Err(e) = copydown_to_children(id, &rel, &children, &resolve) {
+                errors.push(json!({"path": rel, "error": e}));
+                continue;
+            }
             if let Some((rowid, _, _)) = row_of(&conn, &rel) {
                 consume(&conn, id, &rel, rowid);
                 discarded.push(Value::String(rel));
             }
         }
     }
-    json!({"discarded": discarded, "errors": []})
+    json!({"discarded": discarded, "errors": errors})
 }
 
 /// Split bytes into lines on '\n', keeping the terminator on each line (the last
@@ -509,7 +579,7 @@ pub fn discard_hunk(id: i64, rel: &str, index: i64) -> Value {
 /// apply-matched paths to the host, discard everything else (the rest copies
 /// nowhere for a top-level box). Used by dissolve. Returns {applied, discarded,
 /// errors}; non-empty errors mean the caller must NOT free the box.
-pub fn finalize_by_rules(id: i64) -> Value {
+pub fn finalize_by_rules(id: i64, ctx: &NestCtx) -> Value {
     let rules = crate::rules::Rules::load();
     // Box display name (only resolved when a rule actually needs it).
     let box_name = if rules.needs_box() {
@@ -536,28 +606,265 @@ pub fn finalize_by_rules(id: i64) -> Value {
             _ => discard_paths.push(Value::from(rel)),  // discard / passthrough / none
         }
     }
-    let ar = apply(id, &Value::Array(apply_paths));
-    let dr = discard(id, &Value::Array(discard_paths));
+    let ar = apply(id, &Value::Array(apply_paths), ctx);
+    // The discard pass now copies each path DOWN into immediate children that
+    // inherit it (discard() does this) before dropping the row — so a finalized
+    // box with children preserves each child's merged view, matching Python.
+    let dr = discard(id, &Value::Array(discard_paths), ctx);
+    let mut errs = ar.get("errors").and_then(Value::as_array).cloned()
+        .unwrap_or_default();
+    errs.extend(dr.get("errors").and_then(Value::as_array).cloned().unwrap_or_default());
     json!({"applied": ar.get("applied").cloned().unwrap_or(json!([])),
            "discarded": dr.get("discarded").cloned().unwrap_or(json!([])),
-           "errors": ar.get("errors").cloned().unwrap_or(json!([]))})
+           "errors": Value::Array(errs)})
+}
+
+/// One source entry's full record (the sqlar row + its side-table rows), read
+/// once from the source box's at-rest sqlar so the writers below never re-read.
+struct SrcEntry {
+    rowid: i64,
+    mode: u32,
+    mtime: i64,
+    sz: i64,
+    data: Option<Vec<u8>>,
+    opaque: i64,
+    owner: Option<(i64, i64)>,
+    rdev: Option<i64>,
+    xattrs: Vec<(String, Vec<u8>)>,
+}
+
+/// Read `rel`'s complete record from `src`'s on-disk sqlar (row + ownership +
+/// rdev + xattrs). None if the source has no such row.
+fn read_src_entry(src: i64, rel: &str) -> Option<SrcEntry> {
+    let pc = open_ro(src)?;
+    let (rowid, mode, mtime, sz, data, opaque): (i64, i64, i64, i64, Option<Vec<u8>>, i64) = pc
+        .query_row("SELECT rowid,mode,mtime,sz,data,opaque FROM sqlar WHERE name=?1",
+                   [rel], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?,
+                                  r.get(4)?, r.get(5)?))).ok()?;
+    let owner: Option<(i64, i64)> = pc.query_row(
+        "SELECT uid,gid FROM ownership WHERE name=?1", [rel],
+        |r| Ok((r.get(0)?, r.get(1)?))).ok();
+    let rdev: Option<i64> = pc.query_row("SELECT dev FROM rdev WHERE name=?1", [rel],
+                                         |r| r.get(0)).ok();
+    let mut xattrs: Vec<(String, Vec<u8>)> = vec![];
+    if let Ok(mut st) = pc.prepare("SELECT key,value FROM xattr WHERE name=?1") {
+        if let Ok(rows) = st.query_map([rel], |r|
+            Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))) {
+            xattrs = rows.flatten().collect();
+        }
+    }
+    Some(SrcEntry { rowid, mode: mode as u32, mtime, sz, data, opaque, owner, rdev, xattrs })
+}
+
+/// Does `id`'s OWN view (live RAM mirror when running, else at-rest sqlar)
+/// resolve `rel` to "whiteout" (a tombstone), "present" (file/symlink/dir/
+/// special), or None? Mirror of Python ChangeReview._own_kind.
+fn own_kind(id: i64, live: Option<&crate::capture::BoxState>, rel: &str)
+    -> Option<&'static str> {
+    if let Some(cb) = live {
+        use crate::capture::Entry;
+        return match cb.entry(rel) {
+            Some(Entry::Whiteout) => Some("whiteout"),
+            Some(_) => Some("present"),
+            None => None,
+        };
+    }
+    let conn = open_ro(id)?;
+    let mode: u32 = conn.query_row("SELECT mode FROM sqlar WHERE name=?1", [rel],
+                                   |r| r.get::<_, i64>(0)).ok().map(|m| m as u32)?;
+    Some(if mode & S_IFMT == S_IFCHR { "whiteout" } else { "present" })
+}
+
+/// Does `id`'s LOWER (what it INHERITS, ignoring its own overlay) currently
+/// resolve `rel` to a PRESENT entry? Walks the parent chain to the host —
+/// mirror of Python ChangeReview._lower_has:
+///   - no parent (top-level box): whether the host path exists or is a symlink;
+///   - has parent p: inspect p's OWN entry — a whiteout means deleted (False);
+///     a present entry means True; no own entry → recurse into p's lower.
+/// `resolve_live(p)` returns p's live BoxState when p is running (so the walk
+/// reads the RAM mirror, not a stale at-rest sqlar), else None. A `seen` set +
+/// depth cap (matching display_path) guard a circular parent chain.
+pub fn lower_has<F>(id: i64, resolve_live: &F, rel: &str) -> bool
+    where F: Fn(i64) -> Option<std::sync::Arc<crate::capture::BoxState>> {
+    let rel = rel.trim_start_matches('/');
+    let boxes = crate::discover::discover();
+    let mut cur = id;
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..64 {
+        // Parent: a live box knows its own parent(); else read at-rest meta.
+        let psid = match resolve_live(cur) {
+            Some(cb) => cb.parent(),
+            None => boxes.get(&cur).and_then(|b| b.parent),
+        };
+        let Some(psid) = psid else {
+            let host = Path::new("/").join(rel);
+            return host.symlink_metadata().is_ok();
+        };
+        if !seen.insert(psid) {
+            return false; // cycle in the parent chain: stop safely
+        }
+        match own_kind(psid, resolve_live(psid).as_deref(), rel) {
+            Some("whiteout") => return false,
+            Some(_) => return true,
+            None => cur = psid,
+        }
+    }
+    false // depth exceeded: treat as not found
+}
+
+/// Drop a live box's OWN row + pool blob for `rel` (the live counterpart of the
+/// at-rest row+blob drop). Used when a delete promotes into a destination whose
+/// lower has nothing to shadow, so the destination's own row is removed entirely.
+fn drop_live_entry(cb: &crate::capture::BoxState, rel: &str) {
+    let rowid = {
+        let conn = cb.conn.lock().unwrap();
+        let rid = conn.query_row("SELECT rowid FROM sqlar WHERE name=?1", [rel],
+                                 |r| r.get::<_, i64>(0)).ok();
+        let _ = conn.execute("DELETE FROM sqlar WHERE name=?1", [rel]);
+        rid
+    };
+    cb.forget_kind(rel);
+    if let Some(rid) = rowid {
+        let _ = std::fs::remove_file(blob_path(cb.id, rid));
+    }
+}
+
+/// Write a source entry RECORD into a destination box's overlay (live BoxState
+/// + RAM mirror when running, else the at-rest sqlar). The single write path
+/// shared by dissolve copy-down and nested apply-promote.
+///
+/// For a tombstone source (a deletion), `tombstone_as_whiteout` chooses the
+/// outcome: true → write a whiteout into the destination (the deletion must
+/// shadow whatever the destination's lower still resolves); false → just drop
+/// the destination's own row + blob (its lower has nothing here, so no shadow is
+/// needed — a plain row-drop, mirroring _promote_into_parent's delete branch).
+fn promote_record(e: &SrcEntry, src: i64, dst: i64,
+                  dst_live: Option<&crate::capture::BoxState>,
+                  rel: &str, tombstone_as_whiteout: bool) -> Result<(), String> {
+    let kind = e.mode & S_IFMT;
+
+    if let Some(cb) = dst_live {
+        // ── live destination: write through the BoxState (conn + RAM mirror) ──
+        match kind {
+            S_IFCHR => {
+                if tombstone_as_whiteout {
+                    cb.set_whiteout(rel, 0);
+                } else {
+                    drop_live_entry(cb, rel);
+                    return Ok(());
+                }
+            }
+            S_IFLNK => {
+                let tgt = e.data.clone().unwrap_or_default();
+                cb.set_symlink(rel, std::path::Path::new(
+                    std::ffi::OsStr::from_bytes(&tgt)), 0);
+            }
+            0o040000 => cb.set_dir(rel, e.mode & 0o7777, 0),
+            S_IFIFO | S_IFBLK =>
+                cb.set_special(rel, e.mode, e.rdev.unwrap_or(0) as u64, 0),
+            _ => {
+                // regular file: row via the live Index, bytes into the dst pool.
+                let rid = cb.ensure_file_row(rel, e.mode, 0);
+                let s = blob_path(src, e.rowid);
+                let dstb = blob_path(cb.id, rid);
+                if let Some(p) = dstb.parent() {
+                    std::fs::create_dir_all(p).map_err(|x| x.to_string())?;
+                }
+                if s.exists() {
+                    std::fs::copy(&s, &dstb).map_err(|x| x.to_string())?;
+                } else if let Some(d) = &e.data {
+                    std::fs::write(&dstb, d).map_err(|x| x.to_string())?;
+                }
+                cb.finalize_file(rel, e.sz, e.mtime, 0);
+            }
+        }
+        if let Some((u, g)) = e.owner { cb.set_owner(rel, u as u32, g as u32); }
+        for (k, v) in &e.xattrs { cb.set_xattr(rel, k, v); }
+        return Ok(());
+    }
+
+    // ── at-rest destination: write its on-disk sqlar directly ────────────────
+    let cc = open_rw(dst).ok_or("destination archive unavailable")?;
+    if kind == S_IFCHR && !tombstone_as_whiteout {
+        // Lower has nothing here: drop the destination's own row + blob.
+        if let Some((rowid, _, _)) = row_of(&cc, rel) {
+            consume(&cc, dst, rel, rowid);
+        }
+        return Ok(());
+    }
+    // INSERT OR REPLACE so an apply-promote OVERWRITES the destination's prior
+    // view; drop any stale blob the replaced row named first. (A copy-down never
+    // reaches here for an already-present destination — its caller guards on
+    // has_own.)
+    if let Some((old_rowid, _, _)) = row_of(&cc, rel) {
+        let _ = std::fs::remove_file(blob_path(dst, old_rowid));
+    }
+    cc.execute("INSERT OR REPLACE INTO sqlar(name,mode,mtime,sz,data,opaque) \
+                VALUES(?1,?2,?3,?4,?5,?6)",
+               params![rel, e.mode as i64, e.mtime, e.sz, e.data, e.opaque])
+        .map_err(|x| x.to_string())?;
+    let new_rowid = cc.last_insert_rowid();
+    if kind == 0o100000 {
+        let s = blob_path(src, e.rowid);
+        if s.exists() {
+            let dstb = blob_path(dst, new_rowid);
+            if let Some(p) = dstb.parent() {
+                std::fs::create_dir_all(p).map_err(|x| x.to_string())?;
+            }
+            std::fs::copy(&s, &dstb).map_err(|x| x.to_string())?;
+        }
+    }
+    if let Some((u, g)) = e.owner {
+        let _ = cc.execute("INSERT OR REPLACE INTO ownership(name,uid,gid) \
+                            VALUES(?1,?2,?3)", params![rel, u, g]);
+    }
+    if let Some(dev) = e.rdev {
+        let _ = cc.execute("INSERT OR REPLACE INTO rdev(name,dev) VALUES(?1,?2)",
+                           params![rel, dev]);
+    }
+    for (k, v) in &e.xattrs {
+        let _ = cc.execute("INSERT OR REPLACE INTO xattr(name,key,value) \
+                            VALUES(?1,?2,?3)", params![rel, k, v]);
+    }
+    Ok(())
+}
+
+/// Promote `rel`'s captured change from `box_id` (the box being APPLIED) INTO
+/// `parent`'s overlay — a nested apply captures the change as a PENDING change
+/// in the parent box instead of writing the host. Mirror of Python
+/// _promote_into_parent. `parent_live` routes the write through the parent's
+/// live BoxState (RAM mirror) when the parent is running. A deletion promotes as
+/// a whiteout iff the PARENT's own lower (its parent chain) still resolves rel to
+/// a present entry; otherwise it drops the parent's own row.
+pub fn promote_into_parent<F>(box_id: i64, parent: i64,
+                              parent_live: Option<&crate::capture::BoxState>,
+                              rel: &str, resolve_live: &F) -> Result<(), String>
+    where F: Fn(i64) -> Option<std::sync::Arc<crate::capture::BoxState>> {
+    let rel = rel.trim_start_matches('/');
+    // The source is read from box_id's at-rest sqlar (apply() operates on a
+    // stopped box's archive — see apply()).
+    let Some(e) = read_src_entry(box_id, rel) else {
+        return Err("not in archive".into());
+    };
+    let tombstone_as_whiteout = lower_has(parent, resolve_live, rel);
+    promote_record(&e, box_id, parent, parent_live, rel, tombstone_as_whiteout)
 }
 
 /// Copy a single parent entry DOWN into a child box, but ONLY if the child has
 /// no entry of its own for that path. This preserves the child's merged view
-/// (read-through-parent) at the instant the parent is dissolved: a path the
-/// child inherited from the parent (never touched itself) would vanish once the
-/// parent is freed, so we snapshot the parent's version into the child first.
-/// If the child already has its own row for `rel` (it copied-up / wrote /
-/// whiteout'd), its view is self-contained and we leave it untouched.
+/// (read-through-parent) at the instant the parent is dissolved OR a parent path
+/// is discarded: a path the child inherited from the parent (never touched
+/// itself) would change once the parent's row is dropped, so we snapshot the
+/// parent's version into the child first. If the child already has its own row
+/// for `rel`, its view is self-contained and we leave it untouched.
 ///
 /// `child_live`: when the child box is RUNNING, its live `BoxState` — the write
-/// then goes through that one connection + RAM mirror (so the mounted FUSE view
+/// goes through that one connection + RAM mirror (so the mounted FUSE view
 /// serves the copied-down entry immediately), never a rival on-disk handle.
 /// When None, the child is at rest and we write its on-disk sqlar directly.
-/// (The dissolving PARENT is always non-live, so reading its sqlar at rest is
-/// safe in both cases.) Files copy the parent blob into the child's pool under a
-/// fresh rowid; symlinks/tombstones/special carry their row data + side tables.
+/// Files copy the parent blob into the child's pool under a fresh rowid;
+/// symlinks/tombstones/special carry their row data + side tables. A tombstone
+/// copies down AS a whiteout (the child keeps seeing 'absent').
 pub fn copy_down_entry(parent: i64, child: i64, rel: &str,
                        child_live: Option<&crate::capture::BoxState>)
     -> Result<(), String> {
@@ -571,92 +878,35 @@ pub fn copy_down_entry(parent: i64, child: i64, rel: &str,
     if has {
         return Ok(());
     }
-    let pc = open_ro(parent).ok_or("parent archive unavailable")?;
-    let (p_rowid, mode, mtime, sz, data, opaque): (i64, i64, i64, i64, Option<Vec<u8>>, i64) = pc
-        .query_row("SELECT rowid,mode,mtime,sz,data,opaque FROM sqlar WHERE name=?1",
-                   [rel], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?,
-                                  r.get(4)?, r.get(5)?)))
-        .map_err(|_| "parent has no such entry")?;
-    let owner: Option<(i64, i64)> = pc.query_row(
-        "SELECT uid,gid FROM ownership WHERE name=?1", [rel],
-        |r| Ok((r.get(0)?, r.get(1)?))).ok();
-    let rdev: Option<i64> = pc.query_row("SELECT dev FROM rdev WHERE name=?1", [rel],
-                                         |r| r.get(0)).ok();
-    let mut xattrs: Vec<(String, Vec<u8>)> = vec![];
-    if let Ok(mut st) = pc.prepare("SELECT key,value FROM xattr WHERE name=?1") {
-        if let Ok(rows) = st.query_map([rel], |r|
-            Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))) {
-            xattrs = rows.flatten().collect();
-        }
-    }
-    let umode = mode as u32;
-    let kind = umode & S_IFMT;
+    let Some(e) = read_src_entry(parent, rel) else {
+        return Err("parent has no such entry".into());
+    };
+    promote_record(&e, parent, child, child_live, rel, /*tombstone_as_whiteout=*/true)
+}
 
-    if let Some(cb) = child_live {
-        // ── live child: write through the BoxState (connection + RAM mirror) ──
-        match kind {
-            S_IFCHR => cb.set_whiteout(rel, 0),                  // tombstone
-            S_IFLNK => {
-                let tgt = data.clone().unwrap_or_default();
-                cb.set_symlink(rel, std::path::Path::new(
-                    std::ffi::OsStr::from_bytes(&tgt)), 0);
-            }
-            0o040000 => cb.set_dir(rel, umode & 0o7777, 0),
-            S_IFIFO | S_IFBLK =>
-                cb.set_special(rel, umode, rdev.unwrap_or(0) as u64, 0),
-            _ => {
-                // regular file: row via the live Index, bytes into the child pool.
-                let rid = cb.ensure_file_row(rel, umode, 0);
-                let src = blob_path(parent, p_rowid);
-                if src.exists() {
-                    let dst = blob_path(cb.id, rid);
-                    if let Some(p) = dst.parent() {
-                        std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
-                    }
-                    std::fs::copy(&src, &dst).map_err(|e| e.to_string())?;
-                } else if let Some(d) = &data {
-                    let dst = blob_path(cb.id, rid);
-                    if let Some(p) = dst.parent() {
-                        std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
-                    }
-                    std::fs::write(&dst, d).map_err(|e| e.to_string())?;
-                }
-                cb.finalize_file(rel, sz, mtime, 0);
-            }
-        }
-        if let Some((u, g)) = owner { cb.set_owner(rel, u as u32, g as u32); }
-        for (k, v) in &xattrs { cb.set_xattr(rel, k, v); }
+/// Copy `rel` DOWN into every immediate child of `sid` that inherits it (has no
+/// own entry) BEFORE `sid`'s own row is dropped — so discarding from `sid` never
+/// changes a child's merged view. Mirror of Python _copydown_to_children.
+/// `children_of(sid)` lists the immediate child box ids (live + at-rest);
+/// `resolve_live(c)` is each child's live BoxState when running. Returns
+/// Err(msg) if any child copy-down failed (the caller MUST NOT then drop the
+/// row — the child would lose its inherited view).
+fn copydown_to_children<C, F>(sid: i64, rel: &str, children_of: &C, resolve_live: &F)
+    -> Result<(), String>
+    where C: Fn(i64) -> Vec<i64>,
+          F: Fn(i64) -> Option<std::sync::Arc<crate::capture::BoxState>> {
+    let kids = children_of(sid);
+    if kids.is_empty() {
         return Ok(());
     }
-
-    // ── at-rest child: write its on-disk sqlar directly ──────────────────────
-    let cc = open_rw(child).ok_or("child archive unavailable")?;
-    cc.execute("INSERT INTO sqlar(name,mode,mtime,sz,data,opaque) \
-                VALUES(?1,?2,?3,?4,?5,?6)",
-               params![rel, mode, mtime, sz, data, opaque])
-        .map_err(|e| e.to_string())?;
-    let new_rowid = cc.last_insert_rowid();
-    if kind == 0o100000 {
-        let src = blob_path(parent, p_rowid);
-        if src.exists() {
-            let dst = blob_path(child, new_rowid);
-            if let Some(p) = dst.parent() {
-                std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
-            }
-            std::fs::copy(&src, &dst).map_err(|e| e.to_string())?;
-        }
+    // Source claims this path; if its bytes can't be read, fail closed.
+    if read_src_entry(sid, rel).is_none() {
+        return Err(format!("copy-down: {rel} not readable from source"));
     }
-    if let Some((u, g)) = owner {
-        let _ = cc.execute("INSERT OR REPLACE INTO ownership(name,uid,gid) \
-                            VALUES(?1,?2,?3)", params![rel, u, g]);
-    }
-    if let Some(dev) = rdev {
-        let _ = cc.execute("INSERT OR REPLACE INTO rdev(name,dev) VALUES(?1,?2)",
-                           params![rel, dev]);
-    }
-    for (k, v) in &xattrs {
-        let _ = cc.execute("INSERT OR REPLACE INTO xattr(name,key,value) \
-                            VALUES(?1,?2,?3)", params![rel, k, v]);
+    for child in kids {
+        let live = resolve_live(child);
+        copy_down_entry(sid, child, rel, live.as_deref())
+            .map_err(|e| format!("copy-down into {child}: {e}"))?;
     }
     Ok(())
 }
