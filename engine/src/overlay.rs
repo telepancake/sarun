@@ -932,6 +932,50 @@ impl Filesystem for Overlay {
             return reply.error(Errno::ENOENT);
         };
         let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
+        // HOST-DIRECT (passthrough file rule, or -d direct): metadata ops hit the
+        // REAL host file, never copy-up/capture — mirroring the host-direct
+        // read/write path. This is the fix for the O_TRUNC bug: the kernel
+        // delivers `> file`'s truncate as setattr(size=0); routing it through
+        // copy_up captured a spurious row AND left the host file's tail intact
+        // (the write went host-direct, the truncate went to a blob). Truncate
+        // propagates the real errno; chmod/chown/utimes are best-effort.
+        if b.direct() || self.is_passthrough(&rel) {
+            let host = self.host(&rel);
+            let cpath = std::ffi::CString::new(host.as_os_str().as_encoded_bytes());
+            if let Some(sz) = size {
+                match OpenOptions::new().write(true).open(&host) {
+                    Ok(f) => if let Err(e) = f.set_len(sz) {
+                        return reply.error(Errno::from(e));
+                    },
+                    Err(e) => return reply.error(Errno::from(e)),
+                }
+            }
+            if let (Some(m), Ok(c)) = (mode, &cpath) {
+                unsafe { libc::chmod(c.as_ptr(), (m & 0o7777) as libc::mode_t); }
+            }
+            if (uid.is_some() || gid.is_some()) && cpath.is_ok() {
+                let c = cpath.as_ref().unwrap();
+                // uid_t (-1) == no change.
+                unsafe { libc::lchown(c.as_ptr(), uid.unwrap_or(u32::MAX),
+                                      gid.unwrap_or(u32::MAX)); }
+            }
+            if let (Some(t), Ok(c)) = (mtime, &cpath) {
+                let st = match t {
+                    TimeOrNow::SpecificTime(s) => s,
+                    TimeOrNow::Now => SystemTime::now(),
+                };
+                let d = st.duration_since(UNIX_EPOCH).unwrap_or_default();
+                let ts = libc::timespec { tv_sec: d.as_secs() as libc::time_t,
+                                          tv_nsec: d.subsec_nanos() as i64 };
+                let times = [ts, ts];
+                unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(),
+                                         times.as_ptr(), libc::AT_SYMLINK_NOFOLLOW); }
+            }
+            return match self.attr_of(&b, u64::from(ino), &rel) {
+                Some(a) => reply.attr(&TTL, &a),
+                None => reply.error(Errno::ENOENT),
+            };
+        }
         if let Some(sz) = size {
             // truncate: a write — copy-up if still lower, then set_len.
             let f = match self.layer(&b, &rel) {

@@ -40,6 +40,7 @@ ORIG = b"PT-INPUT-" + bytes(range(256)) * 32000  # ~8 MB
 PT = Path("/root/ptr_in.bin")       # passthrough-ruled
 OTHER = Path("/root/ptr_other.bin") # not ruled
 BM = Path("/root/ptr_boxmatch.bin") # targeted by a (ignored) box-scoped rule
+TRUNC = Path("/root/ptr_trunc.bin") # passthrough-ruled, EXISTING (O_TRUNC case)
 
 _fails = []
 def check(cond, msg):
@@ -94,8 +95,9 @@ def main():
     # path-only passthrough (honored) + a box-scoped line (must be IGNORED).
     rules.write_text("passthrough root/ptr_in.bin\n"
                      "passthrough root/ptr_new.bin\n"
+                     "passthrough root/ptr_trunc.bin\n"
                      "passthrough box:PTR root/ptr_boxmatch.bin\n")
-    for p in (PT, OTHER, BM): p.write_bytes(ORIG)
+    for p in (PT, OTHER, BM, TRUNC): p.write_bytes(ORIG)
     eng = None
 
     def box(cmd):
@@ -151,6 +153,17 @@ def main():
               "ptr-rs: passthrough write NOT captured in the box (host-direct)")
         new.unlink(missing_ok=True)
 
+        # 3b) TRUNCATING write to an EXISTING passthrough file (the O_TRUNC bug):
+        #     the truncate (setattr size=0) must hit the host, not copy-up. Host
+        #     ends up cleanly the new bytes (no stale tail) and nothing captured.
+        box("printf 'SHORT' > /root/ptr_trunc.bin")
+        sp = latest()
+        check(TRUNC.read_bytes() == b"SHORT",
+              f"ptr-rs: O_TRUNC of an existing passthrough file truncates the HOST "
+              f"cleanly, no stale tail (got {TRUNC.read_bytes()!r})")
+        check(m.sqlar_content(sp, "root/ptr_trunc.bin") is None,
+              "ptr-rs: O_TRUNC of a passthrough file does NOT spuriously capture")
+
         # 4) a `box:`-scoped rule line is IGNORED → the path stays CAPTURED
         box("printf 'BOXMATCH' > /root/ptr_boxmatch.bin")
         sp = latest()
@@ -178,7 +191,7 @@ def main():
               f"ptr-rs: NESTED child read the passthrough file from the HOST "
               f"directly, correct bytes (got={got!r})")
     finally:
-        for p in (PT, OTHER, BM, Path("/root/ptr_new.bin")):
+        for p in (PT, OTHER, BM, TRUNC, Path("/root/ptr_new.bin")):
             p.unlink(missing_ok=True)
         if eng is not None and eng.poll() is None:
             eng.terminate()

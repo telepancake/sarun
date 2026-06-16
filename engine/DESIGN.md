@@ -91,9 +91,13 @@ divergence. (Verified: test_passthrough_rule_rs.py — rule gates passthrough; a
 directly. test_concurrent_rw_rs.py guards that CAPTURED files, never
 passthrough'd, keep concurrent read+write correct.)
 
-KNOWN BUG (pre-existing, separate): the host-direct write path does not honor
-O_TRUNC — `printf NEW > existing_ruled_file` leaves a stale tail AND spuriously
-captures a row. Noted so it isn't lost; not yet fixed.
+Host-direct metadata is host-direct too: setattr (truncate/chmod/chown/utimes)
+on a `passthrough`/`-d` path goes straight to the host file, never copy-up. This
+fixed the O_TRUNC bug where `printf NEW > existing_ruled_file` (whose truncate
+the kernel delivers as setattr size=0) was routed through copy_up — capturing a
+spurious row AND leaving the host file's tail intact (the write went host-direct,
+the truncate went to a blob). Now the truncate hits the host: clean bytes, no
+capture (test_passthrough_rule_rs.py covers it).
 
 ## D6 · Storage for the index (OPEN: rusqlite vs redb)
 The index (paths, modes, whiteouts, writers, process/provenance/env/outputs)
