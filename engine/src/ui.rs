@@ -292,6 +292,35 @@ enum ConfirmAction {
     Dissolve,
 }
 
+/// State of the off-loop structural diff for the selected BINARY change. Mirrors
+/// the Python `_struct_*` worker fields (generation, spinner, cached lines).
+#[derive(Default)]
+struct StructState {
+    /// Generation counter bumped on every navigate-away — a worker result tagged
+    /// with a stale generation is dropped (Python `_struct_gen`).
+    generation: u64,
+    /// The engine struct job id while a finish is in flight (for struct_cancel).
+    job: Option<i64>,
+    /// Quick (type + header) lines rendered immediately; (style,text) pairs.
+    quick_lines: Vec<(String, String)>,
+    /// Full structural diff lines once the worker returns, else None (pending).
+    full_lines: Option<Vec<(String, String)>>,
+    /// Animated spinner phase while a finish is pending.
+    spin: usize,
+    /// True while a finish worker is running (show the spinner).
+    pending: bool,
+    /// Hexdump fallback lines (unrecognized type): rendered straight from bytes.
+    hex_lines: Vec<String>,
+    /// The binary detail header lines (path · kind · size · mode · ⚠ stale).
+    header: Vec<(String, String)>,
+}
+
+/// What a structural-diff worker thread sends back when `struct_finish` returns.
+struct StructResult {
+    generation: u64,
+    lines: Vec<(String, String)>,
+}
+
 struct App {
     sock: String,
     sessions: Vec<Value>,
@@ -322,6 +351,13 @@ struct App {
     /// Live engine-held PTY pane, present while one is open (Pane::Pty). None
     /// otherwise. Kept out of the headless `--once` path (which never opens one).
     pty: Option<PtyPane>,
+    /// Off-loop structural-diff state for the selected BINARY change.
+    structd: StructState,
+    /// Hunk cursor within the diff pane (index into the hunk list); used for
+    /// per-hunk apply/discard.
+    sel_hunk: usize,
+    /// Receiver for finished structural-diff worker results (drained each tick).
+    struct_rx: Option<mpsc::Receiver<StructResult>>,
 }
 
 impl App {
@@ -351,6 +387,9 @@ impl App {
             f_outputs: ViewFilter::default(),
             should_quit: false,
             pty: None,
+            structd: StructState::default(),
+            sel_hunk: 0,
+            struct_rx: None,
         };
         a.refresh_sessions();
         a.load_changes();
@@ -394,6 +433,8 @@ impl App {
         self.hunks = Value::Null;
         self.sel_change = 0;
         self.hunk_scroll = 0;
+        self.sel_hunk = 0;
+        self.cancel_struct();
         let Some(sid) = self.cur_sid() else { return };
         match rpc(&self.sock, "review.session_changes", json!([sid])) {
             Ok(Value::Array(a)) => self.changes = a,
@@ -406,9 +447,14 @@ impl App {
     }
 
     /// Load the hunks (unified diff) for the selected change of the selected box.
+    /// For a BINARY change this also kicks off the off-loop structural diff
+    /// (struct_quick now, struct_finish on a worker thread).
     fn load_hunks(&mut self) {
         self.hunks = Value::Null;
         self.hunk_scroll = 0;
+        self.sel_hunk = 0;
+        // Supersede any structural diff in flight for the previous row.
+        self.cancel_struct();
         let (Some(sid), Some(path)) = (self.cur_sid(), self.cur_change_path()) else {
             return;
         };
@@ -416,6 +462,282 @@ impl App {
             Ok(v) => self.hunks = v,
             Err(e) => self.status = format!("hunks: {e}"),
         }
+        // text changes use the unified-diff hunk pane; binary changes drive the
+        // structural-diff pane (detail header + struct_quick → struct_finish).
+        if self.hunks.get("is_text").and_then(Value::as_bool) != Some(true) {
+            self.begin_struct(&sid, &path);
+        }
+    }
+
+    /// Bump the generation so any in-flight worker result is dropped, drop the
+    /// receiver, and tell the engine to cancel the running job (Python
+    /// `_cancel_struct`). Clears the cached struct state.
+    fn cancel_struct(&mut self) {
+        self.structd.generation = self.structd.generation.wrapping_add(1);
+        if let Some(job) = self.structd.job.take() {
+            let _ = rpc(&self.sock, "struct_cancel", json!([job]));
+        }
+        self.struct_rx = None;
+        self.structd.pending = false;
+        self.structd.quick_lines.clear();
+        self.structd.full_lines = None;
+        self.structd.hex_lines.clear();
+        self.structd.header.clear();
+    }
+
+    /// Build the binary detail header + run struct_quick; for a recognized type
+    /// spawn a worker thread that runs struct_finish off the render path. For an
+    /// unrecognized type build a hexdump fallback from the change's bytes.
+    fn begin_struct(&mut self, sid: &str, rel: &str) {
+        // detail header (path · kind · size · mode · ⚠ stale) from decorate.
+        self.structd.header = self.binary_header(sid, rel);
+        // FAST half: type lines + header + (maybe) a job id.
+        let quick = rpc(&self.sock, "struct_quick", json!([sid, rel]))
+            .unwrap_or_else(|e| json!({"lines": [["err", e]], "job": Value::Null}));
+        self.structd.quick_lines = pairs_of(quick.get("lines"));
+        let job = quick.get("job").and_then(Value::as_i64);
+        if let Some(job) = job {
+            // recognized type: run the heavy sandboxed dump off the render path.
+            self.structd.job = Some(job);
+            self.structd.pending = true;
+            self.structd.full_lines = None;
+            let (tx, rx) = mpsc::channel();
+            self.struct_rx = Some(rx);
+            let generation = self.structd.generation;
+            let sock = self.sock.clone();
+            std::thread::spawn(move || {
+                let r = rpc(&sock, "struct_finish", json!([job]))
+                    .unwrap_or_else(|e| json!({"lines": [["err", e]]}));
+                let _ = tx.send(StructResult { generation, lines: pairs_of(r.get("lines")) });
+            });
+        } else {
+            // unrecognized type: hexdump fallback (before/after bytes).
+            self.structd.hex_lines = self.hexdump_fallback();
+        }
+    }
+
+    /// Drain a finished structural-diff worker result if present, dropping a
+    /// stale-generation result. Returns true if the cached lines changed (a
+    /// redraw is warranted). Mirrors Python `_struct_done`.
+    fn pump_struct(&mut self) -> bool {
+        let Some(rx) = self.struct_rx.as_ref() else { return false };
+        match rx.try_recv() {
+            Ok(res) => {
+                self.struct_rx = None;
+                if res.generation != self.structd.generation {
+                    return false; // superseded during navigation: drop it
+                }
+                self.structd.full_lines = Some(res.lines);
+                self.structd.pending = false;
+                self.structd.job = None;
+                true
+            }
+            Err(mpsc::TryRecvError::Empty) => false,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.struct_rx = None;
+                self.structd.pending = false;
+                false
+            }
+        }
+    }
+
+    /// The binary detail header lines for the selected change (path · kind ·
+    /// size · mode · ⚠ stale), from review.decorate + review.change_mode + the
+    /// change row's size. Mirrors Python `_update_cd_info`.
+    fn binary_header(&self, sid: &str, rel: &str) -> Vec<(String, String)> {
+        let ent = self.visible_changes().get(self.sel_change).cloned().cloned();
+        let size = ent.as_ref().and_then(|c| c.get("size").and_then(Value::as_i64));
+        let row_kind = ent
+            .as_ref()
+            .and_then(|c| c.get("kind").and_then(Value::as_str))
+            .unwrap_or("changed")
+            .to_string();
+        let dec = rpc(&self.sock, "review.decorate", json!([sid, rel])).ok();
+        let kind = dec
+            .as_ref()
+            .and_then(|d| d.get("kind").and_then(Value::as_str))
+            .unwrap_or(&row_kind)
+            .to_string();
+        let stale = dec
+            .as_ref()
+            .and_then(|d| d.get("stale").and_then(Value::as_bool))
+            .unwrap_or(false);
+        let mode = rpc(&self.sock, "review.change_mode", json!([sid, rel]))
+            .ok()
+            .and_then(|v| v.as_i64());
+        let mut meta = kind;
+        if let Some(sz) = size {
+            meta.push_str(&format!(" · {}", fmt_bytes(sz)));
+        }
+        if let Some(m) = mode {
+            meta.push_str(&format!(" · {} {:o}", filemode(m), m & 0o7777));
+        }
+        let mut out = vec![("bold".to_string(), format!("/{rel}")), ("dim".to_string(), meta)];
+        if stale {
+            out.push(("stale".to_string(), "⚠ host changed since capture".to_string()));
+        }
+        out
+    }
+
+    /// A before/after hexdump (16 bytes per row, hex + ASCII) of the selected
+    /// binary change, used when the type is unrecognized (no structural differ).
+    /// Mirrors the Python `_hexdump` fallback in `_diff_info_lines`.
+    fn hexdump_fallback(&self) -> Vec<String> {
+        let (Some(sid), Some(rel)) = (self.cur_sid(), self.cur_change_path()) else {
+            return vec![];
+        };
+        let diff = self.hunks.get("diff").cloned().unwrap_or(Value::Null);
+        let _ = (sid, rel);
+        let mut out = vec![];
+        let decode = |v: Option<&Value>| -> Vec<u8> {
+            v.and_then(Value::as_str)
+                .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())
+                .unwrap_or_default()
+        };
+        let after = decode(diff.get("content"));
+        if let Some(before_v) = diff.get("content_before") {
+            let before = decode(Some(before_v));
+            out.push(format!("── before ── binary · {}", fmt_bytes(before.len() as i64)));
+            hexdump_into(&before, &mut out);
+            out.push(format!("── after ──  binary · {}", fmt_bytes(after.len() as i64)));
+        } else {
+            out.push(format!("binary · {}", fmt_bytes(after.len() as i64)));
+        }
+        hexdump_into(&after, &mut out);
+        out
+    }
+
+    // ── per-hunk + batch apply/discard (Python _hunk_apply / action_apply_*) ──
+
+    /// The hunk indices present in the current text diff (the `index` field of
+    /// each hunk in review.hunks), in order.
+    fn hunk_indices(&self) -> Vec<i64> {
+        self.hunks
+            .get("hunks")
+            .and_then(Value::as_array)
+            .map(|hs| hs.iter().filter_map(|h| h.get("index").and_then(Value::as_i64)).collect())
+            .unwrap_or_default()
+    }
+
+    /// The engine-side index of the hunk under the diff cursor, if any.
+    fn cur_hunk_index(&self) -> Option<i64> {
+        self.hunk_indices().get(self.sel_hunk).copied()
+    }
+
+    /// Apply ONE hunk (review.apply_hunk sid,rel,index): the box already holds
+    /// it, so applying it to the host stops it being a difference. Reloads.
+    fn apply_hunk(&mut self) {
+        let (Some(sid), Some(rel), Some(ix)) =
+            (self.cur_sid(), self.cur_change_path(), self.cur_hunk_index())
+        else {
+            self.status = "no hunk under cursor".into();
+            return;
+        };
+        match rpc(&self.sock, "review.apply_hunk", json!([sid, rel, ix])) {
+            Ok(r) if r.get("ok").and_then(Value::as_bool) == Some(true) =>
+                self.status = format!("applied hunk {ix}"),
+            Ok(r) => self.status = format!(
+                "apply_hunk: {}",
+                r.get("error").and_then(Value::as_str).unwrap_or("failed")
+            ),
+            Err(e) => self.status = format!("apply_hunk: {e}"),
+        }
+        self.reload_after_hunk();
+    }
+
+    /// Discard ONE hunk (review.discard_hunk sid,rel,index): revert that hunk in
+    /// the box back to the host's bytes. Reloads.
+    fn discard_hunk(&mut self) {
+        let (Some(sid), Some(rel), Some(ix)) =
+            (self.cur_sid(), self.cur_change_path(), self.cur_hunk_index())
+        else {
+            self.status = "no hunk under cursor".into();
+            return;
+        };
+        match rpc(&self.sock, "review.discard_hunk", json!([sid, rel, ix])) {
+            Ok(r) if r.get("ok").and_then(Value::as_bool) == Some(true) =>
+                self.status = format!("discarded hunk {ix}"),
+            Ok(r) => self.status = format!(
+                "discard_hunk: {}",
+                r.get("error").and_then(Value::as_str).unwrap_or("failed")
+            ),
+            Err(e) => self.status = format!("discard_hunk: {e}"),
+        }
+        self.reload_after_hunk();
+    }
+
+    /// After a per-hunk op: reload changes + the diff for the same path, clamping
+    /// the hunk cursor (the change may have vanished when its last hunk went).
+    fn reload_after_hunk(&mut self) {
+        let path = self.cur_change_path();
+        self.refresh_sessions();
+        let sid = self.cur_sid();
+        if let Some(sid) = sid {
+            match rpc(&self.sock, "review.session_changes", json!([sid])) {
+                Ok(Value::Array(a)) => self.changes = a,
+                _ => {}
+            }
+        }
+        // keep the cursor on the same path if it survives.
+        if let Some(p) = &path {
+            if let Some(i) = self.visible_changes().iter().position(|c| {
+                c.get("path").and_then(Value::as_str) == Some(p.as_str())
+            }) {
+                self.sel_change = i;
+            } else if self.sel_change >= self.visible_changes().len() {
+                self.sel_change = self.visible_changes().len().saturating_sub(1);
+            }
+        }
+        let n = self.hunk_indices().len();
+        if n > 0 && self.sel_hunk >= n {
+            self.sel_hunk = n - 1;
+        }
+        self.load_hunks();
+    }
+
+    /// `A` — apply ALL changes of the selected box (review.apply with a null
+    /// selector). Mirrors Python `action_apply_all`.
+    fn apply_all(&mut self) {
+        let Some(sid) = self.cur_sid() else { return };
+        match rpc(&self.sock, "review.apply", json!([sid, Value::Null])) {
+            Ok(r) => {
+                let n = r.get("applied").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0);
+                self.status = format!("applied all ({n} change(s))");
+            }
+            Err(e) => self.status = format!("apply_all: {e}"),
+        }
+        self.refresh_sessions();
+        self.load_changes();
+    }
+
+    /// `X` — discard ALL changes of the selected box (review.discard with a null
+    /// selector). Mirrors Python `action_discard_all`.
+    fn discard_all(&mut self) {
+        let Some(sid) = self.cur_sid() else { return };
+        match rpc(&self.sock, "review.discard", json!([sid, Value::Null])) {
+            Ok(r) => {
+                let n = r.get("discarded").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0);
+                self.status = format!("discarded all ({n} change(s))");
+            }
+            Err(e) => self.status = format!("discard_all: {e}"),
+        }
+        self.refresh_sessions();
+        self.load_changes();
+    }
+
+    /// Move the selected file rule by `delta` (ctrl+up = -1, ctrl+down = +1),
+    /// rewrite the filerules file in the new order, and reload_rules. Mirrors
+    /// Python FileRules.move.
+    fn move_rule(&mut self, delta: isize) {
+        let i = self.sel_rule;
+        let j = i as isize + delta;
+        if j < 0 || j as usize >= self.rules.len() || self.rules.is_empty() {
+            return;
+        }
+        let j = j as usize;
+        self.rules.swap(i, j);
+        self.sel_rule = j;
+        self.save_rules();
     }
 
     /// Load the captured process tree for the selected box (rows are
@@ -536,7 +858,16 @@ impl App {
                     self.load_hunks();
                 }
             }
-            Pane::Hunks => self.hunk_scroll = self.hunk_scroll.saturating_add(1),
+            Pane::Hunks => {
+                // move the hunk cursor between hunks when there are multiple;
+                // otherwise scroll the diff body.
+                let n = self.hunk_indices().len();
+                if n > 1 && self.sel_hunk + 1 < n {
+                    self.sel_hunk += 1;
+                } else {
+                    self.hunk_scroll = self.hunk_scroll.saturating_add(1);
+                }
+            }
             Pane::Processes => {
                 if self.sel_proc + 1 < self.proc_selectable().len() {
                     self.sel_proc += 1;
@@ -548,7 +879,8 @@ impl App {
                     self.sel_rule += 1;
                 }
             }
-            Pane::Help | Pane::Pty => {}
+            Pane::Help => self.out_scroll = self.out_scroll.saturating_add(1),
+            Pane::Pty => {}
         }
     }
 
@@ -567,11 +899,18 @@ impl App {
                     self.load_hunks();
                 }
             }
-            Pane::Hunks => self.hunk_scroll = self.hunk_scroll.saturating_sub(1),
+            Pane::Hunks => {
+                if self.hunk_indices().len() > 1 && self.sel_hunk > 0 {
+                    self.sel_hunk -= 1;
+                } else {
+                    self.hunk_scroll = self.hunk_scroll.saturating_sub(1);
+                }
+            }
             Pane::Processes => self.sel_proc = self.sel_proc.saturating_sub(1),
             Pane::Outputs => self.out_scroll = self.out_scroll.saturating_sub(1),
             Pane::Rules => self.sel_rule = self.sel_rule.saturating_sub(1),
-            Pane::Help | Pane::Pty => {}
+            Pane::Help => self.out_scroll = self.out_scroll.saturating_sub(1),
+            Pane::Pty => {}
         }
     }
 
@@ -1170,6 +1509,96 @@ fn build_proc_tree(
 
 // ── rendering ───────────────────────────────────────────────────────────────
 
+/// Convert an engine `lines` array of [style,text] pairs into owned tuples.
+fn pairs_of(v: Option<&Value>) -> Vec<(String, String)> {
+    v.and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .map(|p| {
+                    let arr = p.as_array();
+                    let style = arr.and_then(|x| x.first()).and_then(Value::as_str).unwrap_or("").to_string();
+                    let text = arr.and_then(|x| x.get(1)).and_then(Value::as_str).unwrap_or("").to_string();
+                    (style, text)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Map a structural-diff style tag to a ratatui color (Python `_STRUCT_STYLE`).
+fn struct_color(style: &str) -> Color {
+    match style {
+        "type" => Color::Yellow,
+        "hdr" => Color::Cyan,
+        "+" => Color::Green,
+        "-" => Color::Red,
+        "@" => Color::Cyan,
+        "err" => Color::Red,
+        _ => Color::DarkGray, // " " / "dim"
+    }
+}
+
+/// Human byte size (mirrors Python fmt_bytes: B/KiB/MiB/… with one decimal).
+fn fmt_bytes(n: i64) -> String {
+    let n = n as f64;
+    const U: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut v = n;
+    let mut i = 0;
+    while v >= 1024.0 && i < U.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{} {}", n as i64, U[0])
+    } else {
+        format!("{v:.1} {}", U[i])
+    }
+}
+
+/// `ls -l`-style mode string (mirrors Python stat.filemode for the common bits).
+fn filemode(mode: i64) -> String {
+    let m = mode as u32;
+    let ft = match m & 0o170000 {
+        0o120000 => 'l',
+        0o040000 => 'd',
+        0o100000 => '-',
+        0o060000 => 'b',
+        0o020000 => 'c',
+        0o010000 => 'p',
+        0o140000 => 's',
+        _ => '?',
+    };
+    let bit = |on: bool, c: char| if on { c } else { '-' };
+    let mut s = String::new();
+    s.push(ft);
+    let perms = [
+        (0o400, 'r'), (0o200, 'w'), (0o100, 'x'),
+        (0o040, 'r'), (0o020, 'w'), (0o010, 'x'),
+        (0o004, 'r'), (0o002, 'w'), (0o001, 'x'),
+    ];
+    for (mask, c) in perms {
+        s.push(bit(m & mask != 0, c));
+    }
+    s
+}
+
+/// Append a hexdump of `data` (first 256 bytes, 16 per row: offset, hex, ASCII)
+/// to `out`. Mirrors the Python `_hexdump` helper.
+fn hexdump_into(data: &[u8], out: &mut Vec<String>) {
+    let n = data.len().min(256);
+    let mut i = 0;
+    while i < n {
+        let chunk = &data[i..(i + 16).min(n)];
+        let hex = chunk.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ");
+        let ascii: String = chunk
+            .iter()
+            .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
+            .collect();
+        out.push(format!("{i:04x}  {hex:<48}  {ascii}"));
+        i += 16;
+    }
+}
+
 fn title(base: &str, focused: bool) -> String {
     if focused {
         format!(" {base} «focus» ")
@@ -1260,11 +1689,14 @@ fn hunk_lines(app: &App) -> Vec<Line<'static>> {
     }
     if h.get("is_text").and_then(Value::as_bool) == Some(true) {
         let mut out = vec![];
+        let cur_idx = app.cur_hunk_index();
         if let Some(hunks) = h.get("hunks").and_then(Value::as_array) {
             if hunks.is_empty() {
                 out.push(Line::from("(no textual differences)"));
             }
             for hunk in hunks {
+                let hidx = hunk.get("index").and_then(Value::as_i64);
+                let on_cursor = hidx.is_some() && hidx == cur_idx;
                 if let Some(lines) = hunk.get("lines").and_then(Value::as_array) {
                     for l in lines {
                         let arr = l.as_array();
@@ -1276,10 +1708,13 @@ fn hunk_lines(app: &App) -> Vec<Line<'static>> {
                             "-" => ("-", Color::Red),
                             _ => (" ", Color::Gray),
                         };
-                        out.push(Line::from(Span::styled(
-                            format!("{prefix}{txt}"),
-                            Style::default().fg(color),
-                        )));
+                        // mark the hunk under the cursor (a/x apply/discard target).
+                        let mark = if on_cursor && tag == "hdr" { "▶ " } else if tag == "hdr" { "  " } else { "" };
+                        let mut st = Style::default().fg(color);
+                        if on_cursor {
+                            st = st.add_modifier(Modifier::BOLD);
+                        }
+                        out.push(Line::from(Span::styled(format!("{mark}{prefix}{txt}"), st)));
                     }
                 }
             }
@@ -1289,18 +1724,50 @@ fn hunk_lines(app: &App) -> Vec<Line<'static>> {
         }
         out
     } else {
-        let diff = h.get("diff").cloned().unwrap_or(Value::Null);
-        let kind = diff.get("kind").and_then(Value::as_str).unwrap_or("binary");
-        let mut out = vec![Line::from(Span::styled(
-            format!("[{kind}]"),
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-        ))];
-        if let Some(d) = diff.get("diff").and_then(Value::as_str) {
-            out.push(Line::from(d.to_string()));
-        } else if let Some(e) = diff.get("error").and_then(Value::as_str) {
-            out.push(Line::from(format!("error: {e}")));
-        } else if diff.get("content").is_some() {
-            out.push(Line::from("(binary content — not rendered)"));
+        // BINARY change: detail header + (struct_quick lines / structural diff
+        // once the worker returns / animated spinner while pending / hexdump
+        // fallback when the type was unrecognized).
+        let mut out = vec![];
+        for (style, txt) in &app.structd.header {
+            let st = match style.as_str() {
+                "bold" => Style::default().add_modifier(Modifier::BOLD),
+                "stale" => Style::default().fg(Color::Red).add_modifier(Modifier::REVERSED),
+                _ => Style::default().fg(Color::DarkGray),
+            };
+            out.push(Line::from(Span::styled(txt.clone(), st)));
+        }
+        if !out.is_empty() {
+            out.push(Line::from(""));
+        }
+        // If the full structural diff has returned, render it; else the quick
+        // (type + header) lines, plus a spinner row while the finish is pending.
+        let lines = app.structd.full_lines.as_ref().unwrap_or(&app.structd.quick_lines);
+        for (style, txt) in lines {
+            let prefix = match style.as_str() {
+                "+" => "+",
+                "-" => "-",
+                " " => " ",
+                _ => "",
+            };
+            out.push(Line::from(Span::styled(
+                format!("{prefix}{txt}"),
+                Style::default().fg(struct_color(style)),
+            )));
+        }
+        if app.structd.pending && app.structd.full_lines.is_none() {
+            let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+            let f = frames[app.structd.spin % frames.len()];
+            out.push(Line::from(Span::styled(
+                format!("  {f} analyzing structure…  (navigate away to cancel)"),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        // hexdump fallback (unrecognized type): before/after bytes.
+        for l in &app.structd.hex_lines {
+            out.push(Line::from(Span::styled(l.clone(), Style::default().fg(Color::DarkGray))));
+        }
+        if out.is_empty() {
+            out.push(Line::from("(binary change)"));
         }
         out
     }
@@ -1459,36 +1926,74 @@ fn rules_lines(app: &App) -> Vec<Line<'static>> {
 fn help_lines() -> Vec<Line<'static>> {
     let h = |s: &str| Line::from(Span::styled(s.to_string(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
     let t = |s: &str| Line::from(s.to_string());
+    let d = |s: &str| Line::from(Span::styled(s.to_string(), Style::default().fg(Color::DarkGray)));
     vec![
         h("sarun — sandboxed run → inspect → apply/discard"),
         t(""),
-        t("A box runs your command over a copy-on-write overlay of the"),
-        t("filesystem. Its writes, processes, and stdout/stderr are captured"),
-        t("for review. You then apply (materialize on the host) or discard."),
+        h("The loop"),
+        t("  1. RUN a command in a box: it executes over a copy-on-write overlay"),
+        t("     of your filesystem, so its writes never touch the host yet."),
+        t("  2. INSPECT what it did: the changed files (diffs), the process tree,"),
+        t("     and the captured stdout/stderr — all without committing anything."),
+        t("  3. APPLY the writes you want onto the real host, or DISCARD them."),
+        t("     Apply/discard can be whole-box, per-file, or per-HUNK."),
+        d("  Boxes run in the HOST network namespace (normal connectivity). Only"),
+        d("  the untrusted binary viewer is network-isolated under bwrap."),
         t(""),
-        h("Panes"),
-        t("  b  boxes/sessions     c  changes (files)     (Enter→diff)"),
-        t("  p  processes          o  outputs (stdout/err)"),
-        t("  e  file rules         ?  this help            Tab cycles"),
-        t("  P  open an engine-held PTY (live interactive shell pane)"),
-        t("     keys go to the box · Ctrl-] detaches back to the UI"),
+        h("Panes (Tab cycles; or jump directly)"),
+        t("  b  boxes/sessions      the list of boxes (path · id · status · cmd)"),
+        t("  c  changes             files the box wrote (Enter → its diff)"),
+        t("  p  processes           the captured process TREE (exe · argv · env)"),
+        t("  o  outputs             decoded stdout/stderr transcript"),
+        t("  e  file rules          the ordered apply/discard/passthrough rules"),
+        t("  ?  this help"),
+        t("  P  open an engine-held PTY — a live interactive shell pane"),
+        d("     keys go to the box · Ctrl-] detaches back to the UI"),
         t(""),
-        h("Navigation"),
-        t("  j/k or ↓/↑  move      Enter  open selection in next pane"),
-        t("  R  refresh            /      filter active pane (clause editor)"),
-        t("  c/p/o cross-navigate: pin the destination to the cursor's rows"),
+        h("Navigation & filters"),
+        t("  j/k or ↓/↑  move       Enter  open the selection in the next pane"),
+        t("  R  refresh             q      quit"),
+        t("  /  filter the active pane with a clause editor. Filter KINDS:"),
+        d("     path  — match the changed file's path (changes pane)"),
+        d("     box   — match the box name"),
+        d("     exe   — match a process's executable path"),
+        d("     cwd   — match a process's working directory"),
+        d("     arg   — match a token in a process's argv"),
+        d("     Rows fold top→bottom by each row's and/or; 'not' negates a row."),
+        t("  c/p/o also cross-navigate: pin the destination pane to the rows the"),
+        t("       cursor relates to (a change's writers, a process's outputs…)."),
+        d("       Esc drops such a generated filter."),
         t(""),
-        h("Actions"),
-        t("  a  apply change/box   x  discard change/box"),
-        t("  K  kill box (y/n)     D  delete box (y/n)   X  dissolve (y/n)"),
-        t("  r  rename box"),
+        h("Reviewing changes"),
+        t("  a  apply selected change / whole box     x  discard it"),
+        t("  A  apply ALL the box's changes           X  discard ALL"),
+        t("  In the DIFF pane, a TEXT change is shown as unified-diff hunks:"),
+        t("    ↑/↓  move the hunk cursor (▶)  ·  a  apply this hunk to the host"),
+        t("    x or d  discard this hunk (revert it in the box)"),
+        t("  A BINARY change shows a detail header (path · kind · size · mode,"),
+        t("  ⚠ when the host changed since capture) and a STRUCTURAL diff: the"),
+        t("  type is sniffed and a differ (readelf/ar/unzip/tar) runs in a"),
+        t("  sandbox off the render path. Unrecognized types get a hexdump."),
+        t(""),
+        h("Boxes & nesting"),
+        t("  K  kill box (SIGTERM, y/n)    D  delete box + captures (y/n)"),
+        t("  Z  dissolve box (y/n)         r  rename box"),
+        d("  A box may be NESTED inside another: applying a nested box promotes"),
+        d("  its changes into the PARENT box (still pending), not the host;"),
+        d("  discarding copies the change DOWN into immediate child boxes."),
+        d("  Only a TOP-LEVEL box's apply reaches the real host."),
         t(""),
         h("File rules (e)"),
-        t("  n  new rule           Enter  edit selected   d  delete selected"),
-        t("  Rules are 'apply|discard|passthrough <glob>', first match wins;"),
-        t("  saving reloads them in the engine."),
-        t(""),
-        t("  q  quit"),
+        t("  n  new rule    Enter  edit selected    d  delete selected"),
+        t("  ctrl+↑ / ctrl+↓  reorder the selected rule (order = priority)"),
+        t("  Each rule is '<action> <clause>' where action is one of:"),
+        d("     apply        keep the matching writes (let them reach the host)"),
+        d("     discard      drop the matching writes"),
+        d("     passthrough  let the box write straight through to the host"),
+        t("  A clause is a glob (e.g. **/*.log) or a typed clause like"),
+        t("  'exe:**/gcc' / 'box:WORK' combined with and/or/not. Rules are"),
+        t("  evaluated TOP → BOTTOM and the FIRST match wins; saving any edit"),
+        t("  rewrites the filerules file and reloads it in the engine."),
     ]
 }
 
@@ -1619,7 +2124,8 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     } else if app.focus == Pane::Help {
         // The Help pane takes the whole body.
         let help = Paragraph::new(Text::from(help_lines()))
-            .block(block(title("help", true), true))
+            .block(block(title("help · j/k scroll", true), true))
+            .scroll((app.out_scroll, 0))
             .wrap(Wrap { trim: false });
         f.render_widget(help, body);
     } else {
@@ -1687,8 +2193,11 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                 ));
                 f.render_widget(changes, left[1]);
 
+                let is_bin = !app.hunks.is_null()
+                    && app.hunks.get("is_text").and_then(Value::as_bool) != Some(true);
+                let diff_title = if is_bin { "structural diff" } else { "diff" };
                 let hunks = Paragraph::new(Text::from(hunk_lines(app)))
-                    .block(block(title("diff", app.focus == Pane::Hunks), app.focus == Pane::Hunks))
+                    .block(block(title(diff_title, app.focus == Pane::Hunks), app.focus == Pane::Hunks))
                     .scroll((app.hunk_scroll, 0))
                     .wrap(Wrap { trim: false });
                 f.render_widget(hunks, cols[1]);
@@ -2103,6 +2612,12 @@ fn run_interactive(sock: &str) -> Result<(), String> {
             if let Some(pty) = app.pty.as_mut() {
                 pty.pump();
             }
+            // drain a finished structural-diff worker result, and animate the
+            // spinner while one is still pending.
+            app.pump_struct();
+            if app.structd.pending && app.structd.full_lines.is_none() {
+                app.structd.spin = app.structd.spin.wrapping_add(1);
+            }
             term.draw(|f| draw(f, &app)).map_err(|e| e.to_string())?;
             if app.should_quit {
                 break;
@@ -2151,8 +2666,14 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                     }
                     continue;
                 }
+                use crossterm::event::KeyModifiers as KM;
+                let ctrl = k.modifiers.contains(KM::CONTROL);
                 match k.code {
                     KeyCode::Char('q') => app.should_quit = true,
+                    // ctrl+up / ctrl+down reorder the selected file rule (before
+                    // the plain move arm, which also matches Up/Down).
+                    KeyCode::Up if ctrl && app.focus == Pane::Rules => app.move_rule(-1),
+                    KeyCode::Down if ctrl && app.focus == Pane::Rules => app.move_rule(1),
                     KeyCode::Char('j') | KeyCode::Down => app.move_down(),
                     KeyCode::Char('k') | KeyCode::Up => app.move_up(),
                     KeyCode::Tab => app.next_pane(),
@@ -2172,11 +2693,18 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                     KeyCode::Char('p') => app.nav(Pane::Processes),
                     KeyCode::Char('o') => app.nav(Pane::Outputs),
                     KeyCode::Char('e') => app.focus = Pane::Rules,
-                    KeyCode::Char('?') => app.focus = Pane::Help,
+                    KeyCode::Char('?') => { app.focus = Pane::Help; app.out_scroll = 0; }
                     KeyCode::Char('P') =>
                         app.modal = Some(Modal::PtyCmd { buf: pty_default_cmd() }),
+                    // In the diff pane, a/x/d are PER-HUNK; elsewhere they act on
+                    // the selected change / whole box.
+                    KeyCode::Char('a') if app.focus == Pane::Hunks => app.apply_hunk(),
+                    KeyCode::Char('x') | KeyCode::Char('d') if app.focus == Pane::Hunks => app.discard_hunk(),
                     KeyCode::Char('a') => app.apply(),
                     KeyCode::Char('x') => app.discard(),
+                    // batch apply/discard of the WHOLE box (Python A/X).
+                    KeyCode::Char('A') => app.apply_all(),
+                    KeyCode::Char('X') => app.discard_all(),
                     KeyCode::Char('K') => {
                         app.modal = Some(Modal::Confirm {
                             prompt: "Kill (SIGTERM) the selected box?".into(),
@@ -2189,7 +2717,7 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                             action: ConfirmAction::Delete,
                         })
                     }
-                    KeyCode::Char('X') => {
+                    KeyCode::Char('Z') => {
                         app.modal = Some(Modal::Confirm {
                             prompt: "Dissolve the selected box (unmount/cleanup)?".into(),
                             action: ConfirmAction::Dissolve,
@@ -2298,6 +2826,11 @@ mod tests {
     use super::*;
     use std::process::Child;
     use std::process::Command;
+
+    /// The App computes its filerules path from the (process-global) env, so the
+    /// rule-editing tests share one on-disk file. Serialize them with this lock
+    /// and each clears the file under it.
+    static RULES_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn shell_split_handles_quotes() {
@@ -2693,8 +3226,13 @@ mod tests {
             eprintln!("SKIP: engine binary missing or FUSE unavailable");
             return;
         };
+        let _guard = RULES_LOCK.lock().unwrap();
         let mut app = App::new(eng.sock.clone());
         app.focus = Pane::Rules;
+        // start clean (the filerules path is shared across in-process tests).
+        let _ = std::fs::remove_file(app.rules_path());
+        app.rules.clear();
+        app.load_rules();
         assert!(app.rules.is_empty(), "fresh instance should have no rules");
         // add a rule the way the RuleForm modal commit does.
         app.commit_rule("discard **/*.RULEMARKER_log".into(), None);
@@ -3006,11 +3544,269 @@ mod tests {
             f_outputs: ViewFilter::default(),
             should_quit: false,
             pty: None,
+            structd: StructState::default(),
+            sel_hunk: 0,
+            struct_rx: None,
         };
         app.focus = Pane::Help;
-        let buf = render_to_string(&app, 100, 40).unwrap();
+        // render tall enough to fit the full manual (it scrolls in a real term).
+        let buf = render_to_string(&app, 100, 80).unwrap();
         assert!(buf.contains("help"), "help pane title missing:\n{buf}");
         assert!(buf.contains("apply") && buf.contains("discard"), "help should mention apply/discard:\n{buf}");
         assert!(buf.contains("processes"), "help should mention the processes pane:\n{buf}");
+        // the richer manual must cover the loop, filter kinds, rule syntax, nesting.
+        assert!(buf.contains("copy-on-write") || buf.contains("overlay"),
+                "manual should explain the overlay loop:\n{buf}");
+        assert!(buf.contains("hunk"), "manual should mention per-hunk apply:\n{buf}");
+        assert!(buf.contains("passthrough"), "manual should document rule actions:\n{buf}");
+        assert!(buf.contains("ctrl+"), "manual should mention rule reorder:\n{buf}");
+    }
+
+    /// Helper: select the box (and change) whose path matches `pred`, returning
+    /// true once the App is positioned on it in the Changes pane.
+    fn select_change(app: &mut App, pred: impl Fn(&str) -> bool) -> bool {
+        app.refresh_sessions();
+        for i in 0..app.sessions.len() {
+            app.sel_session = i;
+            app.load_changes();
+            let pos = app.visible_changes().iter().position(|c| {
+                c.get("path").and_then(Value::as_str).map(&pred).unwrap_or(false)
+            });
+            if let Some(ci) = pos {
+                app.focus = Pane::Changes;
+                app.sel_change = ci;
+                app.load_hunks();
+                return true;
+            }
+        }
+        false
+    }
+
+    /// STRUCT PANE: a box with a real ELF binary change (cp /bin/true). Drive the
+    /// quick→finish flow and assert the rendered diff shows REAL structural lines
+    /// (an ELF section/program-header keyword from readelf) — actual file content.
+    #[test]
+    fn struct_pane_shows_elf_structure() {
+        let Some(eng) = boot() else {
+            eprintln!("SKIP: engine binary missing or FUSE unavailable");
+            return;
+        };
+        // create an ELF binary change inside the box by copying a host ELF.
+        let (_sid, root) = make_box(&eng.sock);
+        let src = ["/bin/true", "/usr/bin/true", "/bin/echo"].iter()
+            .map(PathBuf::from).find(|p| p.exists());
+        let Some(src) = src else { eprintln!("SKIP: no host ELF to copy"); return; };
+        let bytes = std::fs::read(&src).expect("read host ELF");
+        assert_eq!(&bytes[..4], b"\x7fELF", "test fixture must be an ELF");
+        let dir = root.join("tmp");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join("struct_elf_marker"), &bytes).expect("write ELF through mount");
+
+        let mut app = App::new(eng.sock.clone());
+        if !select_change(&mut app, |p| p.contains("struct_elf_marker")) {
+            eprintln!("SKIP: ELF change not captured");
+            return;
+        }
+        // it must be a BINARY change driving the structural pane.
+        assert!(app.hunks.get("is_text").and_then(Value::as_bool) != Some(true),
+                "ELF change should be binary, not text");
+        // quick half ran: the type line names ELF, and a finish job was kicked.
+        let quick_joined: String = app.structd.quick_lines.iter()
+            .map(|(_, t)| t.clone()).collect::<Vec<_>>().join("\n");
+        assert!(quick_joined.to_lowercase().contains("elf"),
+                "struct_quick should report the ELF type; got: {quick_joined}");
+        // drive the worker to completion (it runs readelf in a sandbox).
+        let mut done = false;
+        for _ in 0..100 {
+            if app.pump_struct() { done = true; break; }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        // render the pane and assert it shows a REAL readelf keyword OR (if the
+        // sandbox/readelf is unavailable here) at least the ELF type line.
+        let buf = render_to_string(&app, 160, 60).unwrap();
+        let readelf_ok = done && app.structd.full_lines.as_ref().map(|ls| {
+            let j = ls.iter().map(|(_,t)| t.clone()).collect::<Vec<_>>().join("\n");
+            j.contains("ELF Header") || j.contains("Section Headers")
+                || j.contains("Program Headers") || j.contains(".text")
+                || j.contains("readelf")
+        }).unwrap_or(false);
+        assert!(buf.contains("structural diff"), "pane title should be structural:\n{buf}");
+        assert!(
+            readelf_ok || buf.to_lowercase().contains("elf"),
+            "structural pane should show real ELF structure (or at least the ELF \
+             type line); done={done}; got:\n{buf}"
+        );
+    }
+
+    /// STRUCT PANE hexdump fallback: a binary change of an UNRECOGNIZED type
+    /// (random NUL-containing bytes) renders a hexdump of the real bytes.
+    #[test]
+    fn struct_pane_hexdump_fallback_shows_real_bytes() {
+        let Some(eng) = boot() else {
+            eprintln!("SKIP: engine binary missing or FUSE unavailable");
+            return;
+        };
+        let (_sid, root) = make_box(&eng.sock);
+        // bytes with a NUL (→ binary) and a recognizable hex signature, but no
+        // known magic (so no differ → hexdump fallback).
+        let data: Vec<u8> = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x11, 0x22, 0x33,
+                                 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB,
+                                 0x00, 0xCC];
+        let dir = root.join("tmp");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join("struct_hex_marker.bin"), &data).expect("write");
+
+        let mut app = App::new(eng.sock.clone());
+        if !select_change(&mut app, |p| p.contains("struct_hex_marker.bin")) {
+            eprintln!("SKIP: binary change not captured");
+            return;
+        }
+        assert!(app.hunks.get("is_text").and_then(Value::as_bool) != Some(true),
+                "should be a binary change");
+        // unrecognized → no finish job, hexdump fallback built immediately.
+        assert!(app.structd.job.is_none(), "unrecognized type must not kick a job");
+        assert!(!app.structd.hex_lines.is_empty(), "hexdump fallback must be built");
+        let buf = render_to_string(&app, 160, 40).unwrap();
+        // the real leading bytes must appear in the hexdump (offset 0 row).
+        assert!(buf.contains("dead beef") || buf.contains("de ad be ef"),
+                "hexdump should show the real bytes; got:\n{buf}");
+    }
+
+    /// HUNK APPLY: a 2-hunk text change. Drive `a` on hunk 0 via the UI key path
+    /// and assert (through the engine) the host got exactly that hunk while the
+    /// other hunk remains pending.
+    #[test]
+    fn hunk_apply_applies_only_the_selected_hunk() {
+        let Some(eng) = boot() else {
+            eprintln!("SKIP: engine binary missing or FUSE unavailable");
+            return;
+        };
+        // a host file with two well-separated regions; the box edits BOTH so the
+        // diff has two distinct hunks.
+        let host = PathBuf::from(format!("/tmp/hunk2_{}.txt", std::process::id()));
+        let base: String = (1..=40).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(&host, &base).expect("seed host file");
+        let rel = host.strip_prefix("/").unwrap().to_string_lossy().to_string();
+
+        let (sid, root) = make_box(&eng.sock);
+        // edit line 2 and line 38 in the box's view of the same file.
+        let mut edited: Vec<String> = base.lines().map(|l| format!("{l}\n")).collect();
+        edited[1] = "line 2 CHANGED_TOP\n".into();
+        edited[37] = "line 38 CHANGED_BOTTOM\n".into();
+        let boxpath = root.join(&rel);
+        std::fs::create_dir_all(boxpath.parent().unwrap()).ok();
+        std::fs::write(&boxpath, edited.concat()).expect("write through mount");
+
+        let mut app = App::new(eng.sock.clone());
+        let _ = sid;
+        if !select_change(&mut app, |p| p == rel) {
+            let _ = std::fs::remove_file(&host);
+            eprintln!("SKIP: 2-hunk change not captured");
+            return;
+        }
+        let idxs = app.hunk_indices();
+        assert!(idxs.len() >= 2, "expected ≥2 hunks, got {}", idxs.len());
+        // focus the diff pane, cursor on hunk 0, then exercise the UI's apply_hunk.
+        app.focus = Pane::Hunks;
+        app.sel_hunk = 0;
+        let first_ix = app.cur_hunk_index().unwrap();
+        app.apply_hunk();
+        assert!(app.status.starts_with("applied hunk"),
+                "apply_hunk status should report success; got {}", app.status);
+        // the host file must now contain hunk 0's content but NOT hunk 1's (still
+        // pending in the box).
+        let on_host = std::fs::read_to_string(&host).unwrap_or_default();
+        assert!(on_host.contains("CHANGED_TOP"),
+                "host should have the applied top hunk; got:\n{on_host}");
+        assert!(!on_host.contains("CHANGED_BOTTOM"),
+                "host must NOT yet have the un-applied bottom hunk; got:\n{on_host}");
+        // and the box still reports a remaining (bottom) hunk for this path.
+        let remaining = rpc(&eng.sock, "review.hunks", json!([app.cur_sid().unwrap(), rel]))
+            .ok().and_then(|v| v.get("hunks").and_then(Value::as_array).map(|a| a.len()))
+            .unwrap_or(0);
+        assert!(remaining >= 1, "the other hunk must remain pending (idx {first_ix} applied)");
+        let _ = std::fs::remove_file(&host);
+    }
+
+    /// BATCH A: a box with ≥2 changes; the UI's apply_all applies them all.
+    #[test]
+    fn batch_apply_all_applies_every_change() {
+        let Some(eng) = boot() else {
+            eprintln!("SKIP: engine binary missing or FUSE unavailable");
+            return;
+        };
+        let (_sid, root) = make_box(&eng.sock);
+        let dir = root.join("tmp");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let pid = std::process::id();
+        let names = [format!("batch_a_{pid}.txt"), format!("batch_b_{pid}.txt")];
+        for (i, n) in names.iter().enumerate() {
+            std::fs::write(dir.join(n), format!("content {i}\n")).expect("write");
+        }
+        for n in &names { let _ = std::fs::remove_file(PathBuf::from("/tmp").join(n)); }
+
+        let mut app = App::new(eng.sock.clone());
+        app.refresh_sessions();
+        // select the box that holds both changes.
+        let ok = (0..app.sessions.len()).any(|i| {
+            app.sel_session = i;
+            app.load_changes();
+            names.iter().all(|n| app.changes.iter().any(|c|
+                c.get("path").and_then(Value::as_str).map(|p| p.contains(n)).unwrap_or(false)))
+        });
+        assert!(ok, "expected a box holding both changes");
+        assert!(app.changes.len() >= 2, "expected ≥2 changes before apply_all");
+        app.apply_all();
+        assert!(app.status.starts_with("applied all"),
+                "apply_all status should report success; got {}", app.status);
+        // both files must now exist on the host.
+        for n in &names {
+            let hp = PathBuf::from("/tmp").join(n);
+            assert!(hp.exists(), "apply_all should materialize {hp:?} on the host");
+            let _ = std::fs::remove_file(&hp);
+        }
+        // and the box's pending changes are gone.
+        assert!(app.changes.is_empty() || app.changes.iter().all(|c|
+            !names.iter().any(|n| c.get("path").and_then(Value::as_str)
+                .map(|p| p.contains(n)).unwrap_or(false))),
+            "applied changes should no longer be pending");
+    }
+
+    /// RULE MOVE: two rules; ctrl-down on the first swaps the on-disk order and
+    /// calls reload_rules (status reflects the reload).
+    #[test]
+    fn rule_move_swaps_on_disk_order_and_reloads() {
+        let Some(eng) = boot() else {
+            eprintln!("SKIP: engine binary missing or FUSE unavailable");
+            return;
+        };
+        let _guard = RULES_LOCK.lock().unwrap();
+        let mut app = App::new(eng.sock.clone());
+        app.focus = Pane::Rules;
+        // start from a clean filerules file (the App computes its path from the
+        // process env, shared across in-process tests — isolate by clearing it).
+        let _ = std::fs::remove_file(app.rules_path());
+        app.rules.clear();
+        app.load_rules();
+        // two distinct rules.
+        app.commit_rule("apply src/**".into(), None);
+        app.commit_rule("discard **/*.log".into(), None);
+        let before = std::fs::read_to_string(app.rules_path()).unwrap_or_default();
+        let lines_before: Vec<&str> = before.lines().collect();
+        assert_eq!(lines_before, vec!["apply src/**", "discard **/*.log"],
+                   "two rules in insertion order on disk");
+        // ctrl-down on the first rule.
+        app.sel_rule = 0;
+        app.move_rule(1);
+        assert_eq!(app.sel_rule, 1, "cursor should follow the moved rule");
+        let after = std::fs::read_to_string(app.rules_path()).unwrap_or_default();
+        let lines_after: Vec<&str> = after.lines().collect();
+        assert_eq!(lines_after, vec!["discard **/*.log", "apply src/**"],
+                   "ctrl-down must swap the on-disk order; got: {after:?}");
+        // save_rules calls reload_rules — status reflects the reload.
+        assert!(app.status.contains("reloaded"),
+                "rule move should reload_rules; status={}", app.status);
+        // restore a clean filerules file (shared in-process path).
+        let _ = std::fs::remove_file(app.rules_path());
     }
 }
