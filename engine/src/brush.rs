@@ -883,3 +883,189 @@ async fn run_brush(conn_fd: i32, script: String) -> i32 {
     }
     last_code
 }
+
+// ── n2/ninja in-process recipe executor (Phase 1) ────────────────────────────
+// When a -b box runs `ninja` (shadow-bound to the engine, see runner.rs and
+// crate::n2run), we embed the vendored n2 build scheduler IN-PROCESS and route
+// each recipe THROUGH this executor instead of n2's posix_spawn(/bin/sh -c …).
+// The byte/Termination contract is identical to n2's upstream run_command:
+//   * stdin = /dev/null (recipes get no input)
+//   * stdout+stderr MERGED into one pipe, fed to n2's output_cb
+//   * exit 0 → Success, non-zero → Failure
+// The recipe runs through the SAME embedded brush (BashMode builtins +
+// in-process coreutils via build_box_shell) as every other -b recipe, so a
+// `cp`/`sort`/pipeline runs in-process with NO /bin/sh fork and NO engine
+// re-exec.
+//
+// Capture: the recipe's file writes go through the overlay (FUSE) exactly as
+// usual — they are NOT on the fd 1/2 path. The recipe's stdout/stderr BYTES are
+// teed: read off the pipe, handed to n2's output_cb AND written to the box's
+// real FUSE stdout sink (fd 1, saved before we point brush's fd 1/2 at the
+// pipe), so console output is still recorded like any captured run.
+
+/// One shared multi-thread tokio runtime for all embedded-n2 recipes. n2's
+/// scheduler calls the executor on its own std::thread (sync); we block_on the
+/// async brush future against this runtime. A OnceLock so it is built once.
+static N2_RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+
+fn n2_runtime() -> Option<&'static tokio::runtime::Runtime> {
+    N2_RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all().build()
+            .expect("sarun-engine n2: tokio runtime")
+    });
+    N2_RT.get()
+}
+
+/// Strip a leading `/bin/sh -c '<recipe>'` (or sh/bash/dash by basename)
+/// wrapper, returning the inner recipe; otherwise return the cmdline unchanged.
+/// ninja `command =` lines are frequently `/bin/sh -c '<recipe>'`; we unwrap to
+/// the inner recipe and run THAT through brush rather than nesting a shell
+/// (model: script_from_argv's `sh -c` handling). A bare command line (no `sh -c`
+/// wrapper) is returned unchanged and brush runs it directly.
+///
+/// We split the wrapper with a small POSIX-faithful word splitter (handling
+/// '…' and "…" quoting + backslash escapes) ONLY to recognise the
+/// `<shell> -c <script> [name…]` shape and recover the literal inner script.
+/// If the prefix is not a recognised `sh -c`, the ORIGINAL cmdline is run as-is
+/// (no re-quoting), so non-wrapped recipes are byte-identical.
+fn unwrap_sh_c(cmdline: &str) -> String {
+    let words = split_words(cmdline);
+    if words.len() >= 3 {
+        let base = std::path::Path::new(&words[0])
+            .file_name().and_then(|s| s.to_str()).unwrap_or("");
+        if matches!(base, "sh" | "bash" | "dash" | "brush") && words[1] == "-c" {
+            return words[2].clone();
+        }
+    }
+    cmdline.to_string()
+}
+
+/// Minimal POSIX word splitter: splits on unquoted whitespace, honouring single
+/// quotes (literal), double quotes (backslash escapes \" \\ \$ \`), and bare
+/// backslash escapes. Sufficient to recover the inner script of `sh -c '…'`.
+fn split_words(s: &str) -> Vec<String> {
+    let mut words = vec![];
+    let mut cur = String::new();
+    let mut in_word = false;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            ' ' | '\t' | '\n' if !in_word => {}
+            ' ' | '\t' | '\n' => { words.push(std::mem::take(&mut cur)); in_word = false; }
+            '\'' => {
+                in_word = true;
+                for q in chars.by_ref() { if q == '\'' { break; } cur.push(q); }
+            }
+            '"' => {
+                in_word = true;
+                while let Some(q) = chars.next() {
+                    if q == '"' { break; }
+                    if q == '\\' {
+                        if let Some(&n) = chars.peek() {
+                            if matches!(n, '"' | '\\' | '$' | '`') { cur.push(chars.next().unwrap()); continue; }
+                        }
+                    }
+                    cur.push(q);
+                }
+            }
+            '\\' => { in_word = true; if let Some(n) = chars.next() { cur.push(n); } }
+            _ => { in_word = true; cur.push(c); }
+        }
+    }
+    if in_word { words.push(cur); }
+    words
+}
+
+/// Run ONE n2 recipe `cmdline` through embedded brush, merging stdout+stderr
+/// into `output_cb` (n2's contract) while teeing those bytes to the box FUSE
+/// stdout sink for capture. Returns the recipe's exit code.
+pub fn run_recipe_in_process(cmdline: &str, output_cb: &mut dyn FnMut(&[u8])) -> i32 {
+    let recipe = unwrap_sh_c(cmdline);
+    let Some(rt) = n2_runtime() else {
+        output_cb(b"sarun-engine n2: no tokio runtime\n");
+        return 127;
+    };
+    // The single merged stdout+stderr pipe (matches n2's posix path: one pipe,
+    // both fds dup'd onto it). brush's fd 1 and fd 2 both point at the write end.
+    let (mut reader, writer) = match std::io::pipe() {
+        Ok(p) => p,
+        Err(e) => { output_cb(format!("sarun-engine n2: pipe: {e}\n").as_bytes()); return 127; }
+    };
+    // Save the box's real FUSE stdout sink (fd 1) so we can tee captured bytes to
+    // it (the recipe's stdout is otherwise diverted to the pipe). Best-effort.
+    let sink = unsafe { libc::dup(1) };
+
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
+    let recipe_owned = recipe.clone();
+    // Run brush on a worker thread so the calling (n2 scheduler) thread can drain
+    // the pipe concurrently — a finite pipe buffer would otherwise deadlock.
+    let exec = std::thread::spawn(move || {
+        rt.block_on(async move {
+            let mut shell = match build_box_shell(true, None, None, Some(cwd)).await {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("sarun-engine n2: brush init failed: {e}");
+                    return 127;
+                }
+            };
+            // Point brush's fd 1 AND fd 2 at the SAME pipe write end (merged).
+            // PipeWriter is fd-backed, so a uutils coreutil's CoreutilWrapper
+            // dup2's that fd onto the process 1/2 around its uumain call too —
+            // builtins, coreutils and any forked binary all land on the pipe.
+            let w2 = match writer.try_clone() {
+                Ok(w) => w,
+                Err(e) => { eprintln!("sarun-engine n2: pipe clone: {e}"); return 127; }
+            };
+            shell.open_files_mut().set_fd(1, brush_core::openfiles::OpenFile::from(writer));
+            shell.open_files_mut().set_fd(2, brush_core::openfiles::OpenFile::from(w2));
+            let prog = match shell.parse_string(recipe_owned.clone()) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("sarun-engine n2: cannot parse recipe \
+                               (NO /bin/sh fallback): {e}");
+                    return 2;
+                }
+            };
+            let params = shell.default_exec_params();
+            match shell.run_program(prog, &params).await {
+                Ok(result) => u8::from(result.exit_code) as i32,
+                Err(e) => {
+                    eprintln!("sarun-engine n2: recipe execution error \
+                               (NO /bin/sh fallback): {e}");
+                    1
+                }
+            }
+            // shell (and its PipeWriter clones) drop here → write end closed →
+            // the drain loop below sees EOF.
+        })
+    });
+
+    // Drain the merged pipe: feed n2's output_cb AND tee to the FUSE sink.
+    let mut buf = [0u8; 4 << 10];
+    loop {
+        let n = match std::io::Read::read(&mut reader, &mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        output_cb(&buf[..n]);
+        if sink >= 0 {
+            unsafe { libc::write(sink, buf.as_ptr().cast(), n); }
+        }
+    }
+    if sink >= 0 { unsafe { libc::close(sink); } }
+    exec.join().unwrap_or(127)
+}
+
+/// The bare-fn executor installed into the vendored n2 (process::set_executor).
+/// Maps the recipe exit code → n2::process::Termination, matching upstream:
+/// 0 → Success, anything else → Failure (a brush recipe has no signal path, so
+/// Interrupted is not produced here — n2's own SIGINT handling is suppressed in
+/// embedded mode anyway).
+pub fn n2_executor(cmdline: &str, output_cb: &mut dyn FnMut(&[u8])) -> n2::process::Termination {
+    if run_recipe_in_process(cmdline, output_cb) == 0 {
+        n2::process::Termination::Success
+    } else {
+        n2::process::Termination::Failure
+    }
+}

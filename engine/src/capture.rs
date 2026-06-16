@@ -49,6 +49,12 @@ CREATE TABLE IF NOT EXISTS rdev(name TEXT PRIMARY KEY, dev INT);
 --   box's own embedded brush ran. Queryable so a reader can tell the two apart.
 CREATE TABLE IF NOT EXISTS brushprov(id INTEGER PRIMARY KEY AUTOINCREMENT,
  ts REAL, cmd TEXT, record TEXT, pipeline INT, spawn_ts REAL, nested INT DEFAULT 0);
+-- Phase 1 embedded-ninja: one row per parsed n2/ninja build edge, captured when
+-- the box's `ninja` (vendored n2 in-process) loads build.ninja — INCLUDING
+-- up-to-date targets that never execute. `outs`/`ins` are JSON arrays of
+-- target/dependency paths; `cmd` is the recipe command line (NULL for phony).
+CREATE TABLE IF NOT EXISTS build_edges(id INTEGER PRIMARY KEY AUTOINCREMENT,
+ ts REAL, outs TEXT, ins TEXT, cmd TEXT);
 ";
 
 #[derive(Clone)]
@@ -752,6 +758,21 @@ impl BoxState {
             "INSERT INTO brushprov(ts,cmd,record,pipeline,spawn_ts,nested) \
              VALUES(?1,?2,?3,?4,?5,1)",
             params![ts, cmd, record_json, pipeline, spawn_ts]);
+        conn.last_insert_rowid()
+    }
+
+    /// Record one parsed n2/ninja build edge (Phase 1 embedded-ninja). `outs`
+    /// and `ins` are serialized JSON arrays; `cmd` is the recipe command line
+    /// (None for a phony edge). Returns the inserted row id (0 on failure).
+    pub fn add_build_edge(&self, outs_json: &str, ins_json: &str,
+                          cmd: Option<&str>) -> i64 {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64()).unwrap_or(0.0);
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute(
+            "INSERT INTO build_edges(ts,outs,ins,cmd) VALUES(?1,?2,?3,?4)",
+            params![ts, outs_json, ins_json, cmd]);
         conn.last_insert_rowid()
     }
 

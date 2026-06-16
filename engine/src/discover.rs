@@ -143,6 +143,12 @@ fn has_col(conn: &rusqlite::Connection, table: &str, col: &str) -> bool {
         }).unwrap_or(false)
 }
 
+fn has_table(conn: &rusqlite::Connection, table: &str) -> bool {
+    conn.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1")
+        .and_then(|mut st| Ok(st.exists([table])?))
+        .unwrap_or(false)
+}
+
 pub fn processes(box_id: i64) -> Value {
     let db = sqlar_path(box_id);
     let Ok(conn) = rusqlite::Connection::open_with_flags(
@@ -246,6 +252,35 @@ pub fn brushprov(box_id: i64) -> Value {
                 row["processes"] = Value::Array(procs);
             }
         }
+    }
+    Value::Array(rows)
+}
+
+/// Phase 1 embedded-ninja: the parsed build-graph edges captured when the box's
+/// `ninja` (vendored n2 in-process) loaded build.ninja. Each row is one edge
+/// {outs, ins, cmd}, INCLUDING up-to-date targets that never executed. Empty for
+/// boxes that never ran ninja (or whose sqlar predates the build_edges table).
+pub fn build_edges(box_id: i64) -> Value {
+    let db = sqlar_path(box_id);
+    let Ok(conn) = rusqlite::Connection::open_with_flags(
+        &db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) else {
+        return json!([]);
+    };
+    if !has_table(&conn, "build_edges") { return json!([]); }
+    let mut rows = vec![];
+    if let Ok(mut st) = conn.prepare(
+        "SELECT id,ts,outs,ins,cmd FROM build_edges ORDER BY id") {
+        let it = st.query_map([], |r| {
+            let outs: String = r.get(2)?;
+            let ins: String = r.get(3)?;
+            Ok(json!({
+                "id": r.get::<_, i64>(0)?, "ts": r.get::<_, f64>(1)?,
+                "outs": serde_json::from_str::<Value>(&outs).unwrap_or(json!([])),
+                "ins": serde_json::from_str::<Value>(&ins).unwrap_or(json!([])),
+                "cmd": r.get::<_, Option<String>>(4)?,
+            }))
+        });
+        if let Ok(it) = it { for row in it.flatten() { rows.push(row); } }
     }
     Value::Array(rows)
 }

@@ -19,6 +19,7 @@ mod capture;
 mod control;
 mod discover;
 mod frames;
+mod n2run;
 mod overlay;
 mod paths;
 mod pty;
@@ -140,6 +141,14 @@ fn main() {
     if brush::is_brush_sh_invocation() {
         let full: Vec<String> = std::env::args().collect();
         std::process::exit(brush::brush_sh(&full));
+    }
+    // Phase 1 — embedded ninja. A -b box shadows /bin/ninja with this engine
+    // binary; when the box runs `ninja`, we land HERE (argv[0] basename ==
+    // "ninja" && SARUN_BRUSH_SH=1) and run the vendored n2 in-process, executing
+    // each recipe through embedded brush. Detected BEFORE normal dispatch.
+    if n2run::is_ninja_invocation() {
+        let full: Vec<String> = std::env::args().collect();
+        std::process::exit(n2run::n2_main(&full));
     }
     let argv: Vec<String> = std::env::args().skip(1).collect();
     // Explicit `brush-sh -- <argv...>` subcommand for DIRECT testing of the shim

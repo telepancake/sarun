@@ -303,6 +303,12 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
                     "--ro-bind-try", &self_exe, "/usr/bin/sh",
                     "--ro-bind-try", &self_exe, "/bin/bash",
                     "--ro-bind-try", &self_exe, "/usr/bin/bash"]);
+        // Phase 1 — embedded ninja: shadow ninja with the engine too, so a -b
+        // box running `ninja` lands in n2run::n2_main (vendored n2 in-process,
+        // recipes through embedded brush). --ro-bind-try: many boxes have no
+        // ninja installed, and one path may be a symlink to the other.
+        bwrap.args(["--ro-bind-try", &self_exe, "/usr/bin/ninja",
+                    "--ro-bind-try", &self_exe, "/bin/ninja"]);
         bwrap.args(["--setenv", "SARUN_BRUSH_SH", "1"]);
     }
     bwrap.args(["--unshare-pid", "--unshare-ipc", "--unshare-uts",

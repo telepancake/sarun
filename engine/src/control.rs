@@ -193,6 +193,40 @@ fn brush_prov_nested(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Val
     json!({"ok": true, "recorded": n})
 }
 
+/// Phase 1 embedded-ninja `build_edges` verb. The shadowed `ninja` (vendored n2,
+/// in-process) sends ONE message carrying the FULL parsed build graph — every
+/// edge {outs, ins, cmd}, INCLUDING up-to-date targets that never execute — plus
+/// ITS OWN pidfd as SCM_RIGHTS. We resolve the enclosing box from /proc ancestry
+/// (the same path register/brush_prov_nested use) and store each edge in the
+/// box's `build_edges` table. One-shot control reply; not a box channel.
+fn build_edges(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
+    let host_pid = peer_pidfd.map(host_pid_from_pidfd).filter(|p| *p > 0)
+        .unwrap_or(0);
+    if let Some(fd) = peer_pidfd { unsafe { libc::close(fd); } }
+    let Some(id) = derive_parent_box(state, host_pid) else {
+        return json!({"ok": false, "error": "no enclosing box"});
+    };
+    let ov = state.lock().unwrap().overlay.clone();
+    let Some(edges) = msg.get("edges").and_then(Value::as_array) else {
+        return json!({"ok": false, "error": "no edges"});
+    };
+    let mut n = 0i64;
+    if let Some(ov) = ov.as_ref() {
+        if let Some(b) = ov.live_box(id) {
+            for e in edges {
+                let outs = e.get("outs").cloned().unwrap_or_else(|| json!([]));
+                let ins = e.get("ins").cloned().unwrap_or_else(|| json!([]));
+                let cmd = e.get("cmd").and_then(Value::as_str);
+                b.add_build_edge(&outs.to_string(), &ins.to_string(), cmd);
+                n += 1;
+            }
+        }
+    }
+    broadcast(state, &json!({"type": "build_edges",
+                            "session_id": id.to_string(), "edges": n}));
+    json!({"ok": true, "recorded": n})
+}
+
 pub fn broadcast(state: &State, ev: &Value) {
     let data = format!("{ev}\n");
     let mut s = state.lock().unwrap();
@@ -663,6 +697,12 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
             Some(id) => discover::brushprov(id),
             None => json!([]),
         },
+        // Phase 1 embedded-ninja: the parsed build-graph edges (outs/ins/cmd),
+        // including up-to-date targets that never executed.
+        "build_edges" => match arg_sid(args) {
+            Some(id) => discover::build_edges(id),
+            None => json!([]),
+        },
         // D9 brush↔process linkage joins (both directions).
         "proc_pipeline" => match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
             (Some(id), Some(rid)) => discover::proc_pipeline(id, rid),
@@ -1013,6 +1053,11 @@ fn handle(state: State, conn: UnixStream) {
             // the enclosing box from /proc ancestry. NOT a box channel — record
             // and reply once, then the connection closes. The pidfd is consumed.
             brush_prov_nested(&state, &msg, peer_pidfd.take())
+        } else if msg.get("type").and_then(Value::as_str) == Some("build_edges") {
+            // Phase 1 embedded-ninja: a one-shot control message from the
+            // shadowed `ninja` (vendored n2) carrying its OWN pidfd, resolved to
+            // the enclosing box by /proc ancestry exactly like brush_prov_nested.
+            build_edges(&state, &msg, peer_pidfd.take())
         } else {
             dispatch(&state, &msg)
         };

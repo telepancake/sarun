@@ -1365,7 +1365,7 @@ dependencies = [
  "fluent-syntax",
  "intl-memoizer",
  "intl_pluralrules",
- "rustc-hash",
+ "rustc-hash 2.1.2",
  "self_cell",
  "smallvec",
  "unic-langid",
@@ -2251,6 +2251,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
 
 [[package]]
+name = "lexopt"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "803ec87c9cfb29b9d2633f20cba1f488db3fd53f2158b1024cbefb47ba05d413"
+
+[[package]]
 name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2428,6 +2434,16 @@ dependencies = [
  "log",
  "wasi 0.11.1+wasi-snapshot-preview1",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "n2"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "lexopt",
+ "libc",
+ "rustc-hash 1.1.0",
 ]
 
 [[package]]
@@ -3369,6 +3385,12 @@ dependencies = [
 
 [[package]]
 name = "rustc-hash"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08d43f7aa6b08d49f382cde6a7982047c3426db949b1424bc4b7ec9ae12c6ce2"
+
+[[package]]
+name = "rustc-hash"
 version = "2.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94300abf3f1ae2e2b8ffb7b58043de3d399c73fa6f4b73826402a5c457614dbe"
@@ -3429,6 +3451,7 @@ dependencies = [
  "fuser",
  "glob",
  "libc",
+ "n2",
  "portable-pty",
  "ratatui",
  "rusqlite",
@@ -4025,7 +4048,7 @@ version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb30dbbd9036155e74adad6812e9898d03ec374946234fbcebd5dfc7b9187b90"
 dependencies = [
- "rustc-hash",
+ "rustc-hash 2.1.2",
 ]
 
 [[package]]
@@ -4386,7 +4409,7 @@ dependencies = [
  "clap",
  "fluent",
  "glob",
- "rustc-hash",
+ "rustc-hash 2.1.2",
  "thiserror 2.0.18",
  "uucore",
  "windows-sys 0.61.2",
@@ -4570,7 +4593,7 @@ dependencies = [
  "glob",
  "hostname",
  "lscolors",
- "rustc-hash",
+ "rustc-hash 2.1.2",
  "terminal_size",
  "thiserror 2.0.18",
  "uucore",
@@ -4638,7 +4661,7 @@ dependencies = [
  "fs_extra",
  "indicatif",
  "libc",
- "rustc-hash",
+ "rustc-hash 2.1.2",
  "thiserror 2.0.18",
  "uucore",
  "windows-sys 0.61.2",
@@ -4916,7 +4939,7 @@ dependencies = [
  "itoa",
  "rand 0.10.1",
  "rand_chacha 0.10.0",
- "rustc-hash",
+ "rustc-hash 2.1.2",
  "sha3",
  "uucore",
 ]
@@ -5112,7 +5135,7 @@ checksum = "1b7004cb4f0aeeb103250e6c1bd471eeb6a15a4ceafa8d1b8aa9735b127f4789"
 dependencies = [
  "clap",
  "fluent",
- "rustc-hash",
+ "rustc-hash 2.1.2",
  "rustix",
  "string-interner",
  "thiserror 2.0.18",
@@ -5254,7 +5277,7 @@ dependencies = [
  "num-traits",
  "os_display",
  "procfs",
- "rustc-hash",
+ "rustc-hash 2.1.2",
  "rustix",
  "sha1",
  "sha2",
