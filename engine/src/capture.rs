@@ -724,12 +724,16 @@ impl BoxState {
         conn.last_insert_rowid()
     }
 
-    /// Record a NESTED-shell provenance row (a recipe a `sh -c` the box spawned
-    /// ran, observed by the brush-sh shim). Same shape as add_brushprov but with
-    /// nested=1, so a reader can distinguish it from a top-level pipeline. There
-    /// is no process↔pipeline linkage for these (the recipe's processes are
-    /// already attributed to the TOP-LEVEL pipeline by forest ancestry); this row
-    /// adds only the recipe's OWN semantic command string + structure.
+    /// Record a NESTED-shell provenance row (a recipe a `sh -c` the box
+    /// spawned ran, EXECUTED by the brush-sh shim through embedded brush-core
+    /// — there is no real-shell fallback). Same shape as add_brushprov but
+    /// with nested=1, so a reader can distinguish it from a top-level
+    /// pipeline. Process↔pipeline linkage IS available for nested rows whose
+    /// pipeline has a literal `> file` target: control.rs feeds those targets
+    /// into the same brush_links bucket as top-level rows, and
+    /// finalize_brush_links stamps the writer with this row's id under the
+    /// forest-ancestry guard (the nested-shim's descendants chain up through
+    /// the box's brush --inner, so the guard accepts them).
     pub fn add_brushprov_nested(&self, cmd: &str, record_json: &str, pipeline: i64,
                                 spawn_ts: f64) -> i64 {
         let ts = std::time::SystemTime::now()

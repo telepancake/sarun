@@ -167,6 +167,21 @@ fn brush_prov_nested(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Val
         if let Some(ov) = ov.as_ref() {
             if let Some(b) = ov.live_box(id) {
                 prov_id = b.add_brushprov_nested(&cmd, &record_json, seq, spawn_ts);
+                // D9 brush-IS-the-shell: a nested pipeline's literal output
+                // targets are written by descendants of the top-level brush
+                // --inner (via the brush-sh shim → caller → recipe-process
+                // chain), so the same forest-ancestry guard in
+                // finalize_brush_links accepts them. Feed them into the same
+                // brush_links bucket so a nested `> file` stamps its writer
+                // with the NESTED brushprov row's id. Two pipelines never
+                // compete for the same literal target (each file is written
+                // by exactly one pipeline).
+                let targets: Vec<String> = rec.get("out_targets")
+                    .and_then(Value::as_array)
+                    .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from))
+                              .collect())
+                    .unwrap_or_default();
+                b.on_brush_prov(prov_id, targets);
             }
         }
         broadcast(state, &json!({"type": "brush_prov",

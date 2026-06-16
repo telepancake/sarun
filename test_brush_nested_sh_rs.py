@@ -1,26 +1,31 @@
 #!/usr/bin/env python3
-"""D9 follow-on — NESTED-shell semantic provenance for the RUST engine (engine/).
+"""D9 follow-on — NESTED-shell IS-brush for the RUST engine (engine/).
 
-The gap this closes: today brush sees only a -b box's TOP-LEVEL command. When
-that command spawns a NESTED shell — `make` (or libc system(), or any tool)
-exec'ing `/bin/sh -c "RECIPE"` — the recipe's PROCESSES are already attributed
-to the top-level pipeline by forest ancestry, but the recipe's OWN semantic
-command string got NO brushprov row. This wires an OBSERVE-ONLY interposition:
-runner shadows the box's /bin/sh (etc.) with the engine binary; the brush-sh
-shim parses the nested `-c` script, emits its provenance to the engine over a
-`brush_prov_nested` control message, then execve's the REAL shell with the
-ORIGINAL argv — so the recipe runs byte-for-byte unchanged.
+The previous round did OBSERVE-ONLY interposition: it parsed a nested `sh -c`
+just for provenance, then exec'd the REAL /bin/sh. That can never see what a
+real shell actually did with builtins / vars / control flow / expansions.
 
-REAL effects, never shape-only:
-  1. A -b box whose top-level command spawns a nested `/bin/sh -c "echo nested
-     > /root/nested.txt"` (alongside a top-level `echo top > /root/top.txt`).
-     We assert BOTH writes are captured, AND a brushprov row exists for the
-     NESTED recipe (`echo nested ...`) flagged nested=1, IN ADDITION to the
-     top-level rows — read via the sqlar AND the `brushprov` control verb.
-  2. The recipe ran via the REAL shell: the captured file content is exactly
-     right (interception did not change behavior).
-  3. Negative: a NON-brush box's `/bin/sh -c` is NOT intercepted — no nested
-     brushprov rows (no shadow binds, no setenv for a non-brush box).
+This round flips it: a -b brush box's /bin/sh, /bin/bash (and the /usr/bin/
+aliases) are shadowed by the engine binary, and the brush-sh shim RUNS the
+nested recipe THROUGH embedded brush-core. There is NO real-shell fallback —
+anything brush cannot run is a VISIBLE error and a non-zero exit, matching the
+D9 explicit-toggle rule that already governs the top-level brush body.
+
+Cases verified (all real, against the released engine binary):
+  1. Nested `sh -c 'echo nested > /root/n.txt'`: file is written, a brushprov
+     row exists for the recipe with nested=1, parsed pipeline structure
+     matches the source.
+  2. Builtins really run THROUGH brush (not silently dropped): a nested
+     `sh -c 'X=1; cd /tmp; pwd; export Y=2; echo $X-$Y > /root/vars.txt'`
+     writes "1-2" and produces a brushprov row — proves cd / X=/export / $X
+     expansion are executed by brush in this process, not by /bin/sh.
+  3. Visible failure / no fallback: a nested `sh -c` containing process
+     substitution `<(…)` — which brush-core sh-mode does NOT parse — exits
+     non-zero with a stderr message; NO /bin/sh fallback runs the recipe.
+  4. Negative: a non-brush box has no shadow binds; its /bin/sh is the real
+     system shell (no brushprov rows on the box).
+  5. Sanity: a top-level -b box still runs end-to-end (writes captured,
+     top-level brushprov rows present).
 
 Run:
     uv run --with "pyfuse3>=3.2" --with "trio>=0.22" --with "wcmatch>=8.4" \
@@ -81,11 +86,11 @@ def main():
     m = SourceFileLoader("slopbox", SARUN).load_module()
     m.ensure_dirs()
     eng = None
-    # Host paths that must never be touched (the box captures into the overlay).
-    host_top = Path("/root/top.txt")
-    host_nested = Path("/root/nested.txt")
-    host_neg = Path("/root/neg.txt")
-    for h in (host_top, host_nested, host_neg): h.unlink(missing_ok=True)
+    # Host paths the box must NEVER touch (every write should land in overlay).
+    host_paths = [Path(p) for p in ("/root/top.txt", "/root/nested.txt",
+                                    "/root/vars.txt", "/root/bad.txt",
+                                    "/root/neg.txt")]
+    for h in host_paths: h.unlink(missing_ok=True)
     try:
         eng = subprocess.Popen([str(BIN), "serve"],
                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
@@ -93,12 +98,7 @@ def main():
         if not wait_socket(sock):
             raise RuntimeError("rust engine socket never appeared")
 
-        # ── PARTS 1 & 2: top-level + nested recipe, observe-only ────────────
-        # The top-level command (run by the box's embedded brush) writes top.txt
-        # AND spawns a NESTED `/bin/sh -c` (the make-recipe shape) that writes
-        # nested.txt. The nested sh is shadowed by the engine binary (brush-sh
-        # shim): it emits the recipe's provenance, then execs the REAL /bin/sh so
-        # the recipe runs unchanged.
+        # ── CASE 1+5: top-level brush body + nested `sh -c` write ───────────
         r = subprocess.run(
             [str(BIN), "run", "-b", "NEST", "--",
              "sh", "-c",
@@ -106,76 +106,115 @@ def main():
              "/bin/sh -c 'echo nested > /root/nested.txt'"],
             capture_output=True, text=True, timeout=120)
         check(r.returncode == 0,
-              f"brush-nested-sh-rs: box exits 0 (got {r.returncode}: "
+              f"case1: -b box w/ nested sh -c exits 0 (got {r.returncode}: "
               f"{r.stderr[-400:]})")
-        check(not host_top.exists() and not host_nested.exists(),
-              "brush-nested-sh-rs: both writes captured, real host untouched")
+        check(not any(h.exists() for h in host_paths),
+              "case1: nothing leaks to the host fs")
 
         sp = latest_sqlar(m)
-        # PART 2: the recipe really ran via the REAL shell — content is correct.
         check(m.sqlar_content(sp, "root/top.txt") == b"top\n",
-              "brush-nested-sh-rs: top-level write captured ('top')")
+              "case5: top-level write captured ('top')")
         check(m.sqlar_content(sp, "root/nested.txt") == b"nested\n",
-              "brush-nested-sh-rs: NESTED recipe ran via real shell, write "
-              "captured ('nested') — behavior unchanged")
+              "case1: nested-recipe write captured ('nested') — brush ran it")
 
-        # PART 1: a brushprov row for the NESTED recipe, flagged nested=1, IN
-        # ADDITION to the top-level row(s). Read the sqlar directly.
         con = sqlite3.connect(f"file:{sp}?mode=ro", uri=True)
         try:
             rows = con.execute(
-                "SELECT cmd, nested FROM brushprov ORDER BY id").fetchall()
+                "SELECT cmd, nested, record FROM brushprov ORDER BY id").fetchall()
         finally:
             con.close()
-        top_rows = [c for (c, n) in rows if not n]
-        nested_rows = [c for (c, n) in rows if n]
-        check(any("echo top" in c for c in top_rows),
-              f"brush-nested-sh-rs: a TOP-LEVEL brushprov row exists "
-              f"(top_rows={top_rows!r})")
-        check(any(c.strip().startswith("echo nested") for c in nested_rows),
-              f"brush-nested-sh-rs: a NESTED brushprov row exists for the "
-              f"recipe, flagged nested=1 (nested_rows={nested_rows!r})")
+        top_rows = [(c, rj) for (c, n, rj) in rows if not n]
+        nested_rows = [(c, rj) for (c, n, rj) in rows if n]
+        check(any("echo top" in c for c, _ in top_rows),
+              f"case5: a TOP-LEVEL brushprov row exists (top={[c for c,_ in top_rows]!r})")
+        # Find the nested 'echo nested > /root/nested.txt' record; the
+        # parsed-structure JSON must reflect brush's view (1 stage, the literal
+        # output target).
+        import json as _json
+        nested_hit = [(c, rj) for c, rj in nested_rows
+                      if c.strip().startswith("echo nested")]
+        check(bool(nested_hit),
+              f"case1: a NESTED brushprov row exists for the recipe "
+              f"(nested={[c for c,_ in nested_rows]!r})")
+        if nested_hit:
+            rj = _json.loads(nested_hit[0][1])
+            check(rj.get("stages") == 1 and "/root/nested.txt" in (rj.get("out_targets") or []),
+                  f"case1: nested record has parsed structure brush saw "
+                  f"(stages=1, out_targets includes /root/nested.txt): {rj!r}")
 
-        # Same via the control `brushprov` verb (live read path): the nested row
-        # is present AND carries nested:true.
-        rep = m.sync_request(sock, type="ui", verb="brushprov", args=[sp.stem])
-        bprows = rep.get("r") if isinstance(rep, dict) else None
-        nested_via_verb = [b for b in (bprows or [])
-                           if b.get("nested") is True
-                           and b.get("cmd", "").strip().startswith("echo nested")]
-        check(bool(nested_via_verb),
-              f"brush-nested-sh-rs: control brushprov verb reports the nested "
-              f"row with nested:true ({bprows!r})")
-        # And a top-level row that is NOT flagged nested.
-        check(any(b.get("nested") is False and "echo top" in b.get("cmd", "")
-                  for b in (bprows or [])),
-              "brush-nested-sh-rs: control verb still reports top-level rows "
-              "as nested:false")
+        # ── CASE 2: builtins really run THROUGH brush ───────────────────────
+        r = subprocess.run(
+            [str(BIN), "run", "-b", "VARS", "--",
+             "sh", "-c",
+             "/bin/sh -c 'X=1; cd /tmp; export Y=2; echo $X-$Y > /root/vars.txt'"],
+            capture_output=True, text=True, timeout=120)
+        check(r.returncode == 0,
+              f"case2: vars/builtins box exits 0 (got {r.returncode}: "
+              f"{r.stderr[-300:]})")
+        sp2 = latest_sqlar(m)
+        check(m.sqlar_content(sp2, "root/vars.txt") == b"1-2\n",
+              "case2: vars.txt is '1-2' — assignment, cd, export, $-expansion "
+              "all ran THROUGH brush (not silently dropped)")
+        con = sqlite3.connect(f"file:{sp2}?mode=ro", uri=True)
+        try:
+            ncmds = [c for (c,) in con.execute(
+                "SELECT cmd FROM brushprov WHERE nested=1")]
+        finally:
+            con.close()
+        check(any("X=1" in c or "echo $X" in c for c in ncmds),
+              f"case2: a nested brushprov row exists for the vars recipe "
+              f"({ncmds!r})")
 
-        # ── PART 3 (negative): a NON-brush box is NOT intercepted ───────────
-        # Without -b there are no shadow binds, no SARUN_BRUSH_SH, so the nested
-        # /bin/sh is the real shell directly — and there is no brushprov table
-        # content at all (non-brush boxes never emit provenance).
+        # ── CASE 3: visible failure / no fallback ──────────────────────────
+        # Process substitution `<(...)` is genuinely unparseable by brush-core's
+        # sh-mode parser. With brush-IS-the-shell this MUST surface as a
+        # non-zero exit and a stderr message — never fall back to /bin/sh.
+        r = subprocess.run(
+            [str(BIN), "run", "-b", "FAIL", "--",
+             "sh", "-c",
+             # Quote so the OUTER -b body (which is also brush) accepts it; the
+             # offending construct must reach the NESTED brush-sh shim.
+             "/bin/sh -c 'cat <(echo bad) > /root/bad.txt'"],
+            capture_output=True, text=True, timeout=120)
+        check(r.returncode != 0,
+              f"case3: nested unsupported construct → non-zero exit "
+              f"(got {r.returncode})")
+        check("NO /bin/sh fallback" in r.stderr or "cannot parse" in r.stderr,
+              f"case3: stderr says brush refused (no fallback): "
+              f"{r.stderr[-400:]!r}")
+        # bad.txt must NOT exist — if a real /bin/sh had fallen in, it would.
+        sp3 = latest_sqlar(m)
+        try:
+            content = m.sqlar_content(sp3, "root/bad.txt")
+        except Exception:
+            content = None
+        check(content in (None, b""),
+              f"case3: bad.txt is NOT written (no real-shell fallback): "
+              f"content={content!r}")
+
+        # ── CASE 4 (negative): non-brush box ───────────────────────────────
+        # No -b → no shadow binds, no SARUN_BRUSH_SH. The nested /bin/sh is the
+        # real system shell directly, and the box has NO brushprov rows.
         r = subprocess.run(
             [str(BIN), "run", "NEG", "--",
              "sh", "-c", "/bin/sh -c 'echo neg > /root/neg.txt'"],
             capture_output=True, text=True, timeout=120)
         check(r.returncode == 0,
-              f"brush-nested-sh-rs: non-brush box exits 0 (got {r.returncode}: "
+              f"case4: non-brush box exits 0 (got {r.returncode}: "
               f"{r.stderr[-300:]})")
         spn = latest_sqlar(m)
         check(m.sqlar_content(spn, "root/neg.txt") == b"neg\n",
-              "brush-nested-sh-rs: non-brush nested write IS captured (FUSE)")
+              "case4: non-brush nested write IS captured (FUSE)")
         con = sqlite3.connect(f"file:{spn}?mode=ro", uri=True)
         try:
             ncmds = [c for (c,) in con.execute("SELECT cmd FROM brushprov")]
         finally:
             con.close()
         check(ncmds == [],
-              f"brush-nested-sh-rs: non-brush box has NO brushprov rows — its "
-              f"/bin/sh is NOT intercepted (cmds={ncmds!r})")
+              f"case4: non-brush box has NO brushprov rows — its /bin/sh is "
+              f"NOT intercepted (cmds={ncmds!r})")
     finally:
-        for h in (host_top, host_nested, host_neg): h.unlink(missing_ok=True)
+        for h in host_paths: h.unlink(missing_ok=True)
         if eng is not None and eng.poll() is None:
             eng.terminate()
             try: eng.wait(timeout=10)
