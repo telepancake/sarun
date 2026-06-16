@@ -56,18 +56,41 @@ long-KEPT boxes are uncompressed at rest (the old deflate tier's one real
 service) — a filesystem-level concern, not an engine one. The page-aligned
 arena (D6) remains a contingency, now with even less motivation.
 
-## D5 · FUSE passthrough backing fds — READ-ONLY opens only
-Because bytes are always real files (D4), read-only opens may register
-backing fds (kernel 6.9+, fuser opened_passthrough) and let the kernel serve
-reads with the daemon out of the loop — where the measured pain lives (build
-read storms). WRITE opens stay daemon-served: per-WRITE ctx.pid attribution
-is load-bearing, not a nicety — the common fork-after-open case (`sh -c
-'cmd > out'`: the SHELL opens, the child writes through the inherited fd)
-means per-open attribution would credit half a build's outputs to /bin/sh,
-and the writer/last_writer tags that file rules match against only mean
-anything if each write is attributed through shared fds. (This per-write pid
-is the entire reason the old engine patched pyfuse3; fuser exposes it
-natively via Request::pid.) Fallback to daemon-served reads on older kernels.
+## D5 · FUSE passthrough backing fds — TRIED, REVERTED (kernel concurrency wall)
+The idea: because bytes are always real files (D4), read-only opens could
+register kernel backing fds (kernel 6.9+, fuser opened_passthrough) so the
+kernel serves reads with the daemon out of the loop — where the measured pain
+lives (build read storms). It was implemented and it WORKED for pure reads
+(proven: a 7 MB read served with the daemon read() counter at 0). But it is
+UNSOUND for sarun's workload and has been reverted to daemon-served reads.
+
+The wall (verified by test, not theory): **an inode that has any live
+passthrough fd open rejects every new open-for-WRITE with EIO**, and the daemon
+cannot intercept or fall back from it — the kernel fails the open() before any
+daemon reply matters. Demonstrated scope:
+  - held read fd + `>` or `>>` of the SAME file  → EIO
+  - read → close → write, and writing a DIFFERENT file → fine.
+So passthrough is only safe for files GUARANTEED not to be written while a read
+fd is live. No automatic heuristic can establish that:
+  - captured files (the build-read-storm targets this was FOR) can be written
+    via copy-up → passthrough'ing them EIOs the write;
+  - host-direct `passthrough`-ruled files are writable → same EIO, even when the
+    write open ALSO requests passthrough (the kernel limit is per-inode, not
+    per-fd).
+The blanket "register a backing fd for any read-only open" design was the bug:
+it guesses a file is read-only and breaks the moment it isn't. The only correct
+control is the USER declaring read-only-input paths (cf. the file rules) and
+taking responsibility — which is future work, NOT an automatic mode. Until such
+an explicit, user-declared opt-in exists, reads stay daemon-served (always
+correct; test_concurrent_rw_rs.py guards the concurrent read+write property).
+WRITE opens were always daemon-served anyway: per-WRITE ctx.pid attribution is
+load-bearing (the `sh -c 'cmd > out'` fork-after-open case; the writer tags file
+rules match against), which is the entire reason the old engine patched pyfuse3
+— fuser exposes it natively via Request::pid.
+
+(Aside found while investigating: the host-direct `passthrough`-RULE write path
+does not honor O_TRUNC — `printf NEW > ruled_file` leaves a stale tail. A
+separate, pre-existing bug, noted here so it isn't lost.)
 
 ## D6 · Storage for the index (OPEN: rusqlite vs redb)
 The index (paths, modes, whiteouts, writers, process/provenance/env/outputs)

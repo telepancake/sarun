@@ -22,14 +22,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
-use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-use fuser::BackingId;
 use fuser::Errno;
 use fuser::FileAttr;
 use fuser::FileHandle;
@@ -114,17 +112,6 @@ struct Inner {
     // ancestor sink, already recorded once at its origin box. A MUTE frame adds
     // --inner's own host tgid; UNMUTE / connection-close removes it.
     muted: RwLock<std::collections::HashSet<i32>>,
-    // D5: set true in init() iff the kernel negotiated FUSE_PASSTHROUGH and we
-    // successfully requested it + a >0 stacking depth. When true, READ-ONLY
-    // opens that resolve to a single real backing file register a kernel
-    // backing fd so reads bypass the daemon entirely. Writable opens NEVER
-    // passthrough (per-write ctx.pid attribution is load-bearing — D5).
-    passthrough_ok: AtomicBool,
-    // D5 observability: count of read() ops the DAEMON actually served. With
-    // passthrough engaged for read-only opens, the kernel serves those reads
-    // directly and this counter does NOT advance — a test reads a large file
-    // and asserts the daemon stayed out of the loop. Logged at destroy().
-    daemon_reads: AtomicU64,
 }
 
 struct Fh {
@@ -140,11 +127,6 @@ struct FhInner {
     last_pid: u32,
     sink: Option<i32>, // Some(stream) → writes go to the outputs table, not a blob
     passthrough: bool, // writes go straight to the real host file (uncaptured)
-    // D5 read-passthrough: a kernel backing-fd registration for a READ-ONLY
-    // open. Held here ONLY to keep the BackingId alive for the lifetime of the
-    // fh (Drop issues FUSE_DEV_IOC_BACKING_CLOSE). reads for this fh are served
-    // by the kernel directly, not the daemon — `read()` is never called for it.
-    _backing: Option<BackingId>,
 }
 
 // Reserved box-root paths: the box's stdout/stderr write THROUGH these, and the
@@ -193,7 +175,7 @@ impl Overlay {
         i2k.insert(1u64, (0i64, String::new()));
         let mut k2i = HashMap::new();
         k2i.insert((0i64, String::new()), 1u64);
-        let ov = Overlay { inner: Arc::new(Inner {
+        Overlay { inner: Arc::new(Inner {
             lower,
             boxes: RwLock::new(BTreeMap::new()),
             ino_to_key: RwLock::new(i2k),
@@ -205,27 +187,7 @@ impl Overlay {
             echo: RwLock::new(HashMap::new()),
             sink_open: Mutex::new(HashMap::new()),
             muted: RwLock::new(std::collections::HashSet::new()),
-            passthrough_ok: AtomicBool::new(false),
-            daemon_reads: AtomicU64::new(0),
-        }) };
-        // Test observability: if SARUN_STATS_FILE is set, a background thread
-        // continuously writes "passthrough=<0|1> daemon_reads=<n>" to it. This
-        // survives the SIGTERM `_exit(0)` teardown (which skips destroy()), so
-        // a cross-process test can assert that read-only reads bypassed the
-        // daemon (daemon_reads stays 0 with passthrough engaged). No-op in
-        // production where the env var is unset.
-        if let Ok(path) = std::env::var("SARUN_STATS_FILE") {
-            let inner = ov.inner.clone();
-            std::thread::spawn(move || loop {
-                let line = format!(
-                    "passthrough={} daemon_reads={}\n",
-                    inner.passthrough_ok.load(Ordering::Relaxed) as u8,
-                    inner.daemon_reads.load(Ordering::Relaxed));
-                let _ = std::fs::write(&path, line);
-                std::thread::sleep(Duration::from_millis(100));
-            });
-        }
-        ov
+        }) }
     }
 
     pub fn reload_rules(&self) {
@@ -597,42 +559,6 @@ impl Overlay {
 }
 
 impl Filesystem for Overlay {
-    fn init(&mut self, _req: &Request,
-            config: &mut fuser::KernelConfig) -> std::io::Result<()> {
-        // D5: probe + request kernel FUSE read-passthrough. add_capabilities
-        // errors if the kernel did not advertise FUSE_PASSTHROUGH (kernel <6.9
-        // or no CONFIG); set_max_stack_depth(2) is the >0 stacking depth the
-        // backing-fd path requires. Both must succeed for passthrough to be
-        // negotiated — otherwise we leave passthrough_ok false and every open
-        // stays daemon-served (the existing behavior). Never fail init over
-        // this: a missing capability is a graceful fallback, not an error.
-        let ok = config
-            .add_capabilities(fuser::InitFlags::FUSE_PASSTHROUGH)
-            .is_ok()
-            // Stack depth 2 (the kernel hard max): the backing files (host
-            // lower files, pool blobs) can themselves live on a stacked fs
-            // (e.g. the container's overlayfs root) — depth 1 would reject
-            // those backings with EIO.
-            && config.set_max_stack_depth(2).is_ok();
-        self.inner.passthrough_ok.store(ok, Ordering::Relaxed);
-        if ok {
-            eprintln!("sarun-engine: FUSE read-passthrough ENABLED \
-                       (read-only opens register kernel backing fds)");
-        } else {
-            eprintln!("sarun-engine: FUSE read-passthrough unavailable \
-                       (kernel <6.9 or no FUSE_PASSTHROUGH) — daemon-served reads");
-        }
-        Ok(())
-    }
-
-    fn destroy(&mut self) {
-        // D5 observability: report how many read() ops the daemon served over
-        // the mount's life. With passthrough engaged this stays far below the
-        // number of bytes/requests read through read-only opens.
-        eprintln!("sarun-engine: daemon-served read() ops over mount life: {}",
-                  self.inner.daemon_reads.load(Ordering::Relaxed));
-    }
-
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let Some((bid, prel)) = self.key_of(parent) else {
             return reply.error(Errno::ENOENT);
@@ -724,7 +650,7 @@ impl Filesystem for Overlay {
             self.note_sink_open(bid);
             let n = self.reg_fh(FhInner {
                 box_id: bid, rel, file: None, upper: false, dirty: false,
-                last_pid: req.pid(), sink: Some(stream), passthrough: false, _backing: None,
+                last_pid: req.pid(), sink: Some(stream), passthrough: false,
             });
             return reply.opened(FileHandle(n), FopenFlags::empty());
         }
@@ -741,7 +667,7 @@ impl Filesystem for Overlay {
                 Ok(f) => {
                     let n = self.reg_fh(FhInner {
                         box_id: bid, rel, file: Some(f), upper: true, dirty: false,
-                        last_pid: req.pid(), sink: None, passthrough: true, _backing: None });
+                        last_pid: req.pid(), sink: None, passthrough: true });
                     return reply.opened(FileHandle(n), FopenFlags::empty());
                 }
                 Err(_) => return reply.error(Errno::EACCES),
@@ -768,52 +694,8 @@ impl Filesystem for Overlay {
             },
             _ => return reply.error(Errno::ENOENT),
         };
-        // D5: a READ-ONLY open whose resolve() landed on a SINGLE real backing
-        // file (host lower file or a pool blob) may register a kernel backing
-        // fd, so the kernel serves reads with the daemon out of the loop — this
-        // is where the build-read-storm pain lives. We never passthrough a
-        // writable open (`want_write`): per-write ctx.pid attribution and lazy
-        // copy-up both require the daemon to see each write. Probe-gated on the
-        // kernel having negotiated FUSE_PASSTHROUGH (init); any registration
-        // failure cleanly falls back to a normal daemon-served fd.
-        // Exec opens carry the kernel's __FMODE_EXEC marker (0x20) in the FUSE
-        // open flags; exec maps the file (mmap), which the kernel currently
-        // REJECTS (EIO) on a passthrough-backed FUSE file. Those opens must
-        // stay daemon-served or every binary read through the overlay (e.g. a
-        // nested box exec'ing its runner/bash) fails to launch. Passthrough is
-        // a plain-read() acceleration; exec/mmap is not in scope for D5.
-        const FMODE_EXEC: i32 = 0x20;
-        let is_exec = flags.0 & FMODE_EXEC != 0;
-        if !want_write && !is_exec
-            && self.inner.passthrough_ok.load(Ordering::Relaxed) {
-            if let Some(f) = file.as_ref() {
-                if let Ok(backing) = reply.open_backing(f) {
-                    // Register the fh first (so flush/release see it), then
-                    // hand the kernel the backing id; finally stash the
-                    // BackingId in the fh so it lives as long as the open fd
-                    // (its Drop closes the kernel registration). The reply
-                    // flags are empty: with passthrough the kernel serves
-                    // reads from the backing file directly (cache flags are
-                    // not meaningful and FOPEN_KEEP_CACHE alongside passthrough
-                    // is rejected by the kernel).
-                    let n = self.reg_fh(FhInner {
-                        box_id: bid, rel, file, upper, dirty: false,
-                        last_pid: req.pid(), sink: None, passthrough: false,
-                        _backing: None,
-                    });
-                    reply.opened_passthrough(FileHandle(n),
-                        FopenFlags::empty(), &backing);
-                    if let Some(h) = self.inner.fhs.read().unwrap().get(&n) {
-                        h.lock().unwrap().inner._backing = Some(backing);
-                    }
-                    return;
-                }
-                // open_backing failed (kernel too old at runtime, fd not
-                // backable): fall through to daemon-served below.
-            }
-        }
         let n = self.reg_fh(FhInner {
-            box_id: bid, rel, file, upper, dirty: false, last_pid: req.pid(), sink: None, passthrough: false, _backing: None,
+            box_id: bid, rel, file, upper, dirty: false, last_pid: req.pid(), sink: None, passthrough: false,
         });
         reply.opened(FileHandle(n), FopenFlags::FOPEN_KEEP_CACHE);
     }
@@ -846,7 +728,7 @@ impl Filesystem for Overlay {
                     attr.perm = (mode & 0o7777) as u16;
                     let n = self.reg_fh(FhInner {
                         box_id: bid, rel, file: Some(f), upper: true, dirty: false,
-                        last_pid: req.pid(), sink: None, passthrough: true, _backing: None });
+                        last_pid: req.pid(), sink: None, passthrough: true });
                     return reply.created(&TTL, &attr, Generation(0),
                                          FileHandle(n), FopenFlags::empty());
                 }
@@ -872,7 +754,7 @@ impl Filesystem for Overlay {
         attr.perm = (mode & 0o7777) as u16;
         let n = self.reg_fh(FhInner {
             box_id: bid, rel, file: Some(f), upper: true,
-            dirty: true, last_pid: req.pid(), sink: None, passthrough: false, _backing: None,
+            dirty: true, last_pid: req.pid(), sink: None, passthrough: false,
         });
         reply.created(&TTL, &attr, Generation(0), FileHandle(n),
                       FopenFlags::empty());
@@ -880,7 +762,6 @@ impl Filesystem for Overlay {
 
     fn read(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, offset: u64,
             size: u32, _flags: OpenFlags, _lo: Option<LockOwner>, reply: ReplyData) {
-        self.inner.daemon_reads.fetch_add(1, Ordering::Relaxed);
         let fhs = self.inner.fhs.read().unwrap();
         let Some(h) = fhs.get(&u64::from(fh)) else {
             return reply.error(Errno::EBADF);
