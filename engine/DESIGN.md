@@ -56,41 +56,44 @@ long-KEPT boxes are uncompressed at rest (the old deflate tier's one real
 service) — a filesystem-level concern, not an engine one. The page-aligned
 arena (D6) remains a contingency, now with even less motivation.
 
-## D5 · FUSE passthrough backing fds — TRIED, REVERTED (kernel concurrency wall)
-The idea: because bytes are always real files (D4), read-only opens could
-register kernel backing fds (kernel 6.9+, fuser opened_passthrough) so the
-kernel serves reads with the daemon out of the loop — where the measured pain
-lives (build read storms). It was implemented and it WORKED for pure reads
-(proven: a 7 MB read served with the daemon read() counter at 0). But it is
-UNSOUND for sarun's workload and has been reverted to daemon-served reads.
+## D5 · FUSE read-passthrough — GATED ON THE `passthrough` FILE RULE (path-only)
+Kernel read-passthrough (kernel 6.9+, fuser opened_passthrough): a read-only
+open can register a kernel backing fd so the kernel serves reads with the daemon
+out of the loop (the build-read-storm win). But there is a hard kernel wall,
+verified by test: **an inode with any live passthrough fd rejects every new
+open-for-WRITE with EIO**, and the daemon cannot intercept it — the kernel fails
+open() before any reply matters (held read fd + `>`/`>>` of the SAME file → EIO;
+read→close→write or writing a DIFFERENT file → fine; the limit is per-INODE, not
+per-fd, so a write open requesting passthrough EIOs too).
 
-The wall (verified by test, not theory): **an inode that has any live
-passthrough fd open rejects every new open-for-WRITE with EIO**, and the daemon
-cannot intercept or fall back from it — the kernel fails the open() before any
-daemon reply matters. Demonstrated scope:
-  - held read fd + `>` or `>>` of the SAME file  → EIO
-  - read → close → write, and writing a DIFFERENT file → fine.
-So passthrough is only safe for files GUARANTEED not to be written while a read
-fd is live. No automatic heuristic can establish that:
-  - captured files (the build-read-storm targets this was FOR) can be written
-    via copy-up → passthrough'ing them EIOs the write;
-  - host-direct `passthrough`-ruled files are writable → same EIO, even when the
-    write open ALSO requests passthrough (the kernel limit is per-inode, not
-    per-fd).
-The blanket "register a backing fd for any read-only open" design was the bug:
-it guesses a file is read-only and breaks the moment it isn't. The only correct
-control is the USER declaring read-only-input paths (cf. the file rules) and
-taking responsibility — which is future work, NOT an automatic mode. Until such
-an explicit, user-declared opt-in exists, reads stay daemon-served (always
-correct; test_concurrent_rw_rs.py guards the concurrent read+write property).
-WRITE opens were always daemon-served anyway: per-WRITE ctx.pid attribution is
-load-bearing (the `sh -c 'cmd > out'` fork-after-open case; the writer tags file
-rules match against), which is the entire reason the old engine patched pyfuse3
-— fuser exposes it natively via Request::pid.
+So passthrough is ONLY sound for files the user DECLARES host-direct — and that
+is exactly what the existing `passthrough` file rule already means (host-direct:
+reads served from the host, writes straight to the host, uncaptured). The
+FIRST, blanket implementation guessed "any read-only open is safe" and EIO'd the
+moment such a file was written — the bug. The fix is NOT a new rule: the
+`passthrough` rule drives read-passthrough. A `passthrough`-ruled (or `-d`
+direct) READ open gets a kernel backing fd; everything else stays daemon-served
+(captured paths must — the daemon mediates copy-up + per-write ctx.pid
+attribution, the load-bearing `sh -c 'cmd > out'` case). Exec opens stay
+daemon-served (mmap of a passthrough-backed file EIOs). The kernel write-EIO is
+thus scoped to user-declared host-direct paths, where it is the rule's own
+contract, not a surprise.
 
-(Aside found while investigating: the host-direct `passthrough`-RULE write path
-does not honor O_TRUNC — `printf NEW > ruled_file` leaves a stale tail. A
-separate, pre-existing bug, noted here so it isn't lost.)
+CRITICAL — passthrough rules are PATH-ONLY (the parser skips any clause with a
+`:` matcher, so `passthrough box:A.B …` is ignored). This is required, not a
+limitation, and the nested case is why: a box-SCOPED rule (host-direct in child
+A.B but CAPTURED in parent A) would make A.B read A's still-captured blob through
+a passthrough fd, and A copying-up that blob would hit the per-inode write-EIO.
+Path-only means a passthrough path is host-direct in EVERY box, so a child reads
+it straight from the HOST — never through a parent's overlay, no copy-up, no
+divergence. (Verified: test_passthrough_rule_rs.py — rule gates passthrough; a
+`box:` line is ignored; a nested child reads the passthrough file from the host
+directly. test_concurrent_rw_rs.py guards that CAPTURED files, never
+passthrough'd, keep concurrent read+write correct.)
+
+KNOWN BUG (pre-existing, separate): the host-direct write path does not honor
+O_TRUNC — `printf NEW > existing_ruled_file` leaves a stale tail AND spuriously
+captures a row. Noted so it isn't lost; not yet fixed.
 
 ## D6 · Storage for the index (OPEN: rusqlite vs redb)
 The index (paths, modes, whiteouts, writers, process/provenance/env/outputs)

@@ -29,6 +29,13 @@ impl Rules {
             let action = match act {
                 "apply" => Action::Apply,
                 "discard" => Action::Discard,
+                // `passthrough <glob>`: the path is HOST-DIRECT — reads served by
+                // the kernel (read-passthrough, D5), writes straight to the host,
+                // uncaptured. PATH-ONLY by construction (clause lines with ':'
+                // are skipped below): a passthrough path must be host-direct in
+                // EVERY box, never captured-here-but-passthrough-there, or a
+                // child reading through a parent's still-captured copy would hit
+                // the kernel's passthrough-vs-write EIO (see DESIGN.md D5).
                 "passthrough" => Action::Passthrough,
                 _ => continue,
             };

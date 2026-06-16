@@ -112,6 +112,12 @@ struct Inner {
     // ancestor sink, already recorded once at its origin box. A MUTE frame adds
     // --inner's own host tgid; UNMUTE / connection-close removes it.
     muted: RwLock<std::collections::HashSet<i32>>,
+    // D5 (rule-gated): true iff the kernel negotiated FUSE_PASSTHROUGH at init.
+    // ONLY read-only opens of `readonly`-RULED paths register backing fds; never
+    // a blind per-open guess (see DESIGN.md D5). daemon_reads counts read() ops
+    // the daemon served (test observability: stays ~0 for passthrough'd reads).
+    passthrough_ok: std::sync::atomic::AtomicBool,
+    daemon_reads: AtomicU64,
 }
 
 struct Fh {
@@ -127,6 +133,9 @@ struct FhInner {
     last_pid: u32,
     sink: Option<i32>, // Some(stream) → writes go to the outputs table, not a blob
     passthrough: bool, // writes go straight to the real host file (uncaptured)
+    // Kernel passthrough backing registration; kept alive as long as the fd
+    // (its Drop closes the registration). Only set for readonly-ruled reads.
+    _backing: Option<fuser::BackingId>,
 }
 
 // Reserved box-root paths: the box's stdout/stderr write THROUGH these, and the
@@ -175,7 +184,7 @@ impl Overlay {
         i2k.insert(1u64, (0i64, String::new()));
         let mut k2i = HashMap::new();
         k2i.insert((0i64, String::new()), 1u64);
-        Overlay { inner: Arc::new(Inner {
+        let ov = Overlay { inner: Arc::new(Inner {
             lower,
             boxes: RwLock::new(BTreeMap::new()),
             ino_to_key: RwLock::new(i2k),
@@ -187,8 +196,25 @@ impl Overlay {
             echo: RwLock::new(HashMap::new()),
             sink_open: Mutex::new(HashMap::new()),
             muted: RwLock::new(std::collections::HashSet::new()),
-        }) }
+            passthrough_ok: std::sync::atomic::AtomicBool::new(false),
+            daemon_reads: AtomicU64::new(0),
+        }) };
+        // Test observability: if SARUN_STATS_FILE is set, a thread writes
+        // "passthrough=<0|1> daemon_reads=<n>" to it (survives the SIGTERM
+        // _exit teardown, which skips destroy()). No-op when unset.
+        if let Ok(path) = std::env::var("SARUN_STATS_FILE") {
+            let inner = ov.inner.clone();
+            std::thread::spawn(move || loop {
+                let line = format!("passthrough={} daemon_reads={}\n",
+                    inner.passthrough_ok.load(Ordering::Relaxed) as u8,
+                    inner.daemon_reads.load(Ordering::Relaxed));
+                let _ = std::fs::write(&path, line);
+                std::thread::sleep(Duration::from_millis(100));
+            });
+        }
+        ov
     }
+
 
     pub fn reload_rules(&self) {
         *self.inner.rules.write().unwrap() = crate::rules::Rules::load();
@@ -559,6 +585,18 @@ impl Overlay {
 }
 
 impl Filesystem for Overlay {
+    fn init(&mut self, _req: &Request,
+            config: &mut fuser::KernelConfig) -> std::io::Result<()> {
+        // Negotiate kernel FUSE_PASSTHROUGH (kernel 6.9+). WHICH opens use it is
+        // decided per-path by the `readonly` file rule — never automatically.
+        // set_max_stack_depth(2) is needed because backing files can live on a
+        // stacked fs (the container's overlayfs root). Never fail init over this.
+        let ok = config.add_capabilities(fuser::InitFlags::FUSE_PASSTHROUGH).is_ok()
+            && config.set_max_stack_depth(2).is_ok();
+        self.inner.passthrough_ok.store(ok, Ordering::Relaxed);
+        Ok(())
+    }
+
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let Some((bid, prel)) = self.key_of(parent) else {
             return reply.error(Errno::ENOENT);
@@ -650,8 +688,7 @@ impl Filesystem for Overlay {
             self.note_sink_open(bid);
             let n = self.reg_fh(FhInner {
                 box_id: bid, rel, file: None, upper: false, dirty: false,
-                last_pid: req.pid(), sink: Some(stream), passthrough: false,
-            });
+                last_pid: req.pid(), sink: Some(stream), passthrough: false, _backing: None });
             return reply.opened(FileHandle(n), FopenFlags::empty());
         }
         let want_write = !matches!(flags.acc_mode(),
@@ -667,7 +704,7 @@ impl Filesystem for Overlay {
                 Ok(f) => {
                     let n = self.reg_fh(FhInner {
                         box_id: bid, rel, file: Some(f), upper: true, dirty: false,
-                        last_pid: req.pid(), sink: None, passthrough: true });
+                        last_pid: req.pid(), sink: None, passthrough: true, _backing: None });
                     return reply.opened(FileHandle(n), FopenFlags::empty());
                 }
                 Err(_) => return reply.error(Errno::EACCES),
@@ -694,9 +731,38 @@ impl Filesystem for Overlay {
             },
             _ => return reply.error(Errno::ENOENT),
         };
+        // D5 (rule-gated): a READ-ONLY open of a HOST-DIRECT path (the existing
+        // `passthrough` file rule, or a -d direct box) gets a kernel backing fd,
+        // so the kernel serves reads with the daemon out of the loop (the build-
+        // read-storm win). The user declares these paths host-direct via the
+        // rule — never an automatic guess. Exec opens stay daemon-served (mmap of
+        // a passthrough-backed file EIOs). The kernel limit (a write-open of a
+        // file with a live passthrough read fd EIOs) is therefore SCOPED to
+        // user-declared host-direct paths, and — because passthrough rules are
+        // PATH-ONLY — those paths are host-direct in every box, so the EIO is
+        // uniform, never a captured-vs-passthrough divergence (see DESIGN.md D5).
+        const FMODE_EXEC: i32 = 0x20;
+        let is_exec = flags.0 & FMODE_EXEC != 0;
+        if !want_write && !is_exec && (b.direct() || self.is_passthrough(&rel))
+            && self.inner.passthrough_ok.load(Ordering::Relaxed) {
+            if let Some(f) = file.as_ref() {
+                if let Ok(backing) = reply.open_backing(f) {
+                    let n = self.reg_fh(FhInner {
+                        box_id: bid, rel, file, upper, dirty: false,
+                        last_pid: req.pid(), sink: None, passthrough: false,
+                        _backing: None });
+                    reply.opened_passthrough(FileHandle(n), FopenFlags::empty(),
+                                             &backing);
+                    if let Some(h) = self.inner.fhs.read().unwrap().get(&n) {
+                        h.lock().unwrap().inner._backing = Some(backing);
+                    }
+                    return;
+                }
+                // open_backing failed: fall through to daemon-served.
+            }
+        }
         let n = self.reg_fh(FhInner {
-            box_id: bid, rel, file, upper, dirty: false, last_pid: req.pid(), sink: None, passthrough: false,
-        });
+            box_id: bid, rel, file, upper, dirty: false, last_pid: req.pid(), sink: None, passthrough: false, _backing: None });
         reply.opened(FileHandle(n), FopenFlags::FOPEN_KEEP_CACHE);
     }
 
@@ -728,7 +794,7 @@ impl Filesystem for Overlay {
                     attr.perm = (mode & 0o7777) as u16;
                     let n = self.reg_fh(FhInner {
                         box_id: bid, rel, file: Some(f), upper: true, dirty: false,
-                        last_pid: req.pid(), sink: None, passthrough: true });
+                        last_pid: req.pid(), sink: None, passthrough: true, _backing: None });
                     return reply.created(&TTL, &attr, Generation(0),
                                          FileHandle(n), FopenFlags::empty());
                 }
@@ -754,14 +820,16 @@ impl Filesystem for Overlay {
         attr.perm = (mode & 0o7777) as u16;
         let n = self.reg_fh(FhInner {
             box_id: bid, rel, file: Some(f), upper: true,
-            dirty: true, last_pid: req.pid(), sink: None, passthrough: false,
-        });
+            dirty: true, last_pid: req.pid(), sink: None, passthrough: false, _backing: None });
         reply.created(&TTL, &attr, Generation(0), FileHandle(n),
                       FopenFlags::empty());
     }
 
     fn read(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, offset: u64,
             size: u32, _flags: OpenFlags, _lo: Option<LockOwner>, reply: ReplyData) {
+        // The daemon served this read (a passthrough'd read never reaches here —
+        // the kernel serves it directly). Counter is test observability.
+        self.inner.daemon_reads.fetch_add(1, Ordering::Relaxed);
         let fhs = self.inner.fhs.read().unwrap();
         let Some(h) = fhs.get(&u64::from(fh)) else {
             return reply.error(Errno::EBADF);
