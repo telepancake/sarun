@@ -142,10 +142,19 @@ resizes as FRAME_PTY_RESIZE. Proven end to end: pty.rs `#[cfg(test)]` (real chil
 → FRAME_PTY_DATA → vt100 + tui-term → ratatui TestBackend, asserting the child's
 marker is ON the grid; plus input-readback, escape-emulation, resize, and
 sink-recording) and test_pty_ui_rs.py (the engine half over a real socket).
-FOLLOW-ON: this first cut spawns the PTY child DIRECTLY (no bwrap/overlay box).
-Wrapping the PTY child in a bwrap'd overlay box (a real captured box, like a
-normal `run`) reuses this exact frame mux unchanged — that is the remaining
-engine-side work to make an engine-held PTY a full captured box.
+GENERIC TRANSPORT — `serve_pty` runs whatever argv the caller passes; it does
+NOT presume a box or any box parameters. Spawning the argv directly (a bare
+command on a PTY, like `script`/`ssh`) is a correct, first-class mode, NOT a
+deficiency. Running a full captured box on the PTY is just a different argv:
+pass `[<self-exe>, "run", <flags>, "--", <cmd>]` and the engine-held PTY drives
+that box (with whatever -t/-d/-e/-b/-C/NAME the user chose) — no special-casing
+in the mechanism, because the engine cannot and must not presume the user's box
+parameters. The UI's `P` key opens a PROMPT pre-filled with a CONFIGURABLE
+default (the "login command": first non-blank line of
+$XDG_CONFIG_HOME/slopbox[.NS]/pty_command, else $SHELL -i / sh -i) — a default
+the user edits, never an enforced choice. So the only thing saved is a
+convenience command; everything else is the caller's parameter. (ui.rs
+`pty_default_cmd`/`shell_split`, unit-tested.)
 
 ## D8 · No migration obligations
 Zero users: compatibility choices are scaffolding for OUR transition (keep

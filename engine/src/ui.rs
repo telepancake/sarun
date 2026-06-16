@@ -154,6 +154,13 @@ enum Modal {
     /// Add or edit a file rule. `editing` is Some(index) when editing an
     /// existing rule, None when adding. `buf` is the "<action> <glob>" line.
     RuleForm { buf: String, editing: Option<usize> },
+    /// Command to run on a fresh engine-held PTY pane. `buf` is the command
+    /// line (pre-filled with the configurable default — a saved "login
+    /// command"); the user runs whatever they type, e.g. `bash`, a remote
+    /// shell, or a full box: `sarun run -b -- make`. The engine-held PTY is a
+    /// generic transport — it runs the given argv; it does NOT presume a box or
+    /// any box parameters (that is the caller's choice).
+    PtyCmd { buf: String },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -486,11 +493,14 @@ impl App {
         }
     }
 
-    /// Open an engine-held PTY pane running an interactive shell, and focus it.
-    /// 'P' from any pane. Mirrors the ptyspike stack but over the engine socket.
+    /// Open an engine-held PTY pane running `argv`, and focus it. The argv is
+    /// whatever the user chose (the engine-held PTY is a generic transport: it
+    /// runs the given command; nothing about a box or its parameters is
+    /// presumed here). 'P' first prompts (pre-filled with the configured
+    /// default), then calls this with the entered command line.
     #[cfg_attr(test, allow(dead_code))]
-    fn open_pty(&mut self) {
-        let argv = vec!["sh".to_string(), "-i".to_string()];
+    fn open_pty(&mut self, argv: Vec<String>) {
+        if argv.is_empty() { self.status = "pty: empty command".into(); return; }
         match PtyPane::open(&self.sock, &argv, 24, 80) {
             Ok(p) => {
                 self.pty = Some(p);
@@ -943,6 +953,15 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal) {
                 Line::from("e.g.  discard **/*.log   ·   Enter save · Esc cancel"),
             ],
         ),
+        Modal::PtyCmd { buf } => (
+            " run on a PTY ",
+            vec![
+                Line::from(format!("{buf}_")),
+                Line::from(""),
+                Line::from("any command — e.g. `bash` or `sarun run -b -- make` · \
+                            Enter run · Esc cancel"),
+            ],
+        ),
     };
     let p = Paragraph::new(Text::from(body))
         .block(
@@ -1102,6 +1121,61 @@ fn proc_detail_lines(app: &App) -> Vec<Line<'static>> {
             }
         }
     }
+    out
+}
+
+/// The default command for a fresh PTY pane — the configurable "login command".
+/// Reads the first non-blank, non-`#` line of
+/// $XDG_CONFIG_HOME/slopbox[.NS]/pty_command if present; else falls back to the
+/// user's $SHELL (interactive) or `sh -i`. This is only a DEFAULT the user can
+/// edit at the prompt — never an enforced choice, and it presumes NOTHING about
+/// a box or its parameters (the engine-held PTY just runs whatever argv it gets;
+/// to run a box you type e.g. `sarun run -b -- make`).
+fn pty_default_cmd() -> String {
+    let app_dir = match std::env::var("SLOPBOX_NS") {
+        Ok(ns) if !ns.is_empty() => format!("slopbox.{ns}"),
+        _ => "slopbox".into(),
+    };
+    let base = match std::env::var("XDG_CONFIG_HOME") {
+        Ok(v) if !v.is_empty() => PathBuf::from(v),
+        _ => PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/root".into()))
+            .join(".config"),
+    };
+    if let Ok(s) = std::fs::read_to_string(base.join(app_dir).join("pty_command")) {
+        if let Some(l) = s.lines().map(str::trim)
+            .find(|l| !l.is_empty() && !l.starts_with('#')) {
+            return l.to_string();
+        }
+    }
+    match std::env::var("SHELL") {
+        Ok(sh) if !sh.is_empty() => format!("{sh} -i"),
+        _ => "sh -i".to_string(),
+    }
+}
+
+/// Split a typed command line into argv, honoring single and double quotes
+/// (enough for the PTY prompt). Unquoted whitespace separates words.
+fn shell_split(s: &str) -> Vec<String> {
+    let mut out = vec![];
+    let mut cur = String::new();
+    let mut in_word = false;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' | '"' => {
+                in_word = true;
+                while let Some(n) = chars.next() {
+                    if n == c { break; }
+                    cur.push(n);
+                }
+            }
+            c if c.is_whitespace() => {
+                if in_word { out.push(std::mem::take(&mut cur)); in_word = false; }
+            }
+            c => { in_word = true; cur.push(c); }
+        }
+    }
+    if in_word { out.push(cur); }
     out
 }
 
@@ -1319,6 +1393,19 @@ fn handle_modal_key(app: &mut App, code: crossterm::event::KeyCode) {
             }
             _ => app.modal = Some(Modal::RuleForm { buf, editing }),
         },
+        Modal::PtyCmd { mut buf } => match code {
+            KeyCode::Enter => app.open_pty(shell_split(&buf)),
+            KeyCode::Esc => app.status = "pty cancelled".into(),
+            KeyCode::Backspace => {
+                buf.pop();
+                app.modal = Some(Modal::PtyCmd { buf });
+            }
+            KeyCode::Char(c) => {
+                buf.push(c);
+                app.modal = Some(Modal::PtyCmd { buf });
+            }
+            _ => app.modal = Some(Modal::PtyCmd { buf }),
+        },
     }
 }
 
@@ -1420,7 +1507,8 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                     KeyCode::Char('o') => app.focus = Pane::Outputs,
                     KeyCode::Char('e') => app.focus = Pane::Rules,
                     KeyCode::Char('?') => app.focus = Pane::Help,
-                    KeyCode::Char('P') => app.open_pty(),
+                    KeyCode::Char('P') =>
+                        app.modal = Some(Modal::PtyCmd { buf: pty_default_cmd() }),
                     KeyCode::Char('a') => app.apply(),
                     KeyCode::Char('x') => app.discard(),
                     KeyCode::Char('K') => {
@@ -1538,6 +1626,49 @@ mod tests {
     use super::*;
     use std::process::Child;
     use std::process::Command;
+
+    #[test]
+    fn shell_split_handles_quotes() {
+        assert_eq!(shell_split("bash"), vec!["bash"]);
+        assert_eq!(shell_split("sarun run -b -- make all"),
+                   vec!["sarun", "run", "-b", "--", "make", "all"]);
+        assert_eq!(shell_split("sh -c 'echo hi there'"),
+                   vec!["sh", "-c", "echo hi there"]);
+        assert_eq!(shell_split(r#"a "b c" d"#), vec!["a", "b c", "d"]);
+        assert!(shell_split("   ").is_empty());
+    }
+
+    #[test]
+    fn pty_default_cmd_is_configurable_not_enforced() {
+        // A saved "login command" in the config wins …
+        let tmp = std::env::temp_dir()
+            .join(format!("sarun-ptycfg-{}", std::process::id()));
+        let cfgdir = tmp.join("slopbox.PTYCFG");
+        std::fs::create_dir_all(&cfgdir).unwrap();
+        std::fs::write(cfgdir.join("pty_command"),
+                       "# comment\n\nsarun run -b -- make\n").unwrap();
+        let prev_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+        let prev_ns = std::env::var("SLOPBOX_NS").ok();
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", &tmp);
+            std::env::set_var("SLOPBOX_NS", "PTYCFG");
+        }
+        assert_eq!(pty_default_cmd(), "sarun run -b -- make",
+                   "configured login command must be used verbatim");
+        // … and with no config it falls back to a shell — a DEFAULT, not a
+        // baked-in box decision.
+        std::fs::remove_file(cfgdir.join("pty_command")).unwrap();
+        let d = pty_default_cmd();
+        assert!(d.contains("sh") || d.contains("bash"),
+                "fallback should be a shell, got {d:?}");
+        unsafe {
+            match prev_xdg { Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                             None => std::env::remove_var("XDG_CONFIG_HOME") }
+            match prev_ns { Some(v) => std::env::set_var("SLOPBOX_NS", v),
+                            None => std::env::remove_var("SLOPBOX_NS") }
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 
     struct Engine {
         child: Child,
