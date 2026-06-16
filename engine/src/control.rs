@@ -100,6 +100,24 @@ fn derive_parent_box(state: &State, host_pid: i32) -> Option<i64> {
 
 pub type State = Arc<Mutex<Shared>>;
 
+/// Record one D9 brush-shell provenance frame for box `id`: parse the JSON
+/// payload, write it into the live box's sqlar `brushprov` table, and broadcast
+/// a `brush_prov` event. Best-effort — a malformed payload is dropped quietly.
+fn record_brush_prov(state: &State, ov: &Option<crate::overlay::Overlay>,
+                     id: i64, payload: &[u8]) {
+    let Ok(rec) = serde_json::from_slice::<Value>(payload) else { return; };
+    let cmd = rec.get("cmd").and_then(Value::as_str).unwrap_or("").to_string();
+    let record_json = rec.to_string();
+    if let Some(ov) = ov.as_ref() {
+        if let Some(b) = ov.live_box(id) {
+            b.add_brushprov(&cmd, &record_json);
+        }
+    }
+    broadcast(state, &json!({"type": "brush_prov",
+                            "session_id": id.to_string(),
+                            "cmd": cmd, "record": rec}));
+}
+
 pub fn broadcast(state: &State, ev: &Value) {
     let data = format!("{ev}\n");
     let mut s = state.lock().unwrap();
@@ -562,6 +580,10 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
             Some(id) => discover::outputs(id),
             None => json!([]),
         },
+        "brushprov" => match arg_sid(args) {
+            Some(id) => discover::brushprov(id),
+            None => json!([]),
+        },
         "output_detail" => match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
             (Some(id), Some(oid)) => discover::output_detail(id, oid),
             _ => Value::Null,
@@ -855,6 +877,15 @@ fn handle(state: State, conn: UnixStream) {
                             }
                         }
                         _ => {}
+                    }
+                }
+                // D9 brush provenance (separate from MUTE/UNMUTE): a FRAME_PROV
+                // carries a JSON object describing one shell command the box's
+                // embedded brush shell ran. Record it into the box's sqlar and
+                // broadcast a `brush_prov` event so live UIs see it.
+                for (ft, payload) in &frames {
+                    if *ft == crate::frames::FRAME_PROV {
+                        record_brush_prov(&state, &ov, id, payload);
                     }
                 }
                 fbuf.drain(..used);

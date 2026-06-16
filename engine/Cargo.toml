@@ -9,7 +9,10 @@ path = "src/main.rs"
 
 [dependencies]
 base64 = "0.22.1"
+brush-core = "0.5"
+brush-parser = { version = "0.4", features = ["serde"] }
 crossterm = "0.29"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 fuser = "0.17.0"
 glob = "0.3.3"
 libc = "0.2.186"

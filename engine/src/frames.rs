@@ -25,6 +25,13 @@ pub const FRAME_ECHO: u8 = 2;
 pub const FRAME_ECHO_DONE: u8 = 3;
 pub const FRAME_MUTE: u8 = 4;
 pub const FRAME_UNMUTE: u8 = 5;
+//   PROV      (inner→engine) D9 semantic-provenance for the embedded brush
+//             shell (-b). payload = a UTF-8 JSON object describing ONE shell
+//             command brush is about to run: the exact command string plus the
+//             pipeline/redirect structure brush actually parsed (NOT a Makefile
+//             line — see D9). The engine records it into the box's sqlar
+//             `brushprov` table and broadcasts a `brush_prov` event.
+pub const FRAME_PROV: u8 = 6;
 
 /// Encode one typed frame: [total-len:4 BE][type:1][payload].
 pub fn encode(ftype: u8, payload: &[u8]) -> Vec<u8> {

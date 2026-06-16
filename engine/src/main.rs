@@ -14,6 +14,7 @@ use std::time::Duration;
 use fuser::Config;
 use fuser::MountOption;
 
+mod brush;
 mod capture;
 mod control;
 mod discover;
@@ -155,6 +156,7 @@ fn main() {
             let mut direct = false;
             let mut env = false;
             let mut pty = false;
+            let mut brush = false;
             let mut chdir: Option<String> = None;
             let mut name: Option<String> = None;
             let mut it = pre.iter();
@@ -167,11 +169,18 @@ fn main() {
                     //     (real tty inside the box), captured like ordinary
                     //     capture mode. Implies capture-on; ignored under -d.
                     "-p" => pty = true,
+                    // -b  brush: run the box's command THROUGH the embedded
+                    //     brush shell (brush-core/brush-parser) instead of
+                    //     /bin/sh, emitting SEMANTIC-PROVENANCE frames. An
+                    //     EXPLICIT toggle — no silent fallback to /bin/sh (D9).
+                    //     Implies capture-on (so provenance + writes are
+                    //     recorded), except under -d which has no overlay.
+                    "-b" => brush = true,
                     "-C" => chdir = it.next().cloned(),
                     _ => if name.is_none() { name = Some(a.clone()); },
                 }
             }
-            std::process::exit(runner::run(name, passthrough, direct, env, pty, chdir, cmd));
+            std::process::exit(runner::run(name, passthrough, direct, env, pty, brush, chdir, cmd));
         }
         Some("inner") => {
             // inner --conn-fd N -- CMD...
@@ -179,16 +188,18 @@ fn main() {
             let mut conn_fd = -1;
             let mut capture = false;
             let mut pty = false;
+            let mut brush = false;
             let mut i = 0;
             while i < rest.len() {
                 if rest[i] == "--conn-fd" && i + 1 < rest.len() {
                     conn_fd = rest[i + 1].parse().unwrap_or(-1); i += 2;
                 } else if rest[i] == "--capture" { capture = true; i += 1; }
                 else if rest[i] == "--pty" { pty = true; i += 1; }
+                else if rest[i] == "--brush" { brush = true; i += 1; }
                 else if rest[i] == "--" { i += 1; break; }
                 else { i += 1; }
             }
-            std::process::exit(runner::inner(conn_fd, capture, pty, rest[i..].to_vec()));
+            std::process::exit(runner::inner(conn_fd, capture, pty, brush, rest[i..].to_vec()));
         }
         // CLI conveniences mirroring `slopbox NAME <op>`: a leading all-caps
         // (optionally dotted) box NAME selects it, and an optional op acts on it

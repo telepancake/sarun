@@ -34,6 +34,13 @@ fn pidfd_open(pid: i32) -> i32 {
     unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as i32 }
 }
 
+/// pidfd_open, exposed for the brush module (same capture/MUTE wiring).
+pub fn pidfd_open_pub(pid: i32) -> i32 { pidfd_open(pid) }
+/// send_frame, exposed for the brush module's MUTE/UNMUTE/teardown frames.
+pub fn send_frame_pub(conn_fd: i32, frame: &[u8], pidfd: Option<i32>) {
+    send_frame(conn_fd, frame, pidfd)
+}
+
 /// Send one register line plus our own pidfd as SCM_RIGHTS ancillary data, so
 /// the engine derives our HOST-namespace pid from /proc/self/fdinfo/<pidfd>
 /// (the wrap-immune identity path) — correct for both top-level and nested
@@ -146,16 +153,28 @@ fn tty_restore(tty_fd: Option<i32>, old_fg: Option<i32>,
 }
 
 pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
-           pty: bool, chdir: Option<String>, cmd: Vec<String>) -> i32 {
+           pty: bool, brush: bool, chdir: Option<String>, cmd: Vec<String>) -> i32 {
     if cmd.is_empty() {
         eprintln!("sarun-engine run: no command after --");
+        return 2;
+    }
+    // -b brush REQUIRES the overlay+capture (provenance + recorded writes flow
+    // through it). -d has no overlay, so -b+-d is incoherent — error VISIBLY
+    // here rather than letting the box fall through to a plain /bin/sh run (the
+    // D9 no-silent-downgrade rule applies at selection time too).
+    if brush && direct {
+        eprintln!("sarun-engine run: -b (brush shell) is incompatible with -d \
+                   (no overlay to capture provenance/writes into).");
         return 2;
     }
     // -t passthrough suppresses output capture; -d direct has no overlay so no
     // sinks either (capture = not -t and not -d, mirroring the Python runner).
     // -p PTY mode always wants its output recorded, so it forces capture on
     // even under -t (but never under -d: there is no overlay to capture into).
-    let want_capture = (!passthrough && !direct) || (pty && !direct);
+    // -b brush also wants capture (so provenance frames + writes are recorded),
+    // mirroring -p; never under -d (no overlay to capture/provenance into).
+    let want_capture = (!passthrough && !direct) || (pty && !direct)
+        || (brush && !direct);
     // IN-BOX vs HOST: a nested runner reaches the engine via the socket
     // bind-mounted at UI_SOCK_INBOX; a top-level runner uses the host socket.
     // Pure path-presence, no env var (mirrors the Python runner).
@@ -181,6 +200,7 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
                          "want_capture": want_capture,
                          "want_direct": direct,
                          "want_env": env,
+                         "want_brush": brush,
                          // Advisory: the engine reruns iff a sibling NAME exists.
                          // A named launch is always rerun-eligible.
                          "want_rerun": name.is_some()});
@@ -243,6 +263,8 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
     // PTY needs the capture sink files to record into; if the engine declined
     // capture (-d) there is nothing to PTY into, so gate --pty on capture_on.
     if pty && capture_on { inner_args.push("--pty"); }
+    // -b brush likewise needs the capture sinks to record provenance + writes.
+    if brush && capture_on { inner_args.push("--brush"); }
     inner_args.push("--");
     let status = Command::new("bwrap")
         .args(["--bind", &root_src, "/",
@@ -289,11 +311,24 @@ fn send_frame(conn_fd: i32, frame: &[u8], pidfd: Option<i32>) {
     }
 }
 
-pub fn inner(conn_fd: i32, capture: bool, pty: bool, cmd: Vec<String>) -> i32 {
+pub fn inner(conn_fd: i32, capture: bool, pty: bool, brush: bool,
+             cmd: Vec<String>) -> i32 {
     if cmd.is_empty() { return 2; }
     // Hold the box-channel fd open (not CLOEXEC) so the engine sees EOF — its
     // teardown signal — only when this process (and CMD) finally exits.
     if conn_fd >= 0 { clear_cloexec(conn_fd); }
+    // -b brush (D9): the box's shell IS the embedded brush, not /bin/sh. It
+    // needs the capture sinks (provenance + recorded writes), so it only
+    // engages when capture is active; otherwise this is a misuse (-b under -d)
+    // and we error VISIBLY rather than silently exec'ing /bin/sh.
+    if brush {
+        if !capture || conn_fd < 0 {
+            eprintln!("sarun-engine inner: -b (brush) requires capture; \
+                       it is incompatible with -d (no overlay).");
+            return 2;
+        }
+        return crate::brush::inner_brush(conn_fd, cmd);
+    }
     // PTY mode (third path): an interactive controlling-tty box whose output is
     // ALSO captured. `-p` means "give the CHILD a pty" — it does NOT require the
     // runner to have a tty (cf. `script`, `docker -t`, `ssh -tt`): a non-tty

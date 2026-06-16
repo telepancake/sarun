@@ -37,6 +37,10 @@ CREATE TABLE IF NOT EXISTS xattr(name TEXT, key TEXT, value BLOB,
  PRIMARY KEY(name,key));
 CREATE TABLE IF NOT EXISTS ownership(name TEXT PRIMARY KEY, uid INT, gid INT);
 CREATE TABLE IF NOT EXISTS rdev(name TEXT PRIMARY KEY, dev INT);
+-- D9 brush-shell semantic provenance: one row per pipeline the embedded brush
+-- shell (-b) ran, carrying the exact command string + parsed structure (JSON).
+CREATE TABLE IF NOT EXISTS brushprov(id INTEGER PRIMARY KEY AUTOINCREMENT,
+ ts REAL, cmd TEXT, record TEXT);
 ";
 
 #[derive(Clone)]
@@ -421,6 +425,18 @@ impl BoxState {
         let _ = conn.execute(
             "INSERT INTO outputs(ts,process_id,stream,content) VALUES(?1,?2,?3,?4)",
             rusqlite::params![ts, writer, stream, content]);
+    }
+
+    /// Record one D9 brush-shell provenance frame: the exact command string
+    /// plus the full parsed-structure JSON the embedded brush shell reported.
+    pub fn add_brushprov(&self, cmd: &str, record_json: &str) {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64()).unwrap_or(0.0);
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute(
+            "INSERT INTO brushprov(ts,cmd,record) VALUES(?1,?2,?3)",
+            params![ts, cmd, record_json]);
     }
 
     pub fn set_meta(&self, key: &str, value: &str) {

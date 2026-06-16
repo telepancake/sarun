@@ -180,6 +180,31 @@ pub fn outputs(box_id: i64) -> Value {
     Value::Array(rows)
 }
 
+/// D9 brush-shell semantic provenance rows for a box: each is one pipeline the
+/// embedded brush shell (-b) ran, with its exact command string and the parsed
+/// pipeline/redirect structure. Empty for boxes not run with -b.
+pub fn brushprov(box_id: i64) -> Value {
+    let db = sqlar_path(box_id);
+    let Ok(conn) = rusqlite::Connection::open_with_flags(
+        &db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) else {
+        return json!([]);
+    };
+    let mut rows = vec![];
+    if let Ok(mut st) = conn.prepare(
+        "SELECT id,ts,cmd,record FROM brushprov ORDER BY id") {
+        let it = st.query_map([], |r| {
+            let rec: String = r.get(3)?;
+            Ok(json!({
+                "id": r.get::<_, i64>(0)?, "ts": r.get::<_, f64>(1)?,
+                "cmd": r.get::<_, String>(2)?,
+                "record": serde_json::from_str::<Value>(&rec).unwrap_or(Value::Null),
+            }))
+        });
+        if let Ok(it) = it { for row in it.flatten() { rows.push(row); } }
+    }
+    Value::Array(rows)
+}
+
 fn open_ro(box_id: i64) -> Option<rusqlite::Connection> {
     rusqlite::Connection::open_with_flags(
         sqlar_path(box_id), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).ok()
