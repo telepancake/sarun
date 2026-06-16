@@ -1051,7 +1051,7 @@ fn handle(state: State, conn: UnixStream) {
                                 if hp > 0 {
                                     muted_pid = Some(hp);
                                     if let Some(ov) = ov.as_ref() {
-                                        ov.mute_add(hp);
+                                        ov.mute_add(hp, id);
                                         // D9 brush↔process linkage: for a brush box
                                         // the muted pid IS the embedded brush shell's
                                         // --inner host tgid — the forest root every

@@ -194,8 +194,16 @@ impl BoxState {
                     "SELECT last_writer FROM sqlar WHERE name=?1", [rel],
                     |r| r.get::<_, Option<i64>>(0)).ok().flatten();
                 let Some(w) = writer else { continue };
-                if by_id.get(&w).map(|(tg, _)| *tg) == Some(bt) { continue; }
-                if !is_brush_descendant(w) { continue; }
+                // The writer either IS the brush --inner process itself (an
+                // IN-PROCESS pipeline stage: a brush builtin or a bundled
+                // coreutil like `tr`/`sort` writing the redirect target from the
+                // --inner pid — no forked child) OR is a forked descendant of it.
+                // Both are this pipeline's writer; link both. (Pre-coreutils a
+                // writer == the brush root meant "brush wrote it, not a pipeline
+                // process" and was skipped — that no longer holds now that
+                // pipeline stages can run in-process.)
+                let writer_is_root = by_id.get(&w).map(|(tg, _)| *tg) == Some(bt);
+                if !writer_is_root && !is_brush_descendant(w) { continue; }
                 let _ = conn.execute(
                     "UPDATE process SET brush_pipeline_id=?2 \
                      WHERE id=?1 AND brush_pipeline_id IS NULL",

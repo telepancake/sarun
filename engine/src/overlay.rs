@@ -107,11 +107,15 @@ struct Inner {
     // Per-box open-sink count: when it returns to 0 (both sinks released at child
     // exit) the engine sends ECHO_DONE so --inner stops without truncation.
     sink_open: Mutex<HashMap<i64, u32>>,
-    // Globally muted HOST tgids: a write whose tgid is here is echoed upward but
-    // NOT recorded — it is a nested box's echo readback travelling up through an
-    // ancestor sink, already recorded once at its origin box. A MUTE frame adds
-    // --inner's own host tgid; UNMUTE / connection-close removes it.
-    muted: RwLock<std::collections::HashSet<i32>>,
+    // Globally muted HOST tgids → the box id that muted tgid OWNS. A muted
+    // tgid's write to an ANCESTOR box's sink (sink box_id != its own box) is
+    // echo readback travelling up — echoed onward but NOT recorded (it was
+    // already captured once at its origin box). But a muted tgid's write to ITS
+    // OWN box's sink is FIRST-PARTY output (e.g. a brush in-process builtin like
+    // echo/printf, which writes fd 1 from the muted --inner pid) and MUST be
+    // recorded. A MUTE frame adds --inner's own host tgid mapped to its box id;
+    // UNMUTE / connection-close removes it.
+    muted: RwLock<std::collections::HashMap<i32, i64>>,
     // D5 (rule-gated): true iff the kernel negotiated FUSE_PASSTHROUGH at init.
     // ONLY read-only opens of `readonly`-RULED paths register backing fds; never
     // a blind per-open guess (see DESIGN.md D5). daemon_reads counts read() ops
@@ -210,7 +214,7 @@ impl Overlay {
             rules: RwLock::new(crate::rules::Rules::load()),
             echo: RwLock::new(HashMap::new()),
             sink_open: Mutex::new(HashMap::new()),
-            muted: RwLock::new(std::collections::HashSet::new()),
+            muted: RwLock::new(std::collections::HashMap::new()),
             passthrough_ok: std::sync::atomic::AtomicBool::new(false),
             daemon_reads: AtomicU64::new(0),
         }) };
@@ -247,15 +251,19 @@ impl Overlay {
         self.inner.echo.write().unwrap().remove(&id);
         self.inner.sink_open.lock().unwrap().remove(&id);
     }
-    pub fn mute_add(&self, host_pid: i32) {
-        if host_pid > 0 { self.inner.muted.write().unwrap().insert(host_pid); }
+    pub fn mute_add(&self, host_pid: i32, box_id: i64) {
+        if host_pid > 0 { self.inner.muted.write().unwrap().insert(host_pid, box_id); }
     }
     pub fn mute_remove(&self, host_pid: i32) {
         self.inner.muted.write().unwrap().remove(&host_pid);
     }
-    fn is_muted(&self, pid: u32) -> bool {
+    /// If `pid`'s tgid is muted, returns the box id that muted tgid OWNS (so the
+    /// sink-write path can tell a first-party write to its own box's sink from an
+    /// echo readback bubbling up through an ancestor sink). None if not muted.
+    fn muted_owner(&self, pid: u32) -> Option<i64> {
         let m = self.inner.muted.read().unwrap();
-        !m.is_empty() && m.contains(&(tgid_of(pid) as i32))
+        if m.is_empty() { return None; }
+        m.get(&(tgid_of(pid) as i32)).copied()
     }
     /// Frame `data` as an ECHO for `id`'s stream and send it over the box
     /// channel (best-effort; a dropped/blocked channel never fails a write).
@@ -908,16 +916,23 @@ impl Filesystem for Overlay {
         };
         let mut h = h.lock().unwrap();
         if let Some(stream) = h.inner.sink {
-            // stdout/stderr sink. MUTE: if the writer's tgid is muted, this is a
-            // nested box's echo readback travelling UP through an ancestor sink —
-            // echo it onward so it keeps propagating, but do NOT record it (it
-            // was already captured once at the origin box). Otherwise record it
-            // with per-write pid attribution. Either way, echo it live.
+            // stdout/stderr sink. MUTE: a muted writer's write to an ANCESTOR
+            // box's sink (owner box != this sink's box) is a nested box's echo
+            // readback travelling UP — echo it onward so it keeps propagating,
+            // but do NOT record it (already captured once at the origin box). A
+            // muted writer's write to ITS OWN box's sink, however, is first-party
+            // output (e.g. a brush in-process builtin writing fd 1 from the muted
+            // --inner pid) and IS recorded. A non-muted writer is always
+            // recorded. Either way, echo it live.
             let bid = h.inner.box_id;
             let pid = req.pid();
             drop(h);
             drop(fhs);
-            if !self.is_muted(pid) {
+            let record = match self.muted_owner(pid) {
+                None => true,             // not muted: record
+                Some(owner) => owner == bid,  // muted: record only its own sink
+            };
+            if record {
                 if let Some(b) = self.box_of(bid) {
                     b.add_output(stream, pid, data);
                 }

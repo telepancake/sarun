@@ -15,6 +15,29 @@
 // exactly like ordinary capture mode — brush sits ABOVE FUSE, it does not
 // replace it.
 //
+// BUILTIN STDOUT IS CAPTURED — VERIFIED (so we use the BashMode builtin set:
+// echo/printf/test/[/let/source/declare etc. all run in-process). brush-core's
+// `OpenFile::Stdout(std::io::Stdout)` write() does `f.write(buf)` to the real
+// fd 1 (openfiles.rs), and we dup2 the box's FUSE sink onto fd 1 BEFORE building
+// the shell — so a builtin writing to stdout writes to fd 1 == the sink == it is
+// captured, exactly like a forked binary. There is NO capture reason to keep
+// echo/printf/test external; the prior "ShMode preserves capture" claim was
+// FALSE. (When a builtin's stdout is redirected — a pipe or `> file` — brush
+// hands it a different OpenFile, also fd-backed and captured.)
+//
+// IN-PROCESS COREUTILS: on top of the BashMode shell builtins we fold in
+// `brush_coreutils_builtins::bundled_commands()` (uutils/coreutils uumain
+// adapters) as brush builtins — so `cat ls cp mv rm mkdir wc sort cut tr …` run
+// IN-PROCESS too (no fork of /usr/bin/cat). Shell builtins WIN for overlapping
+// names (we install coreutils FIRST, then let the BashMode set overwrite the
+// overlaps), so brush's own `test`/`[`/`echo`/`printf`/`pwd`/`kill` stay shell
+// builtins. A uutils uumain writes the PROCESS's real fd 1/2 (it ignores brush's
+// in-memory OpenFiles), so the wrapper dup2's the context's stdout/stderr fd
+// onto 1/2 around the call — see CoreutilWrapper below. shell_builder_common()
+// is the one place all three shells (top-level box, nested sh, nested bash) get
+// their builtins, so capture/coreutils/builtin-set policy lives in exactly one
+// spot.
+//
 // brush↔PROCESS LINKAGE (D9, DONE — see capture.rs):
 //   Every command brush fork/execs is a child of THIS --inner process (the brush
 //   shell), so in the process FOREST every pipeline process's parent_id chain
@@ -82,19 +105,211 @@
 // targetless) row. Two pipelines never compete for the same literal target
 // because each file is written by exactly one pipeline.
 //
-// Brush-core coverage gaps (VERIFIED — failures listed in brush_sh comments
-// near run_brush_script, where the tests exercise them): brush-core does NOT
-// implement bash extended-test `[[ … ]]` or process substitution `<(…) / >(…)`
-// in sh-mode (both surface as visible parse or execution errors). It DOES run
-// POSIX builtins (cd, export, set, [, test, printf, echo, shift, …), variable
-// assignment + expansion, arithmetic, if/case/for/while/until control flow,
-// functions, simple traps, here-docs/here-strings and the standard one-char
-// flag set (-e/-u/-x/-o, set/unset of same).
+// PARSER MODE BY INVOCATION NAME (B): the nested shim `brush_sh` is reached as
+// `sh`, `bash`, or `dash` (argv0 basename, see is_brush_sh_invocation). When it
+// is `bash` we build the shell in BASH mode (sh_mode(false)) so bashisms work —
+// `[[ … ]]` extended test, process substitution `<(…)/>(…)`, arrays,
+// `${x//a/b}`, etc. — matching real /bin/bash. When it is `sh`/`dash` we keep
+// sh_mode(true): faithful POSIX, where `[[` is just a command name and (absent a
+// `[[` binary) fails visibly. The top-level box brush (run_brush/inner_brush)
+// stands in for the box's default /bin/sh, so it stays sh_mode(true). Mode is the
+// ONLY difference between the three; builtins come from shell_builder_common().
+//
+// Brush-core coverage (VERIFIED): in BOTH modes brush-core runs POSIX builtins
+// (cd, export, set, [, test, printf, echo, shift, …), variable assignment +
+// expansion, arithmetic, if/case/for/while/until control flow, functions, simple
+// traps, here-docs/here-strings and the standard one-char flag set (-e/-u/-x/-o,
+// set/unset of same). Bash-only constructs (`[[ … ]]`, `<(…)/>(…)`, arrays, …)
+// work in BASH mode and surface as visible parse/exec errors in sh-mode — which
+// is exactly the /bin/sh-vs-/bin/bash contract.
 
 use std::os::fd::AsRawFd;
 
 use serde_json::json;
 use serde_json::Value;
+
+// ── shared shell builder (A + C) ─────────────────────────────────────────────
+// All three brush shells (top-level box, nested sh, nested bash) install the
+// SAME builtin policy. The ONLY per-call difference is the parser mode, passed
+// as `sh_mode`. This is the single place capture/coreutils/builtin-set decisions
+// live (see the module header).
+
+use std::ffi::OsString;
+
+/// A uutils coreutil (`fn(Vec<OsString>) -> i32`) wrapped as a brush-core
+/// `SimpleCommand` so it runs IN-PROCESS as a brush builtin.
+///
+/// THE CORRECTNESS TRAP: a uutils `uumain` writes the PROCESS's real fd 1/2 —
+/// it ignores brush's in-memory `OpenFiles`. So `execute` inspects the brush
+/// `context`'s stdout/stderr OpenFile and, if it is backed by a real fd that is
+/// NOT already 1/2 (a pipe stage, a `> file` redirect, …), dup2's that fd onto
+/// 1/2 for the duration of the call, then restores the saved 1/2. If stdout is
+/// the plain `Stdout` (fd 1 already → the FUSE sink) we call directly. If the
+/// OpenFile is an in-memory `Stream` with no raw fd (`try_borrow_as_fd` errors)
+/// uutils CANNOT be pointed at it, so we error visibly rather than silently
+/// write to the wrong fd — that path does not arise for box capture (sinks and
+/// pipes are all real fds) but we refuse it loudly if it ever does.
+struct CoreutilWrapper;
+
+impl CoreutilWrapper {
+    /// Look up the coreutil fn for `name` (the registered builtin name) from the
+    /// bundled table. Built once per call; the table is tiny (<100 fn ptrs).
+    fn lookup(name: &str) -> Option<fn(Vec<OsString>) -> i32> {
+        brush_coreutils_builtins::bundled_commands().get(name).copied()
+    }
+}
+
+/// Redirect `target_fd` (1 or 2) to the raw fd backing `of` for the duration of
+/// `run`, restoring the original afterwards. Returns the run's value. If `of`
+/// already maps to `target_fd` (the common Stdout/Stderr → sink case) nothing is
+/// dup'd. Returns Err with a visible message if `of` has no usable raw fd.
+fn with_fd_redirected<R>(
+    target_fd: i32,
+    of: &brush_core::openfiles::OpenFile,
+    run: impl FnOnce() -> R,
+) -> Result<R, String> {
+    // The raw fd brush would have uutils write to. Stream has none.
+    let borrowed = of.try_borrow_as_fd().map_err(|_| {
+        format!("coreutil output fd {target_fd} is an in-memory stream with no \
+                 raw fd; cannot run uutils against it")
+    })?;
+    let src = borrowed.as_raw_fd();
+    if src == target_fd {
+        // Already the right fd (e.g. Stdout == fd 1 == the FUSE sink). No dup.
+        return Ok(run());
+    }
+    // Save the current target fd, point it at `src`, run, restore.
+    let saved = unsafe { libc::dup(target_fd) };
+    if saved < 0 {
+        return Err(format!("coreutil: dup(save fd {target_fd}) failed"));
+    }
+    if unsafe { libc::dup2(src, target_fd) } < 0 {
+        unsafe { libc::close(saved); }
+        return Err(format!("coreutil: dup2 onto fd {target_fd} failed"));
+    }
+    let r = run();
+    unsafe {
+        // Best-effort restore; flush is the uutils adapter's job (it does).
+        libc::dup2(saved, target_fd);
+        libc::close(saved);
+    }
+    Ok(r)
+}
+
+impl brush_core::builtins::SimpleCommand for CoreutilWrapper {
+    fn get_content(
+        name: &str,
+        _content_type: brush_core::builtins::ContentType,
+        _options: &brush_core::builtins::ContentOptions,
+    ) -> Result<String, brush_core::error::Error> {
+        Ok(format!("{name}: bundled uutils/coreutils builtin\n"))
+    }
+
+    fn execute<SE: brush_core::extensions::ShellExtensions,
+               I: Iterator<Item = S>, S: AsRef<str>>(
+        context: brush_core::commands::ExecutionContext<'_, SE>,
+        args: I,
+    ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
+        let name = context.command_name.clone();
+        let Some(func) = CoreutilWrapper::lookup(&name) else {
+            // Should not happen: we only register names present in the table.
+            eprintln!("sarun-engine brush: coreutil '{name}' not in bundled table");
+            return Ok(brush_core::results::ExecutionResult::new(127));
+        };
+        // argv as OsString. brush passes `args` INCLUDING the command name as
+        // the first element (CommandArg "including the command itself" — see
+        // brush_core::commands::ExecutionContext::args), which is exactly the
+        // argv[0]=util-name uutils expects, so we do NOT prepend `name` again.
+        // Defensive: if brush ever hands an empty list, seed argv[0]=name.
+        let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
+        if argv.is_empty() { argv.push(OsString::from(&name)); }
+
+        // Resolve the brush context's stdin/stdout/stderr OpenFiles so we can
+        // point the PROCESS's real fd 0/1/2 at them around the uumain call — a
+        // uutils uumain reads/writes the real fds, ignoring brush's OpenFiles.
+        // ShellFd is i32; 0/1/2 are the well-known std fds. ALL THREE matter: a
+        // coreutil in a PIPE has stdin = the upstream pipe (fd 0, e.g. `… | sort`)
+        // and/or stdout = the downstream pipe (fd 1); a `> file` redirect makes
+        // stdout a File. Where the OpenFile already maps to the same fd (the
+        // common Stdout==1 / Stderr==2 / Stdin==0 sink case) with_fd_redirected
+        // is a no-op; where it is a pipe/File it dup2's around the call.
+        // ShellFd is i32; 0/1/2 are the well-known std fds.
+        let in_ = context.try_fd(0);
+        let out = context.try_fd(1);
+        let err = context.try_fd(2);
+
+        // Redirect fd N to `of` (if present) around `run`; map a redirect failure
+        // to a visible message + exit 1. Returns the uumain exit code.
+        fn step(
+            fd: i32,
+            of: &Option<brush_core::openfiles::OpenFile>,
+            run: impl FnOnce() -> i32,
+        ) -> i32 {
+            match of {
+                Some(of) => match with_fd_redirected(fd, of, run) {
+                    Ok(c) => c,
+                    Err(msg) => { eprintln!("sarun-engine brush: {msg}"); 1 }
+                },
+                // No entry for this fd → leave the process fd as-is.
+                None => run(),
+            }
+        }
+
+        // Nest fd 2 (outer) → fd 1 → fd 0 (inner) → uumain.
+        let code = step(2, &err, || {
+            step(1, &out, || {
+                step(0, &in_, || func(argv))
+            })
+        });
+        Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
+    }
+}
+
+/// The set of builtin registrations every box brush shell installs: bundled
+/// coreutils FIRST, then the BashMode shell builtins OVERWRITE any overlapping
+/// names (so brush's own echo/printf/test/[/pwd/kill/etc. win — they must stay
+/// shell builtins). Coreutils fills in the file utilities brush has no builtin
+/// for (cat ls cp mv rm mkdir wc sort cut tr od stat du df …).
+fn box_builtins<SE: brush_core::extensions::ShellExtensions>()
+    -> std::collections::HashMap<String, brush_core::builtins::Registration<SE>> {
+    use brush_core::builtins::simple_builtin;
+    let mut m: std::collections::HashMap<String, brush_core::builtins::Registration<SE>>
+        = std::collections::HashMap::new();
+    // Coreutils first (lowest priority).
+    for name in brush_coreutils_builtins::bundled_commands().keys() {
+        m.insert(name.clone(), simple_builtin::<CoreutilWrapper, SE>());
+    }
+    // BashMode shell builtins overwrite overlaps (highest priority).
+    m.extend(brush_builtins::default_builtins(brush_builtins::BuiltinSet::BashMode));
+    m
+}
+
+/// Build a box brush shell with the shared builtin policy. `sh_mode == true`
+/// → faithful POSIX (/bin/sh, /bin/dash, top-level box); `false` → BASH mode
+/// (bashisms enabled, for a nested `bash -c`). `shell_name`/`positional`/`cwd`
+/// are optional ($0 / $1.. / working dir); None keeps brush-core defaults.
+async fn build_box_shell(
+    sh_mode: bool,
+    shell_name: Option<String>,
+    positional: Option<Vec<String>>,
+    cwd: Option<std::path::PathBuf>,
+) -> Result<brush_core::Shell, brush_core::error::Error> {
+    // bon's builder is typestate-typed (each setter changes the type), so we
+    // can't conditionally chain. shell_name/shell_args/working_dir are all
+    // Option fields whose bon setter accepts the inner value — passing None's
+    // natural default ("", [], $PWD) reproduces brush-core's own unset default,
+    // so this is equivalent to omitting the setter.
+    let cwd = cwd.unwrap_or_else(|| {
+        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"))
+    });
+    brush_core::Shell::builder()
+        .sh_mode(sh_mode)
+        .builtins(box_builtins())
+        .shell_name(shell_name.unwrap_or_default())
+        .shell_args(positional.unwrap_or_default())
+        .working_dir(cwd)
+        .build().await
+}
 
 /// Point this process's fd 1 and 2 at the box's FUSE stdout/stderr sink files,
 /// so brush's own output and every binary it forks inherit captured fds. Returns
@@ -505,8 +720,11 @@ pub fn brush_sh(argv: &[String]) -> i32 {
         Ok(rt) => rt,
         Err(e) => { eprintln!("sarun-engine brush-sh: runtime: {e}"); return 127; }
     };
+    // PARSER MODE BY INVOCATION NAME (B): invoked as `bash` → BASH mode (bashisms
+    // on, matching /bin/bash); `sh`/`dash` → faithful POSIX sh_mode.
+    let bash_mode = base == "bash";
     rt.block_on(run_brush_script(script_src, dollar0, positional,
-                                  set_flags, set_o, unset_o))
+                                  set_flags, set_o, unset_o, bash_mode))
 }
 
 /// Ship one `brush_prov_nested` control message carrying one pipeline's
@@ -526,19 +744,14 @@ fn send_nested_pipeline_records(records: Vec<Value>) {
 async fn run_brush_script(script: String, shell_name: String,
                           positional: Vec<String>,
                           set_flags: Vec<String>, set_o: Vec<String>,
-                          unset_o: Vec<String>) -> i32 {
+                          unset_o: Vec<String>, bash_mode: bool) -> i32 {
     // The shim INHERITS cwd from execve; brush-core defaults to $PWD/getcwd()
     // when working_dir is unspecified, which matches that. We still pass it
     // explicitly to be defensive against any future builder default change.
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
-    use brush_builtins::ShellBuilderExt;
-    let shell_res = brush_core::Shell::builder()
-        .sh_mode(true)
-        .default_builtins(brush_builtins::BuiltinSet::ShMode)
-        .shell_name(shell_name.clone())
-        .shell_args(positional.clone())
-        .working_dir(cwd)
-        .build().await;
+    // sh_mode == !bash_mode: `sh`/`dash` → POSIX, `bash` → bashisms (B).
+    let shell_res = build_box_shell(!bash_mode, Some(shell_name.clone()),
+                                    Some(positional.clone()), Some(cwd)).await;
     let mut shell = match shell_res {
         Ok(s) => s,
         Err(e) => {
@@ -613,15 +826,12 @@ async fn run_brush_script(script: String, shell_name: String,
 ///   - a fatal exec error (unsupported construct) → VISIBLE message, non-zero
 async fn run_brush(conn_fd: i32, script: String) -> i32 {
     // sh-mode brush: POSIX-ish, closest to the /bin/sh the box would otherwise
-    // get, and skip rc/profile so the box's own filesystem isn't sourced.
-    // Default ShMode builtins are registered (cd, export, set, [, test, …) —
-    // without them brush-core ships an empty builtin table, so even POSIX
-    // builtins would surface as "command not found" from inside brush.
-    use brush_builtins::ShellBuilderExt;
-    let shell_res = brush_core::Shell::builder()
-        .sh_mode(true)
-        .default_builtins(brush_builtins::BuiltinSet::ShMode)
-        .build().await;
+    // get (the top-level body stands in for the box's default /bin/sh, so it is
+    // sh_mode even though nested `bash -c` uses bash mode). The shared
+    // build_box_shell() installs the BashMode shell builtins + bundled coreutils
+    // (see module header) — without builtins brush-core ships an empty table, so
+    // even POSIX builtins would surface as "command not found".
+    let shell_res = build_box_shell(true, None, None, None).await;
     let mut shell = match shell_res {
         Ok(s) => s,
         Err(e) => { eprintln!("sarun-engine inner: -b brush init failed: {e}"); return 127; }

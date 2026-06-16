@@ -2,19 +2,22 @@
 """D9 brush <-> process LINKAGE for the RUST engine (engine/).
 
 Part 1 (linkage) — REAL effects, never shape-only:
-  A `-b` box runs a PIPELINE that spawns a real external process which WRITES a
-  file (`echo hi | tr a-z A-Z > /root/link_out.txt`). brush runs each pipeline
-  in execution order and emits one FRAME_PROV per pipeline; the engine records a
-  `brushprov` row and stamps every process whose forest ancestry reaches the
-  brush --inner shell with that pipeline's row id (process.brush_pipeline_id).
-  We assert, reading the box sqlar AND the control join verbs, that:
+  A `-b` box runs a PIPELINE that WRITES a file
+  (`echo hi | tr a-z A-Z > /root/link_out.txt`). brush runs each pipeline in
+  execution order and emits one FRAME_PROV per pipeline; the engine records a
+  `brushprov` row and stamps the pipeline's writer process with that pipeline's
+  row id (process.brush_pipeline_id). NOTE: `tr` (and `echo`) are now bundled
+  uutils coreutils / brush builtins that run IN-PROCESS — there is NO forked
+  `/usr/bin/tr` child. So the redirect target's writer is the brush --inner
+  process ITSELF, and the linkage stamps that --inner row (a writer whose tgid
+  IS the brush root is an in-process pipeline stage, not "brush wrote it" — see
+  finalize_brush_links in engine/src/capture.rs). We assert, reading the box
+  sqlar AND the control join verbs, that:
     * the process that actually WROTE the file (sqlar.writer -> process row) is
       linked to a brushprov pipeline whose `cmd` is that real pipeline;
     * process -> pipeline (proc_pipeline) and pipeline -> processes
-      (pipeline_procs) both reflect the REAL spawn (round-trip);
+      (pipeline_procs) both round-trip;
     * the brushprov row carries its own `processes` list including that writer.
-  This is the true spawn: `tr` is an external binary brush fork/execs, so its
-  /proc ancestry really climbs through the brush shell row.
 
 Part 2 (/bin/sh -> brush overlay mapping) — DOCUMENTED-GAP assertion:
   This cut does NOT remap /bin/sh to brush inside the box (see the header of
@@ -150,18 +153,17 @@ def main():
                   f"brush-link-rs: pipeline->processes includes the writer "
                   f"(writer={writer_id}, procs={procs})")
 
-            # The linked writer is a process brush SPAWNED (its parent_id chain
-            # climbs to the brush --inner row), NOT the brush shell row itself —
-            # a real fork/exec child of the pipeline. (Its exe may be empty: the
-            # short-lived `tr` had already exited when its row was materialized at
-            # file close, so /proc/<pid>/exe was gone — the linkage is by forest
-            # ancestry + start-time window, not by reading the dead exe.)
+            # The linked writer is the brush --inner process running the
+            # in-process `tr` coreutil stage. It still has a real forest parent
+            # (the bwrap that launched --inner), so its /proc ancestry is intact;
+            # the linkage stamps this --inner row because the in-process stage
+            # wrote the redirect target from the --inner pid (no forked child).
             parent_row = con.execute(
                 "SELECT parent_id FROM process WHERE id=?", (writer_id,)
                 ).fetchone()
             check(parent_row is not None and parent_row[0] is not None,
-                  f"brush-link-rs: the linked writer has a forest parent (the "
-                  f"brush shell), i.e. it was really spawned ({parent_row})")
+                  f"brush-link-rs: the linked writer has a forest parent, i.e. "
+                  f"it is a real process row ({parent_row})")
         finally:
             con.close()
 

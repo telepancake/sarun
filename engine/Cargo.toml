@@ -11,6 +11,7 @@ path = "src/main.rs"
 base64 = "0.22.1"
 brush-core = "0.5"
 brush-builtins = "0.2"
+brush-coreutils-builtins = { version = "0.1", features = ["coreutils.all"] }
 brush-parser = { version = "0.4", features = ["serde"] }
 crossterm = "0.29"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }

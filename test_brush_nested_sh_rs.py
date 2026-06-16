@@ -89,7 +89,8 @@ def main():
     # Host paths the box must NEVER touch (every write should land in overlay).
     host_paths = [Path(p) for p in ("/root/top.txt", "/root/nested.txt",
                                     "/root/vars.txt", "/root/bad.txt",
-                                    "/root/neg.txt")]
+                                    "/root/neg.txt", "/root/f.txt",
+                                    "/root/bash.txt", "/root/shbad.txt")]
     for h in host_paths: h.unlink(missing_ok=True)
     try:
         eng = subprocess.Popen([str(BIN), "serve"],
@@ -191,6 +192,116 @@ def main():
         check(content in (None, b""),
               f"case3: bad.txt is NOT written (no real-shell fallback): "
               f"content={content!r}")
+
+        # Helpers shared by the in-process-builtin cases below.
+        def outputs_of(sp):
+            con = sqlite3.connect(f"file:{sp}?mode=ro", uri=True)
+            try:
+                return b"".join(c for (c,) in con.execute(
+                    "SELECT content FROM outputs WHERE stream=0 "
+                    "AND content IS NOT NULL"))
+            finally:
+                con.close()
+
+        def process_rows(sp):
+            con = sqlite3.connect(f"file:{sp}?mode=ro", uri=True)
+            try:
+                return [(e or "", a or "") for (e, a) in con.execute(
+                    "SELECT exe, argv FROM process")]
+            finally:
+                con.close()
+
+        def has_external(sp, util):
+            # True if the process table shows an external coreutil binary for
+            # `util` (e.g. /usr/bin/printf, /bin/cat). The basename of exe (or
+            # argv[0]) equals util.
+            for exe, argv in process_rows(sp):
+                base = os.path.basename(exe)
+                if base == util:
+                    return True
+                # argv is stored as JSON or NUL/space-joined; check first token.
+                try:
+                    a0 = json.loads(argv)[0] if argv.strip().startswith("[") else argv.split()[0]
+                except Exception:
+                    a0 = argv.split()[0] if argv.split() else ""
+                if os.path.basename(a0) == util:
+                    return True
+            return False
+
+        # ── CASE 6: echo/printf are IN-PROCESS builtins AND captured ───────
+        # printf is a brush BashMode builtin → runs in-process, writes fd 1 →
+        # the FUSE sink → captured. No external /usr/bin/printf is forked.
+        r = subprocess.run(
+            [str(BIN), "run", "-b", "PRINTF", "--",
+             "sh", "-c", r'printf "%s-%d\n" hi 42'],
+            capture_output=True, text=True, timeout=120)
+        check(r.returncode == 0,
+              f"case6: printf box exits 0 (got {r.returncode}: {r.stderr[-300:]})")
+        sp6 = latest_sqlar(m)
+        check(b"hi-42" in outputs_of(sp6),
+              f"case6: printf output 'hi-42' captured ({outputs_of(sp6)[:40]!r})")
+        check(not has_external(sp6, "printf"),
+              "case6: NO external /usr/bin/printf process row (it ran in-process)")
+        check(not has_external(sp6, "echo"),
+              "case6: NO external echo process row")
+
+        # ── CASE 7: cat is an IN-PROCESS coreutil AND captured ─────────────
+        r = subprocess.run(
+            [str(BIN), "run", "-b", "CAT", "--",
+             "sh", "-c", "echo data > /root/f.txt; cat /root/f.txt"],
+            capture_output=True, text=True, timeout=120)
+        check(r.returncode == 0,
+              f"case7: cat box exits 0 (got {r.returncode}: {r.stderr[-300:]})")
+        sp7 = latest_sqlar(m)
+        check(m.sqlar_content(sp7, "root/f.txt") == b"data\n",
+              "case7: write 'data' captured")
+        check(b"data" in outputs_of(sp7),
+              f"case7: cat output 'data' captured ({outputs_of(sp7)[:40]!r})")
+        check(not has_external(sp7, "cat"),
+              "case7: NO external /usr/bin/cat process row (coreutil ran in-process)")
+
+        # ── CASE 8: coreutil in a PIPE — the fd-redirect trap ──────────────
+        # `printf … | sort`: sort's stdout is a PIPE stage (not fd 1). The
+        # wrapper must dup2 the pipe fd onto the process's real fd 1 around the
+        # uumain call, else output goes to the wrong place / is empty.
+        r = subprocess.run(
+            [str(BIN), "run", "-b", "SORT", "--",
+             "sh", "-c", r'printf "c\nb\na\n" | sort'],
+            capture_output=True, text=True, timeout=120)
+        check(r.returncode == 0,
+              f"case8: sort-pipe box exits 0 (got {r.returncode}: {r.stderr[-300:]})")
+        sp8 = latest_sqlar(m)
+        check(b"a\nb\nc\n" in outputs_of(sp8),
+              f"case8: piped `sort` output is a\\nb\\nc\\n — fd-redirect works "
+              f"({outputs_of(sp8)[:40]!r})")
+        check(not has_external(sp8, "sort"),
+              "case8: NO external /usr/bin/sort process row (coreutil in-process)")
+
+        # ── CASE 9: bash-mode bashism works as `bash`, FAILS as `sh` ───────
+        # Invoked as bash → BASH-mode parser → `[[ … ]]` works.
+        r = subprocess.run(
+            [str(BIN), "run", "-b", "BASHOK", "--",
+             "sh", "-c", "/bin/bash -c '[[ -d /root ]] && echo yes > /root/bash.txt'"],
+            capture_output=True, text=True, timeout=120)
+        check(r.returncode == 0,
+              f"case9: bash -c [[ ]] box exits 0 (got {r.returncode}: {r.stderr[-300:]})")
+        sp9 = latest_sqlar(m)
+        check(m.sqlar_content(sp9, "root/bash.txt") == b"yes\n",
+              "case9: bash.txt is 'yes' — bash-mode `[[ ]]` ran (mode by name)")
+        # The SAME under sh -c (POSIX) must FAIL visibly: `[[` is not a command.
+        r = subprocess.run(
+            [str(BIN), "run", "-b", "SHBAD", "--",
+             "sh", "-c", "/bin/sh -c '[[ -d /root ]] && echo no > /root/shbad.txt'"],
+            capture_output=True, text=True, timeout=120)
+        check(r.returncode != 0,
+              f"case9: sh -c [[ ]] FAILS (POSIX sh-mode, got {r.returncode})")
+        sp9b = latest_sqlar(m)
+        try:
+            shbad = m.sqlar_content(sp9b, "root/shbad.txt")
+        except Exception:
+            shbad = None
+        check(shbad in (None, b""),
+              f"case9: shbad.txt NOT written under sh-mode (content={shbad!r})")
 
         # ── CASE 4 (negative): non-brush box ───────────────────────────────
         # No -b → no shadow binds, no SARUN_BRUSH_SH. The nested /bin/sh is the
