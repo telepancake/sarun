@@ -21,6 +21,7 @@ mod discover;
 mod frames;
 mod overlay;
 mod paths;
+mod pty;
 mod review;
 mod rules;
 mod runner;

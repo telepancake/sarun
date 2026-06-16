@@ -797,6 +797,79 @@ fn recv_frame_bytes(raw: i32, buf: &mut [u8], fd: &mut Option<i32>) -> isize {
     n
 }
 
+/// A UnixStream with a few leading bytes (already pulled into the BufReader
+/// before we noticed this was a PTY connection) replayed first on read. Writes
+/// and clones go straight to the underlying stream. This lets `pty::serve_pty`
+/// treat the whole connection — prebuffered frame bytes included — as one Read.
+struct Prebuffered {
+    pre: Vec<u8>,
+    pos: usize,
+    inner: UnixStream,
+}
+
+impl std::io::Read for Prebuffered {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.pos < self.pre.len() {
+            let n = (self.pre.len() - self.pos).min(buf.len());
+            buf[..n].copy_from_slice(&self.pre[self.pos..self.pos + n]);
+            self.pos += n;
+            return Ok(n);
+        }
+        self.inner.read(buf)
+    }
+}
+impl std::io::Write for Prebuffered {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> { self.inner.write(buf) }
+    fn flush(&mut self) -> std::io::Result<()> { self.inner.flush() }
+}
+impl crate::pty::CloneStream for Prebuffered {
+    fn clone_stream(&self) -> Self {
+        // The clone shares the socket but NOT the one-time prebuffer (only the
+        // original replays it, so bytes are never delivered twice).
+        Prebuffered {
+            pre: vec![],
+            pos: 0,
+            inner: self.inner.try_clone().expect("UnixStream::try_clone"),
+        }
+    }
+    fn shutdown_read(&self) {
+        let _ = self.inner.shutdown(std::net::Shutdown::Read);
+    }
+}
+
+/// Engine-held-PTY connection (D7/D9). `msg` is the `pty_spawn` request:
+///   {"type":"pty_spawn","argv":[...],"rows":R,"cols":C}
+/// We ack one JSON line, then the connection becomes a bidirectional FRAME_PTY_*
+/// mux driven by `crate::pty::serve_pty` (master↔client + EOF). `prebuf` is any
+/// bytes the BufReader already consumed past the request line.
+///
+/// HONEST SCOPE: the command is spawned DIRECTLY on the engine's PTY (no bwrap /
+/// overlay box). The mux/render/input loop is the proven, reusable half; wrapping
+/// the PTY child in an overlay-backed box reuses this exact frame mux and is the
+/// documented follow-on (DESIGN.md D9 — PTY mode toggle over the box channel).
+fn handle_pty_spawn(msg: &Value, writer: &mut UnixStream, prebuf: Vec<u8>) {
+    let argv: Vec<String> = msg.get("argv").and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    if argv.is_empty() {
+        let _ = writer.write_all(b"{\"ok\":false,\"error\":\"pty_spawn: empty argv\"}\n");
+        return;
+    }
+    let rows = msg.get("rows").and_then(Value::as_u64).unwrap_or(24) as u16;
+    let cols = msg.get("cols").and_then(Value::as_u64).unwrap_or(80) as u16;
+    // Ack BEFORE the frame mux begins so the client knows to switch to frames.
+    if writer.write_all(b"{\"ok\":true,\"r\":\"pty\"}\n").is_err() {
+        return;
+    }
+    let _ = writer.flush();
+    let stream = match writer.try_clone() {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let chan = Prebuffered { pre: prebuf, pos: 0, inner: stream };
+    crate::pty::serve_pty(&argv, rows, cols, chan, None);
+}
+
 fn handle(state: State, conn: UnixStream) {
     // The register handshake carries the runner's pidfd as the connection's
     // first SCM_RIGHTS fd; keep it for host-pid derivation + kill. It belongs
@@ -827,6 +900,15 @@ fn handle(state: State, conn: UnixStream) {
             if let Some(fd) = peer_pidfd.take() { unsafe { libc::close(fd); } }
             return;
         };
+        // Engine-held PTY (D7/D9): this connection becomes a bidirectional
+        // FRAME_PTY_* mux. Handled in its own function, fully separate from the
+        // newline-JSON verb dispatch below. Any register pidfd is irrelevant to a
+        // PTY connection, so close it.
+        if msg.get("type").and_then(Value::as_str) == Some("pty_spawn") {
+            if let Some(fd) = peer_pidfd.take() { unsafe { libc::close(fd); } }
+            handle_pty_spawn(&msg, &mut writer, reader.buffer().to_vec());
+            return;
+        }
         let mut reply = if msg.get("type").and_then(Value::as_str) == Some("register") {
             register(&state, &msg, peer_pidfd.take())
         } else {

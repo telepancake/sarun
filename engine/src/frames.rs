@@ -32,6 +32,39 @@ pub const FRAME_UNMUTE: u8 = 5;
 //             line — see D9). The engine records it into the box's sqlar
 //             `brushprov` table and broadcasts a `brush_prov` event.
 pub const FRAME_PROV: u8 = 6;
+//
+// Engine-held-PTY mux frames (D7/D9). On a `pty_spawn` control connection the
+// engine spawns a command on a PTY it holds (portable-pty) and muxes the master
+// ↔ the UI client over these typed frames (same [len:4][type:1][payload] wire):
+//   FRAME_PTY_DATA   (both directions) payload = raw PTY bytes. engine→client:
+//                    bytes the child emitted (feed straight into vt100). client→
+//                    engine: keystrokes to write to the PTY master (input path).
+//   FRAME_PTY_RESIZE (client→engine) payload = [rows:u16 BE][cols:u16 BE]; the
+//                    client's pane size — engine applies it to the PTY (resize).
+//   FRAME_PTY_EOF    (engine→client) empty; the child exited and the master hit
+//                    EOF — the pane may freeze its last screen.
+pub const FRAME_PTY_DATA: u8 = 7;
+pub const FRAME_PTY_RESIZE: u8 = 8;
+pub const FRAME_PTY_EOF: u8 = 9;
+
+/// Body of a FRAME_PTY_RESIZE frame: [rows:u16 BE][cols:u16 BE].
+pub fn pty_resize_payload(rows: u16, cols: u16) -> Vec<u8> {
+    let mut v = Vec::with_capacity(4);
+    v.extend_from_slice(&rows.to_be_bytes());
+    v.extend_from_slice(&cols.to_be_bytes());
+    v
+}
+
+/// Decode a FRAME_PTY_RESIZE body back to (rows, cols). None if malformed.
+pub fn pty_resize_parse(payload: &[u8]) -> Option<(u16, u16)> {
+    if payload.len() < 4 {
+        return None;
+    }
+    Some((
+        u16::from_be_bytes([payload[0], payload[1]]),
+        u16::from_be_bytes([payload[2], payload[3]]),
+    ))
+}
 
 /// Encode one typed frame: [total-len:4 BE][type:1][payload].
 pub fn encode(ftype: u8, payload: &[u8]) -> Vec<u8> {

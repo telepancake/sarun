@@ -129,6 +129,23 @@ the remaining unknowns are engine-side (PTY allocation + bidirectional mux
 frames, which depend on capture mode being ported — currently downgraded
 since m3b). Order: finish engine port -> Rust mux/capture -> PTY boxes ->
 ratatui client with tui-term panes. Building the pane before the client = twice.
+DONE (first cut): the engine-held PTY + its ratatui pane. A `pty_spawn` control
+connection (control.rs `handle_pty_spawn`) makes the engine spawn a command on a
+portable-pty PTY it OWNS (pty.rs `serve_pty`) and mux the master ↔ the client
+over three new frames (frames.rs): FRAME_PTY_DATA (7, both directions — raw PTY
+bytes), FRAME_PTY_RESIZE (8, client→engine, [rows][cols]), FRAME_PTY_EOF (9,
+engine→client on child exit). The master is tee'd to an optional sink so the
+session can be recorded. The ratatui client (ui.rs `PtyPane`, Pane::Pty, key
+'P') feeds the FRAME_PTY_DATA stream into a vt100::Parser and renders it with a
+tui_term::PseudoTerminal; focused keystrokes go back as FRAME_PTY_DATA and pane
+resizes as FRAME_PTY_RESIZE. Proven end to end: pty.rs `#[cfg(test)]` (real child
+→ FRAME_PTY_DATA → vt100 + tui-term → ratatui TestBackend, asserting the child's
+marker is ON the grid; plus input-readback, escape-emulation, resize, and
+sink-recording) and test_pty_ui_rs.py (the engine half over a real socket).
+FOLLOW-ON: this first cut spawns the PTY child DIRECTLY (no bwrap/overlay box).
+Wrapping the PTY child in a bwrap'd overlay box (a real captured box, like a
+normal `run`) reuses this exact frame mux unchanged — that is the remaining
+engine-side work to make an engine-held PTY a full captured box.
 
 ## D8 · No migration obligations
 Zero users: compatibility choices are scaffolding for OUR transition (keep

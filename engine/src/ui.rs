@@ -26,6 +26,7 @@
 
 use std::io::BufRead;
 use std::io::BufReader;
+use std::io::Read;
 use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -136,6 +137,9 @@ enum Pane {
     Outputs,
     Rules,
     Help,
+    /// The engine-held PTY pane (D7/D9): a live tui-term view of an interactive
+    /// command the ENGINE runs on a PTY, driven over the FRAME_PTY_* mux.
+    Pty,
 }
 
 /// A transient modal overlaid on the main view. Mirrors the Python Textual
@@ -184,6 +188,9 @@ struct App {
     filter: String,
     #[cfg_attr(test, allow(dead_code))]
     should_quit: bool,
+    /// Live engine-held PTY pane, present while one is open (Pane::Pty). None
+    /// otherwise. Kept out of the headless `--once` path (which never opens one).
+    pty: Option<PtyPane>,
 }
 
 impl App {
@@ -210,6 +217,7 @@ impl App {
             modal: None,
             filter: String::new(),
             should_quit: false,
+            pty: None,
         };
         a.refresh_sessions();
         a.load_changes();
@@ -407,7 +415,7 @@ impl App {
                     self.sel_rule += 1;
                 }
             }
-            Pane::Help => {}
+            Pane::Help | Pane::Pty => {}
         }
     }
 
@@ -430,7 +438,7 @@ impl App {
             Pane::Processes => self.sel_proc = self.sel_proc.saturating_sub(1),
             Pane::Outputs => self.out_scroll = self.out_scroll.saturating_sub(1),
             Pane::Rules => self.sel_rule = self.sel_rule.saturating_sub(1),
-            Pane::Help => {}
+            Pane::Help | Pane::Pty => {}
         }
     }
 
@@ -444,6 +452,9 @@ impl App {
             Pane::Outputs => Pane::Rules,
             Pane::Rules => Pane::Sessions,
             Pane::Help => Pane::Sessions,
+            // Tab out of the PTY pane back to the box list (keystrokes are not
+            // captured by Tab while focused — see the interactive loop's Pty arm).
+            Pane::Pty => Pane::Sessions,
         };
     }
 
@@ -470,7 +481,23 @@ impl App {
                 self.load_hunks();
                 self.focus = Pane::Hunks;
             }
-            Pane::Hunks | Pane::Processes | Pane::Outputs | Pane::Rules | Pane::Help => {}
+            Pane::Hunks | Pane::Processes | Pane::Outputs | Pane::Rules
+            | Pane::Help | Pane::Pty => {}
+        }
+    }
+
+    /// Open an engine-held PTY pane running an interactive shell, and focus it.
+    /// 'P' from any pane. Mirrors the ptyspike stack but over the engine socket.
+    #[cfg_attr(test, allow(dead_code))]
+    fn open_pty(&mut self) {
+        let argv = vec!["sh".to_string(), "-i".to_string()];
+        match PtyPane::open(&self.sock, &argv, 24, 80) {
+            Ok(p) => {
+                self.pty = Some(p);
+                self.focus = Pane::Pty;
+                self.status = "PTY · keys go to the box · Ctrl-] detaches".into();
+            }
+            Err(e) => self.status = format!("pty: {e}"),
         }
     }
 
@@ -865,6 +892,8 @@ fn help_lines() -> Vec<Line<'static>> {
         t("  b  boxes/sessions     c  changes (files)     (Enter→diff)"),
         t("  p  processes          o  outputs (stdout/err)"),
         t("  e  file rules         ?  this help            Tab cycles"),
+        t("  P  open an engine-held PTY (live interactive shell pane)"),
+        t("     keys go to the box · Ctrl-] detaches back to the UI"),
         t(""),
         h("Navigation"),
         t("  j/k or ↓/↑  move      Enter  open selection in next pane"),
@@ -934,8 +963,23 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     let body = root[0];
     let status_area = root[1];
 
-    // The Help pane takes the whole body.
-    if app.focus == Pane::Help {
+    // The PTY pane takes the whole body: a live tui-term view of the engine-held
+    // PTY child, rendered from the vt100 screen grid.
+    if app.focus == Pane::Pty {
+        if let Some(pty) = &app.pty {
+            let t = if pty.eof { "PTY · (exited)" } else { "PTY · live" };
+            let blk = block(title(t, true), true);
+            let inner = blk.inner(body);
+            f.render_widget(blk, body);
+            let screen = pty.parser.screen();
+            f.render_widget(tui_term::widget::PseudoTerminal::new(screen), inner);
+        } else {
+            let msg = Paragraph::new("no PTY open")
+                .block(block(title("PTY", true), true));
+            f.render_widget(msg, body);
+        }
+    } else if app.focus == Pane::Help {
+        // The Help pane takes the whole body.
         let help = Paragraph::new(Text::from(help_lines()))
             .block(block(title("help", true), true))
             .wrap(Wrap { trim: false });
@@ -1061,6 +1105,160 @@ fn proc_detail_lines(app: &App) -> Vec<Line<'static>> {
     out
 }
 
+// ── engine-held PTY pane (D7/D9) ─────────────────────────────────────────────
+//
+// The client side of the FRAME_PTY_* mux: open a `pty_spawn` control connection,
+// spawn a reader thread that forwards every FRAME_PTY_DATA payload (and the
+// FRAME_PTY_EOF) over an mpsc channel, and keep the write half to send keystrokes
+// (FRAME_PTY_DATA) and resizes (FRAME_PTY_RESIZE). The vt100 Parser accumulates
+// the data into a screen grid that the tui-term PseudoTerminal widget renders —
+// the EXACT stack proven in ptyspike/, now driven over the engine socket.
+
+struct PtyPane {
+    parser: tui_term::vt100::Parser,
+    writer: UnixStream,            // write half: keystrokes + resize frames
+    rx: mpsc::Receiver<PtyMsg>,    // data/eof from the reader thread
+    rows: u16,
+    cols: u16,
+    eof: bool,
+}
+
+enum PtyMsg {
+    Data(Vec<u8>),
+    Eof,
+}
+
+impl PtyPane {
+    /// Open a PTY connection to the engine and spawn `argv` on it. Returns a pane
+    /// whose parser will fill as the reader thread delivers FRAME_PTY_DATA.
+    fn open(sock: &str, argv: &[String], rows: u16, cols: u16) -> Result<PtyPane, String> {
+        let mut s = UnixStream::connect(sock).map_err(|e| format!("connect: {e}"))?;
+        let req = json!({"type": "pty_spawn", "argv": argv, "rows": rows, "cols": cols});
+        s.write_all(format!("{req}\n").as_bytes()).map_err(|e| e.to_string())?;
+        s.flush().ok();
+        // Read the one-line ack ({"ok":true,...}) before the frame stream begins.
+        // We must NOT consume any frame bytes, so read a single line byte-by-byte.
+        let ack = read_one_line(&mut s)?;
+        let v: Value = serde_json::from_str(ack.trim())
+            .map_err(|e| format!("bad ack: {e}"))?;
+        if v.get("ok").and_then(Value::as_bool) != Some(true) {
+            return Err(v.get("error").and_then(Value::as_str)
+                .unwrap_or("pty_spawn refused").to_string());
+        }
+        let writer = s.try_clone().map_err(|e| e.to_string())?;
+        let (tx, rx) = mpsc::channel();
+        // Reader thread: decode FRAME_PTY_DATA / FRAME_PTY_EOF off the socket.
+        std::thread::spawn(move || {
+            let mut reader = s;
+            let mut acc: Vec<u8> = vec![];
+            let mut buf = [0u8; 8192];
+            loop {
+                let n = match reader.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                acc.extend_from_slice(&buf[..n]);
+                let (frames_v, used) = crate::frames::decode(&acc);
+                acc.drain(..used);
+                for (ft, payload) in frames_v {
+                    if ft == crate::frames::FRAME_PTY_DATA {
+                        if tx.send(PtyMsg::Data(payload)).is_err() { return; }
+                    } else if ft == crate::frames::FRAME_PTY_EOF {
+                        let _ = tx.send(PtyMsg::Eof);
+                        return;
+                    }
+                }
+            }
+            let _ = tx.send(PtyMsg::Eof);
+        });
+        Ok(PtyPane {
+            parser: tui_term::vt100::Parser::new(rows, cols, 0),
+            writer, rx, rows, cols, eof: false,
+        })
+    }
+
+    /// Drain any pending PTY output into the vt100 parser. Non-blocking; call each
+    /// UI tick. Returns true if anything changed (a redraw is warranted).
+    fn pump(&mut self) -> bool {
+        let mut changed = false;
+        while let Ok(msg) = self.rx.try_recv() {
+            match msg {
+                PtyMsg::Data(d) => { self.parser.process(&d); changed = true; }
+                PtyMsg::Eof => { self.eof = true; changed = true; }
+            }
+        }
+        changed
+    }
+
+    /// Send raw keystroke bytes to the child (FRAME_PTY_DATA, client→engine).
+    fn send_input(&mut self, bytes: &[u8]) {
+        let frame = crate::frames::encode(crate::frames::FRAME_PTY_DATA, bytes);
+        let _ = self.writer.write_all(&frame);
+        let _ = self.writer.flush();
+    }
+
+    /// Tell the engine the pane was resized (FRAME_PTY_RESIZE).
+    fn resize(&mut self, rows: u16, cols: u16) {
+        if rows == self.rows && cols == self.cols { return; }
+        self.rows = rows;
+        self.cols = cols;
+        self.parser.screen_mut().set_size(rows, cols);
+        let frame = crate::frames::encode(crate::frames::FRAME_PTY_RESIZE,
+            &crate::frames::pty_resize_payload(rows, cols));
+        let _ = self.writer.write_all(&frame);
+        let _ = self.writer.flush();
+    }
+}
+
+/// Read exactly one '\n'-terminated line from a stream byte-by-byte, so we never
+/// over-read into the frame stream that follows the JSON ack.
+fn read_one_line(s: &mut UnixStream) -> Result<String, String> {
+    let mut out = Vec::new();
+    let mut b = [0u8; 1];
+    loop {
+        match s.read(&mut b) {
+            Ok(0) => break,
+            Ok(_) => { if b[0] == b'\n' { break; } out.push(b[0]); }
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    String::from_utf8(out).map_err(|e| e.to_string())
+}
+
+/// Translate a crossterm key event into the bytes a terminal would send to the
+/// child PTY (the input encoding the pane forwards as FRAME_PTY_DATA).
+fn key_to_pty_bytes(code: crossterm::event::KeyCode,
+                    mods: crossterm::event::KeyModifiers) -> Option<Vec<u8>> {
+    use crossterm::event::KeyCode;
+    use crossterm::event::KeyModifiers;
+    Some(match code {
+        KeyCode::Char(c) => {
+            if mods.contains(KeyModifiers::CONTROL) {
+                // Ctrl-A..Ctrl-Z and friends → control bytes 0x01..0x1a.
+                let up = c.to_ascii_uppercase();
+                if up.is_ascii_alphabetic() {
+                    vec![(up as u8) - b'A' + 1]
+                } else {
+                    let mut b = [0u8; 4];
+                    c.encode_utf8(&mut b).as_bytes().to_vec()
+                }
+            } else {
+                let mut b = [0u8; 4];
+                c.encode_utf8(&mut b).as_bytes().to_vec()
+            }
+        }
+        KeyCode::Enter => vec![b'\r'],
+        KeyCode::Tab => vec![b'\t'],
+        KeyCode::Backspace => vec![0x7f],
+        KeyCode::Esc => vec![0x1b],
+        KeyCode::Up => b"\x1b[A".to_vec(),
+        KeyCode::Down => b"\x1b[B".to_vec(),
+        KeyCode::Right => b"\x1b[C".to_vec(),
+        KeyCode::Left => b"\x1b[D".to_vec(),
+        _ => return None,
+    })
+}
+
 // ── headless one-frame render (tests / --once) ──────────────────────────────
 
 /// Render the current app state to a TestBackend and return the buffer as text.
@@ -1149,6 +1347,10 @@ fn run_interactive(sock: &str) -> Result<(), String> {
             while let Ok(ev) = rx.try_recv() {
                 app.on_event(&ev);
             }
+            // drain engine-held PTY output into the vt100 parser each tick.
+            if let Some(pty) = app.pty.as_mut() {
+                pty.pump();
+            }
             term.draw(|f| draw(f, &app)).map_err(|e| e.to_string())?;
             if app.should_quit {
                 break;
@@ -1181,6 +1383,22 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                     }
                     continue;
                 }
+                // PTY pane captures ALL keystrokes and forwards them to the
+                // engine-held child, EXCEPT Ctrl-] which detaches back to the UI
+                // (the classic telnet/ssh escape). This must come before the
+                // global keymap so 'q', Tab, etc. reach the shell, not the UI.
+                if app.focus == Pane::Pty {
+                    use crossterm::event::KeyModifiers;
+                    let detach = matches!(k.code, KeyCode::Char(']'))
+                        && k.modifiers.contains(KeyModifiers::CONTROL);
+                    if detach {
+                        app.focus = Pane::Sessions;
+                        app.status = "PTY detached (still running)".into();
+                    } else if let Some(bytes) = key_to_pty_bytes(k.code, k.modifiers) {
+                        if let Some(pty) = app.pty.as_mut() { pty.send_input(&bytes); }
+                    }
+                    continue;
+                }
                 match k.code {
                     KeyCode::Char('q') => app.should_quit = true,
                     KeyCode::Char('j') | KeyCode::Down => app.move_down(),
@@ -1202,6 +1420,7 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                     KeyCode::Char('o') => app.focus = Pane::Outputs,
                     KeyCode::Char('e') => app.focus = Pane::Rules,
                     KeyCode::Char('?') => app.focus = Pane::Help,
+                    KeyCode::Char('P') => app.open_pty(),
                     KeyCode::Char('a') => app.apply(),
                     KeyCode::Char('x') => app.discard(),
                     KeyCode::Char('K') => {
@@ -1795,6 +2014,7 @@ mod tests {
             modal: None,
             filter: String::new(),
             should_quit: false,
+            pty: None,
         };
         app.focus = Pane::Help;
         let buf = render_to_string(&app, 100, 40).unwrap();
