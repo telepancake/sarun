@@ -511,11 +511,27 @@ pub fn discard_hunk(id: i64, rel: &str, index: i64) -> Value {
 /// errors}; non-empty errors mean the caller must NOT free the box.
 pub fn finalize_by_rules(id: i64) -> Value {
     let rules = crate::rules::Rules::load();
+    // Box display name (only resolved when a rule actually needs it).
+    let box_name = if rules.needs_box() {
+        crate::discover::display_path(&crate::discover::discover(), id)
+    } else { String::new() };
     let mut apply_paths = vec![];
     let mut discard_paths = vec![];
     for e in session_changes(id).as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
         let rel = e.get("path").and_then(Value::as_str).unwrap_or("").to_string();
-        match rules.decide(&rel) {
+        // The change's FIRST-WRITER provenance (exe/cwd/argv) + box, so a
+        // process-/box-scoped rule decides exactly as the Python FileRules.
+        let mut subject = crate::rules::Subject {
+            box_name: box_name.clone(), ..Default::default() };
+        if rules.needs_proc() {
+            let prov = crate::discover::first_writer_prov(id, &rel);
+            subject.exe = prov.get("exe").and_then(Value::as_str).unwrap_or("").to_string();
+            subject.cwd = prov.get("cwd").and_then(Value::as_str).unwrap_or("").to_string();
+            subject.argv = prov.get("argv").and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+        }
+        match rules.decide(&rel, &subject) {
             Some(crate::rules::Action::Apply) => apply_paths.push(Value::from(rel)),
             _ => discard_paths.push(Value::from(rel)),  // discard / passthrough / none
         }
