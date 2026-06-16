@@ -173,6 +173,22 @@ def main():
         check(b"PTYNO" in cap2 and b"PTYYES" not in cap2,
               f"pty-rs: NEGATIVE control — no -p captured PTYNO (cap={cap2[:40]!r})")
 
+        # ── -p with NON-tty runner stdio STILL gives the child a pty ─────────
+        # The whole point of -p is "the child runs on a pty" (like script /
+        # docker -t): the runner having no tty must NOT silently downgrade to a
+        # headless box. Run with plain pipes (no pty for the runner) and assert
+        # the child still saw a tty + the run didn't hang.
+        rno = subprocess.run(
+            [str(BIN), "run", "-p", "--", "sh", "-c",
+             "test -t 1 && echo PTYYES || echo PTYNO"],
+            stdin=subprocess.DEVNULL, capture_output=True, timeout=60)
+        check(rno.returncode == 0, "pty-rs: -p with non-tty stdio exits 0 (no hang)")
+        sidn = latest_sid(m)
+        capn = captured_bytes(m, sidn) if sidn else b""
+        check(b"PTYYES" in capn and b"PTYNO" not in capn,
+              f"pty-rs: -p gave the child a pty even with NON-tty runner stdio "
+              f"(cap={capn[:40]!r})")
+
         # ── interactivity: feed a line into the master, child reads it ───────
         code3, out3, _ = run_on_pty(
             [str(BIN), "run", "-p", "--", "sh", "-c", "read x; echo got:$x"],

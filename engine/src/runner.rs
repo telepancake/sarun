@@ -295,15 +295,14 @@ pub fn inner(conn_fd: i32, capture: bool, pty: bool, cmd: Vec<String>) -> i32 {
     // teardown signal — only when this process (and CMD) finally exits.
     if conn_fd >= 0 { clear_cloexec(conn_fd); }
     // PTY mode (third path): an interactive controlling-tty box whose output is
-    // ALSO captured. Requires capture (sink files) and a real tty on our fds; a
-    // piped runner (no tty) falls back to ordinary capture so it never hangs.
+    // ALSO captured. `-p` means "give the CHILD a pty" — it does NOT require the
+    // runner to have a tty (cf. `script`, `docker -t`, `ssh -tt`): a non-tty
+    // runner just gets a degraded bridge (no raw mode / live winsize), the child
+    // still runs on a real pty. We honor it or fail visibly — never a silent
+    // downgrade to non-pty capture (a box you asked to be interactive would
+    // otherwise come back headless without you knowing).
     if pty && capture && conn_fd >= 0 {
-        let have_tty = (0..3).any(|fd| unsafe { libc::isatty(fd) } == 1);
-        if have_tty {
-            return inner_pty(conn_fd, cmd);
-        }
-        eprintln!("sarun-engine inner: -p requested but no tty on stdio; \
-                   falling back to capture mode");
+        return inner_pty(conn_fd, cmd);
     }
     if !capture || conn_fd < 0 {
         // Passthrough (-t/-d): stdio is inherited. Spawn (not exec) so we can do
@@ -437,7 +436,6 @@ fn set_winsize(fd: i32, ws: &libc::winsize) {
 
 fn inner_pty(conn_fd: i32, cmd: Vec<String>) -> i32 {
     use std::os::fd::FromRawFd;
-    use std::os::fd::IntoRawFd;
     use std::process::Stdio;
 
     // The real terminal among our fds (its size + termios we mirror/restore).
@@ -454,8 +452,11 @@ fn inner_pty(conn_fd: i32, cmd: Vec<String>) -> i32 {
                       std::ptr::null(), ws_ptr)
     };
     if rc != 0 {
-        eprintln!("sarun-engine inner: openpty failed — falling back to capture");
-        return inner_capture(conn_fd, cmd);
+        // Can't honor -p at all: error VISIBLY rather than silently producing a
+        // non-pty box (per the no-silent-downgrade rule).
+        eprintln!("sarun-engine inner: -p requested but openpty failed: {}",
+                  std::io::Error::last_os_error());
+        return 1;
     }
 
     // Open the box stdout sink: bytes we write here flow through the overlay and
@@ -464,9 +465,9 @@ fn inner_pty(conn_fd: i32, cmd: Vec<String>) -> i32 {
     let sink = match std::fs::OpenOptions::new().write(true).open("/.slopbox-stdout") {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("inner: open stdout sink: {e} — falling back to capture");
+            eprintln!("sarun-engine inner: -p capture sink unavailable: {e}");
             unsafe { libc::close(master); libc::close(slave); }
-            return inner_capture(conn_fd, cmd);
+            return 1;
         }
     };
 
@@ -538,13 +539,18 @@ fn inner_pty(conn_fd: i32, cmd: Vec<String>) -> i32 {
     // resize is applied on each tick. Bounded by the child's lifetime.
     let stdin_fd = 0;
     let mut master_eof = false;
+    // Stop watching stdin once it hits EOF/HUP (a piped or /dev/null runner
+    // stdin would otherwise stay perpetually "ready" and busy-spin the poll).
+    // poll() ignores a pollfd whose fd is negative, so we flip it to -1.
+    let mut stdin_open = true;
     while !master_eof {
         if WINCH_FLAG.swap(false, std::sync::atomic::Ordering::SeqCst) {
             if let Some(ws) = get_winsize(real_tty) { set_winsize(master, &ws); }
         }
         let mut fds = [
             libc::pollfd { fd: master, events: libc::POLLIN, revents: 0 },
-            libc::pollfd { fd: stdin_fd, events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: if stdin_open { stdin_fd } else { -1 },
+                           events: libc::POLLIN, revents: 0 },
         ];
         let pr = unsafe { libc::poll(fds.as_mut_ptr(), 2, 200) };
         if pr < 0 {
@@ -564,14 +570,17 @@ fn inner_pty(conn_fd: i32, cmd: Vec<String>) -> i32 {
                 let _ = (&sink).write_all(s);
             }
         }
-        // real stdin → master (keystrokes); EOF on stdin is fine, keep relaying
-        // master output until the child exits.
-        if fds[1].revents & libc::POLLIN != 0 {
+        // real stdin → master (keystrokes). On EOF/HUP stop polling stdin but
+        // keep relaying master output until the child exits.
+        if stdin_open && fds[1].revents & libc::POLLIN != 0 {
             let mut b = [0u8; 65536];
             let n = unsafe { libc::read(stdin_fd, b.as_mut_ptr().cast(), b.len()) };
-            if n > 0 {
-                unsafe { libc::write(master, b.as_ptr().cast(), n as usize); }
-            }
+            if n > 0 { unsafe { libc::write(master, b.as_ptr().cast(), n as usize); } }
+            else { stdin_open = false; } // EOF
+        }
+        if stdin_open && fds[1].revents & (libc::POLLHUP | libc::POLLERR
+                                           | libc::POLLNVAL) != 0 {
+            stdin_open = false;
         }
     }
 
