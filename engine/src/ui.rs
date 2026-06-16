@@ -35,6 +35,14 @@ use std::time::Duration;
 
 use base64::Engine as _;
 
+use crate::rules::Clause;
+use crate::rules::Join;
+use crate::rules::Match;
+use crate::rules::PathTarget;
+use crate::rules::ProcFilterTarget;
+use crate::rules::Subject;
+use crate::rules::eval_clauses;
+
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::layout::Constraint;
@@ -126,6 +134,65 @@ fn spawn_subscriber(sock: &str, tx: mpsc::Sender<Value>) {
     });
 }
 
+// ── typed filter system (mirrors Python _view_filters / FILTERABLE) ──────────
+//
+// Each filterable list view (changes / procs / outputs) keeps its own clause
+// list, an on/off flag, and a "generated" marker. A user-typed '/' filter
+// persists its clauses when toggled off; a GENERATED "ids" filter (built by a
+// cross-pane navigation) is dropped on the next nav / esc. Evaluation reuses the
+// in-crate clause engine: a PathTarget (changes) or ProcFilterTarget (procs /
+// outputs) is built per row from its data and run through `eval_clauses`.
+
+/// The user Match kinds '/' offers per view — always WITHOUT the internal "ids"
+/// kind (that is built only by cross-pane navigation). Mirrors Python
+/// SUBJECT_KINDS / FILE_KINDS and FILTERABLE.
+const FILE_FILTER_KINDS: &[&str] = &["path", "box", "exe", "cwd", "arg"];
+const SUBJECT_FILTER_KINDS: &[&str] = &["box", "exe", "cwd", "arg"];
+
+/// Which list view a '/' filter applies to. Sessions/Hunks/Rules/Help/Pty are
+/// not filterable.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FilterView {
+    Changes,
+    Procs,
+    Outputs,
+}
+
+impl FilterView {
+    fn kinds(self) -> &'static [&'static str] {
+        match self {
+            FilterView::Changes => FILE_FILTER_KINDS,
+            _ => SUBJECT_FILTER_KINDS,
+        }
+    }
+    fn default_kind(self) -> &'static str {
+        match self {
+            FilterView::Changes => "path",
+            _ => "exe",
+        }
+    }
+}
+
+/// Per-view '/' filter state (mirrors the Python `_view_filters[v]` dict).
+#[derive(Clone, Default)]
+struct ViewFilter {
+    clauses: Vec<Clause>,
+    on: bool,
+    generated: bool,
+}
+
+impl ViewFilter {
+    /// The active clause list, or None when the filter is off (Python
+    /// `_filter_clauses`).
+    fn active(&self) -> Option<&[Clause]> {
+        if self.on && !self.clauses.is_empty() {
+            Some(&self.clauses)
+        } else {
+            None
+        }
+    }
+}
+
 // ── app state ───────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -149,8 +216,18 @@ enum Pane {
 enum Modal {
     /// A y/n confirmation. `action` names the destructive op to run on 'y'.
     Confirm { prompt: String, action: ConfirmAction },
-    /// Substring filter of the focused pane; `buf` is the live query.
-    Search { buf: String },
+    /// Clause filter editor of the focused list view (the '/' SearchModal — a
+    /// reusable ClauseList). `view` is the list it filters; `kinds` the user
+    /// Match vocabulary it offers; `rows` the editable clause rows (enabled ·
+    /// and/or · not · kind · pattern); `sel` the cursored row; `field` the
+    /// cursored column being edited within that row.
+    Search {
+        view: FilterView,
+        kinds: &'static [&'static str],
+        rows: Vec<ClauseRow>,
+        sel: usize,
+        field: ClauseField,
+    },
     /// Add or edit a file rule. `editing` is Some(index) when editing an
     /// existing rule, None when adding. `buf` is the "<action> <glob>" line.
     RuleForm { buf: String, editing: Option<usize> },
@@ -161,6 +238,50 @@ enum Modal {
     /// generic transport — it runs the given argv; it does NOT presume a box or
     /// any box parameters (that is the caller's choice).
     PtyCmd { buf: String },
+}
+
+/// One editable line of the '/' clause editor (mirrors Python ClauseRow): the
+/// fields a Clause carries, kept as plain editable state until the modal commits
+/// them into `crate::rules::Clause` values.
+#[derive(Clone)]
+#[cfg_attr(test, allow(dead_code))]
+struct ClauseRow {
+    enabled: bool,
+    join: Join,
+    negate: bool,
+    kind: String,
+    pattern: String,
+}
+
+impl ClauseRow {
+    fn from_clause(c: &Clause) -> ClauseRow {
+        ClauseRow {
+            enabled: c.enabled,
+            join: c.join,
+            negate: c.negate,
+            kind: c.m.kind.clone(),
+            pattern: c.m.pattern.clone(),
+        }
+    }
+    fn to_clause(&self) -> Clause {
+        Clause {
+            m: Match { kind: self.kind.clone(), pattern: self.pattern.trim().to_string() },
+            join: self.join,
+            negate: self.negate,
+            enabled: self.enabled,
+        }
+    }
+}
+
+/// The cursored column within a clause row in the '/' editor.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(test, allow(dead_code))]
+enum ClauseField {
+    Enabled,
+    Join,
+    Negate,
+    Kind,
+    Pattern,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -191,8 +312,11 @@ struct App {
     status: String,
     renaming: Option<String>, // Some(buffer) while editing a new name
     modal: Option<Modal>,
-    /// Active substring filter (committed from the Search modal). Empty = none.
-    filter: String,
+    /// Per-view typed clause filters (mirrors Python `_view_filters`): changes /
+    /// procs / outputs each keep their own clause list + on/generated flags.
+    f_changes: ViewFilter,
+    f_procs: ViewFilter,
+    f_outputs: ViewFilter,
     #[cfg_attr(test, allow(dead_code))]
     should_quit: bool,
     /// Live engine-held PTY pane, present while one is open (Pane::Pty). None
@@ -222,7 +346,9 @@ impl App {
             status: "ready · j/k move · b/c/p/o boxes/changes/procs/outputs · e rules · ? help · Enter open · a apply · x discard · K kill · D delete · r rename · / search · q quit".into(),
             renaming: None,
             modal: None,
-            filter: String::new(),
+            f_changes: ViewFilter::default(),
+            f_procs: ViewFilter::default(),
+            f_outputs: ViewFilter::default(),
             should_quit: false,
             pty: None,
         };
@@ -242,7 +368,7 @@ impl App {
     }
 
     fn cur_change_path(&self) -> Option<String> {
-        self.changes
+        self.visible_changes()
             .get(self.sel_change)
             .and_then(|c| c.get("path"))
             .and_then(Value::as_str)
@@ -405,14 +531,14 @@ impl App {
                 }
             }
             Pane::Changes => {
-                if self.sel_change + 1 < self.changes.len() {
+                if self.sel_change + 1 < self.visible_changes().len() {
                     self.sel_change += 1;
                     self.load_hunks();
                 }
             }
             Pane::Hunks => self.hunk_scroll = self.hunk_scroll.saturating_add(1),
             Pane::Processes => {
-                if self.sel_proc + 1 < self.visible_processes().len() {
+                if self.sel_proc + 1 < self.proc_selectable().len() {
                     self.sel_proc += 1;
                 }
             }
@@ -463,18 +589,6 @@ impl App {
             // captured by Tab while focused — see the interactive loop's Pty arm).
             Pane::Pty => Pane::Sessions,
         };
-    }
-
-    /// Processes after applying the active substring filter (matches exe/argv).
-    fn visible_processes(&self) -> Vec<&Value> {
-        if self.filter.is_empty() {
-            return self.processes.iter().collect();
-        }
-        let f = self.filter.to_lowercase();
-        self.processes
-            .iter()
-            .filter(|p| proc_text(p).to_lowercase().contains(&f))
-            .collect()
     }
 
     /// Enter: open the selected row into the next pane.
@@ -651,21 +765,410 @@ impl App {
             _ => {}
         }
     }
+
+    // ── typed filters (mirrors Python _view_filters / action_filter / _nav) ──
+
+    /// The filter slot for a list view.
+    fn view_filter(&self, v: FilterView) -> &ViewFilter {
+        match v {
+            FilterView::Changes => &self.f_changes,
+            FilterView::Procs => &self.f_procs,
+            FilterView::Outputs => &self.f_outputs,
+        }
+    }
+    fn view_filter_mut(&mut self, v: FilterView) -> &mut ViewFilter {
+        match v {
+            FilterView::Changes => &mut self.f_changes,
+            FilterView::Procs => &mut self.f_procs,
+            FilterView::Outputs => &mut self.f_outputs,
+        }
+    }
+
+    /// The FilterView the focused pane filters, if any (Sessions/Hunks/Rules/
+    /// Help/Pty are not filterable).
+    fn focus_filter_view(&self) -> Option<FilterView> {
+        match self.focus {
+            Pane::Changes => Some(FilterView::Changes),
+            Pane::Processes => Some(FilterView::Procs),
+            Pane::Outputs => Some(FilterView::Outputs),
+            _ => None,
+        }
+    }
+
+    /// '/' on a filterable list (Python `action_filter`). OFF → open the clause
+    /// editor seeded with the view's last clauses. ON → clear it (a generated
+    /// "ids" filter is dropped; a user one keeps its clauses for next time).
+    #[cfg_attr(test, allow(dead_code))]
+    fn toggle_filter(&mut self) {
+        let Some(v) = self.focus_filter_view() else {
+            self.status = "filter: not a filterable pane".into();
+            return;
+        };
+        if self.view_filter(v).on {
+            self.clear_filter(v);
+            return;
+        }
+        let kinds = v.kinds();
+        let seed = self.view_filter(v).clauses.clone();
+        let rows: Vec<ClauseRow> = if seed.is_empty() {
+            vec![ClauseRow {
+                enabled: true,
+                join: Join::And,
+                negate: false,
+                kind: v.default_kind().to_string(),
+                pattern: String::new(),
+            }]
+        } else {
+            seed.iter().map(ClauseRow::from_clause).collect()
+        };
+        self.modal = Some(Modal::Search { view: v, kinds, rows, sel: 0, field: ClauseField::Pattern });
+    }
+
+    /// Commit the clause editor: drop empty-pattern rows; if any enabled clause
+    /// remains, turn the filter on (user-typed, not generated); else leave off.
+    #[cfg_attr(test, allow(dead_code))]
+    fn commit_filter(&mut self, v: FilterView, rows: &[ClauseRow]) {
+        let clauses: Vec<Clause> = rows
+            .iter()
+            .filter(|r| !r.pattern.trim().is_empty())
+            .map(ClauseRow::to_clause)
+            .collect();
+        if clauses.iter().any(|c| c.enabled) {
+            *self.view_filter_mut(v) = ViewFilter { clauses, on: true, generated: false };
+            self.reset_view_cursor(v);
+            self.status = "filter applied".into();
+        } else {
+            self.status = "filter: no enabled clause".into();
+        }
+    }
+
+    /// Turn a view's filter off, keeping its clauses for next time (a generated
+    /// "ids" filter is dropped). Mirrors Python `_clear_filter`.
+    fn clear_filter(&mut self, v: FilterView) {
+        let f = self.view_filter_mut(v);
+        if f.generated {
+            f.clauses.clear();
+        }
+        f.on = false;
+        f.generated = false;
+        self.reset_view_cursor(v);
+        self.status = "filter cleared".into();
+    }
+
+    fn reset_view_cursor(&mut self, v: FilterView) {
+        match v {
+            FilterView::Changes => self.sel_change = 0,
+            FilterView::Procs => self.sel_proc = 0,
+            FilterView::Outputs => self.sel_output = 0,
+        }
+    }
+
+    /// Build the Subject (box/exe/cwd/argv) for a process row, used to evaluate
+    /// SUBJECT-kind clauses. `prov` falls back to a `proc_prov` lookup for cwd
+    /// (the processes() row carries exe+argv but not cwd).
+    fn proc_subject(&self, p: &Value) -> Subject {
+        let a = p.as_array();
+        let exe = a.and_then(|x| x.get(4)).and_then(Value::as_str).unwrap_or("").to_string();
+        let argv = a
+            .and_then(|x| x.get(5))
+            .and_then(Value::as_array)
+            .map(|v| v.iter().filter_map(Value::as_str).map(String::from).collect())
+            .unwrap_or_default();
+        let rid = a.and_then(|x| x.first()).and_then(Value::as_i64).unwrap_or(-1);
+        let cwd = self
+            .cur_sid()
+            .filter(|_| rid >= 0)
+            .and_then(|sid| rpc(&self.sock, "proc_prov", json!([sid, rid])).ok())
+            .and_then(|pr| pr.get("cwd").and_then(Value::as_str).map(String::from))
+            .unwrap_or_default();
+        let box_name = self
+            .sessions
+            .get(self.sel_session)
+            .and_then(|s| s.get("name").or_else(|| s.get("path")))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        Subject { box_name, exe, cwd, argv }
+    }
+
+    /// Processes after applying the procs view's typed filter. Evaluates each
+    /// row's ProcFilterTarget (row id + subject) against the active clauses via
+    /// the in-crate `eval_clauses`.
+    fn visible_processes(&self) -> Vec<&Value> {
+        let Some(clauses) = self.f_procs.active() else {
+            return self.processes.iter().collect();
+        };
+        self.processes
+            .iter()
+            .filter(|p| {
+                let rid = p
+                    .as_array()
+                    .and_then(|x| x.first())
+                    .and_then(Value::as_i64)
+                    .unwrap_or(-1);
+                let target = ProcFilterTarget { row_id: rid, subject: self.proc_subject(p) };
+                eval_clauses(&target, clauses)
+            })
+            .collect()
+    }
+
+    /// Changes after applying the changes view's typed filter (PathTarget per
+    /// row: the change path + its writer ids for "ids" clauses).
+    fn visible_changes(&self) -> Vec<&Value> {
+        let Some(clauses) = self.f_changes.active() else {
+            return self.changes.iter().collect();
+        };
+        let sid = self.cur_sid();
+        self.changes
+            .iter()
+            .filter(|c| {
+                let rel = c.get("path").and_then(Value::as_str).unwrap_or("");
+                let ids = sid
+                    .as_ref()
+                    .map(|s| self.change_writer_ids(s, rel))
+                    .unwrap_or_default();
+                let target = PathTarget { rel, subject: Subject::default(), ids };
+                eval_clauses(&target, clauses)
+            })
+            .collect()
+    }
+
+    /// Output rows after applying the outputs view's typed filter. An output is
+    /// matched via its process_id (ProcFilterTarget); subject clauses resolve
+    /// against that process's provenance.
+    fn visible_outputs(&self) -> Vec<&Value> {
+        let Some(clauses) = self.f_outputs.active() else {
+            return self.outputs.iter().collect();
+        };
+        let sid = self.cur_sid();
+        self.outputs
+            .iter()
+            .filter(|o| {
+                let pid = o.get("process_id").and_then(Value::as_i64).unwrap_or(-1);
+                let subject = sid
+                    .as_ref()
+                    .filter(|_| pid >= 0)
+                    .and_then(|s| rpc(&self.sock, "proc_prov", json!([s, pid])).ok())
+                    .map(|pr| Subject {
+                        box_name: String::new(),
+                        exe: pr.get("exe").and_then(Value::as_str).unwrap_or("").to_string(),
+                        cwd: pr.get("cwd").and_then(Value::as_str).unwrap_or("").to_string(),
+                        argv: pr
+                            .get("argv")
+                            .and_then(Value::as_array)
+                            .map(|v| v.iter().filter_map(Value::as_str).map(String::from).collect())
+                            .unwrap_or_default(),
+                    })
+                    .unwrap_or_default();
+                let target = ProcFilterTarget { row_id: pid, subject };
+                eval_clauses(&target, clauses)
+            })
+            .collect()
+    }
+
+    /// Writer row ids for a change (first_writer_id + writer_id), de-duped
+    /// preserving order — the changes→procs nav target and the "ids" clause set.
+    fn change_writer_ids(&self, sid: &str, rel: &str) -> Vec<i64> {
+        let mut ids = vec![];
+        for verb in ["first_writer_id", "writer_id"] {
+            if let Ok(v) = rpc(&self.sock, verb, json!([sid, rel])) {
+                if let Some(i) = v.as_i64() {
+                    if !ids.contains(&i) {
+                        ids.push(i);
+                    }
+                }
+            }
+        }
+        ids
+    }
+
+    // ── cross-pane nav-id transitions (Python _nav / _nav_ids) ───────────────
+
+    /// Resolve the destination row ids for an src→dest cross-navigation against
+    /// the CURRENT cursor (Python `_nav_ids`). None for transitions that don't
+    /// auto-filter.
+    fn nav_ids(&self, src: FilterView, dest: FilterView) -> Option<Vec<i64>> {
+        let sid = self.cur_sid()?;
+        match (src, dest) {
+            (FilterView::Changes, FilterView::Procs) => {
+                let rel = self.cur_change_path()?;
+                let ids = self.change_writer_ids(&sid, &rel);
+                if ids.is_empty() { None } else { Some(ids) }
+            }
+            (FilterView::Procs, FilterView::Changes) | (FilterView::Procs, FilterView::Outputs) => {
+                let p = self.visible_processes();
+                let row = p.get(self.sel_proc)?;
+                let rid = row.as_array().and_then(|x| x.first()).and_then(Value::as_i64)?;
+                Some(vec![rid])
+            }
+            (FilterView::Outputs, FilterView::Procs) => {
+                let o = self.visible_outputs();
+                let row = o.get(self.sel_output)?;
+                let pid = row.get("process_id").and_then(Value::as_i64)?;
+                Some(vec![pid])
+            }
+            _ => None,
+        }
+    }
+
+    /// Cross-pane navigation to `dest` (Python `_nav`): install a GENERATED
+    /// "ids" filter on the destination resolved from the current cursor, or drop
+    /// a stale generated filter when this nav produces none. A user-typed filter
+    /// on the destination is left untouched. Then focus the destination pane.
+    #[cfg_attr(test, allow(dead_code))]
+    fn nav(&mut self, dest_pane: Pane) {
+        let dest = match dest_pane {
+            Pane::Changes => Some(FilterView::Changes),
+            Pane::Processes => Some(FilterView::Procs),
+            Pane::Outputs => Some(FilterView::Outputs),
+            _ => None,
+        };
+        if let (Some(src), Some(dest)) = (self.focus_filter_view(), dest) {
+            if src != dest {
+                let ids = self.nav_ids(src, dest);
+                match ids {
+                    Some(ids) => {
+                        let pat = ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+                        *self.view_filter_mut(dest) = ViewFilter {
+                            clauses: vec![Clause {
+                                m: Match { kind: "ids".into(), pattern: pat },
+                                join: Join::And,
+                                negate: false,
+                                enabled: true,
+                            }],
+                            on: true,
+                            generated: true,
+                        };
+                        self.reset_view_cursor(dest);
+                    }
+                    None => {
+                        if self.view_filter(dest).generated {
+                            *self.view_filter_mut(dest) = ViewFilter::default();
+                            self.reset_view_cursor(dest);
+                        }
+                    }
+                }
+            }
+        }
+        self.focus = dest_pane;
+    }
+}
+
+// ── process tree (mirrors Python build_proc_tree / build_path_tree) ──────────
+
+/// One DFS-ordered tree row: (row_id, tgid, ppid, exe, argv, depth, connector).
+/// `connector` is true for a purely-structural ancestor added to connect the
+/// forest (dimmed; the cursor skips it).
+#[derive(Clone)]
+struct ProcTreeRow {
+    rid: i64,
+    tgid: i64,
+    ppid: i64,
+    exe: String,
+    argv: Vec<String>,
+    depth: usize,
+    connector: bool,
+}
+
+const PROC_TREE_DEPTH: usize = 64;
+
+/// Resolve (tgid, ppid, parent_id, exe, argv) for a row id, first from the
+/// in-memory member/node map, else via a `proc_info` RPC (connector ancestors
+/// not present in `procs`). Returns None if unrecorded.
+type NodeInfo = (i64, i64, Option<i64>, String, Vec<String>);
+
+fn node_info(p: &Value) -> NodeInfo {
+    let a = p.as_array();
+    let g = |i: usize| a.and_then(|x| x.get(i)).and_then(Value::as_i64);
+    let exe = a.and_then(|x| x.get(4)).and_then(Value::as_str).unwrap_or("").to_string();
+    let argv = a
+        .and_then(|x| x.get(5))
+        .and_then(Value::as_array)
+        .map(|v| v.iter().filter_map(Value::as_str).map(String::from).collect())
+        .unwrap_or_default();
+    (g(1).unwrap_or(0), g(2).unwrap_or(0), g(3), exe, argv)
+}
+
+/// Build the DFS-ordered, depth-indented process tree from the flat `procs`
+/// list, walking parent_id chains up to `roots` and unioning structural
+/// ancestors (resolved via `lookup`). Mirrors Python `build_proc_tree` +
+/// `build_path_tree`: parent immediately precedes its subtree; order-independent
+/// (a pure function of inputs).
+fn build_proc_tree(
+    procs: &[&Value],
+    roots: &std::collections::HashSet<i64>,
+    lookup: &dyn Fn(i64) -> Option<NodeInfo>,
+) -> Vec<ProcTreeRow> {
+    use std::collections::HashMap;
+    use std::collections::HashSet;
+
+    let mut members: HashMap<i64, NodeInfo> = HashMap::new();
+    for p in procs {
+        if let Some(rid) = p.as_array().and_then(|x| x.first()).and_then(Value::as_i64) {
+            members.insert(rid, node_info(p));
+        }
+    }
+    let mut nodes: HashMap<i64, NodeInfo> = members.clone();
+
+    let info = |rid: i64, nodes: &HashMap<i64, NodeInfo>| -> Option<NodeInfo> {
+        if let Some(n) = nodes.get(&rid) {
+            return Some(n.clone());
+        }
+        lookup(rid)
+    };
+
+    // root→self row-id path for each member, unioning ancestors into `nodes`.
+    let mut member_paths: HashMap<i64, Vec<i64>> = HashMap::new();
+    let member_ids: Vec<i64> = members.keys().copied().collect();
+    for &start in &member_ids {
+        let mut path = vec![];
+        let mut seen = HashSet::new();
+        let mut cur = start;
+        for _ in 0..PROC_TREE_DEPTH {
+            if seen.contains(&cur) {
+                break;
+            }
+            seen.insert(cur);
+            path.push(cur);
+            if roots.contains(&cur) {
+                break;
+            }
+            let Some(got) = info(cur, &nodes) else { break };
+            let Some(parent_id) = got.2 else { break };
+            if parent_id == 0 {
+                break;
+            }
+            let Some(got_p) = info(parent_id, &nodes) else { break };
+            nodes.entry(parent_id).or_insert(got_p);
+            cur = parent_id;
+        }
+        path.reverse();
+        member_paths.insert(start, path);
+    }
+
+    // Sort member root→self paths lexicographically → DFS order (parent before
+    // subtree). Each member contributes its full path; intermediate ancestors
+    // become connector rows the first time they appear.
+    let mut paths: Vec<Vec<i64>> = member_paths.values().cloned().collect();
+    paths.sort();
+
+    let mut emitted: HashSet<i64> = HashSet::new();
+    let mut out = vec![];
+    for path in &paths {
+        for (depth, &rid) in path.iter().enumerate() {
+            if !emitted.insert(rid) {
+                continue;
+            }
+            let connector = !members.contains_key(&rid);
+            let (tgid, ppid, _par, exe, argv) =
+                nodes.get(&rid).cloned().or_else(|| lookup(rid)).unwrap_or((0, 0, None, String::new(), vec![]));
+            out.push(ProcTreeRow { rid, tgid, ppid, exe, argv, depth, connector });
+        }
+    }
+    out
 }
 
 // ── rendering ───────────────────────────────────────────────────────────────
-
-/// "exe argv0 argv1 …" for a processes() row [id,tgid,ppid,parent_id,exe,argv].
-fn proc_text(p: &Value) -> String {
-    let arr = p.as_array();
-    let exe = arr.and_then(|a| a.get(4)).and_then(Value::as_str).unwrap_or("");
-    let argv = arr
-        .and_then(|a| a.get(5))
-        .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" "))
-        .unwrap_or_default();
-    format!("{exe} {argv}").trim().to_string()
-}
 
 fn title(base: &str, focused: bool) -> String {
     if focused {
@@ -721,11 +1224,12 @@ fn changes_lines(app: &App) -> Vec<Line<'static>> {
         format!("{:<9} {:>10}  {}", "KIND", "SIZE", "PATH"),
         Style::default().add_modifier(Modifier::BOLD),
     ))];
-    if app.changes.is_empty() {
-        out.push(Line::from("(no changes)"));
+    let vis = app.visible_changes();
+    if vis.is_empty() {
+        out.push(Line::from(if app.changes.is_empty() { "(no changes)" } else { "(no changes match filter)" }));
         return out;
     }
-    for (i, c) in app.changes.iter().enumerate() {
+    for (i, c) in vis.iter().enumerate() {
         let kind = c.get("kind").and_then(Value::as_str).unwrap_or("");
         let path = c.get("path").and_then(Value::as_str).unwrap_or("");
         let size = c.get("size").and_then(Value::as_i64).unwrap_or(0);
@@ -802,24 +1306,88 @@ fn hunk_lines(app: &App) -> Vec<Line<'static>> {
     }
 }
 
-/// PROCESSES pane: tgid · ppid · exe · argv, one row per captured process.
+impl App {
+    /// The procs pane's render rows. With NO filter: the full DFS process TREE
+    /// (depth-indented, structural connectors included). With a typed filter:
+    /// the surviving REAL processes rendered FLAT (depth 0, no connectors) — the
+    /// filter means "show me exactly these rows", not the hierarchy. Mirrors the
+    /// Python `_load_procs` filtered/unfiltered split.
+    fn proc_tree_rows(&self) -> Vec<ProcTreeRow> {
+        if self.f_procs.active().is_some() {
+            // filtered: flat list of surviving processes (depth 0, no connectors).
+            return self
+                .visible_processes()
+                .iter()
+                .map(|p| {
+                    let (tgid, ppid, _par, exe, argv) = node_info(p);
+                    let rid = p.as_array().and_then(|x| x.first()).and_then(Value::as_i64).unwrap_or(-1);
+                    ProcTreeRow { rid, tgid, ppid, exe, argv, depth: 0, connector: false }
+                })
+                .collect();
+        }
+        // unfiltered: the full tree.
+        let roots: std::collections::HashSet<i64> = self
+            .cur_sid()
+            .and_then(|sid| rpc(&self.sock, "proc_roots", json!([sid])).ok())
+            .and_then(|v| v.as_array().cloned())
+            .map(|a| a.iter().filter_map(Value::as_i64).collect())
+            .unwrap_or_default();
+        let sid = self.cur_sid();
+        let sock = self.sock.clone();
+        let lookup = move |rid: i64| -> Option<NodeInfo> {
+            let sid = sid.clone()?;
+            let v = rpc(&sock, "proc_info", json!([sid, rid])).ok()?;
+            let a = v.as_array()?;
+            // proc_info returns [tgid,ppid,parent_id,exe,argv]
+            let g = |i: usize| a.get(i).and_then(Value::as_i64);
+            let exe = a.get(3).and_then(Value::as_str).unwrap_or("").to_string();
+            let argv = a
+                .get(4)
+                .and_then(Value::as_array)
+                .map(|x| x.iter().filter_map(Value::as_str).map(String::from).collect())
+                .unwrap_or_default();
+            Some((g(0).unwrap_or(0), g(1).unwrap_or(0), g(2), exe, argv))
+        };
+        let procs: Vec<&Value> = self.processes.iter().collect();
+        build_proc_tree(&procs, &roots, &lookup)
+    }
+
+    /// Indices into `proc_tree_rows()` the cursor may land on (non-connectors).
+    fn proc_selectable(&self) -> Vec<usize> {
+        self.proc_tree_rows()
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| !r.connector)
+            .map(|(i, _)| i)
+            .collect()
+    }
+}
+
+/// PROCESSES pane: a depth-indented process TREE. Each row shows tgid · ppid ·
+/// (indented) exe · argv. Structural-ancestor connector rows are dimmed and the
+/// cursor (sel_proc, counted over non-connector rows) skips them.
 fn processes_lines(app: &App) -> Vec<Line<'static>> {
     let mut out = vec![Line::from(Span::styled(
         format!("{:>6} {:>6}  {}", "TGID", "PPID", "EXE · ARGV"),
         Style::default().add_modifier(Modifier::BOLD),
     ))];
-    let vis = app.visible_processes();
-    if vis.is_empty() {
+    let rows = app.proc_tree_rows();
+    if rows.is_empty() {
         out.push(Line::from("(no captured processes)"));
         return out;
     }
-    for (i, p) in vis.iter().enumerate() {
-        let a = p.as_array();
-        let tgid = a.and_then(|x| x.get(1)).and_then(Value::as_i64).unwrap_or(0);
-        let ppid = a.and_then(|x| x.get(2)).and_then(Value::as_i64).unwrap_or(0);
-        let text = format!("{tgid:>6} {ppid:>6}  {}", proc_text(p));
-        let line = if i == app.sel_proc {
+    // map sel_proc (index over real rows) to the highlighted tree-row index.
+    let real = app.proc_selectable();
+    let hi = real.get(app.sel_proc).copied();
+    for (i, r) in rows.iter().enumerate() {
+        let indent = "  ".repeat(r.depth);
+        let base = r.exe.rsplit('/').next().unwrap_or(&r.exe);
+        let argv = r.argv.join(" ");
+        let text = format!("{:>6} {:>6}  {indent}{base} {argv}", r.tgid, r.ppid).trim_end().to_string();
+        let line = if Some(i) == hi {
             Line::from(Span::styled(text, Style::default().fg(Color::Black).bg(Color::Cyan)))
+        } else if r.connector {
+            Line::from(Span::styled(text, Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM)))
         } else {
             Line::from(text)
         };
@@ -907,7 +1475,8 @@ fn help_lines() -> Vec<Line<'static>> {
         t(""),
         h("Navigation"),
         t("  j/k or ↓/↑  move      Enter  open selection in next pane"),
-        t("  R  refresh            /      filter active pane (substring)"),
+        t("  R  refresh            /      filter active pane (clause editor)"),
+        t("  c/p/o cross-navigate: pin the destination to the cursor's rows"),
         t(""),
         h("Actions"),
         t("  a  apply change/box   x  discard change/box"),
@@ -926,7 +1495,11 @@ fn help_lines() -> Vec<Line<'static>> {
 /// Render the active modal centered over the body. Returns the area consumed.
 fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal) {
     let w = (area.width * 7 / 10).clamp(20, area.width);
-    let hgt = 7u16.min(area.height);
+    let want = match modal {
+        Modal::Search { rows, .. } => (rows.len() as u16) + 6,
+        _ => 7,
+    };
+    let hgt = want.min(area.height);
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(hgt)) / 2;
     let rect = Rect { x, y, width: w, height: hgt };
@@ -937,14 +1510,60 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal) {
             " confirm ",
             vec![Line::from(prompt.clone()), Line::from(""), Line::from("y = yes · n / Esc = cancel")],
         ),
-        Modal::Search { buf } => (
-            " search / filter ",
-            vec![
-                Line::from(format!("filter: {buf}_")),
-                Line::from(""),
-                Line::from("type to filter the active pane · Enter apply · Esc clear"),
-            ],
-        ),
+        Modal::Search { rows, sel, field, .. } => {
+            let mut body = vec![Line::from(Span::styled(
+                "keep only entries matching — rows folded top→bottom by each row's and/or",
+                Style::default().fg(Color::Gray),
+            ))];
+            for (i, r) in rows.iter().enumerate() {
+                let cur = i == *sel;
+                let mark = |on: bool, label: &str, f: ClauseField| -> Span<'static> {
+                    let active = cur && *field == f;
+                    let txt = format!("[{}]", if on { label } else { " " });
+                    let mut st = Style::default();
+                    if active { st = st.fg(Color::Black).bg(Color::Cyan); }
+                    Span::styled(txt, st)
+                };
+                let joinlbl = if i == 0 { "   ".to_string() } else { match r.join { Join::And => "and".into(), Join::Or => "or ".into() } };
+                let join_sp = {
+                    let active = cur && *field == ClauseField::Join;
+                    let mut st = Style::default();
+                    if active { st = st.fg(Color::Black).bg(Color::Cyan); }
+                    Span::styled(joinlbl, st)
+                };
+                let kind_sp = {
+                    let active = cur && *field == ClauseField::Kind;
+                    let mut st = Style::default().fg(Color::Yellow);
+                    if active { st = Style::default().fg(Color::Black).bg(Color::Cyan); }
+                    Span::styled(format!("{:<5}", r.kind), st)
+                };
+                let pat_sp = {
+                    let active = cur && *field == ClauseField::Pattern;
+                    let mut st = Style::default();
+                    if active { st = st.fg(Color::Black).bg(Color::Cyan); }
+                    let shown = if active { format!("{}_", r.pattern) } else { r.pattern.clone() };
+                    Span::styled(shown, st)
+                };
+                body.push(Line::from(vec![
+                    Span::raw(if cur { "› " } else { "  " }),
+                    mark(r.enabled, "on", ClauseField::Enabled),
+                    Span::raw(" "),
+                    join_sp,
+                    Span::raw(" "),
+                    mark(r.negate, "not", ClauseField::Negate),
+                    Span::raw(" "),
+                    kind_sp,
+                    Span::raw(" "),
+                    pat_sp,
+                ]));
+            }
+            body.push(Line::from(""));
+            body.push(Line::from(Span::styled(
+                "←/→ field · space toggle · type pattern · n new row · ^s apply · esc clear",
+                Style::default().fg(Color::Gray),
+            )));
+            (" filter ", body)
+        }
         Modal::RuleForm { buf, editing } => (
             if editing.is_some() { " edit rule " } else { " new rule " },
             vec![
@@ -1099,14 +1718,18 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
 /// Detail for the selected process: full exe + argv + the deduped env (via the
 /// process_env verb), keyed off the processes() row id.
 fn proc_detail_lines(app: &App) -> Vec<Line<'static>> {
-    let vis = app.visible_processes();
-    let Some(p) = vis.get(app.sel_proc) else {
+    let rows = app.proc_tree_rows();
+    let real = app.proc_selectable();
+    let Some(&ti) = real.get(app.sel_proc) else {
         return vec![Line::from("(no process selected)")];
     };
-    let a = p.as_array();
-    let rid = a.and_then(|x| x.first()).and_then(Value::as_i64).unwrap_or(-1);
+    let r = &rows[ti];
+    let rid = r.rid;
     let mut out = vec![
-        Line::from(Span::styled(proc_text(p), Style::default().add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled(
+            format!("{} {}", r.exe, r.argv.join(" ")).trim().to_string(),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
         Line::from(""),
     ];
     if let (Some(sid), true) = (app.cur_sid(), rid >= 0) {
@@ -1348,8 +1971,10 @@ fn render_to_string(app: &App, w: u16, h: u16) -> Result<String, String> {
 
 /// Handle one keypress while a modal is open. Mirrors the Python Confirm /
 /// SearchModal / RuleFormModal interactions.
-fn handle_modal_key(app: &mut App, code: crossterm::event::KeyCode) {
+fn handle_modal_key(app: &mut App, code: crossterm::event::KeyCode,
+                    mods: crossterm::event::KeyModifiers) {
     use crossterm::event::KeyCode;
+    use crossterm::event::KeyModifiers;
     let Some(modal) = app.modal.take() else { return };
     match modal {
         Modal::Confirm { prompt, action } => match code {
@@ -1359,27 +1984,67 @@ fn handle_modal_key(app: &mut App, code: crossterm::event::KeyCode) {
             }
             _ => app.modal = Some(Modal::Confirm { prompt, action }),
         },
-        Modal::Search { mut buf } => match code {
-            KeyCode::Enter => {
-                app.filter = buf.trim().to_string();
-                app.sel_proc = 0;
-                app.status = format!("filter: '{}'", app.filter);
+        Modal::Search { view, kinds, mut rows, mut sel, mut field } => {
+            let ctrl = mods.contains(KeyModifiers::CONTROL);
+            // ^s / Enter → commit; Esc → cancel (no change). All else edits rows.
+            if (ctrl && matches!(code, KeyCode::Char('s'))) || code == KeyCode::Enter {
+                app.commit_filter(view, &rows);
+                return;
             }
-            KeyCode::Esc => {
-                app.filter.clear();
-                app.sel_proc = 0;
-                app.status = "filter cleared".into();
+            if code == KeyCode::Esc {
+                app.status = "filter unchanged".into();
+                return;
             }
-            KeyCode::Backspace => {
-                buf.pop();
-                app.modal = Some(Modal::Search { buf });
+            // field/row navigation and edits.
+            let order = [
+                ClauseField::Enabled, ClauseField::Join, ClauseField::Negate,
+                ClauseField::Kind, ClauseField::Pattern,
+            ];
+            let cur_fi = order.iter().position(|f| *f == field).unwrap_or(4);
+            match code {
+                KeyCode::Left => field = order[cur_fi.saturating_sub(1)],
+                KeyCode::Right => field = order[(cur_fi + 1).min(order.len() - 1)],
+                KeyCode::Up => sel = sel.saturating_sub(1),
+                KeyCode::Down => sel = (sel + 1).min(rows.len().saturating_sub(1)),
+                KeyCode::Char('n') if field != ClauseField::Pattern => {
+                    rows.push(ClauseRow {
+                        enabled: true, join: Join::And, negate: false,
+                        kind: kinds[0].to_string(), pattern: String::new(),
+                    });
+                    sel = rows.len() - 1;
+                    field = ClauseField::Pattern;
+                }
+                _ => {
+                    if let Some(r) = rows.get_mut(sel) {
+                        match field {
+                            ClauseField::Pattern => match code {
+                                KeyCode::Backspace => { r.pattern.pop(); }
+                                KeyCode::Char(c) => r.pattern.push(c),
+                                _ => {}
+                            },
+                            ClauseField::Enabled => {
+                                if matches!(code, KeyCode::Char(' ')) { r.enabled = !r.enabled; }
+                            }
+                            ClauseField::Negate => {
+                                if matches!(code, KeyCode::Char(' ')) { r.negate = !r.negate; }
+                            }
+                            ClauseField::Join => {
+                                if matches!(code, KeyCode::Char(' ') | KeyCode::Char('j') | KeyCode::Char('o')) {
+                                    r.join = match r.join { Join::And => Join::Or, Join::Or => Join::And };
+                                }
+                            }
+                            ClauseField::Kind => {
+                                if matches!(code, KeyCode::Char(' ')) {
+                                    let ki = kinds.iter().position(|k| *k == r.kind).unwrap_or(0);
+                                    r.kind = kinds[(ki + 1) % kinds.len()].to_string();
+                                }
+                            }
+                        }
+                    }
+                }
             }
-            KeyCode::Char(c) => {
-                buf.push(c);
-                app.modal = Some(Modal::Search { buf });
-            }
-            _ => app.modal = Some(Modal::Search { buf }),
-        },
+            app.modal = Some(Modal::Search { view, kinds, rows, sel, field });
+        }
         Modal::RuleForm { mut buf, editing } => match code {
             KeyCode::Enter => app.commit_rule(buf, editing),
             KeyCode::Esc => app.status = "rule edit cancelled".into(),
@@ -1451,7 +2116,7 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                 }
                 // modal captures keys (Confirm / Search / RuleForm).
                 if app.modal.is_some() {
-                    handle_modal_key(&mut app, k.code);
+                    handle_modal_key(&mut app, k.code, k.modifiers);
                     continue;
                 }
                 // rename input mode captures keys
@@ -1500,11 +2165,12 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                             app.open();
                         }
                     }
-                    // pane switches
+                    // pane switches; c/p/o cross-navigate (install a generated
+                    // ids filter on the destination from the cursor).
                     KeyCode::Char('b') => app.focus = Pane::Sessions,
-                    KeyCode::Char('c') => app.focus = Pane::Changes,
-                    KeyCode::Char('p') => app.focus = Pane::Processes,
-                    KeyCode::Char('o') => app.focus = Pane::Outputs,
+                    KeyCode::Char('c') => app.nav(Pane::Changes),
+                    KeyCode::Char('p') => app.nav(Pane::Processes),
+                    KeyCode::Char('o') => app.nav(Pane::Outputs),
                     KeyCode::Char('e') => app.focus = Pane::Rules,
                     KeyCode::Char('?') => app.focus = Pane::Help,
                     KeyCode::Char('P') =>
@@ -1533,8 +2199,14 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                         app.modal = Some(Modal::RuleForm { buf: String::new(), editing: None });
                     }
                     KeyCode::Char('d') if app.focus == Pane::Rules => app.delete_rule(),
-                    KeyCode::Char('/') => {
-                        app.modal = Some(Modal::Search { buf: app.filter.clone() });
+                    KeyCode::Char('/') => app.toggle_filter(),
+                    KeyCode::Esc => {
+                        // esc clears a generated (cross-nav) filter on the focused pane.
+                        if let Some(v) = app.focus_filter_view() {
+                            if app.view_filter(v).generated {
+                                app.clear_filter(v);
+                            }
+                        }
                     }
                     KeyCode::Char('r') => app.renaming = Some(String::new()),
                     KeyCode::Char('R') => {
@@ -2108,16 +2780,202 @@ mod tests {
         });
         assert!(ok, "expected captured processes");
         let total = app.processes.len();
-        // a filter that matches nothing hides every row.
-        app.filter = "NO_SUCH_PROC_zzzz".into();
-        assert!(app.visible_processes().is_empty(), "bogus filter should hide all rows");
-        // a filter on the real exe keeps the echo row.
-        app.filter = "echo".into();
+        // a typed exe-clause that matches nothing hides every row.
+        let bogus = vec![ClauseRow {
+            enabled: true, join: Join::And, negate: false,
+            kind: "exe".into(), pattern: "NO_SUCH_PROC_zzzz".into(),
+        }];
+        app.commit_filter(FilterView::Procs, &bogus);
+        assert!(app.visible_processes().is_empty(), "bogus exe clause should hide all rows");
+        // an exe clause on '**/echo' keeps the echo row.
+        let keep = vec![ClauseRow {
+            enabled: true, join: Join::And, negate: false,
+            kind: "exe".into(), pattern: "**/echo".into(),
+        }];
+        app.commit_filter(FilterView::Procs, &keep);
         let vis = app.visible_processes();
-        assert!(!vis.is_empty() && vis.len() <= total, "exe filter should keep ≥1, ≤all rows");
+        assert!(!vis.is_empty() && vis.len() <= total, "exe clause should keep ≥1, ≤all rows");
         app.focus = Pane::Processes;
         let buf = render_to_string(&app, 160, 40).unwrap();
         assert!(buf.contains("echo"), "filtered processes pane should still show echo:\n{buf}");
+
+        // CROSS-CHECK: the same (clause, target) inputs run through the in-crate
+        // eval_clauses directly must agree with the UI's filter decision.
+        let clause = keep[0].to_clause();
+        for p in &app.processes {
+            let rid = p.as_array().and_then(|x| x.first()).and_then(Value::as_i64).unwrap_or(-1);
+            let tgt = crate::rules::ProcFilterTarget { row_id: rid, subject: app.proc_subject(p) };
+            let direct = crate::rules::eval_clauses(&tgt, std::slice::from_ref(&clause));
+            let via_ui = app.visible_processes().iter().any(|q| {
+                q.as_array().and_then(|x| x.first()).and_then(Value::as_i64) == Some(rid)
+            });
+            assert_eq!(direct, via_ui,
+                "eval_clauses and the UI filter must agree for row {rid}");
+        }
+    }
+
+    /// Build a known multi-level process tree in a box and assert the procs pane
+    /// renders children INDENTED under their parents (a tree, not a flat list).
+    #[test]
+    fn proc_tree_renders_children_indented() {
+        let Some(eng) = boot() else {
+            eprintln!("SKIP: engine binary missing or FUSE unavailable");
+            return;
+        };
+        // a 3-level chain: sh -> sh -c (parent) -> a grandchild marker process.
+        if !run_cmd(&eng, &["/bin/sh", "-c",
+            "/bin/sh -c '/bin/sleep 0.05; /bin/echo TREEKID_marker'"]) {
+            eprintln!("SKIP: could not run a box command");
+            return;
+        }
+        let mut app = App::new(eng.sock.clone());
+        app.refresh_sessions();
+        let ok = (0..app.sessions.len()).any(|i| {
+            app.sel_session = i;
+            app.load_processes();
+            app.processes.len() >= 2
+        });
+        assert!(ok, "expected a box with a multi-process tree");
+        let rows = app.proc_tree_rows();
+        // there must be at least one row at depth>0 (a child indented under a parent).
+        assert!(rows.iter().any(|r| r.depth > 0),
+                "proc tree should have an indented child; rows depths: {:?}",
+                rows.iter().map(|r| r.depth).collect::<Vec<_>>());
+        // a parent must appear before its deeper child in DFS order.
+        let first_deep = rows.iter().position(|r| r.depth > 0).unwrap();
+        assert!(rows[..first_deep].iter().any(|r| r.depth == 0),
+                "a depth-0 ancestor must precede the first deep row");
+        app.focus = Pane::Processes;
+        let buf = render_to_string(&app, 160, 40).unwrap();
+        // the rendered grid must show indentation (leading spaces before an exe).
+        assert!(buf.lines().any(|l| {
+            let t = l.trim_start_matches(|c: char| c.is_ascii_digit() || c == ' ');
+            // a deeper row has MORE leading spaces in the EXE column than a root.
+            l.contains("sh") && l.matches("  ").count() >= 2 && !t.is_empty()
+        }), "rendered tree should show indented rows:\n{buf}");
+        assert!(buf.contains("sh"), "tree should show the sh processes:\n{buf}");
+    }
+
+    /// changes→procs navigation installs a GENERATED ids filter pinning the procs
+    /// pane to exactly the change's writer(s); a subsequent nav/esc clears it.
+    #[test]
+    fn nav_ids_filters_procs_to_writer_then_clears() {
+        let Some(eng) = boot() else {
+            eprintln!("SKIP: engine binary missing or FUSE unavailable");
+            return;
+        };
+        // write a file from a known box process so the change has a recorded
+        // writer (the cp process). cp through the box: a captured proc IS the
+        // writer, so changes→procs nav resolves to it.
+        let (_sid0, root) = make_box(&eng.sock);
+        std::fs::write(root.join("tmp").join("navids_seed.txt"), b"seed\n").ok();
+        // a real box command that writes a file (its captured proc is the writer).
+        if !run_cmd(&eng, &["/bin/cp", "/bin/echo", "/tmp/navids_marker_file.txt"]) {
+            eprintln!("SKIP: could not run a box command");
+            return;
+        }
+        let mut app = App::new(eng.sock.clone());
+        app.refresh_sessions();
+        // pick the box that has a change WITH a recorded writer AND processes.
+        let mut chosen = None;
+        for i in 0..app.sessions.len() {
+            app.sel_session = i;
+            app.load_changes();
+            if app.processes.is_empty() { continue; }
+            let sid = app.cur_sid().unwrap();
+            let vc = app.visible_changes();
+            if let Some(ci) = vc.iter().position(|c| {
+                let rel = c.get("path").and_then(Value::as_str).unwrap_or("");
+                !app.change_writer_ids(&sid, rel).is_empty()
+            }) {
+                chosen = Some((i, ci));
+                break;
+            }
+        }
+        let Some((bi, ci)) = chosen else {
+            eprintln!("SKIP: no box with a change carrying a recorded writer + procs");
+            return;
+        };
+        app.sel_session = bi;
+        app.load_changes();
+        app.focus = Pane::Changes;
+        app.sel_change = ci;
+        let sid = app.cur_sid().unwrap();
+        let rel = app.cur_change_path().unwrap();
+        let expect_ids = app.change_writer_ids(&sid, &rel);
+        assert!(!expect_ids.is_empty(), "the written file must have a recorded writer");
+
+        // changes→procs nav: a generated ids filter must appear on procs.
+        app.nav(Pane::Processes);
+        assert!(app.focus == Pane::Processes);
+        assert!(app.f_procs.on && app.f_procs.generated,
+                "procs pane should carry a generated filter after nav");
+        // the procs pane must be narrowed to exactly the writer row(s).
+        let vis: Vec<i64> = app.visible_processes().iter().map(|p|
+            p.as_array().and_then(|x| x.first()).and_then(Value::as_i64).unwrap_or(-1)).collect();
+        assert!(!vis.is_empty(), "filtered procs must be non-empty");
+        for id in &vis {
+            assert!(expect_ids.contains(id),
+                "procs filter must show only the writer ids {expect_ids:?}, saw {id}");
+        }
+
+        // esc on the procs pane clears the generated (cross-nav) filter.
+        app.focus = Pane::Processes;
+        assert!(app.f_procs.generated, "filter still generated before esc");
+        app.clear_filter(FilterView::Procs);
+        assert!(!app.f_procs.on && !app.f_procs.generated && app.f_procs.clauses.is_empty(),
+                "esc/clear must drop the generated ids filter entirely");
+        // and the procs pane is back to the full set.
+        assert_eq!(app.visible_processes().len(), app.processes.len(),
+                   "cleared filter shows all processes again");
+    }
+
+    #[test]
+    fn build_proc_tree_is_dfs_ordered_with_connectors() {
+        // pure unit test (no engine): a forest where row 30's parent (20) is a
+        // structural connector NOT present in `procs` (resolved via lookup).
+        let p = |rid: i64, parent: i64, exe: &str| {
+            json!([rid, rid * 10, 1, parent, exe, [exe]])
+        };
+        let owned = vec![p(10, 0, "root"), p(30, 20, "leaf")];
+        let procs: Vec<&Value> = owned.iter().collect();
+        let mut roots = std::collections::HashSet::new();
+        roots.insert(10i64);
+        // 20 is the connector ancestor: parent_id 10 (a root member), not in procs.
+        let lookup = |rid: i64| -> Option<NodeInfo> {
+            if rid == 20 { Some((200, 1, Some(10), "mid".into(), vec!["mid".into()])) } else { None }
+        };
+        let rows = build_proc_tree(&procs, &roots, &lookup);
+        // DFS: 10 (root, depth0) -> 20 (connector, depth1) -> 30 (leaf, depth2).
+        let ids: Vec<(i64, usize, bool)> =
+            rows.iter().map(|r| (r.rid, r.depth, r.connector)).collect();
+        assert_eq!(ids, vec![(10, 0, false), (20, 1, true), (30, 2, false)],
+                   "tree must be DFS-ordered with the unioned connector at depth 1");
+    }
+
+    #[test]
+    fn eval_clauses_cross_check_matches_python_semantics() {
+        // Construct identical (clause, target) inputs the way the Python
+        // eval_clauses would receive them and assert the in-crate engine agrees
+        // with the hand-computed boolean fold.
+        let exe_clause = Clause {
+            m: Match { kind: "exe".into(), pattern: "**/echo".into() },
+            join: Join::And, negate: false, enabled: true,
+        };
+        let yes = ProcFilterTarget { row_id: 1,
+            subject: Subject { box_name: "B".into(), exe: "/bin/echo".into(),
+                               cwd: "/".into(), argv: vec!["echo".into(), "hi".into()] } };
+        let no = ProcFilterTarget { row_id: 2,
+            subject: Subject { exe: "/bin/cat".into(), ..Default::default() } };
+        assert!(eval_clauses(&yes, std::slice::from_ref(&exe_clause)));
+        assert!(!eval_clauses(&no, std::slice::from_ref(&exe_clause)));
+        // an ids clause pins to an exact row set (the generated-filter form).
+        let ids_clause = Clause {
+            m: Match { kind: "ids".into(), pattern: "1,5".into() },
+            join: Join::And, negate: false, enabled: true,
+        };
+        assert!(eval_clauses(&yes, std::slice::from_ref(&ids_clause)));
+        assert!(!eval_clauses(&no, std::slice::from_ref(&ids_clause)));
     }
 
     #[test]
@@ -2143,7 +3001,9 @@ mod tests {
             status: String::new(),
             renaming: None,
             modal: None,
-            filter: String::new(),
+            f_changes: ViewFilter::default(),
+            f_procs: ViewFilter::default(),
+            f_outputs: ViewFilter::default(),
             should_quit: false,
             pty: None,
         };
