@@ -15,12 +15,50 @@
 // exactly like ordinary capture mode — brush sits ABOVE FUSE, it does not
 // replace it.
 //
+// brush↔PROCESS LINKAGE (D9, DONE — see capture.rs):
+//   Every command brush fork/execs is a child of THIS --inner process (the brush
+//   shell), so in the process FOREST every pipeline process's parent_id chain
+//   passes through the brush --inner row. We exploit that for a faithful link:
+//     • brush emits one FRAME_PROV per pipeline, IN EXECUTION ORDER, immediately
+//       before running that pipeline (run_brush runs complete-commands one at a
+//       time on the same persistent shell), carrying a 0-based `seq`.
+//     • the engine inserts a brushprov row, then marks it as the box's CURRENT
+//       pipeline; any process recorded while it is current whose ancestry reaches
+//       the brush --inner row is stamped process.brush_pipeline_id = that row.
+//   How the link is made — EXACT, race-free, semantic: each FRAME_PROV carries
+//   the pipeline's literal WRITE-redirect TARGET paths (`> file`, `>>`, `&>`).
+//   At box teardown the engine resolves each target file's LAST writer process
+//   row and stamps it with that pipeline's brushprov id (guarded so it really is
+//   a brush descendant in the forest). A pipeline's output file is written by
+//   exactly that pipeline's process, so this needs NO clock/timing comparison —
+//   which matters because a process row is only materialized at file *close*
+//   (an async FUSE release), long after and out of order with its pipeline, so a
+//   time-window scheme could not separate sub-jiffy-apart pipelines. Pipelines
+//   that produce no write-redirect target are still recognizable as brush
+//   children by forest ancestry but are not stamped to a SPECIFIC pipeline (the
+//   per-pipeline column stays NULL for them). Two further linkage limitations,
+//   stated honestly: (a) only LITERAL output targets link — a redirect target
+//   needing expansion (`> $OUT`, `> a/*.o`, `> $(cmd)`) is skipped, since the
+//   engine resolves the path offline, not in brush's expansion context; (b) the
+//   target is matched as a box-ABSOLUTE path (`/root/x`), so a RELATIVE redirect
+//   (`> out.txt`) — whose sqlar name is the cwd-resolved path — does not link in
+//   this cut. Both are documented gaps, not silent mislinks.
+//   Readers: discover::{proc_pipeline, pipeline_procs, brushprov(.processes)}.
+//
 // Scope of THIS cut (honest): brush runs the box's TOP-LEVEL command string
-// (which is the /bin/sh-resolution point for a top-level `sh -c '…'`). The
-// in-box overlay mapping that would make a nested `make` recipe's own
-// `sh -c` resolve to brush is NOT yet wired — see the note in DESIGN.md / the
-// runner. Top-level brush + real provenance is the solid base; the overlay
-// /bin/sh→brush redirect is the documented follow-on.
+// (which is the /bin/sh-resolution point for a top-level `sh -c '…'`) AND owns
+// the per-pipeline provenance + process linkage for everything it forks. The
+// in-box overlay mapping that would make a NESTED `make` recipe's own `sh -c`
+// resolve to brush (so the recipe string itself gets a FRAME_PROV) is the
+// documented follow-on (Part 2). It is NOT wired in this cut: doing it safely
+// requires intercepting /bin/sh resolution in the overlay for brush boxes only,
+// a re-entrant brush-sh engine entrypoint, and an in-box provenance-ingest
+// channel for a deep descendant that has no box-channel fd — three interacting
+// pieces whose exec semantics (shebang scripts, libc system(), brush re-entry)
+// carry real regression risk, so they are deferred rather than half-landed.
+// NOTE: even today a nested recipe's processes ARE attributed — to the
+// TOP-LEVEL pipeline that ran `make` — via the forest linkage above; what the
+// follow-on adds is the recipe's OWN semantic command string.
 
 use std::os::fd::AsRawFd;
 
@@ -88,32 +126,84 @@ fn shell_quote(w: &str) -> String {
 /// command words. This is the genuine semantic context brush has (D9), NOT a
 /// Makefile line. We also include the FULL serde-serialized AST under "ast" so
 /// nothing in the structure is lost.
-fn provenance_records(prog: &brush_parser::ast::Program) -> Vec<Value> {
+/// The per-pipeline provenance records for ONE complete-command (CompoundList).
+/// Used to emit FRAME_PROV immediately before brush runs that complete-command,
+/// so the engine's `current_pipeline` window matches real execution order.
+fn complete_command_records(complete: &brush_parser::ast::CompoundList) -> Vec<Value> {
     use brush_parser::ast;
     let mut out = vec![];
-    for complete in &prog.complete_commands {
-        // CompleteCommand = CompoundList = Vec<CompoundListItem(AndOrList, sep)>.
-        for item in &complete.0 {
-            let andor = &item.0;
-            // The first pipeline plus any && / || continuations.
-            let mut pipelines: Vec<&ast::Pipeline> = vec![&andor.first];
-            for cont in &andor.additional {
-                match cont {
-                    ast::AndOr::And(p) | ast::AndOr::Or(p) => pipelines.push(p),
-                }
+    // CompleteCommand = CompoundList = Vec<CompoundListItem(AndOrList, sep)>.
+    for item in &complete.0 {
+        let andor = &item.0;
+        // The first pipeline plus any && / || continuations.
+        let mut pipelines: Vec<&ast::Pipeline> = vec![&andor.first];
+        for cont in &andor.additional {
+            match cont {
+                ast::AndOr::And(p) | ast::AndOr::Or(p) => pipelines.push(p),
             }
-            for pl in pipelines {
-                let stages: Vec<Value> = pl.seq.iter().map(stage_record).collect();
-                out.push(json!({
-                    "cmd": pl.to_string(),
-                    "bang": pl.bang,
-                    "stages": pl.seq.len(),
-                    "stage_detail": stages,
-                }));
-            }
+        }
+        for pl in pipelines {
+            let stages: Vec<Value> = pl.seq.iter().map(stage_record).collect();
+            out.push(json!({
+                "cmd": pl.to_string(),
+                "bang": pl.bang,
+                "stages": pl.seq.len(),
+                "stage_detail": stages,
+                // The literal WRITE-redirect target paths this pipeline opens for
+                // output (`>`, `>>`, `>|`, `&>`). The engine uses these as the
+                // EXACT, race-free brush↔process link: the process that last wrote
+                // such a file IS this pipeline's process. Words requiring expansion
+                // (vars/globs/`$()`) are skipped — they can't be resolved here.
+                "out_targets": pipeline_out_targets(pl),
+            }));
         }
     }
     out
+}
+
+/// The literal WRITE-redirect target filenames a pipeline opens for output
+/// (across all its stages). Only un-expanded literal filenames (`> /a/b`) are
+/// returned; a target needing expansion is skipped (can't be resolved offline).
+fn pipeline_out_targets(pl: &brush_parser::ast::Pipeline) -> Vec<String> {
+    use brush_parser::ast::Command;
+    let mut out = vec![];
+    for cmd in &pl.seq {
+        if let Command::Simple(s) = cmd {
+            if let Some(p) = &s.prefix { collect_out_targets(&p.0, &mut out); }
+            if let Some(suf) = &s.suffix { collect_out_targets(&suf.0, &mut out); }
+        }
+    }
+    out
+}
+
+fn collect_out_targets(items: &[brush_parser::ast::CommandPrefixOrSuffixItem],
+                       out: &mut Vec<String>) {
+    use brush_parser::ast::CommandPrefixOrSuffixItem as It;
+    use brush_parser::ast::{IoRedirect, IoFileRedirectKind as K, IoFileRedirectTarget as T};
+    for it in items {
+        let It::IoRedirect(io) = it else { continue };
+        match io {
+            IoRedirect::File(_, kind, T::Filename(w)) => {
+                if matches!(kind, K::Write | K::Append | K::Clobber | K::ReadAndWrite) {
+                    if let Some(p) = literal_word(w) { out.push(p); }
+                }
+            }
+            IoRedirect::OutputAndError(w, _) => {
+                if let Some(p) = literal_word(w) { out.push(p); }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// A redirect target word as a literal path IF it needs no expansion (no $ ` *
+/// ? [ ~ ); else None. The Word's Display is the source text brush parsed.
+fn literal_word(w: &brush_parser::ast::Word) -> Option<String> {
+    let s = w.to_string();
+    if s.is_empty() || s.chars().any(|c| matches!(c, '$' | '`' | '*' | '?' | '[' | '~')) {
+        return None;
+    }
+    Some(s)
 }
 
 fn scan_items(items: &[brush_parser::ast::CommandPrefixOrSuffixItem],
@@ -262,22 +352,39 @@ async fn run_brush(conn_fd: i32, script: String) -> i32 {
             return 2;
         }
     };
-    // Emit semantic provenance for each pipeline brush is about to run.
-    for rec in provenance_records(&prog) {
-        send_prov(conn_fd, &rec);
-    }
-
-    // Execute the parsed program through brush-core (public run_program). We do
-    // our OWN error handling rather than run_string's auto-display so an
-    // unsupported construct surfaces as a visible message + non-zero — never a
-    // silent /bin/sh fallback.
+    // Execute one complete-command at a time on the SAME persistent shell, so
+    // shell state (vars, cwd, exit status, functions) carries across exactly as a
+    // single run_program over the whole Program would — emitting each pipeline's
+    // FRAME_PROV (carrying its parsed structure + literal output-redirect targets,
+    // plus a `spawn_ts`/`seq` for ordering/diagnostics) BEFORE running it. The
+    // engine makes the process↔pipeline link from those output targets at teardown
+    // (see the header). We do our OWN error handling (no run_string auto-display,
+    // no /bin/sh fallback) so an unsupported construct surfaces as a visible
+    // message + non-zero.
     let params = shell.default_exec_params();
-    match shell.run_program(prog, &params).await {
-        Ok(result) => u8::from(result.exit_code) as i32,
-        Err(e) => {
-            eprintln!("sarun-engine inner: -b brush execution error \
-                       (NO /bin/sh fallback): {e}");
-            1
+    let mut last_code = 0i32;
+    let mut seq = 0i64;
+    for complete in prog.complete_commands {
+        let spawn_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64()).unwrap_or(0.0);
+        for mut rec in complete_command_records(&complete) {
+            if let Value::Object(ref mut m) = rec {
+                m.insert("seq".to_string(), json!(seq));
+                m.insert("spawn_ts".to_string(), json!(spawn_ts));
+            }
+            send_prov(conn_fd, &rec);
+            seq += 1;
+        }
+        let one = brush_parser::ast::Program { complete_commands: vec![complete] };
+        match shell.run_program(one, &params).await {
+            Ok(result) => last_code = u8::from(result.exit_code) as i32,
+            Err(e) => {
+                eprintln!("sarun-engine inner: -b brush execution error \
+                           (NO /bin/sh fallback): {e}");
+                return 1;
+            }
         }
     }
+    last_code
 }

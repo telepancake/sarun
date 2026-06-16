@@ -107,14 +107,31 @@ fn record_brush_prov(state: &State, ov: &Option<crate::overlay::Overlay>,
                      id: i64, payload: &[u8]) {
     let Ok(rec) = serde_json::from_slice::<Value>(payload) else { return; };
     let cmd = rec.get("cmd").and_then(Value::as_str).unwrap_or("").to_string();
+    // The 0-based pipeline ordinal + the wall-clock spawn instant brush captured
+    // right before running this pipeline's complete-command. The spawn_ts defines
+    // the attribution window; the actual process↔pipeline stamping is done in one
+    // race-free pass at box teardown (finalize_brush_links), since a process row
+    // (e.g. a redirect target's writer) can be materialized long after its pipeline.
+    let seq = rec.get("seq").and_then(Value::as_i64).unwrap_or(0);
+    let spawn_ts = rec.get("spawn_ts").and_then(Value::as_f64).unwrap_or(0.0);
     let record_json = rec.to_string();
+    let mut prov_id = 0i64;
     if let Some(ov) = ov.as_ref() {
         if let Some(b) = ov.live_box(id) {
-            b.add_brushprov(&cmd, &record_json);
+            prov_id = b.add_brushprov(&cmd, &record_json, seq, spawn_ts);
+            // Remember this pipeline's output-redirect targets for the exact
+            // file→process linkage made at teardown.
+            let targets: Vec<String> = rec.get("out_targets")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from))
+                          .collect())
+                .unwrap_or_default();
+            b.on_brush_prov(prov_id, targets);
         }
     }
     broadcast(state, &json!({"type": "brush_prov",
                             "session_id": id.to_string(),
+                            "brushprov_id": prov_id, "seq": seq,
                             "cmd": cmd, "record": rec}));
 }
 
@@ -515,6 +532,7 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
     if rerun { b.load_mirror(); }
     b.set_env_capture(env_capture);
     b.set_direct(direct);
+    b.set_is_brush(msg.get("want_brush").and_then(Value::as_bool).unwrap_or(false));
     b.set_meta("name", &name);
     if let Some(p) = parent {
         b.set_parent(Some(p));
@@ -586,6 +604,15 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
         "brushprov" => match arg_sid(args) {
             Some(id) => discover::brushprov(id),
             None => json!([]),
+        },
+        // D9 brush↔process linkage joins (both directions).
+        "proc_pipeline" => match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
+            (Some(id), Some(rid)) => discover::proc_pipeline(id, rid),
+            _ => Value::Null,
+        },
+        "pipeline_procs" => match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
+            (Some(id), Some(pid)) => discover::pipeline_procs(id, pid),
+            _ => json!([]),
         },
         "output_detail" => match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
             (Some(id), Some(oid)) => discover::output_detail(id, oid),
@@ -959,7 +986,19 @@ fn handle(state: State, conn: UnixStream) {
                                 unsafe { libc::close(fd); }
                                 if hp > 0 {
                                     muted_pid = Some(hp);
-                                    if let Some(ov) = ov.as_ref() { ov.mute_add(hp); }
+                                    if let Some(ov) = ov.as_ref() {
+                                        ov.mute_add(hp);
+                                        // D9 brush↔process linkage: for a brush box
+                                        // the muted pid IS the embedded brush shell's
+                                        // --inner host tgid — the forest root every
+                                        // pipeline process descends from. Record it so
+                                        // brush-descendant rows can be attributed.
+                                        if let Some(b) = ov.live_box(id) {
+                                            if b.is_brush() {
+                                                b.set_brush_host_tgid(hp as u32);
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -998,6 +1037,11 @@ fn handle(state: State, conn: UnixStream) {
             if let Some(fd) = pending_fd { unsafe { libc::close(fd); } }
             if let Some(ov) = ov.as_ref() {
                 if let Some(hp) = muted_pid { ov.mute_remove(hp); }
+                // D9 brush↔process linkage: now that the box channel hit EOF the
+                // brush shell has exited — ALL pipelines + process rows exist, so
+                // attribute every brush-spawned process to its pipeline in one
+                // race-free pass (no-op for non-brush boxes).
+                if let Some(b) = ov.live_box(id) { b.finalize_brush_links(); }
                 ov.clear_echo(id);
                 ov.remove_box(id);
             }

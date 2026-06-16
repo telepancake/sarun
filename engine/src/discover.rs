@@ -133,6 +133,16 @@ pub fn session_dict(boxes: &BTreeMap<i64, Box_>, b: &Box_) -> Value {
     })
 }
 
+/// True if `table` has a column named `col` (PRAGMA table_info). Used so the
+/// Rust-engine-only columns degrade gracefully on a Python-written sqlar.
+fn has_col(conn: &rusqlite::Connection, table: &str, col: &str) -> bool {
+    conn.prepare(&format!("PRAGMA table_info({table})"))
+        .and_then(|mut st| {
+            let it = st.query_map([], |r| r.get::<_, String>(1))?;
+            Ok(it.flatten().any(|c| c == col))
+        }).unwrap_or(false)
+}
+
 pub fn processes(box_id: i64) -> Value {
     let db = sqlar_path(box_id);
     let Ok(conn) = rusqlite::Connection::open_with_flags(
@@ -140,8 +150,15 @@ pub fn processes(box_id: i64) -> Value {
         return json!([]);
     };
     let mut rows = vec![];
-    if let Ok(mut st) = conn.prepare(
-        "SELECT id,tgid,ppid,parent_id,exe,argv FROM process ORDER BY id") {
+    // brush_pipeline_id is a Rust-engine column; a Python-written sqlar lacks it.
+    // COALESCE over a guarded expression keeps element 6 present (NULL) either way
+    // without failing the whole read. Element 6 is ADDITIVE — existing consumers
+    // index 0..5 only — so it is backward-compatible.
+    let col = if has_col(&conn, "process", "brush_pipeline_id")
+              { "brush_pipeline_id" } else { "NULL" };
+    let q = format!(
+        "SELECT id,tgid,ppid,parent_id,exe,argv,{col} FROM process ORDER BY id");
+    if let Ok(mut st) = conn.prepare(&q) {
         let it = st.query_map([], |r| {
             let argv: Option<String> = r.get(5)?;
             Ok(json!([
@@ -150,6 +167,7 @@ pub fn processes(box_id: i64) -> Value {
                 r.get::<_, Option<String>>(4)?.unwrap_or_default(),
                 argv.and_then(|s| serde_json::from_str::<Value>(&s).ok())
                     .unwrap_or_else(|| json!([])),
+                r.get::<_, Option<i64>>(6)?,
             ]))
         });
         if let Ok(it) = it {
@@ -191,18 +209,73 @@ pub fn brushprov(box_id: i64) -> Value {
     };
     let mut rows = vec![];
     if let Ok(mut st) = conn.prepare(
-        "SELECT id,ts,cmd,record FROM brushprov ORDER BY id") {
+        "SELECT id,ts,cmd,record,pipeline,spawn_ts FROM brushprov ORDER BY id") {
         let it = st.query_map([], |r| {
             let rec: String = r.get(3)?;
             Ok(json!({
                 "id": r.get::<_, i64>(0)?, "ts": r.get::<_, f64>(1)?,
                 "cmd": r.get::<_, String>(2)?,
                 "record": serde_json::from_str::<Value>(&rec).unwrap_or(Value::Null),
+                "pipeline": r.get::<_, Option<i64>>(4)?,
+                "spawn_ts": r.get::<_, Option<f64>>(5)?,
             }))
         });
         if let Ok(it) = it { for row in it.flatten() { rows.push(row); } }
     }
+    // Attach the process row ids each pipeline spawned (the D9 brush↔process
+    // linkage, pipeline→processes direction). One extra grouped query, joined in.
+    if let Ok(mut st) = conn.prepare(
+        "SELECT brush_pipeline_id,id FROM process \
+         WHERE brush_pipeline_id IS NOT NULL ORDER BY id") {
+        let mut by_pl: BTreeMap<i64, Vec<Value>> = BTreeMap::new();
+        if let Ok(it) = st.query_map([], |r| Ok((
+            r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))) {
+            for (pl, pid) in it.flatten() {
+                by_pl.entry(pl).or_default().push(Value::from(pid));
+            }
+        }
+        for row in rows.iter_mut() {
+            if let Some(id) = row.get("id").and_then(Value::as_i64) {
+                let procs = by_pl.remove(&id).unwrap_or_default();
+                row["processes"] = Value::Array(procs);
+            }
+        }
+    }
     Value::Array(rows)
+}
+
+/// D9 brush↔process linkage, process→pipeline direction: the brushprov pipeline
+/// row that spawned process `row_id` (its exact cmd + parsed structure), or Null
+/// if that process was not spawned by a brush pipeline (or the box isn't -b).
+pub fn proc_pipeline(box_id: i64, row_id: i64) -> Value {
+    let Some(c) = open_ro(box_id) else { return Value::Null };
+    c.query_row(
+        "SELECT bp.id,bp.ts,bp.cmd,bp.record,bp.pipeline \
+         FROM process p JOIN brushprov bp ON p.brush_pipeline_id=bp.id \
+         WHERE p.id=?1",
+        [row_id], |r| {
+            let rec: String = r.get(3)?;
+            Ok(json!({
+                "id": r.get::<_, i64>(0)?, "ts": r.get::<_, f64>(1)?,
+                "cmd": r.get::<_, String>(2)?,
+                "record": serde_json::from_str::<Value>(&rec).unwrap_or(Value::Null),
+                "pipeline": r.get::<_, Option<i64>>(4)?,
+            }))
+        }).unwrap_or(Value::Null)
+}
+
+/// D9 brush↔process linkage, pipeline→processes direction: the process row ids
+/// the brushprov pipeline `brushprov_id` spawned (empty if none/unknown).
+pub fn pipeline_procs(box_id: i64, brushprov_id: i64) -> Value {
+    let Some(c) = open_ro(box_id) else { return json!([]) };
+    let mut out = vec![];
+    if let Ok(mut st) = c.prepare(
+        "SELECT id FROM process WHERE brush_pipeline_id=?1 ORDER BY id") {
+        if let Ok(it) = st.query_map([brushprov_id], |r| r.get::<_, i64>(0)) {
+            out = it.flatten().map(Value::from).collect();
+        }
+    }
+    Value::Array(out)
 }
 
 fn open_ro(box_id: i64) -> Option<rusqlite::Connection> {

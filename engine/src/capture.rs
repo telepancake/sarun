@@ -28,7 +28,7 @@ CREATE TABLE IF NOT EXISTS env(id INTEGER PRIMARY KEY AUTOINCREMENT,
  hash TEXT UNIQUE, env TEXT);
 CREATE TABLE IF NOT EXISTS process(id INTEGER PRIMARY KEY AUTOINCREMENT,
  tgid INT, start INT, ppid INT, parent_id INT, exe TEXT, cwd TEXT, argv TEXT,
- env_id INT, root INT DEFAULT 0, UNIQUE(tgid, start));
+ env_id INT, root INT DEFAULT 0, brush_pipeline_id INT, UNIQUE(tgid, start));
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS outputs(id INTEGER PRIMARY KEY AUTOINCREMENT,
  ts REAL, process_id INT, stream INT, content BLOB);
@@ -39,8 +39,13 @@ CREATE TABLE IF NOT EXISTS ownership(name TEXT PRIMARY KEY, uid INT, gid INT);
 CREATE TABLE IF NOT EXISTS rdev(name TEXT PRIMARY KEY, dev INT);
 -- D9 brush-shell semantic provenance: one row per pipeline the embedded brush
 -- shell (-b) ran, carrying the exact command string + parsed structure (JSON).
+--   pipeline: a 0-based ordinal of the pipeline within the brush run, so the
+--   reader can present pipelines in execution order independent of row id.
+--   spawn_ts: the wall-clock instant brush reported right before spawning this
+--   pipeline's complete-command; the [spawn_ts, next spawn_ts) window is what a
+--   brush-descendant process's real /proc start time is bucketed into to link it.
 CREATE TABLE IF NOT EXISTS brushprov(id INTEGER PRIMARY KEY AUTOINCREMENT,
- ts REAL, cmd TEXT, record TEXT);
+ ts REAL, cmd TEXT, record TEXT, pipeline INT, spawn_ts REAL);
 ";
 
 #[derive(Clone)]
@@ -74,6 +79,24 @@ pub struct BoxState {
     // -d direct: the box has NO overlay — every write goes straight to the real
     // host file, uncaptured (mirrors Python's whole-box passthrough=direct).
     direct: std::sync::atomic::AtomicBool,
+    // ── brush↔process linkage (D9) ───────────────────────────────────────────
+    // The HOST tgid of this box's embedded brush shell (-b) --inner process, as
+    // resolved by the engine from the MUTE pidfd. 0 = not a brush box. Every
+    // process brush fork/execs is a descendant of this tgid in the forest, so a
+    // process is "spawned by brush" iff its parent_id chain reaches the brush
+    // --inner row (whose own tgid == this).
+    // True when the box was launched with -b (embedded brush shell). The MUTE
+    // handler stamps brush_host_tgid only for these, so a normal box's --inner
+    // mute never gets mistaken for a brush root.
+    is_brush: std::sync::atomic::AtomicBool,
+    brush_host_tgid: std::sync::atomic::AtomicU32,
+    // brush↔process link inputs: (brushprov row id, literal WRITE-redirect target
+    // paths the pipeline opens for output). Collected as each FRAME_PROV arrives,
+    // consumed at teardown (finalize_brush_links). The link is EXACT and race
+    // free: a pipeline's output-redirect target file is written by exactly that
+    // pipeline's process, so stamping that file's last_writer process row with the
+    // pipeline id needs no timing/clock comparison at all.
+    brush_links: Mutex<Vec<(i64, Vec<String>)>>,
 }
 
 impl BoxState {
@@ -96,6 +119,86 @@ impl BoxState {
     }
     pub fn direct(&self) -> bool {
         self.direct.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    /// Record the HOST tgid of this box's embedded brush --inner process (the
+    /// brush↔process linkage root). The engine resolves it from the MUTE pidfd
+    /// the brush shell sends and stamps it here, so the forest walk can decide
+    /// which process rows brush spawned. 0 disables linkage.
+    pub fn set_is_brush(&self, on: bool) {
+        self.is_brush.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub fn is_brush(&self) -> bool {
+        self.is_brush.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    pub fn set_brush_host_tgid(&self, tgid: u32) {
+        self.brush_host_tgid.store(tgid, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub fn brush_host_tgid(&self) -> u32 {
+        self.brush_host_tgid.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    /// Called when a pipeline's FRAME_PROV arrives: remember its (brushprov id,
+    /// literal output-redirect target paths) so the EXACT link can be made at
+    /// teardown. `targets` are box-absolute paths as brush parsed them.
+    pub fn on_brush_prov(&self, pipeline_id: i64, targets: Vec<String>) {
+        if pipeline_id == 0 || targets.is_empty() { return; }
+        self.brush_links.lock().unwrap().push((pipeline_id, targets));
+    }
+
+    /// Finalize the brush↔process linkage at box teardown, when the brush shell
+    /// has exited and every process row + file row exists. For each pipeline that
+    /// declared an output-redirect target, resolve that file's LAST writer process
+    /// row (the process that actually streamed the pipeline's output into it) and
+    /// stamp it with the pipeline id — IF that process is a real brush descendant
+    /// (forest ancestry reaches the brush --inner row), a guard against a stale
+    /// pre-existing writer. This is EXACT and race-free: a pipeline's `> file`
+    /// target is written by exactly that pipeline's process, no clock involved.
+    pub fn finalize_brush_links(&self) {
+        let bt = self.brush_host_tgid();
+        if bt == 0 { return; }
+        let links = std::mem::take(&mut *self.brush_links.lock().unwrap());
+        if links.is_empty() { return; }
+        let conn = self.conn.lock().unwrap();
+        // Forest map for the descendant guard.
+        let mut by_id: HashMap<i64, (u32, Option<i64>)> = HashMap::new();
+        if let Ok(mut st) = conn.prepare("SELECT id,tgid,parent_id FROM process") {
+            if let Ok(it) = st.query_map([], |r| Ok((
+                r.get::<_, i64>(0)?, r.get::<_, i64>(1)? as u32,
+                r.get::<_, Option<i64>>(2)?))) {
+                for (id, tg, par) in it.flatten() { by_id.insert(id, (tg, par)); }
+            }
+        }
+        let is_brush_descendant = |start: i64| -> bool {
+            let mut cur = by_id.get(&start).and_then(|(_, p)| *p);
+            let mut hops = 0;
+            while let Some(p) = cur {
+                if hops > 128 { return false; }
+                hops += 1;
+                match by_id.get(&p) {
+                    Some((ptg, ppar)) => {
+                        if *ptg == bt { return true; }
+                        cur = *ppar;
+                    }
+                    None => return false,
+                }
+            }
+            false
+        };
+        for (pipeline_id, targets) in links {
+            for t in targets {
+                // Targets are box-absolute (/root/x); sqlar names are relative.
+                let rel = t.trim_start_matches('/');
+                let writer: Option<i64> = conn.query_row(
+                    "SELECT last_writer FROM sqlar WHERE name=?1", [rel],
+                    |r| r.get::<_, Option<i64>>(0)).ok().flatten();
+                let Some(w) = writer else { continue };
+                if by_id.get(&w).map(|(tg, _)| *tg) == Some(bt) { continue; }
+                if !is_brush_descendant(w) { continue; }
+                let _ = conn.execute(
+                    "UPDATE process SET brush_pipeline_id=?2 \
+                     WHERE id=?1 AND brush_pipeline_id IS NULL",
+                    params![w, pipeline_id]);
+            }
+        }
     }
 
     /// Dedup the environment text (a stable JSON object string) into the `env`
@@ -163,6 +266,9 @@ impl BoxState {
             parent: std::sync::atomic::AtomicI64::new(0),
             env_capture: std::sync::atomic::AtomicBool::new(false),
             direct: std::sync::atomic::AtomicBool::new(false),
+            is_brush: std::sync::atomic::AtomicBool::new(false),
+            brush_host_tgid: std::sync::atomic::AtomicU32::new(0),
+            brush_links: Mutex::new(vec![]),
         })
     }
 
@@ -598,14 +704,21 @@ impl BoxState {
 
     /// Record one D9 brush-shell provenance frame: the exact command string
     /// plus the full parsed-structure JSON the embedded brush shell reported.
-    pub fn add_brushprov(&self, cmd: &str, record_json: &str) {
+    /// Returns the inserted brushprov row id (0 on failure). `pipeline` is the
+    /// 0-based execution ordinal. The caller marks this id as the box's current
+    /// pipeline (set_current_pipeline) so subsequently-recorded brush-descendant
+    /// processes are stamped with it.
+    pub fn add_brushprov(&self, cmd: &str, record_json: &str, pipeline: i64,
+                         spawn_ts: f64) -> i64 {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs_f64()).unwrap_or(0.0);
         let conn = self.conn.lock().unwrap();
         let _ = conn.execute(
-            "INSERT INTO brushprov(ts,cmd,record) VALUES(?1,?2,?3)",
-            params![ts, cmd, record_json]);
+            "INSERT INTO brushprov(ts,cmd,record,pipeline,spawn_ts) \
+             VALUES(?1,?2,?3,?4,?5)",
+            params![ts, cmd, record_json, pipeline, spawn_ts]);
+        conn.last_insert_rowid()
     }
 
     pub fn set_meta(&self, key: &str, value: &str) {
