@@ -40,6 +40,7 @@ impl Action {
             _ => None,
         }
     }
+    #[allow(dead_code)]
     pub fn as_str(self) -> &'static str {
         match self { Action::Apply => "apply", Action::Discard => "discard",
                      Action::Passthrough => "passthrough" }
@@ -184,6 +185,7 @@ impl FileRule {
         eval_clauses(target, &self.clauses)
     }
 
+    #[allow(dead_code)]
     pub fn to_line(&self) -> String {
         let mut out = vec![self.action.as_str().to_string()];
         for (n, c) in self.clauses.iter().enumerate() {

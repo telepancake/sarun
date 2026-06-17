@@ -2324,8 +2324,8 @@ struct PtyPane {
     parser: tui_term::vt100::Parser,
     writer: UnixStream,            // write half: keystrokes + resize frames
     rx: mpsc::Receiver<PtyMsg>,    // data/eof from the reader thread
-    rows: u16,
-    cols: u16,
+    #[allow(dead_code)] rows: u16,
+    #[allow(dead_code)] cols: u16,
     eof: bool,
 }
 
@@ -2404,6 +2404,7 @@ impl PtyPane {
     }
 
     /// Tell the engine the pane was resized (FRAME_PTY_RESIZE).
+    #[allow(dead_code)]
     fn resize(&mut self, rows: u16, cols: u16) {
         if rows == self.rows && cols == self.cols { return; }
         self.rows = rows;

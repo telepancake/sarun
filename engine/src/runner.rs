@@ -199,7 +199,7 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
     let in_box = std::path::Path::new(UI_SOCK_INBOX).exists();
     let sock = if in_box { std::path::PathBuf::from(UI_SOCK_INBOX) }
                else { paths::sock_path() };
-    let mut conn = match UnixStream::connect(&sock) {
+    let conn = match UnixStream::connect(&sock) {
         Ok(c) => c,
         Err(_) => {
             eprintln!("sarun-engine: no engine running (control socket {}).",
@@ -562,7 +562,7 @@ fn inner_pty(conn_fd: i32, cmd: Vec<String>) -> i32 {
     }
 
     // SIGWINCH → propagate the new size to the master on the next loop tick.
-    unsafe { libc::signal(libc::SIGWINCH, on_winch as libc::sighandler_t); }
+    unsafe { libc::signal(libc::SIGWINCH, on_winch as *const () as libc::sighandler_t); }
 
     // Spawn the child with the SLAVE as stdin/stdout/stderr and as its
     // controlling terminal: new session (setsid) + TIOCSCTTY in a pre_exec.
