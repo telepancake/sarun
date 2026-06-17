@@ -10,10 +10,12 @@
 # exists so you don't have to remember (or copy-paste) them.
 #
 # Two binaries share the name "sarun":
-#   * ./sarun           — the Python prototype that the Rust port was
+#   * prototype/sarun   — the Python prototype that the Rust port was
 #                         developed and tested against. uv shebang;
 #                         first run also builds patched pyfuse3 (~25s,
-#                         cached after).
+#                         cached after). It lives under prototype/ so
+#                         a top-level `./sarun` doesn't accidentally
+#                         drop you into the slow first-run path.
 #   * engine/.../sarun  — the Rust port (the production target). Same
 #                         control protocol; a full standalone UI+engine.
 # `make run` prefers the built Rust binary and falls back to the Python
@@ -43,27 +45,28 @@ run: ## Start sarun (prefers a built Rust binary; falls back to the Python proto
 	  echo "→ engine/target/release/sarun"; \
 	  exec engine/target/release/sarun; \
 	else \
-	  echo "→ ./sarun  (Python prototype — first run builds patched pyfuse3, ~25s)"; \
-	  exec ./sarun; \
+	  echo "→ prototype/sarun  (Python prototype — first run builds patched pyfuse3, ~25s)"; \
+	  exec prototype/sarun; \
 	fi
 
 .PHONY: run-py
-run-py: ## Start the Python prototype specifically (./sarun), even if a Rust binary is built
-	./sarun
+run-py: ## Start the Python prototype specifically (prototype/sarun)
+	prototype/sarun
 
 .PHONY: warmup
-warmup: ## Pre-build patched pyfuse3 + uv deps so the Python ./sarun starts instantly
-	./sarun -h >/dev/null
+warmup: ## Pre-build patched pyfuse3 + uv deps so prototype/sarun starts instantly
+	prototype/sarun -h >/dev/null
 
 .PHONY: sarun-help
-sarun-help: ## Show sarun's own CLI help (./sarun -h)
-	./sarun -h
+sarun-help: ## Show the prototype's CLI help (prototype/sarun -h)
+	prototype/sarun -h
 
 # ---- System dependencies --------------------------------------------------
 #
-# The first ./sarun run builds a patched pyfuse3 and needs a C toolchain
-# plus libfuse3 dev headers; boxes need bubblewrap. Everything Python is
-# pulled by uv from sarun's PEP 723 header — do NOT pip install anything.
+# The first prototype/sarun run builds a patched pyfuse3 and needs a C
+# toolchain plus libfuse3 dev headers; boxes need bubblewrap. Everything
+# Python is pulled by uv from prototype/sarun's PEP 723 header — do NOT
+# pip install anything.
 
 .PHONY: deps
 deps: ## Install system packages (libfuse3-dev, fuse3, pkg-config, bubblewrap)
@@ -92,20 +95,20 @@ engine-musl: ## Build the Rust port as a fully-static musl binary (cargo-zigbuil
 # ---- Tests ----------------------------------------------------------------
 
 .PHONY: test
-test: ## Run the Python test suite (excludes sakar/* and pjdfstest)
-	uv run --with pytest --with pytest-timeout --with "textual>=0.60" \
+test: ## Run the Python test suite (in prototype/; excludes sakar/* and pjdfstest)
+	cd prototype && uv run --with pytest --with pytest-timeout --with "textual>=0.60" \
 	  --with "wcmatch>=8.4" --with "pyfuse3>=3.2" \
 	  --with "trio>=0.22" --with "python-magic>=0.4" \
 	  pytest -q -p no:cacheprovider --ignore=test_e2e.py \
-	  --ignore=test_sakar.py --ignore=test_sakar_e2e.py --ignore=test_pjdfstest.py
+	  --ignore=test_pjdfstest.py
 
 .PHONY: test-e2e
 test-e2e: ## Run the end-to-end tests (real UI + real sandboxes; minutes)
-	./test_e2e.py
+	prototype/test_e2e.py
 
 # ---- Housekeeping ---------------------------------------------------------
 
 .PHONY: clean
-clean: ## Remove build artifacts (engine target/, __pycache__)
+clean: ## Remove build artifacts (engine/target/, __pycache__)
 	rm -rf engine/target
 	find . -type d -name __pycache__ -prune -exec rm -rf {} +

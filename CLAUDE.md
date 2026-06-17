@@ -12,11 +12,21 @@ don't work around it. (Example already fixed: `test_e2e.py` once hardcoded a
 re-derive "can it even run" every session — it can.
 
 ## What `sarun` is
-A single-file app. The file `sarun` IS the executable — its shebang is
-`#!/usr/bin/env -S uv run --script` with a PEP 723 `# /// script` dependency
-block. **`uv` installs every dependency automatically on first run.** You do
-not pip-install anything, you do not need a venv, you do not "set up the
-environment." You just run it.
+
+There are TWO binaries with the name `sarun`:
+
+* **`prototype/sarun`** — the original Python single-file app. The file IS the
+  executable: shebang `#!/usr/bin/env -S uv run --script`, PEP 723 deps in a
+  `# /// script` block, **uv installs every dependency on first run.** You do
+  not pip-install anything, you do not need a venv. The Rust port was developed
+  and tested against this prototype, and it still works.
+* **`engine/target/.../sarun`** — the Rust port. Same control protocol, full
+  standalone UI+engine. Production target.
+
+The prototype + its tests + the `bench/` harness all live under `prototype/`
+so a top-level `./sarun` does not exist by accident — see the Makefile for
+the top-level entry points. The default for `make run` is the Rust binary if
+built, else the prototype.
 
 `sarun` is **filesystem/proc only**: it sandboxes a command over a copy-on-write
 overlay of your filesystem, captures its writes/processes/output for review, and
@@ -24,20 +34,30 @@ applies/discards them. **Boxes run in the HOST network namespace** (normal
 connectivity — no proxy, no gating, no DNS spoofing, no per-write network
 policy). The only network-isolated piece is the untrusted binary viewer
 (`run_on_untrusted`, used to render box-produced bytes), which runs under bwrap
-`--unshare-all`. **Network interception lives in a separate tool, `sakar`** (with
-its own `test_sakar*.py`) — do NOT touch `sakar` when working on `sarun`.
+`--unshare-all`. **Network interception lives in a separate tool, `sakar`** (top
+level, with its own `test_sakar*.py`) — do NOT touch `sakar` when working on
+`sarun`.
 
 ## Run the app
+The Makefile is the entry point. `make` (no args) lists every command.
 ```
-./sarun -h            # or:  uv run --script sarun -h
-./sarun                # starts the UI/server
-./sarun -- some cmd    # runs `some cmd` in a sandbox against a running UI
+make run                       # Rust binary if built, else prototype/sarun
+make run-py                    # always the prototype
+make engine                    # build the Rust port (dynamic glibc)
+make engine-musl               # build the Rust port as a fully-static binary
 ```
-First run also **builds a patched pyfuse3** (see section 0 of `sarun`):
-downloads a pinned sdist, applies an embedded patch, compiles it into
-`~/.cache/sarun/…`. That takes ~25 s ONCE (needs network + a C toolchain:
-gcc, pkg-config, libfuse3 dev headers), then it is cached and every later run
-is ~0.4 s. Do not be surprised by the first-run pause; it is not a hang.
+Or invoke directly:
+```
+prototype/sarun -h
+prototype/sarun                       # starts the UI/server
+prototype/sarun -- some cmd           # runs `some cmd` in a sandbox
+```
+The prototype's first run also **builds a patched pyfuse3** (see section 0 of
+`prototype/sarun`): downloads a pinned sdist, applies an embedded patch,
+compiles it into `~/.cache/sarun/…`. That takes ~25 s ONCE (needs network + a
+C toolchain: gcc, pkg-config, libfuse3 dev headers), then it is cached and
+every later run is ~0.4 s. Do not be surprised by the first-run pause; it is
+not a hang. `make warmup` pays this cost deliberately.
 
 Some fresh containers are missing the system packages. If the pyfuse3 build
 fails with `Package 'fuse3' … not found`, or boxes die with
@@ -46,56 +66,58 @@ fails with `Package 'fuse3' … not found`, or boxes die with
 apt-get install -y libfuse3-dev fuse3 pkg-config bubblewrap
 ```
 
-## The Rust engine — glibc default vs static musl
-The engine lives in `engine/` (one crate → one binary `engine/target/.../sarun`).
+## The Rust port — glibc default vs static musl
+The engine crate lives in `engine/` → one binary `engine/target/.../sarun`.
 The DEFAULT build is dynamic glibc and is what every test harness uses:
 ```
-cd engine && cargo build --release        # -> target/release/sarun (dynamic, glibc)
+make engine                               # or: cd engine && cargo build --release
 ```
-For a fully-static, portable single executable (DESIGN.md m4, DONE), build the
-musl target — needs the musl rust-std + musl-gcc, both installable here:
+For a fully-static, portable single executable, build the musl target. `make
+engine-musl` does this without `apt`, using `cargo-zigbuild` + `ziglang` from
+`uv` (a tiny `musl-gcc → zig cc -target x86_64-linux-musl` shim under
+`engine/target/zigshim/` keeps cc-rs happy for the C deps like onig_sys):
 ```
-rustup target add x86_64-unknown-linux-musl
-apt-get install -y musl-tools             # provides musl-gcc
-cd engine && cargo build --release --target x86_64-unknown-linux-musl
-file target/x86_64-unknown-linux-musl/release/sarun   # "statically linked"
-ldd  target/x86_64-unknown-linux-musl/release/sarun   # "statically linked" (no dynamic libc)
+make engine-musl
+file engine/target/x86_64-unknown-linux-musl/release/sarun   # "statically linked"
 ```
 `engine/.cargo/config.toml` scopes the musl linker/CC so the default glibc
-build is untouched. `test_musl_rs.py` proves the static binary serves + runs a
-box (and self-skips cleanly if the musl target wasn't built).
+build is untouched. `prototype/test_musl_rs.py` proves the static binary
+serves + runs a box (and self-skips cleanly if the musl target wasn't built).
 
 ## Run the tests
-Each `test_*.py` is standalone (repo `check()/_fails` + `__main__` style) AND
-pytest-compatible. The dependency list each file needs is in its module
-docstring. `sarun` no longer depends on mitmproxy. The whole suite (the
-`sakar*` tests and `test_pjdfstest.py` are excluded — `sakar` is the separate
-network tool with its own deps):
+The Python prototype's tests, the pytest glue (`conftest.py`), and the `bench/`
+harness all live under `prototype/`. Each `test_*.py` is standalone (repo
+`check()/_fails` + `__main__` style) AND pytest-compatible; the deps each file
+needs are in its module docstring. `sarun` no longer depends on mitmproxy.
+```
+make test          # the whole suite (excludes test_e2e.py + test_pjdfstest.py)
+```
+which expands to (in `prototype/`):
 ```
 uv run --with pytest --with pytest-timeout --with "textual>=0.60" \
   --with "wcmatch>=8.4" --with "pyfuse3>=3.2" \
   --with "trio>=0.22" --with "python-magic>=0.4" \
-  pytest -q -p no:cacheprovider --ignore=test_e2e.py \
-  --ignore=test_sakar.py --ignore=test_sakar_e2e.py --ignore=test_pjdfstest.py
+  pytest -q -p no:cacheprovider --ignore=test_e2e.py --ignore=test_pjdfstest.py
 ```
-Expected today: **121 passed** (test_engine_rs self-skips without cargo). A single file:
+Expected today: **141 passed**. The `sakar*` tests stay at top level and are
+not collected from `prototype/`. A single file:
 ```
-uv run --with pytest --with "pyfuse3>=3.2" --with "trio>=0.22" \
+cd prototype && uv run --with pytest --with "pyfuse3>=3.2" --with "trio>=0.22" \
   pytest -q -p no:cacheprovider test_outputs_capture.py
 ```
-(Loading any test imports `sarun`, which triggers the section-0 pyfuse3
+(Loading any test imports the prototype, which triggers the section-0 pyfuse3
 bootstrap, so the first test run also pays the ~25 s build, then caches.)
 
 These are **real** tests: FUSE actually mounts, bwrap actually runs, the
 network actually works in this sandbox. The patched-pyfuse3 assertion means a
 test that somehow ran on stock pyfuse3 would fail loudly — by design.
 
-## e2e tests (`test_e2e.py`)
-End-to-end: launches the real headless UI + real `sarun -- cmd` boxes (basic,
-nested, named, forced-userns, stdout/stderr capture). bwrap and FUSE mounts work
-in this sandbox — so these really run here. Has a uv shebang; run it directly:
+## e2e tests (`prototype/test_e2e.py`)
+End-to-end: launches the real headless UI + real `prototype/sarun -- cmd` boxes
+(basic, nested, named, forced-userns, stdout/stderr capture). bwrap and FUSE
+mounts work in this sandbox — so these really run here. Has a uv shebang:
 ```
-./test_e2e.py            # or  uv run test_e2e.py
+make test-e2e        # or directly: prototype/test_e2e.py
 ```
 Expected: `E2E PASS` (one NOTE-skip: nested-inside-userns isn't exercisable as
 root). The test process runs under uv (deps for its in-process SourceFileLoader)
@@ -107,6 +129,6 @@ Develop on the branch you were told to; commit with clear messages; push only
 when asked (`git push -u origin <branch>`). One clean commit per logical change.
 
 ## The one true rule
-Before claiming something can't run, **run it.** `./sarun -h` and the pytest
-command above both work from a clean checkout here. If a step seems to need a
+Before claiming something can't run, **run it.** `prototype/sarun -h`, `make`,
+and `make test` all work from a clean checkout here. If a step seems to need a
 venv or a pip install, you are holding it wrong — it's a uv script.
