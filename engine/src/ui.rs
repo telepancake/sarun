@@ -495,7 +495,19 @@ impl App {
 
     fn refresh_sessions(&mut self) {
         match rpc(&self.sock, "session_dicts", json!([])) {
-            Ok(Value::Array(a)) => {
+            Ok(Value::Array(mut a)) => {
+                // Sort by dotted display path so the sessions pane's tree
+                // renders in DFS order — children come right after their
+                // parent. Same ordering the prototype derives via
+                // build_path_tree; with sessions keyed by box_id from the
+                // engine the natural sort by `path` does the work for any
+                // well-formed forest. sel_session indexes the SORTED vec,
+                // so cursor moves match the on-screen rows.
+                a.sort_by(|x, y| {
+                    let px = x.get("path").and_then(Value::as_str).unwrap_or("");
+                    let py = y.get("path").and_then(Value::as_str).unwrap_or("");
+                    px.cmp(py)
+                });
                 self.sessions = a;
                 if self.sel_session >= self.sessions.len() {
                     self.sel_session = self.sessions.len().saturating_sub(1);
@@ -1958,8 +1970,12 @@ fn session_flag(status: &str) -> (&'static str, Color) {
 
 fn sessions_lines(app: &App) -> Vec<Line<'static>> {
     // Columns mirror the prototype's #s-tab: F | Name | PID | Cmd | Age.
+    // Sessions are nested under parents via the dotted display path — render
+    // them as a DFS-ordered tree, indenting children under their parent.
+    // (Same shape as the prototype's _rebuild_sessions; we walk a sorted-by-
+    // path order which gives DFS automatically for any well-formed forest.)
     let mut out = vec![Line::from(Span::styled(
-        format!("{:<1} {:<14} {:<6} {:<24} {:>8}",
+        format!("{:<1} {:<24} {:<6} {:<24} {:>8}",
                 "F", "Name", "PID", "Cmd", "Age"),
         Style::default().add_modifier(Modifier::BOLD),
     ))];
@@ -1967,18 +1983,24 @@ fn sessions_lines(app: &App) -> Vec<Line<'static>> {
         out.push(Line::from("(no boxes)"));
         return out;
     }
+    // refresh_sessions already sorted by dotted display path, so this is
+    // DFS order — children land immediately after their parent.
     for (i, s) in app.sessions.iter().enumerate() {
         let g = |k: &str| s.get(k).and_then(Value::as_str).unwrap_or("").to_string();
         let status = g("status");
         let (flag, color) = session_flag(&status);
-        let name = {
-            // Prefer the box's NAME; fall back to the dotted display path's
-            // last segment, then the box id. Matches the prototype's pick.
+        let path = g("path");
+        // Depth from dot count; bare top-level boxes have depth 0.
+        let depth = if path.is_empty() { 0 }
+                    else { path.matches('.').count() };
+        let indent = "  ".repeat(depth);
+        // Display label: name if present, else the dotted-path's last
+        // segment, else the session id.
+        let basename = {
             let n = g("name");
             if !n.is_empty() { n }
-            else { let p = g("path");
-                   if !p.is_empty() { p.rsplit('.').next().unwrap_or(&p).to_string() }
-                   else { g("session_id") } }
+            else if !path.is_empty() { path.rsplit('.').next().unwrap_or(&path).to_string() }
+            else { g("session_id") }
         };
         let pid = s.get("pid").and_then(Value::as_i64).unwrap_or(0);
         let cmd = s.get("cmd").and_then(Value::as_array)
@@ -1988,7 +2010,8 @@ fn sessions_lines(app: &App) -> Vec<Line<'static>> {
         let started = s.get("started").and_then(Value::as_f64).unwrap_or(0.0);
         let age = if started > 0.0 { fmt_age(started) } else { String::new() };
         let pid_str = if pid > 0 { pid.to_string() } else { String::new() };
-        let text = format!("{flag:<1} {name:<14} {pid_str:<6} {cmd24:<24} {age:>8}");
+        let name_col = format!("{indent}{basename}");
+        let text = format!("{flag:<1} {name_col:<24} {pid_str:<6} {cmd24:<24} {age:>8}");
         let line = if i == app.sel_session {
             Line::from(Span::styled(text, Style::default().fg(Color::Black).bg(Color::Cyan)))
         } else {
