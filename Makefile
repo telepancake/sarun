@@ -49,10 +49,15 @@ engine: ## Build the Rust engine (release, dynamic glibc — what tests use)
 	cd engine && cargo build --release
 
 .PHONY: engine-musl
-engine-musl: ## Build the fully-static musl engine binary
-	apt-get install -y musl-tools
+engine-musl: ## Build the fully-static musl engine (cargo-zigbuild + zig — no apt, no musl-gcc)
+	@command -v uv >/dev/null || { echo "engine-musl needs uv (https://docs.astral.sh/uv/)"; exit 1; }
+	uv tool install --with ziglang cargo-zigbuild
 	rustup target add x86_64-unknown-linux-musl
-	cd engine && cargo build --release --target x86_64-unknown-linux-musl
+	mkdir -p engine/target/zigshim
+	printf '#!/bin/sh\nexec cargo-zigbuild zig cc -- -target x86_64-linux-musl "$$@"\n' > engine/target/zigshim/musl-gcc
+	chmod +x engine/target/zigshim/musl-gcc
+	cd engine && PATH="$(CURDIR)/engine/target/zigshim:$$(uv tool dir)/cargo-zigbuild/bin:$$HOME/.local/bin:$$PATH" \
+	  cargo zigbuild --release --target x86_64-unknown-linux-musl
 
 # ---- Tests ----------------------------------------------------------------
 
