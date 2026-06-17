@@ -102,36 +102,80 @@ fn ui_launch(args: &[String]) -> i32 {
     if std::os::unix::net::UnixStream::connect(&sock).is_err() {
         // No engine running — spawn one detached and wait (bounded) for the
         // control socket to appear. current_exe() is a path, so it keeps
-        // working under the renamed `sarun` binary.
-        if let Ok(exe) = std::env::current_exe() {
-            let spawned = std::process::Command::new(exe)
-                .arg("serve")
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn();
-            if let Err(e) = spawned {
-                eprintln!("sarun: failed to spawn engine: {e}");
+        // working under the renamed `sarun` binary. The engine's stderr is
+        // captured to engine.log under data_home — if startup fails (deadline
+        // hit, missing fuse3, mount permission, etc.), the user has somewhere
+        // to look instead of a silent timeout.
+        let log_path = paths::data_home().join("engine.log");
+        let _ = std::fs::create_dir_all(paths::data_home());
+        let log = match std::fs::OpenOptions::new()
+            .create(true).append(true).open(&log_path) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("sarun: cannot open {}: {e}", log_path.display());
                 return 1;
             }
-        } else {
-            eprintln!("sarun: cannot locate own executable to spawn engine");
+        };
+        let log_err = log.try_clone().unwrap_or_else(|_| {
+            std::fs::OpenOptions::new().create(true).append(true)
+                .open(&log_path).expect("reopen engine.log")
+        });
+        let exe = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!("sarun: cannot locate own executable to spawn engine");
+                return 1;
+            }
+        };
+        let spawned = std::process::Command::new(&exe)
+            .arg("serve")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::from(log))
+            .stderr(std::process::Stdio::from(log_err))
+            .spawn();
+        if let Err(e) = spawned {
+            eprintln!("sarun: failed to spawn engine: {e}");
             return 1;
         }
+        let mut proc = spawned.unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
         loop {
             if std::os::unix::net::UnixStream::connect(&sock).is_ok() {
                 break;
             }
+            // If the engine already exited, surface its log immediately
+            // rather than waiting out the full deadline.
+            if let Ok(Some(status)) = proc.try_wait() {
+                eprintln!("sarun: engine exited before serving (status: {status}). \
+                          Last log lines from {}:", log_path.display());
+                tail_log(&log_path, 20);
+                return 1;
+            }
             if std::time::Instant::now() >= deadline {
-                eprintln!("sarun: engine control socket never appeared at {}",
-                          sock.display());
+                eprintln!("sarun: engine control socket never appeared at {} \
+                          (20s deadline). Last log lines from {}:",
+                          sock.display(), log_path.display());
+                tail_log(&log_path, 20);
                 return 1;
             }
             std::thread::sleep(Duration::from_millis(50));
         }
     }
     ui::ui_main(args)
+}
+
+/// Print the tail of `path` to stderr, for surfacing engine startup
+/// errors to the user without making them go fish for the log file.
+fn tail_log(path: &std::path::Path, n_lines: usize) {
+    let Ok(s) = std::fs::read_to_string(path) else {
+        eprintln!("  (could not read {})", path.display());
+        return;
+    };
+    let lines: Vec<&str> = s.lines().collect();
+    let start = lines.len().saturating_sub(n_lines);
+    for l in &lines[start..] {
+        eprintln!("  | {l}");
+    }
 }
 
 fn main() {
