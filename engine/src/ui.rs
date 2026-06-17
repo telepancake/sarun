@@ -409,6 +409,12 @@ struct App {
     /// Live engine-held PTY pane, present while one is open (Pane::Pty). None
     /// otherwise. Kept out of the headless `--once` path (which never opens one).
     pty: Option<PtyPane>,
+    /// Esc-Esc detach chord: wall-clock instant of the LAST Esc keypress
+    /// inside the PTY pane, used to fire the detach on a second Esc
+    /// within 400 ms. None = no Esc queued. A non-Esc keystroke or an
+    /// out-of-window Esc flushes the queued Esc into the box (so vi-mode
+    /// Esc and brush-interactive's bindings keep working).
+    pty_esc_at: Option<std::time::Instant>,
     /// Off-loop structural-diff state for the selected BINARY change.
     structd: StructState,
     /// Hunk cursor within the diff pane (index into the hunk list); used for
@@ -481,7 +487,7 @@ impl App {
             f_procs: ViewFilter::default(),
             f_outputs: ViewFilter::default(),
             should_quit: false,
-            pty: None,
+            pty: None, pty_esc_at: None,
             structd: StructState::default(),
             sel_hunk: 0,
             struct_rx: None,
@@ -3445,10 +3451,23 @@ fn key_to_pty_bytes(code: crossterm::event::KeyCode,
     Some(match code {
         KeyCode::Char(c) => {
             if mods.contains(KeyModifiers::CONTROL) {
-                // Ctrl-A..Ctrl-Z and friends → control bytes 0x01..0x1a.
+                // Ctrl-A..Ctrl-Z → control bytes 0x01..0x1a.
                 let up = c.to_ascii_uppercase();
                 if up.is_ascii_alphabetic() {
                     vec![(up as u8) - b'A' + 1]
+                } else if matches!(c, '4'..='7') {
+                    // Crossterm collapses raw 0x1c..0x1f into Char('4')..
+                    // Char('7') with CONTROL (parse.rs L110). Translate
+                    // back to the original control byte so Ctrl-\ /
+                    // Ctrl-] / Ctrl-^ / Ctrl-_ behave as the shell
+                    // expects (and Ctrl-\ keeps killing the foreground).
+                    vec![0x1c + (c as u8 - b'4')]
+                } else if c == ' ' || c == '@' {
+                    // Ctrl-Space / Ctrl-@ → NUL (the historical mapping).
+                    vec![0]
+                } else if c == '?' {
+                    // Ctrl-? → DEL.
+                    vec![0x7f]
                 } else {
                     let mut b = [0u8; 4];
                     c.encode_utf8(&mut b).as_bytes().to_vec()
@@ -3668,22 +3687,62 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                     // EOF: child is dead. Any key detaches (no point typing
                     // into a corpse — that's how the user got stuck last time).
                     let dead = app.pty.as_ref().map(|p| p.eof).unwrap_or(true);
-                    // Ctrl-]: the classic detach. Crossterm reports this two
-                    // ways depending on the host terminal — KeyCode::Char(']')
-                    // with CONTROL set on modern xterm-likes, or the raw
-                    // group-separator byte 0x1d on older/legacy terminals.
-                    // Accept both so the user is never stranded.
-                    let detach = dead
-                        || (matches!(k.code, KeyCode::Char(']'))
-                            && k.modifiers.contains(KeyModifiers::CONTROL))
-                        || matches!(k.code, KeyCode::Char('\u{1d}'));
+                    // Detach is offered THREE ways, because Ctrl-] is
+                    // famously unreliable across terminals/keyboard layouts:
+                    //   * F12              — guaranteed, single key.
+                    //   * Esc Esc          — double-tap escape (chord; the
+                    //     first Esc just queues, the second within 400 ms
+                    //     fires the detach). Falls back to "single Esc"
+                    //     forwarding into the box on a slower second press.
+                    //   * Ctrl-]           — classic telnet/ssh escape.
+                    //                        Crossterm collapses raw
+                    //                        0x1c..0x1f into Char('4')..
+                    //                        Char('7') with CONTROL set
+                    //                        (crossterm parse.rs L110), so
+                    //                        a Ctrl-] arrives as
+                    //                        Char('5')+CONTROL — NOT
+                    //                        Char(']')+CONTROL. We accept
+                    //                        all three spellings: the
+                    //                        named char, the collapsed
+                    //                        digit, and the raw GS byte.
+                    let ctrl_bracket = k.modifiers.contains(KeyModifiers::CONTROL)
+                        && matches!(k.code, KeyCode::Char(']') | KeyCode::Char('5'));
+                    let raw_gs = matches!(k.code, KeyCode::Char('\u{1d}'));
+                    let f12 = matches!(k.code, KeyCode::F(12));
+                    // Esc-Esc chord. esc_at = Instant of the previous Esc
+                    // if we're inside the 400 ms window, else None.
+                    let now = std::time::Instant::now();
+                    let esc_chord = matches!(k.code, KeyCode::Esc)
+                        && app.pty_esc_at.is_some_and(|t|
+                            now.duration_since(t) < Duration::from_millis(400));
+                    let detach = dead || ctrl_bracket || raw_gs || f12 || esc_chord;
                     if detach {
                         let msg = if dead { "PTY exited — detached" }
                                   else { "PTY detached (still running)" };
                         app.pty = None;
+                        app.pty_esc_at = None;
                         app.focus = Pane::Sessions;
                         app.status = msg.into();
+                    } else if matches!(k.code, KeyCode::Esc) {
+                        // Arm the chord: remember when this Esc landed.
+                        // The keystroke is NOT forwarded yet; if the user
+                        // doesn't press Esc again within 400 ms, the next
+                        // non-Esc keystroke (or a non-detaching Esc that
+                        // falls outside the window) re-fires this as a
+                        // plain Esc to the shell. brush-interactive uses
+                        // Esc for vi-mode toggles, so swallowing a lone
+                        // Esc would surprise vi users.
+                        app.pty_esc_at = Some(now);
                     } else if let Some(bytes) = key_to_pty_bytes(k.code, k.modifiers) {
+                        // A non-Esc key arrived. If an Esc was queued and
+                        // is still within the window, flush it first.
+                        if let Some(t) = app.pty_esc_at.take() {
+                            if now.duration_since(t) < Duration::from_millis(400) {
+                                if let Some(pty) = app.pty.as_mut() {
+                                    pty.send_input(&[0x1b]);
+                                }
+                            }
+                        }
                         if let Some(pty) = app.pty.as_mut() { pty.send_input(&bytes); }
                     }
                     continue;
@@ -4565,7 +4624,7 @@ mod tests {
             f_procs: ViewFilter::default(),
             f_outputs: ViewFilter::default(),
             should_quit: false,
-            pty: None,
+            pty: None, pty_esc_at: None,
             structd: StructState::default(),
             sel_hunk: 0,
             struct_rx: None,
