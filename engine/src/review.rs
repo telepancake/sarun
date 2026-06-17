@@ -166,6 +166,34 @@ pub fn decorate_many(id: i64, rels: &[&str]) -> Value {
     Value::Array(rels.iter().map(|r| decorate(id, r)).collect())
 }
 
+/// Newest-first slice of the box's change set — the source feed for a live
+/// box's "recently changed" panel in the boxes view. Sorted by sqlar.mtime
+/// desc, capped at `limit`. Returns the same row shape as session_changes
+/// so the UI can reuse the same render path.
+pub fn recent_changes(id: i64, limit: i64) -> Value {
+    let Some(conn) = open_ro(id) else { return json!([]) };
+    let mut out = vec![];
+    if let Ok(mut st) = conn.prepare(
+        "SELECT name, mode, sz FROM sqlar ORDER BY mtime DESC LIMIT ?1") {
+        let it = st.query_map([limit], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)? as u32,
+                r.get::<_, i64>(2)?,
+            ))
+        });
+        if let Ok(it) = it {
+            for (name, mode, sz) in it.flatten() {
+                let kind = if mode & S_IFMT == S_IFCHR { "deleted" }
+                           else if mode & S_IFMT == S_IFLNK { "symlink" }
+                           else { "changed" };
+                out.push(json!({"path": name, "kind": kind, "size": sz}));
+            }
+        }
+    }
+    Value::Array(out)
+}
+
 pub fn decorate(id: i64, rel: &str) -> Value {
     let rel = rel.trim_start_matches('/');
     let Some(mode) = current_mode(id, rel) else {
