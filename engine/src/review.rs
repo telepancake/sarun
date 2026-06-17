@@ -159,6 +159,13 @@ pub fn current_mtime(id: i64, rel: &str) -> Option<i64> {
 /// changed entry — {is_text, stale, kind}. is_text = NUL-pairwise text rule,
 /// stale = host mtime newer than the stored mtime, kind refined to
 /// created/modified/deleted via a single host lstat.
+/// Decorate a batch of paths in one go (one RPC, one server-side host stat
+/// loop). Used by the UI to decorate a window of changes-pane rows without
+/// paying a round-trip per row.
+pub fn decorate_many(id: i64, rels: &[&str]) -> Value {
+    Value::Array(rels.iter().map(|r| decorate(id, r)).collect())
+}
+
 pub fn decorate(id: i64, rel: &str) -> Value {
     let rel = rel.trim_start_matches('/');
     let Some(mode) = current_mode(id, rel) else {

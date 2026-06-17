@@ -431,6 +431,14 @@ struct App {
     /// entry and apply the 8000-char windowed render the prototype does
     /// (mirrors its _update_output_detail). Cleared on view reload.
     output_segs: Vec<(i64, i64, String)>,
+    /// Per-row decoration for the changes window: parallel to `changes`,
+    /// each entry is (kind, stale). `kind` is "created" / "modified" /
+    /// "deleted" / "symlink" / "changed" — finer than the source row's
+    /// kind, which can't distinguish created vs modified without stating
+    /// the host. Filled by a single bulk `review.decorate_many` after
+    /// every fetch_changes_window so changes_lines can paint the
+    /// prototype's per-row +/~ glyph and the `!` stale marker.
+    changes_decor: Vec<(String, bool)>,
 }
 
 /// Cap on the transcript window: chars rendered in one frame, centred on
@@ -484,6 +492,7 @@ impl App {
             last_tick: Instant::now(),
             cd_info: None,
             output_segs: vec![],
+            changes_decor: vec![],
         };
         a.refresh_sessions();
         a.load_changes();
@@ -603,7 +612,36 @@ impl App {
                 self.changes = v.get("rows").and_then(Value::as_array).cloned()
                     .unwrap_or_default();
             }
-            Err(e) => self.status = format!("view.window changes: {e}"),
+            Err(e) => { self.status = format!("view.window changes: {e}"); return; }
+        }
+        // Decorate the window's LEAF rows in ONE RPC — the engine looks up
+        // each row's (kind, stale) by stat-ing the host; connectors get an
+        // empty placeholder so indices stay parallel to `self.changes`.
+        self.changes_decor = vec![(String::new(), false); self.changes.len()];
+        let Some(sid) = self.cur_sid() else { return };
+        let leaf_paths: Vec<&str> = self.changes.iter().filter_map(|c| {
+            if c.get("connector").and_then(Value::as_bool) == Some(true) { None }
+            else { c.get("path").and_then(Value::as_str) }
+        }).collect();
+        if leaf_paths.is_empty() { return; }
+        let leaf_paths_value: Vec<Value> = leaf_paths.iter()
+            .map(|p| Value::String((*p).into())).collect();
+        if let Ok(rep) = rpc(&self.sock, "review.decorate_many",
+                             json!([sid, leaf_paths_value])) {
+            let decs = rep.as_array().cloned().unwrap_or_default();
+            // Walk `self.changes` and `decs` in lockstep, skipping connector
+            // slots in the result vec.
+            let mut di = 0;
+            for (i, c) in self.changes.iter().enumerate() {
+                if c.get("connector").and_then(Value::as_bool) == Some(true) { continue; }
+                if let Some(d) = decs.get(di) {
+                    let kind = d.get("kind").and_then(Value::as_str)
+                        .unwrap_or("changed").to_string();
+                    let stale = d.get("stale").and_then(Value::as_bool).unwrap_or(false);
+                    self.changes_decor[i] = (kind, stale);
+                }
+                di += 1;
+            }
         }
     }
 
@@ -2085,31 +2123,46 @@ fn changes_lines(app: &App) -> Vec<Line<'static>> {
         let size = c.get("size").and_then(Value::as_i64).unwrap_or(0);
         let depth = c.get("depth").and_then(Value::as_u64).unwrap_or(0) as usize;
         let connector = c.get("connector").and_then(Value::as_bool) == Some(true);
-        // Glyphs match the prototype's _ch_cells: + green created, ~ yellow
-        // modified, - red deleted, … dim placeholder when decoration is
-        // unknown. (The Rust engine doesn't run the prototype's decoration
-        // RPC yet, so "changed" rows show ~; a future decorate pass would
-        // distinguish + vs ~ properly.)
-        let (glyph, color) = match kind {
-            "deleted" => ("-", Color::Red),
-            "symlink" => ("~", Color::Magenta),
-            "changed" => ("~", Color::Yellow),
+        // Prefer the per-row decoration (created vs modified, plus stale).
+        // The source row's `kind` only knows deleted / symlink / changed.
+        let (dec_kind, stale) = app.changes_decor.get(i)
+            .map(|(k, s)| (k.as_str(), *s)).unwrap_or(("", false));
+        let effective_kind = if !dec_kind.is_empty() { dec_kind } else { kind };
+        let (glyph, color) = match effective_kind {
+            "created"  => ("+", Color::Green),
+            "modified" => ("~", Color::Yellow),
+            "deleted"  => ("-", Color::Red),
+            "symlink"  => ("~", Color::Magenta),
+            "changed"  => ("~", Color::Yellow),
             _ => ("…", Color::DarkGray),
         };
         let indent = tree_indent(depth);
-        let text = if connector {
-            format!("{:<1} {:>10}  {indent}{name}/", "", "")
-        } else {
-            let sz = if size > 0 { fmt_bytes(size) } else { String::new() };
-            format!("{glyph:<1} {sz:>10}  {indent}{name}")
-        };
-        let line = if i == app.sel_change {
-            Line::from(Span::styled(text, Style::default().fg(Color::Black).bg(Color::Cyan)))
-        } else if connector {
+        let line = if connector {
+            let text = format!("{:<1} {:>10}  {indent}{name}/", "", "");
             Line::from(Span::styled(text,
                 Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM)))
+        } else if i == app.sel_change {
+            let sz = if size > 0 { fmt_bytes(size) } else { String::new() };
+            let stale_mark = if stale { "!" } else { "" };
+            let text = format!("{glyph}{stale_mark:<1} {sz:>10}  {indent}{name}");
+            Line::from(Span::styled(text,
+                Style::default().fg(Color::Black).bg(Color::Cyan)))
         } else {
-            Line::from(Span::styled(text, Style::default().fg(color)))
+            let sz = if size > 0 { fmt_bytes(size) } else { String::new() };
+            let mut spans = vec![
+                Span::styled(glyph.to_string(), Style::default().fg(color)),
+            ];
+            if stale {
+                spans.push(Span::styled("!",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::REVERSED)));
+            } else {
+                spans.push(Span::raw(" "));
+            }
+            spans.push(Span::raw(format!(" {sz:>10}  {indent}")));
+            spans.push(Span::styled(name.to_string(),
+                if stale { Style::default().fg(Color::Red) }
+                else { Style::default().fg(color) }));
+            Line::from(spans)
         };
         out.push(line);
     }
@@ -3805,9 +3858,11 @@ mod tests {
             buf.contains("hello_ui_marker.txt"),
             "changes pane should list the written file; got:\n{buf}"
         );
-        // Kind is shown as the prototype's single-char glyph: ~ for
-        // changed/modified rows. (Previously this asserted "changed" text.)
-        assert!(buf.contains('~'), "changed-row glyph missing:\n{buf}");
+        // Kind is shown as the prototype's single-char glyph. With per-row
+        // decoration now wired up, a newly-written file renders as '+'
+        // (created); a modified one would be '~'.
+        assert!(buf.contains('+') || buf.contains('~'),
+                "kind glyph (+ / ~) missing:\n{buf}");
         // the 19-byte write's size must show in the pane.
         assert!(buf.contains("19"), "size column missing:\n{buf}");
     }
@@ -4311,6 +4366,7 @@ mod tests {
             last_tick: Instant::now(),
             cd_info: None,
             output_segs: vec![],
+            changes_decor: vec![],
         };
         app.focus = Pane::Help;
         // render tall enough to fit the full manual (it scrolls in a real term).

@@ -855,6 +855,20 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
             (Some(id), Some(rel)) => crate::review::decorate(id, rel),
             _ => json!({"is_text": false, "stale": false, "kind": "changed"}),
         },
+        // Bulk decorate: one RPC for a whole window of changes-pane rows
+        // (kind / stale / is_text per row) — the UI uses this to label the
+        // changes list with +/~/- glyphs and the `!` stale marker without a
+        // round-trip per row.
+        "review.decorate_many" => {
+            let id = arg_sid(args);
+            let rels: Vec<&str> = args.get(1).and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            match id {
+                Some(id) => crate::review::decorate_many(id, &rels),
+                None => Value::Array(vec![]),
+            }
+        }
         "review.apply_hunk" => match (arg_sid(args), args.get(1).and_then(Value::as_str),
                                       args.get(2).and_then(Value::as_i64)) {
             (Some(id), Some(rel), Some(ix)) => {
