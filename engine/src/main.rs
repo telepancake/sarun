@@ -60,8 +60,8 @@ fn serve() -> i32 {
     let c = std::ffi::CString::new(sock.as_os_str().as_encoded_bytes()).unwrap();
     let _ = SOCK_FOR_SIGNAL.set(c);
     unsafe {
-        libc::signal(libc::SIGTERM, on_term as libc::sighandler_t);
-        libc::signal(libc::SIGINT, on_term as libc::sighandler_t);
+        libc::signal(libc::SIGTERM, on_term as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGINT, on_term as *const () as libc::sighandler_t);
     }
     // Mount the multi-box overlay at the instance mountpoint (threads = cores).
     let mnt = paths::mnt_point();

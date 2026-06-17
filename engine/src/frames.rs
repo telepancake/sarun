@@ -48,6 +48,7 @@ pub const FRAME_PTY_RESIZE: u8 = 8;
 pub const FRAME_PTY_EOF: u8 = 9;
 
 /// Body of a FRAME_PTY_RESIZE frame: [rows:u16 BE][cols:u16 BE].
+#[allow(dead_code)]
 pub fn pty_resize_payload(rows: u16, cols: u16) -> Vec<u8> {
     let mut v = Vec::with_capacity(4);
     v.extend_from_slice(&rows.to_be_bytes());

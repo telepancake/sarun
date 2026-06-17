@@ -726,7 +726,7 @@ impl Filesystem for Overlay {
         let Some((bid, rel)) = self.key_of(ino) else {
             return reply.error(Errno::ENOENT);
         };
-        let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
+        let Some(_) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
         match self.resolve(bid, &rel) {
             Layer::UpperSymlink { target } =>
                 reply.data(target.as_os_str().as_encoded_bytes()),
