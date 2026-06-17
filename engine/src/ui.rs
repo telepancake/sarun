@@ -38,9 +38,11 @@ use base64::Engine as _;
 use crate::rules::Clause;
 use crate::rules::Join;
 use crate::rules::Match;
-use crate::rules::ProcFilterTarget;
-use crate::rules::Subject;
-use crate::rules::eval_clauses;
+// Subject / ProcFilterTarget / eval_clauses moved server-side (views.rs
+// owns filter evaluation now), but the unit-test module still references
+// the same types for a parity check against rules::eval_clauses.
+#[cfg(test)]
+use crate::rules::{ProcFilterTarget, Subject, eval_clauses};
 
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -370,17 +372,15 @@ struct App {
     /// Same window/view scheme for the processes pane. `processes` rows here
     /// are the engine-side flattened tree (depth + connector baked in), so
     /// the UI no longer rebuilds the tree.
-    /// TODO follow-up commit migrates this pane to the view RPCs; the fields
-    /// below are reserved so the App layout doesn't churn twice.
     processes: Vec<Value>,
-    #[allow(dead_code)] processes_view: Option<u64>,
-    #[allow(dead_code)] processes_total: usize,
-    #[allow(dead_code)] processes_window_start: usize,
+    processes_view: Option<u64>,
+    processes_total: usize,
+    processes_window_start: usize,
     /// Same for outputs.
     outputs: Vec<Value>,
-    #[allow(dead_code)] outputs_view: Option<u64>,
-    #[allow(dead_code)] outputs_total: usize,
-    #[allow(dead_code)] outputs_window_start: usize,
+    outputs_view: Option<u64>,
+    outputs_total: usize,
+    outputs_window_start: usize,
     output_view: String,   // decoded bytes of the captured streams (stdout/stderr)
     rules: Vec<String>,    // raw filerules lines (apply/discard/passthrough <glob>)
     sel_session: usize,
@@ -906,16 +906,117 @@ impl App {
         self.save_rules();
     }
 
-    /// Load the captured process tree for the selected box (rows are
-    /// [id,tgid,ppid,parent_id,exe,argv]).
+    /// Open the engine-side procs view and fetch the first window. The
+    /// engine returns the DFS-flattened tree rows (depth + connector flag
+    /// baked into each row), so the UI no longer rebuilds the tree per
+    /// keystroke — that was the multi-second-per-keypress death spiral on a
+    /// box with millions of processes.
     fn load_processes(&mut self) {
+        self.close_processes_view();
         self.processes.clear();
+        self.processes_total = 0;
+        self.processes_window_start = 0;
         self.sel_proc = 0;
-        let Some(sid) = self.cur_sid() else { return };
-        match rpc(&self.sock, "processes", json!([sid])) {
-            Ok(Value::Array(a)) => self.processes = a,
-            Ok(_) => {}
-            Err(e) => self.status = format!("processes: {e}"),
+        let Some(sid) = self.cur_sid_i64() else { return };
+        let filter = filter_to_json(self.f_procs.active());
+        match rpc(&self.sock, "view.open", json!(["procs", sid, filter])) {
+            Ok(v) => {
+                self.processes_view = v.get("view_id").and_then(Value::as_u64);
+                self.processes_total =
+                    v.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
+            }
+            Err(e) if e.contains("unknown verb") => {
+                self.status = format!(
+                    "engine doesn't speak view.* — kill the stale engine \
+                     (the socket {} is being answered by an old process) and \
+                     run sarun again", self.sock);
+                return;
+            }
+            Err(e) => { self.status = format!("view.open procs: {e}"); return; }
+        }
+        self.fetch_processes_window(0);
+    }
+
+    /// Pull one window of the procs view; `start` is in engine-view
+    /// coordinates (post-filter), the response carries the row slice
+    /// already flattened (each row has rid/tgid/ppid/exe/argv/depth/
+    /// connector — same shape as the old ProcTreeRow).
+    fn fetch_processes_window(&mut self, start: usize) {
+        let Some(vid) = self.processes_view else { return };
+        let start = start.min(self.processes_total.saturating_sub(1).max(0));
+        match rpc(&self.sock, "view.window",
+                  json!([vid, start, WINDOW_SIZE])) {
+            Ok(v) => {
+                self.processes_window_start =
+                    v.get("start").and_then(Value::as_u64).unwrap_or(start as u64) as usize;
+                self.processes_total =
+                    v.get("total").and_then(Value::as_u64)
+                        .unwrap_or(self.processes_total as u64) as usize;
+                self.processes = v.get("rows").and_then(Value::as_array).cloned()
+                    .unwrap_or_default();
+            }
+            Err(e) => self.status = format!("view.window procs: {e}"),
+        }
+    }
+
+    fn close_processes_view(&mut self) {
+        if let Some(vid) = self.processes_view.take() {
+            let _ = rpc(&self.sock, "view.close", json!([vid]));
+        }
+    }
+
+    /// Push the local f_procs filter to the engine view, then refetch from
+    /// the top. Same shape as push_changes_filter.
+    fn push_procs_filter(&mut self) {
+        let Some(vid) = self.processes_view else { return };
+        let filter = filter_to_json(self.f_procs.active());
+        match rpc(&self.sock, "view.filter", json!([vid, filter])) {
+            Ok(v) => {
+                self.processes_total =
+                    v.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
+                self.processes_window_start = 0;
+                self.sel_proc = 0;
+                self.fetch_processes_window(0);
+            }
+            Err(e) => self.status = format!("view.filter procs: {e}"),
+        }
+    }
+
+    /// Move the procs cursor by `delta`, skipping connector rows.
+    /// `sel_proc` indexes into the current window; when the cursor walks
+    /// off the window edge, slide one window worth and re-aim. Connectors
+    /// inside a filtered view never appear (the engine excludes them),
+    /// so the skip loop only matters in the unfiltered tree.
+    fn move_proc_cursor(&mut self, delta: isize) {
+        if self.processes_total == 0 { return; }
+        let step: isize = if delta > 0 { 1 } else { -1 };
+        // global cursor position within the engine view's idx
+        let mut global = self.processes_window_start + self.sel_proc;
+        loop {
+            let new_global = global as isize + step;
+            if new_global < 0 || new_global as usize >= self.processes_total {
+                return; // hit the boundary, leave cursor where it was
+            }
+            global = new_global as usize;
+            // is this row in the current window?
+            let win_end = self.processes_window_start + self.processes.len();
+            if global < self.processes_window_start || global >= win_end {
+                let quarter = WINDOW_SIZE / 4;
+                let new_start = global.saturating_sub(
+                    if step > 0 { quarter } else { WINDOW_SIZE - quarter });
+                self.fetch_processes_window(new_start);
+            }
+            // skip connectors (unfiltered view shows them, but the cursor
+            // doesn't land on them — they're structural-ancestor dim rows)
+            let off = global.saturating_sub(self.processes_window_start);
+            let is_connector = self.processes.get(off)
+                .and_then(|r| r.get("connector").and_then(Value::as_bool))
+                .unwrap_or(false);
+            if !is_connector {
+                self.sel_proc = off;
+                return;
+            }
+            // connector: keep stepping in the same direction.
         }
     }
 
@@ -923,41 +1024,98 @@ impl App {
     /// decode each row's bytes (output_detail wire-encodes them as {"__b":b64})
     /// into a single scrollable stdout/stderr transcript.
     fn load_outputs(&mut self) {
+        self.close_outputs_view();
         self.outputs.clear();
         self.output_view.clear();
+        self.outputs_total = 0;
+        self.outputs_window_start = 0;
         self.sel_output = 0;
         self.out_scroll = 0;
-        let Some(sid) = self.cur_sid() else { return };
-        match rpc(&self.sock, "outputs", json!([sid])) {
-            Ok(Value::Array(a)) => self.outputs = a,
-            Ok(_) => return,
-            Err(e) => {
-                self.status = format!("outputs: {e}");
+        let Some(sid) = self.cur_sid_i64() else { return };
+        let filter = filter_to_json(self.f_outputs.active());
+        match rpc(&self.sock, "view.open", json!(["outputs", sid, filter])) {
+            Ok(v) => {
+                self.outputs_view = v.get("view_id").and_then(Value::as_u64);
+                self.outputs_total =
+                    v.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
+            }
+            Err(e) if e.contains("unknown verb") => {
+                self.status = format!(
+                    "engine doesn't speak view.* — kill the stale engine \
+                     (the socket {} is being answered by an old process) and \
+                     run sarun again", self.sock);
                 return;
             }
+            Err(e) => { self.status = format!("view.open outputs: {e}"); return; }
         }
-        let mut view = String::new();
+        self.fetch_outputs_window(0);
+    }
+
+    /// Pull one window of the outputs index, then decode just those rows'
+    /// captured bytes into the scrollback `output_view`. The decode loop is
+    /// bounded by the window so a box with thousands of recorded outputs
+    /// doesn't pin the UI thread on RPCs at load time.
+    fn fetch_outputs_window(&mut self, start: usize) {
+        let Some(vid) = self.outputs_view else { return };
+        let start = start.min(self.outputs_total.saturating_sub(1).max(0));
+        match rpc(&self.sock, "view.window",
+                  json!([vid, start, WINDOW_SIZE])) {
+            Ok(v) => {
+                self.outputs_window_start =
+                    v.get("start").and_then(Value::as_u64).unwrap_or(start as u64) as usize;
+                self.outputs_total =
+                    v.get("total").and_then(Value::as_u64)
+                        .unwrap_or(self.outputs_total as u64) as usize;
+                self.outputs = v.get("rows").and_then(Value::as_array).cloned()
+                    .unwrap_or_default();
+            }
+            Err(e) => { self.status = format!("view.window outputs: {e}"); return; }
+        }
+        // Decode just the window's bytes into the scrollback text pane.
+        let Some(sid) = self.cur_sid() else { return };
+        let mut text = String::new();
         for o in &self.outputs {
             let oid = o.get("id").and_then(Value::as_i64).unwrap_or(-1);
             let stream = o.get("stream").and_then(Value::as_i64).unwrap_or(0);
             let tag = if stream == 1 { "err" } else { "out" };
             if let Ok(d) = rpc(&self.sock, "output_detail", json!([sid, oid])) {
-                if let Some(b64) = d
-                    .get("content")
+                if let Some(b64) = d.get("content")
                     .and_then(|c| c.get("__b"))
                     .and_then(Value::as_str)
                 {
                     if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
-                        let text = String::from_utf8_lossy(&bytes);
-                        for chunk in text.split_inclusive('\n') {
-                            view.push_str(&format!("[{tag}] {}", chunk.trim_end_matches('\n')));
-                            view.push('\n');
+                        let s = String::from_utf8_lossy(&bytes);
+                        for chunk in s.split_inclusive('\n') {
+                            text.push_str(&format!("[{tag}] {}", chunk.trim_end_matches('\n')));
+                            text.push('\n');
                         }
                     }
                 }
             }
         }
-        self.output_view = view;
+        self.output_view = text;
+    }
+
+    fn close_outputs_view(&mut self) {
+        if let Some(vid) = self.outputs_view.take() {
+            let _ = rpc(&self.sock, "view.close", json!([vid]));
+        }
+    }
+
+    /// Push the local f_outputs filter to the engine view, then refetch.
+    fn push_outputs_filter(&mut self) {
+        let Some(vid) = self.outputs_view else { return };
+        let filter = filter_to_json(self.f_outputs.active());
+        match rpc(&self.sock, "view.filter", json!([vid, filter])) {
+            Ok(v) => {
+                self.outputs_total =
+                    v.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
+                self.outputs_window_start = 0;
+                self.sel_output = 0;
+                self.fetch_outputs_window(0);
+            }
+            Err(e) => self.status = format!("view.filter outputs: {e}"),
+        }
     }
 
     /// The on-disk filerules path for the active namespace, computed the same
@@ -1034,11 +1192,7 @@ impl App {
                     self.hunk_scroll = self.hunk_scroll.saturating_add(1);
                 }
             }
-            Pane::Processes => {
-                if self.sel_proc + 1 < self.proc_selectable().len() {
-                    self.sel_proc += 1;
-                }
-            }
+            Pane::Processes => self.move_proc_cursor(1),
             Pane::Outputs => self.out_scroll = self.out_scroll.saturating_add(1),
             Pane::Rules => {
                 if self.sel_rule + 1 < self.rules.len() {
@@ -1072,7 +1226,7 @@ impl App {
                     self.hunk_scroll = self.hunk_scroll.saturating_sub(1);
                 }
             }
-            Pane::Processes => self.sel_proc = self.sel_proc.saturating_sub(1),
+            Pane::Processes => self.move_proc_cursor(-1),
             Pane::Outputs => self.out_scroll = self.out_scroll.saturating_sub(1),
             Pane::Rules => self.sel_rule = self.sel_rule.saturating_sub(1),
             Pane::Help => self.out_scroll = self.out_scroll.saturating_sub(1),
@@ -1368,7 +1522,8 @@ impl App {
     fn push_view_filter(&mut self, v: FilterView) {
         match v {
             FilterView::Changes => self.push_changes_filter(),
-            FilterView::Procs | FilterView::Outputs => {}
+            FilterView::Procs => self.push_procs_filter(),
+            FilterView::Outputs => self.push_outputs_filter(),
         }
     }
 
@@ -1380,53 +1535,11 @@ impl App {
         }
     }
 
-    /// Build the Subject (box/exe/cwd/argv) for a process row, used to evaluate
-    /// SUBJECT-kind clauses. `prov` falls back to a `proc_prov` lookup for cwd
-    /// (the processes() row carries exe+argv but not cwd).
-    fn proc_subject(&self, p: &Value) -> Subject {
-        let a = p.as_array();
-        let exe = a.and_then(|x| x.get(4)).and_then(Value::as_str).unwrap_or("").to_string();
-        let argv = a
-            .and_then(|x| x.get(5))
-            .and_then(Value::as_array)
-            .map(|v| v.iter().filter_map(Value::as_str).map(String::from).collect())
-            .unwrap_or_default();
-        let rid = a.and_then(|x| x.first()).and_then(Value::as_i64).unwrap_or(-1);
-        let cwd = self
-            .cur_sid()
-            .filter(|_| rid >= 0)
-            .and_then(|sid| rpc(&self.sock, "proc_prov", json!([sid, rid])).ok())
-            .and_then(|pr| pr.get("cwd").and_then(Value::as_str).map(String::from))
-            .unwrap_or_default();
-        let box_name = self
-            .sessions
-            .get(self.sel_session)
-            .and_then(|s| s.get("name").or_else(|| s.get("path")))
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        Subject { box_name, exe, cwd, argv }
-    }
-
-    /// Processes after applying the procs view's typed filter. Evaluates each
-    /// row's ProcFilterTarget (row id + subject) against the active clauses via
-    /// the in-crate `eval_clauses`.
+    /// The current procs WINDOW — already filtered + tree-flattened by the
+    /// engine-side view, so the UI just walks the slice. Rows carry depth +
+    /// connector flags; sel_proc indexes into this window.
     fn visible_processes(&self) -> Vec<&Value> {
-        let Some(clauses) = self.f_procs.active() else {
-            return self.processes.iter().collect();
-        };
-        self.processes
-            .iter()
-            .filter(|p| {
-                let rid = p
-                    .as_array()
-                    .and_then(|x| x.first())
-                    .and_then(Value::as_i64)
-                    .unwrap_or(-1);
-                let target = ProcFilterTarget { row_id: rid, subject: self.proc_subject(p) };
-                eval_clauses(&target, clauses)
-            })
-            .collect()
+        self.processes.iter().collect()
     }
 
     /// The current changes WINDOW — already filtered by the engine-side view,
@@ -1437,37 +1550,10 @@ impl App {
         self.changes.iter().collect()
     }
 
-    /// Output rows after applying the outputs view's typed filter. An output is
-    /// matched via its process_id (ProcFilterTarget); subject clauses resolve
-    /// against that process's provenance.
+    /// The current outputs WINDOW — already filtered by the engine view, so
+    /// the UI just returns the slice.
     fn visible_outputs(&self) -> Vec<&Value> {
-        let Some(clauses) = self.f_outputs.active() else {
-            return self.outputs.iter().collect();
-        };
-        let sid = self.cur_sid();
-        self.outputs
-            .iter()
-            .filter(|o| {
-                let pid = o.get("process_id").and_then(Value::as_i64).unwrap_or(-1);
-                let subject = sid
-                    .as_ref()
-                    .filter(|_| pid >= 0)
-                    .and_then(|s| rpc(&self.sock, "proc_prov", json!([s, pid])).ok())
-                    .map(|pr| Subject {
-                        box_name: String::new(),
-                        exe: pr.get("exe").and_then(Value::as_str).unwrap_or("").to_string(),
-                        cwd: pr.get("cwd").and_then(Value::as_str).unwrap_or("").to_string(),
-                        argv: pr
-                            .get("argv")
-                            .and_then(Value::as_array)
-                            .map(|v| v.iter().filter_map(Value::as_str).map(String::from).collect())
-                            .unwrap_or_default(),
-                    })
-                    .unwrap_or_default();
-                let target = ProcFilterTarget { row_id: pid, subject };
-                eval_clauses(&target, clauses)
-            })
-            .collect()
+        self.outputs.iter().collect()
     }
 
     /// Writer row ids for a change (first_writer_id + writer_id), de-duped
@@ -1530,7 +1616,7 @@ impl App {
         if let (Some(src), Some(dest)) = (self.focus_filter_view(), dest) {
             if src != dest {
                 let ids = self.nav_ids(src, dest);
-                match ids {
+                let touched = match ids {
                     Some(ids) => {
                         let pat = ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
                         *self.view_filter_mut(dest) = ViewFilter {
@@ -1544,25 +1630,34 @@ impl App {
                             generated: true,
                         };
                         self.reset_view_cursor(dest);
+                        true
                     }
                     None => {
                         if self.view_filter(dest).generated {
                             *self.view_filter_mut(dest) = ViewFilter::default();
                             self.reset_view_cursor(dest);
-                        }
+                            true
+                        } else { false }
                     }
-                }
+                };
+                // Push the new (or cleared) generated filter to the engine
+                // view — without this the local f_* flips but the engine's
+                // materialized idx still reflects the old filter and the
+                // pane shows stale rows.
+                if touched { self.push_view_filter(dest); }
             }
         }
         self.focus = dest_pane;
     }
 }
 
-// ── process tree (mirrors Python build_proc_tree / build_path_tree) ──────────
+// ── process tree row (the projection of the engine-flattened tree) ──────────
 
 /// One DFS-ordered tree row: (row_id, tgid, ppid, exe, argv, depth, connector).
 /// `connector` is true for a purely-structural ancestor added to connect the
-/// forest (dimmed; the cursor skips it).
+/// forest (dimmed; the cursor skips it). The actual DFS flatten happens in
+/// the engine (views.rs); this struct is just what the UI projects out of
+/// the windowed JSON rows for rendering.
 #[derive(Clone)]
 struct ProcTreeRow {
     rid: i64,
@@ -1572,104 +1667,6 @@ struct ProcTreeRow {
     argv: Vec<String>,
     depth: usize,
     connector: bool,
-}
-
-const PROC_TREE_DEPTH: usize = 64;
-
-/// Resolve (tgid, ppid, parent_id, exe, argv) for a row id, first from the
-/// in-memory member/node map, else via a `proc_info` RPC (connector ancestors
-/// not present in `procs`). Returns None if unrecorded.
-type NodeInfo = (i64, i64, Option<i64>, String, Vec<String>);
-
-fn node_info(p: &Value) -> NodeInfo {
-    let a = p.as_array();
-    let g = |i: usize| a.and_then(|x| x.get(i)).and_then(Value::as_i64);
-    let exe = a.and_then(|x| x.get(4)).and_then(Value::as_str).unwrap_or("").to_string();
-    let argv = a
-        .and_then(|x| x.get(5))
-        .and_then(Value::as_array)
-        .map(|v| v.iter().filter_map(Value::as_str).map(String::from).collect())
-        .unwrap_or_default();
-    (g(1).unwrap_or(0), g(2).unwrap_or(0), g(3), exe, argv)
-}
-
-/// Build the DFS-ordered, depth-indented process tree from the flat `procs`
-/// list, walking parent_id chains up to `roots` and unioning structural
-/// ancestors (resolved via `lookup`). Mirrors Python `build_proc_tree` +
-/// `build_path_tree`: parent immediately precedes its subtree; order-independent
-/// (a pure function of inputs).
-fn build_proc_tree(
-    procs: &[&Value],
-    roots: &std::collections::HashSet<i64>,
-    lookup: &dyn Fn(i64) -> Option<NodeInfo>,
-) -> Vec<ProcTreeRow> {
-    use std::collections::HashMap;
-    use std::collections::HashSet;
-
-    let mut members: HashMap<i64, NodeInfo> = HashMap::new();
-    for p in procs {
-        if let Some(rid) = p.as_array().and_then(|x| x.first()).and_then(Value::as_i64) {
-            members.insert(rid, node_info(p));
-        }
-    }
-    let mut nodes: HashMap<i64, NodeInfo> = members.clone();
-
-    let info = |rid: i64, nodes: &HashMap<i64, NodeInfo>| -> Option<NodeInfo> {
-        if let Some(n) = nodes.get(&rid) {
-            return Some(n.clone());
-        }
-        lookup(rid)
-    };
-
-    // root→self row-id path for each member, unioning ancestors into `nodes`.
-    let mut member_paths: HashMap<i64, Vec<i64>> = HashMap::new();
-    let member_ids: Vec<i64> = members.keys().copied().collect();
-    for &start in &member_ids {
-        let mut path = vec![];
-        let mut seen = HashSet::new();
-        let mut cur = start;
-        for _ in 0..PROC_TREE_DEPTH {
-            if seen.contains(&cur) {
-                break;
-            }
-            seen.insert(cur);
-            path.push(cur);
-            if roots.contains(&cur) {
-                break;
-            }
-            let Some(got) = info(cur, &nodes) else { break };
-            let Some(parent_id) = got.2 else { break };
-            if parent_id == 0 {
-                break;
-            }
-            let Some(got_p) = info(parent_id, &nodes) else { break };
-            nodes.entry(parent_id).or_insert(got_p);
-            cur = parent_id;
-        }
-        path.reverse();
-        member_paths.insert(start, path);
-    }
-
-    // Sort member root→self paths lexicographically → DFS order (parent before
-    // subtree). Each member contributes its full path; intermediate ancestors
-    // become connector rows the first time they appear.
-    let mut paths: Vec<Vec<i64>> = member_paths.values().cloned().collect();
-    paths.sort();
-
-    let mut emitted: HashSet<i64> = HashSet::new();
-    let mut out = vec![];
-    for path in &paths {
-        for (depth, &rid) in path.iter().enumerate() {
-            if !emitted.insert(rid) {
-                continue;
-            }
-            let connector = !members.contains_key(&rid);
-            let (tgid, ppid, _par, exe, argv) =
-                nodes.get(&rid).cloned().or_else(|| lookup(rid)).unwrap_or((0, 0, None, String::new(), vec![]));
-            out.push(ProcTreeRow { rid, tgid, ppid, exe, argv, depth, connector });
-        }
-    }
-    out
 }
 
 // ── rendering ───────────────────────────────────────────────────────────────
@@ -1949,54 +1946,24 @@ impl App {
     /// the surviving REAL processes rendered FLAT (depth 0, no connectors) — the
     /// filter means "show me exactly these rows", not the hierarchy. Mirrors the
     /// Python `_load_procs` filtered/unfiltered split.
+    /// Render rows for the procs pane. The engine flattens the tree at
+    /// view.open and embeds depth + connector flag in every row, so this is
+    /// just a cheap projection of the window — no RPC, no rebuild, no tree
+    /// walk per keystroke (that walk was N proc_info RPCs per row per
+    /// render, which was the multi-second hot path).
     fn proc_tree_rows(&self) -> Vec<ProcTreeRow> {
-        if self.f_procs.active().is_some() {
-            // filtered: flat list of surviving processes (depth 0, no connectors).
-            return self
-                .visible_processes()
-                .iter()
-                .map(|p| {
-                    let (tgid, ppid, _par, exe, argv) = node_info(p);
-                    let rid = p.as_array().and_then(|x| x.first()).and_then(Value::as_i64).unwrap_or(-1);
-                    ProcTreeRow { rid, tgid, ppid, exe, argv, depth: 0, connector: false }
-                })
-                .collect();
-        }
-        // unfiltered: the full tree.
-        let roots: std::collections::HashSet<i64> = self
-            .cur_sid()
-            .and_then(|sid| rpc(&self.sock, "proc_roots", json!([sid])).ok())
-            .and_then(|v| v.as_array().cloned())
-            .map(|a| a.iter().filter_map(Value::as_i64).collect())
-            .unwrap_or_default();
-        let sid = self.cur_sid();
-        let sock = self.sock.clone();
-        let lookup = move |rid: i64| -> Option<NodeInfo> {
-            let sid = sid.clone()?;
-            let v = rpc(&sock, "proc_info", json!([sid, rid])).ok()?;
-            let a = v.as_array()?;
-            // proc_info returns [tgid,ppid,parent_id,exe,argv]
-            let g = |i: usize| a.get(i).and_then(Value::as_i64);
-            let exe = a.get(3).and_then(Value::as_str).unwrap_or("").to_string();
-            let argv = a
-                .get(4)
-                .and_then(Value::as_array)
-                .map(|x| x.iter().filter_map(Value::as_str).map(String::from).collect())
-                .unwrap_or_default();
-            Some((g(0).unwrap_or(0), g(1).unwrap_or(0), g(2), exe, argv))
-        };
-        let procs: Vec<&Value> = self.processes.iter().collect();
-        build_proc_tree(&procs, &roots, &lookup)
-    }
-
-    /// Indices into `proc_tree_rows()` the cursor may land on (non-connectors).
-    fn proc_selectable(&self) -> Vec<usize> {
-        self.proc_tree_rows()
-            .iter()
-            .enumerate()
-            .filter(|(_, r)| !r.connector)
-            .map(|(i, _)| i)
-            .collect()
+        self.processes.iter().map(|p| ProcTreeRow {
+            rid: p.get("rid").and_then(Value::as_i64).unwrap_or(-1),
+            tgid: p.get("tgid").and_then(Value::as_i64).unwrap_or(0),
+            ppid: p.get("ppid").and_then(Value::as_i64).unwrap_or(0),
+            exe: p.get("exe").and_then(Value::as_str).unwrap_or("").to_string(),
+            argv: p.get("argv").and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(Value::as_str)
+                          .map(String::from).collect())
+                .unwrap_or_default(),
+            depth: p.get("depth").and_then(Value::as_u64).unwrap_or(0) as usize,
+            connector: p.get("connector").and_then(Value::as_bool).unwrap_or(false),
+        }).collect()
     }
 }
 
@@ -2010,12 +1977,18 @@ fn processes_lines(app: &App) -> Vec<Line<'static>> {
     ))];
     let rows = app.proc_tree_rows();
     if rows.is_empty() {
-        out.push(Line::from("(no captured processes)"));
+        let msg = if app.processes_total == 0 {
+            if app.f_procs.active().is_some() {
+                "(no processes match filter)"
+            } else { "(no captured processes)" }
+        } else { "(empty window — engine view drifted)" };
+        out.push(Line::from(msg));
         return out;
     }
-    // map sel_proc (index over real rows) to the highlighted tree-row index.
-    let real = app.proc_selectable();
-    let hi = real.get(app.sel_proc).copied();
+    // sel_proc is window-relative now; the engine-side view already excluded
+    // connectors in the filtered case, and move_proc_cursor skips them in
+    // the unfiltered case, so the highlight just points at sel_proc.
+    let hi = Some(app.sel_proc);
     for (i, r) in rows.iter().enumerate() {
         let indent = "  ".repeat(r.depth);
         let base = r.exe.rsplit('/').next().unwrap_or(&r.exe);
@@ -2399,11 +2372,9 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
 /// process_env verb), keyed off the processes() row id.
 fn proc_detail_lines(app: &App) -> Vec<Line<'static>> {
     let rows = app.proc_tree_rows();
-    let real = app.proc_selectable();
-    let Some(&ti) = real.get(app.sel_proc) else {
+    let Some(r) = rows.get(app.sel_proc) else {
         return vec![Line::from("(no process selected)")];
     };
-    let r = &rows[ti];
     let rid = r.rid;
     let mut out = vec![
         Line::from(Span::styled(
@@ -3520,20 +3491,10 @@ mod tests {
         app.focus = Pane::Processes;
         let buf = render_to_string(&app, 160, 40).unwrap();
         assert!(buf.contains("echo"), "filtered processes pane should still show echo:\n{buf}");
-
-        // CROSS-CHECK: the same (clause, target) inputs run through the in-crate
-        // eval_clauses directly must agree with the UI's filter decision.
-        let clause = keep[0].to_clause();
-        for p in &app.processes {
-            let rid = p.as_array().and_then(|x| x.first()).and_then(Value::as_i64).unwrap_or(-1);
-            let tgt = crate::rules::ProcFilterTarget { row_id: rid, subject: app.proc_subject(p) };
-            let direct = crate::rules::eval_clauses(&tgt, std::slice::from_ref(&clause));
-            let via_ui = app.visible_processes().iter().any(|q| {
-                q.as_array().and_then(|x| x.first()).and_then(Value::as_i64) == Some(rid)
-            });
-            assert_eq!(direct, via_ui,
-                "eval_clauses and the UI filter must agree for row {rid}");
-        }
+        // Filtering now happens server-side (engine's views::rebuild_idx
+        // runs the same rules::eval_clauses); the cross-check that the UI's
+        // filtered output matches an in-process eval_clauses was for the
+        // old client-side filter and no longer applies.
     }
 
     /// Build a known multi-level process tree in a box and assert the procs pane
@@ -3633,8 +3594,9 @@ mod tests {
         assert!(app.f_procs.on && app.f_procs.generated,
                 "procs pane should carry a generated filter after nav");
         // the procs pane must be narrowed to exactly the writer row(s).
+        // Engine-side view rows are objects {rid,tgid,ppid,exe,argv,depth,connector}.
         let vis: Vec<i64> = app.visible_processes().iter().map(|p|
-            p.as_array().and_then(|x| x.first()).and_then(Value::as_i64).unwrap_or(-1)).collect();
+            p.get("rid").and_then(Value::as_i64).unwrap_or(-1)).collect();
         assert!(!vis.is_empty(), "filtered procs must be non-empty");
         for id in &vis {
             assert!(expect_ids.contains(id),
@@ -3650,29 +3612,6 @@ mod tests {
         // and the procs pane is back to the full set.
         assert_eq!(app.visible_processes().len(), app.processes.len(),
                    "cleared filter shows all processes again");
-    }
-
-    #[test]
-    fn build_proc_tree_is_dfs_ordered_with_connectors() {
-        // pure unit test (no engine): a forest where row 30's parent (20) is a
-        // structural connector NOT present in `procs` (resolved via lookup).
-        let p = |rid: i64, parent: i64, exe: &str| {
-            json!([rid, rid * 10, 1, parent, exe, [exe]])
-        };
-        let owned = vec![p(10, 0, "root"), p(30, 20, "leaf")];
-        let procs: Vec<&Value> = owned.iter().collect();
-        let mut roots = std::collections::HashSet::new();
-        roots.insert(10i64);
-        // 20 is the connector ancestor: parent_id 10 (a root member), not in procs.
-        let lookup = |rid: i64| -> Option<NodeInfo> {
-            if rid == 20 { Some((200, 1, Some(10), "mid".into(), vec!["mid".into()])) } else { None }
-        };
-        let rows = build_proc_tree(&procs, &roots, &lookup);
-        // DFS: 10 (root, depth0) -> 20 (connector, depth1) -> 30 (leaf, depth2).
-        let ids: Vec<(i64, usize, bool)> =
-            rows.iter().map(|r| (r.rid, r.depth, r.connector)).collect();
-        assert_eq!(ids, vec![(10, 0, false), (20, 1, true), (30, 2, false)],
-                   "tree must be DFS-ordered with the unioned connector at depth 1");
     }
 
     #[test]
