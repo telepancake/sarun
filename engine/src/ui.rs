@@ -422,6 +422,10 @@ struct App {
     /// nudges sessions + the focused view's data every TICK_PERIOD so a live
     /// box's panes reflect new writes / spawns without a manual reload.
     last_tick: Instant,
+    /// Cached header for the currently-selected change: prototype's #cd-info
+    /// content — full path / kind / size / mode / stale banner. Populated in
+    /// load_hunks (on Enter / cursor move) so draw() doesn't RPC per frame.
+    cd_info: Option<Vec<(String, String)>>,
 }
 
 /// How often the UI runs its background refresh tick (mirrors the prototype's
@@ -469,6 +473,7 @@ impl App {
             sel_hunk: 0,
             struct_rx: None,
             last_tick: Instant::now(),
+            cd_info: None,
         };
         a.refresh_sessions();
         a.load_changes();
@@ -690,11 +695,16 @@ impl App {
         self.hunks = Value::Null;
         self.hunk_scroll = 0;
         self.sel_hunk = 0;
+        self.cd_info = None;
         // Supersede any structural diff in flight for the previous row.
         self.cancel_struct();
         let (Some(sid), Some(path)) = (self.cur_sid(), self.cur_change_path()) else {
             return;
         };
+        // cd-info header for any diff (text or binary). One decorate +
+        // change_mode RPC at cursor-move time keeps the per-frame draw RPC-
+        // free. Shape mirrors the prototype's _update_cd_info.
+        self.cd_info = Some(self.binary_header(&sid, &path));
         match rpc(&self.sock, "review.hunks", json!([sid, path])) {
             Ok(v) => self.hunks = v,
             Err(e) => self.status = format!("hunks: {e}"),
@@ -2029,6 +2039,24 @@ fn tree_indent(depth: usize) -> String {
     if depth == 0 { String::new() } else { format!("{}└ ", "  ".repeat(depth)) }
 }
 
+/// Render the cached cd_info tuples (style-tag, text) as styled Lines —
+/// the small header strip above the diff. Same set of style tags the
+/// binary structural-diff header uses.
+fn cd_info_lines(app: &App) -> Vec<Line<'static>> {
+    let Some(items) = app.cd_info.as_ref() else {
+        return vec![Line::from(Span::styled("(select a change)",
+            Style::default().add_modifier(Modifier::DIM)))];
+    };
+    items.iter().map(|(tag, txt)| {
+        let st = match tag.as_str() {
+            "bold" => Style::default().add_modifier(Modifier::BOLD),
+            "stale" => Style::default().fg(Color::Red).add_modifier(Modifier::REVERSED),
+            _ => Style::default().fg(Color::DarkGray),
+        };
+        Line::from(Span::styled(txt.clone(), st))
+    }).collect()
+}
+
 fn changes_lines(app: &App) -> Vec<Line<'static>> {
     let mut out = vec![Line::from(Span::styled(
         format!("{:<1} {:>10}  {}", "", "SIZE", "PATH"),
@@ -2661,7 +2689,10 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                 f.render_widget(hint, right);
             }
             // Changes view (Pane::Changes is list-focused; Pane::Hunks is
-            // diff-focused — same two-pane layout, different border).
+            // diff-focused — same two-pane layout, different border). The
+            // right half is split vertically: a 3-row cd-info strip with
+            // the selected change's full path + kind/size/mode + stale
+            // banner, and the diff body below it.
             _ => {
                 let lines = changes_lines(app);
                 let scroll = scroll_for_cursor(app.sel_change + 1, lines.len(), left.height);
@@ -2672,6 +2703,17 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                     ))
                     .scroll((scroll, 0));
                 f.render_widget(p, left);
+
+                let rsplit = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(4), Constraint::Min(3)])
+                    .split(right);
+                f.render_widget(
+                    Paragraph::new(Text::from(cd_info_lines(app)))
+                        .block(block(title("path", false), false))
+                        .wrap(Wrap { trim: false }),
+                    rsplit[0]);
+
                 let is_bin = !app.hunks.is_null()
                     && app.hunks.get("is_text").and_then(Value::as_bool) != Some(true);
                 let diff_title = if is_bin { "structural diff" } else { "diff" };
@@ -2680,7 +2722,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                                  app.focus == Pane::Hunks))
                     .scroll((app.hunk_scroll, 0))
                     .wrap(Wrap { trim: false });
-                f.render_widget(hunks, right);
+                f.render_widget(hunks, rsplit[1]);
             }
         }
     }
@@ -4119,6 +4161,7 @@ mod tests {
             sel_hunk: 0,
             struct_rx: None,
             last_tick: Instant::now(),
+            cd_info: None,
         };
         app.focus = Pane::Help;
         // render tall enough to fit the full manual (it scrolls in a real term).
