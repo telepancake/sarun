@@ -388,7 +388,6 @@ struct App {
     outputs_view: Option<u64>,
     outputs_total: usize,
     outputs_window_start: usize,
-    output_view: String,   // decoded bytes of the captured streams (stdout/stderr)
     rules: Vec<String>,    // raw filerules lines (apply/discard/passthrough <glob>)
     sel_session: usize,
     sel_change: usize,
@@ -426,7 +425,18 @@ struct App {
     /// content — full path / kind / size / mode / stale banner. Populated in
     /// load_hunks (on Enter / cursor move) so draw() doesn't RPC per frame.
     cd_info: Option<Vec<(String, String)>>,
+    /// Decoded transcript segments for the outputs view, one per row in
+    /// `self.outputs`. Tuple is (output_id, stream, decoded_text). Used by
+    /// outputs_lines to draw a per-line gutter mark for the selected
+    /// entry and apply the 8000-char windowed render the prototype does
+    /// (mirrors its _update_output_detail). Cleared on view reload.
+    output_segs: Vec<(i64, i64, String)>,
 }
+
+/// Cap on the transcript window: chars rendered in one frame, centred on
+/// the selected entry (prototype's _OUT_CAP = 8000). Bytes outside the
+/// window get rolled up into "… N earlier" / "… N more" elision lines.
+const OUTPUT_WINDOW_CAP: usize = 8000;
 
 /// How often the UI runs its background refresh tick (mirrors the prototype's
 /// set_interval(3, _tick) cadence). The render loop wakes every 200 ms on its
@@ -451,7 +461,6 @@ impl App {
             outputs_view: None,
             outputs_total: 0,
             outputs_window_start: 0,
-            output_view: String::new(),
             rules: vec![],
             sel_session: 0,
             sel_change: 0,
@@ -474,6 +483,7 @@ impl App {
             struct_rx: None,
             last_tick: Instant::now(),
             cd_info: None,
+            output_segs: vec![],
         };
         a.refresh_sessions();
         a.load_changes();
@@ -1131,7 +1141,7 @@ impl App {
     fn load_outputs(&mut self) {
         self.close_outputs_view();
         self.outputs.clear();
-        self.output_view.clear();
+        self.output_segs.clear();
         self.outputs_total = 0;
         self.outputs_window_start = 0;
         self.sel_output = 0;
@@ -1176,29 +1186,26 @@ impl App {
             }
             Err(e) => { self.status = format!("view.window outputs: {e}"); return; }
         }
-        // Decode just the window's bytes into the scrollback text pane.
+        // Decode each window-row's captured bytes into a segment kept under
+        // its origin (oid, stream). outputs_lines uses these to draw a
+        // per-line gutter for the selected entry and the OUTPUT_WINDOW_CAP
+        // window centred on it — both impossible if we'd concatenated the
+        // text into one string.
         let Some(sid) = self.cur_sid() else { return };
-        let mut text = String::new();
+        self.output_segs.clear();
         for o in &self.outputs {
             let oid = o.get("id").and_then(Value::as_i64).unwrap_or(-1);
             let stream = o.get("stream").and_then(Value::as_i64).unwrap_or(0);
-            let tag = if stream == 1 { "err" } else { "out" };
-            if let Ok(d) = rpc(&self.sock, "output_detail", json!([sid, oid])) {
-                if let Some(b64) = d.get("content")
-                    .and_then(|c| c.get("__b"))
+            let text = match rpc(&self.sock, "output_detail", json!([sid, oid])) {
+                Ok(d) => d.get("content").and_then(|c| c.get("__b"))
                     .and_then(Value::as_str)
-                {
-                    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
-                        let s = String::from_utf8_lossy(&bytes);
-                        for chunk in s.split_inclusive('\n') {
-                            text.push_str(&format!("[{tag}] {}", chunk.trim_end_matches('\n')));
-                            text.push('\n');
-                        }
-                    }
-                }
-            }
+                    .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())
+                    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                    .unwrap_or_default(),
+                Err(_) => String::new(),
+            };
+            self.output_segs.push((oid, stream, text));
         }
-        self.output_view = text;
     }
 
     fn close_outputs_view(&mut self) {
@@ -2296,30 +2303,92 @@ fn processes_lines(app: &App) -> Vec<Line<'static>> {
     out
 }
 
-/// OUTPUTS pane: an index header (count + per-stream byte tally) followed by the
-/// decoded stdout/stderr transcript, each line tagged [out]/[err].
+/// OUTPUTS transcript pane — port of the prototype's _update_output_detail.
+/// Walks `app.output_segs` line-by-line within a OUTPUT_WINDOW_CAP window
+/// centred on the selected entry; prefixes every line with a "▌ " gutter
+/// (yellow-bold) when its origin is the selection, "  " (dim) otherwise;
+/// stderr lines render red; the selected entry's lines also get bold +
+/// grey23 background. Out-of-window bytes get rolled up as
+/// "… N earlier" / "… N more" elision lines.
 fn outputs_lines(app: &App) -> Vec<Line<'static>> {
-    let mut out = vec![];
+    let mut out: Vec<Line<'static>> = Vec::new();
+    // Header: total counts per stream — quick orientation.
     let (mut nout, mut nerr) = (0i64, 0i64);
     for o in &app.outputs {
         let len = o.get("len").and_then(Value::as_i64).unwrap_or(0);
-        if o.get("stream").and_then(Value::as_i64).unwrap_or(0) == 1 {
-            nerr += len;
-        } else {
-            nout += len;
-        }
+        if o.get("stream").and_then(Value::as_i64).unwrap_or(0) == 1 { nerr += len; }
+        else { nout += len; }
     }
     out.push(Line::from(Span::styled(
-        format!("{} write(s) · {} stdout B · {} stderr B", app.outputs.len(), nout, nerr),
-        Style::default().add_modifier(Modifier::BOLD),
-    )));
-    if app.output_view.is_empty() {
+        format!("{} write(s) · {} stdout B · {} stderr B",
+                app.outputs.len(), nout, nerr),
+        Style::default().add_modifier(Modifier::BOLD))));
+    if app.output_segs.is_empty() {
         out.push(Line::from("(no captured output)"));
         return out;
     }
-    for l in app.output_view.lines() {
-        let color = if l.starts_with("[err]") { Color::Red } else { Color::Gray };
-        out.push(Line::from(Span::styled(l.to_string(), Style::default().fg(color))));
+    // Selected entry's id (used to drive the gutter mark and the window
+    // centre). sel_output indexes the OUTPUTS index list, which lines up
+    // with output_segs by construction.
+    let sel_oid = app.outputs.get(app.sel_output)
+        .and_then(|o| o.get("id").and_then(Value::as_i64));
+    // Total concat size + selected entry's start offset (for centring).
+    let total: usize = app.output_segs.iter().map(|(_, _, t)| t.len()).sum();
+    let mut sel_off = 0usize;
+    let mut acc = 0usize;
+    for (oid, _st, txt) in &app.output_segs {
+        if Some(*oid) == sel_oid { sel_off = acc; }
+        acc += txt.len();
+    }
+    // Centre the window on sel_off, then clamp.
+    let (start, end) = if total > OUTPUT_WINDOW_CAP {
+        let half = OUTPUT_WINDOW_CAP / 2;
+        let mut s = sel_off.saturating_sub(half);
+        let e = (s + OUTPUT_WINDOW_CAP).min(total);
+        s = e.saturating_sub(OUTPUT_WINDOW_CAP);
+        (s, e)
+    } else { (0, total) };
+    if start > 0 {
+        out.push(Line::from(Span::styled(
+            format!("  … {} earlier", fmt_bytes(start as i64)),
+            Style::default().add_modifier(Modifier::DIM))));
+    }
+    // Walk segments line-by-line within [start, end), applying gutter +
+    // style per the prototype.
+    let mut pos = 0usize;
+    for (oid, stream, txt) in &app.output_segs {
+        let seg_start = pos;
+        let seg_end = pos + txt.len();
+        pos = seg_end;
+        if seg_end <= start || seg_start >= end { continue; }
+        // Visible slice of this segment.
+        let lo = start.saturating_sub(seg_start);
+        let hi = txt.len() - seg_end.saturating_sub(end);
+        let vis = &txt[lo..hi];
+        let is_sel = Some(*oid) == sel_oid;
+        let mut text_style = Style::default();
+        if *stream == 1 { text_style = text_style.fg(Color::Red); }
+        if is_sel {
+            text_style = text_style.add_modifier(Modifier::BOLD).bg(Color::Rgb(58, 58, 58));
+        }
+        let gutter_style = if is_sel {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else { Style::default().add_modifier(Modifier::DIM) };
+        let gutter = if is_sel { "▌ " } else { "  " };
+        let lines: Vec<&str> = vis.split('\n').collect();
+        let last_idx = lines.len().saturating_sub(1);
+        for (i, ln) in lines.iter().enumerate() {
+            if ln.is_empty() && i == last_idx && i > 0 { break; }
+            out.push(Line::from(vec![
+                Span::styled(gutter.to_string(), gutter_style),
+                Span::styled(ln.to_string(), text_style),
+            ]));
+        }
+    }
+    if end < total {
+        out.push(Line::from(Span::styled(
+            format!("  … {} more", fmt_bytes((total - end) as i64)),
+            Style::default().add_modifier(Modifier::DIM))));
     }
     out
 }
@@ -3924,7 +3993,7 @@ mod tests {
         let found = (0..app.sessions.len()).any(|i| {
             app.sel_session = i;
             app.load_outputs();
-            app.output_view.contains("OUTPUT_MARKER_qqq")
+            app.output_segs.iter().any(|(_, _, t)| t.contains("OUTPUT_MARKER_qqq"))
         });
         assert!(found, "expected the echoed bytes in some box's outputs; status={}", app.status);
         app.focus = Pane::Outputs;
@@ -4219,7 +4288,6 @@ mod tests {
             outputs_view: None,
             outputs_total: 0,
             outputs_window_start: 0,
-            output_view: String::new(),
             rules: vec![],
             sel_session: 0,
             sel_change: 0,
@@ -4242,6 +4310,7 @@ mod tests {
             struct_rx: None,
             last_tick: Instant::now(),
             cd_info: None,
+            output_segs: vec![],
         };
         app.focus = Pane::Help;
         // render tall enough to fit the full manual (it scrolls in a real term).
