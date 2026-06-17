@@ -523,9 +523,25 @@ impl App {
             }
         }
         self.fetch_changes_window(0);
+        self.seek_first_leaf();
         // the procs/outputs panes track the same selected box.
         self.load_processes();
         self.load_outputs();
+    }
+
+    /// After (re)loading the changes view, advance sel_change to the first
+    /// LEAF (non-connector) row in the window. Without this the cursor would
+    /// land on row 0, which in the new directory-tree layout is the top
+    /// connector ("tmp/") instead of an actual change — load_hunks then has
+    /// nothing to fetch and the diff pane shows "(select a change)".
+    fn seek_first_leaf(&mut self) {
+        for (i, c) in self.changes.iter().enumerate() {
+            if c.get("connector").and_then(Value::as_bool) != Some(true) {
+                self.sel_change = i;
+                return;
+            }
+        }
+        self.sel_change = 0;
     }
 
     /// Pull a single window worth of rows from the engine's changes view.
@@ -579,27 +595,34 @@ impl App {
 
     /// Move the changes-pane cursor by `delta` rows in the engine-side view
     /// coordinate system, sliding the window if the new position would leave
-    /// it. `sel_change` is kept in [0, window.len()) after this returns.
-    /// Caller is responsible for the bound check against `changes_total`.
+    /// it AND skipping connector (directory) rows the same way the procs
+    /// pane skips its structural ancestors. `sel_change` is kept in
+    /// [0, window.len()) after this returns.
     fn sel_change_global_advance(&mut self, delta: isize) {
-        let cur_global = self.changes_window_start + self.sel_change;
-        let new_global = (cur_global as isize + delta).max(0) as usize;
-        // Still in the current window? Adjust the local cursor in-place — no
-        // RPC, the common case for any single-step navigation.
-        let win_end = self.changes_window_start + self.changes.len();
-        if new_global >= self.changes_window_start && new_global < win_end {
-            self.sel_change = new_global - self.changes_window_start;
-            return;
-        }
-        // Out of window — slide. Anchor the cursor at ~1/4 in so there's
-        // ~3/4 of a window of look-ahead in the direction of motion.
-        let quarter = WINDOW_SIZE / 4;
-        let new_start = new_global.saturating_sub(if delta > 0 { quarter } else { WINDOW_SIZE - quarter });
-        self.fetch_changes_window(new_start);
-        self.sel_change = new_global.saturating_sub(self.changes_window_start);
-        // Defend against a too-short window at the tail (sel beyond rows).
-        if self.sel_change >= self.changes.len() && !self.changes.is_empty() {
-            self.sel_change = self.changes.len() - 1;
+        if self.changes_total == 0 { return; }
+        let step: isize = if delta > 0 { 1 } else { -1 };
+        let mut global = self.changes_window_start + self.sel_change;
+        loop {
+            let new_global = global as isize + step;
+            if new_global < 0 || new_global as usize >= self.changes_total {
+                return; // hit boundary
+            }
+            global = new_global as usize;
+            let win_end = self.changes_window_start + self.changes.len();
+            if global < self.changes_window_start || global >= win_end {
+                let quarter = WINDOW_SIZE / 4;
+                let new_start = global.saturating_sub(
+                    if step > 0 { quarter } else { WINDOW_SIZE - quarter });
+                self.fetch_changes_window(new_start);
+            }
+            let off = global.saturating_sub(self.changes_window_start);
+            let is_connector = self.changes.get(off)
+                .and_then(|c| c.get("connector").and_then(Value::as_bool))
+                .unwrap_or(false);
+            if !is_connector {
+                self.sel_change = off;
+                return;
+            }
         }
     }
 
@@ -935,6 +958,21 @@ impl App {
             Err(e) => { self.status = format!("view.open procs: {e}"); return; }
         }
         self.fetch_processes_window(0);
+        self.seek_first_real_proc();
+    }
+
+    /// Advance sel_proc to the first non-connector row in the window. Without
+    /// this the cursor sits on a structural ancestor (a connector dim row),
+    /// which feels like "no item selected" — the prototype puts the cursor
+    /// on a real process, never a connector.
+    fn seek_first_real_proc(&mut self) {
+        for (i, p) in self.processes.iter().enumerate() {
+            if p.get("connector").and_then(Value::as_bool) != Some(true) {
+                self.sel_proc = i;
+                return;
+            }
+        }
+        self.sel_proc = 0;
     }
 
     /// Pull one window of the procs view; `start` is in engine-view
@@ -1814,9 +1852,16 @@ fn sessions_lines(app: &App) -> Vec<Line<'static>> {
     out
 }
 
+/// Visual "└ " tree-arm prefix at depth > 0, mirroring the prototype's
+/// _ch_indent ("  "*depth + ("└ " if depth else "")) — applied to both leaf
+/// and connector rows of the changes / procs trees.
+fn tree_indent(depth: usize) -> String {
+    if depth == 0 { String::new() } else { format!("{}└ ", "  ".repeat(depth)) }
+}
+
 fn changes_lines(app: &App) -> Vec<Line<'static>> {
     let mut out = vec![Line::from(Span::styled(
-        format!("{:<9} {:>10}  {}", "KIND", "SIZE", "PATH"),
+        format!("{:<1} {:>10}  {}", "", "SIZE", "PATH"),
         Style::default().add_modifier(Modifier::BOLD),
     ))];
     let vis = app.visible_changes();
@@ -1831,18 +1876,35 @@ fn changes_lines(app: &App) -> Vec<Line<'static>> {
     }
     for (i, c) in vis.iter().enumerate() {
         let kind = c.get("kind").and_then(Value::as_str).unwrap_or("");
-        let path = c.get("path").and_then(Value::as_str).unwrap_or("");
+        let name = c.get("name").and_then(Value::as_str).unwrap_or("");
         let size = c.get("size").and_then(Value::as_i64).unwrap_or(0);
-        let kcolor = match kind {
-            "deleted" => Color::Red,
-            "symlink" => Color::Magenta,
-            _ => Color::Green,
+        let depth = c.get("depth").and_then(Value::as_u64).unwrap_or(0) as usize;
+        let connector = c.get("connector").and_then(Value::as_bool) == Some(true);
+        // Glyphs match the prototype's _ch_cells: + green created, ~ yellow
+        // modified, - red deleted, … dim placeholder when decoration is
+        // unknown. (The Rust engine doesn't run the prototype's decoration
+        // RPC yet, so "changed" rows show ~; a future decorate pass would
+        // distinguish + vs ~ properly.)
+        let (glyph, color) = match kind {
+            "deleted" => ("-", Color::Red),
+            "symlink" => ("~", Color::Magenta),
+            "changed" => ("~", Color::Yellow),
+            _ => ("…", Color::DarkGray),
         };
-        let text = format!("{kind:<9} {size:>10}  {path}");
+        let indent = tree_indent(depth);
+        let text = if connector {
+            format!("{:<1} {:>10}  {indent}{name}/", "", "")
+        } else {
+            let sz = if size > 0 { fmt_bytes(size) } else { String::new() };
+            format!("{glyph:<1} {sz:>10}  {indent}{name}")
+        };
         let line = if i == app.sel_change {
             Line::from(Span::styled(text, Style::default().fg(Color::Black).bg(Color::Cyan)))
+        } else if connector {
+            Line::from(Span::styled(text,
+                Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM)))
         } else {
-            Line::from(Span::styled(text, Style::default().fg(kcolor)))
+            Line::from(Span::styled(text, Style::default().fg(color)))
         };
         out.push(line);
     }
@@ -1994,7 +2056,7 @@ fn processes_lines(app: &App) -> Vec<Line<'static>> {
     // the unfiltered case, so the highlight just points at sel_proc.
     let hi = Some(app.sel_proc);
     for (i, r) in rows.iter().enumerate() {
-        let indent = "  ".repeat(r.depth);
+        let indent = tree_indent(r.depth);
         let base = r.exe.rsplit('/').next().unwrap_or(&r.exe);
         let argv = r.argv.join(" ");
         let text = format!("{:>6} {:>6}  {indent}{base} {argv}", r.tgid, r.ppid).trim_end().to_string();
@@ -2319,10 +2381,12 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                 let lines = processes_lines(app);
                 let scroll = scroll_for_cursor(app.sel_proc + 1, lines.len(),
                                                left[1].height);
+                // No .wrap(): rows must be ONE visual line each, otherwise
+                // a long argv pushes everything else down and the cursor
+                // accounting (which counts logical rows) falls off the rect.
                 let procs = Paragraph::new(Text::from(lines))
                     .block(block(title("PROCESSES", true), true))
-                    .scroll((scroll, 0))
-                    .wrap(Wrap { trim: false });
+                    .scroll((scroll, 0));
                 f.render_widget(procs, left[1]);
                 let detail = Paragraph::new(Text::from(proc_detail_lines(app)))
                     .block(block(title("ENVIRONMENT · DETAIL", false), false))
@@ -3217,7 +3281,9 @@ mod tests {
             buf.contains("hello_ui_marker.txt"),
             "changes pane should list the written file; got:\n{buf}"
         );
-        assert!(buf.contains("changed"), "kind 'changed' missing:\n{buf}");
+        // Kind is shown as the prototype's single-char glyph: ~ for
+        // changed/modified rows. (Previously this asserted "changed" text.)
+        assert!(buf.contains('~'), "changed-row glyph missing:\n{buf}");
         // the 19-byte write's size must show in the pane.
         assert!(buf.contains("19"), "size column missing:\n{buf}");
     }
