@@ -8,6 +8,16 @@
 # Nothing here is magic: every recipe is a thin wrapper around the
 # exact commands documented in CLAUDE.md and README.md. The Makefile
 # exists so you don't have to remember (or copy-paste) them.
+#
+# Two binaries share the name "sarun":
+#   * ./sarun           — the Python prototype that the Rust port was
+#                         developed and tested against. uv shebang;
+#                         first run also builds patched pyfuse3 (~25s,
+#                         cached after).
+#   * engine/.../sarun  — the Rust port (the production target). Same
+#                         control protocol; a full standalone UI+engine.
+# `make run` prefers the built Rust binary and falls back to the Python
+# prototype, so `make engine[-musl] && make run` does what you expect.
 
 SHELL := bash
 .DEFAULT_GOAL := help
@@ -25,8 +35,25 @@ help: ## Show this help (the list of every command)
 # ---- App ------------------------------------------------------------------
 
 .PHONY: run
-run: ## Start the sarun UI/server (./sarun)
+run: ## Start sarun (prefers a built Rust binary; falls back to the Python prototype)
+	@if [ -x engine/target/x86_64-unknown-linux-musl/release/sarun ]; then \
+	  echo "→ engine/target/x86_64-unknown-linux-musl/release/sarun"; \
+	  exec engine/target/x86_64-unknown-linux-musl/release/sarun; \
+	elif [ -x engine/target/release/sarun ]; then \
+	  echo "→ engine/target/release/sarun"; \
+	  exec engine/target/release/sarun; \
+	else \
+	  echo "→ ./sarun  (Python prototype — first run builds patched pyfuse3, ~25s)"; \
+	  exec ./sarun; \
+	fi
+
+.PHONY: run-py
+run-py: ## Start the Python prototype specifically (./sarun), even if a Rust binary is built
 	./sarun
+
+.PHONY: warmup
+warmup: ## Pre-build patched pyfuse3 + uv deps so the Python ./sarun starts instantly
+	./sarun -h >/dev/null
 
 .PHONY: sarun-help
 sarun-help: ## Show sarun's own CLI help (./sarun -h)
@@ -42,14 +69,17 @@ sarun-help: ## Show sarun's own CLI help (./sarun -h)
 deps: ## Install system packages (libfuse3-dev, fuse3, pkg-config, bubblewrap)
 	apt-get install -y libfuse3-dev fuse3 pkg-config bubblewrap
 
-# ---- Rust engine ----------------------------------------------------------
+# ---- Rust port ------------------------------------------------------------
+#
+# Builds engine/target/.../sarun, the Rust port of the Python prototype.
+# Same control protocol — a built binary is what `make run` picks up.
 
 .PHONY: engine
-engine: ## Build the Rust engine (release, dynamic glibc — what tests use)
+engine: ## Build the Rust port (release, dynamic glibc — what `make run` prefers, what tests use)
 	cd engine && cargo build --release
 
 .PHONY: engine-musl
-engine-musl: ## Build the fully-static musl engine (cargo-zigbuild + zig — no apt, no musl-gcc)
+engine-musl: ## Build the Rust port as a fully-static musl binary (cargo-zigbuild + zig)
 	@command -v uv >/dev/null || { echo "engine-musl needs uv (https://docs.astral.sh/uv/)"; exit 1; }
 	uv tool install --with ziglang cargo-zigbuild
 	rustup target add x86_64-unknown-linux-musl
