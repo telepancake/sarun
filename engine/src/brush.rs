@@ -621,6 +621,7 @@ pub fn brush_sh(argv: &[String]) -> i32 {
     let mut set_o: Vec<String> = vec![];       // names from `-o NAME`
     let mut unset_o: Vec<String> = vec![];     // names from `+o NAME`
     let mut have_c = false;
+    let mut interactive = false;
     while idx < argv.len() {
         let a = &argv[idx];
         if a == "--" { idx += 1; break; }
@@ -634,8 +635,15 @@ pub fn brush_sh(argv: &[String]) -> i32 {
             else { unset_o.push(name.clone()); }
             idx += 2; continue;
         }
-        // -i / -l / --login: out of scope inside a box.
-        if a == "-i" || a == "-l" || a == "--login" || a == "--interactive" {
+        // -i / --interactive: drop the box into the brush-interactive REPL
+        // (reedline-based: history, multi-line edit, completion). -l/--login
+        // is still out of scope — the brush-sh shim is never executed as a
+        // login shell inside a box (no /etc/profile chain).
+        if a == "-i" || a == "--interactive" {
+            interactive = true;
+            idx += 1; continue;
+        }
+        if a == "-l" || a == "--login" {
             eprintln!("sarun-engine brush-sh: {a} not supported inside a brush box");
             return 2;
         }
@@ -675,6 +683,26 @@ pub fn brush_sh(argv: &[String]) -> i32 {
         }
         // First non-flag operand: stop flag parsing here.
         break;
+    }
+
+    // Interactive REPL form: `sh -i` (no -c, no script path). Hand the
+    // whole loop to brush-interactive's reedline backend. Set flags
+    // (-e / -u / -o NAME ...) are applied to the shell before the loop
+    // starts, same as the non-interactive paths below.
+    if interactive && have_c == false
+        && idx >= argv.len()  // no script path follows the flags
+    {
+        let rt = match tokio::runtime::Builder::new_multi_thread()
+            .enable_all().build() {
+            Ok(rt) => rt,
+            Err(e) => {
+                eprintln!("sarun-engine brush-sh: runtime: {e}");
+                return 127;
+            }
+        };
+        let bash_mode = base == "bash";
+        return rt.block_on(run_brush_interactive(
+            base.clone(), set_flags, set_o, unset_o, bash_mode));
     }
 
     // Discriminate forms.
@@ -818,6 +846,76 @@ async fn run_brush_script(script: String, shell_name: String,
         }
     }
     last_code
+}
+
+/// Brush-sh interactive REPL: `sh -i` / `bash -i` inside a -b box drops
+/// into brush-interactive's reedline backend — multi-line editing,
+/// history, completion, highlighting — all driven by the SAME brush-core
+/// shell we use for `-c SCRIPT`, so semantics match script mode exactly.
+/// Set-flags (`-e`/`-u`/`-o NAME`/...) are applied before the loop starts.
+async fn run_brush_interactive(shell_name: String,
+                               set_flags: Vec<String>, set_o: Vec<String>,
+                               unset_o: Vec<String>, bash_mode: bool) -> i32 {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
+    let shell_res = build_box_shell(!bash_mode, Some(shell_name.clone()),
+                                    Some(vec![]), Some(cwd)).await;
+    let mut shell = match shell_res {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("sarun-engine brush-sh: brush init failed: {e}");
+            return 127;
+        }
+    };
+    // Flip the shell into interactive mode so $PS1, job-control,
+    // ignoreeof, and similar `set` options take their interactive
+    // defaults (brush-interactive's start_interactive_session inspects
+    // this too).
+    shell.options_mut().interactive = true;
+    // Apply set/+set flags exactly like the non-interactive paths.
+    if !set_flags.is_empty() || !set_o.is_empty() || !unset_o.is_empty() {
+        let mut set_cmd = String::from("set");
+        for f in &set_flags { set_cmd.push(' '); set_cmd.push_str(f); }
+        for n in &set_o    { set_cmd.push_str(" -o "); set_cmd.push_str(n); }
+        for n in &unset_o  { set_cmd.push_str(" +o "); set_cmd.push_str(n); }
+        let src = brush_core::SourceInfo {
+            source: "<brush-sh flags>".into(), start: None,
+        };
+        let params0 = shell.default_exec_params();
+        if let Err(e) = shell.run_string(set_cmd.clone(), &src, &params0).await {
+            eprintln!("sarun-engine brush-sh: applying flags ({set_cmd}) failed: {e}");
+            return 2;
+        }
+    }
+    // Hand the shell off to brush-interactive. It needs an Arc<tokio::Mutex<>>
+    // (ShellRef) because the reedline helpers (completer/validator/highlighter)
+    // all clone the ref to query the shell from their callbacks.
+    let shell_ref: brush_interactive::ShellRef = std::sync::Arc::new(
+        tokio::sync::Mutex::new(shell));
+    let ui_opts = brush_interactive::UIOptions::builder().build();
+    let mut backend = match brush_interactive::ReedlineInputBackend::new(
+        &ui_opts, &shell_ref) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("sarun-engine brush-sh: reedline init failed: {e}");
+            return 127;
+        }
+    };
+    let opts: brush_interactive::InteractiveOptions = (&ui_opts).into();
+    let mut iash = match brush_interactive::InteractiveShell::new(
+        &shell_ref, &mut backend, &opts) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("sarun-engine brush-sh: interactive shell init failed: {e}");
+            return 127;
+        }
+    };
+    if let Err(e) = iash.run_interactively().await {
+        eprintln!("sarun-engine brush-sh: interactive: {e}");
+        return 1;
+    }
+    // Last exit code lives on the shell after the loop ends.
+    let s = shell_ref.lock().await;
+    i32::from(u8::from(s.last_exit_status()))
 }
 
 /// Build the brush shell, parse the script, emit one FRAME_PROV per pipeline,

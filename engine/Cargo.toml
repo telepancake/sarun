@@ -15,6 +15,10 @@ brush-core = "0.5"
 brush-builtins = "0.2"
 brush-coreutils-builtins = { version = "0.1", features = ["coreutils.all"] }
 brush-parser = { version = "0.4", features = ["serde"] }
+# Reedline-based interactive REPL for the brush-sh shim's -i mode:
+# multi-line editing, history, completion, syntax highlight — built on
+# the same brush-core we already run, so semantics match script mode.
+brush-interactive = { version = "0.4", default-features = false, features = ["reedline"] }
 crossterm = "0.29"
 # Vendored lib-only patched fork of n2 (github.com/evmar/n2) — see vendor/n2.
 n2 = { path = "vendor/n2", default-features = false }
