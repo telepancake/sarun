@@ -3258,11 +3258,11 @@ fn proc_detail_lines(app: &App) -> Vec<Line<'static>> {
 
 /// The default command for a fresh PTY pane — the configurable "login command".
 /// Reads the first non-blank, non-`#` line of
-/// $XDG_CONFIG_HOME/slopbox[.NS]/pty_command if present; else falls back to the
-/// user's $SHELL (interactive) or `sh -i`. This is only a DEFAULT the user can
-/// edit at the prompt — never an enforced choice, and it presumes NOTHING about
-/// a box or its parameters (the engine-held PTY just runs whatever argv it gets;
-/// to run a box you type e.g. `sarun run -b -- make`).
+/// $XDG_CONFIG_HOME/slopbox[.NS]/pty_command if present; else falls back to
+/// `<this-binary> run -b --` so the box opens in brush-shell mode without
+/// requiring `sarun` on $PATH (the engine's PTY does no shell lookup — it
+/// execvp's argv[0] directly). The user can edit the line before launching;
+/// this is a default, not an enforced choice.
 fn pty_default_cmd() -> String {
     let app_dir = match std::env::var("SLOPBOX_NS") {
         Ok(ns) if !ns.is_empty() => format!("slopbox.{ns}"),
@@ -3279,10 +3279,14 @@ fn pty_default_cmd() -> String {
             return l.to_string();
         }
     }
-    match std::env::var("SHELL") {
-        Ok(sh) if !sh.is_empty() => format!("{sh} -i"),
-        _ => "sh -i".to_string(),
-    }
+    // Absolute path to this very binary: `<…>/sarun run -b --` drops the
+    // user into a brush shell inside a fresh box. They can add a NAME or
+    // change the trailing command before pressing Enter.
+    let exe = std::env::current_exe()
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "sarun".to_string());
+    format!("{exe} run -b -- ")
 }
 
 /// Split a typed command line into argv, honoring single and double quotes
@@ -3661,11 +3665,24 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                 // global keymap so 'q', Tab, etc. reach the shell, not the UI.
                 if app.focus == Pane::Pty {
                     use crossterm::event::KeyModifiers;
-                    let detach = matches!(k.code, KeyCode::Char(']'))
-                        && k.modifiers.contains(KeyModifiers::CONTROL);
+                    // EOF: child is dead. Any key detaches (no point typing
+                    // into a corpse — that's how the user got stuck last time).
+                    let dead = app.pty.as_ref().map(|p| p.eof).unwrap_or(true);
+                    // Ctrl-]: the classic detach. Crossterm reports this two
+                    // ways depending on the host terminal — KeyCode::Char(']')
+                    // with CONTROL set on modern xterm-likes, or the raw
+                    // group-separator byte 0x1d on older/legacy terminals.
+                    // Accept both so the user is never stranded.
+                    let detach = dead
+                        || (matches!(k.code, KeyCode::Char(']'))
+                            && k.modifiers.contains(KeyModifiers::CONTROL))
+                        || matches!(k.code, KeyCode::Char('\u{1d}'));
                     if detach {
+                        let msg = if dead { "PTY exited — detached" }
+                                  else { "PTY detached (still running)" };
+                        app.pty = None;
                         app.focus = Pane::Sessions;
-                        app.status = "PTY detached (still running)".into();
+                        app.status = msg.into();
                     } else if let Some(bytes) = key_to_pty_bytes(k.code, k.modifiers) {
                         if let Some(pty) = app.pty.as_mut() { pty.send_input(&bytes); }
                     }
@@ -3879,12 +3896,16 @@ mod tests {
         }
         assert_eq!(pty_default_cmd(), "sarun run -b -- make",
                    "configured login command must be used verbatim");
-        // … and with no config it falls back to a shell — a DEFAULT, not a
-        // baked-in box decision.
+        // … and with no config it falls back to `<this-binary> run -b --`
+        // — an absolute path so the engine's PTY (which execvp's argv[0]
+        // directly, no shell lookup) can find it without `sarun` on PATH.
         std::fs::remove_file(cfgdir.join("pty_command")).unwrap();
         let d = pty_default_cmd();
-        assert!(d.contains("sh") || d.contains("bash"),
-                "fallback should be a shell, got {d:?}");
+        assert!(d.contains("run -b --"),
+                "fallback should drop into a fresh brush-mode box, got {d:?}");
+        let head = d.split_whitespace().next().unwrap_or("");
+        assert!(head.starts_with('/'),
+                "fallback head should be an absolute path, got {head:?}");
         unsafe {
             match prev_xdg { Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
                              None => std::env::remove_var("XDG_CONFIG_HOME") }

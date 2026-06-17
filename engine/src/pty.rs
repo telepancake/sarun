@@ -69,7 +69,19 @@ where
     }
     let mut child = match pair.slave.spawn_command(cmd) {
         Ok(c) => c,
-        Err(_) => return 127,
+        Err(e) => {
+            // Surface the real reason to the client (most often "executable
+            // not found in PATH"): one DATA frame with the human-readable
+            // error, then EOF. Without this the client just sees "(exited)"
+            // on an empty pane and can't tell whether it was a missing
+            // binary, a permission error, or anything else.
+            let msg = format!("pty: spawn {:?} failed: {}\r\n", argv[0], e);
+            let _ = client.write_all(&frames::encode(
+                frames::FRAME_PTY_DATA, msg.as_bytes()));
+            let _ = client.write_all(&frames::encode(frames::FRAME_PTY_EOF, &[]));
+            let _ = client.flush();
+            return 127;
+        }
     };
     // Drop the slave handle so the master sees EOF once the child closes its tty
     // (otherwise the reader never ends).
@@ -328,6 +340,28 @@ mod tests {
         let text = String::from_utf8_lossy(&data);
         assert!(text.contains("40 100"),
                 "resize did not reach the child tty; stty output=\n{text}");
+    }
+
+    // SPAWN FAILURE: argv[0] not on PATH. The mux must send a DATA frame with
+    // the human-readable error and an EOF frame — without this the client sees
+    // an empty pane labeled "(exited)" and can't tell what went wrong.
+    #[test]
+    fn engine_pty_surfaces_spawn_error() {
+        let (engine_end, client_end) = UnixStream::pair().expect("socketpair");
+        let h = std::thread::spawn(move || {
+            serve_pty(&["definitely-not-a-real-binary-xyzzy".into()],
+                      24, 80, engine_end, None)
+        });
+        let stream = drain_to_eof(client_end);
+        let rc = h.join().unwrap();
+        assert_eq!(rc, 127, "spawn-failure should return 127");
+        let (data, eof) = collect_pty_data(&stream);
+        assert!(eof, "EOF frame must follow a failed spawn");
+        let text = String::from_utf8_lossy(&data);
+        assert!(text.contains("definitely-not-a-real-binary-xyzzy"),
+                "error text should name the bad executable; got {text:?}");
+        assert!(text.contains("pty: spawn"),
+                "error text should be tagged; got {text:?}");
     }
 
     // TEE: the optional sink records the session bytes (so an engine PTY box can
