@@ -4955,6 +4955,37 @@ mod tests {
                 "path-kind help line missing:\n{buf}");
     }
 
+    /// The overlay's mutating ops push (sid, rel, op) events through the
+    /// engine's broadcast stream as type=overlay. Subscribing then writing
+    /// through the FUSE mount must deliver one matching event.
+    #[test]
+    fn overlay_write_broadcasts_change_event() {
+        let Some(eng) = boot() else {
+            eprintln!("SKIP: engine binary missing or FUSE unavailable");
+            return;
+        };
+        let (tx, rx) = mpsc::channel();
+        spawn_subscriber(&eng.sock, tx);
+        std::thread::sleep(Duration::from_millis(300));
+        let (sid, root) = make_box(&eng.sock);
+        let dir = root.join("tmp");
+        std::fs::create_dir_all(&dir).expect("mkdir through mount");
+        std::fs::write(dir.join("overlay_evt_marker.txt"), b"hi\n")
+            .expect("write through mount");
+        // Wait for an overlay event whose sid matches the box we just wrote.
+        let mut saw = false;
+        for _ in 0..15 {
+            if let Ok(ev) = rx.recv_timeout(Duration::from_secs(2)) {
+                if ev.get("type").and_then(Value::as_str) == Some("overlay")
+                   && ev.get("sid").and_then(Value::as_str) == Some(sid.as_str())
+                {
+                    saw = true; break;
+                }
+            }
+        }
+        assert!(saw, "expected an overlay event for the written file");
+    }
+
     /// Sessions sorted by dotted path so children land right after their
     /// parent. With one top-level box, just assert sel_session=0 finds it
     /// and the boxes view renders its label.

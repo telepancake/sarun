@@ -122,7 +122,22 @@ struct Inner {
     // the daemon served (test observability: stays ~0 for passthrough'd reads).
     passthrough_ok: std::sync::atomic::AtomicBool,
     daemon_reads: AtomicU64,
+    /// Per-write change notifications produced by the mutating ops
+    /// (write / create / mkdir / symlink / unlink / rename / mknod).
+    /// Each entry is (box_id, rel, op). The control loop drains this on
+    /// a timer and broadcasts type=overlay events so the UI can refresh
+    /// a live box's panes the moment something changes — without it,
+    /// the UI only updates on its 3 s tick. Bounded by `OVERLAY_EVT_CAP`
+    /// (drops the oldest if drain falls behind) so a write storm can't
+    /// blow heap.
+    events: std::sync::Mutex<std::collections::VecDeque<(i64, String, &'static str)>>,
 }
+
+/// Soft cap on the per-overlay event queue. The control loop drains every
+/// few hundred ms; anything still queued past this bound is the oldest
+/// half-shed, which is fine for "what just changed" notifications (the UI
+/// re-reads the underlying view on the broadcast).
+pub const OVERLAY_EVT_CAP: usize = 4096;
 
 struct Fh {
     inner: FhInner,
@@ -198,6 +213,28 @@ enum Layer {
 }
 
 impl Overlay {
+    /// Drain queued (box_id, rel, op) events out of the overlay — the
+    /// control loop calls this on a tick and broadcasts each one as a
+    /// type=overlay event to subscribers. Returns at most OVERLAY_EVT_CAP
+    /// items; anything beyond is dropped before the call returns to keep
+    /// the queue from growing unbounded under a write storm.
+    pub fn drain_events(&self) -> Vec<(i64, String, &'static str)> {
+        let mut q = self.inner.events.lock().unwrap();
+        let drained: Vec<_> = q.drain(..).collect();
+        drained
+    }
+
+    /// Append one change notification; called from the mutating FS ops.
+    /// Bounded — drops the oldest half if we'd exceed OVERLAY_EVT_CAP.
+    fn push_event(&self, box_id: i64, rel: String, op: &'static str) {
+        let mut q = self.inner.events.lock().unwrap();
+        if q.len() >= OVERLAY_EVT_CAP {
+            let drop_n = OVERLAY_EVT_CAP / 2;
+            q.drain(..drop_n);
+        }
+        q.push_back((box_id, rel, op));
+    }
+
     pub fn new(lower: PathBuf) -> Self {
         let mut i2k = HashMap::new();
         i2k.insert(1u64, (0i64, String::new()));
@@ -217,6 +254,7 @@ impl Overlay {
             muted: RwLock::new(std::collections::HashMap::new()),
             passthrough_ok: std::sync::atomic::AtomicBool::new(false),
             daemon_reads: AtomicU64::new(0),
+            events: std::sync::Mutex::new(std::collections::VecDeque::new()),
         }) };
         // Test observability: if SARUN_STATS_FILE is set, a thread writes
         // "passthrough=<0|1> daemon_reads=<n>" to it (survives the SIGTERM
@@ -958,8 +996,16 @@ impl Filesystem for Overlay {
         let Some(f) = h.inner.file.as_ref() else {
             return reply.error(Errno::EBADF);
         };
+        let box_id = h.inner.box_id;
+        let rel = h.inner.rel.clone();
         match f.write_at(data, offset) {
-            Ok(n) => reply.written(n as u32),
+            Ok(n) => {
+                // Per-write notification so a subscribed UI can refresh a
+                // live box's panes without waiting for its periodic tick.
+                drop(h); drop(fhs);
+                self.push_event(box_id, rel, "write");
+                reply.written(n as u32)
+            }
             Err(_) => reply.error(Errno::EIO),
         }
     }

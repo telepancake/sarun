@@ -111,6 +111,27 @@ fn serve() -> i32 {
     state.lock().unwrap().overlay = Some(ov.clone());
     println!("sarun-engine: listening · {}  ·  overlay {}",
              sock.display(), mnt.display());
+    // Drainer: pump overlay events out as type=overlay broadcasts so a
+    // subscribed UI can refresh a live box's panes the moment something
+    // changes (the UI also has a periodic tick as a fallback). Lives for
+    // the engine process's lifetime.
+    {
+        let ov = ov.clone();
+        let state = state.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(Duration::from_millis(200));
+            let evts = ov.drain_events();
+            if evts.is_empty() { continue; }
+            for (sid, rel, op) in evts {
+                control::broadcast(&state, &serde_json::json!({
+                    "type": "overlay",
+                    "sid": sid.to_string(),
+                    "rel": rel,
+                    "op": op,
+                }));
+            }
+        });
+    }
     let rc = match control::serve(state, &sock) {
         Ok(()) => 0,
         Err(e) => {
