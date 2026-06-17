@@ -294,6 +294,21 @@ async fn build_box_shell(
     positional: Option<Vec<String>>,
     cwd: Option<std::path::PathBuf>,
 ) -> Result<brush_core::Shell, brush_core::error::Error> {
+    build_box_shell_opt(sh_mode, shell_name, positional, cwd, false).await
+}
+
+/// Same as build_box_shell but lets the caller mark the shell as interactive.
+/// brush-core's builder propagates that into enable_command_history +
+/// enable_job_control; without it the shell.history is None and
+/// brush-interactive's reedline hinter panics with HistoryFeatureUnsupported
+/// on every keystroke. The non-interactive callers use the wrapper above.
+async fn build_box_shell_opt(
+    sh_mode: bool,
+    shell_name: Option<String>,
+    positional: Option<Vec<String>>,
+    cwd: Option<std::path::PathBuf>,
+    interactive: bool,
+) -> Result<brush_core::Shell, brush_core::error::Error> {
     // bon's builder is typestate-typed (each setter changes the type), so we
     // can't conditionally chain. shell_name/shell_args/working_dir are all
     // Option fields whose bon setter accepts the inner value — passing None's
@@ -304,6 +319,7 @@ async fn build_box_shell(
     });
     brush_core::Shell::builder()
         .sh_mode(sh_mode)
+        .interactive(interactive)
         .builtins(box_builtins())
         .shell_name(shell_name.unwrap_or_default())
         .shell_args(positional.unwrap_or_default())
@@ -857,8 +873,14 @@ async fn run_brush_interactive(shell_name: String,
                                set_flags: Vec<String>, set_o: Vec<String>,
                                unset_o: Vec<String>, bash_mode: bool) -> i32 {
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
-    let shell_res = build_box_shell(!bash_mode, Some(shell_name.clone()),
-                                    Some(vec![]), Some(cwd)).await;
+    // Build the shell as INTERACTIVE from the start — brush-core's builder
+    // wires up Option<History> and enables job-control during build(), and
+    // both are checked there only. Setting shell.options_mut().interactive
+    // afterwards leaves history=None, which makes brush-interactive's
+    // reedline DefaultHinter panic on todo! the first keystroke.
+    let shell_res = build_box_shell_opt(!bash_mode, Some(shell_name.clone()),
+                                        Some(vec![]), Some(cwd),
+                                        /*interactive=*/ true).await;
     let mut shell = match shell_res {
         Ok(s) => s,
         Err(e) => {
@@ -866,11 +888,6 @@ async fn run_brush_interactive(shell_name: String,
             return 127;
         }
     };
-    // Flip the shell into interactive mode so $PS1, job-control,
-    // ignoreeof, and similar `set` options take their interactive
-    // defaults (brush-interactive's start_interactive_session inspects
-    // this too).
-    shell.options_mut().interactive = true;
     // Apply set/+set flags exactly like the non-interactive paths.
     if !set_flags.is_empty() || !set_o.is_empty() || !unset_o.is_empty() {
         let mut set_cmd = String::from("set");
