@@ -50,6 +50,7 @@ engine: ## Build the Rust engine (release, dynamic glibc — what tests use)
 
 .PHONY: engine-musl
 engine-musl: ## Build the fully-static musl engine binary
+	apt-get install -y musl-tools
 	rustup target add x86_64-unknown-linux-musl
 	cd engine && cargo build --release --target x86_64-unknown-linux-musl
 
