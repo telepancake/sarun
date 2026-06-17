@@ -356,6 +356,12 @@ struct StructResult {
 /// per keystroke would still cost more than a slice.
 const WINDOW_SIZE: usize = 400;
 
+/// How many rows PgDn / PgUp jumps the cursor. Sized to one screenful on a
+/// typical-height terminal (the panes are split, so the visible half is
+/// roughly this tall); WINDOW_SIZE / 20 ratio keeps page jumps cheap —
+/// staying inside a single fetched window for normal terminals.
+const PAGE_SIZE: usize = 20;
+
 struct App {
     sock: String,
     sessions: Vec<Value>,
@@ -1272,6 +1278,69 @@ impl App {
             Pane::Outputs => self.sel_output = self.sel_output.saturating_sub(1),
             Pane::Rules => self.sel_rule = self.sel_rule.saturating_sub(1),
             Pane::Help => self.out_scroll = self.out_scroll.saturating_sub(1),
+            Pane::Pty => {}
+        }
+    }
+
+    /// PgDn / PgUp move the cursor by ~one screenful (PAGE_SIZE rows). For
+    /// list panes that's a multi-step nav so the existing window-slide /
+    /// connector-skip stays correct; for the diff and help bodies it's a
+    /// straight scroll bump.
+    #[cfg_attr(test, allow(dead_code))]
+    fn page_down(&mut self) { self.page_move(PAGE_SIZE as isize); }
+    #[cfg_attr(test, allow(dead_code))]
+    fn page_up(&mut self) { self.page_move(-(PAGE_SIZE as isize)); }
+
+    fn page_move(&mut self, delta: isize) {
+        let n = delta.unsigned_abs();
+        let step: isize = if delta > 0 { 1 } else { -1 };
+        match self.focus {
+            Pane::Sessions => {
+                let total = self.sessions.len();
+                if total == 0 { return; }
+                let cur = self.sel_session as isize;
+                let new = (cur + delta).clamp(0, total as isize - 1) as usize;
+                if new != self.sel_session {
+                    self.sel_session = new;
+                    self.load_changes();
+                }
+            }
+            Pane::Changes => {
+                if self.changes_total == 0 { return; }
+                for _ in 0..n {
+                    let g = self.changes_window_start + self.sel_change;
+                    if (step > 0 && g + 1 >= self.changes_total) || (step < 0 && g == 0) {
+                        break;
+                    }
+                    self.sel_change_global_advance(step);
+                }
+                self.load_hunks();
+            }
+            Pane::Processes => {
+                for _ in 0..n { self.move_proc_cursor(step); }
+            }
+            Pane::Outputs => {
+                let total = self.outputs.len();
+                if total == 0 { return; }
+                let cur = self.sel_output as isize;
+                self.sel_output = (cur + delta).clamp(0, total as isize - 1) as usize;
+            }
+            Pane::Rules => {
+                let total = self.rules.len();
+                if total == 0 { return; }
+                let cur = self.sel_rule as isize;
+                self.sel_rule = (cur + delta).clamp(0, total as isize - 1) as usize;
+            }
+            Pane::Hunks => {
+                let n16 = n as u16;
+                if step > 0 { self.hunk_scroll = self.hunk_scroll.saturating_add(n16); }
+                else { self.hunk_scroll = self.hunk_scroll.saturating_sub(n16); }
+            }
+            Pane::Help => {
+                let n16 = n as u16;
+                if step > 0 { self.out_scroll = self.out_scroll.saturating_add(n16); }
+                else { self.out_scroll = self.out_scroll.saturating_sub(n16); }
+            }
             Pane::Pty => {}
         }
     }
@@ -3013,6 +3082,8 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                     KeyCode::Down if ctrl && app.focus == Pane::Rules => app.move_rule(1),
                     KeyCode::Char('j') | KeyCode::Down => app.move_down(),
                     KeyCode::Char('k') | KeyCode::Up => app.move_up(),
+                    KeyCode::PageDown => app.page_down(),
+                    KeyCode::PageUp => app.page_up(),
                     KeyCode::Tab => app.next_pane(),
                     KeyCode::Enter => {
                         if app.focus == Pane::Rules {
