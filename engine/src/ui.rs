@@ -1761,21 +1761,25 @@ fn hexdump_into(data: &[u8], out: &mut Vec<String>) {
     }
 }
 
-fn title(base: &str, focused: bool) -> String {
-    if focused {
-        format!(" {base} «focus» ")
-    } else {
-        format!(" {base} ")
-    }
+fn title(base: &str, _focused: bool) -> String {
+    format!(" {base} ")
 }
 
 fn block(t: String, focused: bool) -> Block<'static> {
-    let style = if focused {
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+    // Focused pane: cyan-bold DOUBLE border (Norton/Turbo style); blurred:
+    // gray plain. No "«focus»" tag in the title — the border carries it.
+    let (style, btype) = if focused {
+        (Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+         ratatui::widgets::BorderType::Double)
     } else {
-        Style::default().fg(Color::Gray)
+        (Style::default().fg(Color::Gray),
+         ratatui::widgets::BorderType::Plain)
     };
-    Block::default().borders(Borders::ALL).border_style(style).title(t)
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(btype)
+        .border_style(style)
+        .title(t)
 }
 
 fn sessions_lines(app: &App) -> Vec<Line<'static>> {
@@ -2242,6 +2246,20 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal) {
     f.render_widget(p, rect);
 }
 
+/// Compute a vertical scroll offset for a Paragraph so the cursor row stays
+/// inside the visible rect. `cursor_line` is the 0-based index of the
+/// highlighted Line inside the Lines vector (so for our panes that emit a
+/// header at index 0 and rows from index 1, it's `sel_row + 1`). `rect_h`
+/// is the full pane rect height (block borders included; we subtract 2).
+/// Anchors the cursor ~1/3 down so motion in either direction has room.
+fn scroll_for_cursor(cursor_line: usize, n_lines: usize, rect_h: u16) -> u16 {
+    let visible = (rect_h as usize).saturating_sub(2);
+    if visible == 0 || n_lines <= visible { return 0; }
+    let third = visible / 3;
+    let want = cursor_line.saturating_sub(third);
+    want.min(n_lines.saturating_sub(visible)) as u16
+}
+
 fn draw(f: &mut ratatui::Frame, app: &App) {
     let root = Layout::default()
         .direction(Direction::Vertical)
@@ -2284,17 +2302,26 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(cols[0]);
 
-        let sessions = Paragraph::new(Text::from(sessions_lines(app))).block(block(
-            title("sarun · boxes", app.focus == Pane::Sessions),
-            app.focus == Pane::Sessions,
-        ));
+        let slines = sessions_lines(app);
+        let s_scroll = scroll_for_cursor(app.sel_session + 1, slines.len(),
+                                         left[0].height);
+        let sessions = Paragraph::new(Text::from(slines))
+            .block(block(
+                title("sarun · boxes", app.focus == Pane::Sessions),
+                app.focus == Pane::Sessions,
+            ))
+            .scroll((s_scroll, 0));
         f.render_widget(sessions, left[0]);
 
         // Bottom-left list + right detail depend on which pane group is focused.
         match app.focus {
             Pane::Processes => {
-                let procs = Paragraph::new(Text::from(processes_lines(app)))
+                let lines = processes_lines(app);
+                let scroll = scroll_for_cursor(app.sel_proc + 1, lines.len(),
+                                               left[1].height);
+                let procs = Paragraph::new(Text::from(lines))
                     .block(block(title("PROCESSES", true), true))
+                    .scroll((scroll, 0))
                     .wrap(Wrap { trim: false });
                 f.render_widget(procs, left[1]);
                 let detail = Paragraph::new(Text::from(proc_detail_lines(app)))
@@ -2303,8 +2330,12 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                 f.render_widget(detail, cols[1]);
             }
             Pane::Outputs => {
-                let idx = Paragraph::new(Text::from(changes_lines(app)))
-                    .block(block(title("changes", false), false));
+                let clines = changes_lines(app);
+                let c_scroll = scroll_for_cursor(app.sel_change + 1, clines.len(),
+                                                 left[1].height);
+                let idx = Paragraph::new(Text::from(clines))
+                    .block(block(title("changes", false), false))
+                    .scroll((c_scroll, 0));
                 f.render_widget(idx, left[1]);
                 let out = Paragraph::new(Text::from(outputs_lines(app)))
                     .block(block(title("OUTPUT · stdout/stderr", true), true))
@@ -2313,8 +2344,12 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                 f.render_widget(out, cols[1]);
             }
             Pane::Rules => {
-                let rules = Paragraph::new(Text::from(rules_lines(app)))
+                let rlines = rules_lines(app);
+                let r_scroll = scroll_for_cursor(app.sel_rule + 1, rlines.len(),
+                                                 left[1].height);
+                let rules = Paragraph::new(Text::from(rlines))
                     .block(block(title("FILE RULES", true), true))
+                    .scroll((r_scroll, 0))
                     .wrap(Wrap { trim: false });
                 f.render_widget(rules, left[1]);
                 let hint = Paragraph::new(Text::from(vec![
@@ -2331,10 +2366,15 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
             }
             _ => {
                 // Sessions / Changes / Hunks group: changes list + diff.
-                let changes = Paragraph::new(Text::from(changes_lines(app))).block(block(
-                    title("changes", app.focus == Pane::Changes),
-                    app.focus == Pane::Changes,
-                ));
+                let lines = changes_lines(app);
+                let scroll = scroll_for_cursor(app.sel_change + 1, lines.len(),
+                                               left[1].height);
+                let changes = Paragraph::new(Text::from(lines))
+                    .block(block(
+                        title("changes", app.focus == Pane::Changes),
+                        app.focus == Pane::Changes,
+                    ))
+                    .scroll((scroll, 0));
                 f.render_widget(changes, left[1]);
 
                 let is_bin = !app.hunks.is_null()
