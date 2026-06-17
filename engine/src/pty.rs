@@ -34,6 +34,51 @@ use crate::frames;
 /// shared `Vec<u8>` buffer.
 pub type Sink = Arc<Mutex<dyn Write + Send>>;
 
+// The engine PTY proxy is a "good citizen" terminal as far as the child is
+// concerned: it answers DSR (cursor-position) and Device-Attribute queries
+// the same way a real terminal would. Without this, reedline-based
+// interactive shells (brush -i, anything else built on crossterm) time out
+// on init waiting for ESC[6n to come back. The UI's tui-term front end
+// renders the bytes but can't reply across the mux, so the engine does it.
+struct ProxyCallbacks {
+    /// Bytes queued for the input loop to write back to the PTY master
+    /// (DSR / DA1 replies). Drained after every process() call.
+    pending: Vec<u8>,
+}
+
+impl tui_term::vt100::Callbacks for ProxyCallbacks {
+    fn unhandled_csi(
+        &mut self,
+        screen: &mut tui_term::vt100::Screen,
+        intro: Option<u8>,
+        _i2: Option<u8>,
+        params: &[&[u16]],
+        c: char,
+    ) {
+        // CSI 6 n  →  ESC [ row ; col R   (DSR — cursor position report).
+        //   vt100's (row,col) is 0-based; the wire reply is 1-based.
+        // CSI 5 n  →  ESC [ 0 n           (DSR — terminal status OK).
+        // CSI c    →  ESC [ ? 1 ; 0 c     (DA1 — VT100, no options) — the
+        //   minimum reedline / crossterm need to stop waiting.
+        // Anything else with a private intro ('?', '>', '=', '!') is left
+        // unanswered; same for unknown final bytes.
+        if intro.is_some() { return; }
+        match c {
+            'n' => match params.first().and_then(|p| p.first()).copied().unwrap_or(0) {
+                6 => {
+                    let (r, col) = screen.cursor_position();
+                    let s = format!("\x1b[{};{}R", r + 1, col + 1);
+                    self.pending.extend_from_slice(s.as_bytes());
+                }
+                5 => self.pending.extend_from_slice(b"\x1b[0n"),
+                _ => {}
+            }
+            'c' => self.pending.extend_from_slice(b"\x1b[?1;0c"),
+            _ => {}
+        }
+    }
+}
+
 /// Drive an engine-held PTY for `argv` to EOF, muxing it over `client`.
 ///
 /// Behavior:
@@ -87,7 +132,7 @@ where
     // (otherwise the reader never ends).
     drop(pair.slave);
 
-    let mut master_writer = match pair.master.take_writer() {
+    let master_writer = match pair.master.take_writer() {
         Ok(w) => w,
         Err(_) => return 1,
     };
@@ -95,6 +140,9 @@ where
         Ok(r) => r,
         Err(_) => return 1,
     };
+    // Shared between the input loop (writes raw keystrokes) and the output
+    // thread (writes DSR / DA1 replies via the ProxyCallbacks queue).
+    let master_writer = Arc::new(Mutex::new(master_writer));
 
     // The master must outlive both directions; keep it owned by the resizer so we
     // can apply FRAME_PTY_RESIZE. portable-pty's MasterPty::resize takes &self.
@@ -105,7 +153,11 @@ where
     // ── OUTPUT direction: master → client (FRAME_PTY_DATA) + tee to sink ──────
     let mut out_client = client.clone_stream();
     let done_out = done.clone();
+    let mw_out = master_writer.clone();
     let out = std::thread::spawn(move || {
+        // Shadow vt100 parser so we know the cursor when a DSR query arrives.
+        let mut parser = tui_term::vt100::Parser::new_with_callbacks(
+            rows, cols, 0, ProxyCallbacks { pending: vec![] });
         let mut buf = [0u8; 8192];
         loop {
             let n = match master_reader.read(&mut buf) {
@@ -115,6 +167,17 @@ where
             let data = &buf[..n];
             if let Some(s) = &sink {
                 let _ = s.lock().unwrap().write_all(data);
+            }
+            // Track cursor / catch DSR + DA queries. The callbacks queue
+            // their replies; we drain them straight back to the master so
+            // the child sees a real terminal answering.
+            parser.process(data);
+            let replies = std::mem::take(&mut parser.callbacks_mut().pending);
+            if !replies.is_empty() {
+                if let Ok(mut w) = mw_out.lock() {
+                    let _ = w.write_all(&replies);
+                    let _ = w.flush();
+                }
             }
             let frame = frames::encode(frames::FRAME_PTY_DATA, data);
             if out_client.write_all(&frame).is_err() {
@@ -143,7 +206,7 @@ where
             // no point blocking on client reads for a dead PTY.
             let (frames_v, used) = frames::decode(&acc);
             acc.drain(..used);
-            apply_input(&frames_v, &mut master_writer, &master);
+            apply_input(&frames_v, &master_writer, &master);
             break;
         }
         let n = match client.read(&mut rbuf) {
@@ -153,7 +216,7 @@ where
         acc.extend_from_slice(&rbuf[..n]);
         let (frames_v, used) = frames::decode(&acc);
         acc.drain(..used);
-        apply_input(&frames_v, &mut master_writer, &master);
+        apply_input(&frames_v, &master_writer, &master);
     }
 
     let code = child.wait().map(|s| s.exit_code() as i32).unwrap_or(0);
@@ -166,13 +229,16 @@ where
 }
 
 /// Apply a batch of client→engine input frames to the PTY master.
-fn apply_input(frames_v: &[(u8, Vec<u8>)], master_writer: &mut Box<dyn Write + Send>,
+fn apply_input(frames_v: &[(u8, Vec<u8>)],
+               master_writer: &Arc<Mutex<Box<dyn Write + Send>>>,
                master: &Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>) {
     for (ft, payload) in frames_v {
         match *ft {
             x if x == frames::FRAME_PTY_DATA => {
-                let _ = master_writer.write_all(payload);
-                let _ = master_writer.flush();
+                if let Ok(mut w) = master_writer.lock() {
+                    let _ = w.write_all(payload);
+                    let _ = w.flush();
+                }
             }
             x if x == frames::FRAME_PTY_RESIZE => {
                 if let Some((rows, cols)) = frames::pty_resize_parse(payload) {
@@ -340,6 +406,44 @@ mod tests {
         let text = String::from_utf8_lossy(&data);
         assert!(text.contains("40 100"),
                 "resize did not reach the child tty; stty output=\n{text}");
+    }
+
+    // TERMINAL QUERIES: a child that writes CSI 6 n (DSR — cursor position) or
+    // CSI c (DA1 — device attributes) must receive an actual reply, or
+    // reedline-based interactive shells time out on init. The shim asks via
+    // tty, then `read` echoes whatever came back; the child sees the reply
+    // because the engine writes it onto the master.
+    #[test]
+    fn engine_pty_answers_cursor_and_device_queries() {
+        let (engine_end, client_end) = UnixStream::pair().expect("socketpair");
+        let h = std::thread::spawn(move || {
+            // Put the tty in raw mode so reads aren't buffered to a newline,
+            // emit DSR + DA1, then read EXACTLY 13 bytes back (CSI 1;1 R is
+            // 6, CSI ?1;0 c is 7). od dumps the bytes octal-escaped so the
+            // test can find them on the muxed output stream. A backgrounded
+            // alarm kills the read if no reply arrives — without this a
+            // broken engine would deadlock the test instead of failing it.
+            serve_pty(
+                &["sh".into(), "-c".into(),
+                  "stty raw -echo 2>/dev/null; \
+                   (sleep 3; kill -ALRM $$) & \
+                   printf '\\033[6n\\033[c'; \
+                   dd ibs=1 count=13 2>/dev/null | od -An -c | tr -d '\\n' | \
+                       awk '{print \"REPLY:\" $0}'; \
+                   stty sane 2>/dev/null".into()],
+                24, 80, engine_end, None)
+        });
+        let stream = drain_to_eof(client_end);
+        let _ = h.join();
+        let (data, _) = collect_pty_data(&stream);
+        let text = String::from_utf8_lossy(&data);
+        assert!(text.contains("REPLY:"), "shim never produced readback marker; got {text:?}");
+        // od -An -c renders the DSR reply ESC[1;1R as " 033   [   1   ;   1   R",
+        // and DA1 reply ESC[?1;0c as " 033   [   ?   1   ;   0   c".
+        assert!(text.contains("033   [   1   ;   1   R"),
+                "missing DSR cursor-position reply in {text:?}");
+        assert!(text.contains("033   [   ?   1   ;   0   c"),
+                "missing DA1 device-attribute reply in {text:?}");
     }
 
     // SPAWN FAILURE: argv[0] not on PATH. The mux must send a DATA frame with
