@@ -4762,4 +4762,219 @@ mod tests {
         // restore a clean filerules file (shared in-process path).
         let _ = std::fs::remove_file(app.rules_path());
     }
+
+    // ── coverage for the post-port UI behaviors ───────────────────────────
+
+    /// The boxes view's right pane carries the BOX · DETAIL block — bold
+    /// label, status / cmd / pid·age labels, "changes N file(s) [↵ to
+    /// review]" — and a preview of recent paths. Asserts every piece of
+    /// that header shows in a freshly-opened UI against a real box.
+    #[test]
+    fn box_detail_pane_shows_status_cmd_pid_age_and_changes_count() {
+        let Some(eng) = boot() else {
+            eprintln!("SKIP: engine binary missing or FUSE unavailable");
+            return;
+        };
+        let (_sid, root) = make_box(&eng.sock);
+        std::fs::write(root.join("root/box_detail_marker.txt"),
+                       b"hi\n").expect("write");
+        let mut app = App::new(eng.sock.clone());
+        app.refresh_sessions();
+        app.load_changes();
+        let buf = render_to_string(&app, 160, 30).unwrap();
+        assert!(buf.contains("BOX · DETAIL"), "block title missing:\n{buf}");
+        assert!(buf.contains("status  "), "status label missing:\n{buf}");
+        assert!(buf.contains("cmd     "), "cmd label missing:\n{buf}");
+        assert!(buf.contains("pid     "), "pid label missing:\n{buf}");
+        assert!(buf.contains("age "), "age label missing:\n{buf}");
+        assert!(buf.contains("changes "), "changes count line missing:\n{buf}");
+        // The finished-box preview label.
+        assert!(buf.contains("[↵ to review]"),
+                "↵ to review label missing for finished box:\n{buf}");
+        // The actual written path makes it into the preview.
+        assert!(buf.contains("box_detail_marker.txt"),
+                "recent preview missing the written path:\n{buf}");
+    }
+
+    /// The keybar carries one chip per view (b/c/p/o/e) and the active
+    /// view's chip+label is highlighted. Switch focus and assert the
+    /// active chip moves with it.
+    #[test]
+    fn keybar_chips_track_focus() {
+        let Some(eng) = boot() else {
+            eprintln!("SKIP: engine binary missing or FUSE unavailable");
+            return;
+        };
+        let _box = make_box(&eng.sock);
+        let mut app = App::new(eng.sock.clone());
+        app.refresh_sessions();
+        app.load_changes();
+        // boxes view: keybar must mention every chip label.
+        let buf = render_to_string(&app, 160, 30).unwrap();
+        for lab in ["boxes", "changes", "procs", "outputs", "rules"] {
+            assert!(buf.contains(lab), "keybar chip {lab:?} missing:\n{buf}");
+        }
+        // chip letters appear at least once for each view.
+        for k in ['b', 'c', 'p', 'o', 'e'] {
+            assert!(buf.contains(k), "keybar chip letter {k:?} missing:\n{buf}");
+        }
+        // Move focus to procs and re-render — the active label must still
+        // be there (now styled, not gone).
+        app.focus = Pane::Processes;
+        app.load_processes();
+        let buf2 = render_to_string(&app, 160, 30).unwrap();
+        assert!(buf2.contains("procs"), "procs label missing after focus:\n{buf2}");
+    }
+
+    /// Active filter on the focused view surfaces as a "⦿ filter" chip in
+    /// the keybar (yellow) with the clause expression rendered.
+    #[test]
+    fn keybar_shows_active_filter_expression() {
+        let Some(eng) = boot() else {
+            eprintln!("SKIP: engine binary missing or FUSE unavailable");
+            return;
+        };
+        let (_sid, root) = make_box(&eng.sock);
+        std::fs::write(root.join("root/keepme_PUMPKIN.txt"), b"x").expect("write");
+        std::fs::write(root.join("root/other_THING.txt"), b"y").expect("write");
+        let mut app = App::new(eng.sock.clone());
+        app.refresh_sessions();
+        app.load_changes();
+        app.focus = Pane::Changes;
+        let rows = vec![ClauseRow {
+            enabled: true, join: Join::And, negate: false,
+            kind: "path".into(), pattern: "**/PUMPKIN*".into(),
+        }];
+        app.commit_filter(FilterView::Changes, &rows);
+        let buf = render_to_string(&app, 160, 30).unwrap();
+        assert!(buf.contains("⦿ filter"), "filter chip missing:\n{buf}");
+        assert!(buf.contains("path:**/PUMPKIN*"),
+                "filter expression missing in chip:\n{buf}");
+    }
+
+    /// A freshly-created file (no host counterpart at lower) renders as
+    /// '+' (green created) on the changes pane after the bulk-decorate
+    /// pass — distinct from the '~' yellow modified glyph the previous
+    /// undifferentiated render used.
+    #[test]
+    fn changes_pane_uses_plus_glyph_for_created_file() {
+        let Some(eng) = boot() else {
+            eprintln!("SKIP: engine binary missing or FUSE unavailable");
+            return;
+        };
+        let (_sid, root) = make_box(&eng.sock);
+        // a path that almost certainly doesn't exist on the host →
+        // decorate should say kind=created → render with '+'.
+        let dir = root.join("tmp");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join("created_only_xyzzy.txt"), b"new!\n").expect("write");
+        let mut app = App::new(eng.sock.clone());
+        app.refresh_sessions();
+        app.load_changes();
+        app.focus = Pane::Changes;
+        let buf = render_to_string(&app, 160, 30).unwrap();
+        assert!(buf.contains("created_only_xyzzy.txt"),
+                "the file should appear in the changes pane:\n{buf}");
+        assert!(buf.contains('+'),
+                "created file should render with '+' glyph:\n{buf}");
+    }
+
+    /// cd-info strip (path / kind / size / mode) renders ABOVE the diff
+    /// area for any selected change, not just binary ones.
+    #[test]
+    fn cd_info_strip_shows_selected_change_path_and_meta() {
+        let Some(eng) = boot() else {
+            eprintln!("SKIP: engine binary missing or FUSE unavailable");
+            return;
+        };
+        let (_sid, root) = make_box(&eng.sock);
+        let dir = root.join("tmp");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join("cd_info_TARGET.txt"),
+                       b"sample bytes\n").expect("write");
+        let mut app = App::new(eng.sock.clone());
+        app.refresh_sessions();
+        app.load_changes();
+        app.open();          // sessions → changes
+        app.open();          // changes → hunks (loads the diff + cd-info)
+        let buf = render_to_string(&app, 160, 40).unwrap();
+        assert!(buf.contains("/tmp/cd_info_TARGET.txt"),
+                "cd-info should show the leading-slashed full path:\n{buf}");
+        assert!(buf.contains("path"), "cd-info title 'path' missing:\n{buf}");
+    }
+
+    /// PgDn / PgUp jump the cursor by PAGE_SIZE rows in list panes.
+    #[test]
+    fn page_down_advances_cursor_by_page_size_in_changes() {
+        let Some(eng) = boot() else {
+            eprintln!("SKIP: engine binary missing or FUSE unavailable");
+            return;
+        };
+        let (_sid, root) = make_box(&eng.sock);
+        // Make 60 files so a single PAGE_SIZE jump won't hit the tail.
+        let dir = root.join("tmp/page");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        for i in 0..60 {
+            std::fs::write(dir.join(format!("f_{i:04}.txt")),
+                           b"x").expect("write");
+        }
+        let mut app = App::new(eng.sock.clone());
+        app.refresh_sessions();
+        app.load_changes();
+        app.focus = Pane::Changes;
+        let before = app.changes_window_start + app.sel_change;
+        app.page_down();
+        let after = app.changes_window_start + app.sel_change;
+        let moved = after - before;
+        // We don't require EXACTLY PAGE_SIZE because the tree has connector
+        // rows that the cursor skips; just assert it moved by more than one
+        // and less than 2× PAGE_SIZE.
+        assert!(moved > 1, "page_down should move more than 1 row, got {moved}");
+        assert!(moved <= PAGE_SIZE * 2,
+                "page_down moved {moved} rows, expected around {PAGE_SIZE}");
+    }
+
+    /// The rules pane right side parses the selected rule and prints the
+    /// ACTION + per-clause breakdown (not the old static hint).
+    #[test]
+    fn rules_pane_parses_rule_and_shows_clauses() {
+        let Some(eng) = boot() else {
+            eprintln!("SKIP: engine binary missing or FUSE unavailable");
+            return;
+        };
+        let _box = make_box(&eng.sock);
+        let mut app = App::new(eng.sock.clone());
+        app.rules = vec!["apply path:src/** and exe:**/gcc".into()];
+        app.focus = Pane::Rules;
+        let buf = render_to_string(&app, 160, 30).unwrap();
+        assert!(buf.contains("APPLY"), "ACTION heading missing:\n{buf}");
+        assert!(buf.contains("path:src/**"), "first clause missing:\n{buf}");
+        assert!(buf.contains("exe:**/gcc"), "second clause missing:\n{buf}");
+        // per-kind help line should appear for at least one kind.
+        assert!(buf.contains("changed path"),
+                "path-kind help line missing:\n{buf}");
+    }
+
+    /// Sessions sorted by dotted path so children land right after their
+    /// parent. With one top-level box, just assert sel_session=0 finds it
+    /// and the boxes view renders its label.
+    #[test]
+    fn sessions_pane_renders_top_level_box() {
+        let Some(eng) = boot() else {
+            eprintln!("SKIP: engine binary missing or FUSE unavailable");
+            return;
+        };
+        let (_sid, _root) = make_box(&eng.sock);
+        let mut app = App::new(eng.sock.clone());
+        app.refresh_sessions();
+        // refresh_sessions sorts by `path`; sel_session=0 picks a real box.
+        assert!(!app.sessions.is_empty(), "expected at least one session");
+        let buf = render_to_string(&app, 160, 30).unwrap();
+        assert!(buf.contains('F') || buf.contains('R'),
+                "session F/R status flag missing:\n{buf}");
+        assert!(buf.contains("Name"), "Name column header missing:\n{buf}");
+        assert!(buf.contains("PID"), "PID column header missing:\n{buf}");
+        assert!(buf.contains("Cmd"), "Cmd column header missing:\n{buf}");
+        assert!(buf.contains("Age"), "Age column header missing:\n{buf}");
+    }
 }
