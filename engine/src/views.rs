@@ -81,8 +81,8 @@ fn source_changes(sid: i64) -> (Vec<Value>, Vec<Vec<i64>>) {
     const S_IFMT: u32 = 0o170000;
     const S_IFCHR: u32 = 0o020000;
     const S_IFLNK: u32 = 0o120000;
-    let mut rows = vec![];
-    let mut ids = vec![];
+    // Pull leaves first (sorted by name), then walk to build the tree.
+    let mut leaves: Vec<(String, &'static str, i64, Vec<i64>)> = vec![];
     if let Ok(mut st) = conn.prepare(
         "SELECT name, mode, sz, writer, last_writer FROM sqlar ORDER BY name") {
         let it = st.query_map([], |r| {
@@ -99,14 +99,54 @@ fn source_changes(sid: i64) -> (Vec<Value>, Vec<Vec<i64>>) {
                 let kind = if mode & S_IFMT == S_IFCHR { "deleted" }
                            else if mode & S_IFMT == S_IFLNK { "symlink" }
                            else { "changed" };
-                rows.push(json!({"path": name, "kind": kind, "size": sz}));
                 let mut wids = vec![];
                 for w in [w0, w1].into_iter().flatten() {
                     if !wids.contains(&w) { wids.push(w); }
                 }
-                ids.push(wids);
+                leaves.push((name, kind, sz, wids));
             }
         }
+    }
+    // Build the DIRECTORY TREE in DFS order: for each leaf, emit any new
+    // ancestor directories as connector rows then the leaf itself. Sorted
+    // by name already gives us DFS order. Mirrors the Python prototype's
+    // changes-as-tree view (CLAUDE.md: "_ch_rows is the DFS-ordered render
+    // list [(key, name, depth, connector)]").
+    let mut rows = vec![];
+    let mut ids = vec![];
+    let mut prev: Vec<String> = vec![];
+    for (name, kind, sz, wids) in leaves {
+        let parts: Vec<String> = name.split('/')
+            .filter(|s| !s.is_empty()).map(String::from).collect();
+        if parts.is_empty() { continue; }
+        let leaf_depth = parts.len() - 1;
+        let mut common = 0;
+        while common < parts.len() && common < prev.len()
+            && parts[common] == prev[common] {
+            common += 1;
+        }
+        // Emit connector rows for any newly-entered directory levels.
+        for d in common..leaf_depth {
+            rows.push(json!({
+                "path": parts[..=d].join("/"),
+                "name": parts[d],
+                "kind": "dir",
+                "size": 0,
+                "depth": d,
+                "connector": true,
+            }));
+            ids.push(vec![]);
+        }
+        rows.push(json!({
+            "path": name,
+            "name": parts[leaf_depth],
+            "kind": kind,
+            "size": sz,
+            "depth": leaf_depth,
+            "connector": false,
+        }));
+        ids.push(wids);
+        prev = parts;
     }
     (rows, ids)
 }
@@ -313,6 +353,12 @@ fn rebuild_idx(view: &mut View) {
     match (&view.kind, &view.aux) {
         (Kind::Changes, ViewAux::Changes(ids)) => {
             view.idx = view.source.iter().enumerate().filter_map(|(i, c)| {
+                // A filter is a "show me these rows" set — connectors are
+                // tree-scaffolding, not changes to match against; they only
+                // appear in the unfiltered tree view.
+                if c.get("connector").and_then(Value::as_bool) == Some(true) {
+                    return None;
+                }
                 let rel = c.get("path").and_then(Value::as_str).unwrap_or("");
                 let row_ids = ids.get(i).cloned().unwrap_or_default();
                 let t = PathTarget { rel, subject: Subject::default(), ids: row_ids };
