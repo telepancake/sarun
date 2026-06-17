@@ -1231,7 +1231,11 @@ impl App {
                 }
             }
             Pane::Processes => self.move_proc_cursor(1),
-            Pane::Outputs => self.out_scroll = self.out_scroll.saturating_add(1),
+            Pane::Outputs => {
+                if self.sel_output + 1 < self.outputs.len() {
+                    self.sel_output += 1;
+                }
+            }
             Pane::Rules => {
                 if self.sel_rule + 1 < self.rules.len() {
                     self.sel_rule += 1;
@@ -1265,7 +1269,7 @@ impl App {
                 }
             }
             Pane::Processes => self.move_proc_cursor(-1),
-            Pane::Outputs => self.out_scroll = self.out_scroll.saturating_sub(1),
+            Pane::Outputs => self.sel_output = self.sel_output.saturating_sub(1),
             Pane::Rules => self.sel_rule = self.sel_rule.saturating_sub(1),
             Pane::Help => self.out_scroll = self.out_scroll.saturating_sub(1),
             Pane::Pty => {}
@@ -1820,9 +1824,35 @@ fn block(t: String, focused: bool) -> Block<'static> {
         .title(t)
 }
 
+/// "Now minus ts" as a tight human label — seconds/minutes/hours, same shape
+/// as the prototype's fmt_age helper. Used for the sessions pane's Age col.
+fn fmt_age(ts: f64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64()).unwrap_or(0.0);
+    let s = (now - ts).max(0.0) as i64;
+    if s < 60 { format!("{s}s") }
+    else if s < 3600 { format!("{}m{:02}s", s / 60, s % 60) }
+    else { format!("{}h{:02}m", s / 3600, (s % 3600) / 60) }
+}
+
+/// Map a session status string to (single-char flag, color) — F column of
+/// the sessions pane (mirrors the prototype's sty()/flag scheme).
+fn session_flag(status: &str) -> (&'static str, Color) {
+    match status {
+        "running"  => ("R", Color::Green),
+        "finished" => ("F", Color::DarkGray),
+        "killed"   => ("K", Color::Red),
+        "error"    => ("E", Color::Red),
+        _          => ("?", Color::Reset),
+    }
+}
+
 fn sessions_lines(app: &App) -> Vec<Line<'static>> {
+    // Columns mirror the prototype's #s-tab: F | Name | PID | Cmd | Age.
     let mut out = vec![Line::from(Span::styled(
-        format!("{:<14} {:<4} {:<9} {}", "PATH", "ID", "STATUS", "CMD"),
+        format!("{:<1} {:<14} {:<6} {:<24} {:>8}",
+                "F", "Name", "PID", "Cmd", "Age"),
         Style::default().add_modifier(Modifier::BOLD),
     ))];
     if app.sessions.is_empty() {
@@ -1831,21 +1861,30 @@ fn sessions_lines(app: &App) -> Vec<Line<'static>> {
     }
     for (i, s) in app.sessions.iter().enumerate() {
         let g = |k: &str| s.get(k).and_then(Value::as_str).unwrap_or("").to_string();
-        let path = g("path");
-        let id = g("session_id");
         let status = g("status");
-        let name = g("name");
-        let cmd = s
-            .get("cmd")
-            .and_then(Value::as_array)
+        let (flag, color) = session_flag(&status);
+        let name = {
+            // Prefer the box's NAME; fall back to the dotted display path's
+            // last segment, then the box id. Matches the prototype's pick.
+            let n = g("name");
+            if !n.is_empty() { n }
+            else { let p = g("path");
+                   if !p.is_empty() { p.rsplit('.').next().unwrap_or(&p).to_string() }
+                   else { g("session_id") } }
+        };
+        let pid = s.get("pid").and_then(Value::as_i64).unwrap_or(0);
+        let cmd = s.get("cmd").and_then(Value::as_array)
             .map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" "))
             .unwrap_or_default();
-        let label = if path.is_empty() { name } else { path };
-        let text = format!("{label:<14} {id:<4} {status:<9} {cmd}");
+        let cmd24: String = cmd.chars().take(24).collect();
+        let started = s.get("started").and_then(Value::as_f64).unwrap_or(0.0);
+        let age = if started > 0.0 { fmt_age(started) } else { String::new() };
+        let pid_str = if pid > 0 { pid.to_string() } else { String::new() };
+        let text = format!("{flag:<1} {name:<14} {pid_str:<6} {cmd24:<24} {age:>8}");
         let line = if i == app.sel_session {
             Line::from(Span::styled(text, Style::default().fg(Color::Black).bg(Color::Cyan)))
         } else {
-            Line::from(text)
+            Line::from(Span::styled(text, Style::default().fg(color)))
         };
         out.push(line);
     }
@@ -2096,6 +2135,49 @@ fn outputs_lines(app: &App) -> Vec<Line<'static>> {
     for l in app.output_view.lines() {
         let color = if l.starts_with("[err]") { Color::Red } else { Color::Gray };
         out.push(Line::from(Span::styled(l.to_string(), Style::default().fg(color))));
+    }
+    out
+}
+
+/// OUTPUTS index (left pane). Columns mirror the prototype's #out-tab:
+/// Time | Stream | Process | Bytes. exe + tgid are baked into each row by
+/// the engine's source_outputs so the renderer doesn't RPC per output.
+fn outputs_index_lines(app: &App) -> Vec<Line<'static>> {
+    let mut out = vec![Line::from(Span::styled(
+        format!("{:<8} {:<6} {:<20} {:>10}", "Time", "Stream", "Process", "Bytes"),
+        Style::default().add_modifier(Modifier::BOLD),
+    ))];
+    if app.outputs.is_empty() {
+        let msg = if app.outputs_total == 0 {
+            if app.f_outputs.active().is_some() { "(no outputs match filter)" }
+            else { "(no captured output)" }
+        } else { "(empty window — engine view drifted)" };
+        out.push(Line::from(msg));
+        return out;
+    }
+    for (i, o) in app.outputs.iter().enumerate() {
+        let ts = o.get("ts").and_then(Value::as_f64).unwrap_or(0.0) as i64;
+        let stream = o.get("stream").and_then(Value::as_i64).unwrap_or(0);
+        let len = o.get("len").and_then(Value::as_i64).unwrap_or(0);
+        let exe = o.get("exe").and_then(Value::as_str).unwrap_or("");
+        let tgid = o.get("tgid").and_then(Value::as_i64).unwrap_or(0);
+        let base = exe.rsplit('/').next().unwrap_or(exe);
+        let proc_label = if tgid > 0 { format!("{base}·{tgid}") } else { base.to_string() };
+        let proc_label: String = proc_label.chars().take(20).collect();
+        let time_label = {
+            let secs = ts.rem_euclid(86400);
+            let h = secs / 3600; let m = (secs % 3600) / 60; let s = secs % 60;
+            format!("{h:02}:{m:02}:{s:02}")
+        };
+        let stream_label = if stream == 1 { "err" } else { "out" };
+        let text = format!("{time_label:<8} {stream_label:<6} {proc_label:<20} {len:>10}");
+        let line = if i == app.sel_output {
+            Line::from(Span::styled(text, Style::default().fg(Color::Black).bg(Color::Cyan)))
+        } else {
+            let color = if stream == 1 { Color::Red } else { Color::Reset };
+            Line::from(Span::styled(text, Style::default().fg(color)))
+        };
+        out.push(line);
     }
     out
 }
@@ -2394,12 +2476,12 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                 f.render_widget(detail, cols[1]);
             }
             Pane::Outputs => {
-                let clines = changes_lines(app);
-                let c_scroll = scroll_for_cursor(app.sel_change + 1, clines.len(),
+                let olines = outputs_index_lines(app);
+                let o_scroll = scroll_for_cursor(app.sel_output + 1, olines.len(),
                                                  left[1].height);
-                let idx = Paragraph::new(Text::from(clines))
-                    .block(block(title("changes", false), false))
-                    .scroll((c_scroll, 0));
+                let idx = Paragraph::new(Text::from(olines))
+                    .block(block(title("OUTPUTS", true), true))
+                    .scroll((o_scroll, 0));
                 f.render_widget(idx, left[1]);
                 let out = Paragraph::new(Text::from(outputs_lines(app)))
                     .block(block(title("OUTPUT · stdout/stderr", true), true))

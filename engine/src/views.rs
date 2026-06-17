@@ -154,36 +154,42 @@ fn source_changes(sid: i64) -> (Vec<Value>, Vec<Vec<i64>>) {
 fn source_outputs(sid: i64) -> (Vec<Value>, Vec<Subject>) {
     let rows = discover::outputs(sid);
     let rows: Vec<Value> = rows.as_array().cloned().unwrap_or_default();
-    // Subject per row, via the row's process_id. Cache by pid so a chatty box
-    // with thousands of outputs from a few processes pays the prov cost once.
-    let mut cache: HashMap<i64, Subject> = HashMap::new();
+    // The outputs index needs a per-row (exe, tgid) tag for the prototype's
+    // "Process" column ("<basename>·<tgid>"). Pull the whole process table
+    // ONCE — one sqlite scan, indexed by row id — so we don't run a
+    // proc_prov / process row query per output.
+    let pmap: HashMap<i64, (String, i64)> = discover::open_ro_for(sid)
+        .and_then(|c| c.prepare("SELECT id, tgid, exe FROM process").ok().map(|mut st| {
+            st.query_map([], |r| Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+            ))).ok()
+              .map(|it| it.flatten().map(|(id, tg, ex)| (id, (ex, tg))).collect())
+              .unwrap_or_default()
+        }))
+        .unwrap_or_default();
+    // Subject + (exe, tgid) annotations. Subject is for the filter; the
+    // annotations are embedded into each row so the UI doesn't have to RPC
+    // to render the index.
+    let mut rows_out = Vec::with_capacity(rows.len());
     let mut subjects = Vec::with_capacity(rows.len());
-    for r in &rows {
+    for r in rows {
         let pid = r.get("process_id").and_then(Value::as_i64).unwrap_or(-1);
-        let s = if pid < 0 {
-            Subject::default()
-        } else if let Some(s) = cache.get(&pid) {
-            s.clone()
-        } else {
-            let prov = discover::proc_prov(sid, pid);
-            let s = subject_from_prov(&prov);
-            cache.insert(pid, s.clone());
-            s
-        };
-        subjects.push(s);
+        let (exe, tgid) = pmap.get(&pid).cloned().unwrap_or_default();
+        let argv: Vec<String> = vec![]; // outputs filter doesn't use arg
+        subjects.push(Subject { box_name: String::new(),
+                                exe: exe.clone(), cwd: String::new(), argv });
+        // Tack exe + tgid onto the row so the renderer can show them
+        // without another round-trip per row.
+        let mut r2 = r;
+        if let Some(obj) = r2.as_object_mut() {
+            obj.insert("exe".into(), Value::String(exe));
+            obj.insert("tgid".into(), Value::Number(tgid.into()));
+        }
+        rows_out.push(r2);
     }
-    (rows, subjects)
-}
-
-fn subject_from_prov(v: &Value) -> Subject {
-    Subject {
-        box_name: String::new(),
-        exe: v.get("exe").and_then(Value::as_str).unwrap_or("").to_string(),
-        cwd: v.get("cwd").and_then(Value::as_str).unwrap_or("").to_string(),
-        argv: v.get("argv").and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
-            .unwrap_or_default(),
-    }
+    (rows_out, subjects)
 }
 
 fn source_procs(sid: i64) -> (Vec<Value>, Vec<Subject>) {
