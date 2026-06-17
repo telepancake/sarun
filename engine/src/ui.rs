@@ -1637,6 +1637,39 @@ impl App {
                     ev.get("type").and_then(Value::as_str).unwrap_or("?")
                 );
             }
+            // Overlay file-change event from a live box. If it's for the
+            // currently-loaded box, refresh the focused view's data so the
+            // UI updates between 3 s ticks. (Engine: prototype broadcasts
+            // these as type=overlay; the Rust engine doesn't broadcast them
+            // yet, but the UI handles either source.)
+            Some("overlay") => {
+                let sid = ev.get("sid").and_then(Value::as_str)
+                    .or_else(|| ev.get("session_id").and_then(Value::as_str));
+                if sid.is_some() && sid == self.cur_sid().as_deref() {
+                    match self.focus {
+                        Pane::Changes | Pane::Hunks => self.load_changes(),
+                        Pane::Processes => self.load_processes(),
+                        Pane::Outputs => self.load_outputs(),
+                        _ => {}
+                    }
+                }
+            }
+            // Consolidation events from the Python prototype's engine (the
+            // Rust engine has no consolidation phase, so these are only
+            // ever seen by a Rust UI attached to a Python engine).
+            Some("consolidate_progress") => {
+                let done = ev.get("done").and_then(Value::as_u64).unwrap_or(0);
+                let total = ev.get("total").and_then(Value::as_u64).unwrap_or(0);
+                self.status = format!("consolidating… {done}/{total}");
+            }
+            Some("consolidate_done") => {
+                self.status = "consolidated".into();
+                self.load_changes();
+            }
+            Some("consolidate_failed") => {
+                let err = ev.get("error").and_then(Value::as_str).unwrap_or("?");
+                self.status = format!("consolidate failed: {err}");
+            }
             Some("pong") => self.status = "pong".into(),
             _ => {}
         }
