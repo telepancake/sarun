@@ -157,29 +157,27 @@ fn source_procs(sid: i64) -> (Vec<Value>, Vec<Subject>) {
         .as_array().cloned().unwrap_or_default()
         .iter().filter_map(Value::as_i64).collect();
     let rows = build_proc_tree(&procs, &roots, sid);
-    // Subject per row for "exe"/"cwd"/"arg" filter kinds. Connector rows get a
-    // default subject (they don't survive filter anyway when their kind isn't
-    // "ids"); cwd is filled lazily via proc_prov, cached by rid.
-    let mut cache: HashMap<i64, Subject> = HashMap::new();
+    // Subject per row for "exe"/"cwd"/"arg" filter kinds. `cwd` lives in the
+    // `process` table but discover::processes() doesn't include it; pull all
+    // (rid → cwd) pairs in ONE sqlite scan so a million-row procs view isn't
+    // a million per-row queries (which made view.open take ~30 s at scale).
+    let cwd_by_rid: HashMap<i64, String> = discover::open_ro_for(sid)
+        .and_then(|c| c.prepare("SELECT id, cwd FROM process").ok().map(|mut st| {
+            st.query_map([], |r| Ok((r.get::<_, i64>(0)?,
+                                     r.get::<_, Option<String>>(1)?.unwrap_or_default())))
+              .ok().map(|it| it.flatten().collect::<HashMap<_, _>>())
+              .unwrap_or_default()
+        }))
+        .unwrap_or_default();
     let mut subjects = Vec::with_capacity(rows.len());
     for r in &rows {
         let rid = r.get("rid").and_then(Value::as_i64).unwrap_or(-1);
-        let s = if rid < 0 {
-            Subject::default()
-        } else if let Some(s) = cache.get(&rid) {
-            s.clone()
-        } else {
-            let exe = r.get("exe").and_then(Value::as_str).unwrap_or("").to_string();
-            let argv = r.get("argv").and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
-                .unwrap_or_default();
-            let cwd = discover::proc_prov(sid, rid)
-                .get("cwd").and_then(Value::as_str).unwrap_or("").to_string();
-            let s = Subject { box_name: String::new(), exe, cwd, argv };
-            cache.insert(rid, s.clone());
-            s
-        };
-        subjects.push(s);
+        let exe = r.get("exe").and_then(Value::as_str).unwrap_or("").to_string();
+        let argv = r.get("argv").and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
+            .unwrap_or_default();
+        let cwd = cwd_by_rid.get(&rid).cloned().unwrap_or_default();
+        subjects.push(Subject { box_name: String::new(), exe, cwd, argv });
     }
     (rows, subjects)
 }
