@@ -2489,6 +2489,77 @@ fn outputs_index_lines(app: &App) -> Vec<Line<'static>> {
     out
 }
 
+/// Right pane of the RULES view — the prototype's _clause_detail / _update_
+/// rule_detail. Parses the currently-selected rule line via rules::FileRule,
+/// prints the ACTION (colored by verb), then each clause as
+/// "[join] [off] [not] kind:pattern" with the same dim styling for
+/// disabled clauses; finally a per-kind help table for the kinds actually
+/// used by this rule.
+fn rule_detail_lines(app: &App) -> Vec<Line<'static>> {
+    let Some(line) = app.rules.get(app.sel_rule) else {
+        return vec![
+            Line::from(Span::styled("n new · Enter edit · d delete",
+                Style::default().add_modifier(Modifier::DIM))),
+            Line::from(""),
+            Line::from(format!("file: {}", app.rules_path().display())),
+            Line::from(""),
+            Line::from("Rules decide each captured write: apply (keep),"),
+            Line::from("discard (drop), or passthrough. First match wins."),
+        ];
+    };
+    let Some(rule) = crate::rules::FileRule::parse(line) else {
+        return vec![Line::from(Span::styled(
+            "(unparseable rule)",
+            Style::default().fg(Color::Red)))];
+    };
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let cyan = Style::default().fg(Color::Cyan);
+    let (action_label, action_color) = match rule.action {
+        crate::rules::Action::Apply       => ("APPLY",       Color::Green),
+        crate::rules::Action::Discard     => ("DISCARD",     Color::Red),
+        crate::rules::Action::Passthrough => ("PASSTHROUGH", Color::Cyan),
+    };
+    let mut out = vec![
+        Line::from(Span::styled(action_label.to_string(),
+            Style::default().fg(action_color).add_modifier(Modifier::BOLD))),
+    ];
+    for (n, c) in rule.clauses.iter().enumerate() {
+        let mut lead = String::new();
+        if n > 0 { lead.push_str(match c.join {
+            crate::rules::Join::And => "and ", crate::rules::Join::Or => "or " }); }
+        if !c.enabled { lead.push_str("off "); }
+        if c.negate { lead.push_str("not "); }
+        let kp = format!("{}:{}", c.m.kind, c.m.pattern);
+        let kp_style = if c.enabled { Style::default() } else { dim };
+        out.push(Line::from(vec![
+            Span::styled(format!("  {lead}"), dim),
+            Span::styled(kp, kp_style),
+        ]));
+    }
+    out.push(Line::from(""));
+    // Per-kind help table: each kind that this rule actually uses, with its
+    // one-line glob semantics. Same text the prototype shows.
+    let help = |k: &str| match k {
+        "path" => "changed path (extended glob: * ** ? @(a|b) {a,b}; bare = any depth)",
+        "box"  => "the box's hierarchical name (same globs as paths)",
+        "exe"  => "triggering process's command pathname (path globs)",
+        "cwd"  => "triggering process's working directory (path globs)",
+        "arg"  => "any one of the triggering process's argv (raw glob)",
+        _ => "",
+    };
+    let mut seen: Vec<&str> = vec![];
+    for c in &rule.clauses {
+        if !seen.contains(&c.m.kind.as_str()) { seen.push(c.m.kind.as_str()); }
+    }
+    for k in seen {
+        out.push(Line::from(vec![
+            Span::styled(format!("{:6} ", k), cyan),
+            Span::styled(help(k).to_string(), dim),
+        ]));
+    }
+    out
+}
+
 /// FILE RULES pane: the ordered filerules lines (first match wins).
 fn rules_lines(app: &App) -> Vec<Line<'static>> {
     let mut out = vec![Line::from(Span::styled(
@@ -2872,17 +2943,10 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                     .scroll((scroll, 0))
                     .wrap(Wrap { trim: false });
                 f.render_widget(p, left);
-                let hint = Paragraph::new(Text::from(vec![
-                    Line::from("n new · Enter edit · d delete"),
-                    Line::from(""),
-                    Line::from(format!("file: {}", app.rules_path().display())),
-                    Line::from(""),
-                    Line::from("Rules decide each captured write: apply (keep),"),
-                    Line::from("discard (drop), or passthrough. First match wins."),
-                ]))
-                .block(block(title("WHAT IT MATCHES", false), false))
-                .wrap(Wrap { trim: false });
-                f.render_widget(hint, right);
+                let detail = Paragraph::new(Text::from(rule_detail_lines(app)))
+                    .block(block(title("WHAT IT MATCHES", false), false))
+                    .wrap(Wrap { trim: false });
+                f.render_widget(detail, right);
             }
             // Changes view (Pane::Changes is list-focused; Pane::Hunks is
             // diff-focused — same two-pane layout, different border). The
