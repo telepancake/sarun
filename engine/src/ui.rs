@@ -700,18 +700,108 @@ impl App {
                 self.sel_session = i;
             }
         }
+        // Cursor-preserving refresh of the focused view's data. Crucially
+        // NOT load_changes / load_processes / load_outputs: those reopen
+        // the engine view and reset the cursor (seek_first_leaf etc.),
+        // which is correct on a box-switch but wrong for a periodic
+        // tick — it would yank the user back to the top every few
+        // seconds. Instead, reopen the view's engine handle (so it sees
+        // newly-appearing rows) and refetch the SAME window while
+        // pinning sel_* by row identity.
         match self.focus {
-            Pane::Changes | Pane::Hunks => self.load_changes(),
-            Pane::Processes => self.load_processes(),
-            Pane::Outputs => self.load_outputs(),
-            // The boxes view: refresh "recently changed" for a live box so
-            // the detail panel shows the newest writes (the prototype's
-            // _live_recent behavior). For a finished box we leave the
-            // recent_changes empty and box_detail_lines falls back to
-            // the alphabetical preview.
-            Pane::Sessions => self.refresh_recent_changes(),
+            Pane::Changes | Pane::Hunks => self.refresh_changes_preserving_cursor(),
+            Pane::Processes              => self.refresh_processes_preserving_cursor(),
+            Pane::Outputs                => self.refresh_outputs_preserving_cursor(),
+            Pane::Sessions               => self.refresh_recent_changes(),
             Pane::Rules | Pane::Help | Pane::Pty => {}
         }
+    }
+
+    /// Reopen the changes view (engine source is a snapshot at open time,
+    /// so a live box's new files need a reopen to appear) AND keep the
+    /// user's cursor pinned to the same path. Window_start is also
+    /// preserved so a scrolled-down list doesn't jump back to the top.
+    fn refresh_changes_preserving_cursor(&mut self) {
+        let pinned_path = self.cur_change_path();
+        let saved_start = self.changes_window_start;
+        let saved_sel   = self.sel_change;
+        self.close_changes_view();
+        let Some(sid) = self.cur_sid_i64() else { return };
+        let filter = filter_to_json(self.f_changes.active());
+        match rpc(&self.sock, "view.open", json!(["changes", sid, filter])) {
+            Ok(v) => {
+                self.changes_view = v.get("view_id").and_then(Value::as_u64);
+                self.changes_total =
+                    v.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
+            }
+            Err(e) => { self.status = format!("view.open changes: {e}"); return; }
+        }
+        // Refetch the window we were on; if it slid off the end of the
+        // new total, clamp.
+        let cap = self.changes_total.saturating_sub(1);
+        self.fetch_changes_window(saved_start.min(cap));
+        // Pin sel_change by PATH if it's still in the window; otherwise
+        // fall back to the saved offset.
+        let restored = pinned_path.and_then(|p| {
+            self.changes.iter().position(|c|
+                c.get("path").and_then(Value::as_str) == Some(p.as_str()))
+        });
+        self.sel_change = restored
+            .unwrap_or_else(|| saved_sel.min(self.changes.len().saturating_sub(1)));
+    }
+
+    /// Same idea for procs: reopen + pin sel_proc by row id.
+    fn refresh_processes_preserving_cursor(&mut self) {
+        let pinned_rid = self.processes.get(self.sel_proc)
+            .and_then(|p| p.get("rid").and_then(Value::as_i64));
+        let saved_start = self.processes_window_start;
+        let saved_sel   = self.sel_proc;
+        self.close_processes_view();
+        let Some(sid) = self.cur_sid_i64() else { return };
+        let filter = filter_to_json(self.f_procs.active());
+        match rpc(&self.sock, "view.open", json!(["procs", sid, filter])) {
+            Ok(v) => {
+                self.processes_view = v.get("view_id").and_then(Value::as_u64);
+                self.processes_total =
+                    v.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
+            }
+            Err(e) => { self.status = format!("view.open procs: {e}"); return; }
+        }
+        let cap = self.processes_total.saturating_sub(1);
+        self.fetch_processes_window(saved_start.min(cap));
+        let restored = pinned_rid.and_then(|want| {
+            self.processes.iter().position(|p|
+                p.get("rid").and_then(Value::as_i64) == Some(want))
+        });
+        self.sel_proc = restored
+            .unwrap_or_else(|| saved_sel.min(self.processes.len().saturating_sub(1)));
+    }
+
+    /// Same for outputs: reopen + pin sel_output by output id.
+    fn refresh_outputs_preserving_cursor(&mut self) {
+        let pinned_oid = self.outputs.get(self.sel_output)
+            .and_then(|o| o.get("id").and_then(Value::as_i64));
+        let saved_start = self.outputs_window_start;
+        let saved_sel   = self.sel_output;
+        self.close_outputs_view();
+        let Some(sid) = self.cur_sid_i64() else { return };
+        let filter = filter_to_json(self.f_outputs.active());
+        match rpc(&self.sock, "view.open", json!(["outputs", sid, filter])) {
+            Ok(v) => {
+                self.outputs_view = v.get("view_id").and_then(Value::as_u64);
+                self.outputs_total =
+                    v.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
+            }
+            Err(e) => { self.status = format!("view.open outputs: {e}"); return; }
+        }
+        let cap = self.outputs_total.saturating_sub(1);
+        self.fetch_outputs_window(saved_start.min(cap));
+        let restored = pinned_oid.and_then(|want| {
+            self.outputs.iter().position(|o|
+                o.get("id").and_then(Value::as_i64) == Some(want))
+        });
+        self.sel_output = restored
+            .unwrap_or_else(|| saved_sel.min(self.outputs.len().saturating_sub(1)));
     }
 
     /// Pull the newest-first slice of the current box's sqlar — populates
@@ -1675,9 +1765,11 @@ impl App {
                     .or_else(|| ev.get("session_id").and_then(Value::as_str));
                 if sid.is_some() && sid == self.cur_sid().as_deref() {
                     match self.focus {
-                        Pane::Changes | Pane::Hunks => self.load_changes(),
-                        Pane::Processes => self.load_processes(),
-                        Pane::Outputs => self.load_outputs(),
+                        Pane::Changes | Pane::Hunks =>
+                            self.refresh_changes_preserving_cursor(),
+                        Pane::Processes => self.refresh_processes_preserving_cursor(),
+                        Pane::Outputs => self.refresh_outputs_preserving_cursor(),
+                        Pane::Sessions => self.refresh_recent_changes(),
                         _ => {}
                     }
                 }
@@ -2138,12 +2230,10 @@ fn sessions_lines(app: &App) -> Vec<Line<'static>> {
     out
 }
 
-/// Visual "└ " tree-arm prefix at depth > 0, mirroring the prototype's
-/// _ch_indent ("  "*depth + ("└ " if depth else "")) — applied to both leaf
-/// and connector rows of the changes / procs trees.
-fn tree_indent(depth: usize) -> String {
-    if depth == 0 { String::new() } else { format!("{}└ ", "  ".repeat(depth)) }
-}
+/// Plain-space tree indent (used by both the procs and changes panes —
+/// the earlier "└ " glyph hurt legibility more than it added structure;
+/// the depth alone is enough).
+fn tree_indent(depth: usize) -> String { "  ".repeat(depth) }
 
 /// Render the cached cd_info tuples (style-tag, text) as styled Lines —
 /// the small header strip above the diff. Same set of style tags the
