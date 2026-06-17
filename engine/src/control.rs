@@ -28,6 +28,12 @@ pub struct Shared {
     pub overlay: Option<crate::overlay::Overlay>,
     pub box_pids: std::collections::HashMap<i64, i32>, // box_id -> runner pidfd
     pub box_runpids: std::collections::HashMap<i64, i32>, // box_id -> runner HOST pid
+    /// Server-side materialized views (changes / procs / outputs) keyed by an
+    /// opaque u64 the client got back from view.open. The values hold the
+    /// per-box source rows + a Vec<usize> idx of survivors after the current
+    /// filter, so view.window is a cheap slice.
+    pub views: crate::views::Registry,
+    pub next_view_id: u64,
 }
 
 fn pidfd_open(pid: i32) -> i32 {
@@ -834,6 +840,41 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
             }
             _ => json!({"ok": false, "error": "bad args"}),
         },
+        // ── server-side windowed views over per-box data ────────────────────
+        // The UI lists are millions of rows in the limit; shipping the whole
+        // set client-side made keystrokes multi-second. These verbs let the
+        // client open a materialized view (filtered + sorted) and read it as
+        // small windows — see views.rs.
+        "view.open" => {
+            let kind = args.first().and_then(Value::as_str).unwrap_or("");
+            // Accept either an int or a string-of-int for the sid (the Python
+            // and Rust UIs both send strings, matching the existing verbs;
+            // tests sometimes pass ints).
+            let sid = args.get(1).and_then(|v| v.as_i64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))).unwrap_or(0);
+            let filter = args.get(2).cloned().unwrap_or(Value::Null);
+            let mut s = state.lock().unwrap();
+            let Shared { views, next_view_id, .. } = &mut *s;
+            crate::views::open(views, next_view_id, kind, sid, &filter)
+        }
+        "view.window" => {
+            let vid = args.first().and_then(Value::as_u64).unwrap_or(0);
+            let start = args.get(1).and_then(Value::as_u64).unwrap_or(0) as usize;
+            let size = args.get(2).and_then(Value::as_u64).unwrap_or(0) as usize;
+            let s = state.lock().unwrap();
+            crate::views::window(&s.views, vid, start, size)
+        }
+        "view.filter" => {
+            let vid = args.first().and_then(Value::as_u64).unwrap_or(0);
+            let filter = args.get(1).cloned().unwrap_or(Value::Null);
+            let mut s = state.lock().unwrap();
+            crate::views::set_filter(&mut s.views, vid, &filter)
+        }
+        "view.close" => {
+            let vid = args.first().and_then(Value::as_u64).unwrap_or(0);
+            let mut s = state.lock().unwrap();
+            crate::views::close(&mut s.views, vid)
+        }
         // At-rest-the-instant-it-exits Rust box (DESIGN.md D4): no consolidate
         // phase, no separate caches — these UI lifecycle pokes are vacuous, but
         // must not return "unknown verb".
