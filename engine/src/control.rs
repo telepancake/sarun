@@ -753,7 +753,21 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
             (Some(id), Some(oid)) => discover::output_detail(id, oid),
             _ => Value::Null,
         },
-        "processes_live" => Value::Null,  // finished-style: UI falls back to processes()
+        "processes_live" => {
+            // For a box whose runner is still registered the engine returns
+            // the captured process set as the "live" snapshot; the UI uses
+            // null vs non-null to choose live-style vs finished-style
+            // rendering. Without a separate exit-tracking pass the set
+            // includes already-exited rows too — but the prototype's
+            // strict-active behavior would need engine-level exit
+            // detection (a separate ticket).
+            let live_sids: std::collections::HashSet<i64> =
+                state.lock().unwrap().box_runpids.keys().copied().collect();
+            match arg_sid(args) {
+                Some(id) if live_sids.contains(&id) => discover::processes(id),
+                _ => Value::Null,
+            }
+        }
         "proc_info" => match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
             (Some(id), Some(rid)) => discover::proc_info(id, rid),
             _ => Value::Null,

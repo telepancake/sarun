@@ -918,6 +918,7 @@ impl Filesystem for Overlay {
             .unwrap_or_else(|| self.synth_dir_attr(ino, mode, 0));
         attr.kind = FileType::RegularFile;
         attr.perm = (mode & 0o7777) as u16;
+        self.push_event(bid, rel.clone(), "create");
         let n = self.reg_fh(FhInner {
             box_id: bid, rel, file: Some(f), upper: true,
             dirty: true, last_pid: req.pid(), sink: None, passthrough: false, _backing: None });
@@ -1204,7 +1205,8 @@ impl Filesystem for Overlay {
             return reply.error(Errno::EEXIST);
         }
         b.set_dir(&rel, mode, b.writer_for(req.pid()));
-        let ino = self.ino_for(&(bid, rel));
+        let ino = self.ino_for(&(bid, rel.clone()));
+        self.push_event(bid, rel, "mkdir");
         reply.entry(&TTL, &self.synth_dir_attr(ino, mode | 0o40000, 0),
                     Generation(0));
     }
@@ -1224,7 +1226,8 @@ impl Filesystem for Overlay {
         let rel = if prel.is_empty() { name.to_string() }
                   else { format!("{prel}/{name}") };
         b.set_symlink(&rel, target, b.writer_for(req.pid()));
-        let ino = self.ino_for(&(bid, rel));
+        let ino = self.ino_for(&(bid, rel.clone()));
+        self.push_event(bid, rel, "symlink");
         reply.entry(&TTL, &self.synth_link_attr(
             ino, target.as_os_str().as_encoded_bytes().len() as u64),
             Generation(0));
@@ -1253,6 +1256,7 @@ impl Filesystem for Overlay {
                 b.set_special(&rel, mode, rdev as u64, b.writer_for(req.pid())),
             _ => return reply.error(Errno::EINVAL),
         }
+        self.push_event(bid, rel.clone(), "mknod");
         let ino = self.ino_for(&(bid, rel.clone()));
         match self.attr_of(&b, ino, &rel) {
             Some(a) => reply.entry(&TTL, &a, Generation(0)),
@@ -1399,6 +1403,7 @@ impl Filesystem for Overlay {
             }
             _ => b.set_whiteout(&rel, writer),
         }
+        self.push_event(bid, rel, "unlink");
         reply.ok();
     }
 
@@ -1421,6 +1426,7 @@ impl Filesystem for Overlay {
         if self.host(&rel).is_dir() {
             b.set_whiteout(&rel, writer);
         }
+        self.push_event(bid, rel, "rmdir");
         reply.ok();
     }
 
@@ -1512,6 +1518,8 @@ impl Filesystem for Overlay {
             }
         }
         self.remap_inode_subtree(bo, &rel_o, &rel_n);
+        self.push_event(bo, rel_o, "rename_src");
+        self.push_event(bo, rel_n, "rename_dst");
         reply.ok();
     }
 
