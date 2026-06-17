@@ -38,7 +38,6 @@ use base64::Engine as _;
 use crate::rules::Clause;
 use crate::rules::Join;
 use crate::rules::Match;
-use crate::rules::PathTarget;
 use crate::rules::ProcFilterTarget;
 use crate::rules::Subject;
 use crate::rules::eval_clauses;
@@ -193,6 +192,20 @@ impl ViewFilter {
     }
 }
 
+/// Wire format for view.open / view.filter — null for "no filter", else a
+/// JSON array of clauses the engine reparses against the same `rules::Clause`
+/// the UI uses.
+fn filter_to_json(clauses: Option<&[Clause]>) -> Value {
+    let Some(cs) = clauses else { return Value::Null };
+    Value::Array(cs.iter().map(|c| json!({
+        "kind": c.m.kind,
+        "pattern": c.m.pattern,
+        "join": match c.join { Join::And => "and", Join::Or => "or" },
+        "negate": c.negate,
+        "enabled": c.enabled,
+    })).collect())
+}
+
 // ── app state ───────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -321,13 +334,40 @@ struct StructResult {
     lines: Vec<(String, String)>,
 }
 
+/// How many rows we hold client-side at once for the changes / procs / outputs
+/// panes. The engine owns the materialized + filtered list; the UI just walks
+/// a window of it. Sized large enough to make a screen of scrolling fit
+/// without a refetch — the engine answer is small and fast, but a round-trip
+/// per keystroke would still cost more than a slice.
+const WINDOW_SIZE: usize = 400;
+
 struct App {
     sock: String,
     sessions: Vec<Value>,
+    /// Changes WINDOW for the selected box: a contiguous slice of the engine's
+    /// view starting at `changes_window_start`. `sel_change` is the cursor
+    /// inside this window (NOT global), so when the cursor walks off an edge
+    /// the window slides and the cursor stays in bounds. `changes_total` is
+    /// the engine-side row count after the current filter.
     changes: Vec<Value>,
+    changes_view: Option<u64>,
+    changes_total: usize,
+    changes_window_start: usize,
     hunks: Value, // raw review.hunks result for the selected change
-    processes: Vec<Value>, // processes() rows: [id,tgid,ppid,parent_id,exe,argv]
-    outputs: Vec<Value>,   // outputs() rows: {id,ts,process_id,stream,len}
+    /// Same window/view scheme for the processes pane. `processes` rows here
+    /// are the engine-side flattened tree (depth + connector baked in), so
+    /// the UI no longer rebuilds the tree.
+    /// TODO follow-up commit migrates this pane to the view RPCs; the fields
+    /// below are reserved so the App layout doesn't churn twice.
+    processes: Vec<Value>,
+    #[allow(dead_code)] processes_view: Option<u64>,
+    #[allow(dead_code)] processes_total: usize,
+    #[allow(dead_code)] processes_window_start: usize,
+    /// Same for outputs.
+    outputs: Vec<Value>,
+    #[allow(dead_code)] outputs_view: Option<u64>,
+    #[allow(dead_code)] outputs_total: usize,
+    #[allow(dead_code)] outputs_window_start: usize,
     output_view: String,   // decoded bytes of the captured streams (stdout/stderr)
     rules: Vec<String>,    // raw filerules lines (apply/discard/passthrough <glob>)
     sel_session: usize,
@@ -366,9 +406,18 @@ impl App {
             sock,
             sessions: vec![],
             changes: vec![],
+            changes_view: None,
+            changes_total: 0,
+            changes_window_start: 0,
             hunks: Value::Null,
             processes: vec![],
+            processes_view: None,
+            processes_total: 0,
+            processes_window_start: 0,
             outputs: vec![],
+            outputs_view: None,
+            outputs_total: 0,
+            outputs_window_start: 0,
             output_view: String::new(),
             rules: vec![],
             sel_session: 0,
@@ -427,23 +476,111 @@ impl App {
         }
     }
 
-    /// Load the changes for the selected box and reset the change cursor.
+    /// Open / reopen the engine-side changes view for the selected box and
+    /// fetch the first window. `sel_change` is window-relative; the view
+    /// keeps the materialized + filtered list, we just walk a slice.
     fn load_changes(&mut self) {
+        self.close_changes_view();
         self.changes.clear();
+        self.changes_total = 0;
+        self.changes_window_start = 0;
         self.hunks = Value::Null;
         self.sel_change = 0;
         self.hunk_scroll = 0;
         self.sel_hunk = 0;
         self.cancel_struct();
-        let Some(sid) = self.cur_sid() else { return };
-        match rpc(&self.sock, "review.session_changes", json!([sid])) {
-            Ok(Value::Array(a)) => self.changes = a,
-            Ok(_) => {}
-            Err(e) => self.status = format!("session_changes: {e}"),
+        let Some(sid) = self.cur_sid_i64() else { return };
+        let filter = filter_to_json(self.f_changes.active());
+        match rpc(&self.sock, "view.open", json!(["changes", sid, filter])) {
+            Ok(v) => {
+                self.changes_view = v.get("view_id").and_then(Value::as_u64);
+                self.changes_total =
+                    v.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
+            }
+            Err(e) => {
+                self.status = format!("view.open changes: {e}");
+                return;
+            }
         }
+        self.fetch_changes_window(0);
         // the procs/outputs panes track the same selected box.
         self.load_processes();
         self.load_outputs();
+    }
+
+    /// Pull a single window worth of rows from the engine's changes view.
+    /// On success replaces `self.changes` + updates window_start / total.
+    fn fetch_changes_window(&mut self, start: usize) {
+        let Some(vid) = self.changes_view else { return };
+        let start = start.min(self.changes_total.saturating_sub(1).max(0));
+        match rpc(&self.sock, "view.window",
+                  json!([vid, start, WINDOW_SIZE])) {
+            Ok(v) => {
+                self.changes_window_start =
+                    v.get("start").and_then(Value::as_u64).unwrap_or(start as u64) as usize;
+                self.changes_total =
+                    v.get("total").and_then(Value::as_u64).unwrap_or(self.changes_total as u64) as usize;
+                self.changes = v.get("rows").and_then(Value::as_array).cloned()
+                    .unwrap_or_default();
+            }
+            Err(e) => self.status = format!("view.window changes: {e}"),
+        }
+    }
+
+    /// Drop the engine-side changes view (after which `changes_view` is None).
+    /// No-op if we never opened one.
+    fn close_changes_view(&mut self) {
+        if let Some(vid) = self.changes_view.take() {
+            let _ = rpc(&self.sock, "view.close", json!([vid]));
+        }
+    }
+
+    /// Push the current local f_changes filter to the engine-side view (so the
+    /// engine recomputes `idx`), then refetch the window from the top.
+    fn push_changes_filter(&mut self) {
+        let Some(vid) = self.changes_view else { return };
+        let filter = filter_to_json(self.f_changes.active());
+        match rpc(&self.sock, "view.filter", json!([vid, filter])) {
+            Ok(v) => {
+                self.changes_total =
+                    v.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
+                self.changes_window_start = 0;
+                self.sel_change = 0;
+                self.fetch_changes_window(0);
+            }
+            Err(e) => self.status = format!("view.filter changes: {e}"),
+        }
+    }
+
+    /// box_id of the selected box as i64 (the view RPCs take it numerically).
+    fn cur_sid_i64(&self) -> Option<i64> {
+        self.cur_sid().and_then(|s| s.parse::<i64>().ok())
+    }
+
+    /// Move the changes-pane cursor by `delta` rows in the engine-side view
+    /// coordinate system, sliding the window if the new position would leave
+    /// it. `sel_change` is kept in [0, window.len()) after this returns.
+    /// Caller is responsible for the bound check against `changes_total`.
+    fn sel_change_global_advance(&mut self, delta: isize) {
+        let cur_global = self.changes_window_start + self.sel_change;
+        let new_global = (cur_global as isize + delta).max(0) as usize;
+        // Still in the current window? Adjust the local cursor in-place — no
+        // RPC, the common case for any single-step navigation.
+        let win_end = self.changes_window_start + self.changes.len();
+        if new_global >= self.changes_window_start && new_global < win_end {
+            self.sel_change = new_global - self.changes_window_start;
+            return;
+        }
+        // Out of window — slide. Anchor the cursor at ~1/4 in so there's
+        // ~3/4 of a window of look-ahead in the direction of motion.
+        let quarter = WINDOW_SIZE / 4;
+        let new_start = new_global.saturating_sub(if delta > 0 { quarter } else { WINDOW_SIZE - quarter });
+        self.fetch_changes_window(new_start);
+        self.sel_change = new_global.saturating_sub(self.changes_window_start);
+        // Defend against a too-short window at the tail (sel beyond rows).
+        if self.sel_change >= self.changes.len() && !self.changes.is_empty() {
+            self.sel_change = self.changes.len() - 1;
+        }
     }
 
     /// Load the hunks (unified diff) for the selected change of the selected box.
@@ -666,26 +803,37 @@ impl App {
         self.reload_after_hunk();
     }
 
-    /// After a per-hunk op: reload changes + the diff for the same path, clamping
-    /// the hunk cursor (the change may have vanished when its last hunk went).
+    /// After a per-hunk op: refresh sessions, reopen the engine-side changes
+    /// view (the box's sqlar may have lost a row when its last hunk went), and
+    /// keep the cursor on the same path if it survived. The view is reopened
+    /// rather than just re-windowed because the engine snapshots the row set
+    /// at open time — and that snapshot is now stale.
     fn reload_after_hunk(&mut self) {
         let path = self.cur_change_path();
         self.refresh_sessions();
-        let sid = self.cur_sid();
-        if let Some(sid) = sid {
-            match rpc(&self.sock, "review.session_changes", json!([sid])) {
-                Ok(Value::Array(a)) => self.changes = a,
-                _ => {}
+        // Reopen the changes view so the engine rescans sqlar with our filter.
+        self.close_changes_view();
+        if let Some(sid) = self.cur_sid_i64() {
+            let filter = filter_to_json(self.f_changes.active());
+            match rpc(&self.sock, "view.open", json!(["changes", sid, filter])) {
+                Ok(v) => {
+                    self.changes_view = v.get("view_id").and_then(Value::as_u64);
+                    self.changes_total =
+                        v.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
+                }
+                Err(e) => self.status = format!("view.open changes: {e}"),
             }
         }
-        // keep the cursor on the same path if it survives.
+        self.fetch_changes_window(0);
+        self.sel_change = 0;
+        // Re-locate the previously-selected path in the new window, if it
+        // landed there. Cheap O(window_size) — millions of rows are still
+        // shielded server-side.
         if let Some(p) = &path {
-            if let Some(i) = self.visible_changes().iter().position(|c| {
+            if let Some(i) = self.changes.iter().position(|c| {
                 c.get("path").and_then(Value::as_str) == Some(p.as_str())
             }) {
                 self.sel_change = i;
-            } else if self.sel_change >= self.visible_changes().len() {
-                self.sel_change = self.visible_changes().len().saturating_sub(1);
             }
         }
         let n = self.hunk_indices().len();
@@ -853,8 +1001,8 @@ impl App {
                 }
             }
             Pane::Changes => {
-                if self.sel_change + 1 < self.visible_changes().len() {
-                    self.sel_change += 1;
+                if self.changes_window_start + self.sel_change + 1 < self.changes_total {
+                    self.sel_change_global_advance(1);
                     self.load_hunks();
                 }
             }
@@ -894,8 +1042,8 @@ impl App {
                 }
             }
             Pane::Changes => {
-                if self.sel_change > 0 {
-                    self.sel_change -= 1;
+                if self.changes_window_start + self.sel_change > 0 {
+                    self.sel_change_global_advance(-1);
                     self.load_hunks();
                 }
             }
@@ -1175,6 +1323,7 @@ impl App {
         if clauses.iter().any(|c| c.enabled) {
             *self.view_filter_mut(v) = ViewFilter { clauses, on: true, generated: false };
             self.reset_view_cursor(v);
+            self.push_view_filter(v);
             self.status = "filter applied".into();
         } else {
             self.status = "filter: no enabled clause".into();
@@ -1191,7 +1340,18 @@ impl App {
         f.on = false;
         f.generated = false;
         self.reset_view_cursor(v);
+        self.push_view_filter(v);
         self.status = "filter cleared".into();
+    }
+
+    /// Push the active client-side filter for view `v` into the engine-side
+    /// view (so the engine recomputes its idx) and refetches the window. A
+    /// no-op for views that haven't been migrated yet (procs / outputs).
+    fn push_view_filter(&mut self, v: FilterView) {
+        match v {
+            FilterView::Changes => self.push_changes_filter(),
+            FilterView::Procs | FilterView::Outputs => {}
+        }
     }
 
     fn reset_view_cursor(&mut self, v: FilterView) {
@@ -1251,25 +1411,12 @@ impl App {
             .collect()
     }
 
-    /// Changes after applying the changes view's typed filter (PathTarget per
-    /// row: the change path + its writer ids for "ids" clauses).
+    /// The current changes WINDOW — already filtered by the engine-side view,
+    /// so the UI just walks the (small) slice. `sel_change` indexes into this.
+    /// Use `changes_total` for the underlying view size; this is just what
+    /// the UI happens to be holding right now.
     fn visible_changes(&self) -> Vec<&Value> {
-        let Some(clauses) = self.f_changes.active() else {
-            return self.changes.iter().collect();
-        };
-        let sid = self.cur_sid();
-        self.changes
-            .iter()
-            .filter(|c| {
-                let rel = c.get("path").and_then(Value::as_str).unwrap_or("");
-                let ids = sid
-                    .as_ref()
-                    .map(|s| self.change_writer_ids(s, rel))
-                    .unwrap_or_default();
-                let target = PathTarget { rel, subject: Subject::default(), ids };
-                eval_clauses(&target, clauses)
-            })
-            .collect()
+        self.changes.iter().collect()
     }
 
     /// Output rows after applying the outputs view's typed filter. An output is
@@ -1655,7 +1802,12 @@ fn changes_lines(app: &App) -> Vec<Line<'static>> {
     ))];
     let vis = app.visible_changes();
     if vis.is_empty() {
-        out.push(Line::from(if app.changes.is_empty() { "(no changes)" } else { "(no changes match filter)" }));
+        let empty_msg = if app.changes_total == 0 {
+            if app.f_changes.active().is_some() { "(no changes match filter)" } else { "(no changes)" }
+        } else {
+            "(empty window — engine view drifted)"
+        };
+        out.push(Line::from(empty_msg));
         return out;
     }
     for (i, c) in vis.iter().enumerate() {
@@ -3524,9 +3676,18 @@ mod tests {
             sock: String::new(),
             sessions: vec![],
             changes: vec![],
+            changes_view: None,
+            changes_total: 0,
+            changes_window_start: 0,
             hunks: Value::Null,
             processes: vec![],
+            processes_view: None,
+            processes_total: 0,
+            processes_window_start: 0,
             outputs: vec![],
+            outputs_view: None,
+            outputs_total: 0,
+            outputs_window_start: 0,
             output_view: String::new(),
             rules: vec![],
             sel_session: 0,

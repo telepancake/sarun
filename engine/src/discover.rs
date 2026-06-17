@@ -319,6 +319,8 @@ pub fn pipeline_procs(box_id: i64, brushprov_id: i64) -> Value {
     Value::Array(out)
 }
 
+pub fn open_ro_for(box_id: i64) -> Option<rusqlite::Connection> { open_ro(box_id) }
+
 fn open_ro(box_id: i64) -> Option<rusqlite::Connection> {
     rusqlite::Connection::open_with_flags(
         sqlar_path(box_id), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).ok()

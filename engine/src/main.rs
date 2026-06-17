@@ -28,6 +28,7 @@ mod review;
 mod rules;
 mod runner;
 mod ui;
+mod views;
 
 // m2 `serve` mode: the control socket at the instance's namespaced path,
 // speaking the Python ChannelServer's protocol (single-instance guard, ui
