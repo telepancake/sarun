@@ -32,7 +32,6 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Duration;
-use std::time::Instant;
 
 use base64::Engine as _;
 
@@ -417,10 +416,6 @@ struct App {
     sel_hunk: usize,
     /// Receiver for finished structural-diff worker results (drained each tick).
     struct_rx: Option<mpsc::Receiver<StructResult>>,
-    /// Wall-clock stamp of the last periodic refresh — the interactive loop
-    /// nudges sessions + the focused view's data every TICK_PERIOD so a live
-    /// box's panes reflect new writes / spawns without a manual reload.
-    last_tick: Instant,
     /// Cached header for the currently-selected change: prototype's #cd-info
     /// content — full path / kind / size / mode / stale banner. Populated in
     /// load_hunks (on Enter / cursor move) so draw() doesn't RPC per frame.
@@ -451,10 +446,6 @@ struct App {
 /// window get rolled up into "… N earlier" / "… N more" elision lines.
 const OUTPUT_WINDOW_CAP: usize = 8000;
 
-/// How often the UI runs its background refresh tick (mirrors the prototype's
-/// set_interval(3, _tick) cadence). The render loop wakes every 200 ms on its
-/// event poll; tick fires once per TICK_PERIOD on top of that.
-const TICK_PERIOD: Duration = Duration::from_secs(3);
 
 impl App {
     fn new(sock: String) -> Self {
@@ -494,7 +485,6 @@ impl App {
             structd: StructState::default(),
             sel_hunk: 0,
             struct_rx: None,
-            last_tick: Instant::now(),
             cd_info: None,
             output_segs: vec![],
             changes_decor: vec![],
@@ -682,39 +672,6 @@ impl App {
     /// box_id of the selected box as i64 (the view RPCs take it numerically).
     fn cur_sid_i64(&self) -> Option<i64> {
         self.cur_sid().and_then(|s| s.parse::<i64>().ok())
-    }
-
-    /// Periodic background refresh, mirrors the prototype's _tick: rescan
-    /// sessions and reload whichever view the user is on, so a live box's
-    /// panes update without a manual R. Each step is best-effort — a
-    /// network blip on one shouldn't take down the rest.
-    fn tick(&mut self) {
-        // Preserve the cursor on the currently-selected box across the
-        // sessions reload (a new box appearing shouldn't shove the user's
-        // cursor around).
-        let pinned = self.cur_sid();
-        self.refresh_sessions();
-        if let Some(p) = &pinned {
-            if let Some(i) = self.sessions.iter().position(|s|
-                s.get("session_id").and_then(Value::as_str) == Some(p.as_str())) {
-                self.sel_session = i;
-            }
-        }
-        // Cursor-preserving refresh of the focused view's data. Crucially
-        // NOT load_changes / load_processes / load_outputs: those reopen
-        // the engine view and reset the cursor (seek_first_leaf etc.),
-        // which is correct on a box-switch but wrong for a periodic
-        // tick — it would yank the user back to the top every few
-        // seconds. Instead, reopen the view's engine handle (so it sees
-        // newly-appearing rows) and refetch the SAME window while
-        // pinning sel_* by row identity.
-        match self.focus {
-            Pane::Changes | Pane::Hunks => self.refresh_changes_preserving_cursor(),
-            Pane::Processes              => self.refresh_processes_preserving_cursor(),
-            Pane::Outputs                => self.refresh_outputs_preserving_cursor(),
-            Pane::Sessions               => self.refresh_recent_changes(),
-            Pane::Rules | Pane::Help | Pane::Pty => {}
-        }
     }
 
     /// Reopen the changes view (engine source is a snapshot at open time,
@@ -1755,20 +1712,27 @@ impl App {
                     ev.get("type").and_then(Value::as_str).unwrap_or("?")
                 );
             }
-            // Overlay file-change event from a live box. If it's for the
-            // currently-loaded box, refresh the focused view's data so the
-            // UI updates between 3 s ticks. (Engine: prototype broadcasts
-            // these as type=overlay; the Rust engine doesn't broadcast them
-            // yet, but the UI handles either source.)
-            Some("overlay") => {
+            // Live-box notifications, both broadcast on every actual
+            // change (no polling): type=overlay for file writes, mkdir,
+            // unlink, etc.; type=process_added when capture.rs records
+            // a new process row. If it's for the currently-loaded box,
+            // refresh the focused view's data so the UI tracks reality.
+            Some("overlay") | Some("process_added") => {
+                // Both events refresh the focused view's data when the
+                // affected sid matches the currently-loaded box. Routing
+                // to the cursor-preserving refreshers, never the reset-
+                // happy load_*() versions.
                 let sid = ev.get("sid").and_then(Value::as_str)
                     .or_else(|| ev.get("session_id").and_then(Value::as_str));
                 if sid.is_some() && sid == self.cur_sid().as_deref() {
+                    let kind = ev.get("type").and_then(Value::as_str).unwrap_or("");
                     match self.focus {
-                        Pane::Changes | Pane::Hunks =>
+                        Pane::Changes | Pane::Hunks if kind == "overlay" =>
                             self.refresh_changes_preserving_cursor(),
-                        Pane::Processes => self.refresh_processes_preserving_cursor(),
-                        Pane::Outputs => self.refresh_outputs_preserving_cursor(),
+                        Pane::Processes if kind == "process_added" =>
+                            self.refresh_processes_preserving_cursor(),
+                        Pane::Outputs if kind == "overlay" =>
+                            self.refresh_outputs_preserving_cursor(),
                         Pane::Sessions => self.refresh_recent_changes(),
                         _ => {}
                     }
@@ -3655,11 +3619,10 @@ fn run_interactive(sock: &str) -> Result<(), String> {
             if app.structd.pending && app.structd.full_lines.is_none() {
                 app.structd.spin = app.structd.spin.wrapping_add(1);
             }
-            // Periodic background refresh — mirrors the prototype's _tick.
-            if app.last_tick.elapsed() >= TICK_PERIOD {
-                app.tick();
-                app.last_tick = Instant::now();
-            }
+            // No periodic refresh — the engine pushes overlay /
+            // process_added / session_* events on the subscribe stream
+            // (see on_event), so the UI reacts to actual change instead
+            // of polling.
             term.draw(|f| draw(f, &app)).map_err(|e| e.to_string())?;
             if app.should_quit {
                 break;
@@ -4585,7 +4548,6 @@ mod tests {
             structd: StructState::default(),
             sel_hunk: 0,
             struct_rx: None,
-            last_tick: Instant::now(),
             cd_info: None,
             output_segs: vec![],
             changes_decor: vec![],
@@ -5074,6 +5036,37 @@ mod tests {
             }
         }
         assert!(saw, "expected an overlay event for the written file");
+    }
+
+    /// Running a real command in a box has its BoxState push a
+    /// "process_added" entry into the shared engine event queue
+    /// (capture.rs::record_proc); the broadcaster turns each one
+    /// into a type=process_added event on the subscribe stream. With
+    /// these events flowing the UI has no need for a 3 s polling
+    /// tick — the procs / changes / outputs views refresh on the
+    /// actual change.
+    #[test]
+    fn process_added_event_arrives_after_running_a_command() {
+        let Some(eng) = boot() else {
+            eprintln!("SKIP: engine binary missing or FUSE unavailable");
+            return;
+        };
+        let (tx, rx) = mpsc::channel();
+        spawn_subscriber(&eng.sock, tx);
+        std::thread::sleep(Duration::from_millis(300));
+        if !run_cmd(&eng, &["/bin/echo", "hi"]) {
+            eprintln!("SKIP: could not run a box command (bwrap unavailable?)");
+            return;
+        }
+        let mut saw = false;
+        for _ in 0..15 {
+            if let Ok(ev) = rx.recv_timeout(Duration::from_secs(2)) {
+                if ev.get("type").and_then(Value::as_str) == Some("process_added") {
+                    saw = true; break;
+                }
+            }
+        }
+        assert!(saw, "expected a process_added event after running a command");
     }
 
     /// Sessions sorted by dotted path so children land right after their

@@ -8,7 +8,9 @@
 // reader already handles).
 
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
 
@@ -18,6 +20,13 @@ use rusqlite::params;
 use crate::paths;
 
 pub const S_IFCHR: u32 = 0o020000; // tombstone mode, matches the Python engine
+
+/// Engine -> UI event queue, shared between the overlay (the file-change
+/// producer) and every registered BoxState (the proc-table producer).
+/// Items: (sid, rel, op) — the broadcaster in main.rs::serve drains this
+/// and turns each entry into a JSON event on the subscribe stream
+/// (type=overlay for file ops; type=process_added for op="process_added").
+pub type EventQ = Arc<Mutex<VecDeque<(i64, String, &'static str)>>>;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sqlar(name TEXT PRIMARY KEY, mode INT, mtime INT,
@@ -70,6 +79,14 @@ pub struct BoxState {
     pub id: i64,
     pub conn: Mutex<Connection>,
     pub kinds: RwLock<HashMap<String, Entry>>,
+    /// Optional shared engine->UI event queue. The overlay calls
+    /// set_event_sink() in add_box() with its own Arc-wrapped queue,
+    /// so when record_proc inserts a NEW process row it can push a
+    /// (sid, "", "process_added") entry directly — no polling, no
+    /// race with box teardown removing the BoxState before a 200 ms
+    /// drainer notices. Stays None for off-line uses (apply review,
+    /// e.g.) that don't need to broadcast.
+    event_sink: Mutex<Option<EventQ>>,
     // Process FOREST caches (mirror the Python Index._proc_cache/_proc_current):
     //   proc_cache:   (tgid,start) -> process row id  — incarnation identity.
     //   proc_current: tgid -> (start, row id)         — the latest-seen incarnation,
@@ -109,6 +126,27 @@ pub struct BoxState {
 }
 
 impl BoxState {
+    /// Plug the shared engine event queue in; overlay::add_box calls
+    /// this with its own Arc-wrapped queue so record_proc can push
+    /// notifications directly. Idempotent — overwrites any prior sink.
+    pub fn set_event_sink(&self, sink: EventQ) {
+        *self.event_sink.lock().unwrap() = Some(sink);
+    }
+
+    /// Append one (sid, rel, op) entry to the shared event queue, if a
+    /// sink is plugged in. Bounded — sheds the oldest half on overflow
+    /// (matches the overlay's own file-event push_event policy).
+    fn push_event(&self, rel: &str, op: &'static str) {
+        let g = self.event_sink.lock().unwrap();
+        let Some(sink) = g.as_ref() else { return };
+        let mut q = sink.lock().unwrap();
+        if q.len() >= 4096 {
+            let drop_n = 4096 / 2;
+            q.drain(..drop_n);
+        }
+        q.push_back((self.id, rel.to_string(), op));
+    }
+
     pub fn set_parent(&self, p: Option<i64>) {
         self.parent.store(p.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
     }
@@ -277,6 +315,7 @@ impl BoxState {
             id,
             conn: Mutex::new(conn),
             kinds: RwLock::new(HashMap::new()),
+            event_sink: Mutex::new(None),
             proc_cache: Mutex::new(HashMap::new()),
             proc_current: Mutex::new(HashMap::new()),
             roots: Mutex::new(std::collections::HashSet::new()),
@@ -447,12 +486,12 @@ impl BoxState {
         let conn = self.conn.lock().unwrap();
         let eid: Option<i64> = env_json.and_then(|j| Self::ensure_env(&conn, &j));
         let argv_json = serde_json::to_string(&argv).unwrap_or_default();
-        let _ = conn.execute(
+        let inserted = conn.execute(
             "INSERT OR IGNORE INTO process(tgid,start,ppid,parent_id,exe,cwd,argv,env_id,root)
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             params![tgid, start, ppid, parent_id, exe, cwd, argv_json, eid,
                     if root { 1 } else { 0 }],
-        );
+        ).unwrap_or(0);
         let rowid: i64 = conn
             .query_row("SELECT id FROM process WHERE tgid=?1 AND start=?2",
                        params![tgid, start], |r| r.get(0))
@@ -460,6 +499,14 @@ impl BoxState {
         drop(conn);
         self.proc_cache.lock().unwrap().insert((tgid, start), rowid);
         self.proc_current.lock().unwrap().insert(tgid, (start, rowid));
+        // Notify the broadcaster about new process rows: push directly
+        // into the shared event queue (set by overlay::add_box). The
+        // broadcaster turns it into a type=process_added event. Direct
+        // push, not a counter — no race with box teardown removing the
+        // BoxState before a periodic drainer notices.
+        if inserted > 0 {
+            self.push_event("", "process_added");
+        }
         Some(rowid)
     }
 

@@ -111,24 +111,38 @@ fn serve() -> i32 {
     state.lock().unwrap().overlay = Some(ov.clone());
     println!("sarun-engine: listening · {}  ·  overlay {}",
              sock.display(), mnt.display());
-    // Drainer: pump overlay events out as type=overlay broadcasts so a
-    // subscribed UI can refresh a live box's panes the moment something
-    // changes (the UI also has a periodic tick as a fallback). Lives for
-    // the engine process's lifetime.
+    // Engine -> UI event broadcaster. Lives for the engine process's
+    // lifetime. Drains ONE shared queue every ~100 ms — the queue
+    // collects FS-mutation events (from the FUSE ops) and process
+    // notifications (record_proc pushes directly via the sink
+    // overlay::add_box plugs into each BoxState), and the op string
+    // selects which `type` the broadcast carries:
+    //   op == "process_added"  →  type=process_added (sid only)
+    //   else                   →  type=overlay (sid, rel, op)
+    // Direct-push from the producers means there's no race window
+    // between the work and the wakeup, so the UI never needs a tick.
     {
         let ov = ov.clone();
         let state = state.clone();
-        std::thread::spawn(move || loop {
-            std::thread::sleep(Duration::from_millis(200));
-            let evts = ov.drain_events();
-            if evts.is_empty() { continue; }
-            for (sid, rel, op) in evts {
-                control::broadcast(&state, &serde_json::json!({
-                    "type": "overlay",
-                    "sid": sid.to_string(),
-                    "rel": rel,
-                    "op": op,
-                }));
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(Duration::from_millis(100));
+                for (sid, rel, op) in ov.drain_events() {
+                    let payload = if op == "process_added" {
+                        serde_json::json!({
+                            "type": "process_added",
+                            "sid": sid.to_string(),
+                        })
+                    } else {
+                        serde_json::json!({
+                            "type": "overlay",
+                            "sid": sid.to_string(),
+                            "rel": rel,
+                            "op": op,
+                        })
+                    };
+                    control::broadcast(&state, &payload);
+                }
             }
         });
     }

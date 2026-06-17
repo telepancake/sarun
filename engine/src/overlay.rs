@@ -122,15 +122,16 @@ struct Inner {
     // the daemon served (test observability: stays ~0 for passthrough'd reads).
     passthrough_ok: std::sync::atomic::AtomicBool,
     daemon_reads: AtomicU64,
-    /// Per-write change notifications produced by the mutating ops
-    /// (write / create / mkdir / symlink / unlink / rename / mknod).
-    /// Each entry is (box_id, rel, op). The control loop drains this on
-    /// a timer and broadcasts type=overlay events so the UI can refresh
-    /// a live box's panes the moment something changes — without it,
-    /// the UI only updates on its 3 s tick. Bounded by `OVERLAY_EVT_CAP`
-    /// (drops the oldest if drain falls behind) so a write storm can't
-    /// blow heap.
-    events: std::sync::Mutex<std::collections::VecDeque<(i64, String, &'static str)>>,
+    /// Engine-to-UI event queue, drained by the broadcaster thread in
+    /// main.rs::serve. Two producers, ONE queue:
+    ///   * overlay's mutating FS ops (write / create / mkdir / ...)
+    ///     push (sid, rel, op) → broadcast as type=overlay.
+    ///   * each registered BoxState (record_proc) pushes
+    ///     (sid, "", "process_added") → broadcast as type=process_added.
+    /// add_box() hands every BoxState a clone of this Arc so a direct
+    /// push from the producer beats any race with box teardown.
+    /// Bounded by OVERLAY_EVT_CAP (oldest half-shed on overflow).
+    events: crate::capture::EventQ,
 }
 
 /// Soft cap on the per-overlay event queue. The control loop drains every
@@ -254,7 +255,7 @@ impl Overlay {
             muted: RwLock::new(std::collections::HashMap::new()),
             passthrough_ok: std::sync::atomic::AtomicBool::new(false),
             daemon_reads: AtomicU64::new(0),
-            events: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            events: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
         }) };
         // Test observability: if SARUN_STATS_FILE is set, a thread writes
         // "passthrough=<0|1> daemon_reads=<n>" to it (survives the SIGTERM
@@ -384,6 +385,7 @@ impl Overlay {
     }
 
     pub fn add_box(&self, b: Arc<BoxState>) {
+        b.set_event_sink(self.inner.events.clone());
         self.inner.boxes.write().unwrap().insert(b.id, b);
     }
 
