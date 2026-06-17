@@ -2589,13 +2589,87 @@ fn scroll_for_cursor(cursor_line: usize, n_lines: usize, rect_h: u16) -> u16 {
     want.min(n_lines.saturating_sub(visible)) as u16
 }
 
+/// Mirrors the prototype's _keybar: a row of view-key chips (b/c/p/o/e),
+/// the active view's chip reversed-bold + its label yellow-bold, plus a
+/// "⦿ filter <expr>" badge when the focused view has an active filter.
+fn keybar_spans(app: &App) -> Vec<Span<'static>> {
+    let view_of = |p: Pane| match p {
+        Pane::Sessions => Some(('b', "boxes",   FilterView::Changes /* unused */)),
+        Pane::Changes | Pane::Hunks
+                       => Some(('c', "changes", FilterView::Changes)),
+        Pane::Processes => Some(('p', "procs",   FilterView::Procs)),
+        Pane::Outputs   => Some(('o', "outputs", FilterView::Outputs)),
+        Pane::Rules     => Some(('e', "rules",   FilterView::Changes /* unused */)),
+        _ => None,
+    };
+    let active = view_of(app.focus);
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (key, label) in [('b', "boxes"), ('c', "changes"),
+                         ('p', "procs"), ('o', "outputs"), ('e', "rules")] {
+        let on = active.map(|(k, _, _)| k == key).unwrap_or(false);
+        let chip_style = if on {
+            Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        } else { Style::default().add_modifier(Modifier::BOLD) };
+        let label_style = if on {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else { Style::default().add_modifier(Modifier::DIM) };
+        spans.push(Span::styled(format!(" {key} "), chip_style));
+        spans.push(Span::styled(format!("{label}  "), label_style));
+    }
+    spans.push(Span::styled(" │  ", Style::default().add_modifier(Modifier::DIM)));
+    spans.push(Span::styled("esc back  q quit  d detach",
+                            Style::default().add_modifier(Modifier::DIM)));
+    // Filter badge for the focused view.
+    if let Some((_, _, v)) = active {
+        let f = app.view_filter(v);
+        if f.on && !f.clauses.is_empty() {
+            spans.push(Span::raw("    "));
+            spans.push(Span::styled("⦿ filter ",
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
+            let expr = clauses_expr(&f.clauses);
+            let trimmed: String = expr.chars().take(60).collect();
+            spans.push(Span::styled(trimmed, Style::default().fg(Color::Yellow)));
+            spans.push(Span::styled("  ['/' clears]",
+                Style::default().add_modifier(Modifier::DIM)));
+        }
+    }
+    spans
+}
+
+/// Render a clause list as a one-line expression (kind:pattern, joined by
+/// the per-clause join keyword) — the prototype's _clauses_expr.
+fn clauses_expr(clauses: &[Clause]) -> String {
+    let mut s = String::new();
+    for (i, c) in clauses.iter().enumerate() {
+        if !c.enabled { continue; }
+        if i > 0 {
+            s.push(' ');
+            s.push_str(match c.join { Join::And => "and", Join::Or => "or" });
+            s.push(' ');
+        }
+        if c.negate { s.push_str("not "); }
+        s.push_str(&c.m.kind);
+        s.push(':');
+        s.push_str(&c.m.pattern);
+    }
+    s
+}
+
 fn draw(f: &mut ratatui::Frame, app: &App) {
+    // Two single-line strips along the bottom: a keybar (view keys with the
+    // active view's letter lit + active-filter chip) and the status / error
+    // message line. Matches the prototype's #keybar + #status arrangement.
     let root = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(1)])
+        .constraints([
+            Constraint::Min(3),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
         .split(f.area());
     let body = root[0];
-    let status_area = root[1];
+    let keybar_area = root[1];
+    let status_area = root[2];
 
     // The PTY pane takes the whole body: a live tui-term view of the engine-held
     // PTY child, rendered from the vt100 screen grid.
@@ -2726,6 +2800,12 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
             }
         }
     }
+
+    // Keybar: view-key tabs (active one reversed) + the global keys + the
+    // currently-active '/' filter expression if any.
+    f.render_widget(
+        Paragraph::new(Line::from(keybar_spans(app))),
+        Rect { x: keybar_area.x, y: keybar_area.y, width: keybar_area.width, height: 1 });
 
     let status_text = if let Some(buf) = &app.renaming {
         format!("rename -> {buf}_  (Enter to commit, Esc to cancel)")
