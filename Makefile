@@ -18,8 +18,12 @@
 #                         drop you into the slow first-run path.
 #   * engine/.../sarun  — the Rust port (the production target). Same
 #                         control protocol; a full standalone UI+engine.
-# `make run` prefers the built Rust binary and falls back to the Python
-# prototype, so `make engine[-musl] && make run` does what you expect.
+#
+# `make engine` and `make engine-musl` drop a `./sarun` SYMLINK at the
+# repo root pointing at whichever build they just produced — so you can
+# invoke the freshly-built binary as `./sarun` without spelunking into
+# engine/target/. `make run` execs that symlink when present, else the
+# Python prototype. `make clean` removes the symlink. .gitignore'd.
 
 SHELL := bash
 .DEFAULT_GOAL := help
@@ -37,15 +41,13 @@ help: ## Show this help (the list of every command)
 # ---- App ------------------------------------------------------------------
 
 .PHONY: run
-run: ## Start sarun (prefers a built Rust binary; falls back to the Python prototype)
-	@if [ -x engine/target/x86_64-unknown-linux-musl/release/sarun ]; then \
-	  echo "→ engine/target/x86_64-unknown-linux-musl/release/sarun"; \
-	  exec engine/target/x86_64-unknown-linux-musl/release/sarun; \
-	elif [ -x engine/target/release/sarun ]; then \
-	  echo "→ engine/target/release/sarun"; \
-	  exec engine/target/release/sarun; \
+run: ## Start sarun (./sarun symlink from the last engine build, else the Python prototype)
+	@if [ -x ./sarun ]; then \
+	  echo "→ ./sarun → $$(readlink ./sarun 2>/dev/null || echo ./sarun)"; \
+	  exec ./sarun; \
 	else \
 	  echo "→ prototype/sarun  (Python prototype — first run builds patched pyfuse3, ~25s)"; \
+	  echo "  (build the Rust port with 'make engine' or 'make engine-musl' to get a top-level ./sarun)"; \
 	  exec prototype/sarun; \
 	fi
 
@@ -80,6 +82,8 @@ deps: ## Install system packages (libfuse3-dev, fuse3, pkg-config, bubblewrap)
 .PHONY: engine
 engine: ## Build the Rust port (release, dynamic glibc — what `make run` prefers, what tests use)
 	cd engine && cargo build --release
+	@ln -sfn engine/target/release/sarun sarun
+	@echo "→ ./sarun → engine/target/release/sarun"
 
 .PHONY: engine-musl
 engine-musl: ## Build the Rust port as a fully-static musl binary (cargo-zigbuild + zig)
@@ -91,6 +95,8 @@ engine-musl: ## Build the Rust port as a fully-static musl binary (cargo-zigbuil
 	chmod +x engine/target/zigshim/musl-gcc
 	cd engine && PATH="$(CURDIR)/engine/target/zigshim:$$(uv tool dir)/cargo-zigbuild/bin:$$HOME/.local/bin:$$PATH" \
 	  cargo zigbuild --release --target x86_64-unknown-linux-musl
+	@ln -sfn engine/target/x86_64-unknown-linux-musl/release/sarun sarun
+	@echo "→ ./sarun → engine/target/x86_64-unknown-linux-musl/release/sarun"
 
 # ---- Tests ----------------------------------------------------------------
 
@@ -109,6 +115,7 @@ test-e2e: ## Run the end-to-end tests (real UI + real sandboxes; minutes)
 # ---- Housekeeping ---------------------------------------------------------
 
 .PHONY: clean
-clean: ## Remove build artifacts (engine/target/, __pycache__)
+clean: ## Remove build artifacts (engine/target/, ./sarun symlink, __pycache__)
 	rm -rf engine/target
+	rm -f sarun
 	find . -type d -name __pycache__ -prune -exec rm -rf {} +
