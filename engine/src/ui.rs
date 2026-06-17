@@ -230,6 +230,15 @@ enum Pane {
     Hunks,
     Processes,
     Outputs,
+    /// D9 brush↔process pipelines: one row per recorded shell pipeline
+    /// (cmd + parsed structure JSON + which proc rows it spawned), from
+    /// the box's `brushprov` table. Top-level + nested-shim pipelines
+    /// share this view; the nested? column tags them.
+    Pipelines,
+    /// Phase 1 embedded-ninja build graph: one row per parsed n2 build
+    /// edge (outs / ins / cmd), from the box's `build_edges` table —
+    /// INCLUDING up-to-date targets that never executed.
+    BuildEdges,
     Rules,
     Help,
     /// The engine-held PTY pane (D7/D9): a live tui-term view of an interactive
@@ -388,9 +397,18 @@ struct App {
     outputs_total: usize,
     outputs_window_start: usize,
     rules: Vec<String>,    // raw filerules lines (apply/discard/passthrough <glob>)
+    /// D9 pipelines for the currently-loaded box (one row per `brushprov`
+    /// entry; engine returns the full list — these are bounded by what
+    /// brush actually ran, so no windowing needed).
+    pipelines: Vec<Value>,
+    /// Phase 1 build edges for the currently-loaded box (one row per
+    /// `build_edges` entry; same "full list, no windowing" reasoning).
+    build_edges: Vec<Value>,
     sel_session: usize,
     sel_change: usize,
     sel_proc: usize,
+    sel_pipeline: usize,
+    sel_edge: usize,
     sel_output: usize,
     sel_rule: usize,
     hunk_scroll: u16,
@@ -471,10 +489,10 @@ impl App {
             outputs_view: None,
             outputs_total: 0,
             outputs_window_start: 0,
-            rules: vec![],
+            rules: vec![], pipelines: vec![], build_edges: vec![],
             sel_session: 0,
             sel_change: 0,
-            sel_proc: 0,
+            sel_proc: 0, sel_pipeline: 0, sel_edge: 0,
             sel_output: 0,
             sel_rule: 0,
             hunk_scroll: 0,
@@ -1157,6 +1175,35 @@ impl App {
         self.seek_first_real_proc();
     }
 
+    /// Load the brush pipelines for the currently-selected box. Each row
+    /// is one `brushprov` entry: cmd + parsed structure + which process
+    /// rows brush spawned for it (the D9 pipeline→processes linkage).
+    /// Full list (no windowing) — bounded by what brush actually ran.
+    fn load_pipelines(&mut self) {
+        self.pipelines.clear();
+        self.sel_pipeline = 0;
+        let Some(sid) = self.cur_sid_i64() else { return };
+        match rpc(&self.sock, "brushprov", json!([sid])) {
+            Ok(Value::Array(rows)) => self.pipelines = rows,
+            Ok(_) => {}
+            Err(e) => self.status = format!("brushprov: {e}"),
+        }
+    }
+
+    /// Load the embedded-ninja build edges for the currently-selected box.
+    /// Each row is one parsed edge: outs / ins / cmd. Includes up-to-date
+    /// targets that never executed.
+    fn load_build_edges(&mut self) {
+        self.build_edges.clear();
+        self.sel_edge = 0;
+        let Some(sid) = self.cur_sid_i64() else { return };
+        match rpc(&self.sock, "build_edges", json!([sid])) {
+            Ok(Value::Array(rows)) => self.build_edges = rows,
+            Ok(_) => {}
+            Err(e) => self.status = format!("build_edges: {e}"),
+        }
+    }
+
     /// Advance sel_proc to the first non-connector row in the window. Without
     /// this the cursor sits on a structural ancestor (a connector dim row),
     /// which feels like "no item selected" — the prototype puts the cursor
@@ -1434,6 +1481,16 @@ impl App {
                     self.sel_rule += 1;
                 }
             }
+            Pane::Pipelines => {
+                if self.sel_pipeline + 1 < self.pipelines.len() {
+                    self.sel_pipeline += 1;
+                }
+            }
+            Pane::BuildEdges => {
+                if self.sel_edge + 1 < self.build_edges.len() {
+                    self.sel_edge += 1;
+                }
+            }
             Pane::Help => self.out_scroll = self.out_scroll.saturating_add(1),
             Pane::Pty => {}
         }
@@ -1464,6 +1521,8 @@ impl App {
             Pane::Processes => self.move_proc_cursor(-1),
             Pane::Outputs => self.sel_output = self.sel_output.saturating_sub(1),
             Pane::Rules => self.sel_rule = self.sel_rule.saturating_sub(1),
+            Pane::Pipelines => self.sel_pipeline = self.sel_pipeline.saturating_sub(1),
+            Pane::BuildEdges => self.sel_edge = self.sel_edge.saturating_sub(1),
             Pane::Help => self.out_scroll = self.out_scroll.saturating_sub(1),
             Pane::Pty => {}
         }
@@ -1518,6 +1577,18 @@ impl App {
                 let cur = self.sel_rule as isize;
                 self.sel_rule = (cur + delta).clamp(0, total as isize - 1) as usize;
             }
+            Pane::Pipelines => {
+                let total = self.pipelines.len();
+                if total == 0 { return; }
+                let cur = self.sel_pipeline as isize;
+                self.sel_pipeline = (cur + delta).clamp(0, total as isize - 1) as usize;
+            }
+            Pane::BuildEdges => {
+                let total = self.build_edges.len();
+                if total == 0 { return; }
+                let cur = self.sel_edge as isize;
+                self.sel_edge = (cur + delta).clamp(0, total as isize - 1) as usize;
+            }
             Pane::Hunks => {
                 let n16 = n as u16;
                 if step > 0 { self.hunk_scroll = self.hunk_scroll.saturating_add(n16); }
@@ -1539,13 +1610,23 @@ impl App {
             Pane::Changes => Pane::Hunks,
             Pane::Hunks => Pane::Processes,
             Pane::Processes => Pane::Outputs,
-            Pane::Outputs => Pane::Rules,
+            Pane::Outputs => Pane::Pipelines,
+            Pane::Pipelines => Pane::BuildEdges,
+            Pane::BuildEdges => Pane::Rules,
             Pane::Rules => Pane::Sessions,
             Pane::Help => Pane::Sessions,
             // Tab out of the PTY pane back to the box list (keystrokes are not
             // captured by Tab while focused — see the interactive loop's Pty arm).
             Pane::Pty => Pane::Sessions,
         };
+        // Tab-landing fetches: pipelines / build_edges are loaded on demand
+        // (no live engine view backs them), so tabbing onto them refreshes
+        // for the current box. Cheap RPC — bounded by what brush / ninja ran.
+        match self.focus {
+            Pane::Pipelines => self.load_pipelines(),
+            Pane::BuildEdges => self.load_build_edges(),
+            _ => {}
+        }
     }
 
     /// Enter: open the selected row into the next pane.
@@ -1560,6 +1641,7 @@ impl App {
                 self.focus = Pane::Hunks;
             }
             Pane::Hunks | Pane::Processes | Pane::Outputs | Pane::Rules
+            | Pane::Pipelines | Pane::BuildEdges
             | Pane::Help | Pane::Pty => {}
         }
     }
@@ -2735,10 +2817,14 @@ fn help_lines() -> Vec<Line<'static>> {
         t("  c  changes             files the box wrote (Enter → its diff)"),
         t("  p  processes           the captured process TREE (exe · argv · env)"),
         t("  o  outputs             decoded stdout/stderr transcript"),
+        t("  l  pipeLines           shell pipelines brush ran inside a -b box,"),
+        d("     with their parsed structure and the process rows they spawned"),
+        t("  g  build Graph         parsed ninja/make build edges from a -b box,"),
+        d("     including up-to-date targets that never executed"),
         t("  e  file rules          the ordered apply/discard/passthrough rules"),
         t("  ?  this help"),
         t("  P  open an engine-held PTY — a live interactive shell pane"),
-        d("     keys go to the box · Ctrl-] detaches back to the UI"),
+        d("     keys go to the box · Ctrl-] / F12 / Esc-Esc detaches back to the UI"),
         t(""),
         h("Navigation & filters"),
         t("  j/k or ↓/↑  move       Enter  open the selection in the next pane"),
@@ -2913,13 +2999,17 @@ fn keybar_spans(app: &App) -> Vec<Span<'static>> {
                        => Some(('c', "changes", FilterView::Changes)),
         Pane::Processes => Some(('p', "procs",   FilterView::Procs)),
         Pane::Outputs   => Some(('o', "outputs", FilterView::Outputs)),
+        Pane::Pipelines => Some(('l', "pipes",   FilterView::Changes /* unused */)),
+        Pane::BuildEdges => Some(('g', "build",  FilterView::Changes /* unused */)),
         Pane::Rules     => Some(('e', "rules",   FilterView::Changes /* unused */)),
         _ => None,
     };
     let active = view_of(app.focus);
     let mut spans: Vec<Span<'static>> = Vec::new();
     for (key, label) in [('b', "boxes"), ('c', "changes"),
-                         ('p', "procs"), ('o', "outputs"), ('e', "rules")] {
+                         ('p', "procs"), ('o', "outputs"),
+                         ('l', "pipes"), ('g', "build"),
+                         ('e', "rules")] {
         let on = active.map(|(k, _, _)| k == key).unwrap_or(false);
         let chip_style = if on {
             Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
@@ -3055,6 +3145,30 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                     .scroll((app.out_scroll, 0))
                     .wrap(Wrap { trim: false });
                 f.render_widget(out, right);
+            }
+            Pane::Pipelines => {
+                let lines = pipelines_lines(app);
+                let scroll = scroll_for_cursor(app.sel_pipeline + 1, lines.len(), left.height);
+                let p = Paragraph::new(Text::from(lines))
+                    .block(block(title("PIPELINES · brush", true), true))
+                    .scroll((scroll, 0));
+                f.render_widget(p, left);
+                let detail = Paragraph::new(Text::from(pipeline_detail_lines(app)))
+                    .block(block(title("PIPELINE · DETAIL", false), false))
+                    .wrap(Wrap { trim: false });
+                f.render_widget(detail, right);
+            }
+            Pane::BuildEdges => {
+                let lines = build_edges_lines(app);
+                let scroll = scroll_for_cursor(app.sel_edge + 1, lines.len(), left.height);
+                let p = Paragraph::new(Text::from(lines))
+                    .block(block(title("BUILD EDGES · ninja/make", true), true))
+                    .scroll((scroll, 0));
+                f.render_widget(p, left);
+                let detail = Paragraph::new(Text::from(build_edge_detail_lines(app)))
+                    .block(block(title("EDGE · DETAIL", false), false))
+                    .wrap(Wrap { trim: false });
+                f.render_widget(detail, right);
             }
             Pane::Rules => {
                 let lines = rules_lines(app);
@@ -3211,6 +3325,217 @@ fn box_detail_lines(app: &App) -> Vec<Line<'static>> {
 
 fn bold_count(n: usize) -> String {
     if n == 1 { "1 file".into() } else { format!("{n} files") }
+}
+
+/// One line per pipeline row: a single-letter origin marker (T = top-level,
+/// N = nested-shim), the seq index, and the command. The pipeline's full
+/// parsed structure + linked process row ids live in the detail pane.
+fn pipelines_lines(app: &App) -> Vec<Line<'static>> {
+    if app.pipelines.is_empty() {
+        return vec![Line::from(Span::styled(
+            "no pipelines yet — run something through brush (-b) to populate",
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC))),
+        ];
+    }
+    let mut out = vec![];
+    for (i, row) in app.pipelines.iter().enumerate() {
+        let id = row.get("id").and_then(Value::as_i64).unwrap_or(0);
+        let nested = row.get("nested").and_then(Value::as_bool) == Some(true);
+        let pipeline = row.get("pipeline").and_then(Value::as_i64).unwrap_or(0);
+        let cmd = row.get("cmd").and_then(Value::as_str).unwrap_or("");
+        let nprocs = row.get("processes").and_then(Value::as_array)
+            .map(|a| a.len()).unwrap_or(0);
+        let mark = if nested { "N" } else { "T" };
+        let mark_style = if nested {
+            Style::default().fg(Color::Magenta)
+        } else {
+            Style::default().fg(Color::Cyan)
+        };
+        let mut spans = vec![
+            Span::styled(format!("{:>4}  ", id),
+                         Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("{mark}  "), mark_style),
+            Span::styled(format!("p{pipeline:<2}  "),
+                         Style::default().fg(Color::DarkGray)),
+            Span::raw(cmd.to_string()),
+        ];
+        if nprocs > 0 {
+            spans.push(Span::styled(format!("  ·  {nprocs} proc{}",
+                if nprocs == 1 { "" } else { "s" }),
+                Style::default().fg(Color::DarkGray)));
+        }
+        let mut line = Line::from(spans);
+        if i == app.sel_pipeline {
+            line = line.style(Style::default().add_modifier(Modifier::REVERSED));
+        }
+        out.push(line);
+    }
+    out
+}
+
+/// Right-hand detail for the selected pipeline: cmd, origin, ts/spawn_ts,
+/// the linked process row ids, and the parsed structure JSON (pretty).
+fn pipeline_detail_lines(app: &App) -> Vec<Line<'static>> {
+    let Some(row) = app.pipelines.get(app.sel_pipeline) else {
+        return vec![Line::from(Span::styled(
+            "(select a pipeline)",
+            Style::default().fg(Color::DarkGray)))];
+    };
+    let nested = row.get("nested").and_then(Value::as_bool) == Some(true);
+    let id = row.get("id").and_then(Value::as_i64).unwrap_or(0);
+    let pipeline = row.get("pipeline").and_then(Value::as_i64).unwrap_or(0);
+    let cmd = row.get("cmd").and_then(Value::as_str).unwrap_or("");
+    let ts = row.get("ts").and_then(Value::as_f64).unwrap_or(0.0);
+    let spawn_ts = row.get("spawn_ts").and_then(Value::as_f64);
+    let procs: Vec<String> = row.get("processes").and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(|v| v.as_i64().map(|i| i.to_string())).collect())
+        .unwrap_or_default();
+    let label = Style::default().fg(Color::DarkGray);
+    let val = Style::default().add_modifier(Modifier::BOLD);
+    let mut lines = vec![
+        Line::from(vec![Span::styled("id        ", label),
+                        Span::styled(id.to_string(), val)]),
+        Line::from(vec![Span::styled("origin    ", label),
+                        Span::styled(if nested { "nested  (sh -c shim)" }
+                                     else { "top-level brush body" }, val)]),
+        Line::from(vec![Span::styled("seq       ", label),
+                        Span::styled(format!("p{pipeline}"), val)]),
+        Line::from(vec![Span::styled("ts        ", label),
+                        Span::raw(format!("{ts:.6}"))]),
+    ];
+    if let Some(st) = spawn_ts {
+        lines.push(Line::from(vec![Span::styled("spawn_ts  ", label),
+                                    Span::raw(format!("{st:.6}"))]));
+    }
+    lines.push(Line::from(vec![Span::styled("cmd       ", label),
+                                Span::styled(cmd.to_string(), val)]));
+    if !procs.is_empty() {
+        lines.push(Line::from(vec![Span::styled("processes ", label),
+            Span::raw(procs.join(", "))]));
+    } else {
+        lines.push(Line::from(vec![Span::styled("processes ", label),
+            Span::styled("(none linked — brush ran this in-process)",
+                         Style::default().fg(Color::DarkGray)
+                                          .add_modifier(Modifier::ITALIC))]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "── parsed structure ──",
+        Style::default().fg(Color::DarkGray))));
+    let rec = row.get("record").cloned().unwrap_or(Value::Null);
+    let pretty = serde_json::to_string_pretty(&rec).unwrap_or_default();
+    for l in pretty.lines() {
+        lines.push(Line::from(l.to_string()));
+    }
+    lines
+}
+
+/// One line per build_edges row: a marker (P for phony, R for real recipe),
+/// the first output target, → and the cmd (truncated). The detail pane
+/// shows all outs/ins and the full cmd.
+fn build_edges_lines(app: &App) -> Vec<Line<'static>> {
+    if app.build_edges.is_empty() {
+        return vec![Line::from(Span::styled(
+            "no build edges yet — run `ninja` or `make` inside a -b box",
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC))),
+        ];
+    }
+    let mut out = vec![];
+    for (i, row) in app.build_edges.iter().enumerate() {
+        let outs = row.get("outs").and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from))
+                              .collect::<Vec<_>>())
+            .unwrap_or_default();
+        let cmd_opt = row.get("cmd").and_then(Value::as_str);
+        let phony = cmd_opt.is_none() || cmd_opt == Some("");
+        let mark = if phony { "P" } else { "R" };
+        let mark_style = if phony {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default().fg(Color::Green)
+        };
+        let head = outs.first().cloned().unwrap_or_else(|| "(unnamed)".into());
+        let extra = if outs.len() > 1 {
+            format!(" (+{})", outs.len() - 1)
+        } else { String::new() };
+        let mut spans = vec![
+            Span::styled(format!("{mark}  "), mark_style),
+            Span::styled(head, Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(extra, Style::default().fg(Color::DarkGray)),
+        ];
+        if let Some(cmd) = cmd_opt.filter(|c| !c.is_empty()) {
+            let trimmed: String = cmd.chars().take(60).collect();
+            spans.push(Span::styled("  ←  ",
+                Style::default().fg(Color::DarkGray)));
+            spans.push(Span::raw(trimmed));
+        }
+        let mut line = Line::from(spans);
+        if i == app.sel_edge {
+            line = line.style(Style::default().add_modifier(Modifier::REVERSED));
+        }
+        out.push(line);
+    }
+    out
+}
+
+/// Right-hand detail for the selected build edge: full outs/ins lists,
+/// the recipe cmd (or "phony"), and the timestamp.
+fn build_edge_detail_lines(app: &App) -> Vec<Line<'static>> {
+    let Some(row) = app.build_edges.get(app.sel_edge) else {
+        return vec![Line::from(Span::styled(
+            "(select an edge)",
+            Style::default().fg(Color::DarkGray)))];
+    };
+    let id = row.get("id").and_then(Value::as_i64).unwrap_or(0);
+    let ts = row.get("ts").and_then(Value::as_f64).unwrap_or(0.0);
+    let outs = row.get("outs").and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from))
+                          .collect::<Vec<_>>()).unwrap_or_default();
+    let ins = row.get("ins").and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from))
+                          .collect::<Vec<_>>()).unwrap_or_default();
+    let cmd = row.get("cmd").and_then(Value::as_str).unwrap_or("");
+    let label = Style::default().fg(Color::DarkGray);
+    let mut lines = vec![
+        Line::from(vec![Span::styled("id        ", label),
+                        Span::raw(id.to_string())]),
+        Line::from(vec![Span::styled("ts        ", label),
+                        Span::raw(format!("{ts:.6}"))]),
+        Line::from(""),
+        Line::from(Span::styled("outputs", Style::default().fg(Color::Green)
+                                                   .add_modifier(Modifier::BOLD))),
+    ];
+    if outs.is_empty() {
+        lines.push(Line::from(Span::styled("  (none)",
+            Style::default().fg(Color::DarkGray))));
+    }
+    for o in &outs {
+        lines.push(Line::from(format!("  {o}")));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "inputs", Style::default().fg(Color::Cyan)
+                          .add_modifier(Modifier::BOLD))));
+    if ins.is_empty() {
+        lines.push(Line::from(Span::styled("  (none — leaf or phony)",
+            Style::default().fg(Color::DarkGray))));
+    }
+    for i in &ins {
+        lines.push(Line::from(format!("  {i}")));
+    }
+    lines.push(Line::from(""));
+    if cmd.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "phony — no recipe; this edge only declares dependencies",
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC))));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "recipe", Style::default().add_modifier(Modifier::BOLD))));
+        // Wrap-friendly: just hand the whole cmd to the paragraph; ratatui
+        // re-wraps at the pane width via wrap: trim:false.
+        lines.push(Line::from(cmd.to_string()));
+    }
+    lines
 }
 
 fn proc_detail_lines(app: &App) -> Vec<Line<'static>> {
@@ -3783,6 +4108,14 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                     KeyCode::Char('c') => app.nav(Pane::Changes),
                     KeyCode::Char('p') => app.nav(Pane::Processes),
                     KeyCode::Char('o') => app.nav(Pane::Outputs),
+                    KeyCode::Char('l') => {
+                        app.focus = Pane::Pipelines;
+                        app.load_pipelines();
+                    }
+                    KeyCode::Char('g') => {
+                        app.focus = Pane::BuildEdges;
+                        app.load_build_edges();
+                    }
                     KeyCode::Char('e') => app.focus = Pane::Rules,
                     KeyCode::Char('?') => { app.focus = Pane::Help; app.out_scroll = 0; }
                     KeyCode::Char('P') =>
@@ -4608,10 +4941,10 @@ mod tests {
             outputs_view: None,
             outputs_total: 0,
             outputs_window_start: 0,
-            rules: vec![],
+            rules: vec![], pipelines: vec![], build_edges: vec![],
             sel_session: 0,
             sel_change: 0,
-            sel_proc: 0,
+            sel_proc: 0, sel_pipeline: 0, sel_edge: 0,
             sel_output: 0,
             sel_rule: 0,
             hunk_scroll: 0,
@@ -5170,5 +5503,37 @@ mod tests {
         assert!(buf.contains("PID"), "PID column header missing:\n{buf}");
         assert!(buf.contains("Cmd"), "Cmd column header missing:\n{buf}");
         assert!(buf.contains("Age"), "Age column header missing:\n{buf}");
+    }
+
+    /// New panes render even on an empty box: pipelines and build_edges
+    /// must show their "no rows yet" hints (not crash), and the keybar
+    /// must list both letter chips ('l' and 'g'). Live data is exercised
+    /// by the engine's own brushprov / build_edges tests; the UI test
+    /// just guarantees the front end doesn't crash on the empty case.
+    #[test]
+    fn pipelines_and_build_edges_panes_render() {
+        let Some(eng) = boot() else {
+            eprintln!("SKIP: engine binary missing or FUSE unavailable");
+            return;
+        };
+        let (_sid, _root) = make_box(&eng.sock);
+        let mut app = App::new(eng.sock.clone());
+        app.refresh_sessions();
+        app.focus = Pane::Pipelines;
+        app.load_pipelines();
+        let buf = render_to_string(&app, 160, 30).unwrap();
+        assert!(buf.contains("PIPELINES"), "pipelines title missing:\n{buf}");
+        assert!(buf.contains("no pipelines yet"),
+                "empty-state hint missing on pipelines pane:\n{buf}");
+        assert!(buf.contains(" l ") || buf.contains("pipes"),
+                "keybar must surface the pipelines chip:\n{buf}");
+        app.focus = Pane::BuildEdges;
+        app.load_build_edges();
+        let buf = render_to_string(&app, 160, 30).unwrap();
+        assert!(buf.contains("BUILD EDGES"), "build-edges title missing:\n{buf}");
+        assert!(buf.contains("no build edges yet"),
+                "empty-state hint missing on build-edges pane:\n{buf}");
+        assert!(buf.contains(" g ") || buf.contains("build"),
+                "keybar must surface the build-edges chip:\n{buf}");
     }
 }
