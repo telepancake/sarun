@@ -8976,6 +8976,14 @@ class ChannelServer:
             # Remote-UI event stream: ack, then _handle converts THIS connection
             # into a one-way event feed (see the _subscribe marker handling).
             return dict(ok=True, _subscribe=True)
+        elif t == "shutdown":
+            # Remote 'quit': stop the engine. SIGTERM is already wired (in
+            # run_engine and Textual's App) to flip the stop event → server.stop()
+            # → mount.stop(). Reply ok BEFORE signalling so the caller sees a
+            # clean ack rather than a broken-pipe on the dying socket.
+            try: os.kill(os.getpid(), signal.SIGTERM)
+            except Exception: pass
+            return dict(ok=True)
         elif t == "ui":
             return await self._dispatch_ui(msg)
         else:
@@ -9238,6 +9246,13 @@ class RemoteSupervisor:
 
     async def sweep_orphans(self, loop=None) -> None:
         return None                       # the engine swept at ITS startup
+
+    def request_shutdown(self) -> None:
+        """Ask the engine to terminate (q's remote-quit path). Fire-and-forget:
+        the engine replies ok and then SIGTERMs itself, so any error here just
+        means the engine is already gone."""
+        try: sync_request(self.sock, type="shutdown")
+        except Exception: pass
 
 
 def find_self() -> str: return os.path.abspath(sys.argv[0])
@@ -10191,7 +10206,8 @@ def _make_ui_app():
             Binding("f","view_file","file rules"),
             Binding("/","filter","filter"),
             Binding("escape","back","back"),
-            Binding("q","quit","quit")]
+            Binding("q","quit","quit"),
+            Binding("d","detach","detach")]
         sessions=reactive({}, layout=True)
 
         def __init__(self, remote: bool = False, engine_proc=None):
@@ -10616,17 +10632,41 @@ def _make_ui_app():
             if self.view=="boxes" and self._sel_sid in changed:
                 self._update_box_detail()
 
+        # ── quit / detach ─────────────────────────────────────────────────────
+        # 'q' stops the engine; 'd' detaches and leaves the engine running. The
+        # actions just set self._detach (True=detach, False=quit) and call exit;
+        # on_unmount reads it and tears down accordingly. Default is QUIT — so a
+        # SIGINT / window-close / Textual-internal exit also stops the engine.
+        def action_quit(self):
+            self._detach=False; self.exit()
+
+        def action_detach(self):
+            if not self.remote:
+                self._status("nothing to detach: this UI runs the engine "
+                             "in-process (use `sarun engine` + `sarun attach` "
+                             "to run them separately)")
+                return
+            self._detach=True; self.exit()
+
         async def on_unmount(self):
             try: self._cancel_struct()    # kill any in-flight structural parser
             except Exception: pass
+            detach=getattr(self,"_detach",False)
             if self.remote:
                 t=getattr(self,"_sub_task",None)
                 if t is not None: t.cancel()
-                # If `attach` auto-spawned the engine, this UI owns its lifetime:
-                # terminate it (boxes torn down, overlay unmounted — the embedded
-                # UI's quit semantics). An adopted pre-existing engine stays up.
+                if detach:
+                    # Leave the engine running. If we auto-spawned it, hand it
+                    # off — it stays under its own session (start_new_session).
+                    return
+                # Quit: stop the engine. Owned proc → terminate directly;
+                # adopted pre-existing engine → ask it to shut down over the
+                # socket (it SIGTERMs itself).
                 if self._engine_proc is not None:
                     try: self._engine_proc.terminate()
+                    except Exception: pass
+                else:
+                    try: self.sup.request_shutdown()
                     except Exception: pass
                 return
             if self.server: await self.server.stop()
@@ -10987,7 +11027,7 @@ def _make_ui_app():
                 t.append(k, style="bold"); t.append(f" {lab}  ", style="dim")
             if self.view in self.FILTERABLE:
                 t.append("/", style="bold"); t.append(" filter  ", style="dim")
-            t.append(" esc back  q quit", style="dim")
+            t.append(" esc back  q quit  d detach", style="dim")
             # Active '/' filter: show the expression + how to clear it, so a filtered
             # (or auto-navigated) list never looks mysteriously empty.
             st=self._view_filters.get(self.view)
@@ -12073,9 +12113,10 @@ def _make_ui_app():
 #:
 #: [b]Attach:[/] [cyan]slopbox attach[/] runs the SAME interactive UI as a pure client of a running
 #: engine: every pane reads, and every action acts, over the control socket — nothing is
-#: mounted in the UI process. If no engine is up, attach spawns a headless one and owns
-#: it (quitting the UI stops it, like the embedded UI); attaching to an engine that was
-#: already running leaves it running when you quit.
+#: mounted in the UI process. If no engine is up, attach spawns a headless one. [b]q[/] stops
+#: the engine (whether auto-spawned by attach or already running — same semantics as the
+#: embedded UI's quit); [b]d[/] detaches: closes the UI and leaves the engine running so you
+#: can [cyan]slopbox attach[/] back into it later.
 def run_ui() -> int:
     # A single UI instance only: if one is already running its control socket
     # answers, so refuse a second.
@@ -12161,9 +12202,10 @@ def run_attach() -> int:
     """Remote UI (`slopbox attach`): the full Textual UI as a pure CLIENT of a
     running engine — every read/action goes over the control socket, no mount or
     server in this process. If no engine is running, auto-spawn a headless one
-    first; an auto-spawned engine is OWNED by this UI (terminated when it exits,
-    matching the embedded UI's quit semantics), while a pre-existing engine is
-    merely attached to and left running."""
+    first. The UI offers two ways out: q (quit) stops the engine — directly if
+    we auto-spawned it, via a `type=shutdown` control RPC if we adopted a
+    pre-existing one; d (detach) closes only the UI, leaving the engine alive
+    for a later `slopbox attach`."""
     ensure_dirs()
     proc = None
     if not ui_is_running(sock_path()):
