@@ -387,6 +387,14 @@ fn dispatch(state: &State, msg: &Value) -> Value {
                 None => json!({"ok": false, "error": "no slopbox"}),
             }
         }
+        "shutdown" => {
+            // Stop the engine. SIGTERM self → the existing signal handler
+            // tears down the overlay + control socket; everything that
+            // follows in this dispatch is racing the exit, so reply ok now
+            // and let the kernel deliver the signal a few syscalls later.
+            unsafe { libc::kill(libc::getpid(), libc::SIGTERM); }
+            json!({"ok": true})
+        }
         other => json!({"ok": false,
                         "error": format!("unknown control type '{other}'")}),
     }

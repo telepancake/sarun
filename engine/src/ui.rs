@@ -84,6 +84,19 @@ fn rpc(sock: &str, verb: &str, args: Value) -> Result<Value, String> {
     Ok(rep.get("r").cloned().unwrap_or(Value::Null))
 }
 
+/// Ask the engine to terminate ('q' contract — quit stops the server, like
+/// the Python prototype). Top-level type, fire-and-forget: the engine acks
+/// then SIGTERMs itself, so a broken-pipe on the read side is normal and
+/// expected. No-op against an engine that doesn't speak `shutdown` (the
+/// Python prototype DOES, this branch is just for older Rust engines).
+#[cfg_attr(test, allow(dead_code))]
+fn shutdown_rpc(sock: &str) {
+    let Ok(mut s) = UnixStream::connect(sock) else { return };
+    let _ = s.write_all(b"{\"type\":\"shutdown\"}\n");
+    let mut line = String::new();
+    let _ = BufReader::new(&s).read_line(&mut line);
+}
+
 /// The engine's `rename` is a top-level control type (not a "ui" verb): it takes
 /// {"type":"rename","sid":..,"name":..} and replies {"ok":true,...}.
 // Driven only by the interactive loop; the headless tests don't exercise rename.
@@ -497,6 +510,13 @@ impl App {
                 self.changes_total =
                     v.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
             }
+            Err(e) if e.contains("unknown verb") => {
+                self.status = format!(
+                    "engine doesn't speak view.* — kill the stale engine \
+                     (the socket {} is being answered by an old process) and \
+                     run sarun again", self.sock);
+                return;
+            }
             Err(e) => {
                 self.status = format!("view.open changes: {e}");
                 return;
@@ -815,13 +835,11 @@ impl App {
         self.close_changes_view();
         if let Some(sid) = self.cur_sid_i64() {
             let filter = filter_to_json(self.f_changes.active());
-            match rpc(&self.sock, "view.open", json!(["changes", sid, filter])) {
-                Ok(v) => {
-                    self.changes_view = v.get("view_id").and_then(Value::as_u64);
-                    self.changes_total =
-                        v.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
-                }
-                Err(e) => self.status = format!("view.open changes: {e}"),
+            if let Ok(v) = rpc(&self.sock, "view.open",
+                               json!(["changes", sid, filter])) {
+                self.changes_view = v.get("view_id").and_then(Value::as_u64);
+                self.changes_total =
+                    v.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
             }
         }
         self.fetch_changes_window(0);
@@ -2104,7 +2122,8 @@ fn help_lines() -> Vec<Line<'static>> {
         t(""),
         h("Navigation & filters"),
         t("  j/k or ↓/↑  move       Enter  open the selection in the next pane"),
-        t("  R  refresh             q      quit"),
+        t("  R  refresh             q      quit (stops the engine)"),
+        t("                          d      detach (leaves the engine running)"),
         t("  /  filter the active pane with a clause editor. Filter KINDS:"),
         d("     path  — match the changed file's path (changes pane)"),
         d("     box   — match the box name"),
@@ -2822,7 +2841,15 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                 use crossterm::event::KeyModifiers as KM;
                 let ctrl = k.modifiers.contains(KM::CONTROL);
                 match k.code {
-                    KeyCode::Char('q') => app.should_quit = true,
+                    // 'q' stops the engine too (mirrors the Python prototype's
+                    // contract — q is QUIT, not detach). 'd' detaching is
+                    // matched LATER, after the pane-specific 'd' bindings
+                    // (discard_hunk on Hunks, delete_rule on Rules) have had
+                    // their guards checked.
+                    KeyCode::Char('q') => {
+                        shutdown_rpc(&app.sock);
+                        app.should_quit = true;
+                    }
                     // ctrl+up / ctrl+down reorder the selected file rule (before
                     // the plain move arm, which also matches Up/Down).
                     KeyCode::Up if ctrl && app.focus == Pane::Rules => app.move_rule(-1),
@@ -2880,6 +2907,10 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                         app.modal = Some(Modal::RuleForm { buf: String::new(), editing: None });
                     }
                     KeyCode::Char('d') if app.focus == Pane::Rules => app.delete_rule(),
+                    // Plain 'd' (no Hunks/Rules guard above caught it) =
+                    // detach: close just the UI, leave the engine running so
+                    // a later `sarun` reattaches to it.
+                    KeyCode::Char('d') => app.should_quit = true,
                     KeyCode::Char('/') => app.toggle_filter(),
                     KeyCode::Esc => {
                         // esc clears a generated (cross-nav) filter on the focused pane.
