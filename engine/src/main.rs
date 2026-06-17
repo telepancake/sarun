@@ -36,9 +36,19 @@ mod views;
 // register is refused politely; the overlay arrives at m3.
 static SOCK_FOR_SIGNAL: std::sync::OnceLock<std::ffi::CString> =
     std::sync::OnceLock::new();
+static MNT_FOR_SIGNAL: std::sync::OnceLock<std::ffi::CString> =
+    std::sync::OnceLock::new();
 
 extern "C" fn on_term(_sig: i32) {
-    // async-signal-safe teardown: drop the socket, exit clean.
+    // async-signal-safe teardown: lazy-unmount our FUSE overlay (MNT_DETACH
+    // lets the kernel finalize when the last reference drops, so the call
+    // itself can't block on in-flight handlers), drop the socket, exit. The
+    // detach prevents a "File exists (os error 17)" on the next startup —
+    // without it, the dead mountpoint stays in the kernel's mount table and
+    // `create_dir_all` on it returns EEXIST instead of "already a dir".
+    if let Some(p) = MNT_FOR_SIGNAL.get() {
+        unsafe { libc::umount2(p.as_ptr(), libc::MNT_DETACH); }
+    }
     if let Some(p) = SOCK_FOR_SIGNAL.get() {
         unsafe { libc::unlink(p.as_ptr()) };
     }
@@ -46,20 +56,37 @@ extern "C" fn on_term(_sig: i32) {
 }
 
 fn serve() -> i32 {
-    if let Err(e) = paths::ensure_dirs() {
-        eprintln!("sarun-engine: cannot create instance dirs: {e}");
-        return 1;
-    }
     let sock = paths::sock_path();
-    // Single-instance guard, same semantics as the Python engine/UI: a live
-    // socket means an instance is running; a dead file is stale and replaced.
+    // Single-instance guard FIRST, before any self-heal — a live socket
+    // means another engine is up, and we must not touch its mountpoint.
+    // Python uses the same semantics: a live socket means an instance is
+    // running; a dead file is stale and replaced.
     if std::os::unix::net::UnixStream::connect(&sock).is_ok() {
         eprintln!("sarun-engine: an engine/UI is already running \
                    (control socket {}).", sock.display());
         return 4;
     }
+    // No live engine — safe to clean up after a previous crashed one. A
+    // stale FUSE mount at mnt_point() makes ensure_dirs() fail with
+    // EEXIST: stat() on a dead-daemon FUSE mount returns ENOTCONN, so
+    // create_dir_all() can't verify the path is a directory and the
+    // error bubbles up. Path::exists() ALSO returns false on a dead
+    // mount (same ENOTCONN), so we just try unconditionally —
+    // fusermount3 silently no-ops when there's nothing to unmount.
+    let mnt = paths::mnt_point();
+    let _ = std::process::Command::new("fusermount3")
+        .arg("-u").arg(&mnt)
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .status();
+    if let Err(e) = paths::ensure_dirs() {
+        eprintln!("sarun-engine: cannot create instance dirs: {e}");
+        return 1;
+    }
     let c = std::ffi::CString::new(sock.as_os_str().as_encoded_bytes()).unwrap();
     let _ = SOCK_FOR_SIGNAL.set(c);
+    let mc = std::ffi::CString::new(mnt.as_os_str().as_encoded_bytes()).unwrap();
+    let _ = MNT_FOR_SIGNAL.set(mc);
     unsafe {
         libc::signal(libc::SIGTERM, on_term as *const () as libc::sighandler_t);
         libc::signal(libc::SIGINT, on_term as *const () as libc::sighandler_t);
