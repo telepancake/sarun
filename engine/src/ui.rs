@@ -439,6 +439,11 @@ struct App {
     /// every fetch_changes_window so changes_lines can paint the
     /// prototype's per-row +/~ glyph and the `!` stale marker.
     changes_decor: Vec<(String, bool)>,
+    /// "Recently changed" tail for the selected LIVE box's detail panel.
+    /// Newest-first (by sqlar.mtime), capped server-side. Empty for
+    /// finished boxes (the detail panel uses self.changes head instead).
+    /// Refreshed by tick() when on the boxes view.
+    recent_changes: Vec<Value>,
 }
 
 /// Cap on the transcript window: chars rendered in one frame, centred on
@@ -493,6 +498,7 @@ impl App {
             cd_info: None,
             output_segs: vec![],
             changes_decor: vec![],
+            recent_changes: vec![],
         };
         a.refresh_sessions();
         a.load_changes();
@@ -577,6 +583,9 @@ impl App {
         }
         self.fetch_changes_window(0);
         self.seek_first_leaf();
+        // For live boxes, also pull the newest-first slice for the box-
+        // detail panel — cheap, server-side ORDER BY mtime DESC LIMIT 40.
+        self.refresh_recent_changes();
         // the procs/outputs panes track the same selected box.
         self.load_processes();
         self.load_outputs();
@@ -695,11 +704,30 @@ impl App {
             Pane::Changes | Pane::Hunks => self.load_changes(),
             Pane::Processes => self.load_processes(),
             Pane::Outputs => self.load_outputs(),
-            // The boxes view re-renders box_detail from app state on every
-            // draw, and refresh_sessions above just refreshed app.sessions,
-            // so there's nothing else to do here.
-            Pane::Sessions => {}
+            // The boxes view: refresh "recently changed" for a live box so
+            // the detail panel shows the newest writes (the prototype's
+            // _live_recent behavior). For a finished box we leave the
+            // recent_changes empty and box_detail_lines falls back to
+            // the alphabetical preview.
+            Pane::Sessions => self.refresh_recent_changes(),
             Pane::Rules | Pane::Help | Pane::Pty => {}
+        }
+    }
+
+    /// Pull the newest-first slice of the current box's sqlar — populates
+    /// `recent_changes` when the selected box is live, clears it otherwise.
+    fn refresh_recent_changes(&mut self) {
+        self.recent_changes.clear();
+        let live = self.sessions.get(self.sel_session)
+            .and_then(|s| s.get("live").and_then(Value::as_bool))
+            .unwrap_or(false);
+        if !live { return; }
+        let Some(sid) = self.cur_sid() else { return };
+        if let Ok(rep) = rpc(&self.sock, "review.recent_changes",
+                             json!([sid, 40])) {
+            if let Some(arr) = rep.as_array() {
+                self.recent_changes = arr.clone();
+            }
         }
     }
 
@@ -3072,6 +3100,8 @@ fn box_detail_lines(app: &App) -> Vec<Line<'static>> {
         .unwrap_or_default();
     let pid = s.get("pid").and_then(Value::as_i64).unwrap_or(0);
     let started = s.get("started").and_then(Value::as_f64).unwrap_or(0.0);
+    let live = s.get("live").and_then(Value::as_bool).unwrap_or(false);
+    let preview_label = if live { "recently changed" } else { "↵ to review" };
     let mut out = vec![
         Line::from(Span::styled(label,
             Style::default().fg(color).add_modifier(Modifier::BOLD))),
@@ -3088,14 +3118,19 @@ fn box_detail_lines(app: &App) -> Vec<Line<'static>> {
         Line::from(vec![
             Span::styled("changes ", dim),
             Span::styled(bold_count(app.changes_total), bold),
-            Span::styled("   [↵ to review]", dim),
+            Span::styled(format!("   [{preview_label}]"), dim),
         ]),
         Line::from(""),
     ];
-    // Preview the head of the box's changes window. The window IS up to
-    // WINDOW_SIZE rows, so this is bounded — not the prototype's 200-row
-    // preview, but enough to show the shape of the change set.
-    for c in app.changes.iter().take(40) {
+    // Preview rows: for a LIVE box, the newest-first tail (recent_changes,
+    // populated via review.recent_changes); for a finished box, the head
+    // of the alphabetical change window. Same per-row format either way.
+    let preview: Box<dyn Iterator<Item = &Value>> = if live && !app.recent_changes.is_empty() {
+        Box::new(app.recent_changes.iter())
+    } else {
+        Box::new(app.changes.iter().take(40))
+    };
+    for c in preview {
         if c.get("connector").and_then(Value::as_bool) == Some(true) { continue; }
         let kind = c.get("kind").and_then(Value::as_str).unwrap_or("");
         let path = c.get("path").and_then(Value::as_str).unwrap_or("");
@@ -4464,6 +4499,7 @@ mod tests {
             cd_info: None,
             output_segs: vec![],
             changes_decor: vec![],
+            recent_changes: vec![],
         };
         app.focus = Pane::Help;
         // render tall enough to fit the full manual (it scrolls in a real term).

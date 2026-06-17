@@ -855,6 +855,16 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
             (Some(id), Some(rel)) => crate::review::decorate(id, rel),
             _ => json!({"is_text": false, "stale": false, "kind": "changed"}),
         },
+        // Newest-first slice of the box's change set, for the boxes view's
+        // "recently changed" panel on a live box. limit defaults to 200.
+        "review.recent_changes" => {
+            let id = arg_sid(args);
+            let limit = args.get(1).and_then(Value::as_i64).unwrap_or(200);
+            match id {
+                Some(id) => crate::review::recent_changes(id, limit),
+                None => Value::Array(vec![]),
+            }
+        }
         // Bulk decorate: one RPC for a whole window of changes-pane rows
         // (kind / stale / is_text per row) — the UI uses this to label the
         // changes list with +/~/- glyphs and the `!` stale marker without a
