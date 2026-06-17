@@ -1773,7 +1773,7 @@ impl App {
 struct ProcTreeRow {
     rid: i64,
     tgid: i64,
-    ppid: i64,
+    #[allow(dead_code)] ppid: i64,
     exe: String,
     argv: Vec<String>,
     depth: usize,
@@ -2145,8 +2145,13 @@ impl App {
 /// (indented) exe · argv. Structural-ancestor connector rows are dimmed and the
 /// cursor (sel_proc, counted over non-connector rows) skips them.
 fn processes_lines(app: &App) -> Vec<Line<'static>> {
+    // Layout: TGID, then the argv (indented by tree depth, with the
+    // exe/argv[0] basename highlighted as the legibility anchor). PPID is
+    // redundant — the indent already says "child of the row above" — and
+    // the "└ " connector glyph was making everything harder to scan, so the
+    // indent is just spaces.
     let mut out = vec![Line::from(Span::styled(
-        format!("{:>6} {:>6}  {}", "TGID", "PPID", "EXE · ARGV"),
+        format!("{:>6}  {}", "TGID", "PROCESS"),
         Style::default().add_modifier(Modifier::BOLD),
     ))];
     let rows = app.proc_tree_rows();
@@ -2159,23 +2164,44 @@ fn processes_lines(app: &App) -> Vec<Line<'static>> {
         out.push(Line::from(msg));
         return out;
     }
-    // sel_proc is window-relative now; the engine-side view already excluded
-    // connectors in the filtered case, and move_proc_cursor skips them in
-    // the unfiltered case, so the highlight just points at sel_proc.
     let hi = Some(app.sel_proc);
     for (i, r) in rows.iter().enumerate() {
-        let indent = tree_indent(r.depth);
-        let base = r.exe.rsplit('/').next().unwrap_or(&r.exe);
-        let argv = r.argv.join(" ");
-        let text = format!("{:>6} {:>6}  {indent}{base} {argv}", r.tgid, r.ppid).trim_end().to_string();
-        let line = if Some(i) == hi {
-            Line::from(Span::styled(text, Style::default().fg(Color::Black).bg(Color::Cyan)))
+        // Pick the program-name anchor. argv[0] is what the user typed; fall
+        // back to exe when argv is empty (e.g. an exec without a recorded
+        // argv). Take the basename so a long /usr/local/bin/foo doesn't
+        // drown out the rest of the row.
+        let anchor_path = r.argv.first().filter(|s| !s.is_empty()).cloned()
+            .unwrap_or_else(|| r.exe.clone());
+        let anchor = anchor_path.rsplit('/').next().unwrap_or(&anchor_path).to_string();
+        let rest_argv = if r.argv.len() > 1 { r.argv[1..].join(" ") } else { String::new() };
+        let indent = "  ".repeat(r.depth);
+
+        let (anchor_style, rest_style) = if Some(i) == hi {
+            (Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
+             Style::default().fg(Color::Black).bg(Color::Cyan))
         } else if r.connector {
-            Line::from(Span::styled(text, Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM)))
+            (Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+             Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM))
         } else {
-            Line::from(text)
+            (Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+             Style::default().fg(Color::DarkGray))
         };
-        out.push(line);
+        let tgid_str = if r.connector { String::new() } else { r.tgid.to_string() };
+        let mut spans = vec![
+            Span::styled(format!("{tgid_str:>6}  "),
+                         if Some(i) == hi {
+                             Style::default().fg(Color::Black).bg(Color::Cyan)
+                         } else { Style::default() }),
+            Span::styled(indent,
+                         if Some(i) == hi {
+                             Style::default().fg(Color::Black).bg(Color::Cyan)
+                         } else { Style::default() }),
+            Span::styled(anchor, anchor_style),
+        ];
+        if !rest_argv.is_empty() {
+            spans.push(Span::styled(format!(" {rest_argv}"), rest_style));
+        }
+        out.push(Line::from(spans));
     }
     out
 }
@@ -2504,69 +2530,62 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
             .wrap(Wrap { trim: false });
         f.render_widget(help, body);
     } else {
+        // Single-list-per-view layout (mirrors the prototype's _set_view /
+        // LEFT/RIGHT scheme): the left half is the FOCUSED view's primary
+        // list, the right half is that view's detail. Sessions only appears
+        // on the boxes view — no more "boxes on every screen". Pane::Hunks
+        // is the changes view with focus on the diff (right half).
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
             .split(body);
-
-        // left column: sessions on top, a context list below.
-        let left = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(cols[0]);
-
-        let slines = sessions_lines(app);
-        let s_scroll = scroll_for_cursor(app.sel_session + 1, slines.len(),
-                                         left[0].height);
-        let sessions = Paragraph::new(Text::from(slines))
-            .block(block(
-                title("sarun · boxes", app.focus == Pane::Sessions),
-                app.focus == Pane::Sessions,
-            ))
-            .scroll((s_scroll, 0));
-        f.render_widget(sessions, left[0]);
-
-        // Bottom-left list + right detail depend on which pane group is focused.
+        let left = cols[0]; let right = cols[1];
         match app.focus {
+            Pane::Sessions => {
+                let lines = sessions_lines(app);
+                let scroll = scroll_for_cursor(app.sel_session + 1, lines.len(), left.height);
+                let p = Paragraph::new(Text::from(lines))
+                    .block(block(title("sarun · boxes", true), true))
+                    .scroll((scroll, 0));
+                f.render_widget(p, left);
+                let detail = Paragraph::new(Text::from(box_detail_lines(app)))
+                    .block(block(title("BOX · DETAIL", false), false))
+                    .wrap(Wrap { trim: false });
+                f.render_widget(detail, right);
+            }
             Pane::Processes => {
                 let lines = processes_lines(app);
-                let scroll = scroll_for_cursor(app.sel_proc + 1, lines.len(),
-                                               left[1].height);
-                // No .wrap(): rows must be ONE visual line each, otherwise
-                // a long argv pushes everything else down and the cursor
-                // accounting (which counts logical rows) falls off the rect.
-                let procs = Paragraph::new(Text::from(lines))
+                let scroll = scroll_for_cursor(app.sel_proc + 1, lines.len(), left.height);
+                let p = Paragraph::new(Text::from(lines))
                     .block(block(title("PROCESSES", true), true))
                     .scroll((scroll, 0));
-                f.render_widget(procs, left[1]);
+                f.render_widget(p, left);
                 let detail = Paragraph::new(Text::from(proc_detail_lines(app)))
                     .block(block(title("ENVIRONMENT · DETAIL", false), false))
                     .wrap(Wrap { trim: false });
-                f.render_widget(detail, cols[1]);
+                f.render_widget(detail, right);
             }
             Pane::Outputs => {
-                let olines = outputs_index_lines(app);
-                let o_scroll = scroll_for_cursor(app.sel_output + 1, olines.len(),
-                                                 left[1].height);
-                let idx = Paragraph::new(Text::from(olines))
+                let lines = outputs_index_lines(app);
+                let scroll = scroll_for_cursor(app.sel_output + 1, lines.len(), left.height);
+                let p = Paragraph::new(Text::from(lines))
                     .block(block(title("OUTPUTS", true), true))
-                    .scroll((o_scroll, 0));
-                f.render_widget(idx, left[1]);
+                    .scroll((scroll, 0));
+                f.render_widget(p, left);
                 let out = Paragraph::new(Text::from(outputs_lines(app)))
-                    .block(block(title("OUTPUT · stdout/stderr", true), true))
+                    .block(block(title("OUTPUT · stdout/stderr", false), false))
                     .scroll((app.out_scroll, 0))
                     .wrap(Wrap { trim: false });
-                f.render_widget(out, cols[1]);
+                f.render_widget(out, right);
             }
             Pane::Rules => {
-                let rlines = rules_lines(app);
-                let r_scroll = scroll_for_cursor(app.sel_rule + 1, rlines.len(),
-                                                 left[1].height);
-                let rules = Paragraph::new(Text::from(rlines))
+                let lines = rules_lines(app);
+                let scroll = scroll_for_cursor(app.sel_rule + 1, lines.len(), left.height);
+                let p = Paragraph::new(Text::from(lines))
                     .block(block(title("FILE RULES", true), true))
-                    .scroll((r_scroll, 0))
+                    .scroll((scroll, 0))
                     .wrap(Wrap { trim: false });
-                f.render_widget(rules, left[1]);
+                f.render_widget(p, left);
                 let hint = Paragraph::new(Text::from(vec![
                     Line::from("n new · Enter edit · d delete"),
                     Line::from(""),
@@ -2577,29 +2596,29 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                 ]))
                 .block(block(title("WHAT IT MATCHES", false), false))
                 .wrap(Wrap { trim: false });
-                f.render_widget(hint, cols[1]);
+                f.render_widget(hint, right);
             }
+            // Changes view (Pane::Changes is list-focused; Pane::Hunks is
+            // diff-focused — same two-pane layout, different border).
             _ => {
-                // Sessions / Changes / Hunks group: changes list + diff.
                 let lines = changes_lines(app);
-                let scroll = scroll_for_cursor(app.sel_change + 1, lines.len(),
-                                               left[1].height);
-                let changes = Paragraph::new(Text::from(lines))
+                let scroll = scroll_for_cursor(app.sel_change + 1, lines.len(), left.height);
+                let p = Paragraph::new(Text::from(lines))
                     .block(block(
                         title("changes", app.focus == Pane::Changes),
                         app.focus == Pane::Changes,
                     ))
                     .scroll((scroll, 0));
-                f.render_widget(changes, left[1]);
-
+                f.render_widget(p, left);
                 let is_bin = !app.hunks.is_null()
                     && app.hunks.get("is_text").and_then(Value::as_bool) != Some(true);
                 let diff_title = if is_bin { "structural diff" } else { "diff" };
                 let hunks = Paragraph::new(Text::from(hunk_lines(app)))
-                    .block(block(title(diff_title, app.focus == Pane::Hunks), app.focus == Pane::Hunks))
+                    .block(block(title(diff_title, app.focus == Pane::Hunks),
+                                 app.focus == Pane::Hunks))
                     .scroll((app.hunk_scroll, 0))
                     .wrap(Wrap { trim: false });
-                f.render_widget(hunks, cols[1]);
+                f.render_widget(hunks, right);
             }
         }
     }
@@ -2625,30 +2644,122 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
 
 /// Detail for the selected process: full exe + argv + the deduped env (via the
 /// process_env verb), keyed off the processes() row id.
-fn proc_detail_lines(app: &App) -> Vec<Line<'static>> {
-    let rows = app.proc_tree_rows();
-    let Some(r) = rows.get(app.sel_proc) else {
-        return vec![Line::from("(no process selected)")];
+/// Right pane of the BOXES view — the box-detail summary. Faithful port of
+/// the prototype's _update_box_detail (lines 11086-11137): label/path bold
+/// colored by status, then status / cmd / pid·age labels, then a change
+/// count line and a small preview of recent paths.
+fn box_detail_lines(app: &App) -> Vec<Line<'static>> {
+    let Some(s) = app.sessions.get(app.sel_session) else {
+        return vec![Line::from(Span::styled("(no slopbox selected)",
+            Style::default().add_modifier(Modifier::DIM)))];
     };
-    let rid = r.rid;
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    let g = |k: &str| s.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    let status = g("status");
+    let (_flag, color) = session_flag(&status);
+    let path = g("path");
+    let name = g("name");
+    let sid = g("session_id");
+    let label = if !path.is_empty() { path }
+                else if !name.is_empty() { name }
+                else { sid };
+    let cmd = s.get("cmd").and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" "))
+        .unwrap_or_default();
+    let pid = s.get("pid").and_then(Value::as_i64).unwrap_or(0);
+    let started = s.get("started").and_then(Value::as_f64).unwrap_or(0.0);
     let mut out = vec![
-        Line::from(Span::styled(
-            format!("{} {}", r.exe, r.argv.join(" ")).trim().to_string(),
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
+        Line::from(Span::styled(label,
+            Style::default().fg(color).add_modifier(Modifier::BOLD))),
+        Line::from(vec![Span::styled("status  ", dim),
+                        Span::styled(status.clone(), Style::default().fg(color))]),
+        Line::from(vec![Span::styled("cmd     ", dim), Span::raw(cmd)]),
+        Line::from(vec![
+            Span::styled("pid     ", dim),
+            Span::raw(if pid > 0 { pid.to_string() } else { "0".into() }),
+            Span::raw("    "),
+            Span::styled("age ", dim),
+            Span::raw(if started > 0.0 { fmt_age(started) } else { String::new() }),
+        ]),
+        Line::from(vec![
+            Span::styled("changes ", dim),
+            Span::styled(bold_count(app.changes_total), bold),
+            Span::styled("   [↵ to review]", dim),
+        ]),
         Line::from(""),
     ];
-    if let (Some(sid), true) = (app.cur_sid(), rid >= 0) {
-        if let Ok(env) = rpc(&app.sock, "process_env", json!([sid, rid])) {
-            if let Some(obj) = env.as_object() {
-                if obj.is_empty() {
-                    out.push(Line::from("(no recorded environment)"));
-                }
-                for (k, v) in obj {
-                    out.push(Line::from(format!("{k}={}", v.as_str().unwrap_or(""))));
-                }
+    // Preview the head of the box's changes window. The window IS up to
+    // WINDOW_SIZE rows, so this is bounded — not the prototype's 200-row
+    // preview, but enough to show the shape of the change set.
+    for c in app.changes.iter().take(40) {
+        if c.get("connector").and_then(Value::as_bool) == Some(true) { continue; }
+        let kind = c.get("kind").and_then(Value::as_str).unwrap_or("");
+        let path = c.get("path").and_then(Value::as_str).unwrap_or("");
+        let (glyph, col) = match kind {
+            "deleted" => ("-", Color::Red),
+            "symlink" => ("~", Color::Magenta),
+            "changed" => ("~", Color::Yellow),
+            _ => ("·", Color::DarkGray),
+        };
+        out.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(format!("{glyph} "), Style::default().fg(col)),
+            Span::raw(path.to_string()),
+        ]));
+    }
+    out
+}
+
+fn bold_count(n: usize) -> String {
+    if n == 1 { "1 file".into() } else { format!("{n} files") }
+}
+
+fn proc_detail_lines(app: &App) -> Vec<Line<'static>> {
+    // Faithful port of the prototype's _update_proc_detail:
+    //   tgid X  ppid Y                       (bold)
+    //   exe   <path>                         (label dim)
+    //   argv  <joined>                       (label dim)
+    //                                        (blank)
+    //   ── environment ──                    (dim header)
+    //   KEY=value  (KEY cyan)   one per line
+    //   ...or the "-e to record" hint when env is empty.
+    let rows = app.proc_tree_rows();
+    let Some(r) = rows.get(app.sel_proc) else {
+        return vec![Line::from(Span::styled("(no process selected)",
+            Style::default().add_modifier(Modifier::DIM)))];
+    };
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    let cyan = Style::default().fg(Color::Cyan);
+    let mut out = vec![
+        Line::from(Span::styled(format!("tgid {}  ppid {}", r.tgid, r.ppid), bold)),
+        Line::from(vec![Span::styled("exe   ", dim),
+                        Span::raw(if r.exe.is_empty() { "?".into() } else { r.exe.clone() })]),
+        Line::from(vec![Span::styled("argv  ", dim),
+                        Span::raw(r.argv.join(" "))]),
+        Line::from(""),
+        Line::from(Span::styled("── environment ──", dim)),
+    ];
+    let rid = r.rid;
+    if rid < 0 { return out; }
+    let env = app.cur_sid()
+        .and_then(|sid| rpc(&app.sock, "process_env", json!([sid, rid])).ok());
+    let obj = env.as_ref().and_then(|v| v.as_object());
+    match obj {
+        Some(m) if !m.is_empty() => {
+            let mut keys: Vec<&String> = m.keys().collect();
+            keys.sort();
+            for k in keys {
+                let v = m.get(k).and_then(Value::as_str).unwrap_or("");
+                out.push(Line::from(vec![
+                    Span::styled(k.clone(), cyan),
+                    Span::raw(format!("={v}")),
+                ]));
             }
         }
+        _ => out.push(Line::from(Span::styled(
+            "(none captured — run with -e to record the environment)", dim))),
     }
     out
 }
@@ -3404,10 +3515,12 @@ mod tests {
         let (sid, _root) = make_box(&eng.sock);
         let app = App::new(eng.sock.clone());
         let buf = render_to_string(&app, 100, 30).unwrap();
+        // Single-list-per-view layout: the boxes view shows the sessions
+        // list (left) + box detail (right). No changes/diff pane until the
+        // user navigates to those views via c/Enter.
         assert!(buf.contains(&sid), "frame should contain box id {sid}; got:\n{buf}");
         assert!(buf.contains("boxes"), "sessions pane title missing");
-        assert!(buf.contains("changes"), "changes pane title missing");
-        assert!(buf.contains("diff"), "diff pane title missing");
+        assert!(buf.contains("BOX · DETAIL"), "box-detail pane title missing");
     }
 
     #[test]
