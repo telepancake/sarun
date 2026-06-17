@@ -682,8 +682,31 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
     let args = msg.get("args").and_then(Value::as_array).unwrap_or(&empty);
     let boxes = discover::discover();
     let r: Value = match verb {
-        "session_dicts" => Value::Array(
-            boxes.values().map(|b| discover::session_dict(&boxes, b)).collect()),
+        "session_dicts" => {
+            // discover::session_dict reads on-disk metadata only, so every box
+            // looks "finished" to it. Override `live` / `status` / `pid` for
+            // boxes whose runner is still registered with this engine — that's
+            // what the UI uses to flip on live-mode rendering (e.g., the
+            // boxes view's "recently changed" panel and the procs view's
+            // active-set behavior).
+            let runpids: std::collections::HashMap<i64, i32> =
+                state.lock().unwrap().box_runpids.clone();
+            Value::Array(boxes.values().map(|b| {
+                let mut sd = discover::session_dict(&boxes, b);
+                if let Some(&pid) = runpids.get(&b.box_id) {
+                    if let Some(obj) = sd.as_object_mut() {
+                        obj.insert("live".into(), Value::Bool(true));
+                        obj.insert("status".into(),
+                                   Value::String("running".into()));
+                        obj.insert("pid".into(),
+                                   Value::Number((pid as i64).into()));
+                        obj.insert("run_pid".into(),
+                                   Value::Number((pid as i64).into()));
+                    }
+                }
+                sd
+            }).collect())
+        }
         "display_path" => match arg_sid(args) {
             Some(id) => Value::String(discover::display_path(&boxes, id)),
             None => Value::Null,

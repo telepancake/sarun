@@ -32,6 +32,7 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Duration;
+use std::time::Instant;
 
 use base64::Engine as _;
 
@@ -417,7 +418,16 @@ struct App {
     sel_hunk: usize,
     /// Receiver for finished structural-diff worker results (drained each tick).
     struct_rx: Option<mpsc::Receiver<StructResult>>,
+    /// Wall-clock stamp of the last periodic refresh — the interactive loop
+    /// nudges sessions + the focused view's data every TICK_PERIOD so a live
+    /// box's panes reflect new writes / spawns without a manual reload.
+    last_tick: Instant,
 }
+
+/// How often the UI runs its background refresh tick (mirrors the prototype's
+/// set_interval(3, _tick) cadence). The render loop wakes every 200 ms on its
+/// event poll; tick fires once per TICK_PERIOD on top of that.
+const TICK_PERIOD: Duration = Duration::from_secs(3);
 
 impl App {
     fn new(sock: String) -> Self {
@@ -458,6 +468,7 @@ impl App {
             structd: StructState::default(),
             sel_hunk: 0,
             struct_rx: None,
+            last_tick: Instant::now(),
         };
         a.refresh_sessions();
         a.load_changes();
@@ -597,6 +608,34 @@ impl App {
     /// box_id of the selected box as i64 (the view RPCs take it numerically).
     fn cur_sid_i64(&self) -> Option<i64> {
         self.cur_sid().and_then(|s| s.parse::<i64>().ok())
+    }
+
+    /// Periodic background refresh, mirrors the prototype's _tick: rescan
+    /// sessions and reload whichever view the user is on, so a live box's
+    /// panes update without a manual R. Each step is best-effort — a
+    /// network blip on one shouldn't take down the rest.
+    fn tick(&mut self) {
+        // Preserve the cursor on the currently-selected box across the
+        // sessions reload (a new box appearing shouldn't shove the user's
+        // cursor around).
+        let pinned = self.cur_sid();
+        self.refresh_sessions();
+        if let Some(p) = &pinned {
+            if let Some(i) = self.sessions.iter().position(|s|
+                s.get("session_id").and_then(Value::as_str) == Some(p.as_str())) {
+                self.sel_session = i;
+            }
+        }
+        match self.focus {
+            Pane::Changes | Pane::Hunks => self.load_changes(),
+            Pane::Processes => self.load_processes(),
+            Pane::Outputs => self.load_outputs(),
+            // The boxes view re-renders box_detail from app state on every
+            // draw, and refresh_sessions above just refreshed app.sessions,
+            // so there's nothing else to do here.
+            Pane::Sessions => {}
+            Pane::Rules | Pane::Help | Pane::Pty => {}
+        }
     }
 
     /// Move the changes-pane cursor by `delta` rows in the engine-side view
@@ -3127,6 +3166,11 @@ fn run_interactive(sock: &str) -> Result<(), String> {
             if app.structd.pending && app.structd.full_lines.is_none() {
                 app.structd.spin = app.structd.spin.wrapping_add(1);
             }
+            // Periodic background refresh — mirrors the prototype's _tick.
+            if app.last_tick.elapsed() >= TICK_PERIOD {
+                app.tick();
+                app.last_tick = Instant::now();
+            }
             term.draw(|f| draw(f, &app)).map_err(|e| e.to_string())?;
             if app.should_quit {
                 break;
@@ -4051,6 +4095,7 @@ mod tests {
             structd: StructState::default(),
             sel_hunk: 0,
             struct_rx: None,
+            last_tick: Instant::now(),
         };
         app.focus = Pane::Help;
         // render tall enough to fit the full manual (it scrolls in a real term).
