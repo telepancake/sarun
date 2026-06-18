@@ -275,6 +275,49 @@ enum Modal {
     /// generic transport — it runs the given argv; it does NOT presume a box or
     /// any box parameters (that is the caller's choice).
     PtyCmd { buf: String },
+    /// Context-menu popup for the currently-selected list row. Opened
+    /// with `m`. `title` is the row identity (e.g. "Box: foo" or
+    /// "Change: src/main.rs"); `items` are (label, hint, action). The
+    /// `hint` column shows the global key for the same action when one
+    /// exists, so the popup doubles as a discoverable cheat-sheet.
+    ActionMenu {
+        title: String,
+        items: Vec<ActionItem>,
+        sel: usize,
+    },
+}
+
+/// One row inside Modal::ActionMenu. `hint` shows the global key that
+/// would do the same thing (e.g. "F5" / "a") so the popup teaches the
+/// keymap as the user uses it.
+#[derive(Clone)]
+struct ActionItem {
+    label: String,
+    hint: &'static str,
+    action: Action,
+}
+
+/// Actions dispatchable from the context-menu popup. Each variant maps
+/// to a single mutation on App, so the modal-key handler can run them
+/// without holding any pane-specific data.
+#[derive(Clone, Copy)]
+enum Action {
+    OpenSelection,
+    ApplyFile,
+    DiscardFile,
+    ApplyHunk,
+    DiscardHunk,
+    ApplyBox,
+    DiscardBox,
+    StartRename,
+    EditRule,
+    NewRule,
+    DeleteRule,
+    MoveRuleUp,
+    MoveRuleDown,
+    PtyNew,
+    PtyKill,
+    PtyEmbedToggle,
 }
 
 /// One editable line of the '/' clause editor (mirrors Python ClauseRow): the
@@ -3021,6 +3064,7 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal) {
     let w = (area.width * 7 / 10).clamp(20, area.width);
     let want = match modal {
         Modal::Search { rows, .. } => (rows.len() as u16) + 6,
+        Modal::ActionMenu { items, .. } => (items.len() as u16) + 5,
         _ => 7,
     };
     let hgt = want.min(area.height);
@@ -3105,6 +3149,37 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal) {
                             Enter run · Esc cancel"),
             ],
         ),
+        Modal::ActionMenu { title, items, sel } => {
+            let mut body = vec![
+                Line::from(Span::styled(title.clone(),
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
+                Line::from(""),
+            ];
+            // Two-column rows: label on the left (wide), key hint on
+            // the right (narrow). Active row reverses; arrows move,
+            // Enter activates, Esc cancels.
+            let lw = items.iter().map(|i| i.label.chars().count())
+                              .max().unwrap_or(20).max(20);
+            for (i, it) in items.iter().enumerate() {
+                let active = i == *sel;
+                let style = if active {
+                    Style::default().fg(Color::Black).bg(Color::Cyan)
+                } else {
+                    Style::default()
+                };
+                let label = format!("  {:<lw$}", it.label, lw = lw);
+                body.push(Line::from(vec![
+                    Span::styled(label, style),
+                    Span::styled(format!("  {}", it.hint),
+                        Style::default().fg(Color::DarkGray)),
+                ]));
+            }
+            body.push(Line::from(""));
+            body.push(Line::from(Span::styled(
+                "↑/↓ move · Enter run · Esc cancel",
+                Style::default().fg(Color::Gray))));
+            (" actions ", body)
+        }
     };
     let p = Paragraph::new(Text::from(body))
         .block(
@@ -4367,6 +4442,111 @@ fn render_to_string(app: &App, w: u16, h: u16) -> Result<String, String> {
 /// P / ?). Shared between the F9 menu-nav Enter path and the direct
 /// letter-key handler — same effect either way (snap focus to the
 /// left list, switch view, load data when relevant).
+/// Build the context-menu items for the current pane. Empty when the
+/// current pane has nothing meaningful you'd do to a row (Help, Pty
+/// — both manage themselves). Caller wraps the returned list in
+/// Modal::ActionMenu and presents it.
+fn pane_action_menu(app: &App) -> Option<(String, Vec<ActionItem>)> {
+    let mk = |label: &str, hint: &'static str, action: Action| ActionItem {
+        label: label.into(), hint, action,
+    };
+    let title = |what: &str, target: &str| if target.is_empty() {
+        format!("{what}")
+    } else {
+        format!("{what}: {target}")
+    };
+    match app.focus {
+        Pane::Sessions => {
+            let row = app.sessions.get(app.sel_session);
+            let path = row.and_then(|r| r.get("path").and_then(Value::as_str))
+                .unwrap_or("").to_string();
+            Some((title("Box", &path), vec![
+                mk("Open changes view", "Enter",  Action::OpenSelection),
+                mk("Apply ALL changes", "a/F5",   Action::ApplyBox),
+                mk("Discard ALL changes", "x/F8", Action::DiscardBox),
+                mk("Rename box",        "r/F6",   Action::StartRename),
+            ]))
+        }
+        Pane::Changes => {
+            let row = app.changes.get(app.sel_change);
+            let path = row.and_then(|r| r.get("path").and_then(Value::as_str))
+                .unwrap_or("").to_string();
+            Some((title("Change", &path), vec![
+                mk("Open diff",          "Enter",  Action::OpenSelection),
+                mk("Apply this file",    "a/F5",   Action::ApplyFile),
+                mk("Discard this file",  "x/F8",   Action::DiscardFile),
+            ]))
+        }
+        Pane::Hunks => Some(("Hunk (selected)".into(), vec![
+            mk("Apply this hunk",    "a/F5",   Action::ApplyHunk),
+            mk("Discard this hunk",  "x/F8",   Action::DiscardHunk),
+        ])),
+        Pane::Rules => {
+            let cur = app.rules.get(app.sel_rule).cloned().unwrap_or_default();
+            Some((title("Rule", &cur), vec![
+                mk("Edit rule",   "F4",   Action::EditRule),
+                mk("New rule",    "n/F7", Action::NewRule),
+                mk("Delete rule", "d/F8", Action::DeleteRule),
+                mk("Move up",     "Ctrl-↑", Action::MoveRuleUp),
+                mk("Move down",   "Ctrl-↓", Action::MoveRuleDown),
+            ]))
+        }
+        Pane::Pty => {
+            let total = app.ptys.len();
+            let sel = app.sel_pty + 1;
+            Some((format!("PTY {sel}/{total}"), vec![
+                mk("New PTY",         "F7",   Action::PtyNew),
+                mk("Kill this PTY",   "F8",   Action::PtyKill),
+                mk("Embed in pane",   "F11",  Action::PtyEmbedToggle),
+            ]))
+        }
+        // Procs / Outputs / Pipelines / BuildEdges: no destructive ops
+        // worth grouping into a menu today; the popup would be just
+        // "Open" → same as Enter. Defer until there's something to
+        // offer beyond what Enter already does.
+        _ => None,
+    }
+}
+
+/// Run a context-menu Action. Each variant maps to a single mutation
+/// on the app, so the modal-key handler can dispatch without holding
+/// any pane-specific data.
+fn run_action(app: &mut App, a: Action) {
+    match a {
+        Action::OpenSelection  => app.open(),
+        Action::ApplyFile      => app.apply(),
+        Action::DiscardFile    => app.discard(),
+        Action::ApplyHunk      => app.apply_hunk(),
+        Action::DiscardHunk    => app.discard_hunk(),
+        Action::ApplyBox       => app.apply(),
+        Action::DiscardBox     => app.discard(),
+        Action::StartRename    => app.renaming = Some(String::new()),
+        Action::EditRule       => {
+            let cur = app.rules.get(app.sel_rule).cloned().unwrap_or_default();
+            app.modal = Some(Modal::RuleForm { buf: cur, editing: Some(app.sel_rule) });
+        }
+        Action::NewRule        => {
+            app.modal = Some(Modal::RuleForm { buf: String::new(), editing: None });
+        }
+        Action::DeleteRule     => app.delete_rule(),
+        Action::MoveRuleUp     => app.move_rule(-1),
+        Action::MoveRuleDown   => app.move_rule(1),
+        Action::PtyNew         => {
+            app.modal = Some(Modal::PtyCmd { buf: pty_default_cmd() });
+        }
+        Action::PtyKill        => app.pty_kill(),
+        Action::PtyEmbedToggle => {
+            if app.ptys.is_empty() {
+                app.modal = Some(Modal::PtyCmd { buf: pty_default_cmd() });
+            } else {
+                app.pty_in_right = !app.pty_in_right;
+                app.right_focused = app.pty_in_right;
+                app.right_scroll = 0;
+            }
+        }
+    }
+}
+
 fn dispatch_menubar_key(app: &mut App, k: char) {
     match k {
         'b' => { app.snap_left(); app.focus = Pane::Sessions; }
@@ -4500,6 +4680,32 @@ fn handle_modal_key(app: &mut App, code: crossterm::event::KeyCode,
                 app.modal = Some(Modal::PtyCmd { buf });
             }
             _ => app.modal = Some(Modal::PtyCmd { buf }),
+        },
+        Modal::ActionMenu { title, items, mut sel } => match code {
+            KeyCode::Esc => app.status = "menu cancelled".into(),
+            KeyCode::Up => {
+                if sel > 0 { sel -= 1; }
+                app.modal = Some(Modal::ActionMenu { title, items, sel });
+            }
+            KeyCode::Down => {
+                if sel + 1 < items.len() { sel += 1; }
+                app.modal = Some(Modal::ActionMenu { title, items, sel });
+            }
+            KeyCode::Home => app.modal = Some(Modal::ActionMenu {
+                title, items, sel: 0 }),
+            KeyCode::End => {
+                let last = items.len().saturating_sub(1);
+                app.modal = Some(Modal::ActionMenu { title, items, sel: last });
+            }
+            KeyCode::Enter => {
+                if let Some(it) = items.get(sel) {
+                    let act = it.action;
+                    run_action(app, act);
+                }
+                // Modal stays closed; the dispatched action may
+                // re-open a different one (e.g. RuleForm).
+            }
+            _ => app.modal = Some(Modal::ActionMenu { title, items, sel }),
         },
     }
 }
@@ -4869,6 +5075,21 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                         dispatch_menubar_key(&mut app, c),
                     // In the diff pane, a/x/d are PER-HUNK; elsewhere they act on
                     // the selected change / whole box.
+                    // 'm' opens the context-menu popup for the
+                    // currently-selected row. Per-pane action list +
+                    // hints come from pane_action_menu(); pressing m
+                    // on a pane with no contextual actions (Procs /
+                    // Outputs / Pipelines / BuildEdges today) is a
+                    // no-op with a status note.
+                    KeyCode::Char('m') => {
+                        if let Some((title, items)) = pane_action_menu(&app) {
+                            app.modal = Some(Modal::ActionMenu {
+                                title, items, sel: 0,
+                            });
+                        } else {
+                            app.status = "no actions for this row yet".into();
+                        }
+                    }
                     KeyCode::Char('a') if app.focus == Pane::Hunks => app.apply_hunk(),
                     KeyCode::Char('x') | KeyCode::Char('d') if app.focus == Pane::Hunks => app.discard_hunk(),
                     KeyCode::Char('a') => app.apply(),
