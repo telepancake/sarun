@@ -185,6 +185,64 @@ pub fn processes(box_id: i64) -> Value {
     Value::Array(rows)
 }
 
+/// oaita-proxy API log rows for a box: one row per request the engine
+/// forwarded on this box's behalf. The body bytes are summary-sized (lengths
+/// only) here; `api_log_detail` fetches the full request/response on demand.
+pub fn api_log(box_id: i64) -> Value {
+    let db = sqlar_path(box_id);
+    let Ok(conn) = rusqlite::Connection::open_with_flags(
+        &db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) else {
+        return json!([]);
+    };
+    let mut rows = vec![];
+    if let Ok(mut st) = conn.prepare(
+        "SELECT id,ts,method,path,model,status,stream,length(req),length(resp) \
+         FROM api_log ORDER BY id") {
+        let it = st.query_map([], |r| Ok(json!({
+            "id": r.get::<_, i64>(0)?,
+            "ts": r.get::<_, f64>(1)?,
+            "method": r.get::<_, String>(2)?,
+            "path": r.get::<_, String>(3)?,
+            "model": r.get::<_, String>(4)?,
+            "status": r.get::<_, i64>(5)?,
+            "stream": r.get::<_, i64>(6)?,
+            "req_len": r.get::<_, i64>(7)?,
+            "resp_len": r.get::<_, i64>(8)?,
+        })));
+        if let Ok(it) = it { for row in it.flatten() { rows.push(row); } }
+    }
+    Value::Array(rows)
+}
+
+/// Full request/response payloads for one api_log row.
+pub fn api_log_detail(box_id: i64, row_id: i64) -> Value {
+    let db = sqlar_path(box_id);
+    let Ok(conn) = rusqlite::Connection::open_with_flags(
+        &db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) else {
+        return Value::Null;
+    };
+    let row = conn.query_row(
+        "SELECT id,ts,method,path,model,status,stream,req,resp \
+         FROM api_log WHERE id=?1",
+        [row_id],
+        |r| {
+            let req: Vec<u8> = r.get(7)?;
+            let resp: Vec<u8> = r.get(8)?;
+            Ok(json!({
+                "id": r.get::<_, i64>(0)?, "ts": r.get::<_, f64>(1)?,
+                "method": r.get::<_, String>(2)?,
+                "path": r.get::<_, String>(3)?,
+                "model": r.get::<_, String>(4)?,
+                "status": r.get::<_, i64>(5)?,
+                "stream": r.get::<_, i64>(6)?,
+                "req": String::from_utf8_lossy(&req),
+                "resp": String::from_utf8_lossy(&resp),
+            }))
+        }
+    );
+    row.unwrap_or(Value::Null)
+}
+
 pub fn outputs(box_id: i64) -> Value {
     let db = sqlar_path(box_id);
     let Ok(conn) = rusqlite::Connection::open_with_flags(

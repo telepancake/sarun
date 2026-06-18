@@ -1,0 +1,532 @@
+// gen / call / run — the one-step primitives plus the driver loop. Matches
+// the Python prototype's semantics turn-for-turn (and file-for-file): each
+// turn is one file in the session folder; gen writes a `p`-flagged partial
+// while streaming and drops the flag on clean completion; tool calls are
+// persisted as `c`-flagged assistant turns and answered by `call`.
+
+use std::collections::HashSet;
+use std::fs;
+use std::path::PathBuf;
+
+use serde_json::{json, Value};
+
+use crate::oaita::client::Client;
+use crate::oaita::config::Config;
+use crate::oaita::exec::{box_name, Executor};
+use crate::oaita::ids::{is_adoptable_slug, new_turn_id};
+use crate::oaita::inspect::{inspect, parse_locator, read_path};
+use crate::oaita::tools::{tools_array, ExecResult};
+use crate::oaita::trace;
+use crate::oaita::turns::{
+    append_turn, assign_slugs, build_messages, load_stitched, load_turns,
+    next_number, parse_stitch, session_dir, strip_emitted_turn_id,
+    target_segment, turn_filename, Turn,
+};
+
+#[derive(Clone, Debug)]
+pub struct Settings {
+    pub model: String,
+    pub base_url: String,
+    pub api_key: String,
+    pub capabilities: Option<String>,
+    pub tool_context: Option<String>,
+    pub depth: u32,
+    pub sarun_override: Option<String>,
+    pub no_sandbox: bool,
+}
+
+impl Settings {
+    pub fn resolve(model: Option<String>, base_url: Option<String>,
+                   api_key: Option<String>,
+                   capabilities: Option<String>,
+                   tool_context: Option<String>,
+                   sarun_override: Option<String>,
+                   no_sandbox: bool)
+        -> Result<Self, String>
+    {
+        let cfg = Config::load();
+        let (model_d, base_d, key_d) = cfg.resolve()?;
+        let depth = std::env::var("OAITA_DEPTH").ok()
+            .and_then(|s| s.parse().ok()).unwrap_or(0);
+        Ok(Settings {
+            model: model.unwrap_or(model_d),
+            base_url: base_url.unwrap_or(base_d),
+            api_key: api_key.unwrap_or(key_d),
+            capabilities,
+            tool_context,
+            depth,
+            sarun_override,
+            no_sandbox,
+        })
+    }
+}
+
+// ── gen ─────────────────────────────────────────────────────────────────────
+/// One model generation. The streamed reply is written incrementally to a
+/// `p`-flagged target file; on clean completion the flag drops (rename). If
+/// the model emits tool calls instead of prose (or alongside it), each call
+/// is persisted as a `c`-flagged assistant turn and gen STOPS without
+/// evaluating them (that is `call`'s job).
+pub fn generate(spec: &str, set: &Settings) -> Result<Vec<PathBuf>, String> {
+    let segs = parse_stitch(spec)?;
+    let target = segs.last().unwrap().clone();
+    fs::create_dir_all(session_dir(&target))
+        .map_err(|e| format!("create session dir: {e}"))?;
+
+    // Ensure every turn has a slug; turn-ids stay unique across the stitched
+    // context.
+    let stitched = load_stitched(spec)?;
+    // The TARGET session's current turn list (for resume / append logic).
+    let mut target_turns = load_turns(&target);
+    let mut existing: HashSet<String> = stitched.iter()
+        .filter_map(|t| t.slug.clone()).collect();
+    target_turns = assign_slugs(target_turns, &mut existing)
+        .map_err(|e| format!("assign slugs: {e}"))?;
+
+    // Resume rules: if the LAST target turn is `p`-flagged, regenerate IN
+    // PLACE and EXCLUDE it from the prompt. Otherwise append a new
+    // `p`-flagged turn.
+    let resume = target_turns.last()
+        .map(|t| t.kind == "assistant" && t.flags.contains('p'))
+        .unwrap_or(false);
+
+    let (target_path, target_slug) = if resume {
+        let last = target_turns.last().unwrap().clone();
+        (last.path, last.slug.unwrap())
+    } else {
+        let n = next_number(&target_turns);
+        let slug = new_turn_id(&existing);
+        existing.insert(slug.clone());
+        let name = turn_filename(n, "assistant", Some(&slug), None, "p");
+        let path = session_dir(&target).join(name);
+        fs::write(&path, "").map_err(|e| format!("create target: {e}"))?;
+        (path, slug)
+    };
+
+    // The prompt: stitched context up to and excluding our target if resuming.
+    let prompt_turns: Vec<Turn> = if resume {
+        stitched.into_iter()
+            .filter(|t| t.path != target_path).collect()
+    } else { stitched };
+
+    let messages = build_messages(&prompt_turns);
+    let tools = tools_array(set.capabilities.as_deref(), set.depth);
+
+    trace::event("gen.request", json!({
+        "session": &target, "model": &set.model,
+        "n_messages": messages.len(),
+        "tools": tools.as_array().map(|a| a.iter().filter_map(|s|
+            s.get("function").and_then(|f| f.get("name")).and_then(Value::as_str)
+              .map(String::from)).collect::<Vec<_>>()),
+    }));
+
+    let body = json!({
+        "model": set.model,
+        "messages": messages,
+        "tools": tools,
+        "stream": true,
+    });
+
+    let client = Client::from_resolved(&set.base_url, &set.api_key)?;
+    let mut content = String::new();
+    let mut tool_calls: Vec<AssembledToolCall> = Vec::new();
+    let mut finish_reason: String = String::new();
+
+    crate::oaita::client::block_on(async {
+        client.post_stream("/chat/completions", body, |payload| {
+            let Ok(v) = serde_json::from_str::<Value>(payload) else { return; };
+            let Some(choices) = v.get("choices").and_then(Value::as_array)
+                else { return; };
+            for choice in choices {
+                if let Some(d) = choice.get("delta").and_then(Value::as_object) {
+                    if let Some(c) = d.get("content").and_then(Value::as_str) {
+                        if !c.is_empty() {
+                            content.push_str(c);
+                            // Stream-into-target: write the partial whenever
+                            // content grows. Resilient resume needs the file
+                            // to reflect what we have RIGHT NOW.
+                            let _ = fs::write(&target_path, &content);
+                            print!("{c}");
+                            use std::io::Write;
+                            let _ = std::io::stdout().flush();
+                        }
+                    }
+                    if let Some(tcs) = d.get("tool_calls").and_then(Value::as_array) {
+                        assemble_tool_calls(&mut tool_calls, tcs);
+                    }
+                }
+                if let Some(fr) = choice.get("finish_reason").and_then(Value::as_str) {
+                    if !fr.is_empty() { finish_reason = fr.to_string(); }
+                }
+            }
+        }).await
+    })?;
+
+    // Strip an emitted turn-id header and possibly ADOPT it as our slug.
+    let (emitted, body) = strip_emitted_turn_id(&content);
+    let mut produced: Vec<PathBuf> = Vec::new();
+    let mut new_slug = target_slug.clone();
+    if let Some(eid) = emitted {
+        if is_adoptable_slug(&eid) && !existing.contains(&eid) {
+            new_slug = eid;
+        }
+    }
+
+    // Decide the assistant turn's final filename:
+    // — kept `p` if finish_reason=="length" (a token-cut reply remains a
+    //   truthful resumable partial; gen will continue it next round).
+    // — `b`-flagged WAYPOINT NOT here (only backtrack(waypoint=true) sets it).
+    // — clean otherwise.
+    let kept_partial = finish_reason == "length";
+    let final_flags = if kept_partial { "p" } else { "" };
+    let number = parse_existing_number(&target_path)
+        .unwrap_or_else(|| next_number(&load_turns(&target)));
+    let final_name = turn_filename(number, "assistant", Some(&new_slug),
+                                   None, final_flags);
+    let final_path = target_path.parent().unwrap().join(final_name);
+    // Only rewrite the file content if we stripped a header / made it terminal.
+    if body != content || !kept_partial || new_slug != target_slug {
+        let _ = fs::write(&target_path, &body);
+    }
+    if final_path != target_path {
+        let _ = fs::rename(&target_path, &final_path);
+    }
+    if !body.is_empty() { produced.push(final_path.clone()); }
+
+    // Persist tool calls as `c`-flagged assistant turns. ONE turn per call.
+    let mut taken: HashSet<String> = existing.clone();
+    taken.insert(new_slug.clone());
+    for tc in &tool_calls {
+        let call_slug = adopt_call_id(tc.id.as_deref(), &mut taken);
+        let envelope = json!({"tool": tc.name, "arguments": tc.arguments_json()});
+        let n = next_number(&load_turns(&target));
+        let name = turn_filename(n, "assistant", Some(&call_slug), None, "c");
+        let path = session_dir(&target).join(name);
+        fs::write(&path, envelope.to_string()).map_err(|e| format!("write call: {e}"))?;
+        produced.push(path);
+    }
+
+    trace::event("gen.reply", json!({
+        "session": &target, "content_len": body.len(),
+        "n_tool_calls": tool_calls.len(),
+        "finish_reason": finish_reason, "kept_partial": kept_partial,
+    }));
+    Ok(produced)
+}
+
+fn parse_existing_number(path: &PathBuf) -> Option<u32> {
+    let name = path.file_name()?.to_str()?;
+    let digits: String = name.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
+fn adopt_call_id(wire_id: Option<&str>, taken: &mut HashSet<String>) -> String {
+    if let Some(id) = wire_id {
+        // Sanitize: lowercase, [a-z0-9]+, length-bound.
+        let sane: String = id.chars().filter(|c| c.is_ascii_alphanumeric())
+            .flat_map(|c| c.to_lowercase()).take(16).collect();
+        if !sane.is_empty() && !taken.contains(&sane) {
+            taken.insert(sane.clone());
+            return sane;
+        }
+    }
+    let id = new_turn_id(taken);
+    taken.insert(id.clone());
+    id
+}
+
+#[derive(Default, Debug)]
+struct AssembledToolCall {
+    pub id: Option<String>,
+    pub name: String,
+    pub arguments: String, // JSON string assembled from streamed fragments
+}
+impl AssembledToolCall {
+    fn arguments_json(&self) -> Value {
+        serde_json::from_str(&self.arguments).unwrap_or_else(|_| Value::String(self.arguments.clone()))
+    }
+}
+
+fn assemble_tool_calls(acc: &mut Vec<AssembledToolCall>, frags: &[Value]) {
+    for frag in frags {
+        let idx = frag.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+        while acc.len() <= idx { acc.push(AssembledToolCall::default()); }
+        let row = &mut acc[idx];
+        if row.id.is_none() {
+            if let Some(s) = frag.get("id").and_then(Value::as_str) {
+                row.id = Some(s.to_string());
+            }
+        }
+        if let Some(func) = frag.get("function") {
+            if row.name.is_empty() {
+                if let Some(n) = func.get("name").and_then(Value::as_str) {
+                    row.name = n.to_string();
+                }
+            }
+            if let Some(a) = func.get("arguments").and_then(Value::as_str) {
+                row.arguments.push_str(a);
+            }
+        }
+    }
+}
+
+// ── call ────────────────────────────────────────────────────────────────────
+/// Evaluate the first UNANSWERED tool call (positional pairing: k-th result
+/// answers k-th call in the trailing call/result block). The result is
+/// posted back as a `.tool` turn carrying from=<inner-session> when the
+/// caller is delegated; otherwise just a plain result turn.
+pub fn evaluate_call(spec: &str, set: &Settings,
+                     executor: Option<&dyn Executor>) -> Result<Vec<PathBuf>, String> {
+    let target = target_segment(spec)?;
+    let turns = load_turns(&target);
+    let pending = first_pending_call(&turns)
+        .ok_or_else(|| "no unanswered tool calls".to_string())?;
+
+    let (tool, arguments) = parse_call_envelope(&pending.read().map_err(|e| e.to_string())?)?;
+    trace::event("call.eval", json!({"session": &target, "tool": &tool}));
+
+    let result_text = dispatch(&tool, &arguments, &target, set, executor, &turns);
+
+    // Write the result turn. Sender = self by default; for an inner sub-agent
+    // case the executor is the box, and `act` builds its own machinery — for
+    // a directly-dispatched call we simply post under the session's own name.
+    let n = next_number(&load_turns(&target));
+    let mut existing: HashSet<String> = turns.iter()
+        .filter_map(|t| t.slug.clone()).collect();
+    let slug = new_turn_id(&existing);
+    existing.insert(slug.clone());
+    let name = turn_filename(n, "tool", Some(&slug), None, "");
+    let path = session_dir(&target).join(name);
+    fs::write(&path, &result_text).map_err(|e| format!("write result: {e}"))?;
+    trace::event("call.result", json!({"session": &target, "tool": &tool, "bytes": result_text.len()}));
+    Ok(vec![path])
+}
+
+fn first_pending_call(turns: &[Turn]) -> Option<&Turn> {
+    // Walk backwards collecting trailing assistant `c` turns and matching
+    // them positionally to trailing `.tool` turns.
+    let mut calls: Vec<&Turn> = Vec::new();
+    let mut results = 0usize;
+    for t in turns.iter().rev() {
+        if t.kind == "tool" { results += 1; continue; }
+        if t.kind == "assistant" && t.flags.contains('c') {
+            calls.push(t);
+            continue;
+        }
+        break;
+    }
+    calls.reverse();
+    calls.into_iter().nth(results)
+}
+
+fn parse_call_envelope(content: &str) -> Result<(String, Value), String> {
+    let v: Value = serde_json::from_str(content)
+        .map_err(|e| format!("bad call envelope: {e}"))?;
+    let tool = v.get("tool").and_then(Value::as_str)
+        .ok_or_else(|| "call envelope missing `tool`".to_string())?.to_string();
+    let args = v.get("arguments").cloned().unwrap_or(Value::Null);
+    Ok((tool, args))
+}
+
+fn dispatch(tool: &str, arguments: &Value, target: &str, set: &Settings,
+            executor: Option<&dyn Executor>, turns: &[Turn]) -> String {
+    match tool {
+        "act" => dispatch_act(arguments, target, set, executor),
+        "shell" => dispatch_shell(arguments, target, executor),
+        "inspect" => dispatch_inspect(arguments, turns),
+        "read" => dispatch_read(arguments, turns),
+        "apply" | "reject" => dispatch_box_resolve(tool, arguments),
+        "backtrack" => dispatch_backtrack(arguments, target),
+        "delete" => dispatch_delete(arguments),
+        other => format!("error: unknown tool {other:?}"),
+    }
+}
+
+fn args_str(v: &Value, k: &str) -> Option<String> {
+    v.get(k).and_then(Value::as_str).map(String::from)
+}
+fn args_bool(v: &Value, k: &str) -> bool {
+    v.get(k).and_then(Value::as_bool).unwrap_or(false)
+}
+
+fn dispatch_act(args: &Value, outer: &str, set: &Settings,
+                executor: Option<&dyn Executor>) -> String {
+    if set.depth >= crate::oaita::tools::max_depth() {
+        return "act: too deep — do the task yourself".to_string();
+    }
+    let Some(request) = args_str(args, "request") else {
+        return "act: missing required `request`".to_string();
+    };
+    let data = args_str(args, "data").unwrap_or_default();
+    let follow_up = args_str(args, "follow_up").unwrap_or_default();
+    // Inner session: if follow_up names a previous act call, reuse its
+    // sub-agent id; otherwise mint a new one (folder name is the slug too).
+    let inner = if !follow_up.is_empty() {
+        // The Python prototype looks up the inner session via the previous
+        // call's id; we lean on the model passing the same id forward.
+        follow_up
+    } else {
+        let existing: HashSet<String> = HashSet::new();
+        new_turn_id(&existing)
+    };
+    let _ = fs::create_dir_all(session_dir(&inner));
+    // Seed: a user turn from the outer session.
+    let seed_content = if data.is_empty() { request.clone() }
+                       else { format!("{request}\n\n{data}") };
+    let _ = append_turn(&inner, "user", &seed_content, None, Some(outer.to_string()), "", None);
+    // Run the inner session in its own box.
+    let inner_box = box_name(&inner);
+    let script = act_script(&inner, set.depth + 1);
+    let Some(exe) = executor else {
+        return "act: no executor (sandbox disabled) — cannot delegate".to_string();
+    };
+    let r = exe.run(&inner_box, &script, false);
+    format_act_result(&r, &inner)
+}
+
+fn act_script(inner: &str, child_depth: u32) -> String {
+    // OAITA_DEPTH rides into the child process so its `act` calls see the
+    // bumped depth (and the exhausted form fires at MAX_DEPTH).
+    format!(
+        "set -e\n\
+         export OAITA_DEPTH={child_depth}\n\
+         oaita run {inner}\n\
+         oaita tail {inner}\n"
+    )
+}
+
+fn format_act_result(r: &ExecResult, inner: &str) -> String {
+    let mut text = String::new();
+    text.push_str(&format!("[from box {} of {}]\n\n", crate::oaita::exec::box_name(inner), inner));
+    text.push_str(&r.text);
+    text
+}
+
+fn dispatch_shell(args: &Value, target: &str, executor: Option<&dyn Executor>) -> String {
+    let Some(script) = args_str(args, "script") else {
+        return "shell: missing required `script`".to_string();
+    };
+    let discard = args_bool(args, "discard");
+    let Some(exe) = executor else {
+        return "shell: no executor (sandbox disabled) — pass --sarun to enable".to_string();
+    };
+    let r = exe.run(&box_name(target), &script, discard);
+    r.text
+}
+
+fn dispatch_inspect(args: &Value, turns: &[Turn]) -> String {
+    let Some(path) = args_str(args, "path") else {
+        return "inspect: missing required `path`".to_string();
+    };
+    let loc = parse_locator(&path);
+    inspect(&loc, turns)
+}
+
+fn dispatch_read(args: &Value, turns: &[Turn]) -> String {
+    let Some(path) = args_str(args, "path") else {
+        return "read: missing required `path`".to_string();
+    };
+    let loc = parse_locator(&path);
+    read_path(&loc, turns)
+}
+
+fn dispatch_box_resolve(verb: &str, args: &Value) -> String {
+    let Some(target) = args_str(args, "target") else {
+        return format!("{verb}: missing required `target`");
+    };
+    // verb = apply / reject (== discard in sarun terminology). Defer to the
+    // sarun CLI which already implements both as control verbs.
+    let cmd = if verb == "apply" { "apply" } else { "discard" };
+    let sarun = crate::oaita::exec::SarunExecutor::new(None).sarun;
+    let inner_box = box_name(&target);
+    let r = std::process::Command::new(&sarun)
+        .args([&inner_box, cmd]).output();
+    match r {
+        Ok(o) if o.status.success() => format!("{verb}({inner_box}) ok"),
+        Ok(o) => format!("{verb}({inner_box}) failed: {}",
+                         String::from_utf8_lossy(&o.stderr)),
+        Err(e) => format!("{verb}: cannot run sarun: {e}"),
+    }
+}
+
+fn dispatch_backtrack(args: &Value, target: &str) -> String {
+    let Some(turn_id) = args_str(args, "turn_id") else {
+        return "backtrack: missing `turn_id`".to_string();
+    };
+    let Some(summary) = args_str(args, "summary") else {
+        return "backtrack: missing `summary`".to_string();
+    };
+    let inclusive = args.get("inclusive").and_then(Value::as_bool).unwrap_or(true);
+    let final_answer = args_bool(args, "final");
+    let turns = load_turns(target);
+    let cut = turns.iter().position(|t| t.slug.as_deref() == Some(turn_id.as_str()));
+    let Some(mut cut) = cut else {
+        return format!("backtrack: no turn with id {turn_id:?}");
+    };
+    if !inclusive { cut += 1; }
+    // Remove every turn from `cut` onward.
+    let mut removed = 0usize;
+    for t in &turns[cut..] {
+        if fs::remove_file(&t.path).is_ok() { removed += 1; }
+    }
+    // Plant the summary as an assistant turn — `b`-flagged unless final.
+    let kept = &turns[..cut];
+    let n = kept.iter().map(|t| t.number).max().unwrap_or(0) + crate::oaita::turns::NUM_STEP;
+    let mut existing: HashSet<String> = kept.iter().filter_map(|t| t.slug.clone()).collect();
+    let slug = new_turn_id(&existing);
+    existing.insert(slug.clone());
+    let flags = if final_answer { "" } else { "b" };
+    let name = turn_filename(n, "assistant", Some(&slug), None, flags);
+    let path = session_dir(target).join(name);
+    let _ = fs::write(&path, &summary);
+    format!("backtrack: removed {removed} turns; {} planted at {}",
+            if final_answer { "answer" } else { "waypoint" },
+            path.display())
+}
+
+fn dispatch_delete(args: &Value) -> String {
+    let Some(session) = args_str(args, "session") else {
+        return "delete: missing `session`".to_string();
+    };
+    let dir = session_dir(&session);
+    let _ = fs::remove_dir_all(&dir);
+    // Also discard the session's box (if any).
+    let sarun = crate::oaita::exec::SarunExecutor::new(None).sarun;
+    let _ = std::process::Command::new(&sarun)
+        .args([&box_name(&session), "discard"]).output();
+    format!("delete: dropped session {session}")
+}
+
+// ── run ─────────────────────────────────────────────────────────────────────
+/// run = drive call/gen until the tail is a CLEAN assistant turn (no `p`, no
+/// `c`, no `b`). Bounded by `max_steps` to prevent runaway.
+pub fn run_to_completion(spec: &str, set: &Settings,
+                         executor: Option<&dyn Executor>,
+                         max_steps: u32) -> Result<Vec<PathBuf>, String> {
+    let target = target_segment(spec)?;
+    let mut produced: Vec<PathBuf> = Vec::new();
+    trace::event("run.start", json!({"session": &target, "max_steps": max_steps}));
+    for _ in 0..max_steps {
+        let turns = load_turns(&target);
+        // Settled? — last turn is assistant with no p/c/b flags.
+        if let Some(last) = turns.last() {
+            if last.kind == "assistant"
+                && !last.flags.contains('p')
+                && !last.flags.contains('c')
+                && !last.flags.contains('b') {
+                trace::event("run.settled", json!({"session": &target}));
+                return Ok(produced);
+            }
+            // Pending call? → evaluate it.
+            if first_pending_call(&turns).is_some() {
+                let mut r = evaluate_call(spec, set, executor)?;
+                produced.append(&mut r);
+                continue;
+            }
+        }
+        // Otherwise generate.
+        let mut r = generate(spec, set)?;
+        produced.append(&mut r);
+    }
+    Err(format!("run: exhausted {max_steps} steps without settling"))
+}

@@ -1,0 +1,148 @@
+// Executors — the inward face of the `shell` tool. The SarunExecutor runs the
+// script in a persistent sarun BOX (so all writes STAGE for review/apply); the
+// LocalExecutor is the ungated subprocess stand-in for tests/no-sarun runs.
+//
+// The persistent-box naming convention is OAITA-<SESSION> (uppercase prefix
+// matches sarun's CLI box-name convention — control::is_box_name checks for an
+// uppercase-leading token). One box per session — so the same conversation's
+// shell calls compose, just like a long-lived terminal.
+
+use std::process::{Command, Stdio};
+
+use crate::oaita::tools::{ExecResult, summarize_patch, fit_output,
+                          RESULT_BUDGET, CHANGES_BUDGET};
+
+pub trait Executor: Send + Sync {
+    /// Run a script in a session-owned box, capture stdout+stderr+rc, and
+    /// describe the staged changes (`patch_text`-style). `box_id` is the
+    /// session-derived box name (UPPERCASE — see `box_name`).
+    fn run(&self, box_id: &str, script: &str, discard: bool) -> ExecResult;
+}
+
+/// The persistent-box name for a session. Capital-letters prefix keeps it
+/// distinguishable from human-typed boxes (`MYBOX`) and matches the Python
+/// prototype's convention.
+pub fn box_name(session: &str) -> String {
+    format!("OAITA-{}", session.to_uppercase())
+}
+
+pub struct SarunExecutor {
+    pub sarun: String,
+}
+
+impl SarunExecutor {
+    pub fn new(sarun_override: Option<String>) -> Self {
+        let sarun = sarun_override
+            .or_else(|| Some(default_sarun()))
+            .unwrap();
+        SarunExecutor { sarun }
+    }
+}
+
+/// Try `./sarun` first (sibling next to a symlinked oaita); else `sarun` on
+/// PATH; else current_exe (when invoked via subcommand we already ARE sarun).
+fn default_sarun() -> String {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(stem) = exe.file_name().and_then(|s| s.to_str()) {
+            if stem == "sarun" || stem == "sarun-engine" {
+                return exe.to_string_lossy().into_owned();
+            }
+        }
+        if let Some(parent) = exe.parent() {
+            let sib = parent.join("sarun");
+            if sib.exists() { return sib.to_string_lossy().into_owned(); }
+        }
+    }
+    "sarun".to_string()
+}
+
+impl Executor for SarunExecutor {
+    fn run(&self, box_id: &str, script: &str, discard: bool) -> ExecResult {
+        // For discard mode use a one-shot PEEK box; for the persistent case
+        // run into `box_id`. Either way we get capture + overlay.
+        let target = if discard { format!("{box_id}-PEEK") } else { box_id.to_string() };
+        crate::oaita::trace::event("exec.run", serde_json::json!({
+            "box": target, "discard": discard, "script_len": script.len(),
+        }));
+        let out = Command::new(&self.sarun)
+            .args(["run", &target, "--", "sh", "-c", script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output();
+        let (stdout, stderr, rc) = match out {
+            Ok(o) => (String::from_utf8_lossy(&o.stdout).into_owned(),
+                      String::from_utf8_lossy(&o.stderr).into_owned(),
+                      o.status.code().unwrap_or(-1)),
+            Err(e) => return ExecResult {
+                text: format!("error: cannot run sarun: {e}"),
+                rc: -1, ..Default::default()
+            }
+        };
+        let combined = if stderr.is_empty() { stdout.clone() }
+                       else { format!("{stdout}{stderr}") };
+        // Pull the staged patch via the existing `patch` control verb (the CLI
+        // has a `patch` op — see control::cli_box_op).
+        let patch = Command::new(&self.sarun)
+            .args([&target, "patch"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        let changes = summarize_patch(&patch, CHANGES_BUDGET);
+        // Discard mode: tell sarun to throw away the box (no review).
+        if discard {
+            let _ = Command::new(&self.sarun).args([&target, "discard"]).status();
+        }
+        let output_budget = RESULT_BUDGET.saturating_sub(changes.len() + 32);
+        let trimmed = fit_output(&combined, output_budget);
+        let text = if patch.is_empty() {
+            trimmed.clone()
+        } else {
+            format!("{trimmed}\n\n=== changes ===\n{changes}")
+        };
+        crate::oaita::trace::event("exec.done", serde_json::json!({
+            "rc": rc, "bytes": text.len(),
+        }));
+        ExecResult { text, raw_output: combined, patch, rc }
+    }
+}
+
+/// Trial-runs / tests: no sarun, no overlay. Writes leak to the host —
+/// $OAITA_EXECUTOR=local is opt-in and explicitly NOT a safe substitute.
+pub struct LocalExecutor;
+
+impl Executor for LocalExecutor {
+    fn run(&self, _box_id: &str, script: &str, _discard: bool) -> ExecResult {
+        let out = Command::new("sh")
+            .args(["-c", script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output();
+        let (stdout, stderr, rc) = match out {
+            Ok(o) => (String::from_utf8_lossy(&o.stdout).into_owned(),
+                      String::from_utf8_lossy(&o.stderr).into_owned(),
+                      o.status.code().unwrap_or(-1)),
+            Err(e) => return ExecResult {
+                text: format!("error: {e}"), rc: -1, ..Default::default()
+            },
+        };
+        let combined = format!("{stdout}{stderr}");
+        let trimmed = fit_output(&combined, RESULT_BUDGET);
+        ExecResult { text: trimmed.clone(), raw_output: combined, patch: String::new(), rc }
+    }
+}
+
+/// Build the executor implied by env+args:
+///   --no-sandbox          → None (shell calls error-result back)
+///   $OAITA_EXECUTOR=local → LocalExecutor (UNGATED)
+///   default               → SarunExecutor
+pub fn build_executor(no_sandbox: bool, sarun_override: Option<String>)
+    -> Option<Box<dyn Executor>>
+{
+    if no_sandbox { return None; }
+    if std::env::var("OAITA_EXECUTOR").as_deref() == Ok("local") {
+        return Some(Box::new(LocalExecutor));
+    }
+    Some(Box::new(SarunExecutor::new(sarun_override)))
+}

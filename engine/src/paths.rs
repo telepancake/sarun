@@ -67,12 +67,36 @@ pub fn sock_path() -> PathBuf {
     runtime_home().join("ui.sock")
 }
 
+/// Per-engine API proxy socket. An `--api` box has THIS bind-mounted at
+/// `/run/sarun/api.sock` inside, and oaita talks plain HTTP/1.1 over it; the
+/// engine proxies the call upstream after injecting the auth header from
+/// `oaita.toml` and logging the request/response into the box's `api_log`
+/// sqlar table.
+pub fn api_sock_path() -> PathBuf {
+    runtime_home().join("api.sock")
+}
+
+/// Config file holding the API credentials (model, base_url, api_key). Lives
+/// under XDG config home, separate from sarun's other settings so a user can
+/// chmod 0600 it without dragging other config along.
+pub fn oaita_config_path() -> PathBuf {
+    config_home().join("oaita.toml")
+}
+
+/// Where oaita sessions live: one folder per session under here. Mirrors the
+/// Python prototype's `$XDG_STATE_HOME/oaita/<name>/` layout but lives under
+/// sarun's own state root so removing sarun's state removes oaita's too.
+pub fn oaita_state_home() -> PathBuf {
+    state_home().join("oaita")
+}
+
 pub fn mnt_point() -> PathBuf {
     runtime_home().join("mnt")
 }
 
 pub fn ensure_dirs() -> std::io::Result<()> {
-    for d in [data_home(), runtime_home(), state_home(), live_home(), mnt_point()] {
+    for d in [data_home(), config_home(), runtime_home(), state_home(),
+              live_home(), mnt_point(), oaita_state_home()] {
         std::fs::create_dir_all(&d)?;
     }
     Ok(())

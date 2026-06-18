@@ -254,6 +254,13 @@ enum Pane {
     /// the verbose tshark dissection of the selected flow's frame
     /// (`flows.detail`, also sandboxed).
     Flows,
+    /// oaita `--api` proxy logs: one row per request the engine forwarded
+    /// on this box's behalf. Routes AROUND the network proxy (the API call
+    /// leaves through the engine's HOST-namespace upstream connection, not
+    /// the box's netns / loopback), so it has its OWN log surface — the
+    /// network pcap/MITM views would not see it. Backed by the box's
+    /// `api_log` sqlar table (`api_log` / `api_log_detail` control verbs).
+    ApiLogs,
     /// Drill-down INTO a flow's TCP stream: left pane = every packet in
     /// that connection (frame · time · src→dst · proto · len · info),
     /// right pane = the same tshark -V dissection but per-packet. Pushed
@@ -479,6 +486,12 @@ struct App {
     sel_pipeline: usize,
     sel_edge: usize,
     sel_output: usize,
+    sel_api_log: usize,
+    /// One row per api_log entry for the focused box (id, ts, method, path,
+    /// model, status, stream, req_len, resp_len). Populated lazily by
+    /// load_api_logs_if_needed; refreshed on `api_log_added` notifications.
+    api_log_rows: Vec<Value>,
+    api_log_loaded_sid: Option<String>,
     sel_rule: usize,
     hunk_scroll: u16,
     out_scroll: u16,
@@ -626,6 +639,9 @@ impl App {
             sel_change: 0,
             sel_proc: 0, sel_pipeline: 0, sel_edge: 0,
             sel_output: 0,
+            sel_api_log: 0,
+            api_log_rows: vec![],
+            api_log_loaded_sid: None,
             sel_rule: 0,
             hunk_scroll: 0,
             out_scroll: 0,
@@ -1683,6 +1699,31 @@ impl App {
         self.fetch_outputs_window(0);
     }
 
+    /// Pull this box's `api_log` table directly (no view machinery — the
+    /// rows are bounded by the number of LLM calls a box has made, and
+    /// the table fits comfortably in one fetch). One row per row.
+    fn load_api_logs(&mut self) {
+        let Some(sid) = self.cur_sid() else { return };
+        match rpc(&self.sock, "api_log", json!([sid])) {
+            Ok(v) => {
+                self.api_log_rows = v.as_array().cloned().unwrap_or_default();
+                self.api_log_loaded_sid = Some(sid);
+            }
+            Err(e) if e.contains("unknown verb") => {
+                self.status = "engine doesn't speak api_log — old engine?".into();
+            }
+            Err(e) => { self.status = format!("api_log: {e}"); }
+        }
+    }
+
+    fn load_api_logs_if_needed(&mut self) {
+        let cur = self.cur_sid();
+        if cur.is_some() && self.api_log_loaded_sid == cur && !self.api_log_rows.is_empty() {
+            return;
+        }
+        self.load_api_logs();
+    }
+
     /// Lazy counterpart of load_outputs — same idea as
     /// load_processes_if_needed: only re-open when the box changed.
     fn load_outputs_if_needed(&mut self) {
@@ -1875,6 +1916,11 @@ impl App {
             }
             Pane::Help => self.out_scroll = self.out_scroll.saturating_add(1),
             Pane::Pty => {}
+            Pane::ApiLogs => {
+                if self.sel_api_log + 1 < self.api_log_rows.len() {
+                    self.sel_api_log += 1;
+                }
+            }
         }
     }
 
@@ -1925,6 +1971,9 @@ impl App {
             }
             Pane::Help => self.out_scroll = self.out_scroll.saturating_sub(1),
             Pane::Pty => {}
+            Pane::ApiLogs => {
+                self.sel_api_log = self.sel_api_log.saturating_sub(1);
+            }
         }
     }
 
@@ -2028,6 +2077,12 @@ impl App {
                 else { self.out_scroll = self.out_scroll.saturating_sub(n16); }
             }
             Pane::Pty => {}
+            Pane::ApiLogs => {
+                let total = self.api_log_rows.len();
+                if total == 0 { return; }
+                let cur = self.sel_api_log as isize;
+                self.sel_api_log = (cur + delta).clamp(0, total as isize - 1) as usize;
+            }
         }
     }
 
@@ -2093,7 +2148,7 @@ impl App {
             Pane::Flows => self.open_packets(),
             Pane::Hunks | Pane::Processes | Pane::Outputs | Pane::Rules
             | Pane::Pipelines | Pane::BuildEdges | Pane::Packets
-            | Pane::Help | Pane::Pty => {}
+            | Pane::Help | Pane::Pty | Pane::ApiLogs => {}
         }
     }
 
@@ -3198,6 +3253,88 @@ fn outputs_lines(app: &App) -> Vec<Line<'static>> {
 /// OUTPUTS index (left pane). Columns mirror the prototype's #out-tab:
 /// Time | Stream | Process | Bytes. exe + tgid are baked into each row by
 /// the engine's source_outputs so the renderer doesn't RPC per output.
+/// API LOG · oaita proxy view. One row per request the engine forwarded on
+/// this box's behalf. Backed by the box's `api_log` sqlar table — sourced
+/// via the `api_log` control verb (no view machinery; rows are bounded by
+/// LLM call count which is naturally small).
+fn api_log_index_lines(app: &App) -> Vec<Line<'static>> {
+    let mut out = vec![Line::from(Span::styled(
+        format!("{:<8} {:<6} {:<5} {:<24} {:<12} {:>7}",
+                "Time", "Method", "Stat", "Path", "Model", "Bytes"),
+        Style::default().add_modifier(Modifier::BOLD),
+    ))];
+    if app.api_log_rows.is_empty() {
+        out.push(Line::from("(no API calls — this box wasn't launched with --api, \
+                             or hasn't made one yet)"));
+        return out;
+    }
+    for (i, r) in app.api_log_rows.iter().enumerate() {
+        let ts = r.get("ts").and_then(Value::as_f64).unwrap_or(0.0) as i64;
+        let method = r.get("method").and_then(Value::as_str).unwrap_or("?");
+        let path = r.get("path").and_then(Value::as_str).unwrap_or("");
+        let model = r.get("model").and_then(Value::as_str).unwrap_or("");
+        let status = r.get("status").and_then(Value::as_i64).unwrap_or(0);
+        let resp_len = r.get("resp_len").and_then(Value::as_i64).unwrap_or(0);
+        let time_label = {
+            let secs = ts.rem_euclid(86400);
+            let h = secs / 3600; let m = (secs % 3600) / 60; let s = secs % 60;
+            format!("{h:02}:{m:02}:{s:02}")
+        };
+        let path_short: String = path.chars().take(24).collect();
+        let model_short: String = model.chars().take(12).collect();
+        let text = format!("{time_label:<8} {method:<6} {status:<5} \
+                            {path_short:<24} {model_short:<12} {resp_len:>7}");
+        let line = if i == app.sel_api_log {
+            Line::from(Span::styled(text, Style::default().fg(Color::Black).bg(Color::Cyan)))
+        } else {
+            let color = if status >= 400 { Color::Red }
+                        else if status >= 200 && status < 300 { Color::Reset }
+                        else { Color::Yellow };
+            Line::from(Span::styled(text, Style::default().fg(color)))
+        };
+        out.push(line);
+    }
+    out
+}
+
+/// API LOG · request + response detail for the focused row. Fetches the
+/// full request/response bytes on demand via `api_log_detail`, falling
+/// back to the index row's lengths-only metadata when unreachable.
+fn api_log_detail_lines(app: &App) -> Vec<Line<'static>> {
+    let Some(row) = app.api_log_rows.get(app.sel_api_log) else {
+        return vec![Line::from("(no call selected)")];
+    };
+    let id = row.get("id").and_then(Value::as_i64).unwrap_or(-1);
+    let Some(sid) = app.cur_sid() else {
+        return vec![Line::from("(no box focused)")];
+    };
+    let detail = rpc(&app.sock, "api_log_detail", json!([sid, id])).ok();
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let model = row.get("model").and_then(Value::as_str).unwrap_or("");
+    let path = row.get("path").and_then(Value::as_str).unwrap_or("");
+    let status = row.get("status").and_then(Value::as_i64).unwrap_or(0);
+    let stream = row.get("stream").and_then(Value::as_i64).unwrap_or(0) != 0;
+    out.push(Line::from(format!("{path} · model={model} · status={status} · \
+                                 stream={stream}")));
+    out.push(Line::from(""));
+    if let Some(d) = detail {
+        out.push(Line::from(Span::styled("REQUEST",
+            Style::default().add_modifier(Modifier::BOLD).fg(Color::Yellow))));
+        for l in d.get("req").and_then(Value::as_str).unwrap_or("").lines() {
+            out.push(Line::from(l.to_string()));
+        }
+        out.push(Line::from(""));
+        out.push(Line::from(Span::styled("RESPONSE",
+            Style::default().add_modifier(Modifier::BOLD).fg(Color::Green))));
+        for l in d.get("resp").and_then(Value::as_str).unwrap_or("").lines() {
+            out.push(Line::from(l.to_string()));
+        }
+    } else {
+        out.push(Line::from("(could not load detail — engine offline?)"));
+    }
+    out
+}
+
 fn outputs_index_lines(app: &App) -> Vec<Line<'static>> {
     let mut out = vec![Line::from(Span::styled(
         format!("{:<8} {:<6} {:<20} {:>10}", "Time", "Stream", "Process", "Bytes"),
@@ -3599,6 +3736,7 @@ fn view_of_pane(p: Pane) -> Option<(char, &'static str, FilterView)> {
                         => Some(('f', "flows",   FilterView::Changes /* unused */)),
         Pane::Help      => Some(('?', "help",    FilterView::Changes /* unused */)),
         Pane::Pty       => Some(('P', "PTY",     FilterView::Changes /* unused */)),
+        Pane::ApiLogs   => Some(('A', "api",     FilterView::Changes /* unused */)),
     }
 }
 
@@ -3630,6 +3768,9 @@ fn menubar_chips(app: &App) -> Vec<(char, &'static str)> {
         Some(('f', "Flows")),
         Some(('e', "Rules")),
         if any_pty { Some(('P', "PTYs")) } else { None },
+        // oaita api-proxy log: shown for any box that's currently focused,
+        // even if it has no rows yet (the placeholder explains itself).
+        Some(('A', "Api")),
         Some(('?', "Help")),
     ].into_iter().flatten().collect()
 }
@@ -4017,6 +4158,19 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                 f.render_widget(p, left);
                 let detail = Paragraph::new(Text::from(packet_detail_lines(app)))
                     .block(block(title("PACKET · DETAIL (tshark -V)", rf), rf))
+                    .scroll((rscroll, 0))
+                    .wrap(Wrap { trim: false });
+                if !skip_right { f.render_widget(detail, right); }
+            }
+            Pane::ApiLogs => {
+                let lines = api_log_index_lines(app);
+                let scroll = scroll_for_cursor(app.sel_api_log + 1, lines.len(), left.height);
+                let p = Paragraph::new(Text::from(lines))
+                    .block(block(title("API LOG · oaita proxy", lf), lf))
+                    .scroll((scroll, 0));
+                f.render_widget(p, left);
+                let detail = Paragraph::new(Text::from(api_log_detail_lines(app)))
+                    .block(block(title("CALL · request + response", rf), rf))
                     .scroll((rscroll, 0))
                     .wrap(Wrap { trim: false });
                 if !skip_right { f.render_widget(detail, right); }
@@ -5225,6 +5379,11 @@ fn dispatch_menubar_key(app: &mut App, k: char) {
                  app.load_processes_if_needed(); }
         'o' => { app.snap_left(); app.nav(Pane::Outputs);
                  app.load_outputs_if_needed(); }
+        // 'A' (capital) — `--api` proxy log pane. New rows arrive via the
+        // `api_log_added` subscribe event; the load only fires on demand
+        // (or when the focused box changes).
+        'A' => { app.snap_left(); app.nav(Pane::ApiLogs);
+                 app.load_api_logs_if_needed(); }
         // -n network flows: tshark-decoded HTTP/TLS list from the box's
         // pcapng (engine runs tshark sandboxed). The detail (right) pane
         // shows tshark -V for the selected frame.
@@ -6870,6 +7029,9 @@ mod tests {
             sel_change: 0,
             sel_proc: 0, sel_pipeline: 0, sel_edge: 0,
             sel_output: 0,
+            sel_api_log: 0,
+            api_log_rows: vec![],
+            api_log_loaded_sid: None,
             sel_rule: 0,
             hunk_scroll: 0,
             out_scroll: 0,
