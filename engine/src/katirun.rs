@@ -134,7 +134,19 @@ fn read_bootstrap_makefile(targets: &[Symbol]) -> anyhow::Result<Arc<Mutex<Vec<k
     bootstrap.put_slice(b"CC?=cc\n");
     bootstrap.put_slice(b"CXX?=g++\n");
     bootstrap.put_slice(b"AR?=ar\n");
-    bootstrap.put_slice(b"MAKE_VERSION?=4.2.1\n");
+    // sarun: report GNU make 4.3 (matches our compat target); Makefiles
+    // gated on `ifeq ($(MAKE_VERSION),4.x)` see what they expect.
+    bootstrap.put_slice(b"MAKE_VERSION?=4.3\n");
+    // sarun: MAKELEVEL tracks recursion across sub-makes. Initialize
+    // from env (default 0) so $(MAKELEVEL) is defined for the top
+    // makefile; the bump-for-children happens in the recipe-runner.
+    {
+        let level = std::env::var("MAKELEVEL")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(0);
+        bootstrap.put_slice(format!("MAKELEVEL:={level}\n").as_bytes());
+    }
     bootstrap.put_slice(b"KATI?=ckati\n");
     bootstrap.put_slice(b"SHELL=/bin/sh\n");
     if !FLAGS.no_builtin_rules {
@@ -190,6 +202,18 @@ fn run_kati(targets: &[Symbol], cl_vars: &[bytes::Bytes], ninja_path: &OsStr) ->
     }
 
     let bootstrap_asts = read_bootstrap_makefile(targets)?;
+    // sarun: bootstrap captured the current MAKELEVEL above. Bump env
+    // for any recipe-spawned sub-make so it sees the next level.
+    // SAFETY: single-threaded at this point in the pipeline.
+    {
+        let level = std::env::var("MAKELEVEL")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(0);
+        unsafe {
+            std::env::set_var("MAKELEVEL", (level + 1).to_string());
+        }
+    }
     {
         let _frame = ev.enter(FrameType::Phase, bytes::Bytes::from_static(b"*bootstrap*"), Loc::default());
         ev.in_bootstrap();

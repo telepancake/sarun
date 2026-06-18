@@ -495,6 +495,44 @@ impl<'a> NinjaGenerator<'a> {
                 &mut cmd_buf,
                 &mut description,
             );
+            // sarun: target-specific exported vars (`target: export V := …`)
+            // need to be in the recipe's environment. The executor-side
+            // fix in exec.rs only covers rkati's standalone executor;
+            // the kati→n2 pipeline emits ninja and lets n2 run it, so we
+            // bake `export NAME='value'; ` into the recipe text instead.
+            if let Some(rule_vars) = &node.rule_vars {
+                let mut prefix = BytesMut::new();
+                let entries: Vec<(crate::symtab::Symbol, crate::var::Var)> = rule_vars
+                    .0
+                    .lock()
+                    .iter()
+                    .map(|(s, v)| (*s, v.clone()))
+                    .collect();
+                for (sym, var) in entries {
+                    if !var.read().exported {
+                        continue;
+                    }
+                    let value = var.read().eval_to_buf(self.ce.ev)?;
+                    prefix.put_slice(sym.as_bytes().as_ref());
+                    prefix.put_slice(b"=");
+                    // Shell-quote: wrap in '...' with embedded ' escaped.
+                    prefix.put_u8(b'\'');
+                    for &b in &value {
+                        if b == b'\'' {
+                            prefix.put_slice(b"'\"'\"'");
+                        } else {
+                            prefix.put_u8(b);
+                        }
+                    }
+                    prefix.put_slice(b"'; export ");
+                    prefix.put_slice(sym.as_bytes().as_ref());
+                    prefix.put_slice(b"; ");
+                }
+                if !prefix.is_empty() {
+                    prefix.put_slice(&cmd_buf);
+                    cmd_buf = prefix;
+                }
+            }
             out.write_all(b" description = ")?;
             out.write_all(&description)?;
             out.write_all(b"\n")?;
