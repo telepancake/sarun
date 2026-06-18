@@ -32,7 +32,7 @@ use crate::{
     error,
     eval::{Evaluator, FrameType},
     expr::Evaluable,
-    fileutil::{RedirectStderr, get_timestamp, run_command},
+    fileutil::{RedirectStderr, get_timestamp, run_command, run_with_installed_runner},
     flags::FLAGS,
     log,
     symtab::Symbol,
@@ -210,19 +210,31 @@ impl<'a> Executor<'a> {
                 println!("{}", String::from_utf8_lossy(&command.cmd));
             }
             if !FLAGS.is_dry_run {
-                let (status, output) = run_command(
-                    &self.shell,
-                    self.shellflag,
-                    &command.cmd,
-                    RedirectStderr::Stdout,
-                )?;
+                // sarun: prefer the embedder's in-process runner (brush)
+                // when installed; fall back to fork+exec /bin/sh otherwise.
+                // The installed runner returns only an exit code, not a
+                // signal-bearing ExitStatus — fine because the box's brush
+                // path has no SIGINT/SIGQUIT signaling distinct from a
+                // non-zero code.
+                let (ok, output, code_for_msg) =
+                    if let Some((ok, out)) = run_with_installed_runner(&command.cmd) {
+                        (ok, out, if ok { 0 } else { 1 })
+                    } else {
+                        let (status, out) = run_command(
+                            &self.shell,
+                            self.shellflag,
+                            &command.cmd,
+                            RedirectStderr::Stdout,
+                        )?;
+                        (status.success(), out, status.code().unwrap_or(1))
+                    };
                 print!("{}", String::from_utf8_lossy(&output));
-                if !status.success() {
+                if !ok {
                     if command.ignore_error {
                         eprintln!(
                             "[{}] Error {} (ignored)",
                             command.output,
-                            status.code().unwrap_or(1)
+                            code_for_msg
                         )
                     } else {
                         // sarun: .DELETE_ON_ERROR — remove the target's
@@ -234,7 +246,7 @@ impl<'a> Executor<'a> {
                         eprintln!(
                             "*** [{}] Error {}",
                             command.output,
-                            status.code().unwrap_or(1)
+                            code_for_msg
                         );
                         if self.ce.ev.delete_on_error && !n.lock().is_phony {
                             let out_bytes = command.output.as_bytes();

@@ -28,6 +28,37 @@ use std::{
 use anyhow::Result;
 use bytes::{BufMut, Bytes, BytesMut};
 use memchr::memchr2;
+
+// sarun: hook for embedders (the sarun engine) to substitute their own
+// recipe runner — runs the shell command IN-PROCESS via embedded brush
+// instead of fork+exec'ing /bin/sh. Returns the recipe's exit code; the
+// merged stdout+stderr bytes are pushed through `output_cb` as they
+// arrive. When `None` (rkati standalone), `exec.rs` falls back to the
+// classic `run_command()` path below. The closure form (boxed) lets
+// callers capture a tokio runtime / oneshot context without making
+// kati depend on brush.
+pub type RecipeRunner =
+    Box<dyn Fn(&[u8], &mut dyn FnMut(&[u8])) -> i32 + Send + Sync + 'static>;
+
+static RECIPE_RUNNER: parking_lot::Mutex<Option<RecipeRunner>> =
+    parking_lot::Mutex::new(None);
+
+/// Install an in-process recipe runner. exec.rs will use this instead of
+/// fork+exec'ing /bin/sh for every command. Idempotent; last call wins.
+pub fn install_recipe_runner(f: RecipeRunner) {
+    *RECIPE_RUNNER.lock() = Some(f);
+}
+
+/// Run `cmd` through the installed in-process runner, if any. Returns
+/// `Some((success, merged_output))` when the hook was used, `None` to
+/// fall back to `run_command()`.
+pub fn run_with_installed_runner(cmd: &[u8]) -> Option<(bool, Vec<u8>)> {
+    let guard = RECIPE_RUNNER.lock();
+    let runner = guard.as_ref()?;
+    let mut out = Vec::new();
+    let code = runner(cmd, &mut |b| out.extend_from_slice(b));
+    Some((code == 0, out))
+}
 use parking_lot::Mutex;
 
 use crate::log;

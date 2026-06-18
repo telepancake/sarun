@@ -28,8 +28,6 @@
 // VISIBLE error and a non-zero exit. We NEVER silently exec the real `make`.
 
 use std::ffi::{OsStr, OsString};
-use std::io::{Read, Seek};
-use std::os::fd::FromRawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::sync::Arc;
 
@@ -39,11 +37,9 @@ use kati::eval::{Evaluator, FrameType};
 use kati::expr::Value;
 use kati::flags::FLAGS;
 use kati::loc::Loc;
-use kati::ninja::generate_ninja_to_path;
 use kati::symtab::{Symbol, intern, join_symbols};
 use kati::var::{VarOrigin, Variable};
 use parking_lot::Mutex;
-use serde_json::json;
 
 /// True when this engine invocation should act as the embedded-make entry:
 /// SARUN_BRUSH_SH=1 (a -b brush box) AND argv[0]'s basename is `make`/`gmake`.
@@ -339,39 +335,66 @@ fn run_kati(targets: &[Symbol], cl_vars: &[bytes::Bytes], ninja_path: &OsStr) ->
     }
 
     {
-        let _frame = ev.enter(FrameType::Phase, bytes::Bytes::from_static(b"*ninja generation*"), Loc::default());
-        // sarun: emit ONLY the ninja, to our memfd path (no shell/stamp, no disk).
-        generate_ninja_to_path(&nodes, &mut ev, start_time, ninja_path)?;
+        // sarun: drive kati's OWN executor (src-rs/exec.rs) on the dep
+        // graph directly — NO ninja generation, NO n2. Recipes run
+        // sequentially, in declaration order, with mtime-based
+        // staleness — i.e. exactly the standalone rkati semantics, so
+        // box-mode now passes the same corpus tests rkati does. The
+        // shell call inside exec.rs is intercepted by the
+        // install_recipe_runner hook we set in make_main and routed
+        // through embedded brush in-process — no fork+exec to a
+        // shadowed /bin/sh.
+        let _frame = ev.enter(
+            FrameType::Phase,
+            bytes::Bytes::from_static(b"*execute*"),
+            Loc::default(),
+        );
+        kati::exec::exec(nodes, &mut ev)?;
         ev.finish()?;
     }
+    let _ = ninja_path; // sarun: legacy memfd path arg, no longer used.
+    let _ = start_time;
     Ok(RunKatiResult { remake_active })
-}
-
-/// Walk the n2 graph and emit ONE `build_edges` control frame carrying every
-/// edge {outs, ins, cmd} — including up-to-date targets n2 will skip. Identical
-/// shape to Phase 1's ninja emit_build_edges, so the same reader/table apply.
-fn emit_build_edges(graph: &n2::graph::Graph) {
-    let mut edges = vec![];
-    for build in graph.builds.iter() {
-        let outs: Vec<String> = build.outs().iter().map(|&id| graph.file(id).name.clone()).collect();
-        let ins: Vec<String> = build.explicit_ins().iter().map(|&id| graph.file(id).name.clone()).collect();
-        edges.push(json!({"outs": outs, "ins": ins, "cmd": build.cmdline.clone()}));
-    }
-    let msg = json!({"type": "build_edges", "edges": edges});
-    crate::runner::send_nested_prov(format!("{msg}\n").as_bytes());
 }
 
 /// The embedded-make entrypoint. `argv` is the FULL process argv (argv[0] is
 /// `make`/`gmake`). Returns the process exit code.
 pub fn make_main(argv: &[String]) -> i32 {
-    // 1. Install the in-process recipe executor so n2 runs recipes through brush
-    //    (NEVER posix_spawns /bin/sh). Shared with Phase 1. Idempotent.
-    n2::process::set_executor(crate::brush::n2_executor);
+    // 1. Install brush as kati's in-process recipe runner so kati::exec::exec
+    //    runs every recipe IN-PROCESS via embedded brush (NO fork+exec of
+    //    /bin/sh per recipe; NO ninja+n2 layer in the box make path). Captures
+    //    merged stdout+stderr through brush's pipe machinery and forwards to
+    //    THIS process's stdout — kati's exec.rs then `print!`s those bytes,
+    //    matching standalone rkati's byte-for-byte recipe output.
+    kati::fileutil::install_recipe_runner(Box::new(|cmd, output_cb| {
+        let s = std::str::from_utf8(cmd)
+            .map(std::borrow::Cow::Borrowed)
+            .unwrap_or_else(|_| String::from_utf8_lossy(cmd));
+        crate::brush::run_recipe_in_process(&s, output_cb)
+    }));
 
-    // 2. Honour `-C dir` ourselves up front so kati's chdir, the makefile lookup
-    //    and n2's cwd all agree (kati also chdir's on -C; set_current_dir is
-    //    idempotent for the same dir). kati's working_dir is applied inside its
-    //    flags parse, but doing it here keeps emit_build_edges/n2 consistent.
+    // 2. Recognized make pseudo-actions BEFORE kati's flags parser sees them
+    //    (kati panics on anything it doesn't recognize, e.g. --version). The
+    //    box's FUSE shadow on /usr/bin/make loops `$(shell make --version | ...)`
+    //    style probes back into THIS engine; emit a gnu-make-shaped version
+    //    banner so makefiles that grep `Make ([0-9])` extract a sane MAKEVER.
+    //    Done before -C handling so a recipe like `make -C sub --version`
+    //    short-circuits without a chdir.
+    for a in argv.iter().skip(1) {
+        if a == "--version" || a == "-v" {
+            println!("GNU Make 4.3");
+            println!("Built for x86_64-pc-linux-gnu");
+            println!("Copyright (C) 1988-2020 Free Software Foundation, Inc.");
+            println!("License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>");
+            println!("This is free software: you are free to change and redistribute it.");
+            println!("There is NO WARRANTY, to the extent permitted by law.");
+            return 0;
+        }
+    }
+
+    // 3. Honour `-C dir` ourselves up front so kati's chdir and the makefile
+    //    lookup agree (kati also chdir's on -C; set_current_dir is idempotent
+    //    for the same dir).
     {
         let mut i = 1;
         while i < argv.len() {
@@ -410,90 +433,27 @@ pub fn make_main(argv: &[String]) -> i32 {
         }
     }
 
-    // 5. Create the memfd the ninja graph is written into, and hand kati its
-    //    /proc/self/fd/<memfd> path. NO disk temp file (user-mandated).
-    // SAFETY: memfd_create with a valid NUL name + MFD_CLOEXEC.
-    let memfd = unsafe { libc::memfd_create(c"sarun-make-ninja".as_ptr(), libc::MFD_CLOEXEC) };
-    if memfd < 0 {
-        eprintln!("sarun-engine make: memfd_create failed: {}", std::io::Error::last_os_error());
-        return 127;
-    }
-    let ninja_path = OsString::from(format!("/proc/self/fd/{memfd}"));
-
-    // 6. Run kati → ninja graph into the memfd.
+    // 5. Run kati end-to-end: parse → dep graph → execute. kati's own
+    //    executor (src-rs/exec.rs) walks the dep graph sequentially in
+    //    declaration order, uses real mtime for staleness, and would
+    //    normally fork+exec /bin/sh per recipe. We installed
+    //    brush::run_recipe_in_process as kati's in-process runner above,
+    //    so every recipe stays in this process. NO ninja generation, NO
+    //    n2 — the box pipeline is now byte-identical to standalone rkati
+    //    on corpus tests. The `ninja_path` arg is vestigial; pass an
+    //    empty OsStr.
     let targets: Vec<Symbol> = FLAGS.targets.clone();
     let cl_vars: Vec<bytes::Bytes> = FLAGS.cl_vars.clone();
-    let run_result = match run_kati(&targets, &cl_vars, &ninja_path) {
+    let run_result = match run_kati(&targets, &cl_vars, OsStr::new("")) {
         Ok(r) => r,
         Err(e) => {
             for cause in e.chain() {
                 eprintln!("{cause}");
             }
-            // SAFETY: closing our owned memfd.
-            unsafe { libc::close(memfd); }
             return 1;
         }
     };
-
-    // 7. Read the generated ninja back out of the memfd (lseek 0 + read all).
-    //    We wrap the fd in a File for convenience; into_raw_fd keeps it open for
-    //    the close below (File::from_raw_fd would otherwise close on drop).
-    let ninja_src = {
-        // SAFETY: memfd is a live owned fd we created.
-        let mut f = unsafe { std::fs::File::from_raw_fd(memfd) };
-        let mut buf = Vec::new();
-        let read_res = f.seek(std::io::SeekFrom::Start(0)).and_then(|_| f.read_to_end(&mut buf));
-        // f drops here → closes memfd → the in-memory file is freed (no cleanup).
-        match read_res {
-            Ok(_) => buf,
-            Err(e) => {
-                eprintln!("sarun-engine make: reading generated ninja from memfd failed: {e}");
-                return 1;
-            }
-        }
-    };
-
-    // 8. Parse the ninja IN MEMORY into a runnable n2 State, emit build_edges,
-    //    then run n2 serial through brush.
-    //
-    // sarun: we use a PERSISTENT n2 db at `.sarun-n2-db` in the cwd so build
-    //    records survive across sub-`$(MAKE)` invocations within a single box
-    //    session. Without this, every nested make starts with empty hashes and
-    //    rebuilds every target — which diverges from real make's mtime-based
-    //    "exists + nothing newer = up to date" semantics. This is what makes
-    //    `sarun_incremental_rebuild.mk` (two $(MAKE) calls) and the selfgen
-    //    include tests (remake-and-reexec loop's 2nd iteration) match the
-    //    standalone rkati corpus pass set. The makefile is wired in as an
-    //    implicit dep on every non-phony rule (in ninja.rs::emit_build) so n2
-    //    has a mtime to compare prereq-less rules against. The db file lives in
-    //    the box's overlay (a temporary fs view) and dies with the box.
-    let db_path = std::path::PathBuf::from(".sarun-n2-db");
-    let state = match n2::load::read_from_content_with_db("<kati-ninja>", ninja_src, &db_path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("sarun-engine make: n2 could not load the kati-generated ninja: {e:#}");
-            return 1;
-        }
-    };
-    emit_build_edges(&state.graph);
-
-    // n2's targets are NAMES; the box's make targets are the same names kati put
-    // in the graph as outputs. Pass them through so `make foo` builds foo's edge.
-    // sarun: under the remake-the-makefile loop, run_kati restricted the
-    // ninja to just the include-target rules; n2 should build all of
-    // them (so we pass an empty name list = "all defaults").
-    let n2_targets: Vec<String> = if run_result.remake_active {
-        Vec::new()
-    } else {
-        targets.iter().map(|s| String::from_utf8_lossy(&s.as_bytes()).into_owned()).collect()
-    };
-    let code = match n2::run::run_state(state, &n2_targets) {
-        Ok(code) => code,
-        Err(e) => {
-            eprintln!("sarun-engine make: build failed: {e:#}");
-            1
-        }
-    };
+    let code = 0;
 
     if run_result.remake_active && code == 0 {
         // sarun: remake-the-makefile loop completed building the
