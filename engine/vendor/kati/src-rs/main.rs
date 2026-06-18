@@ -293,10 +293,16 @@ fn run(targets: &[Symbol], cl_vars: &Vec<Bytes>, orig_args: OsString) -> Result<
             kati::exec::exec(nodes, &mut ev)?;
         }
         // Re-exec ourselves with the same args. GLOB_CACHE et al. reset
-        // naturally because it's a fresh process.
+        // naturally because it's a fresh process. Use current_exe() for
+        // the actual binary path (argv[0] might be "make" via FUSE shadow
+        // / Command::arg0, which would PATH-resolve to a different
+        // binary), and preserve the original argv[0] for the new
+        // process.
         let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
         let argv0 = argv.first().cloned().unwrap_or_default();
-        let mut cmd = std::process::Command::new(&argv0);
+        let exe = std::env::current_exe().unwrap_or_else(|_| argv0.clone().into());
+        let mut cmd = std::process::Command::new(&exe);
+        std::os::unix::process::CommandExt::arg0(&mut cmd, &argv0);
         cmd.args(argv.iter().skip(1));
         cmd.env("SARUN_KATI_REMAKE_DEPTH", (depth + 1).to_string());
         let err = std::os::unix::process::CommandExt::exec(&mut cmd);
