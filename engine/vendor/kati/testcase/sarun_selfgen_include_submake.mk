@@ -1,4 +1,3 @@
-# TODO(rust)
 # Generated .mk uses $(MAKE) — testing recursive invocation hook-up.
 .DEFAULT_GOAL := all
 

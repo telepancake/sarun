@@ -247,6 +247,11 @@ pub struct Evaluator {
     /// target. Causes every make-defined variable to be exported into
     /// recipe environments, mirroring GNU make's behavior.
     pub export_all_vars: bool,
+    /// sarun: required `include` directives whose file didn't exist at
+    /// parse time, paired with the source location of the directive.
+    /// The remake-the-makefile loop in main.rs checks for rules
+    /// producing these names and builds + re-parses if any apply.
+    pub pending_remake_includes: Vec<(Loc, OsString)>,
     symbols_for_eval: HashSet<Symbol>,
 
     in_rule: bool,
@@ -294,6 +299,7 @@ impl Evaluator {
             rules: Vec::new(),
             exports: HashMap::new(),
             export_all_vars: false,
+            pending_remake_includes: Vec::new(),
             symbols_for_eval: HashSet::new(),
 
             in_rule: false,
@@ -904,24 +910,21 @@ impl Evaluator {
             let files = crate::fileutil::glob(pat.clone());
 
             if stmt.should_exist {
-                match files.as_ref() {
-                    Err(err) => {
-                        // TODO: Kati does not support building a missing include file.
-                        error_loc!(
-                            self.loc.as_ref(),
-                            "{}: {err}",
-                            String::from_utf8_lossy(&pat)
-                        );
-                    }
-                    Ok(files) => {
-                        if files.is_empty() {
-                            error_loc!(
-                                self.loc.as_ref(),
-                                "{}: Not found",
-                                String::from_utf8_lossy(&pat)
-                            );
-                        }
-                    }
+                let missing = match files.as_ref() {
+                    Err(_) => true,
+                    Ok(v) => v.is_empty(),
+                };
+                if missing {
+                    // sarun: defer "missing required include" to the remake
+                    // loop in main.rs. If a rule for this file is discovered
+                    // by the end of parse, main will build it and re-parse
+                    // the makefile (mirroring GNU make's
+                    // remake-the-makefile-then-re-exec behavior). If no rule
+                    // exists, main raises the error after the loop settles.
+                    let loc = self.loc.clone().unwrap_or_default();
+                    self.pending_remake_includes
+                        .push((loc, OsString::from_vec(pat.to_vec())));
+                    continue;
                 }
             }
             let Ok(files) = files.as_ref() else {

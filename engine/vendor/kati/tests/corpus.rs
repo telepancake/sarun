@@ -61,6 +61,10 @@ fn make_norms() -> Vec<Norm> {
         normalize_quotes(),
         norm(r"make(?:\[\d+\])?: (Entering|Leaving) directory[^\n]*\n", ""),
         norm(r"make(?:\[\d+\])?: ", ""),
+        // sarun: real make prints `"X" is up to date.` after a
+        // skip-recipe run; rkati doesn't, and we shouldn't pollute every
+        // incremental build with that. Strip the whole line.
+        norm(r#""[^"\n]+" is up to date\.\n"#, ""),
         norm(" recipe for target ", " commands for target "),
         norm(" recipe commences ", " commands commence "),
         norm(r"missing rule before recipe\.", "missing rule before commands."),
@@ -313,9 +317,11 @@ fn corpus_pass_rate() {
         // Normalize the recipe-echo line — and ONLY that, anchored to start
         // of line — so submake_basic and friends diff cleanly without
         // catching "make" embedded in error messages.
-        let make_invoke_re = regex_lite::Regex::new(r"(?m)^make ").unwrap();
+        // Strip "make " at line start OR right after a recipe-prefix
+        // ('+' for recursive-make, '-' for ignore-error, '@' for silent).
+        let make_invoke_re = regex_lite::Regex::new(r"(?m)(^|[+\-@])make ").unwrap();
         let mk_canon = make_invoke_re
-            .replace_all(&String::from_utf8_lossy(&mk_out), "$$(MAKE) ")
+            .replace_all(&String::from_utf8_lossy(&mk_out), "${1}$$(MAKE) ")
             .into_owned();
         let rkati_invocation = format!(
             "{} --use_find_emulator SHELL=/bin/bash ",
