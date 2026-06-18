@@ -499,8 +499,15 @@ impl<'a> DepBuilder<'a> {
         // gone; we leave it). Belongs in the warn list.
         // sarun: .NOTPARALLEL is a no-op for us because the executor
         // runs one recipe at a time anyway — there's nothing parallel to
-        // serialize. So no warning, no diff with real make.
-        let noop_for_us = [".PRECIOUS", ".SECONDARY", ".NOTPARALLEL"];
+        // serialize. .INTERMEDIATE asks for post-build deletion of the
+        // marked targets; we don't delete, but the user-observable
+        // recipe output is identical, and warning would diverge it.
+        let noop_for_us = [
+            ".PRECIOUS",
+            ".SECONDARY",
+            ".NOTPARALLEL",
+            ".INTERMEDIATE",
+        ];
         // sarun: .EXPORT_ALL_VARIABLES isn't a rule whose recipe runs —
         // it's a flag that tells make to export every variable into the
         // recipe environment. Flip the Evaluator flag if present.
@@ -514,7 +521,6 @@ impl<'a> DepBuilder<'a> {
             self.secondexpansion = true;
         }
         let real_unsupported = [
-            ".INTERMEDIATE",
             ".IGNORE",
             ".LOW_RESOLUTION_TIME",
             ".SILENT",
