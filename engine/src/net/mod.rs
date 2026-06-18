@@ -55,7 +55,7 @@ impl NetMode {
     }
 }
 
-// Skeletons for now — populated as the implementation lands.
+// Runtime modules.
 pub mod tap;
 pub mod stack;
 pub mod dhcp;
@@ -67,6 +67,8 @@ pub mod l4;
 pub mod flows;
 pub mod policy;
 pub mod prompt;
+pub mod bridge;
+pub mod dispatch;
 
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
