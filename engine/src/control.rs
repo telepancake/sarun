@@ -644,6 +644,17 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
     let name = name.unwrap_or_else(|| format!("A{id}"));
     let env_capture = msg.get("want_env").and_then(Value::as_bool).unwrap_or(false);
     let direct = msg.get("want_direct").and_then(Value::as_bool).unwrap_or(false);
+    // D-parent flags. `want_no_parent` is the runner's explicit "this box has
+    // NO parent and the lower chain does NOT bottom at the host /": the box's
+    // own contents are its entire filesystem (the bottom of an OCI image
+    // stack). It overrides the kernel-derived parent walk, so even a runner
+    // nested under another box can declare itself a rootfs.
+    let want_no_parent = msg.get("want_no_parent")
+        .and_then(Value::as_bool).unwrap_or(false);
+    let want_readonly_parent = msg.get("want_readonly_parent")
+        .and_then(Value::as_bool).unwrap_or(false);
+    let want_frozen = msg.get("want_frozen")
+        .and_then(Value::as_bool).unwrap_or(false);
     let want_capture = msg.get("want_capture").and_then(Value::as_bool)
         .unwrap_or(true) && !direct;
     let backing = crate::paths::live_home().join(id.to_string());
@@ -665,6 +676,24 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
     b.set_direct(direct);
     b.set_is_brush(msg.get("want_brush").and_then(Value::as_bool).unwrap_or(false));
     b.set_meta("name", &name);
+    // D-parent: `want_no_parent` strips any kernel-derived parent AND closes
+    // the lower chain so reads never fall through to the real host. It's the
+    // "OCI rootfs" / "Dockerfile FROM scratch" semantic. Mid-stack and top
+    // boxes can independently mark themselves frozen / readonly-parent.
+    let mut parent = parent;
+    if want_no_parent {
+        parent = None;
+        b.set_no_host_fallback(true);
+        b.set_meta("no_host_fallback", "1");
+    }
+    if want_readonly_parent {
+        b.set_readonly_parent(true);
+        b.set_meta("readonly_parent", "1");
+    }
+    if want_frozen {
+        b.set_frozen(true);
+        b.set_meta("frozen", "1");
+    }
     if let Some(p) = parent {
         b.set_parent(Some(p));
         b.set_meta("parent_box_id", &p.to_string());

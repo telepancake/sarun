@@ -422,6 +422,24 @@ impl NestCtx {
     fn live(&self, id: i64) -> Option<std::sync::Arc<crate::capture::BoxState>> {
         self.overlay.as_ref().and_then(|o| o.live_box(id))
     }
+
+    /// D-parent: is `id`'s `readonly_parent` flag set? A live box answers
+    /// straight from its BoxState; an at-rest box reads the sqlar meta. The
+    /// flag is a child's ATTITUDE toward its parent — it stops `apply` from
+    /// promoting captured changes into the parent box's overlay.
+    fn readonly_parent_of(&self, id: i64) -> bool {
+        if let Some(cb) = self.live(id) {
+            return cb.readonly_parent();
+        }
+        let p = crate::paths::state_home().join(format!("{id}.sqlar"));
+        if let Ok(conn) = rusqlite::Connection::open_with_flags(
+            &p, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) {
+            return conn.query_row(
+                "SELECT value FROM meta WHERE key='readonly_parent'", [],
+                |r| r.get::<_, String>(0)).ok().as_deref() == Some("1");
+        }
+        false
+    }
 }
 
 fn row_of(conn: &Connection, rel: &str) -> Option<(i64, u32, Option<Vec<u8>>)> {
@@ -539,19 +557,28 @@ pub fn apply(id: i64, paths: &Value, ctx: &NestCtx) -> Value {
         return json!({"applied": [], "errors": [{"path": "", "error": "no archive"}]});
     };
     let parent = ctx.parent_of(id);
+    // D-parent: a child marked `readonly_parent` REFUSES to promote into its
+    // parent — its captured changes can be reviewed/discarded but never leak
+    // up the box stack. Same flag also blocks the top-level host-materialize
+    // when a no-parent box has it set (e.g. an OCI rootfs that should never
+    // touch the host). The error string is the same shape Python returns so
+    // the UI's error pane works uniformly.
+    let ro_parent = ctx.readonly_parent_of(id);
     let resolve = |b: i64| ctx.live(b);
     let mut applied = vec![];
     let mut errors = vec![];
     for rel in paths_arg(id, paths) {
         let rel = rel.trim_start_matches('/').to_string();
-        let result = match parent {
+        let result = if ro_parent {
+            Err("parent is read-only (--readonly-parent); apply refused".into())
+        } else { match parent {
             Some(p) => {
                 // Nested box: promote into the parent's overlay, not the host.
                 let plive = ctx.live(p);
                 promote_into_parent(id, p, plive.as_deref(), &rel, &resolve)
             }
             None => materialize(&conn, id, &rel),  // top-level: write the host
-        };
+        }};
         match result {
             Ok(()) => {
                 if let Some((rowid, _, _)) = row_of(&conn, &rel) {

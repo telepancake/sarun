@@ -175,7 +175,7 @@ fn open_tap(name: &str) -> Result<OwnedFd> {
     // IFF_TAP | IFF_NO_PI (no extra packet info header on each read)
     req.flags = (0x0002 | 0x1000) as i16;
     const TUNSETIFF: libc::c_ulong = 0x400454ca;
-    let r = unsafe { libc::ioctl(owned.as_raw_fd(), TUNSETIFF, &mut req) };
+    let r = unsafe { libc::ioctl(owned.as_raw_fd(), TUNSETIFF as _, &mut req) };
     if r < 0 { bail!("TUNSETIFF: {}", std::io::Error::last_os_error()); }
     Ok(owned)
 }
@@ -205,7 +205,7 @@ fn ifflags(name: &str) -> Result<i16> {
     let mut req: IfreqFlags = unsafe { std::mem::zeroed() };
     write_name(&mut req.name, name)?;
     const SIOCGIFFLAGS: libc::c_ulong = 0x8913;
-    let r = unsafe { libc::ioctl(s.as_raw_fd(), SIOCGIFFLAGS, &mut req) };
+    let r = unsafe { libc::ioctl(s.as_raw_fd(), SIOCGIFFLAGS as _, &mut req) };
     if r < 0 { bail!("SIOCGIFFLAGS: {}", std::io::Error::last_os_error()); }
     Ok(req.flags)
 }
@@ -216,9 +216,9 @@ fn set_link_up(name: &str) -> Result<()> {
     write_name(&mut req.name, name)?;
     const SIOCGIFFLAGS: libc::c_ulong = 0x8913;
     const SIOCSIFFLAGS: libc::c_ulong = 0x8914;
-    let _ = unsafe { libc::ioctl(s.as_raw_fd(), SIOCGIFFLAGS, &mut req) };
+    let _ = unsafe { libc::ioctl(s.as_raw_fd(), SIOCGIFFLAGS as _, &mut req) };
     req.flags |= 0x1; // IFF_UP
-    let r = unsafe { libc::ioctl(s.as_raw_fd(), SIOCSIFFLAGS, &mut req) };
+    let r = unsafe { libc::ioctl(s.as_raw_fd(), SIOCSIFFLAGS as _, &mut req) };
     if r < 0 { bail!("SIOCSIFFLAGS up({name}): {}", std::io::Error::last_os_error()); }
     Ok(())
 }
@@ -232,7 +232,7 @@ fn set_mac(name: &str, mac: [u8; 6]) -> Result<()> {
     req.hwaddr.sa_family = 1; // ARPHRD_ETHER
     for i in 0..6 { req.hwaddr.sa_data[i] = mac[i] as libc::c_char; }
     const SIOCSIFHWADDR: libc::c_ulong = 0x8924;
-    let r = unsafe { libc::ioctl(s.as_raw_fd(), SIOCSIFHWADDR, &req) };
+    let r = unsafe { libc::ioctl(s.as_raw_fd(), SIOCSIFHWADDR as _, &req) };
     if r < 0 { bail!("SIOCSIFHWADDR: {}", std::io::Error::last_os_error()); }
     Ok(())
 }
@@ -280,7 +280,7 @@ fn add_default_route(gw: [u8; 4]) -> Result<()> {
     // RTF_UP | RTF_GATEWAY
     r.rt_flags = 0x0001 | 0x0002;
     const SIOCADDRT: libc::c_ulong = 0x890B;
-    let rc = unsafe { libc::ioctl(s.as_raw_fd(), SIOCADDRT, &r) };
+    let rc = unsafe { libc::ioctl(s.as_raw_fd(), SIOCADDRT as _, &r) };
     if rc < 0 { bail!("SIOCADDRT default→{:?}: {}", gw, std::io::Error::last_os_error()); }
     Ok(())
 }
@@ -309,7 +309,7 @@ fn add_neigh(ip: [u8; 4], mac: [u8; 6], ifname: &str) -> Result<()> {
     a.arp_flags = 0x02 | 0x04;  // ATF_COM | ATF_PERM
     write_name(&mut a.arp_dev, ifname)?;
     const SIOCSARP: libc::c_ulong = 0x8955;
-    let rc = unsafe { libc::ioctl(s.as_raw_fd(), SIOCSARP, &a) };
+    let rc = unsafe { libc::ioctl(s.as_raw_fd(), SIOCSARP as _, &a) };
     if rc < 0 { bail!("SIOCSARP {:?}: {}", ip, std::io::Error::last_os_error()); }
     Ok(())
 }
@@ -322,7 +322,7 @@ fn assign_ip(name: &str, ip: [u8; 4], prefix: u8) -> Result<()> {
     req.addr.sin_family = libc::AF_INET as u16;
     req.addr.sin_addr = libc::in_addr { s_addr: u32::from_ne_bytes(ip) };
     const SIOCSIFADDR: libc::c_ulong = 0x8916;
-    let r = unsafe { libc::ioctl(s.as_raw_fd(), SIOCSIFADDR, &req) };
+    let r = unsafe { libc::ioctl(s.as_raw_fd(), SIOCSIFADDR as _, &req) };
     if r < 0 { bail!("SIOCSIFADDR({name}): {}", std::io::Error::last_os_error()); }
     // Netmask.
     let mut req: IfreqAddr = unsafe { std::mem::zeroed() };
@@ -331,7 +331,7 @@ fn assign_ip(name: &str, ip: [u8; 4], prefix: u8) -> Result<()> {
     let mask: u32 = if prefix == 0 { 0 } else { !0u32 << (32 - prefix) };
     req.addr.sin_addr = libc::in_addr { s_addr: mask.to_be() };
     const SIOCSIFNETMASK: libc::c_ulong = 0x891c;
-    let r = unsafe { libc::ioctl(s.as_raw_fd(), SIOCSIFNETMASK, &req) };
+    let r = unsafe { libc::ioctl(s.as_raw_fd(), SIOCSIFNETMASK as _, &req) };
     if r < 0 { bail!("SIOCSIFNETMASK({name}): {}", std::io::Error::last_os_error()); }
     let _ = ifflags(name)?; // suppress unused warning if it ever drifts
     Ok(())
