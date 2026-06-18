@@ -472,11 +472,28 @@ impl<'a> DepBuilder<'a> {
             }
         }
 
-        let unsupported_builtin_targets = vec![
+        // Built-in pseudo-targets that change behavior we don't model.
+        // Sorted by whether NOT supporting them actually changes the
+        // build result in our kati→n2→brush pipeline:
+        //
+        //   noop_for_us — semantics are "don't delete this file". n2
+        //   never deletes intermediates anyway, so the user's intent
+        //   is preserved for free; rebuild semantics (mtime / dep
+        //   checks) are unchanged. Silently accept, don't warn.
+        //
+        //   real_unsupported — these DO change parse / scheduling /
+        //   variable / file-lifetime semantics we can't honor. We
+        //   warn so the user knows their build may run differently
+        //   than under GNU make.
+        //
+        // Note .INTERMEDIATE specifically: opposite of .SECONDARY —
+        // it asks make to DELETE the file after build. We don't, so
+        // it's a real semantic divergence (user expects the file
+        // gone; we leave it). Belongs in the warn list.
+        let noop_for_us = [".PRECIOUS", ".SECONDARY"];
+        let real_unsupported = [
             ".DEFAULT",
-            ".PRECIOUS",
             ".INTERMEDIATE",
-            ".SECONDARY",
             ".SECONDEXPANSION",
             ".IGNORE",
             ".LOW_RESOLUTION_TIME",
@@ -485,7 +502,12 @@ impl<'a> DepBuilder<'a> {
             ".NOTPARALLEL",
             ".ONESHELL",
         ];
-        for p in unsupported_builtin_targets {
+        for p in noop_for_us {
+            // Touch the symbol so the rule is consumed; the "don't
+            // delete" part is implicit (n2 keeps everything).
+            let _ = self.get_rule_inputs(intern(p));
+        }
+        for p in real_unsupported {
             if let Some((_, loc)) = self.get_rule_inputs(intern(p)) {
                 warn_loc!(Some(&loc), "kati doesn't support {p}");
             }
