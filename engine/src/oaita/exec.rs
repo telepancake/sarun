@@ -7,6 +7,7 @@
 // uppercase-leading token). One box per session — so the same conversation's
 // shell calls compose, just like a long-lived terminal.
 
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use crate::oaita::tools::{ExecResult, summarize_patch, fit_output,
@@ -24,6 +25,15 @@ pub trait Executor: Send + Sync {
     /// box). Plain `shell` tool calls pass false — no need for proxy
     /// access on user scripts.
     fn run(&self, box_id: &str, script: &str, discard: bool, api_access: bool) -> ExecResult;
+
+    /// Materialize the box if it doesn't exist yet, and return the host-side
+    /// path to its merged view — `<mnt>/<box_id>/` — where reads see lower⊕
+    /// upper and writes STAGE in the box's upper layer (same as `shell`
+    /// writes). The file-inspection tools (inspect/read/write) prefix paths
+    /// with this so they see the box's view, not the raw host. Returns None
+    /// when this executor doesn't sandbox (LocalExecutor) — the tools then
+    /// fall back to host paths.
+    fn box_root(&self, box_id: &str) -> Option<PathBuf>;
 }
 
 /// The persistent-box name for a session. Capital-letters prefix keeps it
@@ -75,6 +85,22 @@ fn default_sarun() -> String {
 }
 
 impl Executor for SarunExecutor {
+    fn box_root(&self, _box_id: &str) -> Option<PathBuf> {
+        // TEMPORARY: returns None until we pick a sandboxing strategy for
+        // file IO. The naive idea — `mnt_point().join(box_id)` — doesn't
+        // work because sarun only mounts a box's overlay at `<mnt>/<id>`
+        // WHILE a `sarun run` process is actively holding it; the mount
+        // goes away as soon as the process exits. So a one-shot `sarun
+        // run BOX -- true` to "materialize" the box gives us a path that
+        // unmounts before we can read/write through it. Until we either
+        //   (a) hold a supervisor process open per session, or
+        //   (b) route IO through ephemeral `sarun run BOX -- cat`/`tee`
+        // every read/write keeps going to the host directly (the existing
+        // leak documented under the `write` tool). The trait method is
+        // ready; the implementation is awaiting an architectural call.
+        None
+    }
+
     fn run(&self, box_id: &str, script: &str, discard: bool, api_access: bool) -> ExecResult {
         // For discard mode use a one-shot PEEK box launched as a CHILD of
         // the persistent session box. The dotted name `BOX.PEEK` is sarun's
@@ -160,6 +186,8 @@ impl Executor for SarunExecutor {
 pub struct LocalExecutor;
 
 impl Executor for LocalExecutor {
+    fn box_root(&self, _box_id: &str) -> Option<PathBuf> { None }
+
     fn run(&self, _box_id: &str, script: &str, _discard: bool, _api_access: bool) -> ExecResult {
         let out = Command::new("sh")
             .args(["-c", script])
