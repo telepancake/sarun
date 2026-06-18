@@ -6260,8 +6260,24 @@ mod tests {
         }
         assert!(saw_pong, "expected a 'pong' live event on the subscribe feed");
 
-        // a structural event (delete) should arrive and refresh the App.
+        // A fresh box registration should ALSO broadcast — this was
+        // missing for a long time (engine sent session_removed and
+        // session_renamed but never session_added) and the UI was
+        // silently never seeing new boxes until detach/restart.
         let (sid, _root) = make_box(&eng.sock);
+        let mut saw_added = false;
+        for _ in 0..10 {
+            if let Ok(ev) = rx.recv_timeout(Duration::from_secs(2)) {
+                if ev.get("type").and_then(Value::as_str) == Some("session_added")
+                   && ev.get("sid").and_then(Value::as_str) == Some(sid.as_str()) {
+                    saw_added = true;
+                    break;
+                }
+            }
+        }
+        assert!(saw_added, "expected a 'session_added' event after register");
+
+        // a structural event (delete) should arrive and refresh the App.
         let mut app = App::new(eng.sock.clone());
         let _ = rpc(&eng.sock, "delete", json!([sid.clone()]));
         let mut saw_removed = false;

@@ -686,6 +686,18 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
         }
     }
     ov.add_box(std::sync::Arc::new(b));
+    // Announce the new box on the subscribe stream so attached UIs
+    // rebuild their session list WITHOUT a manual refresh. on_event
+    // already handles session_added/removed/renamed identically — it
+    // just never fired here because we forgot to broadcast it.
+    // session_removed (in delete / kill paths) and session_renamed
+    // (in rename) were getting sent; this is the missing third leg.
+    broadcast(state, &json!({
+        "type": "session_added",
+        "sid": id.to_string(),
+        "name": name,
+        "parent": parent,
+    }));
     let root = crate::paths::mnt_point().join(id.to_string());
 
     // ── Networking (-n boxes only) ────────────────────────────────────────
@@ -1111,6 +1123,15 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
                         b.set_meta("parent_box_id", &p.to_string());
                     }
                     ov.add_box(std::sync::Arc::new(b));
+                    // Same announce as register(): attached UIs need
+                    // to know a new box exists. Without this the
+                    // session list only updates on the next event of
+                    // any kind (or a manual refresh).
+                    broadcast(state, &json!({
+                        "type": "session_added",
+                        "sid": id.to_string(),
+                        "parent": parent,
+                    }));
                     json!({"sid": id.to_string(),
                            "root": crate::paths::mnt_point().join(id.to_string())
                                    .to_string_lossy()})

@@ -100,6 +100,12 @@ struct Inner {
     fhs: RwLock<HashMap<u64, Mutex<Fh>>>,
     next_fh: AtomicU64,
     rules: RwLock<crate::rules::Rules>,  // passthrough decisions (reload verb)
+    /// Lazy shadowing for -b boxes: at lookup/open time, if the
+    /// box-relative path matches one of the compiled glob patterns,
+    /// the FUSE layer serves `self_exe` (the engine binary) instead
+    /// of the host file. NO pre-enumeration of the host filesystem —
+    /// matching is per-lookup, the way the user asked for it.
+    shadows: RwLock<Shadows>,
     // ── live echo mux (the captured-output readback channel) ──
     // Per-box framed writer over the box's ONE muxed connection: the sink-write
     // handler frames captured bytes as ECHO and sends them back to --inner.
@@ -204,6 +210,73 @@ fn proc_facets(pid: u32) -> (String, String, Vec<String>) {
     (exe, cwd, argv)
 }
 
+/// Compiled shadow-pattern globs, loaded from the user's
+/// shadow_sh.glob / shadow_make.glob / shadow_ninja.glob in
+/// config_home. Empty file → empty patterns → no shadowing.
+/// Missing file → historical defaults (matches the old hardcoded
+/// shadow set so existing users see no behavior change).
+#[derive(Clone, Debug, Default)]
+struct Shadows {
+    sh: Vec<glob::Pattern>,
+    make: Vec<glob::Pattern>,
+    ninja: Vec<glob::Pattern>,
+    /// The engine binary path on the host. None if current_exe()
+    /// failed (very unusual; we can't shadow without it).
+    self_exe: Option<PathBuf>,
+}
+
+impl Shadows {
+    fn load() -> Self {
+        Self {
+            sh: load_glob_lines(
+                &crate::paths::shadow_sh_glob_path(),
+                &["/bin/sh", "/usr/bin/sh",
+                  "/bin/bash", "/usr/bin/bash",
+                  "/bin/dash", "/usr/bin/dash"]),
+            make: load_glob_lines(
+                &crate::paths::shadow_make_glob_path(),
+                &["/bin/make", "/usr/bin/make",
+                  "/bin/gmake", "/usr/bin/gmake"]),
+            ninja: load_glob_lines(
+                &crate::paths::shadow_ninja_glob_path(),
+                &["/bin/ninja", "/usr/bin/ninja"]),
+            self_exe: std::env::current_exe().ok(),
+        }
+    }
+}
+
+fn load_glob_lines(file: &std::path::Path, defaults: &[&str])
+    -> Vec<glob::Pattern>
+{
+    let raw: Vec<String> = match std::fs::read_to_string(file) {
+        Ok(s) => s.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(String::from)
+            .collect(),
+        Err(_) => defaults.iter().map(|s| (*s).to_string()).collect(),
+    };
+    raw.iter().filter_map(|p| {
+        // Patterns SHOULD be absolute (the FUSE matcher prepends '/'
+        // to the box-relative path). Relative patterns would silently
+        // not match anything; loudly skip with a hint instead.
+        if !p.starts_with('/') {
+            eprintln!("sarun-engine: shadow glob {p:?} ignored \
+                       (must be an absolute path; e.g. /bin/sh, \
+                       /opt/**/bin/make)");
+            return None;
+        }
+        match glob::Pattern::new(p) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                eprintln!("sarun-engine: shadow glob {p:?} is not a \
+                           valid pattern: {e}");
+                None
+            }
+        }
+    }).collect()
+}
+
 enum Layer {
     Absent,
     UpperFile { owner: i64, rowid: i64, mode: u32 },
@@ -256,6 +329,7 @@ impl Overlay {
             passthrough_ok: std::sync::atomic::AtomicBool::new(false),
             daemon_reads: AtomicU64::new(0),
             events: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            shadows: RwLock::new(Shadows::load()),
         }) };
         // Test observability: if SARUN_STATS_FILE is set, a thread writes
         // "passthrough=<0|1> daemon_reads=<n>" to it (survives the SIGTERM
@@ -274,7 +348,42 @@ impl Overlay {
     }
 
 
+    /// Reload the shadow_sh / shadow_make / shadow_ninja globs from
+    /// disk. Called by the `reload_rules` control verb (so the user
+    /// edits all three families together with one RPC) AND on first
+    /// box-attach so a fresh edit lands without an engine restart.
+    pub fn reload_shadows(&self) {
+        *self.inner.shadows.write().unwrap() = Shadows::load();
+    }
+
+    /// True if `rel` (a box-relative path, no leading '/') matches
+    /// any compiled shadow pattern. Caller gates on b.is_brush().
+    /// Cheap (pattern.matches_str over a small Vec) — no filesystem
+    /// access. Used by both lookup/getattr and open to decide whether
+    /// to serve the engine binary in place of the host file.
+    fn shadow_matches(&self, rel: &str) -> bool {
+        let full = if rel.starts_with('/') { rel.to_string() }
+                   else { format!("/{rel}") };
+        let p = std::path::Path::new(&full);
+        let s = self.inner.shadows.read().unwrap();
+        s.sh.iter().any(|pat| pat.matches_path(p))
+            || s.make.iter().any(|pat| pat.matches_path(p))
+            || s.ninja.iter().any(|pat| pat.matches_path(p))
+    }
+
+    /// The host path of the engine binary — what we serve as the
+    /// shadow target. Cloned out under the read lock; the path
+    /// rarely changes during a run (only on Shadows::reload).
+    fn shadow_target_path(&self) -> Option<PathBuf> {
+        let s = self.inner.shadows.read().unwrap();
+        s.self_exe.clone()
+    }
+
     pub fn reload_rules(&self) {
+        // One reload covers both rules.txt AND the three shadow_*.glob
+        // files — they're all "things on disk the user can edit while
+        // the engine is running". One control verb, two reloads.
+        self.reload_shadows();
         *self.inner.rules.write().unwrap() = crate::rules::Rules::load();
     }
 
@@ -578,7 +687,25 @@ impl Overlay {
     /// Attributes for (box, rel) through the FULL merge (own → parent chain →
     /// host), or None when absent.
     fn attr_of(&self, b: &BoxState, ino: u64, rel: &str) -> Option<FileAttr> {
-        match self.resolve(b.id, rel) {
+        let layer = self.resolve(b.id, rel);
+        // Brush-mode shadow: if the box is -b AND this lookup falls
+        // through to the lower (host) AND the rel matches one of the
+        // compiled shadow patterns, serve the engine binary's attrs.
+        // If the box wrote to this path (UpperFile / UpperSymlink /
+        // ...) the upper wins — the shadow only kicks in for the
+        // host-passthrough case.
+        if matches!(layer, Layer::Lower) && b.is_brush() && self.shadow_matches(rel) {
+            if let Some(exe) = self.shadow_target_path() {
+                if let Ok(md) = std::fs::metadata(&exe) {
+                    let mut a = self.attr_from_md(ino, &md);
+                    a.kind = FileType::RegularFile;
+                    // Keep exec bits — most shadow targets are
+                    // /bin/sh-shaped things the box wants to exec.
+                    return Some(a);
+                }
+            }
+        }
+        match layer {
             Layer::Absent => None,
             Layer::Lower => self.lower_attr(ino, rel),
             Layer::UpperFile { owner, rowid, mode } => {
@@ -825,11 +952,20 @@ impl Filesystem for Overlay {
                     Err(_) => return reply.error(Errno::EIO),
                 }
             }
-            Layer::Lower => match File::open(self.host(&rel)) {
-                // D3: open-for-write stays on the LOWER file (read-only) until
-                // the first write op arrives — opens are free.
-                Ok(f) => (Some(f), false),
-                Err(_) => return reply.error(Errno::EACCES),
+            Layer::Lower => {
+                // Brush-mode shadow: open the engine binary instead
+                // of the host file when this rel matches a shadow
+                // pattern. Read-only — the box never writes back
+                // through the shadow (anyone trying to copy-on-write
+                // /bin/sh would land here too, but write opens are
+                // gated above and this branch is read-only-passthrough).
+                let host = if b.is_brush() && self.shadow_matches(&rel) {
+                    self.shadow_target_path().unwrap_or_else(|| self.host(&rel))
+                } else { self.host(&rel) };
+                match File::open(host) {
+                    Ok(f) => (Some(f), false),
+                    Err(_) => return reply.error(Errno::EACCES),
+                }
             },
             _ => return reply.error(Errno::ENOENT),
         };
