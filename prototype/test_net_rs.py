@@ -278,6 +278,58 @@ def test_n_box_writes_pcapng_and_keylog():
         eng.stop()
 
 
+def test_n_box_flows_list_via_tshark():
+    """The engine exposes the captured flows back to the UI by running
+    tshark inside a `run_on_untrusted`-style bwrap: host / ro-bound, every
+    namespace unshared (including net — tshark CAN'T phone home), caps
+    dropped, env cleared, the box's flows dir ro-bound at /tmp/ut. We
+    drive it via the `flows.list` control verb and assert the resulting
+    rows include the HTTPS handshake's SNI and the decrypted HTTP GET /."""
+    skip_if_no_binary()
+    skip_if_offline()
+    if shutil.which("tshark") is None:
+        import pytest
+        pytest.skip("tshark not installed")
+    eng = Engine("TST9")
+    try:
+        eng.start()
+        r = eng.run("-n", "--", "curl", "-sS", "-m", "15", "-o", "/dev/null",
+                    "https://example.com/")
+        assert r.returncode == 0, r.stderr
+        # Drive flows.list over the control socket; the box's session_id is
+        # the integer 1 (first box this engine handed out).
+        import json
+        msg = json.dumps({"type": "ui", "verb": "flows.list",
+                          "args": ["1"]}).encode() + b"\n"
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.connect(str(eng.sock_path))
+            s.sendall(msg)
+            # Read one line of reply (the engine's dispatch_ui is one-shot).
+            buf = b""
+            s.settimeout(10.0)
+            while b"\n" not in buf and len(buf) < 1_000_000:
+                chunk = s.recv(65536)
+                if not chunk: break
+                buf += chunk
+        line = buf.split(b"\n", 1)[0]
+        resp = json.loads(line)
+        # Whole response is wrapped: {"ok": true, "r": <inner>}
+        inner = resp.get("r") or resp
+        assert inner.get("ok"), f"flows.list errored: {inner}"
+        flows = inner["flows"]
+        # Sanity: at least one TLS handshake (with example.com SNI) and one
+        # decrypted HTTP row.
+        snis = [f["sni"] for f in flows if f["sni"]]
+        hosts = [f["host"] for f in flows if f["host"]]
+        methods = [f["method"] for f in flows if f["method"]]
+        assert "example.com" in snis, f"no SNI=example.com in {flows!r}"
+        assert "example.com" in hosts, \
+            f"no decrypted Host=example.com in {flows!r}"
+        assert "GET" in methods, f"no decrypted GET in {flows!r}"
+    finally:
+        eng.stop()
+
+
 def test_n_box_quic_blocked():
     """UDP other than :53 is dropped at the stack — there's no listener
     bound. curl's --http3-only sends a QUIC Initial UDP packet to :443;

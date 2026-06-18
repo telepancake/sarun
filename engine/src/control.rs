@@ -432,6 +432,16 @@ fn find_named_child(boxes: &std::collections::BTreeMap<i64, discover::Box_>,
         .map(|b| b.box_id)
 }
 
+fn selected_sid(state: &State) -> Option<i64> {
+    state.lock().unwrap().selected.as_ref()
+        .and_then(|s| s.parse::<i64>().ok())
+}
+
+fn flows_dir_for(box_id: i64) -> Option<std::path::PathBuf> {
+    let d = crate::paths::state_home().join(format!("flows/box{box_id}"));
+    if d.is_dir() { Some(d) } else { None }
+}
+
 fn arg_sid(args: &[Value]) -> Option<i64> {
     args.first()?.as_str()?.parse().ok()
 }
@@ -1112,6 +1122,37 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
             match (arg_sid(args), args.get(1).and_then(Value::as_str)) {
                 (Some(id), Some(rel)) => crate::review::struct_quick(id, rel),
                 _ => json!({"lines": [["err", "bad args"]], "job": Value::Null}),
+            }
+        }
+        // ── flows pane: tshark-decoded HTTP/TLS rows for one box's pcapng ──
+        // flows.list  [SID]              → {ok, flows: [row, ...]}
+        // flows.detail [SID, FRAME]      → {ok, text: "..."}
+        // SID may be omitted to mean the currently-selected box.
+        "flows.list" => {
+            match arg_sid(args).or_else(|| selected_sid(state)) {
+                Some(id) => match flows_dir_for(id) {
+                    Some(dir) => match crate::net::flows::tshark_list(&dir) {
+                        Ok(rows) => json!({"ok": true,
+                            "flows": rows.iter().map(|r| r.to_json())
+                                .collect::<Vec<_>>()}),
+                        Err(e) => json!({"ok": false, "error": e}),
+                    },
+                    None => json!({"ok": false, "error": "no flows dir for box"}),
+                },
+                None => json!({"ok": false, "error": "no box selected"}),
+            }
+        }
+        "flows.detail" => {
+            let frame = args.get(1).and_then(Value::as_u64).unwrap_or(0);
+            match arg_sid(args).or_else(|| selected_sid(state)) {
+                Some(id) if frame > 0 => match flows_dir_for(id) {
+                    Some(dir) => match crate::net::flows::tshark_detail(&dir, frame) {
+                        Ok(text) => json!({"ok": true, "text": text}),
+                        Err(e) => json!({"ok": false, "error": e}),
+                    },
+                    None => json!({"ok": false, "error": "no flows dir for box"}),
+                },
+                _ => json!({"ok": false, "error": "bad args"}),
             }
         }
         "struct_finish" => match args.first().and_then(Value::as_i64) {
