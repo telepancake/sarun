@@ -3068,11 +3068,29 @@ fn keybar_spans(app: &App) -> Vec<Span<'static>> {
         _ => None,
     };
     let active = view_of(app.focus);
+    // Per-section presence in the current box's summary: hide chips that
+    // would lead to a 45 %-wide pane containing only "no rows yet" for
+    // THIS box. We always show the chip for the active view (so the
+    // user can see where they are even if they forced their way in) and
+    // for boxes / changes / rules / help (those always make sense — a
+    // fresh box's "no changes yet" is the whole point of staring at it).
+    let has = |k: &str| app.box_summary.get(k)
+        .and_then(Value::as_array).map(|a| !a.is_empty()).unwrap_or(false);
+    let show_procs    = has("processes") || app.focus == Pane::Processes;
+    let show_outputs  = has("outputs")   || app.focus == Pane::Outputs;
+    let show_pipes    = has("pipelines") || app.focus == Pane::Pipelines;
+    let show_build    = has("edges")     || app.focus == Pane::BuildEdges;
     let mut spans: Vec<Span<'static>> = Vec::new();
-    for (key, label) in [('b', "boxes"), ('c', "changes"),
-                         ('p', "procs"), ('o', "outputs"),
-                         ('l', "pipes"), ('g', "build"),
-                         ('e', "rules")] {
+    let chips: Vec<(char, &str)> = [
+        Some(('b', "boxes")),
+        Some(('c', "changes")),
+        if show_procs   { Some(('p', "procs"))   } else { None },
+        if show_outputs { Some(('o', "outputs")) } else { None },
+        if show_pipes   { Some(('l', "pipes"))   } else { None },
+        if show_build   { Some(('g', "build"))   } else { None },
+        Some(('e', "rules")),
+    ].into_iter().flatten().collect();
+    for (key, label) in chips {
         let on = active.map(|(k, _, _)| k == key).unwrap_or(false);
         let chip_style = if on {
             Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
