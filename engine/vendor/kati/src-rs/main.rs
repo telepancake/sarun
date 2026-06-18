@@ -111,8 +111,11 @@ fn run(targets: &[Symbol], cl_vars: &Vec<Bytes>, orig_args: OsString) -> Result<
 
     let mut ev = Evaluator::new();
     ev.start()?;
+    // sarun: GNU make's MAKEFILE_LIST has no leading space — the main
+    // makefile is the very first word. Kati used to seed it with " name",
+    // which leaked an extra space into any recipe that referenced
+    // $(MAKEFILE_LIST) (e.g. `echo  Makefile` instead of `echo Makefile`).
     let mut makefile_list = BytesMut::new();
-    makefile_list.put_u8(b' ');
     makefile_list.put_slice(FLAGS.makefile.lock().clone().unwrap().as_bytes());
     intern("MAKEFILE_LIST").set_global_var(
         Variable::with_simple_string(
