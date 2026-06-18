@@ -413,6 +413,84 @@ impl Overlay {
         rel == stripped
     }
 
+    /// True when `rel` is the substituted oaita.toml OR one of its ancestor
+    /// directories — so that the self-hide gate keeps the path TO the file
+    /// reachable even when the parent dirs (config_home) are otherwise
+    /// hidden. Used by lookup/readdir exemption for `--api` boxes.
+    fn oaita_config_ancestor_or_self(rel: &str) -> bool {
+        let host = crate::paths::oaita_config_path();
+        let s = host.to_string_lossy();
+        let stripped = s.strip_prefix('/').unwrap_or(&s);
+        if rel == stripped { return true; }
+        // rel is a strict directory ancestor of the safe toml path.
+        // Compare component-wise: `stripped` starts with `rel/`.
+        stripped.starts_with(&format!("{rel}/"))
+    }
+
+    /// True when `rel` is the in-box oaita state dir, an ancestor of it,
+    /// or WITHIN it — the path tree the in-box oaita CLI needs writable
+    /// to persist its own session folders. `--api` boxes use this to
+    /// punch through the otherwise-blanket self-hide of state_home so the
+    /// in-box `oaita add` / `oaita run` can write to the natural XDG
+    /// location without colliding with host sessions (each box gets its
+    /// own copy via the overlay — host sessions remain hidden through
+    /// the rest of state_home).
+    fn oaita_state_ancestor_self_or_within(rel: &str) -> bool {
+        let host = crate::paths::oaita_state_home();
+        let s = host.to_string_lossy();
+        let stripped = s.strip_prefix('/').unwrap_or(&s);
+        if rel == stripped { return true; }
+        // ancestor of the dir
+        if stripped.starts_with(&format!("{rel}/")) { return true; }
+        // descendant of the dir
+        rel.starts_with(&format!("{stripped}/"))
+    }
+
+    /// True when `rel` falls inside one of sarun's OWN host directories —
+    /// data_home / config_home / state_home / runtime_home. Those hold the
+    /// engine's runtime artifacts (sqlar files, sockets, blobs, the CA
+    /// bundle, the per-box pool, oaita.toml) and have no business being
+    /// visible to a sandboxed box: visibility there lets the box re-enter
+    /// its own overlay, read other boxes' sqlars, lift the api_key, or get
+    /// its own writes captured as "changes" when something accidentally
+    /// touches a path it has via passthrough. Hiding is component-wise:
+    /// any rel inside or equal to one of the four roots is treated as
+    /// absent. Mirrors the Python prototype's behaviour (commit 9e9138b).
+    ///
+    /// Note: --api `oaita.toml` substitution is checked BEFORE this hide,
+    /// so the substituted safe toml is still served to api boxes even
+    /// though config_home is otherwise hidden.
+    fn is_engine_path(rel: &str) -> bool {
+        // Cache the four (already-stripped) roots so the per-lookup cost is
+        // just four string compares against `rel`.
+        use std::sync::OnceLock;
+        static ROOTS: OnceLock<Vec<String>> = OnceLock::new();
+        let roots = ROOTS.get_or_init(|| {
+            [crate::paths::data_home(),
+             crate::paths::config_home(),
+             crate::paths::state_home(),
+             crate::paths::runtime_home()]
+                .iter()
+                .map(|p| {
+                    let s = p.to_string_lossy().into_owned();
+                    s.strip_prefix('/').unwrap_or(&s).to_string()
+                })
+                .filter(|s| !s.is_empty())
+                .collect()
+        });
+        for r in roots {
+            if rel == r { return true; }
+            // subtree match — `rel` starts with `r/`
+            if rel.len() > r.len() + 1
+                && rel.starts_with(r)
+                && rel.as_bytes()[r.len()] == b'/'
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn reload_rules(&self) {
         // One reload covers both rules.txt AND the three shadow_*.glob
         // files — they're all "things on disk the user can edit while
@@ -998,6 +1076,17 @@ impl Filesystem for Overlay {
         let ino = self.ino_for(&(bid, rel.clone()));
         if prel.is_empty() && sink_stream(&rel).is_some() {
             return reply.entry(&TTL, &self.synth_file_attr(ino), Generation(0));
+        }
+        // Engine self-hide: sarun's own host dirs are invisible to boxes.
+        // --api substitution path is checked inside attr_of BEFORE this,
+        // so the substituted oaita.toml stays visible for api boxes.
+        if b.is_api()
+            && (Self::oaita_config_ancestor_or_self(&rel)
+                || Self::oaita_state_ancestor_self_or_within(&rel))
+        {
+            // exempt — fall through to normal lookup
+        } else if Self::is_engine_path(&rel) {
+            return reply.error(Errno::ENOENT);
         }
         match self.attr_of(&b, ino, &rel) {
             Some(a) => reply.entry(&TTL, &a, Generation(0)),
@@ -1826,8 +1915,24 @@ impl Filesystem for Overlay {
             return reply.ok();
         }
         let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
-        for (i, (name, kind, cino, _)) in
-            self.scan_dir(&b, &rel, false).into_iter().enumerate() {
+        // Engine self-hide: omit children that resolve to one of sarun's
+        // own host dirs. --api oaita.toml is exempt (the substituted file
+        // stays visible). Matches lookup's gate, so a ls/readdir agrees
+        // with stat: nothing tells the box that hidden dirs ever existed.
+        let entries: Vec<_> = self.scan_dir(&b, &rel, false).into_iter()
+            .filter(|(name, _, _, _)| {
+                let child_rel = if rel.is_empty() { name.clone() }
+                                else { format!("{rel}/{name}") };
+                if b.is_api()
+                    && (Self::oaita_config_ancestor_or_self(&child_rel)
+                        || Self::oaita_state_ancestor_self_or_within(&child_rel))
+                {
+                    return true;
+                }
+                !Self::is_engine_path(&child_rel)
+            })
+            .collect();
+        for (i, (name, kind, cino, _)) in entries.into_iter().enumerate() {
             if (i as u64) < offset { continue; }
             if reply.add(INodeNo(cino), (i + 1) as u64, kind, name) {
                 break;
@@ -1864,8 +1969,21 @@ impl Filesystem for Overlay {
             return reply.ok();
         }
         let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
-        for (i, (name, _k, cino, attr)) in
-            self.scan_dir(&b, &rel, true).into_iter().enumerate() {
+        // Engine self-hide (mirrors readdir's filter) — see is_engine_path.
+        let entries: Vec<_> = self.scan_dir(&b, &rel, true).into_iter()
+            .filter(|(name, _, _, _)| {
+                let child_rel = if rel.is_empty() { name.clone() }
+                                else { format!("{rel}/{name}") };
+                if b.is_api()
+                    && (Self::oaita_config_ancestor_or_self(&child_rel)
+                        || Self::oaita_state_ancestor_self_or_within(&child_rel))
+                {
+                    return true;
+                }
+                !Self::is_engine_path(&child_rel)
+            })
+            .collect();
+        for (i, (name, _k, cino, attr)) in entries.into_iter().enumerate() {
             if (i as u64) < offset { continue; }
             let Some(a) = attr else { continue };
             if reply.add(INodeNo(cino), (i + 1) as u64, name, &TTL, &a,
