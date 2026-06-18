@@ -1,13 +1,27 @@
 # sarun: vendored lib-only patched fork of kati (github.com/google/kati).
 # Upstream commit: 7eb37cd16ed29b90335983689d3c6caabc17ca70 (2026-05-26).
-# Patches are minimal and marked `// sarun:`. The [[bin]]/[[bench]] targets and
-# the tikv-jemallocator #[global_allocator] (which lived in main.rs only) are
-# dropped so none of that compiles into the engine; criterion is dropped (it
-# was a bench-only dep).
+# Patches are minimal and marked `// sarun:`. The [[bench]] target is dropped
+# so criterion isn't pulled in; the upstream `[[bin]] rkati` is kept but gated
+# on the `kati-corpus` feature — it is built only when running the compat
+# corpus (`tests/corpus.rs`), never as part of the engine. The
+# `tikv-jemallocator` global allocator (linux-only, lived in main.rs) and the
+# `find_emulator` helper bin are dropped.
+#
+# Compat target: GNU make 4.3 (what Ubuntu 22.04 LTS ships, what upstream
+# kati's docker tests against). The `testcase/` directory is upstream's
+# verbatim corpus; `cargo test --features kati-corpus` diffs each `.mk`'s
+# normalized output between system `make` and our `rkati` and reports
+# `KATI_COMPAT_PASS=N/total`.
 [package]
 name = "kati"
 version = "0.1.0"
 edition = "2024"
+
+[features]
+# Build the `rkati` binary and the `tests/corpus.rs` test that exercises it
+# against the vendored upstream testcase corpus. Off by default — the engine
+# does not need rkati-the-binary, only kati-the-library.
+kati-corpus = []
 
 [dependencies]
 anyhow = "1.0.98"
@@ -19,5 +33,14 @@ memchr = "2.7.4"
 os_pipe = "1.2.1"
 parking_lot = { version = "0.12.3" }
 
+[dev-dependencies]
+regex-lite = "0.1"
+tempfile = "3"
+
 [lib]
 path = "src-rs/lib.rs"
+
+[[bin]]
+name = "rkati"
+path = "src-rs/main.rs"
+required-features = ["kati-corpus"]
