@@ -3,3 +3,6 @@ __pycache__/
 .claude/
 # Top-level symlink created by `make engine[-musl]` pointing at the build artifact.
 /sarun
+# Scratch dir for `sarun run -b -C <dir> -- make` smoke tests when iterating
+# on box-mode kati behavior (see kati corpus runner work).
+/.corpus-staging/
