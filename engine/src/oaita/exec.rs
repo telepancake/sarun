@@ -76,9 +76,32 @@ fn default_sarun() -> String {
 
 impl Executor for SarunExecutor {
     fn run(&self, box_id: &str, script: &str, discard: bool, api_access: bool) -> ExecResult {
-        // For discard mode use a one-shot PEEK box; for the persistent case
-        // run into `box_id`. Either way we get capture + overlay.
-        let target = if discard { format!("{box_id}-PEEK") } else { box_id.to_string() };
+        // For discard mode use a one-shot PEEK box launched as a CHILD of
+        // the persistent session box. The dotted name `BOX.PEEK` is sarun's
+        // shorthand for "parent=BOX, name=PEEK" — control.rs's register
+        // splits the prefix and sets parent_box_id when the parent exists.
+        //
+        // Why a CHILD instead of a sibling:
+        //   sibling PEEK shares only `host` as its lower layer, so writes
+        //   the persistent box staged (e.g. /root/fft512.sh) are INVISIBLE
+        //   to it — model wrote a file in turn N+1 and `bash that-file`
+        //   returned "No such file or directory" in turn N+2.
+        //   child PEEK has lower chain `host → persistent → upper`, so it
+        //   sees the persistent box's writes AND its own writes are still
+        //   discarded after the run.
+        let target = if discard {
+            // Make sure the persistent parent exists FIRST: dotted names
+            // require an extant parent prefix or register errors out.
+            let _ = Command::new(&self.sarun)
+                .args(["run", box_id, "--", "true"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            format!("{box_id}.PEEK")
+        } else {
+            box_id.to_string()
+        };
         crate::oaita::trace::event("exec.run", serde_json::json!({
             "box": target, "discard": discard, "api_access": api_access,
             "script_len": script.len(),
