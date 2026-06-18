@@ -36,6 +36,7 @@ pub mod driver;
 pub mod exec;
 pub mod ids;
 pub mod inspect;
+pub mod pretty;
 pub mod proxy;
 pub mod replay;
 pub mod tools;
