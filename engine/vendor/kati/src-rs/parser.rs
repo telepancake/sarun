@@ -716,7 +716,11 @@ impl Parser {
         match directive {
             b"define" => self.parse_define(rest)?,
             b"override" => self.parse_override(rest)?,
-            b"export" => self.parse_export(rest)?,
+            // sarun: when we're already inside `export`, a second `export`
+            // word is the name of a variable being exported (real make
+            // tolerates a variable literally called `export`). Don't
+            // recurse — let the caller treat the line as the var-name.
+            b"export" if !self.is_in_export() => self.parse_export(rest)?,
             b"undefine" => self.parse_undefine(rest)?,
             _ => return Ok(false),
         }
