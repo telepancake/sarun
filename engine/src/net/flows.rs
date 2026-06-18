@@ -86,6 +86,9 @@ pub struct FlowRow {
     pub method: String,
     pub uri: String,
     pub status: String,
+    /// tshark's tcp.stream id (per-connection u32). Lets the UI ask for
+    /// every packet in this flow's stream via `tshark_packets`.
+    pub stream: i64,       // -1 when tshark couldn't fill it in
 }
 
 impl FlowRow {
@@ -95,6 +98,31 @@ impl FlowRow {
             "src": self.src, "dst": self.dst,
             "sni": self.sni, "host": self.host,
             "method": self.method, "uri": self.uri, "status": self.status,
+            "stream": self.stream,
+        })
+    }
+}
+
+/// One row per ethernet frame in a tcp.stream. Used by the
+/// packet-list drill-down in the flows pane.
+#[derive(Clone, Debug)]
+pub struct PacketRow {
+    pub frame: u64,
+    pub t: f64,
+    pub src: String,
+    pub dst: String,
+    pub proto: String,   // tshark's _ws.col.protocol (TCP / TLSv1.3 / HTTP / …)
+    pub len: u32,
+    pub info: String,    // tshark's _ws.col.info
+}
+
+impl PacketRow {
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "frame": self.frame, "t": self.t,
+            "src": self.src, "dst": self.dst,
+            "proto": self.proto, "len": self.len,
+            "info": self.info,
         })
     }
 }
@@ -179,14 +207,20 @@ fn find_flows_files(box_state_root: &Path) -> Option<(PathBuf, PathBuf)> {
     Some((pcap, keys))
 }
 
-const FIELDS: &[&str] = &[
+const FLOW_FIELDS: &[&str] = &[
     "frame.number", "frame.time_relative", "ip.src", "ip.dst",
     "tls.handshake.extensions_server_name",
     "http.host", "http.request.method", "http.request.uri", "http.response.code",
+    "tcp.stream",
+];
+
+const PACKET_FIELDS: &[&str] = &[
+    "frame.number", "frame.time_relative", "ip.src", "ip.dst",
+    "_ws.col.protocol", "frame.len", "_ws.col.info",
 ];
 
 /// Parse tshark `-T fields` tab-separated output into FlowRows.
-fn parse_field_rows(out: &str) -> Vec<FlowRow> {
+fn parse_flow_rows(out: &str) -> Vec<FlowRow> {
     out.lines().filter_map(|line| {
         let mut it = line.split('\t');
         let frame: u64 = it.next()?.parse().ok()?;
@@ -198,10 +232,27 @@ fn parse_field_rows(out: &str) -> Vec<FlowRow> {
         let method = it.next().unwrap_or("").to_string();
         let uri = it.next().unwrap_or("").to_string();
         let status = it.next().unwrap_or("").to_string();
+        let stream: i64 = it.next().unwrap_or("").parse().unwrap_or(-1);
         // Drop fully-empty rows (junk between blocks).
         if sni.is_empty() && host.is_empty() && method.is_empty()
             && status.is_empty() { return None; }
-        Some(FlowRow { frame, t, src, dst, sni, host, method, uri, status })
+        Some(FlowRow { frame, t, src, dst, sni, host, method, uri, status,
+                       stream })
+    }).collect()
+}
+
+/// Parse the packet-list tshark output.
+fn parse_packet_rows(out: &str) -> Vec<PacketRow> {
+    out.lines().filter_map(|line| {
+        let mut it = line.split('\t');
+        let frame: u64 = it.next()?.parse().ok()?;
+        let t: f64 = it.next()?.parse().unwrap_or(0.0);
+        let src = it.next().unwrap_or("").to_string();
+        let dst = it.next().unwrap_or("").to_string();
+        let proto = it.next().unwrap_or("").to_string();
+        let len: u32 = it.next().unwrap_or("").parse().unwrap_or(0);
+        let info = it.next().unwrap_or("").to_string();
+        Some(PacketRow { frame, t, src, dst, proto, len, info })
     }).collect()
 }
 
@@ -209,16 +260,32 @@ fn parse_field_rows(out: &str) -> Vec<FlowRow> {
 /// request/response rows + TLS ClientHello (so the user sees SNIs for
 /// connections that didn't decrypt for whatever reason).
 pub fn tshark_list(box_state_root: &Path) -> Result<Vec<FlowRow>, String> {
-    let argv = ["tshark", "-r", "{pcap}",
-                "-o", "tls.keylog_file:{keys}",
-                "-Y", "http or tls.handshake.type==1",
-                "-T", "fields",
-                "-e", FIELDS[0], "-e", FIELDS[1],
-                "-e", FIELDS[2], "-e", FIELDS[3],
-                "-e", FIELDS[4], "-e", FIELDS[5],
-                "-e", FIELDS[6], "-e", FIELDS[7], "-e", FIELDS[8]];
+    let mut argv: Vec<&str> = vec![
+        "tshark", "-r", "{pcap}",
+        "-o", "tls.keylog_file:{keys}",
+        "-Y", "http or tls.handshake.type==1",
+        "-T", "fields",
+    ];
+    for f in FLOW_FIELDS { argv.push("-e"); argv.push(f); }
     let out = run_tshark_in_box_sandbox(box_state_root, &argv)?;
-    Ok(parse_field_rows(&out))
+    Ok(parse_flow_rows(&out))
+}
+
+/// Every frame in `tcp.stream == STREAM` — i.e. the whole TCP connection
+/// the user clicked into. Powers the packet-list drill-down on the flows
+/// pane. Returns rows in time order (tshark already emits them ordered).
+pub fn tshark_packets(box_state_root: &Path, stream: i64)
+                      -> Result<Vec<PacketRow>, String> {
+    let filter = format!("tcp.stream == {stream}");
+    let mut argv: Vec<&str> = vec![
+        "tshark", "-r", "{pcap}",
+        "-o", "tls.keylog_file:{keys}",
+        "-Y", &filter,
+        "-T", "fields",
+    ];
+    for f in PACKET_FIELDS { argv.push("-e"); argv.push(f); }
+    let out = run_tshark_in_box_sandbox(box_state_root, &argv)?;
+    Ok(parse_packet_rows(&out))
 }
 
 /// Verbose dissection of one frame: `tshark -V` filtered to that frame.

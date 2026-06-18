@@ -1155,6 +1155,24 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
                 _ => json!({"ok": false, "error": "bad args"}),
             }
         }
+        // flows.packets [SID, STREAM] → every frame in `tcp.stream == STREAM`
+        // (i.e. the connection the user just drilled into from the flows
+        // list pane). Powers the packet-list view inside Pane::Packets.
+        "flows.packets" => {
+            let stream = args.get(1).and_then(Value::as_i64).unwrap_or(-1);
+            match arg_sid(args).or_else(|| selected_sid(state)) {
+                Some(id) if stream >= 0 => match flows_dir_for(id) {
+                    Some(dir) => match crate::net::flows::tshark_packets(&dir, stream) {
+                        Ok(rows) => json!({"ok": true,
+                            "packets": rows.iter().map(|r| r.to_json())
+                                .collect::<Vec<_>>()}),
+                        Err(e) => json!({"ok": false, "error": e}),
+                    },
+                    None => json!({"ok": false, "error": "no flows dir for box"}),
+                },
+                _ => json!({"ok": false, "error": "bad args"}),
+            }
+        }
         "struct_finish" => match args.first().and_then(Value::as_i64) {
             Some(job) => crate::review::struct_finish(job),
             None => json!({"lines": [["err", "bad job"]]}),
