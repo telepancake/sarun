@@ -1,4 +1,3 @@
-# TODO(rust)
 # Two sub-make invocations in series: the second pass should be a no-op
 # because `thing` already exists and has no newer prereqs. If kati treats
 # every file target as out-of-date across invocations (issue #260), the
