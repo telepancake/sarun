@@ -54,6 +54,7 @@ struct Parser {
     out_stmts: Arc<Mutex<Vec<Stmt>>>,
 
     define_name: Option<Bytes>,
+    define_op: AssignOp,
     num_define_nest: i32,
     define_start: usize,
     define_start_line: i32,
@@ -79,6 +80,7 @@ impl Parser {
             out_stmts: stmts,
 
             define_name: None,
+            define_op: AssignOp::Eq,
             num_define_nest: 0,
             define_start: 0,
             define_start_line: 0,
@@ -307,7 +309,16 @@ impl Parser {
         if line.is_empty() {
             error_loc!(Some(&self.loc), "*** empty variable name.");
         }
-        self.define_name = Some(line);
+        // sarun: GNU make 3.82+ accepts `define NAME OP` where OP is one of
+        // `=`, `:=`, `::=`, `?=`, `+=`. Detect the trailing op so we drive
+        // the right path in the evaluator (simple-expand at define-time for
+        // `:=`, append for `+=`, etc). Without this kati treated everything
+        // as plain `=` and discarded the operator suffix as part of the name,
+        // which silently broke `define X :=` (the name was "X :=" instead
+        // of "X", and lookup of "X" returned undefined).
+        let (name, op) = split_define_assign_op(&line);
+        self.define_name = Some(line.slice_ref(name));
+        self.define_op = op;
         self.num_define_nest = 1;
         self.define_start = 0;
         self.define_start_line = self.loc.line;
@@ -360,11 +371,12 @@ impl Parser {
             lhs,
             rhs,
             orig_rhs,
-            AssignOp::Eq,
+            self.define_op,
             self.current_directive,
             false,
         ));
         self.define_name = None;
+        self.define_op = AssignOp::Eq;
         Ok(())
     }
 
@@ -661,6 +673,32 @@ fn parse_buf_no_stats_impl(
     let mut p = Parser::with_buf(buf, loc, stmts.clone(), fixed_lineno);
     p.parse()?;
     Ok(stmts)
+}
+
+/// sarun: parse the header of `define NAME [OP]` — strip the trailing
+/// assignment operator (if any) and return (name_slice, op). Recognizes
+/// `=`, `:=`, `::=`, `?=`, `+=`. `::=` is treated as `:=` (POSIX form;
+/// kati already lacks `:::=` which is make-4.4-only). When no operator
+/// suffix is present, returns (trimmed_line, AssignOp::Eq).
+pub fn split_define_assign_op(line: &[u8]) -> (&[u8], AssignOp) {
+    let trimmed = trim_right_space(line);
+    if let Some(rest) = trimmed.strip_suffix(b"=") {
+        let rest_t = trim_right_space(rest);
+        if let Some(name) = rest_t.strip_suffix(b"::") {
+            return (trim_right_space(name), AssignOp::ColonEq);
+        }
+        if let Some(name) = rest_t.strip_suffix(b":") {
+            return (trim_right_space(name), AssignOp::ColonEq);
+        }
+        if let Some(name) = rest_t.strip_suffix(b"+") {
+            return (trim_right_space(name), AssignOp::PlusEq);
+        }
+        if let Some(name) = rest_t.strip_suffix(b"?") {
+            return (trim_right_space(name), AssignOp::QuestionEq);
+        }
+        return (rest_t, AssignOp::Eq);
+    }
+    (trimmed, AssignOp::Eq)
 }
 
 pub struct ParsedAssign<'a> {
