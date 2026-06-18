@@ -172,7 +172,17 @@ fn read_bootstrap_makefile(targets: &[Symbol]) -> anyhow::Result<Arc<Mutex<Vec<k
 /// analysis + generate the ninja graph into `ninja_path` (our memfd path). This
 /// is a faithful port of upstream kati main.rs `run()` restricted to the
 /// generate-ninja branch (the only mode sarun uses). Returns Ok on success.
-fn run_kati(targets: &[Symbol], cl_vars: &[bytes::Bytes], ninja_path: &OsStr) -> anyhow::Result<()> {
+/// Result of run_kati. `remake_active` means the makefile had at least
+/// one required `include` of a file that the same makefile has a rule
+/// for; n2 will build the include target(s) first, then the caller
+/// re-execs the engine so the next invocation parses with the
+/// freshly-generated content visible (GNU make's remake-the-makefile
+/// loop).
+struct RunKatiResult {
+    remake_active: bool,
+}
+
+fn run_kati(targets: &[Symbol], cl_vars: &[bytes::Bytes], ninja_path: &OsStr) -> anyhow::Result<RunKatiResult> {
     let start_time = std::time::SystemTime::now();
     let mut ev = Evaluator::new();
     ev.start()?;
@@ -246,10 +256,40 @@ fn run_kati(targets: &[Symbol], cl_vars: &[bytes::Bytes], ninja_path: &OsStr) ->
         }
     }
 
+    // sarun: GNU make's remake-the-makefile loop. After parse, if a
+    // required `include` named a file that didn't exist at parse time
+    // AND a rule for it is in ev.rules, build THOSE targets first;
+    // make_main will then re-exec the engine so the second parse sees
+    // the freshly-generated content. If no rule applies, raise the
+    // canonical error and exit.
+    let mut remake_targets: Vec<Symbol> = Vec::new();
+    {
+        let pending = std::mem::take(&mut ev.pending_remake_includes);
+        for (loc, name) in &pending {
+            let sym = intern(name.as_bytes().to_vec());
+            if ev.rules.iter().any(|r| r.outputs.contains(&sym)) {
+                remake_targets.push(sym);
+            } else {
+                let pat_str = String::from_utf8_lossy(name.as_bytes());
+                eprintln!("{loc}: {pat_str}: No such file or directory");
+                std::process::exit(2);
+            }
+        }
+    }
+    let remake_active = !remake_targets.is_empty();
+
     let nodes: Vec<NamedDepNode>;
     {
         let _frame = ev.enter(FrameType::Phase, bytes::Bytes::from_static(b"*dependency analysis*"), Loc::default());
-        nodes = make_dep(&mut ev, targets.to_owned())?;
+        // When remaking, only build the include targets in this
+        // invocation; the user's real targets get built in the
+        // re-exec'd process.
+        let dep_targets = if remake_active {
+            remake_targets.clone()
+        } else {
+            targets.to_owned()
+        };
+        nodes = make_dep(&mut ev, dep_targets)?;
     }
 
     // sarun: stage explicit (and, under .EXPORT_ALL_VARIABLES, every)
@@ -299,7 +339,7 @@ fn run_kati(targets: &[Symbol], cl_vars: &[bytes::Bytes], ninja_path: &OsStr) ->
         generate_ninja_to_path(&nodes, &mut ev, start_time, ninja_path)?;
         ev.finish()?;
     }
-    Ok(())
+    Ok(RunKatiResult { remake_active })
 }
 
 /// Walk the n2 graph and emit ONE `build_edges` control frame carrying every
@@ -378,14 +418,17 @@ pub fn make_main(argv: &[String]) -> i32 {
     // 6. Run kati → ninja graph into the memfd.
     let targets: Vec<Symbol> = FLAGS.targets.clone();
     let cl_vars: Vec<bytes::Bytes> = FLAGS.cl_vars.clone();
-    if let Err(e) = run_kati(&targets, &cl_vars, &ninja_path) {
-        for cause in e.chain() {
-            eprintln!("{cause}");
+    let run_result = match run_kati(&targets, &cl_vars, &ninja_path) {
+        Ok(r) => r,
+        Err(e) => {
+            for cause in e.chain() {
+                eprintln!("{cause}");
+            }
+            // SAFETY: closing our owned memfd.
+            unsafe { libc::close(memfd); }
+            return 1;
         }
-        // SAFETY: closing our owned memfd.
-        unsafe { libc::close(memfd); }
-        return 1;
-    }
+    };
 
     // 7. Read the generated ninja back out of the memfd (lseek 0 + read all).
     //    We wrap the fd in a File for convenience; into_raw_fd keeps it open for
@@ -418,12 +461,46 @@ pub fn make_main(argv: &[String]) -> i32 {
 
     // n2's targets are NAMES; the box's make targets are the same names kati put
     // in the graph as outputs. Pass them through so `make foo` builds foo's edge.
-    let n2_targets: Vec<String> = targets.iter().map(|s| String::from_utf8_lossy(&s.as_bytes()).into_owned()).collect();
-    match n2::run::run_state(state, &n2_targets) {
+    // sarun: under the remake-the-makefile loop, run_kati restricted the
+    // ninja to just the include-target rules; n2 should build all of
+    // them (so we pass an empty name list = "all defaults").
+    let n2_targets: Vec<String> = if run_result.remake_active {
+        Vec::new()
+    } else {
+        targets.iter().map(|s| String::from_utf8_lossy(&s.as_bytes()).into_owned()).collect()
+    };
+    let code = match n2::run::run_state(state, &n2_targets) {
         Ok(code) => code,
         Err(e) => {
             eprintln!("sarun-engine make: build failed: {e:#}");
             1
         }
+    };
+
+    if run_result.remake_active && code == 0 {
+        // sarun: remake-the-makefile loop completed building the
+        // generated includes. Re-exec the engine binary with the same
+        // argv so the second invocation parses the makefile with the
+        // freshly-generated content visible (matches GNU make's
+        // self-re-exec). Capped via SARUN_KATI_REMAKE_DEPTH.
+        let depth: u32 = std::env::var("SARUN_KATI_REMAKE_DEPTH")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        if depth >= 5 {
+            eprintln!("*** kati: remake-the-makefile loop exceeded 5 iterations");
+            return 2;
+        }
+        let argv_os: Vec<std::ffi::OsString> = std::env::args_os().collect();
+        let argv0 = argv_os.first().cloned().unwrap_or_default();
+        let exe = std::env::current_exe().unwrap_or_else(|_| argv0.clone().into());
+        let mut cmd = std::process::Command::new(&exe);
+        std::os::unix::process::CommandExt::arg0(&mut cmd, &argv0);
+        cmd.args(argv_os.iter().skip(1));
+        cmd.env("SARUN_KATI_REMAKE_DEPTH", (depth + 1).to_string());
+        let err = std::os::unix::process::CommandExt::exec(&mut cmd);
+        eprintln!("*** kati: failed to re-exec for remake: {err}");
+        return 2;
     }
+    code
 }
