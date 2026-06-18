@@ -184,14 +184,21 @@ pub fn generate(spec: &str, set: &Settings) -> Result<Vec<PathBuf>, String> {
     let final_name = turn_filename(number, "assistant", Some(&new_slug),
                                    None, final_flags);
     let final_path = target_path.parent().unwrap().join(final_name);
-    // Only rewrite the file content if we stripped a header / made it terminal.
-    if body != content || !kept_partial || new_slug != target_slug {
-        let _ = fs::write(&target_path, &body);
+    // Tool-call-ONLY reply (no prose): the streamed content is empty and we
+    // already persist each call as its own c-flagged turn below. Drop the
+    // empty assistant placeholder rather than banking a 0-byte turn that
+    // would look like a settled answer to `run`'s settle check.
+    if body.is_empty() && !tool_calls.is_empty() {
+        let _ = fs::remove_file(&target_path);
+    } else {
+        if body != content || !kept_partial || new_slug != target_slug {
+            let _ = fs::write(&target_path, &body);
+        }
+        if final_path != target_path {
+            let _ = fs::rename(&target_path, &final_path);
+        }
+        if !body.is_empty() { produced.push(final_path.clone()); }
     }
-    if final_path != target_path {
-        let _ = fs::rename(&target_path, &final_path);
-    }
-    if !body.is_empty() { produced.push(final_path.clone()); }
 
     // Persist tool calls as `c`-flagged assistant turns. ONE turn per call.
     let mut taken: HashSet<String> = existing.clone();
