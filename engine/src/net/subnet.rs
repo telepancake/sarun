@@ -38,7 +38,16 @@ impl BoxSubnet {
 
     pub fn netmask(self) -> [u8; 4] { [255, 255, 0, 0] }
 
-    pub fn prefix_len(self) -> u8 { 16 }
+    /// /16 — what the engine-side smoltcp Interface claims (so it can
+    /// receive packets destined to any synth-pool IP).
+    pub fn engine_prefix_len(self) -> u8 { 16 }
+
+    /// /30 — what the BOX's kernel sees on the TAP. With only .0.1 (gw)
+    /// and .0.2 (box) in the subnet, anything else (including synth pool
+    /// IPs) routes via the default route → gateway → engine. Without this
+    /// the box would believe synth IPs are on-link and try to ARP them
+    /// directly (and smoltcp won't proxy-ARP for the whole /16).
+    pub fn box_prefix_len(self) -> u8 { 30 }
 
     /// Yield synth-pool addresses .1.0 .. .255.254 (skipping .1.255 etc. broadcasts
     /// would be over-engineered: the /16 has one bcast at .255.255 and we just

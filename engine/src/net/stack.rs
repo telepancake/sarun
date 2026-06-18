@@ -33,10 +33,28 @@ use super::dns::DnsServer;
 use super::flows::FlowsLog;
 use super::subnet::BoxSubnet;
 
-const LISTEN_POOL: usize = 32;
-const TCP_RX_BUF: usize = 64 * 1024;
-const TCP_TX_BUF: usize = 64 * 1024;
+// smoltcp won't accept a 0-port listen, so we bind a per-port pool covering
+// the ports the box might realistically dial. Each port gets `LISTENERS_PER_PORT`
+// idle sockets; as soon as one is claimed, a fresh listener is bound to the
+// same port so concurrent connections still go through.
+const LISTENERS_PER_PORT: usize = 4;
+const TCP_RX_BUF: usize = 32 * 1024;
+const TCP_TX_BUF: usize = 32 * 1024;
 const UDP_BUF: usize = 32 * 1024;
+
+/// Ports the box's TCP traffic gets terminated on. Anything else falls
+/// through smoltcp with no listener → RST to the box (which is a fine signal
+/// that the destination port isn't reachable through the proxy).
+const LISTEN_PORTS: &[u16] = &[
+    22, 25, 53, 80, 110, 143, 443, 465, 587, 993, 995,
+    1025, 1080, 1433, 1521, 1883, 2049, 2375, 2376, 3000, 3128,
+    3306, 4000, 4040, 4321, 5000, 5044, 5060, 5061, 5222, 5432,
+    5601, 5672, 5900, 5984, 6000, 6379, 6443, 7000, 7474,
+    7687, 8000, 8001, 8008, 8080, 8081, 8082, 8086, 8088,
+    8443, 8500, 8888, 9000, 9001, 9042, 9090, 9091, 9092,
+    9200, 9300, 9418, 10000, 10250, 11211, 15672, 25565, 27017,
+    50051, 50052,
+];
 
 /// A handle on an established TCP connection inside the stack, plus the
 /// destination it was dialed at (recovered from the smoltcp socket's
@@ -183,6 +201,15 @@ fn run_poll_loop(rt: Arc<StackRuntime>, tap_fd: OwnedFd,
         let _ = addrs.push(IpCidr::new(
             IpAddress::Ipv4(Ipv4Address::from(rt.gateway_ip)), 16));
     });
+    // any_ip = "process packets to ANY routable unicast address, not just
+    // the one configured on the interface". The synth-pool IPs are not
+    // configured (only the gateway is), so without any_ip + a covering
+    // route, smoltcp rejects SYNs to 240.X.1.0 etc. The route below points
+    // every Class E address back through our own gateway IP — smoltcp's
+    // any_ip path then sees "next-hop is myself" and terminates locally.
+    iface.set_any_ip(true);
+    iface.routes_mut().add_default_ipv4_route(
+        Ipv4Address::from(rt.gateway_ip)).ok();
 
     let mut sockets = SocketSet::new(vec![]);
 
@@ -214,8 +241,13 @@ fn run_poll_loop(rt: Arc<StackRuntime>, tap_fd: OwnedFd,
         sockets.add(s)
     };
 
-    let mut listen_pool: VecDeque<SocketHandle> = VecDeque::new();
-    for _ in 0..LISTEN_POOL { listen_pool.push_back(add_listener(&mut sockets)); }
+    // Per-port pool: (handle, port).
+    let mut listen_pool: VecDeque<(SocketHandle, u16)> = VecDeque::new();
+    for &p in LISTEN_PORTS {
+        for _ in 0..LISTENERS_PER_PORT {
+            listen_pool.push_back((add_listener(&mut sockets, p), p));
+        }
+    }
     let mut claimed: HashSet<SocketHandle> = HashSet::new();
     let mut rx_map: std::collections::HashMap<SocketHandle, std::sync::mpsc::Sender<Vec<u8>>>
         = Default::default();
@@ -277,8 +309,8 @@ fn run_poll_loop(rt: Arc<StackRuntime>, tap_fd: OwnedFd,
         }
 
         // 5. Promote freshly-established TCP sockets to AcceptedConn.
-        let mut to_claim = vec![];
-        for handle in listen_pool.iter().copied() {
+        let mut to_claim: Vec<(SocketHandle, u16, AcceptedConn)> = vec![];
+        for &(handle, port) in listen_pool.iter() {
             if claimed.contains(&handle) { continue; }
             let s = sockets.get_mut::<tcp::Socket>(handle);
             if s.is_active() && s.state() == tcp::State::Established {
@@ -287,21 +319,22 @@ fn run_poll_loop(rt: Arc<StackRuntime>, tap_fd: OwnedFd,
                 if let (Some(l), Some(r)) = (local, remote) {
                     let dst_ip = ip_octets(l.addr);
                     let src_ip = ip_octets(r.addr);
-                    to_claim.push((handle, AcceptedConn {
+                    to_claim.push((handle, port, AcceptedConn {
                         handle, dst_ip, dst_port: l.port,
                         src_ip, src_port: r.port,
                     }));
                 }
             }
         }
-        for (h, acc) in to_claim {
+        for (h, port, acc) in to_claim {
             claimed.insert(h);
             let _ = accept_tx.send(acc);
-            listen_pool.push_back(add_listener(&mut sockets));
+            listen_pool.push_back((add_listener(&mut sockets, port), port));
         }
-        // Cap the pool so a busy box doesn't unbounded-grow.
-        while listen_pool.len() > LISTEN_POOL * 4 {
-            if let Some(h) = listen_pool.pop_front() {
+        // GC: drop oldest unclaimed-but-stale listeners if pool blows up.
+        let cap = LISTEN_PORTS.len() * LISTENERS_PER_PORT * 4;
+        while listen_pool.len() > cap {
+            if let Some((h, _)) = listen_pool.pop_front() {
                 if !claimed.contains(&h) { sockets.remove(h); }
             }
         }
@@ -328,14 +361,13 @@ fn run_poll_loop(rt: Arc<StackRuntime>, tap_fd: OwnedFd,
     }
 }
 
-fn add_listener(sockets: &mut SocketSet) -> SocketHandle {
+fn add_listener(sockets: &mut SocketSet, port: u16) -> SocketHandle {
     let rx = tcp::SocketBuffer::new(vec![0u8; TCP_RX_BUF]);
     let tx = tcp::SocketBuffer::new(vec![0u8; TCP_TX_BUF]);
     let mut s = tcp::Socket::new(rx, tx);
-    // Listen on any port at any address — we own every IP in the box's /16,
-    // and the DNS allocator hands them out for whichever hostnames the box
-    // asks about.
-    let _ = s.listen(IpListenEndpoint { addr: None, port: 0 });
+    // Listen at any local address (we own the whole /16) on this specific
+    // port. smoltcp won't accept a 0-port listen, hence the per-port pool.
+    let _ = s.listen(IpListenEndpoint { addr: None, port });
     sockets.add(s)
 }
 
