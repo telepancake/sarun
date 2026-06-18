@@ -47,44 +47,10 @@ fn pidfd_open(pid: i32) -> i32 {
     unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as i32 }
 }
 
-/// Expand a user-editable glob-pattern file into a deduplicated list
-/// of host paths. Lines starting with '#' and blank lines are skipped.
-/// A literal path (no glob meta-character) is passed through as-is
-/// (cheap, no filesystem walk). A glob pattern is expanded against
-/// the host filesystem with the `glob` crate. Missing file falls back
-/// to `defaults` — used so the historical -b shadow set (/bin/sh
-/// /bin/bash etc.) keeps working without the user creating a config.
-fn expand_shadow_glob(file: &std::path::Path, defaults: &[&str]) -> Vec<String> {
-    let patterns: Vec<String> = match std::fs::read_to_string(file) {
-        Ok(s) => s.lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty() && !l.starts_with('#'))
-            .map(String::from)
-            .collect(),
-        Err(_) => defaults.iter().map(|s| (*s).to_string()).collect(),
-    };
-    let has_meta = |p: &str| p.contains(['*', '?', '[']);
-    let mut out: Vec<String> = vec![];
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for pat in &patterns {
-        if has_meta(pat) {
-            // Glob: walk the host filesystem. Errors per-entry are
-            // ignored — a permission-denied dir on the way to a
-            // legitimate match shouldn't kill the box launch.
-            if let Ok(it) = glob::glob(pat) {
-                for p in it.flatten() {
-                    let s = p.to_string_lossy().into_owned();
-                    if seen.insert(s.clone()) { out.push(s); }
-                }
-            }
-        } else {
-            // Literal path: no filesystem walk needed, --ro-bind-try
-            // does the existence check at bwrap-launch time.
-            if seen.insert(pat.clone()) { out.push(pat.clone()); }
-        }
-    }
-    out
-}
+// Note: shadowing is now done LAZILY inside the FUSE overlay's
+// lookup/open path. No filesystem walk from this module. See
+// overlay.rs::shadows for the actual matching, and
+// paths::shadow_*_glob_path() for the config files that drive it.
 
 /// pidfd_open, exposed for the brush module (same capture/MUTE wiring).
 pub fn pidfd_open_pub(pid: i32) -> i32 { pidfd_open(pid) }
@@ -354,31 +320,12 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
     // governs the top-level brush body. Non-brush boxes are NOT touched (their
     // /bin/sh is the real system shell).
     if brush && capture_on {
-        // Shadow set comes from three USER-EDITABLE glob files (one per
-        // tool kind), so toolchains in non-default locations can be
-        // intercepted by adding lines like `/opt/**/bin/sh`. Missing
-        // file → historical defaults ({/bin,/usr/bin}/sh,bash,dash, etc.)
-        // so this is backward-compatible: the existing user keeps the
-        // same behavior, the new user can prune or extend at will.
-        let sh_paths = expand_shadow_glob(
-            &paths::shadow_sh_glob_path(),
-            &["/bin/sh", "/usr/bin/sh",
-              "/bin/bash", "/usr/bin/bash",
-              "/bin/dash", "/usr/bin/dash"]);
-        let make_paths = expand_shadow_glob(
-            &paths::shadow_make_glob_path(),
-            &["/bin/make", "/usr/bin/make",
-              "/bin/gmake", "/usr/bin/gmake"]);
-        let ninja_paths = expand_shadow_glob(
-            &paths::shadow_ninja_glob_path(),
-            &["/bin/ninja", "/usr/bin/ninja"]);
-        // One --ro-bind-try per resolved host path. -try because a
-        // toolchain glob may point at files the host doesn't have
-        // (or that get added later), and we never want a missing
-        // shadow target to kill the box launch.
-        for p in sh_paths.iter().chain(make_paths.iter()).chain(ninja_paths.iter()) {
-            bwrap.args(["--ro-bind-try", &self_exe, p]);
-        }
+        // The /bin/sh, /usr/bin/make, /bin/ninja etc. shadowing is
+        // applied LAZILY by the FUSE overlay at lookup time (it
+        // reads shadow_*.glob and matches each open against the
+        // patterns). No pre-enumeration of the host filesystem here.
+        // We still need to tell the box that the shim should kick in
+        // when it gets exec'd as /bin/sh.
         bwrap.args(["--setenv", "SARUN_BRUSH_SH", "1"]);
     }
     bwrap.args(["--unshare-pid", "--unshare-ipc", "--unshare-uts",
