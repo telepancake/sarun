@@ -3310,7 +3310,7 @@ fn cmdline_spans(app: &App) -> Vec<Span<'static>> {
         }
     }
     vec![prompt,
-         Span::styled("(idle — '/' opens filter, F-keys below)",
+         Span::styled("(idle — '/' filter · F4 / m row actions · F-keys below)",
              Style::default().add_modifier(Modifier::DIM))]
 }
 
@@ -3349,12 +3349,17 @@ fn fkey_labels(app: &App) -> [&'static str; 11] {
     let sessions = app.focus == Pane::Sessions;
     let changes  = app.focus == Pane::Changes;
     let any_pty  = !app.ptys.is_empty();
-    // Default fields. Override per pane below.
+    // Whether THIS pane has a context-menu popup ('m' / F4 opens
+    // pane_action_menu) — so the F4 label reads "Actions" when it's
+    // available and dims to "·" when it isn't.
+    let has_menu = matches!(app.focus,
+        Pane::Sessions | Pane::Changes | Pane::Hunks
+        | Pane::Rules | Pane::Pty);
     let mut f: [&'static str; 11] = [
         "Help",     // F1   — always
         if pty_pane { "PtyNext" } else { "Pty+" },  // F2
         if pty_pane { "PtyPrev" } else { "Tab" },   // F3
-        "Edit",     // F4 (edit-current rule, edit-current name)
+        if has_menu { "Actions" } else { "·" }, // F4 — context popup
         if hunks || changes { "Apply" } else { "·" },  // F5
         if sessions { "Rename" } else { "·" }, // F6
         if pty_pane { "PtyNew" }
@@ -3364,7 +3369,7 @@ fn fkey_labels(app: &App) -> [&'static str; 11] {
         else if hunks || changes { "Discard" }
         else if rules { "DelRule" }
         else { "·" }, // F8
-        "Menu",     // F9 (navigation in menubar — placeholder for now)
+        "Menu",     // F9 (menubar nav)
         "Quit",     // F10  — always
         // F11: split/un-split. The label flips with `pty_in_right`
         // so the user can read what F11 will DO next.
@@ -3373,9 +3378,8 @@ fn fkey_labels(app: &App) -> [&'static str; 11] {
         else if app.pty_in_right { "Solo" }
         else { "Split" },
     ];
-    // Override: PTY pane F12 detach is shown in the title strip too;
-    // we mirror that here so the user doesn't have to look up.
-    if pty_pane { f[8] = "·"; }  // no menu nav while in PTY
+    // PTY full-screen has no menubar-nav meaning for F9.
+    if pty_pane { f[8] = "·"; }
     f
 }
 
@@ -4872,6 +4876,17 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                     // labels in the bar tell you what each does here).
                     if matches!(k.code, KeyCode::F(2)) { app.pty_next(); continue; }
                     if matches!(k.code, KeyCode::F(3)) { app.pty_prev(); continue; }
+                    if matches!(k.code, KeyCode::F(4)) {
+                        // Context-menu popup inside the PTY pane (PTY-
+                        // specific actions: new, kill, embed). Same
+                        // entrypoint as 'm' in any other pane.
+                        if let Some((title, items)) = pane_action_menu(&app) {
+                            app.modal = Some(Modal::ActionMenu {
+                                title, items, sel: 0,
+                            });
+                        }
+                        continue;
+                    }
                     if matches!(k.code, KeyCode::F(7)) {
                         app.modal = Some(Modal::PtyCmd { buf: pty_default_cmd() });
                         continue;
@@ -4986,12 +5001,18 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                             }
                         }
                         4 => {
-                            if app.focus == Pane::Rules {
-                                let cur = app.rules.get(app.sel_rule).cloned().unwrap_or_default();
-                                app.modal = Some(Modal::RuleForm {
-                                    buf: cur, editing: Some(app.sel_rule) });
-                            } else if app.focus == Pane::Sessions {
-                                app.renaming = Some(String::new());
+                            // F4 = "Actions" — open the per-row context
+                            // popup (same as the 'm' shortcut, but now
+                            // visible in the always-on F-keybar). The
+                            // popup itself lists Edit / Rename / etc.
+                            // with their underlying global keys, so the
+                            // muscle memory transfer is straightforward.
+                            if let Some((title, items)) = pane_action_menu(&app) {
+                                app.modal = Some(Modal::ActionMenu {
+                                    title, items, sel: 0,
+                                });
+                            } else {
+                                app.status = "no actions for this row yet".into();
                             }
                         }
                         5 => {
