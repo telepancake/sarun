@@ -442,8 +442,14 @@ fn flows_dir_for(box_id: i64) -> Option<std::path::PathBuf> {
     if d.is_dir() { Some(d) } else { None }
 }
 
+// Accept the sid as either a JSON number OR a string-of-int. Most UI verbs
+// send a string (cur_sid is a String) but a few — load_pipelines /
+// load_build_edges and assorted tests — send the i64 straight from
+// cur_sid_i64; without the dual parse those silently got None and the verb
+// returned an empty default. view.open already had this same dual parse.
 fn arg_sid(args: &[Value]) -> Option<i64> {
-    args.first()?.as_str()?.parse().ok()
+    let v = args.first()?;
+    v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))
 }
 
 /// Unconditionally remove a box: drop it from the overlay, delete its sqlar +

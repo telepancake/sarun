@@ -7471,4 +7471,62 @@ mod tests {
         assert!(buf.contains("(g)") || buf.contains("Build"),
                 "menubar must surface the build-edges chip:\n{buf}");
     }
+
+    /// Run a real command in a -b BRUSH box (so brushprov rows actually
+    /// land in the box's sqlar). Mirrors `run_cmd` but prepends `-b TAG`.
+    fn run_cmd_brush(eng: &Engine, tag: &str, cmd: &[&str]) -> bool {
+        let bin = engine_bin().expect("engine bin");
+        let mut args: Vec<String> = vec!["run".into(), "-b".into(),
+            tag.into(), "--".into()];
+        args.extend(cmd.iter().map(|s| s.to_string()));
+        Command::new(&bin)
+            .args(&args)
+            .env("SLOPBOX_NS", &eng.ns)
+            .env("HOME", &eng._tmp)
+            .env("XDG_DATA_HOME", &eng.xdg)
+            .env("XDG_STATE_HOME", &eng.xdg)
+            .env("XDG_CONFIG_HOME", &eng.xdg)
+            .env("XDG_RUNTIME_DIR", &eng.xdg)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// With real brushprov rows in the box, the Pipes pane must RENDER
+    /// those rows — not the "no pipelines yet" empty hint. Regression
+    /// guard for the bug where load_pipelines passed an i64 sid into
+    /// brushprov / build_edges (whose arg_sid only accepted a String),
+    /// so every dedicated pane was silently empty even when the right-
+    /// pane box summary on the Sessions view showed the same rows.
+    #[test]
+    fn pipelines_pane_shows_live_brushprov_row() {
+        let Some(eng) = boot() else {
+            eprintln!("SKIP: engine binary missing or FUSE unavailable");
+            return;
+        };
+        if !run_cmd_brush(&eng, "BRPIPE", &["sh", "-c",
+            "echo hi | tr a-z A-Z > /tmp/brush_pipe_uitest.txt"]) {
+            eprintln!("SKIP: -b box failed to run (likely no userns / bwrap)");
+            return;
+        }
+        let mut app = App::new(eng.sock.clone());
+        app.refresh_sessions();
+        assert!(!app.sessions.is_empty(), "no sessions after brush run");
+        app.sel_session = 0;
+        app.focus = Pane::Pipelines;
+        app.load_pipelines();
+        assert!(!app.pipelines.is_empty(),
+            "load_pipelines returned 0 rows for a -b box that DID record a \
+             pipeline — brushprov RPC wire format probably regressed (arg_sid \
+             rejecting i64 sids again?)");
+        let buf = render_to_string(&app, 160, 30).unwrap();
+        assert!(!buf.contains("no pipelines yet"),
+            "Pipes pane STILL renders the empty hint despite \
+             app.pipelines.len() = {}:\n{buf}", app.pipelines.len());
+        // the command text we ran must be visible on the pane.
+        assert!(buf.contains("tr") && buf.contains("echo hi"),
+            "rendered pane does not surface the recorded cmd:\n{buf}");
+    }
 }
