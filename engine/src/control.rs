@@ -742,11 +742,19 @@ fn prepare_net(state: &State, id: i64, msg: &Value) -> Option<(String, String, S
 
     // Start the per-box dispatcher: it pulls AcceptedConn off the stack's
     // accept channel and routes each new connection to the right handler
-    // (HTTP MITM / HTTPS MITM / L4 forward).
-    if let Some(rt) = state.lock().unwrap().net_rt.clone() {
+    // (HTTP MITM / HTTPS MITM / L4 forward). The keylog is per-box (file
+    // sits next to the box's pcapng) so a tshark with `-o
+    // tls.keylog_file:<flows>.keys` decrypts every TLS connection in the
+    // pcapng. The upstream rustls config is shared (the real internet's
+    // trust roots don't vary by box).
+    let keylog = crate::net::mitm::KeyLogFile::new(&flows.keylog_path).ok();
+    let upstream_tls = crate::net::mitm::build_upstream_client_config();
+    if let (Some(rt), Some(keylog)) = (state.lock().unwrap().net_rt.clone(), keylog) {
         crate::net::dispatch::Dispatcher::start(
             stack.clone(), stack.dns.clone(),
-            format!("box{id}"), rt);
+            format!("box{id}"),
+            net.ca.clone(), keylog, upstream_tls,
+            rt);
     }
 
     Some((rig.netns_path.to_string_lossy().into_owned(),

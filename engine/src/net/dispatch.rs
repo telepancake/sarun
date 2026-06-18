@@ -12,20 +12,27 @@
 use std::sync::Arc;
 
 use super::bridge::SmoltcpStream;
+use super::ca::Ca;
 use super::dns::DnsServer;
+use super::mitm::KeyLogFile;
 use super::stack::{AcceptedConn, StackRuntime};
 
 pub struct Dispatcher {
     pub stack: Arc<StackRuntime>,
     pub dns: Arc<DnsServer>,
     pub box_name: String,
+    pub ca: Arc<Ca>,
+    pub keylog: Arc<KeyLogFile>,
+    pub upstream_tls: Arc<rustls::ClientConfig>,
 }
 
 impl Dispatcher {
     pub fn start(stack: Arc<StackRuntime>, dns: Arc<DnsServer>,
-                 box_name: String, rt: tokio::runtime::Handle) {
+                 box_name: String, ca: Arc<Ca>, keylog: Arc<KeyLogFile>,
+                 upstream_tls: Arc<rustls::ClientConfig>,
+                 rt: tokio::runtime::Handle) {
         let Some(rx) = stack.take_accept_rx() else { return; };
-        let me = Self { stack, dns, box_name };
+        let me = Self { stack, dns, box_name, ca, keylog, upstream_tls };
         std::thread::Builder::new()
             .name("sarun-net-dispatch".into())
             .spawn(move || {
@@ -33,25 +40,34 @@ impl Dispatcher {
                     let stack = me.stack.clone();
                     let dns = me.dns.clone();
                     let box_name = me.box_name.clone();
-                    rt.spawn(handle_conn(stack, dns, box_name, acc));
+                    let ca = me.ca.clone();
+                    let keylog = me.keylog.clone();
+                    let up = me.upstream_tls.clone();
+                    rt.spawn(handle_conn(stack, dns, box_name, ca, keylog, up, acc));
                 }
             }).expect("spawn dispatcher");
     }
 }
 
 async fn handle_conn(stack: Arc<StackRuntime>, dns: Arc<DnsServer>,
-                     box_name: String, acc: AcceptedConn) {
+                     box_name: String,
+                     ca: Arc<Ca>, keylog: Arc<KeyLogFile>,
+                     upstream_tls: Arc<rustls::ClientConfig>,
+                     acc: AcceptedConn) {
     let host = dns.host_for_ip(acc.dst_ip)
         .unwrap_or_else(|| ipv4(acc.dst_ip));
     let port = acc.dst_port;
     let stream = SmoltcpStream::new(stack, acc.handle);
     let _ = box_name; // policy hook will use this once rules ship
-    if port == 443 {
-        let _ = super::mitm::serve_https(stream, &host).await;
+    let r = if port == 443 {
+        super::mitm::serve_https(stream, &host, ca, keylog, upstream_tls).await
     } else if port == 80 {
-        let _ = super::mitm::serve_http(stream, &host, port).await;
+        super::mitm::serve_http(stream, &host, port).await
     } else {
-        let _ = super::l4::forward(stream, &host, port).await;
+        super::l4::forward(stream, &host, port).await
+    };
+    if let Err(e) = r {
+        eprintln!("sarun-net: conn {host}:{port}: {e}");
     }
 }
 
