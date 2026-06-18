@@ -667,17 +667,19 @@ fn shell_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> 
     let cmd = args[0].eval_to_buf(ev)?;
     if ev.avoid_io && !has_no_io_in_shell_script(&cmd) {
         if ev.eval_depth > 1 {
-            error_loc!(
-                ev.loc.as_ref(),
-                "kati doesn't support passing results of $(shell) to other make constructs: {}",
-                String::from_utf8_lossy(&cmd)
-            );
+            // sarun: real make happily runs $(shell) inside other
+            // constructs ($(if $(shell ...), …)). Kati's
+            // ninja-generation mode delays I/O to keep build.ninja
+            // cacheable — but we'd rather match make than be cacheable
+            // here. Fall through to the actual run path so the result
+            // is folded into the surrounding construct's evaluation.
+        } else {
+            let cmd = strip_shell_comment(cmd);
+            out.put_slice(b"$(");
+            out.put_slice(&cmd);
+            out.put_u8(b')');
+            return Ok(());
         }
-        let cmd = strip_shell_comment(cmd);
-        out.put_slice(b"$(");
-        out.put_slice(&cmd);
-        out.put_u8(b')');
-        return Ok(());
     }
 
     let loc = ev.loc.clone().unwrap_or_default();
