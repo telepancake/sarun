@@ -95,6 +95,20 @@ pub enum InnerVar {
     VariableNames { name: Bytes, all: bool },
 }
 
+// sarun: cheap shallow emptiness check for `+=` to mirror GNU make's
+// "no separator when prior value is empty" rule. Only looks at literally
+// empty AST nodes — won't peer into $(funcs) or var refs, which is fine
+// because those don't normally appear as the *whole* of an initializing
+// `X=` assignment (and matching real make in those edge cases would
+// require an eval, which is too expensive at append time).
+fn is_value_empty(v: &Arc<Value>) -> bool {
+    match v.as_ref() {
+        Value::Literal(_, b) => b.is_empty(),
+        Value::List(_, xs) => xs.iter().all(is_value_empty),
+        _ => false,
+    }
+}
+
 impl Variable {
     pub fn loc(&self) -> &Option<Loc> {
         &self.loc
@@ -151,14 +165,22 @@ impl Variable {
                 panic!("append_var should not be used when immediate_eval returns true")
             }
             InnerVar::Recursive { v: prev, .. } => {
-                *prev = Arc::new(Value::List(
-                    prev.loc(),
-                    vec![
-                        prev.clone(),
-                        Arc::new(Value::Literal(None, Bytes::from_static(b" "))),
-                        v,
-                    ],
-                ));
+                // sarun: GNU make omits the separator when the existing value
+                // is empty (manual §6.6.1 "appending"). Skip it for literally
+                // empty prev — match the rule cheaply at append time without
+                // forcing eval.
+                if is_value_empty(prev) {
+                    *prev = v;
+                } else {
+                    *prev = Arc::new(Value::List(
+                        prev.loc(),
+                        vec![
+                            prev.clone(),
+                            Arc::new(Value::Literal(None, Bytes::from_static(b" "))),
+                            v,
+                        ],
+                    ));
+                }
                 self.definition = Some(frame);
             }
             InnerVar::AutoCommand(sym, _) => {
@@ -172,19 +194,27 @@ impl Variable {
     pub fn append_str(&mut self, buf: &Bytes, frame: Arc<Frame>) -> Result<()> {
         match &mut self.value {
             InnerVar::Simple(s) => {
-                s.push(b' ');
+                // sarun: ditto — no leading separator when the prior value is
+                // empty.
+                if !s.is_empty() {
+                    s.push(b' ');
+                }
                 s.extend_from_slice(buf);
                 self.definition = Some(frame);
             }
             InnerVar::Recursive { v: prev, .. } => {
-                *prev = Arc::new(Value::List(
-                    prev.loc(),
-                    vec![
-                        prev.clone(),
-                        Arc::new(Value::Literal(None, Bytes::from_static(b" "))),
-                        Arc::new(Value::Literal(None, buf.clone())),
-                    ],
-                ));
+                if is_value_empty(prev) {
+                    *prev = Arc::new(Value::Literal(None, buf.clone()));
+                } else {
+                    *prev = Arc::new(Value::List(
+                        prev.loc(),
+                        vec![
+                            prev.clone(),
+                            Arc::new(Value::Literal(None, Bytes::from_static(b" "))),
+                            Arc::new(Value::Literal(None, buf.clone())),
+                        ],
+                    ));
+                }
                 self.definition = Some(frame);
             }
             InnerVar::AutoCommand(sym, _) => {
