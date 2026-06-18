@@ -1,4 +1,3 @@
-# TODO(rust)
 .PRECIOUS: out
 all: out
 out:

@@ -1,4 +1,3 @@
-# TODO(rust)
 A := hi
 $(info before flavor=[$(flavor A)] value=[$(A)])
 undefine A

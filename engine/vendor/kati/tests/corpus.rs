@@ -123,7 +123,10 @@ fn normalize(input: &str, norms: &[Norm]) -> String {
 }
 
 // Returns Some(reason) if the testcase header marks it as TODO/expected-fail
-// for the configuration we're running ("rust", non-ninja, non-gen-all).
+// for the configuration we're running ("rust", default goal, non-ninja,
+// non-gen-all). Markers with a "/testN" suffix apply only when that specific
+// sub-test target is invoked — since we only run the default goal, those
+// don't apply to us.
 fn xfail_reason(src: &str) -> Option<String> {
     let todo_re = regex_lite::Regex::new(r"^# TODO(?:\(([-a-z|]+)(?:/([-a-z0-9|]+))?\))?")
         .unwrap();
@@ -134,6 +137,11 @@ fn xfail_reason(src: &str) -> Option<String> {
         let Some(cap) = todo_re.captures(line) else {
             continue;
         };
+        let subtest = cap.get(2).map(|m| m.as_str()).unwrap_or("");
+        if !subtest.is_empty() {
+            // Sub-test-scoped TODO; we don't invoke sub-tests.
+            continue;
+        }
         let tags = cap.get(1).map(|m| m.as_str()).unwrap_or("");
         if tags.is_empty() {
             return Some(line.to_string());
@@ -205,6 +213,7 @@ struct Tally {
     xfail_unexpected_pass: usize,
     xfail: usize,
     skipped: usize,
+    xpass_names: Vec<String>,
 }
 
 #[test]
@@ -322,7 +331,10 @@ fn corpus_pass_rate() {
         let matched = mk_norm == rk_norm;
         match (matched, xfail.is_some()) {
             (true, false) => tally.pass += 1,
-            (true, true) => tally.xfail_unexpected_pass += 1,
+            (true, true) => {
+                tally.xfail_unexpected_pass += 1;
+                tally.xpass_names.push(name.clone());
+            }
             (false, false) => {
                 tally.fail += 1;
                 if failures.len() < 25 {
@@ -343,6 +355,12 @@ fn corpus_pass_rate() {
     if !failures.is_empty() {
         println!("    first failing (up to 25):");
         for f in &failures {
+            println!("        {f}");
+        }
+    }
+    if !tally.xpass_names.is_empty() {
+        println!("    xpass (drop the TODO marker to count as pass):");
+        for f in &tally.xpass_names {
             println!("        {f}");
         }
     }

@@ -34,7 +34,7 @@ use crate::parser::{parse_assign_statement, parse_buf_no_stats};
 use crate::rule::{Rule, is_pattern_rule};
 use crate::stmt::{
     AssignOp, AssignStmt, CommandStmt, CondOp, ExportStmt, IfStmt, IncludeStmt, RuleSep, RuleStmt,
-    Statement,
+    Statement, UndefineStmt,
 };
 use crate::strutil::{is_space_byte, trim_leading_curdir, trim_right_space, word_scanner};
 use crate::symtab::{ALLOW_RULES_SYM, KATI_READONLY_SYM, MAKEFILE_LIST, SHELL_SYM, Symbol, intern};
@@ -895,6 +895,29 @@ impl Evaluator {
             }
         }
 
+        Ok(())
+    }
+
+    pub fn eval_undefine(&mut self, stmt: &UndefineStmt) -> Result<()> {
+        self.loc = Some(stmt.loc());
+        self.in_rule = false;
+        let names = stmt.expr.eval_to_buf(self)?;
+        for tok in word_scanner(&names) {
+            let sym = intern(names.slice_ref(tok));
+            // Mirrors set_global_var's command-line-override rule: a plain
+            // `undefine` won't unset a command-line variable, but
+            // `override undefine` will.
+            if let Some(prev) = sym.peek_global_var()
+                && !stmt.is_override
+                && matches!(
+                    prev.read().origin(),
+                    VarOrigin::CommandLine | VarOrigin::Override
+                )
+            {
+                continue;
+            }
+            sym.clear_global_var();
+        }
         Ok(())
     }
 

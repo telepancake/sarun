@@ -27,7 +27,7 @@ use crate::{
     loc::Loc,
     stmt::{
         AssignDirective, AssignOp, AssignStmt, CommandStmt, CondOp, ExportStmt, IfStmt,
-        IncludeStmt, RuleSep, RuleStmt, Stmt,
+        IncludeStmt, RuleSep, RuleStmt, Stmt, UndefineStmt,
     },
     strutil::{
         find_end_of_line, find_outside_paren, trim_left_space, trim_right_space, trim_space,
@@ -576,6 +576,22 @@ impl Parser {
         self.create_export(line, false)
     }
 
+    fn parse_undefine(&mut self, line: Bytes) -> Result<()> {
+        if line.is_empty() {
+            error_loc!(Some(&self.loc), "*** empty variable name.");
+        }
+        let is_override = self
+            .current_directive
+            .is_some_and(|d| d.is_override);
+        let loc = self.loc.clone();
+        let mut mutable_loc = loc.clone();
+        let expr = parse_expr(&mut mutable_loc, line, ParseExprOpt::Normal)?;
+        self.out_stmts
+            .lock()
+            .push(UndefineStmt::new(loc, expr, is_override));
+        Ok(())
+    }
+
     fn check_if_stack(&self, keyword: &'static str) -> Result<()> {
         if self.if_stack.is_empty() {
             error_loc!(Some(&self.loc), "*** extraneous `{keyword}'.");
@@ -616,6 +632,7 @@ impl Parser {
             b"override" => self.parse_override(rest)?,
             b"export" => self.parse_export(rest)?,
             b"unexport" => self.parse_unexport(&rest)?,
+            b"undefine" => self.parse_undefine(rest)?,
             _ => return Ok(false),
         }
         Ok(true)
@@ -643,6 +660,7 @@ impl Parser {
             b"define" => self.parse_define(rest)?,
             b"override" => self.parse_override(rest)?,
             b"export" => self.parse_export(rest)?,
+            b"undefine" => self.parse_undefine(rest)?,
             _ => return Ok(false),
         }
         Ok(true)
