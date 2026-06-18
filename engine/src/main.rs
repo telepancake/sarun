@@ -119,6 +119,13 @@ fn serve() -> i32 {
         Ok(n) => state.lock().unwrap().net = Some(std::sync::Arc::new(n)),
         Err(e) => eprintln!("sarun-engine: net init failed (-n disabled): {e}"),
     }
+    // One tokio runtime, multi-thread; long-lived. Dispatcher tasks (one
+    // per accepted box-side connection) live on this. Leaked so the handle
+    // stays valid for the engine's entire lifetime.
+    let net_rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all().worker_threads(2).build()
+        .map(|rt| { let h = rt.handle().clone(); Box::leak(Box::new(rt)); h });
+    if let Ok(h) = net_rt { state.lock().unwrap().net_rt = Some(h); }
     println!("sarun-engine: listening · {}  ·  overlay {}",
              sock.display(), mnt.display());
     // Engine -> UI event broadcaster. Lives for the engine process's

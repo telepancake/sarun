@@ -40,6 +40,11 @@ pub struct Shared {
     /// fd open, netns anchor child SIGTERM-ed on Drop) until the box reaps.
     pub net: Option<std::sync::Arc<crate::net::Net>>,
     pub net_handles: std::collections::HashMap<i64, std::sync::Arc<crate::net::NetHandle>>,
+    /// Long-lived tokio runtime handle used by the dispatcher tasks (one
+    /// per-conn task per box). One runtime is plenty: the network is rarely
+    /// the bottleneck, and a single runtime keeps reasoning about lifetimes
+    /// simple.
+    pub net_rt: Option<tokio::runtime::Handle>,
 }
 
 fn pidfd_open(pid: i32) -> i32 {
@@ -434,6 +439,10 @@ fn arg_sid(args: &[Value]) -> Option<i64> {
 /// Unconditionally remove a box: drop it from the overlay, delete its sqlar +
 /// backing + pool blobs, broadcast session_removed. The `delete` verb's body.
 fn reap(state: &State, id: i64) {
+    // Drop the NetHandle (Tap mode only) — the Drop impl SIGTERM's the
+    // netns anchor, which releases the last reference to /proc/<a>/ns/net
+    // and tears down the netns + TAP. Idempotent: no-op for Off / Host.
+    let _ = state.lock().unwrap().net_handles.remove(&id);
     if let Some(ov) = state.lock().unwrap().overlay.clone() {
         ov.remove_box(id);
     }
@@ -728,8 +737,17 @@ fn prepare_net(state: &State, id: i64, msg: &Value) -> Option<(String, String, S
     let handle = std::sync::Arc::new(crate::net::make_handle(
         box_id_u16, subnet.gateway_ip(), subnet.box_ip(),
         rig.anchor_pid, rig.netns_path.clone(),
-        stack, flows.path.clone(), flows.keylog_path.clone()));
+        stack.clone(), flows.path.clone(), flows.keylog_path.clone()));
     state.lock().unwrap().net_handles.insert(id, handle);
+
+    // Start the per-box dispatcher: it pulls AcceptedConn off the stack's
+    // accept channel and routes each new connection to the right handler
+    // (HTTP MITM / HTTPS MITM / L4 forward).
+    if let Some(rt) = state.lock().unwrap().net_rt.clone() {
+        crate::net::dispatch::Dispatcher::start(
+            stack.clone(), stack.dns.clone(),
+            format!("box{id}"), rt);
+    }
 
     Some((rig.netns_path.to_string_lossy().into_owned(),
           ipv4_str(subnet.gateway_ip()),
