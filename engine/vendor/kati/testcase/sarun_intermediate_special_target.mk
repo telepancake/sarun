@@ -1,4 +1,3 @@
-# TODO(rust)
 .INTERMEDIATE: thing
 all: thing
 thing:
