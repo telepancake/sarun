@@ -731,7 +731,15 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
     let (netns_path, dns_ip, ca_pem_path) =
         prepare_net(state, id, msg).unwrap_or_default();
 
-    json!({
+    // D-oci: if any ancestor in the parent chain has an oci_config meta key
+    // (stamped by `sarun oci load` on the top layer of an image), surface
+    // env / cwd / cmd / entrypoint / user in the ack so the runner can
+    // bwrap with the image's PATH set, in the image's WorkingDir, with the
+    // image's User — without which `sarun img -- /bin/sh` would inherit
+    // the HOST's PATH (pointing at host bins that don't exist in a closed
+    // box) and the HOST's cwd (likely a path outside the image).
+    let oci = oci_runtime_from_chain(parent);
+    let mut reply = json!({
         "ok": true, "mount": root.to_string_lossy(),
         "shm_dir": backing.to_string_lossy(),
         "netns_path": netns_path,
@@ -745,7 +753,60 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
         "box_id": id, "session_id": id.to_string(), "name": name,
         "capture": want_capture,      // sinks + live echo mux active (off for -t/-d)
         "_box_sid": id,               // caller marker: this conn is now the box channel
-    })
+    });
+    if let Some(o) = oci {
+        reply["oci"] = o;
+    }
+    reply
+}
+
+/// Walk the parent chain looking for an `oci_config` meta entry (stamped by
+/// `sarun oci load` on the image's TOP layer). Returns the parsed runtime
+/// view {env, cwd, cmd, entrypoint, user} the runner uses, or None when the
+/// chain has no OCI ancestor (a non-OCI box). Reads each ancestor's sqlar
+/// meta directly — at-rest boxes that aren't live yet are common here, since
+/// `sarun img.SCRATCH` is the first thing a user does after `oci load`.
+fn oci_runtime_from_chain(parent: Option<i64>) -> Option<Value> {
+    let mut cur = parent;
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..64 {
+        let id = cur?;
+        if !seen.insert(id) { return None; }
+        let sqlar = crate::paths::state_home().join(format!("{id}.sqlar"));
+        let conn = rusqlite::Connection::open_with_flags(
+            &sqlar, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+        let cfg: Option<String> = conn.query_row(
+            "SELECT value FROM meta WHERE key='oci_config'", [],
+            |r| r.get(0)).ok();
+        if let Some(cfg_json) = cfg {
+            return parse_oci_runtime(&cfg_json);
+        }
+        let parent_str: Option<String> = conn.query_row(
+            "SELECT value FROM meta WHERE key='parent_box_id'", [],
+            |r| r.get(0)).ok();
+        cur = parent_str.and_then(|s| s.parse::<i64>().ok());
+    }
+    None
+}
+
+/// Pull env / cwd / cmd / entrypoint / user out of the raw OCI image config
+/// JSON. We don't link `oci_spec` here on purpose — those fields are stable
+/// across the OCI spec versions and a hand-rolled extractor avoids dragging
+/// the dep into control.rs just to read five fields.
+fn parse_oci_runtime(cfg_json: &str) -> Option<Value> {
+    let v: Value = serde_json::from_str(cfg_json).ok()?;
+    let inner = v.get("config")?;
+    let mut out = serde_json::Map::new();
+    if let Some(env) = inner.get("Env") { out.insert("env".into(), env.clone()); }
+    if let Some(cwd) = inner.get("WorkingDir") {
+        out.insert("cwd".into(), cwd.clone());
+    }
+    if let Some(cmd) = inner.get("Cmd") { out.insert("cmd".into(), cmd.clone()); }
+    if let Some(ep) = inner.get("Entrypoint") {
+        out.insert("entrypoint".into(), ep.clone());
+    }
+    if let Some(u) = inner.get("User") { out.insert("user".into(), u.clone()); }
+    if out.is_empty() { None } else { Some(Value::Object(out)) }
 }
 
 /// Equip a `-n` box's netns and start its smoltcp stack.
