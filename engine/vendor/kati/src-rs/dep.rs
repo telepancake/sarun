@@ -1135,19 +1135,52 @@ impl<'a> DepBuilder<'a> {
             let inputs = n.lock().actual_inputs.clone();
             let needs_expand = inputs.iter().any(|s| s.as_bytes().contains(&b'$'));
             if needs_expand {
-                let at_sym = intern("@");
-                let target_name = Variable::with_simple_string(
-                    output.as_bytes(),
-                    crate::var::VarOrigin::Automatic,
-                    None,
-                    None,
-                );
-                let _scoped_at = crate::symtab::ScopedGlobalVar::new(at_sym, target_name)?;
+                let out_bytes = output.as_bytes();
+                let dir = crate::strutil::dirname(&out_bytes);
+                let base = crate::strutil::basename(&out_bytes);
+                let mk_var = |v: Bytes| {
+                    Variable::with_simple_string(
+                        v,
+                        crate::var::VarOrigin::Automatic,
+                        None,
+                        None,
+                    )
+                };
+                let _scoped_at = crate::symtab::ScopedGlobalVar::new(
+                    intern("@"),
+                    mk_var(out_bytes.clone()),
+                )?;
+                let _scoped_at_d = crate::symtab::ScopedGlobalVar::new(
+                    intern("@D"),
+                    mk_var(Bytes::copy_from_slice(&dir)),
+                )?;
+                let _scoped_at_f = crate::symtab::ScopedGlobalVar::new(
+                    intern("@F"),
+                    mk_var(Bytes::copy_from_slice(base)),
+                )?;
+                // First pass dropped the source text on the floor and only
+                // kept space-split tokens. `$(call f,arg)` ends up split
+                // into `$(call` + `f,arg)`, which is unparseable individually.
+                // Rejoin adjacent tokens whose paren/brace counts don't
+                // balance before re-evaluating.
+                let mut joined: Vec<Bytes> = Vec::new();
+                for input in &inputs {
+                    let b = input.as_bytes();
+                    if let Some(last) = joined.last_mut()
+                        && paren_balance(last) != 0
+                    {
+                        let mut combined = bytes::BytesMut::from(last.as_ref());
+                        combined.put_u8(b' ');
+                        combined.put_slice(&b);
+                        *last = combined.freeze();
+                    } else {
+                        joined.push(b.clone());
+                    }
+                }
                 let mut new_inputs: Vec<Symbol> = Vec::new();
-                for input in inputs {
-                    let bytes = input.as_bytes();
+                for bytes in joined {
                     if !bytes.contains(&b'$') {
-                        new_inputs.push(input);
+                        new_inputs.push(intern(bytes.to_vec()));
                         continue;
                     }
                     let mut mloc = n.lock().loc.clone().unwrap_or_default();
@@ -1296,6 +1329,20 @@ pub fn make_dep(ev: &mut Evaluator, targets: Vec<Symbol>) -> Result<Vec<NamedDep
     let mut db = DepBuilder::new(ev)?;
     let _tr = ScopedTimeReporter::new("make dep (build)");
     db.build(targets)
+}
+
+// sarun: count `(`/`{` minus `)`/`}` outside quotes — used to detect
+// SECONDEXPANSION tokens that the first-pass word-split tore apart.
+fn paren_balance(s: &[u8]) -> i32 {
+    let mut depth = 0i32;
+    for &b in s {
+        match b {
+            b'(' | b'{' => depth += 1,
+            b')' | b'}' => depth -= 1,
+            _ => {}
+        }
+    }
+    depth
 }
 
 pub fn is_special_target(output: &Symbol) -> bool {
