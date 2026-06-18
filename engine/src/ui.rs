@@ -424,6 +424,7 @@ struct App {
     /// the engine-side row count after the current filter.
     changes: Vec<Value>,
     changes_view: Option<u64>,
+    changes_view_sid: Option<i64>,
     changes_total: usize,
     changes_window_start: usize,
     hunks: Value, // raw review.hunks result for the selected change
@@ -432,11 +433,17 @@ struct App {
     /// the UI no longer rebuilds the tree.
     processes: Vec<Value>,
     processes_view: Option<u64>,
+    /// Sid the procs view was last opened for. Compared against
+    /// `cur_sid_i64()` by `load_processes_if_needed` so we don't
+    /// re-open on the same box (load_processes itself is expensive
+    /// for million-row boxes).
+    processes_view_sid: Option<i64>,
     processes_total: usize,
     processes_window_start: usize,
     /// Same for outputs.
     outputs: Vec<Value>,
     outputs_view: Option<u64>,
+    outputs_view_sid: Option<i64>,
     outputs_total: usize,
     outputs_window_start: usize,
     rules: Vec<String>,    // raw filerules lines (apply/discard/passthrough <glob>)
@@ -542,7 +549,6 @@ struct App {
     /// Newest-first (by sqlar.mtime), capped server-side. Empty for
     /// finished boxes (the detail panel uses self.changes head instead).
     /// Refreshed by tick() when on the boxes view.
-    recent_changes: Vec<Value>,
     /// Five-list bundle for the Sessions-view right pane (the box-detail
     /// summary): newest-first outputs / changes / processes / pipelines /
     /// build_edges, fetched in one RPC on each session switch. Defaults
@@ -562,16 +568,16 @@ impl App {
             sock,
             sessions: vec![],
             changes: vec![],
-            changes_view: None,
+            changes_view: None, changes_view_sid: None,
             changes_total: 0,
             changes_window_start: 0,
             hunks: Value::Null,
             processes: vec![],
-            processes_view: None,
+            processes_view: None, processes_view_sid: None,
             processes_total: 0,
             processes_window_start: 0,
             outputs: vec![],
-            outputs_view: None,
+            outputs_view: None, outputs_view_sid: None,
             outputs_total: 0,
             outputs_window_start: 0,
             rules: vec![], pipelines: vec![], build_edges: vec![],
@@ -597,7 +603,7 @@ impl App {
             cd_info: None,
             output_segs: vec![],
             changes_decor: vec![],
-            recent_changes: vec![], box_summary: serde_json::json!(null),
+            box_summary: serde_json::json!(null),
         };
         a.refresh_sessions();
         a.load_changes();
@@ -667,6 +673,7 @@ impl App {
                 self.changes_view = v.get("view_id").and_then(Value::as_u64);
                 self.changes_total =
                     v.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
+                self.changes_view_sid = Some(sid);
             }
             Err(e) if e.contains("unknown verb") => {
                 self.status = format!(
@@ -682,12 +689,34 @@ impl App {
         }
         self.fetch_changes_window(0);
         self.seek_first_leaf();
-        // For live boxes, also pull the newest-first slice for the box-
-        // detail panel — cheap, server-side ORDER BY mtime DESC LIMIT 40.
         self.refresh_recent_changes();
-        // the procs/outputs panes track the same selected box.
-        self.load_processes();
-        self.load_outputs();
+    }
+
+    /// Lazy counterpart of load_changes — call from the 'c' chip
+    /// / Tab path so the heavy view.open only runs when the user
+    /// actually navigates to the Changes pane (and skips when the
+    /// view is already open for THIS box).
+    fn load_changes_if_needed(&mut self) {
+        let cur = self.cur_sid_i64();
+        if cur.is_some() && self.changes_view_sid == cur {
+            return;
+        }
+        self.load_changes();
+    }
+
+    /// Session-cursor moved to a different box. We do NOT open the
+    /// changes / procs / outputs views here — those each cost a
+    /// full sqlar scan + JSON serialize (multi-second on million-row
+    /// boxes). The box summary RPC is enough to populate the
+    /// Sessions-view right pane; the views lazy-load when the user
+    /// actually navigates to those panes via the letter chips.
+    fn on_box_cursor_moved(&mut self) {
+        self.refresh_recent_changes();
+        // Drop any old per-box state so the next focus on Changes /
+        // Hunks / Procs / Outputs forces a fresh load_*_if_needed.
+        self.changes_view_sid = None;
+        self.processes_view_sid = None;
+        self.outputs_view_sid = None;
     }
 
     /// After (re)loading the changes view, advance sel_change to the first
@@ -880,29 +909,16 @@ impl App {
     }
 
     /// Pull the newest-first slice of the current box's sqlar — populates
-    /// `recent_changes` when the selected box is live, clears it otherwise.
+    /// Pull the box summary bundle for the currently-selected box.
+    /// One small RPC; populates `box_summary` which `box_detail_lines`
+    /// reads. Named for the legacy "recent_changes" call but renamed
+    /// in spirit — recent_changes Vec is gone, the bundle is the
+    /// single source of truth now (no fallback).
     fn refresh_recent_changes(&mut self) {
-        self.recent_changes.clear();
-        let live = self.sessions.get(self.sel_session)
-            .and_then(|s| s.get("live").and_then(Value::as_bool))
-            .unwrap_or(false);
-        if !live { return; }
         let Some(sid) = self.cur_sid() else { return };
-        if let Ok(rep) = rpc(&self.sock, "review.recent_changes",
-                             json!([sid, 40])) {
-            if let Some(arr) = rep.as_array() {
-                self.recent_changes = arr.clone();
-            }
-        }
-        // The Sessions-view right pane shows the five-list bundle
-        // (outputs / changes / processes / pipelines / build-edges)
-        // newest-first. One RPC instead of five — engine packs them in
-        // review.box_summary; xattr modifications mix into the changes
-        // list as kind="xattr" rows.
         self.box_summary = serde_json::json!(null);
-        match rpc(&self.sock, "review.box_summary", json!([sid, 8])) {
-            Ok(v) => self.box_summary = v,
-            Err(_) => {}
+        if let Ok(v) = rpc(&self.sock, "review.box_summary", json!([sid, 8])) {
+            self.box_summary = v;
         }
     }
 
@@ -1265,6 +1281,7 @@ impl App {
                 self.processes_view = v.get("view_id").and_then(Value::as_u64);
                 self.processes_total =
                     v.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
+                self.processes_view_sid = Some(sid);
             }
             Err(e) if e.contains("unknown verb") => {
                 self.status = format!(
@@ -1277,6 +1294,19 @@ impl App {
         }
         self.fetch_processes_window(0);
         self.seek_first_real_proc();
+    }
+
+    /// Load the procs view only if it's not already loaded for the
+    /// currently-selected box. Called from the letter-chip / nav /
+    /// Tab path so a session-switch doesn't pay the view.open cost
+    /// (eager full-sqlar scan, expensive on million-row boxes); the
+    /// user pays it once when they actually navigate to procs.
+    fn load_processes_if_needed(&mut self) {
+        let cur = self.cur_sid_i64();
+        if cur.is_some() && self.processes_view_sid == cur {
+            return;
+        }
+        self.load_processes();
     }
 
     /// Load the brush pipelines for the currently-selected box. Each row
@@ -1423,6 +1453,7 @@ impl App {
                 self.outputs_view = v.get("view_id").and_then(Value::as_u64);
                 self.outputs_total =
                     v.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
+                self.outputs_view_sid = Some(sid);
             }
             Err(e) if e.contains("unknown verb") => {
                 self.status = format!(
@@ -1434,6 +1465,16 @@ impl App {
             Err(e) => { self.status = format!("view.open outputs: {e}"); return; }
         }
         self.fetch_outputs_window(0);
+    }
+
+    /// Lazy counterpart of load_outputs — same idea as
+    /// load_processes_if_needed: only re-open when the box changed.
+    fn load_outputs_if_needed(&mut self) {
+        let cur = self.cur_sid_i64();
+        if cur.is_some() && self.outputs_view_sid == cur {
+            return;
+        }
+        self.load_outputs();
     }
 
     /// Pull one window of the outputs index, then decode just those rows'
@@ -1562,7 +1603,7 @@ impl App {
             Pane::Sessions => {
                 if self.sel_session + 1 < self.sessions.len() {
                     self.sel_session += 1;
-                    self.load_changes();
+                    self.on_box_cursor_moved();
                 }
             }
             Pane::Changes => {
@@ -1617,7 +1658,7 @@ impl App {
             Pane::Sessions => {
                 if self.sel_session > 0 {
                     self.sel_session -= 1;
-                    self.load_changes();
+                    self.on_box_cursor_moved();
                 }
             }
             Pane::Changes => {
@@ -1669,7 +1710,7 @@ impl App {
                 let new = (cur + delta).clamp(0, total as isize - 1) as usize;
                 if new != self.sel_session {
                     self.sel_session = new;
-                    self.load_changes();
+                    self.on_box_cursor_moved();
                 }
             }
             Pane::Changes => {
@@ -3934,33 +3975,20 @@ fn box_detail_lines(app: &App) -> Vec<Line<'static>> {
     render_pipelines_section(&mut out, &pipes);
     render_edges_section(&mut out, &edges);
 
-    // Fallback: if the bundle never arrived (e.g. old engine that doesn't
-    // know review.box_summary) keep the previous behavior so the pane
-    // isn't blank — show the recent_changes list the old way.
-    if changes.is_empty() && outputs.is_empty() && procs.is_empty()
+    // No fallback: if box_summary is null (RPC failed) or every
+    // section is empty (a fresh box), we say so. The old code fell
+    // back to app.changes.iter().take(40) — alphabetical first 40 —
+    // which silently hid bugs in the summary path. Visible failure
+    // beats stale data the user can't tell is wrong.
+    if app.box_summary.is_null() {
+        out.push(Line::from(Span::styled(
+            "(no summary yet — engine is still answering review.box_summary)",
+            Style::default().add_modifier(Modifier::DIM).fg(Color::Yellow))));
+    } else if changes.is_empty() && outputs.is_empty() && procs.is_empty()
         && pipes.is_empty() && edges.is_empty() {
-        let preview: Box<dyn Iterator<Item = &Value>> =
-            if live && !app.recent_changes.is_empty() {
-                Box::new(app.recent_changes.iter())
-            } else {
-                Box::new(app.changes.iter().take(40))
-            };
-        for c in preview {
-            if c.get("connector").and_then(Value::as_bool) == Some(true) { continue; }
-            let kind = c.get("kind").and_then(Value::as_str).unwrap_or("");
-            let path = c.get("path").and_then(Value::as_str).unwrap_or("");
-            let (glyph, col) = match kind {
-                "deleted" => ("-", Color::Red),
-                "symlink" => ("~", Color::Magenta),
-                "changed" => ("~", Color::Yellow),
-                _ => ("·", Color::DarkGray),
-            };
-            out.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(format!("{glyph} "), Style::default().fg(col)),
-                Span::raw(path.to_string()),
-            ]));
-        }
+        out.push(Line::from(Span::styled(
+            "(box is empty — no changes, outputs, processes yet)",
+            Style::default().add_modifier(Modifier::DIM))));
     }
     out
 }
@@ -4740,9 +4768,12 @@ fn run_action(app: &mut App, a: Action) {
 fn dispatch_menubar_key(app: &mut App, k: char) {
     match k {
         'b' => { app.snap_left(); app.focus = Pane::Sessions; }
-        'c' => { app.snap_left(); app.nav(Pane::Changes); }
-        'p' => { app.snap_left(); app.nav(Pane::Processes); }
-        'o' => { app.snap_left(); app.nav(Pane::Outputs); }
+        'c' => { app.snap_left(); app.nav(Pane::Changes);
+                 app.load_changes_if_needed(); }
+        'p' => { app.snap_left(); app.nav(Pane::Processes);
+                 app.load_processes_if_needed(); }
+        'o' => { app.snap_left(); app.nav(Pane::Outputs);
+                 app.load_outputs_if_needed(); }
         'l' => {
             app.snap_left();
             app.focus = Pane::Pipelines;
@@ -6121,16 +6152,16 @@ mod tests {
             sock: String::new(),
             sessions: vec![],
             changes: vec![],
-            changes_view: None,
+            changes_view: None, changes_view_sid: None,
             changes_total: 0,
             changes_window_start: 0,
             hunks: Value::Null,
             processes: vec![],
-            processes_view: None,
+            processes_view: None, processes_view_sid: None,
             processes_total: 0,
             processes_window_start: 0,
             outputs: vec![],
-            outputs_view: None,
+            outputs_view: None, outputs_view_sid: None,
             outputs_total: 0,
             outputs_window_start: 0,
             rules: vec![], pipelines: vec![], build_edges: vec![],
@@ -6156,7 +6187,7 @@ mod tests {
             cd_info: None,
             output_segs: vec![],
             changes_decor: vec![],
-            recent_changes: vec![], box_summary: serde_json::json!(null),
+            box_summary: serde_json::json!(null),
         };
         app.focus = Pane::Help;
         // render tall enough to fit the full manual (it scrolls in a real term).

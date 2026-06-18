@@ -34,6 +34,45 @@ fn pidfd_open(pid: i32) -> i32 {
     unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as i32 }
 }
 
+/// Expand a user-editable glob-pattern file into a deduplicated list
+/// of host paths. Lines starting with '#' and blank lines are skipped.
+/// A literal path (no glob meta-character) is passed through as-is
+/// (cheap, no filesystem walk). A glob pattern is expanded against
+/// the host filesystem with the `glob` crate. Missing file falls back
+/// to `defaults` — used so the historical -b shadow set (/bin/sh
+/// /bin/bash etc.) keeps working without the user creating a config.
+fn expand_shadow_glob(file: &std::path::Path, defaults: &[&str]) -> Vec<String> {
+    let patterns: Vec<String> = match std::fs::read_to_string(file) {
+        Ok(s) => s.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(String::from)
+            .collect(),
+        Err(_) => defaults.iter().map(|s| (*s).to_string()).collect(),
+    };
+    let has_meta = |p: &str| p.contains(['*', '?', '[']);
+    let mut out: Vec<String> = vec![];
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for pat in &patterns {
+        if has_meta(pat) {
+            // Glob: walk the host filesystem. Errors per-entry are
+            // ignored — a permission-denied dir on the way to a
+            // legitimate match shouldn't kill the box launch.
+            if let Ok(it) = glob::glob(pat) {
+                for p in it.flatten() {
+                    let s = p.to_string_lossy().into_owned();
+                    if seen.insert(s.clone()) { out.push(s); }
+                }
+            }
+        } else {
+            // Literal path: no filesystem walk needed, --ro-bind-try
+            // does the existence check at bwrap-launch time.
+            if seen.insert(pat.clone()) { out.push(pat.clone()); }
+        }
+    }
+    out
+}
+
 /// pidfd_open, exposed for the brush module (same capture/MUTE wiring).
 pub fn pidfd_open_pub(pid: i32) -> i32 { pidfd_open(pid) }
 
@@ -299,24 +338,31 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
     // governs the top-level brush body. Non-brush boxes are NOT touched (their
     // /bin/sh is the real system shell).
     if brush && capture_on {
-        bwrap.args(["--ro-bind", &self_exe, "/bin/sh",
-                    "--ro-bind-try", &self_exe, "/usr/bin/sh",
-                    "--ro-bind-try", &self_exe, "/bin/bash",
-                    "--ro-bind-try", &self_exe, "/usr/bin/bash"]);
-        // Phase 1 — embedded ninja: shadow ninja with the engine too, so a -b
-        // box running `ninja` lands in n2run::n2_main (vendored n2 in-process,
-        // recipes through embedded brush). --ro-bind-try: many boxes have no
-        // ninja installed, and one path may be a symlink to the other.
-        bwrap.args(["--ro-bind-try", &self_exe, "/usr/bin/ninja",
-                    "--ro-bind-try", &self_exe, "/bin/ninja"]);
-        // Phase 2 — embedded make: shadow make/gmake the same way, so a -b box
-        // running `make` lands in katirun::make_main (vendored kati parses the
-        // Makefile → ninja graph in-memory, embedded n2 executes it, recipes
-        // through brush). --ro-bind-try: many boxes have only one of these paths.
-        bwrap.args(["--ro-bind-try", &self_exe, "/usr/bin/make",
-                    "--ro-bind-try", &self_exe, "/bin/make",
-                    "--ro-bind-try", &self_exe, "/usr/bin/gmake",
-                    "--ro-bind-try", &self_exe, "/bin/gmake"]);
+        // Shadow set comes from three USER-EDITABLE glob files (one per
+        // tool kind), so toolchains in non-default locations can be
+        // intercepted by adding lines like `/opt/**/bin/sh`. Missing
+        // file → historical defaults ({/bin,/usr/bin}/sh,bash,dash, etc.)
+        // so this is backward-compatible: the existing user keeps the
+        // same behavior, the new user can prune or extend at will.
+        let sh_paths = expand_shadow_glob(
+            &paths::shadow_sh_glob_path(),
+            &["/bin/sh", "/usr/bin/sh",
+              "/bin/bash", "/usr/bin/bash",
+              "/bin/dash", "/usr/bin/dash"]);
+        let make_paths = expand_shadow_glob(
+            &paths::shadow_make_glob_path(),
+            &["/bin/make", "/usr/bin/make",
+              "/bin/gmake", "/usr/bin/gmake"]);
+        let ninja_paths = expand_shadow_glob(
+            &paths::shadow_ninja_glob_path(),
+            &["/bin/ninja", "/usr/bin/ninja"]);
+        // One --ro-bind-try per resolved host path. -try because a
+        // toolchain glob may point at files the host doesn't have
+        // (or that get added later), and we never want a missing
+        // shadow target to kill the box launch.
+        for p in sh_paths.iter().chain(make_paths.iter()).chain(ninja_paths.iter()) {
+            bwrap.args(["--ro-bind-try", &self_exe, p]);
+        }
         bwrap.args(["--setenv", "SARUN_BRUSH_SH", "1"]);
     }
     bwrap.args(["--unshare-pid", "--unshare-ipc", "--unshare-uts",

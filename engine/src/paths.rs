@@ -28,6 +28,26 @@ pub fn config_home() -> PathBuf {
     home("XDG_CONFIG_HOME", ".config").join(app_dir())
 }
 
+/// User-edited list of host paths the engine should shadow with itself
+/// when a -b box runs, redirecting them to the brush-sh shim. One glob
+/// per line in the config file ({config_home}/shadow_sh.glob); blank
+/// lines and lines starting with `#` are ignored. Missing file falls
+/// back to the historical defaults ({/bin,/usr/bin}/{sh,bash,dash}).
+pub fn shadow_sh_glob_path() -> PathBuf {
+    config_home().join("shadow_sh.glob")
+}
+
+/// Same for the embedded-make redirect. Pattern file lives at
+/// {config_home}/shadow_make.glob; default {/bin,/usr/bin}/{make,gmake}.
+pub fn shadow_make_glob_path() -> PathBuf {
+    config_home().join("shadow_make.glob")
+}
+
+/// Same for the embedded-ninja redirect; default {/bin,/usr/bin}/ninja.
+pub fn shadow_ninja_glob_path() -> PathBuf {
+    config_home().join("shadow_ninja.glob")
+}
+
 pub fn runtime_home() -> PathBuf {
     match env::var("XDG_RUNTIME_DIR") {
         Ok(v) if !v.is_empty() => PathBuf::from(v).join(app_dir()),
