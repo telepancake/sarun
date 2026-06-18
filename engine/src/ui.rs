@@ -452,6 +452,15 @@ struct App {
     /// view's right column instead of the normal detail body. Stays
     /// false on PTY full-screen mode (Pane::Pty manages itself).
     pty_in_right: bool,
+    /// F9 menu navigation: when true, the menubar cursor is active
+    /// and arrow keys move between top-level menu chips. Enter
+    /// activates the chip under the cursor (same as pressing its
+    /// accelerator letter); Esc cancels. The letter accelerators
+    /// (b/c/p/o/l/g/e/?/P) keep working alongside.
+    menu_nav: bool,
+    /// Index into menubar_chips(self) the menu cursor is on. Only
+    /// meaningful when menu_nav is true.
+    menu_sel: usize,
     /// Index into `ptys`. Always < ptys.len() when ptys non-empty;
     /// 0 when empty (rendering checks ptys.is_empty()).
     sel_pty: usize,
@@ -538,7 +547,7 @@ impl App {
             f_procs: ViewFilter::default(),
             f_outputs: ViewFilter::default(),
             should_quit: false,
-            ptys: vec![], sel_pty: 0, pty_esc_at: None, right_focused: false, right_scroll: 0, pty_in_right: false,
+            ptys: vec![], sel_pty: 0, pty_esc_at: None, right_focused: false, right_scroll: 0, pty_in_right: false, menu_nav: false, menu_sel: 0,
             structd: StructState::default(),
             sel_hunk: 0,
             struct_rx: None,
@@ -3147,8 +3156,10 @@ fn view_of_pane(p: Pane) -> Option<(char, &'static str, FilterView)> {
 /// active pane reverses; chips that would lead to an empty pane for
 /// this box are dimmed (procs/outputs/pipes/build) or hidden (same
 /// rule as the old keybar). PTY chip shows when any PTY is open.
-fn menubar_spans(app: &App) -> Vec<Span<'static>> {
-    let active = view_of_pane(app.focus).map(|(k, _, _)| k);
+/// Visible top-level menu chips for the current state. The same list
+/// drives both the menubar render and F9 menu-nav dispatch — one
+/// source of truth so they can't drift.
+fn menubar_chips(app: &App) -> Vec<(char, &'static str)> {
     let has = |k: &str| app.box_summary.get(k)
         .and_then(Value::as_array).map(|a| !a.is_empty()).unwrap_or(false);
     let show_procs    = has("processes") || app.focus == Pane::Processes;
@@ -3156,7 +3167,7 @@ fn menubar_spans(app: &App) -> Vec<Span<'static>> {
     let show_pipes    = has("pipelines") || app.focus == Pane::Pipelines;
     let show_build    = has("edges")     || app.focus == Pane::BuildEdges;
     let any_pty       = !app.ptys.is_empty();
-    let chips: Vec<(char, &str)> = [
+    [
         Some(('b', "Boxes")),
         Some(('c', "Changes")),
         if show_procs   { Some(('p', "Procs"))   } else { None },
@@ -3166,23 +3177,37 @@ fn menubar_spans(app: &App) -> Vec<Span<'static>> {
         Some(('e', "Rules")),
         if any_pty { Some(('P', "PTYs")) } else { None },
         Some(('?', "Help")),
-    ].into_iter().flatten().collect();
+    ].into_iter().flatten().collect()
+}
+
+fn menubar_spans(app: &App) -> Vec<Span<'static>> {
+    let active = view_of_pane(app.focus).map(|(k, _, _)| k);
+    let chips = menubar_chips(app);
     let mut spans: Vec<Span<'static>> = Vec::new();
-    for (key, label) in chips {
-        let on = active == Some(key);
-        let style = if on {
+    for (i, (key, label)) in chips.iter().enumerate() {
+        let on = active == Some(*key);
+        // Menu-nav mode (F9): the cursor lands on a chip and arrows
+        // move it. Highlight differs from "active view" so the user
+        // can tell "the cursor is HERE waiting for Enter" apart from
+        // "this is the view I'm currently on".
+        let menu_cursor = app.menu_nav && app.menu_sel == i;
+        let style = if menu_cursor {
+            Style::default().fg(Color::Black).bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else if on {
             Style::default().fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD | Modifier::REVERSED)
         } else {
             Style::default().add_modifier(Modifier::BOLD)
         };
-        // Spell the letter accelerator BOLD-colored inside the label
-        // (Norton-Commander look: " Boxes "), and re-tint the chip when
-        // it's the active one. We bake the highlight into the chip
-        // string rather than a sub-span to keep menubar one Line wide.
         spans.push(Span::styled(format!("  {label}"), style));
         spans.push(Span::styled(format!(" ({key}) "),
-            Style::default().fg(if on { Color::Yellow } else { Color::DarkGray })));
+            Style::default().fg(if on || menu_cursor { Color::Yellow }
+                                else { Color::DarkGray })));
+    }
+    if app.menu_nav {
+        spans.push(Span::styled("   ←/→ move · Enter pick · Esc cancel",
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::DIM)));
     }
     spans
 }
@@ -4338,6 +4363,44 @@ fn render_to_string(app: &App, w: u16, h: u16) -> Result<String, String> {
 
 /// Handle one keypress while a modal is open. Mirrors the Python Confirm /
 /// SearchModal / RuleFormModal interactions.
+/// Dispatch a menubar accelerator letter (b / c / p / o / l / g / e /
+/// P / ?). Shared between the F9 menu-nav Enter path and the direct
+/// letter-key handler — same effect either way (snap focus to the
+/// left list, switch view, load data when relevant).
+fn dispatch_menubar_key(app: &mut App, k: char) {
+    match k {
+        'b' => { app.snap_left(); app.focus = Pane::Sessions; }
+        'c' => { app.snap_left(); app.nav(Pane::Changes); }
+        'p' => { app.snap_left(); app.nav(Pane::Processes); }
+        'o' => { app.snap_left(); app.nav(Pane::Outputs); }
+        'l' => {
+            app.snap_left();
+            app.focus = Pane::Pipelines;
+            app.load_pipelines();
+        }
+        'g' => {
+            app.snap_left();
+            app.focus = Pane::BuildEdges;
+            app.load_build_edges();
+        }
+        'e' => { app.snap_left(); app.focus = Pane::Rules; }
+        '?' => { app.snap_left(); app.focus = Pane::Help; app.out_scroll = 0; }
+        'P' => {
+            let any_live = app.ptys.iter().any(|p| !p.eof);
+            if any_live {
+                if app.cur_pty().map(|p| p.eof).unwrap_or(true) {
+                    if let Some((i, _)) = app.ptys.iter().enumerate()
+                        .find(|(_, p)| !p.eof) { app.sel_pty = i; }
+                }
+                app.focus = Pane::Pty;
+            } else {
+                app.modal = Some(Modal::PtyCmd { buf: pty_default_cmd() });
+            }
+        }
+        _ => {}
+    }
+}
+
 fn handle_modal_key(app: &mut App, code: crossterm::event::KeyCode,
                     mods: crossterm::event::KeyModifiers) {
     use crossterm::event::KeyCode;
@@ -4496,6 +4559,69 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                 // modal captures keys (Confirm / Search / RuleForm).
                 if app.modal.is_some() {
                     handle_modal_key(&mut app, k.code, k.modifiers);
+                    continue;
+                }
+                // F9 menu nav: ←/→ move the menubar cursor, Enter
+                // dispatches via the chip's accelerator letter, Esc
+                // cancels back to normal mode. The letter accelerators
+                // (b/c/p/o/l/g/e/?/P) still work directly without
+                // entering nav mode, so this is purely additive.
+                if app.menu_nav {
+                    let chips = menubar_chips(&app);
+                    match k.code {
+                        KeyCode::Esc => {
+                            app.menu_nav = false;
+                            app.status = "menu cancelled".into();
+                        }
+                        KeyCode::Left => {
+                            if !chips.is_empty() {
+                                app.menu_sel = (app.menu_sel + chips.len() - 1)
+                                    % chips.len();
+                            }
+                        }
+                        KeyCode::Right => {
+                            if !chips.is_empty() {
+                                app.menu_sel = (app.menu_sel + 1) % chips.len();
+                            }
+                        }
+                        KeyCode::Home => app.menu_sel = 0,
+                        KeyCode::End => {
+                            if !chips.is_empty() {
+                                app.menu_sel = chips.len() - 1;
+                            }
+                        }
+                        KeyCode::Enter => {
+                            // Exit nav, then synthesize the accelerator
+                            // letter to dispatch via the existing chip
+                            // handler (which already does snap_left and
+                            // any per-pane setup).
+                            app.menu_nav = false;
+                            if let Some((key, _)) = chips.get(app.menu_sel).copied() {
+                                let letter_event = crossterm::event::KeyEvent::new(
+                                    KeyCode::Char(key),
+                                    crossterm::event::KeyModifiers::empty());
+                                // Replay through the same loop body by
+                                // re-injecting; cleaner: dispatch inline.
+                                dispatch_menubar_key(&mut app, key);
+                                let _ = letter_event;
+                            }
+                        }
+                        KeyCode::Char(c) => {
+                            // Typing the letter accelerator while in
+                            // nav mode also activates (so F9 then 'p'
+                            // works the same as just 'p'). Anything
+                            // else cancels — typing a non-chip letter
+                            // in menu mode is most likely a fat-finger.
+                            if chips.iter().any(|(k, _)| *k == c) {
+                                app.menu_nav = false;
+                                dispatch_menubar_key(&mut app, c);
+                            } else {
+                                app.menu_nav = false;
+                                app.status = "menu cancelled (unknown chip)".into();
+                            }
+                        }
+                        _ => {}
+                    }
                     continue;
                 }
                 // rename input mode captures keys
@@ -4682,7 +4808,21 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                             else if app.focus == Pane::Changes { app.discard(); }
                             else if app.focus == Pane::Rules { app.delete_rule(); }
                         }
-                        9 => { app.status = "F9 menu navigation — coming next".into(); }
+                        9 => {
+                            // F9 enters menu-nav mode: highlight a
+                            // menubar chip, ←/→ move, Enter picks,
+                            // Esc cancels. We land on the chip for
+                            // the currently-active view (or the
+                            // first chip if no chip maps).
+                            let chips = menubar_chips(&app);
+                            let active = view_of_pane(app.focus)
+                                .map(|(k, _, _)| k);
+                            app.menu_sel = chips.iter()
+                                .position(|(k, _)| Some(*k) == active)
+                                .unwrap_or(0);
+                            app.menu_nav = true;
+                            app.status = "menu — ←/→ move · Enter pick · Esc cancel".into();
+                        }
                         10 => { shutdown_rpc(&app.sock); app.should_quit = true; }
                         _ => {}
                     }
@@ -4722,43 +4862,11 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                     // clears the right-pane scroll — carrying right_focused
                     // across views would put the cursor in the new view's
                     // detail body, which has no cursor of its own.
-                    KeyCode::Char('b') => { app.snap_left(); app.focus = Pane::Sessions; }
-                    KeyCode::Char('c') => { app.snap_left(); app.nav(Pane::Changes); }
-                    KeyCode::Char('p') => { app.snap_left(); app.nav(Pane::Processes); }
-                    KeyCode::Char('o') => { app.snap_left(); app.nav(Pane::Outputs); }
-                    KeyCode::Char('l') => {
-                        app.snap_left();
-                        app.focus = Pane::Pipelines;
-                        app.load_pipelines();
-                    }
-                    KeyCode::Char('g') => {
-                        app.snap_left();
-                        app.focus = Pane::BuildEdges;
-                        app.load_build_edges();
-                    }
-                    KeyCode::Char('e') => { app.snap_left(); app.focus = Pane::Rules; }
-                    KeyCode::Char('?') => { app.snap_left(); app.focus = Pane::Help; app.out_scroll = 0; }
-                    // 'P' re-attaches to the most recent live PTY if any
-                    // exist, otherwise prompts for a fresh command (same
-                    // entrypoint as F7 inside the PTY pane). To force a
-                    // NEW PTY when others are open, use F7 from inside
-                    // the pane.
-                    KeyCode::Char('P') => {
-                        let any_live = app.ptys.iter().any(|p| !p.eof);
-                        if any_live {
-                            // Pick a live one closest to the current sel.
-                            if app.cur_pty().map(|p| p.eof).unwrap_or(true) {
-                                if let Some((i, _)) = app.ptys.iter().enumerate()
-                                    .find(|(_, p)| !p.eof) { app.sel_pty = i; }
-                            }
-                            app.focus = Pane::Pty;
-                            app.status = format!(
-                                "PTY {}/{} re-attached",
-                                app.sel_pty + 1, app.ptys.len());
-                        } else {
-                            app.modal = Some(Modal::PtyCmd { buf: pty_default_cmd() });
-                        }
-                    }
+                    // Letter accelerators: route through the same
+                    // dispatch_menubar_key the F9 menu-nav path uses,
+                    // so the two paths can't diverge.
+                    KeyCode::Char(c @ ('b'|'c'|'p'|'o'|'l'|'g'|'e'|'?'|'P')) =>
+                        dispatch_menubar_key(&mut app, c),
                     // In the diff pane, a/x/d are PER-HUNK; elsewhere they act on
                     // the selected change / whole box.
                     KeyCode::Char('a') if app.focus == Pane::Hunks => app.apply_hunk(),
@@ -5596,7 +5704,7 @@ mod tests {
             f_procs: ViewFilter::default(),
             f_outputs: ViewFilter::default(),
             should_quit: false,
-            ptys: vec![], sel_pty: 0, pty_esc_at: None, right_focused: false, right_scroll: 0, pty_in_right: false,
+            ptys: vec![], sel_pty: 0, pty_esc_at: None, right_focused: false, right_scroll: 0, pty_in_right: false, menu_nav: false, menu_sel: 0,
             structd: StructState::default(),
             sel_hunk: 0,
             struct_rx: None,
