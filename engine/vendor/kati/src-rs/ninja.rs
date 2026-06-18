@@ -380,6 +380,7 @@ impl<'a> NinjaGenerator<'a> {
     }
 
     fn gen_shell_script(
+        &self,
         name: &Bytes,
         commands: &Vec<Command>,
         cmd_buf: &mut BytesMut,
@@ -390,7 +391,15 @@ impl<'a> NinjaGenerator<'a> {
         for c in commands {
             let inp = c.cmd.slice_ref(c.cmd.trim_ascii_start());
 
-            let needs_subshell = (command_count > 1 || c.ignore_error) && !c.force_no_subshell;
+            // sarun: .ONESHELL — all recipe lines share one shell, so
+            // they MUST NOT be wrapped in `()` (which would isolate
+            // variable / cwd / set-flag state) and MUST be joined by
+            // newlines (not `&&`, so each runs even if a prior one
+            // failed — matching the make manual's semantics under
+            // .ONESHELL).
+            let oneshell = self.ce.ev.oneshell;
+            let needs_subshell = !oneshell
+                && ((command_count > 1 || c.ignore_error) && !c.force_no_subshell);
 
             let mut translated = Self::translate_command(inp);
             if FLAGS.detect_android_echo
@@ -409,7 +418,12 @@ impl<'a> NinjaGenerator<'a> {
             }
 
             if !cmd_buf.is_empty() {
-                cmd_buf.put_slice(b" && ");
+                // sarun: with .ONESHELL active and no subshells, commands
+                // ride on one ninja-recipe line, separated by `; ` (don't
+                // abort on prior failure — matches bash's default
+                // behavior the .ONESHELL semantics rest on). A literal
+                // newline here is rejected by n2's ninja parser.
+                cmd_buf.put_slice(if oneshell { b" ; " } else { b" && " });
             }
 
             if needs_subshell {
@@ -475,7 +489,7 @@ impl<'a> NinjaGenerator<'a> {
 
             let mut description = Bytes::from_static(b"build $out");
             let mut cmd_buf = BytesMut::new();
-            Self::gen_shell_script(
+            self.gen_shell_script(
                 &node.output.as_bytes(),
                 commands,
                 &mut cmd_buf,
