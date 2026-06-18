@@ -194,6 +194,152 @@ pub fn recent_changes(id: i64, limit: i64) -> Value {
     Value::Array(out)
 }
 
+/// Five-list bundle for the Sessions-view right pane: newest-first
+/// previews of each kind, capped at `limit` per kind. One RPC per
+/// session-switch instead of five. xattr modifications ride in the
+/// changes list as their own rows (kind="xattr"), tagged with the file
+/// they hang off + the xattr key — they were invisible before, now
+/// they aren't.
+pub fn box_summary(id: i64, limit: i64) -> Value {
+    let Some(conn) = open_ro(id) else {
+        return json!({"outputs":[], "changes":[], "processes":[],
+                      "pipelines":[], "edges":[]});
+    };
+    // Files: newest-first by mtime. Same kind classification as
+    // recent_changes (sqlar S_IFCHR row = whiteout = deleted).
+    let mut file_rows: Vec<(i64, Value)> = vec![];
+    if let Ok(mut st) = conn.prepare(
+        "SELECT name, mode, sz, mtime FROM sqlar ORDER BY mtime DESC LIMIT ?1") {
+        if let Ok(it) = st.query_map([limit], |r| Ok((
+            r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u32,
+            r.get::<_, i64>(2)?, r.get::<_, i64>(3)?,
+        ))) {
+            for (name, mode, sz, mtime) in it.flatten() {
+                let kind = if mode & S_IFMT == S_IFCHR { "deleted" }
+                           else if mode & S_IFMT == S_IFLNK { "symlink" }
+                           else { "changed" };
+                file_rows.push((mtime, json!({
+                    "path": name, "kind": kind, "size": sz, "mtime": mtime,
+                })));
+            }
+        }
+    }
+    // xattrs: the side table has no mtime, so we ride the OWNING file's
+    // mtime to mix them into one timeline. Each xattr (name,key) pair is
+    // one row with kind="xattr". Key + value-byte-count surface; the raw
+    // bytes don't (they could be huge / binary).
+    let mut xattr_rows: Vec<(i64, Value)> = vec![];
+    if has_table(&conn, "xattr") {
+        if let Ok(mut st) = conn.prepare(
+            "SELECT x.name, x.key, length(x.value), \
+                    COALESCE(s.mtime, 0) \
+             FROM xattr x LEFT JOIN sqlar s ON s.name=x.name \
+             ORDER BY COALESCE(s.mtime, 0) DESC LIMIT ?1") {
+            if let Ok(it) = st.query_map([limit], |r| Ok((
+                r.get::<_, String>(0)?, r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?, r.get::<_, i64>(3)?,
+            ))) {
+                for (path, key, vlen, mtime) in it.flatten() {
+                    xattr_rows.push((mtime, json!({
+                        "path": path, "kind": "xattr",
+                        "xattr_key": key, "xattr_len": vlen, "mtime": mtime,
+                    })));
+                }
+            }
+        }
+    }
+    // Merge file + xattr rows by mtime desc, cap at `limit`.
+    let mut changes_merged: Vec<(i64, Value)> = file_rows;
+    changes_merged.extend(xattr_rows);
+    changes_merged.sort_by(|a, b| b.0.cmp(&a.0));
+    let changes: Vec<Value> = changes_merged.into_iter()
+        .take(limit as usize).map(|(_, v)| v).collect();
+
+    let mut outputs = vec![];
+    if let Ok(mut st) = conn.prepare(
+        "SELECT id, ts, stream, length(content), \
+                CAST(substr(content,1,80) AS TEXT) \
+         FROM outputs ORDER BY id DESC LIMIT ?1") {
+        if let Ok(it) = st.query_map([limit], |r| Ok(json!({
+            "id": r.get::<_, i64>(0)?, "ts": r.get::<_, f64>(1)?,
+            "stream": r.get::<_, i64>(2)?, "len": r.get::<_, i64>(3)?,
+            "preview": r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+        }))) {
+            for row in it.flatten() { outputs.push(row); }
+        }
+    }
+    // Reverse so the topmost row in the UI is the OLDEST of the tail —
+    // matches how a transcript reads. Actually no: keep newest-first so
+    // the user sees the latest first. The UI renders top-down.
+
+    let mut processes = vec![];
+    if let Ok(mut st) = conn.prepare(
+        "SELECT id, tgid, exe, argv FROM process ORDER BY id DESC LIMIT ?1") {
+        if let Ok(it) = st.query_map([limit], |r| {
+            let argv: String = r.get(3)?;
+            let av: Vec<String> = serde_json::from_str(&argv).unwrap_or_default();
+            let head = av.first().cloned().unwrap_or_default();
+            Ok(json!({
+                "id": r.get::<_, i64>(0)?, "tgid": r.get::<_, i64>(1)?,
+                "exe": r.get::<_, String>(2)?, "argv0": head,
+            }))
+        }) {
+            for row in it.flatten() { processes.push(row); }
+        }
+    }
+
+    let mut pipelines = vec![];
+    if has_table(&conn, "brushprov") {
+        if let Ok(mut st) = conn.prepare(
+            "SELECT id, cmd, COALESCE(nested,0) FROM brushprov \
+             ORDER BY id DESC LIMIT ?1") {
+            if let Ok(it) = st.query_map([limit], |r| Ok(json!({
+                "id": r.get::<_, i64>(0)?,
+                "cmd": r.get::<_, String>(1)?,
+                "nested": r.get::<_, i64>(2)? != 0,
+            }))) {
+                for row in it.flatten() { pipelines.push(row); }
+            }
+        }
+    }
+
+    let mut edges = vec![];
+    if has_table(&conn, "build_edges") {
+        if let Ok(mut st) = conn.prepare(
+            "SELECT id, outs, cmd FROM build_edges ORDER BY id DESC LIMIT ?1") {
+            if let Ok(it) = st.query_map([limit], |r| {
+                let outs: String = r.get(1)?;
+                let arr: Vec<String> = serde_json::from_str(&outs).unwrap_or_default();
+                let head = arr.first().cloned().unwrap_or_default();
+                Ok(json!({
+                    "id": r.get::<_, i64>(0)?, "out": head,
+                    "n_outs": arr.len(),
+                    "cmd": r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                }))
+            }) {
+                for row in it.flatten() { edges.push(row); }
+            }
+        }
+    }
+
+    json!({
+        "outputs":   outputs,
+        "changes":   changes,
+        "processes": processes,
+        "pipelines": pipelines,
+        "edges":     edges,
+    })
+}
+
+/// Cheap "does this sqlar have a given table" probe — Python-engine
+/// archives won't have brushprov / build_edges / xattr; old sarun
+/// archives won't have one or the other. Saves a noisy SQLITE_ERROR.
+fn has_table(conn: &rusqlite::Connection, name: &str) -> bool {
+    conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+        [name], |_| Ok(())).is_ok()
+}
+
 pub fn decorate(id: i64, rel: &str) -> Value {
     let rel = rel.trim_start_matches('/');
     let Some(mode) = current_mode(id, rel) else {
