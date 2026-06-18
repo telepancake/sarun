@@ -113,6 +113,65 @@ pub fn trim_suffix<'a>(s: &'a [u8], suffix: &[u8]) -> &'a [u8] {
     }
 }
 
+// sarun: walk a patsubst/subst-style replacement template and split at
+// the FIRST unescaped `%`. A `\%` is a literal `%` (the backslash is
+// consumed in the output); a `\\` is a literal `\`. Returns
+// (idx_in_subst, prefix_after_escape_processing, suffix_after_escape_processing)
+// or None when there is no unescaped `%`. Matches GNU make's behavior
+// (issue google/kati#234).
+fn split_subst_at_unescaped_percent(subst: &[u8]) -> Option<(usize, Vec<u8>, Vec<u8>)> {
+    let mut prefix = Vec::with_capacity(subst.len());
+    let mut i = 0;
+    while i < subst.len() {
+        if subst[i] == b'\\' && i + 1 < subst.len() {
+            let n = subst[i + 1];
+            if n == b'%' || n == b'\\' {
+                prefix.push(n);
+                i += 2;
+                continue;
+            }
+        }
+        if subst[i] == b'%' {
+            let mut suffix = Vec::with_capacity(subst.len() - i);
+            let mut j = i + 1;
+            while j < subst.len() {
+                if subst[j] == b'\\' && j + 1 < subst.len() {
+                    let n = subst[j + 1];
+                    if n == b'%' || n == b'\\' {
+                        suffix.push(n);
+                        j += 2;
+                        continue;
+                    }
+                }
+                suffix.push(subst[j]);
+                j += 1;
+            }
+            return Some((i, prefix, suffix));
+        }
+        prefix.push(subst[i]);
+        i += 1;
+    }
+    None
+}
+
+fn strip_backslash_before_percent(subst: &[u8]) -> Bytes {
+    let mut out = Vec::with_capacity(subst.len());
+    let mut i = 0;
+    while i < subst.len() {
+        if subst[i] == b'\\' && i + 1 < subst.len() {
+            let n = subst[i + 1];
+            if n == b'%' || n == b'\\' {
+                out.push(n);
+                i += 2;
+                continue;
+            }
+        }
+        out.push(subst[i]);
+        i += 1;
+    }
+    Bytes::from(out)
+}
+
 #[derive(Debug)]
 pub struct Pattern {
     pat: Bytes,
@@ -158,14 +217,18 @@ impl Pattern {
         };
 
         if self.match_impl(s, percent_index) {
-            if let Some(subst_percent_index) = memchr(b'%', subst) {
-                let mut ret = BytesMut::with_capacity(subst.len() + s.len() - self.pat.len() + 1);
-                ret.put_slice(&subst[..subst_percent_index]);
+            if let Some((subst_percent_index, prefix, suffix)) =
+                split_subst_at_unescaped_percent(subst)
+            {
+                let mut ret = BytesMut::with_capacity(prefix.len() + suffix.len() + s.len());
+                ret.put_slice(&prefix);
                 ret.put_slice(&s[percent_index..(percent_index + s.len() + 1 - self.pat.len())]);
-                ret.put_slice(&subst[subst_percent_index + 1..]);
+                ret.put_slice(&suffix);
+                let _ = subst_percent_index;
                 return ret.into();
             }
-            return subst.clone();
+            // No unescaped %: still need to process \% -> % escapes.
+            return strip_backslash_before_percent(subst);
         }
         s.clone()
     }
