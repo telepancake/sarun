@@ -435,13 +435,23 @@ struct App {
     /// currently rendered. Reset to 0 on every view switch (so each
     /// view's right pane starts at the top, the prototype's behavior).
     right_scroll: u16,
-    /// All currently-open engine-held PTYs. Pane::Pty renders
-    /// `ptys[sel_pty]`; F2/F3 cycle between them, F7 creates a new
-    /// one, F8 kills the current one. The vec stays non-empty as
-    /// long as ANY PTY is live — an EOF'd PTY is dropped when the
-    /// user moves off of it, so re-opening the pane lands on a
-    /// running shell, not a corpse.
+    /// When true, the focused view's RIGHT column hosts the currently
+    /// selected PTY (`ptys[sel_pty]`) instead of the normal detail
+    /// body. Lets the user watch a live shell next to the boxes /
+    /// changes / procs lists. Toggled by F11; only meaningful when
+    /// ptys.is_empty() == false. PTY full-screen (Pane::Pty) is a
+    /// separate state — F11 from there shrinks the PTY into the
+    /// previous view's right column instead of toggling.
+    /// All currently-open engine-held PTYs. Pane::Pty renders the
+    /// full-screen view of `ptys[sel_pty]`; F2/F3 cycle between them,
+    /// F7 creates a new one, F8 kills the current one. EOF'd PTYs
+    /// are dropped when the user moves off of them, so re-opening
+    /// the pane lands on a running shell, not a corpse.
     ptys: Vec<PtyPane>,
+    /// F11 toggle — when true, embed the active PTY into the focused
+    /// view's right column instead of the normal detail body. Stays
+    /// false on PTY full-screen mode (Pane::Pty manages itself).
+    pty_in_right: bool,
     /// Index into `ptys`. Always < ptys.len() when ptys non-empty;
     /// 0 when empty (rendering checks ptys.is_empty()).
     sel_pty: usize,
@@ -528,7 +538,7 @@ impl App {
             f_procs: ViewFilter::default(),
             f_outputs: ViewFilter::default(),
             should_quit: false,
-            ptys: vec![], sel_pty: 0, pty_esc_at: None, right_focused: false, right_scroll: 0,
+            ptys: vec![], sel_pty: 0, pty_esc_at: None, right_focused: false, right_scroll: 0, pty_in_right: false,
             structd: StructState::default(),
             sel_hunk: 0,
             struct_rx: None,
@@ -3220,23 +3230,27 @@ fn fkeybar_spans(app: &App) -> Vec<Span<'static>> {
         } else {
             Style::default().fg(Color::Black).bg(Color::Cyan)
         };
-        spans.push(Span::styled(format!("{label:<8}"), lstyle));
+        // F11 (index 10) takes slot 11 — narrower because of the
+        // two-digit prefix, but still readable.
+        let width = if n == 10 { 7 } else { 8 };
+        spans.push(Span::styled(format!("{label:<width$}"), lstyle));
         spans.push(Span::raw(" "));
     }
     spans
 }
 
-/// Compute the 10 F-key labels for the current pane. "·" means
-/// unbound (renders dim). The keymap in the interactive loop honors
-/// the same set — Help+Quit always work, the rest dispatch on focus.
-fn fkey_labels(app: &App) -> [&'static str; 10] {
+/// Compute the labels for the F-keybar. We use 11 slots so F11
+/// (split/un-split with the PTY in the right column) can surface
+/// alongside F1..F10. "·" means unbound; rendered dim.
+fn fkey_labels(app: &App) -> [&'static str; 11] {
     let pty_pane = app.focus == Pane::Pty;
     let hunks    = app.focus == Pane::Hunks;
     let rules    = app.focus == Pane::Rules;
     let sessions = app.focus == Pane::Sessions;
     let changes  = app.focus == Pane::Changes;
+    let any_pty  = !app.ptys.is_empty();
     // Default fields. Override per pane below.
-    let mut f: [&'static str; 10] = [
+    let mut f: [&'static str; 11] = [
         "Help",     // F1   — always
         if pty_pane { "PtyNext" } else { "Pty+" },  // F2
         if pty_pane { "PtyPrev" } else { "Tab" },   // F3
@@ -3252,6 +3266,12 @@ fn fkey_labels(app: &App) -> [&'static str; 10] {
         else { "·" }, // F8
         "Menu",     // F9 (navigation in menubar — placeholder for now)
         "Quit",     // F10  — always
+        // F11: split/un-split. The label flips with `pty_in_right`
+        // so the user can read what F11 will DO next.
+        if pty_pane { "Embed" }
+        else if !any_pty { "Pty+" }
+        else if app.pty_in_right { "Solo" }
+        else { "Split" },
     ];
     // Override: PTY pane F12 detach is shown in the title strip too;
     // we mirror that here so the user doesn't have to look up.
@@ -3371,6 +3391,45 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         let lf = !app.right_focused;
         let rf = app.right_focused;
         let rscroll = app.right_scroll;
+        // F11 embed mode: swap the RIGHT column for the active PTY's
+        // screen. Renders a thin title strip + the vt100 grid, like the
+        // full-screen Pane::Pty path but constrained to the right area.
+        // Falls through to normal detail rendering when off / no PTY.
+        let embed_pty = app.pty_in_right && !app.ptys.is_empty();
+        if embed_pty {
+            if let Some(pty) = app.cur_pty() {
+                let total = app.ptys.len();
+                let sel = app.sel_pty + 1;
+                let state = if pty.eof { "(exited)" } else { "live" };
+                let tag = format!("PTY {sel}/{total} · {state}");
+                let split = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(1), Constraint::Min(1)])
+                    .split(right);
+                let title_bar = Paragraph::new(Line::from(vec![
+                    Span::styled(tag,
+                        Style::default().fg(if rf { Color::Yellow } else { Color::DarkGray })
+                            .add_modifier(Modifier::BOLD)),
+                    Span::raw("   "),
+                    Span::styled("F11 full-screen · F8 kill · F2/F3 cycle",
+                        Style::default().add_modifier(Modifier::DIM)),
+                ]));
+                f.render_widget(title_bar, split[0]);
+                let screen = pty.parser.screen();
+                f.render_widget(tui_term::widget::PseudoTerminal::new(screen), split[1]);
+                // Now render the LEFT pane below per the focus arm (the
+                // `match` keeps its existing arms; only the right
+                // half above is overridden). Bypass the per-arm right
+                // render by re-purposing `right` to the empty rect
+                // we already drew on, and shortening the match's
+                // right-side responsibilities to nothing.
+                // We accomplish this by setting a sentinel and letting
+                // each arm check it.
+            }
+        }
+        // Sentinel for the per-arm right renderers to skip their detail
+        // body when the embed has already taken over the right column.
+        let skip_right = embed_pty;
         match app.focus {
             Pane::Sessions => {
                 let lines = sessions_lines(app);
@@ -3383,7 +3442,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                     .block(block(title("BOX · DETAIL", rf), rf))
                     .scroll((rscroll, 0))
                     .wrap(Wrap { trim: false });
-                f.render_widget(detail, right);
+                if !skip_right { f.render_widget(detail, right); }
             }
             Pane::Processes => {
                 let lines = processes_lines(app);
@@ -3396,7 +3455,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                     .block(block(title("ENVIRONMENT · DETAIL", rf), rf))
                     .scroll((rscroll, 0))
                     .wrap(Wrap { trim: false });
-                f.render_widget(detail, right);
+                if !skip_right { f.render_widget(detail, right); }
             }
             Pane::Outputs => {
                 let lines = outputs_index_lines(app);
@@ -3409,7 +3468,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                     .block(block(title("OUTPUT · stdout/stderr", rf), rf))
                     .scroll((rscroll, 0))
                     .wrap(Wrap { trim: false });
-                f.render_widget(out, right);
+                if !skip_right { f.render_widget(out, right); }
             }
             Pane::Pipelines => {
                 let lines = pipelines_lines(app);
@@ -3422,7 +3481,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                     .block(block(title("PIPELINE · DETAIL", rf), rf))
                     .scroll((rscroll, 0))
                     .wrap(Wrap { trim: false });
-                f.render_widget(detail, right);
+                if !skip_right { f.render_widget(detail, right); }
             }
             Pane::BuildEdges => {
                 let lines = build_edges_lines(app);
@@ -3435,7 +3494,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                     .block(block(title("EDGE · DETAIL", rf), rf))
                     .scroll((rscroll, 0))
                     .wrap(Wrap { trim: false });
-                f.render_widget(detail, right);
+                if !skip_right { f.render_widget(detail, right); }
             }
             Pane::Rules => {
                 let lines = rules_lines(app);
@@ -3449,7 +3508,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                     .block(block(title("WHAT IT MATCHES", rf), rf))
                     .scroll((rscroll, 0))
                     .wrap(Wrap { trim: false });
-                f.render_widget(detail, right);
+                if !skip_right { f.render_widget(detail, right); }
             }
             // Changes view (Pane::Changes is list-focused; Pane::Hunks is
             // diff-focused — same two-pane layout, different border). The
@@ -3467,25 +3526,27 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                     .scroll((scroll, 0));
                 f.render_widget(p, left);
 
-                let rsplit = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([Constraint::Length(4), Constraint::Min(3)])
-                    .split(right);
-                f.render_widget(
-                    Paragraph::new(Text::from(cd_info_lines(app)))
-                        .block(block(title("path", false), false))
-                        .wrap(Wrap { trim: false }),
-                    rsplit[0]);
+                if !skip_right {
+                    let rsplit = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([Constraint::Length(4), Constraint::Min(3)])
+                        .split(right);
+                    f.render_widget(
+                        Paragraph::new(Text::from(cd_info_lines(app)))
+                            .block(block(title("path", false), false))
+                            .wrap(Wrap { trim: false }),
+                        rsplit[0]);
 
-                let is_bin = !app.hunks.is_null()
-                    && app.hunks.get("is_text").and_then(Value::as_bool) != Some(true);
-                let diff_title = if is_bin { "structural diff" } else { "diff" };
-                let hunks = Paragraph::new(Text::from(hunk_lines(app)))
-                    .block(block(title(diff_title, app.focus == Pane::Hunks),
-                                 app.focus == Pane::Hunks))
-                    .scroll((app.hunk_scroll, 0))
-                    .wrap(Wrap { trim: false });
-                f.render_widget(hunks, rsplit[1]);
+                    let is_bin = !app.hunks.is_null()
+                        && app.hunks.get("is_text").and_then(Value::as_bool) != Some(true);
+                    let diff_title = if is_bin { "structural diff" } else { "diff" };
+                    let hunks = Paragraph::new(Text::from(hunk_lines(app)))
+                        .block(block(title(diff_title, app.focus == Pane::Hunks),
+                                     app.focus == Pane::Hunks))
+                        .scroll((app.hunk_scroll, 0))
+                        .wrap(Wrap { trim: false });
+                    f.render_widget(hunks, rsplit[1]);
+                }
             }
         }
     }
@@ -4457,7 +4518,17 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                 // engine-held child, EXCEPT Ctrl-] which detaches back to the UI
                 // (the classic telnet/ssh escape). This must come before the
                 // global keymap so 'q', Tab, etc. reach the shell, not the UI.
-                if app.focus == Pane::Pty {
+                // The PTY input handler fires when EITHER (a) we're on
+                // Pane::Pty (full-screen) OR (b) the active PTY is
+                // embedded into the focused view's right column and
+                // that column has the focus. In case (b) Tab takes the
+                // focus back to the left list, so user can still
+                // navigate boxes / changes / procs while a shell runs
+                // on the right.
+                let pty_input_active = app.focus == Pane::Pty
+                    || (app.pty_in_right && app.right_focused
+                        && !app.ptys.is_empty());
+                if pty_input_active {
                     use crossterm::event::KeyModifiers;
                     // EOF: child is dead. Any key detaches (no point typing
                     // into a corpse — that's how the user got stuck last time).
@@ -4474,6 +4545,17 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                         continue;
                     }
                     if matches!(k.code, KeyCode::F(8)) { app.pty_kill(); continue; }
+                    if matches!(k.code, KeyCode::F(11)) {
+                        // F11 from full-screen PTY: shrink the PTY into
+                        // the Sessions view's right column (default
+                        // landing for the embed mode). The user can then
+                        // F11 again to pop back to full-screen.
+                        app.focus = Pane::Sessions;
+                        app.pty_in_right = true;
+                        app.right_focused = true;
+                        app.right_scroll = 0;
+                        continue;
+                    }
                     if matches!(k.code, KeyCode::F(1)) {
                         app.snap_left();
                         app.focus = Pane::Help;
@@ -4506,10 +4588,22 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                         // The reader thread keeps draining the master into
                         // vt100's screen (so re-attach via the boxes view
                         // shows live state). No teardown — the box is fine.
+                        // Two flavors of detach:
+                        //   * Full-screen Pty pane → go back to Sessions.
+                        //   * Embedded (pty_in_right) → just unfocus the
+                        //     right column; the user stays on whichever
+                        //     list view they were on, with the PTY still
+                        //     running in the right pane (the next Tab
+                        //     reattaches it).
                         app.pty_esc_at = None;
-                        app.focus = Pane::Sessions;
+                        if app.focus == Pane::Pty {
+                            app.focus = Pane::Sessions;
+                        } else {
+                            // Embedded mode: leave focus, just unfocus.
+                            app.right_focused = false;
+                        }
                         app.status = format!(
-                            "PTY {}/{} detached (still running · P to re-attach)",
+                            "PTY {}/{} detached (still running · Tab/P re-attach)",
                             app.sel_pty + 1, app.ptys.len());
                     } else if matches!(k.code, KeyCode::Esc) {
                         // Arm the Esc-Esc chord; lone Esc still reaches
@@ -4544,6 +4638,21 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                         1 => { app.snap_left(); app.focus = Pane::Help; app.out_scroll = 0; }
                         2 => { app.modal = Some(Modal::PtyCmd { buf: pty_default_cmd() }); }
                         3 => { app.next_pane(); }
+                        11 => {
+                            // Embed the active PTY into the focused view's
+                            // RIGHT column (or un-embed). No-op when no PTY
+                            // is open; opens a fresh prompt in that case
+                            // so the toggle does something visible.
+                            if app.ptys.is_empty() {
+                                app.modal = Some(Modal::PtyCmd { buf: pty_default_cmd() });
+                            } else {
+                                app.pty_in_right = !app.pty_in_right;
+                                // Right-focus follows the embedded PTY so
+                                // keystrokes land there immediately.
+                                app.right_focused = app.pty_in_right;
+                                app.right_scroll = 0;
+                            }
+                        }
                         4 => {
                             if app.focus == Pane::Rules {
                                 let cur = app.rules.get(app.sel_rule).cloned().unwrap_or_default();
@@ -5487,7 +5596,7 @@ mod tests {
             f_procs: ViewFilter::default(),
             f_outputs: ViewFilter::default(),
             should_quit: false,
-            ptys: vec![], sel_pty: 0, pty_esc_at: None, right_focused: false, right_scroll: 0,
+            ptys: vec![], sel_pty: 0, pty_esc_at: None, right_focused: false, right_scroll: 0, pty_in_right: false,
             structd: StructState::default(),
             sel_hunk: 0,
             struct_rx: None,
