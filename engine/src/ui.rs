@@ -590,6 +590,11 @@ struct App {
     packet_detail: String,
     packet_detail_frame: u64,
     packets_stream: i64,
+    /// Banner-prompt queue head, refreshed each tick from the engine's
+    /// `prompts.peek`. While Some(_), the bottom status line gets
+    /// replaced with a YELLOW banner asking the user for a verdict;
+    /// y/n/a/d send the answer via `prompts.answer`.
+    pending_prompt: Option<Value>,
 }
 
 /// Cap on the transcript window: chars rendered in one frame, centred on
@@ -645,6 +650,7 @@ impl App {
             packets: vec![], sel_packet: 0,
             packet_detail: String::new(), packet_detail_frame: 0,
             packets_stream: -1,
+            pending_prompt: None,
         };
         a.refresh_sessions();
         a.load_changes();
@@ -1500,6 +1506,43 @@ impl App {
             Err(e) => { self.status = format!("flows.list: {e}"); }
         }
         self.load_flow_detail();
+    }
+
+    /// Poll the engine for the next pending banner-prompt. Idempotent;
+    /// safe to call every tick. The only stateful effect is replacing
+    /// `self.pending_prompt` with the engine's view.
+    fn refresh_prompt(&mut self) {
+        match rpc(&self.sock, "prompts.peek", json!([])) {
+            Ok(v) if v.get("ok").and_then(Value::as_bool) == Some(true) => {
+                let ask = v.get("ask").cloned();
+                self.pending_prompt = match ask {
+                    Some(Value::Null) | None => None,
+                    Some(other) => Some(other),
+                };
+            }
+            _ => {}
+        }
+    }
+
+    /// Send the user's verdict back; on success the engine pops the
+    /// queue and the next tick's refresh_prompt picks up whatever's
+    /// behind it (or None).
+    fn answer_prompt(&mut self, verdict: &'static str) {
+        let Some(p) = self.pending_prompt.clone() else { return };
+        let Some(id) = p.get("id").and_then(Value::as_u64) else { return };
+        let _ = rpc(&self.sock, "prompts.answer", json!([id, verdict]));
+        self.pending_prompt = None;
+        // Eager refresh so the banner doesn't flicker between answer and
+        // the next tick (a fast-typer can hit y twice before the tick).
+        self.refresh_prompt();
+        let host = p.get("host").and_then(Value::as_str).unwrap_or("");
+        self.status = match verdict {
+            "yes_once"  => format!("allow this once: {host}"),
+            "no_once"   => format!("deny this once: {host}"),
+            "allow_save" => format!("ALLOW + saved: apply host:{host}"),
+            "deny_save"  => format!("DENY + saved: discard host:{host}"),
+            _ => String::new(),
+        };
     }
 
     /// Drill from the selected flow row into its TCP stream's packet
@@ -3224,6 +3267,7 @@ fn rule_detail_lines(app: &App) -> Vec<Line<'static>> {
         crate::rules::Action::Apply       => ("APPLY",       Color::Green),
         crate::rules::Action::Discard     => ("DISCARD",     Color::Red),
         crate::rules::Action::Passthrough => ("PASSTHROUGH", Color::Cyan),
+        crate::rules::Action::Ask         => ("ASK",         Color::Yellow),
     };
     let mut out = vec![
         Line::from(Span::styled(action_label.to_string(),
@@ -4033,17 +4077,33 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         Paragraph::new(Line::from(fkeybar_spans(app))),
         fkeybar_area);
 
-    let status_text = if let Some(buf) = &app.renaming {
-        format!("rename -> {buf}_  (Enter to commit, Esc to cancel)")
+    // Banner-prompt overrides the regular status bar while a -n box
+    // connection is waiting on a verdict. yellow + bold so it's
+    // unmistakable; format mirrors sakar's prompt text.
+    let status_widget = if let Some(p) = &app.pending_prompt {
+        let host = p.get("host").and_then(Value::as_str).unwrap_or("");
+        let port = p.get("port").and_then(Value::as_u64).unwrap_or(0);
+        let scheme = p.get("scheme").and_then(Value::as_str).unwrap_or("");
+        let box_name = p.get("box").and_then(Value::as_str).unwrap_or("");
+        let body = format!(
+            "[{box_name}] connection: {scheme}://{host}:{port}  \
+             [y]es once  [n]o once  [a]llow+save  [d]eny+save");
+        Paragraph::new(Line::from(Span::styled(
+            body, Style::default().fg(Color::Black).bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD))))
     } else {
-        app.status.clone()
+        let status_text = if let Some(buf) = &app.renaming {
+            format!("rename -> {buf}_  (Enter to commit, Esc to cancel)")
+        } else {
+            app.status.clone()
+        };
+        Paragraph::new(Line::from(Span::styled(
+            status_text,
+            Style::default().fg(Color::Black).bg(Color::Gray),
+        )))
     };
-    let status = Paragraph::new(Line::from(Span::styled(
-        status_text,
-        Style::default().fg(Color::Black).bg(Color::Gray),
-    )));
     f.render_widget(
-        status,
+        status_widget,
         Rect { x: status_area.x, y: status_area.y, width: status_area.width, height: 1 },
     );
 
@@ -5342,6 +5402,9 @@ fn run_interactive(sock: &str) -> Result<(), String> {
     let mut app = App::new(sock.to_string());
     let (tx, rx) = mpsc::channel();
     spawn_subscriber(sock, tx);
+    // Tell the engine the TUI is up — `-n` dispatcher's Ask gate goes
+    // from immediate-deny to "enqueue and wait" while this is true.
+    let _ = rpc(sock, "prompts.ui_active", json!([true]));
 
     terminal::enable_raw_mode().map_err(|e| e.to_string())?;
     let mut out = std::io::stdout();
@@ -5368,6 +5431,10 @@ fn run_interactive(sock: &str) -> Result<(), String> {
             if let Ok((c, r)) = terminal::size() {
                 app.fit_active_pty(c, r);
             }
+            // Banner-prompt queue: poll the engine for the next pending
+            // ask; while one is up the bottom status line becomes a
+            // yellow banner that captures y/n/a/d.
+            app.refresh_prompt();
             // drain a finished structural-diff worker result, and animate the
             // spinner while one is still pending.
             app.pump_struct();
@@ -5688,6 +5755,19 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                     }
                     continue;
                 }
+                // Banner-prompt keys take priority over EVERYTHING (so y/n/a/d
+                // don't accidentally trigger pane bindings like 'n' = new
+                // rule / 'a' = apply / 'd' = detach). The banner only steals
+                // these four keys; the rest of the UI is fully usable.
+                if app.pending_prompt.is_some() {
+                    match k.code {
+                        KeyCode::Char('y') => { app.answer_prompt("yes_once"); continue; }
+                        KeyCode::Char('n') => { app.answer_prompt("no_once");  continue; }
+                        KeyCode::Char('a') => { app.answer_prompt("allow_save"); continue; }
+                        KeyCode::Char('d') => { app.answer_prompt("deny_save");  continue; }
+                        _ => {}
+                    }
+                }
                 match k.code {
                     // 'q' stops the engine too (mirrors the Python prototype's
                     // contract — q is QUIT, not detach). 'd' detaching is
@@ -5804,6 +5884,9 @@ fn run_interactive(sock: &str) -> Result<(), String> {
         Ok(())
     })();
 
+    // TUI is going away — let the engine know so any -n dispatcher
+    // waiters get NoOnce instead of timing out.
+    let _ = rpc(sock, "prompts.ui_active", json!([false]));
     terminal::disable_raw_mode().map_err(|e| e.to_string())?;
     execute!(term.backend_mut(), terminal::LeaveAlternateScreen).map_err(|e| e.to_string())?;
     term.show_cursor().map_err(|e| e.to_string())?;
@@ -6424,6 +6507,36 @@ mod tests {
         assert_eq!(app.sel_flow, 0, "flows cursor preserved across pop");
     }
 
+    /// Banner-prompt: pending_prompt is None → the regular grey status
+    /// bar at the bottom; pending_prompt is Some(_) → a yellow banner
+    /// asking the user for a verdict with all four keystrokes labelled.
+    #[test]
+    fn banner_prompt_renders_at_status_bar() {
+        let Some(eng) = boot() else {
+            eprintln!("SKIP: engine binary missing");
+            return;
+        };
+        let mut app = App::new(eng.sock.clone());
+        // No prompt: regular status bar (which has app.status text).
+        let plain = render_to_string(&app, 160, 30).unwrap();
+        assert!(!plain.contains("[y]es once"),
+                "no banner should be visible without a pending prompt");
+        // Inject a pending prompt; the banner should render at the
+        // bottom row with all four key labels.
+        app.pending_prompt = Some(serde_json::json!({
+            "id": 1, "box": "BOX3",
+            "host": "tracker.example", "port": 443, "scheme": "https",
+        }));
+        let buf = render_to_string(&app, 160, 30).unwrap();
+        assert!(buf.contains("[BOX3]"),
+                "box name missing from banner:\n{buf}");
+        assert!(buf.contains("tracker.example:443"),
+                "host:port missing from banner:\n{buf}");
+        assert!(buf.contains("[y]es once") && buf.contains("[n]o once")
+                && buf.contains("[a]llow+save") && buf.contains("[d]eny+save"),
+                "all four verdicts must label-into the banner:\n{buf}");
+    }
+
     /// Flows pane keyboard nav: j/k moves the cursor (with detail
     /// refresh stubbed via flows-only mutation), 'f' triggers
     /// load_flows (we just verify it doesn't crash on a clean App).
@@ -6765,6 +6878,7 @@ mod tests {
             packets: vec![], sel_packet: 0,
             packet_detail: String::new(), packet_detail_frame: 0,
             packets_stream: -1,
+            pending_prompt: None,
         };
         app.focus = Pane::Help;
         // render tall enough to fit the full manual (it scrolls in a real term).

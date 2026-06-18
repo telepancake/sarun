@@ -15,6 +15,7 @@ use super::bridge::SmoltcpStream;
 use super::ca::Ca;
 use super::dns::DnsServer;
 use super::mitm::KeyLogFile;
+use super::prompt::{PromptQueue, Verdict};
 use super::stack::{AcceptedConn, StackRuntime};
 
 pub struct Dispatcher {
@@ -24,15 +25,17 @@ pub struct Dispatcher {
     pub ca: Arc<Ca>,
     pub keylog: Arc<KeyLogFile>,
     pub upstream_tls: Arc<rustls::ClientConfig>,
+    pub prompts: Arc<PromptQueue>,
 }
 
 impl Dispatcher {
     pub fn start(stack: Arc<StackRuntime>, dns: Arc<DnsServer>,
                  box_name: String, ca: Arc<Ca>, keylog: Arc<KeyLogFile>,
                  upstream_tls: Arc<rustls::ClientConfig>,
+                 prompts: Arc<PromptQueue>,
                  rt: tokio::runtime::Handle) {
         let Some(rx) = stack.take_accept_rx() else { return; };
-        let me = Self { stack, dns, box_name, ca, keylog, upstream_tls };
+        let me = Self { stack, dns, box_name, ca, keylog, upstream_tls, prompts };
         std::thread::Builder::new()
             .name("sarun-net-dispatch".into())
             .spawn(move || {
@@ -43,7 +46,9 @@ impl Dispatcher {
                     let ca = me.ca.clone();
                     let keylog = me.keylog.clone();
                     let up = me.upstream_tls.clone();
-                    rt.spawn(handle_conn(stack, dns, box_name, ca, keylog, up, acc));
+                    let prompts = me.prompts.clone();
+                    rt.spawn(handle_conn(stack, dns, box_name, ca, keylog,
+                                          up, prompts, acc));
                 }
             }).expect("spawn dispatcher");
     }
@@ -53,32 +58,49 @@ async fn handle_conn(stack: Arc<StackRuntime>, dns: Arc<DnsServer>,
                      box_name: String,
                      ca: Arc<Ca>, keylog: Arc<KeyLogFile>,
                      upstream_tls: Arc<rustls::ClientConfig>,
+                     prompts: Arc<PromptQueue>,
                      acc: AcceptedConn) {
     let host = dns.host_for_ip(acc.dst_ip)
         .unwrap_or_else(|| ipv4(acc.dst_ip));
     let port = acc.dst_port;
+    let scheme = if port == 443 { "https" } else if port == 80 { "http" }
+                 else { "tcp" }.to_string();
 
     // ── policy gate ─────────────────────────────────────────────────────
-    // The same rules.rs file the UI edits is consulted here at SYN-accept
-    // time. Net-applicable rules (any clause references a NET_KIND) are
-    // first-match-wins via `net::policy::decide`; file-only rules slide
-    // off (field resolver returns "" for unknown kinds). Default = Allow
-    // on no match, so the proxy works out of the box.
     let subj = super::policy::NetSubject {
         host: host.clone(),
         port,
-        scheme: if port == 443 { "https" } else if port == 80 { "http" }
-                else { "tcp" }.to_string(),
+        scheme: scheme.clone(),
         sni: String::new(),
         proto: "tcp".to_string(),
         box_name: box_name.clone(),
         ..Default::default()
     };
     let rules = crate::rules::Rules::load();
-    if super::policy::decide(&rules.rules, &subj) == crate::rules::Action::Discard {
+    let verdict = super::policy::decide(&rules.rules, &subj);
+    let allow = match verdict {
+        crate::rules::Action::Apply => true,
+        crate::rules::Action::Discard => false,
+        crate::rules::Action::Passthrough => true,
+        crate::rules::Action::Ask => {
+            // Banner-prompt the user (deny-if-no-TUI is enforced inside
+            // PromptQueue::ask). On AllowSave/DenySave persist a new rule
+            // line to filerules so the next conn skips the banner.
+            let v = prompts.ask(box_name.clone(), host.clone(),
+                                port, scheme.clone()).await;
+            if v.is_persistent() {
+                let act = if v == Verdict::AllowSave { "apply" } else { "discard" };
+                if let Err(e) = append_rule_line(
+                    &format!("{act} host:{host}\n"))
+                {
+                    eprintln!("sarun-net: persist {act} host:{host}: {e}");
+                }
+            }
+            v.is_allow()
+        }
+    };
+    if !allow {
         eprintln!("sarun-net: DENY {host}:{port} (box={box_name})");
-        // Drop the stream — the smoltcp socket's RST goes back to the box,
-        // curl/whatever sees "connection refused".
         stack.close(acc.handle);
         return;
     }
@@ -98,4 +120,31 @@ async fn handle_conn(stack: Arc<StackRuntime>, dns: Arc<DnsServer>,
 
 fn ipv4(o: [u8; 4]) -> String {
     format!("{}.{}.{}.{}", o[0], o[1], o[2], o[3])
+}
+
+/// PREPEND one rule line to the same on-disk filerules file the rules
+/// pane edits. Prepend (not append) matters semantically: rules are
+/// first-match-wins, and a specific saved rule like
+///   apply host:example.com
+/// must win over a broader earlier rule like
+///   ask host:*
+/// otherwise the very rule we just saved gets shadowed and the user
+/// gets asked again on the next dial. Writing through a tempfile +
+/// rename keeps the swap atomic so a concurrent reader can't see a
+/// half-written file.
+fn append_rule_line(line: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let dir = crate::paths::config_home();
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("filerules");
+    let prev = std::fs::read_to_string(&path).unwrap_or_default();
+    let tmp = dir.join("filerules.tmp");
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .create(true).truncate(true).write(true).open(&tmp)?;
+        f.write_all(line.as_bytes())?;
+        f.write_all(prev.as_bytes())?;
+        f.sync_all().ok();
+    }
+    std::fs::rename(tmp, path)
 }

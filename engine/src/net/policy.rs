@@ -47,6 +47,7 @@ pub fn decide(rules: &[crate::rules::FileRule], subj: &NetSubject) -> Action {
                 Action::Apply => Action::Apply,    // = Allow
                 Action::Discard => Action::Discard, // = Deny
                 Action::Passthrough => Action::Apply,
+                Action::Ask => Action::Ask,         // banner-prompt the user
             };
         }
     }

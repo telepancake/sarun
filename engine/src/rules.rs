@@ -84,7 +84,15 @@ mod parse_net_rules {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Action { Apply, Discard, Passthrough }
+pub enum Action { Apply, Discard, Passthrough,
+                  /// Net-only: a matching `ask` rule prompts the user via
+                  /// the banner-queue when the TUI is up, denies if not.
+                  /// The user's chosen YesOnce/NoOnce verdict drives the
+                  /// per-conn outcome; AllowSave/DenySave additionally
+                  /// appends a new `apply host:H` / `discard host:H` line
+                  /// to the filerules file so the next conn skips the
+                  /// banner. File-rule paths ignore Ask (treated as Apply).
+                  Ask }
 
 impl Action {
     pub fn parse(s: &str) -> Option<Action> {
@@ -92,13 +100,15 @@ impl Action {
             "apply" => Some(Action::Apply),
             "discard" => Some(Action::Discard),
             "passthrough" => Some(Action::Passthrough),
+            "ask" => Some(Action::Ask),
             _ => None,
         }
     }
     #[allow(dead_code)]
     pub fn as_str(self) -> &'static str {
         match self { Action::Apply => "apply", Action::Discard => "discard",
-                     Action::Passthrough => "passthrough" }
+                     Action::Passthrough => "passthrough",
+                     Action::Ask => "ask" }
     }
 }
 

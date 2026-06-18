@@ -433,6 +433,115 @@ def test_n_box_rules_gate_dial_at_syn_accept():
         eng.stop()
 
 
+def test_n_box_banner_prompt_allow_save_persists_rule():
+    """`ask host:*` rule → dispatcher enqueues a banner-prompt. We don't
+    drive a real TUI; instead we exercise the engine half directly:
+    mark ui_active=true via the control verb, fire curl in the background,
+    poll prompts.peek until the ask appears, answer "allow_save", and
+    verify (a) curl ultimately succeeds, (b) the rules file now contains
+    `apply host:example.com`, and (c) a follow-up curl completes without
+    re-prompting (the saved rule short-circuits the banner)."""
+    skip_if_no_binary()
+    skip_if_offline()
+    eng = Engine("TST12")
+    try:
+        eng.start()
+        rules_path = Path(eng.env["XDG_CONFIG_HOME"]) / "slopbox.TST12" / "filerules"
+        rules_path.parent.mkdir(parents=True, exist_ok=True)
+        rules_path.write_text("ask host:*\n")
+
+        # ── helpers to drive the engine over the control socket ────────
+        import json
+        def call(verb, args=None):
+            msg = json.dumps({"type": "ui", "verb": verb,
+                              "args": args or []}).encode() + b"\n"
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.connect(str(eng.sock_path))
+                s.sendall(msg)
+                buf = b""; s.settimeout(15.0)
+                while b"\n" not in buf and len(buf) < 1_000_000:
+                    chunk = s.recv(65536)
+                    if not chunk: break
+                    buf += chunk
+            return json.loads(buf.split(b"\n", 1)[0]).get("r")
+
+        # TUI up: the dispatcher's Ask gate moves from immediate-deny to
+        # enqueue-and-wait.
+        assert call("prompts.ui_active", [True])["ok"]
+
+        # Fire curl in the background; the dispatcher will block on the
+        # banner until we answer.
+        import subprocess as sp
+        proc = sp.Popen(
+            [str(BIN), "run", "-n", "--", "curl", "-sS", "-m", "20", "-o", "/dev/null",
+             "-w", "%{http_code}", "http://example.com/"],
+            env=eng.env, stdout=sp.PIPE, stderr=sp.PIPE)
+
+        # Wait for an Ask to appear (poll every 100 ms for up to 8 s).
+        ask = None
+        for _ in range(80):
+            r = call("prompts.peek")
+            if r and r.get("ask"):
+                ask = r["ask"]
+                break
+            time.sleep(0.1)
+        assert ask is not None, "no prompt enqueued"
+        assert ask["host"] == "example.com", f"unexpected ask: {ask}"
+        assert ask["port"] == 80
+        assert ask["scheme"] == "http"
+        # Answer allow+save.
+        ans = call("prompts.answer", [ask["id"], "allow_save"])
+        assert ans["ok"], f"answer rejected: {ans}"
+
+        # curl should now finish and return 200.
+        out, err = proc.communicate(timeout=20)
+        assert proc.returncode == 0, f"curl failed: {err.decode()}"
+        assert out.decode().strip() == "200", \
+            f"unexpected status: {out.decode()!r}"
+
+        # The rule file should contain the persisted apply host:example.com.
+        rules_now = rules_path.read_text()
+        assert "apply host:example.com" in rules_now, \
+            f"save didn't persist: {rules_now!r}"
+
+        # Follow-up curl: the new rule short-circuits the Ask path, so
+        # no prompt is enqueued and the request goes through immediately.
+        r2 = eng.run("-n", "--", "curl", "-sS", "-m", "10", "-o", "/dev/null",
+                     "-w", "%{http_code}", "http://example.com/")
+        assert r2.returncode == 0 and r2.stdout.strip() == "200", \
+            f"follow-up failed: {r2.stdout!r} {r2.stderr!r}"
+        # Confirm no leftover prompt is pending.
+        assert call("prompts.peek")["ask"] is None
+    finally:
+        eng.stop()
+
+
+def test_n_box_banner_prompt_denied_when_ui_absent():
+    """Without `prompts.ui_active true`, an `ask` rule fails closed:
+    the dispatcher's Ask returns NoOnce immediately, the box-side curl
+    sees a closed connection. (This is the deny-if-no-TUI invariant —
+    connect-stage timeouts are seconds; we don't want connections
+    wedged on a non-running UI.)"""
+    skip_if_no_binary()
+    skip_if_offline()
+    eng = Engine("TST13")
+    try:
+        eng.start()
+        rules_path = Path(eng.env["XDG_CONFIG_HOME"]) / "slopbox.TST13" / "filerules"
+        rules_path.parent.mkdir(parents=True, exist_ok=True)
+        rules_path.write_text("ask host:*\n")
+        # Note: NO prompts.ui_active call — the queue starts inactive.
+        r = eng.run("-n", "--", "curl", "-sS", "-m", "10",
+                    "-o", "/dev/null", "-w", "%{http_code}",
+                    "http://example.com/")
+        # Either non-zero exit OR a zero HTTP code is fine; both prove
+        # the dial was refused without prompting.
+        assert r.returncode != 0 or r.stdout.strip() in ("", "000"), \
+            f"deny-if-no-TUI failed: rc={r.returncode} out={r.stdout!r}"
+    finally:
+        eng.stop()
+
+
 def test_n_box_quic_blocked():
     """UDP other than :53 is dropped at the stack — there's no listener
     bound. curl's --http3-only sends a QUIC Initial UDP packet to :443;
