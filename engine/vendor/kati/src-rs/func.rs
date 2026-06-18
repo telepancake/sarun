@@ -554,7 +554,7 @@ fn has_no_io_in_shell_script(cmd: &[u8]) -> bool {
     false
 }
 
-fn shell_func_impl(
+pub fn shell_func_impl(
     shell: &[u8],
     shellflag: &[u8],
     cmd: &Bytes,
