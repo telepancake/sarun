@@ -81,6 +81,30 @@ fn source_changes(sid: i64) -> (Vec<Value>, Vec<Vec<i64>>) {
     const S_IFMT: u32 = 0o170000;
     const S_IFCHR: u32 = 0o020000;
     const S_IFLNK: u32 = 0o120000;
+    // xattr rows: one entry per (file, key) pair. Pre-loaded into a
+    // map keyed on the file's name so the tree-walk loop can emit a
+    // "kind=xattr" child row right after each file leaf without a
+    // per-leaf sqlite hit. Empty for boxes without the xattr table or
+    // without any xattr writes.
+    let mut xattr_by_name: std::collections::HashMap<String, Vec<(String, i64)>>
+        = std::collections::HashMap::new();
+    let has_xattr = conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='xattr'",
+        [], |_| Ok(())).is_ok();
+    if has_xattr {
+        if let Ok(mut st) = conn.prepare(
+            "SELECT name, key, length(value) FROM xattr ORDER BY name, key") {
+            if let Ok(it) = st.query_map([], |r| Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+            ))) {
+                for (name, key, vlen) in it.flatten() {
+                    xattr_by_name.entry(name).or_default().push((key, vlen));
+                }
+            }
+        }
+    }
     // Pull leaves first (sorted by name), then walk to build the tree.
     let mut leaves: Vec<(String, &'static str, i64, Vec<i64>)> = vec![];
     if let Ok(mut st) = conn.prepare(
@@ -115,6 +139,12 @@ fn source_changes(sid: i64) -> (Vec<Value>, Vec<Vec<i64>>) {
     let mut rows = vec![];
     let mut ids = vec![];
     let mut prev: Vec<String> = vec![];
+    // Files whose only sqlar row is data-NULL but DO have xattrs — those
+    // need to still emit xattr children. We catch them by iterating
+    // xattr_by_name entries we never consumed (the file may not appear
+    // in sqlar at all if it's an xattr-only modification of a lower).
+    let mut consumed: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     for (name, kind, sz, wids) in leaves {
         let parts: Vec<String> = name.split('/')
             .filter(|s| !s.is_empty()).map(String::from).collect();
@@ -138,7 +168,7 @@ fn source_changes(sid: i64) -> (Vec<Value>, Vec<Vec<i64>>) {
             ids.push(vec![]);
         }
         rows.push(json!({
-            "path": name,
+            "path": name.clone(),
             "name": parts[leaf_depth],
             "kind": kind,
             "size": sz,
@@ -146,6 +176,85 @@ fn source_changes(sid: i64) -> (Vec<Value>, Vec<Vec<i64>>) {
             "connector": false,
         }));
         ids.push(wids);
+        // Xattr children: one row per (file, key) pair, indented one
+        // level under the file leaf. Their "name" is the key
+        // (e.g. user.foo), "size" is the value byte length, "kind" is
+        // "xattr". They're leaves themselves (not connectors), so the
+        // cursor lands on them and they're decorate/diff-targetable
+        // later (the apply/discard path can stamp them as their own
+        // unit instead of being bundled with the file).
+        if let Some(xs) = xattr_by_name.get(&name) {
+            for (key, vlen) in xs {
+                rows.push(json!({
+                    "path": format!("{name}#xattr={key}"),
+                    "name": key.clone(),
+                    "kind": "xattr",
+                    "size": vlen,
+                    "depth": leaf_depth + 1,
+                    "connector": false,
+                    "xattr_for": name.clone(),
+                    "xattr_key": key.clone(),
+                }));
+                ids.push(vec![]);
+            }
+            consumed.insert(name.clone());
+        }
+        prev = parts;
+    }
+    // Xattr-only files: their sqlar row never existed (a passthrough
+    // file the box just chattr-tagged, say). Append them at the end,
+    // sorted by name, each with its own minimal connector chain so
+    // they slot into the right directory.
+    let mut leftover: Vec<(String, Vec<(String, i64)>)> = xattr_by_name.into_iter()
+        .filter(|(n, _)| !consumed.contains(n))
+        .collect();
+    leftover.sort_by(|a, b| a.0.cmp(&b.0));
+    for (name, xs) in leftover {
+        let parts: Vec<String> = name.split('/')
+            .filter(|s| !s.is_empty()).map(String::from).collect();
+        if parts.is_empty() { continue; }
+        let leaf_depth = parts.len() - 1;
+        let mut common = 0;
+        while common < parts.len() && common < prev.len()
+            && parts[common] == prev[common] {
+            common += 1;
+        }
+        for d in common..leaf_depth {
+            rows.push(json!({
+                "path": parts[..=d].join("/"),
+                "name": parts[d],
+                "kind": "dir",
+                "size": 0,
+                "depth": d,
+                "connector": true,
+            }));
+            ids.push(vec![]);
+        }
+        // Synthetic parent file row so the xattrs aren't hanging in
+        // the air: kind="xattr-only" carries a hint glyph distinct
+        // from a real "changed" file.
+        rows.push(json!({
+            "path": name.clone(),
+            "name": parts[leaf_depth],
+            "kind": "xattr-only",
+            "size": 0,
+            "depth": leaf_depth,
+            "connector": false,
+        }));
+        ids.push(vec![]);
+        for (key, vlen) in xs {
+            rows.push(json!({
+                "path": format!("{name}#xattr={key}"),
+                "name": key,
+                "kind": "xattr",
+                "size": vlen,
+                "depth": leaf_depth + 1,
+                "connector": false,
+                "xattr_for": name.clone(),
+                "xattr_key": "",
+            }));
+            ids.push(vec![]);
+        }
         prev = parts;
     }
     (rows, ids)

@@ -656,23 +656,32 @@ impl App {
         // Decorate the window's LEAF rows in ONE RPC — the engine looks up
         // each row's (kind, stale) by stat-ing the host; connectors get an
         // empty placeholder so indices stay parallel to `self.changes`.
+        // xattr / xattr-only rows are skipped the same way connectors are:
+        // their "kind" is canonical at the source and decorate_many's
+        // file-on-disk lookup would either fail (synthetic #xattr= path)
+        // or wrongly stamp the row as "changed".
         self.changes_decor = vec![(String::new(), false); self.changes.len()];
         let Some(sid) = self.cur_sid() else { return };
-        let leaf_paths: Vec<&str> = self.changes.iter().filter_map(|c| {
-            if c.get("connector").and_then(Value::as_bool) == Some(true) { None }
-            else { c.get("path").and_then(Value::as_str) }
-        }).collect();
+        let is_decoratable = |c: &Value| -> bool {
+            if c.get("connector").and_then(Value::as_bool) == Some(true) { return false; }
+            !matches!(c.get("kind").and_then(Value::as_str),
+                      Some("xattr") | Some("xattr-only"))
+        };
+        let leaf_paths: Vec<&str> = self.changes.iter()
+            .filter(|c| is_decoratable(c))
+            .filter_map(|c| c.get("path").and_then(Value::as_str))
+            .collect();
         if leaf_paths.is_empty() { return; }
         let leaf_paths_value: Vec<Value> = leaf_paths.iter()
             .map(|p| Value::String((*p).into())).collect();
         if let Ok(rep) = rpc(&self.sock, "review.decorate_many",
                              json!([sid, leaf_paths_value])) {
             let decs = rep.as_array().cloned().unwrap_or_default();
-            // Walk `self.changes` and `decs` in lockstep, skipping connector
-            // slots in the result vec.
+            // Walk `self.changes` and `decs` in lockstep, skipping the
+            // slots we filtered out so indices stay parallel.
             let mut di = 0;
             for (i, c) in self.changes.iter().enumerate() {
-                if c.get("connector").and_then(Value::as_bool) == Some(true) { continue; }
+                if !is_decoratable(c) { continue; }
                 if let Some(d) = decs.get(di) {
                     let kind = d.get("kind").and_then(Value::as_str)
                         .unwrap_or("changed").to_string();
@@ -2400,6 +2409,14 @@ fn changes_lines(app: &App) -> Vec<Line<'static>> {
             "deleted"  => ("-", Color::Red),
             "symlink"  => ("~", Color::Magenta),
             "changed"  => ("~", Color::Yellow),
+            // xattr leaf: indented under its file, displays the key
+            // (set as `name`) and the value byte count (set as `size`).
+            "xattr"    => ("@", Color::Cyan),
+            // xattr-only file: an xattr was set on a path whose data
+            // didn't change (no sqlar row of its own — the box just
+            // chattr-tagged a passthrough file). Distinct dim glyph so
+            // it doesn't pretend to be a "changed" file.
+            "xattr-only" => ("@", Color::DarkGray),
             _ => ("…", Color::DarkGray),
         };
         let indent = tree_indent(depth);
