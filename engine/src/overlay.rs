@@ -401,6 +401,18 @@ impl Overlay {
         s.self_exe.clone()
     }
 
+    /// True when `rel` is the box's view of the HOST oaita config file
+    /// (the path computed by `paths::oaita_config_path()` with its leading
+    /// `/` stripped). For `--api` boxes the overlay substitutes the safe
+    /// pre-generated toml at this path: the box never sees the host's
+    /// api_key or its real upstream URL.
+    fn matches_host_oaita_config(rel: &str) -> bool {
+        let host = crate::paths::oaita_config_path();
+        let s = host.to_string_lossy();
+        let stripped = s.strip_prefix('/').unwrap_or(&s);
+        rel == stripped
+    }
+
     pub fn reload_rules(&self) {
         // One reload covers both rules.txt AND the three shadow_*.glob
         // files — they're all "things on disk the user can edit while
@@ -778,6 +790,20 @@ impl Overlay {
     /// host), or None when absent.
     fn attr_of(&self, b: &BoxState, ino: u64, rel: &str) -> Option<FileAttr> {
         let layer = self.resolve(b.id, rel);
+        // --api substitute: same FUSE-shadow trick as brush, but the target
+        // is the safe-for-box oaita.toml the engine pre-wrote at startup.
+        // Only when the box was launched with --api AND the rel is the host
+        // oaita config's path AND the lower (host) is what would otherwise
+        // serve — a box that wrote into this path keeps its own write.
+        if matches!(layer, Layer::Lower) && b.is_api()
+            && Self::matches_host_oaita_config(rel) {
+            let safe = crate::paths::api_box_oaita_toml_path();
+            if let Ok(md) = std::fs::metadata(&safe) {
+                let mut a = self.attr_from_md(ino, &md);
+                a.kind = FileType::RegularFile;
+                return Some(a);
+            }
+        }
         // Brush-mode shadow: if the box is -b AND this lookup falls
         // through to the lower (host) AND the rel matches one of the
         // compiled shadow patterns, serve the engine binary's attrs.
@@ -1067,7 +1093,12 @@ impl Filesystem for Overlay {
                 // through the shadow (anyone trying to copy-on-write
                 // /bin/sh would land here too, but write opens are
                 // gated above and this branch is read-only-passthrough).
-                let host = if b.is_brush() && self.shadow_matches(&rel) {
+                // --api substitute: open the safe-for-box oaita.toml
+                // instead of the host config when the box is --api and
+                // the rel is the host oaita.toml path.
+                let host = if b.is_api() && Self::matches_host_oaita_config(&rel) {
+                    crate::paths::api_box_oaita_toml_path()
+                } else if b.is_brush() && self.shadow_matches(&rel) {
                     self.shadow_target_path().unwrap_or_else(|| self.host(&rel))
                 } else { self.host(&rel) };
                 match File::open(host) {

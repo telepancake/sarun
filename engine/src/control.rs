@@ -730,6 +730,7 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
     b.set_env_capture(env_capture);
     b.set_direct(direct);
     b.set_is_brush(msg.get("want_brush").and_then(Value::as_bool).unwrap_or(false));
+    b.set_is_api(msg.get("want_api").and_then(Value::as_bool).unwrap_or(false));
     b.set_meta("name", &name);
     // D-parent: `want_no_parent` strips any kernel-derived parent AND closes
     // the lower chain so reads never fall through to the real host. It's the
