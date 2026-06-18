@@ -232,9 +232,18 @@ pub fn exec(roots: Vec<NamedDepNode>, ev: &mut Evaluator) -> Result<()> {
     for (_sym, root) in &roots {
         executor.exec_node(root, None)?;
     }
+    // sarun: emit "Nothing to be done" only for roots whose rule has no
+    // commands at all (or which had no rule). If the rule had commands
+    // but they were skipped because the file was up-to-date, GNU make
+    // stays silent under -s (or prints "<target> is up to date"
+    // otherwise); kati's old unconditional message diverged on every
+    // benign incremental rebuild.
     if executor.num_commands == 0 {
-        for (sym, _) in roots {
-            println!("kati: Nothing to be done for `{sym}'.")
+        for (sym, root) in roots {
+            let node = root.lock();
+            if node.cmds.is_empty() {
+                println!("kati: Nothing to be done for `{sym}'.")
+            }
         }
     }
     Ok(())
