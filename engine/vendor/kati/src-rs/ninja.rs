@@ -46,6 +46,22 @@ use crate::{
 };
 use crate::{error, file_cache};
 
+// sarun: shell-quote `s` into `out` using POSIX single-quote rules —
+// wrap in `'...'` and replace any embedded `'` with `'"'"'`. Used by
+// gen_shell_script's recipe-echo synthesis so the printed text matches
+// the recipe text verbatim regardless of metacharacters.
+fn emit_shell_single_quoted(s: &[u8], out: &mut BytesMut) {
+    out.put_u8(b'\'');
+    for &b in s {
+        if b == b'\'' {
+            out.put_slice(b"'\"'\"'");
+        } else {
+            out.put_u8(b);
+        }
+    }
+    out.put_u8(b'\'');
+}
+
 fn find_command_line_flag(cmd: &[u8], name: &[u8]) -> Option<usize> {
     match memmem::find(cmd, name) {
         Some(0) => None,
@@ -428,6 +444,28 @@ impl<'a> NinjaGenerator<'a> {
 
             if needs_subshell {
                 cmd_buf.put_u8(b'(');
+            }
+
+            // sarun: GNU make echoes each recipe line BEFORE running it
+            // unless the `@` prefix was set. Kati's ninja generator
+            // hands the command line off to ninja/n2 which runs but
+            // doesn't echo, so the user loses the recipe-as-it-runs
+            // trace.
+            //
+            // Without .ONESHELL: per-command — c.echo decides.
+            // With .ONESHELL: per the manual, the first character of
+            // the recipe decides; @/-/+ on later lines is just data,
+            // not a prefix. So under oneshell we echo every command
+            // when commands[0].echo is true.
+            let should_echo = if oneshell {
+                commands.first().map(|c0| c0.echo).unwrap_or(true)
+            } else {
+                c.echo
+            };
+            if should_echo {
+                cmd_buf.put_slice(b"printf '%s\\n' ");
+                emit_shell_single_quoted(&translated, cmd_buf);
+                cmd_buf.put_slice(b" ; ");
             }
 
             cmd_buf.put_slice(&translated);
