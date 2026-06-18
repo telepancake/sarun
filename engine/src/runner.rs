@@ -193,10 +193,10 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
            readonly_parent: bool, chdir: Option<String>,
            net_mode: crate::net::NetMode,
            cmd: Vec<String>) -> i32 {
-    if cmd.is_empty() {
-        eprintln!("sarun-engine run: no command after --");
-        return 2;
-    }
+    // Note: an EMPTY cmd is no longer fatal here — when the parent chain
+    // carries an OCI image config, we fall back to the image's
+    // Entrypoint + Cmd after the register ack returns. A non-OCI box with
+    // no cmd still errors out (in the cmd.is_empty() branch after the ack).
     // -b brush REQUIRES the overlay+capture (provenance + recorded writes flow
     // through it). -d has no overlay, so -b+-d is incoherent — error VISIBLY
     // here rather than letting the box fall through to a plain /bin/sh run (the
@@ -272,9 +272,54 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
     }
     let mount = ack.get("mount").and_then(Value::as_str).unwrap_or("").to_string();
     let sid = ack.get("session_id").and_then(Value::as_str).unwrap_or("?").to_string();
-    // -C overrides the box's working directory; else inherit ours.
-    let cwd = chdir.unwrap_or_else(|| std::env::current_dir()
-        .map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| "/".into()));
+    // D-oci: when an ancestor box is an OCI image layer (it carries an
+    // `oci_config` meta key), the engine echoes the image's runtime fields
+    // in `ack.oci` — env / cwd / cmd / entrypoint / user. We apply each
+    // unless the user explicitly overrode it:
+    //   * -C wins over the image's WorkingDir
+    //   * a supplied cmd wins over the image's Entrypoint + Cmd
+    //   * the image's Env is unioned INTO the inherited host env (entries
+    //     in the image win on collision)
+    let oci_runtime = ack.get("oci").cloned();
+    let oci_cwd = oci_runtime.as_ref()
+        .and_then(|o| o.get("cwd")).and_then(Value::as_str)
+        .map(String::from)
+        .filter(|s| !s.is_empty());
+    let oci_env: Vec<String> = oci_runtime.as_ref()
+        .and_then(|o| o.get("env")).and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let oci_user = oci_runtime.as_ref()
+        .and_then(|o| o.get("user")).and_then(Value::as_str)
+        .map(String::from)
+        .filter(|s| !s.is_empty());
+    // -C overrides the box's working directory; else the image's WorkingDir;
+    // else our own cwd.
+    let cwd = chdir
+        .or(oci_cwd)
+        .unwrap_or_else(|| std::env::current_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "/".into()));
+    // No-cmd path: pull Entrypoint + Cmd from the image config and use it.
+    let cmd = if cmd.is_empty() {
+        let mut combined: Vec<String> = oci_runtime.as_ref()
+            .and_then(|o| o.get("entrypoint")).and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        let oci_cmd: Vec<String> = oci_runtime.as_ref()
+            .and_then(|o| o.get("cmd")).and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        combined.extend(oci_cmd);
+        if combined.is_empty() {
+            eprintln!("sarun-engine: no command given (and the image config \
+                       has neither Entrypoint nor Cmd to fall back on).");
+            return 2;
+        }
+        combined
+    } else {
+        cmd
+    };
     eprintln!("sarun-engine: box {sid}  (overlay root: {mount})  UI connected");
 
     // bwrap CMD onto the box's overlay root, exec'ing our own `inner`. The box
@@ -338,6 +383,35 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
         // We still need to tell the box that the shim should kick in
         // when it gets exec'd as /bin/sh.
         bwrap.args(["--setenv", "SARUN_BRUSH_SH", "1"]);
+    }
+    // D-oci: apply the image config's Env (PATH, etc.) so a /bin/sh inside the
+    // closed image actually finds /usr/bin/* and the user's command resolves
+    // without needing `-C / env PATH=...` boilerplate. Each `KEY=VALUE` from
+    // the image's Env becomes a --setenv. Image entries WIN over the host's
+    // inherited env on collision — that's the OCI runtime semantic (the
+    // image's PATH is the right one for the image's filesystem).
+    for kv in &oci_env {
+        if let Some((k, v)) = kv.split_once('=') {
+            bwrap.args(["--setenv", k, v]);
+        }
+    }
+    // D-oci: apply User as bwrap --uid/--gid. The user spec is
+    // "uid[:gid]" or a name we don't try to resolve (containers usually
+    // ship a numeric uid in their config). Skipping the parse on a name
+    // keeps us safe rather than crashing on a non-numeric User.
+    if let Some(u) = &oci_user {
+        let (uid, gid) = u.split_once(':')
+            .map(|(a, b)| (a, Some(b)))
+            .unwrap_or((u.as_str(), None));
+        if let Ok(uid_n) = uid.parse::<u32>() {
+            // Hold the formatted strings in locals so they outlive the .args() call.
+            let uid_s = uid_n.to_string();
+            bwrap.args(["--uid", &uid_s]);
+            if let Some(g) = gid.and_then(|g| g.parse::<u32>().ok()) {
+                let gid_s = g.to_string();
+                bwrap.args(["--gid", &gid_s]);
+            }
+        }
     }
     bwrap.args(["--unshare-pid", "--unshare-ipc", "--unshare-uts",
                 "--die-with-parent"]);

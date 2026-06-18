@@ -274,8 +274,11 @@ def main():
               f"hardlink: 'usr/bin/alias' carries the source's bytes "
               f"(got sz={sz_alias})")
 
-        # ── runtime: register a child of the top box and verify the FUSE
-        #    merged view honors opaque + whiteouts as expected.
+        # ── runtime: register a child of the top box and verify
+        #    (a) the engine surfaces oci runtime fields (env/cwd/cmd/user)
+        #        in the register ack, walked from the parent chain's TOP
+        #        layer where oci_config was stamped;
+        #    (b) the FUSE merged view honors opaque + whiteouts as expected.
         eng = subprocess.Popen([str(BIN), "serve"],
                                stdout=subprocess.PIPE,
                                stderr=subprocess.STDOUT)
@@ -293,6 +296,19 @@ def main():
         check(ack_j.get("ok") is True,
               f"runtime: child of top layer registered (got {ack[:200]})")
         mnt = ack_j.get("mount")
+        # OCI runtime fields surfaced from the chain's oci_config.
+        oci_rt = ack_j.get("oci") or {}
+        check(isinstance(oci_rt, dict) and oci_rt,
+              f"oci-runtime: ack carries the oci runtime fields (got {oci_rt!r})")
+        check(oci_rt.get("cwd") == "/",
+              f"oci-runtime: WorkingDir → cwd = '/' (got {oci_rt.get('cwd')!r})")
+        check(oci_rt.get("cmd") == ["/bin/sh"],
+              f"oci-runtime: Cmd → cmd = ['/bin/sh'] (got {oci_rt.get('cmd')!r})")
+        check(oci_rt.get("user") == "0:0",
+              f"oci-runtime: User → user = '0:0' (got {oci_rt.get('user')!r})")
+        env_list = oci_rt.get("env") or []
+        check(any(e.startswith("PATH=") for e in env_list),
+              f"oci-runtime: Env carries the image's PATH (got {env_list!r})")
 
         # /etc: opaque'd in top → only 'd' is visible (a, b, c GONE).
         etc_listing = sorted(os.listdir(Path(mnt, "etc"))) if mnt else []
