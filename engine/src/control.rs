@@ -879,6 +879,19 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
                 None => Value::Array(vec![]),
             }
         }
+        // Five-list bundle for the Sessions-view right pane: newest-first
+        // outputs / changes / processes / pipelines / build-edges in one
+        // round-trip, capped at `limit` per kind (default 20). Changes
+        // includes xattr modifications inline as kind="xattr" rows.
+        "review.box_summary" => {
+            let id = arg_sid(args);
+            let limit = args.get(1).and_then(Value::as_i64).unwrap_or(20);
+            match id {
+                Some(id) => crate::review::box_summary(id, limit),
+                None => json!({"outputs":[], "changes":[], "processes":[],
+                               "pipelines":[], "edges":[]}),
+            }
+        }
         // Bulk decorate: one RPC for a whole window of changes-pane rows
         // (kind / stale / is_text per row) — the UI uses this to label the
         // changes list with +/~/- glyphs and the `!` stale marker without a

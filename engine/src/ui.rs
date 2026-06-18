@@ -474,6 +474,11 @@ struct App {
     /// finished boxes (the detail panel uses self.changes head instead).
     /// Refreshed by tick() when on the boxes view.
     recent_changes: Vec<Value>,
+    /// Five-list bundle for the Sessions-view right pane (the box-detail
+    /// summary): newest-first outputs / changes / processes / pipelines /
+    /// build_edges, fetched in one RPC on each session switch. Defaults
+    /// to all-empty arrays so box_detail_lines can render unconditionally.
+    box_summary: Value,
 }
 
 /// Cap on the transcript window: chars rendered in one frame, centred on
@@ -523,7 +528,7 @@ impl App {
             cd_info: None,
             output_segs: vec![],
             changes_decor: vec![],
-            recent_changes: vec![],
+            recent_changes: vec![], box_summary: serde_json::json!(null),
         };
         a.refresh_sessions();
         a.load_changes();
@@ -810,6 +815,16 @@ impl App {
             if let Some(arr) = rep.as_array() {
                 self.recent_changes = arr.clone();
             }
+        }
+        // The Sessions-view right pane shows the five-list bundle
+        // (outputs / changes / processes / pipelines / build-edges)
+        // newest-first. One RPC instead of five — engine packs them in
+        // review.box_summary; xattr modifications mix into the changes
+        // list as kind="xattr" rows.
+        self.box_summary = serde_json::json!(null);
+        match rpc(&self.sock, "review.box_summary", json!([sid, 8])) {
+            Ok(v) => self.box_summary = v,
+            Err(_) => {}
         }
     }
 
@@ -3356,29 +3371,178 @@ fn box_detail_lines(app: &App) -> Vec<Line<'static>> {
         ]),
         Line::from(""),
     ];
-    // Preview rows: for a LIVE box, the newest-first tail (recent_changes,
-    // populated via review.recent_changes); for a finished box, the head
-    // of the alphabetical change window. Same per-row format either way.
-    let preview: Box<dyn Iterator<Item = &Value>> = if live && !app.recent_changes.is_empty() {
-        Box::new(app.recent_changes.iter())
-    } else {
-        Box::new(app.changes.iter().take(40))
+    // Five-list summary: the engine packs newest-first outputs / changes /
+    // processes / pipelines / build-edges into review.box_summary on each
+    // session switch. Sections are headed with a dim "── label · N ──" and
+    // hidden when empty (so a non-brush box doesn't show "── pipelines ──").
+    let header = |title: &str, n: usize| Line::from(vec![
+        Span::styled(format!("── {title} · "), dim),
+        Span::styled(n.to_string(), Style::default().fg(Color::Cyan)
+                                                    .add_modifier(Modifier::BOLD)),
+        Span::styled(" ──", dim),
+    ]);
+    let render_changes_section = |out: &mut Vec<Line<'static>>, rows: &[Value]| {
+        if rows.is_empty() { return; }
+        out.push(header("recent changes", rows.len()));
+        for c in rows {
+            let kind = c.get("kind").and_then(Value::as_str).unwrap_or("");
+            let path = c.get("path").and_then(Value::as_str).unwrap_or("");
+            let (glyph, col) = match kind {
+                "deleted" => ("-", Color::Red),
+                "symlink" => ("~", Color::Magenta),
+                "xattr"   => ("@", Color::Cyan),
+                "changed" => ("~", Color::Yellow),
+                _ => ("·", Color::DarkGray),
+            };
+            let mut spans = vec![
+                Span::raw("  "),
+                Span::styled(format!("{glyph} "), Style::default().fg(col)),
+                Span::raw(path.to_string()),
+            ];
+            // xattr rows ride the file's mtime and surface as
+            //   @ /the/file   key=user.foo  (12 B)
+            // so the user can see the file + the affected xattr without a
+            // separate pane (they were invisible before).
+            if kind == "xattr" {
+                let key = c.get("xattr_key").and_then(Value::as_str).unwrap_or("");
+                let n = c.get("xattr_len").and_then(Value::as_i64).unwrap_or(0);
+                spans.push(Span::styled(format!("   {key}"),
+                    Style::default().fg(Color::Cyan)));
+                spans.push(Span::styled(format!("  ({n} B)"), dim));
+            }
+            out.push(Line::from(spans));
+        }
+        out.push(Line::from(""));
     };
-    for c in preview {
-        if c.get("connector").and_then(Value::as_bool) == Some(true) { continue; }
-        let kind = c.get("kind").and_then(Value::as_str).unwrap_or("");
-        let path = c.get("path").and_then(Value::as_str).unwrap_or("");
-        let (glyph, col) = match kind {
-            "deleted" => ("-", Color::Red),
-            "symlink" => ("~", Color::Magenta),
-            "changed" => ("~", Color::Yellow),
-            _ => ("·", Color::DarkGray),
-        };
-        out.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(format!("{glyph} "), Style::default().fg(col)),
-            Span::raw(path.to_string()),
-        ]));
+    let render_outputs_section = |out: &mut Vec<Line<'static>>, rows: &[Value]| {
+        if rows.is_empty() { return; }
+        out.push(header("recent outputs", rows.len()));
+        for r in rows {
+            let stream = r.get("stream").and_then(Value::as_i64).unwrap_or(0);
+            let len = r.get("len").and_then(Value::as_i64).unwrap_or(0);
+            let preview = r.get("preview").and_then(Value::as_str).unwrap_or("");
+            let tag = if stream == 1 { "err" } else { "out" };
+            let tag_col = if stream == 1 { Color::Red } else { Color::Green };
+            let one_line: String = preview.chars()
+                .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+                .take(80).collect();
+            out.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(tag.to_string(), Style::default().fg(tag_col)),
+                Span::styled(format!("  {len:>5} B  "), dim),
+                Span::raw(one_line),
+            ]));
+        }
+        out.push(Line::from(""));
+    };
+    let render_processes_section = |out: &mut Vec<Line<'static>>, rows: &[Value]| {
+        if rows.is_empty() { return; }
+        out.push(header("recent processes", rows.len()));
+        for r in rows {
+            let tgid = r.get("tgid").and_then(Value::as_i64).unwrap_or(0);
+            let argv0 = r.get("argv0").and_then(Value::as_str).unwrap_or("");
+            let exe = r.get("exe").and_then(Value::as_str).unwrap_or("");
+            // basename of argv[0] (if any) else of exe
+            let head = std::path::Path::new(
+                if !argv0.is_empty() { argv0 } else { exe })
+                .file_name().and_then(|s| s.to_str()).unwrap_or("");
+            out.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(format!("{tgid:>6}  "), dim),
+                Span::styled(head.to_string(), bold),
+            ]));
+        }
+        out.push(Line::from(""));
+    };
+    let render_pipelines_section = |out: &mut Vec<Line<'static>>, rows: &[Value]| {
+        if rows.is_empty() { return; }
+        out.push(header("recent pipelines", rows.len()));
+        for r in rows {
+            let cmd = r.get("cmd").and_then(Value::as_str).unwrap_or("");
+            let nested = r.get("nested").and_then(Value::as_bool) == Some(true);
+            let mark = if nested { "N" } else { "T" };
+            let mark_style = if nested {
+                Style::default().fg(Color::Magenta)
+            } else { Style::default().fg(Color::Cyan) };
+            let trimmed: String = cmd.chars().take(72).collect();
+            out.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(format!("{mark} "), mark_style),
+                Span::raw(trimmed),
+            ]));
+        }
+        out.push(Line::from(""));
+    };
+    let render_edges_section = |out: &mut Vec<Line<'static>>, rows: &[Value]| {
+        if rows.is_empty() { return; }
+        out.push(header("recent build edges", rows.len()));
+        for r in rows {
+            let target = r.get("out").and_then(Value::as_str).unwrap_or("(unnamed)");
+            let n = r.get("n_outs").and_then(Value::as_i64).unwrap_or(1);
+            let cmd = r.get("cmd").and_then(Value::as_str).unwrap_or("");
+            let phony = cmd.is_empty();
+            let mark = if phony { "P" } else { "R" };
+            let mark_style = if phony {
+                Style::default().fg(Color::DarkGray)
+            } else { Style::default().fg(Color::Green) };
+            let extra = if n > 1 { format!(" (+{})", n - 1) } else { String::new() };
+            out.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(format!("{mark} "), mark_style),
+                Span::styled(target.to_string(), bold),
+                Span::styled(extra, dim),
+            ]));
+        }
+        out.push(Line::from(""));
+    };
+
+    // Pull each list out of the bundle (empty defaults if the bundle is
+    // null — happens momentarily on session switch before the RPC returns).
+    let g_arr = |k: &str| app.box_summary.get(k)
+        .and_then(Value::as_array).cloned().unwrap_or_default();
+    let changes  = g_arr("changes");
+    let outputs  = g_arr("outputs");
+    let procs    = g_arr("processes");
+    let pipes    = g_arr("pipelines");
+    let edges    = g_arr("edges");
+
+    // Order: outputs first (what just printed), then changes (files /
+    // xattrs that just landed), then processes (who did it), then the
+    // brush / build views below for context. Empty sections drop out
+    // so a vanilla (non-brush) box's right pane stays tight.
+    render_outputs_section(&mut out, &outputs);
+    render_changes_section(&mut out, &changes);
+    render_processes_section(&mut out, &procs);
+    render_pipelines_section(&mut out, &pipes);
+    render_edges_section(&mut out, &edges);
+
+    // Fallback: if the bundle never arrived (e.g. old engine that doesn't
+    // know review.box_summary) keep the previous behavior so the pane
+    // isn't blank — show the recent_changes list the old way.
+    if changes.is_empty() && outputs.is_empty() && procs.is_empty()
+        && pipes.is_empty() && edges.is_empty() {
+        let preview: Box<dyn Iterator<Item = &Value>> =
+            if live && !app.recent_changes.is_empty() {
+                Box::new(app.recent_changes.iter())
+            } else {
+                Box::new(app.changes.iter().take(40))
+            };
+        for c in preview {
+            if c.get("connector").and_then(Value::as_bool) == Some(true) { continue; }
+            let kind = c.get("kind").and_then(Value::as_str).unwrap_or("");
+            let path = c.get("path").and_then(Value::as_str).unwrap_or("");
+            let (glyph, col) = match kind {
+                "deleted" => ("-", Color::Red),
+                "symlink" => ("~", Color::Magenta),
+                "changed" => ("~", Color::Yellow),
+                _ => ("·", Color::DarkGray),
+            };
+            out.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(format!("{glyph} "), Style::default().fg(col)),
+                Span::raw(path.to_string()),
+            ]));
+        }
     }
     out
 }
@@ -5030,7 +5194,7 @@ mod tests {
             cd_info: None,
             output_segs: vec![],
             changes_decor: vec![],
-            recent_changes: vec![],
+            recent_changes: vec![], box_summary: serde_json::json!(null),
         };
         app.focus = Pane::Help;
         // render tall enough to fit the full manual (it scrolls in a real term).

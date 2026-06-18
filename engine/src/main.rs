@@ -112,37 +112,71 @@ fn serve() -> i32 {
     println!("sarun-engine: listening · {}  ·  overlay {}",
              sock.display(), mnt.display());
     // Engine -> UI event broadcaster. Lives for the engine process's
-    // lifetime. Drains ONE shared queue every ~100 ms — the queue
-    // collects FS-mutation events (from the FUSE ops) and process
-    // notifications (record_proc pushes directly via the sink
-    // overlay::add_box plugs into each BoxState), and the op string
-    // selects which `type` the broadcast carries:
-    //   op == "process_added"  →  type=process_added (sid only)
-    //   else                   →  type=overlay (sid, rel, op)
-    // Direct-push from the producers means there's no race window
-    // between the work and the wakeup, so the UI never needs a tick.
+    // lifetime. Drains ONE shared queue and COALESCES bursts so a
+    // write-storm in one box doesn't flood every subscriber. The rules:
+    //
+    //   * Each tick (~100 ms) we drain the shared queue. Many events
+    //     may have been pushed since the last tick.
+    //   * Per (sid, kind) bucket — where kind is "overlay" or
+    //     "process_added" — we send AT MOST one notification per
+    //     COALESCE_WINDOW (250 ms). The notification carries the count
+    //     of events that were folded into it so the UI knows it wasn't
+    //     just one row that changed.
+    //   * Any (sid, kind) we already broadcast THIS WINDOW from is
+    //     simply tracked: we count what arrived but don't re-send.
+    //   * For overlay events we send {rel} from the LAST event of the
+    //     batch (newest path the producer touched) — the UI doesn't
+    //     consume rel for anything beyond a debug status line; it
+    //     re-fetches the relevant view anyway.
+    //
+    // No tick on the UI side; this just stops the engine from being
+    // chatty per fs op. A `make` doing 50k writes lands as ~4-5
+    // notifications per second per box, not 50k.
+    const COALESCE_WINDOW: Duration = Duration::from_millis(250);
     {
         let ov = ov.clone();
         let state = state.clone();
         std::thread::spawn(move || {
+            use std::collections::HashMap;
+            // last broadcast wall-clock per (sid, kind) bucket
+            let mut last_sent: HashMap<(i64, &'static str), std::time::Instant> = HashMap::new();
+            // pending (sid, kind) → (count, last_rel)
+            let mut pending: HashMap<(i64, &'static str), (u64, String)> = HashMap::new();
             loop {
                 std::thread::sleep(Duration::from_millis(100));
                 for (sid, rel, op) in ov.drain_events() {
-                    let payload = if op == "process_added" {
+                    let kind: &'static str = if op == "process_added" {
+                        "process_added"
+                    } else { "overlay" };
+                    let e = pending.entry((sid, kind))
+                        .or_insert_with(|| (0, String::new()));
+                    e.0 += 1;
+                    if !rel.is_empty() { e.1 = rel; }
+                }
+                let now = std::time::Instant::now();
+                pending.retain(|&(sid, kind), &mut (count, ref rel)| {
+                    let allowed = last_sent.get(&(sid, kind))
+                        .map(|t| now.duration_since(*t) >= COALESCE_WINDOW)
+                        .unwrap_or(true);
+                    if !allowed { return true; }   // still in cooldown — keep pending
+                    let payload = if kind == "process_added" {
                         serde_json::json!({
                             "type": "process_added",
                             "sid": sid.to_string(),
+                            "n": count,
                         })
                     } else {
                         serde_json::json!({
                             "type": "overlay",
                             "sid": sid.to_string(),
                             "rel": rel,
-                            "op": op,
+                            "n": count,
                         })
                     };
                     control::broadcast(&state, &payload);
-                }
+                    last_sent.insert((sid, kind), now);
+                    false  // drop from pending — flushed
+                });
             }
         });
     }
