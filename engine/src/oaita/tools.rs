@@ -70,10 +70,32 @@ fn act_spec(capabilities: &str, exhausted: bool) -> ToolSpec {
          will return 'too deep' — so just do the task yourself.".to_string()
     } else {
         format!(
-            "Use your capabilities by describing what you want. Put a \
-             natural-language description in `request` and any data in `data`. \
-             Your capabilities: {capabilities}. To follow up on an earlier \
-             result, set `follow_up` to that call's turn-id.")
+            "Use this to DELEGATE A SUB-TASK to a fresh sub-agent — one \
+             whose intermediate reasoning will NOT clutter your own \
+             context. The sub-agent runs in its own sandbox, uses its \
+             own tool calls, and returns one clean result text plus a \
+             summary of any file changes it staged. \
+             \
+             Best for: tasks whose intermediate steps would crowd your \
+             context (multi-step exploration, build-and-test loops, \
+             pattern-search across many files), tasks you want to try \
+             multiple variants of (kick off several `act`s with different \
+             requests), or tasks whose result is small but whose work is \
+             large. \
+             \
+             AFTER the sub-agent returns, you MUST resolve its box by \
+             calling exactly one of: `apply(target=<id>)` to commit its \
+             staged file changes, `reject(target=<id>)` to discard the \
+             changes but keep the result text, or `delete(session=<id>)` \
+             when the result was already incorporated and nothing more \
+             is needed. The harness will announce unresolved sub-agents \
+             at the start of each of your turns; leaving them unhandled \
+             keeps boxes alive. \
+             \
+             Put a natural-language description in `request` and any \
+             input data in `data`. Your capabilities: {capabilities}. To \
+             continue an EARLIER sub-agent (turn-based follow-up instead \
+             of a fresh one), set `follow_up` to that call's turn-id.")
     };
     ToolSpec {
         name: META_TOOL_NAME,
@@ -98,18 +120,26 @@ fn shell_spec() -> ToolSpec {
     ToolSpec {
         name: "shell",
         description:
-            "Run a shell script in this conversation's persistent sandbox box. \
-             The script is executed with `sh -c`; stdout/stderr are captured \
-             and returned, followed by a summary of any file changes the run \
-             staged in the box (changes stay STAGED until resolved — they do \
-             not touch the host). Set `discard` true for a read-only look: \
-             the script runs in a throwaway box discarded right after — \
-             output comes back, nothing stays staged. \
-             IMPORTANT: /tmp is a FRESH tmpfs on every shell call (it is not \
-             part of the overlay) — files written there in one call are GONE \
-             by the next call. To persist state ACROSS shell calls, write to \
-             /root, $HOME, /var, or any other path (those go through the \
-             overlay and persist for the session).".to_string(),
+            "Run a shell script for ACTIONS and RUNTIME work — building, \
+             compiling, installing packages, running tests, invoking other \
+             binaries, anything that changes state or needs a real process. \
+             For READING files or BROWSING the filesystem, use `inspect` \
+             and `read` instead — they're faster, paged, cursor-keyed, and \
+             don't burn a fresh sandbox box per call. Don't use shell to \
+             `cat foo.txt` or `ls /etc` — those are inspect/read's job. \
+             \
+             Mechanics: the script is executed with `sh -c` in this \
+             conversation's persistent sandbox box. stdout/stderr are \
+             captured and returned, followed by a summary of any file \
+             changes the run staged in the box (changes stay STAGED until \
+             you resolve them — they do not touch the host). Set `discard` \
+             true for a read-only look: the script runs in a throwaway box \
+             discarded right after. \
+             \
+             IMPORTANT: /tmp is a FRESH tmpfs per shell call (not part of \
+             the overlay) — files written to /tmp in one call are GONE by \
+             the next. To persist state across calls, write to /root, \
+             $HOME, /var, or any other path under the overlay.".to_string(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -126,14 +156,26 @@ fn inspect_spec() -> ToolSpec {
     ToolSpec {
         name: "inspect",
         description:
-            "Page through the structure of the thing at `path`: a directory \
-             (entries, kind + name), a text file (numbered lines), or \
-             box:<sub-agent id> — its STAGED change set (box:<id>/<file> \
-             pages that file's staged diff; this is the one thing shell \
-             cannot show). Append \"lines A..B\" / \"entries A..B\" or \
-             \"around N\" to a path to jump. A reduced page ends with a \
-             cursor footer; continue it by calling inspect with just next, \
-             previous, first or last.".to_string(),
+            "Use this for FILESYSTEM NAVIGATION and STRUCTURE — anything \
+             you'd normally do with `ls`, `find`, `head`, line-numbered \
+             `cat`, or `grep -n`. inspect is PAGED so you won't get an \
+             8KB blob back, KEYED so you can ask for `next` page instead \
+             of repeating the path, and TYPE-AWARE so it formats a dir \
+             entry list as kind+name, a text file as numbered lines, and \
+             a box:<id> as the staged change set (the one view shell \
+             literally cannot give you). \
+             \
+             Locators: `<path>` for the whole thing, `<path> lines A..B` \
+             to jump to file lines A..B, `<path> entries A..B` to jump to \
+             directory entries A..B, `<path> around N` for a small window \
+             centred on line N, or `box:<id>[/<file>]` for staged diffs. \
+             A reduced page ends with a cursor footer; continue it by \
+             calling inspect with just `next`, `previous`, `first`, or \
+             `last` (no path needed — the cursor lives in the result \
+             turns). The cursor footer says either END (you've seen \
+             everything) or shows the available page keys — read it \
+             and decide whether you have what you need before paginating \
+             further.".to_string(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -150,11 +192,17 @@ fn read_spec() -> ToolSpec {
     ToolSpec {
         name: "read",
         description:
-            "The RAW text of a file or slice — exactly the content, no line \
-             numbers, no framing; use after inspect to quote precisely. `path` \
-             takes inspect's locators: a file path, optionally with \"lines \
-             A..B\" or \"around N\", or a page key (next/previous/first/last) \
-             returning the last paged window raw.".to_string(),
+            "Use this when you need to QUOTE FILE CONTENT VERBATIM — the \
+             raw bytes, no line numbers, no framing. inspect shows you \
+             structure and numbered lines (use it first to find WHERE in \
+             the file you want); read gives you the exact text from there \
+             so you can include it in your reply unaltered. \
+             \
+             `path` takes inspect's locator grammar: a file path, \
+             optionally with `lines A..B` or `around N`, or a page key \
+             (next/previous/first/last) returning the last paged window \
+             raw. Use this instead of `shell` + `cat`/`sed -n`/`awk` — \
+             those add line numbers, framing, or formatting noise.".to_string(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -170,11 +218,21 @@ fn apply_spec() -> ToolSpec {
     ToolSpec {
         name: "apply",
         description:
-            "APPLY a sub-agent's staged changes: fold everything its sandbox \
-             box accumulated (files, session edits) into this plane, then \
-             remove the box. `target` is the sub-agent id (the from-sender of \
-             its result turn). Review the change summary first — applying is \
-             the commit.".to_string(),
+            "Call this AFTER a successful `act` to commit the sub-agent's \
+             work. The sub-agent ran in its own sandbox box; its file \
+             writes are STAGED there, not yet folded into your plane. \
+             apply takes the change summary you saw in the act result \
+             and merges every staged file into your conversation's \
+             working state, then removes the box. \
+             \
+             ALWAYS review the change summary in the sub-agent's result \
+             turn before applying — once applied you cannot un-apply. \
+             If the staged changes look wrong: call `reject` instead, or \
+             call `act` again to fix them in a new sub-agent. \
+             \
+             `target` is the sub-agent's session id — find it as the \
+             `from` field on the act result turn (`{\"turn-id\":\"...\", \
+             \"from\":\"<target>\"}` header).".to_string(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -190,10 +248,20 @@ fn reject_spec() -> ToolSpec {
     ToolSpec {
         name: "reject",
         description:
-            "REJECT a sub-agent's staged changes: discard everything its \
-             sandbox box accumulated and remove the box. `target` is the \
-             sub-agent id (the from-sender of its result turn). Its result \
-             text stays in this conversation; only the staged changes vanish.".to_string(),
+            "Call this when a sub-agent's STAGED FILE CHANGES are wrong \
+             or unwanted, but its RESULT TEXT is still useful. Discards \
+             everything the sub-agent's sandbox box accumulated and \
+             removes the box — but the act tool result stays in your \
+             conversation for reasoning. Use this when the model wrote \
+             experimental files you don't want to keep, or wrote to the \
+             wrong paths, but its conclusion is still meaningful. \
+             \
+             If you also want to drop the result text (the sub-agent's \
+             session was a dead-end, no useful conclusion), use `delete` \
+             instead. \
+             \
+             `target` is the sub-agent's session id — find it as the \
+             `from` field on the act result turn.".to_string(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -209,15 +277,30 @@ fn backtrack_spec() -> ToolSpec {
     ToolSpec {
         name: "backtrack",
         description:
-            "Rewind this conversation: discard every turn from `turn_id` \
-             onward (this very call included; inclusive=false keeps the named \
-             turn itself) and put `summary` — your condensed record of the \
-             discarded branch, e.g. \"tried X; dead end: Y\" — in its place. \
-             By default the summary is a WAYPOINT and work CONTINUES from the \
-             rewound context (shed a failed approach, compact a stretch you \
-             no longer need verbatim); with final=true it is your FINISHED \
-             ANSWER and the run settles on it (collapse a messy arc into the \
-             clean result).".to_string(),
+            "USE THIS TO SHIP YOUR FINAL ANSWER cleanly. When you've \
+             worked through tool calls, dead ends, retries, and now know \
+             the answer — DO NOT just emit prose. Call backtrack with \
+             final=true and your answer as the summary. The harness will \
+             erase every messy derivation turn from `turn_id` onward and \
+             plant your clean answer in their place. The settled \
+             conversation reads `<question> → <your-clean-answer>`. \
+             No tool calls, no half-formed paragraphs, no walk-throughs \
+             of failed attempts — just the result. \
+             \
+             This is also the right move for compacting MID-DERIVATION \
+             when one branch dead-ended. Call backtrack with the bad \
+             branch's first turn_id and final=false (default); the \
+             summary becomes a WAYPOINT (`tried X; dead end: Y, moving \
+             on`) and the run keeps going from the rewound state. \
+             \
+             Pick turn_id by reading the {\"turn-id\":\"…\"} header at the \
+             top of each turn in your context. inclusive=true (default) \
+             discards the named turn too; false keeps it. \
+             \
+             You cannot use this to edit your CALLER's context — only \
+             your own. Sub-agents must call backtrack(final=true) to \
+             cleanly ship a result, otherwise the messy derivation \
+             flows back to the caller.".to_string(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -236,9 +319,22 @@ fn delete_spec() -> ToolSpec {
     ToolSpec {
         name: "delete",
         description:
-            "Delete a finished sub-agent session entirely (its turns and its \
-             sandbox box) once its result is banked. For rewinding your OWN \
-             context, use backtrack.".to_string(),
+            "Call this when a sub-agent's WORK was a dead end — you've \
+             already incorporated whatever signal you got into your own \
+             reasoning (or there was no useful signal), and now you want \
+             to free the harness from tracking that sub-agent at all. \
+             Drops the sub-agent's session folder AND its sandbox box \
+             completely. \
+             \
+             Use this instead of `reject` when even the result TEXT \
+             isn't worth keeping — the sub-agent contributed nothing \
+             you'll cite. Use `apply` (not delete) when the staged \
+             changes ARE wanted; use `reject` (not delete) when the \
+             changes are unwanted but the result text is. \
+             \
+             For rewinding your OWN context — collapsing your derivation \
+             into a clean answer — use `backtrack(final=true)`, NOT \
+             delete.".to_string(),
         parameters: json!({
             "type": "object",
             "properties": {

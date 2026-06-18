@@ -110,6 +110,21 @@ pub fn generate(spec: &str, set: &Settings) -> Result<Vec<PathBuf>, String> {
     } else { stitched };
 
     let mut messages = build_messages(&prompt_turns);
+    // Baseline harness guide: if the session doesn't already have a system
+    // turn (user-authored via a dot-stitched guide context), prepend one
+    // that primes the model on tool preference. Without this, ds4-flash /
+    // mimo / and most open models default to "I'll just use shell+python"
+    // because that's what training reinforced — they bypass inspect/read
+    // even when those would be cheaper and cleaner.
+    let has_system = messages.iter().any(|m|
+        m.get("role").and_then(Value::as_str) == Some("system")
+        || m.get("role").and_then(Value::as_str) == Some("developer"));
+    if !has_system {
+        messages.insert(0, serde_json::json!({
+            "role": "system",
+            "content": HARNESS_GUIDE,
+        }));
+    }
     // Announcement: surface unhandled completed sub-tasks (act sub-agents
     // that have settled but whose box hasn't been apply/reject'd). Without
     // this, a model can move on and leave staged work — and the orphan box
@@ -332,6 +347,43 @@ fn assemble_tool_calls(acc: &mut Vec<AssembledToolCall>, frags: &[Value]) {
     }
 }
 
+/// Baseline guide prepended as the first system message when the session
+/// has no user-authored system turn. Primes the model on tool preference
+/// — without this guidance most models default to their training-shaped
+/// "shell + python" reflex even for tasks where inspect/read/backtrack
+/// are the correct gesture.
+const HARNESS_GUIDE: &str = "\
+You are running inside the oaita harness. You have specialised tools — \
+use them in preference to the shell+python defaults you might reach for \
+otherwise.
+
+PREFER:
+- `inspect` for filesystem browsing, file structure, line-number listings, \
+  staged change sets — anything you'd normally do with ls/find/head/cat-n. \
+  inspect is paged with a cursor protocol; read the footer.
+- `read` for quoting file contents verbatim — instead of `shell` + `cat`/`sed`/`awk`.
+- `act` to delegate sub-tasks whose intermediate steps would clutter your \
+  context. The sub-agent runs in its own sandbox; you only see the result \
+  and a change summary.
+- `backtrack(final=true)` to SHIP YOUR ANSWER cleanly — don't just emit \
+  prose at the end of a messy derivation. Backtrack to the original \
+  question and plant your clean answer in place. The settled \
+  conversation should read `<question> → <clean-answer>` with the \
+  derivation purged.
+
+USE SHELL FOR ACTIONS: building, compiling, installing, running tests, \
+invoking binaries — things that need a real process. Do NOT use shell \
+just to `cat` or `ls` something.
+
+AFTER `act` returns, ALWAYS resolve the sub-agent's box: `apply` to \
+commit its staged file changes, `reject` to discard them, or `delete` if \
+its result has been fully incorporated. Unresolved sub-agents are \
+announced to you at the start of each turn — handle them before settling.
+
+You can use any tool. Pick the one that best matches the gesture, not \
+the one most familiar from training.
+";
+
 // ── announcements & sub-agent cleanup ───────────────────────────────────────
 
 /// Walk every oaita session folder, pick out the ones that look like
@@ -469,6 +521,19 @@ pub fn evaluate_call(spec: &str, set: &Settings,
 
     let (tool, arguments) = parse_call_envelope(&pending.read().map_err(|e| e.to_string())?)?;
     trace::event("call.eval", json!({"session": &target, "tool": &tool}));
+
+    // backtrack is special: it REWRITES this session's turn history in
+    // place (removes turns, plants the summary). The pending c.assistant
+    // call itself is among the turns it deletes (inclusive=true by
+    // default discards from the named turn onward including the call),
+    // so writing a tool result for it would resurrect the call/result
+    // pair the user just asked us to purge. Dispatch it without
+    // emitting a `.tool` turn — the planted summary IS the result, and
+    // for final=true it's the settled answer.
+    if tool == "backtrack" {
+        let _ = dispatch_backtrack(&arguments, &target);
+        return Ok(vec![]);
+    }
 
     let result_text = dispatch(&tool, &arguments, &target, set, executor, &turns);
 
