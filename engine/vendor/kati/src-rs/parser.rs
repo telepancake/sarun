@@ -58,6 +58,9 @@ struct Parser {
     num_define_nest: i32,
     define_start: usize,
     define_start_line: i32,
+    /// sarun: .RECIPEPREFIX value — the char that marks a recipe line.
+    /// Defaults to TAB; user can change it via `.RECIPEPREFIX := <char>`.
+    recipe_prefix: u8,
 
     orig_line_with_directives: Option<Bytes>,
     current_directive: Option<AssignDirective>,
@@ -84,6 +87,7 @@ impl Parser {
             num_define_nest: 0,
             define_start: 0,
             define_start_line: 0,
+            recipe_prefix: b'\t',
 
             orig_line_with_directives: None,
             current_directive: None,
@@ -146,7 +150,13 @@ impl Parser {
 
         self.current_directive = None;
 
-        if line.starts_with(b"\t") && self.after_rule {
+        // sarun: .RECIPEPREFIX changes the leading char that marks a
+        // recipe line (default \t). The parser tracks the current
+        // value because the test happens at parse time.
+        if self.after_rule
+            && !line.is_empty()
+            && line[0] == self.recipe_prefix
+        {
             let loc = self.loc.clone();
             let mut mutable_loc = self.loc.clone();
             let expr = parse_expr(&mut mutable_loc, line.slice(1..), ParseExprOpt::Command)?;
@@ -280,6 +290,20 @@ impl Parser {
         )?;
         let orig_rhs = line.slice_ref(assign.rhs);
         let rhs = parse_expr(&mut mutable_loc, orig_rhs.clone(), ParseExprOpt::Normal)?;
+
+        // sarun: .RECIPEPREFIX changes the leading char that marks a
+        // recipe line. Track it at parse time because the test happens
+        // before any eval — only the immediately-expanded form (`:=`)
+        // with a literal RHS is honored (matches GNU make's behavior;
+        // empty RHS restores TAB).
+        if assign.op == AssignOp::ColonEq && assign.lhs == b".RECIPEPREFIX" {
+            let trimmed = trim_space(assign.rhs);
+            self.recipe_prefix = if trimmed.is_empty() {
+                b'\t'
+            } else {
+                trimmed[0]
+            };
+        }
 
         self.after_rule = false;
         self.out_stmts.lock().push(AssignStmt::new(
