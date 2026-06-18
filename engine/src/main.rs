@@ -24,6 +24,7 @@ mod frames;
 mod katirun;
 mod n2run;
 mod net;
+mod oci;
 mod overlay;
 mod paths;
 mod pty;
@@ -433,6 +434,11 @@ fn main() {
             std::process::exit(runner::run(name, passthrough, direct, env,
                 pty, brush, no_parent, readonly_parent, chdir,
                 net_mode, cmd));
+        }
+        Some("oci") => {
+            // sarun oci load <ref> [NAME]  → populate a chain of at-rest sarun
+            // boxes from an OCI image. See engine/src/oci.rs.
+            std::process::exit(oci::cli_oci(&argv[1..]));
         }
         Some("inner") => {
             // inner --conn-fd N -- CMD...

@@ -65,3 +65,18 @@ pcap-file = "2"
 nix = { version = "0.30", features = ["sched", "net", "socket", "ioctl", "user", "fs", "process"] }
 rand = "0.8"
 time = "0.3"
+tui-term = { version = "0.3", features = ["vt100"] }
+# OCI image import — `sarun oci load` reads a manifest's layers and creates
+# a chain of at-rest sarun boxes (one per layer). Public-registry pulls and
+# local oci-archive/oci-layout inputs only — no signing, no push.
+#   oci-client  registry pull (renamed from oci-distribution; oras-project)
+#   oci-spec    typed ImageConfiguration (env/cmd/workdir/user) + layout files
+#   tar         per-layer entry iteration (PAX/GNU long-name aware)
+#   flate2      gzip layers (tar+gzip media type, the common case)
+#   ruzstd      zstd layers (tar+zstd media type) — pure-Rust, no C dep so
+#               the static-musl build stays a single binary
+oci-client = { version = "0.17", default-features = false, features = ["rustls-tls"] }
+oci-spec = "0.10"
+tar = "0.4"
+flate2 = "1"
+ruzstd = "0.7"
