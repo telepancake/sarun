@@ -1,0 +1,2 @@
+ifdef a b
+endif
