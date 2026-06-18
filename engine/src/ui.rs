@@ -3932,8 +3932,24 @@ impl PtyPane {
     /// Open a PTY connection to the engine and spawn `argv` on it. Returns a pane
     /// whose parser will fill as the reader thread delivers FRAME_PTY_DATA.
     fn open(sock: &str, argv: &[String], rows: u16, cols: u16) -> Result<PtyPane, String> {
+        // The engine daemon is long-lived; its own cwd is wherever the
+        // first `sarun` invocation started it, typically $HOME. The user
+        // expects the PTY child to launch in the directory the CURRENT
+        // sarun was invoked from, so we ship it explicitly. Same story
+        // for env: portable_pty's CommandBuilder defaults to a minimal
+        // env, so `bash -i` lands SHELL/HOME/PATH-less. We ship our own.
+        let cwd = std::env::current_dir().ok()
+            .map(|p| p.to_string_lossy().into_owned());
+        let env: std::collections::BTreeMap<String, String> =
+            std::env::vars().collect();
         let mut s = UnixStream::connect(sock).map_err(|e| format!("connect: {e}"))?;
-        let req = json!({"type": "pty_spawn", "argv": argv, "rows": rows, "cols": cols});
+        let req = json!({
+            "type": "pty_spawn",
+            "argv": argv,
+            "rows": rows, "cols": cols,
+            "cwd": cwd,
+            "env": env,
+        });
         s.write_all(format!("{req}\n").as_bytes()).map_err(|e| e.to_string())?;
         s.flush().ok();
         // Read the one-line ack ({"ok":true,...}) before the frame stream begins.
@@ -4301,11 +4317,31 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                             now.duration_since(t) < Duration::from_millis(400));
                     let detach = dead || ctrl_bracket || raw_gs || f12 || esc_chord;
                     if detach {
-                        let msg = if dead { "PTY exited — detached" }
-                                  else { "PTY detached (still running)" };
-                        app.pty = None;
+                        // Detach = STOP forwarding keys, NOT close the PTY.
+                        // Closing the client socket made the engine's
+                        // serve_pty drop the master, which SIGHUPs the
+                        // slave's child (the `sarun run` runner) — that
+                        // killed the box the user was running, exactly
+                        // what we DON'T want on a detach. So we keep
+                        // app.pty alive when the child is still running;
+                        // the reader thread keeps draining (output goes
+                        // into vt100's screen, visible on re-attach via
+                        // 'P'). Only an EOF'd child is actually closed.
+                        let msg = if dead {
+                            app.pty = None;
+                            "PTY exited — detached"
+                        } else {
+                            "PTY detached (still running · P to re-attach)"
+                        };
                         app.pty_esc_at = None;
                         app.focus = Pane::Sessions;
+                        // No manual refresh here: the engine already
+                        // broadcasts session_added when the runner the
+                        // PTY launched calls register, and on_event's
+                        // session_added arm rebuilds the boxes list.
+                        // If the box is missing after a detach that's
+                        // an event-flow bug, not something to paper
+                        // over with a poll.
                         app.status = msg.into();
                     } else if matches!(k.code, KeyCode::Esc) {
                         // Arm the chord: remember when this Esc landed.
@@ -4383,8 +4419,24 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                     }
                     KeyCode::Char('e') => { app.snap_left(); app.focus = Pane::Rules; }
                     KeyCode::Char('?') => { app.snap_left(); app.focus = Pane::Help; app.out_scroll = 0; }
-                    KeyCode::Char('P') =>
-                        app.modal = Some(Modal::PtyCmd { buf: pty_default_cmd() }),
+                    // 'P' reattaches the existing PTY if one is alive
+                    // (Ctrl-]/F12/Esc-Esc only detach the focus, the
+                    // child keeps running). Only a fresh prompt opens a
+                    // new command — pressing 'P' twice in a row used
+                    // to immediately killed a running shell, now it
+                    // just flips focus back.
+                    KeyCode::Char('P') => {
+                        if app.pty.as_ref().is_some_and(|p| !p.eof) {
+                            app.focus = Pane::Pty;
+                            app.status = "PTY re-attached".into();
+                        } else {
+                            // No PTY (or the one we had exited): prompt
+                            // for a fresh command. The Modal-cancel arm
+                            // ("pty cancelled") still says cancelled
+                            // even when there's nothing to cancel.
+                            app.modal = Some(Modal::PtyCmd { buf: pty_default_cmd() });
+                        }
+                    }
                     // In the diff pane, a/x/d are PER-HUNK; elsewhere they act on
                     // the selected change / whole box.
                     KeyCode::Char('a') if app.focus == Pane::Hunks => app.apply_hunk(),
