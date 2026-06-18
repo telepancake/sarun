@@ -29,7 +29,7 @@ from importlib.machinery import SourceFileLoader
 
 SARUN = "/home/user/sarun/prototype/sarun"
 CRATE = Path("/home/user/sarun/engine")
-BIN = CRATE / "target/release/sarun-engine"
+BIN = CRATE / "target/x86_64-unknown-linux-musl/release/sarun-engine"
 WROOT = Path("/root/wl_rs")          # host scratch, visible in the box overlay
 QPREFIX = "root/wl_rs/"              # how WROOT paths appear in the sqlar
 
@@ -55,7 +55,7 @@ def ensure_binary() -> bool:
         return True
     if shutil.which("cargo") is None:
         return False
-    r = subprocess.run(["cargo", "build", "--release"], cwd=CRATE,
+    r = subprocess.run(["make", "engine"], cwd=CRATE.parent,
                        capture_output=True, text=True)
     return r.returncode == 0 and BIN.exists()
 

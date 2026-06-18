@@ -43,8 +43,7 @@ The Makefile is the entry point. `make` (no args) lists every command.
 ```
 make run                       # Rust binary if built, else prototype/sarun
 make run-py                    # always the prototype
-make engine                    # build the Rust port (dynamic glibc)
-make engine-musl               # build the Rust port as a fully-static binary
+make engine                    # build the Rust port (fully-static musl binary)
 ```
 Or invoke directly:
 ```
@@ -66,23 +65,24 @@ fails with `Package 'fuse3' … not found`, or boxes die with
 apt-get install -y libfuse3-dev fuse3 pkg-config bubblewrap
 ```
 
-## The Rust port — glibc default vs static musl
-The engine crate lives in `engine/` → one binary `engine/target/.../sarun`.
-The DEFAULT build is dynamic glibc and is what every test harness uses:
+## The Rust port — static musl, the only build
+The engine crate lives in `engine/` → one binary at
+`engine/target/x86_64-unknown-linux-musl/release/sarun`. The ONLY build is
+a fully-static musl binary (the dynamic glibc path is gone — `sarun` ships
+a single static executable, and that's what every test harness uses).
+Built without `apt`, via `cargo-zigbuild` + `ziglang` from `uv` (a tiny
+`musl-gcc → zig cc -target x86_64-linux-musl` shim under
+`engine/target/zigshim/` keeps cc-rs happy for the C deps like onig_sys
+and rusqlite's bundled SQLite):
 ```
-make engine                               # or: cd engine && cargo build --release
-```
-For a fully-static, portable single executable, build the musl target. `make
-engine-musl` does this without `apt`, using `cargo-zigbuild` + `ziglang` from
-`uv` (a tiny `musl-gcc → zig cc -target x86_64-linux-musl` shim under
-`engine/target/zigshim/` keeps cc-rs happy for the C deps like onig_sys):
-```
-make engine-musl
+make engine
 file engine/target/x86_64-unknown-linux-musl/release/sarun   # "statically linked"
 ```
-`engine/.cargo/config.toml` scopes the musl linker/CC so the default glibc
-build is untouched. `prototype/test_musl_rs.py` proves the static binary
-serves + runs a box (and self-skips cleanly if the musl target wasn't built).
+`engine/.cargo/config.toml` sets `build.target = x86_64-unknown-linux-musl`
+so plain `cargo build --release` from inside `engine/` also produces the
+static binary, AFTER `make engine` has set up the zigshim+ziglang once.
+`prototype/test_musl_rs.py` cross-checks the static-linkage guarantee via
+`file` + `ldd`.
 
 ## Run the tests
 The Python prototype's tests, the pytest glue (`conftest.py`), and the `bench/`

@@ -12,8 +12,8 @@ from pathlib import Path
 from importlib.machinery import SourceFileLoader
 
 SARUN = "/home/user/sarun/prototype/sarun"
-ENG = Path("/home/user/sarun/engine/target/release/sarun-engine")
-UI = Path("/home/user/sarun/ui/target/release/sarun-ui")
+ENG = Path("/home/user/sarun/engine/target/x86_64-unknown-linux-musl/release/sarun-engine")
+UI = Path("/home/user/sarun/ui/target/x86_64-unknown-linux-musl/release/sarun-ui")
 
 _fails = []
 def check(c, m):
@@ -23,8 +23,8 @@ def check(c, m):
 
 def build(crate, binp):
     if binp.exists(): return True
-    if shutil.which("cargo") is None: return False
-    subprocess.run(["cargo","build","--release"], cwd=crate,
+    if shutil.which("make") is None: return False
+    subprocess.run(["make","engine"], cwd=crate.parent,
                    capture_output=True)
     return binp.exists()
 

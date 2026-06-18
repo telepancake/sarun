@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "bench"))
 import extsuite
 from test_pjdfstest import parse_failures, GROUPS  # reuse parser + group list
 
-BIN = Path(__file__).resolve().parent / "engine/target/release/sarun"
+BIN = Path(__file__).resolve().parent / "engine/target/x86_64-unknown-linux-musl/release/sarun"
 PYBASELINE = Path("bench/pjdfstest_baseline.txt")
 RSBASELINE = Path("bench/pjdfstest_baseline_rs.txt")
 _fails = []
@@ -38,9 +38,9 @@ def wait_socket(s, t=60):
 
 def main():
     if not BIN.exists():
-        if shutil.which("cargo"):
-            subprocess.run(["cargo","build","--release"],
-                           cwd="/home/user/sarun/engine", capture_output=True)
+        if shutil.which("make"):
+            subprocess.run(["make","engine"],
+                           cwd="/home/user/sarun", capture_output=True)
     if not BIN.exists():
         print("  ok  pjdfstest-rs: engine binary unavailable — SKIP\n\nALL PASS"); return 0
     try:

@@ -52,8 +52,7 @@ def wait_socket(sock, timeout=30):
 def main():
     if not MUSL_BIN.exists():
         print("  ok  musl-rs: static musl binary not built — SKIP "
-              "(build with `cargo build --release "
-              "--target x86_64-unknown-linux-musl` in engine/)")
+              "(build with `make engine` from the repo root)")
         return 0
 
     # --- static-link proof ---------------------------------------------------
