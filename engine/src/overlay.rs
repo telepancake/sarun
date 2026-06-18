@@ -84,16 +84,22 @@ fn kind_of_mode(mode: u32) -> FileType {
 type Key = (i64, String);
 
 /// True if any ANCESTOR directory of `rel` is marked OPAQUE in box `b`. Walks
-/// rel's path components upward (rel="a/b/c/d" → checks "a/b/c", "a/b", "a")
-/// and returns at the first opaque hit. Empty/root rel has no ancestors → false.
+/// rel's path components upward (rel="a/b/c/d" → checks "a/b/c", "a/b", "a",
+/// then the box root ""). The box root itself IS a valid opaque target — a
+/// layer can carry a `.wh..wh..opq` directly at its top to opacify EVERYTHING
+/// from below. Root rel ("") has no ancestors → false.
 fn has_opaque_ancestor(b: &BoxState, rel: &str) -> bool {
+    if rel.is_empty() { return false; }
     let mut p = Path::new(rel).parent();
     while let Some(ancestor) = p {
         let s = ancestor.to_string_lossy();
         let s = s.as_ref();
-        if !s.is_empty() && b.is_opaque(s) {
+        // Note: s.is_empty() == true is the BOX ROOT — a valid opacity
+        // target. is_opaque("") asks "is the box root marked opaque?".
+        if b.is_opaque(s) {
             return true;
         }
+        if s.is_empty() { break; }   // walked past the root; stop
         p = ancestor.parent();
     }
     false

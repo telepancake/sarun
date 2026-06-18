@@ -440,13 +440,11 @@ fn ingest_layer(b: &BoxState, blob: &[u8], media_type: &str) -> Result<()> {
             let parent_rel = raw_path.parent()
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            // An opaque marker at the layer root (.wh..wh..opq directly
-            // under /) is rare but legal — it opacifies the root itself.
-            // We can't easily mark "" as opaque (rel="" is the box root and
-            // has no sqlar row); skip that corner case for v1.
-            if !parent_rel.is_empty() {
-                b.set_opaque(&parent_rel, writer);
-            }
+            // An opaque marker at the layer root (.wh..wh..opq directly at
+            // the tar's top) sets parent_rel to "" — the BOX ROOT, which IS
+            // a valid opaque target. set_opaque writes a sqlar row with
+            // name="" and the overlay's has_opaque_ancestor walks down to it.
+            b.set_opaque(&parent_rel, writer);
             continue;
         }
         if let Some(orig) = basename.strip_prefix(".wh.") {
