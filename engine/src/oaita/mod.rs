@@ -37,6 +37,7 @@ pub mod exec;
 pub mod ids;
 pub mod inspect;
 pub mod proxy;
+pub mod replay;
 pub mod tools;
 pub mod trace;
 pub mod turns;

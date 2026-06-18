@@ -25,6 +25,7 @@ USAGE:
   oaita tail  NAME
   oaita add   [NAME] [--type ROLE] [--id TURNID] [--from NAME] [--flags F] [--number N]
   oaita trace [ENDPOINT] [--jsonl FILE]
+  oaita replay --jsonl FILE [--port N] [--once]
   oaita where               (print where oaita.toml is looked up)
 
 NAME may be a dot-stitched spec 'a.b.c' — writes go to the LAST segment;
@@ -43,6 +44,7 @@ pub fn main(argv: &[String]) -> i32 {
         "tail" => cmd_tail(&rest),
         "add" => cmd_add(&rest),
         "trace" => cmd_trace(&rest),
+        "replay" => crate::oaita::replay::run(&rest),
         "where" => cmd_where(),
         "-h" | "--help" => { println!("{USAGE}"); 0 }
         other => { eprintln!("oaita: unknown subcommand {other:?}\n{USAGE}"); 2 }
