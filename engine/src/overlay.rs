@@ -610,10 +610,17 @@ impl Overlay {
     fn resolve(&self, bid: i64, rel: &str) -> Layer {
         let mut cur = Some(bid);
         let mut seen = 0;
+        // D-parent: any box in the lookup chain having `no_host_fallback` set
+        // closes the bottom of the stack — when the parent walk runs out, the
+        // path is Absent rather than served from the real host /. Set on the
+        // bottom of an OCI image stack so `ls /etc` inside the box sees only
+        // the image's /etc, never the host's.
+        let mut no_host = false;
         while let Some(id) = cur {
             seen += 1;
             if seen > 64 { break; }
             let Some(b) = self.box_of(id) else { break };
+            if b.no_host_fallback() { no_host = true; }
             match b.entry(rel) {
                 Some(Entry::Whiteout) => return Layer::Absent,
                 Some(Entry::File { rowid, mode }) =>
@@ -627,6 +634,7 @@ impl Overlay {
                 None => cur = b.parent(),  // not in this box → try its parent
             }
         }
+        if no_host { return Layer::Absent; }
         if self.host(rel).symlink_metadata().is_ok() { Layer::Lower }
         else { Layer::Absent }
     }
@@ -775,13 +783,6 @@ impl Overlay {
     fn scan_dir(&self, b: &BoxState, rel: &str, plus: bool)
                 -> Vec<(String, FileType, u64, Option<FileAttr>)> {
         let mut names: BTreeMap<String, ()> = BTreeMap::new();
-        if let Ok(rd) = std::fs::read_dir(self.host(rel)) {
-            for ent in rd.flatten() {
-                if let Some(n) = ent.file_name().to_str() {
-                    names.insert(n.to_string(), ());
-                }
-            }
-        }
         // chain of box ids, root-first.
         let mut chain = vec![b.id];
         let mut cur = b.parent();
@@ -792,6 +793,20 @@ impl Overlay {
             cur = self.box_of(p).and_then(|bx| bx.parent());
         }
         chain.reverse();
+        // D-parent: skip host seeding when any box in the chain disables it
+        // (matches resolve()'s no_host_fallback semantics — the box stack is
+        // closed at the bottom, no /etc-from-host bleed-through).
+        let no_host = chain.iter().filter_map(|id| self.box_of(*id))
+                           .any(|bx| bx.no_host_fallback());
+        if !no_host {
+            if let Ok(rd) = std::fs::read_dir(self.host(rel)) {
+                for ent in rd.flatten() {
+                    if let Some(n) = ent.file_name().to_str() {
+                        names.insert(n.to_string(), ());
+                    }
+                }
+            }
+        }
         for id in chain {
             if let Some(bx) = self.box_of(id) {
                 let (white, present) = bx.children_of(rel);
@@ -1013,6 +1028,7 @@ impl Filesystem for Overlay {
             return reply.error(Errno::EPERM);
         }
         let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
+        if b.frozen() { return reply.error(Errno::EROFS); }
         let Some(name) = name.to_str() else { return reply.error(Errno::EINVAL) };
         let rel = if prel.is_empty() { name.to_string() }
                   else { format!("{prel}/{name}") };
@@ -1122,6 +1138,7 @@ impl Filesystem for Overlay {
             let Some(b) = self.box_of(h.inner.box_id) else {
                 return reply.error(Errno::EIO);
             };
+            if b.frozen() { return reply.error(Errno::EROFS); }
             match self.copy_up(&b, &h.inner.rel.clone(), req.pid()) {
                 Ok(f) => {
                     h.inner.file = Some(f);
@@ -1186,6 +1203,11 @@ impl Filesystem for Overlay {
             return reply.error(Errno::ENOENT);
         };
         let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
+        if b.frozen()
+            && (mode.is_some() || size.is_some() || mtime.is_some()
+                || uid.is_some() || gid.is_some()) {
+            return reply.error(Errno::EROFS);
+        }
         // HOST-DIRECT (passthrough file rule, or -d direct): metadata ops hit the
         // REAL host file, never copy-up/capture — mirroring the host-direct
         // read/write path. This is the fix for the O_TRUNC bug: the kernel
@@ -1336,6 +1358,7 @@ impl Filesystem for Overlay {
             return reply.error(Errno::EPERM);
         }
         let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
+        if b.frozen() { return reply.error(Errno::EROFS); }
         let Some(name) = name.to_str() else { return reply.error(Errno::EINVAL) };
         let rel = if prel.is_empty() { name.to_string() }
                   else { format!("{prel}/{name}") };
@@ -1358,6 +1381,7 @@ impl Filesystem for Overlay {
             return reply.error(Errno::EPERM);
         }
         let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
+        if b.frozen() { return reply.error(Errno::EROFS); }
         let Some(name) = link_name.to_str() else {
             return reply.error(Errno::EINVAL);
         };
@@ -1378,6 +1402,7 @@ impl Filesystem for Overlay {
         };
         if bid == 0 { return reply.error(Errno::EPERM); }
         let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
+        if b.frozen() { return reply.error(Errno::EROFS); }
         let Some(name) = name.to_str() else { return reply.error(Errno::EINVAL) };
         let rel = if prel.is_empty() { name.to_string() }
                   else { format!("{prel}/{name}") };
@@ -1414,6 +1439,7 @@ impl Filesystem for Overlay {
         };
         if sbid != nbid || sbid == 0 { return reply.error(Errno::EXDEV); }
         let Some(b) = self.box_of(sbid) else { return reply.error(Errno::ENOENT) };
+        if b.frozen() { return reply.error(Errno::EROFS); }
         let Some(name) = newname.to_str() else { return reply.error(Errno::EINVAL) };
         let nrel = if nprel.is_empty() { name.to_string() }
                    else { format!("{nprel}/{name}") };
@@ -1469,6 +1495,7 @@ impl Filesystem for Overlay {
             return reply.error(Errno::ENOENT);
         };
         let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
+        if b.frozen() { return reply.error(Errno::EROFS); }
         if let Some(k) = name.to_str() { b.set_xattr(&rel, k, value); }
         reply.ok();
     }
@@ -1512,6 +1539,7 @@ impl Filesystem for Overlay {
             return reply.error(Errno::ENOENT);
         };
         let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
+        if b.frozen() { return reply.error(Errno::EROFS); }
         match name.to_str() {
             Some(k) if b.remove_xattr(&rel, k) => reply.ok(),
             _ => reply.error(Errno::ENODATA),
@@ -1524,6 +1552,7 @@ impl Filesystem for Overlay {
             return reply.error(Errno::ENOENT);
         };
         let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
+        if b.frozen() { return reply.error(Errno::EROFS); }
         let Some(name) = name.to_str() else { return reply.error(Errno::EINVAL) };
         let rel = if prel.is_empty() { name.to_string() }
                   else { format!("{prel}/{name}") };
@@ -1551,6 +1580,7 @@ impl Filesystem for Overlay {
             return reply.error(Errno::ENOENT);
         };
         let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
+        if b.frozen() { return reply.error(Errno::EROFS); }
         let Some(name) = name.to_str() else { return reply.error(Errno::EINVAL) };
         let rel = if prel.is_empty() { name.to_string() }
                   else { format!("{prel}/{name}") };
@@ -1625,6 +1655,7 @@ impl Filesystem for Overlay {
             return reply.error(Errno::EXDEV); // no cross-box / root rename
         }
         let Some(b) = self.box_of(bo) else { return reply.error(Errno::ENOENT) };
+        if b.frozen() { return reply.error(Errno::EROFS); }
         let (Some(no), Some(nn)) = (name.to_str(), newname.to_str()) else {
             return reply.error(Errno::EINVAL);
         };

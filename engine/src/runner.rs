@@ -189,7 +189,8 @@ fn tty_restore(tty_fd: Option<i32>, old_fg: Option<i32>,
 }
 
 pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
-           pty: bool, brush: bool, chdir: Option<String>,
+           pty: bool, brush: bool, frozen: bool, no_parent: bool,
+           readonly_parent: bool, chdir: Option<String>,
            net_mode: crate::net::NetMode,
            cmd: Vec<String>) -> i32 {
     if cmd.is_empty() {
@@ -240,6 +241,9 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
                          "want_env": env,
                          "want_brush": brush,
                          "net_mode": net_mode.as_str(),
+                         "want_frozen": frozen,
+                         "want_no_parent": no_parent,
+                         "want_readonly_parent": readonly_parent,
                          // Advisory: the engine reruns iff a sibling NAME exists.
                          // A named launch is always rerun-eligible.
                          "want_rerun": name.is_some()});

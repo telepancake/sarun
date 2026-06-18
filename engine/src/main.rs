@@ -373,10 +373,15 @@ fn main() {
             std::process::exit(0);
         }
         Some("run") => {
-            // run [-t] [-d] [-e] [NAME] -- CMD...
-            //   -t  passthrough: no stdout/stderr capture (inner just execs)
-            //   -d  direct: no overlay — writes land on the real host, uncaptured
-            //   -e  env: record each writer's full environment
+            // run [-t] [-d] [-e] [--frozen] [--no-parent] [--readonly-parent] [NAME] -- CMD...
+            //   -t                  passthrough: no stdout/stderr capture (inner just execs)
+            //   -d                  direct: no overlay — writes land on the real host, uncaptured
+            //   -e                  env: record each writer's full environment
+            //   --frozen            overlay accepts no NEW writes — EROFS on every mutating op
+            //   --no-parent         strip kernel-derived parent AND close the lower chain at
+            //                       this box (no host / bleed-through); the box's own
+            //                       contents are its entire filesystem
+            //   --readonly-parent   `apply` refuses to promote into the parent
             let rest = &argv[1..];
             let sep = rest.iter().position(|a| a == "--");
             let (pre, cmd) = match sep {
@@ -388,6 +393,9 @@ fn main() {
             let mut env = false;
             let mut pty = false;
             let mut brush = false;
+            let mut frozen = false;
+            let mut no_parent = false;
+            let mut readonly_parent = false;
             let mut chdir: Option<String> = None;
             let mut name: Option<String> = None;
             let mut net_mode = NetMode::Off;
@@ -408,6 +416,9 @@ fn main() {
                     //     Implies capture-on (so provenance + writes are
                     //     recorded), except under -d which has no overlay.
                     "-b" => brush = true,
+                    "--frozen" => frozen = true,
+                    "--no-parent" => no_parent = true,
+                    "--readonly-parent" => readonly_parent = true,
                     "-C" => chdir = it.next().cloned(),
                     // -n  network: per-box netns with a TAP whose other end
                     //     terminates at the engine's userland TCP/IP stack
@@ -422,7 +433,9 @@ fn main() {
                     _ => if name.is_none() { name = Some(a.clone()); },
                 }
             }
-            std::process::exit(runner::run(name, passthrough, direct, env, pty, brush, chdir, net_mode, cmd));
+            std::process::exit(runner::run(name, passthrough, direct, env,
+                pty, brush, frozen, no_parent, readonly_parent, chdir,
+                net_mode, cmd));
         }
         Some("inner") => {
             // inner --conn-fd N -- CMD...
