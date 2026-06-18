@@ -1,4 +1,3 @@
-# TODO(rust)
 .EXPORT_ALL_VARIABLES:
 FOO := bar
 all:

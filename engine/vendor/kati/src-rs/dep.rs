@@ -495,6 +495,12 @@ impl<'a> DepBuilder<'a> {
         // runs one recipe at a time anyway — there's nothing parallel to
         // serialize. So no warning, no diff with real make.
         let noop_for_us = [".PRECIOUS", ".SECONDARY", ".NOTPARALLEL"];
+        // sarun: .EXPORT_ALL_VARIABLES isn't a rule whose recipe runs —
+        // it's a flag that tells make to export every variable into the
+        // recipe environment. Flip the Evaluator flag if present.
+        if self.get_rule_inputs(intern(".EXPORT_ALL_VARIABLES")).is_some() {
+            self.ev.export_all_vars = true;
+        }
         let real_unsupported = [
             ".DEFAULT",
             ".INTERMEDIATE",
@@ -502,7 +508,6 @@ impl<'a> DepBuilder<'a> {
             ".IGNORE",
             ".LOW_RESOLUTION_TIME",
             ".SILENT",
-            ".EXPORT_ALL_VARIABLES",
             ".ONESHELL",
         ];
         for p in noop_for_us {
@@ -1075,6 +1080,27 @@ impl<'a> DepBuilder<'a> {
                             n.lock().loc.as_ref(),
                             "warning: writing to readonly directory: \"{output}\""
                         );
+                    }
+                }
+            }
+        }
+
+        // sarun: `.EXTRA_PREREQS := dep1 dep2` (GNU make 4.3+) injects
+        // those names as prerequisites of every regular target. Skip
+        // special targets (.PHONY, .DEFAULT, etc.) — including the
+        // EXTRA_PREREQS targets themselves (or we'd build a cycle).
+        if !is_special_target(&output)
+            && let Some(ep_var) = self.ev.lookup_var(intern(".EXTRA_PREREQS"))?
+        {
+            let ep_buf = ep_var.read().eval_to_buf(self.ev)?;
+            let extras: Vec<Symbol> = crate::strutil::word_scanner(&ep_buf)
+                .map(|w| intern(w.to_vec()))
+                .collect();
+            if !extras.iter().any(|s| *s == output) {
+                let mut node = n.lock();
+                for extra in extras {
+                    if !node.actual_inputs.contains(&extra) {
+                        node.actual_inputs.push(extra);
                     }
                 }
             }

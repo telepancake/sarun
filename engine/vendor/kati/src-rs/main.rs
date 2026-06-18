@@ -235,6 +235,23 @@ fn run(targets: &[Symbol], cl_vars: &Vec<Bytes>, orig_args: OsString) -> Result<
         return Ok(0);
     }
 
+    // sarun: `.EXPORT_ALL_VARIABLES:` makes every make-defined variable
+    // visible to recipe environments. Stage them all here, before the
+    // explicit-exports loop (which can still override with unexport).
+    if ev.export_all_vars {
+        let all = kati::symtab::get_symbol_names(|v| {
+            !matches!(
+                v.read().origin(),
+                kati::var::VarOrigin::Default | kati::var::VarOrigin::Automatic
+            )
+        });
+        for (sym, _name) in all {
+            if !ev.exports.contains_key(&sym) {
+                ev.exports.insert(sym, true);
+            }
+        }
+    }
+
     for (name, export) in ev.exports.clone() {
         if export {
             let value = if let Some(v) = ev.lookup_var(name)? {
