@@ -34,6 +34,12 @@ pub struct Shared {
     /// filter, so view.window is a cheap slice.
     pub views: crate::views::Registry,
     pub next_view_id: u64,
+    /// Per-box networking handles (`-n` mode only). Engine-owned: the runner
+    /// asks for one in the register handshake and we hand back the netns path
+    /// + gateway/box IPs; the handle stays alive (poll thread running, TAP
+    /// fd open, netns anchor child SIGTERM-ed on Drop) until the box reaps.
+    pub net: Option<std::sync::Arc<crate::net::Net>>,
+    pub net_handles: std::collections::HashMap<i64, std::sync::Arc<crate::net::NetHandle>>,
 }
 
 fn pidfd_open(pid: i32) -> i32 {
@@ -662,9 +668,21 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
     }
     ov.add_box(std::sync::Arc::new(b));
     let root = crate::paths::mnt_point().join(id.to_string());
+
+    // ── Networking (-n boxes only) ────────────────────────────────────────
+    // For Tap mode: fork the netns anchor, equip its netns with the TAP +
+    // gateway IP, build a StackRuntime + flows log around the TAP fd, write
+    // the augmented CA bundle to a per-box temp path, and return netns_path
+    // + dns_ip + ca_pem_path so the runner can wire bwrap up.
+    let (netns_path, dns_ip, ca_pem_path) =
+        prepare_net(state, id, msg).unwrap_or_default();
+
     json!({
         "ok": true, "mount": root.to_string_lossy(),
         "shm_dir": backing.to_string_lossy(),
+        "netns_path": netns_path,
+        "dns_ip": dns_ip,
+        "ca_pem_path": ca_pem_path,
         "owner_token": format!("{:032x}", std::process::id() as u128
                                ^ (id as u128) << 64
                                ^ std::time::SystemTime::now()
@@ -674,6 +692,78 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
         "capture": want_capture,      // sinks + live echo mux active (off for -t/-d)
         "_box_sid": id,               // caller marker: this conn is now the box channel
     })
+}
+
+/// Equip a `-n` box's netns and start its smoltcp stack.
+/// Returns (netns_path, dns_ip, augmented_ca_bundle_path) — empty strings
+/// when networking is off/host or anything fails (the caller's bwrap then
+/// falls back to the default behavior the runner chose).
+fn prepare_net(state: &State, id: i64, msg: &Value) -> Option<(String, String, String)> {
+    let net_mode = msg.get("net_mode").and_then(Value::as_str).unwrap_or("off");
+    if net_mode != "tap" { return Some((String::new(), String::new(), String::new())); }
+    let net = state.lock().unwrap().net.clone()?;
+    let box_id_u16 = net.alloc_box_id();
+    let subnet = crate::net::subnet::BoxSubnet::new(box_id_u16);
+    let rig = match crate::net::tap::spawn_anchor(subnet) {
+        Ok(r) => r,
+        Err(e) => { eprintln!("sarun-engine: tap anchor failed: {e}"); return None; }
+    };
+    let box_dir = crate::paths::state_home().join(format!("flows/box{id}"));
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let flows = match crate::net::flows::FlowsLog::create(&box_dir, ts, box_id_u16) {
+        Ok(f) => f, Err(e) => {
+            eprintln!("sarun-engine: flows log: {e}"); return None;
+        }
+    };
+    let gw_mac = derive_gw_mac(box_id_u16);
+    let stack = crate::net::stack::StackRuntime::start(
+        box_id_u16, subnet, gw_mac, rig.mac, rig.tap_fd, flows.clone());
+
+    // Write the augmented CA bundle (host bundle + engine CA appended) once,
+    // under the runner's runtime dir so bwrap can --ro-bind it later.
+    let ca_pem_path = write_augmented_ca_bundle(&net.ca, id)
+        .unwrap_or_default();
+
+    let handle = std::sync::Arc::new(crate::net::make_handle(
+        box_id_u16, subnet.gateway_ip(), subnet.box_ip(),
+        rig.anchor_pid, rig.netns_path.clone(),
+        stack, flows.path.clone(), flows.keylog_path.clone()));
+    state.lock().unwrap().net_handles.insert(id, handle);
+
+    Some((rig.netns_path.to_string_lossy().into_owned(),
+          ipv4_str(subnet.gateway_ip()),
+          ca_pem_path))
+}
+
+fn ipv4_str(o: [u8; 4]) -> String {
+    format!("{}.{}.{}.{}", o[0], o[1], o[2], o[3])
+}
+
+fn derive_gw_mac(box_id: u16) -> [u8; 6] {
+    // Locally-administered unicast; embed the box id so anchor + gateway are
+    // distinguishable on a packet capture.
+    [0x02, 0x73, 0x72, 0x6e, (box_id >> 8) as u8, (box_id & 0xff) as u8]
+}
+
+fn write_augmented_ca_bundle(ca: &crate::net::ca::Ca, box_id: i64) -> Option<String> {
+    // Append our root to whichever system bundle exists; if none does, fall
+    // back to "just our root" (a self-contained mini-bundle is still trusted).
+    let mut bundle = String::new();
+    for p in &[
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/pki/tls/certs/ca-bundle.crt",
+        "/etc/ssl/cert.pem",
+    ] {
+        if let Ok(s) = std::fs::read_to_string(p) { bundle = s; break; }
+    }
+    if !bundle.ends_with('\n') { bundle.push('\n'); }
+    bundle.push_str(&ca.cert_pem);
+    let dir = crate::paths::runtime_home().join("ca");
+    std::fs::create_dir_all(&dir).ok()?;
+    let p = dir.join(format!("box{box_id}.pem"));
+    std::fs::write(&p, bundle).ok()?;
+    Some(p.to_string_lossy().into_owned())
 }
 
 fn dispatch_ui(state: &State, msg: &Value) -> Value {

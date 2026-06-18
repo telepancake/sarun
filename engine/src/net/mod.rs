@@ -38,6 +38,23 @@
 pub mod ca;
 pub mod subnet;
 
+/// `-n` / `-N` / default CLI choice. Off (the default) gives the box an
+/// EMPTY netns — getaddrinfo and any dial fail closed. Host shares the
+/// engine's own netns (the pre-feature behavior). Tap wires the box up to
+/// the per-box smoltcp stack.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NetMode { Off, Tap, Host }
+
+impl NetMode {
+    pub fn as_str(self) -> &'static str {
+        match self { Self::Off => "off", Self::Tap => "tap", Self::Host => "host" }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        match s { "off" => Some(Self::Off), "tap" => Some(Self::Tap),
+                  "host" => Some(Self::Host), _ => None }
+    }
+}
+
 // Skeletons for now — populated as the implementation lands.
 pub mod tap;
 pub mod stack;
