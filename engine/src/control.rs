@@ -1743,8 +1743,21 @@ pub fn is_box_name(s: &str) -> bool {
 pub fn cli_box_op(argv: &[String]) -> i32 {
     let name = argv[0].as_str();
     let op = argv.get(1).map(String::as_str);
+    // IN-BOX vs HOST socket selection: a `sarun OAITA-X discard` invoked
+    // from INSIDE a box (e.g. by oaita's cleanup_spawned_subagents when a
+    // sub-agent settles) reaches the engine via the UI socket bind-mounted
+    // at /tmp/.slopbox/ui.sock (the path runner.rs uses). The host
+    // runtime path isn't connectable from inside the box (different
+    // namespace, no bind mount). Mirror runner::run's path-presence
+    // detection.
+    const UI_SOCK_INBOX: &str = "/tmp/.slopbox/ui.sock";
+    let sock = if std::path::Path::new(UI_SOCK_INBOX).exists() {
+        std::path::PathBuf::from(UI_SOCK_INBOX)
+    } else {
+        crate::paths::sock_path()
+    };
     let one = |msg: Value| -> Result<Value, String> {
-        let mut c = UnixStream::connect(crate::paths::sock_path())
+        let mut c = UnixStream::connect(&sock)
             .map_err(|_| "no engine running".to_string())?;
         c.write_all(format!("{msg}\n").as_bytes()).map_err(|e| e.to_string())?;
         let mut line = String::new();
