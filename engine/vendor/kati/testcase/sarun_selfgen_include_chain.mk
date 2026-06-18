@@ -1,4 +1,3 @@
-# TODO(rust)
 # Two-level remake: a.mk emits an include of b.mk, b.mk defines B.
 a.mk:
 	echo 'A := from-a' > $@
