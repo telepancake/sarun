@@ -189,8 +189,8 @@ fn tty_restore(tty_fd: Option<i32>, old_fg: Option<i32>,
 }
 
 pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
-           pty: bool, brush: bool, no_parent: bool,
-           readonly_parent: bool, chdir: Option<String>,
+           pty: bool, brush: bool, api: bool,
+           no_parent: bool, readonly_parent: bool, chdir: Option<String>,
            net_mode: crate::net::NetMode,
            cmd: Vec<String>) -> i32 {
     // Note: an EMPTY cmd is no longer fatal here — when the parent chain
@@ -240,6 +240,7 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
                          "want_direct": direct,
                          "want_env": env,
                          "want_brush": brush,
+                         "want_api": api,
                          "net_mode": net_mode.as_str(),
                          "want_no_parent": no_parent,
                          "want_readonly_parent": readonly_parent,
@@ -412,6 +413,32 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
                 bwrap.args(["--gid", &gid_s]);
             }
         }
+    }
+    // --api: bind the engine's API proxy socket into the box and tell oaita
+    // to dial it (instead of phoning out directly). The engine has already
+    // marked this box's id as `--api`-enabled (see register handler) so the
+    // proxy will accept its connections; without that handshake a stray bind
+    // mount of api.sock would be refused at handle-time.
+    let api_on = ack.get("api").and_then(Value::as_bool).unwrap_or(false);
+    if api_on {
+        let host_api = paths::api_sock_path();
+        let host_api_s = host_api.to_string_lossy().into_owned();
+        const IN_BOX_API: &str = "/run/sarun/api.sock";
+        // Bind-mounted: the box gets the host socket at IN_BOX_API. The
+        // parent dir /run/sarun is materialised by bwrap when we bind.
+        bwrap.args(["--ro-bind", &host_api_s, IN_BOX_API]);
+        bwrap.args(["--setenv", "OAITA_API_SOCK", IN_BOX_API]);
+        // The in-box oaita client also needs a base_url string to satisfy
+        // its parser — anything non-empty works because the UDS endpoint
+        // wins over it.
+        bwrap.args(["--setenv", "OPENAI_BASE_URL", "http://oaita-proxy/v1"]);
+        // Expose the engine binary inside the box as both `oaita` and
+        // `sarun` so an in-box `oaita run X` reaches the symlinked-as-oaita
+        // dispatch (and a nested `sarun ...` for the shell executor reaches
+        // the normal subcommand path). Both shadow over /usr/local/bin —
+        // standard PATH on every distro we target.
+        bwrap.args(["--ro-bind", &self_exe, "/usr/local/bin/oaita"]);
+        bwrap.args(["--ro-bind", &self_exe, "/usr/local/bin/sarun"]);
     }
     bwrap.args(["--unshare-pid", "--unshare-ipc", "--unshare-uts",
                 "--die-with-parent"]);

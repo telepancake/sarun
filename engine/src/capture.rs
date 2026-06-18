@@ -70,6 +70,16 @@ CREATE TABLE IF NOT EXISTS brushprov(id INTEGER PRIMARY KEY AUTOINCREMENT,
 CREATE TABLE IF NOT EXISTS build_edges(id INTEGER PRIMARY KEY AUTOINCREMENT,
  ts REAL, outs TEXT, ins TEXT, cmd TEXT,
  started_ts REAL, ended_ts REAL, exit_code INT, output_excerpt TEXT);
+-- oaita `--api` proxy log: one row per request the engine forwarded on this
+-- box's behalf. Routed AROUND the network proxy (the API call leaves through
+-- the engine's HOST-namespace upstream connection, not the box's netns or
+-- host-loopback), so it has its OWN log surface — the network pcap/MITM
+-- views would not see it. `model` is what the request asked for (best-effort
+-- — may be empty if the wire body omits it). `req`/`resp` are full bytes
+-- (for streaming: a SSE-frame-concatenated reconstitution).
+CREATE TABLE IF NOT EXISTS api_log(id INTEGER PRIMARY KEY AUTOINCREMENT,
+ ts REAL, method TEXT, path TEXT, model TEXT, status INT,
+ stream INT DEFAULT 0, req BLOB, resp BLOB);
 ";
 
 #[derive(Clone)]
@@ -911,6 +921,23 @@ impl BoxState {
             "INSERT INTO brushprov(ts,cmd,record,pipeline,spawn_ts,nested) \
              VALUES(?1,?2,?3,?4,?5,1)",
             params![ts, cmd, record_json, pipeline, spawn_ts]);
+        conn.last_insert_rowid()
+    }
+
+    /// Record one oaita-proxy API call into this box's `api_log` table.
+    /// `ts` is the wall-clock UNIX seconds when the proxy finished handling
+    /// the call. `req`/`resp` are the FULL bytes (response is a SSE-frames
+    /// reconstitution when `stream` is true). Best-effort: a stale connection
+    /// drops the row silently.
+    pub fn add_api_log(&self, ts: f64, method: &str, path: &str,
+                       model: &str, status: i32, req: &[u8], resp: &[u8],
+                       stream: bool) -> i64 {
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute(
+            "INSERT INTO api_log(ts,method,path,model,status,stream,req,resp) \
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![ts, method, path, model, status,
+                    if stream { 1 } else { 0 }, req, resp]);
         conn.last_insert_rowid()
     }
 

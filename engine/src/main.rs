@@ -24,6 +24,7 @@ mod frames;
 mod katirun;
 mod n2run;
 mod net;
+mod oaita;
 mod oci;
 mod overlay;
 mod paths;
@@ -113,6 +114,7 @@ fn serve() -> i32 {
     };
     let state: control::State = Default::default();
     state.lock().unwrap().overlay = Some(ov.clone());
+    control::install_state_handle(state.clone());
     // Engine-side networking registry. Lazily loaded — only `-n` boxes will
     // ever invoke it. Failure here (e.g. can't write the CA dir) is not
     // fatal: `-n` will refuse at register time, other modes work normally.
@@ -127,6 +129,24 @@ fn serve() -> i32 {
         .enable_all().worker_threads(2).build()
         .map(|rt| { let h = rt.handle().clone(); Box::leak(Box::new(rt)); h });
     if let Ok(h) = net_rt { state.lock().unwrap().net_rt = Some(h); }
+    // oaita API proxy: listen on api.sock, parallel to the control socket. A
+    // `--api` box gets this bind-mounted in at /run/sarun/api.sock and speaks
+    // plain HTTP/1.1; the proxy injects the Authorization header from
+    // `oaita.toml` and logs each call into the box's api_log sqlar table. A
+    // missing/blank config is fine — the proxy answers 503 with a hint until
+    // it is configured.
+    let proxy = std::sync::Arc::new(oaita::proxy::Proxy::new());
+    proxy.set_overlay(ov.clone());
+    state.lock().unwrap().api_proxy = Some(proxy.clone());
+    if let Some(h) = state.lock().unwrap().net_rt.clone() {
+        let proxy = proxy.clone();
+        let api_sock = paths::api_sock_path();
+        h.spawn(async move {
+            if let Err(e) = oaita::proxy::serve(proxy, api_sock).await {
+                eprintln!("sarun-engine: oaita API proxy failed: {e}");
+            }
+        });
+    }
     println!("sarun-engine: listening · {}  ·  overlay {}",
              sock.display(), mnt.display());
     // Engine -> UI event broadcaster. Lives for the engine process's
@@ -293,6 +313,16 @@ fn tail_log(path: &std::path::Path, n_lines: usize) {
 }
 
 fn main() {
+    // Symlinked-as-`oaita` dispatch — same trick brush_sh / ninja / make use
+    // below: when this engine binary is invoked under the name `oaita` (a
+    // symlink to it), route straight to the oaita CLI. Detected BEFORE normal
+    // subcommand dispatch so the top-level `sarun` argument grammar doesn't
+    // try to parse oaita's. Inside a sarun-launched box the runner exports
+    // PATH so that `oaita` resolves to the engine binary itself.
+    if oaita::is_oaita_invocation() {
+        let argv: Vec<String> = std::env::args().skip(1).collect();
+        std::process::exit(oaita::cli::main(&argv));
+    }
     // D9 follow-on — brush-sh shim. When a -b box shadows /bin/sh (etc.) with
     // this engine binary, a nested `sh -c RECIPE` execs us under the original
     // program name. Detect that BEFORE normal subcommand dispatch (argv[0]'s
@@ -334,6 +364,9 @@ fn main() {
         std::process::exit(brush::brush_sh(&shell_argv));
     }
     match argv.first().map(String::as_str) {
+        // `sarun oaita …` — the second entry into the oaita duty (symlinked
+        // `oaita` binary is the first, handled above). Equivalent code path.
+        Some("oaita") => std::process::exit(oaita::cli::main(&argv[1..])),
         // Bare launch / explicit `attach` / `--once` headless render → UI role,
         // auto-spawning the engine when its socket is down.
         None => std::process::exit(ui_launch(&argv)),
@@ -395,6 +428,7 @@ fn main() {
             let mut brush = false;
             let mut no_parent = false;
             let mut readonly_parent = false;
+            let mut api = false;
             let mut chdir: Option<String> = None;
             let mut name: Option<String> = None;
             let mut net_mode = NetMode::Off;
@@ -428,11 +462,17 @@ fn main() {
                     //     need to dial localhost services or your VPN).
                     "-n" => net_mode = NetMode::Tap,
                     "-N" => net_mode = NetMode::Host,
+                    // --api  enable the oaita API proxy for this box. The
+                    //        engine bind-mounts its api.sock into the box at
+                    //        /run/sarun/api.sock and exports OAITA_API_SOCK
+                    //        so an in-box `oaita gen` routes through us — no
+                    //        api key, no direct network needed.
+                    "--api" => api = true,
                     _ => if name.is_none() { name = Some(a.clone()); },
                 }
             }
             std::process::exit(runner::run(name, passthrough, direct, env,
-                pty, brush, no_parent, readonly_parent, chdir,
+                pty, brush, api, no_parent, readonly_parent, chdir,
                 net_mode, cmd));
         }
         Some("oci") => {

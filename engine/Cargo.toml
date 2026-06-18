@@ -25,7 +25,13 @@ n2 = { path = "vendor/n2", default-features = false }
 # Vendored lib-only patched fork of kati (github.com/google/kati) — see
 # vendor/kati. Parses Makefiles → ninja graph for the embedded `make` path.
 kati = { path = "vendor/kati" }
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "fs", "process", "sync"] }
+tokio-stream = "0.1"
+futures-util = "0.3"
+regex = "1"
+rustls-pemfile = "2"
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
 fuser = "0.17.0"
 glob = "0.3.3"
 libc = "0.2.186"

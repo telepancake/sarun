@@ -45,6 +45,10 @@ pub struct Shared {
     /// the bottleneck, and a single runtime keeps reasoning about lifetimes
     /// simple.
     pub net_rt: Option<tokio::runtime::Handle>,
+    /// oaita API proxy. Owns the upstream config + the set of `--api`-enabled
+    /// boxes. Spawned by main.rs::serve once the overlay is up; serves the
+    /// api.sock concurrently with the control socket.
+    pub api_proxy: Option<std::sync::Arc<crate::oaita::proxy::Proxy>>,
 }
 
 fn pidfd_open(pid: i32) -> i32 {
@@ -116,6 +120,53 @@ fn derive_parent_box(state: &State, host_pid: i32) -> Option<i64> {
 }
 
 pub type State = Arc<Mutex<Shared>>;
+
+// ── api-proxy attribution shim ───────────────────────────────────────────────
+// The oaita API proxy lives on its own UDS but needs to know which BOX is
+// dialing it. SO_PEERCRED gives us the peer's pid; we walk /proc PPid up to a
+// registered runner pid (same trick `derive_parent_box` uses). The proxy
+// can't reach the State directly because it lives on the engine's tokio
+// runtime and the State lock is sync — so we stash the runner-pid → box-id
+// map in a parking_lot RwLock that both sides read.
+static API_RUNPID_MAP: parking_lot::RwLock<
+    Option<std::collections::HashMap<i32, i64>>>
+    = parking_lot::RwLock::new(None);
+
+fn refresh_api_runpid_map(state: &State) {
+    let m = state.lock().unwrap().box_runpids.clone();
+    *API_RUNPID_MAP.write() = Some(m.into_iter().map(|(b, p)| (p, b)).collect());
+}
+
+/// Lookup helper for the proxy: given a peer pid, return the box_id of the
+/// `--api` runner that is its ancestor (None if not found / not `--api`).
+pub fn api_box_for_pid(pid: i32) -> Option<i64> {
+    let g = API_RUNPID_MAP.read();
+    g.as_ref()?.get(&pid).copied()
+}
+
+/// Broadcast that box `box_id` has new api_log rows so the UI's API Logs pane
+/// refreshes. Best-effort; the broadcaster swallows send errors.
+pub fn broadcast_api_log(box_id: i64) {
+    // We need the State to actually broadcast — go through a global handle
+    // set up by serve().
+    if let Some(state) = STATE_HANDLE.read().clone() {
+        broadcast(&state, &json!({
+            "type": "api_log_added",
+            "sid": box_id.to_string(),
+        }));
+    }
+}
+
+static STATE_HANDLE: parking_lot::RwLock<Option<State>> = parking_lot::RwLock::new(None);
+pub fn install_state_handle(s: State) {
+    *STATE_HANDLE.write() = Some(s.clone());
+    refresh_api_runpid_map(&s);
+}
+pub fn refresh_api_runpids() {
+    if let Some(s) = STATE_HANDLE.read().clone() {
+        refresh_api_runpid_map(&s);
+    }
+}
 
 /// Record one D9 brush-shell provenance frame for box `id`: parse the JSON
 /// payload, write it into the live box's sqlar `brushprov` table, and broadcast
@@ -714,6 +765,16 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
             if fd >= 0 { s.box_pids.insert(id, fd); }
         }
     }
+    // --api opt-in: register this box with the oaita proxy so connections
+    // from inside it are accepted (and route to its api_log table). Refresh
+    // the runner-pid map the proxy uses for peer attribution.
+    let want_api = msg.get("want_api").and_then(Value::as_bool).unwrap_or(false);
+    if want_api {
+        if let Some(p) = state.lock().unwrap().api_proxy.clone() {
+            p.enable_box(id);
+        }
+    }
+    refresh_api_runpids();
     ov.add_box(std::sync::Arc::new(b));
     // Announce the new box on the subscribe stream so attached UIs
     // rebuild their session list WITHOUT a manual refresh. on_event
@@ -758,6 +819,7 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
                                  .map(|d| d.as_nanos()).unwrap_or(0)),
         "box_id": id, "session_id": id.to_string(), "name": name,
         "capture": want_capture,      // sinks + live echo mux active (off for -t/-d)
+        "api": want_api,              // proxy admits this box; runner binds api.sock
         "_box_sid": id,               // caller marker: this conn is now the box channel
     });
     if let Some(o) = oci {
@@ -958,6 +1020,14 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
         "outputs" => match arg_sid(args) {
             Some(id) => discover::outputs(id),
             None => json!([]),
+        },
+        "api_log" => match arg_sid(args) {
+            Some(id) => discover::api_log(id),
+            None => json!([]),
+        },
+        "api_log_detail" => match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
+            (Some(id), Some(rid)) => discover::api_log_detail(id, rid),
+            _ => Value::Null,
         },
         "brushprov" => match arg_sid(args) {
             Some(id) => discover::brushprov(id),
@@ -1635,7 +1705,11 @@ fn handle(state: State, conn: UnixStream) {
                     unsafe { libc::close(fd); }
                 }
                 s.box_runpids.remove(&id);
+                if let Some(p) = s.api_proxy.clone() {
+                    p.disable_box(id);
+                }
             }
+            refresh_api_runpids();
             broadcast(&state, &json!({"type": "session_removed",
                                       "session_id": id.to_string()}));
             return;
