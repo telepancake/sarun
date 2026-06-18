@@ -3511,8 +3511,9 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                     Style::default().add_modifier(Modifier::DIM)),
             ]));
             f.render_widget(title_bar, split[0]);
-            let screen = pty.parser.screen();
-            f.render_widget(tui_term::widget::PseudoTerminal::new(screen), split[1]);
+            // Direct paint into the buffer — we manage the cell-by-cell
+            // render so the wezterm-term Screen drives the ratatui frame.
+            render_pty_into(f.buffer_mut(), split[1], pty);
         } else {
             // No PTY open: a one-line message, also frame-less so the
             // empty-state matches the live-PTY layout.
@@ -3570,8 +3571,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                         Style::default().add_modifier(Modifier::DIM)),
                 ]));
                 f.render_widget(title_bar, split[0]);
-                let screen = pty.parser.screen();
-                f.render_widget(tui_term::widget::PseudoTerminal::new(screen), split[1]);
+                render_pty_into(f.buffer_mut(), split[1], pty);
                 // Now render the LEFT pane below per the focus arm (the
                 // `match` keeps its existing arms; only the right
                 // half above is overridden). Bypass the per-arm right
@@ -4293,16 +4293,48 @@ fn shell_split(s: &str) -> Vec<String> {
 // The client side of the FRAME_PTY_* mux: open a `pty_spawn` control connection,
 // spawn a reader thread that forwards every FRAME_PTY_DATA payload (and the
 // FRAME_PTY_EOF) over an mpsc channel, and keep the write half to send keystrokes
-// (FRAME_PTY_DATA) and resizes (FRAME_PTY_RESIZE). The vt100 Parser accumulates
-// the data into a screen grid that the tui-term PseudoTerminal widget renders —
-// the EXACT stack proven in ptyspike/, now driven over the engine socket.
+// (FRAME_PTY_DATA) and resizes (FRAME_PTY_RESIZE). A full wezterm-term
+// `Terminal` accumulates the data into a screen grid that we render into
+// ratatui's Buffer cell-by-cell. wezterm-term answers DSR / DA1 /
+// terminal-info queries via its internal Writer, which we hook to the same
+// UnixStream so the replies travel upstream as FRAME_PTY_DATA and reach the
+// PTY child correctly.
+
+/// Minimal TerminalConfiguration impl: just enough for wezterm-term to be
+/// happy. Scrollback size matches the old vt100 number (10 000 rows);
+/// other knobs use the trait defaults.
+#[derive(Debug)]
+struct PtyTermConfig;
+impl tattoy_wezterm_term::TerminalConfiguration for PtyTermConfig {
+    fn scrollback_size(&self) -> usize { 10_000 }
+    fn color_palette(&self) -> tattoy_wezterm_term::color::ColorPalette {
+        tattoy_wezterm_term::color::ColorPalette::default()
+    }
+}
+
+/// Writer wezterm-term's Terminal uses to send DSR / DA1 / mouse / etc.
+/// replies BACK to the child. We wrap each chunk of bytes the emulator
+/// writes into one FRAME_PTY_DATA frame and forward over the shared
+/// UnixStream — engine → master_writer → child reads them on its tty.
+struct PtyResponseWriter(std::sync::Arc<std::sync::Mutex<UnixStream>>);
+impl std::io::Write for PtyResponseWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let frame = crate::frames::encode(crate::frames::FRAME_PTY_DATA, buf);
+        let mut s = self.0.lock().unwrap();
+        s.write_all(&frame)?;
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.lock().unwrap().flush()
+    }
+}
 
 struct PtyPane {
-    parser: tui_term::vt100::Parser,
-    writer: UnixStream,            // write half: keystrokes + resize frames
-    rx: mpsc::Receiver<PtyMsg>,    // data/eof from the reader thread
-    #[allow(dead_code)] rows: u16,
-    #[allow(dead_code)] cols: u16,
+    terminal: tattoy_wezterm_term::Terminal,
+    writer: std::sync::Arc<std::sync::Mutex<UnixStream>>,
+    rx: mpsc::Receiver<PtyMsg>,
+    rows: u16,
+    cols: u16,
     eof: bool,
 }
 
@@ -4312,8 +4344,7 @@ enum PtyMsg {
 }
 
 impl PtyPane {
-    /// Open a PTY connection to the engine and spawn `argv` on it. Returns a pane
-    /// whose parser will fill as the reader thread delivers FRAME_PTY_DATA.
+    /// Open a PTY connection to the engine and spawn `argv` on it.
     fn open(sock: &str, argv: &[String], rows: u16, cols: u16) -> Result<PtyPane, String> {
         // The engine daemon is long-lived; its own cwd is wherever the
         // first `sarun` invocation started it, typically $HOME. The user
@@ -4335,8 +4366,6 @@ impl PtyPane {
         });
         s.write_all(format!("{req}\n").as_bytes()).map_err(|e| e.to_string())?;
         s.flush().ok();
-        // Read the one-line ack ({"ok":true,...}) before the frame stream begins.
-        // We must NOT consume any frame bytes, so read a single line byte-by-byte.
         let ack = read_one_line(&mut s)?;
         let v: Value = serde_json::from_str(ack.trim())
             .map_err(|e| format!("bad ack: {e}"))?;
@@ -4344,11 +4373,19 @@ impl PtyPane {
             return Err(v.get("error").and_then(Value::as_str)
                 .unwrap_or("pty_spawn refused").to_string());
         }
-        let writer = s.try_clone().map_err(|e| e.to_string())?;
+        // Share the UnixStream between three roles:
+        //   * READER thread reads the byte stream → FRAME_PTY_DATA / EOF.
+        //   * send_input / resize write FRAME_PTY_DATA / FRAME_PTY_RESIZE.
+        //   * wezterm-term's emulator writer writes DSR / DA1 / mouse
+        //     responses (encoded as FRAME_PTY_DATA).
+        // Reader uses its own try_clone; the two writer roles share an
+        // Arc<Mutex<>> so concurrent writes never interleave bytes mid-frame.
+        let writer = std::sync::Arc::new(std::sync::Mutex::new(
+            s.try_clone().map_err(|e| e.to_string())?));
+        let reader_handle = s.try_clone().map_err(|e| e.to_string())?;
         let (tx, rx) = mpsc::channel();
-        // Reader thread: decode FRAME_PTY_DATA / FRAME_PTY_EOF off the socket.
         std::thread::spawn(move || {
-            let mut reader = s;
+            let mut reader = reader_handle;
             let mut acc: Vec<u8> = vec![];
             let mut buf = [0u8; 8192];
             loop {
@@ -4370,25 +4407,31 @@ impl PtyPane {
             }
             let _ = tx.send(PtyMsg::Eof);
         });
-        Ok(PtyPane {
-            // 10 000 rows of scrollback: vt100's screen grid is rows×cols,
-            // anything that scrolled off the top is preserved in the
-            // scrollback buffer. Without this (the old `0`) long output
-            // truncated the moment it overflowed the visible screen —
-            // which is exactly what the user noticed when running a
-            // build inside the PTY pane.
-            parser: tui_term::vt100::Parser::new(rows, cols, 10_000),
-            writer, rx, rows, cols, eof: false,
-        })
+        // The ORIGINAL `s` is no longer needed (both threads use clones).
+        drop(s);
+        // Build the wezterm-term Terminal. The Writer it gets is the
+        // PtyResponseWriter wrapping our shared UnixStream — that's how
+        // DSR / DA1 / etc. replies flow upstream.
+        let size = tattoy_wezterm_term::TerminalSize {
+            rows: rows as usize, cols: cols as usize,
+            pixel_width: 0, pixel_height: 0, dpi: 0,
+        };
+        let response_writer = Box::new(PtyResponseWriter(writer.clone()));
+        let term = tattoy_wezterm_term::Terminal::new(
+            size,
+            std::sync::Arc::new(PtyTermConfig),
+            "sarun", env!("CARGO_PKG_VERSION"),
+            response_writer);
+        Ok(PtyPane { terminal: term, writer, rx, rows, cols, eof: false })
     }
 
-    /// Drain any pending PTY output into the vt100 parser. Non-blocking; call each
-    /// UI tick. Returns true if anything changed (a redraw is warranted).
+    /// Drain any pending PTY output into the wezterm-term emulator.
+    /// Non-blocking; call each UI tick. Returns true if anything changed.
     fn pump(&mut self) -> bool {
         let mut changed = false;
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
-                PtyMsg::Data(d) => { self.parser.process(&d); changed = true; }
+                PtyMsg::Data(d) => { self.terminal.advance_bytes(&d); changed = true; }
                 PtyMsg::Eof => { self.eof = true; changed = true; }
             }
         }
@@ -4398,22 +4441,114 @@ impl PtyPane {
     /// Send raw keystroke bytes to the child (FRAME_PTY_DATA, client→engine).
     fn send_input(&mut self, bytes: &[u8]) {
         let frame = crate::frames::encode(crate::frames::FRAME_PTY_DATA, bytes);
-        let _ = self.writer.write_all(&frame);
-        let _ = self.writer.flush();
+        let mut w = self.writer.lock().unwrap();
+        let _ = w.write_all(&frame);
+        let _ = w.flush();
     }
 
-    /// Tell the engine the pane was resized (FRAME_PTY_RESIZE).
-    #[allow(dead_code)]
+    /// Tell the engine the pane was resized (FRAME_PTY_RESIZE) and resize
+    /// the emulator's screen to match.
     fn resize(&mut self, rows: u16, cols: u16) {
         if rows == self.rows && cols == self.cols { return; }
         self.rows = rows;
         self.cols = cols;
-        self.parser.screen_mut().set_size(rows, cols);
+        let size = tattoy_wezterm_term::TerminalSize {
+            rows: rows as usize, cols: cols as usize,
+            pixel_width: 0, pixel_height: 0, dpi: 0,
+        };
+        self.terminal.resize(size);
         let frame = crate::frames::encode(crate::frames::FRAME_PTY_RESIZE,
             &crate::frames::pty_resize_payload(rows, cols));
-        let _ = self.writer.write_all(&frame);
-        let _ = self.writer.flush();
+        let mut w = self.writer.lock().unwrap();
+        let _ = w.write_all(&frame);
+        let _ = w.flush();
     }
+}
+
+/// Render a wezterm-term Screen's VISIBLE region into a ratatui Buffer.
+/// Walks each visible row + its cells, translates wezterm CellAttributes
+/// to ratatui Style, writes one ratatui cell per terminal cell. Empty
+/// trailing space (default-attr) is left alone.
+fn render_pty_into(buffer: &mut ratatui::buffer::Buffer, area: Rect,
+                   pty: &PtyPane) {
+    if area.width == 0 || area.height == 0 { return; }
+    let screen = pty.terminal.screen();
+    let phys_rows = screen.physical_rows;
+    let phys_cols = screen.physical_cols;
+    let total_lines = {
+        // physical_rows is the visible height; the visible window is the
+        // LAST physical_rows lines of the full line buffer. We iterate
+        // for_each_phys_line and skip everything before the visible range.
+        let mut total = 0usize;
+        screen.for_each_phys_line(|_idx, _line| { total += 1; });
+        total
+    };
+    let visible_start = total_lines.saturating_sub(phys_rows);
+    let max_rows = area.height as usize;
+    let max_cols = area.width as usize;
+    screen.for_each_phys_line(|idx, line| {
+        if idx < visible_start { return; }
+        let row = idx - visible_start;
+        if row >= max_rows || row >= phys_rows { return; }
+        let y = area.y + row as u16;
+        for cell in line.visible_cells() {
+            let x = cell.cell_index();
+            if x >= max_cols || x >= phys_cols { break; }
+            let s = cell.str();
+            let style = wezterm_attrs_to_ratatui_style(cell.attrs());
+            let bx = area.x + x as u16;
+            buffer[(bx, y)].set_symbol(s).set_style(style);
+        }
+    });
+}
+
+/// Translate wezterm-term CellAttributes → ratatui Style. Covers the
+/// common subset: fg / bg color, bold, dim, italic, underline, reverse,
+/// strikethrough, hidden, slow blink. Image-cell rendering isn't here
+/// yet (that's the sixel-passthrough follow-on we discussed).
+fn wezterm_attrs_to_ratatui_style(a: &tattoy_wezterm_term::CellAttributes) -> Style {
+    use tattoy_wezterm_term::color::ColorAttribute;
+    use tattoy_wezterm_term::Intensity;
+    use tattoy_wezterm_term::Underline;
+    let mut st = Style::default();
+    let map_color = |c: ColorAttribute| -> Option<Color> {
+        match c {
+            ColorAttribute::TrueColorWithDefaultFallback(rgb)
+            | ColorAttribute::TrueColorWithPaletteFallback(rgb, _) => {
+                let (r, g, b, _a) = rgb.to_srgb_u8();
+                Some(Color::Rgb(r, g, b))
+            }
+            ColorAttribute::PaletteIndex(i) => Some(match i {
+                0 => Color::Black, 1 => Color::Red, 2 => Color::Green,
+                3 => Color::Yellow, 4 => Color::Blue, 5 => Color::Magenta,
+                6 => Color::Cyan, 7 => Color::Gray,
+                8 => Color::DarkGray, 9 => Color::LightRed,
+                10 => Color::LightGreen, 11 => Color::LightYellow,
+                12 => Color::LightBlue, 13 => Color::LightMagenta,
+                14 => Color::LightCyan, 15 => Color::White,
+                n => Color::Indexed(n),
+            }),
+            ColorAttribute::Default => None,
+        }
+    };
+    if let Some(fg) = map_color(a.foreground()) { st = st.fg(fg); }
+    if let Some(bg) = map_color(a.background()) { st = st.bg(bg); }
+    match a.intensity() {
+        Intensity::Bold => st = st.add_modifier(Modifier::BOLD),
+        Intensity::Half => st = st.add_modifier(Modifier::DIM),
+        Intensity::Normal => {}
+    }
+    if a.italic() { st = st.add_modifier(Modifier::ITALIC); }
+    if !matches!(a.underline(), Underline::None) {
+        st = st.add_modifier(Modifier::UNDERLINED);
+    }
+    if a.reverse() { st = st.add_modifier(Modifier::REVERSED); }
+    if a.strikethrough() { st = st.add_modifier(Modifier::CROSSED_OUT); }
+    if a.invisible() { st = st.add_modifier(Modifier::HIDDEN); }
+    if a.blink() != tattoy_wezterm_term::Blink::None {
+        st = st.add_modifier(Modifier::SLOW_BLINK);
+    }
+    st
 }
 
 /// Read exactly one '\n'-terminated line from a stream byte-by-byte, so we never
