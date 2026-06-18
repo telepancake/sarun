@@ -1,4 +1,3 @@
-# TODO(rust)
 all: test.a
 
 %.a: %.b
