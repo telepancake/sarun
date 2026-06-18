@@ -16,7 +16,7 @@ from importlib.machinery import SourceFileLoader
 
 SARUN = str(Path(__file__).resolve().parent / "sarun")
 CRATE = Path(__file__).resolve().parent.parent / "engine"
-BIN = CRATE / "target/release/sarun-engine"
+BIN = CRATE / "target/x86_64-unknown-linux-musl/release/sarun-engine"
 
 _fails = []
 def check(cond, msg):
@@ -29,7 +29,7 @@ def ensure_binary() -> bool:
         return True
     if shutil.which("cargo") is None:
         return False
-    r = subprocess.run(["cargo", "build", "--release"], cwd=CRATE,
+    r = subprocess.run(["make", "engine"], cwd=CRATE.parent,
                        capture_output=True, text=True)
     return r.returncode == 0 and BIN.exists()
 

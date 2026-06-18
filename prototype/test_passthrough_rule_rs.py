@@ -34,7 +34,7 @@ from importlib.machinery import SourceFileLoader
 _HERE = Path(__file__).resolve().parent
 SARUN = str(_HERE / "sarun")
 CRATE = _HERE.parent / "engine"
-BIN = CRATE / "target/release/sarun"
+BIN = CRATE / "target/x86_64-unknown-linux-musl/release/sarun"
 
 ORIG = b"PT-INPUT-" + bytes(range(256)) * 32000  # ~8 MB
 PT = Path("/root/ptr_in.bin")       # passthrough-ruled
@@ -53,7 +53,7 @@ def ensure_binary() -> bool:
         return True
     if shutil.which("cargo") is None:
         return False
-    r = subprocess.run(["cargo", "build", "--release"], cwd=CRATE,
+    r = subprocess.run(["make", "engine"], cwd=CRATE.parent,
                        capture_output=True, text=True)
     return r.returncode == 0 and BIN.exists()
 

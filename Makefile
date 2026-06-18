@@ -19,11 +19,11 @@
 #   * engine/.../sarun  — the Rust port (the production target). Same
 #                         control protocol; a full standalone UI+engine.
 #
-# `make engine` and `make engine-musl` drop a `./sarun` SYMLINK at the
-# repo root pointing at whichever build they just produced — so you can
-# invoke the freshly-built binary as `./sarun` without spelunking into
-# engine/target/. `make run` execs that symlink when present, else the
-# Python prototype. `make clean` removes the symlink. .gitignore'd.
+# `make engine` drops a `./sarun` SYMLINK at the repo root pointing at the
+# freshly-built static musl binary, so you can invoke it as `./sarun`
+# without spelunking into engine/target/. `make run` execs that symlink
+# when present, else the Python prototype. `make clean` removes the
+# symlink. .gitignore'd.
 
 SHELL := bash
 .DEFAULT_GOAL := help
@@ -47,7 +47,7 @@ run: ## Start sarun (./sarun symlink from the last engine build, else the Python
 	  exec ./sarun; \
 	else \
 	  echo "→ prototype/sarun  (Python prototype — first run builds patched pyfuse3, ~25s)"; \
-	  echo "  (build the Rust port with 'make engine' or 'make engine-musl' to get a top-level ./sarun)"; \
+	  echo "  (build the Rust port with 'make engine' to get a top-level ./sarun)"; \
 	  exec prototype/sarun; \
 	fi
 
@@ -76,24 +76,18 @@ deps: ## Install system packages (libfuse3-dev, fuse3, pkg-config, bubblewrap)
 
 # ---- Rust port ------------------------------------------------------------
 #
-# Builds engine/target/.../sarun, the Rust port of the Python prototype.
-# Same control protocol — a built binary is what `make run` picks up.
+# Builds engine/target/x86_64-unknown-linux-musl/release/sarun, the
+# fully-static Rust port — the project's only shipped binary. Built with
+# cargo-zigbuild + ziglang so no system musl-tools is required. The cargo
+# default target is set to musl in engine/.cargo/config.toml; tests and
+# everything else go through this single target.
 
 .PHONY: engine
-engine: ## Build the Rust port (release, dynamic glibc — what `make run` prefers, what tests use)
-	cd engine && cargo build --release
-	@ln -sfn engine/target/release/sarun sarun
-	@echo "→ ./sarun → engine/target/release/sarun"
-
-.PHONY: engine-musl
-engine-musl: ## Build the Rust port as a fully-static musl binary (cargo-zigbuild + zig)
-	@command -v uv >/dev/null || { echo "engine-musl needs uv (https://docs.astral.sh/uv/)"; exit 1; }
+engine: ## Build the Rust port (fully-static musl binary; cargo-zigbuild + zig)
+	@command -v uv >/dev/null || { echo "engine needs uv (https://docs.astral.sh/uv/)"; exit 1; }
 	uv tool install --with ziglang cargo-zigbuild
 	rustup target add x86_64-unknown-linux-musl
-	mkdir -p engine/target/zigshim
-	printf '#!/bin/sh\nexec cargo-zigbuild zig cc -- -target x86_64-linux-musl "$$@"\n' > engine/target/zigshim/musl-gcc
-	chmod +x engine/target/zigshim/musl-gcc
-	cd engine && PATH="$(CURDIR)/engine/target/zigshim:$$(uv tool dir)/cargo-zigbuild/bin:$$HOME/.local/bin:$$PATH" \
+	cd engine && PATH="$$(uv tool dir)/cargo-zigbuild/bin:$$HOME/.local/bin:$$PATH" \
 	  cargo zigbuild --release --target x86_64-unknown-linux-musl
 	@ln -sfn engine/target/x86_64-unknown-linux-musl/release/sarun sarun
 	@echo "→ ./sarun → engine/target/x86_64-unknown-linux-musl/release/sarun"
@@ -101,12 +95,12 @@ engine-musl: ## Build the Rust port as a fully-static musl binary (cargo-zigbuil
 # ---- Tests ----------------------------------------------------------------
 
 .PHONY: test
-test: ## Run the Python test suite (in prototype/; excludes sakar/* and pjdfstest)
-	cd prototype && uv run --with pytest --with pytest-timeout --with "textual>=0.60" \
-	  --with "wcmatch>=8.4" --with "pyfuse3>=3.2" \
+test: ## Run the Python test suite (parallel via pytest-xdist; excludes test_e2e.py and pjdfstest)
+	cd prototype && uv run --with pytest --with pytest-xdist --with pytest-timeout \
+	  --with "textual>=0.60" --with "wcmatch>=8.4" --with "pyfuse3>=3.2" \
 	  --with "trio>=0.22" --with "python-magic>=0.4" \
-	  pytest -q -p no:cacheprovider --ignore=test_e2e.py \
-	  --ignore=test_pjdfstest.py
+	  pytest -q -p no:cacheprovider -n auto --dist=loadscope \
+	  --ignore=test_e2e.py --ignore=test_pjdfstest.py
 
 .PHONY: test-e2e
 test-e2e: ## Run the end-to-end tests (real UI + real sandboxes; minutes)
