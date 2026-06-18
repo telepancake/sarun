@@ -24,7 +24,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::Duration;
 
 const TIMEOUT: Duration = Duration::from_secs(30);
@@ -148,9 +148,22 @@ fn xfail_reason(src: &str) -> Option<String> {
 }
 
 fn run_with_timeout(mut cmd: Command, dir: &Path) -> (Vec<u8>, Option<i32>) {
+    // Merge stderr into stdout via a single OS pipe so the runner reads one
+    // naturally-interleaved stream (mirrors what `2>&1` gives at the shell
+    // and what Go's `cmd.CombinedOutput()` does upstream). Otherwise reading
+    // stdout-then-stderr would compare apples to oranges any time make
+    // routed info()/warn() and recipe-echo lines differently from rkati.
+    let (read_pipe, write_pipe) = match os_pipe::pipe() {
+        Ok(p) => p,
+        Err(e) => return (format!("pipe: {e}").into_bytes(), None),
+    };
+    let stdout_w = match write_pipe.try_clone() {
+        Ok(w) => w,
+        Err(e) => return (format!("pipe clone: {e}").into_bytes(), None),
+    };
     cmd.current_dir(dir)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(stdout_w)
+        .stderr(write_pipe)
         .env_remove("MAKEFLAGS")
         .env_remove("MAKELEVEL")
         .env("LC_ALL", "C");
@@ -158,20 +171,18 @@ fn run_with_timeout(mut cmd: Command, dir: &Path) -> (Vec<u8>, Option<i32>) {
         Ok(c) => c,
         Err(e) => return (format!("spawn failed: {e}").into_bytes(), None),
     };
+    // Drop our copies of the write side so the read end sees EOF once the
+    // child exits.
+    drop(cmd);
+    let mut read_pipe = read_pipe;
 
     let start = std::time::Instant::now();
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
+                use std::io::Read;
                 let mut out = Vec::new();
-                if let Some(mut o) = child.stdout.take() {
-                    use std::io::Read;
-                    let _ = o.read_to_end(&mut out);
-                }
-                if let Some(mut e) = child.stderr.take() {
-                    use std::io::Read;
-                    let _ = e.read_to_end(&mut out);
-                }
+                let _ = read_pipe.read_to_end(&mut out);
                 return (out, status.code());
             }
             Ok(None) => {
@@ -246,15 +257,33 @@ fn corpus_pass_rate() {
         let workdir = tempfile::tempdir().expect("tempdir");
         std::fs::copy(entry.path(), workdir.path().join("Makefile"))
             .expect("copy Makefile");
+        // Some testcases reference auxiliary files in sibling subdirectories
+        // of testcase/ (e.g. `$(MAKE) -f submake/basic.mk`). Symlink each
+        // such subdir into the tmpdir only when the .mk actually mentions
+        // it — otherwise tests that walk the filesystem (find, wildcard)
+        // start seeing files they shouldn't.
+        for sub in &["submake", "dump", "tools"] {
+            if !src.contains(sub) {
+                continue;
+            }
+            let from = dir.join(sub);
+            if from.is_dir() {
+                let _ = std::os::unix::fs::symlink(&from, workdir.path().join(sub));
+            }
+        }
 
         let mut mk_cmd = Command::new("make");
         mk_cmd.arg("SHELL=/bin/bash");
         let (mk_out, _) = run_with_timeout(mk_cmd, workdir.path());
 
-        // Wipe everything except the Makefile so rkati starts from the same
-        // state make did.
+        // Wipe everything except the Makefile and the staged symlinks so
+        // rkati starts from the same state make did. Symlinks we put there
+        // (submake/, dump/, tools/) are inputs, not artifacts — leave them.
         for e in std::fs::read_dir(workdir.path()).unwrap().flatten() {
             if e.file_name() == "Makefile" {
+                continue;
+            }
+            if e.file_type().map(|t| t.is_symlink()).unwrap_or(false) {
                 continue;
             }
             let p = e.path();
@@ -269,8 +298,26 @@ fn corpus_pass_rate() {
         rk_cmd.arg("--use_find_emulator").arg("SHELL=/bin/bash");
         let (rk_out, _) = run_with_timeout(rk_cmd, workdir.path());
 
-        let mk_norm = normalize(&String::from_utf8_lossy(&mk_out), &make_norms());
-        let rk_norm = normalize(&String::from_utf8_lossy(&rk_out), &kati_norms());
+        // $(MAKE) expands to "make" under GNU make but to "<rkati-path>
+        // --use_find_emulator SHELL=/bin/bash" under our rkati invocation
+        // (kati propagates subkati_args via $(MAKE) rather than MAKEFLAGS).
+        // Normalize the recipe-echo line — and ONLY that, anchored to start
+        // of line — so submake_basic and friends diff cleanly without
+        // catching "make" embedded in error messages.
+        let make_invoke_re = regex_lite::Regex::new(r"(?m)^make ").unwrap();
+        let mk_canon = make_invoke_re
+            .replace_all(&String::from_utf8_lossy(&mk_out), "$$(MAKE) ")
+            .into_owned();
+        let rkati_invocation = format!(
+            "{} --use_find_emulator SHELL=/bin/bash ",
+            rkati.display()
+        );
+        let rk_canon = String::from_utf8_lossy(&rk_out)
+            .replace(&format!("\n{rkati_invocation}"), "\n$(MAKE) ")
+            .replace(rkati_invocation.as_str(), "$(MAKE) ");
+
+        let mk_norm = normalize(&mk_canon, &make_norms());
+        let rk_norm = normalize(&rk_canon, &kati_norms());
 
         let matched = mk_norm == rk_norm;
         match (matched, xfail.is_some()) {
