@@ -17,7 +17,7 @@ limitations under the License.
 use std::sync::Arc;
 
 use anyhow::Result;
-use bytes::{Buf, Bytes};
+use bytes::{Buf, BufMut, Bytes};
 use memchr::{memchr, memchr3};
 use parking_lot::Mutex;
 
@@ -443,8 +443,31 @@ impl Parser {
         let mut mutable_loc = loc.clone();
         let lhs;
         let rhs;
-        if line.first() == Some(&b'(') && line.last() == Some(&b')') {
-            line = line.slice(1..line.len() - 1);
+        // sarun: GNU make accepts trailing extraneous text after the
+        // closing paren of `ifeq (lhs, rhs)` (it warns). Kati used to
+        // require the last char to be `)`, which fell through to the
+        // quoted-form parser and hard-errored. Find the matching `)`
+        // by counting parens; anything after is left in `line` for the
+        // trailing-warn block at the bottom.
+        if line.first() == Some(&b'(') {
+            let mut depth = 0i32;
+            let mut close = None;
+            for (i, &b) in line.iter().enumerate() {
+                if b == b'(' {
+                    depth += 1;
+                } else if b == b')' {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(i);
+                        break;
+                    }
+                }
+            }
+            let Some(close) = close else {
+                error_loc!(Some(&self.loc), "*** invalid syntax in conditional.");
+            };
+            let trailing = line.slice(close + 1..);
+            line = line.slice(1..close);
             let terms = vec![b','];
             let mut n;
             (n, lhs) = parse_expr_impl(
@@ -468,6 +491,14 @@ impl Parser {
                 true,
             )?;
             line = line.slice_ref(trim_left_space(&line[n.min(line.len())..]));
+            // sarun: any text past the matching `)` is "extraneous" —
+            // surface it to the trailing-warn block below.
+            if !trailing.is_empty() {
+                let mut combined = bytes::BytesMut::new();
+                combined.put_slice(&line);
+                combined.put_slice(&trailing);
+                line = combined.freeze();
+            }
         } else {
             if line.is_empty() {
                 error_loc!(Some(&self.loc), "*** invalid syntax in conditional.");
