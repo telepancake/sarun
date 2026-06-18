@@ -187,6 +187,17 @@ impl AssignStmt {
             if v.is_empty() {
                 error_loc!(Some(&self.loc), "*** empty variable name.");
             }
+            // sarun: literal whitespace inside the LHS bytes (e.g. `X Y := zz`)
+            // is invalid per GNU make. Check only the literal-LHS path —
+            // names that came from $(expansion) are unaffected, so the
+            // legitimate `$(pf) := PASS` case where $(pf) expands to
+            // something containing colons or spaces still works. Skip
+            // for `export X Y Z := val` (multi-target export) which is
+            // legitimate even though LHS has whitespace.
+            let in_export = self.directive.is_some_and(|d| d.export);
+            if !in_export && v.iter().any(|b| matches!(b, b' ' | b'\t')) {
+                error_loc!(Some(&self.loc), "*** empty variable name.");
+            }
 
             let mut cache = self.lhs_sym_cache.lock();
             if cache.is_none() {
