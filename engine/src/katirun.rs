@@ -155,7 +155,12 @@ fn read_bootstrap_makefile(targets: &[Symbol]) -> anyhow::Result<Arc<Mutex<Vec<k
         bootstrap.put_slice(b".cc.o:\n");
         bootstrap.put_slice(b"\t$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(TARGET_ARCH) -c -o $@ $<\n");
     }
-    bootstrap.put_slice(format!("MAKE?=make -j{}\n", FLAGS.num_jobs.max(1)).as_bytes());
+    // sarun: GNU make's $(MAKE) is the name make was invoked as (argv[0]) — no
+    // -jN appended. Parallelism propagates via MAKEFLAGS, not MAKE itself.
+    // Without this, sub-`$(MAKE)` recipes echoed verbatim by the parent (e.g.
+    // `echo '... $(MAKE) ...'`) would print `make -j4`, diverging from gnu's
+    // plain `make`. The FUSE shadow makes `make` route back to the engine.
+    bootstrap.put_slice(b"MAKE?=make\n");
     bootstrap.put_slice(b"MAKECMDGOALS?=");
     bootstrap.put(join_symbols(targets, b" "));
     bootstrap.put_u8(b'\n');
@@ -448,9 +453,22 @@ pub fn make_main(argv: &[String]) -> i32 {
         }
     };
 
-    // 8. Parse the ninja IN MEMORY into a runnable n2 State (memfd-backed db, no
-    //    .n2_db on disk), emit build_edges, then run n2 serial through brush.
-    let state = match n2::load::read_from_content("<kati-ninja>", ninja_src) {
+    // 8. Parse the ninja IN MEMORY into a runnable n2 State, emit build_edges,
+    //    then run n2 serial through brush.
+    //
+    // sarun: we use a PERSISTENT n2 db at `.sarun-n2-db` in the cwd so build
+    //    records survive across sub-`$(MAKE)` invocations within a single box
+    //    session. Without this, every nested make starts with empty hashes and
+    //    rebuilds every target — which diverges from real make's mtime-based
+    //    "exists + nothing newer = up to date" semantics. This is what makes
+    //    `sarun_incremental_rebuild.mk` (two $(MAKE) calls) and the selfgen
+    //    include tests (remake-and-reexec loop's 2nd iteration) match the
+    //    standalone rkati corpus pass set. The makefile is wired in as an
+    //    implicit dep on every non-phony rule (in ninja.rs::emit_build) so n2
+    //    has a mtime to compare prereq-less rules against. The db file lives in
+    //    the box's overlay (a temporary fs view) and dies with the box.
+    let db_path = std::path::PathBuf::from(".sarun-n2-db");
+    let state = match n2::load::read_from_content_with_db("<kati-ninja>", ninja_src, &db_path) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("sarun-engine make: n2 could not load the kati-generated ninja: {e:#}");

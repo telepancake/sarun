@@ -327,3 +327,41 @@ pub fn read_from_content(name: &str, mut content: Vec<u8>) -> anyhow::Result<Sta
         pools: loader.pools,
     })
 }
+
+// sarun: variant of read_from_content that ALSO opens a persistent disk
+// db at db_path (creating parent dirs as needed). The kati→n2 box pipeline
+// uses this to share build state across sub-makes within a single box
+// session — without it, every `$(MAKE)` invocation starts with an empty
+// hashes map and rebuilds every target, diverging from real make's
+// mtime-based "exists + nothing newer = up to date" semantics.
+pub fn read_from_content_with_db(
+    name: &str,
+    mut content: Vec<u8>,
+    db_path: &std::path::Path,
+) -> anyhow::Result<State> {
+    content.push(0);
+    let mut loader = Loader::new();
+    trace::scope("loader.read_content", || {
+        let mut parser = parse::Parser::new(&content);
+        loader.parse_with_parser(&mut parser, PathBuf::from(name), &[])
+    })?;
+
+    let mut hashes = graph::Hashes::default();
+    if let Some(parent) = db_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+    }
+    let db = trace::scope("db::open", || {
+        db::open(db_path, &mut loader.graph, &mut hashes)
+    })
+    .map_err(|err| anyhow!("n2 db {}: {}", db_path.display(), err))?;
+
+    Ok(State {
+        graph: loader.graph,
+        db,
+        hashes,
+        default: loader.default,
+        pools: loader.pools,
+    })
+}
