@@ -136,6 +136,18 @@ pub fn generate(spec: &str, set: &Settings) -> Result<Vec<PathBuf>, String> {
             "content": note,
         }));
     }
+    // Behavioural announcements: nudge the model toward backtrack when its
+    // pattern of recent turns indicates it either has a working result and
+    // should ship, OR is going in circles and should rewind. The two are
+    // mutually exclusive — productive spin fires if the last N tool
+    // results all succeeded with no failure markers; unproductive spin
+    // fires if there have been multiple errors in a row.
+    if let Some(note) = backtrack_behavioural_announcement(&target) {
+        messages.push(serde_json::json!({
+            "role": "system",
+            "content": note,
+        }));
+    }
     let tools = tools_array(set.capabilities.as_deref(), set.depth);
 
     trace::event("gen.request", json!({
@@ -453,6 +465,107 @@ fn already_resolved(outer: &str, inner: &str) -> bool {
         if target_match || session_match { return true; }
     }
     false
+}
+
+/// Cheap textual screen for tool-result content that looks like a failure
+/// the model would naturally retry — non-zero exit, common error tokens,
+/// shell complaints. Used by the behavioural announcement heuristics to
+/// decide "productive spin" (clean) vs "unproductive spin" (errory).
+fn tool_result_looks_failed(content: &str) -> bool {
+    // The shell tool's result text BEGINS with stdout+stderr; if rc was
+    // non-zero, common messages appear early. We check the FIRST 2KB —
+    // long successful outputs may incidentally contain "error" later
+    // (e.g. log lines), but the leader is normally a clean run's data.
+    let head: String = content.chars().take(2048).collect();
+    let lc = head.to_lowercase();
+    let markers = [
+        "no such file or directory",
+        "permission denied",
+        "command not found",
+        "syntax error",
+        "traceback (most recent call last)",
+        "error: unknown tool",
+        "fatal error",
+        "segfault",
+        "core dumped",
+        "exited with status",
+    ];
+    if markers.iter().any(|m| lc.contains(m)) { return true; }
+    // sh `set -e` aborts emit lines like "line 12: foo: ...". A bare
+    // "error" or "failed" token is too noisy; require a prefix.
+    if lc.contains(": error:") || lc.contains(": failed:") { return true; }
+    false
+}
+
+/// Walk recent turns and decide whether the conversation looks like a
+/// productive spin (consecutive successful tool calls — the model has
+/// what it needs and should ship) or an unproductive spin (recent tool
+/// results are failing — model is in a loop and should rewind).
+///
+/// Returns the announcement to inject, or None if neither pattern is
+/// strong enough. Both reminders are written so the model is told
+/// EXACTLY which gesture is correct (backtrack(final=true) to ship,
+/// backtrack with a waypoint summary to rewind) — backtrack overloads
+/// "ship" and "compact" under one tool, so the reminder has to spell
+/// out the right form.
+fn backtrack_behavioural_announcement(target: &str) -> Option<String> {
+    let turns = crate::oaita::turns::load_turns(target);
+    // We need a few rounds of activity before either pattern fires —
+    // otherwise the announcement looks gratuitous in short tasks.
+    let n_tool = turns.iter().filter(|t| t.kind == "tool").count();
+    if n_tool < 3 { return None; }
+    // Find the first user turn — that's where backtrack(turn_id=..., final=true,
+    // inclusive=false) should rewind TO so the original question stays.
+    let first_user_id: Option<String> = turns.iter()
+        .find(|t| t.kind == "user")
+        .and_then(|t| t.slug.clone());
+
+    // Walk the LAST 5 tool turns. Tally clean vs errory.
+    let recent_tools: Vec<&crate::oaita::turns::Turn> =
+        turns.iter().filter(|t| t.kind == "tool").rev().take(5).collect();
+    let mut errs = 0;
+    let mut cleans = 0;
+    for t in &recent_tools {
+        let content = t.read().unwrap_or_default();
+        if tool_result_looks_failed(&content) { errs += 1; } else { cleans += 1; }
+    }
+    // Productive: 3+ recent tool results all clean, and the model has
+    // taken at least 3 generations (so it's had time to settle). Suggest
+    // shipping.
+    if cleans >= 3 && errs == 0 && recent_tools.len() >= 3 {
+        let tid = first_user_id.as_deref().unwrap_or("<first-user-turn-id>");
+        return Some(format!(
+            "HARNESS ANNOUNCEMENT: your last {n} tool calls all succeeded \
+             without error markers. If you have the answer you came for, \
+             SHIP IT NOW — call `backtrack(turn_id={tid:?}, inclusive=false, \
+             final=true, summary=<your clean answer>)`. That collapses the \
+             derivation cruft and leaves the session as {{question, answer}}. \
+             Don't run another verification round just to feel sure: the \
+             derivation already records the validation; another shell call \
+             only adds noise. If you genuinely don't have the answer yet, \
+             ignore this and keep going.",
+            n = cleans,
+        ));
+    }
+    // Unproductive: 2+ recent tool results errored. Suggest rewinding
+    // to a known good point with a waypoint summary, then trying a
+    // different approach.
+    if errs >= 2 {
+        let tid = first_user_id.as_deref().unwrap_or("<first-user-turn-id>");
+        return Some(format!(
+            "HARNESS ANNOUNCEMENT: your recent tool calls have been failing \
+             ({errs} of the last {total} returned error markers). You are \
+             likely going in circles. CONSIDER REWINDING — call \
+             `backtrack(turn_id={tid:?}, inclusive=false, final=false, \
+             summary=<one-line note: what you tried, why it failed, what \
+             to try instead>)`. The summary becomes a waypoint the run \
+             continues from; you keep the original question but shed the \
+             dead-end derivation. Then approach the problem differently. \
+             If you actually believe you're close to a fix, ignore this.",
+            total = recent_tools.len(),
+        ));
+    }
+    None
 }
 
 /// Build the system-message announcement for `outer`'s next generation:

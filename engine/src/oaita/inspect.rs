@@ -233,7 +233,7 @@ fn default_sarun() -> String {
     "sarun".to_string()
 }
 
-fn window_indices(window: &Window, n: usize, default_page: usize) -> (usize, usize) {
+pub(crate) fn window_indices(window: &Window, n: usize, default_page: usize) -> (usize, usize) {
     match window {
         Window::Default => (1, n.min(default_page)),
         Window::Range(a, b) => (*a.max(&1), *b.min(&n)),
@@ -248,7 +248,7 @@ fn window_indices(window: &Window, n: usize, default_page: usize) -> (usize, usi
 
 /// Resolve a page key against the most recent cursor footer in the session's
 /// result turns. Returns (target, window) to apply.
-fn resolve_page_key(key: &str, turns: &[Turn]) -> Option<(String, Window)> {
+pub(crate) fn resolve_page_key(key: &str, turns: &[Turn]) -> Option<(String, Window)> {
     // Walk the .tool turns in reverse looking for the footer line.
     let re = regex::Regex::new(
         r#"--- inspect: "(?P<target>[^"]+)" (?P<unit>\w+) (?P<a>\d+)\.\.(?P<b>\d+) of (?P<n>\d+)"#
