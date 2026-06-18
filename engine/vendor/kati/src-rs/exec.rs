@@ -180,7 +180,30 @@ impl<'a> Executor<'a> {
             }
         }
 
-        let commands = self.ce.eval(n)?;
+        let mut commands = self.ce.eval(n)?;
+        // sarun: .ONESHELL — fuse all commands into one shell invocation
+        // so variable/cwd state persists across recipe lines. The first
+        // command's flags (echo, ignore_error) apply to the whole block.
+        if self.ce.ev.oneshell && commands.len() > 1 {
+            use bytes::{BufMut, BytesMut};
+            let mut combined = BytesMut::new();
+            let first_echo = commands[0].echo;
+            let first_ignore = commands[0].ignore_error;
+            let first_output = commands[0].output;
+            for (i, c) in commands.iter().enumerate() {
+                if i > 0 {
+                    combined.put_u8(b'\n');
+                }
+                combined.put_slice(&c.cmd);
+            }
+            commands = vec![crate::command::Command {
+                output: first_output,
+                cmd: combined.freeze(),
+                echo: first_echo,
+                ignore_error: first_ignore,
+                force_no_subshell: false,
+            }];
+        }
         for command in commands {
             self.num_commands += 1;
             if command.echo {

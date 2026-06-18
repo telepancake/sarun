@@ -514,6 +514,9 @@ impl<'a> DepBuilder<'a> {
         if self.get_rule_inputs(intern(".EXPORT_ALL_VARIABLES")).is_some() {
             self.ev.export_all_vars = true;
         }
+        if self.get_rule_inputs(intern(".ONESHELL")).is_some() {
+            self.ev.oneshell = true;
+        }
         // sarun: .SECONDEXPANSION enables a second pass of prereq
         // expansion. Stash the flag now; the actual re-expansion happens
         // in build_plan for each non-special target.
@@ -524,7 +527,6 @@ impl<'a> DepBuilder<'a> {
             ".IGNORE",
             ".LOW_RESOLUTION_TIME",
             ".SILENT",
-            ".ONESHELL",
         ];
         for p in noop_for_us {
             // Touch the symbol so the rule is consumed; the "don't
