@@ -267,9 +267,106 @@ pub fn strip_emitted_turn_id(content: &str) -> (Option<String>, String) {
     (id, content[m.end()..].to_string())
 }
 
-/// Build the OpenAI `messages` array from a list of turns. Skips `b`-flagged
-/// waypoints when they appear in the middle of an exchange? No — keep them in;
-/// the model has them as part of its own context (they ARE assistant turns).
+/// Build the OpenAI `messages` array from a list of turns.
+///
+/// Normal turns go through `Turn::message(true)` (role + injected turn-id
+/// header). The two special cases are tool-call exchanges:
+///
+///   * `c`-flagged assistant turns hold the envelope `{"tool":..., "arguments":...}`
+///     on disk. The wire form is `{"role":"assistant", "tool_calls":[…]}` where
+///     each call carries `id` (the file slug, which IS the OpenAI call_id),
+///     `type:"function"`, and `function.{name,arguments-as-string}`. Consecutive
+///     `c` turns COLLAPSE into one assistant message with N tool_calls — that's
+///     how the wire originally delivered them (one gen.reply with parallel
+///     calls = one assistant message, even though storage splits to one file
+///     per call).
+///
+///   * tool-result turns immediately following a collapsed c-block PAIR
+///     positionally to the calls and need `tool_call_id` set — without it,
+///     strict providers (xiaomi/mimo, others) 400 with "tool_call_id is not
+///     set". ds4-flash tolerates the missing field; mimo doesn't.
+///
+/// Header injection is suppressed on both forms: the c envelope is the
+/// arguments JSON (a header would corrupt it), and the tool result content
+/// already carries its own framing.
 pub fn build_messages(turns: &[Turn]) -> Vec<serde_json::Value> {
-    turns.iter().map(|t| t.message(true)).collect()
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < turns.len() {
+        let t = &turns[i];
+        // Collapse a run of consecutive c-flagged assistant turns into ONE
+        // assistant message with N tool_calls, then pair the following tool
+        // turns by position.
+        if t.kind == "assistant" && t.flags.contains('c') {
+            let mut tool_calls: Vec<serde_json::Value> = Vec::new();
+            let mut call_ids: Vec<String> = Vec::new();
+            let mut j = i;
+            while j < turns.len()
+                && turns[j].kind == "assistant"
+                && turns[j].flags.contains('c')
+            {
+                let body = turns[j].read().unwrap_or_default();
+                let env: serde_json::Value = serde_json::from_str(&body)
+                    .unwrap_or_else(|_| json!({}));
+                let name = env.get("tool").and_then(serde_json::Value::as_str)
+                    .unwrap_or("").to_string();
+                let args = env.get("arguments").cloned().unwrap_or(json!({}));
+                // OpenAI wants arguments as a STRING (stringified JSON), not
+                // an inline object — that's the convention strict providers
+                // enforce.
+                let args_str = match args {
+                    serde_json::Value::String(s) => s,
+                    other => other.to_string(),
+                };
+                let call_id = turns[j].slug.clone()
+                    .unwrap_or_else(|| format!("call_orphan_{}", j));
+                tool_calls.push(json!({
+                    "id": call_id,
+                    "type": "function",
+                    "function": { "name": name, "arguments": args_str },
+                }));
+                call_ids.push(call_id);
+                j += 1;
+            }
+            out.push(json!({
+                "role": "assistant",
+                "content": serde_json::Value::Null,
+                "tool_calls": tool_calls,
+            }));
+            // Pair the next run of .tool turns to those calls positionally.
+            // If there are more tool turns than calls, fan extras onto the
+            // last call_id (degenerate but keeps the wire valid).
+            let mut k: usize = 0;
+            while j < turns.len() && turns[j].kind == "tool" {
+                let raw = turns[j].read().unwrap_or_default();
+                let id = call_ids.get(k)
+                    .or_else(|| call_ids.last())
+                    .cloned()
+                    .unwrap_or_default();
+                out.push(json!({
+                    "role": "tool",
+                    "tool_call_id": id,
+                    "content": raw,
+                }));
+                k += 1;
+                j += 1;
+            }
+            i = j;
+            continue;
+        }
+        // Orphan tool turn (no preceding c assistant — can happen after a
+        // backtrack that ate the call but spared the result). Demote to a
+        // user message so the wire stays valid; the content is preserved.
+        if t.kind == "tool" {
+            out.push(json!({
+                "role": "user",
+                "content": t.read().unwrap_or_default(),
+            }));
+            i += 1;
+            continue;
+        }
+        out.push(t.message(true));
+        i += 1;
+    }
+    out
 }
