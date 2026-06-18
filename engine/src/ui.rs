@@ -1828,7 +1828,23 @@ impl App {
     #[cfg_attr(test, allow(dead_code))]
     fn open_pty(&mut self, argv: Vec<String>) {
         if argv.is_empty() { self.status = "pty: empty command".into(); return; }
-        match PtyPane::open(&self.sock, &argv, 24, 80) {
+        // Initial size: best guess from the actual terminal. The loop
+        // calls fit_active_pty() once per redraw and resizes again
+        // when the layout changes (split vs full-screen, embed
+        // toggle, terminal resize), so the initial guess only has to
+        // be close — better than 24×80 forever.
+        let (cols, rows) = match crossterm::terminal::size() {
+            Ok((c, r)) => {
+                // Body height = rows minus menubar / cmdline / fkeybar
+                // / status = 4. Subtract one more row for the PTY's
+                // title strip.
+                let h = r.saturating_sub(5).max(2);
+                let w = c.max(20);
+                (w, h)
+            }
+            Err(_) => (80, 24),
+        };
+        match PtyPane::open(&self.sock, &argv, rows, cols) {
             Ok(p) => {
                 self.ptys.push(p);
                 self.sel_pty = self.ptys.len() - 1;
@@ -1838,6 +1854,41 @@ impl App {
                     self.sel_pty + 1, self.ptys.len());
             }
             Err(e) => self.status = format!("pty: {e}"),
+        }
+    }
+
+    /// Compute the (rows, cols) the currently-VISIBLE PTY should
+    /// occupy given the terminal size, and resize it if it differs
+    /// from what the child currently thinks. Called from the main
+    /// loop on every iteration AND on Event::Resize. The math
+    /// mirrors the draw() layout exactly:
+    ///   root vertical: 1 (menubar) + body + 1 (cmdline) + 1 (fkeybar)
+    ///                   + 1 (status)   → body = rows − 4
+    ///   embedded:  right column = round(width * 55 / 100), minus the
+    ///              1-row PTY title strip → cols ≈ width*0.55,
+    ///              rows = body − 1
+    ///   full-screen: full width, body − 1 (title strip) rows.
+    /// We resize the ACTIVE PTY only — the others get resized lazily
+    /// the next time they become active (they're not visible anyway).
+    #[cfg_attr(test, allow(dead_code))]
+    fn fit_active_pty(&mut self, term_cols: u16, term_rows: u16) {
+        if self.ptys.is_empty() { return; }
+        let body_rows = term_rows.saturating_sub(4).max(2);
+        let (cols, rows) = if self.focus == Pane::Pty {
+            // Full-screen PTY: subtract 1 for the title strip.
+            (term_cols.max(20), body_rows.saturating_sub(1).max(2))
+        } else if self.pty_in_right {
+            // Embedded right pane: ratatui's Percentage(55) rounds
+            // toward floor, so we mirror that — `term_cols * 55 / 100`.
+            let rc = (term_cols as u32 * 55 / 100) as u16;
+            (rc.max(20), body_rows.saturating_sub(1).max(2))
+        } else {
+            // PTY is not visible — don't resize. Lets the user open
+            // a PTY, switch away, come back, and find the same grid.
+            return;
+        };
+        if let Some(pty) = self.ptys.get_mut(self.sel_pty) {
+            pty.resize(rows, cols);
         }
     }
 
@@ -4745,6 +4796,13 @@ fn run_interactive(sock: &str) -> Result<(), String> {
             // so we pump them all here even when only one is visible
             // (the rest accumulate output for when the user switches).
             for pty in app.ptys.iter_mut() { pty.pump(); }
+            // Keep the active PTY sized to whatever space the layout
+            // actually gives it. The child's $LINES / $COLUMNS / TIOCSWINSZ
+            // tracks the real visible grid, so reedline / less / vim
+            // draw at the right width and lines don't wrap weird.
+            if let Ok((c, r)) = terminal::size() {
+                app.fit_active_pty(c, r);
+            }
             // drain a finished structural-diff worker result, and animate the
             // spinner while one is still pending.
             app.pump_struct();
@@ -4762,7 +4820,17 @@ fn run_interactive(sock: &str) -> Result<(), String> {
             if !event::poll(Duration::from_millis(200)).map_err(|e| e.to_string())? {
                 continue;
             }
-            if let Event::Key(k) = event::read().map_err(|e| e.to_string())? {
+            let ev = event::read().map_err(|e| e.to_string())?;
+            if let Event::Resize(c, r) = ev {
+                // Immediate resize on terminal-resize event. The
+                // per-iteration fit_active_pty also catches this on
+                // the next tick, but reedline / less / vim get
+                // distracted if the gap stretches the redraw out —
+                // route the resize the moment the OS tells us.
+                app.fit_active_pty(c, r);
+                continue;
+            }
+            if let Event::Key(k) = ev {
                 if k.kind != KeyEventKind::Press {
                     continue;
                 }
