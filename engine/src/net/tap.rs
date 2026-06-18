@@ -123,14 +123,26 @@ fn anchor_child_main(sock: OwnedFd, subnet: BoxSubnet, mac: [u8; 6]) -> ! {
         let netns = std::fs::File::open("/proc/self/ns/net").context("open ns/net")?;
         let netns_fd: OwnedFd = netns.into();
 
-        // 3. Bring loopback up + create + configure TAP via netlink (or fall
-        //    back to ioctl). For now use ioctl + /sbin/ip-style assistance.
+        // 3. Bring loopback up + create + configure TAP. The IP that goes
+        //    on the TAP-from-the-box's-perspective is the BOX's address
+        //    (`.0.2`), not the gateway's — the gateway lives on the engine
+        //    side, served entirely by smoltcp's userland stack. We also
+        //    install a default route via the gateway so the box's normal
+        //    dial paths (curl, getaddrinfo, ...) work without dhclient.
         let tap_name = format!("tap{}", subnet.id);
         let tap = open_tap(&tap_name).context("open TAP")?;
         bring_link_up("lo")?;
         set_mac(&tap_name, mac)?;
         set_link_up(&tap_name)?;
-        assign_ip(&tap_name, subnet.gateway_ip(), subnet.prefix_len())?;
+        assign_ip(&tap_name, subnet.box_ip(), subnet.box_prefix_len())?;
+        add_default_route(subnet.gateway_ip())?;
+        // Also seed the ARP cache so the first packet doesn't lose time
+        // resolving the gateway MAC. We don't know it from here (it's the
+        // engine's choice), so we install a permanent neighbour entry using
+        // a deterministic engine-side MAC derived from box id (matches the
+        // `derive_gw_mac` in control.rs).
+        let gw_mac = derive_gw_mac(subnet.id);
+        let _ = add_neigh(subnet.gateway_ip(), gw_mac, &tap_name);
 
         // 4. Hand off (tap_fd, netns_fd) + tap_name.
         send_handoff(&sock, &tap, &netns_fd, &tap_name)?;
@@ -222,6 +234,83 @@ fn set_mac(name: &str, mac: [u8; 6]) -> Result<()> {
     const SIOCSIFHWADDR: libc::c_ulong = 0x8924;
     let r = unsafe { libc::ioctl(s.as_raw_fd(), SIOCSIFHWADDR, &req) };
     if r < 0 { bail!("SIOCSIFHWADDR: {}", std::io::Error::last_os_error()); }
+    Ok(())
+}
+
+/// Match control.rs::derive_gw_mac. Kept here too so the anchor child can
+/// seed the box's ARP cache without an IPC round-trip.
+fn derive_gw_mac(box_id: u16) -> [u8; 6] {
+    [0x02, 0x73, 0x72, 0x6e, (box_id >> 8) as u8, (box_id & 0xff) as u8]
+}
+
+/// `ip route add default via <gw>` via SIOCADDRT.
+fn add_default_route(gw: [u8; 4]) -> Result<()> {
+    let s = ioctl_sock()?;
+    #[repr(C)]
+    struct Rtentry {
+        rt_pad1: libc::c_ulong,
+        rt_dst: libc::sockaddr,
+        rt_gateway: libc::sockaddr,
+        rt_genmask: libc::sockaddr,
+        rt_flags: libc::c_ushort,
+        rt_pad2: libc::c_short,
+        rt_pad3: libc::c_ulong,
+        rt_tos: libc::c_uchar,
+        rt_class: libc::c_uchar,
+        rt_pad4: [libc::c_short; 3],
+        rt_metric: libc::c_short,
+        rt_dev: *mut libc::c_char,
+        rt_mtu: libc::c_ulong,
+        rt_window: libc::c_ulong,
+        rt_irtt: libc::c_ushort,
+    }
+    let mut r: Rtentry = unsafe { std::mem::zeroed() };
+    let mk = |ip: [u8; 4]| -> libc::sockaddr {
+        let s_in = libc::sockaddr_in {
+            sin_family: libc::AF_INET as u16,
+            sin_port: 0,
+            sin_addr: libc::in_addr { s_addr: u32::from_ne_bytes(ip) },
+            sin_zero: [0; 8],
+        };
+        unsafe { std::mem::transmute(s_in) }
+    };
+    r.rt_dst = mk([0, 0, 0, 0]);
+    r.rt_genmask = mk([0, 0, 0, 0]);
+    r.rt_gateway = mk(gw);
+    // RTF_UP | RTF_GATEWAY
+    r.rt_flags = 0x0001 | 0x0002;
+    const SIOCADDRT: libc::c_ulong = 0x890B;
+    let rc = unsafe { libc::ioctl(s.as_raw_fd(), SIOCADDRT, &r) };
+    if rc < 0 { bail!("SIOCADDRT default→{:?}: {}", gw, std::io::Error::last_os_error()); }
+    Ok(())
+}
+
+/// `ip neigh add <gw> lladdr <mac> dev <ifname> nud permanent` via SIOCSARP.
+fn add_neigh(ip: [u8; 4], mac: [u8; 6], ifname: &str) -> Result<()> {
+    let s = ioctl_sock()?;
+    #[repr(C)]
+    struct Arpreq {
+        arp_pa: libc::sockaddr,
+        arp_ha: libc::sockaddr,
+        arp_flags: libc::c_int,
+        arp_netmask: libc::sockaddr,
+        arp_dev: [u8; 16],
+    }
+    let mut a: Arpreq = unsafe { std::mem::zeroed() };
+    let s_in = libc::sockaddr_in {
+        sin_family: libc::AF_INET as u16,
+        sin_port: 0,
+        sin_addr: libc::in_addr { s_addr: u32::from_ne_bytes(ip) },
+        sin_zero: [0; 8],
+    };
+    a.arp_pa = unsafe { std::mem::transmute(s_in) };
+    a.arp_ha.sa_family = 1; // ARPHRD_ETHER
+    for i in 0..6 { a.arp_ha.sa_data[i] = mac[i] as libc::c_char; }
+    a.arp_flags = 0x02 | 0x04;  // ATF_COM | ATF_PERM
+    write_name(&mut a.arp_dev, ifname)?;
+    const SIOCSARP: libc::c_ulong = 0x8955;
+    let rc = unsafe { libc::ioctl(s.as_raw_fd(), SIOCSARP, &a) };
+    if rc < 0 { bail!("SIOCSARP {:?}: {}", ip, std::io::Error::last_os_error()); }
     Ok(())
 }
 

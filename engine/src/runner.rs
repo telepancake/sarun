@@ -430,16 +430,22 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
     }
     if !ca_pem_path.is_empty() {
         // CA bundle augmentation (sakar parity): bind the augmented bundle
-        // over each common system CA path, and set the major library envs so
-        // tools that read their own env-var path also pick up our root.
+        // over each common system CA path. The env vars need to point at a
+        // path that exists INSIDE the box — use the canonical Debian/Ubuntu
+        // one (it's the most common and we also bind it). We bind it
+        // unconditionally (NOT --ro-bind-try) so the env-var path is
+        // guaranteed to resolve.
+        let canonical_inside = "/etc/ssl/certs/ca-certificates.crt";
+        bwrap.args(["--ro-bind", &ca_pem_path, canonical_inside]);
         for tgt in CA_BUNDLE_TARGETS {
+            if *tgt == canonical_inside { continue; }
             bwrap.arg("--ro-bind-try").arg(&ca_pem_path).arg(tgt);
         }
-        for (k, v) in [("SSL_CERT_FILE", ca_pem_path.as_str()),
-                       ("CURL_CA_BUNDLE", &ca_pem_path),
-                       ("NODE_EXTRA_CA_CERTS", &ca_pem_path),
-                       ("REQUESTS_CA_BUNDLE", &ca_pem_path),
-                       ("GIT_SSL_CAINFO", &ca_pem_path)] {
+        for (k, v) in [("SSL_CERT_FILE", canonical_inside),
+                       ("CURL_CA_BUNDLE", canonical_inside),
+                       ("NODE_EXTRA_CA_CERTS", canonical_inside),
+                       ("REQUESTS_CA_BUNDLE", canonical_inside),
+                       ("GIT_SSL_CAINFO", canonical_inside)] {
             bwrap.args(["--setenv", k, v]);
         }
     }
