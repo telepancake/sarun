@@ -109,7 +109,18 @@ pub fn generate(spec: &str, set: &Settings) -> Result<Vec<PathBuf>, String> {
             .filter(|t| t.path != target_path).collect()
     } else { stitched };
 
-    let messages = build_messages(&prompt_turns);
+    let mut messages = build_messages(&prompt_turns);
+    // Announcement: surface unhandled completed sub-tasks (act sub-agents
+    // that have settled but whose box hasn't been apply/reject'd). Without
+    // this, a model can move on and leave staged work — and the orphan box
+    // pile up. Injected as a system message AFTER the existing context so
+    // it's the freshest thing the model sees before its next turn.
+    if let Some(note) = unhandled_subtasks_announcement(&target) {
+        messages.push(serde_json::json!({
+            "role": "system",
+            "content": note,
+        }));
+    }
     let tools = tools_array(set.capabilities.as_deref(), set.depth);
 
     trace::event("gen.request", json!({
@@ -169,6 +180,21 @@ pub fn generate(spec: &str, set: &Settings) -> Result<Vec<PathBuf>, String> {
     if let Some(eid) = emitted {
         if is_adoptable_slug(&eid) && !existing.contains(&eid) {
             new_slug = eid;
+        }
+    }
+
+    // Tool-call-as-content rescue: some open models (ds4-flash, mimo, …)
+    // emit tool calls as plain JSON in the content delta instead of via
+    // the OpenAI `tool_calls` field. Without this rescue the harness banks
+    // them as settled answers and the run stops. Pattern: content (after
+    // stripping the turn-id header) parses as a JSON object with `tool`
+    // (string) and `arguments` (object) at top level — exactly the
+    // c.assistant envelope shape we already use on disk.
+    if tool_calls.is_empty() {
+        if let Some(rescued) = rescue_content_tool_call(&body) {
+            tool_calls.push(rescued);
+            // Drop the content so we don't bank it as a duplicate answer.
+            let _ = std::fs::write(&target_path, "");
         }
     }
 
@@ -254,6 +280,35 @@ impl AssembledToolCall {
     }
 }
 
+/// Rescue a tool call the model emitted as PLAIN CONTENT instead of via
+/// the OpenAI `tool_calls` field. Models like ds4-flash and xiaomi/mimo
+/// frequently do this — they understand the tool schema but encode the
+/// call in the content delta as a JSON object `{"tool":"X","arguments":{…}}`
+/// (exactly the shape we already use on disk for c.assistant envelopes).
+///
+/// Returns the equivalent AssembledToolCall when the content parses as
+/// that shape AND the tool name is one we recognise; None otherwise so
+/// content that legitimately starts with a JSON object is not eaten.
+fn rescue_content_tool_call(body: &str) -> Option<AssembledToolCall> {
+    let trimmed = body.trim();
+    if !trimmed.starts_with('{') { return None; }
+    let v: Value = serde_json::from_str(trimmed).ok()?;
+    let obj = v.as_object()?;
+    let tool = obj.get("tool").and_then(Value::as_str)?;
+    // Only rescue tools we actually dispatch — `tool` could legitimately
+    // appear in a free-form answer that happens to be JSON.
+    if !matches!(tool, "act" | "shell" | "inspect" | "read" |
+                       "apply" | "reject" | "backtrack" | "delete") {
+        return None;
+    }
+    let args = obj.get("arguments").cloned().unwrap_or(Value::Null);
+    Some(AssembledToolCall {
+        id: None,
+        name: tool.to_string(),
+        arguments: serde_json::to_string(&args).unwrap_or_else(|_| "{}".into()),
+    })
+}
+
 fn assemble_tool_calls(acc: &mut Vec<AssembledToolCall>, frags: &[Value]) {
     for frag in frags {
         let idx = frag.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
@@ -274,6 +329,129 @@ fn assemble_tool_calls(acc: &mut Vec<AssembledToolCall>, frags: &[Value]) {
                 row.arguments.push_str(a);
             }
         }
+    }
+}
+
+// ── announcements & sub-agent cleanup ───────────────────────────────────────
+
+/// Walk every oaita session folder, pick out the ones that look like
+/// sub-agents spawned BY `outer` — their 0010 user turn carries
+/// `from=<outer>` in the filename (`NNNN-id-from.user`). Returns
+/// `Vec<inner_session_name>`.
+fn spawned_by(outer: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let root = crate::paths::oaita_state_home();
+    let Ok(rd) = std::fs::read_dir(&root) else { return out; };
+    for entry in rd.flatten() {
+        let p = entry.path();
+        if !p.is_dir() { continue; }
+        let Some(name) = p.file_name().and_then(|s| s.to_str()) else { continue; };
+        if name == outer { continue; }
+        let inner_turns = crate::oaita::turns::load_turns(name);
+        let Some(first) = inner_turns.first() else { continue; };
+        if first.sender.as_deref() == Some(outer) {
+            out.push(name.to_string());
+        }
+    }
+    out
+}
+
+/// True iff the LAST turn of `session` is a clean assistant turn (no `p`,
+/// `c`, or `b` flags) — the "settled" predicate.
+fn session_settled(session: &str) -> bool {
+    let ts = crate::oaita::turns::load_turns(session);
+    ts.last()
+        .map(|t| t.kind == "assistant"
+            && !t.flags.contains('p')
+            && !t.flags.contains('c')
+            && !t.flags.contains('b'))
+        .unwrap_or(false)
+}
+
+/// True iff `outer` has called one of apply/reject/delete on `inner`'s id.
+/// We scan only the OUTER session's c.assistant tool-call envelopes.
+fn already_resolved(outer: &str, inner: &str) -> bool {
+    let turns = crate::oaita::turns::load_turns(outer);
+    for t in &turns {
+        if t.kind != "assistant" || !t.flags.contains('c') { continue; }
+        let Ok(content) = t.read() else { continue; };
+        let Ok(v) = serde_json::from_str::<Value>(&content) else { continue; };
+        let tool = v.get("tool").and_then(Value::as_str).unwrap_or("");
+        let args = v.get("arguments").cloned().unwrap_or(Value::Null);
+        let target_match = matches!(tool, "apply" | "reject")
+            && args.get("target").and_then(Value::as_str) == Some(inner);
+        let session_match = tool == "delete"
+            && args.get("session").and_then(Value::as_str) == Some(inner);
+        if target_match || session_match { return true; }
+    }
+    false
+}
+
+/// Build the system-message announcement for `outer`'s next generation:
+/// a list of completed sub-agents whose result hasn't been resolved.
+/// Returns None when nothing's pending — we don't waste tokens on a no-op
+/// announcement.
+fn unhandled_subtasks_announcement(outer: &str) -> Option<String> {
+    let mut unhandled: Vec<String> = Vec::new();
+    for inner in spawned_by(outer) {
+        if !session_settled(&inner) { continue; }
+        if already_resolved(outer, &inner) { continue; }
+        unhandled.push(inner);
+    }
+    if unhandled.is_empty() { return None; }
+    Some(format!(
+        "HARNESS ANNOUNCEMENT: {n} sub-agent task(s) you launched have \
+         completed and are awaiting your resolution. Each holds staged \
+         changes in its box and a settled answer. You must now call \
+         exactly one of:\n  \
+         apply(target=<id>)    fold the sub-agent's staged changes into \
+         this plane (commit);\n  \
+         reject(target=<id>)   discard the staged changes, keep the result \
+         text in conversation;\n  \
+         delete(session=<id>)  drop the sub-agent entirely (result already \
+         incorporated, no staging needed).\n\
+         Unhandled sub-agent ids: {ids}",
+        n = unhandled.len(),
+        ids = unhandled.join(", "),
+    ))
+}
+
+/// Sub-agent shutdown sweep. When THIS run settled and we are a sub-agent
+/// (depth > 0), every descendant we launched is by definition no longer
+/// reachable — the only thing they could ever do is return results to us,
+/// and we already shipped ours upward. Kill (in case anything's still
+/// running — background sub-agents, partial gens), discard (drop the
+/// box's overlay), delete (drop the session folder). Recurse FIRST so
+/// the deepest unreachable boxes go first; this also catches unsettled
+/// descendants whose own cleanup never ran (because they never settled).
+fn cleanup_spawned_subagents(outer: &str) {
+    let sarun = crate::oaita::exec::SarunExecutor::new(None).sarun;
+    for inner in spawned_by(outer) {
+        // Recurse first: clean up anything `inner` itself spawned
+        // (settled OR unsettled — settled descendants already cleaned
+        // when they settled, but an unsettled inner never ran that
+        // sweep, so its children are still live).
+        cleanup_spawned_subagents(&inner);
+        let inner_box = crate::oaita::exec::box_name(&inner);
+        // Kill any live runner inside the box first — for foreground
+        // sub-agents this is a no-op (Command::output blocked until
+        // exit), but a future background mode would leave processes.
+        let _ = std::process::Command::new(&sarun)
+            .args([&inner_box, "kill"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        // Discard the box's overlay + sqlar.
+        let _ = std::process::Command::new(&sarun)
+            .args([&inner_box, "discard"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        // Drop the session folder.
+        let _ = std::fs::remove_dir_all(crate::oaita::turns::session_dir(&inner));
+        trace::event("run.subagent_cleaned", json!({
+            "outer": outer, "inner": inner,
+        }));
     }
 }
 
@@ -528,6 +706,18 @@ pub fn run_to_completion(spec: &str, set: &Settings,
                 && !last.flags.contains('c')
                 && !last.flags.contains('b') {
                 trace::event("run.settled", json!({"session": &target}));
+                // Sub-agent shutdown: when WE are an inner sub-agent (depth>0)
+                // and we have just settled on a final answer, our caller has
+                // by definition received everything it needs from us. Every
+                // sub-agent WE spawned has already served its purpose — its
+                // result was folded into our reasoning — so discard their
+                // boxes and drop their session folders. This is the
+                // "implicit kill/discard/delete on settle" the user asked
+                // for; cascades naturally because each depth ran the same
+                // sweep when IT settled.
+                if set.depth > 0 {
+                    cleanup_spawned_subagents(&target);
+                }
                 return Ok(produced);
             }
             // Pending call? → evaluate it.
