@@ -240,6 +240,12 @@ enum Pane {
     /// INCLUDING up-to-date targets that never executed.
     BuildEdges,
     Rules,
+    /// `-n` per-box network capture: left pane = list of flows
+    /// (tshark-decoded HTTP requests + TLS handshakes from the box's
+    /// pcapng, queried via the `flows.list` engine verb), right pane =
+    /// the verbose tshark dissection of the selected flow's frame
+    /// (`flows.detail`, also sandboxed).
+    Flows,
     Help,
     /// The engine-held PTY pane (D7/D9): a live tui-term view of an interactive
     /// command the ENGINE runs on a PTY, driven over the FRAME_PTY_* mux.
@@ -554,6 +560,14 @@ struct App {
     /// build_edges, fetched in one RPC on each session switch. Defaults
     /// to all-empty arrays so box_detail_lines can render unconditionally.
     box_summary: Value,
+    /// Flows pane: rows from `flows.list` (tshark-decoded HTTP/TLS entries
+    /// for the selected box's pcapng). One row = one frame; the right
+    /// pane shows the cached `flow_detail` text for `flow_detail_frame`,
+    /// pulled lazily from `flows.detail` on cursor change.
+    flows: Vec<Value>,
+    sel_flow: usize,
+    flow_detail: String,
+    flow_detail_frame: u64,
 }
 
 /// Cap on the transcript window: chars rendered in one frame, centred on
@@ -604,6 +618,8 @@ impl App {
             output_segs: vec![],
             changes_decor: vec![],
             box_summary: serde_json::json!(null),
+            flows: vec![], sel_flow: 0,
+            flow_detail: String::new(), flow_detail_frame: 0,
         };
         a.refresh_sessions();
         a.load_changes();
@@ -1435,6 +1451,60 @@ impl App {
         }
     }
 
+    /// Load the captured flows for the selected box: one RPC, full list
+    /// (a typical box's pcapng has dozens of flows, no windowing needed
+    /// since each row is small). On success the cursor lands on the first
+    /// row and we proactively fetch its detail.
+    fn load_flows(&mut self) {
+        self.flows.clear();
+        self.sel_flow = 0;
+        self.flow_detail.clear();
+        self.flow_detail_frame = 0;
+        self.right_scroll = 0;
+        let Some(sid) = self.cur_sid_i64() else { return };
+        match rpc(&self.sock, "flows.list", json!([sid.to_string()])) {
+            Ok(v) => {
+                if v.get("ok").and_then(Value::as_bool) == Some(true) {
+                    if let Some(arr) = v.get("flows").and_then(Value::as_array) {
+                        self.flows = arr.clone();
+                    }
+                } else if let Some(e) = v.get("error").and_then(Value::as_str) {
+                    self.status = format!("flows.list: {e}");
+                }
+            }
+            Err(e) => { self.status = format!("flows.list: {e}"); }
+        }
+        self.load_flow_detail();
+    }
+
+    /// Lazy-load tshark `-V` for the selected flow's frame. Cached
+    /// until the cursor moves to a different frame.
+    fn load_flow_detail(&mut self) {
+        let Some(sid) = self.cur_sid_i64() else { return };
+        let Some(row) = self.flows.get(self.sel_flow) else {
+            self.flow_detail.clear(); self.flow_detail_frame = 0; return;
+        };
+        let frame = row.get("frame").and_then(Value::as_u64).unwrap_or(0);
+        if frame == 0 { self.flow_detail.clear(); return; }
+        if frame == self.flow_detail_frame && !self.flow_detail.is_empty() {
+            return;
+        }
+        self.flow_detail_frame = frame;
+        match rpc(&self.sock, "flows.detail",
+                  json!([sid.to_string(), frame])) {
+            Ok(v) if v.get("ok").and_then(Value::as_bool) == Some(true) => {
+                self.flow_detail = v.get("text").and_then(Value::as_str)
+                    .unwrap_or("").to_string();
+            }
+            Ok(v) => {
+                self.flow_detail = format!(
+                    "tshark error: {}",
+                    v.get("error").and_then(Value::as_str).unwrap_or("?"));
+            }
+            Err(e) => self.flow_detail = format!("rpc error: {e}"),
+        }
+    }
+
     /// Load the captured outputs index for the selected box, then fetch and
     /// decode each row's bytes (output_detail wire-encodes them as {"__b":b64})
     /// into a single scrollable stdout/stderr transcript.
@@ -1643,6 +1713,13 @@ impl App {
                     self.sel_edge += 1;
                 }
             }
+            Pane::Flows => {
+                if self.sel_flow + 1 < self.flows.len() {
+                    self.sel_flow += 1;
+                    self.right_scroll = 0;
+                    self.load_flow_detail();
+                }
+            }
             Pane::Help => self.out_scroll = self.out_scroll.saturating_add(1),
             Pane::Pty => {}
         }
@@ -1679,6 +1756,13 @@ impl App {
             Pane::Rules => self.sel_rule = self.sel_rule.saturating_sub(1),
             Pane::Pipelines => self.sel_pipeline = self.sel_pipeline.saturating_sub(1),
             Pane::BuildEdges => self.sel_edge = self.sel_edge.saturating_sub(1),
+            Pane::Flows => {
+                if self.sel_flow > 0 {
+                    self.sel_flow -= 1;
+                    self.right_scroll = 0;
+                    self.load_flow_detail();
+                }
+            }
             Pane::Help => self.out_scroll = self.out_scroll.saturating_sub(1),
             Pane::Pty => {}
         }
@@ -1751,6 +1835,17 @@ impl App {
                 let cur = self.sel_edge as isize;
                 self.sel_edge = (cur + delta).clamp(0, total as isize - 1) as usize;
             }
+            Pane::Flows => {
+                let total = self.flows.len();
+                if total == 0 { return; }
+                let cur = self.sel_flow as isize;
+                let new = (cur + delta).clamp(0, total as isize - 1) as usize;
+                if new != self.sel_flow {
+                    self.sel_flow = new;
+                    self.right_scroll = 0;
+                    self.load_flow_detail();
+                }
+            }
             Pane::Hunks => {
                 let n16 = n as u16;
                 if step > 0 { self.hunk_scroll = self.hunk_scroll.saturating_add(n16); }
@@ -1774,7 +1869,8 @@ impl App {
     fn right_pane_scrollable(&self) -> bool {
         matches!(self.focus,
             Pane::Sessions | Pane::Processes | Pane::Outputs
-            | Pane::Pipelines | Pane::BuildEdges | Pane::Rules)
+            | Pane::Pipelines | Pane::BuildEdges | Pane::Rules
+            | Pane::Flows)
     }
 
     /// Snap focus back to the LEFT list and reset the right-pane scroll.
@@ -1823,7 +1919,7 @@ impl App {
                 self.focus = Pane::Hunks;
             }
             Pane::Hunks | Pane::Processes | Pane::Outputs | Pane::Rules
-            | Pane::Pipelines | Pane::BuildEdges
+            | Pane::Pipelines | Pane::BuildEdges | Pane::Flows
             | Pane::Help | Pane::Pty => {}
         }
     }
@@ -3314,6 +3410,7 @@ fn view_of_pane(p: Pane) -> Option<(char, &'static str, FilterView)> {
         Pane::Pipelines => Some(('l', "pipes",   FilterView::Changes /* unused */)),
         Pane::BuildEdges => Some(('g', "build",  FilterView::Changes /* unused */)),
         Pane::Rules     => Some(('e', "rules",   FilterView::Changes /* unused */)),
+        Pane::Flows     => Some(('f', "flows",   FilterView::Changes /* unused */)),
         Pane::Help      => Some(('?', "help",    FilterView::Changes /* unused */)),
         Pane::Pty       => Some(('P', "PTY",     FilterView::Changes /* unused */)),
     }
@@ -3333,6 +3430,7 @@ fn menubar_chips(app: &App) -> Vec<(char, &'static str)> {
     let show_outputs  = has("outputs")   || app.focus == Pane::Outputs;
     let show_pipes    = has("pipelines") || app.focus == Pane::Pipelines;
     let show_build    = has("edges")     || app.focus == Pane::BuildEdges;
+    let show_flows    = has("flows")     || app.focus == Pane::Flows;
     let any_pty       = !app.ptys.is_empty();
     [
         Some(('b', "Boxes")),
@@ -3341,6 +3439,9 @@ fn menubar_chips(app: &App) -> Vec<(char, &'static str)> {
         if show_outputs { Some(('o', "Outputs")) } else { None },
         if show_pipes   { Some(('l', "Pipes"))   } else { None },
         if show_build   { Some(('g', "Build"))   } else { None },
+        // Always-on: the pane works for any -n box, and the "no flows
+        // yet" placeholder explains itself when pressed on a -N / off box.
+        Some(('f', "Flows")),
         Some(('e', "Rules")),
         if any_pty { Some(('P', "PTYs")) } else { None },
         Some(('?', "Help")),
@@ -3702,6 +3803,19 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                 f.render_widget(p, left);
                 let detail = Paragraph::new(Text::from(rule_detail_lines(app)))
                     .block(block(title("WHAT IT MATCHES", rf), rf))
+                    .scroll((rscroll, 0))
+                    .wrap(Wrap { trim: false });
+                if !skip_right { f.render_widget(detail, right); }
+            }
+            Pane::Flows => {
+                let lines = flows_lines(app);
+                let scroll = scroll_for_cursor(app.sel_flow + 1, lines.len(), left.height);
+                let p = Paragraph::new(Text::from(lines))
+                    .block(block(title("FLOWS · -n captured", lf), lf))
+                    .scroll((scroll, 0));
+                f.render_widget(p, left);
+                let detail = Paragraph::new(Text::from(flow_detail_lines(app)))
+                    .block(block(title("FLOW · DETAIL (tshark -V)", rf), rf))
                     .scroll((rscroll, 0))
                     .wrap(Wrap { trim: false });
                 if !skip_right { f.render_widget(detail, right); }
@@ -4146,6 +4260,74 @@ fn build_edges_lines(app: &App) -> Vec<Line<'static>> {
         out.push(line);
     }
     out
+}
+
+/// Flows pane left-list row. One row per tshark-decoded HTTP/TLS frame
+/// in the box's pcapng. Columns rendered:
+///   marker (R/T)  t (sec)  host  method  uri  status
+/// • R = HTTP request / response row (visible because we decrypted).
+/// • T = TLS ClientHello (SNI is the only useful field there).
+fn flows_lines(app: &App) -> Vec<Line<'static>> {
+    if app.flows.is_empty() {
+        return vec![Line::from(Span::styled(
+            "no flows — `sarun run -n -- …` writes pcapng + keylog under \
+             state_home/flows/box<id>/",
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)))];
+    }
+    let mut out = vec![];
+    for row in &app.flows {
+        let method = row.get("method").and_then(Value::as_str).unwrap_or("");
+        let host   = row.get("host").and_then(Value::as_str).unwrap_or("");
+        let sni    = row.get("sni").and_then(Value::as_str).unwrap_or("");
+        let uri    = row.get("uri").and_then(Value::as_str).unwrap_or("");
+        let status = row.get("status").and_then(Value::as_str).unwrap_or("");
+        let t      = row.get("t").and_then(Value::as_f64).unwrap_or(0.0);
+
+        let (mark, mark_style) = if !method.is_empty() || !status.is_empty() {
+            ("R", Style::default().fg(Color::Green))
+        } else {
+            ("T", Style::default().fg(Color::Cyan))
+        };
+        let h = if !host.is_empty() { host } else { sni };
+        let mut spans = vec![
+            Span::styled(format!("{mark}  "), mark_style),
+            Span::styled(format!("{:>7.3}s  ", t),
+                         Style::default().fg(Color::DarkGray)),
+            Span::styled(h.to_string(),
+                         Style::default().add_modifier(Modifier::BOLD)),
+        ];
+        if !method.is_empty() {
+            spans.push(Span::styled(format!("  {method} "),
+                Style::default().fg(Color::Yellow)));
+            let u: String = uri.chars().take(60).collect();
+            spans.push(Span::raw(u));
+        }
+        if !status.is_empty() {
+            let st_style = if status.starts_with('2') {
+                Style::default().fg(Color::Green)
+            } else if status.starts_with('3') {
+                Style::default().fg(Color::Cyan)
+            } else if status.starts_with('4') || status.starts_with('5') {
+                Style::default().fg(Color::Red)
+            } else { Style::default() };
+            spans.push(Span::styled(format!("  → {status}"), st_style));
+        }
+        out.push(Line::from(spans));
+    }
+    out
+}
+
+/// Right-pane verbose dissection: just the tshark -V text for the
+/// selected frame, split into Lines (so ratatui wraps cleanly). The
+/// text was already fetched from the engine and cached in
+/// app.flow_detail by load_flow_detail().
+fn flow_detail_lines(app: &App) -> Vec<Line<'static>> {
+    if app.flow_detail.is_empty() {
+        return vec![Line::from(Span::styled(
+            "(no flow selected)",
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)))];
+    }
+    app.flow_detail.lines().map(|s| Line::from(s.to_string())).collect()
 }
 
 /// Right-hand detail for the selected build edge: full outs/ins lists,
@@ -4774,6 +4956,14 @@ fn dispatch_menubar_key(app: &mut App, k: char) {
                  app.load_processes_if_needed(); }
         'o' => { app.snap_left(); app.nav(Pane::Outputs);
                  app.load_outputs_if_needed(); }
+        // -n network flows: tshark-decoded HTTP/TLS list from the box's
+        // pcapng (engine runs tshark sandboxed). The detail (right) pane
+        // shows tshark -V for the selected frame.
+        'f' => {
+            app.snap_left();
+            app.focus = Pane::Flows;
+            app.load_flows();
+        }
         'l' => {
             app.snap_left();
             app.focus = Pane::Pipelines;
@@ -5881,6 +6071,92 @@ mod tests {
         );
     }
 
+    /// Flows pane render: injects synthetic rows (no live engine — the
+    /// engine-side path is covered by prototype/test_net_rs.py) and
+    /// asserts the rendered table shape on the LEFT and the detail
+    /// text on the RIGHT.
+    #[test]
+    fn flows_pane_renders_list_and_detail() {
+        let Some(eng) = boot() else {
+            eprintln!("SKIP: engine binary missing");
+            return;
+        };
+        let mut app = App::new(eng.sock.clone());
+        app.focus = Pane::Flows;
+        app.flows = vec![
+            serde_json::json!({
+                "frame": 8, "t": 10.659,
+                "src": "240.1.0.2", "dst": "240.1.1.0",
+                "sni": "example.com", "host": "",
+                "method": "", "uri": "", "status": "",
+            }),
+            serde_json::json!({
+                "frame": 12, "t": 38.052,
+                "src": "240.1.0.2", "dst": "240.1.1.0",
+                "sni": "", "host": "example.com",
+                "method": "GET", "uri": "/", "status": "",
+            }),
+            serde_json::json!({
+                "frame": 15, "t": 451.428,
+                "src": "240.1.1.0", "dst": "240.1.0.2",
+                "sni": "", "host": "",
+                "method": "", "uri": "", "status": "200",
+            }),
+        ];
+        app.sel_flow = 1;  // the GET request row
+        app.flow_detail = "Frame 12: 480 bytes on wire\n\
+                            Transmission Control Protocol\n\
+                            Hypertext Transfer Protocol\n    \
+                            GET / HTTP/1.1\n    \
+                            Host: example.com\n".into();
+        app.flow_detail_frame = 12;
+        let buf = render_to_string(&app, 160, 30).unwrap();
+        // The LEFT column shows the request-marker R, the host, method,
+        // and status code mark — all three rows must appear in this
+        // 30-row terminal.
+        assert!(buf.contains("FLOWS"),
+                "flows pane title missing:\n{buf}");
+        assert!(buf.contains("example.com"),
+                "host/SNI didn't render:\n{buf}");
+        assert!(buf.contains("GET"), "method didn't render:\n{buf}");
+        assert!(buf.contains("200"), "status didn't render:\n{buf}");
+        // The RIGHT column shows the tshark -V dissection of the
+        // selected GET frame.
+        assert!(buf.contains("FLOW") && buf.contains("DETAIL"),
+                "flow detail pane title missing:\n{buf}");
+        assert!(buf.contains("GET / HTTP/1.1"),
+                "tshark dissection didn't render in the right pane:\n{buf}");
+    }
+
+    /// Flows pane keyboard nav: j/k moves the cursor (with detail
+    /// refresh stubbed via flows-only mutation), 'f' triggers
+    /// load_flows (we just verify it doesn't crash on a clean App).
+    #[test]
+    fn flows_pane_cursor_moves_and_clamps() {
+        let Some(eng) = boot() else {
+            eprintln!("SKIP: engine binary missing");
+            return;
+        };
+        let mut app = App::new(eng.sock.clone());
+        app.focus = Pane::Flows;
+        app.flows = (0..5).map(|i| serde_json::json!({
+            "frame": (i + 1) as u64, "t": 0.0,
+            "src": "240.1.0.2", "dst": "240.1.1.0",
+            "sni": "", "host": format!("h{i}.example"),
+            "method": "GET", "uri": "/", "status": "",
+        })).collect();
+        for _ in 0..10 { app.move_down(); }       // overshoot
+        assert_eq!(app.sel_flow, app.flows.len() - 1,
+                   "down should clamp at len-1");
+        for _ in 0..10 { app.move_up(); }         // overshoot back
+        assert_eq!(app.sel_flow, 0, "up should clamp at 0");
+        // Empty list: cursor stays at 0 and nothing panics.
+        app.flows.clear();
+        app.sel_flow = 0;
+        app.move_down(); app.move_up();
+        assert_eq!(app.sel_flow, 0);
+    }
+
     #[test]
     fn rules_editor_writes_file_and_reloads() {
         let Some(eng) = boot() else {
@@ -6188,6 +6464,8 @@ mod tests {
             output_segs: vec![],
             changes_decor: vec![],
             box_summary: serde_json::json!(null),
+            flows: vec![], sel_flow: 0,
+            flow_detail: String::new(), flow_detail_frame: 0,
         };
         app.focus = Pane::Help;
         // render tall enough to fit the full manual (it scrolls in a real term).
