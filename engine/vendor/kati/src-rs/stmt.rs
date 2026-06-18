@@ -359,3 +359,47 @@ impl ExportStmt {
         })
     }
 }
+
+// sarun: `undefine NAME...` (GNU make 3.82+). Removes a variable so
+// $(flavor X) returns "undefined" and $(origin X) returns "undefined".
+// `override undefine` removes a variable even if it was set on the
+// command line.
+pub struct UndefineStmt {
+    loc: Loc,
+    orig: Bytes,
+    pub expr: Arc<Value>,
+    pub is_override: bool,
+}
+
+impl Statement for UndefineStmt {
+    fn loc(&self) -> Loc {
+        self.loc.clone()
+    }
+    fn orig(&self) -> Bytes {
+        self.orig.clone()
+    }
+    fn eval(&self, ev: &mut Evaluator) -> Result<()> {
+        ev.eval_undefine(self)
+    }
+}
+
+impl Debug for UndefineStmt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "UndefineStmt({:?}, override={}, loc={})",
+            self.expr, self.is_override, self.loc
+        )
+    }
+}
+
+impl UndefineStmt {
+    pub fn new(loc: Loc, expr: Arc<Value>, is_override: bool) -> Arc<UndefineStmt> {
+        Arc::new(UndefineStmt {
+            loc,
+            orig: Bytes::new(),
+            expr,
+            is_override,
+        })
+    }
+}

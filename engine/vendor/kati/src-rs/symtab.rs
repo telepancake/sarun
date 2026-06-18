@@ -90,6 +90,15 @@ impl Symbol {
         let mut r = SYMTAB.lock();
         r.set_global_var(self, var, is_override, readonly)
     }
+    /// sarun: drop a variable's binding so `$(flavor X)` returns
+    /// "undefined". Used by the `undefine` directive (GNU make 3.82+).
+    pub fn clear_global_var(&self) {
+        let mut r = SYMTAB.lock();
+        let idx = self.0.get();
+        if idx < r.symbol_data.len() {
+            r.symbol_data[idx] = None;
+        }
+    }
 }
 
 pub struct ScopedGlobalVar {
