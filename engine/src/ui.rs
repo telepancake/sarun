@@ -1603,30 +1603,23 @@ impl App {
         }
     }
 
+    /// Tab cycles between the two PANES of the current view — never
+    /// between views. The letter chips (b/c/p/o/l/g/e/?) switch views;
+    /// Tab is for "move within the screen I'm already on". Today only
+    /// the Changes view has a separately-focusable right pane (the
+    /// diff body, with its own per-hunk cursor and a/x/d that fall on
+    /// the hunk under the cursor) — Changes ↔ Hunks. Every other view's
+    /// right half is read-only detail, so Tab is a no-op there.
+    /// PTY tabs out to Sessions because the PTY pane is full-screen and
+    /// has no peer.
     #[cfg_attr(test, allow(dead_code))]
     fn next_pane(&mut self) {
         self.focus = match self.focus {
-            Pane::Sessions => Pane::Changes,
             Pane::Changes => Pane::Hunks,
-            Pane::Hunks => Pane::Processes,
-            Pane::Processes => Pane::Outputs,
-            Pane::Outputs => Pane::Pipelines,
-            Pane::Pipelines => Pane::BuildEdges,
-            Pane::BuildEdges => Pane::Rules,
-            Pane::Rules => Pane::Sessions,
-            Pane::Help => Pane::Sessions,
-            // Tab out of the PTY pane back to the box list (keystrokes are not
-            // captured by Tab while focused — see the interactive loop's Pty arm).
+            Pane::Hunks => Pane::Changes,
             Pane::Pty => Pane::Sessions,
+            other => other,
         };
-        // Tab-landing fetches: pipelines / build_edges are loaded on demand
-        // (no live engine view backs them), so tabbing onto them refreshes
-        // for the current box. Cheap RPC — bounded by what brush / ninja ran.
-        match self.focus {
-            Pane::Pipelines => self.load_pipelines(),
-            Pane::BuildEdges => self.load_build_edges(),
-            _ => {}
-        }
     }
 
     /// Enter: open the selected row into the next pane.
