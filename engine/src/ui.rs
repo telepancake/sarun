@@ -3173,20 +3173,39 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     let keybar_area = root[1];
     let status_area = root[2];
 
-    // The PTY pane takes the whole body: a live tui-term view of the engine-held
-    // PTY child, rendered from the vt100 screen grid.
+    // The PTY pane takes the whole body. NO border block — the surrounding
+    // frame would interfere with the host terminal's native click-drag
+    // selection (the user's "copy this output" gesture would pick up
+    // border glyphs as part of the selection). Title goes on a single
+    // top row above the screen grid; mouse / selection / copy-paste are
+    // left to the OUTER terminal exactly as if you were running the
+    // PTY child in a plain xterm — vt100's scrollback is set wide
+    // enough to absorb long output (otherwise lines off the top of
+    // the screen vanish).
     if app.focus == Pane::Pty {
         if let Some(pty) = &app.pty {
-            let t = if pty.eof { "PTY · (exited)" } else { "PTY · live" };
-            let blk = block(title(t, true), true);
-            let inner = blk.inner(body);
-            f.render_widget(blk, body);
+            let tag = if pty.eof { "PTY · (exited)" } else { "PTY · live" };
+            let split = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(1), Constraint::Min(1)])
+                .split(body);
+            let title_bar = Paragraph::new(Line::from(vec![
+                Span::styled(tag, Style::default().fg(Color::Yellow)
+                                                   .add_modifier(Modifier::BOLD)),
+                Span::raw("   "),
+                Span::styled("F12 / Ctrl-] / Esc-Esc detach",
+                    Style::default().add_modifier(Modifier::DIM)),
+            ]));
+            f.render_widget(title_bar, split[0]);
             let screen = pty.parser.screen();
-            f.render_widget(tui_term::widget::PseudoTerminal::new(screen), inner);
+            f.render_widget(tui_term::widget::PseudoTerminal::new(screen), split[1]);
         } else {
-            let msg = Paragraph::new("no PTY open")
-                .block(block(title("PTY", true), true));
-            f.render_widget(msg, body);
+            // No PTY open: a one-line message, also frame-less so the
+            // empty-state matches the live-PTY layout.
+            f.render_widget(
+                Paragraph::new(Span::styled("no PTY open",
+                    Style::default().add_modifier(Modifier::DIM))),
+                body);
         }
     } else if app.focus == Pane::Help {
         // The Help pane takes the whole body.
@@ -3988,7 +4007,13 @@ impl PtyPane {
             let _ = tx.send(PtyMsg::Eof);
         });
         Ok(PtyPane {
-            parser: tui_term::vt100::Parser::new(rows, cols, 0),
+            // 10 000 rows of scrollback: vt100's screen grid is rows×cols,
+            // anything that scrolled off the top is preserved in the
+            // scrollback buffer. Without this (the old `0`) long output
+            // truncated the moment it overflowed the visible screen —
+            // which is exactly what the user noticed when running a
+            // build inside the PTY pane.
+            parser: tui_term::vt100::Parser::new(rows, cols, 10_000),
             writer, rx, rows, cols, eof: false,
         })
     }
