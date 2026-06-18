@@ -1,4 +1,3 @@
-# TODO(rust)
 # Same pattern-spec applied across multiple matching targets.
 %.x: LABEL := xy
 all: one.x two.x

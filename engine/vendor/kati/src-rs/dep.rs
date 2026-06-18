@@ -814,7 +814,30 @@ impl<'a> DepBuilder<'a> {
 
     fn pick_rule(&mut self, output: Symbol, n: &Arc<Mutex<DepNode>>) -> Option<PickedRuleInfo> {
         let rule_merger = self.lookup_rule_merger(output);
-        let vars = self.lookup_rule_vars(output);
+        let mut vars = self.lookup_rule_vars(output);
+        // sarun: pattern-specific variables (`%.x: CFLAGS := -O2`) apply
+        // to any target matching the pattern, regardless of whether that
+        // target also has an explicit rule. Kati used to only merge them
+        // on the implicit-rule path below, so an explicit `a.x:` recipe
+        // saw an empty CFLAGS even when `%.x: CFLAGS := -O2` was set.
+        // Scan rule_vars for `%`-bearing keys whose pattern matches the
+        // output and merge them in too.
+        let out_bytes = output.as_bytes();
+        let mut pattern_keys: Vec<Symbol> = self
+            .rule_vars
+            .keys()
+            .copied()
+            .filter(|s| s.as_bytes().contains(&b'%'))
+            .collect();
+        // Keep deterministic order — more-specific (longer non-stem
+        // portion) first, like GNU make does for pattern-rule selection.
+        pattern_keys.sort_by_key(|s| std::cmp::Reverse(s.as_bytes().len()));
+        for psym in pattern_keys {
+            let pat = crate::strutil::Pattern::new(psym.as_bytes());
+            if pat.matches(&out_bytes) {
+                vars = self.merge_implicit_rule_vars(psym, vars);
+            }
+        }
         if let Some(rule_merger) = &rule_merger
             && rule_merger.lock().primary_rule.is_some()
         {
