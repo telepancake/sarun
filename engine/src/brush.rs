@@ -1107,9 +1107,6 @@ pub fn run_recipe_in_process(cmdline: &str, output_cb: &mut dyn FnMut(&[u8])) ->
         Ok(p) => p,
         Err(e) => { output_cb(format!("sarun-engine n2: pipe: {e}\n").as_bytes()); return 127; }
     };
-    // Save the box's real FUSE stdout sink (fd 1) so we can tee captured bytes to
-    // it (the recipe's stdout is otherwise diverted to the pipe). Best-effort.
-    let sink = unsafe { libc::dup(1) };
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
     let recipe_owned = recipe.clone();
@@ -1156,7 +1153,12 @@ pub fn run_recipe_in_process(cmdline: &str, output_cb: &mut dyn FnMut(&[u8])) ->
         })
     });
 
-    // Drain the merged pipe: feed n2's output_cb AND tee to the FUSE sink.
+    // sarun: drain the merged pipe into n2's output_cb. n2 itself
+    // writes the bytes back out to the user's terminal as the recipe
+    // runs; we used to ALSO tee directly to a saved fd-1 dup of the
+    // FUSE sink, which made every byte of recipe output appear twice
+    // in the user's terminal (visible diff against real make for any
+    // multi-line recipe).
     let mut buf = [0u8; 4 << 10];
     loop {
         let n = match std::io::Read::read(&mut reader, &mut buf) {
@@ -1164,11 +1166,7 @@ pub fn run_recipe_in_process(cmdline: &str, output_cb: &mut dyn FnMut(&[u8])) ->
             Ok(n) => n,
         };
         output_cb(&buf[..n]);
-        if sink >= 0 {
-            unsafe { libc::write(sink, buf.as_ptr().cast(), n); }
-        }
     }
-    if sink >= 0 { unsafe { libc::close(sink); } }
     exec.join().unwrap_or(127)
 }
 
