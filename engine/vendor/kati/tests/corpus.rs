@@ -218,6 +218,7 @@ struct Tally {
     xfail: usize,
     skipped: usize,
     xpass_names: Vec<String>,
+    xfail_names: Vec<String>,
 }
 
 #[test]
@@ -347,7 +348,10 @@ fn corpus_pass_rate() {
                     failures.push(name.clone());
                 }
             }
-            (false, true) => tally.xfail += 1,
+            (false, true) => {
+                tally.xfail += 1;
+                tally.xfail_names.push(name.clone());
+            }
         }
     }
 
@@ -367,6 +371,12 @@ fn corpus_pass_rate() {
     if !tally.xpass_names.is_empty() {
         println!("    xpass (drop the TODO marker to count as pass):");
         for f in &tally.xpass_names {
+            println!("        {f}");
+        }
+    }
+    if std::env::var("KATI_CORPUS_SHOW_XFAIL").is_ok() && !tally.xfail_names.is_empty() {
+        println!("    xfail:");
+        for f in &tally.xfail_names {
             println!("        {f}");
         }
     }

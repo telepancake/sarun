@@ -259,7 +259,31 @@ impl Variable {
             InnerVar::Simple(s) => Cow::Borrowed(s.as_slice()),
             InnerVar::Recursive { v: _, orig } => Cow::Borrowed(orig),
             InnerVar::AutoCommand(sym, _) => {
-                error!("$(value {sym}) is not implemented yet");
+                // sarun: GNU make's $(value <auto>) returns the literal
+                // unexpanded form. For plain $@/$</$^/etc. that's just
+                // "$<sym>". For the D/F variants make uses a derived
+                // macro form internally — reproduce those so the test
+                // corpus's value_at.mk passes.
+                let bytes = sym.as_bytes();
+                let bytes_slice: &[u8] = &bytes;
+                if bytes_slice.ends_with(b"D") && bytes_slice.len() >= 2 {
+                    let base = &bytes_slice[..bytes_slice.len() - 1];
+                    return Ok(Cow::Owned(
+                        format!(
+                            "$(patsubst %/,%,$(dir ${}))",
+                            String::from_utf8_lossy(base)
+                        )
+                        .into_bytes(),
+                    ));
+                }
+                if bytes_slice.ends_with(b"F") && bytes_slice.len() >= 2 {
+                    let base = &bytes_slice[..bytes_slice.len() - 1];
+                    return Ok(Cow::Owned(
+                        format!("$(notdir ${})", String::from_utf8_lossy(base))
+                            .into_bytes(),
+                    ));
+                }
+                Cow::Owned(format!("${}", String::from_utf8_lossy(bytes_slice)).into_bytes())
             }
             InnerVar::ShellStatus => {
                 Cow::Owned(if let Some(status) = SHELL_STATUS.lock().as_ref() {
