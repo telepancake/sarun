@@ -530,9 +530,7 @@ impl Vars {
             }
             match orig.read().origin() {
                 VarOrigin::Override | VarOrigin::EnvironmentOverride => return Ok(()),
-                VarOrigin::Automatic => {
-                    error!("overriding automatic variable is not implemented yet");
-                }
+                // sarun: see symtab.rs — Automatic is overridable.
                 _ => {}
             }
             *orig = var;
