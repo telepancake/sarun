@@ -136,15 +136,23 @@ pub fn generate(spec: &str, set: &Settings) -> Result<Vec<PathBuf>, String> {
             "content": note,
         }));
     }
-    // Behavioural announcements: nudge the model toward backtrack when its
-    // pattern of recent turns indicates it either has a working result and
-    // should ship, OR is going in circles and should rewind. The two are
-    // mutually exclusive — productive spin fires if the last N tool
-    // results all succeeded with no failure markers; unproductive spin
-    // fires if there have been multiple errors in a row.
+    // Behavioural nudge — INJECTED AS AN ASSISTANT TURN, not a system
+    // message. Models routinely ignore polite system-directives when
+    // their training prior says "keep working" (observed concretely
+    // with ds4-flash on the FFT trace: the system-message form fired
+    // at the right gens and the model ignored every one). Puppeting
+    // the model's OWN VOICE — having the prior assistant turn say "I
+    // should ship now" — pulls on the much stronger compliance the
+    // model has with its own apparent reasoning. The next gen then
+    // sees this as its own most recent thought and the natural
+    // continuation IS the backtrack call.
+    //
+    // Wording is first-person and ends with action-intent so the next
+    // gen's natural continuation is the tool_call itself rather than
+    // another round of deliberation prose.
     if let Some(note) = backtrack_behavioural_announcement(&target) {
         messages.push(serde_json::json!({
-            "role": "system",
+            "role": "assistant",
             "content": note,
         }));
     }
@@ -531,19 +539,23 @@ fn backtrack_behavioural_announcement(target: &str) -> Option<String> {
     }
     // Productive: 3+ recent tool results all clean, and the model has
     // taken at least 3 generations (so it's had time to settle). Suggest
-    // shipping.
+    // shipping. Wording is first-person + ends with intent-to-act so the
+    // next gen's natural continuation is the tool_call itself, not more
+    // prose about whether to call it.
     if cleans >= 3 && errs == 0 && recent_tools.len() >= 3 {
         let tid = first_user_id.as_deref().unwrap_or("<first-user-turn-id>");
         return Some(format!(
-            "HARNESS ANNOUNCEMENT: your last {n} tool calls all succeeded \
-             without error markers. If you have the answer you came for, \
-             SHIP IT NOW — call `backtrack(turn_id={tid:?}, inclusive=false, \
-             final=true, summary=<your clean answer>)`. That collapses the \
-             derivation cruft and leaves the session as {{question, answer}}. \
-             Don't run another verification round just to feel sure: the \
-             derivation already records the validation; another shell call \
-             only adds noise. If you genuinely don't have the answer yet, \
-             ignore this and keep going.",
+            "Quick check on where I am: my last {n} tool calls have all \
+             returned clean results, no error markers. If I already have \
+             the answer I was working toward, the right move now is to \
+             ship it rather than run another verification round — the \
+             derivation already records what I've checked, and an extra \
+             shell call would just add noise to the eventual collapse. \
+             The gesture for shipping is `backtrack(turn_id={tid:?}, \
+             inclusive=false, final=true, summary=<my clean answer>)` — \
+             that collapses the derivation cruft and leaves the session \
+             as {{question, answer}}. I'll call it now if I have the \
+             answer; otherwise I'll keep going.",
             n = cleans,
         ));
     }
@@ -553,15 +565,16 @@ fn backtrack_behavioural_announcement(target: &str) -> Option<String> {
     if errs >= 2 {
         let tid = first_user_id.as_deref().unwrap_or("<first-user-turn-id>");
         return Some(format!(
-            "HARNESS ANNOUNCEMENT: your recent tool calls have been failing \
-             ({errs} of the last {total} returned error markers). You are \
-             likely going in circles. CONSIDER REWINDING — call \
-             `backtrack(turn_id={tid:?}, inclusive=false, final=false, \
-             summary=<one-line note: what you tried, why it failed, what \
-             to try instead>)`. The summary becomes a waypoint the run \
-             continues from; you keep the original question but shed the \
-             dead-end derivation. Then approach the problem differently. \
-             If you actually believe you're close to a fix, ignore this.",
+            "Stepping back for a moment: {errs} of my last {total} tool \
+             calls have come back with error markers. That's a sign I may \
+             be going in circles rather than making progress. The clean \
+             way to recover is to rewind to a known-good point with a \
+             short waypoint note, then try a different approach from there \
+             — the gesture is `backtrack(turn_id={tid:?}, inclusive=false, \
+             final=false, summary=<one-line note: what I tried, why it \
+             failed, what to try instead>)`. That keeps the original \
+             question but sheds the dead-end derivation. I'll do that \
+             now unless I'm genuinely one small fix away from working.",
             total = recent_tools.len(),
         ));
     }
