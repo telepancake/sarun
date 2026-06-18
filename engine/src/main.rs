@@ -362,6 +362,10 @@ fn main() {
                 Some(rules::Action::Apply) => "apply",
                 Some(rules::Action::Discard) => "discard",
                 Some(rules::Action::Passthrough) => "passthrough",
+                // Ask is a net-rule action; on the file-decision path
+                // treat it as a no-decision so the caller's default (or
+                // a later matching rule) takes over.
+                Some(rules::Action::Ask) => "none",
                 None => "none",
             };
             let pt_read = rules.passthrough_path_only(rel) as u8;

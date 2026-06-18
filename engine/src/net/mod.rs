@@ -109,6 +109,11 @@ impl Drop for DropGuard {
 pub struct Net {
     inner: Mutex<NetInner>,
     pub ca: Arc<ca::Ca>,
+    /// One global banner-prompt queue. Boxes share it: the user sees one
+    /// banner at a time regardless of which box's connection triggered
+    /// it. UI consumers (the TUI's tick loop) peek the queue via the
+    /// `prompts.peek` control verb and answer via `prompts.answer`.
+    pub prompts: Arc<prompt::PromptQueue>,
 }
 
 struct NetInner {
@@ -124,6 +129,7 @@ impl Net {
                 next_id: 1, // 0 reserved
             }),
             ca: Arc::new(ca::Ca::load_or_create()?),
+            prompts: prompt::PromptQueue::new(),
         })
     }
 

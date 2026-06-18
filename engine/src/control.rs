@@ -764,6 +764,7 @@ fn prepare_net(state: &State, id: i64, msg: &Value) -> Option<(String, String, S
             stack.clone(), stack.dns.clone(),
             format!("box{id}"),
             net.ca.clone(), keylog, upstream_tls,
+            net.prompts.clone(),
             rt);
     }
 
@@ -1154,6 +1155,55 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
                 },
                 _ => json!({"ok": false, "error": "bad args"}),
             }
+        }
+        // ── banner-prompt queue verbs (the TUI is the consumer) ────────
+        // prompts.peek                          → {ok, ask: {...}|null}
+        // prompts.answer [ID, "yes_once|no_once|allow_save|deny_save"]
+        //                                       → {ok}
+        // prompts.ui_active [bool]              → {ok}
+        //   The TUI calls ui_active(true) on startup and ui_active(false)
+        //   on shutdown; while inactive, dispatcher Ask short-circuits to
+        //   deny so no connection wedges on an absent UI.
+        "prompts.peek" => {
+            match state.lock().unwrap().net.clone() {
+                Some(net) => match net.prompts.peek() {
+                    Some(ask) => json!({"ok": true, "ask": {
+                        "id": ask.id, "box": ask.box_name,
+                        "host": ask.host, "port": ask.port,
+                        "scheme": ask.scheme,
+                    }}),
+                    None => json!({"ok": true, "ask": Value::Null}),
+                },
+                None => json!({"ok": true, "ask": Value::Null}),
+            }
+        }
+        "prompts.answer" => {
+            let id = args.first().and_then(Value::as_u64).unwrap_or(0);
+            let v = args.get(1).and_then(Value::as_str).unwrap_or("");
+            let Some(verdict) = crate::net::prompt::Verdict::parse(v) else {
+                return json!({"ok": false, "error": "bad verdict"});
+            };
+            match state.lock().unwrap().net.clone() {
+                Some(net) => {
+                    let ok = net.prompts.answer(id, verdict);
+                    // Net rules are reloaded from disk by the dispatcher on
+                    // every connection (Rules::load() is cheap), so the
+                    // newly-appended line takes effect immediately for
+                    // future conns without touching the FUSE-side rule
+                    // cache. (Doing the reload synchronously here was
+                    // hanging on RwLock contention with the FUSE serve
+                    // threads.)
+                    json!({"ok": ok})
+                }
+                None => json!({"ok": false, "error": "no net registry"}),
+            }
+        }
+        "prompts.ui_active" => {
+            let on = args.first().and_then(Value::as_bool).unwrap_or(false);
+            if let Some(net) = state.lock().unwrap().net.clone() {
+                net.prompts.mark_ui_active(on);
+            }
+            json!({"ok": true})
         }
         // flows.packets [SID, STREAM] → every frame in `tcp.stream == STREAM`
         // (i.e. the connection the user just drilled into from the flows
