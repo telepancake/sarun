@@ -225,11 +225,29 @@ impl<'a> Executor<'a> {
                             status.code().unwrap_or(1)
                         )
                     } else {
-                        error!(
+                        // sarun: .DELETE_ON_ERROR — remove the target's
+                        // partially-created output file before bailing,
+                        // and announce it the way GNU make does (with
+                        // the same `*** ` prefix and after the Error
+                        // line). Phony targets are never on-disk so
+                        // skip them.
+                        eprintln!(
                             "*** [{}] Error {}",
                             command.output,
                             status.code().unwrap_or(1)
                         );
+                        if self.ce.ev.delete_on_error && !n.lock().is_phony {
+                            let out_bytes = command.output.as_bytes();
+                            let path = OsStr::from_bytes(&out_bytes);
+                            if std::fs::exists(path).unwrap_or(false) {
+                                eprintln!(
+                                    "*** Deleting file \"{}\"",
+                                    String::from_utf8_lossy(&out_bytes)
+                                );
+                                let _ = std::fs::remove_file(path);
+                            }
+                        }
+                        std::process::exit(2);
                     }
                 }
             }
