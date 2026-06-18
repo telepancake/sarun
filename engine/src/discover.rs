@@ -267,17 +267,37 @@ pub fn build_edges(box_id: i64) -> Value {
         return json!([]);
     };
     if !has_table(&conn, "build_edges") { return json!([]); }
+    // The execution columns (started_ts / ended_ts / exit_code /
+    // output_excerpt) were added later; old boxes that ran before
+    // this schema rev don't have them. Pick a SELECT list that
+    // tolerates either layout (the COALESCE-to-NULL is on the
+    // missing columns; SQLite returns NULL for columns absent in
+    // the SELECT result of an old table). Probe once.
+    let has_exec = has_col(&conn, "build_edges", "started_ts");
     let mut rows = vec![];
-    if let Ok(mut st) = conn.prepare(
-        "SELECT id,ts,outs,ins,cmd FROM build_edges ORDER BY id") {
+    let sql = if has_exec {
+        "SELECT id, ts, outs, ins, cmd, \
+                started_ts, ended_ts, exit_code, output_excerpt \
+         FROM build_edges ORDER BY id"
+    } else {
+        "SELECT id, ts, outs, ins, cmd, \
+                NULL, NULL, NULL, NULL \
+         FROM build_edges ORDER BY id"
+    };
+    if let Ok(mut st) = conn.prepare(sql) {
         let it = st.query_map([], |r| {
             let outs: String = r.get(2)?;
             let ins: String = r.get(3)?;
             Ok(json!({
-                "id": r.get::<_, i64>(0)?, "ts": r.get::<_, f64>(1)?,
+                "id": r.get::<_, i64>(0)?,
+                "ts": r.get::<_, f64>(1)?,
                 "outs": serde_json::from_str::<Value>(&outs).unwrap_or(json!([])),
                 "ins": serde_json::from_str::<Value>(&ins).unwrap_or(json!([])),
                 "cmd": r.get::<_, Option<String>>(4)?,
+                "started_ts":  r.get::<_, Option<f64>>(5)?,
+                "ended_ts":    r.get::<_, Option<f64>>(6)?,
+                "exit_code":   r.get::<_, Option<i64>>(7)?,
+                "output_excerpt": r.get::<_, Option<String>>(8)?,
             }))
         });
         if let Ok(it) = it { for row in it.flatten() { rows.push(row); } }

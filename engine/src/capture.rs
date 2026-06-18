@@ -62,8 +62,14 @@ CREATE TABLE IF NOT EXISTS brushprov(id INTEGER PRIMARY KEY AUTOINCREMENT,
 -- the box's `ninja` (vendored n2 in-process) loads build.ninja — INCLUDING
 -- up-to-date targets that never execute. `outs`/`ins` are JSON arrays of
 -- target/dependency paths; `cmd` is the recipe command line (NULL for phony).
+-- Execution columns are filled in BY THE BUILDER as edges run:
+--   started_ts / ended_ts: REAL Unix epoch seconds; NULL when not yet run.
+--   exit_code: 0 success / non-0 failure / NULL not-yet-run.
+--   output_excerpt: first ~1KB of stderr+stdout from the recipe (best-effort,
+--     trimmed at boundary; the full output lives in the outputs table).
 CREATE TABLE IF NOT EXISTS build_edges(id INTEGER PRIMARY KEY AUTOINCREMENT,
- ts REAL, outs TEXT, ins TEXT, cmd TEXT);
+ ts REAL, outs TEXT, ins TEXT, cmd TEXT,
+ started_ts REAL, ended_ts REAL, exit_code INT, output_excerpt TEXT);
 ";
 
 #[derive(Clone)]
