@@ -424,6 +424,17 @@ struct App {
     f_outputs: ViewFilter,
     #[cfg_attr(test, allow(dead_code))]
     should_quit: bool,
+    /// True iff focus is currently on the RIGHT pane of the active view
+    /// (the detail / body half) rather than the LEFT list. Tab toggles
+    /// this on views whose right half is scrollable (Sessions / Procs /
+    /// Outputs / Pipelines / BuildEdges / Rules); j/k/PgUp/PgDn then
+    /// drive `right_scroll` instead of the list cursor. Switching VIEW
+    /// (a letter chip) snaps focus back to the left list.
+    right_focused: bool,
+    /// Wrapping-aware scroll offset for whichever view's right pane is
+    /// currently rendered. Reset to 0 on every view switch (so each
+    /// view's right pane starts at the top, the prototype's behavior).
+    right_scroll: u16,
     /// Live engine-held PTY pane, present while one is open (Pane::Pty). None
     /// otherwise. Kept out of the headless `--once` path (which never opens one).
     pty: Option<PtyPane>,
@@ -505,7 +516,7 @@ impl App {
             f_procs: ViewFilter::default(),
             f_outputs: ViewFilter::default(),
             should_quit: false,
-            pty: None, pty_esc_at: None,
+            pty: None, pty_esc_at: None, right_focused: false, right_scroll: 0,
             structd: StructState::default(),
             sel_hunk: 0,
             struct_rx: None,
@@ -1447,6 +1458,13 @@ impl App {
 
     #[cfg_attr(test, allow(dead_code))]
     fn move_down(&mut self) {
+        // Right-pane focused: scroll the detail body, not the left list.
+        // Hunks doesn't go through here (its own keymap drives the diff
+        // scroll); right_pane_scrollable() filters Hunks out.
+        if self.right_focused && self.right_pane_scrollable() {
+            self.right_scroll = self.right_scroll.saturating_add(1);
+            return;
+        }
         match self.focus {
             Pane::Sessions => {
                 if self.sel_session + 1 < self.sessions.len() {
@@ -1498,6 +1516,10 @@ impl App {
 
     #[cfg_attr(test, allow(dead_code))]
     fn move_up(&mut self) {
+        if self.right_focused && self.right_pane_scrollable() {
+            self.right_scroll = self.right_scroll.saturating_sub(1);
+            return;
+        }
         match self.focus {
             Pane::Sessions => {
                 if self.sel_session > 0 {
@@ -1540,6 +1562,12 @@ impl App {
     fn page_move(&mut self, delta: isize) {
         let n = delta.unsigned_abs();
         let step: isize = if delta > 0 { 1 } else { -1 };
+        if self.right_focused && self.right_pane_scrollable() {
+            let n16 = n as u16;
+            if step > 0 { self.right_scroll = self.right_scroll.saturating_add(n16); }
+            else { self.right_scroll = self.right_scroll.saturating_sub(n16); }
+            return;
+        }
         match self.focus {
             Pane::Sessions => {
                 let total = self.sessions.len();
@@ -1603,23 +1631,50 @@ impl App {
         }
     }
 
-    /// Tab cycles between the two PANES of the current view — never
-    /// between views. The letter chips (b/c/p/o/l/g/e/?) switch views;
-    /// Tab is for "move within the screen I'm already on". Today only
-    /// the Changes view has a separately-focusable right pane (the
-    /// diff body, with its own per-hunk cursor and a/x/d that fall on
-    /// the hunk under the cursor) — Changes ↔ Hunks. Every other view's
-    /// right half is read-only detail, so Tab is a no-op there.
-    /// PTY tabs out to Sessions because the PTY pane is full-screen and
-    /// has no peer.
+    /// True iff the current view's RIGHT pane is keyboard-scrollable —
+    /// i.e. Tab focuses something and j/k/PgUp/PgDn drive `right_scroll`.
+    /// Changes/Hunks is its own thing (toggles between two list-level
+    /// focuses with their own actions); Help and Pty are full-screen
+    /// with no peer. Everywhere else the right pane is a (possibly long)
+    /// detail body — give it a scroll focus.
+    fn right_pane_scrollable(&self) -> bool {
+        matches!(self.focus,
+            Pane::Sessions | Pane::Processes | Pane::Outputs
+            | Pane::Pipelines | Pane::BuildEdges | Pane::Rules)
+    }
+
+    /// Snap focus back to the LEFT list and reset the right-pane scroll.
+    /// Called whenever the user picks a different view via a letter chip
+    /// (b/c/p/o/l/g/e/?) — we don't carry the "right pane focused" bit
+    /// across views, that would confuse the cursor in the new view.
+    fn snap_left(&mut self) {
+        self.right_focused = false;
+        self.right_scroll = 0;
+    }
+
+    /// Tab swaps the active PANE inside the current view — never the view
+    /// itself. The letter chips (b/c/p/o/l/g/e/?) switch views.
+    ///   * Changes ↔ Hunks: a special case — the right pane (diff) has
+    ///     its OWN cursor (sel_hunk) and a/x/d acts per-hunk. We toggle
+    ///     between the two list-level focuses.
+    ///   * Sessions / Procs / Outputs / Pipelines / BuildEdges / Rules:
+    ///     the right pane is a scrollable detail body. Tab flips
+    ///     `right_focused`; j/k/PgUp/PgDn then drive `right_scroll`.
+    ///   * Help / Pty are full-screen with no peer — no-op (PTY does
+    ///     tab-out to Sessions because the keystroke would otherwise be
+    ///     consumed; Help can be left with q/Esc).
     #[cfg_attr(test, allow(dead_code))]
     fn next_pane(&mut self) {
-        self.focus = match self.focus {
-            Pane::Changes => Pane::Hunks,
-            Pane::Hunks => Pane::Changes,
-            Pane::Pty => Pane::Sessions,
-            other => other,
-        };
+        match self.focus {
+            Pane::Changes => self.focus = Pane::Hunks,
+            Pane::Hunks => self.focus = Pane::Changes,
+            Pane::Pty => self.focus = Pane::Sessions,
+            _ if self.right_pane_scrollable() => {
+                self.right_focused = !self.right_focused;
+                if !self.right_focused { self.right_scroll = 0; }
+            }
+            _ => {}
+        }
     }
 
     /// Enter: open the selected row into the next pane.
@@ -3101,16 +3156,24 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
             .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
             .split(body);
         let left = cols[0]; let right = cols[1];
+        // Border / title highlight follows the focused half: when
+        // right_focused is set, the LEFT block dims and the RIGHT block
+        // gets the focused styling — the same "active border" treatment
+        // the Hunks path uses for the diff body.
+        let lf = !app.right_focused;
+        let rf = app.right_focused;
+        let rscroll = app.right_scroll;
         match app.focus {
             Pane::Sessions => {
                 let lines = sessions_lines(app);
                 let scroll = scroll_for_cursor(app.sel_session + 1, lines.len(), left.height);
                 let p = Paragraph::new(Text::from(lines))
-                    .block(block(title("sarun · boxes", true), true))
+                    .block(block(title("sarun · boxes", lf), lf))
                     .scroll((scroll, 0));
                 f.render_widget(p, left);
                 let detail = Paragraph::new(Text::from(box_detail_lines(app)))
-                    .block(block(title("BOX · DETAIL", false), false))
+                    .block(block(title("BOX · DETAIL", rf), rf))
+                    .scroll((rscroll, 0))
                     .wrap(Wrap { trim: false });
                 f.render_widget(detail, right);
             }
@@ -3118,11 +3181,12 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                 let lines = processes_lines(app);
                 let scroll = scroll_for_cursor(app.sel_proc + 1, lines.len(), left.height);
                 let p = Paragraph::new(Text::from(lines))
-                    .block(block(title("PROCESSES", true), true))
+                    .block(block(title("PROCESSES", lf), lf))
                     .scroll((scroll, 0));
                 f.render_widget(p, left);
                 let detail = Paragraph::new(Text::from(proc_detail_lines(app)))
-                    .block(block(title("ENVIRONMENT · DETAIL", false), false))
+                    .block(block(title("ENVIRONMENT · DETAIL", rf), rf))
+                    .scroll((rscroll, 0))
                     .wrap(Wrap { trim: false });
                 f.render_widget(detail, right);
             }
@@ -3130,12 +3194,12 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                 let lines = outputs_index_lines(app);
                 let scroll = scroll_for_cursor(app.sel_output + 1, lines.len(), left.height);
                 let p = Paragraph::new(Text::from(lines))
-                    .block(block(title("OUTPUTS", true), true))
+                    .block(block(title("OUTPUTS", lf), lf))
                     .scroll((scroll, 0));
                 f.render_widget(p, left);
                 let out = Paragraph::new(Text::from(outputs_lines(app)))
-                    .block(block(title("OUTPUT · stdout/stderr", false), false))
-                    .scroll((app.out_scroll, 0))
+                    .block(block(title("OUTPUT · stdout/stderr", rf), rf))
+                    .scroll((rscroll, 0))
                     .wrap(Wrap { trim: false });
                 f.render_widget(out, right);
             }
@@ -3143,11 +3207,12 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                 let lines = pipelines_lines(app);
                 let scroll = scroll_for_cursor(app.sel_pipeline + 1, lines.len(), left.height);
                 let p = Paragraph::new(Text::from(lines))
-                    .block(block(title("PIPELINES · brush", true), true))
+                    .block(block(title("PIPELINES · brush", lf), lf))
                     .scroll((scroll, 0));
                 f.render_widget(p, left);
                 let detail = Paragraph::new(Text::from(pipeline_detail_lines(app)))
-                    .block(block(title("PIPELINE · DETAIL", false), false))
+                    .block(block(title("PIPELINE · DETAIL", rf), rf))
+                    .scroll((rscroll, 0))
                     .wrap(Wrap { trim: false });
                 f.render_widget(detail, right);
             }
@@ -3155,11 +3220,12 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                 let lines = build_edges_lines(app);
                 let scroll = scroll_for_cursor(app.sel_edge + 1, lines.len(), left.height);
                 let p = Paragraph::new(Text::from(lines))
-                    .block(block(title("BUILD EDGES · ninja/make", true), true))
+                    .block(block(title("BUILD EDGES · ninja/make", lf), lf))
                     .scroll((scroll, 0));
                 f.render_widget(p, left);
                 let detail = Paragraph::new(Text::from(build_edge_detail_lines(app)))
-                    .block(block(title("EDGE · DETAIL", false), false))
+                    .block(block(title("EDGE · DETAIL", rf), rf))
+                    .scroll((rscroll, 0))
                     .wrap(Wrap { trim: false });
                 f.render_widget(detail, right);
             }
@@ -3167,12 +3233,13 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                 let lines = rules_lines(app);
                 let scroll = scroll_for_cursor(app.sel_rule + 1, lines.len(), left.height);
                 let p = Paragraph::new(Text::from(lines))
-                    .block(block(title("FILE RULES", true), true))
+                    .block(block(title("FILE RULES", lf), lf))
                     .scroll((scroll, 0))
                     .wrap(Wrap { trim: false });
                 f.render_widget(p, left);
                 let detail = Paragraph::new(Text::from(rule_detail_lines(app)))
-                    .block(block(title("WHAT IT MATCHES", false), false))
+                    .block(block(title("WHAT IT MATCHES", rf), rf))
+                    .scroll((rscroll, 0))
                     .wrap(Wrap { trim: false });
                 f.render_widget(detail, right);
             }
@@ -4097,20 +4164,26 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                     }
                     // pane switches; c/p/o cross-navigate (install a generated
                     // ids filter on the destination from the cursor).
-                    KeyCode::Char('b') => app.focus = Pane::Sessions,
-                    KeyCode::Char('c') => app.nav(Pane::Changes),
-                    KeyCode::Char('p') => app.nav(Pane::Processes),
-                    KeyCode::Char('o') => app.nav(Pane::Outputs),
+                    // Every letter chip snaps focus back to the LEFT list and
+                    // clears the right-pane scroll — carrying right_focused
+                    // across views would put the cursor in the new view's
+                    // detail body, which has no cursor of its own.
+                    KeyCode::Char('b') => { app.snap_left(); app.focus = Pane::Sessions; }
+                    KeyCode::Char('c') => { app.snap_left(); app.nav(Pane::Changes); }
+                    KeyCode::Char('p') => { app.snap_left(); app.nav(Pane::Processes); }
+                    KeyCode::Char('o') => { app.snap_left(); app.nav(Pane::Outputs); }
                     KeyCode::Char('l') => {
+                        app.snap_left();
                         app.focus = Pane::Pipelines;
                         app.load_pipelines();
                     }
                     KeyCode::Char('g') => {
+                        app.snap_left();
                         app.focus = Pane::BuildEdges;
                         app.load_build_edges();
                     }
-                    KeyCode::Char('e') => app.focus = Pane::Rules,
-                    KeyCode::Char('?') => { app.focus = Pane::Help; app.out_scroll = 0; }
+                    KeyCode::Char('e') => { app.snap_left(); app.focus = Pane::Rules; }
+                    KeyCode::Char('?') => { app.snap_left(); app.focus = Pane::Help; app.out_scroll = 0; }
                     KeyCode::Char('P') =>
                         app.modal = Some(Modal::PtyCmd { buf: pty_default_cmd() }),
                     // In the diff pane, a/x/d are PER-HUNK; elsewhere they act on
@@ -4950,7 +5023,7 @@ mod tests {
             f_procs: ViewFilter::default(),
             f_outputs: ViewFilter::default(),
             should_quit: false,
-            pty: None, pty_esc_at: None,
+            pty: None, pty_esc_at: None, right_focused: false, right_scroll: 0,
             structd: StructState::default(),
             sel_hunk: 0,
             struct_rx: None,
