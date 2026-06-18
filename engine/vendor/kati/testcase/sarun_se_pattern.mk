@@ -1,4 +1,3 @@
-# TODO(rust)
 .SECONDEXPANSION:
 %.o: %.c ; @echo compile $< to $@
 %.c: ; @echo gen $@

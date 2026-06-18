@@ -751,6 +751,27 @@ impl<'a> DepBuilder<'a> {
         self.rule_vars.get(&o).cloned()
     }
 
+    /// sarun: shallow producibility check — does some rule (explicit
+    /// or implicit) have output matching this symbol? Used by
+    /// can_pick_implicit_rule to allow chained pattern rules like
+    /// `%.o: %.c` + `%.c:` to build a missing `.c` on demand.
+    fn has_producing_rule(&self, sym: Symbol) -> bool {
+        if self.rules.contains_key(&sym) {
+            return true;
+        }
+        let bytes = sym.as_bytes();
+        let irules = self.implicit_rules.get(&bytes);
+        for rule in irules {
+            for output_pattern in &rule.output_patterns {
+                let pat = crate::strutil::Pattern::new(output_pattern.as_bytes());
+                if pat.matches(&bytes) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     fn can_pick_implicit_rule(
         &mut self,
         rule: &Rule,
@@ -765,7 +786,14 @@ impl<'a> DepBuilder<'a> {
                 let mut ok = true;
                 for input in &rule.inputs {
                     let buf = pat.append_subst(&output_str, &input.as_bytes());
-                    if !self.exists(intern(buf)) {
+                    let sym = intern(buf);
+                    // sarun: accept inputs that don't exist on disk yet
+                    // but ARE buildable — either via an explicit rule
+                    // or via some implicit pattern rule whose output
+                    // pattern matches. Mirrors GNU make's "chained
+                    // implicit rule" derivation (a one-step lookahead;
+                    // we don't recurse further to keep it cheap).
+                    if !self.exists(sym) && !self.has_producing_rule(sym) {
                         ok = false;
                         break;
                     }
