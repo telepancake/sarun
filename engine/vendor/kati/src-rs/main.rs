@@ -57,7 +57,9 @@ fn read_bootstrap_makefile(targets: &[Symbol]) -> Result<Arc<Mutex<Vec<Stmt>>>> 
         bootstrap.put_slice(b"CXX?=g++\n");
     }
     bootstrap.put_slice(b"AR?=ar\n");
-    bootstrap.put_slice(b"MAKE_VERSION?=4.2.1\n");
+    // sarun: upstream pins 4.2.1 for Android-build stability; we declared
+    // GNU make 4.3 (Ubuntu 22.04 LTS) as our compat target, so report that.
+    bootstrap.put_slice(b"MAKE_VERSION?=4.3\n");
     bootstrap.put_slice(b"KATI?=ckati\n");
     bootstrap.put_slice(b"SHELL=/bin/sh\n");
 
