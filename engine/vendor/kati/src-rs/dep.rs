@@ -559,8 +559,16 @@ impl<'a> DepBuilder<'a> {
         // build_plan's `n.is_default_target = self.first_rule == output`
         // marks the right node — otherwise the ninja generator's
         // `default <target>` line panics on an unmarked default_target.
+        // Also: when build() is called with an explicit targets list
+        // (e.g. the remake-the-makefile loop building just the
+        // generated-include outputs), use targets[0] as the default
+        // for marking purposes — otherwise the first_rule from parse
+        // wouldn't match anything in the dep graph this iteration.
         if let Some(override_sym) = default_goal_override {
             self.first_rule = Some(override_sym);
+        }
+        if !targets.is_empty() {
+            self.first_rule = Some(targets[0]);
         }
         let Some(first_rule) = self.first_rule else {
             error!("*** No targets.");
