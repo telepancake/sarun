@@ -435,9 +435,16 @@ struct App {
     /// currently rendered. Reset to 0 on every view switch (so each
     /// view's right pane starts at the top, the prototype's behavior).
     right_scroll: u16,
-    /// Live engine-held PTY pane, present while one is open (Pane::Pty). None
-    /// otherwise. Kept out of the headless `--once` path (which never opens one).
-    pty: Option<PtyPane>,
+    /// All currently-open engine-held PTYs. Pane::Pty renders
+    /// `ptys[sel_pty]`; F2/F3 cycle between them, F7 creates a new
+    /// one, F8 kills the current one. The vec stays non-empty as
+    /// long as ANY PTY is live — an EOF'd PTY is dropped when the
+    /// user moves off of it, so re-opening the pane lands on a
+    /// running shell, not a corpse.
+    ptys: Vec<PtyPane>,
+    /// Index into `ptys`. Always < ptys.len() when ptys non-empty;
+    /// 0 when empty (rendering checks ptys.is_empty()).
+    sel_pty: usize,
     /// Esc-Esc detach chord: wall-clock instant of the LAST Esc keypress
     /// inside the PTY pane, used to fire the detach on a second Esc
     /// within 400 ms. None = no Esc queued. A non-Esc keystroke or an
@@ -521,7 +528,7 @@ impl App {
             f_procs: ViewFilter::default(),
             f_outputs: ViewFilter::default(),
             should_quit: false,
-            pty: None, pty_esc_at: None, right_focused: false, right_scroll: 0,
+            ptys: vec![], sel_pty: 0, pty_esc_at: None, right_focused: false, right_scroll: 0,
             structd: StructState::default(),
             sel_hunk: 0,
             struct_rx: None,
@@ -1718,19 +1725,55 @@ impl App {
         }
     }
 
-    /// Open an engine-held PTY pane running `argv`, and focus it. The argv is
-    /// whatever the user chose (the engine-held PTY is a generic transport: it
-    /// runs the given command; nothing about a box or its parameters is
-    /// presumed here). 'P' first prompts (pre-filled with the configured
-    /// default), then calls this with the entered command line.
+    /// The currently-selected PTY pane, if any.
+    fn cur_pty(&self) -> Option<&PtyPane> { self.ptys.get(self.sel_pty) }
+    #[cfg_attr(test, allow(dead_code))]
+    fn cur_pty_mut(&mut self) -> Option<&mut PtyPane> {
+        self.ptys.get_mut(self.sel_pty)
+    }
+
+    /// Cycle to the next / previous PTY (wrapping).
+    #[cfg_attr(test, allow(dead_code))]
+    fn pty_next(&mut self) {
+        if self.ptys.is_empty() { return; }
+        self.sel_pty = (self.sel_pty + 1) % self.ptys.len();
+    }
+    #[cfg_attr(test, allow(dead_code))]
+    fn pty_prev(&mut self) {
+        if self.ptys.is_empty() { return; }
+        self.sel_pty = (self.sel_pty + self.ptys.len() - 1) % self.ptys.len();
+    }
+    /// Kill the current PTY (drop the connection — engine SIGHUPs the
+    /// child). Selector slides to the next PTY; focus snaps back to
+    /// Sessions if the last one is gone.
+    #[cfg_attr(test, allow(dead_code))]
+    fn pty_kill(&mut self) {
+        if self.sel_pty >= self.ptys.len() { return; }
+        self.ptys.remove(self.sel_pty);
+        if self.ptys.is_empty() {
+            self.sel_pty = 0;
+            self.focus = Pane::Sessions;
+            self.status = "PTY killed (no more open)".into();
+        } else {
+            if self.sel_pty >= self.ptys.len() { self.sel_pty = self.ptys.len() - 1; }
+            self.status = format!("PTY killed · {} remain", self.ptys.len());
+        }
+    }
+
+    /// Open an engine-held PTY running `argv` and focus it. Multiple
+    /// PTYs can coexist; each is appended to `ptys` and becomes the
+    /// active selection.
     #[cfg_attr(test, allow(dead_code))]
     fn open_pty(&mut self, argv: Vec<String>) {
         if argv.is_empty() { self.status = "pty: empty command".into(); return; }
         match PtyPane::open(&self.sock, &argv, 24, 80) {
             Ok(p) => {
-                self.pty = Some(p);
+                self.ptys.push(p);
+                self.sel_pty = self.ptys.len() - 1;
                 self.focus = Pane::Pty;
-                self.status = "PTY · keys go to the box · Ctrl-] detaches".into();
+                self.status = format!(
+                    "PTY {}/{} · F2/F3 cycle · F8 kill · F12 detach",
+                    self.sel_pty + 1, self.ptys.len());
             }
             Err(e) => self.status = format!("pty: {e}"),
         }
@@ -3072,70 +3115,148 @@ fn scroll_for_cursor(cursor_line: usize, n_lines: usize, rect_h: u16) -> u16 {
 /// Mirrors the prototype's _keybar: a row of view-key chips (b/c/p/o/e),
 /// the active view's chip reversed-bold + its label yellow-bold, plus a
 /// "⦿ filter <expr>" badge when the focused view has an active filter.
-fn keybar_spans(app: &App) -> Vec<Span<'static>> {
-    let view_of = |p: Pane| match p {
-        Pane::Sessions => Some(('b', "boxes",   FilterView::Changes /* unused */)),
+/// Map a pane to its (accelerator letter, label, filter-view). The
+/// menubar + fkeybar both use this so the letters / labels stay
+/// consistent in one place.
+fn view_of_pane(p: Pane) -> Option<(char, &'static str, FilterView)> {
+    match p {
+        Pane::Sessions => Some(('b', "boxes",    FilterView::Changes /* unused */)),
         Pane::Changes | Pane::Hunks
-                       => Some(('c', "changes", FilterView::Changes)),
+                       => Some(('c', "changes",  FilterView::Changes)),
         Pane::Processes => Some(('p', "procs",   FilterView::Procs)),
         Pane::Outputs   => Some(('o', "outputs", FilterView::Outputs)),
         Pane::Pipelines => Some(('l', "pipes",   FilterView::Changes /* unused */)),
         Pane::BuildEdges => Some(('g', "build",  FilterView::Changes /* unused */)),
         Pane::Rules     => Some(('e', "rules",   FilterView::Changes /* unused */)),
-        _ => None,
-    };
-    let active = view_of(app.focus);
-    // Per-section presence in the current box's summary: hide chips that
-    // would lead to a 45 %-wide pane containing only "no rows yet" for
-    // THIS box. We always show the chip for the active view (so the
-    // user can see where they are even if they forced their way in) and
-    // for boxes / changes / rules / help (those always make sense — a
-    // fresh box's "no changes yet" is the whole point of staring at it).
+        Pane::Help      => Some(('?', "help",    FilterView::Changes /* unused */)),
+        Pane::Pty       => Some(('P', "PTY",     FilterView::Changes /* unused */)),
+    }
+}
+
+/// Top menubar: pane chips with their letter accelerators. The
+/// active pane reverses; chips that would lead to an empty pane for
+/// this box are dimmed (procs/outputs/pipes/build) or hidden (same
+/// rule as the old keybar). PTY chip shows when any PTY is open.
+fn menubar_spans(app: &App) -> Vec<Span<'static>> {
+    let active = view_of_pane(app.focus).map(|(k, _, _)| k);
     let has = |k: &str| app.box_summary.get(k)
         .and_then(Value::as_array).map(|a| !a.is_empty()).unwrap_or(false);
     let show_procs    = has("processes") || app.focus == Pane::Processes;
     let show_outputs  = has("outputs")   || app.focus == Pane::Outputs;
     let show_pipes    = has("pipelines") || app.focus == Pane::Pipelines;
     let show_build    = has("edges")     || app.focus == Pane::BuildEdges;
-    let mut spans: Vec<Span<'static>> = Vec::new();
+    let any_pty       = !app.ptys.is_empty();
     let chips: Vec<(char, &str)> = [
-        Some(('b', "boxes")),
-        Some(('c', "changes")),
-        if show_procs   { Some(('p', "procs"))   } else { None },
-        if show_outputs { Some(('o', "outputs")) } else { None },
-        if show_pipes   { Some(('l', "pipes"))   } else { None },
-        if show_build   { Some(('g', "build"))   } else { None },
-        Some(('e', "rules")),
+        Some(('b', "Boxes")),
+        Some(('c', "Changes")),
+        if show_procs   { Some(('p', "Procs"))   } else { None },
+        if show_outputs { Some(('o', "Outputs")) } else { None },
+        if show_pipes   { Some(('l', "Pipes"))   } else { None },
+        if show_build   { Some(('g', "Build"))   } else { None },
+        Some(('e', "Rules")),
+        if any_pty { Some(('P', "PTYs")) } else { None },
+        Some(('?', "Help")),
     ].into_iter().flatten().collect();
+    let mut spans: Vec<Span<'static>> = Vec::new();
     for (key, label) in chips {
-        let on = active.map(|(k, _, _)| k == key).unwrap_or(false);
-        let chip_style = if on {
-            Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
-        } else { Style::default().add_modifier(Modifier::BOLD) };
-        let label_style = if on {
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-        } else { Style::default().add_modifier(Modifier::DIM) };
-        spans.push(Span::styled(format!(" {key} "), chip_style));
-        spans.push(Span::styled(format!("{label}  "), label_style));
+        let on = active == Some(key);
+        let style = if on {
+            Style::default().fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        } else {
+            Style::default().add_modifier(Modifier::BOLD)
+        };
+        // Spell the letter accelerator BOLD-colored inside the label
+        // (Norton-Commander look: " Boxes "), and re-tint the chip when
+        // it's the active one. We bake the highlight into the chip
+        // string rather than a sub-span to keep menubar one Line wide.
+        spans.push(Span::styled(format!("  {label}"), style));
+        spans.push(Span::styled(format!(" ({key}) "),
+            Style::default().fg(if on { Color::Yellow } else { Color::DarkGray })));
     }
-    spans.push(Span::styled(" │  ", Style::default().add_modifier(Modifier::DIM)));
-    spans.push(Span::styled("esc back  q quit  d detach",
-                            Style::default().add_modifier(Modifier::DIM)));
-    // Filter badge for the focused view.
+    spans
+}
+
+/// Norton-style cmdline (row above the F-keybar). Shows the active
+/// filter expression when one is set, else a dim "$" placeholder.
+/// Hook point for a future "type a command" input mode — today it's
+/// pure status surface.
+fn cmdline_spans(app: &App) -> Vec<Span<'static>> {
+    let prompt = Span::styled("$ ", Style::default().fg(Color::Cyan)
+                                                    .add_modifier(Modifier::BOLD));
+    let active = view_of_pane(app.focus);
     if let Some((_, _, v)) = active {
         let f = app.view_filter(v);
         if f.on && !f.clauses.is_empty() {
-            spans.push(Span::raw("    "));
-            spans.push(Span::styled("⦿ filter ",
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
             let expr = clauses_expr(&f.clauses);
-            let trimmed: String = expr.chars().take(60).collect();
-            spans.push(Span::styled(trimmed, Style::default().fg(Color::Yellow)));
-            spans.push(Span::styled("  ['/' clears]",
-                Style::default().add_modifier(Modifier::DIM)));
+            return vec![
+                prompt,
+                Span::styled("filter ",
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::styled(expr, Style::default().fg(Color::Yellow)),
+                Span::styled("  ('/' clears)",
+                    Style::default().add_modifier(Modifier::DIM)),
+            ];
         }
     }
+    vec![prompt,
+         Span::styled("(idle — '/' opens filter, F-keys below)",
+             Style::default().add_modifier(Modifier::DIM))]
+}
+
+/// Norton-Commander-style F-key bar: ten contextual fields, one per
+/// F1..F10, each "<n><LABEL>". Labels change based on the focused
+/// pane so the user always knows what each F-key does HERE. F1/F10
+/// (Help / Quit) stay stable across panes for muscle memory.
+fn fkeybar_spans(app: &App) -> Vec<Span<'static>> {
+    let cells = fkey_labels(app);
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (n, label) in cells.iter().enumerate() {
+        spans.push(Span::styled(format!("{} ", n + 1),
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
+        // dim the label when unused (the label is "·")
+        let lstyle = if *label == "·" {
+            Style::default().add_modifier(Modifier::DIM)
+        } else {
+            Style::default().fg(Color::Black).bg(Color::Cyan)
+        };
+        spans.push(Span::styled(format!("{label:<8}"), lstyle));
+        spans.push(Span::raw(" "));
+    }
     spans
+}
+
+/// Compute the 10 F-key labels for the current pane. "·" means
+/// unbound (renders dim). The keymap in the interactive loop honors
+/// the same set — Help+Quit always work, the rest dispatch on focus.
+fn fkey_labels(app: &App) -> [&'static str; 10] {
+    let pty_pane = app.focus == Pane::Pty;
+    let hunks    = app.focus == Pane::Hunks;
+    let rules    = app.focus == Pane::Rules;
+    let sessions = app.focus == Pane::Sessions;
+    let changes  = app.focus == Pane::Changes;
+    // Default fields. Override per pane below.
+    let mut f: [&'static str; 10] = [
+        "Help",     // F1   — always
+        if pty_pane { "PtyNext" } else { "Pty+" },  // F2
+        if pty_pane { "PtyPrev" } else { "Tab" },   // F3
+        "Edit",     // F4 (edit-current rule, edit-current name)
+        if hunks || changes { "Apply" } else { "·" },  // F5
+        if sessions { "Rename" } else { "·" }, // F6
+        if pty_pane { "PtyNew" }
+        else if rules { "NewRule" }
+        else { "·" }, // F7
+        if pty_pane { "PtyKill" }
+        else if hunks || changes { "Discard" }
+        else if rules { "DelRule" }
+        else { "·" }, // F8
+        "Menu",     // F9 (navigation in menubar — placeholder for now)
+        "Quit",     // F10  — always
+    ];
+    // Override: PTY pane F12 detach is shown in the title strip too;
+    // we mirror that here so the user doesn't have to look up.
+    if pty_pane { f[8] = "·"; }  // no menu nav while in PTY
+    f
 }
 
 /// Render a clause list as a one-line expression (kind:pattern, joined by
@@ -3158,20 +3279,35 @@ fn clauses_expr(clauses: &[Clause]) -> String {
 }
 
 fn draw(f: &mut ratatui::Frame, app: &App) {
-    // Two single-line strips along the bottom: a keybar (view keys with the
-    // active view's letter lit + active-filter chip) and the status / error
-    // message line. Matches the prototype's #keybar + #status arrangement.
+    // Norton-Commander-style chrome (top to bottom):
+    //   menubar    : pane names with their letter accelerators (b/c/p/...)
+    //   body       : current 2-pane view, unchanged
+    //   cmdline    : the active filter expression or "$" prompt for input
+    //   fkeybar    : ten F-key fields ("1Help 2Pty+ 3Tab ..."), context-sensitive
+    //   status     : transient status / error line
+    // The two top/bottom strips give the user a stable, ALWAYS-visible
+    // map of what each key does in the current context — no more "open
+    // help to remember which letter switches view".
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(3),
-            Constraint::Length(1),
-            Constraint::Length(1),
+            Constraint::Length(1),   // menubar
+            Constraint::Min(3),      // body
+            Constraint::Length(1),   // cmdline
+            Constraint::Length(1),   // fkeybar
+            Constraint::Length(1),   // status
         ])
         .split(f.area());
-    let body = root[0];
-    let keybar_area = root[1];
-    let status_area = root[2];
+    let menubar_area = root[0];
+    let body = root[1];
+    let cmdline_area = root[2];
+    let fkeybar_area = root[3];
+    let status_area = root[4];
+
+    // Top menubar.
+    f.render_widget(
+        Paragraph::new(Line::from(menubar_spans(app))),
+        menubar_area);
 
     // The PTY pane takes the whole body. NO border block — the surrounding
     // frame would interfere with the host terminal's native click-drag
@@ -3183,8 +3319,11 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     // enough to absorb long output (otherwise lines off the top of
     // the screen vanish).
     if app.focus == Pane::Pty {
-        if let Some(pty) = &app.pty {
-            let tag = if pty.eof { "PTY · (exited)" } else { "PTY · live" };
+        if let Some(pty) = app.cur_pty() {
+            let total = app.ptys.len();
+            let sel = app.sel_pty + 1;
+            let state = if pty.eof { "(exited)" } else { "live" };
+            let tag = format!("PTY {sel}/{total} · {state}");
             let split = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Length(1), Constraint::Min(1)])
@@ -3193,7 +3332,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                 Span::styled(tag, Style::default().fg(Color::Yellow)
                                                    .add_modifier(Modifier::BOLD)),
                 Span::raw("   "),
-                Span::styled("F12 / Ctrl-] / Esc-Esc detach",
+                Span::styled("F2/F3 cycle · F7 new · F8 kill · F12 detach",
                     Style::default().add_modifier(Modifier::DIM)),
             ]));
             f.render_widget(title_bar, split[0]);
@@ -3351,11 +3490,20 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         }
     }
 
-    // Keybar: view-key tabs (active one reversed) + the global keys + the
-    // currently-active '/' filter expression if any.
+    // Cmdline (above the F-keybar). Today: the active filter
+    // expression for the focused view, prefixed with a "$" prompt
+    // glyph; if no filter is set, just the dim "$" placeholder. A
+    // future "type a command here" mode will hook into this row.
     f.render_widget(
-        Paragraph::new(Line::from(keybar_spans(app))),
-        Rect { x: keybar_area.x, y: keybar_area.y, width: keybar_area.width, height: 1 });
+        Paragraph::new(Line::from(cmdline_spans(app))),
+        cmdline_area);
+
+    // F-keybar: ten contextual fields. F1 / F10 are stable across
+    // panes (help / quit); the middle ones change to reflect what
+    // each key does HERE. Look down to know — no help-pane round-trip.
+    f.render_widget(
+        Paragraph::new(Line::from(fkeybar_spans(app))),
+        fkeybar_area);
 
     let status_text = if let Some(buf) = &app.renaming {
         format!("rename -> {buf}_  (Enter to commit, Esc to cancel)")
@@ -4257,10 +4405,12 @@ fn run_interactive(sock: &str) -> Result<(), String> {
             while let Ok(ev) = rx.try_recv() {
                 app.on_event(&ev);
             }
-            // drain engine-held PTY output into the vt100 parser each tick.
-            if let Some(pty) = app.pty.as_mut() {
-                pty.pump();
-            }
+            // drain each engine-held PTY's output into its own vt100
+            // parser. Multi-PTY: every PTY's reader thread runs
+            // independently, but the UI only redraws on its own tick,
+            // so we pump them all here even when only one is visible
+            // (the rest accumulate output for when the user switches).
+            for pty in app.ptys.iter_mut() { pty.pump(); }
             // drain a finished structural-diff worker result, and animate the
             // spinner while one is still pending.
             app.pump_struct();
@@ -4311,89 +4461,124 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                     use crossterm::event::KeyModifiers;
                     // EOF: child is dead. Any key detaches (no point typing
                     // into a corpse — that's how the user got stuck last time).
-                    let dead = app.pty.as_ref().map(|p| p.eof).unwrap_or(true);
-                    // Detach is offered THREE ways, because Ctrl-] is
-                    // famously unreliable across terminals/keyboard layouts:
-                    //   * F12              — guaranteed, single key.
-                    //   * Esc Esc          — double-tap escape (chord; the
-                    //     first Esc just queues, the second within 400 ms
-                    //     fires the detach). Falls back to "single Esc"
-                    //     forwarding into the box on a slower second press.
-                    //   * Ctrl-]           — classic telnet/ssh escape.
-                    //                        Crossterm collapses raw
-                    //                        0x1c..0x1f into Char('4')..
-                    //                        Char('7') with CONTROL set
-                    //                        (crossterm parse.rs L110), so
-                    //                        a Ctrl-] arrives as
-                    //                        Char('5')+CONTROL — NOT
-                    //                        Char(']')+CONTROL. We accept
-                    //                        all three spellings: the
-                    //                        named char, the collapsed
-                    //                        digit, and the raw GS byte.
+                    let dead = app.cur_pty().map(|p| p.eof).unwrap_or(true);
+                    // F-key bindings local to the PTY pane (the F-keybar
+                    // shows the same set in its bottom strip — F1/F2/F3/F7/F8
+                    // for help / next-pty / prev-pty / new-pty / kill-pty,
+                    // F12 for detach. Norton-style: stable mapping, the
+                    // labels in the bar tell you what each does here).
+                    if matches!(k.code, KeyCode::F(2)) { app.pty_next(); continue; }
+                    if matches!(k.code, KeyCode::F(3)) { app.pty_prev(); continue; }
+                    if matches!(k.code, KeyCode::F(7)) {
+                        app.modal = Some(Modal::PtyCmd { buf: pty_default_cmd() });
+                        continue;
+                    }
+                    if matches!(k.code, KeyCode::F(8)) { app.pty_kill(); continue; }
+                    if matches!(k.code, KeyCode::F(1)) {
+                        app.snap_left();
+                        app.focus = Pane::Help;
+                        app.out_scroll = 0;
+                        continue;
+                    }
+                    // Detach via Ctrl-]/F12/Esc-Esc. Crossterm collapses
+                    // raw 0x1c..0x1f into Char('4')..Char('7') with
+                    // CONTROL set (parse.rs L110); we accept named char,
+                    // collapsed digit, and raw GS byte.
                     let ctrl_bracket = k.modifiers.contains(KeyModifiers::CONTROL)
                         && matches!(k.code, KeyCode::Char(']') | KeyCode::Char('5'));
                     let raw_gs = matches!(k.code, KeyCode::Char('\u{1d}'));
                     let f12 = matches!(k.code, KeyCode::F(12));
-                    // Esc-Esc chord. esc_at = Instant of the previous Esc
-                    // if we're inside the 400 ms window, else None.
                     let now = std::time::Instant::now();
                     let esc_chord = matches!(k.code, KeyCode::Esc)
                         && app.pty_esc_at.is_some_and(|t|
                             now.duration_since(t) < Duration::from_millis(400));
-                    let detach = dead || ctrl_bracket || raw_gs || f12 || esc_chord;
+                    let detach = ctrl_bracket || raw_gs || f12 || esc_chord;
+                    if dead {
+                        // Drop the corpse from `ptys` (slides to next/prev)
+                        // and snap focus back to Sessions if none remain.
+                        // Any key triggers — the user can't usefully type
+                        // into an exited PTY.
+                        app.pty_kill();
+                        continue;
+                    }
                     if detach {
                         // Detach = STOP forwarding keys, NOT close the PTY.
-                        // Closing the client socket made the engine's
-                        // serve_pty drop the master, which SIGHUPs the
-                        // slave's child (the `sarun run` runner) — that
-                        // killed the box the user was running, exactly
-                        // what we DON'T want on a detach. So we keep
-                        // app.pty alive when the child is still running;
-                        // the reader thread keeps draining (output goes
-                        // into vt100's screen, visible on re-attach via
-                        // 'P'). Only an EOF'd child is actually closed.
-                        let msg = if dead {
-                            app.pty = None;
-                            "PTY exited — detached"
-                        } else {
-                            "PTY detached (still running · P to re-attach)"
-                        };
+                        // The reader thread keeps draining the master into
+                        // vt100's screen (so re-attach via the boxes view
+                        // shows live state). No teardown — the box is fine.
                         app.pty_esc_at = None;
                         app.focus = Pane::Sessions;
-                        // No manual refresh here: the engine already
-                        // broadcasts session_added when the runner the
-                        // PTY launched calls register, and on_event's
-                        // session_added arm rebuilds the boxes list.
-                        // If the box is missing after a detach that's
-                        // an event-flow bug, not something to paper
-                        // over with a poll.
-                        app.status = msg.into();
+                        app.status = format!(
+                            "PTY {}/{} detached (still running · P to re-attach)",
+                            app.sel_pty + 1, app.ptys.len());
                     } else if matches!(k.code, KeyCode::Esc) {
-                        // Arm the chord: remember when this Esc landed.
-                        // The keystroke is NOT forwarded yet; if the user
-                        // doesn't press Esc again within 400 ms, the next
-                        // non-Esc keystroke (or a non-detaching Esc that
-                        // falls outside the window) re-fires this as a
-                        // plain Esc to the shell. brush-interactive uses
-                        // Esc for vi-mode toggles, so swallowing a lone
-                        // Esc would surprise vi users.
+                        // Arm the Esc-Esc chord; lone Esc still reaches
+                        // the shell via the flush path below.
                         app.pty_esc_at = Some(now);
                     } else if let Some(bytes) = key_to_pty_bytes(k.code, k.modifiers) {
                         // A non-Esc key arrived. If an Esc was queued and
                         // is still within the window, flush it first.
                         if let Some(t) = app.pty_esc_at.take() {
                             if now.duration_since(t) < Duration::from_millis(400) {
-                                if let Some(pty) = app.pty.as_mut() {
+                                if let Some(pty) = app.cur_pty_mut() {
                                     pty.send_input(&[0x1b]);
                                 }
                             }
                         }
-                        if let Some(pty) = app.pty.as_mut() { pty.send_input(&bytes); }
+                        if let Some(pty) = app.cur_pty_mut() { pty.send_input(&bytes); }
                     }
                     continue;
                 }
                 use crossterm::event::KeyModifiers as KM;
                 let ctrl = k.modifiers.contains(KM::CONTROL);
+                // F-key bar bindings, global outside the PTY pane.
+                // (PTY pane handles its own F2/F3/F7/F8/F12 before
+                // we get here.) Mapping mirrors fkey_labels() above:
+                //   F1  Help · F2 new PTY · F3 Tab (next pane within
+                //   view) · F4 edit (rules / rename box) · F5 apply
+                //   · F6 rename (boxes) · F7 new rule (when on Rules)
+                //   · F8 discard (Changes/Hunks) / del rule (Rules)
+                //   · F9 menu (TBD)             · F10 quit
+                if let KeyCode::F(n) = k.code {
+                    match n {
+                        1 => { app.snap_left(); app.focus = Pane::Help; app.out_scroll = 0; }
+                        2 => { app.modal = Some(Modal::PtyCmd { buf: pty_default_cmd() }); }
+                        3 => { app.next_pane(); }
+                        4 => {
+                            if app.focus == Pane::Rules {
+                                let cur = app.rules.get(app.sel_rule).cloned().unwrap_or_default();
+                                app.modal = Some(Modal::RuleForm {
+                                    buf: cur, editing: Some(app.sel_rule) });
+                            } else if app.focus == Pane::Sessions {
+                                app.renaming = Some(String::new());
+                            }
+                        }
+                        5 => {
+                            if app.focus == Pane::Hunks { app.apply_hunk(); }
+                            else if app.focus == Pane::Changes { app.apply(); }
+                        }
+                        6 => {
+                            if app.focus == Pane::Sessions {
+                                app.renaming = Some(String::new());
+                            }
+                        }
+                        7 => {
+                            if app.focus == Pane::Rules {
+                                app.modal = Some(Modal::RuleForm {
+                                    buf: String::new(), editing: None });
+                            }
+                        }
+                        8 => {
+                            if app.focus == Pane::Hunks { app.discard_hunk(); }
+                            else if app.focus == Pane::Changes { app.discard(); }
+                            else if app.focus == Pane::Rules { app.delete_rule(); }
+                        }
+                        9 => { app.status = "F9 menu navigation — coming next".into(); }
+                        10 => { shutdown_rpc(&app.sock); app.should_quit = true; }
+                        _ => {}
+                    }
+                    continue;
+                }
                 match k.code {
                     // 'q' stops the engine too (mirrors the Python prototype's
                     // contract — q is QUIT, not detach). 'd' detaching is
@@ -4444,21 +4629,24 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                     }
                     KeyCode::Char('e') => { app.snap_left(); app.focus = Pane::Rules; }
                     KeyCode::Char('?') => { app.snap_left(); app.focus = Pane::Help; app.out_scroll = 0; }
-                    // 'P' reattaches the existing PTY if one is alive
-                    // (Ctrl-]/F12/Esc-Esc only detach the focus, the
-                    // child keeps running). Only a fresh prompt opens a
-                    // new command — pressing 'P' twice in a row used
-                    // to immediately killed a running shell, now it
-                    // just flips focus back.
+                    // 'P' re-attaches to the most recent live PTY if any
+                    // exist, otherwise prompts for a fresh command (same
+                    // entrypoint as F7 inside the PTY pane). To force a
+                    // NEW PTY when others are open, use F7 from inside
+                    // the pane.
                     KeyCode::Char('P') => {
-                        if app.pty.as_ref().is_some_and(|p| !p.eof) {
+                        let any_live = app.ptys.iter().any(|p| !p.eof);
+                        if any_live {
+                            // Pick a live one closest to the current sel.
+                            if app.cur_pty().map(|p| p.eof).unwrap_or(true) {
+                                if let Some((i, _)) = app.ptys.iter().enumerate()
+                                    .find(|(_, p)| !p.eof) { app.sel_pty = i; }
+                            }
                             app.focus = Pane::Pty;
-                            app.status = "PTY re-attached".into();
+                            app.status = format!(
+                                "PTY {}/{} re-attached",
+                                app.sel_pty + 1, app.ptys.len());
                         } else {
-                            // No PTY (or the one we had exited): prompt
-                            // for a fresh command. The Modal-cancel arm
-                            // ("pty cancelled") still says cancelled
-                            // even when there's nothing to cancel.
                             app.modal = Some(Modal::PtyCmd { buf: pty_default_cmd() });
                         }
                     }
@@ -5299,7 +5487,7 @@ mod tests {
             f_procs: ViewFilter::default(),
             f_outputs: ViewFilter::default(),
             should_quit: false,
-            pty: None, pty_esc_at: None, right_focused: false, right_scroll: 0,
+            ptys: vec![], sel_pty: 0, pty_esc_at: None, right_focused: false, right_scroll: 0,
             structd: StructState::default(),
             sel_hunk: 0,
             struct_rx: None,
@@ -5607,7 +5795,7 @@ mod tests {
     /// view's chip+label is highlighted. Switch focus and assert the
     /// active chip moves with it.
     #[test]
-    fn keybar_chips_track_focus() {
+    fn menubar_chips_track_focus() {
         let Some(eng) = boot() else {
             eprintln!("SKIP: engine binary missing or FUSE unavailable");
             return;
@@ -5616,27 +5804,31 @@ mod tests {
         let mut app = App::new(eng.sock.clone());
         app.refresh_sessions();
         app.load_changes();
-        // boxes view: keybar must mention every chip label.
+        // boxes view: menubar must mention every chip label.
         let buf = render_to_string(&app, 160, 30).unwrap();
-        for lab in ["boxes", "changes", "procs", "outputs", "rules"] {
-            assert!(buf.contains(lab), "keybar chip {lab:?} missing:\n{buf}");
+        for lab in ["Boxes", "Changes", "Rules", "Help"] {
+            assert!(buf.contains(lab), "menubar chip {lab:?} missing:\n{buf}");
         }
-        // chip letters appear at least once for each view.
-        for k in ['b', 'c', 'p', 'o', 'e'] {
-            assert!(buf.contains(k), "keybar chip letter {k:?} missing:\n{buf}");
+        // chip letters appear inside parentheses, e.g. " (b) ".
+        for k in ['b', 'c', 'e', '?'] {
+            let lit = format!("({k})");
+            assert!(buf.contains(&lit),
+                    "menubar accelerator {lit:?} missing:\n{buf}");
         }
-        // Move focus to procs and re-render — the active label must still
-        // be there (now styled, not gone).
+        // Move focus to Procs (forcing it shown since the box has no
+        // procs yet — view_of_pane's "active overrides hide" rule
+        // means the chip surfaces).
         app.focus = Pane::Processes;
         app.load_processes();
         let buf2 = render_to_string(&app, 160, 30).unwrap();
-        assert!(buf2.contains("procs"), "procs label missing after focus:\n{buf2}");
+        assert!(buf2.contains("Procs"), "Procs label missing after focus:\n{buf2}");
     }
 
-    /// Active filter on the focused view surfaces as a "⦿ filter" chip in
-    /// the keybar (yellow) with the clause expression rendered.
+    /// Active filter on the focused view surfaces in the COMMAND LINE
+    /// row (above the F-keybar) with the clause expression rendered.
+    /// Renamed from the old "keybar chip" test — same intent, new spot.
     #[test]
-    fn keybar_shows_active_filter_expression() {
+    fn cmdline_shows_active_filter_expression() {
         let Some(eng) = boot() else {
             eprintln!("SKIP: engine binary missing or FUSE unavailable");
             return;
@@ -5654,9 +5846,10 @@ mod tests {
         }];
         app.commit_filter(FilterView::Changes, &rows);
         let buf = render_to_string(&app, 160, 30).unwrap();
-        assert!(buf.contains("⦿ filter"), "filter chip missing:\n{buf}");
+        assert!(buf.contains("filter"),
+                "cmdline must surface 'filter' tag when one is active:\n{buf}");
         assert!(buf.contains("path:**/PUMPKIN*"),
-                "filter expression missing in chip:\n{buf}");
+                "filter expression missing from cmdline:\n{buf}");
     }
 
     /// A freshly-created file (no host counterpart at lower) renders as
@@ -5867,15 +6060,15 @@ mod tests {
         assert!(buf.contains("PIPELINES"), "pipelines title missing:\n{buf}");
         assert!(buf.contains("no pipelines yet"),
                 "empty-state hint missing on pipelines pane:\n{buf}");
-        assert!(buf.contains(" l ") || buf.contains("pipes"),
-                "keybar must surface the pipelines chip:\n{buf}");
+        assert!(buf.contains("(l)") || buf.contains("Pipes"),
+                "menubar must surface the pipelines chip:\n{buf}");
         app.focus = Pane::BuildEdges;
         app.load_build_edges();
         let buf = render_to_string(&app, 160, 30).unwrap();
         assert!(buf.contains("BUILD EDGES"), "build-edges title missing:\n{buf}");
         assert!(buf.contains("no build edges yet"),
                 "empty-state hint missing on build-edges pane:\n{buf}");
-        assert!(buf.contains(" g ") || buf.contains("build"),
-                "keybar must surface the build-edges chip:\n{buf}");
+        assert!(buf.contains("(g)") || buf.contains("Build"),
+                "menubar must surface the build-edges chip:\n{buf}");
     }
 }
