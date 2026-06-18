@@ -78,6 +78,10 @@ pub struct Variable {
 
     pub assign_op: Option<AssignOp>,
     pub readonly: bool,
+    /// sarun: target-specific export marker. Set when a rule writes
+    /// `target: export VAR := …`. The recipe-runner pushes such vars
+    /// into the child env for that target's commands only.
+    pub exported: bool,
     pub deprecated: Option<Arc<String>>,
     obsolete: Option<Arc<String>>,
 
@@ -279,6 +283,7 @@ impl Variable {
             origin,
             assign_op: None,
             readonly: false,
+            exported: false,
             deprecated: None,
             obsolete: None,
             visibility_prefix: None,
@@ -298,6 +303,7 @@ impl Variable {
             origin,
             assign_op: None,
             readonly: false,
+            exported: false,
             deprecated: None,
             obsolete: None,
             visibility_prefix: None,
@@ -319,6 +325,7 @@ impl Variable {
             origin,
             assign_op: None,
             readonly: false,
+            exported: false,
             deprecated: None,
             obsolete: None,
             visibility_prefix: None,
@@ -339,6 +346,7 @@ impl Variable {
             origin,
             assign_op: None,
             readonly: false,
+            exported: false,
             deprecated: None,
             obsolete: None,
             visibility_prefix: None,
@@ -353,6 +361,7 @@ impl Variable {
             origin: VarOrigin::Automatic,
             assign_op: None,
             readonly: false,
+            exported: false,
             deprecated: None,
             obsolete: None,
             visibility_prefix: None,
@@ -367,6 +376,7 @@ impl Variable {
             origin: VarOrigin::Override,
             assign_op: Some(AssignOp::ColonEq),
             readonly: true,
+            exported: false,
             deprecated: None,
             obsolete: None,
             visibility_prefix: None,
@@ -381,6 +391,7 @@ impl Variable {
             origin: VarOrigin::Override,
             assign_op: Some(AssignOp::ColonEq),
             readonly: true,
+            exported: false,
             deprecated: None,
             obsolete: None,
             visibility_prefix: None,

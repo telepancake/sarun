@@ -603,7 +603,20 @@ impl Evaluator {
         after_targets: &Bytes,
         separator_pos: usize,
     ) -> Result<()> {
-        let assign = parse_assign_statement(after_targets, separator_pos);
+        let mut assign = parse_assign_statement(after_targets, separator_pos);
+        // sarun: target-specific `export VAR := …` and `unexport VAR := …`.
+        // Strip the leading directive from the LHS and remember it so the
+        // recipe-runner can push the var into the child env for this
+        // target's commands.
+        let mut tsv_exported = None;
+        let lhs_trimmed = crate::strutil::trim_left_space(assign.lhs);
+        if let Some(rest) = lhs_trimmed.strip_prefix(b"export ") {
+            tsv_exported = Some(true);
+            assign.lhs = crate::strutil::trim_left_space(rest);
+        } else if let Some(rest) = lhs_trimmed.strip_prefix(b"unexport ") {
+            tsv_exported = Some(false);
+            assign.lhs = crate::strutil::trim_left_space(rest);
+        }
         let var_sym = intern(after_targets.slice_ref(assign.lhs));
         let is_final = stmt.sep == RuleSep::FinalEq;
         for target in targets {
@@ -652,6 +665,9 @@ impl Evaluator {
                 if needs_assign {
                     let mut readonly = false;
                     rhs_var.write().assign_op = Some(assign.op);
+                    if let Some(exp) = tsv_exported {
+                        rhs_var.write().exported = exp;
+                    }
                     self.current_scope.as_ref().unwrap().assign(
                         var_sym,
                         rhs_var.clone(),

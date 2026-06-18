@@ -14,7 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, ffi::OsStr, os::unix::ffi::OsStrExt, sync::Arc, time::SystemTime};
+use std::{
+    collections::HashMap,
+    ffi::OsStr,
+    os::unix::ffi::{OsStrExt, OsStringExt},
+    sync::Arc,
+    time::SystemTime,
+};
 
 use anyhow::Result;
 use bytes::Bytes;
@@ -25,6 +31,7 @@ use crate::{
     dep::{DepNode, NamedDepNode},
     error,
     eval::{Evaluator, FrameType},
+    expr::Evaluable,
     fileutil::{RedirectStderr, get_timestamp, run_command},
     flags::FLAGS,
     log,
@@ -146,6 +153,33 @@ impl<'a> Executor<'a> {
             return Ok(output_ts);
         }
 
+        // sarun: target-specific exported vars (`target: export VAR := …`)
+        // — push them into the process env for the duration of THIS
+        // target's commands, restore after. Single-threaded so the
+        // env-swap is safe.
+        let mut env_restores: Vec<(std::ffi::OsString, Option<std::ffi::OsString>)> = Vec::new();
+        if let Some(rule_vars) = n.lock().rule_vars.clone() {
+            let entries: Vec<(crate::symtab::Symbol, crate::var::Var)> =
+                rule_vars.0.lock().iter().map(|(s, v)| (*s, v.clone())).collect();
+            for (sym, var) in entries {
+                let do_export = var.read().exported;
+                let key = std::ffi::OsString::from_vec(sym.as_bytes().to_vec());
+                if !do_export {
+                    continue;
+                }
+                let value_bytes = var.read().eval_to_buf(self.ce.ev)?;
+                let prev = std::env::var_os(&key);
+                env_restores.push((key.clone(), prev));
+                // SAFETY: single-threaded recipe loop.
+                unsafe {
+                    std::env::set_var(
+                        &key,
+                        <std::ffi::OsStr as OsStrExt>::from_bytes(&value_bytes),
+                    );
+                }
+            }
+        }
+
         let commands = self.ce.eval(n)?;
         for command in commands {
             self.num_commands += 1;
@@ -174,6 +208,16 @@ impl<'a> Executor<'a> {
                             status.code().unwrap_or(1)
                         );
                     }
+                }
+            }
+        }
+
+        for (key, prev) in env_restores.into_iter().rev() {
+            // SAFETY: single-threaded.
+            unsafe {
+                match prev {
+                    Some(v) => std::env::set_var(&key, v),
+                    None => std::env::remove_var(&key),
                 }
             }
         }
