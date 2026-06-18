@@ -514,9 +514,25 @@ fn or_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> Res
 
 fn value_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> Result<()> {
     let var_name = args[0].eval_to_buf(ev)?;
-    let Some(var) = ev.lookup_var(intern(var_name))? else {
+    let Some(var) = ev.lookup_var(intern(var_name.clone()))? else {
         return Ok(());
     };
+    // sarun: real make treats $(value <auto>) specially. Plain auto-vars
+    // ($@/$</$^/$?/$*/$+/$%/$|) return the evaluated value (the literal
+    // target name etc.), while the @D/@F dirname/basename variants
+    // return the make-internal macro form that derives them from the
+    // bare letter. Variable::string handles the latter; for the former
+    // we just evaluate.
+    let bytes = var_name.as_ref();
+    let needs_eval = bytes.len() == 1
+        && matches!(
+            bytes[0],
+            b'@' | b'<' | b'^' | b'?' | b'*' | b'+' | b'%' | b'|'
+        );
+    if needs_eval && matches!(var.read().origin(), crate::var::VarOrigin::Automatic) {
+        var.read().eval(ev, out)?;
+        return Ok(());
+    }
     out.put_slice(&var.read().string()?);
     Ok(())
 }
