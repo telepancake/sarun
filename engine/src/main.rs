@@ -373,11 +373,10 @@ fn main() {
             std::process::exit(0);
         }
         Some("run") => {
-            // run [-t] [-d] [-e] [--frozen] [--no-parent] [--readonly-parent] [NAME] -- CMD...
+            // run [-t] [-d] [-e] [--no-parent] [--readonly-parent] [NAME] -- CMD...
             //   -t                  passthrough: no stdout/stderr capture (inner just execs)
             //   -d                  direct: no overlay — writes land on the real host, uncaptured
             //   -e                  env: record each writer's full environment
-            //   --frozen            overlay accepts no NEW writes — EROFS on every mutating op
             //   --no-parent         strip kernel-derived parent AND close the lower chain at
             //                       this box (no host / bleed-through); the box's own
             //                       contents are its entire filesystem
@@ -393,7 +392,6 @@ fn main() {
             let mut env = false;
             let mut pty = false;
             let mut brush = false;
-            let mut frozen = false;
             let mut no_parent = false;
             let mut readonly_parent = false;
             let mut chdir: Option<String> = None;
@@ -416,7 +414,6 @@ fn main() {
                     //     Implies capture-on (so provenance + writes are
                     //     recorded), except under -d which has no overlay.
                     "-b" => brush = true,
-                    "--frozen" => frozen = true,
                     "--no-parent" => no_parent = true,
                     "--readonly-parent" => readonly_parent = true,
                     "-C" => chdir = it.next().cloned(),
@@ -434,7 +431,7 @@ fn main() {
                 }
             }
             std::process::exit(runner::run(name, passthrough, direct, env,
-                pty, brush, frozen, no_parent, readonly_parent, chdir,
+                pty, brush, no_parent, readonly_parent, chdir,
                 net_mode, cmd));
         }
         Some("inner") => {

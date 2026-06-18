@@ -653,8 +653,6 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
         .and_then(Value::as_bool).unwrap_or(false);
     let want_readonly_parent = msg.get("want_readonly_parent")
         .and_then(Value::as_bool).unwrap_or(false);
-    let want_frozen = msg.get("want_frozen")
-        .and_then(Value::as_bool).unwrap_or(false);
     let want_capture = msg.get("want_capture").and_then(Value::as_bool)
         .unwrap_or(true) && !direct;
     let backing = crate::paths::live_home().join(id.to_string());
@@ -678,8 +676,8 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
     b.set_meta("name", &name);
     // D-parent: `want_no_parent` strips any kernel-derived parent AND closes
     // the lower chain so reads never fall through to the real host. It's the
-    // "OCI rootfs" / "Dockerfile FROM scratch" semantic. Mid-stack and top
-    // boxes can independently mark themselves frozen / readonly-parent.
+    // "OCI rootfs" / "Dockerfile FROM scratch" semantic. A child can
+    // independently mark itself readonly-parent.
     let mut parent = parent;
     if want_no_parent {
         parent = None;
@@ -689,10 +687,6 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
     if want_readonly_parent {
         b.set_readonly_parent(true);
         b.set_meta("readonly_parent", "1");
-    }
-    if want_frozen {
-        b.set_frozen(true);
-        b.set_meta("frozen", "1");
     }
     if let Some(p) = parent {
         b.set_parent(Some(p));

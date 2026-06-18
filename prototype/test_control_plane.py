@@ -218,12 +218,10 @@ def _run_main(argv, **patches):
 def test_dash_dash_required_and_flag_parsing():
     seen = {}
     def fake_run(cmd, env_capture, direct, chdir, reuse_sid=None,
-                 capture=True, no_parent=False, readonly_parent=False,
-                 frozen=False):
+                 capture=True, no_parent=False, readonly_parent=False):
         seen.update(cmd=cmd, env_capture=env_capture, direct=direct,
                     chdir=chdir, reuse_sid=reuse_sid, capture=capture,
-                    no_parent=no_parent, readonly_parent=readonly_parent,
-                    frozen=frozen)
+                    no_parent=no_parent, readonly_parent=readonly_parent)
         return 0
 
     # missing `--` is refused with a clear, fixable message.
