@@ -28,6 +28,31 @@ pub mod glob;
 
 pub const FILE_KINDS: &[&str] = &["path", "box", "exe", "cwd", "arg"];
 
+/// Network rule kinds — used by `-n` boxes' connection gate (see
+/// crate::net::policy). The matcher engine + glob vocabulary are the SAME
+/// as for FILE_KINDS; only the field resolver differs by context. A rule
+/// file may freely mix file and net kinds in a single clause (e.g.
+/// `discard box:* and host:bad.com` to deny bad.com for every box).
+pub const NET_KINDS: &[&str] = &[
+    "host", "port", "scheme", "sni",
+    "http_path", "http_method", "http_status",
+    "proto", "box", "exe", "cwd", "arg",
+];
+
+/// All kinds the parser/UI recognizes. The file format is one rule per
+/// line and is round-trip-compatible across contexts: a rule whose clauses
+/// only reference FILE_KINDS is "file-only" and is consulted by the file
+/// review/finalize path; one referencing any NET_KINDS is consulted at
+/// connection gate time. Mixed-kind rules act on both contexts and the
+/// caller picks the relevant subject.
+pub fn all_kinds() -> Vec<&'static str> {
+    let mut v: Vec<&'static str> = FILE_KINDS.iter().copied().collect();
+    for k in NET_KINDS { if !v.contains(k) { v.push(k); } }
+    v
+}
+
+pub fn is_net_kind(k: &str) -> bool { NET_KINDS.contains(&k) }
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Action { Apply, Discard, Passthrough }
 
