@@ -654,6 +654,20 @@ impl<'a> NinjaGenerator<'a> {
             out.write_all(b" ")?;
             out.write_all(&Self::escape_build_target(*s))?;
         }
+        // sarun: inject the top-level Makefile as an IMPLICIT input on
+        // every non-phony rule with a real (file) target. This is what
+        // GNU make does internally and what makes "no prereqs, file
+        // exists" mean "up to date" — n2 has no other way to decide
+        // staleness for a prereq-less rule, so without this every such
+        // rule rebuilds on every invocation (visible to the user as
+        // duplicated recipe output on incremental builds, divergent
+        // from the standalone rkati path).
+        if !node.is_phony
+            && let Some(makefile) = FLAGS.makefile.lock().as_ref()
+        {
+            write!(out, " | ")?;
+            out.write_all(makefile.as_bytes())?;
+        }
         if !node.order_onlys.is_empty() {
             write!(out, " ||")?;
             for (s, _) in &node.order_onlys {
