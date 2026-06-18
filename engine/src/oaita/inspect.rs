@@ -79,9 +79,22 @@ pub fn parse_locator(s: &str) -> Locator {
     Locator { path: s.to_string(), window: Window::Default }
 }
 
+/// Cursor footer for a PARTIAL page — the model needs to know more pages
+/// exist and which keys to use. Mid-stream only; the end-of-stuff banner
+/// below handles the last-page case.
 fn footer(target: &str, unit: &str, a: usize, b: usize, n: usize) -> String {
     format!("\n--- inspect: {target:?} {unit} {a}..{b} of {n} — \
              keys: first/previous/next/last\n")
+}
+
+/// END-OF-STUFF banner: when the page IS the full listing (a..b covers
+/// 1..n), we used to just OMIT the footer. The model then couldn't tell
+/// whether "no `next` key shown" meant "you've seen everything" or "the
+/// harness forgot to emit one" — and on small directories it would
+/// often try `next` anyway and waste a step. State the end loudly: the
+/// model gets an unambiguous signal it has the complete listing.
+fn end_banner(target: &str, unit: &str, n: usize) -> String {
+    format!("\n--- END of {target:?}: {n} {unit} total, no more pages ---\n")
 }
 
 /// Run the inspect tool with a parsed locator. `turns` is the current
@@ -139,6 +152,8 @@ fn inspect_dir(p: &Path, target: &str, window: &Window) -> String {
     let mut text = format!("{head}{body}");
     if a > 1 || b < n {
         text.push_str(&footer(target, "entries", a, b.min(n), n));
+    } else {
+        text.push_str(&end_banner(target, "entries", n));
     }
     text
 }
@@ -159,6 +174,8 @@ fn inspect_file(p: &Path, target: &str, window: &Window) -> String {
     let mut text = format!("{head}{body}");
     if a > 1 || b < n {
         text.push_str(&footer(target, "lines", a, b.min(n), n));
+    } else {
+        text.push_str(&end_banner(target, "lines", n));
     }
     text
 }

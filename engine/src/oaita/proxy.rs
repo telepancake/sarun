@@ -169,7 +169,15 @@ async fn handle_inner(proxy: Arc<Proxy>, box_id: i64, req: Request<Incoming>)
                              "this box was not launched with --api"));
     }
     let method = req.method().to_string();
-    let path = req.uri().path().to_string();
+    // Strip the box-side base path prefix (we set OPENAI_BASE_URL=…/v1 in the
+    // box, so the incoming URI looks like `/v1/chat/completions`). The
+    // upstream client then prepends its OWN base path from the configured
+    // upstream `base_url`. Without this strip the upstream sees a doubled
+    // prefix (e.g. `/api/v1/v1/chat/completions` → 404).
+    let raw_path = req.uri().path().to_string();
+    let path = raw_path.strip_prefix("/v1")
+        .map(|s| if s.is_empty() { "/" } else { s }.to_string())
+        .unwrap_or_else(|| raw_path.clone());
     let (_head, body) = req.into_parts();
     let body_bytes = match body.collect().await {
         Ok(b) => b.to_bytes(),

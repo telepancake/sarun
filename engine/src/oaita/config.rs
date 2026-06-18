@@ -40,6 +40,12 @@ impl Config {
 
     /// Resolve (model, base_url, api_key) from config + env. Errors only if
     /// `model` is unset in BOTH (the only required field).
+    ///
+    /// In `--api` boxes the safety property — that the box never sees the
+    /// host's api_key or its real upstream URL — is enforced at the FUSE /
+    /// bwrap layer (the engine substitutes a safe `oaita.toml` over the
+    /// box's view of the host config path). So this resolver stays pure
+    /// config+env: it does NOT special-case the proxy.
     pub fn resolve(&self) -> Result<(String, String, String), String> {
         let model = self.model.clone()
             .or_else(|| std::env::var("OAITA_MODEL").ok())

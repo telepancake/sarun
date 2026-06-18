@@ -145,6 +145,12 @@ pub struct BoxState {
     // mute never gets mistaken for a brush root.
     is_brush: std::sync::atomic::AtomicBool,
     brush_host_tgid: std::sync::atomic::AtomicU32,
+    // True when the box was launched with --api: the engine bind-mounts api.sock
+    // for the in-box oaita AND the FUSE overlay substitutes a SAFE oaita.toml
+    // (model only, no api_key, no base_url) over the box's view of the host
+    // config path. So a box can't read the host's real api_key by `cat`ing the
+    // config file. Mirrors is_brush.
+    is_api: std::sync::atomic::AtomicBool,
     // brush↔process link inputs: (brushprov row id, literal WRITE-redirect target
     // paths the pipeline opens for output). Collected as each FRAME_PROV arrives,
     // consumed at teardown (finalize_brush_links). The link is EXACT and race
@@ -217,6 +223,12 @@ impl BoxState {
     }
     pub fn is_brush(&self) -> bool {
         self.is_brush.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    pub fn set_is_api(&self, on: bool) {
+        self.is_api.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub fn is_api(&self) -> bool {
+        self.is_api.load(std::sync::atomic::Ordering::Relaxed)
     }
     pub fn set_brush_host_tgid(&self, tgid: u32) {
         self.brush_host_tgid.store(tgid, std::sync::atomic::Ordering::Relaxed);
@@ -368,6 +380,7 @@ impl BoxState {
             is_brush: std::sync::atomic::AtomicBool::new(false),
             brush_host_tgid: std::sync::atomic::AtomicU32::new(0),
             brush_links: Mutex::new(vec![]),
+            is_api: std::sync::atomic::AtomicBool::new(false),
         })
     }
 

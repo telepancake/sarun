@@ -90,6 +90,16 @@ pub fn oaita_state_home() -> PathBuf {
     state_home().join("oaita")
 }
 
+/// Where the engine writes the SAFE-FOR-BOX oaita.toml. The FUSE overlay
+/// substitutes this file's bytes/attrs over the box's view of the host
+/// oaita.toml whenever the box was launched with `--api`. The substitution
+/// keeps the api_key + real base_url off the box's filesystem entirely
+/// (a `cat` of the path returns the safe content; the host bytes are
+/// never reachable from the box).
+pub fn api_box_oaita_toml_path() -> PathBuf {
+    runtime_home().join("api-box-oaita.toml")
+}
+
 pub fn mnt_point() -> PathBuf {
     runtime_home().join("mnt")
 }
