@@ -21,6 +21,7 @@ mod discover;
 mod frames;
 mod katirun;
 mod n2run;
+mod net;
 mod overlay;
 mod paths;
 mod pty;
