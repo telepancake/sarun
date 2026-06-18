@@ -97,9 +97,33 @@ fn end_banner(target: &str, unit: &str, n: usize) -> String {
     format!("\n--- END of {target:?}: {n} {unit} total, no more pages ---\n")
 }
 
+/// Translate a host-style path (absolute or relative) into the box's
+/// merged-view path: `<mnt>/<box_id>/<abs without leading slash>`. Returns
+/// the raw path unchanged when `box_root` is None (no sandbox).
+///
+/// This is the single point that puts inspect/read/write inside the same
+/// overlay `shell` writes stage in. Without it the engine's host fs and the
+/// box's overlay drift silently: a shell that wrote a file would have it
+/// captured in the box upper, but a follow-up `read` would syscall the host
+/// and miss it. Symmetric on writes — `write` would land on the host instead
+/// of staging in the box (the leak we saw with `fft512.sh`).
+fn box_resolve(box_root: Option<&Path>, target: &str) -> PathBuf {
+    let Some(root) = box_root else { return PathBuf::from(target); };
+    let raw = PathBuf::from(target);
+    let abs = if raw.is_absolute() {
+        raw
+    } else {
+        std::env::current_dir().unwrap_or_default().join(raw)
+    };
+    let rel = abs.strip_prefix("/").unwrap_or(&abs);
+    root.join(rel)
+}
+
 /// Run the inspect tool with a parsed locator. `turns` is the current
 /// session's turn list (used to resolve page keys against the last cursor).
-pub fn inspect(locator: &Locator, turns: &[Turn]) -> String {
+/// `box_root`, when Some, points at the box's merged-view root — paths are
+/// resolved INSIDE the box so we see what the box sees.
+pub fn inspect(locator: &Locator, turns: &[Turn], box_root: Option<&Path>) -> String {
     let (target, window) = match &locator.window {
         Window::PageKey(k) => match resolve_page_key(k, turns) {
             Some((t, w)) => (t, w),
@@ -110,7 +134,7 @@ pub fn inspect(locator: &Locator, turns: &[Turn]) -> String {
     if let Some(rest) = target.strip_prefix("box:") {
         return inspect_box(rest, &window);
     }
-    let p = PathBuf::from(&target);
+    let p = box_resolve(box_root, &target);
     if p.is_dir() {
         inspect_dir(&p, &target, &window)
     } else if p.is_file() {
@@ -277,7 +301,9 @@ pub(crate) fn resolve_page_key(key: &str, turns: &[Turn]) -> Option<(String, Win
 }
 
 /// `read` — raw bytes of a file/slice, using inspect's locator grammar.
-pub fn read_path(locator: &Locator, turns: &[Turn]) -> String {
+/// `box_root`, when Some, points at the box's merged-view root — same path
+/// translation as `inspect` so the model reads what the box sees.
+pub fn read_path(locator: &Locator, turns: &[Turn], box_root: Option<&Path>) -> String {
     let (target, window) = match &locator.window {
         Window::PageKey(k) => match resolve_page_key(k, turns) {
             Some((t, w)) => (t, w),
@@ -289,7 +315,7 @@ pub fn read_path(locator: &Locator, turns: &[Turn]) -> String {
         return "read: box: locators are inspect-only — use shell in that box \
                 to read STAGED file contents".to_string();
     }
-    let p = PathBuf::from(&target);
+    let p = box_resolve(box_root, &target);
     let bytes = match fs::read(&p) { Ok(b) => b, Err(e) => return format!("read: {e}") };
     let text = String::from_utf8_lossy(&bytes);
     let lines: Vec<&str> = text.lines().collect();
@@ -337,7 +363,7 @@ pub fn read_path(locator: &Locator, turns: &[Turn]) -> String {
 /// line; conflicts/errors are also returned as text (no Result) to match how
 /// the other dispatch_* functions hand their bodies back to the call result.
 pub fn write_at_locator(locator: &Locator, content: &str, force: bool,
-                        turns: &[Turn]) -> String {
+                        turns: &[Turn], box_root: Option<&Path>) -> String {
     let (target, window) = match &locator.window {
         Window::PageKey(k) => match resolve_page_key(k, turns) {
             Some((t, w)) => (t, w),
@@ -349,7 +375,7 @@ pub fn write_at_locator(locator: &Locator, content: &str, force: bool,
         return "write: box: locators are inspect-only — staged box contents \
                 are reachable only through shell inside the box".to_string();
     }
-    let p = PathBuf::from(&target);
+    let p = box_resolve(box_root, &target);
 
     // Whole-file replace (Window::Default on either a missing path or an
     // existing file) — easy path, no slicing.

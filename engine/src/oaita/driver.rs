@@ -725,9 +725,9 @@ fn dispatch(tool: &str, arguments: &Value, target: &str, set: &Settings,
     match tool {
         "act" => dispatch_act(arguments, target, set, executor),
         "shell" => dispatch_shell(arguments, target, executor),
-        "inspect" => dispatch_inspect(arguments, turns),
-        "read" => dispatch_read(arguments, turns),
-        "write" => dispatch_write(arguments, turns),
+        "inspect" => dispatch_inspect(arguments, target, executor, turns),
+        "read" => dispatch_read(arguments, target, executor, turns),
+        "write" => dispatch_write(arguments, target, executor, turns),
         "apply" | "reject" => dispatch_box_resolve(tool, arguments),
         "backtrack" => dispatch_backtrack(arguments, target),
         "delete" => dispatch_delete(arguments),
@@ -813,23 +813,28 @@ fn dispatch_shell(args: &Value, target: &str, executor: Option<&dyn Executor>) -
     r.text
 }
 
-fn dispatch_inspect(args: &Value, turns: &[Turn]) -> String {
+fn dispatch_inspect(args: &Value, target: &str, executor: Option<&dyn Executor>,
+                    turns: &[Turn]) -> String {
     let Some(path) = args_str(args, "path") else {
         return "inspect: missing required `path`".to_string();
     };
     let loc = parse_locator(&path);
-    inspect(&loc, turns)
+    let root = executor.and_then(|e| e.box_root(&box_name(target)));
+    inspect(&loc, turns, root.as_deref())
 }
 
-fn dispatch_read(args: &Value, turns: &[Turn]) -> String {
+fn dispatch_read(args: &Value, target: &str, executor: Option<&dyn Executor>,
+                 turns: &[Turn]) -> String {
     let Some(path) = args_str(args, "path") else {
         return "read: missing required `path`".to_string();
     };
     let loc = parse_locator(&path);
-    read_path(&loc, turns)
+    let root = executor.and_then(|e| e.box_root(&box_name(target)));
+    read_path(&loc, turns, root.as_deref())
 }
 
-fn dispatch_write(args: &Value, turns: &[Turn]) -> String {
+fn dispatch_write(args: &Value, target: &str, executor: Option<&dyn Executor>,
+                  turns: &[Turn]) -> String {
     let Some(path) = args_str(args, "path") else {
         return "write: missing required `path`".to_string();
     };
@@ -838,7 +843,8 @@ fn dispatch_write(args: &Value, turns: &[Turn]) -> String {
     };
     let force = args_bool(args, "force");
     let loc = parse_locator(&path);
-    write_at_locator(&loc, &content, force, turns)
+    let root = executor.and_then(|e| e.box_root(&box_name(target)));
+    write_at_locator(&loc, &content, force, turns, root.as_deref())
 }
 
 fn dispatch_box_resolve(verb: &str, args: &Value) -> String {
