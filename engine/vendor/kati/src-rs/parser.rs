@@ -540,7 +540,9 @@ impl Parser {
     fn parse_endif(&mut self, line: Bytes) -> Result<()> {
         self.check_if_stack("endif")?;
         if !line.is_empty() {
-            error_loc!(Some(&self.loc), "extraneous text after `endif` directive");
+            // sarun: matches `else`/`ifeq`/`endef` siblings (warn, not
+            // error). Real make also warns rather than fatally exits.
+            warn_loc!(Some(&self.loc), "extraneous text after `endif' directive");
         }
         let num_nest = self.if_stack.last().unwrap().num_nest;
         for _ in 0..=num_nest {
