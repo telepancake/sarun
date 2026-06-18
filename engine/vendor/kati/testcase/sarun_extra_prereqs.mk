@@ -1,4 +1,3 @@
-# TODO(rust)
 .EXTRA_PREREQS := dep
 all:
 	@echo making-all

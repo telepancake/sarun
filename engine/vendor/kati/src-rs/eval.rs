@@ -243,6 +243,10 @@ pub struct Evaluator {
     pub rule_vars: HashMap<Symbol, Arc<Vars>>,
     pub rules: Vec<Rule>,
     pub exports: HashMap<Symbol, bool>,
+    /// sarun: set when the makefile names `.EXPORT_ALL_VARIABLES` as a
+    /// target. Causes every make-defined variable to be exported into
+    /// recipe environments, mirroring GNU make's behavior.
+    pub export_all_vars: bool,
     symbols_for_eval: HashSet<Symbol>,
 
     in_rule: bool,
@@ -289,6 +293,7 @@ impl Evaluator {
             rule_vars: HashMap::new(),
             rules: Vec::new(),
             exports: HashMap::new(),
+            export_all_vars: false,
             symbols_for_eval: HashSet::new(),
 
             in_rule: false,
