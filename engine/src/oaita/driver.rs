@@ -559,26 +559,75 @@ fn backtrack_behavioural_announcement(target: &str) -> Option<String> {
             n = cleans,
         ));
     }
-    // Unproductive: 2+ recent tool results errored. Suggest rewinding
-    // to a known good point with a waypoint summary, then trying a
-    // different approach.
+    // Errors piling up: surface OPTIONS, not FUD. Telling the model "you're
+    // going in circles, step back" reads as a closing gesture — a strong-
+    // compliance model (xiaomi/mimo) just emits finish_reason=stop and walks
+    // away. What we actually want is to widen the option space: enumerate
+    // tools the model HASN'T used in this run (each is a distinct lever it
+    // may have forgotten about) and the backtrack variants as factual moves,
+    // never as "the answer." No pre-commit prose, no urgency language.
     if errs >= 2 {
         let tid = first_user_id.as_deref().unwrap_or("<first-user-turn-id>");
-        return Some(format!(
-            "Stepping back for a moment: {errs} of my last {total} tool \
-             calls have come back with error markers. That's a sign I may \
-             be going in circles rather than making progress. The clean \
-             way to recover is to rewind to a known-good point with a \
-             short waypoint note, then try a different approach from there \
-             — the gesture is `backtrack(turn_id={tid:?}, inclusive=false, \
-             final=false, summary=<one-line note: what I tried, why it \
-             failed, what to try instead>)`. That keeps the original \
-             question but sheds the dead-end derivation. I'll do that \
-             now unless I'm genuinely one small fix away from working.",
-            total = recent_tools.len(),
-        ));
+        let used = used_tools_so_far(&turns);
+        // Tools worth surfacing as fresh levers. `apply`/`reject`/`delete`
+        // are sub-agent housekeeping, not new approaches, so leave them off
+        // this list — they show up via unhandled_subtasks_announcement.
+        let candidates = ["act", "inspect", "read", "shell", "write"];
+        let unused: Vec<&str> = candidates.iter().copied()
+            .filter(|n| !used.contains(*n)).collect();
+        let mut lines: Vec<String> = Vec::new();
+        lines.push(format!(
+            "Quick options inventory at this point. My recent tool calls \
+             have been hitting errors, so it's worth taking stock of what \
+             else the harness offers — these are available levers, none \
+             is required:"));
+        for t in &unused {
+            let blurb = match *t {
+                "act" => "act(request=…) — spawn a fresh sub-agent in its \
+                          own box; it runs from a clean state and returns \
+                          only the result, useful for trying a different \
+                          approach without polluting this line of work.",
+                "inspect" => "inspect(path=…) — paged structural view of a \
+                              file or directory; cheaper than blind shell \
+                              when I need to see what's actually there.",
+                "read" => "read(path=…) — byte-faithful slice of a file via \
+                           the same locator grammar inspect uses.",
+                "shell" => "shell(script=…) — run a script inside the box; \
+                            writes stage for review.",
+                "write" => "write(path=…, content=…) — replace a file or a \
+                            named range; same overlay shell writes use.",
+                _ => continue,
+            };
+            lines.push(format!("  • {blurb}"));
+        }
+        lines.push(format!(
+            "  • backtrack(turn_id={tid:?}, inclusive=false, final=false, \
+             summary=…) — rewind to a clean state with `summary` kept as a \
+             waypoint note; the rest of the dead-end derivation is dropped. \
+             Useful for compressing what I've learned into one line and \
+             continuing from there with the original question intact."));
+        lines.push(format!(
+            "  • backtrack(turn_id={tid:?}, inclusive=false, final=true, \
+             summary=<my answer>) — ship the answer; the harness collapses \
+             the session to {{question, summary}}."));
+        return Some(lines.join("\n"));
     }
     None
+}
+
+/// Tool names the model has called in this session so far (used to compute
+/// "unused levers" for the options-inventory announcement).
+fn used_tools_so_far(turns: &[crate::oaita::turns::Turn]) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    for t in turns {
+        if t.kind != "assistant" || !t.flags.contains('c') { continue; }
+        let Ok(body) = t.read() else { continue; };
+        let Ok(v) = serde_json::from_str::<Value>(&body) else { continue; };
+        if let Some(name) = v.get("tool").and_then(Value::as_str) {
+            out.insert(name.to_string());
+        }
+    }
+    out
 }
 
 /// Build the system-message announcement for `outer`'s next generation:
