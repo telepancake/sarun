@@ -43,6 +43,10 @@ pub enum AssignOp {
     ColonEq,
     PlusEq,
     QuestionEq,
+    // sarun: `!=` shell-assign (GNU make 4.0+). RHS is run through the
+    // shell at assignment time; output is stored as a simply-expanded
+    // value with internal newlines converted to spaces.
+    BangEq,
 }
 
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]

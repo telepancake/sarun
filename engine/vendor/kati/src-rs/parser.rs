@@ -714,6 +714,9 @@ pub fn split_define_assign_op(line: &[u8]) -> (&[u8], AssignOp) {
         if let Some(name) = rest_t.strip_suffix(b"?") {
             return (trim_right_space(name), AssignOp::QuestionEq);
         }
+        if let Some(name) = rest_t.strip_suffix(b"!") {
+            return (trim_right_space(name), AssignOp::BangEq);
+        }
         return (rest_t, AssignOp::Eq);
     }
     (trimmed, AssignOp::Eq)
@@ -737,6 +740,9 @@ pub fn parse_assign_statement(line: &[u8], sep: usize) -> ParsedAssign<'_> {
     } else if lhs.ends_with(b"?") {
         lhs = &lhs[..lhs.len() - 1];
         op = AssignOp::QuestionEq;
+    } else if lhs.ends_with(b"!") {
+        lhs = &lhs[..lhs.len() - 1];
+        op = AssignOp::BangEq;
     }
     lhs = trim_space(lhs);
     let rhs = trim_left_space(&line[line.len().min(sep + 1)..]);

@@ -459,6 +459,26 @@ impl Evaluator {
                     );
                 }
             }
+            AssignOp::BangEq => {
+                prev = self.peek_var_in_current_scope(lhs);
+                // sarun: `X != cmd` — run cmd through the shell at assign
+                // time, store output as a simply-expanded value. Real make
+                // converts internal newlines to spaces and strips trailing
+                // whitespace, which is what shell_func_impl's
+                // format_for_command_substitution does for us.
+                let cmd_buf = rhs_v.eval_to_buf(self)?;
+                let loc = self.loc.clone().unwrap_or_default();
+                let shell = self.get_shell()?;
+                let shellflag = self.get_shell_flag();
+                let (_exit, output, _fc) =
+                    crate::func::shell_func_impl(&shell, shellflag, &cmd_buf, &loc)?;
+                result = Variable::with_simple_string(
+                    output,
+                    origin,
+                    current_frame,
+                    self.loc.clone(),
+                );
+            }
         }
 
         if let Some(prev) = prev {

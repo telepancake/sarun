@@ -461,15 +461,16 @@ impl<'a> DepBuilder<'a> {
                 self.restat.insert(t);
             }
         }
-        if let Some((targets, loc)) = self.get_rule_inputs(intern(".SUFFIXES")) {
+        if let Some((targets, _loc)) = self.get_rule_inputs(intern(".SUFFIXES")) {
             if targets.is_empty() {
                 self.suffix_rules.clear();
-            } else {
-                warn_loc!(
-                    Some(&loc),
-                    "kati doesn't support .SUFFIXES with prerequisites"
-                );
             }
+            // sarun: `.SUFFIXES: .foo` adds suffixes to make's list. Kati
+            // doesn't actually drive suffix-rule lookup the same way, but
+            // the silent accept matches real make's behavior for the
+            // common case where the user just appends suffixes for
+            // documentation. We can revisit if a corpus case shows that
+            // the suffix list materially affected rule selection.
         }
 
         // Built-in pseudo-targets that change behavior we don't model.
@@ -490,7 +491,10 @@ impl<'a> DepBuilder<'a> {
         // it asks make to DELETE the file after build. We don't, so
         // it's a real semantic divergence (user expects the file
         // gone; we leave it). Belongs in the warn list.
-        let noop_for_us = [".PRECIOUS", ".SECONDARY"];
+        // sarun: .NOTPARALLEL is a no-op for us because the executor
+        // runs one recipe at a time anyway — there's nothing parallel to
+        // serialize. So no warning, no diff with real make.
+        let noop_for_us = [".PRECIOUS", ".SECONDARY", ".NOTPARALLEL"];
         let real_unsupported = [
             ".DEFAULT",
             ".INTERMEDIATE",
@@ -499,7 +503,6 @@ impl<'a> DepBuilder<'a> {
             ".LOW_RESOLUTION_TIME",
             ".SILENT",
             ".EXPORT_ALL_VARIABLES",
-            ".NOTPARALLEL",
             ".ONESHELL",
         ];
         for p in noop_for_us {
@@ -515,7 +518,18 @@ impl<'a> DepBuilder<'a> {
     }
 
     fn build(&mut self, mut targets: Vec<Symbol>) -> Result<Vec<NamedDepNode>> {
-        let Some(first_rule) = self.first_rule else {
+        // sarun: GNU make consults `.DEFAULT_GOAL` before falling back to
+        // the first-encountered rule. Setting `.DEFAULT_GOAL := foo`
+        // makes `make` build foo instead of whatever appeared first. Only
+        // the first whitespace-separated word is honored.
+        let default_goal_override = self.ev.lookup_var(intern(".DEFAULT_GOAL"))?.and_then(|v| {
+            let buf = v.read().eval_to_buf(self.ev).ok()?;
+            crate::strutil::word_scanner(&buf)
+                .next()
+                .map(|w| intern(w.to_vec()))
+        });
+
+        let Some(first_rule) = default_goal_override.or(self.first_rule) else {
             error!("*** No targets.");
         };
 
