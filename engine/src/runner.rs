@@ -30,6 +30,19 @@ use crate::paths;
 const UI_SOCK_INBOX: &str = "/tmp/.slopbox/ui.sock";
 const KIDS_DIR: &str = ".slopbox-kids";
 
+/// Standard CA bundle paths the augmented bundle is bound over. Distro
+/// coverage as of 2026: Debian/Ubuntu (ca-certificates.crt), RHEL/Fedora
+/// (tls/certs/ca-bundle.crt + the .pem twin), Alpine (cert.pem). `--ro-bind-try`
+/// silently skips paths the box's filesystem doesn't ship.
+const CA_BUNDLE_TARGETS: &[&str] = &[
+    "/etc/ssl/certs/ca-certificates.crt",
+    "/etc/pki/tls/certs/ca-bundle.crt",
+    "/etc/pki/tls/certs/ca-bundle.trust.crt",
+    "/etc/ssl/cert.pem",
+    "/etc/ssl/ca-bundle.pem",
+    "/var/lib/ca-certificates/ca-bundle.pem",
+];
+
 fn pidfd_open(pid: i32) -> i32 {
     unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as i32 }
 }
@@ -210,7 +223,9 @@ fn tty_restore(tty_fd: Option<i32>, old_fg: Option<i32>,
 }
 
 pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
-           pty: bool, brush: bool, chdir: Option<String>, cmd: Vec<String>) -> i32 {
+           pty: bool, brush: bool, chdir: Option<String>,
+           net_mode: crate::net::NetMode,
+           cmd: Vec<String>) -> i32 {
     if cmd.is_empty() {
         eprintln!("sarun-engine run: no command after --");
         return 2;
@@ -258,6 +273,7 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
                          "want_direct": direct,
                          "want_env": env,
                          "want_brush": brush,
+                         "net_mode": net_mode.as_str(),
                          // Advisory: the engine reruns iff a sibling NAME exists.
                          // A named launch is always rerun-eligible.
                          "want_rerun": name.is_some()});
@@ -366,8 +382,78 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
         bwrap.args(["--setenv", "SARUN_BRUSH_SH", "1"]);
     }
     bwrap.args(["--unshare-pid", "--unshare-ipc", "--unshare-uts",
-                "--die-with-parent",
-                "--chdir", &cwd, "--"]);
+                "--die-with-parent"]);
+    // Netns dispatch (driven by ack info the engine already prepared based on
+    // the register's net_mode):
+    //   Off  → bwrap --unshare-net  (brand new empty netns; dials fail closed)
+    //   Tap  → engine pre-equipped a netns; ack carries its /proc/<a>/ns/net.
+    //          We open the fd here and Command::pre_exec setns(2)'s the bwrap
+    //          child into it. No --unshare-net → inherits the equipped netns.
+    //   Host → no --unshare-net (box shares the engine's host netns).
+    let netns_path = ack.get("netns_path").and_then(Value::as_str)
+        .map(|s| s.to_string());
+    let dns_ip = ack.get("dns_ip").and_then(Value::as_str)
+        .map(|s| s.to_string()).unwrap_or_default();
+    let ca_pem_path = ack.get("ca_pem_path").and_then(Value::as_str)
+        .map(|s| s.to_string()).unwrap_or_default();
+    match net_mode {
+        crate::net::NetMode::Off => { bwrap.arg("--unshare-net"); }
+        crate::net::NetMode::Host => { /* leave host netns */ }
+        crate::net::NetMode::Tap => {
+            if let Some(p) = netns_path.clone() {
+                // Open the netns fd once HERE (parent), then setns in pre_exec
+                // in the child. The fd is kept open for the lifetime of the
+                // bwrap child via FD_CLOEXEC clear → bwrap inherits it.
+                let fd = unsafe { libc::open(
+                    std::ffi::CString::new(p.as_bytes()).unwrap().as_ptr(),
+                    libc::O_RDONLY | libc::O_CLOEXEC) };
+                if fd < 0 {
+                    eprintln!("sarun-engine: open netns {p}: {}",
+                              std::io::Error::last_os_error());
+                    return 1;
+                }
+                use std::os::unix::process::CommandExt;
+                unsafe {
+                    bwrap.pre_exec(move || {
+                        if libc::setns(fd, libc::CLONE_NEWNET) != 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+            } else {
+                eprintln!("sarun-engine: -n requested but engine returned no \
+                           netns_path");
+                return 1;
+            }
+        }
+    }
+    if !ca_pem_path.is_empty() {
+        // CA bundle augmentation (sakar parity): bind the augmented bundle
+        // over each common system CA path, and set the major library envs so
+        // tools that read their own env-var path also pick up our root.
+        for tgt in CA_BUNDLE_TARGETS {
+            bwrap.arg("--ro-bind-try").arg(&ca_pem_path).arg(tgt);
+        }
+        for (k, v) in [("SSL_CERT_FILE", ca_pem_path.as_str()),
+                       ("CURL_CA_BUNDLE", &ca_pem_path),
+                       ("NODE_EXTRA_CA_CERTS", &ca_pem_path),
+                       ("REQUESTS_CA_BUNDLE", &ca_pem_path),
+                       ("GIT_SSL_CAINFO", &ca_pem_path)] {
+            bwrap.args(["--setenv", k, v]);
+        }
+    }
+    if !dns_ip.is_empty() {
+        // resolv.conf override: the box's stub resolver dials the engine's
+        // gateway IP for DNS. One synthetic file under the runner's tempdir,
+        // bound over /etc/resolv.conf inside the box.
+        let resolv = format!("nameserver {dns_ip}\n");
+        let tmp = std::env::temp_dir().join(format!("sarun-resolv-{}", std::process::id()));
+        let _ = std::fs::write(&tmp, resolv);
+        let tmp_s = tmp.to_string_lossy().into_owned();
+        bwrap.args(["--ro-bind", &tmp_s, "/etc/resolv.conf"]);
+    }
+    bwrap.args(["--chdir", &cwd, "--"]);
     let status = bwrap.args(&inner_args).args(&cmd).status();
     drop(conn); // our copy; inner (in the box) is the channel's sole holder now
     match status {

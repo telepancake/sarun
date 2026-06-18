@@ -14,6 +14,8 @@ use std::time::Duration;
 use fuser::Config;
 use fuser::MountOption;
 
+pub use net::NetMode;
+
 mod brush;
 mod capture;
 mod control;
@@ -110,6 +112,13 @@ fn serve() -> i32 {
     };
     let state: control::State = Default::default();
     state.lock().unwrap().overlay = Some(ov.clone());
+    // Engine-side networking registry. Lazily loaded — only `-n` boxes will
+    // ever invoke it. Failure here (e.g. can't write the CA dir) is not
+    // fatal: `-n` will refuse at register time, other modes work normally.
+    match net::Net::new() {
+        Ok(n) => state.lock().unwrap().net = Some(std::sync::Arc::new(n)),
+        Err(e) => eprintln!("sarun-engine: net init failed (-n disabled): {e}"),
+    }
     println!("sarun-engine: listening · {}  ·  overlay {}",
              sock.display(), mnt.display());
     // Engine -> UI event broadcaster. Lives for the engine process's
@@ -370,6 +379,7 @@ fn main() {
             let mut brush = false;
             let mut chdir: Option<String> = None;
             let mut name: Option<String> = None;
+            let mut net_mode = NetMode::Off;
             let mut it = pre.iter();
             while let Some(a) = it.next() {
                 match a.as_str() {
@@ -388,10 +398,20 @@ fn main() {
                     //     recorded), except under -d which has no overlay.
                     "-b" => brush = true,
                     "-C" => chdir = it.next().cloned(),
+                    // -n  network: per-box netns with a TAP whose other end
+                    //     terminates at the engine's userland TCP/IP stack
+                    //     (DHCP, DNS, MITM proxy). Outbound from box's POV is
+                    //     ordinary; engine originates the real upstream sockets
+                    //     in the host netns. See engine/src/net/mod.rs.
+                    // -N  no netns: keep the host network namespace (the
+                    //     pre-default-empty behavior; useful for boxes that
+                    //     need to dial localhost services or your VPN).
+                    "-n" => net_mode = NetMode::Tap,
+                    "-N" => net_mode = NetMode::Host,
                     _ => if name.is_none() { name = Some(a.clone()); },
                 }
             }
-            std::process::exit(runner::run(name, passthrough, direct, env, pty, brush, chdir, cmd));
+            std::process::exit(runner::run(name, passthrough, direct, env, pty, brush, chdir, net_mode, cmd));
         }
         Some("inner") => {
             // inner --conn-fd N -- CMD...
