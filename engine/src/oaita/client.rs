@@ -128,6 +128,17 @@ impl Client {
             obj.insert("stream".into(), json!(true));
         }
         let mut resp = self.send(path, body).await?;
+        // Non-2xx — read the error body and surface it. Without this, an
+        // OpenAI-style {"error":{"message":...}} reply has no `data:` lines,
+        // the SSE loop sees nothing, gen claims success, and you get an
+        // empty assistant turn with no idea why.
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.body_mut().collect().await
+                .map(|c| c.to_bytes()).unwrap_or_default();
+            let preview = String::from_utf8_lossy(&body[..body.len().min(2048)]);
+            return Err(format!("upstream {status}: {preview}"));
+        }
         let mut buf = Vec::<u8>::new();
         while let Some(frame) = resp.body_mut().frame().await {
             let frame = frame.map_err(|e| format!("stream frame: {e}"))?;
@@ -223,6 +234,12 @@ fn find_double_newline(buf: &[u8]) -> Option<usize> {
 }
 
 fn default_tls_connector() -> tokio_rustls::TlsConnector {
+    // rustls 0.23 fails its auto-pick when more than one rustls user is
+    // linked into the binary (we have both the MITM proxy half of `-n`
+    // boxes and now this client). Install `ring` explicitly the first
+    // time we build a connector; subsequent calls hit the already-set
+    // branch and return an error we ignore.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let mut root_store = rustls::RootCertStore::empty();
     // Pull the host trust store via rustls-native-certs is the usual route,
     // but we don't have it in deps; the augmented CA bundle in the box is
