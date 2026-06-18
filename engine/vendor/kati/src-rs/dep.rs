@@ -514,7 +514,6 @@ impl<'a> DepBuilder<'a> {
             self.secondexpansion = true;
         }
         let real_unsupported = [
-            ".DEFAULT",
             ".INTERMEDIATE",
             ".IGNORE",
             ".LOW_RESOLUTION_TIME",
@@ -903,39 +902,15 @@ impl<'a> DepBuilder<'a> {
 
         let output_str = output.as_bytes();
         let Some(output_suffix) = get_ext(&output_str) else {
-            if rule_merger.is_some() {
-                return Some(PickedRuleInfo {
-                    merger: rule_merger,
-                    pattern_rule: None,
-                    vars,
-                });
-            } else {
-                return None;
-            }
+            return self.try_default_or_merger(rule_merger, output, vars);
         };
         if !output_suffix.starts_with(b".") {
-            if rule_merger.is_some() {
-                return Some(PickedRuleInfo {
-                    merger: rule_merger,
-                    pattern_rule: None,
-                    vars,
-                });
-            } else {
-                return None;
-            }
+            return self.try_default_or_merger(rule_merger, output, vars);
         }
         let output_suffix = &output_suffix[1..];
 
         let Some(found) = self.suffix_rules.get(output_suffix) else {
-            if rule_merger.is_some() {
-                return Some(PickedRuleInfo {
-                    merger: rule_merger,
-                    pattern_rule: None,
-                    vars,
-                });
-            } else {
-                return None;
-            }
+            return self.try_default_or_merger(rule_merger, output, vars);
         };
 
         for irule in found {
@@ -964,15 +939,38 @@ impl<'a> DepBuilder<'a> {
             });
         }
 
+        self.try_default_or_merger(rule_merger, output, vars)
+    }
+
+    /// sarun: final fallback in pick_rule. If the target has its own
+    /// rule_merger, use it. Otherwise, if GNU make's `.DEFAULT:` rule
+    /// is defined and the target isn't itself a special target, run
+    /// the .DEFAULT recipe (with $@ bound to the missing target).
+    /// If neither applies, return None.
+    fn try_default_or_merger(
+        &self,
+        rule_merger: Option<Arc<Mutex<RuleMerger>>>,
+        output: Symbol,
+        vars: Option<Arc<Vars>>,
+    ) -> Option<PickedRuleInfo> {
         if rule_merger.is_some() {
-            Some(PickedRuleInfo {
+            return Some(PickedRuleInfo {
                 merger: rule_merger,
                 pattern_rule: None,
                 vars,
-            })
-        } else {
-            None
+            });
         }
+        if !is_special_target(&output)
+            && let Some(default_merger) = self.lookup_rule_merger(intern(".DEFAULT"))
+            && default_merger.lock().primary_rule.is_some()
+        {
+            return Some(PickedRuleInfo {
+                merger: Some(default_merger),
+                pattern_rule: None,
+                vars,
+            });
+        }
+        None
     }
 
     fn build_plan(
