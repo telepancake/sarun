@@ -1116,6 +1116,21 @@ fn handle_pty_spawn(msg: &Value, writer: &mut UnixStream, prebuf: Vec<u8>) {
     }
     let rows = msg.get("rows").and_then(Value::as_u64).unwrap_or(24) as u16;
     let cols = msg.get("cols").and_then(Value::as_u64).unwrap_or(80) as u16;
+    // cwd: the UI's $PWD at the moment it sent the spawn — what the user
+    // sees as "where I am". Without this the child inherits the engine
+    // daemon's cwd (whatever it was when the daemon started, usually $HOME)
+    // and `bash -i` opens in the wrong dir. Engine daemon is long-lived so
+    // its own cwd is unreliable; the UI's is correct per-launch.
+    let cwd: Option<std::path::PathBuf> = msg.get("cwd").and_then(Value::as_str)
+        .map(std::path::PathBuf::from);
+    // env: portable_pty's CommandBuilder starts from a MINIMAL env by
+    // default — SHELL/HOME/USER/PATH absent, so `bash -i` lands in a
+    // broken shell. The UI ships its own envvars and we lay them on top
+    // of the daemon's so the user gets a normal session.
+    let env: Vec<(String, String)> = msg.get("env").and_then(Value::as_object)
+        .map(|m| m.iter().filter_map(|(k, v)|
+            v.as_str().map(|s| (k.clone(), s.to_string()))).collect())
+        .unwrap_or_default();
     // Ack BEFORE the frame mux begins so the client knows to switch to frames.
     if writer.write_all(b"{\"ok\":true,\"r\":\"pty\"}\n").is_err() {
         return;
@@ -1126,7 +1141,8 @@ fn handle_pty_spawn(msg: &Value, writer: &mut UnixStream, prebuf: Vec<u8>) {
         Err(_) => return,
     };
     let chan = Prebuffered { pre: prebuf, pos: 0, inner: stream };
-    crate::pty::serve_pty(&argv, rows, cols, chan, None);
+    crate::pty::serve_pty(&argv, rows, cols, chan, None,
+                          cwd.as_deref(), &env);
 }
 
 fn handle(state: State, conn: UnixStream) {

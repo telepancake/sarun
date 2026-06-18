@@ -93,8 +93,14 @@ impl tui_term::vt100::Callbacks for ProxyCallbacks {
 ///
 /// `client` must be readable AND writable (a UnixStream, or in tests a
 /// socketpair end). Returns the child's exit code (best-effort; 0 if unknown).
+/// `cwd` is the working directory the child is launched in (the UI's $PWD
+/// when it sent pty_spawn). `env` is a list of (KEY, VAL) pairs piled on
+/// top of the engine's own environment, so the child sees the UI user's
+/// SHELL / HOME / PATH instead of the daemon's minimal env.
 pub fn serve_pty<C>(argv: &[String], rows: u16, cols: u16,
-                    mut client: C, sink: Option<Sink>) -> i32
+                    mut client: C, sink: Option<Sink>,
+                    cwd: Option<&std::path::Path>,
+                    env: &[(String, String)]) -> i32
 where
     C: Read + Write + Send + 'static + CloneStream,
 {
@@ -112,6 +118,8 @@ where
     for a in &argv[1..] {
         cmd.arg(a);
     }
+    if let Some(d) = cwd { cmd.cwd(d); }
+    for (k, v) in env { cmd.env(k, v); }
     let mut child = match pair.slave.spawn_command(cmd) {
         Ok(c) => c,
         Err(e) => {
@@ -329,7 +337,7 @@ mod tests {
             serve_pty(
                 &["sh".into(), "-c".into(),
                   "echo MARKER-ENGINE-PTY; echo second-row".into()],
-                24, 80, engine_end, None)
+                24, 80, engine_end, None, None, &[])
         });
         let stream = drain_to_eof(client_end);
         let _ = h.join();
@@ -350,7 +358,7 @@ mod tests {
             serve_pty(
                 &["printf".into(),
                   "\\033[2J\\033[H\\033[1mBOLD-ENGINE\\033[0m end".into()],
-                24, 80, engine_end, None)
+                24, 80, engine_end, None, None, &[])
         });
         let stream = drain_to_eof(client_end);
         let _ = h.join();
@@ -369,7 +377,7 @@ mod tests {
             serve_pty(
                 &["sh".into(), "-c".into(),
                   "read line; echo GOT:$line".into()],
-                24, 80, engine_end, None)
+                24, 80, engine_end, None, None, &[])
         });
         // Drive a keystroke as the client would: a FRAME_PTY_DATA frame.
         let key = frames::encode(frames::FRAME_PTY_DATA, b"ping-from-ui\n");
@@ -394,7 +402,7 @@ mod tests {
                 &["sh".into(), "-c".into(),
                   // small sleep so the resize frame is applied before stty runs
                   "sleep 0.3; stty size".into()],
-                24, 80, engine_end, None)
+                24, 80, engine_end, None, None, &[])
         });
         let rz = frames::encode(frames::FRAME_PTY_RESIZE,
                                 &frames::pty_resize_payload(40, 100));
@@ -431,7 +439,7 @@ mod tests {
                    dd ibs=1 count=13 2>/dev/null | od -An -c | tr -d '\\n' | \
                        awk '{print \"REPLY:\" $0}'; \
                    stty sane 2>/dev/null".into()],
-                24, 80, engine_end, None)
+                24, 80, engine_end, None, None, &[])
         });
         let stream = drain_to_eof(client_end);
         let _ = h.join();
@@ -454,7 +462,7 @@ mod tests {
         let (engine_end, client_end) = UnixStream::pair().expect("socketpair");
         let h = std::thread::spawn(move || {
             serve_pty(&["definitely-not-a-real-binary-xyzzy".into()],
-                      24, 80, engine_end, None)
+                      24, 80, engine_end, None, None, &[])
         });
         let stream = drain_to_eof(client_end);
         let rc = h.join().unwrap();
@@ -489,7 +497,7 @@ mod tests {
         let h = std::thread::spawn(move || {
             serve_pty(
                 &["sh".into(), "-c".into(), "echo RECORDED-MARKER".into()],
-                24, 80, engine_end, Some(sink_dyn))
+                24, 80, engine_end, Some(sink_dyn), None, &[])
         });
         let _ = drain_to_eof(client_end);
         let _ = h.join();
