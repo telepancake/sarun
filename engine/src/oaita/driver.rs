@@ -387,7 +387,11 @@ fn dispatch_act(args: &Value, outer: &str, set: &Settings,
     let Some(exe) = executor else {
         return "act: no executor (sandbox disabled) — cannot delegate".to_string();
     };
-    let r = exe.run(&inner_box, &script, false);
+    // act sub-agents are `oaita run` PROCESSES IN A BOX — they need the
+    // engine binary on PATH and proxy access for the LLM call. Pass --api
+    // so the runner binds /usr/local/bin/{oaita,sarun} AND admits the
+    // box on the proxy gate.
+    let r = exe.run(&inner_box, &script, false, /*api_access=*/true);
     format_act_result(&r, &inner)
 }
 
@@ -417,7 +421,9 @@ fn dispatch_shell(args: &Value, target: &str, executor: Option<&dyn Executor>) -
     let Some(exe) = executor else {
         return "shell: no executor (sandbox disabled) — pass --sarun to enable".to_string();
     };
-    let r = exe.run(&box_name(target), &script, discard);
+    // Plain shell tool calls: no API proxy access (the script is user code,
+    // not an oaita sub-agent). Cf. dispatch_act which sets api_access=true.
+    let r = exe.run(&box_name(target), &script, discard, /*api_access=*/false);
     r.text
 }
 

@@ -16,7 +16,14 @@ pub trait Executor: Send + Sync {
     /// Run a script in a session-owned box, capture stdout+stderr+rc, and
     /// describe the staged changes (`patch_text`-style). `box_id` is the
     /// session-derived box name (UPPERCASE — see `box_name`).
-    fn run(&self, box_id: &str, script: &str, discard: bool) -> ExecResult;
+    ///
+    /// `api_access` — when true, launch the box with `--api`: the engine
+    /// binary is bound at /usr/local/bin/{oaita,sarun} so an in-box
+    /// `oaita run …` resolves, AND the API proxy admits the box. This is
+    /// what `act` sub-agents need (they ARE `oaita run` processes in a
+    /// box). Plain `shell` tool calls pass false — no need for proxy
+    /// access on user scripts.
+    fn run(&self, box_id: &str, script: &str, discard: bool, api_access: bool) -> ExecResult;
 }
 
 /// The persistent-box name for a session. Capital-letters prefix keeps it
@@ -39,6 +46,17 @@ impl SarunExecutor {
     }
 }
 
+/// Drop sarun's own status lines from a captured stderr so they don't
+/// pollute the tool result that flows back to the model. The runner emits
+/// one informational `sarun-engine: box N (overlay root: ...) UI connected`
+/// per launch; that's noise to the LLM, never something it can act on.
+fn filter_sarun_noise(stderr: &str) -> String {
+    stderr.lines()
+        .filter(|l| !l.starts_with("sarun-engine:"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Try `./sarun` first (sibling next to a symlinked oaita); else `sarun` on
 /// PATH; else current_exe (when invoked via subcommand we already ARE sarun).
 fn default_sarun() -> String {
@@ -57,22 +75,26 @@ fn default_sarun() -> String {
 }
 
 impl Executor for SarunExecutor {
-    fn run(&self, box_id: &str, script: &str, discard: bool) -> ExecResult {
+    fn run(&self, box_id: &str, script: &str, discard: bool, api_access: bool) -> ExecResult {
         // For discard mode use a one-shot PEEK box; for the persistent case
         // run into `box_id`. Either way we get capture + overlay.
         let target = if discard { format!("{box_id}-PEEK") } else { box_id.to_string() };
         crate::oaita::trace::event("exec.run", serde_json::json!({
-            "box": target, "discard": discard, "script_len": script.len(),
+            "box": target, "discard": discard, "api_access": api_access,
+            "script_len": script.len(),
         }));
-        let out = Command::new(&self.sarun)
-            .args(["run", &target, "--", "sh", "-c", script])
+        let mut cmd = Command::new(&self.sarun);
+        cmd.arg("run");
+        if api_access { cmd.arg("--api"); }
+        let out = cmd
+            .args([&target, "--", "sh", "-c", script])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output();
         let (stdout, stderr, rc) = match out {
             Ok(o) => (String::from_utf8_lossy(&o.stdout).into_owned(),
-                      String::from_utf8_lossy(&o.stderr).into_owned(),
+                      filter_sarun_noise(&String::from_utf8_lossy(&o.stderr)),
                       o.status.code().unwrap_or(-1)),
             Err(e) => return ExecResult {
                 text: format!("error: cannot run sarun: {e}"),
@@ -89,9 +111,12 @@ impl Executor for SarunExecutor {
             .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
             .unwrap_or_default();
         let changes = summarize_patch(&patch, CHANGES_BUDGET);
-        // Discard mode: tell sarun to throw away the box (no review).
+        // Discard mode: tell sarun to throw away the box (no review). Send
+        // stdout to /dev/null so the "OAITA-XXX-PEEK: 0 discard" CLI status
+        // doesn't leak — the model only ever cares about its script's output.
         if discard {
-            let _ = Command::new(&self.sarun).args([&target, "discard"]).status();
+            let _ = Command::new(&self.sarun).args([&target, "discard"])
+                .stdout(Stdio::null()).stderr(Stdio::null()).status();
         }
         let output_budget = RESULT_BUDGET.saturating_sub(changes.len() + 32);
         let trimmed = fit_output(&combined, output_budget);
@@ -112,7 +137,7 @@ impl Executor for SarunExecutor {
 pub struct LocalExecutor;
 
 impl Executor for LocalExecutor {
-    fn run(&self, _box_id: &str, script: &str, _discard: bool) -> ExecResult {
+    fn run(&self, _box_id: &str, script: &str, _discard: bool, _api_access: bool) -> ExecResult {
         let out = Command::new("sh")
             .args(["-c", script])
             .stdin(Stdio::null())

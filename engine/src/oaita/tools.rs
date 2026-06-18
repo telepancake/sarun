@@ -104,7 +104,12 @@ fn shell_spec() -> ToolSpec {
              staged in the box (changes stay STAGED until resolved — they do \
              not touch the host). Set `discard` true for a read-only look: \
              the script runs in a throwaway box discarded right after — \
-             output comes back, nothing stays staged.".to_string(),
+             output comes back, nothing stays staged. \
+             IMPORTANT: /tmp is a FRESH tmpfs on every shell call (it is not \
+             part of the overlay) — files written there in one call are GONE \
+             by the next call. To persist state ACROSS shell calls, write to \
+             /root, $HOME, /var, or any other path (those go through the \
+             overlay and persist for the session).".to_string(),
         parameters: json!({
             "type": "object",
             "properties": {
