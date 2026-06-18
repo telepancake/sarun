@@ -174,9 +174,15 @@ fn fetch_oci_layout(path: &Path) -> Result<PulledImage> {
         .context("parse index.json")?;
     let descs = idx.get("manifests").and_then(|v| v.as_array())
         .ok_or_else(|| anyhow!("index.json has no manifests array"))?;
+    // Multi-arch index: prefer a manifest descriptor matching the host's
+    // architecture+os (e.g. amd64/linux). Falls back to the first descriptor
+    // when none matches — better than failing, in case the index lacks
+    // platform tags (single-arch index, or producer didn't annotate).
+    let (host_arch, host_os) = host_platform();
     let manifest_digest = descs.iter()
-        .filter_map(|d| d.get("digest").and_then(|v| v.as_str()))
-        .next()
+        .find(|d| matches_platform(d, &host_arch, &host_os))
+        .or_else(|| descs.first())
+        .and_then(|d| d.get("digest").and_then(|v| v.as_str()))
         .ok_or_else(|| anyhow!("no manifest digest in index.json"))?;
     let manifest_bytes = read_blob_by_digest(path, manifest_digest)?;
     let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)
@@ -225,6 +231,32 @@ fn tempdir_for_archive() -> Result<PathBuf> {
     let _ = std::fs::remove_dir_all(&base);
     std::fs::create_dir_all(&base)?;
     Ok(base)
+}
+
+/// Host platform tuple in OCI naming. The OS is always "linux" on this
+/// engine; the arch maps Rust's target_arch to OCI's name (amd64/arm64/etc.).
+fn host_platform() -> (String, String) {
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        "x86" => "386",
+        "arm" => "arm",
+        "powerpc64" => "ppc64le",
+        "riscv64" => "riscv64",
+        "s390x" => "s390x",
+        other => other,
+    };
+    (arch.to_string(), "linux".to_string())
+}
+
+/// Does an index manifest descriptor's platform field match the host?
+/// A descriptor without a platform field is treated as a NON-match (so the
+/// host-arch entry, if present, is preferred). The first-fallback caller
+/// handles the no-match-but-some-entry case.
+fn matches_platform(desc: &serde_json::Value, arch: &str, os: &str) -> bool {
+    let Some(p) = desc.get("platform") else { return false; };
+    p.get("architecture").and_then(|v| v.as_str()) == Some(arch)
+        && p.get("os").and_then(|v| v.as_str()) == Some(os)
 }
 
 fn read_blob_by_digest(layout: &Path, digest: &str) -> Result<Vec<u8>> {
@@ -349,6 +381,31 @@ fn ingest_layer(b: &BoxState, blob: &[u8], media_type: &str) -> Result<()> {
     ar.set_preserve_mtime(true);
     // Phony writer row id: at-rest ingest has no process attribution.
     let writer = 0i64;
+    // Tar producers are NOT required to emit a Directory entry for every
+    // parent dir before the contents inside it (mtree-style implicit dirs).
+    // Without an explicit Dir row, FUSE's lookup of `foo/bar` returns ENOENT
+    // even though `foo/bar/baz` lives in this layer — so `ls /foo/bar` would
+    // fail. We track which dir rels we've already materialized and create a
+    // mode-0o755 placeholder for any ancestor missing one as we walk entries.
+    let mut ensured_dirs: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let ensure_ancestors = |b: &BoxState, rel: &str,
+                            ensured: &mut std::collections::HashSet<String>| {
+        let mut acc = String::new();
+        for comp in rel.split('/') {
+            if acc.is_empty() { acc.push_str(comp); }
+            else { acc.push('/'); acc.push_str(comp); }
+            // The leaf itself isn't an ancestor — only stop one shy.
+            if acc == rel { break; }
+            if ensured.insert(acc.clone()) {
+                // Don't clobber a non-Dir row a real entry will set later.
+                if !matches!(b.entry(&acc),
+                    Some(crate::capture::Entry::Dir { .. })) {
+                    b.set_dir(&acc, 0o755, 0);
+                }
+            }
+        }
+    };
     for entry in ar.entries().context("read tar entries")? {
         let mut e = entry.context("tar entry")?;
         // Use Entry::path / link_name, NOT header().path() — the Entry-level
@@ -374,13 +431,22 @@ fn ingest_layer(b: &BoxState, blob: &[u8], media_type: &str) -> Result<()> {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
         // ── AUFS/OCI whiteout convention ──
-        //   .wh..wh..opq  → opaque-dir marker (mask the lower at this dir's parent);
-        //                   not yet honored by overlay's children_of — log + skip.
+        //   .wh..wh..opq  → opaque-dir marker (mask the lower at this dir's
+        //                   parent). The PARENT of the marker is the dir
+        //                   being opacified; we set its sqlar.opaque=1 so
+        //                   overlay's resolve()/scan_dir honor it.
         //   .wh.<NAME>    → tombstone for sibling NAME at parent(path).
         if basename == ".wh..wh..opq" {
-            // Opaque dirs are rare in practice; the v1 limitation is
-            // documented at the top of this file. A future commit can set
-            // sqlar.opaque on the parent dir row + teach scan_dir to honor it.
+            let parent_rel = raw_path.parent()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            // An opaque marker at the layer root (.wh..wh..opq directly
+            // under /) is rare but legal — it opacifies the root itself.
+            // We can't easily mark "" as opaque (rel="" is the box root and
+            // has no sqlar row); skip that corner case for v1.
+            if !parent_rel.is_empty() {
+                b.set_opaque(&parent_rel, writer);
+            }
             continue;
         }
         if let Some(orig) = basename.strip_prefix(".wh.") {
@@ -408,6 +474,8 @@ fn ingest_layer(b: &BoxState, blob: &[u8], media_type: &str) -> Result<()> {
         };
         // PAX extensions BEFORE the body read consumes them.
         let xattrs = read_pax_xattrs(&mut e);
+        // Materialise any missing ancestor dirs before we touch the leaf.
+        ensure_ancestors(b, rel, &mut ensured_dirs);
         match ent_type {
             tar::EntryType::Regular | tar::EntryType::Continuous => {
                 let full_mode = 0o100000 | mode;
@@ -441,15 +509,16 @@ fn ingest_layer(b: &BoxState, blob: &[u8], media_type: &str) -> Result<()> {
                 // the source bytes copied in — the existing FUSE link() does
                 // the same approximation (nlink stays 1, but the second name
                 // works for the box's processes; matches the Python engine's
-                // _link_overlay).
+                // _link_overlay). Mode comes from the SOURCE: tar Link entries
+                // commonly have mode=0 in the header because the inode metadata
+                // is supposed to be shared with the target.
                 if let Some(src_path) = e.link_name().ok().flatten() {
                     let src_rel = src_path.to_string_lossy()
                         .trim_end_matches('/')
                         .to_string();
-                    if let Some(src_rowid) = lookup_file_rowid(b, &src_rel) {
+                    if let Some((src_rowid, src_mode)) = lookup_file(b, &src_rel) {
                         let src_blob = crate::capture::blob_path(b.id, src_rowid);
-                        let full_mode = 0o100000 | mode;
-                        let new_rowid = b.ensure_file_row(rel, full_mode, writer);
+                        let new_rowid = b.ensure_file_row(rel, src_mode, writer);
                         let new_blob = crate::capture::blob_path(b.id, new_rowid);
                         if let Some(p) = new_blob.parent() {
                             let _ = std::fs::create_dir_all(p);
@@ -503,11 +572,12 @@ fn read_pax_xattrs<R: Read>(e: &mut tar::Entry<'_, R>) -> Vec<(String, Vec<u8>)>
     out
 }
 
-/// Find the sqlar rowid of a regular file already ingested into `b`. Used by
-/// the hardlink path — sources are always earlier entries in the same tar.
-fn lookup_file_rowid(b: &BoxState, rel: &str) -> Option<i64> {
+/// (rowid, full mode) of a regular file already ingested into `b`. Used by
+/// the hardlink path — sources are always earlier entries in the same tar,
+/// and tar Link entries don't carry mode so we copy it from the source.
+fn lookup_file(b: &BoxState, rel: &str) -> Option<(i64, u32)> {
     match b.entry(rel) {
-        Some(crate::capture::Entry::File { rowid, .. }) => Some(rowid),
+        Some(crate::capture::Entry::File { rowid, mode }) => Some((rowid, mode)),
         _ => None,
     }
 }

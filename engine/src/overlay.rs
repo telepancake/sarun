@@ -83,6 +83,22 @@ fn kind_of_mode(mode: u32) -> FileType {
 /// (box_id, rel) — "" rel is the box root; box_id 0 is the synthetic mount root.
 type Key = (i64, String);
 
+/// True if any ANCESTOR directory of `rel` is marked OPAQUE in box `b`. Walks
+/// rel's path components upward (rel="a/b/c/d" → checks "a/b/c", "a/b", "a")
+/// and returns at the first opaque hit. Empty/root rel has no ancestors → false.
+fn has_opaque_ancestor(b: &BoxState, rel: &str) -> bool {
+    let mut p = Path::new(rel).parent();
+    while let Some(ancestor) = p {
+        let s = ancestor.to_string_lossy();
+        let s = s.as_ref();
+        if !s.is_empty() && b.is_opaque(s) {
+            return true;
+        }
+        p = ancestor.parent();
+    }
+    false
+}
+
 /// Clone-able handle: fuser owns one clone as the mounted filesystem, the
 /// control plane holds another to add/remove boxes. All state is behind the
 /// shared Inner.
@@ -629,7 +645,7 @@ impl Overlay {
             Some(Entry::Whiteout) => Layer::Absent,
             Some(Entry::File { rowid, mode }) =>
                 Layer::UpperFile { owner: b.id, rowid, mode },
-            Some(Entry::Dir { mode, mtime_ns }) => Layer::UpperDir { mode, mtime_ns },
+            Some(Entry::Dir { mode, mtime_ns, .. }) => Layer::UpperDir { mode, mtime_ns },
             Some(Entry::Symlink { target }) => Layer::UpperSymlink { target },
             Some(Entry::Special { mode, rdev }) => Layer::UpperSpecial { mode, rdev },
             None => {
@@ -648,6 +664,14 @@ impl Overlay {
     /// below (parent boxes AND the host). This is the nested read-through-parent
     /// semantic — used by every READ and existence check. UpperFile.owner names
     /// whichever box in the chain actually holds the bytes (for blob_path).
+    ///
+    /// D-opaque: a box may carry an OPAQUE marker on a directory (OCI/AUFS
+    /// `.wh..wh..opq` convention), meaning that directory's lower-layer
+    /// contents are wiped when this box appears in the chain. Used by
+    /// resolve() (a lookup past this box for `dir/X` returns Absent if `dir`
+    /// is opaque here and we have no own entry for it) and by scan_dir()
+    /// (the merged listing clears accumulated names at the opaque-marker box
+    /// before applying its own present/whiteout contributions).
     fn resolve(&self, bid: i64, rel: &str) -> Layer {
         let mut cur = Some(bid);
         let mut seen = 0;
@@ -666,13 +690,24 @@ impl Overlay {
                 Some(Entry::Whiteout) => return Layer::Absent,
                 Some(Entry::File { rowid, mode }) =>
                     return Layer::UpperFile { owner: id, rowid, mode },
-                Some(Entry::Dir { mode, mtime_ns }) =>
+                Some(Entry::Dir { mode, mtime_ns, .. }) =>
                     return Layer::UpperDir { mode, mtime_ns },
                 Some(Entry::Symlink { target }) =>
                     return Layer::UpperSymlink { target },
                 Some(Entry::Special { mode, rdev }) =>
                     return Layer::UpperSpecial { mode, rdev },
-                None => cur = b.parent(),  // not in this box → try its parent
+                None => {
+                    // D-opaque (OCI): an upper box can mark a directory as
+                    // opaque (`.wh..wh..opq` convention) — when we don't have
+                    // our own entry for `rel`, but an ANCESTOR dir of `rel` is
+                    // opaque in this box, the lower-layer chain past this box
+                    // can't contribute (the opaque marker wipes everything
+                    // below for that dir's subtree). Return Absent immediately.
+                    if has_opaque_ancestor(&b, rel) {
+                        return Layer::Absent;
+                    }
+                    cur = b.parent();  // not in this box → try its parent
+                }
             }
         }
         if no_host { return Layer::Absent; }
@@ -850,6 +885,17 @@ impl Overlay {
         }
         for id in chain {
             if let Some(bx) = self.box_of(id) {
+                // D-opaque: clear lower contributions if THIS box marks `rel`
+                // opaque, OR if ANY ANCESTOR of `rel` is opaque here. The
+                // OCI/AUFS spec says `.wh..wh..opq` hides every lower entry
+                // in that directory's WHOLE subtree, not just the immediate
+                // children — so scan_dir of `etc/replace` past a layer with
+                // an opaque `etc` must also drop earlier-layer `replace/*`
+                // entries. Without the ancestor check, `etc/replace/old`
+                // would survive a layer that opacified `etc`.
+                if bx.is_opaque(rel) || has_opaque_ancestor(&bx, rel) {
+                    names.clear();
+                }
                 let (white, present) = bx.children_of(rel);
                 for w in &white { names.remove(w); }
                 for p in present { names.insert(p, ()); }

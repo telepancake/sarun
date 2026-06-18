@@ -69,7 +69,7 @@ CREATE TABLE IF NOT EXISTS build_edges(id INTEGER PRIMARY KEY AUTOINCREMENT,
 #[derive(Clone)]
 pub enum Entry {
     File { rowid: i64, mode: u32 },
-    Dir { mode: u32, mtime_ns: i64 },
+    Dir { mode: u32, mtime_ns: i64, opaque: bool },
     Symlink { target: PathBuf },
     Special { mode: u32, rdev: u64 },  // fifo / char / block device
     Whiteout,
@@ -403,7 +403,13 @@ impl BoxState {
                         let _ = sz;
                         Entry::Symlink { target: PathBuf::from(t) }
                     } else if ft == 0o040000 {
-                        Entry::Dir { mode, mtime_ns: 0 }
+                        // D-opaque (OCI): a non-zero opaque column flips the
+                        // dir's mask-lower attitude — when this box appears in
+                        // the chain, the dir's lower-layer contents are wiped.
+                        let opaque: i64 = conn.query_row(
+                            "SELECT opaque FROM sqlar WHERE name=?1", [&name],
+                            |r| r.get(0)).unwrap_or(0);
+                        Entry::Dir { mode, mtime_ns: 0, opaque: opaque != 0 }
                     } else if ft == 0o010000 || ft == 0o060000 {
                         Entry::Special { mode, rdev: 0 }
                     } else {
@@ -771,8 +777,52 @@ impl BoxState {
             params![rel, m, now_ns(), writer],
         );
         drop(conn);
-        self.kinds.write().unwrap()
-            .insert(rel.to_string(), Entry::Dir { mode: m, mtime_ns: now_ns() });
+        // Preserve a prior opaque flag on update — set_dir for an existing
+        // opaque dir must not silently clear it. Default is false on first
+        // creation (use set_opaque() to flip).
+        let mut kinds = self.kinds.write().unwrap();
+        let was_opaque = matches!(kinds.get(rel),
+            Some(Entry::Dir { opaque: true, .. }));
+        kinds.insert(rel.to_string(),
+            Entry::Dir { mode: m, mtime_ns: now_ns(), opaque: was_opaque });
+    }
+
+    /// Mark `rel` as an OPAQUE directory (OCI/AUFS `.wh..wh..opq` semantics):
+    /// when this box appears in the resolve/scan_dir chain, the directory's
+    /// LOWER-layer contributions are wiped. The dir itself stays visible (the
+    /// upper-layer Dir entry is unchanged); only its children from below are
+    /// masked. Idempotent. If the dir row doesn't exist yet, it's created.
+    pub fn set_opaque(&self, rel: &str, writer: i64) {
+        {
+            let conn = self.conn.lock().unwrap();
+            // Upsert as a dir row with opaque=1. Mode 40755 is a sensible
+            // default for an auto-created dir; an explicit later set_dir
+            // can refine it (and our update above preserves opaque).
+            let _ = conn.execute(
+                "INSERT INTO sqlar(name,mode,mtime,sz,data,opaque,writer,last_writer)
+                 VALUES(?1,?2,?3,0,NULL,1,?4,?4)
+                 ON CONFLICT(name) DO UPDATE SET opaque=1",
+                params![rel, 0o040755u32, now_ns(), writer],
+            );
+        }
+        let mut kinds = self.kinds.write().unwrap();
+        match kinds.get(rel).cloned() {
+            Some(Entry::Dir { mode, mtime_ns, .. }) => {
+                kinds.insert(rel.to_string(),
+                    Entry::Dir { mode, mtime_ns, opaque: true });
+            }
+            _ => {
+                kinds.insert(rel.to_string(), Entry::Dir {
+                    mode: 0o040755, mtime_ns: now_ns(), opaque: true });
+            }
+        }
+    }
+
+    /// Is `rel` an opaque directory in this box? (Used by the overlay
+    /// resolve/scan_dir paths to honor the OCI opaque-dir semantics.)
+    pub fn is_opaque(&self, rel: &str) -> bool {
+        matches!(self.kinds.read().unwrap().get(rel),
+            Some(Entry::Dir { opaque: true, .. }))
     }
 
     pub fn set_symlink(&self, rel: &str, target: &std::path::Path, writer: i64) {
