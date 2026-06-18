@@ -105,10 +105,7 @@ pub struct BoxState {
     // -d direct: the box has NO overlay — every write goes straight to the real
     // host file, uncaptured (mirrors Python's whole-box passthrough=direct).
     direct: std::sync::atomic::AtomicBool,
-    // ── parent-stack modes (D-parent: three orthogonal flags) ────────────────
-    // frozen: the overlay accepts NO new writes from running processes — every
-    //   write/create/mkdir/unlink/rmdir/symlink/setattr/rename returns EROFS.
-    //   Existing rows (e.g. an OCI image layer's contents) stay readable.
+    // ── parent-stack modes (D-parent: two new flags + the default) ───────────
     // readonly_parent: a child's `apply` REFUSES to promote into the parent.
     //   The captured changes can still be reviewed/discarded; they just never
     //   leak up the box stack. Per-CHILD attitude, not a parent property —
@@ -119,7 +116,6 @@ pub struct BoxState {
     //   image stack so `ls /etc` inside the box sees only the image's /etc,
     //   never the host's. Propagates UP the chain — any box in the lookup
     //   chain having it set switches the chain to no-host mode.
-    frozen: std::sync::atomic::AtomicBool,
     readonly_parent: std::sync::atomic::AtomicBool,
     no_host_fallback: std::sync::atomic::AtomicBool,
     // ── brush↔process linkage (D9) ───────────────────────────────────────────
@@ -183,12 +179,6 @@ impl BoxState {
     }
     pub fn direct(&self) -> bool {
         self.direct.load(std::sync::atomic::Ordering::Relaxed)
-    }
-    pub fn set_frozen(&self, on: bool) {
-        self.frozen.store(on, std::sync::atomic::Ordering::Relaxed);
-    }
-    pub fn frozen(&self) -> bool {
-        self.frozen.load(std::sync::atomic::Ordering::Relaxed)
     }
     pub fn set_readonly_parent(&self, on: bool) {
         self.readonly_parent.store(on, std::sync::atomic::Ordering::Relaxed);
@@ -357,7 +347,6 @@ impl BoxState {
             parent: std::sync::atomic::AtomicI64::new(0),
             env_capture: std::sync::atomic::AtomicBool::new(false),
             direct: std::sync::atomic::AtomicBool::new(false),
-            frozen: std::sync::atomic::AtomicBool::new(false),
             readonly_parent: std::sync::atomic::AtomicBool::new(false),
             no_host_fallback: std::sync::atomic::AtomicBool::new(false),
             is_brush: std::sync::atomic::AtomicBool::new(false),
@@ -373,15 +362,14 @@ impl BoxState {
     /// row, not a dedup). Mirrors the Python Index._load_mirror.
     pub fn load_mirror(&self) {
         let conn = self.conn.lock().unwrap();
-        // D-parent: restore the box's parent-stack modes (frozen / read-only-parent
-        // / no-host-fallback) from sqlar meta so a rerun reopens with the same
+        // D-parent: restore the box's parent-stack modes (read-only-parent /
+        // no-host-fallback) from sqlar meta so a rerun reopens with the same
         // semantics. A missing/unset key means the default (off).
         let read_flag = |k: &str| -> bool {
             conn.query_row("SELECT value FROM meta WHERE key=?1", [k],
                            |r| r.get::<_, String>(0))
                 .ok().as_deref() == Some("1")
         };
-        if read_flag("frozen") { self.set_frozen(true); }
         if read_flag("readonly_parent") { self.set_readonly_parent(true); }
         if read_flag("no_host_fallback") { self.set_no_host_fallback(true); }
         let mut kinds = self.kinds.write().unwrap();

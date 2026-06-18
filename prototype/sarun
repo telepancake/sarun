@@ -9417,8 +9417,7 @@ def run_on_untrusted(argv, files, timeout=10, out_cap=256 * 1024, on_spawn=None)
 #:   [cyan]slopbox WORK -- make[/]                   (named WORK box)
 #:   [cyan]slopbox WORK -- make test[/]              (re-runs the same WORK box)
 def cmd_run(cmd, env_capture, direct, chdir, reuse_sid=None,
-            capture=True, no_parent=False, readonly_parent=False,
-            frozen=False) -> int:
+            capture=True, no_parent=False, readonly_parent=False) -> int:
     if not cmd:
         print("slopbox: no command given", file=sys.stderr); return 2
 
@@ -9499,7 +9498,6 @@ def cmd_run(cmd, env_capture, direct, chdir, reuse_sid=None,
                            want_capture=want_capture,
                            want_no_parent=no_parent,
                            want_readonly_parent=readonly_parent,
-                           want_frozen=frozen,
                            **_extra_reg)
     ack = opened[1] if opened else None
     ui_conn = opened[0] if opened else None
@@ -9529,8 +9527,7 @@ def cmd_run(cmd, env_capture, direct, chdir, reuse_sid=None,
                                      ("direct", direct),
                                      ("capture", want_capture),
                                      ("no-parent", no_parent),
-                                     ("readonly-parent", readonly_parent),
-                                     ("frozen", frozen)) if on) or "isolated"
+                                     ("readonly-parent", readonly_parent)) if on) or "isolated"
     print(f"slopbox: {sid}  ({flags}, UI connected)", file=sys.stderr)
     print(f"  overlay root: {box_root}", file=sys.stderr)
 
@@ -12429,18 +12426,14 @@ def main() -> int:
     ap.add_argument("-t", dest="passthrough_tty", action="store_true")  # NO stdout/err capture
     ap.add_argument("-d", dest="direct", action="store_true")
     ap.add_argument("-C", dest="chdir", default=None)
-    # D-parent: per-box parent-stack modes (independent, can compose).
+    # D-parent: per-box parent-stack modes (independent).
     #   --no-parent       strip kernel-derived parent + close lower chain at
     #                     the box's own contents (no host / bleed-through).
     #                     The bottom of an OCI image / Dockerfile stack.
     #   --readonly-parent child's `apply` refuses to promote upward (writes
     #                     stay in this box for review, never reach the parent).
-    #   --frozen          overlay accepts no NEW writes from running processes
-    #                     (EROFS on write/create/mkdir/...). Existing rows
-    #                     stay readable — the shape of an immutable layer.
     ap.add_argument("--no-parent", dest="no_parent", action="store_true")
     ap.add_argument("--readonly-parent", dest="readonly_parent", action="store_true")
-    ap.add_argument("--frozen", dest="frozen", action="store_true")
     try:
         ns = ap.parse_args(pre)
     except SystemExit:
@@ -12453,8 +12446,7 @@ def main() -> int:
                    ns.chdir, reuse_sid=target,
                    capture=not ns.passthrough_tty,
                    no_parent=ns.no_parent,
-                   readonly_parent=ns.readonly_parent,
-                   frozen=ns.frozen)
+                   readonly_parent=ns.readonly_parent)
 
 
 if __name__ == "__main__":

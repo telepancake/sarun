@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
-"""Parent-stack modes against the RUST engine (engine/): three orthogonal
-per-box flags the runner sends through the register handshake and the engine
-enforces.
+"""Parent-stack modes against the RUST engine (engine/): two new per-box
+flags the runner sends through the register handshake (alongside the default
+behaviour, which is unchanged):
 
-  --frozen           overlay accepts NO new writes from running processes —
-                     every write/create/mkdir/etc. returns EROFS. Existing rows
-                     stay readable. The shape of an immutable layer.
   --no-parent        kernel-derived parent is dropped AND the lower chain does
                      NOT bottom at the real host /. The box's own contents are
                      its entire filesystem (the bottom of an OCI image stack).
@@ -13,9 +10,9 @@ enforces.
                      captured changes can still be reviewed/discarded; they
                      just never leak up the box stack. Per-CHILD attitude.
 
-All three assertions are REAL effect tests (a write rejected; a meta key
-persisted; an apply that errored without touching the parent or host) — never
-shape-only. Skips (passes vacuously) if cargo/the binary are unavailable.
+Both assertions are REAL effect tests (meta key persisted; an apply that
+errored without touching the parent) — never shape-only. Skips (passes
+vacuously) if cargo/the binary are unavailable.
 
 Run:
     uv run --with "pyfuse3>=3.2" --with "trio>=0.22" --with "wcmatch>=8.4" \\
@@ -124,55 +121,7 @@ def main():
             raise RuntimeError("rust engine socket never appeared:\n"
                                + out.decode(errors="replace"))
 
-        # ── (1) --frozen: write inside REJECTED with EROFS, nothing captured ─
-        # The box's overlay covers the host /; writes to /root/... go through
-        # the FUSE overlay (unlike /tmp, which bwrap mounts as tmpfs inside the
-        # box and never reaches the overlay). A frozen box returns EROFS on
-        # the create FUSE op so the redirect fails AND the path is NOT in the
-        # box's sqlar. A unique marker keeps the negative control honest.
-        marker = "frozen_" + os.urandom(4).hex() + ".txt"
-        host_marker = Path("/root") / marker
-        host_marker.unlink(missing_ok=True)
-        try:
-            r = subprocess.run(
-                [str(BIN), "run", "--frozen", "FZB", "--", "sh", "-c",
-                 f"(echo x > /root/{marker}) 2>&1; true"],
-                capture_output=True, text=True, timeout=60)
-            check(r.returncode == 0,
-                  f"frozen: runner exits cleanly (got {r.returncode}: "
-                  f"{r.stderr[-200:]})")
-            fsp = newest_sqlar(m); wait_for_sqlar_settled(m, fsp)
-            check(meta_get(fsp, "frozen") == "1",
-                  f"frozen: sqlar meta has frozen=1 (got {meta_get(fsp, 'frozen')!r})")
-            names = {n for n, *_ in m.sqlar_list(fsp)}
-            check(f"root/{marker}" not in names,
-                  f"frozen: write was REJECTED by EROFS — NOT captured "
-                  f"(rows hitting marker: "
-                  f"{sorted(n for n in names if marker in n)})")
-            check(not host_marker.exists(),
-                  "frozen: the real host was NOT touched either")
-
-            # NEGATIVE control: same command in a NON-frozen box DOES capture.
-            r = subprocess.run(
-                [str(BIN), "run", "NFZB", "--", "sh", "-c",
-                 f"echo x > /root/{marker}; true"],
-                capture_output=True, text=True, timeout=60)
-            check(r.returncode == 0,
-                  f"frozen-control: non-frozen runner exits 0 (got {r.returncode})")
-            nfsp = newest_sqlar(m); wait_for_sqlar_settled(m, nfsp)
-            nfnames = {n for n, *_ in m.sqlar_list(nfsp)}
-            check(f"root/{marker}" in nfnames,
-                  f"frozen-control: a NON-frozen box DOES capture the same "
-                  f"write (negative control — proves frozen's EROFS is what "
-                  f"blocked it). got: "
-                  f"{sorted(n for n in nfnames if marker in n)}")
-            check(not host_marker.exists(),
-                  "frozen-control: the non-frozen capture DID NOT reach the "
-                  "real host (overlay isolation intact)")
-        finally:
-            host_marker.unlink(missing_ok=True)
-
-        # ── (2) --no-parent: meta persisted; parent NOT auto-derived ─────────
+        # ── (1) --no-parent: meta persisted; parent NOT auto-derived ─────────
         # The register handshake reads want_no_parent and sets no_host_fallback
         # in BoxState + persists the meta key. The bwrap inside is harmless
         # here (it sees an empty / and will likely fail to find /bin/sh) — but
@@ -191,7 +140,7 @@ def main():
               f"no-parent: parent_box_id NOT recorded "
               f"(got {meta_get(nsp, 'parent_box_id')!r})")
 
-        # ── (3) --readonly-parent: at-rest apply REFUSES to promote upward ──
+        # ── (2) --readonly-parent: at-rest apply REFUSES to promote upward ──
         # Build a parent + child sqlar; stamp readonly_parent=1 on the child.
         # review.apply on the child must:
         #   • return an error per path (parent is read-only)

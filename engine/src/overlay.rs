@@ -1028,7 +1028,6 @@ impl Filesystem for Overlay {
             return reply.error(Errno::EPERM);
         }
         let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
-        if b.frozen() { return reply.error(Errno::EROFS); }
         let Some(name) = name.to_str() else { return reply.error(Errno::EINVAL) };
         let rel = if prel.is_empty() { name.to_string() }
                   else { format!("{prel}/{name}") };
@@ -1138,7 +1137,6 @@ impl Filesystem for Overlay {
             let Some(b) = self.box_of(h.inner.box_id) else {
                 return reply.error(Errno::EIO);
             };
-            if b.frozen() { return reply.error(Errno::EROFS); }
             match self.copy_up(&b, &h.inner.rel.clone(), req.pid()) {
                 Ok(f) => {
                     h.inner.file = Some(f);
@@ -1203,11 +1201,6 @@ impl Filesystem for Overlay {
             return reply.error(Errno::ENOENT);
         };
         let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
-        if b.frozen()
-            && (mode.is_some() || size.is_some() || mtime.is_some()
-                || uid.is_some() || gid.is_some()) {
-            return reply.error(Errno::EROFS);
-        }
         // HOST-DIRECT (passthrough file rule, or -d direct): metadata ops hit the
         // REAL host file, never copy-up/capture — mirroring the host-direct
         // read/write path. This is the fix for the O_TRUNC bug: the kernel
@@ -1358,7 +1351,6 @@ impl Filesystem for Overlay {
             return reply.error(Errno::EPERM);
         }
         let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
-        if b.frozen() { return reply.error(Errno::EROFS); }
         let Some(name) = name.to_str() else { return reply.error(Errno::EINVAL) };
         let rel = if prel.is_empty() { name.to_string() }
                   else { format!("{prel}/{name}") };
@@ -1381,7 +1373,6 @@ impl Filesystem for Overlay {
             return reply.error(Errno::EPERM);
         }
         let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
-        if b.frozen() { return reply.error(Errno::EROFS); }
         let Some(name) = link_name.to_str() else {
             return reply.error(Errno::EINVAL);
         };
@@ -1402,7 +1393,6 @@ impl Filesystem for Overlay {
         };
         if bid == 0 { return reply.error(Errno::EPERM); }
         let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
-        if b.frozen() { return reply.error(Errno::EROFS); }
         let Some(name) = name.to_str() else { return reply.error(Errno::EINVAL) };
         let rel = if prel.is_empty() { name.to_string() }
                   else { format!("{prel}/{name}") };
@@ -1439,7 +1429,6 @@ impl Filesystem for Overlay {
         };
         if sbid != nbid || sbid == 0 { return reply.error(Errno::EXDEV); }
         let Some(b) = self.box_of(sbid) else { return reply.error(Errno::ENOENT) };
-        if b.frozen() { return reply.error(Errno::EROFS); }
         let Some(name) = newname.to_str() else { return reply.error(Errno::EINVAL) };
         let nrel = if nprel.is_empty() { name.to_string() }
                    else { format!("{nprel}/{name}") };
@@ -1495,7 +1484,6 @@ impl Filesystem for Overlay {
             return reply.error(Errno::ENOENT);
         };
         let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
-        if b.frozen() { return reply.error(Errno::EROFS); }
         if let Some(k) = name.to_str() { b.set_xattr(&rel, k, value); }
         reply.ok();
     }
@@ -1539,7 +1527,6 @@ impl Filesystem for Overlay {
             return reply.error(Errno::ENOENT);
         };
         let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
-        if b.frozen() { return reply.error(Errno::EROFS); }
         match name.to_str() {
             Some(k) if b.remove_xattr(&rel, k) => reply.ok(),
             _ => reply.error(Errno::ENODATA),
@@ -1552,7 +1539,6 @@ impl Filesystem for Overlay {
             return reply.error(Errno::ENOENT);
         };
         let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
-        if b.frozen() { return reply.error(Errno::EROFS); }
         let Some(name) = name.to_str() else { return reply.error(Errno::EINVAL) };
         let rel = if prel.is_empty() { name.to_string() }
                   else { format!("{prel}/{name}") };
@@ -1580,7 +1566,6 @@ impl Filesystem for Overlay {
             return reply.error(Errno::ENOENT);
         };
         let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
-        if b.frozen() { return reply.error(Errno::EROFS); }
         let Some(name) = name.to_str() else { return reply.error(Errno::EINVAL) };
         let rel = if prel.is_empty() { name.to_string() }
                   else { format!("{prel}/{name}") };
@@ -1655,7 +1640,6 @@ impl Filesystem for Overlay {
             return reply.error(Errno::EXDEV); // no cross-box / root rename
         }
         let Some(b) = self.box_of(bo) else { return reply.error(Errno::ENOENT) };
-        if b.frozen() { return reply.error(Errno::EROFS); }
         let (Some(no), Some(nn)) = (name.to_str(), newname.to_str()) else {
             return reply.error(Errno::EINVAL);
         };
