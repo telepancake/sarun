@@ -517,6 +517,9 @@ impl<'a> DepBuilder<'a> {
         if self.get_rule_inputs(intern(".ONESHELL")).is_some() {
             self.ev.oneshell = true;
         }
+        if self.get_rule_inputs(intern(".DELETE_ON_ERROR")).is_some() {
+            self.ev.delete_on_error = true;
+        }
         // sarun: .SECONDEXPANSION enables a second pass of prereq
         // expansion. Stash the flag now; the actual re-expansion happens
         // in build_plan for each non-special target.

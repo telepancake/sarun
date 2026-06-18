@@ -252,6 +252,10 @@ pub struct Evaluator {
     /// single shell invocation, so shell state (variables, cwd, set
     /// flags) persists across them.
     pub oneshell: bool,
+    /// sarun: set when the makefile names `.DELETE_ON_ERROR` as a
+    /// target. When a recipe exits with a non-zero status, kati
+    /// removes the target's output file (mirrors GNU make).
+    pub delete_on_error: bool,
     /// sarun: required `include` directives whose file didn't exist at
     /// parse time, paired with the source location of the directive.
     /// The remake-the-makefile loop in main.rs checks for rules
@@ -305,6 +309,7 @@ impl Evaluator {
             exports: HashMap::new(),
             export_all_vars: false,
             oneshell: false,
+            delete_on_error: false,
             pending_remake_includes: Vec::new(),
             symbols_for_eval: HashSet::new(),
 
