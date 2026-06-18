@@ -225,8 +225,12 @@ impl Symtab {
             if origin == VarOrigin::CommandLine && var.read().origin() == VarOrigin::File {
                 return Ok(());
             }
+            // sarun: $(eval) inside $(call) often does `1:=newval` to
+            // rebind the call arg. Real make accepts the override; when
+            // the surrounding ScopedGlobalVar later drops, the original
+            // Automatic binding is restored.
             if origin == VarOrigin::Automatic {
-                error!("overriding automatic variable is not implemented yet");
+                // fall through — overwrite the entry below.
             }
         }
         *entry = Some(var);
