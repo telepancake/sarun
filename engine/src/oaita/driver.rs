@@ -14,7 +14,7 @@ use crate::oaita::client::Client;
 use crate::oaita::config::Config;
 use crate::oaita::exec::{box_name, Executor};
 use crate::oaita::ids::{is_adoptable_slug, new_turn_id};
-use crate::oaita::inspect::{inspect, parse_locator, read_path};
+use crate::oaita::inspect::{inspect, parse_locator, read_path, write_at_locator};
 use crate::oaita::tools::{tools_array, ExecResult};
 use crate::oaita::trace;
 use crate::oaita::turns::{
@@ -340,7 +340,7 @@ fn rescue_content_tool_call(body: &str) -> Option<AssembledToolCall> {
     let tool = obj.get("tool").and_then(Value::as_str)?;
     // Only rescue tools we actually dispatch — `tool` could legitimately
     // appear in a free-form answer that happens to be JSON.
-    if !matches!(tool, "act" | "shell" | "inspect" | "read" |
+    if !matches!(tool, "act" | "shell" | "inspect" | "read" | "write" |
                        "apply" | "reject" | "backtrack" | "delete") {
         return None;
     }
@@ -714,6 +714,7 @@ fn dispatch(tool: &str, arguments: &Value, target: &str, set: &Settings,
         "shell" => dispatch_shell(arguments, target, executor),
         "inspect" => dispatch_inspect(arguments, turns),
         "read" => dispatch_read(arguments, turns),
+        "write" => dispatch_write(arguments, turns),
         "apply" | "reject" => dispatch_box_resolve(tool, arguments),
         "backtrack" => dispatch_backtrack(arguments, target),
         "delete" => dispatch_delete(arguments),
@@ -813,6 +814,18 @@ fn dispatch_read(args: &Value, turns: &[Turn]) -> String {
     };
     let loc = parse_locator(&path);
     read_path(&loc, turns)
+}
+
+fn dispatch_write(args: &Value, turns: &[Turn]) -> String {
+    let Some(path) = args_str(args, "path") else {
+        return "write: missing required `path`".to_string();
+    };
+    let Some(content) = args_str(args, "content") else {
+        return "write: missing required `content`".to_string();
+    };
+    let force = args_bool(args, "force");
+    let loc = parse_locator(&path);
+    write_at_locator(&loc, &content, force, turns)
 }
 
 fn dispatch_box_resolve(verb: &str, args: &Value) -> String {

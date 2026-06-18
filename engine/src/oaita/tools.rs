@@ -214,6 +214,60 @@ fn read_spec() -> ToolSpec {
     }
 }
 
+fn write_spec() -> ToolSpec {
+    ToolSpec {
+        name: "write",
+        description:
+            "Use this to MODIFY a file by NAMING THE THING TO REPLACE — the \
+             same locator grammar `inspect` uses to ENUMERATE things, `write` \
+             uses to REPLACE them. inspect says \"here are the lines / \
+             entries / sections of this thing\"; read quotes one of them \
+             verbatim; write swaps one out for new content. The whole file, \
+             a line range, or the window around a line — anything inspect \
+             can name. \
+             \
+             `path` takes inspect's locator grammar: a bare path replaces \
+             the whole file; `path lines A..B` replaces lines A..B \
+             (line counts may differ — the file grows/shrinks); `path \
+             around N` replaces the same window inspect would have shown \
+             around line N; a page key (next/previous/first/last) replaces \
+             the slice the most recent inspect/read paged to. `content` is \
+             the replacement bytes (no line numbers, no framing — write \
+             accepts what read returns). \
+             \
+             Optimistic concurrency: if you `read` (or `inspect`) the slice \
+             earlier in this session and the on-disk contents changed since \
+             then, write returns a conflict — re-read, reconcile, then \
+             write again. Pass `force=true` to overwrite anyway. First-time \
+             writes to a slice you haven't read aren't gated (no baseline \
+             to compare). \
+             \
+             Use this instead of `shell` + `sed`/`cat >`/`tee` for in-place \
+             edits — write is locator-driven, has the conflict guard, and \
+             doesn't burn a sandbox box. Use shell when you need a real \
+             process to compute the new content (running a formatter, \
+             code-gen tool, etc.) and let it write the file directly. \
+             \
+             box: locators are inspect-only (staged change sets are \
+             read-only here). Structural locators (functions, paragraphs, \
+             sequence before/after) are a planned extension — V1 covers \
+             whole-file, line-range, around-N, and page-key.".to_string(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "path":    {"type": "string",
+                            "description": "Locator (inspect's grammar): path | path lines A..B | path around N | next/previous/first/last."},
+                "content": {"type": "string",
+                            "description": "Replacement bytes for the named slice."},
+                "force":   {"type": "boolean",
+                            "description": "Skip the optimistic-concurrency check and overwrite regardless of drift. Default false."},
+            },
+            "required": ["path", "content"],
+        }),
+        run_location: RunLocation::InBox,
+    }
+}
+
 fn apply_spec() -> ToolSpec {
     ToolSpec {
         name: "apply",
@@ -359,6 +413,7 @@ pub fn tool_registry(capabilities: Option<&str>, depth: u32)
     r.insert("shell", shell_spec());
     r.insert("inspect", inspect_spec());
     r.insert("read", read_spec());
+    r.insert("write", write_spec());
     r.insert("apply", apply_spec());
     r.insert("reject", reject_spec());
     r.insert("backtrack", backtrack_spec());
