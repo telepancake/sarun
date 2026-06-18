@@ -162,6 +162,14 @@ fn spawn_subscriber(sock: &str, tx: mpsc::Sender<Value>) {
 /// SUBJECT_KINDS / FILE_KINDS and FILTERABLE.
 const FILE_FILTER_KINDS: &[&str] = &["path", "box", "exe", "cwd", "arg"];
 const SUBJECT_FILTER_KINDS: &[&str] = &["box", "exe", "cwd", "arg"];
+/// '/' on the flows / packets pane gets the net field set: the user can
+/// filter the pane by host / port / scheme / sni / http_path / http_method
+/// / http_status, plus the shared exe / cwd / arg / box vocabulary.
+const NET_FILTER_KINDS: &[&str] = &[
+    "host", "port", "scheme", "sni",
+    "http_path", "http_method", "http_status",
+    "box", "exe", "cwd", "arg",
+];
 
 /// Which list view a '/' filter applies to. Sessions/Hunks/Rules/Help/Pty are
 /// not filterable.
@@ -3243,6 +3251,17 @@ fn rule_detail_lines(app: &App) -> Vec<Line<'static>> {
         "exe"  => "triggering process's command pathname (path globs)",
         "cwd"  => "triggering process's working directory (path globs)",
         "arg"  => "any one of the triggering process's argv (raw glob)",
+        // -n net rule kinds (applied at SYN-accept time by the dispatcher;
+        // file kinds in the same rule slide off because the field resolver
+        // returns "" for unknown kinds → glob can't match)
+        "host"         => "DNS hostname the box dialed (or .X.0.2 reverse if no DNS)",
+        "port"         => "TCP destination port (numeric, exact-match patterns like 443)",
+        "scheme"       => "http / https / tcp — derived from port at SYN-accept",
+        "sni"          => "TLS SNI from the box's ClientHello (HTTPS gate)",
+        "http_path"    => "HTTP request path (post-decrypt; only on http/https)",
+        "http_method"  => "HTTP method (GET / POST / …) — post-decrypt",
+        "http_status"  => "HTTP response status code — post-decrypt",
+        "proto"        => "tcp / udp (always tcp for a SYN-time gate today)",
         _ => "",
     };
     let mut seen: Vec<&str> = vec![];

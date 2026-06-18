@@ -53,6 +53,36 @@ pub fn all_kinds() -> Vec<&'static str> {
 
 pub fn is_net_kind(k: &str) -> bool { NET_KINDS.contains(&k) }
 
+#[cfg(test)]
+mod parse_net_rules {
+    use super::*;
+    #[test]
+    fn host_kind_parses_as_net_clause() {
+        // Without the NET_KINDS branch in parse_clauses, "host:bad.com" was
+        // being treated as a bare path glob with literal "host:bad.com" in
+        // the pattern. Regression: net rules MUST keep their kind.
+        let r = FileRule::parse("discard host:bad.com").unwrap();
+        assert_eq!(r.action, Action::Discard);
+        assert_eq!(r.clauses.len(), 1);
+        assert_eq!(r.clauses[0].m.kind, "host");
+        assert_eq!(r.clauses[0].m.pattern, "bad.com");
+    }
+    #[test]
+    fn mixed_file_and_net_kinds_in_one_rule() {
+        let r = FileRule::parse(
+            "discard host:tracker.example and box:BAD").unwrap();
+        assert_eq!(r.clauses.len(), 2);
+        assert_eq!(r.clauses[0].m.kind, "host");
+        assert_eq!(r.clauses[1].m.kind, "box");
+    }
+    #[test]
+    fn port_and_scheme_globs() {
+        let r = FileRule::parse("apply scheme:https and port:443").unwrap();
+        assert_eq!(r.clauses[0].m.kind, "scheme");
+        assert_eq!(r.clauses[1].m.kind, "port");
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Action { Apply, Discard, Passthrough }
 
@@ -252,7 +282,8 @@ impl FileRule {
             let pred = toks[i];
             i += 1;
             let (kind, pat) = match pred.split_once(':') {
-                Some((k, p)) if FILE_KINDS.contains(&k.to_ascii_lowercase().as_str()) =>
+                Some((k, p)) if FILE_KINDS.contains(&k.to_ascii_lowercase().as_str())
+                             || NET_KINDS.contains(&k.to_ascii_lowercase().as_str()) =>
                     (k.to_ascii_lowercase(), p.to_string()),
                 _ => ("path".to_string(), pred.to_string()), // bare → path kind
             };

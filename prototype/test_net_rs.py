@@ -392,6 +392,47 @@ def test_n_box_flows_packets_drill_down():
         eng.stop()
 
 
+def test_n_box_rules_gate_dial_at_syn_accept():
+    """The dispatcher consults the same filerules file the rules pane edits
+    before opening the upstream — `discard host:example.com` makes curl fail
+    with a connection error; without the rule the same curl succeeds. We
+    write the rule directly to the per-test filerules path (no UI needed).
+    """
+    skip_if_no_binary()
+    skip_if_offline()
+    eng = Engine("TST11")
+    try:
+        eng.start()
+        # First prove the dial works WITHOUT the deny rule (baseline).
+        r0 = eng.run("-n", "--", "curl", "-sS", "-m", "10", "-o", "/dev/null",
+                     "-w", "%{http_code}", "http://example.com/")
+        assert r0.returncode == 0, r0.stderr
+        assert r0.stdout.strip() == "200", f"baseline failed: {r0.stdout!r}"
+
+        # Plant a deny rule on disk where the engine loads it from.
+        rules_path = Path(eng.env["XDG_CONFIG_HOME"]) / "slopbox.TST11" / "filerules"
+        rules_path.parent.mkdir(parents=True, exist_ok=True)
+        rules_path.write_text("discard host:example.com\n")
+
+        # Now the dial should be refused. curl exit code is the signal.
+        r1 = eng.run("-n", "--", "curl", "-sS", "-m", "10", "-o", "/dev/null",
+                     "-w", "%{http_code}", "http://example.com/")
+        # Two acceptable outcomes: curl exits non-zero (RST), or it gets
+        # back a 0 status code (empty reply / connection closed). Either
+        # one proves the dispatcher tore the conn down.
+        assert r1.returncode != 0 or r1.stdout.strip() == "000", \
+            f"deny rule didn't take effect: rc={r1.returncode} out={r1.stdout!r}"
+
+        # Drop the rule again; baseline curl works once more.
+        rules_path.unlink()
+        r2 = eng.run("-n", "--", "curl", "-sS", "-m", "10", "-o", "/dev/null",
+                     "-w", "%{http_code}", "http://example.com/")
+        assert r2.returncode == 0 and r2.stdout.strip() == "200", \
+            f"baseline after rule removal: rc={r2.returncode} out={r2.stdout!r}"
+    finally:
+        eng.stop()
+
+
 def test_n_box_quic_blocked():
     """UDP other than :53 is dropped at the stack — there's no listener
     bound. curl's --http3-only sends a QUIC Initial UDP packet to :443;
