@@ -57,14 +57,39 @@ async fn handle_conn(stack: Arc<StackRuntime>, dns: Arc<DnsServer>,
     let host = dns.host_for_ip(acc.dst_ip)
         .unwrap_or_else(|| ipv4(acc.dst_ip));
     let port = acc.dst_port;
-    let stream = SmoltcpStream::new(stack, acc.handle);
-    let _ = box_name; // policy hook will use this once rules ship
+
+    // ── policy gate ─────────────────────────────────────────────────────
+    // The same rules.rs file the UI edits is consulted here at SYN-accept
+    // time. Net-applicable rules (any clause references a NET_KIND) are
+    // first-match-wins via `net::policy::decide`; file-only rules slide
+    // off (field resolver returns "" for unknown kinds). Default = Allow
+    // on no match, so the proxy works out of the box.
+    let subj = super::policy::NetSubject {
+        host: host.clone(),
+        port,
+        scheme: if port == 443 { "https" } else if port == 80 { "http" }
+                else { "tcp" }.to_string(),
+        sni: String::new(),
+        proto: "tcp".to_string(),
+        box_name: box_name.clone(),
+        ..Default::default()
+    };
+    let rules = crate::rules::Rules::load();
+    if super::policy::decide(&rules.rules, &subj) == crate::rules::Action::Discard {
+        eprintln!("sarun-net: DENY {host}:{port} (box={box_name})");
+        // Drop the stream — the smoltcp socket's RST goes back to the box,
+        // curl/whatever sees "connection refused".
+        stack.close(acc.handle);
+        return;
+    }
+
+    let stream_io = SmoltcpStream::new(stack, acc.handle);
     let r = if port == 443 {
-        super::mitm::serve_https(stream, &host, ca, keylog, upstream_tls).await
+        super::mitm::serve_https(stream_io, &host, ca, keylog, upstream_tls).await
     } else if port == 80 {
-        super::mitm::serve_http(stream, &host, port).await
+        super::mitm::serve_http(stream_io, &host, port).await
     } else {
-        super::l4::forward(stream, &host, port).await
+        super::l4::forward(stream_io, &host, port).await
     };
     if let Err(e) = r {
         eprintln!("sarun-net: conn {host}:{port}: {e}");
