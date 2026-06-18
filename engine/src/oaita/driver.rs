@@ -140,10 +140,13 @@ pub fn generate(spec: &str, set: &Settings) -> Result<Vec<PathBuf>, String> {
 
     trace::event("gen.request", json!({
         "session": &target, "model": &set.model,
+        // The FULL request — what we'd POST to /chat/completions if not
+        // for the trace. Recorded as the replayable record: a fakeserver
+        // can pair this with the matching gen.reply event and serve them
+        // back byte-identical for byte-replay testing.
+        "messages": messages,
+        "tools": tools,
         "n_messages": messages.len(),
-        "tools": tools.as_array().map(|a| a.iter().filter_map(|s|
-            s.get("function").and_then(|f| f.get("name")).and_then(Value::as_str)
-              .map(String::from)).collect::<Vec<_>>()),
     }));
 
     let body = json!({
@@ -254,10 +257,23 @@ pub fn generate(spec: &str, set: &Settings) -> Result<Vec<PathBuf>, String> {
         produced.push(path);
     }
 
+    // Full reply for byte-replay: content + assembled tool_calls + finish.
+    // The fakeserver pairs this with the preceding gen.request and serves
+    // it back as a streamed SSE response when the same prompt comes in.
+    let tool_calls_json: Vec<Value> = tool_calls.iter().map(|t| json!({
+        "id": t.id,
+        "type": "function",
+        "function": {
+            "name": t.name,
+            "arguments": t.arguments,
+        },
+    })).collect();
     trace::event("gen.reply", json!({
-        "session": &target, "content_len": body.len(),
-        "n_tool_calls": tool_calls.len(),
-        "finish_reason": finish_reason, "kept_partial": kept_partial,
+        "session": &target,
+        "content": &body,
+        "tool_calls": tool_calls_json,
+        "finish_reason": finish_reason,
+        "kept_partial": kept_partial,
     }));
     Ok(produced)
 }
