@@ -30,7 +30,7 @@
 use std::ffi::{OsStr, OsString};
 use std::io::{Read, Seek};
 use std::os::fd::FromRawFd;
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::sync::Arc;
 
 use bytes::{BufMut, BytesMut};
@@ -250,6 +250,47 @@ fn run_kati(targets: &[Symbol], cl_vars: &[bytes::Bytes], ninja_path: &OsStr) ->
     {
         let _frame = ev.enter(FrameType::Phase, bytes::Bytes::from_static(b"*dependency analysis*"), Loc::default());
         nodes = make_dep(&mut ev, targets.to_owned())?;
+    }
+
+    // sarun: stage explicit (and, under .EXPORT_ALL_VARIABLES, every)
+    // make-defined variable into the process env so recipes — which n2
+    // runs via brush_n2_executor IN-PROCESS, inheriting the parent env
+    // — see the right bindings without us having to re-bake them into
+    // each ninja recipe's command line. Mirrors what main.rs does for
+    // the standalone rkati path.
+    if ev.export_all_vars {
+        let all = kati::symtab::get_symbol_names(|v| {
+            !matches!(
+                v.read().origin(),
+                kati::var::VarOrigin::Default | kati::var::VarOrigin::Automatic
+            )
+        });
+        for (sym, _) in all {
+            ev.exports.entry(sym).or_insert(true);
+        }
+    }
+    for (name, export) in ev.exports.clone() {
+        let key = std::ffi::OsString::from_vec(name.as_bytes().to_vec());
+        if export {
+            let value = if let Some(v) = ev.lookup_var(name)? {
+                use kati::expr::Evaluable;
+                v.read().eval_to_buf(&mut ev)?
+            } else {
+                bytes::Bytes::new()
+            };
+            // SAFETY: single-threaded; recipes haven't started.
+            unsafe {
+                std::env::set_var(
+                    &key,
+                    <std::ffi::OsStr as OsStrExt>::from_bytes(&value),
+                );
+            }
+        } else {
+            // SAFETY: see above.
+            unsafe {
+                std::env::remove_var(&key);
+            }
+        }
     }
 
     {
