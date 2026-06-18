@@ -1,4 +1,3 @@
-# TODO(rust)
 .SECONDEXPANSION:
 DEP := after
 all: $$(DEP)

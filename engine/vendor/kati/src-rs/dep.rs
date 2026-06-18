@@ -398,6 +398,11 @@ struct DepBuilder<'a> {
     suffix_rules: SuffixRuleMap,
 
     first_rule: Option<Symbol>,
+    // sarun: set when `.SECONDEXPANSION:` was seen. Triggers a second
+    // pass of prereq expansion when building targets, where `$$...`
+    // tokens that survived the first parse get re-evaluated against the
+    // current variable bindings.
+    secondexpansion: bool,
     done: HashMap<Symbol, Arc<Mutex<DepNode>>>,
     phony: HashSet<Symbol>,
     restat: HashSet<Symbol>,
@@ -428,6 +433,7 @@ impl<'a> DepBuilder<'a> {
             suffix_rules: HashMap::new(),
 
             first_rule: None,
+            secondexpansion: false,
             done: HashMap::new(),
             phony: HashSet::new(),
             restat: HashSet::new(),
@@ -501,10 +507,15 @@ impl<'a> DepBuilder<'a> {
         if self.get_rule_inputs(intern(".EXPORT_ALL_VARIABLES")).is_some() {
             self.ev.export_all_vars = true;
         }
+        // sarun: .SECONDEXPANSION enables a second pass of prereq
+        // expansion. Stash the flag now; the actual re-expansion happens
+        // in build_plan for each non-special target.
+        if self.get_rule_inputs(intern(".SECONDEXPANSION")).is_some() {
+            self.secondexpansion = true;
+        }
         let real_unsupported = [
             ".DEFAULT",
             ".INTERMEDIATE",
-            ".SECONDEXPANSION",
             ".IGNORE",
             ".LOW_RESOLUTION_TIME",
             ".SILENT",
@@ -1082,6 +1093,52 @@ impl<'a> DepBuilder<'a> {
                         );
                     }
                 }
+            }
+        }
+
+        // sarun: .SECONDEXPANSION second pass. Inputs that contain a `$`
+        // (i.e. were `$$VAR`/`$$@`/etc. in the source and survived the
+        // first parse) are re-parsed as expressions and re-evaluated
+        // against the *current* variable bindings, then word-split.
+        // Targets that don't reference `$` are left alone.
+        //
+        // Per the GNU make manual, $@ (target name) and $* (stem) are
+        // bound during second expansion; $<, $^, $? are NOT (deps haven't
+        // been resolved yet). We model that by temporarily installing $@
+        // as a global simple var for the duration of the expansion —
+        // the autocommand `$@` binding isn't yet wired up at this point
+        // in the pipeline (CommandEvaluator hasn't been built).
+        if self.secondexpansion && !is_special_target(&output) {
+            let inputs = n.lock().actual_inputs.clone();
+            let needs_expand = inputs.iter().any(|s| s.as_bytes().contains(&b'$'));
+            if needs_expand {
+                let at_sym = intern("@");
+                let target_name = Variable::with_simple_string(
+                    output.as_bytes(),
+                    crate::var::VarOrigin::Automatic,
+                    None,
+                    None,
+                );
+                let _scoped_at = crate::symtab::ScopedGlobalVar::new(at_sym, target_name)?;
+                let mut new_inputs: Vec<Symbol> = Vec::new();
+                for input in inputs {
+                    let bytes = input.as_bytes();
+                    if !bytes.contains(&b'$') {
+                        new_inputs.push(input);
+                        continue;
+                    }
+                    let mut mloc = n.lock().loc.clone().unwrap_or_default();
+                    let expr = crate::expr::parse_expr(
+                        &mut mloc,
+                        bytes.clone(),
+                        crate::expr::ParseExprOpt::Normal,
+                    )?;
+                    let buf = expr.eval_to_buf(self.ev)?;
+                    for w in crate::strutil::word_scanner(&buf) {
+                        new_inputs.push(intern(w.to_vec()));
+                    }
+                }
+                n.lock().actual_inputs = new_inputs;
             }
         }
 
