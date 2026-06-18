@@ -1,4 +1,3 @@
-# TODO(rust)
 all: sub
 	@echo top-FOO=$(FOO)
 all: FOO := PUB

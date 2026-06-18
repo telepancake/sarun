@@ -604,19 +604,30 @@ impl Evaluator {
         separator_pos: usize,
     ) -> Result<()> {
         let mut assign = parse_assign_statement(after_targets, separator_pos);
-        // sarun: target-specific `export VAR := …` and `unexport VAR := …`.
-        // Strip the leading directive from the LHS and remember it so the
-        // recipe-runner can push the var into the child env for this
-        // target's commands.
+        // sarun: target-specific `export VAR := …`, `unexport VAR := …`,
+        // and `private VAR := …`. Strip the leading directive(s) from the
+        // LHS — kati used to intern e.g. "export VAR" as the variable
+        // name. `private` is a no-op for the assignment value itself; it
+        // means "don't inherit into prereq recipes", which we approximate
+        // well enough by simply consuming the keyword (per-target scope
+        // already isolates the var from siblings, and our prereq
+        // inheritance is shallow).
         let mut tsv_exported = None;
-        let lhs_trimmed = crate::strutil::trim_left_space(assign.lhs);
-        if let Some(rest) = lhs_trimmed.strip_prefix(b"export ") {
-            tsv_exported = Some(true);
-            assign.lhs = crate::strutil::trim_left_space(rest);
-        } else if let Some(rest) = lhs_trimmed.strip_prefix(b"unexport ") {
-            tsv_exported = Some(false);
-            assign.lhs = crate::strutil::trim_left_space(rest);
+        let mut lhs_trimmed = crate::strutil::trim_left_space(assign.lhs);
+        loop {
+            if let Some(rest) = lhs_trimmed.strip_prefix(b"export ") {
+                tsv_exported = Some(true);
+                lhs_trimmed = crate::strutil::trim_left_space(rest);
+            } else if let Some(rest) = lhs_trimmed.strip_prefix(b"unexport ") {
+                tsv_exported = Some(false);
+                lhs_trimmed = crate::strutil::trim_left_space(rest);
+            } else if let Some(rest) = lhs_trimmed.strip_prefix(b"private ") {
+                lhs_trimmed = crate::strutil::trim_left_space(rest);
+            } else {
+                break;
+            }
         }
+        assign.lhs = lhs_trimmed;
         let var_sym = intern(after_targets.slice_ref(assign.lhs));
         let is_final = stmt.sep == RuleSep::FinalEq;
         for target in targets {
