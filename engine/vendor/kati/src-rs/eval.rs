@@ -247,6 +247,11 @@ pub struct Evaluator {
     /// target. Causes every make-defined variable to be exported into
     /// recipe environments, mirroring GNU make's behavior.
     pub export_all_vars: bool,
+    /// sarun: set when the makefile names `.ONESHELL` as a target.
+    /// Recipe lines for each rule are concatenated and passed to a
+    /// single shell invocation, so shell state (variables, cwd, set
+    /// flags) persists across them.
+    pub oneshell: bool,
     /// sarun: required `include` directives whose file didn't exist at
     /// parse time, paired with the source location of the directive.
     /// The remake-the-makefile loop in main.rs checks for rules
@@ -299,6 +304,7 @@ impl Evaluator {
             rules: Vec::new(),
             exports: HashMap::new(),
             export_all_vars: false,
+            oneshell: false,
             pending_remake_includes: Vec::new(),
             symbols_for_eval: HashSet::new(),
 
