@@ -246,6 +246,11 @@ enum Pane {
     /// the verbose tshark dissection of the selected flow's frame
     /// (`flows.detail`, also sandboxed).
     Flows,
+    /// Drill-down INTO a flow's TCP stream: left pane = every packet in
+    /// that connection (frame · time · src→dst · proto · len · info),
+    /// right pane = the same tshark -V dissection but per-packet. Pushed
+    /// by Enter from Pane::Flows; Esc / Backspace pops back to Flows.
+    Packets,
     Help,
     /// The engine-held PTY pane (D7/D9): a live tui-term view of an interactive
     /// command the ENGINE runs on a PTY, driven over the FRAME_PTY_* mux.
@@ -568,6 +573,15 @@ struct App {
     sel_flow: usize,
     flow_detail: String,
     flow_detail_frame: u64,
+    /// Packet drill-down pushed by Enter on a flow row. `packets` holds
+    /// every frame in `packets_stream`'s tcp.stream; `packet_detail` is
+    /// the cached tshark -V for `packet_detail_frame`. Esc / Backspace
+    /// pops back to Flows.
+    packets: Vec<Value>,
+    sel_packet: usize,
+    packet_detail: String,
+    packet_detail_frame: u64,
+    packets_stream: i64,
 }
 
 /// Cap on the transcript window: chars rendered in one frame, centred on
@@ -620,6 +634,9 @@ impl App {
             box_summary: serde_json::json!(null),
             flows: vec![], sel_flow: 0,
             flow_detail: String::new(), flow_detail_frame: 0,
+            packets: vec![], sel_packet: 0,
+            packet_detail: String::new(), packet_detail_frame: 0,
+            packets_stream: -1,
         };
         a.refresh_sessions();
         a.load_changes();
@@ -1477,6 +1494,84 @@ impl App {
         self.load_flow_detail();
     }
 
+    /// Drill from the selected flow row into its TCP stream's packet
+    /// list. Open by `Enter` on the flows pane. Idempotent: re-entering
+    /// with the same stream id replays the cached state.
+    fn open_packets(&mut self) {
+        let Some(sid) = self.cur_sid_i64() else { return };
+        let Some(row) = self.flows.get(self.sel_flow) else { return };
+        let stream = row.get("stream").and_then(Value::as_i64).unwrap_or(-1);
+        if stream < 0 {
+            self.status = "no tcp.stream for that flow".into();
+            return;
+        }
+        self.packets.clear();
+        self.sel_packet = 0;
+        self.packet_detail.clear();
+        self.packet_detail_frame = 0;
+        self.packets_stream = stream;
+        self.right_scroll = 0;
+        match rpc(&self.sock, "flows.packets",
+                  json!([sid.to_string(), stream])) {
+            Ok(v) if v.get("ok").and_then(Value::as_bool) == Some(true) => {
+                if let Some(arr) = v.get("packets").and_then(Value::as_array) {
+                    self.packets = arr.clone();
+                }
+            }
+            Ok(v) => {
+                self.status = format!("flows.packets: {}",
+                    v.get("error").and_then(Value::as_str).unwrap_or("?"));
+            }
+            Err(e) => self.status = format!("flows.packets: {e}"),
+        }
+        // Land the cursor on the same frame the user picked in the flows
+        // list (so the right-pane immediately shows what they clicked on,
+        // not packet #1 of the connection).
+        let want = row.get("frame").and_then(Value::as_u64).unwrap_or(0);
+        if want > 0 {
+            if let Some(pos) = self.packets.iter().position(|r| {
+                r.get("frame").and_then(Value::as_u64) == Some(want)
+            }) {
+                self.sel_packet = pos;
+            }
+        }
+        self.focus = Pane::Packets;
+        self.load_packet_detail();
+    }
+
+    /// Lazy-load tshark -V for the cursored packet (same engine verb as
+    /// the flows pane; one frame is one frame).
+    fn load_packet_detail(&mut self) {
+        let Some(sid) = self.cur_sid_i64() else { return };
+        let Some(row) = self.packets.get(self.sel_packet) else {
+            self.packet_detail.clear(); self.packet_detail_frame = 0; return;
+        };
+        let frame = row.get("frame").and_then(Value::as_u64).unwrap_or(0);
+        if frame == 0 { self.packet_detail.clear(); return; }
+        if frame == self.packet_detail_frame && !self.packet_detail.is_empty() {
+            return;
+        }
+        self.packet_detail_frame = frame;
+        match rpc(&self.sock, "flows.detail",
+                  json!([sid.to_string(), frame])) {
+            Ok(v) if v.get("ok").and_then(Value::as_bool) == Some(true) => {
+                self.packet_detail = v.get("text").and_then(Value::as_str)
+                    .unwrap_or("").to_string();
+            }
+            Ok(v) => self.packet_detail = format!(
+                "tshark error: {}",
+                v.get("error").and_then(Value::as_str).unwrap_or("?")),
+            Err(e) => self.packet_detail = format!("rpc error: {e}"),
+        }
+    }
+
+    /// Pop back from Pane::Packets to Pane::Flows. Cursor and detail
+    /// state on the flows side are untouched.
+    fn close_packets(&mut self) {
+        self.focus = Pane::Flows;
+        self.right_scroll = 0;
+    }
+
     /// Lazy-load tshark `-V` for the selected flow's frame. Cached
     /// until the cursor moves to a different frame.
     fn load_flow_detail(&mut self) {
@@ -1720,6 +1815,13 @@ impl App {
                     self.load_flow_detail();
                 }
             }
+            Pane::Packets => {
+                if self.sel_packet + 1 < self.packets.len() {
+                    self.sel_packet += 1;
+                    self.right_scroll = 0;
+                    self.load_packet_detail();
+                }
+            }
             Pane::Help => self.out_scroll = self.out_scroll.saturating_add(1),
             Pane::Pty => {}
         }
@@ -1761,6 +1863,13 @@ impl App {
                     self.sel_flow -= 1;
                     self.right_scroll = 0;
                     self.load_flow_detail();
+                }
+            }
+            Pane::Packets => {
+                if self.sel_packet > 0 {
+                    self.sel_packet -= 1;
+                    self.right_scroll = 0;
+                    self.load_packet_detail();
                 }
             }
             Pane::Help => self.out_scroll = self.out_scroll.saturating_sub(1),
@@ -1846,6 +1955,17 @@ impl App {
                     self.load_flow_detail();
                 }
             }
+            Pane::Packets => {
+                let total = self.packets.len();
+                if total == 0 { return; }
+                let cur = self.sel_packet as isize;
+                let new = (cur + delta).clamp(0, total as isize - 1) as usize;
+                if new != self.sel_packet {
+                    self.sel_packet = new;
+                    self.right_scroll = 0;
+                    self.load_packet_detail();
+                }
+            }
             Pane::Hunks => {
                 let n16 = n as u16;
                 if step > 0 { self.hunk_scroll = self.hunk_scroll.saturating_add(n16); }
@@ -1870,7 +1990,7 @@ impl App {
         matches!(self.focus,
             Pane::Sessions | Pane::Processes | Pane::Outputs
             | Pane::Pipelines | Pane::BuildEdges | Pane::Rules
-            | Pane::Flows)
+            | Pane::Flows | Pane::Packets)
     }
 
     /// Snap focus back to the LEFT list and reset the right-pane scroll.
@@ -1918,8 +2038,10 @@ impl App {
                 self.load_hunks();
                 self.focus = Pane::Hunks;
             }
+            // Flows → Packets drill-down on Enter; Esc/Backspace pops back.
+            Pane::Flows => self.open_packets(),
             Pane::Hunks | Pane::Processes | Pane::Outputs | Pane::Rules
-            | Pane::Pipelines | Pane::BuildEdges | Pane::Flows
+            | Pane::Pipelines | Pane::BuildEdges | Pane::Packets
             | Pane::Help | Pane::Pty => {}
         }
     }
@@ -3410,7 +3532,8 @@ fn view_of_pane(p: Pane) -> Option<(char, &'static str, FilterView)> {
         Pane::Pipelines => Some(('l', "pipes",   FilterView::Changes /* unused */)),
         Pane::BuildEdges => Some(('g', "build",  FilterView::Changes /* unused */)),
         Pane::Rules     => Some(('e', "rules",   FilterView::Changes /* unused */)),
-        Pane::Flows     => Some(('f', "flows",   FilterView::Changes /* unused */)),
+        Pane::Flows | Pane::Packets
+                        => Some(('f', "flows",   FilterView::Changes /* unused */)),
         Pane::Help      => Some(('?', "help",    FilterView::Changes /* unused */)),
         Pane::Pty       => Some(('P', "PTY",     FilterView::Changes /* unused */)),
     }
@@ -3816,6 +3939,21 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                 f.render_widget(p, left);
                 let detail = Paragraph::new(Text::from(flow_detail_lines(app)))
                     .block(block(title("FLOW · DETAIL (tshark -V)", rf), rf))
+                    .scroll((rscroll, 0))
+                    .wrap(Wrap { trim: false });
+                if !skip_right { f.render_widget(detail, right); }
+            }
+            Pane::Packets => {
+                let lines = packets_lines(app);
+                let scroll = scroll_for_cursor(app.sel_packet + 1, lines.len(), left.height);
+                let p = Paragraph::new(Text::from(lines))
+                    .block(block(
+                        title(&format!("PACKETS · stream {}", app.packets_stream), lf),
+                        lf))
+                    .scroll((scroll, 0));
+                f.render_widget(p, left);
+                let detail = Paragraph::new(Text::from(packet_detail_lines(app)))
+                    .block(block(title("PACKET · DETAIL (tshark -V)", rf), rf))
                     .scroll((rscroll, 0))
                     .wrap(Wrap { trim: false });
                 if !skip_right { f.render_widget(detail, right); }
@@ -4328,6 +4466,58 @@ fn flow_detail_lines(app: &App) -> Vec<Line<'static>> {
             Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)))];
     }
     app.flow_detail.lines().map(|s| Line::from(s.to_string())).collect()
+}
+
+/// Packet drill-down list row. One row per ethernet frame in the
+/// selected flow's TCP stream. Columns: frame · time · src→dst ·
+/// protocol · length · info (tshark's _ws.col.info, e.g. the HTTP
+/// request line or the TLS record type).
+fn packets_lines(app: &App) -> Vec<Line<'static>> {
+    if app.packets.is_empty() {
+        return vec![Line::from(Span::styled(
+            "no packets in this stream",
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)))];
+    }
+    let mut out = vec![];
+    for row in &app.packets {
+        let frame  = row.get("frame").and_then(Value::as_u64).unwrap_or(0);
+        let t      = row.get("t").and_then(Value::as_f64).unwrap_or(0.0);
+        let src    = row.get("src").and_then(Value::as_str).unwrap_or("");
+        let dst    = row.get("dst").and_then(Value::as_str).unwrap_or("");
+        let proto  = row.get("proto").and_then(Value::as_str).unwrap_or("");
+        let len    = row.get("len").and_then(Value::as_u64).unwrap_or(0);
+        let info   = row.get("info").and_then(Value::as_str).unwrap_or("");
+        let proto_color = match proto {
+            "HTTP" | "HTTP/2" => Color::Yellow,
+            "TLSv1.2" | "TLSv1.3" | "TLS" => Color::Cyan,
+            "TCP" => Color::DarkGray,
+            _ => Color::White,
+        };
+        let info_short: String = info.chars().take(80).collect();
+        out.push(Line::from(vec![
+            Span::styled(format!("{:>5}  ", frame),
+                Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("{:>7.3}s  ", t),
+                Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("{:>15} → {:<15}  ", src, dst),
+                Style::default().fg(Color::White)),
+            Span::styled(format!("{:<9} ", proto),
+                Style::default().fg(proto_color).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("{:>5}  ", len),
+                Style::default().fg(Color::DarkGray)),
+            Span::raw(info_short),
+        ]));
+    }
+    out
+}
+
+fn packet_detail_lines(app: &App) -> Vec<Line<'static>> {
+    if app.packet_detail.is_empty() {
+        return vec![Line::from(Span::styled(
+            "(no packet selected)",
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)))];
+    }
+    app.packet_detail.lines().map(|s| Line::from(s.to_string())).collect()
 }
 
 /// Right-hand detail for the selected build edge: full outs/ins lists,
@@ -5516,8 +5706,12 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                     // Letter accelerators: route through the same
                     // dispatch_menubar_key the F9 menu-nav path uses,
                     // so the two paths can't diverge.
-                    KeyCode::Char(c @ ('b'|'c'|'p'|'o'|'l'|'g'|'e'|'?'|'P')) =>
+                    KeyCode::Char(c @ ('b'|'c'|'p'|'o'|'l'|'g'|'f'|'e'|'?'|'P')) =>
                         dispatch_menubar_key(&mut app, c),
+                    // Esc / Backspace from the packet drill-down pops back
+                    // to the flows list, keeping its cursor + detail state.
+                    KeyCode::Esc | KeyCode::Backspace if app.focus == Pane::Packets =>
+                        app.close_packets(),
                     // In the diff pane, a/x/d are PER-HUNK; elsewhere they act on
                     // the selected change / whole box.
                     // 'm' opens the context-menu popup for the
@@ -6128,6 +6322,89 @@ mod tests {
                 "tshark dissection didn't render in the right pane:\n{buf}");
     }
 
+    /// Packet drill-down render: synthetic packet rows + a fake -V
+    /// dissection. Asserts the title, the per-row marker (proto, len,
+    /// info excerpt), and the cached dissection text all render.
+    #[test]
+    fn packets_pane_renders_list_and_detail() {
+        let Some(eng) = boot() else {
+            eprintln!("SKIP: engine binary missing");
+            return;
+        };
+        let mut app = App::new(eng.sock.clone());
+        app.focus = Pane::Packets;
+        app.packets_stream = 0;
+        app.packets = vec![
+            serde_json::json!({"frame": 1, "t": 0.000, "src": "240.1.0.2",
+                "dst": "240.1.1.0", "proto": "TCP",     "len": 74,
+                "info": "33644 → 443 [SYN]"}),
+            serde_json::json!({"frame": 2, "t": 0.001, "src": "240.1.1.0",
+                "dst": "240.1.0.2", "proto": "TCP",     "len": 74,
+                "info": "443 → 33644 [SYN, ACK]"}),
+            serde_json::json!({"frame": 8, "t": 0.011, "src": "240.1.0.2",
+                "dst": "240.1.1.0", "proto": "TLSv1.3", "len": 583,
+                "info": "Client Hello (SNI=example.com)"}),
+            serde_json::json!({"frame": 12, "t": 0.038, "src": "240.1.0.2",
+                "dst": "240.1.1.0", "proto": "HTTP",    "len": 480,
+                "info": "GET / HTTP/1.1"}),
+            serde_json::json!({"frame": 15, "t": 0.451, "src": "240.1.1.0",
+                "dst": "240.1.0.2", "proto": "HTTP",    "len": 1400,
+                "info": "HTTP/1.1 200 OK (text/html)"}),
+        ];
+        app.sel_packet = 3;
+        app.packet_detail = "Frame 12: 480 bytes on wire\n\
+                              Hypertext Transfer Protocol\n    \
+                              GET / HTTP/1.1\n    \
+                              Host: example.com\n".into();
+        app.packet_detail_frame = 12;
+        let buf = render_to_string(&app, 200, 30).unwrap();
+        assert!(buf.contains("PACKETS"),
+                "packets pane title missing:\n{buf}");
+        assert!(buf.contains("stream 0"),
+                "stream id missing from title:\n{buf}");
+        assert!(buf.contains("Client Hello"),
+                "TLS Client Hello row missing:\n{buf}");
+        assert!(buf.contains("GET /"),
+                "HTTP info missing:\n{buf}");
+        assert!(buf.contains("PACKET") && buf.contains("DETAIL"),
+                "packet detail title missing:\n{buf}");
+        assert!(buf.contains("Host: example.com"),
+                "tshark dissection didn't render in the right pane:\n{buf}");
+    }
+
+    /// Pane transitions for the drill-down: open_packets sets focus
+    /// to Packets, close_packets pops back to Flows. Cursor on the
+    /// flows side is preserved across the round trip.
+    #[test]
+    fn packets_pane_drill_down_pops_back() {
+        let Some(eng) = boot() else {
+            eprintln!("SKIP: engine binary missing");
+            return;
+        };
+        let mut app = App::new(eng.sock.clone());
+        app.focus = Pane::Flows;
+        // Without a known cur_sid, open_packets bails — give a fake
+        // session that the engine will reject on the actual rpc but
+        // we still observe the local state. We seed a flows row with
+        // a stream id so the precondition holds.
+        app.sessions = vec![serde_json::json!({
+            "session_id": "9999", "name": "FAKE", "path": "FAKE", "live": false,
+        })];
+        app.flows = vec![serde_json::json!({
+            "frame": 12, "t": 0.0, "src": "", "dst": "",
+            "sni": "", "host": "example.com",
+            "method": "GET", "uri": "/", "status": "",
+            "stream": 7,
+        })];
+        app.sel_flow = 0;
+        app.open_packets();   // rpc will fail; we just want the focus shift
+        assert!(matches!(app.focus, Pane::Packets), "focus should be Packets");
+        assert_eq!(app.packets_stream, 7);
+        app.close_packets();
+        assert!(matches!(app.focus, Pane::Flows), "focus should be Flows");
+        assert_eq!(app.sel_flow, 0, "flows cursor preserved across pop");
+    }
+
     /// Flows pane keyboard nav: j/k moves the cursor (with detail
     /// refresh stubbed via flows-only mutation), 'f' triggers
     /// load_flows (we just verify it doesn't crash on a clean App).
@@ -6466,6 +6743,9 @@ mod tests {
             box_summary: serde_json::json!(null),
             flows: vec![], sel_flow: 0,
             flow_detail: String::new(), flow_detail_frame: 0,
+            packets: vec![], sel_packet: 0,
+            packet_detail: String::new(), packet_detail_frame: 0,
+            packets_stream: -1,
         };
         app.focus = Pane::Help;
         // render tall enough to fit the full manual (it scrolls in a real term).

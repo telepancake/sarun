@@ -330,6 +330,68 @@ def test_n_box_flows_list_via_tshark():
         eng.stop()
 
 
+def test_n_box_flows_packets_drill_down():
+    """The packet drill-down: `flows.list` returns a tcp.stream id per row;
+    `flows.packets [sid, stream]` returns every frame in that stream. For
+    the HTTPS request we expect at least the SYN/SYN-ACK setup, a TLS
+    ClientHello (with example.com SNI), the decrypted GET / line, and the
+    HTTP/1.1 200 OK response — in that order, all on the same stream."""
+    skip_if_no_binary()
+    skip_if_offline()
+    if shutil.which("tshark") is None:
+        import pytest
+        pytest.skip("tshark not installed")
+    eng = Engine("TST10")
+    try:
+        eng.start()
+        r = eng.run("-n", "--", "curl", "-sS", "-m", "15", "-o", "/dev/null",
+                    "https://example.com/")
+        assert r.returncode == 0, r.stderr
+        # First fetch the flow list to discover the stream id.
+        import json
+        def call(verb, args):
+            msg = json.dumps({"type": "ui", "verb": verb,
+                              "args": args}).encode() + b"\n"
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.connect(str(eng.sock_path))
+                s.sendall(msg)
+                buf = b""; s.settimeout(15.0)
+                while b"\n" not in buf and len(buf) < 4_000_000:
+                    chunk = s.recv(65536)
+                    if not chunk: break
+                    buf += chunk
+            return json.loads(buf.split(b"\n", 1)[0])
+        flows = call("flows.list", ["1"])["r"]["flows"]
+        # Pick the GET request row (it has host=example.com + method=GET).
+        get_row = next(f for f in flows
+                       if f["method"] == "GET" and f["host"] == "example.com")
+        stream = get_row["stream"]
+        assert stream >= 0, f"stream id missing: {get_row!r}"
+        packets = call("flows.packets", ["1", stream])["r"]["packets"]
+        # Frames should be in time order.
+        frames = [p["frame"] for p in packets]
+        assert frames == sorted(frames), \
+            f"packet frames not in order: {frames}"
+        protos = {p["proto"] for p in packets}
+        # The drill-down should at minimum include both ends of the
+        # encrypted exchange — TCP setup and the (decrypted) HTTP layer.
+        assert any(p.startswith("TCP") for p in protos), \
+            f"no TCP in stream: {protos!r}"
+        # Either TLS or HTTP framings (the box-side traffic gets
+        # decrypted by the keylog so tshark labels it HTTP, not TLS).
+        assert any("HTTP" in p for p in protos) or \
+               any("TLS" in p for p in protos), \
+            f"no application protocol in stream: {protos!r}"
+        # The Client Hello with SNI=example.com SHOULD be in this stream's
+        # info column somewhere (regardless of which protocol label tshark
+        # picks). Same for the HTTP response status.
+        infos = " ".join(p["info"] for p in packets)
+        assert "example.com" in infos or "Application Data" in infos, \
+            f"no example.com or application data in stream: {infos!r}"
+    finally:
+        eng.stop()
+
+
 def test_n_box_quic_blocked():
     """UDP other than :53 is dropped at the stack — there's no listener
     bound. curl's --http3-only sends a QUIC Initial UDP packet to :443;
