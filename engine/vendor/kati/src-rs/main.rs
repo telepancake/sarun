@@ -60,6 +60,17 @@ fn read_bootstrap_makefile(targets: &[Symbol]) -> Result<Arc<Mutex<Vec<Stmt>>>> 
     // sarun: upstream pins 4.2.1 for Android-build stability; we declared
     // GNU make 4.3 (Ubuntu 22.04 LTS) as our compat target, so report that.
     bootstrap.put_slice(b"MAKE_VERSION?=4.3\n");
+    // sarun: MAKELEVEL tracks recursion depth across sub-makes. Real make
+    // reads it from the environment (default 0), reports it via $(MAKELEVEL),
+    // and bumps it by 1 in every recipe environment so child make
+    // invocations see the next level. Mirror that here.
+    {
+        let level = std::env::var("MAKELEVEL")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(0);
+        bootstrap.put_slice(format!("MAKELEVEL:={level}\n").as_bytes());
+    }
     bootstrap.put_slice(b"KATI?=ckati\n");
     bootstrap.put_slice(b"SHELL=/bin/sh\n");
 
@@ -233,6 +244,19 @@ fn run(targets: &[Symbol], cl_vars: &Vec<Bytes>, orig_args: OsString) -> Result<
         generate_ninja(&nodes, &mut ev, orig_args.as_bytes(), start_time)?;
         ev.finish()?;
         return Ok(0);
+    }
+
+    // sarun: bump MAKELEVEL by 1 in the recipe environment so any sub-make
+    // launched from a recipe sees the next level. Matches real make.
+    {
+        let level = std::env::var("MAKELEVEL")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(0);
+        // SAFETY: single-threaded at this point in the pipeline.
+        unsafe {
+            std::env::set_var("MAKELEVEL", (level + 1).to_string());
+        }
     }
 
     // sarun: `.EXPORT_ALL_VARIABLES:` makes every make-defined variable

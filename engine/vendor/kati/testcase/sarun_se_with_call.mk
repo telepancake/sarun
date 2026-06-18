@@ -1,4 +1,3 @@
-# TODO(rust)
 .SECONDEXPANSION:
 prepend = head-$1
 target = body

@@ -1,4 +1,3 @@
-# TODO(rust)
 all:
 	@echo top=$(MAKELEVEL)
 	@$(MAKE) -f $(firstword $(MAKEFILE_LIST)) sub
