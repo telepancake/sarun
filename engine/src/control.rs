@@ -1422,6 +1422,88 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
             }
             json!({"ok": true})
         }
+        // ── box-rooted file ops — the engine-side half of oaita's read/write/
+        //    inspect tools. Resolve name→id, hydrate the parent chain, then
+        //    use the same overlay API nested boxes use. No FUSE mount needed,
+        //    no subprocess. args: [name_or_id, path_rel_to_root, (write only)
+        //    base64-bytes]. path must NOT start with '/'.
+        "box_file_read" => {
+            let ov = state.lock().unwrap().overlay.clone();
+            let Some(ov) = ov else {
+                return json!({"ok": false, "error": "overlay not available"});
+            };
+            let Some(ident) = args.first().and_then(Value::as_str) else {
+                return json!({"ok": false, "error": "box_file_read: missing name/id"});
+            };
+            let Some(id) = resolve(&boxes, ident) else {
+                return json!({"ok": false, "error": format!("no such box: {ident}")});
+            };
+            let rel = args.get(1).and_then(Value::as_str).unwrap_or("");
+            match ov.box_read_file(id, rel) {
+                Ok(bytes) => {
+                    use base64::{Engine, prelude::BASE64_STANDARD};
+                    json!({"bytes": BASE64_STANDARD.encode(bytes)})
+                }
+                Err(e) => return json!({"ok": false, "error": e.to_string()}),
+            }
+        }
+        "box_file_write" => {
+            let ov = state.lock().unwrap().overlay.clone();
+            let Some(ov) = ov else {
+                return json!({"ok": false, "error": "overlay not available"});
+            };
+            let Some(ident) = args.first().and_then(Value::as_str) else {
+                return json!({"ok": false, "error": "box_file_write: missing name/id"});
+            };
+            let Some(id) = resolve(&boxes, ident) else {
+                return json!({"ok": false, "error": format!("no such box: {ident}")});
+            };
+            let rel = args.get(1).and_then(Value::as_str).unwrap_or("");
+            let b64 = args.get(2).and_then(Value::as_str).unwrap_or("");
+            use base64::{Engine, prelude::BASE64_STANDARD};
+            let bytes = match BASE64_STANDARD.decode(b64) {
+                Ok(b) => b,
+                Err(e) => return json!({"ok": false,
+                    "error": format!("bad base64: {e}")}),
+            };
+            match ov.box_write_file(id, rel, &bytes) {
+                Ok(()) => json!({"len": bytes.len()}),
+                Err(e) => return json!({"ok": false, "error": e.to_string()}),
+            }
+        }
+        "box_dir_list" => {
+            let ov = state.lock().unwrap().overlay.clone();
+            let Some(ov) = ov else {
+                return json!({"ok": false, "error": "overlay not available"});
+            };
+            let Some(ident) = args.first().and_then(Value::as_str) else {
+                return json!({"ok": false, "error": "box_dir_list: missing name/id"});
+            };
+            let Some(id) = resolve(&boxes, ident) else {
+                return json!({"ok": false, "error": format!("no such box: {ident}")});
+            };
+            let rel = args.get(1).and_then(Value::as_str).unwrap_or("");
+            match ov.box_list_dir(id, rel) {
+                Ok(entries) => Value::Array(entries.into_iter()
+                    .map(|(n, k)| json!({"name": n, "kind": k.to_string()}))
+                    .collect()),
+                Err(e) => return json!({"ok": false, "error": e.to_string()}),
+            }
+        }
+        "box_path_kind" => {
+            let ov = state.lock().unwrap().overlay.clone();
+            let Some(ov) = ov else {
+                return json!({"ok": false, "error": "overlay not available"});
+            };
+            let Some(ident) = args.first().and_then(Value::as_str) else {
+                return json!({"ok": false, "error": "box_path_kind: missing name/id"});
+            };
+            let Some(id) = resolve(&boxes, ident) else {
+                return json!({"ok": false, "error": format!("no such box: {ident}")});
+            };
+            let rel = args.get(1).and_then(Value::as_str).unwrap_or("");
+            json!({"kind": ov.box_path_kind(id, rel).to_string()})
+        }
         other => {
             return json!({"ok": false, "error": format!("unknown verb '{other}'")});
         }

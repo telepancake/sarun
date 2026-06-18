@@ -818,9 +818,11 @@ fn dispatch_inspect(args: &Value, target: &str, executor: Option<&dyn Executor>,
     let Some(path) = args_str(args, "path") else {
         return "inspect: missing required `path`".to_string();
     };
+    let Some(exe) = executor else {
+        return "inspect: no executor (sandbox disabled) — file IO requires a box".to_string();
+    };
     let loc = parse_locator(&path);
-    let root = executor.and_then(|e| e.box_root(&box_name(target)));
-    inspect(&loc, turns, root.as_deref())
+    inspect(&loc, turns, &box_name(target), exe)
 }
 
 fn dispatch_read(args: &Value, target: &str, executor: Option<&dyn Executor>,
@@ -828,9 +830,11 @@ fn dispatch_read(args: &Value, target: &str, executor: Option<&dyn Executor>,
     let Some(path) = args_str(args, "path") else {
         return "read: missing required `path`".to_string();
     };
+    let Some(exe) = executor else {
+        return "read: no executor (sandbox disabled) — file IO requires a box".to_string();
+    };
     let loc = parse_locator(&path);
-    let root = executor.and_then(|e| e.box_root(&box_name(target)));
-    read_path(&loc, turns, root.as_deref())
+    read_path(&loc, turns, &box_name(target), exe)
 }
 
 fn dispatch_write(args: &Value, target: &str, executor: Option<&dyn Executor>,
@@ -841,10 +845,12 @@ fn dispatch_write(args: &Value, target: &str, executor: Option<&dyn Executor>,
     let Some(content) = args_str(args, "content") else {
         return "write: missing required `content`".to_string();
     };
+    let Some(exe) = executor else {
+        return "write: no executor (sandbox disabled) — file IO requires a box".to_string();
+    };
     let force = args_bool(args, "force");
     let loc = parse_locator(&path);
-    let root = executor.and_then(|e| e.box_root(&box_name(target)));
-    write_at_locator(&loc, &content, force, turns, root.as_deref())
+    write_at_locator(&loc, &content, force, turns, &box_name(target), exe)
 }
 
 fn dispatch_box_resolve(verb: &str, args: &Value) -> String {

@@ -659,6 +659,105 @@ impl Overlay {
         self.inner.boxes.read().unwrap().keys().copied().collect()
     }
 
+    // ── in-engine file ops, served via control verbs ────────────────────────
+    //
+    // These wrap the same resolve/copy_up machinery FUSE uses, so a tool that
+    // calls them sees and writes the same merged box view a shell-inside-the-
+    // box would see. `hydrate_chain` makes them work for AT-REST boxes too —
+    // the box can be sleeping (no runner holding it) and its sqlar upper +
+    // host-fall-through lower stay reachable. Same pattern nested-box
+    // construction uses; the FUSE mount is just one consumer of this layer.
+
+    /// Read the file at `rel` in box `bid`'s merged view as raw bytes.
+    /// Hydrates the box + its parent chain on demand.
+    pub fn box_read_file(&self, bid: i64, rel: &str) -> std::io::Result<Vec<u8>> {
+        self.hydrate_chain(Some(bid));
+        match self.resolve(bid, rel) {
+            Layer::UpperFile { owner, rowid, .. } => {
+                std::fs::read(crate::capture::blob_path(owner, rowid))
+            }
+            Layer::Lower => std::fs::read(self.host(rel)),
+            Layer::UpperSymlink { target } =>
+                Ok(target.to_string_lossy().into_owned().into_bytes()),
+            Layer::UpperDir { .. } => Err(std::io::Error::new(
+                std::io::ErrorKind::Other, "is a directory")),
+            Layer::UpperSpecial { .. } => Err(std::io::Error::new(
+                std::io::ErrorKind::Other, "special file")),
+            Layer::Absent => Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound, "not found")),
+        }
+    }
+
+    /// Replace the contents of `rel` in box `bid`'s upper with `bytes`. Stages
+    /// the write exactly as a FUSE write would (copy_up → truncate → write →
+    /// finalize_file). If the file doesn't exist anywhere, this creates it
+    /// in the box's upper; the host is never touched.
+    pub fn box_write_file(&self, bid: i64, rel: &str, bytes: &[u8])
+        -> std::io::Result<()>
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        self.hydrate_chain(Some(bid));
+        let Some(b) = self.box_of(bid) else {
+            return Err(std::io::Error::new(std::io::ErrorKind::NotFound,
+                                           format!("box {bid} not registered")));
+        };
+        // pid=0 — control-RPC writes have no host writer; provenance just
+        // records the synthetic 0.
+        let mut f = self.copy_up(&b, rel, 0)?;
+        f.set_len(0)?;
+        f.seek(SeekFrom::Start(0))?;
+        f.write_all(bytes)?;
+        f.flush()?;
+        let sz = bytes.len() as i64;
+        let writer = b.writer_for(0);
+        let mtime_ns = SystemTime::now().duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as i64).unwrap_or(0);
+        b.finalize_file(rel, sz, mtime_ns, writer);
+        Ok(())
+    }
+
+    /// Merged listing of `rel` in box `bid`. Returns (name, kind_char)
+    /// where kind_char ∈ 'f' (file), 'd' (dir), 'l' (symlink), 's' (special),
+    /// '?' (unknown).
+    pub fn box_list_dir(&self, bid: i64, rel: &str)
+        -> std::io::Result<Vec<(String, char)>>
+    {
+        self.hydrate_chain(Some(bid));
+        let Some(b) = self.box_of(bid) else {
+            return Err(std::io::Error::new(std::io::ErrorKind::NotFound,
+                                           format!("box {bid} not registered")));
+        };
+        let entries = self.scan_dir(&b, rel, /*plus=*/false);
+        Ok(entries.into_iter().map(|(name, kind, _, _)| {
+            let c = match kind {
+                FileType::RegularFile => 'f',
+                FileType::Directory => 'd',
+                FileType::Symlink => 'l',
+                _ => 's',
+            };
+            (name, c)
+        }).collect())
+    }
+
+    /// Kind of `rel` in box `bid` (or '?' when absent). Like a single stat.
+    pub fn box_path_kind(&self, bid: i64, rel: &str) -> char {
+        self.hydrate_chain(Some(bid));
+        match self.resolve(bid, rel) {
+            Layer::UpperFile { .. } => 'f',
+            Layer::UpperDir { .. } => 'd',
+            Layer::UpperSymlink { .. } => 'l',
+            Layer::UpperSpecial { .. } => 's',
+            Layer::Lower => match self.host(rel).symlink_metadata() {
+                Ok(m) if m.file_type().is_symlink() => 'l',
+                Ok(m) if m.is_dir() => 'd',
+                Ok(m) if m.is_file() => 'f',
+                Ok(_) => 's',
+                Err(_) => '?',
+            },
+            Layer::Absent => '?',
+        }
+    }
+
     /// Re-parent a live box (dissolve copy-down): point its resolve()/KIDS_DIR
     /// chain at the grandparent (None = top-level). No-op if the box isn't live.
     pub fn set_box_parent(&self, id: i64, parent: Option<i64>) {

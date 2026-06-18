@@ -7,11 +7,56 @@
 // uppercase-leading token). One box per session — so the same conversation's
 // shell calls compose, just like a long-lived terminal.
 
-use std::path::PathBuf;
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+
+use base64::{Engine as _, prelude::BASE64_STANDARD};
+use serde_json::{json, Value};
 
 use crate::oaita::tools::{ExecResult, summarize_patch, fit_output,
                           RESULT_BUDGET, CHANGES_BUDGET};
+
+/// Where the in-box control socket is bind-mounted. Mirrors runner.rs.
+const UI_SOCK_INBOX: &str = "/tmp/.slopbox/ui.sock";
+
+/// One synchronous request/reply over the engine control socket. In-box if
+/// the bind-mounted path exists, host socket otherwise. Returns the unwrapped
+/// `r` payload, or an error string.
+fn ctrl_rpc(verb: &str, args: Value) -> Result<Value, String> {
+    let sock: PathBuf = if Path::new(UI_SOCK_INBOX).exists() {
+        PathBuf::from(UI_SOCK_INBOX)
+    } else {
+        crate::paths::sock_path()
+    };
+    let mut s = UnixStream::connect(&sock)
+        .map_err(|e| format!("connect {}: {e}", sock.display()))?;
+    let msg = json!({"type": "ui", "verb": verb, "args": args});
+    s.write_all(format!("{msg}\n").as_bytes())
+        .map_err(|e| format!("write: {e}"))?;
+    let mut line = String::new();
+    BufReader::new(&s).read_line(&mut line)
+        .map_err(|e| format!("read: {e}"))?;
+    let rep: Value = serde_json::from_str(&line)
+        .map_err(|e| format!("parse: {e}"))?;
+    if rep.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err(rep.get("error").and_then(Value::as_str)
+                   .unwrap_or("rpc failed").to_string());
+    }
+    Ok(rep.get("r").cloned().unwrap_or(Value::Null))
+}
+
+/// Translate a host-style path to a box-relative one. Engine's file ops want
+/// rel-to-root (no leading slash), and relative inputs from the model resolve
+/// against the runner's cwd.
+fn to_box_rel(path: &str) -> String {
+    let p = PathBuf::from(path);
+    let abs = if p.is_absolute() { p }
+              else { std::env::current_dir().unwrap_or_default().join(p) };
+    abs.strip_prefix("/").map(|q| q.to_string_lossy().into_owned())
+       .unwrap_or_else(|_| abs.to_string_lossy().into_owned())
+}
 
 pub trait Executor: Send + Sync {
     /// Run a script in a session-owned box, capture stdout+stderr+rc, and
@@ -26,14 +71,23 @@ pub trait Executor: Send + Sync {
     /// access on user scripts.
     fn run(&self, box_id: &str, script: &str, discard: bool, api_access: bool) -> ExecResult;
 
-    /// Materialize the box if it doesn't exist yet, and return the host-side
-    /// path to its merged view — `<mnt>/<box_id>/` — where reads see lower⊕
-    /// upper and writes STAGE in the box's upper layer (same as `shell`
-    /// writes). The file-inspection tools (inspect/read/write) prefix paths
-    /// with this so they see the box's view, not the raw host. Returns None
-    /// when this executor doesn't sandbox (LocalExecutor) — the tools then
-    /// fall back to host paths.
-    fn box_root(&self, box_id: &str) -> Option<PathBuf>;
+    /// Read `path` in `box_id`'s merged view. `path` may be absolute or
+    /// relative to the runner's cwd; both forms resolve to the same place a
+    /// shell-inside-the-box would resolve them. Returns raw bytes.
+    fn read_file(&self, box_id: &str, path: &str) -> std::io::Result<Vec<u8>>;
+
+    /// Replace `path` in `box_id`'s upper with `bytes`. Staged exactly like
+    /// a shell-inside-the-box write — the host fs is never touched.
+    fn write_file(&self, box_id: &str, path: &str, bytes: &[u8])
+                  -> std::io::Result<()>;
+
+    /// Directory listing as (name, kind_char) where kind ∈ 'f'/'d'/'l'/'s'/'?'.
+    fn list_dir(&self, box_id: &str, path: &str)
+                -> std::io::Result<Vec<(String, char)>>;
+
+    /// Kind of `path`: 'f' (file), 'd' (dir), 'l' (symlink), 's' (special),
+    /// '?' (absent). A stat-without-error gateway for the inspect tool.
+    fn path_kind(&self, box_id: &str, path: &str) -> char;
 }
 
 /// The persistent-box name for a session. Capital-letters prefix keeps it
@@ -85,20 +139,47 @@ fn default_sarun() -> String {
 }
 
 impl Executor for SarunExecutor {
-    fn box_root(&self, _box_id: &str) -> Option<PathBuf> {
-        // TEMPORARY: returns None until we pick a sandboxing strategy for
-        // file IO. The naive idea — `mnt_point().join(box_id)` — doesn't
-        // work because sarun only mounts a box's overlay at `<mnt>/<id>`
-        // WHILE a `sarun run` process is actively holding it; the mount
-        // goes away as soon as the process exits. So a one-shot `sarun
-        // run BOX -- true` to "materialize" the box gives us a path that
-        // unmounts before we can read/write through it. Until we either
-        //   (a) hold a supervisor process open per session, or
-        //   (b) route IO through ephemeral `sarun run BOX -- cat`/`tee`
-        // every read/write keeps going to the host directly (the existing
-        // leak documented under the `write` tool). The trait method is
-        // ready; the implementation is awaiting an architectural call.
-        None
+    fn read_file(&self, box_id: &str, path: &str) -> std::io::Result<Vec<u8>> {
+        let rel = to_box_rel(path);
+        let r = ctrl_rpc("box_file_read", json!([box_id, rel]))
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let b64 = r.get("bytes").and_then(Value::as_str).unwrap_or("");
+        BASE64_STANDARD.decode(b64)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    }
+
+    fn write_file(&self, box_id: &str, path: &str, bytes: &[u8])
+        -> std::io::Result<()>
+    {
+        let rel = to_box_rel(path);
+        let b64 = BASE64_STANDARD.encode(bytes);
+        ctrl_rpc("box_file_write", json!([box_id, rel, b64]))
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        Ok(())
+    }
+
+    fn list_dir(&self, box_id: &str, path: &str)
+        -> std::io::Result<Vec<(String, char)>>
+    {
+        let rel = to_box_rel(path);
+        let r = ctrl_rpc("box_dir_list", json!([box_id, rel]))
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let arr = r.as_array().cloned().unwrap_or_default();
+        Ok(arr.into_iter().filter_map(|e| {
+            let n = e.get("name").and_then(Value::as_str)?.to_string();
+            let k = e.get("kind").and_then(Value::as_str)?
+                     .chars().next().unwrap_or('?');
+            Some((n, k))
+        }).collect())
+    }
+
+    fn path_kind(&self, box_id: &str, path: &str) -> char {
+        let rel = to_box_rel(path);
+        match ctrl_rpc("box_path_kind", json!([box_id, rel])) {
+            Ok(r) => r.get("kind").and_then(Value::as_str)
+                      .and_then(|s| s.chars().next()).unwrap_or('?'),
+            Err(_) => '?',
+        }
     }
 
     fn run(&self, box_id: &str, script: &str, discard: bool, api_access: bool) -> ExecResult {
@@ -186,7 +267,45 @@ impl Executor for SarunExecutor {
 pub struct LocalExecutor;
 
 impl Executor for LocalExecutor {
-    fn box_root(&self, _box_id: &str) -> Option<PathBuf> { None }
+    fn read_file(&self, _box_id: &str, path: &str) -> std::io::Result<Vec<u8>> {
+        std::fs::read(path)
+    }
+    fn write_file(&self, _box_id: &str, path: &str, bytes: &[u8])
+        -> std::io::Result<()>
+    {
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        std::fs::write(path, bytes)
+    }
+    fn list_dir(&self, _box_id: &str, path: &str)
+        -> std::io::Result<Vec<(String, char)>>
+    {
+        let rd = std::fs::read_dir(path)?;
+        let mut out = Vec::new();
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let k = e.file_type().ok().map(|t| {
+                if t.is_dir() { 'd' }
+                else if t.is_symlink() { 'l' }
+                else if t.is_file() { 'f' }
+                else { 's' }
+            }).unwrap_or('?');
+            out.push((name, k));
+        }
+        Ok(out)
+    }
+    fn path_kind(&self, _box_id: &str, path: &str) -> char {
+        match std::fs::symlink_metadata(path) {
+            Ok(m) if m.file_type().is_symlink() => 'l',
+            Ok(m) if m.is_dir() => 'd',
+            Ok(m) if m.is_file() => 'f',
+            Ok(_) => 's',
+            Err(_) => '?',
+        }
+    }
 
     fn run(&self, _box_id: &str, script: &str, _discard: bool, _api_access: bool) -> ExecResult {
         let out = Command::new("sh")

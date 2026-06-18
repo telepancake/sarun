@@ -14,11 +14,9 @@
 //   box:<id>/<file>       page that file's staged diff (sarun BOX patch)
 //   next / previous / first / last       — resolve against last cursor
 
-use std::fs;
-use std::path::{Path, PathBuf};
-
 use serde_json::Value;
 
+use crate::oaita::exec::Executor;
 use crate::oaita::tools::RESULT_BUDGET;
 use crate::oaita::turns::Turn;
 
@@ -97,33 +95,13 @@ fn end_banner(target: &str, unit: &str, n: usize) -> String {
     format!("\n--- END of {target:?}: {n} {unit} total, no more pages ---\n")
 }
 
-/// Translate a host-style path (absolute or relative) into the box's
-/// merged-view path: `<mnt>/<box_id>/<abs without leading slash>`. Returns
-/// the raw path unchanged when `box_root` is None (no sandbox).
-///
-/// This is the single point that puts inspect/read/write inside the same
-/// overlay `shell` writes stage in. Without it the engine's host fs and the
-/// box's overlay drift silently: a shell that wrote a file would have it
-/// captured in the box upper, but a follow-up `read` would syscall the host
-/// and miss it. Symmetric on writes — `write` would land on the host instead
-/// of staging in the box (the leak we saw with `fft512.sh`).
-fn box_resolve(box_root: Option<&Path>, target: &str) -> PathBuf {
-    let Some(root) = box_root else { return PathBuf::from(target); };
-    let raw = PathBuf::from(target);
-    let abs = if raw.is_absolute() {
-        raw
-    } else {
-        std::env::current_dir().unwrap_or_default().join(raw)
-    };
-    let rel = abs.strip_prefix("/").unwrap_or(&abs);
-    root.join(rel)
-}
-
 /// Run the inspect tool with a parsed locator. `turns` is the current
 /// session's turn list (used to resolve page keys against the last cursor).
-/// `box_root`, when Some, points at the box's merged-view root — paths are
-/// resolved INSIDE the box so we see what the box sees.
-pub fn inspect(locator: &Locator, turns: &[Turn], box_root: Option<&Path>) -> String {
+/// `box_id` + `executor` together route file IO through the box overlay so
+/// the tool sees what a shell-inside-the-box would see (lower=host ⊕ upper=
+/// staged) — never the bare host fs.
+pub fn inspect(locator: &Locator, turns: &[Turn],
+               box_id: &str, executor: &dyn Executor) -> String {
     let (target, window) = match &locator.window {
         Window::PageKey(k) => match resolve_page_key(k, turns) {
             Some((t, w)) => (t, w),
@@ -134,31 +112,24 @@ pub fn inspect(locator: &Locator, turns: &[Turn], box_root: Option<&Path>) -> St
     if let Some(rest) = target.strip_prefix("box:") {
         return inspect_box(rest, &window);
     }
-    let p = box_resolve(box_root, &target);
-    if p.is_dir() {
-        inspect_dir(&p, &target, &window)
-    } else if p.is_file() {
-        inspect_file(&p, &target, &window)
-    } else {
-        format!("inspect: not found: {target}")
+    match executor.path_kind(box_id, &target) {
+        'd' => inspect_dir(box_id, executor, &target, &window),
+        'f' => inspect_file(box_id, executor, &target, &window),
+        'l' => format!("inspect: {target}: symlink"),
+        's' => format!("inspect: {target}: special file"),
+        _ => format!("inspect: not found: {target}"),
     }
 }
 
-fn entry_kind(p: &Path) -> &'static str {
-    let m = match fs::symlink_metadata(p) { Ok(m) => m, Err(_) => return "missing" };
-    let ft = m.file_type();
-    if ft.is_dir() { "dir" }
-    else if ft.is_symlink() { "link" }
-    else if ft.is_file() { "file" }
-    else { "other" }
+fn kind_label(k: char) -> &'static str {
+    match k { 'd' => "dir", 'l' => "link", 'f' => "file", _ => "other" }
 }
 
-fn inspect_dir(p: &Path, target: &str, window: &Window) -> String {
-    let mut entries: Vec<(String, String)> = match fs::read_dir(p) {
-        Ok(rd) => rd.filter_map(|e| e.ok())
-            .map(|e| (entry_kind(&e.path()).to_string(),
-                      e.file_name().to_string_lossy().into_owned()))
-            .collect(),
+fn inspect_dir(box_id: &str, executor: &dyn Executor,
+               target: &str, window: &Window) -> String {
+    let mut entries: Vec<(String, String)> = match executor.list_dir(box_id, target) {
+        Ok(es) => es.into_iter().map(|(name, k)| (kind_label(k).to_string(), name))
+                                .collect(),
         Err(e) => return format!("inspect: {e}"),
     };
     entries.sort_by(|a, b| a.1.cmp(&b.1));
@@ -182,8 +153,11 @@ fn inspect_dir(p: &Path, target: &str, window: &Window) -> String {
     text
 }
 
-fn inspect_file(p: &Path, target: &str, window: &Window) -> String {
-    let bytes = match fs::read(p) { Ok(b) => b, Err(e) => return format!("inspect: {e}") };
+fn inspect_file(box_id: &str, executor: &dyn Executor,
+                target: &str, window: &Window) -> String {
+    let bytes = match executor.read_file(box_id, target) {
+        Ok(b) => b, Err(e) => return format!("inspect: {e}"),
+    };
     if bytes.iter().any(|&b| b == 0) {
         return format!("inspect: {target}: binary ({} bytes)", bytes.len());
     }
@@ -301,9 +275,10 @@ pub(crate) fn resolve_page_key(key: &str, turns: &[Turn]) -> Option<(String, Win
 }
 
 /// `read` — raw bytes of a file/slice, using inspect's locator grammar.
-/// `box_root`, when Some, points at the box's merged-view root — same path
-/// translation as `inspect` so the model reads what the box sees.
-pub fn read_path(locator: &Locator, turns: &[Turn], box_root: Option<&Path>) -> String {
+/// Routes through the executor's box overlay (same view a shell-inside-the-
+/// box gets).
+pub fn read_path(locator: &Locator, turns: &[Turn],
+                 box_id: &str, executor: &dyn Executor) -> String {
     let (target, window) = match &locator.window {
         Window::PageKey(k) => match resolve_page_key(k, turns) {
             Some((t, w)) => (t, w),
@@ -315,8 +290,9 @@ pub fn read_path(locator: &Locator, turns: &[Turn], box_root: Option<&Path>) -> 
         return "read: box: locators are inspect-only — use shell in that box \
                 to read STAGED file contents".to_string();
     }
-    let p = box_resolve(box_root, &target);
-    let bytes = match fs::read(&p) { Ok(b) => b, Err(e) => return format!("read: {e}") };
+    let bytes = match executor.read_file(box_id, &target) {
+        Ok(b) => b, Err(e) => return format!("read: {e}"),
+    };
     let text = String::from_utf8_lossy(&bytes);
     let lines: Vec<&str> = text.lines().collect();
     let n = lines.len();
@@ -363,7 +339,8 @@ pub fn read_path(locator: &Locator, turns: &[Turn], box_root: Option<&Path>) -> 
 /// line; conflicts/errors are also returned as text (no Result) to match how
 /// the other dispatch_* functions hand their bodies back to the call result.
 pub fn write_at_locator(locator: &Locator, content: &str, force: bool,
-                        turns: &[Turn], box_root: Option<&Path>) -> String {
+                        turns: &[Turn], box_id: &str,
+                        executor: &dyn Executor) -> String {
     let (target, window) = match &locator.window {
         Window::PageKey(k) => match resolve_page_key(k, turns) {
             Some((t, w)) => (t, w),
@@ -375,42 +352,39 @@ pub fn write_at_locator(locator: &Locator, content: &str, force: bool,
         return "write: box: locators are inspect-only — staged box contents \
                 are reachable only through shell inside the box".to_string();
     }
-    let p = box_resolve(box_root, &target);
+    let kind = executor.path_kind(box_id, &target);
 
     // Whole-file replace (Window::Default on either a missing path or an
     // existing file) — easy path, no slicing.
     if matches!(window, Window::Default) {
-        let exists = p.is_file();
+        let exists = kind == 'f';
         let prev_n = if exists {
-            fs::read_to_string(&p).map(|s| s.lines().count()).unwrap_or(0)
+            executor.read_file(box_id, &target)
+                .map(|b| String::from_utf8_lossy(&b).lines().count())
+                .unwrap_or(0)
         } else { 0 };
         if exists && !force {
-            if let Some(conflict) = check_conflict_whole_file(&target, &p, turns) {
+            if let Some(conflict) = check_conflict_whole_file(
+                box_id, executor, &target, turns) {
                 return conflict;
             }
         }
-        if let Some(parent) = p.parent() {
-            if !parent.as_os_str().is_empty() {
-                let _ = fs::create_dir_all(parent);
-            }
-        }
-        if let Err(e) = fs::write(&p, content) {
+        if let Err(e) = executor.write_file(box_id, &target, content.as_bytes()) {
             return format!("write: {e}");
         }
-        let new_n = content.lines().count()
-            + if content.ends_with('\n') || content.is_empty() { 0 } else { 0 };
-        let new_n = if content.is_empty() { 0 } else { new_n.max(1) };
+        let new_n = if content.is_empty() { 0 } else { content.lines().count().max(1) };
         return format!("write: {target}: replaced whole file ({prev_n} -> {new_n} lines)");
     }
 
     // From here on, we need an existing file to slice into.
-    if !p.is_file() {
+    if kind != 'f' {
         return format!("write: not a file: {target}");
     }
-    let original = match fs::read_to_string(&p) {
-        Ok(s) => s,
+    let original_bytes = match executor.read_file(box_id, &target) {
+        Ok(b) => b,
         Err(e) => return format!("write: {e}"),
     };
+    let original = String::from_utf8_lossy(&original_bytes).into_owned();
     let lines: Vec<&str> = original.lines().collect();
     let n = lines.len();
     let (a, b) = window_indices(&window, n, LINES_PER_PAGE);
@@ -429,10 +403,9 @@ pub fn write_at_locator(locator: &Locator, content: &str, force: bool,
     let prefix_end = lo.saturating_sub(1).min(n);
     let suffix_start = hi.min(n);
     let mut out = String::new();
-    for (i, ln) in lines[..prefix_end].iter().enumerate() {
+    for ln in lines[..prefix_end].iter() {
         out.push_str(ln);
         out.push('\n');
-        let _ = i;
     }
     if !content.is_empty() {
         out.push_str(content);
@@ -447,7 +420,7 @@ pub fn write_at_locator(locator: &Locator, content: &str, force: bool,
     if !original.ends_with('\n') && out.ends_with('\n') {
         out.pop();
     }
-    if let Err(e) = fs::write(&p, &out) {
+    if let Err(e) = executor.write_file(box_id, &target, out.as_bytes()) {
         return format!("write: {e}");
     }
     let new_lines: Vec<&str> = out.lines().collect();
@@ -455,7 +428,6 @@ pub fn write_at_locator(locator: &Locator, content: &str, force: bool,
     let was = if hi < lo { 0 } else { was };
     let now = content.lines().count()
         + if content.is_empty() || content.ends_with('\n') { 0 } else { 1 };
-    // Inspect-style footer so the model knows what range it just touched.
     format!(
         "write: {target}: replaced lines {lo}..{hi} ({was} lines -> {now}); \
          file now {} lines",
@@ -468,7 +440,8 @@ pub fn write_at_locator(locator: &Locator, content: &str, force: bool,
 /// one, compare its captured content to what the file holds now and return a
 /// conflict string when they differ. Returns None when no prior read exists
 /// (=> nothing to compare, write proceeds) or when contents still match.
-fn check_conflict_whole_file(target: &str, p: &Path, turns: &[Turn]) -> Option<String> {
+fn check_conflict_whole_file(box_id: &str, executor: &dyn Executor,
+                             target: &str, turns: &[Turn]) -> Option<String> {
     let (call_args, captured) = last_read_for_path(target, turns)?;
     // Only treat WHOLE-FILE prior reads as a baseline for whole-file writes.
     // A prior `read(path lines 1..3)` doesn't certify the rest of the file
@@ -477,7 +450,8 @@ fn check_conflict_whole_file(target: &str, p: &Path, turns: &[Turn]) -> Option<S
     if !matches!(prev_loc.window, Window::Default) {
         return None;
     }
-    let now = fs::read_to_string(p).ok()?;
+    let bytes = executor.read_file(box_id, target).ok()?;
+    let now = String::from_utf8_lossy(&bytes).into_owned();
     if now == captured {
         None
     } else {
