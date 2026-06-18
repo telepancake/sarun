@@ -706,18 +706,19 @@ pub fn run_to_completion(spec: &str, set: &Settings,
                 && !last.flags.contains('c')
                 && !last.flags.contains('b') {
                 trace::event("run.settled", json!({"session": &target}));
-                // Sub-agent shutdown: when WE are an inner sub-agent (depth>0)
-                // and we have just settled on a final answer, our caller has
-                // by definition received everything it needs from us. Every
-                // sub-agent WE spawned has already served its purpose — its
-                // result was folded into our reasoning — so discard their
-                // boxes and drop their session folders. This is the
-                // "implicit kill/discard/delete on settle" the user asked
-                // for; cascades naturally because each depth ran the same
-                // sweep when IT settled.
-                if set.depth > 0 {
-                    cleanup_spawned_subagents(&target);
-                }
+                // Shutdown sweep: at ANY depth, when we settle on a final
+                // answer, every sub-agent WE spawned via `act` has had its
+                // result folded into our reasoning — there's nothing more
+                // we will do with them. Discard their boxes, drop their
+                // session folders. Top-level (depth=0): the conversation's
+                // OWN persistent box (OAITA-<TARGET>) is NOT in
+                // spawned_by(target), so the user's shell-tool workspace
+                // stays for them to review/apply. Only orphaned
+                // act-launched sub-agent boxes get GC'd — exactly the
+                // "abandoned boxes do not pile up" property the user
+                // wanted. Cascades naturally because each depth ran the
+                // same sweep when IT settled.
+                cleanup_spawned_subagents(&target);
                 return Ok(produced);
             }
             // Pending call? → evaluate it.
