@@ -73,6 +73,10 @@ fn make_norms() -> Vec<Norm> {
         norm(r"\s+Stop\.", ""),
         norm(r#"Makefile:\d+: commands for target ".*?" failed\n"#, ""),
         norm(r"/bin/(ba)?sh: line 1: ", ""),
+        // sarun: dash prefixes errors as `/bin/sh: N: cmd: ...` rather
+        // than `/bin/sh: line N: cmd: ...`. Strip both forms so a
+        // recipe's shell-error landing on either gets canonicalized.
+        norm(r"/bin/(ba)?sh: \d+: ", ""),
         norm(
             r#"(: \S+: No such file or directory)\n\*\*\* No rule to make target "[^"]+"\."#,
             "$1",
@@ -87,9 +91,20 @@ fn make_norms() -> Vec<Norm> {
 fn kati_norms() -> Vec<Norm> {
     vec![
         normalize_quotes(),
+        // sarun: now that rkati's $(MAKE) is just "make" (via arg0), any
+        // $(MAKE) -f sub.mk recipe actually invokes the system make,
+        // whose own Entering/Leaving and "make: " prefixes leak into
+        // rkati's output. Apply the same strips the make-side does.
+        norm(r"make(?:\[\d+\])?: (Entering|Leaving) directory[^\n]*\n", ""),
+        norm(r"make(?:\[\d+\])?: ", ""),
         norm(r"\*kati\*[^\n]*", ""),
         norm(r"c?kati: ", ""),
         norm(r"/bin/(ba)?sh: line 1: ", ""),
+        // sarun: dash form `/bin/sh: N: cmd: ...` (recipe shell-error
+        // prefix when SHELL=/bin/sh-via-dash); strip the leading-digit
+        // form too so make's and rkati's recipe errors normalize the
+        // same way.
+        norm(r"/bin/(ba)?sh: \d+: ", ""),
         norm(r"/bin/sh: ", ""),
         norm(r".*: warning for parse error in an unevaluated line: [^\n]*", ""),
         norm(r"([^\n ]+: )?FindEmulator: ", ""),
@@ -287,7 +302,11 @@ fn corpus_pass_rate() {
         }
 
         let mut mk_cmd = Command::new("make");
-        mk_cmd.arg("SHELL=/bin/bash");
+        // Push SHELL=/bin/bash via MAKEFLAGS — POSIX-mode make ignores
+        // SHELL from the OS env, so we need it as a command-line var,
+        // and MAKEFLAGS is the canonical way to do that without leaking
+        // the assignment into $(MAKE)'s expansion.
+        mk_cmd.env("MAKEFLAGS", "SHELL=/bin/bash");
         let (mk_out, _) = run_with_timeout(mk_cmd, workdir.path());
 
         // Wipe everything except the Makefile and the staged symlinks so
@@ -309,31 +328,36 @@ fn corpus_pass_rate() {
         }
 
         let mut rk_cmd = Command::new(&rkati);
-        rk_cmd.arg("--use_find_emulator").arg("SHELL=/bin/bash");
+        // sarun: mirror what the production FUSE shadow does to argv[0].
+        // When a box's /usr/bin/make is overlaid to serve the engine
+        // binary, the kernel still passes argv[0]="make" (because that's
+        // what the shell put in the array), so kati's MAKE/MAKEFLAGS etc.
+        // end up as "make". The corpus runner has no FUSE; just set
+        // argv[0] directly via Command::arg0 to land on the same state.
+        std::os::unix::process::CommandExt::arg0(&mut rk_cmd, "make");
+        // SHELL=/bin/bash rides MAKEFLAGS for the same reason as the
+        // make side: command-line vars in MAKEFLAGS apply but don't
+        // leak into $(MAKE)'s expansion. --use_find_emulator can't ride
+        // MAKEFLAGS (kati only consumes key=value); we just drop it
+        // — find calls shell out, slower but identical output.
+        rk_cmd.env("MAKEFLAGS", "SHELL=/bin/bash");
         let (rk_out, _) = run_with_timeout(rk_cmd, workdir.path());
 
-        // $(MAKE) expands to "make" under GNU make but to "<rkati-path>
-        // --use_find_emulator SHELL=/bin/bash" under our rkati invocation
-        // (kati propagates subkati_args via $(MAKE) rather than MAKEFLAGS).
-        // Normalize the recipe-echo line — and ONLY that, anchored to start
-        // of line — so submake_basic and friends diff cleanly without
-        // catching "make" embedded in error messages.
-        // Strip "make " at line start OR right after a recipe-prefix
-        // ('+' for recursive-make, '-' for ignore-error, '@' for silent).
-        let make_invoke_re = regex_lite::Regex::new(r"(?m)(^|[+\-@])make ").unwrap();
-        let mk_canon = make_invoke_re
-            .replace_all(&String::from_utf8_lossy(&mk_out), "${1}$$(MAKE) ")
-            .into_owned();
-        let rkati_invocation = format!(
-            "{} --use_find_emulator SHELL=/bin/bash ",
-            rkati.display()
-        );
-        let rk_canon = String::from_utf8_lossy(&rk_out)
-            .replace(&format!("\n{rkati_invocation}"), "\n$(MAKE) ")
-            .replace(rkati_invocation.as_str(), "$(MAKE) ");
+        // sarun: $(MAKE) now matches between sides for free — rkati's
+        // arg0="make" + SHELL=/bin/bash riding MAKEFLAGS leaves
+        // subkati_args = ["make"], so $(MAKE) expands to just "make",
+        // same as real make. No prefix-stripping required.
 
-        let mk_norm = normalize(&mk_canon, &make_norms());
-        let rk_norm = normalize(&rk_canon, &kati_norms());
+        let mk_norm = normalize(&String::from_utf8_lossy(&mk_out), &make_norms());
+        let rk_norm = normalize(&String::from_utf8_lossy(&rk_out), &kati_norms());
+
+        if std::env::var("KATI_CORPUS_DEBUG").is_ok() {
+            eprintln!("=== {name} ===");
+            eprintln!("--- mk raw ---\n{}", String::from_utf8_lossy(&mk_out));
+            eprintln!("--- mk norm ---\n{mk_norm}");
+            eprintln!("--- rk raw ---\n{}", String::from_utf8_lossy(&rk_out));
+            eprintln!("--- rk norm ---\n{rk_norm}");
+        }
 
         let matched = mk_norm == rk_norm;
         match (matched, xfail.is_some()) {
