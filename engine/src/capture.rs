@@ -372,6 +372,19 @@ impl BoxState {
         };
         if read_flag("readonly_parent") { self.set_readonly_parent(true); }
         if read_flag("no_host_fallback") { self.set_no_host_fallback(true); }
+        // Parent linkage: an at-rest sqlar carries parent_box_id in meta;
+        // restore it so load-mirror-from-disk produces the same in-RAM
+        // BoxState shape a register handshake would. Without this an
+        // OCI-loaded layer hydrated into the overlay would look top-level
+        // and its OWN parent chain would be invisible to resolve().
+        if let Ok(s) = conn.query_row(
+            "SELECT value FROM meta WHERE key='parent_box_id'", [],
+            |r| r.get::<_, String>(0))
+        {
+            if let Ok(p) = s.parse::<i64>() {
+                if p > 0 { self.set_parent(Some(p)); }
+            }
+        }
         let mut kinds = self.kinds.write().unwrap();
         if let Ok(mut st) = conn.prepare("SELECT name,mode,sz,data FROM sqlar") {
             let rows = st.query_map([], |r| {

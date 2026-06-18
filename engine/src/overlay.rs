@@ -495,7 +495,48 @@ impl Overlay {
 
     pub fn add_box(&self, b: Arc<BoxState>) {
         b.set_event_sink(self.inner.events.clone());
+        let parent = b.parent();
         self.inner.boxes.write().unwrap().insert(b.id, b);
+        // Hydrate any at-rest parent chain into the overlay's live box map so
+        // resolve()/scan_dir() can WALK INTO the ancestors during the child's
+        // FUSE ops. Without this, a child whose parent is an at-rest box (e.g.
+        // an OCI image layer created by `sarun oci load`) would see the chain
+        // truncate at its own contents — every read past its own entries would
+        // fall through to host (or Absent under no_host_fallback), missing
+        // every layer below. Idempotent — already-loaded ancestors are kept.
+        self.hydrate_chain(parent);
+    }
+
+    /// Open + load-mirror each at-rest box up the parent chain rooted at
+    /// `start`, adding to `self.boxes` (under the same lock discipline as
+    /// add_box). Stops on missing sqlar, on a cycle, or after 64 hops.
+    fn hydrate_chain(&self, start: Option<i64>) {
+        let mut cur = start;
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..64 {
+            let Some(id) = cur else { return };
+            if !seen.insert(id) { return; }
+            if self.inner.boxes.read().unwrap().contains_key(&id) {
+                // already live — but its parent chain may still need work.
+                cur = self.inner.boxes.read().unwrap().get(&id)
+                    .and_then(|b| b.parent());
+                continue;
+            }
+            // Open the at-rest sqlar; `BoxState::create` is a CREATE-IF-NOT-
+            // EXISTS open + schema upsert (additive), so on an existing
+            // sqlar it just rebinds. load_mirror() then populates `kinds`
+            // and restores the parent-stack mode flags from meta.
+            match BoxState::create(id) {
+                Ok(pb) => {
+                    pb.load_mirror();
+                    let next = pb.parent();
+                    self.inner.boxes.write().unwrap()
+                        .insert(pb.id, Arc::new(pb));
+                    cur = next;
+                }
+                Err(_) => return,
+            }
+        }
     }
 
     pub fn remove_box(&self, id: i64) {

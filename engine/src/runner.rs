@@ -299,8 +299,15 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
     // --capture to inner when the ack confirms capture is active.
     let capture_on = want_capture
         && ack.get("capture").and_then(Value::as_bool).unwrap_or(false);
+    // Bind the engine binary into the box at a fixed path next to the socket
+    // and exec --inner from THAT path, not from the host path. The host path
+    // happens to resolve through a regular box's lower-chain fall-through to
+    // host, but a `--no-parent` box has no fall-through — without this bind,
+    // bwrap fails with execvp ENOENT on the engine. The bind is harmless for
+    // ordinary boxes (a redundant ro-bind onto the already-resolvable path).
+    let inner_exe = "/tmp/.slopbox/engine";
     let mut inner_args: Vec<&str> = vec![
-        &self_exe, "inner", "--conn-fd", &fd_s];
+        inner_exe, "inner", "--conn-fd", &fd_s];
     if capture_on { inner_args.push("--capture"); }
     // PTY needs the capture sink files to record into; if the engine declined
     // capture (-d) there is nothing to PTY into, so gate --pty on capture_on.
@@ -313,7 +320,8 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
                 "--proc", "/proc", "--dev", "/dev",
                 "--ro-bind-try", "/sys", "/sys",
                 "--tmpfs", "/tmp",
-                "--ro-bind", &sock_src, UI_SOCK_INBOX]);
+                "--ro-bind", &sock_src, UI_SOCK_INBOX,
+                "--ro-bind", &self_exe, inner_exe]);
     // D9 follow-on — NESTED shell IS brush (brush boxes, capture on only).
     // We shadow the box's /bin/sh, /bin/bash (and /usr/bin/{sh,bash}) with the
     // ENGINE binary: the shim (brush_sh, gated on SARUN_BRUSH_SH=1) RUNS the
