@@ -215,7 +215,15 @@ fn resolve_image_top(reference: &str) -> Result<i64> {
     if let Some(start) = resolve_box(&boxes, reference) {
         return Ok(follow_to_top(&boxes, start));
     }
-    // Not an existing box → treat as an image reference and load it.
+    // Image cache — the Docker model: pull once, share the layer boxes across
+    // runs. If a stack with this image reference is already loaded, reuse it as
+    // the parent instead of pulling again; only the per-run container box is new.
+    if let Some(start) = find_loaded_by_reference(&boxes, reference) {
+        eprintln!("sarun oci: reusing already-loaded image '{reference}' \
+                   (box {start})");
+        return Ok(follow_to_top(&boxes, start));
+    }
+    // Not loaded → treat as an image reference and pull it.
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all().build()
         .context("tokio init")?;
@@ -224,6 +232,17 @@ fn resolve_image_top(reference: &str) -> Result<i64> {
     eprintln!("sarun oci run: loaded image '{reference}' → top box {} ({} layer(s))",
               outcome.top_id, outcome.n_layers);
     Ok(outcome.top_id)
+}
+
+/// Lowest box id of an already-loaded stack whose `oci_reference` meta matches
+/// `reference` — the image-cache key (v1 = the exact reference string; v2 would
+/// key on the manifest digest). The lowest id is the stack's base, so
+/// follow_to_top from it reaches that stack's current top.
+fn find_loaded_by_reference(boxes: &std::collections::BTreeMap<i64, crate::discover::Box_>,
+                            reference: &str) -> Option<i64> {
+    boxes.keys().copied()
+        .filter(|id| read_box_meta(*id, "oci_reference").as_deref() == Some(reference))
+        .min()
 }
 
 /// Box id for `ident` as a numeric id, an exact NAME, or a dotted display path
@@ -911,7 +930,11 @@ struct PulledImage {
 }
 
 async fn load(reference: &str, name: Option<String>) -> Result<LoadOutcome> {
-    let image = fetch(reference).await?;
+    let mut image = fetch(reference).await?;
+    // Record the reference the USER gave: `fetch` rewrites an archive ref to a
+    // temp-layout path, but the image cache (find_loaded_by_reference) dedups on
+    // the original string, so normalize it back here.
+    image.reference = reference.to_string();
     install_chain(image, name)
 }
 

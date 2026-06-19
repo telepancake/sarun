@@ -210,6 +210,19 @@ def main():
         check(r.returncode == 0, f"oci run BUILT exits 0 (stderr: {r.stderr.strip()[:300]})")
         check("oci load" in both,
               "oci run BUILT executed its CMD (RUN step kept the chain runnable)")
+
+        # ── image cache: oci run by the SAME reference reuses the loaded stack ─
+        # SYN was loaded from this archive, so its oci_reference == the archive
+        # ref. Running that ref again must reuse the loaded layer boxes — only a
+        # fresh container box is added, no re-pull / new layer stack.
+        before = len(list(state_dir(e).glob("*.sqlar")))
+        r = sarun(e, "oci", "run", "--net", "off", f"oci-archive:{arch}")
+        after = len(list(state_dir(e).glob("*.sqlar")))
+        check(r.returncode == 0, f"oci run by archive ref exits 0 (stderr: {r.stderr.strip()[:200]})")
+        check("reusing already-loaded image" in r.stderr,
+              "oci run by ref reused the loaded stack (no re-pull)")
+        check(after - before == 1,
+              f"reuse added only the container box, not a new layer stack (+{after - before})")
     finally:
         proc.send_signal(signal.SIGTERM)
         try: proc.wait(timeout=10)
