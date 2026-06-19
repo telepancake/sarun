@@ -140,12 +140,12 @@ ENTRYPOINT/LABEL/EXPOSE/VOLUME/SHELL, multi-stage, `-t`). Closed/minimal rootfs
 boots too — synthetic mount-target landing pads (`overlay.rs::is_synthetic_
 landing`, non-destructive via `chain_dir_has_children`), fd-exec of the inner
 shim (`runner.rs`, via `/proc/self/fd/N`), and the host-visibility cwd default
-(engine `no_host` ack). **Delete a bullet below the moment it's done.**
+(engine `no_host` ack). Regression net: `prototype/test_oci.py` (`make test-oci`)
+synthesizes a scratch oci-archive in-test (rootfs = the static engine binary at
+`/bin/sarun`, no registry/network) and asserts load → run → build → run-result,
+including closed-rootfs boot and that COPY landed. **Delete a bullet below the
+moment it's done.**
 
-- [ ] **Tests first — there is no regression net.** Everything above was
-  hand-verified live, nothing in `make test` covers it. Add a hermetic
-  `prototype/test_oci.py` that builds a synthetic scratch oci-archive in-test
-  (no registry) and asserts load → run → build → run-the-result.
 - [ ] **Tap default for OCI runs.** Every OCI run so far used `--net off`;
   confirm the proxied `Tap` default works *inside* a container (DNS +
   HTTPS-through-proxy) and fix the closed-rootfs/netns interaction if not.
