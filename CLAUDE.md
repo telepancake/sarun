@@ -130,6 +130,48 @@ root). The test process runs under uv (deps for its in-process SourceFileLoader)
 and the box/UI subprocesses reuse that same interpreter via `sys.executable` —
 there is NO hardcoded venv. Takes a few minutes (real boxes).
 
+## OCI containers (`sarun oci …`) — status + backlog
+`oci load|run|build` live in `engine/src/oci.rs` (Dockerfile parser in
+`engine/src/dockerfile.rs`). Working & verified against real images (alpine,
+busybox, hello-world): pull/archive/layout → at-rest layer-box stack; run a
+container box on an image's top layer with its config (env/cmd/entrypoint/
+workdir/user); build a Dockerfile (FROM/RUN/COPY/ADD/ENV/ARG/WORKDIR/USER/CMD/
+ENTRYPOINT/LABEL/EXPOSE/VOLUME/SHELL, multi-stage, `-t`). Closed/minimal rootfs
+boots too — synthetic mount-target landing pads (`overlay.rs::is_synthetic_
+landing`, non-destructive via `chain_dir_has_children`), fd-exec of the inner
+shim (`runner.rs`, via `/proc/self/fd/N`), and the host-visibility cwd default
+(engine `no_host` ack). **Delete a bullet below the moment it's done.**
+
+- [ ] **Tests first — there is no regression net.** Everything above was
+  hand-verified live, nothing in `make test` covers it. Add a hermetic
+  `prototype/test_oci.py` that builds a synthetic scratch oci-archive in-test
+  (no registry) and asserts load → run → build → run-the-result.
+- [ ] **Tap default for OCI runs.** Every OCI run so far used `--net off`;
+  confirm the proxied `Tap` default works *inside* a container (DNS +
+  HTTPS-through-proxy) and fix the closed-rootfs/netns interaction if not.
+- [ ] **Layer reuse / image cache for `oci run`.** `resolve_image_top` only
+  matches `<ref>` by box name/id, so a repeat `oci run <ref>` re-pulls into a
+  fresh stack. Also match the `oci_reference` meta of an already-loaded stack
+  and reuse it as the parent — multiple runs then share the layer boxes (the
+  Docker model; only the per-run container box is new). Key v1 = ref string;
+  v2 = manifest digest (so a moved tag re-pulls, `name:tag`/`@digest` coalesce).
+- [ ] **Container GC.** Each run leaves an at-rest container box; add `oci ps`
+  / `oci rm` (or prune) once layer reuse lands.
+- [ ] **`oci build` instructions:** `COPY --from=<stage|image>`; `ADD` URL
+  fetch + local-tar auto-extract; glob sources; carry HEALTHCHECK/ONBUILD/
+  STOPSIGNAL into the image config (today: warned + skipped).
+- [ ] **Registry reach:** private-registry auth (`fetch_registry` passes
+  `RegistryAuth::Anonymous`); digest/signature verification; `zstd:chunked`
+  fast path (currently decoded as plain zstd — correct, just not chunked).
+- [ ] **`--api` on scratch/distroless (low pri).** Engine paths are FUSE
+  shadows now (`overlay::is_engine_shadow_path`), no binds — but the shadow
+  serves only the exact leaf, so `/usr/local/bin/{oaita,sarun}` aren't
+  reachable on an image lacking `/usr/local/bin`. Present the ancestor dirs
+  too (as `oaita_config_ancestor_or_self` already does for the config path).
+- [ ] **Reconcile opaque-whiteout.** `oci.rs` does `set_opaque` for
+  `.wh..wh..opq`, but the file header still calls it "out of scope
+  (logged + skipped)" — verify the behavior, fix whichever is wrong.
+
 ## Branch / workflow
 Develop on the branch you were told to; commit with clear messages; push only
 when asked (`git push -u origin <branch>`). One clean commit per logical change.
