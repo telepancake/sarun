@@ -787,7 +787,7 @@ fn dispatch(tool: &str, arguments: &Value, target: &str, set: &Settings,
         "inspect" => dispatch_inspect(arguments, target, executor, turns),
         "read" => dispatch_read(arguments, target, executor, turns),
         "write" => dispatch_write(arguments, target, executor, turns),
-        "apply" | "reject" => dispatch_box_resolve(tool, arguments),
+        "apply" | "reject" => dispatch_box_resolve(tool, arguments, target),
         "backtrack" => dispatch_backtrack(arguments, target),
         "delete" => dispatch_delete(arguments),
         other => format!("error: unknown tool {other:?}{}",
@@ -827,17 +827,34 @@ fn dispatch_act(args: &Value, outer: &str, set: &Settings,
     let seed_content = if data.is_empty() { request.clone() }
                        else { format!("{request}\n\n{data}") };
     let _ = append_turn(&inner, "user", &seed_content, None, Some(outer.to_string()), "", None);
-    // Run the inner session in its own box.
+    // Run the inner session in its own box, parented under the agent's
+    // OWN persistent shell box (`OAITA-<outer>.OAITA-<inner>` — dotted
+    // form, parsed by control.rs register's `rsplit_once('.')`).
+    //
+    // Why nest instead of letting the sub-agent box be top-level: when
+    // the model later calls `apply(target=<inner>)`, sarun lifts the
+    // sub-agent's overlay INTO ITS PARENT. With a top-level sub-agent,
+    // the parent IS the host filesystem — the agent's own inspect/read
+    // (which targets `OAITA-<outer>`) doesn't see the lifted files and
+    // returned "not found" right after a successful apply. Nesting under
+    // the agent's box makes apply lift into the agent's overlay, which
+    // is exactly where the agent's later inspect/read will look.
+    let outer_box = box_name(outer);
     let inner_box = box_name(&inner);
+    let dotted = format!("{outer_box}.{inner_box}");
     let script = act_script(&inner, set.depth + 1);
     let Some(exe) = executor else {
         return "act: no executor (sandbox disabled) — cannot delegate".to_string();
     };
+    // Make sure the parent box exists FIRST: dotted-name register errors
+    // if the prefix segment can't be resolved (see control.rs:644). One
+    // no-op materialization is cheap and idempotent.
+    let _ = exe.run(&outer_box, "true", /*discard=*/false, /*api_access=*/false);
     // act sub-agents are `oaita run` PROCESSES IN A BOX — they need the
     // engine binary on PATH and proxy access for the LLM call. Pass --api
     // so the runner binds /usr/local/bin/{oaita,sarun} AND admits the
     // box on the proxy gate.
-    let r = exe.run(&inner_box, &script, false, /*api_access=*/true);
+    let r = exe.run(&dotted, &script, false, /*api_access=*/true);
     format_act_result(&r, &inner)
 }
 
@@ -921,7 +938,7 @@ fn dispatch_write(args: &Value, target: &str, executor: Option<&dyn Executor>,
     write_at_locator(&loc, &content, force, turns, &box_name(target), exe)
 }
 
-fn dispatch_box_resolve(verb: &str, args: &Value) -> String {
+fn dispatch_box_resolve(verb: &str, args: &Value, outer: &str) -> String {
     let Some(target) = args_str(args, "target") else {
         return format!("{verb}: missing required `target`");
     };
@@ -941,8 +958,14 @@ fn dispatch_box_resolve(verb: &str, args: &Value) -> String {
     } else {
         box_name(&target)
     };
+    // Sub-agent boxes spawned via `act` are nested under the agent's own
+    // OAITA-<outer> box (see dispatch_act). Resolve the apply/reject
+    // target against the dotted display path so a stale top-level box
+    // with the same leaf name doesn't shadow ours, and so apply lifts
+    // into the right parent (the agent's box, which inspect/read see).
+    let dotted = format!("{}.{inner_box}", box_name(outer));
     let r = std::process::Command::new(&sarun)
-        .args([&inner_box, cmd]).output();
+        .args([&dotted, cmd]).output();
     match r {
         Ok(o) if o.status.success() => {
             // Stdout looks like `OAITA-X: <count> apply` (or `discard`).
