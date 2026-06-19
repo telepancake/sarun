@@ -1698,11 +1698,23 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
         if msg.get("type").and_then(Value::as_str) == Some("api.proxy") {
             if let Some(fd) = peer_pidfd.take() { unsafe { libc::close(fd); } }
             let Some(box_id) = hint_box_id else { return; };
-            // `session` names the oaita session this call counts against.
-            // The proxy walks its parent chain to debit every ancestor and
-            // refuses (HTTP 503) when any ancestor's pool has hit zero.
-            let session = msg.get("session").and_then(Value::as_str)
-                .unwrap_or("").to_string();
+            // Budget gate: walk this box's parent_box_id chain, debit each
+            // capped box, 503 the conn directly if any ancestor's pool
+            // hit zero. Identity is the broker's hint — the box id is
+            // already authenticated by the FD broker handshake, so no
+            // `session` field on the wire (and no spoofing path).
+            if let Err(top) = crate::oaita::budget::take_chain(&state, box_id) {
+                let body = format!("budget exhausted at box {top} \
+                    — grant more turns and resume.");
+                let resp = format!(
+                    "HTTP/1.1 503 Service Unavailable\r\n\
+                     Content-Length: {}\r\n\
+                     Content-Type: text/plain\r\n\
+                     Connection: close\r\n\r\n{}",
+                    body.len(), body);
+                let _ = writer.write_all(resp.as_bytes());
+                return;
+            }
             let (rt_opt, proxy_opt) = {
                 let s = state.lock().unwrap();
                 (s.net_rt.clone(), s.api_proxy.clone())
@@ -1717,23 +1729,37 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
                     tokio::net::UnixStream::from_std(std_conn) else { return; };
                 let io = PrebufferedIo::new(tokio_conn, prebuffered);
                 let _ = crate::oaita::proxy::serve_one_conn_for_box(
-                    proxy, box_id, session,
-                    hyper_util::rt::TokioIo::new(io)).await;
+                    proxy, box_id, hyper_util::rt::TokioIo::new(io)).await;
             });
             return;
         }
-        // budget.grant: driver tells engine to add N turns to a session's
-        // pool. Additive — granting again on resume extends the pool.
+        // budget.grant: add `amount` to a box's pool. Additive — resume
+        // extends it, doesn't reset. The box is identified either by
+        // display name (`box: "OAITA-X..."`) when the caller knows the
+        // name (top-level cli), OR implicitly as the conn's
+        // hint_box_id (set by the FD broker handshake) when the caller
+        // is in-box and doesn't need to spell out its own identity.
         if msg.get("type").and_then(Value::as_str) == Some("budget.grant") {
             if let Some(fd) = peer_pidfd.take() { unsafe { libc::close(fd); } }
-            let session = msg.get("session").and_then(Value::as_str)
-                .unwrap_or("");
-            let amount = msg.get("amount").and_then(Value::as_i64)
-                .unwrap_or(0);
-            crate::oaita::budget::grant(session, amount);
-            let remaining = crate::oaita::budget::remaining(session);
-            let _ = writer.write_all(
-                format!("{{\"ok\":true,\"remaining\":{remaining}}}\n").as_bytes());
+            let amount = msg.get("amount").and_then(Value::as_i64).unwrap_or(0);
+            let name = msg.get("box").and_then(Value::as_str);
+            let bid = match name {
+                Some(n) if !n.is_empty() => {
+                    let boxes = discover::discover();
+                    resolve(&boxes, n)
+                }
+                _ => hint_box_id,
+            };
+            let resp = match bid {
+                Some(id) => {
+                    crate::oaita::budget::grant(&state, id, amount);
+                    let rem = crate::oaita::budget::remaining(&state, id)
+                        .unwrap_or(0);
+                    format!("{{\"ok\":true,\"remaining\":{rem}}}\n")
+                }
+                None => "{\"ok\":false,\"error\":\"box not resolvable\"}\n".to_string(),
+            };
+            let _ = writer.write_all(resp.as_bytes());
             return;
         }
         // The oaita API proxy lives on the existing box-channel as new

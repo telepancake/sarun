@@ -152,24 +152,45 @@ fn cmd_run(args: &[String]) -> i32 {
                                        p.capabilities, p.tool_context.clone(),
                                        p.sarun.clone(), p.no_sandbox)
     { Ok(s) => s, Err(e) => { eprintln!("{e}"); return 1; } };
-    // Set OAITA_SESSION so api.proxy conns the driver opens debit this
-    // session's pool. `--max-steps N` is an additive grant — the cli
-    // ALWAYS grants (default DEFAULT_CLI_MAX_STEPS if the flag wasn't
-    // passed) so a top-level `oaita run NAME` has a finite budget
-    // without the user having to remember the flag. ask-level caps
-    // are the opposite — uncapped by default — because the model
+    // `--max-steps N` is an additive grant to the agent's persistent
+    // shell box (`OAITA-<UPPER>`). cli always grants — defaulting to
+    // DEFAULT_CLI_MAX_STEPS so a top-level run has a finite ceiling
+    // without the user remembering the flag. Sub-agent (ask) caps are
+    // the opposite — uncapped by default — because the model
     // shouldn't have to invent a number for every delegation; the
     // parent's chain is the natural cap.
+    //
+    // The box must exist before we can write to its sqlar meta. We
+    // materialize it with a no-op `sarun run BOX -- true` then issue
+    // the budget.grant verb naming the box.
     let target = match crate::oaita::turns::target_segment(&p.name) {
         Ok(t) => t, Err(e) => { eprintln!("{e}"); return 2; }
     };
-    let cli_grant = p.max_steps.unwrap_or(DEFAULT_CLI_MAX_STEPS) as i64;
-    if let Err(e) = budget_grant_via_engine(&target, cli_grant) {
+    let exe = build_executor(p.no_sandbox, p.sarun.clone());
+    let target_box = crate::oaita::exec::box_name(&target);
+    let in_box = std::env::var("SARUN_BROKER").map(|s| !s.is_empty())
+        .unwrap_or(false);
+    if !in_box {
+        // Top-level: materialize the agent's persistent shell box so
+        // its sqlar exists for the budget meta write. Sub-agent
+        // invocations are in_box — their box already exists (the ask
+        // spawn created it) and the grant lands via the broker hint
+        // rather than by name.
+        if let Some(exe) = exe.as_deref() {
+            let _ = exe.run(&target_box, "true", /*discard=*/false,
+                            /*api_access=*/false);
+        }
+    }
+    let cli_grant = p.max_steps.map(|n| n as i64)
+        .unwrap_or(DEFAULT_CLI_MAX_STEPS as i64);
+    // Top-level: name the box explicitly. In-box: leave name empty so
+    // the engine resolves it from the broker hint (THIS box). Same
+    // RPC either way, no branching on the grant itself.
+    let grant_target = if in_box { "" } else { target_box.as_str() };
+    if let Err(e) = budget_grant_via_engine(grant_target, cli_grant) {
         eprintln!("oaita: budget.grant: {e}");
         return 1;
     }
-    unsafe { std::env::set_var("OAITA_SESSION", &target); }
-    let exe = build_executor(p.no_sandbox, p.sarun);
     let exe_ref: Option<&dyn crate::oaita::exec::Executor> = exe.as_deref();
     match run_to_completion(&p.name, &set, exe_ref) {
         Ok(paths) => report(&paths),
@@ -177,10 +198,10 @@ fn cmd_run(args: &[String]) -> i32 {
     }
 }
 
-/// Send a `budget.grant` RPC to the engine for THIS session. Uses the FD
-/// broker when in-box, the host filesystem socket otherwise — same dial
-/// dispatch as `oaita::exec::ctrl_rpc`.
-fn budget_grant_via_engine(session: &str, amount: i64) -> Result<(), String> {
+/// Send a `budget.grant` RPC to the engine naming a box (display path).
+/// Engine resolves the name to a box_id and writes the new total into
+/// the box's sqlar `meta` table.
+pub fn budget_grant_via_engine(box_name: &str, amount: i64) -> Result<(), String> {
     use std::io::Write;
     use std::os::unix::net::UnixStream;
     let mut s = if let Ok(name) = std::env::var("SARUN_BROKER") {
@@ -195,8 +216,13 @@ fn budget_grant_via_engine(session: &str, amount: i64) -> Result<(), String> {
         UnixStream::connect(crate::paths::sock_path())
             .map_err(|e| format!("connect: {e}"))?
     };
-    let msg = serde_json::json!({
-        "type": "budget.grant", "session": session, "amount": amount });
+    // Empty box name → engine resolves to the conn's broker hint (the
+    // box that dialed). Non-empty → engine looks it up by display path.
+    let msg = if box_name.is_empty() {
+        serde_json::json!({"type": "budget.grant", "amount": amount })
+    } else {
+        serde_json::json!({"type": "budget.grant", "box": box_name, "amount": amount })
+    };
     s.write_all(format!("{msg}\n").as_bytes())
         .map_err(|e| format!("write: {e}"))?;
     let mut line = String::new();

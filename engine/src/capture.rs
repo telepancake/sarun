@@ -990,6 +990,13 @@ impl BoxState {
         );
     }
 
+    /// Read one `meta` row by key. None if absent.
+    pub fn get_meta(&self, key: &str) -> Option<String> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row("SELECT value FROM meta WHERE key=?1", [key],
+                       |r| r.get::<_, String>(0)).ok()
+    }
+
     /// True if this (live) box has its OWN entry for `rel` — i.e. it copied-up,
     /// wrote, deleted, or otherwise spoke for the path itself, so its merged
     /// view is self-contained and a parent copy-down must NOT override it. The

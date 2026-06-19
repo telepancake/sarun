@@ -928,7 +928,12 @@ fn dispatch_act(args: &Value, outer: &str, set: &Settings,
     let outer_box = box_name(outer);
     let inner_box = box_name(&inner);
     let dotted = format!("{outer_box}.{inner_box}");
-    let script = act_script(&inner, set.depth + 1, max_steps);
+    // Default cap for the sub-agent: 999_999_999 if the model didn't
+    // set max_steps — practically uncapped, lets the parent's chain
+    // do the real bounding. When the model DID set max_steps, we use
+    // its number as the explicit grant.
+    let cap = max_steps.unwrap_or(999_999_999);
+    let script = act_script(&inner, set.depth + 1, cap);
     let Some(exe) = executor else {
         return "ask: no executor (sandbox disabled) — cannot delegate".to_string();
     };
@@ -944,23 +949,20 @@ fn dispatch_act(args: &Value, outer: &str, set: &Settings,
     format_act_result(&r, &inner) + &format_sub_agent_status(outer)
 }
 
-fn act_script(inner: &str, child_depth: u32, max_steps: Option<i64>) -> String {
-    // OAITA_DEPTH rides into the child process so its `ask` calls see the
-    // bumped depth (and the exhausted form fires at MAX_DEPTH).
+fn act_script(inner: &str, child_depth: u32, max_steps: i64) -> String {
+    // OAITA_DEPTH rides into the child process so its `ask` calls see
+    // the bumped depth (and the exhausted form fires at MAX_DEPTH).
     //
-    // --max-steps N is OPTIONAL. When the model set `max_steps` on the
-    // ask call, propagate as a CLI grant — the sub-agent's session pool
-    // gets N more turns (additive, so follow_up grants stack). When the
-    // model didn't set it, omit the flag: the sub-agent is uncapped and
-    // draws only from the parent's chain (whatever the parent has left).
-    let cap = max_steps.map(|n| format!(" --max-steps {n}")).unwrap_or_default();
+    // --max-steps is always passed (default is 999_999_999 when the
+    // model didn't set one — "uncapped" in practice). The sub-agent's
+    // cli grants this against its OWN box (in-box, broker-hinted) so
+    // the parent doesn't need to know the dotted box name to grant.
+    //
     // No `set -e` — we run BOTH commands unconditionally so a budget-
-    // exhausted `oaita run` (rc=1) still gets its tail captured. The
-    // parent's `ask` result then surfaces whatever the sub-agent had
-    // managed to produce up to the cutoff plus the exhaustion notice.
+    // exhausted `oaita run` (rc=1) still gets its tail captured.
     format!(
         "export OAITA_DEPTH={child_depth}\n\
-         oaita run {inner}{cap}\n\
+         oaita run {inner} --max-steps {max_steps}\n\
          oaita tail {inner}\n"
     )
 }
@@ -1008,29 +1010,28 @@ fn budget_exhausted_session(text: &str) -> Option<String> {
 }
 
 fn format_act_result(r: &ExecResult, inner: &str) -> String {
-    // Budget exhausted? Two shapes:
-    //   * `at session <inner>` — the model-set ask cap on THIS
-    //     sub-agent fired. The parent's pool is still alive; the
-    //     parent can react (resume via follow_up + max_steps, or
-    //     move on). Surface the resume gesture.
-    //   * `at session <ancestor>` — an ANCESTOR ran out. The parent's
-    //     own next gen will fire the same 503, so the parent isn't
-    //     going to act on the result. We just pass through without a
-    //     resume nudge — the model never sees this anyway because the
-    //     parent driver exits on its own 503 immediately after.
-    if let Some(exhausted_at) = budget_exhausted_session(&r.text) {
-        if exhausted_at == inner {
-            let mut text = String::new();
-            text.push_str(&format!(
-                "[sub-agent session id: {inner} — pass this as `target` \
-                 to apply/reject/delete]\n\
-                 [stopped: sub-agent hit its own max_steps cap. Box \
-                 preserved. To grant more turns and continue: \
-                 `ask(follow_up={inner:?}, request=\"...\", \
-                 max_steps=N)`]\n\n"));
-            text.push_str(&r.text);
-            return text;
-        }
+    // Budget exhausted? Surface the resume gesture either way. Both
+    // shapes resume the same way (`ask(follow_up=ID, max_steps=N)`):
+    //   * own cap — the model-set max_steps on THIS sub-agent ran
+    //     out. The parent's pool is alive; the parent can react now.
+    //   * ancestor cap — an ancestor ran out, the parent's own
+    //     driver will 503 next gen too and exit. BUT: when the user
+    //     later resumes the run (another `oaita run NAME --max-steps
+    //     M` extending the root pool), the parent driver restarts
+    //     and sees THIS result waiting in its conversation — it CAN
+    //     act on the hint at that point. So the framing has to be
+    //     useful for the "read it later" case too.
+    if budget_exhausted_session(&r.text).is_some() {
+        let mut text = String::new();
+        text.push_str(&format!(
+            "[sub-agent session id: {inner} — pass this as `target` to \
+             apply/reject/delete]\n\
+             [stopped on budget — box preserved, conversation \
+             resumable. Continue with: `ask(follow_up={inner:?}, \
+             request=\"...\", max_steps=N)` — once the chain has \
+             room, the sub-agent picks up where it left off]\n\n"));
+        text.push_str(&r.text);
+        return text;
     }
     // The header puts the SESSION ID front and centre — that's what
     // apply/reject/delete want. The box-name form (OAITA-…) was a
