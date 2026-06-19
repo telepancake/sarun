@@ -401,6 +401,18 @@ impl Overlay {
         s.self_exe.clone()
     }
 
+    /// Box-relative path matches one of the engine-binary FUSE
+    /// shadows. `run/sarun/engine` is universal (every box's bwrap
+    /// exec's the engine as `--inner` from there). `usr/local/bin/
+    /// {oaita,sarun}` are --api-only (only oaita sub-agents look
+    /// them up via PATH).
+    fn is_engine_shadow_path(rel: &str, api: bool) -> bool {
+        if rel == "run/sarun/engine" { return true; }
+        if api && (rel == "usr/local/bin/oaita"
+                   || rel == "usr/local/bin/sarun") { return true; }
+        false
+    }
+
     /// True when `rel` is the box's view of the HOST oaita config file
     /// (the path computed by `paths::oaita_config_path()` with its leading
     /// `/` stripped). For `--api` boxes the overlay substitutes the safe
@@ -996,6 +1008,23 @@ impl Overlay {
     /// Attributes for (box, rel) through the FULL merge (own → parent chain →
     /// host), or None when absent.
     fn attr_of(&self, b: &BoxState, ino: u64, rel: &str) -> Option<FileAttr> {
+        // Engine-binary FUSE shadow. /run/sarun/engine is universal
+        // (every box's bwrap exec's the engine as --inner there);
+        // /usr/local/bin/{oaita,sarun} are --api-only (only oaita
+        // sub-agents in --api boxes look them up via PATH). These
+        // paths don't exist on the host, so the shadow has to fire
+        // BEFORE the lower-layer stat — synthesize the engine
+        // binary's attrs directly. No bwrap binds, no tmpfs at
+        // /run/sarun, no host-path leakage into the mount namespace.
+        if Self::is_engine_shadow_path(rel, b.is_api()) {
+            if let Some(exe) = self.shadow_target_path() {
+                if let Ok(md) = std::fs::metadata(&exe) {
+                    let mut a = self.attr_from_md(ino, &md);
+                    a.kind = FileType::RegularFile;
+                    return Some(a);
+                }
+            }
+        }
         let layer = self.resolve(b.id, rel);
         // --api substitute: same FUSE-shadow trick as brush, but the target
         // is the safe-for-box oaita.toml the engine pre-wrote at startup.
@@ -1295,6 +1324,21 @@ impl Filesystem for Overlay {
         // the host) finds it. `upper` (this box owns the blob) is true ONLY when
         // the resolved owner IS this box; a parent's file or the host file is
         // served read-only until the first write triggers copy-up-from-parent.
+        // Engine-binary FUSE shadow: same paths attr_of synthesizes for —
+        // open the engine binary read-only so the box can exec it from
+        // /run/sarun/engine (universal) or /usr/local/bin/{oaita,sarun}
+        // (--api). No bwrap binds.
+        if !want_write && Self::is_engine_shadow_path(&rel, b.is_api()) {
+            if let Some(exe) = self.shadow_target_path() {
+                if let Ok(f) = File::open(&exe) {
+                    let n = self.reg_fh(FhInner {
+                        box_id: bid, rel, file: Some(f), upper: false,
+                        dirty: false, last_pid: req.pid(), sink: None,
+                        passthrough: false, _backing: None });
+                    return reply.opened(FileHandle(n), FopenFlags::empty());
+                }
+            }
+        }
         let (file, upper) = match self.resolve(bid, &rel) {
             Layer::UpperFile { owner, rowid, .. } => {
                 let bp = blob_path(owner, rowid);
