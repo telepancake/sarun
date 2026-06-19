@@ -27,7 +27,9 @@
 //   exec     — executors: SarunExecutor (sarun box -- sh -c), LocalExecutor
 //   inspect  — inspect/read helpers
 //   trace    — flight-recorder JSONL events to $OAITA_TRACE
-//   proxy    — engine-side: serve api.sock, inject auth, log to sqlar
+//   proxy      — engine-side HTTP server fed by proxy_mux, injects auth,
+//                logs to sqlar
+//   proxy_mux  — per-box-channel FRAME_API_* demultiplexer
 
 pub mod cli;
 pub mod client;

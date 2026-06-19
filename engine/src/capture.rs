@@ -145,11 +145,12 @@ pub struct BoxState {
     // mute never gets mistaken for a brush root.
     is_brush: std::sync::atomic::AtomicBool,
     brush_host_tgid: std::sync::atomic::AtomicU32,
-    // True when the box was launched with --api: the engine bind-mounts api.sock
-    // for the in-box oaita AND the FUSE overlay substitutes a SAFE oaita.toml
+    // True when the box was launched with --api: the inner runner serves
+    // /run/sarun/api.sock inside the box and mux'es each call as FRAME_API_*
+    // on the box channel; the FUSE overlay also substitutes a SAFE oaita.toml
     // (model only, no api_key, no base_url) over the box's view of the host
-    // config path. So a box can't read the host's real api_key by `cat`ing the
-    // config file. Mirrors is_brush.
+    // config path so a box can't read the host's real api_key by `cat`ing
+    // the file. Mirrors is_brush.
     is_api: std::sync::atomic::AtomicBool,
     // brush↔process link inputs: (brushprov row id, literal WRITE-redirect target
     // paths the pipeline opens for output). Collected as each FRAME_PROV arrives,
