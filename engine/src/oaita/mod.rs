@@ -31,6 +31,7 @@
 //                in via the FD broker, injects upstream auth, forwards to
 //                the configured LLM API, logs to sqlar
 
+pub mod budget;
 pub mod cli;
 pub mod client;
 pub mod config;

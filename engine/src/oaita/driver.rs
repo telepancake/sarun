@@ -1131,14 +1131,20 @@ fn dispatch_delete(args: &Value) -> String {
 
 // ── run ─────────────────────────────────────────────────────────────────────
 /// run = drive call/gen until the tail is a CLEAN assistant turn (no `p`, no
-/// `c`, no `b`). Bounded by `max_steps` to prevent runaway.
+/// `c`, no `b`). Termination is engine-managed: the budget pool (see
+/// `oaita::budget`) is debited on every `api.proxy` conn, and the
+/// upstream LLM call returns HTTP 503 when the session or any ancestor
+/// has run out — `generate` surfaces that as `Err("budget exhausted...")`
+/// and we exit cleanly. The box stays alive in intermediate state; a
+/// follow-up `oaita run <session> --max-steps N` adds to the same pool
+/// and resumes.
 pub fn run_to_completion(spec: &str, set: &Settings,
-                         executor: Option<&dyn Executor>,
-                         max_steps: u32) -> Result<Vec<PathBuf>, String> {
+                         executor: Option<&dyn Executor>)
+                         -> Result<Vec<PathBuf>, String> {
     let target = target_segment(spec)?;
     let mut produced: Vec<PathBuf> = Vec::new();
-    trace::event("run.start", json!({"session": &target, "max_steps": max_steps}));
-    for _ in 0..max_steps {
+    trace::event("run.start", json!({"session": &target}));
+    loop {
         let turns = load_turns(&target);
         // Settled? — last turn is assistant with no p/c/b flags.
         if let Some(last) = turns.last() {
@@ -1147,39 +1153,27 @@ pub fn run_to_completion(spec: &str, set: &Settings,
                 && !last.flags.contains('c')
                 && !last.flags.contains('b') {
                 trace::event("run.settled", json!({"session": &target}));
-                // Shutdown sweep: at ANY depth, when we settle on a final
-                // answer, every sub-agent WE spawned via `act` has had its
-                // result folded into our reasoning — there's nothing more
-                // we will do with them. Discard their boxes, drop their
-                // session folders. Top-level (depth=0): the conversation's
-                // OWN persistent box (OAITA-<TARGET>) is NOT in
-                // spawned_by(target), so the user's shell-tool workspace
-                // stays for them to review/apply. Only orphaned
-                // act-launched sub-agent boxes get GC'd — exactly the
-                // "abandoned boxes do not pile up" property the user
-                // wanted. Cascades naturally because each depth ran the
-                // same sweep when IT settled.
                 cleanup_spawned_subagents(&target);
                 return Ok(produced);
             }
-            // Pending call? → evaluate it.
             if first_pending_call(&turns).is_some() {
                 let mut r = evaluate_call(spec, set, executor)?;
                 produced.append(&mut r);
                 continue;
             }
         }
-        // Otherwise generate.
-        let mut r = generate(spec, set)?;
-        produced.append(&mut r);
+        // Generate. If the engine refuses (budget chain hit zero), the
+        // upstream HTTP call returns 503 and `generate` propagates a
+        // matching error — exit cleanly so the user can grant more.
+        match generate(spec, set) {
+            Ok(mut r) => produced.append(&mut r),
+            Err(e) if e.contains("budget exhausted") => {
+                trace::event("run.budget_exhausted",
+                    json!({"session": &target, "detail": &e}));
+                cleanup_spawned_subagents(&target);
+                return Err(e);
+            }
+            Err(e) => return Err(e),
+        }
     }
-    // Exhaustion sweep: a non-settled run still leaves dangling sub-agent
-    // boxes alive (every `act` we spawned holds an OAITA-<INNER> box until
-    // either settled-or-here cleans up). Without this the kayxc-style orphan
-    // observed in mimo's trace persists across resumes and accumulates.
-    // Same `cleanup_spawned_subagents` call the settle path makes — it's
-    // idempotent and recurses through descendant sweeps.
-    let target = target_segment(spec)?;
-    cleanup_spawned_subagents(&target);
-    Err(format!("run: exhausted {max_steps} steps without settling"))
 }
