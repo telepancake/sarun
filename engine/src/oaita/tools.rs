@@ -354,8 +354,11 @@ fn backtrack_spec() -> ToolSpec {
              on`) and the run keeps going from the rewound state. \
              \
              Pick turn_id by reading the {\"turn-id\":\"…\"} header at the \
-             top of each turn in your context. inclusive=true (default) \
-             discards the named turn too; false keeps it. \
+             top of each turn in your context. The rewind point itself \
+             is PRESERVED by default (inclusive=false); pass \
+             inclusive=true to discard it too. User-role turns (the \
+             original question; `act` delegation seeds) are immutable \
+             and the harness rejects any backtrack that would erase one. \
              \
              You cannot use this to edit your CALLER's context — only \
              your own. Sub-agents must call backtrack(final=true) to \
@@ -364,9 +367,9 @@ fn backtrack_spec() -> ToolSpec {
         parameters: json!({
             "type": "object",
             "properties": {
-                "turn_id":   {"type": "string", "description": "Rewind point: turns from here onward are discarded."},
+                "turn_id":   {"type": "string", "description": "Rewind point: turns from here onward are discarded. The turn itself is preserved unless inclusive=true."},
                 "summary":   {"type": "string", "description": "The condensed record of the discarded branch — all that is carried forward."},
-                "inclusive": {"type": "boolean", "description": "Default true: the named turn is discarded too. False keeps it and discards only what follows."},
+                "inclusive": {"type": "boolean", "description": "Default false: the named turn is preserved. True discards it too. User turns are always preserved regardless."},
                 "final":     {"type": "boolean", "description": "Default false: the summary is a waypoint and you keep working. True: the summary is your finished answer."},
             },
             "required": ["turn_id", "summary"],

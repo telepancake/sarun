@@ -541,19 +541,14 @@ fn backtrack_behavioural_announcement(target: &str) -> Option<String> {
         let content = t.read().unwrap_or_default();
         if tool_result_looks_failed(&content) { errs += 1; } else { cleans += 1; }
     }
-    // Productive: 3+ recent tool results all clean. Neutral status line
-    // plus the closing-gesture form, factual, no urgency.
-    if cleans >= 3 && errs == 0 && recent_tools.len() >= 3 {
-        let tid = first_user_id.as_deref().unwrap_or("<first-user-turn-id>");
-        return Some(format!(
-            "the last {n} tool calls returned without error markers. \
-             If you have the answer the original request asked for, the \
-             closing gesture is `backtrack(turn_id={tid:?}, inclusive=false, \
-             final=true, summary=<answer>)` — it ships the summary and \
-             collapses the intermediate derivation.",
-            n = cleans,
-        ));
-    }
+    // The productive-cluster case is now handled by the hint mechanism
+    // (see hints::productive_cluster_append). evaluate_call appends the
+    // marker-deduped body to the tool result that completes the streak,
+    // so it fires exactly once per context and is purged naturally on
+    // backtrack. Only the unproductive case remains here, since "errors
+    // piling up" is a state we want surfaced at gen-time when no fresh
+    // tool result is being produced.
+
     // Errors piling up: list tools NOT used yet (factual inventory) plus
     // both backtrack variants. No suggestion to "step back" — just an
     // enumeration of available levers.
@@ -579,13 +574,12 @@ fn backtrack_behavioural_announcement(target: &str) -> Option<String> {
             parts.push(blurb.to_string());
         }
         parts.push(format!(
-            "backtrack(turn_id={tid:?}, inclusive=false, final=false, \
-             summary=…) — rewind to a clean state, keeping `summary` as a \
-             waypoint note"));
+            "backtrack(turn_id={tid:?}, final=false, summary=…) — rewind \
+             to a clean state, keeping `summary` as a waypoint note"));
         parts.push(format!(
-            "backtrack(turn_id={tid:?}, inclusive=false, final=true, \
-             summary=<answer>) — ship; the harness collapses the session \
-             to {{question, summary}}"));
+            "backtrack(turn_id={tid:?}, final=true, summary=<answer>) \
+             — ship; the harness collapses the session to \
+             {{question, summary}}"));
         return Some(format!(
             "{errs} of the last {total} tool calls returned error markers. \
              Available levers not yet used in this run, listed for \
@@ -721,18 +715,28 @@ pub fn evaluate_call(spec: &str, set: &Settings,
 
     // backtrack is special: it REWRITES this session's turn history in
     // place (removes turns, plants the summary). The pending c.assistant
-    // call itself is among the turns it deletes (inclusive=true by
-    // default discards from the named turn onward including the call),
-    // so writing a tool result for it would resurrect the call/result
-    // pair the user just asked us to purge. Dispatch it without
-    // emitting a `.tool` turn — the planted summary IS the result, and
-    // for final=true it's the settled answer.
+    // call itself is among the turns the rewind will sweep up — writing
+    // a tool result for it would resurrect the call/result pair the user
+    // just asked us to purge. Dispatch it without emitting a `.tool`
+    // turn — the planted summary IS the result, and for final=true it's
+    // the settled answer.
     if tool == "backtrack" {
         let _ = dispatch_backtrack(&arguments, &target);
         return Ok(vec![]);
     }
 
-    let result_text = dispatch(&tool, &arguments, &target, set, executor, &turns);
+    let mut result_text = dispatch(&tool, &arguments, &target, set, executor, &turns);
+
+    // Productive-cluster hint: streak-driven append. The hint fires when
+    // this result is clean AND the four prior tool results were clean too;
+    // its marker stays in context so subsequent results don't repeat it.
+    // Backtrack purges the carrying turn naturally on rewind.
+    let first_user_id = turns.iter().find(|t| t.kind == "user")
+        .and_then(|t| t.slug.clone());
+    let current_clean = !tool_result_looks_failed(&result_text);
+    let extra = crate::oaita::hints::productive_cluster_append(
+        &turns, current_clean, first_user_id.as_deref());
+    if !extra.is_empty() { result_text.push_str(&extra); }
 
     // Write the result turn. Sender = self by default; for an inner sub-agent
     // case the executor is the box, and `act` builds its own machinery — for
@@ -936,7 +940,11 @@ fn dispatch_backtrack(args: &Value, target: &str) -> String {
     let Some(summary) = args_str(args, "summary") else {
         return "backtrack: missing `summary`".to_string();
     };
-    let inclusive = args.get("inclusive").and_then(Value::as_bool).unwrap_or(true);
+    // Default `inclusive=false`: PRESERVE the rewind point. The destructive
+    // form (inclusive=true) is opt-in. Earlier the default was true and a
+    // model that omitted the argument silently erased the user's original
+    // question along with the derivation; that's the wrong default.
+    let inclusive = args.get("inclusive").and_then(Value::as_bool).unwrap_or(false);
     let final_answer = args_bool(args, "final");
     let turns = load_turns(target);
     let cut = turns.iter().position(|t| t.slug.as_deref() == Some(turn_id.as_str()));
@@ -944,6 +952,18 @@ fn dispatch_backtrack(args: &Value, target: &str) -> String {
         return format!("backtrack: no turn with id {turn_id:?}");
     };
     if !inclusive { cut += 1; }
+    // User-kind turns are immutable to backtrack. The first user turn is
+    // the original question (the conversation's reason for being); a
+    // later user turn carrying `from=<outer>` is a delegation seed from
+    // an `act` caller and equally not the model's to destroy. If the cut
+    // would sweep up any user turn, COERCE the cut forward past every
+    // user turn in the history — silently. The model picked an
+    // approximate rewind point; the harness picks the safe one.
+    if let Some(last_user) = turns.iter().rposition(|t| t.kind == "user") {
+        if cut <= last_user {
+            cut = last_user + 1;
+        }
+    }
     // Remove every turn from `cut` onward.
     let mut removed = 0usize;
     for t in &turns[cut..] {

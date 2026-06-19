@@ -99,6 +99,26 @@ const HINTS: &[Hint] = &[
                this error.",
     },
 
+    // ── conditional, streak-driven ───────────────────────────────────────
+    //
+    // productive-cluster fires from inside evaluate_call when the current
+    // tool result and at least four preceding tool results are all clean
+    // (no error markers). The body's `<TID>` placeholder is replaced with
+    // the session's first-user-turn id before emission. Same marker-in-
+    // context dedup as the static hints — fires once per context, then
+    // suppresses until backtrack drops the carrying turn.
+    Hint {
+        id: "productive-cluster",
+        marker: "--- hint: productive-cluster ---",
+        body: "The last 5 tool calls have all returned without error \
+               markers. If you now have the answer the original request \
+               asked for, the closing gesture is `backtrack(turn_id=<TID>, \
+               final=true, summary=<your-answer>)` — it ships the summary \
+               as the settled answer and collapses the intermediate \
+               derivation. (User turns stay in place; the derivation turns \
+               between go.)",
+    },
+
     // ── shell composition reminders ───────────────────────────────────────
     Hint {
         id: "shell",
@@ -110,13 +130,63 @@ const HINTS: &[Hint] = &[
                parallel or one-off work whose intermediate state you don't \
                want to clutter this conversation — it returns only a \
                result; \
-               `backtrack`(turn_id=…, inclusive=false, final=false, \
-               summary=…) compresses a long thinking session into a one-\
-               line waypoint and continues from there with the original \
-               question intact; `backtrack` with `final=true` ships the \
-               summary as the answer and collapses the derivation.",
+               `backtrack`(turn_id=…, final=false, summary=…) compresses \
+               a long thinking session into a one-line waypoint and \
+               continues from there with the original question intact; \
+               `backtrack` with `final=true` ships the summary as the \
+               answer and collapses the derivation.",
     },
 ];
+
+/// Streak-driven productive-cluster hint. Returns the templated body to
+/// append to the CURRENT tool result iff:
+///   * `current_clean` is true (the result we're about to emit is itself
+///     clean — no error markers);
+///   * at least 4 of the most recent prior tool turns are clean too;
+///   * the productive-cluster marker isn't already in any prior turn.
+/// `first_user_id` templates into the suggested backtrack invocation. When
+/// any condition fails, returns an empty string.
+pub fn productive_cluster_append(turns: &[Turn], current_clean: bool,
+                                 first_user_id: Option<&str>) -> String {
+    if !current_clean { return String::new(); }
+    let recent_tools: Vec<&Turn> = turns.iter()
+        .filter(|t| t.kind == "tool").rev().take(4).collect();
+    if recent_tools.len() < 4 { return String::new(); }
+    let prior_clean = recent_tools.iter().all(|t| {
+        let body = t.read().unwrap_or_default();
+        !looks_failed(&body)
+    });
+    if !prior_clean { return String::new(); }
+    // Marker dedup against the full session.
+    let marker = HINTS.iter().find(|h| h.id == "productive-cluster")
+        .map(|h| h.marker).unwrap_or("");
+    for t in turns {
+        if let Ok(content) = t.read() {
+            if content.contains(marker) { return String::new(); }
+        }
+    }
+    let Some(h) = HINTS.iter().find(|h| h.id == "productive-cluster") else {
+        return String::new();
+    };
+    let tid = first_user_id.unwrap_or("<first-user-turn-id>");
+    let body = h.body.replace("<TID>", &format!("{tid:?}"));
+    format!("\n\n{}\n{body}", h.marker)
+}
+
+/// The same "tool result looks like an error" predicate the unproductive
+/// announcement uses. Inlined here to keep the hint module self-contained.
+fn looks_failed(content: &str) -> bool {
+    let lc = content.to_ascii_lowercase();
+    let markers = &[
+        "no such file or directory", "permission denied", "command not found",
+        "syntax error", "traceback (most recent call last)",
+        "error: unknown tool", "fatal error", "segfault", "core dumped",
+        "exited with status",
+    ];
+    if markers.iter().any(|m| lc.contains(m)) { return true; }
+    if lc.contains(": error:") || lc.contains(": failed:") { return true; }
+    false
+}
 
 /// Append all hints in `ids` whose marker isn't already in any session turn.
 /// Returns an empty string when every requested hint has been shown already
