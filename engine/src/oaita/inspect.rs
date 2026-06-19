@@ -601,6 +601,20 @@ pub fn write_at_locator(locator: &Locator, content: &str, force: bool,
         );
     }
 
+    // `Window::Around(N)` has no defensible default radius for a destructive
+    // edit. inspect/read use a 200-line page around the anchor for paged
+    // VIEWING, where wide is helpful; the model writing `path around N` to
+    // `write` almost always expects a small splice and gets a 143-line
+    // slice instead — observed in a trace where 234-line file collapsed
+    // because the model thought "around" meant ±a few lines. No fallback
+    // window; the model uses the precise form (`path lines A..B`) instead.
+    if matches!(window, Window::Around(_)) {
+        return format!(
+            "write: {target}: `around N` is an inspect/read locator only — \
+             for a write you must name the exact range with \
+             `{target} lines A..B`. (No default radius for destructive edits.)");
+    }
+
     let original = String::from_utf8_lossy(&original_bytes).into_owned();
     let lines: Vec<&str> = original.lines().collect();
     let n = lines.len();
