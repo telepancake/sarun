@@ -1,3 +1,7 @@
+# sarun: trimmed to a find-only library fork of uutils/findutils 0.9.1.
+# The `locate`/`updatedb`/`xargs`/`testing-commandline` binaries, their
+# benches, and the dev-dependencies are removed — the engine consumes only the
+# `find` module as a library (engine/vendor/findutils via a path dependency).
 [package]
 name = "findutils"
 version = "0.9.1"
@@ -6,7 +10,7 @@ repository = "https://github.com/uutils/findutils"
 edition = "2021"
 license = "MIT"
 readme = "README.md"
-description = "Rust implementation of GNU findutils"
+description = "Rust implementation of GNU findutils (find-only fork for sarun)"
 authors = ["uutils developers"]
 
 [dependencies]
@@ -21,64 +25,6 @@ uucore = { version = "0.9.0", features = ["entries", "fs", "fsext", "mode"] }
 walkdir = "2.5"
 itertools = "0.15.0"
 thiserror = "2.0.12"
-
-[dev-dependencies]
-criterion = { version = "4.7.0", package = "codspeed-criterion-compat" }
-assert_cmd = "2"
-ctor = "1.0"
-filetime = "0.2"
-nix = { version = "0.31", features = ["fs"] }
-rstest = "0.26.1"
-tempfile = "3"
-uutests = "0.9.0"
-
-[[bench]]
-name = "find_bench"
-harness = false
-
-[[bench]]
-name = "xargs_bench"
-harness = false
-
-[[bench]]
-name = "updatedb_bench"
-harness = false
-
-[[bench]]
-name = "locate_bench"
-harness = false
-
-[[bin]]
-name = "find"
-path = "src/find/main.rs"
-
-[[bin]]
-name = "locate"
-path = "src/locate/main.rs"
-
-[[bin]]
-name = "updatedb"
-path = "src/updatedb/main.rs"
-
-[[bin]]
-name = "xargs"
-path = "src/xargs/main.rs"
-
-[[bin]]
-name = "testing-commandline"
-path = "src/testing/commandline/main.rs"
-
-[profile.release]
-lto = "thin"
-codegen-units = 1
-
-[profile.release-fast]
-inherits = "release"
-panic = "abort"
-
-# The profile that 'dist' (cargo-dist) builds release artifacts with.
-[profile.dist]
-inherits = "release"
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }
@@ -119,5 +65,3 @@ format_push_string = "allow"
 flat_map_option = "allow"
 from_iter_instead_of_collect = "allow"
 large_types_passed_by_value = "allow"
-# Disable for now, we have a few occurrences
-# panic = "warn"
