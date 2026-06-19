@@ -34,6 +34,7 @@ pub mod client;
 pub mod config;
 pub mod driver;
 pub mod exec;
+pub mod hints;
 pub mod ids;
 pub mod inspect;
 pub mod pretty;

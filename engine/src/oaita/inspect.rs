@@ -151,17 +151,17 @@ pub fn inspect(locator: &Locator, turns: &[Turn],
         _ => (locator.path.clone(), locator.window.clone()),
     };
     if let Some(rest) = target.strip_prefix("box:") {
-        return inspect_box(rest, &window);
+        return inspect_box(rest, &window, turns);
     }
     // Structural windows need file bytes regardless of "kind"; route them
     // BEFORE the dir/file dispatch so a stale path_kind cache or a fresh
     // box with no upper yet doesn't false-negative the user's symbol query.
     if matches!(window, Window::Symbols | Window::Symbol(_, _)) {
-        return inspect_structural(box_id, executor, &target, &window);
+        return inspect_structural(box_id, executor, &target, &window, turns);
     }
     match executor.path_kind(box_id, &target) {
-        'd' => inspect_dir(box_id, executor, &target, &window),
-        'f' => inspect_file(box_id, executor, &target, &window),
+        'd' => inspect_dir(box_id, executor, &target, &window, turns),
+        'f' => inspect_file(box_id, executor, &target, &window, turns),
         'l' => format!("inspect: {target}: symlink"),
         's' => format!("inspect: {target}: special file"),
         _ => format!("inspect: not found: {target}"),
@@ -169,7 +169,7 @@ pub fn inspect(locator: &Locator, turns: &[Turn],
 }
 
 fn inspect_structural(box_id: &str, executor: &dyn Executor,
-                      target: &str, window: &Window) -> String {
+                      target: &str, window: &Window, turns: &[Turn]) -> String {
     let bytes = match executor.read_file(box_id, target) {
         Ok(b) => b,
         Err(e) => return format!("inspect: {e}"),
@@ -180,7 +180,7 @@ fn inspect_structural(box_id: &str, executor: &dyn Executor,
              (currently: .rs, .py, .sh, .bash). Use `path lines A..B` for a \
              line window instead.");
     };
-    match window {
+    let body = match window {
         Window::Symbols => render_symbol_list(target, &symbols),
         Window::Symbol(name, n) => match find_symbol(&symbols, name, *n) {
             Some(sym) => render_symbol_focus(target, sym, &bytes),
@@ -198,7 +198,8 @@ fn inspect_structural(box_id: &str, executor: &dyn Executor,
             }
         },
         _ => format!("inspect: internal: non-structural window in structural path"),
-    }
+    };
+    body + &crate::oaita::hints::append(turns, &["inspect-syntax"])
 }
 
 fn render_symbol_list(target: &str, symbols: &[Symbol]) -> String {
@@ -255,7 +256,7 @@ fn kind_label(k: char) -> &'static str {
 }
 
 fn inspect_dir(box_id: &str, executor: &dyn Executor,
-               target: &str, window: &Window) -> String {
+               target: &str, window: &Window, turns: &[Turn]) -> String {
     let mut entries: Vec<(String, String)> = match executor.list_dir(box_id, target) {
         Ok(es) => es.into_iter().map(|(name, k)| (kind_label(k).to_string(), name))
                                 .collect(),
@@ -274,16 +275,19 @@ fn inspect_dir(box_id: &str, executor: &dyn Executor,
                        entries.iter().filter(|(k, _)| k == "file").count(),
                        entries.iter().filter(|(k, _)| !matches!(k.as_str(), "dir"|"file")).count());
     let mut text = format!("{head}{body}");
-    if a > 1 || b < n {
+    let paged = a > 1 || b < n;
+    if paged {
         text.push_str(&footer(target, "entries", a, b.min(n), n));
     } else {
         text.push_str(&end_banner(target, "entries", n));
     }
-    text
+    let mut hint_ids: Vec<&str> = vec!["inspect-dir"];
+    if paged { hint_ids.push("inspect-cursor"); }
+    text + &crate::oaita::hints::append(turns, &hint_ids)
 }
 
 fn inspect_file(box_id: &str, executor: &dyn Executor,
-                target: &str, window: &Window) -> String {
+                target: &str, window: &Window, turns: &[Turn]) -> String {
     let bytes = match executor.read_file(box_id, target) {
         Ok(b) => b, Err(e) => return format!("inspect: {e}"),
     };
@@ -299,15 +303,18 @@ fn inspect_file(box_id: &str, executor: &dyn Executor,
         .map(|(i, l)| format!("{:>6}  {l}", a + i)).collect::<Vec<_>>().join("\n");
     let head = format!("file {target}: {n} lines\n\n");
     let mut text = format!("{head}{body}");
-    if a > 1 || b < n {
+    let paged = a > 1 || b < n;
+    if paged {
         text.push_str(&footer(target, "lines", a, b.min(n), n));
     } else {
         text.push_str(&end_banner(target, "lines", n));
     }
-    text
+    let mut hint_ids: Vec<&str> = vec!["inspect-file-lines"];
+    if paged { hint_ids.push("inspect-cursor"); }
+    text + &crate::oaita::hints::append(turns, &hint_ids)
 }
 
-fn inspect_box(rest: &str, _window: &Window) -> String {
+fn inspect_box(rest: &str, _window: &Window, turns: &[Turn]) -> String {
     // box:<id>           → list the change set as one entry per file
     // box:<id>/<file>    → page that file's staged diff
     let (box_id, sub) = match rest.split_once('/') {
@@ -324,7 +331,7 @@ fn inspect_box(rest: &str, _window: &Window) -> String {
         Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
         Err(e) => return format!("inspect: box:{box_id}: cannot reach sarun: {e}"),
     };
-    if let Some(file) = sub {
+    let body = if let Some(file) = sub {
         // Crude per-file slice — find the `+++ b/<file>` chunk and follow it
         // until the next `diff --git` header.
         let needle = format!("+++ b/{file}\n");
@@ -332,21 +339,24 @@ fn inspect_box(rest: &str, _window: &Window) -> String {
             let tail = &out[start..];
             let end = tail[needle.len()..].find("diff --git ")
                 .map(|i| i + needle.len()).unwrap_or(tail.len());
-            return tail[..end].to_string();
+            tail[..end].to_string()
+        } else {
+            return format!("inspect: box:{box_id}/{file} not in change set");
         }
-        return format!("inspect: box:{box_id}/{file} not in change set");
-    }
-    // List filenames touched.
-    let mut files: Vec<String> = Vec::new();
-    for line in out.lines() {
-        if let Some(rest) = line.strip_prefix("+++ b/") {
-            files.push(rest.to_string());
+    } else {
+        // List filenames touched.
+        let mut files: Vec<String> = Vec::new();
+        for line in out.lines() {
+            if let Some(rest) = line.strip_prefix("+++ b/") {
+                files.push(rest.to_string());
+            }
         }
-    }
-    if files.is_empty() {
-        return format!("box:{box_id}: empty change set");
-    }
-    format!("box:{box_id}: {} changed files\n{}", files.len(), files.join("\n"))
+        if files.is_empty() {
+            return format!("box:{box_id}: empty change set");
+        }
+        format!("box:{box_id}: {} changed files\n{}", files.len(), files.join("\n"))
+    };
+    body + &crate::oaita::hints::append(turns, &["inspect-box"])
 }
 
 fn default_sarun() -> String {
