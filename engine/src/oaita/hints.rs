@@ -87,7 +87,8 @@ const HINTS: &[Hint] = &[
         id: "unknown-tool",
         marker: "--- hint: unknown-tool ---",
         body: "Tools available in this harness: \
-               `act`(request=…) delegates to a sub-agent in its own box; \
+               `ask`(request=…) sends the task to a sub-agent in its own \
+               conversation; \
                `shell`(script=…) runs a script in your box (writes stage \
                for review); `inspect`/`read`/`write` address files via a \
                shared locator grammar (path, `lines A..B`, `around N`, \
@@ -126,10 +127,10 @@ const HINTS: &[Hint] = &[
         body: "shell runs scripts inside your persistent box (writes stage \
                for review — see `box:<id>` via inspect). Related moves you \
                may not have considered: \
-               `act`(request=…) spawns a SUB-AGENT in a fresh box for \
-               parallel or one-off work whose intermediate state you don't \
-               want to clutter this conversation — it returns only a \
-               result; \
+               `ask`(request=…) sends the task to a SUB-AGENT in a fresh \
+               box for parallel or one-off work whose intermediate state \
+               you don't want to clutter this conversation — it returns \
+               only a result; \
                `backtrack`(turn_id=…, final=false, summary=…) compresses \
                a long thinking session into a one-line waypoint and \
                continues from there with the original question intact; \
