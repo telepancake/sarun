@@ -388,8 +388,14 @@ pub fn make_main(argv: &[String]) -> i32 {
         let s = std::str::from_utf8(cmd)
             .map(std::borrow::Cow::Borrowed)
             .unwrap_or_else(|_| String::from_utf8_lossy(cmd));
-        let code = crate::brush::run_recipe_in_process(&s, output_cb);
-        RecipeRunnerDecision::Ran { success: code == 0, output: Vec::new() }
+        // bundle_coreutils=false: see brush::box_builtins_opt. uutils
+        // localization caches each util's FluentResource in a process-
+        // global OnceLock; the first util to run owns it, every later
+        // util's translate!() returns the raw key (e.g. cp's
+        // `cp-error-cannot-stat`). For make recipes we accept the
+        // fork+exec overhead in exchange for bash-compatible stderr.
+        let code = crate::brush::run_recipe_in_process_opt(&s, output_cb, false);
+        RecipeRunnerDecision::Ran { code }
     }));
 
     // 2. Recognized make pseudo-actions BEFORE kati's flags parser sees them
@@ -449,6 +455,36 @@ pub fn make_main(argv: &[String]) -> i32 {
             drop(mf);
             eprintln!("sarun-engine make: no makefile found (and none given with -f)");
             return 2;
+        }
+    }
+
+    // 4b. If `-f <file>` named a missing makefile, emit gnu-shaped error
+    //     output and exit 2 so a recipe like `$(MAKE) -f missing.mk` running
+    //     under the box's FUSE-shadowed `make` prints what gnu make would.
+    //     Standalone rkati's recursive-make recipe resolves $(MAKE) through
+    //     PATH and lands on /usr/bin/make (gnu) for the sub-make, so the
+    //     standalone corpus runner only ever sees gnu's framing for this
+    //     case — and the corpus comparator was written against gnu. Without
+    //     this, box-mode submake_basic diverges from the standalone pass set.
+    //
+    //     We DO NOT emit Entering/Leaving directory messages because that's
+    //     gated on MAKELEVEL > 0 + `--print-directory`; the simpler
+    //     "submake/basic.mk: No such file or directory" + "No rule to make
+    //     target" pair is what survives the corpus runner's make[N]:
+    //     Entering/Leaving strip anyway.
+    {
+        let mf_lock = FLAGS.makefile.lock();
+        if let Some(makefile) = mf_lock.as_ref() {
+            if std::fs::metadata(makefile).is_err() {
+                let display = makefile.to_string_lossy();
+                // No " Stop." suffix: rkati standalone doesn't emit it,
+                // so kati_norms doesn't strip it; gnu does emit it but
+                // make_norms strips it. Matching rkati's no-Stop form is
+                // what makes box ↔ gnu (post-norms) line up.
+                eprintln!("make: {display}: No such file or directory");
+                eprintln!("make: *** No rule to make target '{display}'.");
+                return 2;
+            }
         }
     }
 
