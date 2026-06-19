@@ -418,16 +418,12 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
         bwrap.args(["--tmpfs", "/tmp"]);
     }
     // /run/sarun belongs to the engine — the inner-served api.sock and the
-    // bound-in engine binary live there. Plant a bwrap-private tmpfs at
-    // /run/sarun first so neither the binary bind nor (for --api) the
-    // runner-created api.sock node ever touch the overlay upper: apply
-    // doesn't see them, the change summary stays clean, and there's no
-    // path to clobber the engine's real host-side files at the same name.
-    // (There's no ui.sock bind here anymore — the FD broker carries every
-    // in-box engine conn over the existing box-channel; ui.sock is HOST
-    // only.)
-    bwrap.args(["--tmpfs", "/run/sarun",
-                "--ro-bind", &self_exe, inner_exe]);
+    // No bwrap binds for the engine binary — `/run/sarun/engine` (the
+    // inner-exec path, universal) and `/usr/local/bin/{oaita,sarun}`
+    // (the --api PATH targets) are served via the FUSE overlay shadow
+    // (see overlay::is_engine_shadow_path). Same mechanism the brush
+    // shim uses for /bin/sh: no bwrap bind, no tmpfs at /run/sarun, no
+    // host-path leakage into the mount namespace.
     // FD broker: pick a per-box abstract-UDS name and propagate it to
     // the inner AND every child process via --setenv. The inner binds it
     // (inner_broker_serve), in-box clients dial it (broker_dial). Keying
@@ -493,13 +489,11 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
         // (`/v1`) for outgoing HTTP request URLs. The host part is
         // irrelevant once `SARUN_BROKER` is set — the dial doesn't use it.
         bwrap.args(["--setenv", "OPENAI_BASE_URL", "http://oaita-proxy/v1"]);
-        // Expose the engine binary inside the box as both `oaita` and
-        // `sarun` so an in-box `oaita run X` reaches the symlinked-as-oaita
-        // dispatch (and a nested `sarun ...` for the shell executor reaches
-        // the normal subcommand path). Both shadow over /usr/local/bin —
-        // standard PATH on every distro we target.
-        bwrap.args(["--ro-bind", &self_exe, "/usr/local/bin/oaita"]);
-        bwrap.args(["--ro-bind", &self_exe, "/usr/local/bin/sarun"]);
+        // /usr/local/bin/{oaita,sarun} are served by the FUSE overlay
+        // for --api boxes (overlay::is_engine_shadow_path). No bwrap
+        // binds — the kernel's PATH lookup goes through the FUSE,
+        // which synthesizes the engine binary's attrs and serves the
+        // file on open.
         // OAITA_TRACE is a master on/off switch the in-box driver checks
         // before opening a trace emitter conn — value is irrelevant (the
         // destination is always the engine, reached via the FD broker).
