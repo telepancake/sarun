@@ -37,27 +37,54 @@ use memchr::memchr2;
 // classic `run_command()` path below. The closure form (boxed) lets
 // callers capture a tokio runtime / oneshot context without making
 // kati depend on brush.
-pub type RecipeRunner =
-    Box<dyn Fn(&[u8], &mut dyn FnMut(&[u8])) -> i32 + Send + Sync + 'static>;
+pub enum RecipeRunnerDecision {
+    /// Hook ran the command; here's the merged output and "success" flag.
+    Ran { success: bool, output: Vec<u8> },
+    /// Hook declined (e.g. SHELL not a /bin/sh-shaped shell); let
+    /// `exec.rs` fall through to the classic fork+exec path.
+    Passthrough,
+}
+
+pub type RecipeRunner = Box<
+    dyn Fn(&[u8] /* shell */, &[u8] /* shellflag */, &[u8] /* cmd */, &mut dyn FnMut(&[u8]))
+        -> RecipeRunnerDecision
+        + Send
+        + Sync
+        + 'static,
+>;
 
 static RECIPE_RUNNER: parking_lot::Mutex<Option<RecipeRunner>> =
     parking_lot::Mutex::new(None);
 
-/// Install an in-process recipe runner. exec.rs will use this instead of
-/// fork+exec'ing /bin/sh for every command. Idempotent; last call wins.
+/// Install an in-process recipe runner. exec.rs will consult it before
+/// fork+exec'ing /bin/sh; the runner may handle the command (returning
+/// Ran) or decline and fall back to the classic path (Passthrough).
+/// Idempotent; last call wins.
 pub fn install_recipe_runner(f: RecipeRunner) {
     *RECIPE_RUNNER.lock() = Some(f);
 }
 
 /// Run `cmd` through the installed in-process runner, if any. Returns
-/// `Some((success, merged_output))` when the hook was used, `None` to
-/// fall back to `run_command()`.
-pub fn run_with_installed_runner(cmd: &[u8]) -> Option<(bool, Vec<u8>)> {
+/// `Some((success, merged_output))` when the hook handled the command,
+/// `None` when no hook is installed OR the hook declined.
+pub fn run_with_installed_runner(
+    shell: &[u8],
+    shellflag: &[u8],
+    cmd: &[u8],
+) -> Option<(bool, Vec<u8>)> {
     let guard = RECIPE_RUNNER.lock();
     let runner = guard.as_ref()?;
     let mut out = Vec::new();
-    let code = runner(cmd, &mut |b| out.extend_from_slice(b));
-    Some((code == 0, out))
+    match runner(shell, shellflag, cmd, &mut |b| out.extend_from_slice(b)) {
+        RecipeRunnerDecision::Ran { success, output } => {
+            // The runner pushed bytes through our local callback; ignore
+            // the `output` field (kept for callers that prefer to build
+            // their own buffer). Drop it to avoid confusing copies.
+            let _ = output;
+            Some((success, out))
+        }
+        RecipeRunnerDecision::Passthrough => None,
+    }
 }
 use parking_lot::Mutex;
 

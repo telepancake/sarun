@@ -188,9 +188,11 @@ fn run_kati(targets: &[Symbol], cl_vars: &[bytes::Bytes], ninja_path: &OsStr) ->
     let mut ev = Evaluator::new();
     ev.start()?;
 
-    // MAKEFILE_LIST + environment, like upstream.
+    // sarun: GNU make's MAKEFILE_LIST has no leading space — the main
+    // makefile is the very first word (matches rkati main.rs). The old
+    // " name" form leaked an extra space into recipes that referenced
+    // $(MAKEFILE_LIST).
     let mut makefile_list = BytesMut::new();
-    makefile_list.put_u8(b' ');
     makefile_list.put_slice(FLAGS.makefile.lock().clone().unwrap().as_bytes());
     intern("MAKEFILE_LIST").set_global_var(
         Variable::with_simple_string(
@@ -249,7 +251,7 @@ fn run_kati(targets: &[Symbol], cl_vars: &[bytes::Bytes], ninja_path: &OsStr) ->
         let makefile = FLAGS.makefile.lock().clone().unwrap();
         let _file_frame = ev.enter(FrameType::Parse, bytes::Bytes::from(makefile.as_bytes().to_vec()), Loc::default());
         let Some(mk) = kati::file_cache::get_makefile(&makefile)? else {
-            anyhow::bail!("makefile not found: {}", makefile.to_string_lossy());
+            anyhow::bail!("makefile not found");
         };
         let stmts = mk.stmts.lock();
         for stmt in stmts.iter() {
@@ -366,11 +368,28 @@ pub fn make_main(argv: &[String]) -> i32 {
     //    merged stdout+stderr through brush's pipe machinery and forwards to
     //    THIS process's stdout — kati's exec.rs then `print!`s those bytes,
     //    matching standalone rkati's byte-for-byte recipe output.
-    kati::fileutil::install_recipe_runner(Box::new(|cmd, output_cb| {
+    //
+    //    Honors `SHELL := ...` from the makefile: if SHELL is anything other
+    //    than a /bin/sh-shaped path (sh, bash, dash, ash, ksh, zsh), the
+    //    runner declines (returns Passthrough) and kati's exec.rs falls back
+    //    to the classic fork+exec path — so makefiles that use SHELL=echo or
+    //    SHELL=/path/to/custom-tool still work the way gnu make and standalone
+    //    rkati do.
+    kati::fileutil::install_recipe_runner(Box::new(|shell, _shellflag, cmd, output_cb| {
+        use kati::fileutil::RecipeRunnerDecision;
+        let shell_base = std::path::Path::new(std::ffi::OsStr::from_bytes(shell))
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        let posix_shell = matches!(shell_base, "sh" | "bash" | "dash" | "ash" | "ksh" | "zsh");
+        if !posix_shell {
+            return RecipeRunnerDecision::Passthrough;
+        }
         let s = std::str::from_utf8(cmd)
             .map(std::borrow::Cow::Borrowed)
             .unwrap_or_else(|_| String::from_utf8_lossy(cmd));
-        crate::brush::run_recipe_in_process(&s, output_cb)
+        let code = crate::brush::run_recipe_in_process(&s, output_cb);
+        RecipeRunnerDecision::Ran { success: code == 0, output: Vec::new() }
     }));
 
     // 2. Recognized make pseudo-actions BEFORE kati's flags parser sees them
