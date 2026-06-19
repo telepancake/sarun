@@ -194,8 +194,19 @@ impl Client {
 
         match &self.endpoint {
             Endpoint::Unix(p) => {
-                let stream = UnixStream::connect(p).await
+                let mut stream = UnixStream::connect(p).await
                     .map_err(|e| format!("dial {}: {e}", p.display()))?;
+                // The engine consolidated the API proxy onto the existing
+                // control socket — `--api` boxes dial /tmp/.slopbox/ui.sock
+                // (same UDS the box-channel uses) instead of a separate
+                // api.sock. Send a single upgrade-line BEFORE the HTTP
+                // handshake; the engine's accept loop recognises
+                // {"type":"api_proxy"} as "this connection is HTTP from now
+                // on" and hands it to the proxy handler, then the rest of
+                // the bytes are plain HTTP/1.1. The upgrade line is the
+                // one-byte tax of consolidating onto one socket.
+                stream.write_all(b"{\"type\":\"api_proxy\"}\n").await
+                    .map_err(|e| format!("upgrade: {e}"))?;
                 let (mut sender, conn) = hyper::client::conn::http1::handshake(
                     TokioIo::new(stream)).await
                     .map_err(|e| format!("handshake: {e}"))?;

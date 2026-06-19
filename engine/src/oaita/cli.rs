@@ -202,10 +202,10 @@ fn cmd_trace(args: &[String]) -> i32 {
 
 fn cmd_where() -> i32 {
     let cfg = crate::paths::oaita_config_path();
-    let sock = crate::paths::api_sock_path();
+    let sock = crate::paths::sock_path();
     let state = crate::paths::oaita_state_home();
     println!("config:        {}", cfg.display());
-    println!("api socket:    {}", sock.display());
+    println!("control sock:  {} (also carries --api proxy via upgrade)", sock.display());
     println!("sessions root: {}", state.display());
     let c = Config::load();
     println!("model:         {}", c.model.as_deref().unwrap_or("(unset)"));

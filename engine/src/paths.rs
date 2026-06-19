@@ -67,15 +67,6 @@ pub fn sock_path() -> PathBuf {
     runtime_home().join("ui.sock")
 }
 
-/// Per-engine API proxy socket. An `--api` box has THIS bind-mounted at
-/// `/run/sarun/api.sock` inside, and oaita talks plain HTTP/1.1 over it; the
-/// engine proxies the call upstream after injecting the auth header from
-/// `oaita.toml` and logging the request/response into the box's `api_log`
-/// sqlar table.
-pub fn api_sock_path() -> PathBuf {
-    runtime_home().join("api.sock")
-}
-
 /// Config file holding the API credentials (model, base_url, api_key). Lives
 /// under XDG config home, separate from sarun's other settings so a user can
 /// chmod 0600 it without dragging other config along.
