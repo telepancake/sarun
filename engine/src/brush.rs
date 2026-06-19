@@ -124,6 +124,7 @@
 // is exactly the /bin/sh-vs-/bin/bash contract.
 
 use std::os::fd::AsRawFd;
+use std::os::fd::FromRawFd;
 
 use serde_json::json;
 use serde_json::Value;
@@ -196,13 +197,23 @@ fn with_fd_redirected<R>(
     Ok(r)
 }
 
-/// When the per-util gate refuses an argv, fall through to the host
-/// binary instead of running uutils. `std::process::Command` PATH-looks
-/// up `name`, fork+execs, and inherits THIS process's fd 0/1/2 by
-/// default — so dup'ing those fds to the brush context's stdin/stdout/
-/// stderr via the same `step` nesting the uumain path uses makes the
-/// child read/write the right sinks. Returns the child's exit code
-/// (low 8 bits); on PATH-lookup failure returns 127, matching POSIX
+/// When the per-util gate refuses an argv (or a pipe context forces it), fall
+/// through to the host binary instead of running uutils. `std::process::Command`
+/// PATH-looks up `name` and fork+execs it.
+///
+/// CRITICAL: we wire the brush context's stdin/stdout/stderr ONTO THE CHILD via
+/// `Command::stdin/stdout/stderr`, which dup2's them post-fork/pre-exec IN THE
+/// CHILD. We do NOT touch THIS process's fd table. The earlier implementation
+/// used `with_fd_redirected` — a PROCESS-WIDE `dup2` around `cmd.status()` — and
+/// that races a pipeline: this wrapper runs on a tokio spawn_blocking worker
+/// while brush spawns the sibling stages on the main thread, so while fd 1 was
+/// transiently the downstream pipe's write end, a just-forked downstream stage
+/// (e.g. `sed`, whose stdout is the pipeline's INHERITED fd 1 and is therefore
+/// never re-redirected) inherited that write end as its own fd 1 — reading its
+/// own output, never seeing EOF (the configure/make hang). Per-child wiring has
+/// no such window. Where the brush OpenFile is absent for an fd we leave the
+/// child inheriting this process's fd (the box sink). Returns the child's exit
+/// code (low 8 bits); on PATH-lookup failure returns 127, matching POSIX
 /// `command not found` semantics.
 fn run_coreutil_external(
     name: &str,
@@ -211,39 +222,63 @@ fn run_coreutil_external(
     out: &Option<brush_core::openfiles::OpenFile>,
     err: &Option<brush_core::openfiles::OpenFile>,
 ) -> i32 {
-    fn step(
-        fd: i32,
-        of: &Option<brush_core::openfiles::OpenFile>,
-        run: impl FnOnce() -> i32,
-    ) -> i32 {
-        match of {
-            Some(of) => match with_fd_redirected(fd, of, run) {
-                Ok(c) => c,
-                Err(msg) => { eprintln!("sarun-engine brush: {msg}"); 1 }
-            },
-            None => run(),
+    // Turn a brush OpenFile into a Stdio for the child WITHOUT mutating this
+    // process's fds. We duplicate the raw fd so the original brush fd stays open
+    // after Command consumes (and closes) its copy; if the OpenFile has no raw
+    // fd (an in-memory stream) we return None and let the child inherit.
+    fn child_stdio(of: &Option<brush_core::openfiles::OpenFile>) -> Option<std::process::Stdio> {
+        let of = of.as_ref()?;
+        let borrowed = of.try_borrow_as_fd().ok()?;
+        // F_DUPFD_CLOEXEC (not plain dup): the duplicate MUST be close-on-exec.
+        // A bare dup clears CLOEXEC, leaving a stray write-end of a pipeline
+        // pipe in THIS process until Command consumes it — and a sibling stage
+        // (e.g. a brush-spawned `sed`) forked concurrently would inherit that
+        // write end and never see EOF (the `tr | sed` hang). With CLOEXEC the
+        // duplicate is auto-closed in any child's exec; Command still dup2's it
+        // onto the target child's fd 0/1/2 first (that copy is correctly
+        // non-CLOEXEC), so the wired stdio is unaffected.
+        let dup = unsafe { libc::fcntl(borrowed.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+        if dup < 0 { return None; }
+        Some(unsafe { std::process::Stdio::from_raw_fd(dup) })
+    }
+    let mut cmd = std::process::Command::new(name);
+    // argv[0] is the command name (uumain convention); skip it. Command sets
+    // argv[0] automatically from the program path it spawns.
+    if argv.len() > 1 {
+        cmd.args(&argv[1..]);
+    }
+    if let Some(s) = child_stdio(in_)  { cmd.stdin(s); }
+    if let Some(s) = child_stdio(out)  { cmd.stdout(s); }
+    if let Some(s) = child_stdio(err)  { cmd.stderr(s); }
+
+    // Close every inherited fd > 2 in the child. brush treats this coreutil as
+    // an IN-PROCESS builtin, so it keeps the pipeline's pipe fds open in the
+    // parent (for the sibling stages) and never runs its own CLOEXEC-clearing /
+    // stray-fd-closing path (compose_std_command's sarun_close_stray_fds) for
+    // us. Without this, a 3+-stage pipeline's later external stage inherits a
+    // stray copy of an upstream pipe's WRITE end and the downstream `read()`
+    // never sees EOF — `echo a | cat | cat` (and configure/make pipelines) hang.
+    // Command wires stdio (fd 0/1/2) BEFORE running pre_exec closures, so it is
+    // safe to drop everything from fd 3 up. close_range is a single
+    // async-signal-safe syscall with no allocation (cf. walking /proc/self/fd).
+    #[cfg(target_os = "linux")]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        cmd.pre_exec(|| {
+            // close_range(2) isn't exposed by libc for this target, so call it
+            // raw. flags=0; ignore the result (best-effort, EBADF/ENOSYS are
+            // harmless). Args are u32 fd bounds widened to the syscall's c_long.
+            libc::syscall(libc::SYS_close_range, 3 as libc::c_uint, libc::c_uint::MAX, 0);
+            Ok(())
+        });
+    }
+    match cmd.status() {
+        Ok(s) => s.code().unwrap_or(127),
+        Err(e) => {
+            eprintln!("/bin/sh: line 1: {name}: command not found ({e})");
+            127
         }
     }
-    step(2, err, || {
-        step(1, out, || {
-            step(0, in_, || {
-                let mut cmd = std::process::Command::new(name);
-                // argv[0] is the command name (uumain convention); skip
-                // it. Command sets argv[0] automatically from the
-                // program path it spawns.
-                if argv.len() > 1 {
-                    cmd.args(&argv[1..]);
-                }
-                match cmd.status() {
-                    Ok(s) => s.code().unwrap_or(127),
-                    Err(e) => {
-                        eprintln!("/bin/sh: line 1: {name}: command not found ({e})");
-                        127
-                    }
-                }
-            })
-        })
-    })
 }
 
 impl brush_core::builtins::SimpleCommand for CoreutilWrapper {
@@ -288,7 +323,21 @@ impl brush_core::builtins::SimpleCommand for CoreutilWrapper {
         let out = context.try_fd(1);
         let err = context.try_fd(2);
 
-        if !gate(&argv) {
+        // sarun: CONCURRENT-PIPELINE-STAGE guard. The in-process uumain path below
+        // points the PROCESS's real fd 0/1/2 at the brush OpenFiles via
+        // with_fd_redirected (a process-wide dup2). That is safe for a stand-alone
+        // command, but NOT when this coreutil is a separately-spawned pipeline
+        // stage: brush runs it on a tokio spawn_blocking worker CONCURRENTLY with
+        // spawning the sibling stages, so a transient fd redirect leaks into a
+        // just-forked sibling (the configure/make hang; see run_coreutil_external).
+        // brush tells us this directly via context.spawned_pipeline_stage (true
+        // only on the OwnedShell + spawn_blocking path) — the RIGHT signal, vs.
+        // guessing from fd type, which would wrongly fire on a stand-alone command
+        // that merely inherited a pipe as its stdout (e.g. the whole box piped into
+        // another process). A concurrent stage takes the external host binary,
+        // which wires the child's fds without mutating this process's fd table. We
+        // OR with the gate so a pipeline stage shells out even if its gate is true.
+        if context.spawned_pipeline_stage || !gate(&argv) {
             return Ok(brush_core::results::ExecutionResult::new(
                 (run_coreutil_external(&name, &argv, &in_, &out, &err) & 0xff) as u8,
             ));
