@@ -81,23 +81,22 @@ impl Proxy {
     }
 }
 
-/// Serve ONE proxy connection. Used by control.rs after the box-side oaita
-/// client sends `{"type":"api_proxy"}` on the existing ui.sock. `peer_pid`
-/// is the host-pid of the connecting client (SO_PEERCRED on the original
-/// std::os::unix::net::UnixStream BEFORE the tokio conversion); we walk it
-/// to a registered --api box for authorization.
-pub async fn serve_one_conn<IO>(proxy: Arc<Proxy>, peer_pid: i32, io: IO)
+/// Serve ONE proxy stream from a known box. Used by `oaita::proxy_mux`: the
+/// runner has already accepted an in-box conn and is forwarding its bytes
+/// as FRAME_API_DATA on the box-channel; the mux feeds those bytes into a
+/// duplex pipe whose far end is `io`. The box id is known a priori from
+/// the box-channel identity — no peer-pid walk needed.
+pub async fn serve_one_conn_for_box<IO>(proxy: Arc<Proxy>, box_id: i64, io: IO)
     -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     IO: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
 {
     // Make sure the upstream config is loaded (idempotent on subsequent calls).
     proxy.reload_config().await;
-    let attrib_box = box_id_for_peer(peer_pid);
     let proxy2 = proxy.clone();
     let svc = service_fn(move |req| {
         let proxy = proxy2.clone();
-        async move { handle_inner(proxy, attrib_box, req).await }
+        async move { handle_inner(proxy, box_id, req).await }
     });
     let _ = http1::Builder::new()
         .keep_alive(false)
@@ -105,29 +104,8 @@ where
     Ok(())
 }
 
-fn ppid_of(pid: i32) -> i32 {
-    let Ok(s) = std::fs::read_to_string(format!("/proc/{pid}/status")) else { return 0; };
-    for line in s.lines() {
-        if let Some(rest) = line.strip_prefix("PPid:") {
-            return rest.trim().parse().unwrap_or(0);
-        }
-    }
-    0
-}
-
-fn box_id_for_peer(peer_pid: i32) -> i64 {
-    if peer_pid <= 0 { return 0; }
-    let mut pid = peer_pid;
-    for _ in 0..64 {
-        if let Some(b) = crate::control::api_box_for_pid(pid) {
-            return b;
-        }
-        let pp = ppid_of(pid);
-        if pp <= 1 { break; }
-        pid = pp;
-    }
-    0
-}
+// peer-pid → box-id walking is gone — attribution is now intrinsic to the
+// box-channel the FRAME_API_* stream rides on.
 
 async fn handle_inner(proxy: Arc<Proxy>, box_id: i64, req: Request<Incoming>)
     -> Result<Response<Body>, std::convert::Infallible>

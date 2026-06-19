@@ -39,6 +39,7 @@ pub mod ids;
 pub mod inspect;
 pub mod pretty;
 pub mod proxy;
+pub mod proxy_mux;
 pub mod replay;
 pub mod structural;
 pub mod tools;

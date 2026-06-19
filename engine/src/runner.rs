@@ -273,6 +273,9 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
     }
     let mount = ack.get("mount").and_then(Value::as_str).unwrap_or("").to_string();
     let sid = ack.get("session_id").and_then(Value::as_str).unwrap_or("?").to_string();
+    // Pulled up so `inner_args` (built earlier) can pass `--api` straight
+    // to the inner; the later `--api` block re-uses this same value.
+    let api_on = ack.get("api").and_then(Value::as_bool).unwrap_or(false);
     // D-oci: when an ancestor box is an OCI image layer (it carries an
     // `oci_config` meta key), the engine echoes the image's runtime fields
     // in `ack.oci` — env / cwd / cmd / entrypoint / user. We apply each
@@ -360,6 +363,11 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
     if pty && capture_on { inner_args.push("--pty"); }
     // -b brush likewise needs the capture sinks to record provenance + writes.
     if brush && capture_on { inner_args.push("--brush"); }
+    // --api flag passes through to inner so it knows to serve the in-box
+    // /run/sarun/api.sock UDS, framing each accepted client as FRAME_API_*
+    // on the existing box-channel. One conn per box (the channel itself),
+    // no second host UDS, attribution is implicit.
+    if api_on { inner_args.push("--api"); }
     inner_args.push("--");
     let mut bwrap = Command::new("bwrap");
     bwrap.args(["--bind", &root_src, "/",
@@ -414,20 +422,18 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
             }
         }
     }
-    // --api: point the in-box oaita at the EXISTING ui.sock bind-mount
-    // (UI_SOCK_INBOX). It dials the same UDS the box-channel uses, sends a
-    // one-line `{"type":"api_proxy"}` upgrade, then speaks plain HTTP/1.1;
-    // the engine's control.rs accept loop routes it to oaita::proxy. No
-    // second host UDS, no per-box api.sock bind-mount — which means nested
-    // delegations work too (the outer box's bind of /tmp/.slopbox/ui.sock
-    // carries through every nested register that follows).
-    //
-    // The engine has already marked this box's id as `--api`-enabled (see
-    // register handler) so the proxy accepts its connections; a non-api
-    // box sending the upgrade gets the existing 403 from the handler.
-    let api_on = ack.get("api").and_then(Value::as_bool).unwrap_or(false);
+    // --api: the inner (running INSIDE the box's mount namespace) serves
+    // /run/sarun/api.sock for box processes and tunnels each accepted
+    // connection as FRAME_API_OPEN/DATA/CLOSE on the existing box-channel.
+    // Two consequences:
+    //   * Zero host UDSes beyond ui.sock — the box never sees a path to
+    //     the engine's control socket, can't dial out to anything host-
+    //     side, and a nested act delegation works without a wandering
+    //     host-path bind-mount.
+    //   * Attribution is implicit — every API call on this channel comes
+    //     from this box, no peer-pid walk on the engine side.
     if api_on {
-        bwrap.args(["--setenv", "OAITA_API_SOCK", UI_SOCK_INBOX]);
+        bwrap.args(["--setenv", "OAITA_API_SOCK", "/run/sarun/api.sock"]);
         // The in-box oaita client also needs a base_url string to satisfy
         // its parser — anything non-empty works because the UDS endpoint
         // wins over it.
@@ -585,11 +591,20 @@ fn send_frame(conn_fd: i32, frame: &[u8], pidfd: Option<i32>) {
 }
 
 pub fn inner(conn_fd: i32, capture: bool, pty: bool, brush: bool,
-             cmd: Vec<String>) -> i32 {
+             api: bool, cmd: Vec<String>) -> i32 {
     if cmd.is_empty() { return 2; }
     // Hold the box-channel fd open (not CLOEXEC) so the engine sees EOF — its
     // teardown signal — only when this process (and CMD) finally exits.
     if conn_fd >= 0 { clear_cloexec(conn_fd); }
+    // --api: spin up the in-box LLM-API proxy listener BEFORE we hand the
+    // box channel to the chosen inner mode. The listener owns its own
+    // background thread and frames each accepted box-side connection as
+    // FRAME_API_* over the conn fd; the inner mode's existing reader will
+    // demux engine→runner FRAME_API_DATA back to the right box-side conn.
+    // See inner_api_serve.
+    if api && conn_fd >= 0 {
+        inner_api_serve(conn_fd);
+    }
     // -b brush (D9): the box's shell IS the embedded brush, not /bin/sh. It
     // needs the capture sinks (provenance + recorded writes), so it only
     // engages when capture is active; otherwise this is a misuse (-b under -d)
@@ -628,6 +643,128 @@ pub fn inner(conn_fd: i32, capture: bool, pty: bool, brush: bool,
         return code;
     }
     inner_capture(conn_fd, cmd)
+}
+
+// ── in-box oaita API mux (runner side) ──────────────────────────────────────
+//
+// The inner process serves /run/sarun/api.sock for box-internal `oaita`
+// clients and tunnels each accepted connection as FRAME_API_* over the
+// existing box channel. ONE process per box (the inner), ONE conn to the
+// engine — every API call rides the box-channel as logical streams. There
+// is no second host UDS the box can reach, and no path inside the box that
+// leads to the engine's control socket.
+
+use std::collections::HashMap;
+use std::sync::OnceLock;
+
+/// Per-process API mux. Box-internal — there is exactly one inner process
+/// per box, so a static singleton is the natural home.
+struct RunnerApiMux {
+    next_id: std::sync::atomic::AtomicU32,
+    conn_fd: i32,
+    /// stream_id → write half of the accepted box-side conn. Wrapped so the
+    /// demux thread (which reads FRAME_API_DATA bytes off conn_fd) can write
+    /// response bytes to the right box conn without juggling per-stream
+    /// channels.
+    streams: std::sync::Mutex<HashMap<u32, std::os::unix::net::UnixStream>>,
+}
+
+static RUNNER_API: OnceLock<RunnerApiMux> = OnceLock::new();
+
+/// Bind /run/sarun/api.sock inside the box and spawn the accept thread.
+/// `conn_fd` is the box-channel raw fd (the inner already holds it).
+fn inner_api_serve(conn_fd: i32) {
+    if RUNNER_API.get().is_some() { return; }
+    let _ = std::fs::create_dir_all("/run/sarun");
+    let sock_path = "/run/sarun/api.sock";
+    let _ = std::fs::remove_file(sock_path);
+    let listener = match std::os::unix::net::UnixListener::bind(sock_path) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("sarun-engine inner: api.sock bind: {e}");
+            return;
+        }
+    };
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(sock_path,
+        std::fs::Permissions::from_mode(0o666));
+    let _ = RUNNER_API.set(RunnerApiMux {
+        next_id: std::sync::atomic::AtomicU32::new(1),
+        conn_fd,
+        streams: std::sync::Mutex::new(HashMap::new()),
+    });
+    std::thread::spawn(move || {
+        for conn in listener.incoming().flatten() {
+            std::thread::spawn(move || handle_box_api_conn(conn));
+        }
+    });
+}
+
+/// Box-side API conn lifecycle: assign stream_id, frame OPEN, copy bytes
+/// box→engine as DATA frames, frame CLOSE on EOF. The demux side
+/// (`runner_api_dispatch`) feeds engine→box bytes onto the same conn via
+/// the stream map.
+fn handle_box_api_conn(mut conn: std::os::unix::net::UnixStream) {
+    let Some(mux) = RUNNER_API.get() else { return; };
+    let id = mux.next_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    // Register the conn's write side BEFORE OPEN — engine may start
+    // responding immediately after the upstream answers.
+    let conn_clone = match conn.try_clone() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    mux.streams.lock().unwrap().insert(id, conn_clone);
+    send_frame(mux.conn_fd,
+        &crate::frames::encode(crate::frames::FRAME_API_OPEN,
+                               &crate::frames::api_id_payload(id)),
+        None);
+    use std::io::Read;
+    let mut buf = [0u8; 16 * 1024];
+    loop {
+        match conn.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                send_frame(mux.conn_fd,
+                    &crate::frames::encode(crate::frames::FRAME_API_DATA,
+                                           &crate::frames::api_data_payload(id, &buf[..n])),
+                    None);
+            }
+        }
+    }
+    send_frame(mux.conn_fd,
+        &crate::frames::encode(crate::frames::FRAME_API_CLOSE,
+                               &crate::frames::api_id_payload(id)),
+        None);
+    mux.streams.lock().unwrap().remove(&id);
+}
+
+/// Called from the inner-mode reader thread when an API frame arrives off
+/// conn_fd. Returns true if the frame was consumed (so the reader can
+/// skip its own dispatch for it).
+fn runner_api_dispatch(ft: u8, payload: &[u8]) -> bool {
+    let Some(mux) = RUNNER_API.get() else { return false; };
+    let Some((stream_id, body)) = crate::frames::api_parse(payload) else {
+        return matches!(ft, crate::frames::FRAME_API_OPEN
+                          | crate::frames::FRAME_API_DATA
+                          | crate::frames::FRAME_API_CLOSE);
+    };
+    match ft {
+        crate::frames::FRAME_API_DATA => {
+            use std::io::Write;
+            let conn = mux.streams.lock().unwrap().get(&stream_id)
+                .and_then(|s| s.try_clone().ok());
+            if let Some(mut c) = conn { let _ = c.write_all(body); }
+            true
+        }
+        crate::frames::FRAME_API_CLOSE => {
+            // Engine→box close: drop the box-conn so its writer thread (if
+            // any) sees EOF. Dropping closes the fd.
+            mux.streams.lock().unwrap().remove(&stream_id);
+            true
+        }
+        crate::frames::FRAME_API_OPEN => true, // engine never sends OPEN
+        _ => false,
+    }
 }
 
 fn inner_capture(conn_fd: i32, cmd: Vec<String>) -> i32 {
@@ -670,6 +807,7 @@ fn inner_capture(conn_fd: i32, cmd: Vec<String>) -> i32 {
             let (frames, used) = crate::frames::decode(&buf);
             buf.drain(..used);
             for (ft, payload) in frames {
+                if runner_api_dispatch(ft, &payload) { continue; }
                 if ft == crate::frames::FRAME_ECHO && !payload.is_empty() {
                     let realfd = if payload[0] == 1 { 2 } else { 1 };
                     unsafe { libc::write(realfd, payload[1..].as_ptr().cast(),

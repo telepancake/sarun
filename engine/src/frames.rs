@@ -46,6 +46,50 @@ pub const FRAME_PROV: u8 = 6;
 pub const FRAME_PTY_DATA: u8 = 7;
 pub const FRAME_PTY_RESIZE: u8 = 8;
 pub const FRAME_PTY_EOF: u8 = 9;
+//
+// oaita API proxy mux (`--api` boxes only). The runner serves an in-box UDS at
+// /run/sarun/api.sock and frames each accepted client conn over the existing
+// box-channel as a logical stream — so the engine never sees a second host UDS
+// and a box-internal process has no path to ui.sock at all. Attribution is
+// implicit: every frame on a box-channel is "from this box."
+//   FRAME_API_OPEN  (runner→engine) payload = [u32 BE stream_id]; the runner
+//                   accepted a new in-box client connection. Engine spins up
+//                   an HTTP server per stream and starts feeding bytes through.
+//   FRAME_API_DATA  (both directions) payload = [u32 BE stream_id][bytes];
+//                   runner→engine carries HTTP request bytes; engine→runner
+//                   carries HTTP response bytes (which the runner pipes back
+//                   onto the box-side conn).
+//   FRAME_API_CLOSE (both directions) payload = [u32 BE stream_id]; sender's
+//                   half-close. The receiver finishes draining and closes
+//                   its side.
+pub const FRAME_API_OPEN: u8 = 10;
+pub const FRAME_API_DATA: u8 = 11;
+pub const FRAME_API_CLOSE: u8 = 12;
+
+/// Encode `[u32 BE stream_id]` (no body) — for FRAME_API_OPEN and
+/// FRAME_API_CLOSE.
+#[allow(dead_code)]
+pub fn api_id_payload(stream_id: u32) -> Vec<u8> {
+    stream_id.to_be_bytes().to_vec()
+}
+
+/// Encode `[u32 BE stream_id][bytes]` — for FRAME_API_DATA.
+#[allow(dead_code)]
+pub fn api_data_payload(stream_id: u32, bytes: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(4 + bytes.len());
+    v.extend_from_slice(&stream_id.to_be_bytes());
+    v.extend_from_slice(bytes);
+    v
+}
+
+/// Decode the stream_id off the front of FRAME_API_DATA/OPEN/CLOSE payload.
+/// Returns (stream_id, remaining_bytes). None if too short.
+#[allow(dead_code)]
+pub fn api_parse(payload: &[u8]) -> Option<(u32, &[u8])> {
+    if payload.len() < 4 { return None; }
+    let id = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    Some((id, &payload[4..]))
+}
 
 /// Body of a FRAME_PTY_RESIZE frame: [rows:u16 BE][cols:u16 BE].
 #[allow(dead_code)]
