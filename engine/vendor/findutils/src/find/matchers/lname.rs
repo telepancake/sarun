@@ -4,13 +4,13 @@
 // license that can be found in the LICENSE file or at
 // https://opensource.org/licenses/MIT.
 
-use std::io::{stderr, Write};
+use std::io::Write;
 use std::path::PathBuf;
 
 use super::glob::Pattern;
 use super::{Matcher, MatcherIO, WalkEntry};
 
-fn read_link_target(file_info: &WalkEntry) -> Option<PathBuf> {
+fn read_link_target(file_info: &WalkEntry, err_out: &mut dyn Write) -> Option<PathBuf> {
     match file_info.path().read_link() {
         Ok(target) => Some(target),
         Err(err) => {
@@ -18,7 +18,7 @@ fn read_link_target(file_info: &WalkEntry) -> Option<PathBuf> {
             // shown.
             if err.kind() != std::io::ErrorKind::InvalidInput {
                 writeln!(
-                    &mut stderr(),
+                    err_out,
                     "Error reading target of {}: {}",
                     file_info.path().display(),
                     err
@@ -45,8 +45,8 @@ impl LinkNameMatcher {
 }
 
 impl Matcher for LinkNameMatcher {
-    fn matches(&self, file_info: &WalkEntry, _: &mut MatcherIO) -> bool {
-        if let Some(target) = read_link_target(file_info) {
+    fn matches(&self, file_info: &WalkEntry, matcher_io: &mut MatcherIO) -> bool {
+        if let Some(target) = read_link_target(file_info, &mut *matcher_io.deps.get_error_output().borrow_mut()) {
             self.pattern.matches(&target.to_string_lossy())
         } else {
             false

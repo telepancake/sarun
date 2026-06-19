@@ -7,7 +7,6 @@
 use std::cell::RefCell;
 use std::error::Error;
 use std::ffi::OsString;
-use std::io::{stderr, Write};
 use std::path::Path;
 use std::process::Command;
 
@@ -128,7 +127,7 @@ impl Matcher for SingleExecMatcher {
             Ok(status) => status.success(),
             Err(e) => {
                 writeln!(
-                    &mut stderr(),
+                    &mut *matcher_io.deps.get_error_output().borrow_mut(),
                     "Failed to run {}: {}",
                     resolved_executable.to_string_lossy(),
                     e
@@ -182,7 +181,7 @@ impl MultiExecMatcher {
                 }
             }
             Err(e) => {
-                writeln!(&mut stderr(), "Failed to run {}: {}", self.executable, e).unwrap();
+                writeln!(&mut *matcher_io.deps.get_error_output().borrow_mut(), "Failed to run {}: {}", self.executable, e).unwrap();
                 matcher_io.set_exit_code(1);
             }
         }
@@ -225,7 +224,7 @@ impl Matcher for MultiExecMatcher {
             *command = self.new_command();
             if let Err(e) = command.try_arg(&path_to_file) {
                 writeln!(
-                    &mut stderr(),
+                    &mut *matcher_io.deps.get_error_output().borrow_mut(),
                     "Cannot fit a single argument {}: {}",
                     &path_to_file.to_string_lossy(),
                     e

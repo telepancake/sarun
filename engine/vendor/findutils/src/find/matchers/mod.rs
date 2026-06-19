@@ -1035,13 +1035,20 @@ fn parse_files0_args(config: &mut Config) -> Result<(), Box<dyn Error>> {
         .map(std::string::ToString::to_string)
         .collect();
     // empty starting point checker
-    if string_segments.iter().any(std::string::String::is_empty) {
-        eprintln!("find: invalid zero-length file name");
+    let had_zero_length = string_segments.iter().any(std::string::String::is_empty);
+    if had_zero_length {
         // remove the empty ones so as to avoid file not found error
         string_segments.retain(|s| !s.is_empty());
     }
 
     new_paths.extend(string_segments);
+    // `new_paths` borrowed `config.new_paths`; that borrow ends above, so we can
+    // now record the diagnostic on `config` for `do_find` to emit via deps.
+    if had_zero_length {
+        config
+            .parse_warnings
+            .push("find: invalid zero-length file name".to_string());
+    }
     Ok(())
 }
 

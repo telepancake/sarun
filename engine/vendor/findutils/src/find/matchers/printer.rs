@@ -5,7 +5,7 @@
 // https://opensource.org/licenses/MIT.
 
 use std::fs::File;
-use std::io::{stderr, Write};
+use std::io::Write;
 
 use super::{Matcher, MatcherIO, WalkEntry};
 
@@ -54,7 +54,7 @@ impl Printer {
             Err(e) => {
                 if print_error_message {
                     writeln!(
-                        &mut stderr(),
+                        &mut *matcher_io.deps.get_error_output().borrow_mut(),
                         "Error writing {:?} for {}",
                         file_info.path().to_string_lossy(),
                         e
