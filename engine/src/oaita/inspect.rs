@@ -10,6 +10,9 @@
 //   path lines A..B       jump to file lines A..B
 //   path entries A..B     jump to directory entries A..B
 //   path around N         jump to a small window centered on line N
+//   path symbols          enumerate named definitions (tree-sitter)
+//   path symbol <name>    focus on the named definition (tree-sitter)
+//   path symbol <name>[N] Nth occurrence — disambiguates name collisions
 //   box:<id>              the staged change-set for sub-agent box <id>
 //   box:<id>/<file>       page that file's staged diff (sarun BOX patch)
 //   next / previous / first / last       — resolve against last cursor
@@ -17,6 +20,7 @@
 use serde_json::Value;
 
 use crate::oaita::exec::Executor;
+use crate::oaita::structural::{find_symbol, parse_symbols, Symbol};
 use crate::oaita::tools::RESULT_BUDGET;
 use crate::oaita::turns::Turn;
 
@@ -31,6 +35,11 @@ pub enum Window {
     Range(usize, usize), // 1-based, inclusive
     Around(usize),
     PageKey(&'static str),
+    /// Enumerate named definitions in the file (tree-sitter).
+    Symbols,
+    /// Focus on a named definition. `usize` is the 1-based occurrence index
+    /// for disambiguating same-name collisions (e.g. `fn new` on two structs).
+    Symbol(String, usize),
 }
 
 #[derive(Debug, Clone)]
@@ -74,6 +83,38 @@ pub fn parse_locator(s: &str) -> Locator {
             return Locator { path, window: Window::Around(n) };
         }
     }
+    // Structural locators come last because their separators (` symbols`,
+    // ` symbol `) are more permissive than the prior ones — they'd never
+    // capture a `lines A..B` suffix, but we still check after the numeric
+    // forms for tidiness.
+    if let Some(idx) = s.find(" symbols") {
+        // Accept either "path symbols" exactly or "path symbols<trailing-ws>".
+        let path = s[..idx].to_string();
+        let rest = s[idx + 8..].trim();
+        if rest.is_empty() {
+            return Locator { path, window: Window::Symbols };
+        }
+    }
+    if let Some(idx) = s.find(" symbol ") {
+        let path = s[..idx].to_string();
+        let rest = s[idx + 8..].trim();
+        // `name[N]` → (name, N). Bare `name` → (name, 1).
+        if let Some(open) = rest.find('[') {
+            if let Some(close) = rest.find(']') {
+                if close > open {
+                    let name = rest[..open].trim().to_string();
+                    if let Ok(n) = rest[open + 1..close].trim().parse::<usize>() {
+                        if !name.is_empty() && n >= 1 {
+                            return Locator { path, window: Window::Symbol(name, n) };
+                        }
+                    }
+                }
+            }
+        }
+        if !rest.is_empty() {
+            return Locator { path, window: Window::Symbol(rest.to_string(), 1) };
+        }
+    }
     Locator { path: s.to_string(), window: Window::Default }
 }
 
@@ -112,6 +153,12 @@ pub fn inspect(locator: &Locator, turns: &[Turn],
     if let Some(rest) = target.strip_prefix("box:") {
         return inspect_box(rest, &window);
     }
+    // Structural windows need file bytes regardless of "kind"; route them
+    // BEFORE the dir/file dispatch so a stale path_kind cache or a fresh
+    // box with no upper yet doesn't false-negative the user's symbol query.
+    if matches!(window, Window::Symbols | Window::Symbol(_, _)) {
+        return inspect_structural(box_id, executor, &target, &window);
+    }
     match executor.path_kind(box_id, &target) {
         'd' => inspect_dir(box_id, executor, &target, &window),
         'f' => inspect_file(box_id, executor, &target, &window),
@@ -119,6 +166,88 @@ pub fn inspect(locator: &Locator, turns: &[Turn],
         's' => format!("inspect: {target}: special file"),
         _ => format!("inspect: not found: {target}"),
     }
+}
+
+fn inspect_structural(box_id: &str, executor: &dyn Executor,
+                      target: &str, window: &Window) -> String {
+    let bytes = match executor.read_file(box_id, target) {
+        Ok(b) => b,
+        Err(e) => return format!("inspect: {e}"),
+    };
+    let Some(symbols) = parse_symbols(target, &bytes) else {
+        return format!(
+            "inspect: {target}: no tree-sitter grammar for this extension \
+             (currently: .rs, .py, .sh, .bash). Use `path lines A..B` for a \
+             line window instead.");
+    };
+    match window {
+        Window::Symbols => render_symbol_list(target, &symbols),
+        Window::Symbol(name, n) => match find_symbol(&symbols, name, *n) {
+            Some(sym) => render_symbol_focus(target, sym, &bytes),
+            None => {
+                let matches: Vec<&Symbol> = symbols.iter()
+                    .filter(|s| s.name == *name).collect();
+                if matches.is_empty() {
+                    format!("inspect: {target}: no symbol named {name:?} \
+                             (use `{target} symbols` to list)")
+                } else {
+                    format!("inspect: {target}: symbol {name:?} has only \
+                             {} occurrence(s); asked for #{n}",
+                            matches.len())
+                }
+            }
+        },
+        _ => format!("inspect: internal: non-structural window in structural path"),
+    }
+}
+
+fn render_symbol_list(target: &str, symbols: &[Symbol]) -> String {
+    if symbols.is_empty() {
+        return format!("inspect: {target}: file has no named definitions.");
+    }
+    // Tally same-name collisions so the listing tells the model when it
+    // needs the `[N]` disambiguator. First pass: count names.
+    let mut counts = std::collections::HashMap::<&str, usize>::new();
+    for s in symbols { *counts.entry(s.name.as_str()).or_insert(0) += 1; }
+    let mut by_name_seen = std::collections::HashMap::<&str, usize>::new();
+    let mut lines = Vec::with_capacity(symbols.len() + 1);
+    lines.push(format!("file {target}: {} named definitions", symbols.len()));
+    lines.push(String::new());
+    for s in symbols {
+        let seen = by_name_seen.entry(s.name.as_str()).or_insert(0);
+        *seen += 1;
+        let occ = *seen;
+        let total = *counts.get(s.name.as_str()).unwrap_or(&1);
+        let disambig = if total > 1 { format!("[{occ}]") } else { String::new() };
+        let indent = "  ".repeat(s.depth);
+        lines.push(format!(
+            "{indent}{kind:>6}  {name}{disambig}   (lines {a}..{b})",
+            kind = s.kind, name = s.name,
+            a = s.start_line, b = s.end_line,
+        ));
+    }
+    lines.push(end_banner(target, "symbols", symbols.len()));
+    lines.join("\n")
+}
+
+fn render_symbol_focus(target: &str, sym: &Symbol, bytes: &[u8]) -> String {
+    // Render with 1-based line numbers (same convention as inspect_file).
+    let slice = &bytes[sym.start_byte..sym.end_byte];
+    let text = String::from_utf8_lossy(slice);
+    let mut out = String::new();
+    out.push_str(&format!(
+        "{kind} {name} in {target} (lines {a}..{b})\n\n",
+        kind = sym.kind, name = sym.name, target = target,
+        a = sym.start_line, b = sym.end_line,
+    ));
+    for (i, line) in text.lines().enumerate() {
+        out.push_str(&format!("{:>6}  {line}\n", sym.start_line + i));
+    }
+    out.push_str(&format!(
+        "\n--- inspect: {target:?} symbol {:?}[1..{a}..{b}] of file ---\n",
+        sym.name, a = sym.start_line, b = sym.end_line,
+    ));
+    out
 }
 
 fn kind_label(k: char) -> &'static str {
@@ -235,6 +364,10 @@ pub(crate) fn window_indices(window: &Window, n: usize, default_page: usize) -> 
     match window {
         Window::Default => (1, n.min(default_page)),
         Window::Range(a, b) => (*a.max(&1), *b.min(&n)),
+        // Structural windows route through their own (file-parsing) path
+        // before reaching window_indices — if one reaches here it's a
+        // programming error, but return a safe default rather than panic.
+        Window::Symbols | Window::Symbol(_, _) => (1, n.min(default_page)),
         Window::Around(c) => {
             let half = default_page / 2;
             let a = c.saturating_sub(half).max(1);
@@ -293,6 +426,29 @@ pub fn read_path(locator: &Locator, turns: &[Turn],
     let bytes = match executor.read_file(box_id, &target) {
         Ok(b) => b, Err(e) => return format!("read: {e}"),
     };
+    // Symbol-targeted read returns the raw source of the named definition —
+    // the byte-faithful counterpart of `inspect ... symbol foo`.
+    if let Window::Symbol(name, occurrence) = &window {
+        let Some(symbols) = parse_symbols(&target, &bytes) else {
+            return format!(
+                "read: {target}: no tree-sitter grammar for this extension \
+                 (currently: .rs, .py, .sh, .bash).");
+        };
+        let Some(sym) = find_symbol(&symbols, name, *occurrence) else {
+            return format!("read: {target}: no symbol named {name:?}");
+        };
+        let mut out = String::from_utf8_lossy(
+            &bytes[sym.start_byte..sym.end_byte]).into_owned();
+        if out.len() > RESULT_BUDGET {
+            out = out.chars().take(RESULT_BUDGET).collect();
+        }
+        return out;
+    }
+    if matches!(window, Window::Symbols) {
+        return "read: `path symbols` is inspect-only — use \
+                `inspect <path> symbols` to enumerate, then \
+                `read <path> symbol <name>` for the bytes".to_string();
+    }
     let text = String::from_utf8_lossy(&bytes);
     let lines: Vec<&str> = text.lines().collect();
     let n = lines.len();
@@ -312,20 +468,18 @@ pub fn read_path(locator: &Locator, turns: &[Turn],
 //
 // V1 scope: whole-file replace; line-range replace (`path lines A..B`); around-
 // N replace (`path around N`); page-key replace (resolves the most recent
-// inspect/read window from this session's turns). New content's line count may
-// differ from the slice's — the file grows or shrinks. `box:<id>` locators are
-// read-only and rejected here.
+// inspect/read window from this session's turns); tree-sitter symbol replace
+// (`path symbol <name>[N]`). New content's line count may differ from the
+// slice's — the file grows or shrinks. `box:<id>` locators are read-only and
+// rejected here.
 //
 // Postponed for a later pass:
-//   - tree-sitter-driven STRUCTURAL locators (`path:fn_name`, `path:para[3]`,
-//     etc.) — the design's "lenses". Needs a parser plug-in per file type;
-//     keeping the V1 surface small until that's its own change.
 //   - `path/before` and `path/after` sequence-insertion locators — fake paths
 //     that splice an element ahead of / after the named one in a sequence
-//     (lines, list items, JSON array members, etc.). Postponed alongside the
-//     structural locators: "before/after WHAT" is most useful for structural
-//     things, and the line-range case is already expressible as
-//     `path lines A..A-1` (empty range = pure insertion).
+//     (lines, list items, JSON array members, etc.). The line-range case is
+//     already expressible as `path lines A..A-1` (empty range = pure
+//     insertion); the structural case (insert before/after a symbol) is the
+//     interesting one and wants more design.
 //
 // Optimistic concurrency: when the model previously `read` (or `inspect`ed)
 // this same path+window in the current session, the saved tool-result
@@ -384,6 +538,59 @@ pub fn write_at_locator(locator: &Locator, content: &str, force: bool,
         Ok(b) => b,
         Err(e) => return format!("write: {e}"),
     };
+
+    // Structural splice — parse the file, find the named symbol, replace its
+    // byte range. Falls back to a clean error when tree-sitter doesn't cover
+    // the extension (so the model can switch to `path lines A..B`).
+    if let Window::Symbol(name, occurrence) = &window {
+        let Some(symbols) = parse_symbols(&target, &original_bytes) else {
+            return format!(
+                "write: {target}: no tree-sitter grammar for this extension \
+                 (currently: .rs, .py, .sh, .bash). Use `path lines A..B` \
+                 instead.");
+        };
+        let Some(sym) = find_symbol(&symbols, name, *occurrence) else {
+            let matches: Vec<&Symbol> = symbols.iter()
+                .filter(|s| s.name == *name).collect();
+            return if matches.is_empty() {
+                format!("write: {target}: no symbol named {name:?} (use \
+                         `{target} symbols` to list)")
+            } else {
+                format!("write: {target}: symbol {name:?} has only {} \
+                         occurrence(s); asked for #{occurrence}",
+                        matches.len())
+            };
+        };
+        if !force {
+            if let Some(conflict) = check_conflict_symbol(
+                &target, &original_bytes, sym, turns) {
+                return conflict;
+            }
+        }
+        let mut out = Vec::with_capacity(
+            original_bytes.len() - (sym.end_byte - sym.start_byte) + content.len() + 1);
+        out.extend_from_slice(&original_bytes[..sym.start_byte]);
+        out.extend_from_slice(content.as_bytes());
+        // Preserve a trailing newline if the original symbol's slice ended
+        // with one (most language definitions do — a `}` followed by `\n`).
+        let original_had_trailing_nl = original_bytes
+            .get(sym.end_byte.saturating_sub(1)) == Some(&b'\n');
+        if original_had_trailing_nl && !content.ends_with('\n') {
+            out.push(b'\n');
+        }
+        out.extend_from_slice(&original_bytes[sym.end_byte..]);
+        if let Err(e) = executor.write_file(box_id, &target, &out) {
+            return format!("write: {e}");
+        }
+        let was = sym.end_line.saturating_sub(sym.start_line) + 1;
+        let now = content.lines().count()
+            + if content.is_empty() || content.ends_with('\n') { 0 } else { 1 };
+        return format!(
+            "write: {target}: replaced {kind} {name} ({was} lines -> {now})",
+            kind = sym.kind, name = sym.name,
+        );
+    }
+
     let original = String::from_utf8_lossy(&original_bytes).into_owned();
     let lines: Vec<&str> = original.lines().collect();
     let n = lines.len();
@@ -435,6 +642,41 @@ pub fn write_at_locator(locator: &Locator, content: &str, force: bool,
     )
 }
 
+/// Symbol-grain conflict check. If the model previously inspected/read this
+/// SAME (target, symbol-name, occurrence), compare the captured bytes to the
+/// symbol's current bytes — return a conflict if they differ.
+fn check_conflict_symbol(target: &str, current_bytes: &[u8], sym: &Symbol,
+                         turns: &[Turn]) -> Option<String> {
+    // Walk back to find the most recent (read or inspect) of the SAME
+    // structural locator. We don't compare against line-range baselines
+    // here — the symbol-grain edit doesn't promise anything about lines.
+    let (call_args, captured) = last_read_for_path(target, turns)?;
+    let prev = parse_locator(&call_args);
+    if let Window::Symbol(prev_name, prev_n) = prev.window {
+        if prev_name == sym.name && prev_n == 1 /* current Symbol.depth-aware
+                                                   matching is a later pass */
+        {
+            let now = String::from_utf8_lossy(
+                &current_bytes[sym.start_byte..sym.end_byte]).into_owned();
+            // The captured `read`/`inspect` result includes our own framing
+            // (line-numbered prefix for inspect, plain for read). Bail when
+            // the captured content doesn't byte-contain the current source —
+            // a coarse but safe check. False-positive a model can clear with
+            // `force=true`.
+            if !captured.contains(&now) {
+                return Some(format!(
+                    "write: conflict — {target} {kind} {name} differs from \
+                     what was last read in this session. Re-read it, \
+                     reconcile, then write again (or pass force=true to \
+                     overwrite anyway).",
+                    kind = sym.kind, name = sym.name,
+                ));
+            }
+        }
+    }
+    None
+}
+
 /// Walk the session's turn list backwards for the most recent `read` or
 /// `inspect` tool-result whose CALL was on this same target path. If we find
 /// one, compare its captured content to what the file holds now and return a
@@ -478,6 +720,8 @@ fn check_conflict_slice(target: &str, lines: &[&str], lo: usize, hi: usize,
             (a, (a + LINES_PER_PAGE - 1).min(n))
         }
         Window::PageKey(_) => return None, // can't compare against a page key
+        // Structural prior reads don't certify a line range — no baseline.
+        Window::Symbols | Window::Symbol(_, _) => return None,
     };
     // Require the prior read to fully cover the write window — otherwise we
     // have no baseline for some of the bytes we're about to replace.

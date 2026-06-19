@@ -39,6 +39,7 @@ pub mod inspect;
 pub mod pretty;
 pub mod proxy;
 pub mod replay;
+pub mod structural;
 pub mod tools;
 pub mod trace;
 pub mod turns;
