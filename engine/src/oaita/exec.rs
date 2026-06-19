@@ -287,8 +287,13 @@ impl SarunExecutor {
             "box": target, "discard": discard, "api_access": api_access,
             "script_len": script.len(),
         }));
+        // `-b` runs the script through the embedded brush shell, which
+        // emits per-pipeline FRAME_PROV (semantic provenance) so the
+        // engine can attribute writes/processes to the exact command
+        // string + parsed pipeline. Plain `sh -c` would lose that
+        // visibility (see engine/src/brush.rs module header).
         let mut cmd = Command::new(&self.sarun);
-        cmd.arg("run");
+        cmd.arg("run").arg("-b");
         if api_access { cmd.arg("--api"); }
         let out = cmd
             .args([&target, "--", "sh", "-c", script])
@@ -350,9 +355,16 @@ impl SarunExecutor {
             "box": target, "discard": discard, "api_access": api_access,
             "script_len": script.len(), "in_box": true,
         }));
+        // Discard mode keeps the nested PEEK box (own overlay, then
+        // reaped). Non-discard runs DIRECTLY in this wrapper box via
+        // the engine binary's `brush-sh` shim — no nested `sarun run`,
+        // no extra child box. Either way the script flows through
+        // brush-core so its semantic-provenance is visible (FRAME_PROV
+        // for the nested case; in-process builtins + per-pipeline
+        // execution structure for the direct case).
         let out = if discard {
             let mut cmd = Command::new(&self.sarun);
-            cmd.arg("run");
+            cmd.arg("run").arg("-b");
             if api_access { cmd.arg("--api"); }
             cmd.args(["PEEK", "--", "sh", "-c", script])
                 .stdin(Stdio::null())
@@ -360,7 +372,8 @@ impl SarunExecutor {
                 .stderr(Stdio::piped())
                 .output()
         } else {
-            Command::new("sh").args(["-c", script])
+            Command::new(&self.sarun)
+                .args(["brush-sh", "sh", "-c", script])
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
