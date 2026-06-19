@@ -1159,15 +1159,57 @@ pub fn run_recipe_in_process(cmdline: &str, output_cb: &mut dyn FnMut(&[u8])) ->
     // FUSE sink, which made every byte of recipe output appear twice
     // in the user's terminal (visible diff against real make for any
     // multi-line recipe).
+    //
+    // sarun bash-compat shim: brush emits errors as `error: <msg>` (its
+    // own format from `writeln!(stderr, "error: {e}")` in brush-core
+    // interp.rs). Bash emits `/bin/bash: line N: <msg>`. Both are
+    // stripped by the corpus runner's kati_norms (`/bin/(ba)?sh: ` →
+    // ""), but only if the prefix matches. Rewrite the brush form to a
+    // bash-shaped one ON THE FLY so the user-visible output AND the
+    // corpus comparator see the same shape standalone rkati does. We
+    // process line-by-line to keep the substitution unambiguous; tail
+    // bytes without a trailing newline are buffered until either a
+    // newline arrives or the pipe closes.
     let mut buf = [0u8; 4 << 10];
+    let mut line_buf: Vec<u8> = Vec::new();
     loop {
         let n = match std::io::Read::read(&mut reader, &mut buf) {
             Ok(0) | Err(_) => break,
             Ok(n) => n,
         };
-        output_cb(&buf[..n]);
+        for &b in &buf[..n] {
+            line_buf.push(b);
+            if b == b'\n' {
+                emit_bash_compat(&line_buf, output_cb);
+                line_buf.clear();
+            }
+        }
+    }
+    if !line_buf.is_empty() {
+        emit_bash_compat(&line_buf, output_cb);
     }
     exec.join().unwrap_or(127)
+}
+
+/// One line of brush output → bash-shaped form on `output_cb`.
+/// Currently rewrites the `error: command not found: NAME` shape that
+/// brush emits when builtin/PATH lookup fails into `/bin/sh: line 1:
+/// NAME: command not found` — what bash would emit and what
+/// `kati_norms()` strips down to `NAME: command not found`. Other
+/// `error: <msg>` lines pass through (rare, mostly internal brush
+/// errors that don't appear in standard recipes).
+fn emit_bash_compat(line: &[u8], output_cb: &mut dyn FnMut(&[u8])) {
+    const NF: &[u8] = b"error: command not found: ";
+    if let Some(rest) = line.strip_prefix(NF) {
+        let name = rest.strip_suffix(b"\n").unwrap_or(rest);
+        let mut out = Vec::with_capacity(line.len() + 24);
+        out.extend_from_slice(b"/bin/sh: line 1: ");
+        out.extend_from_slice(name);
+        out.extend_from_slice(b": command not found\n");
+        output_cb(&out);
+        return;
+    }
+    output_cb(line);
 }
 
 /// The bare-fn executor installed into the vendored n2 (process::set_executor).
