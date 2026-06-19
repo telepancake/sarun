@@ -853,8 +853,15 @@ fn act_script(inner: &str, child_depth: u32) -> String {
 }
 
 fn format_act_result(r: &ExecResult, inner: &str) -> String {
+    // The header puts the SESSION ID front and centre — that's what
+    // apply/reject/delete want. The box-name form (OAITA-…) was a
+    // double-prefix trap when included naively; dispatch_box_resolve now
+    // also accepts the box-name form defensively, but framing the result
+    // with the session id removes the temptation.
     let mut text = String::new();
-    text.push_str(&format!("[from box {} of {}]\n\n", crate::oaita::exec::box_name(inner), inner));
+    text.push_str(&format!(
+        "[sub-agent session id: {inner} — pass this as `target` to \
+         apply/reject/delete]\n\n"));
     text.push_str(&r.text);
     text
 }
@@ -920,9 +927,20 @@ fn dispatch_box_resolve(verb: &str, args: &Value) -> String {
     };
     // verb = apply / reject (== discard in sarun terminology). Defer to the
     // sarun CLI which already implements both as control verbs.
+    //
+    // Accept BOTH a bare session id (`uydur`) AND the OAITA-prefixed box
+    // name (`OAITA-UYDUR`). The model has seen both in the act result —
+    // the JSON header carries the session id but the human-readable
+    // "[from box OAITA-… of …]" line tempts it to grab the box-name form.
+    // Double-prefixing was the observed failure mode (`OAITA-OAITA-UYDUR`
+    // → "no slopbox"); the case-insensitive prefix check covers it.
     let cmd = if verb == "apply" { "apply" } else { "discard" };
     let sarun = crate::oaita::exec::SarunExecutor::new(None).sarun;
-    let inner_box = box_name(&target);
+    let inner_box = if target.to_uppercase().starts_with("OAITA-") {
+        target.to_uppercase()
+    } else {
+        box_name(&target)
+    };
     let r = std::process::Command::new(&sarun)
         .args([&inner_box, cmd]).output();
     match r {
