@@ -1868,28 +1868,19 @@ pub fn is_box_name(s: &str) -> bool {
 pub fn cli_box_op(argv: &[String]) -> i32 {
     let name = argv[0].as_str();
     let op = argv.get(1).map(String::as_str);
-    // IN-BOX vs HOST socket selection: a `sarun OAITA-X discard` invoked
-    // from INSIDE a box (e.g. by oaita's cleanup_spawned_subagents when a
-    // sub-agent settles) reaches the engine via the UI socket bind-mounted
-    // at /run/sarun/ui.sock (the path runner.rs uses). The host
-    // runtime path isn't connectable from inside the box (different
-    // namespace, no bind mount). Mirror runner::run's path-presence
-    // detection.
-    const UI_SOCK_INBOX: &str = "/run/sarun/ui.sock";
-    let sock = if std::path::Path::new(UI_SOCK_INBOX).exists() {
-        std::path::PathBuf::from(UI_SOCK_INBOX)
-    } else {
-        crate::paths::sock_path()
-    };
-    // Prefer the in-box FD broker (abstract UDS — survives private netns,
-    // no host-path bind needed). Falls back to the filesystem socket above.
+    // IN-BOX vs HOST socket selection. A `sarun OAITA-X discard` invoked
+    // from INSIDE a box dials the FD broker (abstract UDS, name in
+    // SARUN_BROKER — served by the parent inner). From HOST we use the
+    // engine's filesystem control socket. No fallback chain.
+    let sock = crate::paths::sock_path();
     let broker_name = std::env::var("SARUN_BROKER").ok()
         .filter(|s| !s.is_empty());
     let dial = || -> std::io::Result<UnixStream> {
         if let Some(n) = broker_name.as_ref() {
-            if let Ok(c) = crate::runner::broker_dial(n) { return Ok(c); }
+            crate::runner::broker_dial(n)
+        } else {
+            UnixStream::connect(&sock)
         }
-        UnixStream::connect(&sock)
     };
     let one = |msg: Value| -> Result<Value, String> {
         let mut c = dial().map_err(|_| "no engine running".to_string())?;
@@ -1943,49 +1934,21 @@ pub fn cli_box_op(argv: &[String]) -> i32 {
 }
 
 pub fn serve(state: State, sock: &std::path::Path) -> std::io::Result<()> {
+    // Make sure host /run/sarun exists as a directory so each box's bwrap
+    // setup has somewhere to mount its private tmpfs onto for the
+    // ui.sock + engine-binary binds. Best-effort: a read-only /run on a
+    // weird host just means the tmpfs mount will fail later and shell
+    // calls will error visibly there — preferable to crashing the engine.
+    let _ = std::fs::create_dir_all("/run/sarun");
     let _ = std::fs::remove_file(sock);
     let listener = UnixListener::bind(sock)?;
     let mode = std::os::unix::fs::PermissionsExt::from_mode(0o600);
     std::fs::set_permissions(sock, mode)?;
-    // ALSO listen on an abstract socket keyed off the same path. Boxes
-    // reach this via the host netns without any filesystem path — no
-    // bind-mount into the box's /tmp or /run, no mkdir, no permissions
-    // path to navigate. Abstract sockets are scoped to the network
-    // namespace; every box that shares host netns (which every --api
-    // box does, since the proxy needs upstream access) reaches it.
-    // For -n boxes that unshare netns, abstract is unreachable AND
-    // they have no engine business anyway.
-    let abs_listener = abstract_listener(sock)?;
-    let st_abs = state.clone();
-    std::thread::spawn(move || {
-        for conn in abs_listener.incoming().flatten() {
-            let st = st_abs.clone();
-            std::thread::spawn(move || handle(st, conn));
-        }
-    });
     for conn in listener.incoming().flatten() {
         let st = state.clone();
         std::thread::spawn(move || handle(st, conn));
     }
     Ok(())
-}
-
-/// Bind a Linux abstract Unix socket whose name is keyed off the filesystem
-/// `sock` path — that way every engine instance with a distinct XDG_RUNTIME_DIR
-/// (the host common case is one engine per user) gets a distinct abstract
-/// name. Returns the bound listener.
-pub fn abstract_listener(sock: &std::path::Path) -> std::io::Result<UnixListener> {
-    use std::os::linux::net::SocketAddrExt;
-    let name = abstract_name(sock);
-    let addr = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes())?;
-    UnixListener::bind_addr(&addr)
-}
-
-/// The abstract-socket name string for `sock` — `"sarun:<absolute-sock-path>"`.
-/// Symmetric helper for clients (runner, in-box oaita) to compute the same name
-/// without crossing files.
-pub fn abstract_name(sock: &std::path::Path) -> String {
-    format!("sarun:{}", sock.display())
 }
 
 /// Send a frame over the box-channel WITH an attached fd via SCM_RIGHTS.

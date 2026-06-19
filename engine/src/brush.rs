@@ -80,9 +80,10 @@
 // brush-core does not implement) fails here, by design.
 //
 // Each nested invocation parses the script, emits one `brush_prov_nested`
-// record per pipeline over the engine control socket bind-mounted at
-// UI_SOCK_INBOX (the box is resolved from the shim's pidfd /proc ancestry —
-// the same path `register` uses for nested boxes), then runs the pipelines
+// record per pipeline over a fresh engine connection acquired via the FD
+// broker (SARUN_BROKER — see runner::send_nested_prov; the box is resolved
+// from the shim's pidfd /proc ancestry — the same path `register` uses for
+// nested boxes), then runs the pipelines
 // pipeline-by-pipeline on a fresh brush sh-mode shell built with the original
 // invocation's cwd, $0 (the -c form's NAME or argv[0]'s basename) and the
 // positional parameters ($1..$N).
@@ -645,12 +646,23 @@ pub fn inner_brush(conn_fd: i32, cmd: Vec<String>) -> i32 {
         let mut buf: Vec<u8> = vec![];
         let mut tmp = [0u8; 65536];
         loop {
-            let n = unsafe { libc::read(rfd, tmp.as_mut_ptr().cast(), tmp.len()) };
+            // recvmsg, not plain read, so a FRAME_CONN's SCM_RIGHTS fd
+            // reaches the FD broker. One fd per recvmsg; we associate it
+            // with the first FRAME_CONN in this batch.
+            let mut got_fd: Option<i32> = None;
+            let n = crate::runner::recv_box_frame_bytes_pub(
+                rfd, &mut tmp, &mut got_fd);
             if n <= 0 { break; }
             buf.extend_from_slice(&tmp[..n as usize]);
             let (frames, used) = crate::frames::decode(&buf);
             buf.drain(..used);
             for (ft, payload) in frames {
+                if ft == crate::frames::FRAME_CONN {
+                    if let Some(fd) = got_fd.take() {
+                        crate::runner::runner_broker_handoff_pub(fd);
+                    }
+                    continue;
+                }
                 if ft == crate::frames::FRAME_ECHO && !payload.is_empty() {
                     let realfd = if payload[0] == 1 { real_err } else { real_out };
                     unsafe { libc::write(realfd, payload[1..].as_ptr().cast(),
@@ -660,6 +672,7 @@ pub fn inner_brush(conn_fd: i32, cmd: Vec<String>) -> i32 {
                     return;
                 }
             }
+            if let Some(fd) = got_fd { unsafe { libc::close(fd); } }
         }
     });
 

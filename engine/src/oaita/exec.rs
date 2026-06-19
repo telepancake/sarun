@@ -9,7 +9,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use base64::{Engine as _, prelude::BASE64_STANDARD};
@@ -18,38 +18,16 @@ use serde_json::{json, Value};
 use crate::oaita::tools::{ExecResult, summarize_patch, fit_output,
                           RESULT_BUDGET, CHANGES_BUDGET};
 
-/// Where the in-box control socket is bind-mounted. Mirrors runner.rs.
-const UI_SOCK_INBOX: &str = "/run/sarun/ui.sock";
-
-/// One synchronous request/reply over the engine control socket. In-box if
-/// the bind-mounted path exists, host socket otherwise. Returns the unwrapped
-/// `r` payload, or an error string.
+/// One synchronous request/reply over the engine control socket. The dial
+/// path is broker-via-SARUN_BROKER when in-box, filesystem host UDS when
+/// not — no fallback chain, no path-presence sniffing.
 fn ctrl_rpc(verb: &str, args: Value) -> Result<Value, String> {
-    // Prefer the in-box FD broker (abstract UDS served by our parent
-    // inner — works in private-netns boxes and leaves no host-path
-    // bind-mount inside the box). Falls back to the bind-mounted ui.sock
-    // for in-box callers whose parent didn't bring up a broker, then to
-    // the host filesystem path.
     let broker = std::env::var("SARUN_BROKER").ok().filter(|s| !s.is_empty());
     let mut s = if let Some(name) = broker.as_ref() {
-        match crate::runner::broker_dial(name) {
-            Ok(c) => c,
-            Err(_) => {
-                let sock: PathBuf = if Path::new(UI_SOCK_INBOX).exists() {
-                    PathBuf::from(UI_SOCK_INBOX)
-                } else {
-                    crate::paths::sock_path()
-                };
-                UnixStream::connect(&sock)
-                    .map_err(|e| format!("connect {}: {e}", sock.display()))?
-            }
-        }
+        crate::runner::broker_dial(name)
+            .map_err(|e| format!("broker dial {name}: {e}"))?
     } else {
-        let sock: PathBuf = if Path::new(UI_SOCK_INBOX).exists() {
-            PathBuf::from(UI_SOCK_INBOX)
-        } else {
-            crate::paths::sock_path()
-        };
+        let sock: PathBuf = crate::paths::sock_path();
         UnixStream::connect(&sock)
             .map_err(|e| format!("connect {}: {e}", sock.display()))?
     };
