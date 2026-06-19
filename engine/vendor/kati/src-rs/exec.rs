@@ -217,10 +217,10 @@ impl<'a> Executor<'a> {
                 // path has no SIGINT/SIGQUIT signaling distinct from a
                 // non-zero code.
                 let (ok, output, code_for_msg) =
-                    if let Some((ok, out)) =
+                    if let Some((code, out)) =
                         run_with_installed_runner(&self.shell, self.shellflag, &command.cmd)
                     {
-                        (ok, out, if ok { 0 } else { 1 })
+                        (code == 0, out, code)
                     } else {
                         let (status, out) = run_command(
                             &self.shell,

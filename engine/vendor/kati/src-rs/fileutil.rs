@@ -38,8 +38,10 @@ use memchr::memchr2;
 // callers capture a tokio runtime / oneshot context without making
 // kati depend on brush.
 pub enum RecipeRunnerDecision {
-    /// Hook ran the command; here's the merged output and "success" flag.
-    Ran { success: bool, output: Vec<u8> },
+    /// Hook ran the command; here's the exit code. Merged stdout+stderr
+    /// went through the `output_cb` the hook was invoked with — kati
+    /// doesn't reaccumulate it.
+    Ran { code: i32 },
     /// Hook declined (e.g. SHELL not a /bin/sh-shaped shell); let
     /// `exec.rs` fall through to the classic fork+exec path.
     Passthrough,
@@ -65,24 +67,18 @@ pub fn install_recipe_runner(f: RecipeRunner) {
 }
 
 /// Run `cmd` through the installed in-process runner, if any. Returns
-/// `Some((success, merged_output))` when the hook handled the command,
+/// `Some((exit_code, merged_output))` when the hook handled the command,
 /// `None` when no hook is installed OR the hook declined.
 pub fn run_with_installed_runner(
     shell: &[u8],
     shellflag: &[u8],
     cmd: &[u8],
-) -> Option<(bool, Vec<u8>)> {
+) -> Option<(i32, Vec<u8>)> {
     let guard = RECIPE_RUNNER.lock();
     let runner = guard.as_ref()?;
     let mut out = Vec::new();
     match runner(shell, shellflag, cmd, &mut |b| out.extend_from_slice(b)) {
-        RecipeRunnerDecision::Ran { success, output } => {
-            // The runner pushed bytes through our local callback; ignore
-            // the `output` field (kept for callers that prefer to build
-            // their own buffer). Drop it to avoid confusing copies.
-            let _ = output;
-            Some((success, out))
-        }
+        RecipeRunnerDecision::Ran { code } => Some((code, out)),
         RecipeRunnerDecision::Passthrough => None,
     }
 }
