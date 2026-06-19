@@ -19,7 +19,7 @@ use crate::oaita::tools::{ExecResult, summarize_patch, fit_output,
                           RESULT_BUDGET, CHANGES_BUDGET};
 
 /// Where the in-box control socket is bind-mounted. Mirrors runner.rs.
-const UI_SOCK_INBOX: &str = "/tmp/.slopbox/ui.sock";
+const UI_SOCK_INBOX: &str = "/run/sarun/ui.sock";
 
 /// One synchronous request/reply over the engine control socket. In-box if
 /// the bind-mounted path exists, host socket otherwise. Returns the unwrapped

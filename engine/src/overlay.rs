@@ -461,12 +461,16 @@ impl Overlay {
     /// so the substituted safe toml is still served to api boxes even
     /// though config_home is otherwise hidden.
     fn is_engine_path(rel: &str) -> bool {
-        // Cache the four (already-stripped) roots so the per-lookup cost is
-        // just four string compares against `rel`.
+        // Cache the (already-stripped) roots so the per-lookup cost is
+        // just a handful of string compares against `rel`. The "run/sarun"
+        // entry hides bwrap's bind destinations for ui.sock/api.sock/the
+        // engine binary — without it the overlay captures the bind targets
+        // as ordinary box writes and apply would clobber the engine's real
+        // host-side sockets at the same paths.
         use std::sync::OnceLock;
         static ROOTS: OnceLock<Vec<String>> = OnceLock::new();
         let roots = ROOTS.get_or_init(|| {
-            [crate::paths::data_home(),
+            let mut v: Vec<String> = [crate::paths::data_home(),
              crate::paths::config_home(),
              crate::paths::state_home(),
              crate::paths::runtime_home()]
@@ -476,7 +480,9 @@ impl Overlay {
                     s.strip_prefix('/').unwrap_or(&s).to_string()
                 })
                 .filter(|s| !s.is_empty())
-                .collect()
+                .collect();
+            v.push("run/sarun".to_string());
+            v
         });
         for r in roots {
             if rel == r { return true; }
@@ -876,6 +882,22 @@ impl Overlay {
     /// (the merged listing clears accumulated names at the opaque-marker box
     /// before applying its own present/whiteout contributions).
     fn resolve(&self, bid: i64, rel: &str) -> Layer {
+        // --api substitute: /tmp is presented as a symlink to a per-box dir
+        // under oaita's state home. Lifts the model's strongest write-target
+        // prior into ordinary overlay-captured space so apply/inspect/discard
+        // work — without this /tmp is a bwrap-private tmpfs and writes there
+        // are a black hole. Decided per ORIGINATING box (no chain walk),
+        // since `bid` is the box whose view is being computed; a parent box
+        // having or not having --api is irrelevant to this box's /tmp.
+        if rel == "tmp" {
+            if let Some(orig) = self.box_of(bid) {
+                if orig.is_api() {
+                    let target = crate::paths::oaita_state_home()
+                        .join(".tmp").join(bid.to_string());
+                    return Layer::UpperSymlink { target };
+                }
+            }
+        }
         let mut cur = Some(bid);
         let mut seen = 0;
         // D-parent: any box in the lookup chain having `no_host_fallback` set
