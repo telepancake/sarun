@@ -2837,16 +2837,24 @@ fn sessions_lines(app: &App) -> Vec<Line<'static>> {
         return out;
     }
     // refresh_sessions already sorted by dotted display path, so this is
-    // DFS order — children land immediately after their parent.
+    // DFS order — children land immediately after their parent. Depth is the
+    // dot count; collapse_chains then flattens single-child runs (e.g. an OCI
+    // image's base→layer→…→top spine) onto one indent column, marking each with ⋮.
+    let depths: Vec<usize> = app.sessions.iter()
+        .map(|s| match s.get("path").and_then(Value::as_str) {
+            Some(p) if !p.is_empty() => p.matches('.').count(),
+            _ => 0,
+        })
+        .collect();
+    let collapse = collapse_chains(&depths);
     for (i, s) in app.sessions.iter().enumerate() {
         let g = |k: &str| s.get(k).and_then(Value::as_str).unwrap_or("").to_string();
         let status = g("status");
         let (flag, color) = session_flag(&status);
         let path = g("path");
-        // Depth from dot count; bare top-level boxes have depth 0.
-        let depth = if path.is_empty() { 0 }
-                    else { path.matches('.').count() };
-        let indent = "  ".repeat(depth);
+        let (depth, collapsed) = collapse[i];
+        let indent = format!("{}{}", "  ".repeat(depth),
+                             if collapsed { CHAIN_MARK } else { "" });
         // Display label: name if present, else the dotted-path's last
         // segment, else the session id.
         let basename = {
@@ -2879,6 +2887,54 @@ fn sessions_lines(app: &App) -> Vec<Line<'static>> {
 /// the earlier "└ " glyph hurt legibility more than it added structure;
 /// the depth alone is enough).
 fn tree_indent(depth: usize) -> String { "  ".repeat(depth) }
+
+/// Marker prefixed to a row that belongs to a collapsed single-child chain
+/// (see `collapse_chains`). Three vertical dots — the run reads as one spine.
+const CHAIN_MARK: &str = "⋮";
+
+/// Single-child-chain collapse for a DFS-ordered depth sequence — shared by the
+/// hierarchical panes (sessions / processes / changes). A node that is an only
+/// child inherits its parent's indent level instead of nesting one deeper, so a
+/// long single-child run (a stack of OCI image layers, or an `a/b/c/d` directory
+/// spine) flattens into ONE column instead of marching off the right edge. Every
+/// node that has exactly one child, OR is itself an only child, is flagged
+/// `collapsed` so the renderer can mark the whole flattened run with `⋮`
+/// (including the final, chain-ending single child).
+///
+/// Input: each row's TRUE tree depth, in DFS order (parents precede children).
+/// Output: per-row `(display_depth, collapsed)`.
+fn collapse_chains(depths: &[usize]) -> Vec<(usize, bool)> {
+    let n = depths.len();
+    let mut parent = vec![usize::MAX; n];
+    let mut child_count = vec![0usize; n];
+    let mut stack: Vec<usize> = Vec::new();
+    for i in 0..n {
+        // Unwind the ancestor stack to the nearest shallower row.
+        while let Some(&t) = stack.last() {
+            if depths[t] >= depths[i] { stack.pop(); } else { break; }
+        }
+        if let Some(&p) = stack.last() {
+            // Only a row exactly one level up is a DIRECT parent; a deeper jump
+            // (malformed/elided input) leaves i parentless — treated as a root.
+            if depths[p] + 1 == depths[i] {
+                parent[i] = p;
+                child_count[p] += 1;
+            }
+        }
+        stack.push(i);
+    }
+    let mut dd = vec![0usize; n];
+    for i in 0..n {
+        let p = parent[i];
+        dd[i] = if p == usize::MAX { 0 }
+                else { dd[p] + usize::from(child_count[p] > 1) };
+    }
+    (0..n).map(|i| {
+        let sole_child = parent[i] != usize::MAX && child_count[parent[i]] == 1;
+        let has_one_child = child_count[i] == 1;
+        (dd[i], sole_child || has_one_child)
+    }).collect()
+}
 
 /// Render the cached cd_info tuples (style-tag, text) as styled Lines —
 /// the small header strip above the diff. Same set of style tags the
@@ -2913,11 +2969,14 @@ fn changes_lines(app: &App) -> Vec<Line<'static>> {
         out.push(Line::from(empty_msg));
         return out;
     }
+    // Collapse single-child directory spines (a/b/c/d) onto one column.
+    let collapse = collapse_chains(&vis.iter()
+        .map(|c| c.get("depth").and_then(Value::as_u64).unwrap_or(0) as usize)
+        .collect::<Vec<_>>());
     for (i, c) in vis.iter().enumerate() {
         let kind = c.get("kind").and_then(Value::as_str).unwrap_or("");
         let name = c.get("name").and_then(Value::as_str).unwrap_or("");
         let size = c.get("size").and_then(Value::as_i64).unwrap_or(0);
-        let depth = c.get("depth").and_then(Value::as_u64).unwrap_or(0) as usize;
         let connector = c.get("connector").and_then(Value::as_bool) == Some(true);
         // Prefer the per-row decoration (created vs modified, plus stale).
         // The source row's `kind` only knows deleted / symlink / changed.
@@ -2940,7 +2999,9 @@ fn changes_lines(app: &App) -> Vec<Line<'static>> {
             "xattr-only" => ("@", Color::DarkGray),
             _ => ("…", Color::DarkGray),
         };
-        let indent = tree_indent(depth);
+        let (cdepth, collapsed) = collapse[i];
+        let indent = format!("{}{}", tree_indent(cdepth),
+                             if collapsed { CHAIN_MARK } else { "" });
         let line = if connector {
             let text = format!("{:<1} {:>10}  {indent}{name}/", "", "");
             Line::from(Span::styled(text,
@@ -3119,6 +3180,8 @@ fn processes_lines(app: &App) -> Vec<Line<'static>> {
         return out;
     }
     let hi = Some(app.sel_proc);
+    // Collapse single-child process spines (sh → sh → cmd) onto one column.
+    let collapse = collapse_chains(&rows.iter().map(|r| r.depth).collect::<Vec<_>>());
     for (i, r) in rows.iter().enumerate() {
         // Pick the program-name anchor. argv[0] is what the user typed; fall
         // back to exe when argv is empty (e.g. an exec without a recorded
@@ -3128,7 +3191,9 @@ fn processes_lines(app: &App) -> Vec<Line<'static>> {
             .unwrap_or_else(|| r.exe.clone());
         let anchor = anchor_path.rsplit('/').next().unwrap_or(&anchor_path).to_string();
         let rest_argv = if r.argv.len() > 1 { r.argv[1..].join(" ") } else { String::new() };
-        let indent = "  ".repeat(r.depth);
+        let (cdepth, collapsed) = collapse[i];
+        let indent = format!("{}{}", "  ".repeat(cdepth),
+                             if collapsed { CHAIN_MARK } else { "" });
 
         let (anchor_style, rest_style) = if Some(i) == hi {
             (Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
@@ -6122,6 +6187,42 @@ mod tests {
     use super::*;
     use std::process::Child;
     use std::process::Command;
+
+    #[test]
+    fn collapse_chains_flattens_single_child_runs() {
+        // The spec example:
+        //   A { A1, B }; B { C }; C { D }; D { E }; E { F1, F2 }
+        // DFS-ordered true depths:
+        //   A0  A1=1  B=1  C=2  D=3  E=4  F1=5  F2=5
+        // expected render:
+        //   A
+        //     A1
+        //     ⋮B  ⋮C  ⋮D  ⋮E      (single-child spine, flattened to A1's level)
+        //       F1  F2
+        let depths = [0, 1, 1, 2, 3, 4, 5, 5];
+        let got = collapse_chains(&depths);
+        let want = [
+            (0, false), // A   — root, two children
+            (1, false), // A1  — leaf, sibling of a branch
+            (1, true),  // B   — has one child → starts a collapsed spine
+            (1, true),  // C   — only child
+            (1, true),  // D   — only child
+            (1, true),  // E   — only child (still marked, though it branches below)
+            (2, false), // F1  — E branches, so its children indent one deeper
+            (2, false), // F2
+        ];
+        assert_eq!(got, want, "single-child chain collapse mismatch");
+    }
+
+    #[test]
+    fn collapse_chains_flattens_a_pure_spine() {
+        // An OCI image stack: base → L1 → L2 → L3, each the sole child. The whole
+        // thing collapses to one column, every node ⋮-marked (incl. the leaf).
+        let depths = [0, 1, 2, 3];
+        let got = collapse_chains(&depths);
+        assert!(got.iter().all(|&(d, c)| d == 0 && c),
+                "a pure single-child spine should flatten to depth 0, all marked: {got:?}");
+    }
 
     /// The App computes its filerules path from the (process-global) env, so the
     /// rule-editing tests share one on-disk file. Serialize them with this lock
