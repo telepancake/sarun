@@ -438,6 +438,16 @@ fn box_builtins_opt<SE: brush_core::extensions::ShellExtensions>(
     // the inner runner's own binary via /proc/self/exe.
     m.insert("sarun".to_string(), simple_builtin::<EngineSelfCommand, SE>());
     m.insert("oaita".to_string(), simple_builtin::<EngineSelfCommand, SE>());
+    // In-process `find` (vendored find-only findutils fork). It is neither a
+    // bundled coreutil nor a bash builtin, so it is always present and never
+    // overwritten — registered regardless of `bundle_coreutils` (find does not
+    // share the uucore Fluent localization cache that gated coreutils for make
+    // recipes). It runs against the shell's logical I/O and logical cwd; see
+    // crate::find_builtin.
+    m.insert(
+        "find".to_string(),
+        simple_builtin::<crate::find_builtin::FindBuiltin, SE>(),
+    );
     m
 }
 

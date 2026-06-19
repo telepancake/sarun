@@ -14,6 +14,9 @@ bytes = "1.10"
 brush-core = "0.5"
 brush-builtins = "0.2"
 brush-coreutils-builtins = { version = "0.1", features = ["coreutils.all"] }
+# Vendored, find-only fork of uutils/findutils 0.9.1: run `find` as an
+# in-process brush builtin against the shell's logical I/O. See vendor/findutils.
+findutils = { path = "vendor/findutils" }
 brush-parser = { version = "0.4", features = ["serde"] }
 # Reedline-based interactive REPL for the brush-sh shim's -i mode:
 # multi-line editing, history, completion, syntax highlight — built on

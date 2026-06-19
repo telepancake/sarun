@@ -169,6 +169,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "argmax"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0144c58b55af0133ec3963ce5e4d07aad866e3bbcfdcddbf4590dbd7ad6ff557"
+dependencies = [
+ "libc",
+ "nix 0.30.1",
+ "once_cell",
+]
+
+[[package]]
 name = "arrayref"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -554,7 +565,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -680,7 +691,7 @@ dependencies = [
  "uu_wc",
  "uu_whoami",
  "uu_yes",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -1834,6 +1845,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "faccess"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "59ae66425802d6a903e268ae1a08b8c38ba143520f227a205edf4e9c7e3e26d5"
+dependencies = [
+ "bitflags 1.3.2",
+ "libc",
+ "winapi",
+]
+
+[[package]]
 name = "fallible-iterator"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1951,6 +1973,23 @@ name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
+
+[[package]]
+name = "findutils"
+version = "0.9.1"
+dependencies = [
+ "argmax",
+ "chrono",
+ "clap",
+ "faccess",
+ "itertools 0.15.0",
+ "nix 0.31.3",
+ "onig",
+ "regex",
+ "thiserror 2.0.18",
+ "uucore 0.9.0",
+ "walkdir",
+]
 
 [[package]]
 name = "finl_unicode"
@@ -3064,6 +3103,15 @@ name = "itertools"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
+dependencies = [
+ "either",
+]
+
+[[package]]
+name = "itertools"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b4baf93f58d4425749ca49a51c50ebab072c5df6994d08fed93541c331481dc"
 dependencies = [
  "either",
 ]
@@ -5242,6 +5290,7 @@ dependencies = [
  "crossterm",
  "dhcproto",
  "domain",
+ "findutils",
  "flate2",
  "fuser",
  "futures-util",
@@ -6707,7 +6756,7 @@ dependencies = [
  "clap",
  "fluent",
  "platform-info",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -6719,7 +6768,7 @@ dependencies = [
  "clap",
  "fluent",
  "uu_checksum_common",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -6730,7 +6779,7 @@ checksum = "97a8cd24420f60681362f18c4ee5da81c293fd33859e6c505ca0d1991cc0cf85"
 dependencies = [
  "clap",
  "fluent",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -6742,7 +6791,7 @@ dependencies = [
  "clap",
  "fluent",
  "uu_base32",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -6753,7 +6802,7 @@ checksum = "48b987741da8aaf4f2e4e2f555a6af2e78638dbdb086a96685e83f5f77dfd8d1"
 dependencies = [
  "clap",
  "fluent",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -6765,7 +6814,7 @@ dependencies = [
  "clap",
  "fluent",
  "uu_base32",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -6777,7 +6826,7 @@ dependencies = [
  "memchr",
  "rustix",
  "thiserror 2.0.18",
- "uucore",
+ "uucore 0.8.0",
  "winapi-util",
  "windows-sys 0.61.2",
 ]
@@ -6790,7 +6839,7 @@ checksum = "d9fcef261062ab5c670ed3c5e2a2be84c6b356cc8e98035f7a3484eaa41c449d"
 dependencies = [
  "clap",
  "fluent",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -6802,7 +6851,7 @@ dependencies = [
  "clap",
  "fluent",
  "uu_checksum_common",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -6813,7 +6862,7 @@ checksum = "991b7eba4018e874da977fa0fcc1f13ef80d8427f78c868630240015951bb144"
 dependencies = [
  "clap",
  "fluent",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -6829,7 +6878,7 @@ dependencies = [
  "libc",
  "nix 0.31.3",
  "thiserror 2.0.18",
- "uucore",
+ "uucore 0.8.0",
  "walkdir",
 ]
 
@@ -6843,7 +6892,7 @@ dependencies = [
  "fluent",
  "regex",
  "thiserror 2.0.18",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -6856,7 +6905,7 @@ dependencies = [
  "clap",
  "fluent",
  "memchr",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -6875,7 +6924,7 @@ dependencies = [
  "parse_datetime",
  "regex",
  "rustix",
- "uucore",
+ "uucore 0.8.0",
  "windows-sys 0.61.2",
 ]
 
@@ -6891,7 +6940,7 @@ dependencies = [
  "libc",
  "nix 0.31.3",
  "thiserror 2.0.18",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -6905,7 +6954,7 @@ dependencies = [
  "rustix",
  "thiserror 2.0.18",
  "unicode-width 0.2.2",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -6916,7 +6965,7 @@ checksum = "81009a122ccb488a8452a6a19b8de53b49d86ca177812d665a4c673ff2f53f16"
 dependencies = [
  "clap",
  "uu_ls",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -6927,7 +6976,7 @@ checksum = "de2cdcf201ff166c9d9340f415e087386fcb91ad9f089a41e1257b8772e8de5a"
 dependencies = [
  "clap",
  "fluent",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -6938,7 +6987,7 @@ checksum = "c343f96d17471045a3a18f13519f5f70e899fdee4f33baf8603bd28aa2f80e37"
 dependencies = [
  "clap",
  "fluent",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -6952,7 +7001,7 @@ dependencies = [
  "glob",
  "rustc-hash 2.1.2",
  "thiserror 2.0.18",
- "uucore",
+ "uucore 0.8.0",
  "windows-sys 0.61.2",
 ]
 
@@ -6964,7 +7013,7 @@ checksum = "d20e00a1dc54fef5e26704b35aa8837cb4416120f8a46415b9bdd9f8354070f0"
 dependencies = [
  "clap",
  "fluent",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -6978,7 +7027,7 @@ dependencies = [
  "nix 0.31.3",
  "rust-ini",
  "thiserror 2.0.18",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -6991,7 +7040,7 @@ dependencies = [
  "fluent",
  "thiserror 2.0.18",
  "unicode-width 0.2.2",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -7006,7 +7055,7 @@ dependencies = [
  "num-traits",
  "onig",
  "thiserror 2.0.18",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -7020,7 +7069,7 @@ dependencies = [
  "memchr",
  "num-bigint",
  "num-prime",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -7031,7 +7080,7 @@ checksum = "3bea168d1a5c9e7b72889a922d7ad6d21f18c319f6bbc98202a852ded0c54a4f"
 dependencies = [
  "clap",
  "fluent",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -7044,7 +7093,7 @@ dependencies = [
  "fluent",
  "thiserror 2.0.18",
  "unicode-width 0.2.2",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -7056,7 +7105,7 @@ dependencies = [
  "clap",
  "fluent",
  "unicode-width 0.2.2",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -7069,7 +7118,7 @@ dependencies = [
  "fluent",
  "memchr",
  "thiserror 2.0.18",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -7082,7 +7131,7 @@ dependencies = [
  "dns-lookup",
  "fluent",
  "hostname",
- "uucore",
+ "uucore 0.8.0",
  "windows-sys 0.61.2",
 ]
 
@@ -7096,7 +7145,7 @@ dependencies = [
  "fluent",
  "memchr",
  "thiserror 2.0.18",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -7107,7 +7156,7 @@ checksum = "11ab263e9f3d1052a9eca4c5cad32637eee59b4e6582c6876206e53ae2cf15c4"
 dependencies = [
  "clap",
  "fluent",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -7119,7 +7168,7 @@ dependencies = [
  "clap",
  "fluent",
  "thiserror 2.0.18",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -7137,7 +7186,7 @@ dependencies = [
  "rustc-hash 2.1.2",
  "terminal_size",
  "thiserror 2.0.18",
- "uucore",
+ "uucore 0.8.0",
  "uutils_term_grid",
 ]
 
@@ -7150,7 +7199,7 @@ dependencies = [
  "clap",
  "fluent",
  "uu_checksum_common",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -7162,7 +7211,7 @@ dependencies = [
  "clap",
  "fluent",
  "rustix",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -7176,7 +7225,7 @@ dependencies = [
  "rand 0.10.1",
  "tempfile",
  "thiserror 2.0.18",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -7188,7 +7237,7 @@ dependencies = [
  "clap",
  "crossterm",
  "fluent",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -7204,7 +7253,7 @@ dependencies = [
  "libc",
  "rustc-hash 2.1.2",
  "thiserror 2.0.18",
- "uucore",
+ "uucore 0.8.0",
  "windows-sys 0.61.2",
 ]
 
@@ -7218,7 +7267,7 @@ dependencies = [
  "fluent",
  "itoa",
  "regex",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -7230,7 +7279,7 @@ dependencies = [
  "clap",
  "fluent",
  "libc",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -7243,7 +7292,7 @@ dependencies = [
  "fluent",
  "memchr",
  "thiserror 2.0.18",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -7257,7 +7306,7 @@ dependencies = [
  "fluent",
  "half",
  "libc",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -7268,7 +7317,7 @@ checksum = "2a9f1bb267ba641c5fc3a5fb667d4a0fe2389550a64a17b36d9d07e5e3acf37a"
 dependencies = [
  "clap",
  "fluent",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -7283,7 +7332,7 @@ dependencies = [
  "memchr",
  "regex",
  "thiserror 2.0.18",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -7294,7 +7343,7 @@ checksum = "a9c82f5a4b14ba21f83bda5f34e53966fdce52b161fbd89f5e96f9f8246f3463"
 dependencies = [
  "clap",
  "fluent",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -7305,7 +7354,7 @@ checksum = "3065df614305639340699637729c7af9d793a5a6fe423e5144ef4c9c38bf4ce3"
 dependencies = [
  "clap",
  "fluent",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -7318,7 +7367,7 @@ dependencies = [
  "fluent",
  "regex",
  "thiserror 2.0.18",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -7329,7 +7378,7 @@ checksum = "61681c8d4be40d7a29a8588ccd993f74058230db926366dba4c38e78658e339b"
 dependencies = [
  "clap",
  "fluent",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -7340,7 +7389,7 @@ checksum = "1fbc55e39327cd621699547180b81b65be0af812b47d0a8f2e9a4ec1424c4086"
 dependencies = [
  "clap",
  "fluent",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -7351,7 +7400,7 @@ checksum = "b5102deb8ac0b61da568d863ec77527f94f569a621f1cfe577020ca7f2a6eb71"
 dependencies = [
  "clap",
  "fluent",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -7365,7 +7414,7 @@ dependencies = [
  "indicatif",
  "libc",
  "thiserror 2.0.18",
- "uucore",
+ "uucore 0.8.0",
  "windows-sys 0.61.2",
 ]
 
@@ -7378,7 +7427,7 @@ dependencies = [
  "clap",
  "fluent",
  "libc",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -7393,7 +7442,7 @@ dependencies = [
  "num-bigint",
  "num-traits",
  "thiserror 2.0.18",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -7405,7 +7454,7 @@ dependencies = [
  "clap",
  "fluent",
  "uu_checksum_common",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -7417,7 +7466,7 @@ dependencies = [
  "clap",
  "fluent",
  "uu_checksum_common",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -7429,7 +7478,7 @@ dependencies = [
  "clap",
  "fluent",
  "uu_checksum_common",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -7441,7 +7490,7 @@ dependencies = [
  "clap",
  "fluent",
  "uu_checksum_common",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -7453,7 +7502,7 @@ dependencies = [
  "clap",
  "fluent",
  "uu_checksum_common",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -7466,7 +7515,7 @@ dependencies = [
  "fluent",
  "libc",
  "rand 0.10.1",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -7482,7 +7531,7 @@ dependencies = [
  "rand_chacha 0.10.0",
  "rustc-hash 2.1.2",
  "sha3",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -7493,7 +7542,7 @@ checksum = "569e0d0faa2643b021dfae44c95e427a1d27c1acd0e9c5b77efdb878c6199910"
 dependencies = [
  "clap",
  "fluent",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -7517,7 +7566,7 @@ dependencies = [
  "self_cell",
  "tempfile",
  "thiserror 2.0.18",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -7530,7 +7579,7 @@ dependencies = [
  "fluent",
  "memchr",
  "thiserror 2.0.18",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -7541,7 +7590,7 @@ checksum = "24457592c8a1f58ec83f6a8b1844664a2038811288fa1e5c2359c88c92fe9bf5"
 dependencies = [
  "clap",
  "fluent",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -7553,7 +7602,7 @@ dependencies = [
  "clap",
  "fluent",
  "nix 0.31.3",
- "uucore",
+ "uucore 0.8.0",
  "windows-sys 0.61.2",
 ]
 
@@ -7571,7 +7620,7 @@ dependencies = [
  "regex",
  "tempfile",
  "thiserror 2.0.18",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -7587,7 +7636,7 @@ dependencies = [
  "notify",
  "rustix",
  "same-file",
- "uucore",
+ "uucore 0.8.0",
  "windows-sys 0.61.2",
 ]
 
@@ -7599,7 +7648,7 @@ checksum = "ca95d8bad3884b3ae9fb059e84d55eac42576ac4c596d1479e6c7a2e6308b61d"
 dependencies = [
  "clap",
  "fluent",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -7612,7 +7661,7 @@ dependencies = [
  "fluent",
  "libc",
  "thiserror 2.0.18",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -7629,7 +7678,7 @@ dependencies = [
  "parse_datetime",
  "rustix",
  "thiserror 2.0.18",
- "uucore",
+ "uucore 0.8.0",
  "windows-sys 0.61.2",
 ]
 
@@ -7643,7 +7692,7 @@ dependencies = [
  "clap",
  "fluent",
  "nom 8.0.0",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -7654,7 +7703,7 @@ checksum = "3c915e735ce4bdaa0307ee9672ae2b59ad7cbf89e5a2f7d062f9a0b815ee2d9f"
 dependencies = [
  "clap",
  "fluent",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -7665,7 +7714,7 @@ checksum = "45668c33f9663167bcce0c03a2466a435297400c76b01ae68f3b33e8f876f407"
 dependencies = [
  "clap",
  "fluent",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -7680,7 +7729,7 @@ dependencies = [
  "rustix",
  "string-interner",
  "thiserror 2.0.18",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -7692,7 +7741,7 @@ dependencies = [
  "clap",
  "fluent",
  "platform-info",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -7704,7 +7753,7 @@ dependencies = [
  "clap",
  "fluent",
  "thiserror 2.0.18",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -7715,7 +7764,7 @@ checksum = "cbbe22768fab17ba38bf4ba0a15ab4941e3767eca1def697dfbbcf52876e47ab"
 dependencies = [
  "clap",
  "fluent",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -7726,7 +7775,7 @@ checksum = "b0be81f8ae47e0963d1c1f7ac7085d3ca9ad4c16fe617af27475efec754d87bd"
 dependencies = [
  "clap",
  "fluent",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -7737,7 +7786,7 @@ checksum = "d4f4a26810f4d4dc28f7360c9d51ce0aee6d9177a3d10b0012d6a9b86fe64b96"
 dependencies = [
  "clap",
  "uu_ls",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -7753,7 +7802,7 @@ dependencies = [
  "rustix",
  "thiserror 2.0.18",
  "unicode-width 0.2.2",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -7764,7 +7813,7 @@ checksum = "87bf65bdd9e21258dd484aeb7567f5f833c486ed84ba5aa4fe3b1a93a20e7cee"
 dependencies = [
  "clap",
  "fluent",
- "uucore",
+ "uucore 0.8.0",
  "windows-sys 0.61.2",
 ]
 
@@ -7777,7 +7826,7 @@ dependencies = [
  "clap",
  "fluent",
  "itertools 0.14.0",
- "uucore",
+ "uucore 0.8.0",
 ]
 
 [[package]]
@@ -7827,7 +7876,7 @@ dependencies = [
  "thiserror 2.0.18",
  "unic-langid",
  "unit-prefix",
- "uucore_procs",
+ "uucore_procs 0.8.0",
  "walkdir",
  "wild",
  "winapi-util",
@@ -7837,10 +7886,44 @@ dependencies = [
 ]
 
 [[package]]
+name = "uucore"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "069b34217c27f611e1589f540f58118dbf226a9e407d38ab472052ff075a1dc2"
+dependencies = [
+ "bstr",
+ "clap",
+ "dunce",
+ "fluent",
+ "fluent-syntax",
+ "libc",
+ "nix 0.31.3",
+ "os_display",
+ "rustc-hash 2.1.2",
+ "rustix",
+ "thiserror 2.0.18",
+ "unic-langid",
+ "uucore_procs 0.9.0",
+ "wild",
+ "winapi-util",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "uucore_procs"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da865e8a648b260dbd89fca76d0801995877ab27a4e259b6dec30ba9743b86ab"
+dependencies = [
+ "proc-macro2",
+ "quote",
+]
+
+[[package]]
+name = "uucore_procs"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "34337da211e7abfff7189b794afb3b5018fe356fb36474b73645458fc1201350"
 dependencies = [
  "proc-macro2",
  "quote",
