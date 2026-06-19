@@ -30,13 +30,17 @@ built, else the prototype.
 
 `sarun` is **filesystem/proc only**: it sandboxes a command over a copy-on-write
 overlay of your filesystem, captures its writes/processes/output for review, and
-applies/discards them. **Boxes run in the HOST network namespace** (normal
-connectivity — no proxy, no gating, no DNS spoofing, no per-write network
-policy). The only network-isolated piece is the untrusted binary viewer
-(`run_on_untrusted`, used to render box-produced bytes), which runs under bwrap
-`--unshare-all`. **Network interception lives in a separate tool, `sakar`** (top
-level, with its own `test_sakar*.py`) — do NOT touch `sakar` when working on
-`sarun`.
+applies/discards them. **Box networking is a per-box choice (engine `NetMode`),
+NOT "always host".** The default is `Off`: the box gets an empty netns and every
+dial fails closed. `-n` (`Tap`) wires the box to a per-box userland TCP/IP stack
+the engine drives in-process — DHCP, DNS, an HTTPS MITM proxy that injects its
+own CA into the box, and a per-flow policy hook (all under `engine/src/net/`).
+`-N` (`Host`) shares the host netns for raw connectivity. (The Python
+**prototype** has none of this — it is host-net-only, no `--unshare-net`; the
+proxy stack is engine-only.) The untrusted binary viewer (`run_on_untrusted`,
+used to render box-produced bytes) runs under bwrap `--unshare-all`, fully
+air-gapped. `sakar` is a separate sibling tool (top level, its own
+`test_sakar*.py`) — do NOT touch `sakar` when working on `sarun`.
 
 ## Run the app
 The Makefile is the entry point. `make` (no args) lists every command.
