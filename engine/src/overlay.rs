@@ -308,6 +308,20 @@ enum Layer {
     Lower,
 }
 
+/// Top-level directory names the overlay always presents as an empty, virtual
+/// landing pad — resolve-time only, never written to any box's upper, never
+/// captured. They give the runner's bwrap a mount target on images that ship
+/// no such dir (busybox, distroless, scratch); bwrap then mounts the real fs
+/// (procfs, devtmpfs, the host /sys bind, a /tmp tmpfs) straight over it,
+/// exactly as it would over a dir the image did ship. This is precisely the set
+/// the runner mounts (see runner.rs bwrap setup): proc, dev, sys, tmp. A
+/// landing pad only ever surfaces when nothing real provides the path — a host
+/// box's host dirs and an image's own /proc etc. are untouched — and for --api
+/// boxes /tmp is intercepted earlier in resolve(), so it never reaches here.
+fn is_synthetic_landing(rel: &str) -> bool {
+    matches!(rel, "proc" | "dev" | "sys" | "tmp")
+}
+
 impl Overlay {
     /// Drain queued (box_id, rel, op) events out of the overlay — the
     /// control loop calls this on a tick and broadcasts each one as a
@@ -947,9 +961,48 @@ impl Overlay {
                 }
             }
         }
-        if no_host { return Layer::Absent; }
-        if self.host(rel).symlink_metadata().is_ok() { Layer::Lower }
-        else { Layer::Absent }
+        // Synthetic landing pad (see is_synthetic_landing): reaching here means
+        // NO box in the chain has any entry for `rel` — every real Dir / File /
+        // Symlink / Special / Whiteout already returned above, so a directory an
+        // image actually ships is never touched. As a last resort, for the
+        // mount-target names (proc/dev/sys/tmp), present an empty virtual dir so
+        // bwrap has something to mount over on minimal images. NON-DESTRUCTIVE:
+        // chain_dir_has_children backs the pad off the instant any box holds a
+        // child under `rel`, so it can never stand in for — let alone hide — a
+        // directory that has content. Resolve-only: never a sqlar row, never in
+        // apply/discard/the change summary.
+        if no_host {
+            if is_synthetic_landing(rel) && !self.chain_dir_has_children(bid, rel) {
+                return Layer::UpperDir { mode: 0o0555, mtime_ns: 0 };
+            }
+            return Layer::Absent;
+        }
+        if self.host(rel).symlink_metadata().is_ok() {
+            Layer::Lower
+        } else if is_synthetic_landing(rel) && !self.chain_dir_has_children(bid, rel) {
+            Layer::UpperDir { mode: 0o0555, mtime_ns: 0 }
+        } else {
+            Layer::Absent
+        }
+    }
+
+    /// True if any box in the chain rooted at `bid` carries a direct child under
+    /// `rel` — i.e. that directory actually holds something in the merged view.
+    /// The synthetic landing pad consults this to stay non-destructive: a pad is
+    /// only ever offered for a path that is empty in EVERY box of the chain, so
+    /// it can never hide a real directory's contents.
+    fn chain_dir_has_children(&self, bid: i64, rel: &str) -> bool {
+        let mut cur = Some(bid);
+        let mut seen = 0;
+        while let Some(id) = cur {
+            seen += 1;
+            if seen > 64 { break; }
+            let Some(b) = self.box_of(id) else { break };
+            let (_white, present) = b.children_of(rel);
+            if !present.is_empty() { return true; }
+            cur = b.parent();
+        }
+        false
     }
 
     fn lower_attr(&self, ino: u64, rel: &str) -> Option<FileAttr> {
