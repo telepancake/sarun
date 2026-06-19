@@ -99,6 +99,14 @@ pub fn box_name(session: &str) -> String {
 
 pub struct SarunExecutor {
     pub sarun: String,
+    /// Boxes we've materialized so far this process lifetime — once a name
+    /// has been ensured we skip the no-op subprocess on subsequent file-IO
+    /// touches. Without this, an early `inspect` on a fresh session (before
+    /// any `shell` call has created the box) returns "not found" because
+    /// resolve(name) fails on the engine side — the box exists in spirit but
+    /// not in the box registry until `register` runs. Cheap subprocess once,
+    /// then path_kind/read_file/write_file/list_dir hit the engine directly.
+    ensured: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl SarunExecutor {
@@ -106,7 +114,23 @@ impl SarunExecutor {
         let sarun = sarun_override
             .or_else(|| Some(default_sarun()))
             .unwrap();
-        SarunExecutor { sarun }
+        SarunExecutor { sarun, ensured: std::sync::Mutex::new(Default::default()) }
+    }
+
+    /// First-touch idempotent box materialization: `sarun run BOX -- true`.
+    /// Subsequent calls within this process are no-ops (cached by name).
+    fn ensure_box(&self, box_id: &str) {
+        {
+            let g = self.ensured.lock().unwrap();
+            if g.contains(box_id) { return; }
+        }
+        let _ = Command::new(&self.sarun)
+            .args(["run", box_id, "--", "true"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        self.ensured.lock().unwrap().insert(box_id.to_string());
     }
 }
 
@@ -140,6 +164,7 @@ fn default_sarun() -> String {
 
 impl Executor for SarunExecutor {
     fn read_file(&self, box_id: &str, path: &str) -> std::io::Result<Vec<u8>> {
+        self.ensure_box(box_id);
         let rel = to_box_rel(path);
         let r = ctrl_rpc("box_file_read", json!([box_id, rel]))
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
@@ -151,6 +176,7 @@ impl Executor for SarunExecutor {
     fn write_file(&self, box_id: &str, path: &str, bytes: &[u8])
         -> std::io::Result<()>
     {
+        self.ensure_box(box_id);
         let rel = to_box_rel(path);
         let b64 = BASE64_STANDARD.encode(bytes);
         ctrl_rpc("box_file_write", json!([box_id, rel, b64]))
@@ -161,6 +187,7 @@ impl Executor for SarunExecutor {
     fn list_dir(&self, box_id: &str, path: &str)
         -> std::io::Result<Vec<(String, char)>>
     {
+        self.ensure_box(box_id);
         let rel = to_box_rel(path);
         let r = ctrl_rpc("box_dir_list", json!([box_id, rel]))
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
@@ -174,6 +201,7 @@ impl Executor for SarunExecutor {
     }
 
     fn path_kind(&self, box_id: &str, path: &str) -> char {
+        self.ensure_box(box_id);
         let rel = to_box_rel(path);
         match ctrl_rpc("box_path_kind", json!([box_id, rel])) {
             Ok(r) => r.get("kind").and_then(Value::as_str)

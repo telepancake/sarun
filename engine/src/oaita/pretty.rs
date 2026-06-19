@@ -228,7 +228,8 @@ fn print_message_block(role: &str, content: &str) {
     let trimmed = content.trim_end();
     for line in trimmed.lines().take(20) {
         // Clip very long lines so the narrative stays scannable.
-        let l = if line.len() > 180 { format!("{}…", &line[..180]) } else { line.to_string() };
+        let l = if line.len() > 180 { format!("{}…", clip_at_char(line, 180)) }
+                else { line.to_string() };
         println!("  │ {l}");
     }
     let nlines = trimmed.lines().count();
@@ -236,6 +237,20 @@ fn print_message_block(role: &str, content: &str) {
         println!("  │ …[{} more lines]", nlines - 20);
     }
     println!("  └──");
+}
+
+/// Truncate `s` at the longest char-boundary ≤ `max_bytes`. `&s[..n]` panics
+/// when `n` falls mid-character — a real concern here because tool args carry
+/// arbitrary file content (box-drawing chars, accented letters, etc. all
+/// multi-byte). Walks char_indices and stops at the last index that fits.
+fn clip_at_char(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes { return s; }
+    let mut last = 0;
+    for (i, _) in s.char_indices() {
+        if i > max_bytes { break; }
+        last = i;
+    }
+    &s[..last]
 }
 
 fn print_tool_call_summary(tc: &Value) {
@@ -250,7 +265,8 @@ fn print_tool_call_summary(tc: &Value) {
         for (k, v) in obj {
             let vs = match v {
                 Value::String(s) => {
-                    if s.len() > 80 { format!("{:?}…", &s[..80]) } else { format!("{s:?}") }
+                    if s.len() > 80 { format!("{:?}…", clip_at_char(s, 80)) }
+                    else { format!("{s:?}") }
                 }
                 _ => v.to_string(),
             };
