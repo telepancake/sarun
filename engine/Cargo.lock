@@ -6771,8 +6771,6 @@ dependencies = [
 [[package]]
 name = "uu_cat"
 version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b8c8b09c26aa08c010112715ff724a76fc8a8497c615830ca732e3ebe5c8429"
 dependencies = [
  "clap",
  "fluent",
