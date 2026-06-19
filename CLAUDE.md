@@ -31,11 +31,13 @@ built, else the prototype.
 `sarun` is **filesystem/proc only**: it sandboxes a command over a copy-on-write
 overlay of your filesystem, captures its writes/processes/output for review, and
 applies/discards them. **Box networking is a per-box choice (engine `NetMode`),
-NOT "always host".** The default is `Off`: the box gets an empty netns and every
-dial fails closed. `-n` (`Tap`) wires the box to a per-box userland TCP/IP stack
-the engine drives in-process — DHCP, DNS, an HTTPS MITM proxy that injects its
-own CA into the box, and a per-flow policy hook (all under `engine/src/net/`).
-`-N` (`Host`) shares the host netns for raw connectivity. (The Python
+NOT "always host".** The default is `Tap` (proxied): the box gets a per-box
+netns wired to a userland TCP/IP stack the engine drives in-process — DHCP,
+DNS, an HTTPS MITM proxy that injects its own CA into the box, and a per-flow
+policy hook (all under `engine/src/net/`). Opt out with `--net off` (an empty
+netns where every dial fails closed) or `-N` / `--net host` (share the host
+netns for raw connectivity). `-n` is the explicit spelling of the `Tap`
+default; `--net off|tap|host` is the canonical selector. (The Python
 **prototype** has none of this — it is host-net-only, no `--unshare-net`; the
 proxy stack is engine-only.) The untrusted binary viewer (`run_on_untrusted`,
 used to render box-produced bytes) runs under bwrap `--unshare-all`, fully
