@@ -163,11 +163,15 @@ shim (`runner.rs`, via `/proc/self/fd/N`), and the host-visibility cwd default
 - [ ] **Registry reach:** private-registry auth (`fetch_registry` passes
   `RegistryAuth::Anonymous`); digest/signature verification; `zstd:chunked`
   fast path (currently decoded as plain zstd — correct, just not chunked).
-- [ ] **`--api` on scratch/distroless (low pri).** Engine paths are FUSE
-  shadows now (`overlay::is_engine_shadow_path`), no binds — but the shadow
-  serves only the exact leaf, so `/usr/local/bin/{oaita,sarun}` aren't
-  reachable on an image lacking `/usr/local/bin`. Present the ancestor dirs
-  too (as `oaita_config_ancestor_or_self` already does for the config path).
+- [ ] **`--api` `/usr/local/bin/{oaita,sarun}` on scratch/distroless (low pri,
+  maybe wontfix).** These are FUSE shadows (`overlay::is_engine_shadow_path`),
+  no binds. On a closed minimal image with no `/usr/local/bin` the box can't
+  traverse to the shadow leaf — but **sarun never needs it**: its own in-box
+  engine access goes over SCM_RIGHTS (the FD broker / fd-exec'd inner), never a
+  path. Those PATH entries exist only so a *user* inside the box can type
+  `oaita`/`sarun`. If that's wanted on such images, present the ancestor dirs
+  too (as `oaita_config_ancestor_or_self` does for the config path); otherwise
+  leave it.
 - [ ] **Reconcile opaque-whiteout.** `oci.rs` does `set_opaque` for
   `.wh..wh..opq`, but the file header still calls it "out of scope
   (logged + skipped)" — verify the behavior, fix whichever is wrong.
