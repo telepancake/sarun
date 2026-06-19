@@ -66,6 +66,15 @@ extern "C" fn on_term(_sig: i32) {
 }
 
 fn serve() -> i32 {
+    // rustls 0.23 requires an explicit process-level CryptoProvider when more
+    // than one is in the dependency graph — ours has both `ring` (our direct
+    // rustls/tokio-rustls features) and `aws-lc-rs` (pulled by oci-client's
+    // rustls-tls). Auto-detection then refuses to choose, so the net stack's
+    // first TLS config build (the Tap MITM ServerConfig / upstream ClientConfig
+    // at netns-equip time) panics the net thread and every `-n`/Tap box hangs
+    // waiting on a register ack that never comes. Pin `ring` here, once, before
+    // any box networking starts. Idempotent: a redundant install is harmless.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let sock = paths::sock_path();
     // Single-instance guard FIRST, before any self-heal — a live socket
     // means another engine is up, and we must not touch its mountpoint.
