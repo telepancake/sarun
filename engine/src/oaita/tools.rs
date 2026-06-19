@@ -98,6 +98,16 @@ fn act_spec(capabilities: &str, exhausted: bool) -> ToolSpec {
              set `follow_up` to that earlier `ask` call's turn-id — \
              you'll address the same sub-agent again. \
              \
+             OPTIONAL `max_steps`: cap THIS sub-agent at N LLM-call \
+             turns. If you omit it, the sub-agent is uncapped — it \
+             only stops when YOUR pool runs out (whatever turns YOU \
+             have left, it draws from). Set max_steps when you want a \
+             specific budget for a sub-task (`max_steps=10` for a \
+             quick lookup, leave unset for a deep investigation that \
+             should run until your own budget gives out). On a \
+             `follow_up`, max_steps EXTENDS the existing sub-agent's \
+             pool by N more turns. \
+             \
              Put the natural-language request in `request` and any \
              input data in `data`. Your capabilities are: {capabilities}.")
     };
@@ -113,6 +123,8 @@ fn act_spec(capabilities: &str, exhausted: bool) -> ToolSpec {
                             "description": "Input data the sub-agent operates on (optional)."},
                 "follow_up": {"type": "string",
                               "description": "To address an existing sub-agent again, pass that earlier `ask` call's turn-id."},
+                "max_steps": {"type": "integer",
+                              "description": "Optional cap: this sub-agent stops after at most N LLM-call turns. Omit for uncapped (draws from your own pool)."},
             },
             "required": ["request"],
         }),

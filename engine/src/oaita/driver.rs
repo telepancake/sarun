@@ -444,6 +444,20 @@ same agent):
     ask(request=\"Now also benchmark fft.sh against numpy's FFT.\", \
         follow_up=\"kxabc\")
 
+CAPPING a sub-agent (optional). max_steps bounds the sub-agent at N \
+LLM-call turns. Without it the sub-agent is UNCAPPED and draws from \
+YOUR pool — fine for deep investigations. With it, the sub-agent \
+stops at N regardless of your pool. On a follow_up max_steps EXTENDS \
+the sub-agent's pool by N more turns (so a sub-agent that ran out \
+gets resumed):
+
+    ask(request=\"Quick: just check whether grep -P supports lookahead\", \
+        max_steps=3)
+    ask(request=\"...\", follow_up=\"kxabc\", max_steps=10)
+
+If a sub-agent's result says \"exhausted budget — box preserved\", \
+the resume gesture above is exactly what you want.
+
 READING + EDITING in YOUR own context (no sub-agent):
 
     inspect(path=\"/root/fft.sh\")              # paged structure
@@ -878,6 +892,12 @@ fn dispatch_act(args: &Value, outer: &str, set: &Settings,
     };
     let data = args_str(args, "data").unwrap_or_default();
     let follow_up = args_str(args, "follow_up").unwrap_or_default();
+    // Optional model-set cap for this sub-agent. Omitted = uncapped
+    // (only the parent's chain caps apply, matching `take_chain`'s
+    // absent-entry-is-pass-through rule). When set, it's a GRANT —
+    // additive on follow_up, initial on a fresh sub-agent.
+    let max_steps = args.get("max_steps").and_then(Value::as_i64)
+        .filter(|n| *n > 0);
     // Inner session: if follow_up names a previous act call, reuse its
     // sub-agent id; otherwise mint a new one (folder name is the slug too).
     let inner = if !follow_up.is_empty() {
@@ -908,7 +928,7 @@ fn dispatch_act(args: &Value, outer: &str, set: &Settings,
     let outer_box = box_name(outer);
     let inner_box = box_name(&inner);
     let dotted = format!("{outer_box}.{inner_box}");
-    let script = act_script(&inner, set.depth + 1);
+    let script = act_script(&inner, set.depth + 1, max_steps);
     let Some(exe) = executor else {
         return "ask: no executor (sandbox disabled) — cannot delegate".to_string();
     };
@@ -921,21 +941,97 @@ fn dispatch_act(args: &Value, outer: &str, set: &Settings,
     // so the runner binds /usr/local/bin/{oaita,sarun} AND admits the
     // box on the proxy gate.
     let r = exe.run(&dotted, &script, false, /*api_access=*/true);
-    format_act_result(&r, &inner)
+    format_act_result(&r, &inner) + &format_sub_agent_status(outer)
 }
 
-fn act_script(inner: &str, child_depth: u32) -> String {
-    // OAITA_DEPTH rides into the child process so its `act` calls see the
+fn act_script(inner: &str, child_depth: u32, max_steps: Option<i64>) -> String {
+    // OAITA_DEPTH rides into the child process so its `ask` calls see the
     // bumped depth (and the exhausted form fires at MAX_DEPTH).
+    //
+    // --max-steps N is OPTIONAL. When the model set `max_steps` on the
+    // ask call, propagate as a CLI grant — the sub-agent's session pool
+    // gets N more turns (additive, so follow_up grants stack). When the
+    // model didn't set it, omit the flag: the sub-agent is uncapped and
+    // draws only from the parent's chain (whatever the parent has left).
+    let cap = max_steps.map(|n| format!(" --max-steps {n}")).unwrap_or_default();
+    // No `set -e` — we run BOTH commands unconditionally so a budget-
+    // exhausted `oaita run` (rc=1) still gets its tail captured. The
+    // parent's `ask` result then surfaces whatever the sub-agent had
+    // managed to produce up to the cutoff plus the exhaustion notice.
     format!(
-        "set -e\n\
-         export OAITA_DEPTH={child_depth}\n\
-         oaita run {inner}\n\
+        "export OAITA_DEPTH={child_depth}\n\
+         oaita run {inner}{cap}\n\
          oaita tail {inner}\n"
     )
 }
 
+/// One-line status per spawned sub-agent of `outer` — appended to every
+/// `ask` and `shell` tool result so the model can see at a glance which
+/// sub-agents are pending, resumable, or already resolved. Empty string
+/// when nothing has been spawned yet (no `=== sub-agents ===` header in
+/// that case — avoids noise on the very first turn).
+fn format_sub_agent_status(outer: &str) -> String {
+    let kids = spawned_by(outer);
+    if kids.is_empty() { return String::new(); }
+    let mut rows: Vec<String> = vec!["=== sub-agents ===".to_string()];
+    for inner in &kids {
+        let resolved = already_resolved(outer, inner);
+        let settled = session_settled(inner);
+        let status = if resolved {
+            "resolved (apply/reject/delete already called)"
+        } else if settled {
+            "settled — resolve with apply(target=ID)/reject(target=ID)/\
+             delete(session=ID)"
+        } else {
+            // Not resolved, not settled — either still running OR
+            // stopped on its own cap. Either way, follow_up resumes it.
+            "resumable — `ask(follow_up=ID, request=\"...\", max_steps=N)` \
+             to continue"
+        };
+        rows.push(format!("  {inner}: {status}"));
+    }
+    format!("\n\n{}", rows.join("\n"))
+}
+
+/// Parse the session name out of a budget-exhausted error string.
+/// `oaita run` surfaces "oaita: run: upstream 503 Service Unavailable:
+/// budget exhausted at session \"X\" ...". We pull X back out so the
+/// caller can compare it to its own session id (the model-set-cap
+/// case) vs an ancestor.
+fn budget_exhausted_session(text: &str) -> Option<String> {
+    let i = text.find("budget exhausted at session ")?;
+    let rest = &text[i + "budget exhausted at session ".len()..];
+    // The session is quoted: "X". Find the closing quote.
+    let rest = rest.trim_start_matches('"');
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
 fn format_act_result(r: &ExecResult, inner: &str) -> String {
+    // Budget exhausted? Two shapes:
+    //   * `at session <inner>` — the model-set ask cap on THIS
+    //     sub-agent fired. The parent's pool is still alive; the
+    //     parent can react (resume via follow_up + max_steps, or
+    //     move on). Surface the resume gesture.
+    //   * `at session <ancestor>` — an ANCESTOR ran out. The parent's
+    //     own next gen will fire the same 503, so the parent isn't
+    //     going to act on the result. We just pass through without a
+    //     resume nudge — the model never sees this anyway because the
+    //     parent driver exits on its own 503 immediately after.
+    if let Some(exhausted_at) = budget_exhausted_session(&r.text) {
+        if exhausted_at == inner {
+            let mut text = String::new();
+            text.push_str(&format!(
+                "[sub-agent session id: {inner} — pass this as `target` \
+                 to apply/reject/delete]\n\
+                 [stopped: sub-agent hit its own max_steps cap. Box \
+                 preserved. To grant more turns and continue: \
+                 `ask(follow_up={inner:?}, request=\"...\", \
+                 max_steps=N)`]\n\n"));
+            text.push_str(&r.text);
+            return text;
+        }
+    }
     // The header puts the SESSION ID front and centre — that's what
     // apply/reject/delete want. The box-name form (OAITA-…) was a
     // double-prefix trap when included naively; dispatch_box_resolve now
@@ -961,7 +1057,8 @@ fn dispatch_shell(args: &Value, target: &str, executor: Option<&dyn Executor>,
     // Plain shell tool calls: no API proxy access (the script is user code,
     // not an oaita sub-agent). Cf. dispatch_act which sets api_access=true.
     let r = exe.run(&box_name(target), &script, discard, /*api_access=*/false);
-    r.text + &crate::oaita::hints::append(turns, &["shell"])
+    r.text + &format_sub_agent_status(target)
+        + &crate::oaita::hints::append(turns, &["shell"])
 }
 
 fn dispatch_inspect(args: &Value, target: &str, executor: Option<&dyn Executor>,
