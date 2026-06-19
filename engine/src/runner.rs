@@ -1,8 +1,10 @@
 // The box runner, ported to Rust (the ECHO/capture mux is a follow-on).
 // Supports NESTED launch: a `run` invoked inside a running box reaches the
-// engine via the socket bind-mounted at UI_SOCK_INBOX, registers with a
-// `relname` + its own pidfd (so the engine derives the enclosing box from the
-// /proc ancestry), and roots bwrap on the parent-exposed /<KIDS_DIR>/<id>.
+// engine by dialing the FD broker (SARUN_BROKER abstract UDS, served by the
+// parent inner), which hands back a fresh engine conn via SCM_RIGHTS; it
+// registers with a `relname` + its own pidfd (so the engine derives the
+// enclosing box from the /proc ancestry), and roots bwrap on the
+// parent-exposed /<KIDS_DIR>/<id>.
 // Two subcommands of the sarun-engine binary:
 //   run [NAME] -- CMD   host side: register the box with the engine, then bwrap
 //                       CMD onto the box's overlay root, exec'ing `inner`.
@@ -364,27 +366,38 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
     // --capture to inner when the ack confirms capture is active.
     let capture_on = want_capture
         && ack.get("capture").and_then(Value::as_bool).unwrap_or(false);
-    // Bind the engine binary into the box at a fixed path and exec --inner
-    // from THAT path, not from the host path. The host path happens to
-    // resolve through a regular box's lower-chain fall-through to host,
-    // but a `--no-parent` box has no fall-through — without this bind,
-    // bwrap fails with execvp ENOENT on the engine. /run/sarun/ is the
-    // engine's tenancy inside the box — it's a bwrap-private tmpfs (see
-    // the --tmpfs line below) so this bind and any other engine-injected
-    // file there are isolated from the overlay.
-    let inner_exe = "/run/sarun/engine";
+    // Ferry the engine binary into the box as an INHERITED fd and exec it as
+    // /proc/self/fd/N (fexecve-style) — no bind mount, no /run/sarun tmpfs. A
+    // bind needed an engine-owned mountpoint under the box root, and that tmpfs
+    // can't be planted on a closed OCI rootfs whose /run is a FUSE-synthesized
+    // dir (the mount fails ENOENT and the box never starts). The fd rides into
+    // bwrap with CLOEXEC cleared (exactly like the box-channel fd), and /proc is
+    // mounted (--proc /proc), so /proc/self/fd/N resolves to the engine at the
+    // moment bwrap exec's it — a regular box AND a closed `--no-parent` box both
+    // start, with nothing engine-owned bound inside the box.
+    let bin_fd = unsafe {
+        libc::open(
+            std::ffi::CString::new(self_exe.as_bytes()).unwrap().as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC)
+    };
+    if bin_fd < 0 {
+        eprintln!("sarun-engine: open engine binary {self_exe}: {}",
+                  std::io::Error::last_os_error());
+        return 1;
+    }
+    clear_cloexec(bin_fd);
+    let inner_exe = format!("/proc/self/fd/{bin_fd}");
     let mut inner_args: Vec<&str> = vec![
-        inner_exe, "inner", "--conn-fd", &fd_s];
+        inner_exe.as_str(), "inner", "--conn-fd", &fd_s];
     if capture_on { inner_args.push("--capture"); }
     // PTY needs the capture sink files to record into; if the engine declined
     // capture (-d) there is nothing to PTY into, so gate --pty on capture_on.
     if pty && capture_on { inner_args.push("--pty"); }
     // -b brush likewise needs the capture sinks to record provenance + writes.
     if brush && capture_on { inner_args.push("--brush"); }
-    // --api flag passes through to inner so it knows to serve the in-box
-    // /run/sarun/api.sock UDS, framing each accepted client as FRAME_API_*
-    // on the existing box-channel. One conn per box (the channel itself),
-    // no second host UDS, attribution is implicit.
+    // --api passes through to inner so an in-box `oaita` client knows to reach
+    // the engine's LLM proxy by dialing the FD broker (SARUN_BROKER abstract
+    // UDS) per call — no in-box socket node, no host UDS, attribution implicit.
     if api_on { inner_args.push("--api"); }
     inner_args.push("--");
     let mut bwrap = Command::new("bwrap");
@@ -417,13 +430,16 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
     } else {
         bwrap.args(["--tmpfs", "/tmp"]);
     }
-    // /run/sarun belongs to the engine — the inner-served api.sock and the
-    // No bwrap binds for the engine binary — `/run/sarun/engine` (the
-    // inner-exec path, universal) and `/usr/local/bin/{oaita,sarun}`
-    // (the --api PATH targets) are served via the FUSE overlay shadow
-    // (see overlay::is_engine_shadow_path). Same mechanism the brush
-    // shim uses for /bin/sh: no bwrap bind, no tmpfs at /run/sarun, no
-    // host-path leakage into the mount namespace.
+    // No bwrap binds for the engine binary, no /run/sarun tmpfs. Two
+    // complementary mechanisms, each where it fits best:
+    //   * The runner exec's `inner` from the inherited fd at /proc/self/fd/N
+    //     (see above). That path is ALWAYS reachable, so a closed OCI rootfs
+    //     (no /run to traverse) starts without depending on any in-box path.
+    //   * The conventional paths are still SERVED for in-box callers that want
+    //     the engine by name — `/run/sarun/engine` universally and
+    //     `/usr/local/bin/{oaita,sarun}` for --api boxes — via the FUSE overlay
+    //     shadow (overlay::is_engine_shadow_path), the same mechanism the brush
+    //     /bin/sh shim uses. Convenient when present; the runner never needs it.
     // FD broker: pick a per-box abstract-UDS name and propagate it to
     // the inner AND every child process via --setenv. The inner binds it
     // (inner_broker_serve), in-box clients dial it (broker_dial). Keying
