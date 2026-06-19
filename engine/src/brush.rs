@@ -197,88 +197,128 @@ fn with_fd_redirected<R>(
     Ok(r)
 }
 
-/// When the per-util gate refuses an argv (or a pipe context forces it), fall
-/// through to the host binary instead of running uutils. `std::process::Command`
-/// PATH-looks up `name` and fork+execs it.
+/// When the per-util gate refuses an argv (or this is a concurrent pipeline
+/// stage), fall through to the host binary instead of running uutils.
+/// `std::process::Command` PATH-looks up `name` and fork+execs it.
 ///
-/// CRITICAL: we wire the brush context's stdin/stdout/stderr ONTO THE CHILD via
-/// `Command::stdin/stdout/stderr`, which dup2's them post-fork/pre-exec IN THE
-/// CHILD. We do NOT touch THIS process's fd table. The earlier implementation
-/// used `with_fd_redirected` — a PROCESS-WIDE `dup2` around `cmd.status()` — and
-/// that races a pipeline: this wrapper runs on a tokio spawn_blocking worker
-/// while brush spawns the sibling stages on the main thread, so while fd 1 was
-/// transiently the downstream pipe's write end, a just-forked downstream stage
-/// (e.g. `sed`, whose stdout is the pipeline's INHERITED fd 1 and is therefore
-/// never re-redirected) inherited that write end as its own fd 1 — reading its
-/// own output, never seeing EOF (the configure/make hang). Per-child wiring has
-/// no such window. Where the brush OpenFile is absent for an fd we leave the
-/// child inheriting this process's fd (the box sink). Returns the child's exit
-/// code (low 8 bits); on PATH-lookup failure returns 127, matching POSIX
-/// `command not found` semantics.
+/// FD INHERITANCE — match bash exactly. `fds` is the command's full execution
+/// context fd table (brush's `iter_fds`: its 0/1/2 plus any `exec 3<…`-style
+/// persistent fds, minus overrides). The child must inherit EXACTLY those fds at
+/// those numbers — the same set bash hands an external command — and NOTHING
+/// else. We must close everything else because brush treats this coreutil as an
+/// IN-PROCESS builtin: it keeps the pipeline's other pipe fds (and assorted
+/// engine fds) open in THIS process and never runs its own stray-fd-closing path
+/// (compose_std_command's `sarun_close_stray_fds`) for our fork. A leaked pipe
+/// WRITE end would leave a downstream stage's `read()` blocked forever (the
+/// configure/make hang; `echo a | cat | cat` reproduces it).
+///
+/// This process's fd table is never mutated — fd 0/1/2 are wired onto the child
+/// by `Command` (which dup2's post-fork and closes its own copies after spawn)
+/// and any fd >= 3 is dup2'd into the child by a pre_exec closure — so it is safe
+/// to run on a spawn_blocking worker concurrently with brush spawning the sibling
+/// stages. Each forwarded fd is pre-duplicated CLOEXEC so a sibling can't inherit
+/// the copy and the originals are untouched. Returns the child's exit code (low 8
+/// bits); on PATH-lookup failure returns 127 (POSIX not-found).
 fn run_coreutil_external(
     name: &str,
     argv: &[OsString],
     in_: &Option<brush_core::openfiles::OpenFile>,
     out: &Option<brush_core::openfiles::OpenFile>,
     err: &Option<brush_core::openfiles::OpenFile>,
+    extra_fds: &[(i32, brush_core::openfiles::OpenFile)],
 ) -> i32 {
-    // Turn a brush OpenFile into a Stdio for the child WITHOUT mutating this
-    // process's fds. We duplicate the raw fd so the original brush fd stays open
-    // after Command consumes (and closes) its copy; if the OpenFile has no raw
-    // fd (an in-memory stream) we return None and let the child inherit.
-    fn child_stdio(of: &Option<brush_core::openfiles::OpenFile>) -> Option<std::process::Stdio> {
-        let of = of.as_ref()?;
+    // CLOEXEC duplicate of an OpenFile's raw fd (>= `min`), or None if it has no
+    // raw fd (an in-memory stream — not forwardable to an external process; does
+    // not arise for box capture where every std fd is a real file/pipe). CLOEXEC
+    // so a concurrently-forked SIBLING stage can't inherit the copy and so it
+    // self-closes at our own child's exec.
+    fn cloexec_dup(of: &brush_core::openfiles::OpenFile, min: i32) -> Option<i32> {
         let borrowed = of.try_borrow_as_fd().ok()?;
-        // F_DUPFD_CLOEXEC (not plain dup): the duplicate MUST be close-on-exec.
-        // A bare dup clears CLOEXEC, leaving a stray write-end of a pipeline
-        // pipe in THIS process until Command consumes it — and a sibling stage
-        // (e.g. a brush-spawned `sed`) forked concurrently would inherit that
-        // write end and never see EOF (the `tr | sed` hang). With CLOEXEC the
-        // duplicate is auto-closed in any child's exec; Command still dup2's it
-        // onto the target child's fd 0/1/2 first (that copy is correctly
-        // non-CLOEXEC), so the wired stdio is unaffected.
-        let dup = unsafe { libc::fcntl(borrowed.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
-        if dup < 0 { return None; }
-        Some(unsafe { std::process::Stdio::from_raw_fd(dup) })
+        let copy = unsafe { libc::fcntl(borrowed.as_raw_fd(), libc::F_DUPFD_CLOEXEC, min) };
+        if copy < 0 { None } else { Some(copy) }
     }
+
+    // Forwarded fd-3+ copies must live ABOVE the highest such dest, so a child
+    // dup2 never clobbers a source still pending (and so the std 0/1/2 copies and
+    // these don't collide). For the common coreutil (only 0/1/2) `base` is 3.
+    let max_extra = extra_fds.iter().map(|(d, _)| *d).max().unwrap_or(2);
+    let base = max_extra + 1;
+
     let mut cmd = std::process::Command::new(name);
     // argv[0] is the command name (uumain convention); skip it. Command sets
     // argv[0] automatically from the program path it spawns.
     if argv.len() > 1 {
         cmd.args(&argv[1..]);
     }
-    if let Some(s) = child_stdio(in_)  { cmd.stdin(s); }
-    if let Some(s) = child_stdio(out)  { cmd.stdout(s); }
-    if let Some(s) = child_stdio(err)  { cmd.stderr(s); }
 
-    // Close every inherited fd > 2 in the child. brush treats this coreutil as
-    // an IN-PROCESS builtin, so it keeps the pipeline's pipe fds open in the
-    // parent (for the sibling stages) and never runs its own CLOEXEC-clearing /
-    // stray-fd-closing path (compose_std_command's sarun_close_stray_fds) for
-    // us. Without this, a 3+-stage pipeline's later external stage inherits a
-    // stray copy of an upstream pipe's WRITE end and the downstream `read()`
-    // never sees EOF — `echo a | cat | cat` (and configure/make pipelines) hang.
-    // Command wires stdio (fd 0/1/2) BEFORE running pre_exec closures, so it is
-    // safe to drop everything from fd 3 up. close_range is a single
-    // async-signal-safe syscall with no allocation (cf. walking /proc/self/fd).
+    // fd 0/1/2 → Command::stdin/stdout/stderr. Command dup2's these onto the
+    // child's 0/1/2 post-fork/pre-exec and CLOSES its own copies after spawn — so
+    // nothing leaks into THIS process's fd table and a concurrently-spawned
+    // sibling can't inherit a transient redirect (the path that fixes the
+    // `tr | sed` / `cat | cat` pipeline hangs). Absent OpenFile → child inherits
+    // this process's fd (the box sink), matching bash for an unredirected std fd.
+    if let Some(of) = in_  { if let Some(c) = cloexec_dup(of, base) { cmd.stdin(unsafe { std::process::Stdio::from_raw_fd(c) }); } }
+    if let Some(of) = out  { if let Some(c) = cloexec_dup(of, base) { cmd.stdout(unsafe { std::process::Stdio::from_raw_fd(c) }); } }
+    if let Some(of) = err  { if let Some(c) = cloexec_dup(of, base) { cmd.stderr(unsafe { std::process::Stdio::from_raw_fd(c) }); } }
+
+    // fd >= 3 → forwarded explicitly (an `exec 3<file`-style redirection that
+    // bash WOULD pass on). Command can only wire 0/1/2, so these are dup2'd into
+    // place by a pre_exec closure. `extras` is empty for the overwhelmingly
+    // common coreutil (just 0/1/2), in which case the pre_exec only closes strays.
+    let mut extras: Vec<(i32, i32)> = Vec::new();
+    for (dest, of) in extra_fds {
+        if let Some(copy) = cloexec_dup(of, base) {
+            extras.push((*dest, copy));
+        }
+    }
+    // Parent-side copies to release after spawn (the 0/1/2 Stdio copies are
+    // closed by Command itself; only the `extras` copies are ours to free).
+    let extra_copies: Vec<i32> = extras.iter().map(|(_, c)| *c).collect();
+    let mut extra_dests: Vec<i32> = extras.iter().map(|(d, _)| *d).collect();
+    extra_dests.sort_unstable();
+
+    // Close every inherited fd >= 3 in the child EXCEPT the forwarded `extras`.
+    // brush treats this coreutil as an in-process builtin, so it keeps the
+    // pipeline's other pipe fds (and engine fds) open in THIS process and never
+    // runs its own stray-fd closer (compose_std_command's sarun_close_stray_fds)
+    // for our fork; a leaked pipe WRITE end would block a downstream `read()`
+    // forever (the configure/make hang). Command wires 0/1/2 BEFORE pre_exec, so
+    // it is safe to touch only fd 3 and up here. close_range is one
+    // async-signal-safe syscall, no allocation (cf. walking /proc/self/fd).
     #[cfg(target_os = "linux")]
     unsafe {
         use std::os::unix::process::CommandExt;
-        cmd.pre_exec(|| {
-            // close_range(2) isn't exposed by libc for this target, so call it
-            // raw. flags=0; ignore the result (best-effort, EBADF/ENOSYS are
-            // harmless). Args are u32 fd bounds widened to the syscall's c_long.
-            libc::syscall(libc::SYS_close_range, 3 as libc::c_uint, libc::c_uint::MAX, 0);
+        cmd.pre_exec(move || {
+            for &(dest, src) in &extras {
+                libc::dup2(src, dest);
+            }
+            // Walk the gaps around the (sorted) forwarded dests, closing the rest.
+            // SYS_close_range raw: libc doesn't expose close_range for this
+            // target. Errors (EBADF/ENOSYS) are harmless and ignored.
+            let mut lo: i32 = 3;
+            for &d in &extra_dests {
+                if d > lo {
+                    libc::syscall(libc::SYS_close_range, lo as libc::c_uint, (d - 1) as libc::c_uint, 0);
+                }
+                lo = d + 1;
+            }
+            libc::syscall(libc::SYS_close_range, lo as libc::c_uint, libc::c_uint::MAX, 0);
             Ok(())
         });
     }
-    match cmd.status() {
+
+    let r = match cmd.status() {
         Ok(s) => s.code().unwrap_or(127),
         Err(e) => {
             eprintln!("/bin/sh: line 1: {name}: command not found ({e})");
             127
         }
+    };
+    // Release our parent-side extra copies (the child dup2'd & exec'd already).
+    for c in extra_copies {
+        unsafe { libc::close(c); }
     }
+    r
 }
 
 impl brush_core::builtins::SimpleCommand for CoreutilWrapper {
@@ -319,9 +359,6 @@ impl brush_core::builtins::SimpleCommand for CoreutilWrapper {
         // agent audits them and writes a tighter gate (see
         // brush_gates.rs's module-level docs).
         let gate = crate::brush_gates::gate_for(&name);
-        let in_ = context.try_fd(0);
-        let out = context.try_fd(1);
-        let err = context.try_fd(2);
 
         // sarun: CONCURRENT-PIPELINE-STAGE guard. The in-process uumain path below
         // points the PROCESS's real fd 0/1/2 at the brush OpenFiles via
@@ -338,21 +375,31 @@ impl brush_core::builtins::SimpleCommand for CoreutilWrapper {
         // which wires the child's fds without mutating this process's fd table. We
         // OR with the gate so a pipeline stage shells out even if its gate is true.
         if context.spawned_pipeline_stage || !gate(&argv) {
+            // Hand the child EXACTLY the command's fd table (bash-equivalent
+            // inheritance), nothing more: std 0/1/2 via try_fd, plus any fd >= 3
+            // the command's redirections opened (`exec 3<file`, …).
+            let in_ = context.try_fd(0);
+            let out = context.try_fd(1);
+            let err = context.try_fd(2);
+            let extras: Vec<(i32, brush_core::openfiles::OpenFile)> =
+                context.iter_fds().filter(|(fd, _)| *fd >= 3).collect();
             return Ok(brush_core::results::ExecutionResult::new(
-                (run_coreutil_external(&name, &argv, &in_, &out, &err) & 0xff) as u8,
+                (run_coreutil_external(&name, &argv, &in_, &out, &err, &extras) & 0xff) as u8,
             ));
         }
 
-        // Resolve the brush context's stdin/stdout/stderr OpenFiles so we can
-        // point the PROCESS's real fd 0/1/2 at them around the uumain call — a
+        // In-process uumain path (gate said true AND not a concurrent pipeline
+        // stage). Resolve the brush context's stdin/stdout/stderr OpenFiles so we
+        // can point the PROCESS's real fd 0/1/2 at them around the uumain call — a
         // uutils uumain reads/writes the real fds, ignoring brush's OpenFiles.
-        // ShellFd is i32; 0/1/2 are the well-known std fds. ALL THREE matter: a
-        // coreutil in a PIPE has stdin = the upstream pipe (fd 0, e.g. `… | sort`)
-        // and/or stdout = the downstream pipe (fd 1); a `> file` redirect makes
-        // stdout a File. Where the OpenFile already maps to the same fd (the
-        // common Stdout==1 / Stderr==2 / Stdin==0 sink case) with_fd_redirected
-        // is a no-op; where it is a pipe/File it dup2's around the call.
-        // (in_/out/err were resolved above the gate check.)
+        // Where the OpenFile already maps to the same fd (the common
+        // Stdout==1 / Stderr==2 / Stdin==0 sink case) with_fd_redirected is a
+        // no-op; where it is a File (`> file`) it dup2's around the call. This
+        // path only handles 0/1/2 (uutils uses no other fds); pipe stages and any
+        // exec-3<… cases already went external above with full fd inheritance.
+        let in_ = context.try_fd(0);
+        let out = context.try_fd(1);
+        let err = context.try_fd(2);
 
         // Redirect fd N to `of` (if present) around `run`; map a redirect failure
         // to a visible message + exit 1. Returns the uumain exit code.
