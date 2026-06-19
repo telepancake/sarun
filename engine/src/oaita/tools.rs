@@ -5,7 +5,7 @@
 // (apply/reject/backtrack — fixed templates, never free-form).
 //
 // The seven rows match the Python prototype (oaita branch):
-//   act       — recursive sub-agent (the meta-tool; processes in BOXES, not
+//   ask       — recursive sub-agent (the meta-tool; processes in BOXES, not
 //               in-process recursion); exhausted form at MAX_DEPTH
 //   shell     — sh -c SCRIPT in the persistent box (or throwaway if discard=true)
 //   inspect   — paged structure of the thing at `path` (cursor-keyed)
@@ -16,12 +16,12 @@
 
 use serde_json::{json, Value};
 
-pub const META_TOOL_NAME: &str = "act";
+pub const META_TOOL_NAME: &str = "ask";
 pub const DEFAULT_CAPABILITIES: &str =
     "general assistance (shell, inspect, delegation)";
 
-/// Delegation depth cap — a top-level conversation is depth 0; each `act`
-/// sub-agent is one deeper. Past it `act` stays VISIBLE in the schema but
+/// Delegation depth cap — a top-level conversation is depth 0; each `ask`
+/// sub-agent is one deeper. Past it `ask` stays VISIBLE in the schema but
 /// returns "too deep" so the model is told the capability exists, just
 /// exhausted, and does the work itself instead of spinning.
 pub fn max_depth() -> u32 {
@@ -70,32 +70,36 @@ fn act_spec(capabilities: &str, exhausted: bool) -> ToolSpec {
          will return 'too deep' — so just do the task yourself.".to_string()
     } else {
         format!(
-            "Use this to DELEGATE A SUB-TASK to a fresh sub-agent — one \
-             whose intermediate reasoning will NOT clutter your own \
-             context. The sub-agent runs in its own sandbox, uses its \
-             own tool calls, and returns one clean result text plus a \
-             summary of any file changes it staged. \
+            "ASK A SUB-AGENT to do something for you. Your context is \
+             SHORT — every byte of intermediate thinking you do here is \
+             a byte you don't have for the next move. `ask` sends the \
+             noisy work to a fresh sub-agent whose multi-step \
+             exploration stays in ITS conversation, not yours. You get \
+             back ONE clean result text plus a list of files it staged. \
+             The grind happens elsewhere; you see only the answer. \
              \
-             Best for: tasks whose intermediate steps would crowd your \
-             context (multi-step exploration, build-and-test loops, \
-             pattern-search across many files), tasks you want to try \
-             multiple variants of (kick off several `act`s with different \
-             requests), or tasks whose result is small but whose work is \
-             large. \
+             Use it for: anything multi-step (build-and-test loops, \
+             pattern-search across files, debugging cycles), anything \
+             you want to try \
+             several variants of (issue several `ask`s in the same \
+             assistant turn, each one with a different `request` — they \
+             run as independent sub-agents), or tasks whose result is \
+             small but whose work is large. If you can't fit the task's \
+             intermediate state in your head, don't fit it in your \
+             context — ask. \
              \
-             AFTER the sub-agent returns, you MUST resolve its box by \
-             calling exactly one of: `apply(target=<id>)` to commit its \
-             staged file changes, `reject(target=<id>)` to discard the \
-             changes but keep the result text, or `delete(session=<id>)` \
-             when the result was already incorporated and nothing more \
-             is needed. The harness will announce unresolved sub-agents \
-             at the start of each of your turns; leaving them unhandled \
-             keeps boxes alive. \
+             AFTER the sub-agent returns, resolve its box: \
+             `apply(target=<id>)` keeps its files, \
+             `reject(target=<id>)` tosses the files but keeps the result \
+             text, `delete(session=<id>)` drops both. Unresolved \
+             sub-agents are announced to you at the start of each turn. \
              \
-             Put a natural-language description in `request` and any \
-             input data in `data`. Your capabilities: {capabilities}. To \
-             continue an EARLIER sub-agent (turn-based follow-up instead \
-             of a fresh one), set `follow_up` to that call's turn-id.")
+             To CONTINUE a previous sub-agent (its context persists), \
+             set `follow_up` to that earlier `ask` call's turn-id — \
+             you'll address the same sub-agent again. \
+             \
+             Put the natural-language request in `request` and any \
+             input data in `data`. Your capabilities are: {capabilities}.")
     };
     ToolSpec {
         name: META_TOOL_NAME,
@@ -104,11 +108,11 @@ fn act_spec(capabilities: &str, exhausted: bool) -> ToolSpec {
             "type": "object",
             "properties": {
                 "request": {"type": "string",
-                            "description": "Natural-language description of what you want done."},
+                            "description": "What you want the sub-agent to do, in natural language."},
                 "data":    {"type": "string",
-                            "description": "Any data or payload the request operates on."},
+                            "description": "Input data the sub-agent operates on (optional)."},
                 "follow_up": {"type": "string",
-                              "description": "Turn-id of a previous `act` call to continue as a follow-up."},
+                              "description": "To address an existing sub-agent again, pass that earlier `ask` call's turn-id."},
             },
             "required": ["request"],
         }),
@@ -278,20 +282,20 @@ fn apply_spec() -> ToolSpec {
     ToolSpec {
         name: "apply",
         description:
-            "Call this AFTER a successful `act` to commit the sub-agent's \
+            "Call this AFTER a successful `ask` to commit the sub-agent's \
              work. The sub-agent ran in its own sandbox box; its file \
              writes are STAGED there, not yet folded into your plane. \
-             apply takes the change summary you saw in the act result \
+             apply takes the change summary you saw in the ask result \
              and merges every staged file into your conversation's \
              working state, then removes the box. \
              \
              ALWAYS review the change summary in the sub-agent's result \
              turn before applying — once applied you cannot un-apply. \
              If the staged changes look wrong: call `reject` instead, or \
-             call `act` again to fix them in a new sub-agent. \
+             call `ask` again to fix them in a new sub-agent. \
              \
              `target` is the sub-agent's session id — find it as the \
-             `from` field on the act result turn (`{\"turn-id\":\"...\", \
+             `from` field on the ask result turn (`{\"turn-id\":\"...\", \
              \"from\":\"<target>\"}` header).".to_string(),
         parameters: json!({
             "type": "object",
@@ -311,7 +315,7 @@ fn reject_spec() -> ToolSpec {
             "Call this when a sub-agent's STAGED FILE CHANGES are wrong \
              or unwanted, but its RESULT TEXT is still useful. Discards \
              everything the sub-agent's sandbox box accumulated and \
-             removes the box — but the act tool result stays in your \
+             removes the box — but the ask tool result stays in your \
              conversation for reasoning. Use this when the model wrote \
              experimental files you don't want to keep, or wrote to the \
              wrong paths, but its conclusion is still meaningful. \
@@ -321,7 +325,7 @@ fn reject_spec() -> ToolSpec {
              instead. \
              \
              `target` is the sub-agent's session id — find it as the \
-             `from` field on the act result turn.".to_string(),
+             `from` field on the ask result turn.".to_string(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -357,7 +361,7 @@ fn backtrack_spec() -> ToolSpec {
              top of each turn in your context. The rewind point itself \
              is PRESERVED by default (inclusive=false); pass \
              inclusive=true to discard it too. User-role turns (the \
-             original question; `act` delegation seeds) are immutable \
+             original question; `ask` delegation seeds) are immutable \
              and the harness rejects any backtrack that would erase one. \
              \
              You cannot use this to edit your CALLER's context — only \
@@ -410,7 +414,7 @@ fn delete_spec() -> ToolSpec {
 }
 
 /// The v1 tool rows — keyed by name so the dispatcher can resolve a call.
-/// `depth` (this context's delegation depth) flattens `act` to its exhausted
+/// `depth` (this context's delegation depth) flattens `ask` to its exhausted
 /// form at `MAX_DEPTH` — the row stays so the model sees the capability, but
 /// a call returns "too deep".
 pub fn tool_registry(capabilities: Option<&str>, depth: u32)

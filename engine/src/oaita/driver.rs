@@ -352,7 +352,7 @@ fn rescue_content_tool_call(body: &str) -> Option<AssembledToolCall> {
     let tool = obj.get("tool").and_then(Value::as_str)?;
     // Only rescue tools we actually dispatch — `tool` could legitimately
     // appear in a free-form answer that happens to be JSON.
-    if !matches!(tool, "act" | "shell" | "inspect" | "read" | "write" |
+    if !matches!(tool, "ask" | "shell" | "inspect" | "read" | "write" |
                        "apply" | "reject" | "backtrack" | "delete") {
         return None;
     }
@@ -393,35 +393,101 @@ fn assemble_tool_calls(acc: &mut Vec<AssembledToolCall>, frags: &[Value]) {
 /// "shell + python" reflex even for tasks where inspect/read/backtrack
 /// are the correct gesture.
 const HARNESS_GUIDE: &str = "\
-You are running inside the oaita harness. You have specialised tools — \
-use them in preference to the shell+python defaults you might reach for \
-otherwise.
+You are running on a model with VERY LIMITED USABLE CONTEXT. Every byte \
+you keep in this conversation is a byte you don't have for the next \
+move. Two consequences:
 
-PREFER:
-- `inspect` for filesystem browsing, file structure, line-number listings, \
-  staged change sets — anything you'd normally do with ls/find/head/cat-n. \
-  inspect is paged with a cursor protocol; read the footer.
-- `read` for quoting file contents verbatim — instead of `shell` + `cat`/`sed`/`awk`.
-- `act` to delegate sub-tasks whose intermediate steps would clutter your \
-  context. The sub-agent runs in its own sandbox; you only see the result \
-  and a change summary.
-- `backtrack(final=true)` to SHIP YOUR ANSWER cleanly — don't just emit \
-  prose at the end of a messy derivation. Backtrack to the original \
-  question and plant your clean answer in place. The settled \
-  conversation should read `<question> → <clean-answer>` with the \
-  derivation purged.
+1. DELEGATE noisy work. `ask` sends a sub-task to a sub-agent running \
+   in its own conversation. The sub-agent's intermediate steps stay in \
+   ITS context, not yours. You see one clean result plus a list of \
+   files it staged.
 
-USE SHELL FOR ACTIONS: building, compiling, installing, running tests, \
-invoking binaries — things that need a real process. Do NOT use shell \
-just to `cat` or `ls` something.
+2. CURATE this conversation. You can write notes inline as an \
+   assistant turn — a running TODO, a result table you're building, a \
+   list of files you've examined. The conversation IS your workspace; \
+   you don't need scratch files for this. Then collapse stale \
+   derivation via `backtrack` once the bits you need are in your \
+   notes.
 
-AFTER `act` returns, ALWAYS resolve the sub-agent's box: `apply` to \
-commit its staged file changes, `reject` to discard them, or `delete` if \
-its result has been fully incorporated. Unresolved sub-agents are \
-announced to you at the start of each turn — handle them before settling.
+The tools, with concrete examples.
 
-You can use any tool. Pick the one that best matches the gesture, not \
-the one most familiar from training.
+ASKING A SUB-AGENT
+
+    ask(request=\"Implement a 512-point FFT in pure Bash. Write \
+                 fft.sh, validate with a Python reference, save \
+                 the validator as validate.py.\")
+
+You get back:
+
+    [sub-agent session id: kxabc — pass this as `target` to apply/reject/delete]
+    Implementation done. Validates within 1e-9 tolerance.
+    === changes ===
+    root/fft.sh: +234 -0
+    root/validate.py: +89 -0
+
+To keep its files:    apply(target=\"kxabc\")
+To toss its files but keep the result text:  reject(target=\"kxabc\")
+To drop both:         delete(session=\"kxabc\")
+
+MULTIPLE INDEPENDENT SUB-TASKS — issue several `ask`s in the SAME \
+assistant turn; each runs in its own sub-agent:
+
+    ask(request=\"Implement bubble sort in pure Bash, save as sort_bubble.sh\")
+    ask(request=\"Implement insertion sort in pure Bash, save as sort_insertion.sh\")
+    ask(request=\"Implement quicksort in pure Bash, save as sort_quick.sh\")
+
+Three sub-agents work in parallel; you see only the three small results.
+
+FOLLOWING UP on an earlier sub-agent (keeps its context, addresses the \
+same agent):
+
+    ask(request=\"Now also benchmark fft.sh against numpy's FFT.\", \
+        follow_up=\"kxabc\")
+
+READING + EDITING in YOUR own context (no sub-agent):
+
+    inspect(path=\"/root/fft.sh\")              # paged structure
+    read(path=\"/root/fft.sh lines 40..60\")    # exact bytes for quoting
+    write(path=\"/root/fft.sh lines 50..50\", content=\"set -x\\n\")
+
+RUNNING actions in your persistent box (compile, test, run binaries):
+
+    shell(script=\"cd /root && bash fft.sh < nums.txt > out.txt\")
+
+NOTE-TAKING — write an assistant turn with no tool call. The text \
+becomes part of your context; the next gen sees it. Use this for a \
+running TODO, intermediate findings, file inventories. Example:
+
+    Notes so far:
+      - fft.sh    : working, validates to 1e-9
+      - bench     : 23ms (mine) vs 0.8ms (numpy)
+      - TODO      : try radix-4 variant
+      - applied   : kxabc, mzdee
+      - rejected  : qrwwt (wrong /tmp paths)
+
+SHIPPING the final answer cleanly (collapses derivation; the settled \
+conversation reads `<question> → <your answer>` with the messy \
+middle gone):
+
+    backtrack(turn_id=\"<the-original-user-turn-id>\", final=true, \
+              summary=\"The pure-Bash FFT matches numpy within 1e-9. \
+                       Code in fft.sh, validator in validate.py.\")
+
+COMPRESSING a dead-end mid-run (you keep going from the rewound state):
+
+    backtrack(turn_id=\"<the-branch's-first-turn-id>\", final=false, \
+              summary=\"Tried radix-4 — bash arithmetic precision too \
+                       coarse. Sticking with radix-2.\")
+
+RULES
+
+- USE SHELL FOR ACTIONS (build/compile/install/run/test). Do NOT use \
+  shell to `cat` or `ls` something — that's inspect/read's job.
+- AFTER `ask` returns, ALWAYS resolve its box (apply / reject / \
+  delete). Unresolved sub-agents are announced at the start of each \
+  turn — handle them before you settle.
+- Pick the tool that matches the gesture, not the one most familiar \
+  from training.
 ";
 
 // ── announcements & sub-agent cleanup ───────────────────────────────────────
@@ -555,14 +621,14 @@ fn backtrack_behavioural_announcement(target: &str) -> Option<String> {
     if errs >= 2 {
         let tid = first_user_id.as_deref().unwrap_or("<first-user-turn-id>");
         let used = used_tools_so_far(&turns);
-        let candidates = ["act", "inspect", "read", "shell", "write"];
+        let candidates = ["ask", "inspect", "read", "shell", "write"];
         let unused: Vec<&str> = candidates.iter().copied()
             .filter(|n| !used.contains(*n)).collect();
         let mut parts: Vec<String> = Vec::new();
         for t in &unused {
             let blurb = match *t {
-                "act" => "act(request=…) — delegate a fresh attempt to a \
-                          sub-agent that starts in a clean box",
+                "ask" => "ask(request=…) — send the task to a sub-agent \
+                          that works in its own conversation",
                 "inspect" => "inspect(path=…) — paged structural view of a \
                               file or directory",
                 "read" => "read(path=…) — byte-faithful slice of a file",
@@ -782,7 +848,7 @@ fn parse_call_envelope(content: &str) -> Result<(String, Value), String> {
 fn dispatch(tool: &str, arguments: &Value, target: &str, set: &Settings,
             executor: Option<&dyn Executor>, turns: &[Turn]) -> String {
     match tool {
-        "act" => dispatch_act(arguments, target, set, executor),
+        "ask" => dispatch_act(arguments, target, set, executor),
         "shell" => dispatch_shell(arguments, target, executor, turns),
         "inspect" => dispatch_inspect(arguments, target, executor, turns),
         "read" => dispatch_read(arguments, target, executor, turns),
@@ -805,10 +871,10 @@ fn args_bool(v: &Value, k: &str) -> bool {
 fn dispatch_act(args: &Value, outer: &str, set: &Settings,
                 executor: Option<&dyn Executor>) -> String {
     if set.depth >= crate::oaita::tools::max_depth() {
-        return "act: too deep — do the task yourself".to_string();
+        return "ask: too deep — do the task yourself".to_string();
     }
     let Some(request) = args_str(args, "request") else {
-        return "act: missing required `request`".to_string();
+        return "ask: missing required `request`".to_string();
     };
     let data = args_str(args, "data").unwrap_or_default();
     let follow_up = args_str(args, "follow_up").unwrap_or_default();
@@ -844,7 +910,7 @@ fn dispatch_act(args: &Value, outer: &str, set: &Settings,
     let dotted = format!("{outer_box}.{inner_box}");
     let script = act_script(&inner, set.depth + 1);
     let Some(exe) = executor else {
-        return "act: no executor (sandbox disabled) — cannot delegate".to_string();
+        return "ask: no executor (sandbox disabled) — cannot delegate".to_string();
     };
     // Make sure the parent box exists FIRST: dotted-name register errors
     // if the prefix segment can't be resolved (see control.rs:644). One
