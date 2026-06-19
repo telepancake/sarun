@@ -27,7 +27,26 @@ use crate::paths;
 /// The host control socket, bind-mounted read-only into every box at this fixed
 /// path so a NESTED runner (one launched inside a running box) can reach the
 /// engine. Path-presence is the sole in-box signal — no env var.
-const UI_SOCK_INBOX: &str = "/tmp/.slopbox/ui.sock";
+// Bound by bwrap as the in-box mirror of the engine's host control socket.
+// /tmp is now an --api-box symlink (see Overlay::resolve) and bwrap can't
+// create a bind destination under a symlink — so this lives under /run/
+// sarun/, outside /tmp. Host runners use the filesystem path or the
+// abstract socket; in-box runners go through this bind. -n boxes (private
+// netns) lose the abstract path but still reach the engine through this
+// bind, so the control channel survives netns unsharing.
+const UI_SOCK_INBOX: &str = "/run/sarun/ui.sock";
+
+/// Helper: dial the engine's abstract Unix socket (no filesystem). The name
+/// matches `crate::control::abstract_name(sock_path)` — `sarun:<path>`.
+/// Reachable only inside the same netns the engine is running in; in-box
+/// callers that unshared netns fall through to the filesystem path at
+/// UI_SOCK_INBOX.
+pub fn abstract_connect(sock: &std::path::Path) -> std::io::Result<UnixStream> {
+    use std::os::linux::net::SocketAddrExt;
+    let name = crate::control::abstract_name(sock);
+    let addr = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes())?;
+    UnixStream::connect_addr(&addr)
+}
 const KIDS_DIR: &str = ".slopbox-kids";
 
 /// Standard CA bundle paths the augmented bundle is bound over. Distro
@@ -215,12 +234,19 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
     let want_capture = (!passthrough && !direct) || (pty && !direct)
         || (brush && !direct);
     // IN-BOX vs HOST: a nested runner reaches the engine via the socket
-    // bind-mounted at UI_SOCK_INBOX; a top-level runner uses the host socket.
-    // Pure path-presence, no env var (mirrors the Python runner).
+    // bind-mounted at UI_SOCK_INBOX (works regardless of netns sharing —
+    // -n boxes with private netns still reach the engine through this
+    // bind). A top-level runner uses the host filesystem socket OR the
+    // abstract socket; abstract is preferred for speed but the filesystem
+    // path is the long-term contract for host UIs.
     let in_box = std::path::Path::new(UI_SOCK_INBOX).exists();
     let sock = if in_box { std::path::PathBuf::from(UI_SOCK_INBOX) }
                else { paths::sock_path() };
-    let conn = match UnixStream::connect(&sock) {
+    let conn = match (if in_box {
+        UnixStream::connect(&sock)
+    } else {
+        abstract_connect(&sock).or_else(|_| UnixStream::connect(&sock))
+    }) {
         Ok(c) => c,
         Err(_) => {
             eprintln!("sarun-engine: no engine running (control socket {}).",
@@ -273,6 +299,7 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
     }
     let mount = ack.get("mount").and_then(Value::as_str).unwrap_or("").to_string();
     let sid = ack.get("session_id").and_then(Value::as_str).unwrap_or("?").to_string();
+    let box_name_str = ack.get("name").and_then(Value::as_str).unwrap_or("").to_string();
     // Pulled up so `inner_args` (built earlier) can pass `--api` straight
     // to the inner; the later `--api` block re-uses this same value.
     let api_on = ack.get("api").and_then(Value::as_bool).unwrap_or(false);
@@ -339,8 +366,9 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
     // CAP_SYS_ADMIN over inside its own userns — no ambient caps needed.
     let root_src = if in_box { format!("/{KIDS_DIR}/{sid}") } else { mount.clone() };
     // Forward the engine socket into the box at the fixed inbox path so a
-    // DEEPER nested runner can reach the engine. Bound after --tmpfs /tmp so it
-    // lands on the tmpfs (bwrap creates the parent dir).
+    // DEEPER nested runner can reach the engine. Lives under /run/sarun/
+    // rather than under /tmp (the /tmp redirect for --api boxes would
+    // collide with bwrap's bind destination there).
     let sock_src = if in_box { UI_SOCK_INBOX.to_string() }
                    else { paths::sock_path().to_string_lossy().into_owned() };
     let fd_s = fd.to_string();
@@ -354,7 +382,11 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
     // host, but a `--no-parent` box has no fall-through — without this bind,
     // bwrap fails with execvp ENOENT on the engine. The bind is harmless for
     // ordinary boxes (a redundant ro-bind onto the already-resolvable path).
-    let inner_exe = "/tmp/.slopbox/engine";
+    // Moved out of /tmp for the same reason ui.sock did — /tmp is a
+    // per-box symlink in --api boxes (Overlay::resolve's substitute) and
+    // bwrap can't create bind destinations inside a symlink. /run/sarun/
+    // is the new tenancy for engine-injected paths.
+    let inner_exe = "/run/sarun/engine";
     let mut inner_args: Vec<&str> = vec![
         inner_exe, "inner", "--conn-fd", &fd_s];
     if capture_on { inner_args.push("--capture"); }
@@ -372,9 +404,34 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
     let mut bwrap = Command::new("bwrap");
     bwrap.args(["--bind", &root_src, "/",
                 "--proc", "/proc", "--dev", "/dev",
-                "--ro-bind-try", "/sys", "/sys",
-                "--tmpfs", "/tmp",
-                "--ro-bind", &sock_src, UI_SOCK_INBOX,
+                "--ro-bind-try", "/sys", "/sys"]);
+    // /tmp policy: non-api boxes get the bwrap-private tmpfs (clean
+    // isolation, but nothing written there ever reaches the overlay —
+    // apply/inspect can't see it, the model's strongest write-target
+    // prior becomes a black hole). For oaita `--api` boxes we instead
+    // symlink /tmp at a per-box dir under oaita's state home: writes
+    // resolve into the box's regular overlay coverage so they stage
+    // for review, survive apply, sit alongside the session's other
+    // context for parent inspect, and discard rolls them back with
+    // the rest of the box state. The directory is precreated and
+    // 0700; nothing here is visible to other boxes.
+    if api_on {
+        // The overlay (Overlay::resolve) presents /tmp as a symlink to a
+        // per-box host dir under oaita's state home for --api boxes.
+        // Precreate the target so the very first /tmp lookup resolves to
+        // an extant directory; bwrap inherits the symlink from the FUSE
+        // (no --tmpfs needed and no --symlink either — the FS layer below
+        // does the substitution).
+        let key = sid.to_string();
+        let p = crate::paths::oaita_state_home().join(".tmp").join(&key);
+        let _ = std::fs::create_dir_all(&p);
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&p,
+            std::fs::Permissions::from_mode(0o700));
+    } else {
+        bwrap.args(["--tmpfs", "/tmp"]);
+    }
+    bwrap.args(["--ro-bind", &sock_src, UI_SOCK_INBOX,
                 "--ro-bind", &self_exe, inner_exe]);
     // D9 follow-on — NESTED shell IS brush (brush boxes, capture on only).
     // We shadow the box's /bin/sh, /bin/bash (and /usr/bin/{sh,bash}) with the

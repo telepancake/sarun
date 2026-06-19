@@ -130,11 +130,11 @@ fn serve() -> i32 {
         .enable_all().worker_threads(2).build()
         .map(|rt| { let h = rt.handle().clone(); Box::leak(Box::new(rt)); h });
     if let Ok(h) = net_rt { state.lock().unwrap().net_rt = Some(h); }
-    // oaita API proxy: consolidated onto the existing control socket. An
-    // `--api` box's in-box oaita client dials /tmp/.slopbox/ui.sock (the
-    // same UDS the box-channel uses), sends a one-line `{"type":"api_proxy"}`
-    // upgrade, and from there speaks plain HTTP/1.1; control.rs hands the
-    // connection to `proxy::serve_one_conn`. The Proxy registry on shared
+    // oaita API proxy: now lives as FRAME_API_OPEN/DATA/CLOSE on the
+    // existing box-channel. The in-box runner serves /run/sarun/api.sock
+    // inside the box and tunnels each accepted connection as logical
+    // streams over the same UDS its register handshake rides on. The
+    // Proxy registry on shared
     // state still tracks --api-enabled boxes, holds the upstream config,
     // and logs into each box's api_log sqlar table. No second host UDS;
     // nothing to bind-mount; nested-act delegations work because the
