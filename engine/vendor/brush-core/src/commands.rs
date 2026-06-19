@@ -40,6 +40,16 @@ pub struct ExecutionContext<'a, SE: ShellExtensions = extensions::DefaultShellEx
     pub command_name: String,
     /// The parameters for the execution.
     pub params: ExecutionParameters,
+    /// sarun (NOT upstream brush): true when this command is being run as a
+    /// SEPARATELY-SPAWNED pipeline stage — i.e. via the OwnedShell +
+    /// `tokio::task::spawn_blocking` path (`execute_via_builtin_in_owned_shell`),
+    /// which runs CONCURRENTLY with the spawning of its sibling stages. A
+    /// builtin that mutates this process's fd table (sarun's CoreutilWrapper
+    /// dup2's around an in-process uutils call) must NOT do so on this path, or a
+    /// concurrently-forked sibling stage inherits the transient redirect. False
+    /// for a stand-alone command and the lastpipe tail (both run in the parent
+    /// shell, never concurrently). Plain builtins ignore it.
+    pub spawned_pipeline_stage: bool,
 }
 
 impl<SE: ShellExtensions> ExecutionContext<'_, SE> {
@@ -542,6 +552,9 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
                 shell: &mut shell,
                 command_name,
                 params,
+                // This builtin runs on its own spawn_blocking worker,
+                // concurrently with the spawn of the pipeline's other stages.
+                spawned_pipeline_stage: true,
             };
 
             let rt = tokio::runtime::Handle::current();
@@ -567,6 +580,9 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
             shell: &mut shell,
             command_name: self.command_name,
             params: self.params,
+            // Parent-shell path: a stand-alone command or the lastpipe tail —
+            // run inline, never concurrently with a sibling spawn.
+            spawned_pipeline_stage: false,
         };
 
         let result = execute_builtin_command(&builtin, cmd_context, self.args).await;
@@ -594,6 +610,7 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
             shell: &mut shell,
             command_name: self.command_name,
             params: self.params,
+            spawned_pipeline_stage: false,
         };
 
         // Strip the function name off args.
@@ -620,6 +637,7 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
             shell: &mut shell,
             command_name: self.command_name,
             params: self.params,
+            spawned_pipeline_stage: false,
         };
 
         let resolved_path = path.to_string_lossy();
