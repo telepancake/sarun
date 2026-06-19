@@ -19,6 +19,7 @@ pub use net::NetMode;
 mod brush;
 mod brush_gates;
 mod capture;
+mod find_builtin;
 mod control;
 mod discover;
 // Dockerfile/Containerfile parser for `sarun oci build` / `oci run`. Lands
