@@ -944,7 +944,32 @@ fn dispatch_box_resolve(verb: &str, args: &Value) -> String {
     let r = std::process::Command::new(&sarun)
         .args([&inner_box, cmd]).output();
     match r {
-        Ok(o) if o.status.success() => format!("{verb}({inner_box}) ok"),
+        Ok(o) if o.status.success() => {
+            // Stdout looks like `OAITA-X: <count> apply` (or `discard`).
+            // Surface the count so the model knows whether anything
+            // actually landed — a bare "ok" misled past traces where
+            // the sub-agent's writes were under a bwrap-private path
+            // (e.g. /tmp) so the box captured nothing, apply reported
+            // zero, and the model assumed its sub-agent's work was
+            // present and went looking for it.
+            let out = String::from_utf8_lossy(&o.stdout);
+            let count = out.split_whitespace()
+                .find_map(|w| w.parse::<usize>().ok())
+                .unwrap_or(usize::MAX);
+            match (verb, count) {
+                ("apply", 0) => format!(
+                    "apply({inner_box}): 0 changes — the sub-agent's box \
+                     captured no writes. Common cause: the sub-agent wrote \
+                     under /tmp (a bwrap-private tmpfs the overlay doesn't \
+                     capture) or under another transient path. Use \
+                     /root/… or /home/… for changes that survive apply."),
+                ("apply", n) if n != usize::MAX => format!(
+                    "apply({inner_box}): {n} file(s) folded into the parent."),
+                ("reject", n) if n != usize::MAX => format!(
+                    "reject({inner_box}): {n} staged change(s) discarded."),
+                _ => format!("{verb}({inner_box}) ok"),
+            }
+        }
         Ok(o) => format!("{verb}({inner_box}) failed: {}",
                          String::from_utf8_lossy(&o.stderr)),
         Err(e) => format!("{verb}: cannot run sarun: {e}"),
@@ -1059,5 +1084,13 @@ pub fn run_to_completion(spec: &str, set: &Settings,
         let mut r = generate(spec, set)?;
         produced.append(&mut r);
     }
+    // Exhaustion sweep: a non-settled run still leaves dangling sub-agent
+    // boxes alive (every `act` we spawned holds an OAITA-<INNER> box until
+    // either settled-or-here cleans up). Without this the kayxc-style orphan
+    // observed in mimo's trace persists across resumes and accumulates.
+    // Same `cleanup_spawned_subagents` call the settle path makes — it's
+    // idempotent and recurses through descendant sweeps.
+    let target = target_segment(spec)?;
+    cleanup_spawned_subagents(&target);
     Err(format!("run: exhausted {max_steps} steps without settling"))
 }

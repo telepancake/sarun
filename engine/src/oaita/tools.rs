@@ -473,9 +473,21 @@ pub fn fit_output(output: &str, budget: usize) -> String {
 }
 
 /// Summarise a unified diff into per-file then per-dir then totals lines.
+/// True for paths that are oaita's internal scratch — a sub-agent's own
+/// turn files (its conversation state under {state_home}/slopbox/oaita/<sid>/)
+/// or its api log etc. We never want these in a change summary the model
+/// sees: they're transcripts of "the sub-agent did some stuff", not user-
+/// meaningful diffs, and they crowd out the real changes.
+fn is_oaita_internal_path(p: &str) -> bool {
+    // Path is patch-format-relative — no leading slash. Catch both XDG
+    // (.local/state/slopbox/oaita) and the legacy /run path. Pre-stripped
+    // a/ b/ already by the time we get here.
+    p.contains("slopbox/oaita/") || p.contains("slopbox/runtime/")
+}
+
 pub fn summarize_patch(patch: &str, budget: usize) -> String {
-    if patch.len() <= budget { return patch.to_string(); }
-    // Per-file +/- summary.
+    // Per-file +/- summary. Parse first so we can filter scratch paths
+    // BEFORE the budget check decides whether to abbreviate.
     let mut files: Vec<(String, usize, usize)> = Vec::new(); // (path, +, -)
     let mut cur_path: Option<String> = None;
     let mut adds = 0usize;
@@ -485,7 +497,9 @@ pub fn summarize_patch(patch: &str, budget: usize) -> String {
     let push_cur = |files: &mut Vec<(String, usize, usize)>,
                     cur: &mut Option<String>, a: &mut usize, d: &mut usize| {
         if let Some(p) = cur.take() {
-            files.push((p, *a, *d));
+            if !is_oaita_internal_path(&p) {
+                files.push((p, *a, *d));
+            }
             *a = 0; *d = 0;
         }
     };
@@ -494,12 +508,21 @@ pub fn summarize_patch(patch: &str, budget: usize) -> String {
             push_cur(&mut files, &mut cur_path, &mut adds, &mut dels);
             cur_path = Some(rest.to_string());
         } else if line.starts_with("+") && !line.starts_with("+++") {
-            adds += 1; total_adds += 1;
+            adds += 1;
+            if !cur_path.as_deref().is_some_and(is_oaita_internal_path) {
+                total_adds += 1;
+            }
         } else if line.starts_with("-") && !line.starts_with("---") {
-            dels += 1; total_dels += 1;
+            dels += 1;
+            if !cur_path.as_deref().is_some_and(is_oaita_internal_path) {
+                total_dels += 1;
+            }
         }
     }
     push_cur(&mut files, &mut cur_path, &mut adds, &mut dels);
+    if files.is_empty() {
+        return "(no user-visible file changes)".to_string();
+    }
     // Try the per-file rendering first.
     let mut per_file: Vec<String> = files.iter()
         .map(|(p, a, d)| format!("{p}: +{a} -{d}"))
