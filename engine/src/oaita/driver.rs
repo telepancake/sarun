@@ -136,39 +136,27 @@ pub fn generate(spec: &str, set: &Settings) -> Result<Vec<PathBuf>, String> {
             "content": note,
         }));
     }
-    // Behavioural nudge — APPENDED to the most recent past assistant text
-    // message, not pushed as a new trailing turn. Two reasons:
-    //
-    //   1. Some providers (verified: xiaomi/mimo-v2.5) silently strip a
-    //      trailing assistant message from the input — their chat template
-    //      treats it as a prefill they don't support, or merges it away.
-    //      A canary probe ("begin your next reply with ACK-NUDGE-…")
-    //      delivered as a trailing assistant message reached ds4-flash but
-    //      vanished into mimo. Appending into an EARLIER assistant message
-    //      keeps it inside the conversation history past any trailing-
-    //      message stripping.
-    //
-    //   2. The note then reads as something the model already said — same
-    //      "puppet the model's own voice" property, without the brittle
-    //      template path. We skip when there isn't a normal-text assistant
-    //      message to append to (very early in the run); the announcement
-    //      requires n_tool >= 3 anyway, so by the time it fires there's
-    //      almost always such a turn.
-    //
-    // Wording: short, parenthetical, "Note to self" framing — informational,
-    // not directive. Avoid pre-commit language that a high-compliance model
-    // (mimo) might execute as a closing gesture.
+    // Behavioural nudge — INJECTED AS A USER TURN with an explicit
+    // "Automated harness notification:" prefix. Two earlier attempts didn't
+    // work out:
+    //   * `role: "system"` — strong-prior models (ds4-flash) ignored it.
+    //   * `role: "assistant"` (trailing or appended to a past turn) —
+    //     mimo's reasoning trace called it "a weird hidden instruction"
+    //     and refused to act on it; the puppet-your-own-voice trick
+    //     reads as a prompt-injection attempt.
+    // A labelled user message is honest about WHO is talking (the harness),
+    // doesn't trigger the prompt-injection refusal path, and reaches every
+    // provider's chat template intact. Trailing user is the normal "model
+    // generates an assistant reply next" position — no template edge cases.
     if let Some(note) = backtrack_behavioural_announcement(&target) {
-        // Rate-limit. The note is ephemeral (lives only in this one
-        // request — the model's reply doesn't echo it back into a turn
-        // file), so without a stamp we'd re-inject it every gen the
-        // conditions hold, and the model would see the SAME boilerplate
-        // appended to its history every other turn. That trains a
-        // pattern the model can latch onto and derails generation
-        // ("oh, the conversation rhythm includes this note — I should
-        // emit one too"). One announcement per ~5-turn window is plenty.
+        // Rate-limit. Without a stamp we'd re-inject the same notification
+        // every gen the conditions hold, and the model would see the same
+        // boilerplate every other turn. Once per ~5-turn window is enough.
         if announcement_rate_limit_ok(&target) {
-            attach_note_to_recent_assistant(&mut messages, &note);
+            messages.push(serde_json::json!({
+                "role": "user",
+                "content": format!("Automated harness notification: {note}"),
+            }));
             record_announcement(&target);
         }
     }
@@ -553,24 +541,22 @@ fn backtrack_behavioural_announcement(target: &str) -> Option<String> {
         let content = t.read().unwrap_or_default();
         if tool_result_looks_failed(&content) { errs += 1; } else { cleans += 1; }
     }
-    // Productive: 3+ recent tool results all clean. Short marginalia, no
-    // pre-commit ("I'll do that now"), no urgency. Just remind the model
-    // that backtrack(final=true) is the closing gesture if it has the
-    // answer.
+    // Productive: 3+ recent tool results all clean. Neutral status line
+    // plus the closing-gesture form, factual, no urgency.
     if cleans >= 3 && errs == 0 && recent_tools.len() >= 3 {
         let tid = first_user_id.as_deref().unwrap_or("<first-user-turn-id>");
         return Some(format!(
-            "(Note to self: recent tool calls have been clean. If I already \
-             have the answer I was after, `backtrack(turn_id={tid:?}, \
-             inclusive=false, final=true, summary=<answer>)` ships it and \
-             collapses the derivation.)"
+            "the last {n} tool calls returned without error markers. \
+             If you have the answer the original request asked for, the \
+             closing gesture is `backtrack(turn_id={tid:?}, inclusive=false, \
+             final=true, summary=<answer>)` — it ships the summary and \
+             collapses the intermediate derivation.",
+            n = cleans,
         ));
     }
-    // Errors piling up: don't suggest "stepping back" — that reads as a
-    // closing gesture to high-compliance models and can induce empty-stop
-    // bailouts. Instead, list options the model hasn't tried yet (fresh
-    // levers) plus the backtrack variants as factual moves. Marginalia
-    // framing, never directive. No "I'll do that now."
+    // Errors piling up: list tools NOT used yet (factual inventory) plus
+    // both backtrack variants. No suggestion to "step back" — just an
+    // enumeration of available levers.
     if errs >= 2 {
         let tid = first_user_id.as_deref().unwrap_or("<first-user-turn-id>");
         let used = used_tools_so_far(&turns);
@@ -580,25 +566,32 @@ fn backtrack_behavioural_announcement(target: &str) -> Option<String> {
         let mut parts: Vec<String> = Vec::new();
         for t in &unused {
             let blurb = match *t {
-                "act" => "act(request=…) (delegate a fresh attempt to a \
-                          sub-agent that starts clean)",
-                "inspect" => "inspect(path=…) (paged structural view)",
-                "read" => "read(path=…) (byte-faithful slice)",
-                "shell" => "shell(script=…) (run a script in the box)",
-                "write" => "write(path=…, content=…) (overlay write)",
+                "act" => "act(request=…) — delegate a fresh attempt to a \
+                          sub-agent that starts in a clean box",
+                "inspect" => "inspect(path=…) — paged structural view of a \
+                              file or directory",
+                "read" => "read(path=…) — byte-faithful slice of a file",
+                "shell" => "shell(script=…) — run a script in this box",
+                "write" => "write(path=…, content=…) — overlay write to a \
+                            file or named range",
                 _ => continue,
             };
             parts.push(blurb.to_string());
         }
         parts.push(format!(
             "backtrack(turn_id={tid:?}, inclusive=false, final=false, \
-             summary=…) (compress to a waypoint and continue)"));
+             summary=…) — rewind to a clean state, keeping `summary` as a \
+             waypoint note"));
         parts.push(format!(
             "backtrack(turn_id={tid:?}, inclusive=false, final=true, \
-             summary=<answer>) (ship)"));
+             summary=<answer>) — ship; the harness collapses the session \
+             to {{question, summary}}"));
         return Some(format!(
-            "(Note to self: levers I haven't used yet, in case a different \
-             angle helps — {})", parts.join("; ")
+            "{errs} of the last {total} tool calls returned error markers. \
+             Available levers not yet used in this run, listed for \
+             reference:\n  • {bul}",
+            total = recent_tools.len(),
+            bul = parts.join("\n  • "),
         ));
     }
     None
@@ -626,31 +619,6 @@ fn record_announcement(target: &str) {
         .map(|t| t.number).max().unwrap_or(0);
     let stamp = crate::oaita::turns::session_dir(target).join(ANNOUNCEMENT_STAMP);
     let _ = std::fs::write(stamp, cur.to_string());
-}
-
-/// Append a marginalia note to the most recent assistant text message in
-/// `messages` (walking backwards). Skips messages whose content is null/
-/// missing (tool-call envelopes), and the final message if it's an assistant
-/// (so we don't recreate the trailing-message problem). When no carrier
-/// exists, the note is dropped — by the time the announcement fires there's
-/// almost always a past plain-text assistant turn to carry it.
-fn attach_note_to_recent_assistant(messages: &mut [Value], note: &str) {
-    // Don't touch the last message: if it's an assistant turn it would be
-    // trailing, which is the case we're avoiding.
-    if messages.len() < 2 { return; }
-    let end = messages.len() - 1;
-    for i in (0..end).rev() {
-        if messages[i].get("role").and_then(Value::as_str) != Some("assistant") {
-            continue;
-        }
-        // Need a non-null string content to splice into. Tool-call envelopes
-        // have content: null; skip those.
-        let Some(existing) = messages[i].get("content").and_then(Value::as_str)
-            .map(|s| s.to_string()) else { continue; };
-        let merged = format!("{existing}\n\n{note}");
-        messages[i]["content"] = Value::String(merged);
-        return;
-    }
 }
 
 /// Tool names the model has called in this session so far (used to compute
