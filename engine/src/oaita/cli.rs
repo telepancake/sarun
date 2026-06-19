@@ -146,12 +146,54 @@ fn cmd_run(args: &[String]) -> i32 {
                                        p.capabilities, p.tool_context.clone(),
                                        p.sarun.clone(), p.no_sandbox)
     { Ok(s) => s, Err(e) => { eprintln!("{e}"); return 1; } };
+    // Tell the engine this run is going to count against `p.name`'s pool
+    // AND set OAITA_SESSION so api.proxy conns the driver opens debit it.
+    // `--max-steps N` ADDS N to the session's pool (resume-friendly): a
+    // fresh session is 0 + N = N, a session being resumed gets its
+    // remainder + N.
+    let target = match crate::oaita::turns::target_segment(&p.name) {
+        Ok(t) => t, Err(e) => { eprintln!("{e}"); return 2; }
+    };
+    if let Err(e) = budget_grant_via_engine(&target, p.max_steps as i64) {
+        eprintln!("oaita: budget.grant: {e}");
+        return 1;
+    }
+    unsafe { std::env::set_var("OAITA_SESSION", &target); }
     let exe = build_executor(p.no_sandbox, p.sarun);
     let exe_ref: Option<&dyn crate::oaita::exec::Executor> = exe.as_deref();
-    match run_to_completion(&p.name, &set, exe_ref, p.max_steps) {
+    match run_to_completion(&p.name, &set, exe_ref) {
         Ok(paths) => report(&paths),
         Err(e) => { eprintln!("oaita: run: {e}"); 1 }
     }
+}
+
+/// Send a `budget.grant` RPC to the engine for THIS session. Uses the FD
+/// broker when in-box, the host filesystem socket otherwise — same dial
+/// dispatch as `oaita::exec::ctrl_rpc`.
+fn budget_grant_via_engine(session: &str, amount: i64) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+    let mut s = if let Ok(name) = std::env::var("SARUN_BROKER") {
+        if !name.is_empty() {
+            crate::runner::broker_dial(&name)
+                .map_err(|e| format!("broker dial: {e}"))?
+        } else {
+            UnixStream::connect(crate::paths::sock_path())
+                .map_err(|e| format!("connect: {e}"))?
+        }
+    } else {
+        UnixStream::connect(crate::paths::sock_path())
+            .map_err(|e| format!("connect: {e}"))?
+    };
+    let msg = serde_json::json!({
+        "type": "budget.grant", "session": session, "amount": amount });
+    s.write_all(format!("{msg}\n").as_bytes())
+        .map_err(|e| format!("write: {e}"))?;
+    let mut line = String::new();
+    use std::io::{BufRead, BufReader};
+    BufReader::new(&s).read_line(&mut line)
+        .map_err(|e| format!("read: {e}"))?;
+    Ok(())
 }
 
 fn cmd_tail(args: &[String]) -> i32 {

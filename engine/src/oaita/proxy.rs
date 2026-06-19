@@ -87,7 +87,8 @@ impl Proxy {
 /// as FRAME_API_DATA on the box-channel; the mux feeds those bytes into a
 /// duplex pipe whose far end is `io`. The box id is known a priori from
 /// the box-channel identity — no peer-pid walk needed.
-pub async fn serve_one_conn_for_box<IO>(proxy: Arc<Proxy>, box_id: i64, io: IO)
+pub async fn serve_one_conn_for_box<IO>(proxy: Arc<Proxy>, box_id: i64,
+                                        session: String, io: IO)
     -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     IO: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
@@ -95,9 +96,11 @@ where
     // Make sure the upstream config is loaded (idempotent on subsequent calls).
     proxy.reload_config().await;
     let proxy2 = proxy.clone();
+    let session = session.clone();
     let svc = service_fn(move |req| {
         let proxy = proxy2.clone();
-        async move { handle_inner(proxy, box_id, req).await }
+        let session = session.clone();
+        async move { handle_inner(proxy, box_id, session, req).await }
     });
     let _ = http1::Builder::new()
         .keep_alive(false)
@@ -108,7 +111,8 @@ where
 // peer-pid → box-id walking is gone — attribution is now intrinsic to the
 // box-channel the FRAME_API_* stream rides on.
 
-async fn handle_inner(proxy: Arc<Proxy>, box_id: i64, req: Request<Incoming>)
+async fn handle_inner(proxy: Arc<Proxy>, box_id: i64, session: String,
+                      req: Request<Incoming>)
     -> Result<Response<Body>, std::convert::Infallible>
 {
     // Box opt-in gate: even if a box gets the socket bound in by mistake, we
@@ -118,6 +122,20 @@ async fn handle_inner(proxy: Arc<Proxy>, box_id: i64, req: Request<Incoming>)
     if box_id == 0 || !proxy.is_enabled(box_id) {
         return Ok(error_resp(StatusCode::FORBIDDEN,
                              "this box was not launched with --api"));
+    }
+    // Budget: each LLM call costs one turn at `session` AND at every
+    // ancestor in its parent chain. The topmost ancestor with no
+    // remaining turns 503s its whole subtree — the model's driver
+    // sees the 503 and exits cleanly; the box stays alive in
+    // intermediate state, ready for resume via another
+    // `oaita run <session> --max-steps N`.
+    if !session.is_empty() {
+        if let Err(exhausted) = crate::oaita::budget::take_chain(&session) {
+            let body = format!("budget exhausted at session {exhausted:?} \
+                                — grant more turns via \
+                                `oaita run {exhausted} --max-steps N`");
+            return Ok(error_resp(StatusCode::SERVICE_UNAVAILABLE, &body));
+        }
     }
     let method = req.method().to_string();
     // Strip the box-side base path prefix (we set OPENAI_BASE_URL=…/v1 in the

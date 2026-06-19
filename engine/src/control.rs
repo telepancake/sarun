@@ -1698,31 +1698,42 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
         if msg.get("type").and_then(Value::as_str) == Some("api.proxy") {
             if let Some(fd) = peer_pidfd.take() { unsafe { libc::close(fd); } }
             let Some(box_id) = hint_box_id else { return; };
+            // `session` names the oaita session this call counts against.
+            // The proxy walks its parent chain to debit every ancestor and
+            // refuses (HTTP 503) when any ancestor's pool has hit zero.
+            let session = msg.get("session").and_then(Value::as_str)
+                .unwrap_or("").to_string();
             let (rt_opt, proxy_opt) = {
                 let s = state.lock().unwrap();
                 (s.net_rt.clone(), s.api_proxy.clone())
             };
             let (Some(rt), Some(proxy)) = (rt_opt, proxy_opt) else { return; };
-            // Any HTTP bytes the client wrote before we read the verb header
-            // (none under our protocol, but the client speaks HTTP on the
-            // remaining conn so we must include the BufReader's residual).
             let prebuffered = reader.buffer().to_vec();
             drop(reader);
-            // The conn is the std-blocking UnixStream `writer` — switch it
-            // to non-blocking + hand to tokio for hyper to serve HTTP on.
             if writer.set_nonblocking(true).is_err() { return; }
             let std_conn = writer;
             rt.spawn(async move {
                 let Ok(tokio_conn) =
                     tokio::net::UnixStream::from_std(std_conn) else { return; };
-                let io = if prebuffered.is_empty() {
-                    PrebufferedIo::new(tokio_conn, Vec::new())
-                } else {
-                    PrebufferedIo::new(tokio_conn, prebuffered)
-                };
+                let io = PrebufferedIo::new(tokio_conn, prebuffered);
                 let _ = crate::oaita::proxy::serve_one_conn_for_box(
-                    proxy, box_id, hyper_util::rt::TokioIo::new(io)).await;
+                    proxy, box_id, session,
+                    hyper_util::rt::TokioIo::new(io)).await;
             });
+            return;
+        }
+        // budget.grant: driver tells engine to add N turns to a session's
+        // pool. Additive — granting again on resume extends the pool.
+        if msg.get("type").and_then(Value::as_str) == Some("budget.grant") {
+            if let Some(fd) = peer_pidfd.take() { unsafe { libc::close(fd); } }
+            let session = msg.get("session").and_then(Value::as_str)
+                .unwrap_or("");
+            let amount = msg.get("amount").and_then(Value::as_i64)
+                .unwrap_or(0);
+            crate::oaita::budget::grant(session, amount);
+            let remaining = crate::oaita::budget::remaining(session);
+            let _ = writer.write_all(
+                format!("{{\"ok\":true,\"remaining\":{remaining}}}\n").as_bytes());
             return;
         }
         // The oaita API proxy lives on the existing box-channel as new

@@ -115,9 +115,17 @@ impl Client {
     }
 
     pub async fn post_raw(&self, path: &str, body: Value) -> Result<Bytes, String> {
-        let resp = self.send(path, body).await?;
-        let body = resp.into_body().collect().await
-            .map_err(|e| format!("read body: {e}"))?.to_bytes();
+        let mut resp = self.send(path, body).await?;
+        // Surface non-2xx (engine-side 503 from budget exhaustion;
+        // upstream 4xx/5xx) as Err so the driver loop can react instead
+        // of treating an error body as a model response.
+        let status = resp.status();
+        let body = resp.body_mut().collect().await
+            .map(|c| c.to_bytes()).unwrap_or_default();
+        if !status.is_success() {
+            let preview = String::from_utf8_lossy(&body[..body.len().min(2048)]);
+            return Err(format!("upstream {status}: {preview}"));
+        }
         Ok(body)
     }
 
@@ -215,7 +223,17 @@ impl Client {
                     .map_err(|e| format!("set_nonblocking: {e}"))?;
                 let mut stream = UnixStream::from_std(std_stream)
                     .map_err(|e| format!("from_std: {e}"))?;
-                stream.write_all(b"{\"type\":\"api.proxy\"}\n").await
+                // Include the session name so the engine can debit its
+                // turn budget chain. The session is in OAITA_SESSION env
+                // (set by the cli before run_to_completion); empty if the
+                // call is not from a session-bound oaita process (which
+                // means: no budget check — host tooling stays unmetered).
+                let session_env = std::env::var("OAITA_SESSION")
+                    .unwrap_or_default();
+                let header = format!(
+                    "{{\"type\":\"api.proxy\",\"session\":{}}}\n",
+                    serde_json::Value::String(session_env));
+                stream.write_all(header.as_bytes()).await
                     .map_err(|e| format!("api.proxy header: {e}"))?;
                 let (mut sender, conn) = hyper::client::conn::http1::handshake(
                     TokioIo::new(stream)).await
