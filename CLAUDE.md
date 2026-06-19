@@ -136,8 +136,11 @@ there is NO hardcoded venv. Takes a few minutes (real boxes).
 busybox, hello-world): pull/archive/layout → at-rest layer-box stack; run a
 container box on an image's top layer with its config (env/cmd/entrypoint/
 workdir/user); build a Dockerfile (FROM/RUN/COPY/ADD/ENV/ARG/WORKDIR/USER/CMD/
-ENTRYPOINT/LABEL/EXPOSE/VOLUME/SHELL, multi-stage, `-t`). Closed/minimal rootfs
-boots too — synthetic mount-target landing pads (`overlay.rs::is_synthetic_
+ENTRYPOINT/LABEL/EXPOSE/VOLUME/SHELL, multi-stage, `-t`). The proxied `Tap`
+default works *inside* a container too (verified live: a closed alpine box
+fetched example.com over both HTTP and HTTPS-through-MITM — DNS, TCP, and CA
+injection all through the engine's per-box netns, the box's only route out).
+Closed/minimal rootfs boots too — synthetic mount-target landing pads (`overlay.rs::is_synthetic_
 landing`, non-destructive via `chain_dir_has_children`), fd-exec of the inner
 shim (`runner.rs`, via `/proc/self/fd/N`), and the host-visibility cwd default
 (engine `no_host` ack). Regression net: `prototype/test_oci.py` (`make test-oci`)
@@ -146,9 +149,6 @@ synthesizes a scratch oci-archive in-test (rootfs = the static engine binary at
 including closed-rootfs boot and that COPY landed. **Delete a bullet below the
 moment it's done.**
 
-- [ ] **Tap default for OCI runs.** Every OCI run so far used `--net off`;
-  confirm the proxied `Tap` default works *inside* a container (DNS +
-  HTTPS-through-proxy) and fix the closed-rootfs/netns interaction if not.
 - [ ] **Image cache v2 — key on the manifest digest.** v1 is done:
   `resolve_image_top` → `find_loaded_by_reference` dedups `oci run <ref>` by the
   exact reference string, so a repeat run shares the loaded layer boxes (only
