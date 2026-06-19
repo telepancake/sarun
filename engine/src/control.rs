@@ -1634,6 +1634,97 @@ fn handle_pty_spawn(msg: &Value, writer: &mut UnixStream, prebuf: Vec<u8>) {
                           cwd.as_deref(), &env);
 }
 
+fn handle_api_proxy(state: &State, writer: UnixStream, prebuf: Vec<u8>) {
+    // Pull the tokio runtime + proxy registry off shared state. Both must be
+    // present (set up at serve() bootstrap); if not, decline gracefully.
+    let (rt, proxy) = {
+        let s = state.lock().unwrap();
+        (s.net_rt.clone(), s.api_proxy.clone())
+    };
+    let Some(rt) = rt else {
+        let _ = (&writer).write_all(b"HTTP/1.1 503 Service Unavailable\r\n\r\n");
+        return;
+    };
+    let Some(proxy) = proxy else {
+        let _ = (&writer).write_all(b"HTTP/1.1 503 Service Unavailable\r\n\r\n");
+        return;
+    };
+    // Sync std::os::unix::net::UnixStream → tokio::net::UnixStream. The
+    // proxy's serve_connection wants async I/O; flip nonblocking and hand
+    // it across.
+    if writer.set_nonblocking(true).is_err() { return; }
+    let peer_pid = peer_pid_of_std(&writer);
+    let tokio_conn = match tokio::net::UnixStream::from_std(writer) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    rt.spawn(async move {
+        // Prepend any HTTP bytes the client wrote after the upgrade JSON
+        // line — the BufReader peeked past `\n` and we'd lose them
+        // otherwise.
+        let io = hyper_util::rt::TokioIo::new(PrebufStream {
+            prebuf, pos: 0, inner: tokio_conn,
+        });
+        // The HTTP-server logic lives in oaita::proxy::serve_one_conn; that
+        // entry point boxes the per-connection auth, body parsing, streaming,
+        // and log_call work.
+        let _ = crate::oaita::proxy::serve_one_conn(proxy, peer_pid, io).await;
+    });
+}
+
+fn peer_pid_of_std(conn: &UnixStream) -> i32 {
+    use std::os::fd::AsRawFd;
+    let fd = conn.as_raw_fd();
+    let mut cred = libc::ucred { pid: 0, uid: 0, gid: 0 };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let ok = unsafe { libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_PEERCRED,
+        (&mut cred as *mut libc::ucred).cast(), &mut len) };
+    if ok == 0 { cred.pid } else { 0 }
+}
+
+/// AsyncRead/Write wrapper that yields a leading `prebuf` before the inner
+/// stream. Used to hand HTTP bytes the BufReader peeked past during the
+/// JSON-line upgrade to hyper without losing them.
+struct PrebufStream {
+    prebuf: Vec<u8>,
+    pos: usize,
+    inner: tokio::net::UnixStream,
+}
+
+impl tokio::io::AsyncRead for PrebufStream {
+    fn poll_read(mut self: std::pin::Pin<&mut Self>,
+                 cx: &mut std::task::Context<'_>,
+                 buf: &mut tokio::io::ReadBuf<'_>) -> std::task::Poll<std::io::Result<()>> {
+        if self.pos < self.prebuf.len() {
+            let take = (self.prebuf.len() - self.pos).min(buf.remaining());
+            let start = self.pos;
+            let end = start + take;
+            buf.put_slice(&self.prebuf[start..end]);
+            self.pos = end;
+            return std::task::Poll::Ready(Ok(()));
+        }
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for PrebufStream {
+    fn poll_write(mut self: std::pin::Pin<&mut Self>,
+                  cx: &mut std::task::Context<'_>,
+                  buf: &[u8]) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+    fn poll_flush(mut self: std::pin::Pin<&mut Self>,
+                  cx: &mut std::task::Context<'_>)
+                  -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: std::pin::Pin<&mut Self>,
+                     cx: &mut std::task::Context<'_>)
+                     -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
 fn handle(state: State, conn: UnixStream) {
     // The register handshake carries the runner's pidfd as the connection's
     // first SCM_RIGHTS fd; keep it for host-pid derivation + kill. It belongs
@@ -1671,6 +1762,22 @@ fn handle(state: State, conn: UnixStream) {
         if msg.get("type").and_then(Value::as_str) == Some("pty_spawn") {
             if let Some(fd) = peer_pidfd.take() { unsafe { libc::close(fd); } }
             handle_pty_spawn(&msg, &mut writer, reader.buffer().to_vec());
+            return;
+        }
+        // oaita API proxy upgrade: a box-internal `oaita` client dials the
+        // ui.sock and sends `{"type":"api_proxy"}` as its first line; from
+        // there the connection speaks plain HTTP/1.1 and is handed to the
+        // proxy handler. This consolidates the LLM-API path onto the ONE
+        // control socket — previously the engine bound a separate api.sock
+        // and bind-mounted it into each --api box, which broke for nested
+        // delegations (the host path isn't visible inside the outer box).
+        if msg.get("type").and_then(Value::as_str) == Some("api_proxy") {
+            if let Some(fd) = peer_pidfd.take() { unsafe { libc::close(fd); } }
+            // Reunite reader's buffered prefix with the writer half so we
+            // hand a single sequential byte stream to the proxy.
+            let prebuf = reader.buffer().to_vec();
+            drop(reader);
+            handle_api_proxy(&state, writer, prebuf);
             return;
         }
         let mut reply = if msg.get("type").and_then(Value::as_str) == Some("register") {

@@ -14,7 +14,6 @@
 // runner host pid (the same trick `derive_parent_box` uses in control.rs)
 // and that's the box. Unattributable → box_id=0.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -25,10 +24,8 @@ use hyper::body::{Frame, Incoming};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
-use hyper_util::rt::TokioIo;
 use serde_json::Value;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::net::UnixListener;
 use tokio::sync::Mutex;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
@@ -84,53 +81,28 @@ impl Proxy {
     }
 }
 
-/// Spawn the proxy on the engine's tokio runtime. Returns when the listener
-/// is bound (so callers can rely on the socket existing before they spawn
-/// boxes that bind-mount it). The accept loop runs forever.
-pub async fn serve(proxy: Arc<Proxy>, sock_path: PathBuf) -> std::io::Result<()> {
-    if sock_path.exists() { let _ = std::fs::remove_file(&sock_path); }
-    if let Some(parent) = sock_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let listener = UnixListener::bind(&sock_path)?;
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(&sock_path,
-        std::fs::Permissions::from_mode(0o600));
+/// Serve ONE proxy connection. Used by control.rs after the box-side oaita
+/// client sends `{"type":"api_proxy"}` on the existing ui.sock. `peer_pid`
+/// is the host-pid of the connecting client (SO_PEERCRED on the original
+/// std::os::unix::net::UnixStream BEFORE the tokio conversion); we walk it
+/// to a registered --api box for authorization.
+pub async fn serve_one_conn<IO>(proxy: Arc<Proxy>, peer_pid: i32, io: IO)
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    IO: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
+{
+    // Make sure the upstream config is loaded (idempotent on subsequent calls).
     proxy.reload_config().await;
-    tokio::spawn(async move {
-        loop {
-            match listener.accept().await {
-                Ok((conn, _)) => {
-                    let proxy = proxy.clone();
-                    let peer_pid = peer_pid_of(&conn);
-                    let attrib_box = box_id_for_peer(peer_pid);
-                    tokio::spawn(async move {
-                        let io = TokioIo::new(conn);
-                        let proxy2 = proxy.clone();
-                        let svc = service_fn(move |req| {
-                            let proxy = proxy2.clone();
-                            async move { handle_inner(proxy, attrib_box, req).await }
-                        });
-                        let _ = http1::Builder::new()
-                            .keep_alive(false)
-                            .serve_connection(io, svc).await;
-                    });
-                }
-                Err(e) => eprintln!("oaita-proxy: accept: {e}"),
-            }
-        }
+    let attrib_box = box_id_for_peer(peer_pid);
+    let proxy2 = proxy.clone();
+    let svc = service_fn(move |req| {
+        let proxy = proxy2.clone();
+        async move { handle_inner(proxy, attrib_box, req).await }
     });
+    let _ = http1::Builder::new()
+        .keep_alive(false)
+        .serve_connection(io, svc).await;
     Ok(())
-}
-
-fn peer_pid_of(conn: &tokio::net::UnixStream) -> i32 {
-    use std::os::fd::AsRawFd;
-    let fd = conn.as_raw_fd();
-    let mut cred = libc::ucred { pid: 0, uid: 0, gid: 0 };
-    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    let ok = unsafe { libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_PEERCRED,
-        (&mut cred as *mut libc::ucred).cast(), &mut len) };
-    if ok == 0 { cred.pid } else { 0 }
 }
 
 fn ppid_of(pid: i32) -> i32 {

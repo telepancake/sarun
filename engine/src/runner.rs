@@ -414,20 +414,20 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
             }
         }
     }
-    // --api: bind the engine's API proxy socket into the box and tell oaita
-    // to dial it (instead of phoning out directly). The engine has already
-    // marked this box's id as `--api`-enabled (see register handler) so the
-    // proxy will accept its connections; without that handshake a stray bind
-    // mount of api.sock would be refused at handle-time.
+    // --api: point the in-box oaita at the EXISTING ui.sock bind-mount
+    // (UI_SOCK_INBOX). It dials the same UDS the box-channel uses, sends a
+    // one-line `{"type":"api_proxy"}` upgrade, then speaks plain HTTP/1.1;
+    // the engine's control.rs accept loop routes it to oaita::proxy. No
+    // second host UDS, no per-box api.sock bind-mount — which means nested
+    // delegations work too (the outer box's bind of /tmp/.slopbox/ui.sock
+    // carries through every nested register that follows).
+    //
+    // The engine has already marked this box's id as `--api`-enabled (see
+    // register handler) so the proxy accepts its connections; a non-api
+    // box sending the upgrade gets the existing 403 from the handler.
     let api_on = ack.get("api").and_then(Value::as_bool).unwrap_or(false);
     if api_on {
-        let host_api = paths::api_sock_path();
-        let host_api_s = host_api.to_string_lossy().into_owned();
-        const IN_BOX_API: &str = "/run/sarun/api.sock";
-        // Bind-mounted: the box gets the host socket at IN_BOX_API. The
-        // parent dir /run/sarun is materialised by bwrap when we bind.
-        bwrap.args(["--ro-bind", &host_api_s, IN_BOX_API]);
-        bwrap.args(["--setenv", "OAITA_API_SOCK", IN_BOX_API]);
+        bwrap.args(["--setenv", "OAITA_API_SOCK", UI_SOCK_INBOX]);
         // The in-box oaita client also needs a base_url string to satisfy
         // its parser — anything non-empty works because the UDS endpoint
         // wins over it.
