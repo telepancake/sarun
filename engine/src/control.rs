@@ -2067,12 +2067,6 @@ pub fn cli_box_op(argv: &[String]) -> i32 {
 }
 
 pub fn serve(state: State, sock: &std::path::Path) -> std::io::Result<()> {
-    // Make sure host /run/sarun exists as a directory so each box's bwrap
-    // setup has somewhere to mount its private tmpfs onto for the
-    // ui.sock + engine-binary binds. Best-effort: a read-only /run on a
-    // weird host just means the tmpfs mount will fail later and shell
-    // calls will error visibly there — preferable to crashing the engine.
-    let _ = std::fs::create_dir_all("/run/sarun");
     let _ = std::fs::remove_file(sock);
     let listener = UnixListener::bind(sock)?;
     let mode = std::os::unix::fs::PermissionsExt::from_mode(0o600);

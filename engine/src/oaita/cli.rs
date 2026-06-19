@@ -148,53 +148,65 @@ fn cmd_call(args: &[String]) -> i32 {
 fn cmd_run(args: &[String]) -> i32 {
     let p = match parse(args) { Ok(p) => p, Err(e) => { eprintln!("{e}"); return 2; } };
     if p.name.is_empty() { eprintln!("run: missing NAME"); return 2; }
+    // OAITA_BOX is set by the sarun runner when --api is on. Presence
+    // means "we're inside a dedicated oaita box; run the driver
+    // directly". Absence means "we're a host shim — wrap ourselves in
+    // a fresh `sarun run --api OAITA-<NAME>` and re-exec inside it".
+    // Result: there is no host-side oaita driver process; the cli is
+    // either a thin spawner (host) or the loop body (in-box). Mirrors
+    // `sarun run -- cmd`: host process creates a box and runs the
+    // payload inside.
+    if std::env::var("OAITA_BOX").map(|s| s != "1").unwrap_or(true) {
+        return spawn_in_box(&p, args);
+    }
     let set = match Settings::resolve(p.model, p.base_url, p.api_key,
                                        p.capabilities, p.tool_context.clone(),
                                        p.sarun.clone(), p.no_sandbox)
     { Ok(s) => s, Err(e) => { eprintln!("{e}"); return 1; } };
-    // `--max-steps N` is an additive grant to the agent's persistent
-    // shell box (`OAITA-<UPPER>`). cli always grants — defaulting to
-    // DEFAULT_CLI_MAX_STEPS so a top-level run has a finite ceiling
-    // without the user remembering the flag. Sub-agent (ask) caps are
-    // the opposite — uncapped by default — because the model
-    // shouldn't have to invent a number for every delegation; the
-    // parent's chain is the natural cap.
-    //
-    // The box must exist before we can write to its sqlar meta. We
-    // materialize it with a no-op `sarun run BOX -- true` then issue
-    // the budget.grant verb naming the box.
-    let target = match crate::oaita::turns::target_segment(&p.name) {
-        Ok(t) => t, Err(e) => { eprintln!("{e}"); return 2; }
-    };
-    let exe = build_executor(p.no_sandbox, p.sarun.clone());
-    let target_box = crate::oaita::exec::box_name(&target);
-    let in_box = std::env::var("SARUN_BROKER").map(|s| !s.is_empty())
-        .unwrap_or(false);
-    if !in_box {
-        // Top-level: materialize the agent's persistent shell box so
-        // its sqlar exists for the budget meta write. Sub-agent
-        // invocations are in_box — their box already exists (the ask
-        // spawn created it) and the grant lands via the broker hint
-        // rather than by name.
-        if let Some(exe) = exe.as_deref() {
-            let _ = exe.run(&target_box, "true", /*discard=*/false,
-                            /*api_access=*/false);
-        }
-    }
+    // In-box driver: grant our pool from --max-steps (default
+    // DEFAULT_CLI_MAX_STEPS) using the broker hint as identity. The
+    // sub-agent ask path passes the explicit number via `--max-steps`
+    // on its act_script; top-level wrap passes the original user-
+    // supplied flag (or the default).
     let cli_grant = p.max_steps.map(|n| n as i64)
         .unwrap_or(DEFAULT_CLI_MAX_STEPS as i64);
-    // Top-level: name the box explicitly. In-box: leave name empty so
-    // the engine resolves it from the broker hint (THIS box). Same
-    // RPC either way, no branching on the grant itself.
-    let grant_target = if in_box { "" } else { target_box.as_str() };
-    if let Err(e) = budget_grant_via_engine(grant_target, cli_grant) {
+    if let Err(e) = budget_grant_via_engine("", cli_grant) {
         eprintln!("oaita: budget.grant: {e}");
         return 1;
     }
+    let exe = build_executor(p.no_sandbox, p.sarun);
     let exe_ref: Option<&dyn crate::oaita::exec::Executor> = exe.as_deref();
     match run_to_completion(&p.name, &set, exe_ref) {
         Ok(paths) => report(&paths),
         Err(e) => { eprintln!("oaita: run: {e}"); 1 }
+    }
+}
+
+/// Host-side `oaita run` shim. Materializes the agent's persistent
+/// `OAITA-<NAME>` box via the sarun engine binary, then re-execs the
+/// SAME oaita command inside it. The bwrap setup sets OAITA_BOX=1 so
+/// the inner invocation falls through to the driver loop.
+///
+/// In-box, `sarun` resolves through the box's PATH to the FUSE-
+/// shadowed /usr/local/bin/sarun (overlay::is_engine_shadow_path on
+/// --api boxes), so the nested command is the same engine binary the
+/// runner exec'd from /proc/self/fd/N — no bind mounts, no
+/// /run/sarun anything.
+fn spawn_in_box(p: &Parsed, original_args: &[String]) -> i32 {
+    let target = match crate::oaita::turns::target_segment(&p.name) {
+        Ok(t) => t, Err(e) => { eprintln!("{e}"); return 2; }
+    };
+    let target_box = crate::oaita::exec::box_name(&target);
+    let exe_path = std::env::current_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "sarun".to_string());
+    let mut cmd = std::process::Command::new(&exe_path);
+    cmd.arg("run").arg("--api").arg(&target_box).arg("--");
+    cmd.arg("sarun").arg("oaita").arg("run");
+    for a in original_args { cmd.arg(a); }
+    match cmd.status() {
+        Ok(s) => s.code().unwrap_or(1),
+        Err(e) => { eprintln!("oaita: spawn sarun: {e}"); 1 }
     }
 }
 

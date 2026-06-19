@@ -475,11 +475,11 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
     //   * The runner exec's `inner` from the inherited fd at /proc/self/fd/N
     //     (see above). That path is ALWAYS reachable, so a closed OCI rootfs
     //     (no /run to traverse) starts without depending on any in-box path.
-    //   * The conventional paths are still SERVED for in-box callers that want
-    //     the engine by name — `/run/sarun/engine` universally and
-    //     `/usr/local/bin/{oaita,sarun}` for --api boxes — via the FUSE overlay
-    //     shadow (overlay::is_engine_shadow_path), the same mechanism the brush
-    //     /bin/sh shim uses. Convenient when present; the runner never needs it.
+    //   * For --api boxes (oaita driver + sub-agents), the FUSE overlay
+    //     shadows /usr/local/bin/{oaita,sarun} so in-box PATH lookups for
+    //     `sarun` and `oaita` find the engine binary by name. Same mechanism
+    //     the brush /bin/sh shim uses. Non-api boxes get nothing — they
+    //     never need to invoke the engine by name from inside.
     // FD broker: pick a per-box abstract-UDS name and propagate it to
     // the inner AND every child process via --setenv. The inner binds it
     // (inner_broker_serve), in-box clients dial it (broker_dial). Keying
@@ -545,6 +545,14 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
         // (`/v1`) for outgoing HTTP request URLs. The host part is
         // irrelevant once `SARUN_BROKER` is set — the dial doesn't use it.
         bwrap.args(["--setenv", "OPENAI_BASE_URL", "http://oaita-proxy/v1"]);
+        // Marker that the in-box oaita cli reads to decide "we're in
+        // the right context, run the driver loop directly". When this
+        // is absent, `oaita run NAME` wraps itself with a fresh
+        // `sarun oaita NAME` (creating a dedicated --api box) before
+        // running the driver. Result: there is no host-side oaita
+        // driver process, only host-side oaita CLI shims that spawn
+        // boxes — same shape as `sarun run -- cmd`.
+        bwrap.args(["--setenv", "OAITA_BOX", "1"]);
         // /usr/local/bin/{oaita,sarun} are served by the FUSE overlay
         // for --api boxes (overlay::is_engine_shadow_path). No bwrap
         // binds — the kernel's PATH lookup goes through the FUSE,
