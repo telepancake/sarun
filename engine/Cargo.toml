@@ -95,3 +95,27 @@ tree-sitter = "0.25"
 tree-sitter-rust = "0.24"
 tree-sitter-python = "0.25"
 tree-sitter-bash = "0.25"
+
+# sarun: redirect crates.io brush-core 0.5.0 to our vendored copy, which
+# pins commit 428f477 (PR #1181) — the fd-leak fix for shell pipelines.
+# `brush-core 0.5.0` on crates.io clones `OpenFile` via dup, multiplying
+# fd table entries; some of those dups land on numbered fds that survive
+# fork+exec despite O_CLOEXEC (notably anything that goes through
+# `From<OpenFile> for Stdio`). The visible symptom: long pipelines (e.g.
+# autoconf-generated `./configure`) hang because child processes hold the
+# write end of their own stdin pipe, so the kernel never delivers EOF.
+# PR #1181 reworks OpenFile to wrap File/PipeReader/PipeWriter in Arc, so
+# clone is a refcount bump and no dup happens — the fix.
+#
+# This `[patch.crates-io]` ensures EVERY brush crate (brush-builtins,
+# brush-coreutils-builtins, brush-parser, etc.) that names brush-core
+# resolves to OUR copy rather than two co-existing brush-core versions
+# in the dep graph (which produces "expected (String, Registration<SE>),
+# found (String, Registration<_>)" type-mismatch noise across builtin
+# registration). Once brush-core 0.6 ships to crates.io, drop this.
+[patch.crates-io]
+brush-core               = { path = "vendor/brush-core" }
+brush-builtins           = { path = "vendor/brush-builtins" }
+brush-coreutils-builtins = { path = "vendor/brush-coreutils-builtins" }
+brush-parser             = { path = "vendor/brush-parser" }
+brush-interactive        = { path = "vendor/brush-interactive" }

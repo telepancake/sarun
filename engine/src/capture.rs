@@ -644,6 +644,17 @@ impl BoxState {
             self.proc_current.lock().unwrap().insert(tgid, (start, rid));
             return Some(rid);
         }
+        // sarun: skip phantom ancestor rows. resolve_parent's bubble-walk
+        // calls read_prov(ppid) for every ancestor it has to materialize;
+        // when that pid has already exited (typical with brush's many
+        // short-lived fork-exec-exits), read_link("/proc/<pid>/exe")
+        // silently yields "" and argv is empty. Recording the row leaks
+        // a useless entry into the process table with no exe path that
+        // the UI later renders as "exe ?". Such rows never anchor any
+        // FUSE op; only the bubble-walk ever produces them.
+        if exe.is_empty() && argv.is_empty() {
+            return None;
+        }
         let parent_id = self.resolve_parent(parent_pid, depth + 1, seen);
         let conn = self.conn.lock().unwrap();
         let eid: Option<i64> = env_json.and_then(|j| Self::ensure_env(&conn, &j));
