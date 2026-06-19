@@ -1981,6 +1981,21 @@ pub fn serve(state: State, sock: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Optional engine-owned jsonl file sink. Selected by SARUN_TRACE_JSONL at
+/// engine startup — when set, every broadcast trace event is also appended
+/// here. The engine owning the file means there's no separate collector
+/// process to race with engine startup; whoever wants a recording sets the
+/// env on `sarun serve` and gets one.
+fn trace_file() -> &'static Mutex<Option<std::fs::File>> {
+    static FILE: std::sync::OnceLock<Mutex<Option<std::fs::File>>> =
+        std::sync::OnceLock::new();
+    FILE.get_or_init(|| Mutex::new(
+        std::env::var("SARUN_TRACE_JSONL").ok()
+            .filter(|s| !s.is_empty())
+            .and_then(|p| std::fs::OpenOptions::new()
+                .create(true).append(true).open(p).ok())))
+}
+
 /// Trace subscribers — held UnixStream writers, populated by trace.subscribe
 /// connections. A broadcast write that fails (subscriber EOF / closed) drops
 /// the stream from the list on the next pass.
@@ -1990,9 +2005,16 @@ fn trace_subs() -> &'static Mutex<Vec<UnixStream>> {
     SUBS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-/// Broadcast one already-newline-terminated event line to every subscriber.
-/// Drops subscribers whose write fails.
+/// Broadcast one already-newline-terminated event line to every subscriber
+/// AND append it to the engine's own jsonl sink (if SARUN_TRACE_JSONL was
+/// set). Drops live-stream subscribers whose write fails.
 fn trace_broadcast(line: &[u8]) {
+    if let Ok(mut f) = trace_file().lock() {
+        if let Some(file) = f.as_mut() {
+            let _ = file.write_all(line);
+            let _ = file.flush();
+        }
+    }
     let mut subs = trace_subs().lock().unwrap();
     subs.retain_mut(|s| s.write_all(line).is_ok() && s.flush().is_ok());
 }
