@@ -232,8 +232,11 @@ uses `mint_box_id()` (scans state_home AND live_home) so engine-side loads can't
 collide with a live box that has no at-rest sqlar yet.
 
 ## Branch / workflow
-Develop on the branch you were told to; commit with clear messages; push only
-when asked (`git push -u origin <branch>`). One clean commit per logical change.
+Develop on the branch you were told to; commit with clear messages. **Commit
+and push are one atomic step here** — this is an ephemeral, metered container
+that gets reclaimed, so an unpushed commit is unsynced risk, not saved work.
+Push every logical commit immediately (`git push -u origin <branch>`); do NOT
+wait to be asked. One clean commit per logical change.
 
 ## The one true rule
 Before claiming something can't run, **run it.** `prototype/sarun -h`, `make`,
