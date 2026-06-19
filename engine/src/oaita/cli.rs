@@ -15,6 +15,12 @@ use crate::oaita::driver::{evaluate_call, generate, run_to_completion, Settings}
 use crate::oaita::trace;
 use crate::oaita::turns::{append_turn, load_turns, target_segment};
 
+/// Default turn budget granted by `oaita run NAME` when the user
+/// omits `--max-steps`. The CLI ALWAYS grants something (vs ask,
+/// which defaults to uncapped) so a fresh top-level run has a
+/// finite ceiling without the user having to remember the flag.
+const DEFAULT_CLI_MAX_STEPS: u32 = 32;
+
 const USAGE: &str = "\
 oaita — a resumable OpenAI-compatible chat client (folder-of-turn-files).
 
@@ -147,21 +153,20 @@ fn cmd_run(args: &[String]) -> i32 {
                                        p.sarun.clone(), p.no_sandbox)
     { Ok(s) => s, Err(e) => { eprintln!("{e}"); return 1; } };
     // Set OAITA_SESSION so api.proxy conns the driver opens debit this
-    // session's pool. `--max-steps N` is an OPTIONAL grant: if present
-    // it adds N to the session's pool (resume-friendly — a fresh
-    // session goes 0+N=N, a resumed one extends the remainder by N).
-    // If absent, no grant is sent: the session stays uncapped and only
-    // the caps above it in the chain (parent of a sub-agent, or none
-    // for a top-level run) apply. This matches the asymmetry the user
-    // wants: cli caps are explicit, ask-level caps default to unlimited.
+    // session's pool. `--max-steps N` is an additive grant — the cli
+    // ALWAYS grants (default DEFAULT_CLI_MAX_STEPS if the flag wasn't
+    // passed) so a top-level `oaita run NAME` has a finite budget
+    // without the user having to remember the flag. ask-level caps
+    // are the opposite — uncapped by default — because the model
+    // shouldn't have to invent a number for every delegation; the
+    // parent's chain is the natural cap.
     let target = match crate::oaita::turns::target_segment(&p.name) {
         Ok(t) => t, Err(e) => { eprintln!("{e}"); return 2; }
     };
-    if let Some(n) = p.max_steps {
-        if let Err(e) = budget_grant_via_engine(&target, n as i64) {
-            eprintln!("oaita: budget.grant: {e}");
-            return 1;
-        }
+    let cli_grant = p.max_steps.unwrap_or(DEFAULT_CLI_MAX_STEPS) as i64;
+    if let Err(e) = budget_grant_via_engine(&target, cli_grant) {
+        eprintln!("oaita: budget.grant: {e}");
+        return 1;
     }
     unsafe { std::env::set_var("OAITA_SESSION", &target); }
     let exe = build_executor(p.no_sandbox, p.sarun);
