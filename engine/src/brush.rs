@@ -196,6 +196,56 @@ fn with_fd_redirected<R>(
     Ok(r)
 }
 
+/// When the per-util gate refuses an argv, fall through to the host
+/// binary instead of running uutils. `std::process::Command` PATH-looks
+/// up `name`, fork+execs, and inherits THIS process's fd 0/1/2 by
+/// default — so dup'ing those fds to the brush context's stdin/stdout/
+/// stderr via the same `step` nesting the uumain path uses makes the
+/// child read/write the right sinks. Returns the child's exit code
+/// (low 8 bits); on PATH-lookup failure returns 127, matching POSIX
+/// `command not found` semantics.
+fn run_coreutil_external(
+    name: &str,
+    argv: &[OsString],
+    in_: &Option<brush_core::openfiles::OpenFile>,
+    out: &Option<brush_core::openfiles::OpenFile>,
+    err: &Option<brush_core::openfiles::OpenFile>,
+) -> i32 {
+    fn step(
+        fd: i32,
+        of: &Option<brush_core::openfiles::OpenFile>,
+        run: impl FnOnce() -> i32,
+    ) -> i32 {
+        match of {
+            Some(of) => match with_fd_redirected(fd, of, run) {
+                Ok(c) => c,
+                Err(msg) => { eprintln!("sarun-engine brush: {msg}"); 1 }
+            },
+            None => run(),
+        }
+    }
+    step(2, err, || {
+        step(1, out, || {
+            step(0, in_, || {
+                let mut cmd = std::process::Command::new(name);
+                // argv[0] is the command name (uumain convention); skip
+                // it. Command sets argv[0] automatically from the
+                // program path it spawns.
+                if argv.len() > 1 {
+                    cmd.args(&argv[1..]);
+                }
+                match cmd.status() {
+                    Ok(s) => s.code().unwrap_or(127),
+                    Err(e) => {
+                        eprintln!("/bin/sh: line 1: {name}: command not found ({e})");
+                        127
+                    }
+                }
+            })
+        })
+    })
+}
+
 impl brush_core::builtins::SimpleCommand for CoreutilWrapper {
     fn get_content(
         name: &str,
@@ -224,6 +274,26 @@ impl brush_core::builtins::SimpleCommand for CoreutilWrapper {
         let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
         if argv.is_empty() { argv.push(OsString::from(&name)); }
 
+        // sarun: per-util GATE. The bundled uutils diverges from GNU
+        // coreutils on flags, locale-sensitive output, and a tail of
+        // corner cases. crate::brush_gates::gate_for(name) returns a
+        // per-util predicate: true means uutils faithfully handles
+        // THIS specific argv → call uumain in-process; false (default)
+        // → fall back to fork+exec of the host binary, which IS the
+        // GNU implementation. Most utils start at gate_false until an
+        // agent audits them and writes a tighter gate (see
+        // brush_gates.rs's module-level docs).
+        let gate = crate::brush_gates::gate_for(&name);
+        let in_ = context.try_fd(0);
+        let out = context.try_fd(1);
+        let err = context.try_fd(2);
+
+        if !gate(&argv) {
+            return Ok(brush_core::results::ExecutionResult::new(
+                (run_coreutil_external(&name, &argv, &in_, &out, &err) & 0xff) as u8,
+            ));
+        }
+
         // Resolve the brush context's stdin/stdout/stderr OpenFiles so we can
         // point the PROCESS's real fd 0/1/2 at them around the uumain call — a
         // uutils uumain reads/writes the real fds, ignoring brush's OpenFiles.
@@ -233,10 +303,7 @@ impl brush_core::builtins::SimpleCommand for CoreutilWrapper {
         // stdout a File. Where the OpenFile already maps to the same fd (the
         // common Stdout==1 / Stderr==2 / Stdin==0 sink case) with_fd_redirected
         // is a no-op; where it is a pipe/File it dup2's around the call.
-        // ShellFd is i32; 0/1/2 are the well-known std fds.
-        let in_ = context.try_fd(0);
-        let out = context.try_fd(1);
-        let err = context.try_fd(2);
+        // (in_/out/err were resolved above the gate check.)
 
         // Redirect fd N to `of` (if present) around `run`; map a redirect failure
         // to a visible message + exit 1. Returns the uumain exit code.

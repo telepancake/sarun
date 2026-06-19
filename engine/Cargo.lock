@@ -527,22 +527,18 @@ dependencies = [
 [[package]]
 name = "brush-builtins"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6eb8b0b70385d3c49e28e0f951dd9986393ecdee404cd6166902e685f83e4cf0"
 dependencies = [
  "brush-core",
  "brush-parser",
  "cfg-if",
  "chrono",
  "clap",
- "fancy-regex 0.17.0",
- "futures",
+ "fancy-regex 0.18.0",
  "itertools 0.14.0",
  "nix 0.31.3",
  "procfs",
  "rlimit",
  "strum 0.28.0",
- "strum_macros 0.28.0",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -552,8 +548,6 @@ dependencies = [
 [[package]]
 name = "brush-core"
 version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "967a82f3b1bf090db686d5fb86424b19725073828532a42f960d5a13bff14ecb"
 dependencies = [
  "async-recursion",
  "async-trait",
@@ -566,7 +560,7 @@ dependencies = [
  "clap",
  "color-print",
  "command-fds",
- "fancy-regex 0.17.0",
+ "fancy-regex 0.18.0",
  "futures",
  "getrandom 0.4.3",
  "hostname",
@@ -591,8 +585,6 @@ dependencies = [
 [[package]]
 name = "brush-coreutils-builtins"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eb9d4ec908a643a536d00c377b2ced4baa7827459894ba7c70a5aeccf603d9d3"
 dependencies = [
  "uu_arch",
  "uu_b2sum",
@@ -682,8 +674,6 @@ dependencies = [
 [[package]]
 name = "brush-interactive"
 version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8147f101092e1cc8bc51a0be24535555910af1ef72e2f0b7b4c99eef4c88082b"
 dependencies = [
  "bon",
  "brush-core",
@@ -700,14 +690,11 @@ dependencies = [
 [[package]]
 name = "brush-parser"
 version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9f64b19efc02f0dd6cac1d462e20a1098f425f09cb13624efbb1b7d63f061735"
 dependencies = [
  "bon",
  "cached",
  "getrandom 0.4.3",
  "indenter",
- "insta",
  "peg",
  "serde",
  "thiserror 2.0.18",
@@ -1794,9 +1781,9 @@ dependencies = [
 
 [[package]]
 name = "fancy-regex"
-version = "0.17.0"
+version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72cf461f865c862bb7dc573f643dd6a2b6842f7c30b07882b56bd148cc2761b8"
+checksum = "e1e1dacd0d2082dfcf1351c4bdd566bbe89a2b263235a2b50058f1e130a47277"
 dependencies = [
  "bit-set 0.8.0",
  "regex-automata",
@@ -2888,21 +2875,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e05c02b5e89bff3b946cedeca278abc628fe811e604f027c45a8aa3cf793d0eb"
 dependencies = [
  "libc",
-]
-
-[[package]]
-name = "insta"
-version = "1.48.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "86f0f8fee8c926415c58d6ae43a08523a26faccb2323f5e6b644fe7dd4ef6b82"
-dependencies = [
- "console",
- "once_cell",
- "pest",
- "pest_derive",
- "serde",
- "similar 2.7.0",
- "tempfile",
 ]
 
 [[package]]
@@ -5117,7 +5089,7 @@ dependencies = [
  "ruzstd",
  "serde",
  "serde_json",
- "similar 3.1.1",
+ "similar",
  "smoltcp",
  "tar",
  "tattoy-termwiz",
@@ -5431,12 +5403,6 @@ name = "simdutf8"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
-
-[[package]]
-name = "similar"
-version = "2.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbbb5d9659141646ae647b42fe094daf6c6192d1620870b449d9557f748b2daa"
 
 [[package]]
 name = "similar"

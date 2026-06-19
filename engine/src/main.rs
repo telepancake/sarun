@@ -17,6 +17,7 @@ use fuser::MountOption;
 pub use net::NetMode;
 
 mod brush;
+mod brush_gates;
 mod capture;
 mod control;
 mod discover;
