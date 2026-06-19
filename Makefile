@@ -100,11 +100,15 @@ test: ## Run the Python test suite (parallel via pytest-xdist; excludes test_e2e
 	  --with "textual>=0.60" --with "wcmatch>=8.4" --with "pyfuse3>=3.2" \
 	  --with "trio>=0.22" --with "python-magic>=0.4" \
 	  pytest -q -p no:cacheprovider -n auto --dist=loadscope \
-	  --ignore=test_e2e.py --ignore=test_pjdfstest.py
+	  --ignore=test_e2e.py --ignore=test_pjdfstest.py --ignore=test_oci.py
 
 .PHONY: test-e2e
 test-e2e: ## Run the end-to-end tests (real UI + real sandboxes; minutes)
 	prototype/test_e2e.py
+
+.PHONY: test-oci
+test-oci: ## Run the hermetic OCI tests (synthetic archive; real Rust engine; needs `make engine`)
+	prototype/test_oci.py
 
 # ---- Housekeeping ---------------------------------------------------------
 
