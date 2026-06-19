@@ -1,11 +1,26 @@
 // Executors — the inward face of the `shell` tool. The SarunExecutor runs the
-// script in a persistent sarun BOX (so all writes STAGE for review/apply); the
-// LocalExecutor is the ungated subprocess stand-in for tests/no-sarun runs.
+// script in the agent's persistent sarun BOX (so all writes STAGE for review/
+// apply); the LocalExecutor is the ungated subprocess stand-in for tests/
+// no-sarun runs.
 //
 // The persistent-box naming convention is OAITA-<SESSION> (uppercase prefix
 // matches sarun's CLI box-name convention — control::is_box_name checks for an
 // uppercase-leading token). One box per session — so the same conversation's
 // shell calls compose, just like a long-lived terminal.
+//
+// IN-BOX MODE (OAITA_BOX=1): the driver is already running INSIDE the agent's
+// wrapper box (spawned by cli::spawn_in_box as `sarun run --api OAITA-NAME --
+// sarun oaita run NAME`). The wrapper IS the persistent shell box; shell-tool
+// scripts run as direct `sh -c` children of this process so their writes
+// accumulate in the wrapper's overlay. No nested `sarun run BOX --` spawn for
+// non-discard calls — that would create a same-named grandchild and double
+// the nesting.
+//
+// For discard mode we still need an ephemeral peek child so writes can be
+// thrown away: `sarun run PEEK -- sh -c script` from inside the wrapper sends
+// `relname=PEEK`, which the engine resolves as a CHILD of this wrapper. Then
+// `sarun PEEK discard` reaps it. PEEK is a sibling of any other children the
+// wrapper might spawn; one level deeper than the wrapper.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -118,10 +133,18 @@ impl SarunExecutor {
 
     /// First-touch idempotent box materialization: `sarun run BOX -- true`.
     /// Subsequent calls within this process are no-ops (cached by name).
+    ///
+    /// In-box: the wrapper IS the box, so it exists by definition — mark
+    /// it ensured without spawning anything (the subprocess would create a
+    /// nested same-named child, not resume into the wrapper).
     fn ensure_box(&self, box_id: &str) {
         {
             let g = self.ensured.lock().unwrap();
             if g.contains(box_id) { return; }
+        }
+        if in_box() {
+            self.ensured.lock().unwrap().insert(box_id.to_string());
+            return;
         }
         let _ = Command::new(&self.sarun)
             .args(["run", box_id, "--", "true"])
@@ -131,6 +154,15 @@ impl SarunExecutor {
             .status();
         self.ensured.lock().unwrap().insert(box_id.to_string());
     }
+}
+
+/// True when this process is the in-box oaita driver (spawned by the host
+/// CLI shim via `sarun run --api OAITA-<NAME> -- sarun oaita run …`). The
+/// runner sets OAITA_BOX=1 for --api boxes; cli::cmd_run gates wrap-vs-
+/// drive on it, and the executor uses it to skip nested `sarun run BOX --`
+/// spawns that would create same-named grandchildren of the wrapper.
+fn in_box() -> bool {
+    std::env::var("OAITA_BOX").map(|s| s == "1").unwrap_or(false)
 }
 
 /// Drop sarun's own status lines from a captured stderr so they don't
@@ -210,6 +242,21 @@ impl Executor for SarunExecutor {
     }
 
     fn run(&self, box_id: &str, script: &str, discard: bool, api_access: bool) -> ExecResult {
+        if in_box() {
+            return self.run_in_box(box_id, script, discard, api_access);
+        }
+        self.run_host(box_id, script, discard, api_access)
+    }
+}
+
+impl SarunExecutor {
+    /// Host-side path: each shell tool call gets its own nested sarun
+    /// box (the persistent OAITA-<NAME> box or a PEEK child of it).
+    /// Used when there's no in-box driver yet (e.g. unit tests that
+    /// drive the executor directly without spawn_in_box).
+    fn run_host(&self, box_id: &str, script: &str, discard: bool, api_access: bool)
+        -> ExecResult
+    {
         // For discard mode use a one-shot PEEK box launched as a CHILD of
         // the persistent session box. The dotted name `BOX.PEEK` is sarun's
         // shorthand for "parent=BOX, name=PEEK" — control.rs's register
@@ -275,6 +322,78 @@ impl Executor for SarunExecutor {
             let _ = Command::new(&self.sarun).args([&target, "discard"])
                 .stdout(Stdio::null()).stderr(Stdio::null()).status();
         }
+        let output_budget = RESULT_BUDGET.saturating_sub(changes.len() + 32);
+        let trimmed = fit_output(&combined, output_budget);
+        let text = if patch.is_empty() {
+            trimmed.clone()
+        } else {
+            format!("{trimmed}\n\n=== changes ===\n{changes}")
+        };
+        crate::oaita::trace::event("exec.done", serde_json::json!({
+            "rc": rc, "bytes": text.len(),
+        }));
+        ExecResult { text, raw_output: combined, patch, rc }
+    }
+
+    /// In-box path: this process IS the agent's persistent shell box
+    /// (the wrapper). For non-discard calls the script runs as a
+    /// direct `sh -c` subprocess and writes accumulate in the wrapper's
+    /// overlay. For discard calls, spawn a PEEK child via `sarun run
+    /// PEEK -- …` (relname → parented to this wrapper, one level
+    /// deeper) and discard afterwards. No `BOX.PEEK` dotted name —
+    /// relname rejects dots, and the parent is implicit anyway.
+    fn run_in_box(&self, box_id: &str, script: &str, discard: bool, api_access: bool)
+        -> ExecResult
+    {
+        let target = if discard { "PEEK".to_string() } else { box_id.to_string() };
+        crate::oaita::trace::event("exec.run", serde_json::json!({
+            "box": target, "discard": discard, "api_access": api_access,
+            "script_len": script.len(), "in_box": true,
+        }));
+        let out = if discard {
+            let mut cmd = Command::new(&self.sarun);
+            cmd.arg("run");
+            if api_access { cmd.arg("--api"); }
+            cmd.args(["PEEK", "--", "sh", "-c", script])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+        } else {
+            Command::new("sh").args(["-c", script])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+        };
+        let (stdout, stderr, rc) = match out {
+            Ok(o) => (String::from_utf8_lossy(&o.stdout).into_owned(),
+                      filter_sarun_noise(&String::from_utf8_lossy(&o.stderr)),
+                      o.status.code().unwrap_or(-1)),
+            Err(e) => return ExecResult {
+                text: format!("error: cannot run sh: {e}"),
+                rc: -1, ..Default::default()
+            }
+        };
+        let combined = if stderr.is_empty() { stdout.clone() }
+                       else { format!("{stdout}{stderr}") };
+        // Patch summary:
+        //   discard: PEEK's own upper (just this script's writes), then reaped.
+        //   non-discard: skipped — the wrapper's patch is cumulative across
+        //   every shell call this session, so replaying it on each result is
+        //   noise that grows monotonically. The model can call inspect/read
+        //   if it needs to see the current overlay state.
+        let (patch, changes) = if discard {
+            let p = Command::new(&self.sarun).args(["PEEK", "patch"]).output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                .unwrap_or_default();
+            let s = summarize_patch(&p, CHANGES_BUDGET);
+            let _ = Command::new(&self.sarun).args(["PEEK", "discard"])
+                .stdout(Stdio::null()).stderr(Stdio::null()).status();
+            (p, s)
+        } else {
+            (String::new(), String::new())
+        };
         let output_budget = RESULT_BUDGET.saturating_sub(changes.len() + 32);
         let trimmed = fit_output(&combined, output_budget);
         let text = if patch.is_empty() {

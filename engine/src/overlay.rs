@@ -416,15 +416,14 @@ impl Overlay {
     }
 
     /// Box-relative path matches one of the engine-binary FUSE
-    /// shadows. `run/sarun/engine` is universal (every box's bwrap
-    /// exec's the engine as `--inner` from there). `usr/local/bin/
-    /// {oaita,sarun}` are --api-only (only oaita sub-agents look
-    /// them up via PATH).
+    /// shadows. Only --api boxes get them — they're the in-box PATH
+    /// entries the oaita driver and its sub-agents resolve `sarun`
+    /// and `oaita` through. The runner exec's its OWN `inner` via the
+    /// inherited /proc/self/fd/N (see runner.rs), so no universal
+    /// in-box path is needed for the engine.
     fn is_engine_shadow_path(rel: &str, api: bool) -> bool {
-        if rel == "run/sarun/engine" { return true; }
-        if api && (rel == "usr/local/bin/oaita"
-                   || rel == "usr/local/bin/sarun") { return true; }
-        false
+        api && (rel == "usr/local/bin/oaita"
+                || rel == "usr/local/bin/sarun")
     }
 
     /// True when `rel` is the box's view of the HOST oaita config file
@@ -488,13 +487,10 @@ impl Overlay {
     /// though config_home is otherwise hidden.
     fn is_engine_path(rel: &str) -> bool {
         // Cache the (already-stripped) roots so the per-lookup cost is
-        // just a handful of string compares against `rel`. /run/sarun is
-        // NOT in this list: bwrap mounts a private tmpfs over it before
-        // landing the ui.sock/engine-binary binds, so no overlay writes
-        // happen there in the first place — and hiding it from FUSE
-        // would break the mountpoint lookup bwrap relies on. The engine
-        // ensures host /run/sarun exists at startup so the tmpfs has
-        // somewhere to mount onto.
+        // just a handful of string compares against `rel`. The runner
+        // doesn't bind anything in-box anymore (the inner shim exec's
+        // from /proc/self/fd/N) so there's no /run/sarun path to
+        // consider here.
         use std::sync::OnceLock;
         static ROOTS: OnceLock<Vec<String>> = OnceLock::new();
         let roots = ROOTS.get_or_init(|| {
@@ -1061,14 +1057,12 @@ impl Overlay {
     /// Attributes for (box, rel) through the FULL merge (own → parent chain →
     /// host), or None when absent.
     fn attr_of(&self, b: &BoxState, ino: u64, rel: &str) -> Option<FileAttr> {
-        // Engine-binary FUSE shadow. /run/sarun/engine is universal
-        // (every box's bwrap exec's the engine as --inner there);
-        // /usr/local/bin/{oaita,sarun} are --api-only (only oaita
-        // sub-agents in --api boxes look them up via PATH). These
-        // paths don't exist on the host, so the shadow has to fire
-        // BEFORE the lower-layer stat — synthesize the engine
-        // binary's attrs directly. No bwrap binds, no tmpfs at
-        // /run/sarun, no host-path leakage into the mount namespace.
+        // Engine-binary FUSE shadow at /usr/local/bin/{oaita,sarun}
+        // for --api boxes — the path the in-box oaita driver and its
+        // sub-agents look up via PATH. The host doesn't have these
+        // paths, so the shadow has to fire BEFORE the lower-layer
+        // stat — synthesize the engine binary's attrs directly. No
+        // bwrap binds, no host-path leakage into the mount namespace.
         if Self::is_engine_shadow_path(rel, b.is_api()) {
             if let Some(exe) = self.shadow_target_path() {
                 if let Ok(md) = std::fs::metadata(&exe) {
@@ -1378,9 +1372,8 @@ impl Filesystem for Overlay {
         // the resolved owner IS this box; a parent's file or the host file is
         // served read-only until the first write triggers copy-up-from-parent.
         // Engine-binary FUSE shadow: same paths attr_of synthesizes for —
-        // open the engine binary read-only so the box can exec it from
-        // /run/sarun/engine (universal) or /usr/local/bin/{oaita,sarun}
-        // (--api). No bwrap binds.
+        // open the engine binary read-only so the --api box can exec
+        // it from /usr/local/bin/{oaita,sarun}. No bwrap binds.
         if !want_write && Self::is_engine_shadow_path(&rel, b.is_api()) {
             if let Some(exe) = self.shadow_target_path() {
                 if let Ok(f) = File::open(&exe) {
