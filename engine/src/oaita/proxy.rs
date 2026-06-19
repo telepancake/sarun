@@ -1,18 +1,19 @@
-// Engine-side API proxy. Listens on `{runtime_home}/api.sock` (the same path
-// that `--api` boxes get bind-mounted at `/run/sarun/api.sock` inside): a box
-// speaks plain HTTP/1.1 over the UDS, we inject the Authorization header from
-// `oaita.toml`, forward to the configured upstream, stream the response back,
-// and log the (request, response, model, status) pair into the originating
-// box's `api_log` sqlar table.
+// Engine-side API proxy. There is NO host UDS — the proxy is fed bytes by
+// `oaita::proxy_mux`, which demultiplexes FRAME_API_OPEN/DATA/CLOSE off the
+// existing box-channel into per-stream duplex pipes. The proxy reads HTTP
+// off one end of each pipe, injects the Authorization header from
+// `oaita.toml`, forwards to the configured upstream, streams the response
+// back through the pipe (which the mux re-frames onto the box channel),
+// and logs the (request, response, model, status) pair into the
+// originating box's `api_log` sqlar table.
 //
 // Authentication: the box never sees the API key. The proxy gets it from
 // `oaita.toml` (or env vars, same precedence as the client). Per-box opt-in
-// is controlled at runner-launch time via the new `--api` flag.
+// is controlled at runner-launch time via the `--api` flag.
 //
-// Box attribution: SO_PEERCRED on the accepted UDS conn gives us the
-// connecting client's pid; we walk /proc PPid chain up to a registered
-// runner host pid (the same trick `derive_parent_box` uses in control.rs)
-// and that's the box. Unattributable → box_id=0.
+// Box attribution: intrinsic to the box-channel the FRAME_API_* stream
+// rides on — proxy_mux passes the channel's box_id straight in. No
+// SO_PEERCRED walk, no /proc PPid chasing.
 
 use std::sync::Arc;
 

@@ -22,8 +22,8 @@ use serde_json::{json, Value};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpStream, UnixStream};
 
-/// Where the LLM endpoint lives. UDS via the engine's api.sock; TCP via a
-/// real http(s) base URL.
+/// Where the LLM endpoint lives. UDS via the runner-served in-box
+/// /run/sarun/api.sock; TCP via a real http(s) base URL.
 #[derive(Clone, Debug)]
 pub enum Endpoint {
     /// Plain HTTP/1.1 over a unix socket. The path is the socket; HTTP host
@@ -275,20 +275,6 @@ fn default_tls_connector() -> tokio_rustls::TlsConnector {
         .with_root_certificates(root_store)
         .with_no_client_auth();
     tokio_rustls::TlsConnector::from(Arc::new(config))
-}
-
-/// Open a UNIX listener at `path`, deleting any stale file. Returns the
-/// tokio listener; the caller drives accept() in its own task.
-pub async fn listen_unix(path: &std::path::Path) -> std::io::Result<tokio::net::UnixListener> {
-    if path.exists() { let _ = std::fs::remove_file(path); }
-    if let Some(parent) = path.parent() { let _ = std::fs::create_dir_all(parent); }
-    let l = tokio::net::UnixListener::bind(path)?;
-    // 0600 — anyone with the path is anyone in the box, which is fine; the
-    // socket is bind-mounted into authorised boxes only. Permissions don't
-    // gate inside the box, but tighten anyway to be defensive.
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-    Ok(l)
 }
 
 /// One-shot helper for callers that just want to dial and stream.

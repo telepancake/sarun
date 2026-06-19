@@ -469,10 +469,11 @@ fn main() {
                     "-n" => net_mode = NetMode::Tap,
                     "-N" => net_mode = NetMode::Host,
                     // --api  enable the oaita API proxy for this box. The
-                    //        engine bind-mounts its api.sock into the box at
-                    //        /run/sarun/api.sock and exports OAITA_API_SOCK
-                    //        so an in-box `oaita gen` routes through us — no
-                    //        api key, no direct network needed.
+                    //        inner runner serves /run/sarun/api.sock inside
+                    //        the box and tunnels each accepted connection
+                    //        as FRAME_API_* on the box channel — so an
+                    //        in-box `oaita gen` routes through the engine
+                    //        with no api key in the box and no extra UDS.
                     "--api" => api = true,
                     _ => if name.is_none() { name = Some(a.clone()); },
                 }
