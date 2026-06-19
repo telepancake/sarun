@@ -779,14 +779,15 @@ fn dispatch(tool: &str, arguments: &Value, target: &str, set: &Settings,
             executor: Option<&dyn Executor>, turns: &[Turn]) -> String {
     match tool {
         "act" => dispatch_act(arguments, target, set, executor),
-        "shell" => dispatch_shell(arguments, target, executor),
+        "shell" => dispatch_shell(arguments, target, executor, turns),
         "inspect" => dispatch_inspect(arguments, target, executor, turns),
         "read" => dispatch_read(arguments, target, executor, turns),
         "write" => dispatch_write(arguments, target, executor, turns),
         "apply" | "reject" => dispatch_box_resolve(tool, arguments),
         "backtrack" => dispatch_backtrack(arguments, target),
         "delete" => dispatch_delete(arguments),
-        other => format!("error: unknown tool {other:?}"),
+        other => format!("error: unknown tool {other:?}{}",
+                         crate::oaita::hints::append(turns, &["unknown-tool"])),
     }
 }
 
@@ -854,7 +855,8 @@ fn format_act_result(r: &ExecResult, inner: &str) -> String {
     text
 }
 
-fn dispatch_shell(args: &Value, target: &str, executor: Option<&dyn Executor>) -> String {
+fn dispatch_shell(args: &Value, target: &str, executor: Option<&dyn Executor>,
+                  turns: &[Turn]) -> String {
     let Some(script) = args_str(args, "script") else {
         return "shell: missing required `script`".to_string();
     };
@@ -865,7 +867,7 @@ fn dispatch_shell(args: &Value, target: &str, executor: Option<&dyn Executor>) -
     // Plain shell tool calls: no API proxy access (the script is user code,
     // not an oaita sub-agent). Cf. dispatch_act which sets api_access=true.
     let r = exe.run(&box_name(target), &script, discard, /*api_access=*/false);
-    r.text
+    r.text + &crate::oaita::hints::append(turns, &["shell"])
 }
 
 fn dispatch_inspect(args: &Value, target: &str, executor: Option<&dyn Executor>,
