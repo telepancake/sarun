@@ -149,14 +149,15 @@ moment it's done.**
 - [ ] **Tap default for OCI runs.** Every OCI run so far used `--net off`;
   confirm the proxied `Tap` default works *inside* a container (DNS +
   HTTPS-through-proxy) and fix the closed-rootfs/netns interaction if not.
-- [ ] **Layer reuse / image cache for `oci run`.** `resolve_image_top` only
-  matches `<ref>` by box name/id, so a repeat `oci run <ref>` re-pulls into a
-  fresh stack. Also match the `oci_reference` meta of an already-loaded stack
-  and reuse it as the parent — multiple runs then share the layer boxes (the
-  Docker model; only the per-run container box is new). Key v1 = ref string;
-  v2 = manifest digest (so a moved tag re-pulls, `name:tag`/`@digest` coalesce).
-- [ ] **Container GC.** Each run leaves an at-rest container box; add `oci ps`
-  / `oci rm` (or prune) once layer reuse lands.
+- [ ] **Image cache v2 — key on the manifest digest.** v1 is done:
+  `resolve_image_top` → `find_loaded_by_reference` dedups `oci run <ref>` by the
+  exact reference string, so a repeat run shares the loaded layer boxes (only
+  the per-run container box is new; `test_oci.py` asserts it). v2: also key on
+  the manifest digest so a moved `:tag` re-pulls and `name:tag`/`@digest`
+  coalesce.
+- [ ] **Container GC.** Each run leaves an at-rest container box (layer reuse
+  has landed, so these now accumulate on shared layers); add `oci ps` / `oci rm`
+  (or a prune).
 - [ ] **`oci build` instructions:** `COPY --from=<stage|image>`; `ADD` URL
   fetch + local-tar auto-extract; glob sources; carry HEALTHCHECK/ONBUILD/
   STOPSIGNAL into the image config (today: warned + skipped).
