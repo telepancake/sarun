@@ -6,7 +6,6 @@
 
 use std::{
     fs::read_dir,
-    io::{stderr, Write},
 };
 
 use super::{Matcher, MatcherIO, WalkEntry};
@@ -20,13 +19,13 @@ impl EmptyMatcher {
 }
 
 impl Matcher for EmptyMatcher {
-    fn matches(&self, file_info: &WalkEntry, _: &mut MatcherIO) -> bool {
+    fn matches(&self, file_info: &WalkEntry, matcher_io: &mut MatcherIO) -> bool {
         if file_info.file_type().is_file() {
             match file_info.metadata() {
                 Ok(meta) => meta.len() == 0,
                 Err(err) => {
                     writeln!(
-                        &mut stderr(),
+                        &mut *matcher_io.deps.get_error_output().borrow_mut(),
                         "Error getting size for {}: {}",
                         file_info.path().display(),
                         err
@@ -40,7 +39,7 @@ impl Matcher for EmptyMatcher {
                 Ok(mut it) => it.next().is_none(),
                 Err(err) => {
                     writeln!(
-                        &mut stderr(),
+                        &mut *matcher_io.deps.get_error_output().borrow_mut(),
                         "Error getting contents of {}: {}",
                         file_info.path().display(),
                         err

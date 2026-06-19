@@ -6,7 +6,6 @@
 
 use std::error::Error;
 use std::fs::{self, Metadata};
-use std::io::{stderr, Write};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Local, Timelike};
@@ -63,11 +62,11 @@ impl NewerMatcher {
 }
 
 impl Matcher for NewerMatcher {
-    fn matches(&self, file_info: &WalkEntry, _: &mut MatcherIO) -> bool {
+    fn matches(&self, file_info: &WalkEntry, matcher_io: &mut MatcherIO) -> bool {
         match self.matches_impl(file_info) {
             Err(e) => {
                 writeln!(
-                    &mut stderr(),
+                    &mut *matcher_io.deps.get_error_output().borrow_mut(),
                     "Error getting modification time for {}: {}",
                     file_info.path().to_string_lossy(),
                     e
@@ -151,11 +150,11 @@ impl NewerOptionMatcher {
 }
 
 impl Matcher for NewerOptionMatcher {
-    fn matches(&self, file_info: &WalkEntry, _: &mut MatcherIO) -> bool {
+    fn matches(&self, file_info: &WalkEntry, matcher_io: &mut MatcherIO) -> bool {
         match self.matches_impl(file_info) {
             Err(e) => {
                 writeln!(
-                    &mut stderr(),
+                    &mut *matcher_io.deps.get_error_output().borrow_mut(),
                     "Error getting {:?} and {:?} time for {}: {}",
                     self.x_option,
                     self.y_option,
@@ -202,11 +201,11 @@ impl NewerTimeMatcher {
 }
 
 impl Matcher for NewerTimeMatcher {
-    fn matches(&self, file_info: &WalkEntry, _: &mut MatcherIO) -> bool {
+    fn matches(&self, file_info: &WalkEntry, matcher_io: &mut MatcherIO) -> bool {
         match self.matches_impl(file_info) {
             Err(e) => {
                 writeln!(
-                    &mut stderr(),
+                    &mut *matcher_io.deps.get_error_output().borrow_mut(),
                     "Error getting {:?} time for {}: {}",
                     self.newer_time_type,
                     file_info.path().to_string_lossy(),
@@ -280,7 +279,7 @@ impl Matcher for FileTimeMatcher {
         match self.matches_impl(file_info, start_time) {
             Err(e) => {
                 writeln!(
-                    &mut stderr(),
+                    &mut *matcher_io.deps.get_error_output().borrow_mut(),
                     "Error getting {:?} time for {}: {}",
                     self.file_time_type,
                     file_info.path().to_string_lossy(),
@@ -353,7 +352,7 @@ impl Matcher for FileAgeRangeMatcher {
         match self.matches_impl(file_info, start_time) {
             Err(e) => {
                 writeln!(
-                    &mut stderr(),
+                    &mut *matcher_io.deps.get_error_output().borrow_mut(),
                     "Error getting {:?} time for {}: {}",
                     self.file_time_type,
                     file_info.path().to_string_lossy(),
@@ -401,7 +400,7 @@ mod tests {
     use chrono::NaiveTime;
     use std::fs;
     use std::fs::{File, OpenOptions};
-    use std::io::Read;
+    use std::io::{Read, Write};
     use std::thread;
     use std::time::Duration;
     use tempfile::Builder;

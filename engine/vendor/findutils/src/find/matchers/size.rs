@@ -5,7 +5,6 @@
 // https://opensource.org/licenses/MIT.
 
 use std::error::Error;
-use std::io::{stderr, Write};
 use std::str::FromStr;
 
 use super::{ComparableValue, Matcher, MatcherIO, WalkEntry};
@@ -82,14 +81,14 @@ impl SizeMatcher {
 }
 
 impl Matcher for SizeMatcher {
-    fn matches(&self, file_info: &WalkEntry, _: &mut MatcherIO) -> bool {
+    fn matches(&self, file_info: &WalkEntry, matcher_io: &mut MatcherIO) -> bool {
         match file_info.metadata() {
             Ok(metadata) => self
                 .value_to_match
                 .matches(byte_size_to_unit_size(self.unit, metadata.len())),
             Err(e) => {
                 writeln!(
-                    &mut stderr(),
+                    &mut *matcher_io.deps.get_error_output().borrow_mut(),
                     "Error getting file size for {}: {}",
                     file_info.path().to_string_lossy(),
                     e

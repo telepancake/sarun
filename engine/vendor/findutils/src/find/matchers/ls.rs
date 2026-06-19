@@ -6,7 +6,7 @@
 use chrono::DateTime;
 use std::{
     fs::File,
-    io::{stderr, Write},
+    io::Write,
 };
 
 use super::{Matcher, MatcherIO, WalkEntry};
@@ -181,7 +181,7 @@ impl Ls {
             Err(e) => {
                 if print_error_message {
                     writeln!(
-                        &mut stderr(),
+                        &mut *matcher_io.deps.get_error_output().borrow_mut(),
                         "Error writing {:?} for {}",
                         file_info.path().to_string_lossy(),
                         e
@@ -254,7 +254,7 @@ impl Ls {
             Err(e) => {
                 if print_error_message {
                     writeln!(
-                        &mut stderr(),
+                        &mut *matcher_io.deps.get_error_output().borrow_mut(),
                         "Error writing {:?} for {}",
                         file_info.path().to_string_lossy(),
                         e

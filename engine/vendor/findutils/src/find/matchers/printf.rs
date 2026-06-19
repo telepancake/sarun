@@ -589,7 +589,7 @@ impl Printf {
         })
     }
 
-    fn print(&self, file_info: &WalkEntry, mut out: impl Write) {
+    fn print(&self, file_info: &WalkEntry, mut out: impl Write, err_out: &mut dyn Write) {
         for component in &self.format.components {
             match component {
                 FormatComponent::Literal(literal) => write!(out, "{literal}").unwrap(),
@@ -614,11 +614,13 @@ impl Printf {
                         }
                     }
                     Err(e) => {
-                        eprintln!(
+                        writeln!(
+                            err_out,
                             "Error processing '{}': {}",
                             file_info.path().to_string_lossy(),
                             e
-                        );
+                        )
+                        .unwrap();
                         break;
                     }
                 },
@@ -630,9 +632,19 @@ impl Printf {
 impl Matcher for Printf {
     fn matches(&self, file_info: &WalkEntry, matcher_io: &mut MatcherIO) -> bool {
         if let Some(file) = &self.output_file {
-            self.print(file_info, file);
+            self.print(
+                file_info,
+                file,
+                &mut *matcher_io.deps.get_error_output().borrow_mut(),
+            );
         } else {
-            self.print(file_info, &mut *matcher_io.deps.get_output().borrow_mut());
+            // Borrow the two distinct sinks (output, error) from deps separately.
+            let err = matcher_io.deps.get_error_output();
+            self.print(
+                file_info,
+                &mut *matcher_io.deps.get_output().borrow_mut(),
+                &mut *err.borrow_mut(),
+            );
         }
 
         true

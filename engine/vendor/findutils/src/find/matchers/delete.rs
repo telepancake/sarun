@@ -8,7 +8,7 @@
  */
 
 use std::fs;
-use std::io::{self, stderr, Write};
+use std::io;
 
 use super::{Matcher, MatcherIO, WalkEntry};
 
@@ -44,7 +44,7 @@ impl Matcher for DeleteMatcher {
             Ok(()) => true,
             Err(e) => {
                 matcher_io.set_exit_code(1);
-                writeln!(&mut stderr(), "Failed to delete {path_str}: {e}").unwrap();
+                writeln!(&mut *matcher_io.deps.get_error_output().borrow_mut(), "Failed to delete {path_str}: {e}").unwrap();
                 false
             }
         }

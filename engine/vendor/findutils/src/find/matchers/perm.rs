@@ -9,7 +9,6 @@
 //! even try.
 
 use std::error::Error;
-use std::io::{stderr, Write};
 #[cfg(unix)]
 use uucore::mode::{parse_numeric, parse_symbolic};
 
@@ -100,7 +99,7 @@ impl PermMatcher {
 
 impl Matcher for PermMatcher {
     #[cfg(unix)]
-    fn matches(&self, file_info: &WalkEntry, _: &mut MatcherIO) -> bool {
+    fn matches(&self, file_info: &WalkEntry, matcher_io: &mut MatcherIO) -> bool {
         use std::os::unix::fs::PermissionsExt;
         match file_info.metadata() {
             Ok(metadata) => {
@@ -114,7 +113,7 @@ impl Matcher for PermMatcher {
             }
             Err(e) => {
                 writeln!(
-                    &mut stderr(),
+                    &mut *matcher_io.deps.get_error_output().borrow_mut(),
                     "Error getting permissions for {}: {}",
                     file_info.path().to_string_lossy(),
                     e
@@ -126,9 +125,9 @@ impl Matcher for PermMatcher {
     }
 
     #[cfg(not(unix))]
-    fn matches(&self, _dummy_file_info: &WalkEntry, _: &mut MatcherIO) -> bool {
+    fn matches(&self, _dummy_file_info: &WalkEntry, matcher_io: &mut MatcherIO) -> bool {
         writeln!(
-            &mut stderr(),
+            &mut *matcher_io.deps.get_error_output().borrow_mut(),
             "Permission matching not available on this platform!"
         )
         .unwrap();

@@ -28,7 +28,6 @@ pub struct Cache {
 #[cfg(unix)]
 use std::{
     cell::RefCell,
-    io::{stderr, Write},
     path::Path,
 };
 
@@ -103,7 +102,7 @@ impl FileSystemMatcher {
 
 impl Matcher for FileSystemMatcher {
     #[cfg(unix)]
-    fn matches(&self, file_info: &WalkEntry, _: &mut MatcherIO) -> bool {
+    fn matches(&self, file_info: &WalkEntry, matcher_io: &mut MatcherIO) -> bool {
         use std::os::unix::fs::MetadataExt;
 
         // Reuse the metadata already cached on the entry (a single shared `statx` per entry)
@@ -111,7 +110,7 @@ impl Matcher for FileSystemMatcher {
         // `updatedb` builds) this turns N stats per file into one.
         let Ok(metadata) = file_info.metadata() else {
             writeln!(
-                &mut stderr(),
+                &mut *matcher_io.deps.get_error_output().borrow_mut(),
                 "Error getting filesystem type for {}",
                 file_info.path().to_string_lossy()
             )
@@ -125,7 +124,7 @@ impl Matcher for FileSystemMatcher {
             result == self.fs_text
         } else {
             writeln!(
-                &mut stderr(),
+                &mut *matcher_io.deps.get_error_output().borrow_mut(),
                 "Error getting filesystem type for {}",
                 file_info.path().to_string_lossy()
             )
