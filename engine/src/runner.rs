@@ -514,8 +514,9 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
         //   /path     filesystem-socket UDS — works IF we also bind-mount
         //             the socket file into the box at the same path.
         //             Abstract @name socket would NOT work because --api
-        //             boxes get --unshare-net by default (NetMode::Off)
-        //             and abstract Unix is netns-scoped.
+        //             boxes run in their own netns (NetMode::Off or the
+        //             default Tap, never Host) and abstract Unix is
+        //             netns-scoped.
         //   @name     would require the box share host netns (NetMode::Host
         //             at run time). We just forward — build_sink silently
         //             no-ops when unreachable.

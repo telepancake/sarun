@@ -441,7 +441,11 @@ fn main() {
             let mut api = false;
             let mut chdir: Option<String> = None;
             let mut name: Option<String> = None;
-            let mut net_mode = NetMode::Off;
+            // Box networking defaults to Tap (proxied): the box gets a per-box
+            // netns wired to the engine's in-process TCP/IP stack. Opt out with
+            // `--net off` (air-gapped, fail-closed) or `-N`/`--net host` (raw
+            // host connectivity). See engine/src/net/mod.rs.
+            let mut net_mode = NetMode::Tap;
             let mut it = pre.iter();
             while let Some(a) = it.next() {
                 match a.as_str() {
@@ -462,16 +466,36 @@ fn main() {
                     "--no-parent" => no_parent = true,
                     "--readonly-parent" => readonly_parent = true,
                     "-C" => chdir = it.next().cloned(),
-                    // -n  network: per-box netns with a TAP whose other end
-                    //     terminates at the engine's userland TCP/IP stack
-                    //     (DHCP, DNS, MITM proxy). Outbound from box's POV is
-                    //     ordinary; engine originates the real upstream sockets
-                    //     in the host netns. See engine/src/net/mod.rs.
-                    // -N  no netns: keep the host network namespace (the
-                    //     pre-default-empty behavior; useful for boxes that
-                    //     need to dial localhost services or your VPN).
+                    // Box networking (default Tap — see net_mode init):
+                    // -n   Tap   per-box netns with a TAP whose other end
+                    //            terminates at the engine's userland TCP/IP
+                    //            stack (DHCP, DNS, HTTPS MITM w/ CA injection,
+                    //            per-flow policy). Outbound from the box's POV
+                    //            is ordinary; the engine originates the real
+                    //            upstream sockets in the host netns. Now the
+                    //            default; -n is its explicit spelling.
+                    // -N   Host  keep the host network namespace (raw
+                    //            connectivity — localhost services, your VPN).
+                    // --net off|tap|host  canonical selector. `off` is an
+                    //            empty netns where getaddrinfo and every dial
+                    //            fail closed. See engine/src/net/mod.rs.
                     "-n" => net_mode = NetMode::Tap,
                     "-N" => net_mode = NetMode::Host,
+                    "--net" => match it.next().map(String::as_str) {
+                        Some(m) => match NetMode::parse(m) {
+                            Some(nm) => net_mode = nm,
+                            None => {
+                                eprintln!("sarun: --net wants off|tap|host, \
+                                           got '{m}'");
+                                std::process::exit(2);
+                            }
+                        },
+                        None => {
+                            eprintln!("sarun: --net needs an argument \
+                                       (off|tap|host)");
+                            std::process::exit(2);
+                        }
+                    },
                     // --api  enable the oaita API proxy for this box. The
                     //        inner runner serves /run/sarun/api.sock inside
                     //        the box and tunnels each accepted connection
