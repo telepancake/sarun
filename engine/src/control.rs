@@ -1609,7 +1609,17 @@ fn handle_pty_spawn(msg: &Value, writer: &mut UnixStream, prebuf: Vec<u8>) {
                           cwd.as_deref(), &env);
 }
 
+/// Top-level handler for a control connection. `hint_box_id` is the box id
+/// the conn is known to come from — broker-spawned conns set it (the broker
+/// authenticated the dialer through the box channel); host conns leave it
+/// None. Today only the `api.proxy` verb consumes it (the LLM-API
+/// passthrough needs to know which box's apikey/admission to use); other
+/// verbs derive identity via SCM_RIGHTS pidfd as before.
 fn handle(state: State, conn: UnixStream) {
+    handle_with_box(state, conn, None)
+}
+
+fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
     // The register handshake carries the runner's pidfd as the connection's
     // first SCM_RIGHTS fd; keep it for host-pid derivation + kill. It belongs
     // to the FIRST message only (a register); close it if that never comes.
@@ -1678,6 +1688,43 @@ fn handle(state: State, conn: UnixStream) {
             drop(reader);
             return;
         }
+        // api.proxy: LLM-API passthrough conn from an in-box `oaita` client.
+        // The conn was dialed via the FD broker (hint_box_id is set to the
+        // box that hosts the dialer); the engine accepts HTTP/1.1 on this
+        // conn, injects the configured upstream auth, forwards to the real
+        // LLM API, and streams the response back on the same conn. Replaces
+        // the FRAME_API_OPEN/DATA/CLOSE mux on the box-channel — one conn
+        // per HTTP call, no stream-id demux needed.
+        if msg.get("type").and_then(Value::as_str) == Some("api.proxy") {
+            if let Some(fd) = peer_pidfd.take() { unsafe { libc::close(fd); } }
+            let Some(box_id) = hint_box_id else { return; };
+            let (rt_opt, proxy_opt) = {
+                let s = state.lock().unwrap();
+                (s.net_rt.clone(), s.api_proxy.clone())
+            };
+            let (Some(rt), Some(proxy)) = (rt_opt, proxy_opt) else { return; };
+            // Any HTTP bytes the client wrote before we read the verb header
+            // (none under our protocol, but the client speaks HTTP on the
+            // remaining conn so we must include the BufReader's residual).
+            let prebuffered = reader.buffer().to_vec();
+            drop(reader);
+            // The conn is the std-blocking UnixStream `writer` — switch it
+            // to non-blocking + hand to tokio for hyper to serve HTTP on.
+            if writer.set_nonblocking(true).is_err() { return; }
+            let std_conn = writer;
+            rt.spawn(async move {
+                let Ok(tokio_conn) =
+                    tokio::net::UnixStream::from_std(std_conn) else { return; };
+                let io = if prebuffered.is_empty() {
+                    PrebufferedIo::new(tokio_conn, Vec::new())
+                } else {
+                    PrebufferedIo::new(tokio_conn, prebuffered)
+                };
+                let _ = crate::oaita::proxy::serve_one_conn_for_box(
+                    proxy, box_id, hyper_util::rt::TokioIo::new(io)).await;
+            });
+            return;
+        }
         // The oaita API proxy lives on the existing box-channel as new
         // FRAME_API_* frame types — not as a top-level connection type.
         // See the FRAME_API_* handling in the post-register frame loop
@@ -1722,13 +1769,6 @@ fn handle(state: State, conn: UnixStream) {
             let mut fbuf = reader.buffer().to_vec();
             let mut pending_fd: Option<i32> = None;
             let mut muted_pid: Option<i32> = None;
-            // Per-box-channel oaita API mux. Created lazily on the first
-            // FRAME_API_OPEN this channel sees — most boxes never call the
-            // proxy, so we skip the tokio-runtime + Proxy lookup on the
-            // common path. When a box did register with `--api`, the
-            // runner forwards in-box `/run/sarun/api.sock` connections as
-            // FRAME_API_* streams on this channel; the mux demultiplexes.
-            let mut api_mux: Option<crate::oaita::proxy_mux::ApiMux> = None;
             loop {
                 let (frames, used) = crate::frames::decode(&fbuf);
                 for (ft, _) in &frames {
@@ -1790,45 +1830,14 @@ fn handle(state: State, conn: UnixStream) {
                             Err(_) => continue,
                         };
                     let st_handler = state.clone();
-                    std::thread::spawn(move || handle(st_handler, server_side));
+                    let box_id_hint = id;
+                    std::thread::spawn(move || handle_with_box(
+                        st_handler, server_side, Some(box_id_hint)));
                     use std::os::fd::AsRawFd;
                     send_frame_with_fd(&writer,
                         &crate::frames::encode(crate::frames::FRAME_CONN, &[]),
                         runner_side.as_raw_fd());
                     drop(runner_side); // the receiver dup's it on recvmsg
-                }
-                // oaita API proxy frames. Lazy-init the per-channel mux on
-                // first OPEN so non-api boxes pay nothing. After init,
-                // every FRAME_API_* on this channel feeds the same mux —
-                // attribution is implicit because the channel IS the box.
-                for (ft, payload) in &frames {
-                    if !matches!(*ft, crate::frames::FRAME_API_OPEN
-                                 | crate::frames::FRAME_API_DATA
-                                 | crate::frames::FRAME_API_CLOSE) {
-                        continue;
-                    }
-                    if api_mux.is_none() {
-                        let (rt_opt, proxy_opt, writer_opt) = {
-                            let s = state.lock().unwrap();
-                            (s.net_rt.clone(), s.api_proxy.clone(),
-                             ov.as_ref().and_then(|ov| ov.echo_writer(id)))
-                        };
-                        if let (Some(rt), Some(proxy), Some(writer)) =
-                            (rt_opt, proxy_opt, writer_opt)
-                        {
-                            api_mux = Some(crate::oaita::proxy_mux::ApiMux::new(
-                                id, proxy, rt, writer));
-                        }
-                    }
-                    let Some(mux) = api_mux.as_ref() else { continue; };
-                    let Some((stream_id, body)) =
-                        crate::frames::api_parse(payload) else { continue; };
-                    match *ft {
-                        crate::frames::FRAME_API_OPEN  => mux.open(stream_id),
-                        crate::frames::FRAME_API_DATA  => mux.data(stream_id, body),
-                        crate::frames::FRAME_API_CLOSE => mux.close(stream_id),
-                        _ => unreachable!(),
-                    }
                 }
                 fbuf.drain(..used);
                 if frames.is_empty() {
@@ -1844,7 +1853,6 @@ fn handle(state: State, conn: UnixStream) {
                     fbuf.extend_from_slice(&tmp[..n as usize]);
                 }
             }
-            if let Some(mux) = &api_mux { mux.shutdown(); }
             if let Some(fd) = pending_fd { unsafe { libc::close(fd); } }
             if let Some(ov) = ov.as_ref() {
                 if let Some(hp) = muted_pid { ov.mute_remove(hp); }
@@ -1994,6 +2002,58 @@ fn trace_file() -> &'static Mutex<Option<std::fs::File>> {
             .filter(|s| !s.is_empty())
             .and_then(|p| std::fs::OpenOptions::new()
                 .create(true).append(true).open(p).ok())))
+}
+
+/// A tokio AsyncRead+AsyncWrite that serves a fixed prefix first, then
+/// delegates to the wrapped UnixStream. Used by the `api.proxy` handoff:
+/// the BufReader that read the verb header may have buffered some HTTP
+/// request bytes the client wrote immediately after the header line, and
+/// hyper needs to see those too.
+struct PrebufferedIo {
+    prefix: Vec<u8>,
+    pos: usize,
+    inner: tokio::net::UnixStream,
+}
+
+impl PrebufferedIo {
+    fn new(inner: tokio::net::UnixStream, prefix: Vec<u8>) -> Self {
+        Self { prefix, pos: 0, inner }
+    }
+}
+
+impl tokio::io::AsyncRead for PrebufferedIo {
+    fn poll_read(mut self: std::pin::Pin<&mut Self>,
+                 cx: &mut std::task::Context<'_>,
+                 buf: &mut tokio::io::ReadBuf<'_>)
+                 -> std::task::Poll<std::io::Result<()>> {
+        if self.pos < self.prefix.len() {
+            let avail = self.prefix.len() - self.pos;
+            let n = avail.min(buf.remaining());
+            let start = self.pos;
+            buf.put_slice(&self.prefix[start..start + n]);
+            self.pos += n;
+            return std::task::Poll::Ready(Ok(()));
+        }
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for PrebufferedIo {
+    fn poll_write(mut self: std::pin::Pin<&mut Self>,
+                  cx: &mut std::task::Context<'_>, b: &[u8])
+                  -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, b)
+    }
+    fn poll_flush(mut self: std::pin::Pin<&mut Self>,
+                  cx: &mut std::task::Context<'_>)
+                  -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: std::pin::Pin<&mut Self>,
+                     cx: &mut std::task::Context<'_>)
+                     -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
 }
 
 /// Trace subscribers — held UnixStream writers, populated by trace.subscribe

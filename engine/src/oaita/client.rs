@@ -10,7 +10,6 @@
 // model is whatever the configured upstream serves, so we never lock the
 // schema; only the streaming SSE framing needs to be understood.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -22,24 +21,31 @@ use serde_json::{json, Value};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpStream, UnixStream};
 
-/// Where the LLM endpoint lives. UDS via the runner-served in-box
-/// /run/sarun/api.sock; TCP via a real http(s) base URL.
+/// Where the LLM endpoint lives. Broker: in-box dial of `SARUN_BROKER`
+/// (the FD broker), the returned engine conn carries an HTTP/1.1
+/// `api.proxy` stream — engine handles upstream auth + forwarding. TCP:
+/// direct dial of a real http(s) base URL (host clients).
 #[derive(Clone, Debug)]
 pub enum Endpoint {
-    /// Plain HTTP/1.1 over a unix socket. The path is the socket; HTTP host
-    /// header is irrelevant (the engine ignores it).
-    Unix(PathBuf),
+    /// Per-call dial of the engine via the FD broker; the conn becomes an
+    /// `api.proxy` stream the engine HTTP-proxies to the configured
+    /// upstream. The string is the abstract broker UDS name from
+    /// `SARUN_BROKER`.
+    Broker(String),
     /// Real http(s) URL. The port defaults to 80/443 by scheme.
     Tcp { scheme: String, host: String, port: u16 },
 }
 
 impl Endpoint {
-    /// Pick the endpoint for THIS process: `$OAITA_API_SOCK` (set by the
-    /// `--api` runner shim) wins; otherwise dial the base URL straight.
+    /// Pick the endpoint for THIS process. In-box `--api` clients have
+    /// `SARUN_BROKER` in env (the FD broker's abstract UDS name) — for
+    /// those we dial the broker per request and ride a fresh engine conn
+    /// tagged `api.proxy`. Top-level / host clients fall through to a
+    /// direct TCP dial of the configured base URL.
     pub fn from_env(base_url: &str) -> Result<Self, String> {
-        if let Ok(p) = std::env::var("OAITA_API_SOCK") {
-            if !p.is_empty() {
-                return Ok(Endpoint::Unix(PathBuf::from(p)));
+        if let Ok(name) = std::env::var("SARUN_BROKER") {
+            if !name.is_empty() {
+                return Ok(Endpoint::Broker(name));
             }
         }
         Self::parse_url(base_url)
@@ -59,7 +65,6 @@ impl Endpoint {
         Ok(Endpoint::Tcp { scheme: scheme.to_lowercase(), host, port })
     }
 
-    pub fn is_unix(&self) -> bool { matches!(self, Endpoint::Unix(_)) }
 }
 
 /// The path portion of a request URL: everything after the host. For TCP
@@ -172,7 +177,7 @@ impl Client {
         let body_bytes = serde_json::to_vec(&body)
             .map_err(|e| format!("encode body: {e}"))?;
         let host_header = match &self.endpoint {
-            Endpoint::Unix(_) => "oaita-proxy".to_string(),
+            Endpoint::Broker(_) => "oaita-proxy".to_string(),
             Endpoint::Tcp { host, port, scheme } => {
                 let default = (scheme == "https" && *port == 443)
                            || (scheme == "http" && *port == 80);
@@ -193,15 +198,25 @@ impl Client {
             .map_err(|e| format!("build req: {e}"))?;
 
         match &self.endpoint {
-            Endpoint::Unix(p) => {
-                // For --api boxes, p is `/run/sarun/api.sock` — a UDS the
-                // BOX RUNNER (not the engine) serves inside the box. The
-                // runner accepts the conn and tunnels it as a logical
-                // FRAME_API_* stream over its existing box-channel link to
-                // the engine. From this client's perspective it's just
-                // plain HTTP/1.1 over a UDS — the muxing is transparent.
-                let stream = UnixStream::connect(p).await
-                    .map_err(|e| format!("dial {}: {e}", p.display()))?;
+            Endpoint::Broker(name) => {
+                // For --api boxes: dial the FD broker (an abstract UDS the
+                // box's inner serves) per LLM call; the broker queues us,
+                // engine sends back a fresh socketpair half via SCM_RIGHTS.
+                // We tag that conn `api.proxy` — the engine then HTTP-
+                // proxies to the configured upstream. One conn per call;
+                // no demux on the box-channel.
+                let name_owned = name.clone();
+                let std_stream = tokio::task::spawn_blocking(move ||
+                    crate::runner::broker_dial(&name_owned))
+                    .await
+                    .map_err(|e| format!("broker join: {e}"))?
+                    .map_err(|e| format!("broker dial: {e}"))?;
+                std_stream.set_nonblocking(true)
+                    .map_err(|e| format!("set_nonblocking: {e}"))?;
+                let mut stream = UnixStream::from_std(std_stream)
+                    .map_err(|e| format!("from_std: {e}"))?;
+                stream.write_all(b"{\"type\":\"api.proxy\"}\n").await
+                    .map_err(|e| format!("api.proxy header: {e}"))?;
                 let (mut sender, conn) = hyper::client::conn::http1::handshake(
                     TokioIo::new(stream)).await
                     .map_err(|e| format!("handshake: {e}"))?;
