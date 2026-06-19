@@ -726,6 +726,11 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
         b.set_parent(Some(p));
         b.set_meta("parent_box_id", &p.to_string());
     }
+    // Host visibility: a box whose chain is closed — its own --no-parent, or any
+    // ancestor marked no_host_fallback (e.g. an OCI image's rootfs base) — sees
+    // no host filesystem underneath. Surfaced to the runner so it can pick the
+    // right default cwd ("/" when there's no host directory to inherit).
+    let no_host = b.no_host_fallback() || chain_has_no_host(parent);
     if let Some(prov) = msg.get("prov") {
         b.root_process(prov, host_pid as i64);
     }
@@ -796,6 +801,7 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
         "box_id": id, "session_id": id.to_string(), "name": name,
         "capture": want_capture,      // sinks + live echo mux active (off for -t/-d)
         "api": want_api,              // proxy admits this box; inner serves the in-box UDS
+        "no_host": no_host,           // chain is closed — no host fs underneath
         "_box_sid": id,               // caller marker: this conn is now the box channel
     });
     if let Some(o) = oci {
@@ -831,6 +837,32 @@ fn oci_runtime_from_chain(parent: Option<i64>) -> Option<Value> {
         cur = parent_str.and_then(|s| s.parse::<i64>().ok());
     }
     None
+}
+
+/// True if any ancestor in the parent chain (starting at `parent`) is marked
+/// no_host_fallback — i.e. the chain bottoms out closed, with no host
+/// filesystem underneath. Reads each ancestor's sqlar meta directly, the same
+/// way oci_runtime_from_chain walks for oci_config. The box's OWN --no-parent
+/// is handled by the caller via `b.no_host_fallback()`.
+fn chain_has_no_host(parent: Option<i64>) -> bool {
+    let mut cur = parent;
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..64 {
+        let Some(id) = cur else { return false };
+        if !seen.insert(id) { return false; }
+        let sqlar = crate::paths::state_home().join(format!("{id}.sqlar"));
+        let Ok(conn) = rusqlite::Connection::open_with_flags(
+            &sqlar, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) else { return false };
+        let nh: Option<String> = conn.query_row(
+            "SELECT value FROM meta WHERE key='no_host_fallback'", [],
+            |r| r.get(0)).ok();
+        if nh.as_deref() == Some("1") { return true; }
+        let parent_str: Option<String> = conn.query_row(
+            "SELECT value FROM meta WHERE key='parent_box_id'", [],
+            |r| r.get(0)).ok();
+        cur = parent_str.and_then(|s| s.parse::<i64>().ok());
+    }
+    false
 }
 
 /// Pull env / cwd / cmd / entrypoint / user out of the raw OCI image config

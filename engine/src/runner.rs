@@ -320,13 +320,26 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
         .and_then(|o| o.get("user")).and_then(Value::as_str)
         .map(String::from)
         .filter(|s| !s.is_empty());
-    // -C overrides the box's working directory; else the image's WorkingDir;
-    // else our own cwd.
+    // Working directory: -C wins, else the image's WorkingDir, else a default
+    // chosen by HOST VISIBILITY (the engine's `no_host` ack):
+    //   * no host visibility (closed chain — an OCI image rootfs, or an explicit
+    //     --no-parent box) → "/", exactly what Docker/Podman/containerd do when
+    //     an image sets no WorkingDir. The host's cwd does not exist inside a
+    //     closed rootfs, so inheriting it made bwrap fail `chdir`.
+    //   * has host visibility (a plain host-rooted box) → the runner's own cwd,
+    //     so `sarun run -- cmd` behaves like a shell: it runs where you are.
+    let no_host_box = ack.get("no_host").and_then(Value::as_bool).unwrap_or(false);
     let cwd = chdir
         .or(oci_cwd)
-        .unwrap_or_else(|| std::env::current_dir()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| "/".into()));
+        .unwrap_or_else(|| {
+            if no_host_box {
+                "/".to_string()
+            } else {
+                std::env::current_dir()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| "/".into())
+            }
+        });
     // No-cmd path: pull Entrypoint + Cmd from the image config and use it.
     let cmd = if cmd.is_empty() {
         let mut combined: Vec<String> = oci_runtime.as_ref()
