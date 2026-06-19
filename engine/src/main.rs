@@ -493,6 +493,7 @@ fn main() {
             let mut capture = false;
             let mut pty = false;
             let mut brush = false;
+            let mut api = false;
             let mut i = 0;
             while i < rest.len() {
                 if rest[i] == "--conn-fd" && i + 1 < rest.len() {
@@ -500,10 +501,11 @@ fn main() {
                 } else if rest[i] == "--capture" { capture = true; i += 1; }
                 else if rest[i] == "--pty" { pty = true; i += 1; }
                 else if rest[i] == "--brush" { brush = true; i += 1; }
+                else if rest[i] == "--api" { api = true; i += 1; }
                 else if rest[i] == "--" { i += 1; break; }
                 else { i += 1; }
             }
-            std::process::exit(runner::inner(conn_fd, capture, pty, brush, rest[i..].to_vec()));
+            std::process::exit(runner::inner(conn_fd, capture, pty, brush, api, rest[i..].to_vec()));
         }
         // CLI conveniences mirroring `slopbox NAME <op>`: a leading all-caps
         // (optionally dotted) box NAME selects it, and an optional op acts on it

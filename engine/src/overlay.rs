@@ -511,6 +511,14 @@ impl Overlay {
         self.inner.echo.write().unwrap().remove(&id);
         self.inner.sink_open.lock().unwrap().remove(&id);
     }
+    /// The box-channel writer stored under id (set by control::handle as the
+    /// echo conn). Reused by the oaita API mux to frame FRAME_API_DATA
+    /// responses back over the same channel — no second control conn.
+    pub fn echo_writer(&self, id: i64)
+        -> Option<std::sync::Arc<Mutex<std::os::unix::net::UnixStream>>>
+    {
+        self.inner.echo.read().unwrap().get(&id).cloned()
+    }
     pub fn mute_add(&self, host_pid: i32, box_id: i64) {
         if host_pid > 0 { self.inner.muted.write().unwrap().insert(host_pid, box_id); }
     }
