@@ -462,15 +462,17 @@ impl Overlay {
     /// though config_home is otherwise hidden.
     fn is_engine_path(rel: &str) -> bool {
         // Cache the (already-stripped) roots so the per-lookup cost is
-        // just a handful of string compares against `rel`. The "run/sarun"
-        // entry hides bwrap's bind destinations for ui.sock/api.sock/the
-        // engine binary — without it the overlay captures the bind targets
-        // as ordinary box writes and apply would clobber the engine's real
-        // host-side sockets at the same paths.
+        // just a handful of string compares against `rel`. /run/sarun is
+        // NOT in this list: bwrap mounts a private tmpfs over it before
+        // landing the ui.sock/engine-binary binds, so no overlay writes
+        // happen there in the first place — and hiding it from FUSE
+        // would break the mountpoint lookup bwrap relies on. The engine
+        // ensures host /run/sarun exists at startup so the tmpfs has
+        // somewhere to mount onto.
         use std::sync::OnceLock;
         static ROOTS: OnceLock<Vec<String>> = OnceLock::new();
         let roots = ROOTS.get_or_init(|| {
-            let mut v: Vec<String> = [crate::paths::data_home(),
+            [crate::paths::data_home(),
              crate::paths::config_home(),
              crate::paths::state_home(),
              crate::paths::runtime_home()]
@@ -480,9 +482,7 @@ impl Overlay {
                     s.strip_prefix('/').unwrap_or(&s).to_string()
                 })
                 .filter(|s| !s.is_empty())
-                .collect();
-            v.push("run/sarun".to_string());
-            v
+                .collect()
         });
         for r in roots {
             if rel == r { return true; }

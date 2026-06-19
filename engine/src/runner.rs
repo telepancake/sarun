@@ -24,29 +24,6 @@ use serde_json::json;
 
 use crate::paths;
 
-/// The host control socket, bind-mounted read-only into every box at this fixed
-/// path so a NESTED runner (one launched inside a running box) can reach the
-/// engine. Path-presence is the sole in-box signal — no env var.
-// Bound by bwrap as the in-box mirror of the engine's host control socket.
-// /tmp is now an --api-box symlink (see Overlay::resolve) and bwrap can't
-// create a bind destination under a symlink — so this lives under /run/
-// sarun/, outside /tmp. Host runners use the filesystem path or the
-// abstract socket; in-box runners go through this bind. -n boxes (private
-// netns) lose the abstract path but still reach the engine through this
-// bind, so the control channel survives netns unsharing.
-const UI_SOCK_INBOX: &str = "/run/sarun/ui.sock";
-
-/// Helper: dial the engine's abstract Unix socket (no filesystem). The name
-/// matches `crate::control::abstract_name(sock_path)` — `sarun:<path>`.
-/// Reachable only inside the same netns the engine is running in; in-box
-/// callers that unshared netns fall through to the filesystem path at
-/// UI_SOCK_INBOX.
-pub fn abstract_connect(sock: &std::path::Path) -> std::io::Result<UnixStream> {
-    use std::os::linux::net::SocketAddrExt;
-    let name = crate::control::abstract_name(sock);
-    let addr = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes())?;
-    UnixStream::connect_addr(&addr)
-}
 const KIDS_DIR: &str = ".slopbox-kids";
 
 /// Standard CA bundle paths the augmented bundle is bound over. Distro
@@ -75,15 +52,17 @@ fn pidfd_open(pid: i32) -> i32 {
 pub fn pidfd_open_pub(pid: i32) -> i32 { pidfd_open(pid) }
 
 /// D9 nested-shell provenance: the brush-sh shim (see brush::brush_sh) sends ONE
-/// newline-terminated JSON line over the engine control socket at UI_SOCK_INBOX,
-/// carrying ITS OWN pidfd as SCM_RIGHTS so the engine resolves the enclosing box
-/// from the shim's /proc ancestry (the same identity path register uses). This
-/// is a one-shot control message — NOT a register, NOT a box channel: the engine
-/// records the recipe's brushprov rows and closes. Best-effort: any failure (no
-/// socket, send error) is swallowed so the recipe still runs unchanged. `line`
-/// must already be newline-terminated.
+/// newline-terminated JSON line to the engine, carrying ITS OWN pidfd as
+/// SCM_RIGHTS so the engine resolves the enclosing box from the shim's
+/// /proc ancestry (the same identity path register uses). This is a one-
+/// shot control message — NOT a register, NOT a box channel: the engine
+/// records the recipe's brushprov rows and closes. The conn is acquired
+/// via the FD broker (`SARUN_BROKER` — bound by our parent inner). Best-
+/// effort: any failure (no broker, send error) is swallowed so the recipe
+/// still runs unchanged. `line` must already be newline-terminated.
 pub fn send_nested_prov(line: &[u8]) {
-    let Ok(conn) = UnixStream::connect(UI_SOCK_INBOX) else { return; };
+    let Ok(name) = std::env::var("SARUN_BROKER") else { return; };
+    let Ok(conn) = broker_dial(&name) else { return; };
     let pidfd = pidfd_open(std::process::id() as i32);
     send_register(&conn, line, pidfd);
     if pidfd >= 0 { unsafe { libc::close(pidfd); } }
@@ -95,6 +74,17 @@ pub fn send_nested_prov(line: &[u8]) {
 pub fn send_frame_pub(conn_fd: i32, frame: &[u8], pidfd: Option<i32>) {
     send_frame(conn_fd, frame, pidfd)
 }
+
+/// recv_box_frame_bytes, exposed for the brush + pty readers so their
+/// channel pump can pick up an SCM_RIGHTS-attached fd from FRAME_CONN.
+pub fn recv_box_frame_bytes_pub(raw: i32, buf: &mut [u8],
+                                fd: &mut Option<i32>) -> isize {
+    recv_box_frame_bytes(raw, buf, fd)
+}
+
+/// runner_broker_handoff, exposed for the brush + pty readers so they
+/// can complete the FD broker handshake.
+pub fn runner_broker_handoff_pub(fd: i32) { runner_broker_handoff(fd) }
 
 /// Send one register line plus our own pidfd as SCM_RIGHTS ancillary data, so
 /// the engine derives our HOST-namespace pid from /proc/self/fdinfo/<pidfd>
@@ -233,32 +223,24 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
     // mirroring -p; never under -d (no overlay to capture/provenance into).
     let want_capture = (!passthrough && !direct) || (pty && !direct)
         || (brush && !direct);
-    // IN-BOX vs HOST: a nested runner reaches the engine via the socket
-    // bind-mounted at UI_SOCK_INBOX (works regardless of netns sharing —
-    // -n boxes with private netns still reach the engine through this
-    // bind). A top-level runner uses the host filesystem socket OR the
-    // abstract socket; abstract is preferred for speed but the filesystem
-    // path is the long-term contract for host UIs.
-    // In-box dial order:
-    //   1. SARUN_BROKER (abstract UDS served by our parent inner) — the
-    //      preferred path, works in -n / private-netns boxes too because
-    //      the broker socket lives in the SAME netns as us.
-    //   2. UI_SOCK_INBOX (filesystem-bound host control socket) — fallback
-    //      for nested boxes whose parent didn't bring up a broker.
-    // Host dial order: abstract namespace, then filesystem path.
+    // IN-BOX vs HOST: presence of SARUN_BROKER is the sole in-box signal.
+    // bwrap propagates SARUN_BROKER to every box child; the parent inner
+    // serves it as an abstract UDS, so the FD broker is reachable from
+    // any in-box process — including private-netns / `-n` boxes, since
+    // the broker socket lives in the SAME netns as the box's children.
+    //   in-box: dial broker, recvmsg a fresh engine conn via SCM_RIGHTS.
+    //   host:   dial the engine's filesystem UDS (the universal contract;
+    //           the engine's abstract listener exists for in-box, not
+    //           here).
     let broker_name = std::env::var("SARUN_BROKER").ok()
         .filter(|s| !s.is_empty());
-    let in_box = broker_name.is_some()
-        || std::path::Path::new(UI_SOCK_INBOX).exists();
-    let sock = if in_box { std::path::PathBuf::from(UI_SOCK_INBOX) }
-               else { paths::sock_path() };
-    let conn = match (if let Some(name) = broker_name.as_ref() {
-        broker_dial(name).or_else(|_| UnixStream::connect(&sock))
-    } else if in_box {
-        UnixStream::connect(&sock)
+    let in_box = broker_name.is_some();
+    let sock = paths::sock_path();
+    let conn = match if let Some(name) = broker_name.as_ref() {
+        broker_dial(name)
     } else {
-        abstract_connect(&sock).or_else(|_| UnixStream::connect(&sock))
-    }) {
+        UnixStream::connect(&sock)
+    } {
         Ok(c) => c,
         Err(_) => {
             eprintln!("sarun-engine: no engine running (control socket {}).",
@@ -377,27 +359,19 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
     // routing to this child's real root). Both bind a directory bwrap holds
     // CAP_SYS_ADMIN over inside its own userns — no ambient caps needed.
     let root_src = if in_box { format!("/{KIDS_DIR}/{sid}") } else { mount.clone() };
-    // Forward the engine socket into the box at the fixed inbox path so a
-    // DEEPER nested runner can reach the engine. Lives under /run/sarun/
-    // rather than under /tmp (the /tmp redirect for --api boxes would
-    // collide with bwrap's bind destination there).
-    let sock_src = if in_box { UI_SOCK_INBOX.to_string() }
-                   else { paths::sock_path().to_string_lossy().into_owned() };
     let fd_s = fd.to_string();
     // Honor the engine's capture decision (it downgrades for -t/-d): only pass
     // --capture to inner when the ack confirms capture is active.
     let capture_on = want_capture
         && ack.get("capture").and_then(Value::as_bool).unwrap_or(false);
-    // Bind the engine binary into the box at a fixed path next to the socket
-    // and exec --inner from THAT path, not from the host path. The host path
-    // happens to resolve through a regular box's lower-chain fall-through to
-    // host, but a `--no-parent` box has no fall-through — without this bind,
-    // bwrap fails with execvp ENOENT on the engine. The bind is harmless for
-    // ordinary boxes (a redundant ro-bind onto the already-resolvable path).
-    // Moved out of /tmp for the same reason ui.sock did — /tmp is a
-    // per-box symlink in --api boxes (Overlay::resolve's substitute) and
-    // bwrap can't create bind destinations inside a symlink. /run/sarun/
-    // is the new tenancy for engine-injected paths.
+    // Bind the engine binary into the box at a fixed path and exec --inner
+    // from THAT path, not from the host path. The host path happens to
+    // resolve through a regular box's lower-chain fall-through to host,
+    // but a `--no-parent` box has no fall-through — without this bind,
+    // bwrap fails with execvp ENOENT on the engine. /run/sarun/ is the
+    // engine's tenancy inside the box — it's a bwrap-private tmpfs (see
+    // the --tmpfs line below) so this bind and any other engine-injected
+    // file there are isolated from the overlay.
     let inner_exe = "/run/sarun/engine";
     let mut inner_args: Vec<&str> = vec![
         inner_exe, "inner", "--conn-fd", &fd_s];
@@ -443,7 +417,16 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
     } else {
         bwrap.args(["--tmpfs", "/tmp"]);
     }
-    bwrap.args(["--ro-bind", &sock_src, UI_SOCK_INBOX,
+    // /run/sarun belongs to the engine — the inner-served api.sock and the
+    // bound-in engine binary live there. Plant a bwrap-private tmpfs at
+    // /run/sarun first so neither the binary bind nor (for --api) the
+    // runner-created api.sock node ever touch the overlay upper: apply
+    // doesn't see them, the change summary stays clean, and there's no
+    // path to clobber the engine's real host-side files at the same name.
+    // (There's no ui.sock bind here anymore — the FD broker carries every
+    // in-box engine conn over the existing box-channel; ui.sock is HOST
+    // only.)
+    bwrap.args(["--tmpfs", "/run/sarun",
                 "--ro-bind", &self_exe, inner_exe]);
     // FD broker: pick a per-box abstract-UDS name and propagate it to
     // the inner AND every child process via --setenv. The inner binds it
@@ -722,6 +705,33 @@ pub fn inner(conn_fd: i32, capture: bool, pty: bool, brush: bool,
         // Passthrough (-t/-d): stdio is inherited. Spawn (not exec) so we can do
         // tty job-control + restore for an interactive shell; the box channel,
         // if any, stays held open by us until the child exits (teardown EOF).
+        // Even with no ECHO traffic to consume, we need a broker pump on the
+        // channel: an in-box `sarun run NESTED` issued from the child's shell
+        // sends FRAME_OPEN_CONN, the engine replies FRAME_CONN+SCM_RIGHTS,
+        // and that fd has to get forwarded back to the waiting child. The
+        // pump terminates when the channel EOFs (we close it after wait).
+        if conn_fd >= 0 {
+            std::thread::spawn(move || {
+                let mut tmp = [0u8; 4096];
+                let mut buf: Vec<u8> = vec![];
+                loop {
+                    let mut got_fd: Option<i32> = None;
+                    let n = recv_box_frame_bytes(conn_fd, &mut tmp, &mut got_fd);
+                    if n <= 0 { break; }
+                    buf.extend_from_slice(&tmp[..n as usize]);
+                    let (frames, used) = crate::frames::decode(&buf);
+                    buf.drain(..used);
+                    for (ft, _payload) in frames {
+                        if ft == crate::frames::FRAME_CONN {
+                            if let Some(fd) = got_fd.take() {
+                                runner_broker_handoff(fd);
+                            }
+                        }
+                    }
+                    if let Some(fd) = got_fd { unsafe { libc::close(fd); } }
+                }
+            });
+        }
         let (tty_fd, old_fg) = tty_grab();
         let mut child = match Command::new(&cmd[0]).args(&cmd[1..])
             .process_group(0).spawn() {
@@ -1249,14 +1259,28 @@ fn inner_pty(conn_fd: i32, cmd: Vec<String>) -> i32 {
         let mut buf: Vec<u8> = vec![];
         let mut tmp = [0u8; 65536];
         loop {
-            let n = unsafe { libc::read(rfd, tmp.as_mut_ptr().cast(), tmp.len()) };
+            // recvmsg so a FRAME_CONN's SCM_RIGHTS fd reaches the FD broker
+            // — the in-box dialer handoff. Otherwise identical to the
+            // capture/brush readers, with the PTY-specific subtlety that
+            // the master is our live source for ECHO bytes, so the engine's
+            // FRAME_ECHO copies are discarded here (we wait only for the
+            // ECHO_DONE marker to know capture has flushed).
+            let mut got_fd: Option<i32> = None;
+            let n = recv_box_frame_bytes(rfd, &mut tmp, &mut got_fd);
             if n <= 0 { break; }
             buf.extend_from_slice(&tmp[..n as usize]);
             let (frames, used) = crate::frames::decode(&buf);
             buf.drain(..used);
             for (ft, _payload) in frames {
+                if ft == crate::frames::FRAME_CONN {
+                    if let Some(fd) = got_fd.take() {
+                        runner_broker_handoff(fd);
+                    }
+                    continue;
+                }
                 if ft == crate::frames::FRAME_ECHO_DONE { return; }
             }
+            if let Some(fd) = got_fd { unsafe { libc::close(fd); } }
         }
     });
 
