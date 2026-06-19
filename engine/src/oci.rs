@@ -41,16 +41,22 @@ const DOCKER_LAYER_GZIP_MEDIA_TYPE: &str =
 /// CLI dispatch: `sarun oci <subverb> <args...>`.
 pub fn cli_oci(args: &[String]) -> i32 {
     let Some(sub) = args.first().map(String::as_str) else {
-        eprintln!("usage: sarun oci load <ref> [NAME]");
+        eprintln!("usage: sarun oci <load|run> ...");
         return 2;
     };
     match sub {
         "load" => cli_load(&args[1..]),
+        "run" => cli_run(&args[1..]),
         "-h" | "--help" => {
-            println!("usage: sarun oci load <ref> [NAME]");
+            println!("usage:");
+            println!("  sarun oci load <ref> [NAME]");
+            println!("       populate at-rest boxes from an OCI image, one per layer");
+            println!("  sarun oci run [--name NAME] [--net off|tap|host] <ref> [-- CMD...]");
+            println!("       run a container on top of an image's box stack");
+            println!();
             println!("  ref  e.g. alpine:3.20, ghcr.io/foo/bar:tag,");
-            println!("       oci-archive:/path/to.tar, oci-layout:/path/to/dir");
-            println!("  NAME optional name for the base (rootfs) box");
+            println!("       oci-archive:/path/to.tar, oci-layout:/path/to/dir,");
+            println!("       or the NAME/id of an already-loaded image box");
             0
         }
         other => {
@@ -91,6 +97,187 @@ fn cli_load(args: &[String]) -> i32 {
             1
         }
     }
+}
+
+// ── `sarun oci run` ──────────────────────────────────────────────────────────
+// Run a container on top of an OCI image's box stack. The image's TOP layer box
+// becomes the parent of a fresh, ephemeral container box: the engine walks that
+// parent chain, finds the `oci_config` meta the loader stamped, and fills in
+// env / workdir / user / entrypoint+cmd in the register ack — so an empty CMD
+// runs the image's own entrypoint, and a supplied CMD overrides it. Networking
+// defaults to Tap (proxied); `--net off|tap|host` (and `-n`/`-N`) opt out.
+//
+// `<ref>` is resolved two ways: if it names an already-loaded box (by NAME,
+// dotted display path, or numeric id) we run on that stack's top; otherwise it
+// is treated as an image reference and loaded fresh (anonymous pull / archive /
+// layout) first, exactly like `oci load`.
+fn cli_run(args: &[String]) -> i32 {
+    // A `--` splits an explicit CMD override from the run's own flags+ref.
+    let sep = args.iter().position(|a| a == "--");
+    let (pre, cmd) = match sep {
+        Some(i) => (&args[..i], args[i + 1..].to_vec()),
+        None => (args, vec![]),
+    };
+    let mut name: Option<String> = None;
+    let mut net_mode = crate::net::NetMode::Tap; // proxied by default
+    let mut reference: Option<String> = None;
+    let mut it = pre.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--name" => match it.next() {
+                Some(v) => name = Some(v.clone()),
+                None => { eprintln!("sarun oci run: --name needs an argument"); return 2; }
+            },
+            "-n" => net_mode = crate::net::NetMode::Tap,
+            "-N" => net_mode = crate::net::NetMode::Host,
+            "--net" => match it.next().map(String::as_str) {
+                Some(m) => match crate::net::NetMode::parse(m) {
+                    Some(nm) => net_mode = nm,
+                    None => {
+                        eprintln!("sarun oci run: --net wants off|tap|host, got '{m}'");
+                        return 2;
+                    }
+                },
+                None => {
+                    eprintln!("sarun oci run: --net needs an argument (off|tap|host)");
+                    return 2;
+                }
+            },
+            "-h" | "--help" => {
+                println!("usage: sarun oci run [--name NAME] [--net off|tap|host] \
+                          <ref> [-- CMD...]");
+                return 0;
+            }
+            other if reference.is_none() => reference = Some(other.to_string()),
+            other => {
+                eprintln!("sarun oci run: unexpected argument '{other}'");
+                return 2;
+            }
+        }
+    }
+    let Some(reference) = reference else {
+        eprintln!("usage: sarun oci run [--name NAME] [--net off|tap|host] \
+                   <ref> [-- CMD...]");
+        return 2;
+    };
+    if let Err(e) = paths::ensure_dirs() {
+        eprintln!("sarun oci run: {e}");
+        return 1;
+    }
+    // Resolve <ref> to the TOP box of an image stack (loading it if needed).
+    let top_id = match resolve_image_top(&reference) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("sarun oci run: {e:#}");
+            return 1;
+        }
+    };
+    // A fresh, uppercase-leading container name forces a CREATE (not a rerun)
+    // and stays addressable later as a box NAME.
+    let container = name.unwrap_or_else(unique_container_name);
+    // Dotted session_id: the engine resolves the prefix (the top box, by id) as
+    // the parent and creates a new child box named `container` under it.
+    let session = format!("{top_id}.{container}");
+    // Interactive when stdin is a tty (so `oci run … -- sh` gives a real shell),
+    // mirroring `docker run -it`'s default for an attached terminal.
+    let pty = unsafe { libc::isatty(0) == 1 };
+    eprintln!("sarun oci run: container '{container}' on image top box {top_id} \
+               (net={})", net_mode.as_str());
+    crate::runner::run(
+        Some(session),
+        /* passthrough */ false,
+        /* direct      */ false,
+        /* env          */ false,
+        /* pty          */ pty,
+        /* brush        */ false,
+        /* api          */ false,
+        /* no_parent    */ false,
+        /* readonly_parent */ false,
+        /* chdir        */ None,
+        net_mode,
+        cmd,
+    )
+}
+
+/// Resolve a run target to the box id of its image stack's TOP layer.
+///
+/// If `reference` names an existing box (numeric id, exact NAME, or dotted
+/// display path), we walk DOWN its OCI layer children to the topmost layer and
+/// run on that. Otherwise `reference` is an image ref: we load it fresh and use
+/// the loader's reported top box.
+fn resolve_image_top(reference: &str) -> Result<i64> {
+    let boxes = crate::discover::discover();
+    if let Some(start) = resolve_box(&boxes, reference) {
+        return Ok(follow_to_top(&boxes, start));
+    }
+    // Not an existing box → treat as an image reference and load it.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all().build()
+        .context("tokio init")?;
+    let outcome = rt.block_on(load(reference, None))
+        .with_context(|| format!("load image '{reference}'"))?;
+    eprintln!("sarun oci run: loaded image '{reference}' → top box {} ({} layer(s))",
+              outcome.top_id, outcome.n_layers);
+    Ok(outcome.top_id)
+}
+
+/// Box id for `ident` as a numeric id, an exact NAME, or a dotted display path
+/// (the same identifiers `control::resolve` accepts, replicated here so the CLI
+/// path doesn't depend on the control module's private resolver).
+fn resolve_box(boxes: &std::collections::BTreeMap<i64, crate::discover::Box_>,
+               ident: &str) -> Option<i64> {
+    if let Ok(id) = ident.parse::<i64>() {
+        if boxes.contains_key(&id) { return Some(id); }
+    }
+    boxes.values()
+        .find(|b| b.name == ident
+              || crate::discover::display_path(boxes, b.box_id) == ident)
+        .map(|b| b.box_id)
+}
+
+/// Follow the OCI layer chain DOWN from `start` to the topmost layer box. The
+/// loader builds a linear stack (each layer's parent is the one below), so we
+/// step to the unique child that is itself an OCI layer — skipping any
+/// non-layer children (e.g. previous run-containers parented under the image).
+fn follow_to_top(boxes: &std::collections::BTreeMap<i64, crate::discover::Box_>,
+                 start: i64) -> i64 {
+    let mut cur = start;
+    let mut seen = std::collections::HashSet::new();
+    loop {
+        if !seen.insert(cur) { break; } // cycle guard
+        let next = boxes.values()
+            .find(|b| b.parent == Some(cur) && is_oci_layer(b.box_id))
+            .map(|b| b.box_id);
+        match next {
+            Some(n) => cur = n,
+            None => break,
+        }
+    }
+    cur
+}
+
+/// Is box `id` an OCI image layer (loader-stamped `oci_layer_index` meta)?
+fn is_oci_layer(id: i64) -> bool {
+    read_box_meta(id, "oci_layer_index").is_some()
+}
+
+/// Read one meta value from a box's at-rest sqlar, read-only. Returns None for a
+/// live-only box (no sqlar yet) or a missing key.
+fn read_box_meta(id: i64, key: &str) -> Option<String> {
+    let p = paths::state_home().join(format!("{id}.sqlar"));
+    let conn = rusqlite::Connection::open_with_flags(
+        &p, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+    conn.query_row("SELECT value FROM meta WHERE key=?1", [key],
+                   |r| r.get::<_, String>(0)).ok()
+}
+
+/// A unique, valid (`valid_name`: uppercase-leading [A-Z0-9-]) container box
+/// name, so each run CREATEs a fresh box instead of re-running a sibling.
+fn unique_container_name() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let n = SystemTime::now().duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos()).unwrap_or(0) as u64;
+    format!("R{:X}", n & 0xFFFF_FFFF)
 }
 
 struct LoadOutcome {
