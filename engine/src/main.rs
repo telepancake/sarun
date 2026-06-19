@@ -21,6 +21,10 @@ mod brush_gates;
 mod capture;
 mod control;
 mod discover;
+// Dockerfile/Containerfile parser for `sarun oci build` / `oci run`. Lands
+// ahead of its consumer (the build driver), so allow the not-yet-used items.
+#[allow(dead_code)]
+mod dockerfile;
 mod frames;
 mod katirun;
 mod n2run;
