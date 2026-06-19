@@ -168,7 +168,10 @@ fn inspect_spec() -> ToolSpec {
              Locators: `<path>` for the whole thing, `<path> lines A..B` \
              to jump to file lines A..B, `<path> entries A..B` to jump to \
              directory entries A..B, `<path> around N` for a small window \
-             centred on line N, or `box:<id>[/<file>]` for staged diffs. \
+             centred on line N, `<path> symbols` to list the named \
+             definitions in a source file (tree-sitter; .rs/.py/.sh/.bash), \
+             `<path> symbol <name>[N]` to focus on the Nth occurrence of a \
+             definition by name, or `box:<id>[/<file>]` for staged diffs. \
              A reduced page ends with a cursor footer; continue it by \
              calling inspect with just `next`, `previous`, `first`, or \
              `last` (no path needed — the cursor lives in the result \
@@ -180,7 +183,7 @@ fn inspect_spec() -> ToolSpec {
             "type": "object",
             "properties": {
                 "path": {"type": "string",
-                         "description": "Locator: path | path lines A..B | path around N | box:<id>[/<file>] | next | previous | first | last."},
+                         "description": "Locator: path | path lines A..B | path around N | path symbols | path symbol <name>[N] | box:<id>[/<file>] | next | previous | first | last."},
             },
             "required": ["path"],
         }),
@@ -199,10 +202,12 @@ fn read_spec() -> ToolSpec {
              so you can include it in your reply unaltered. \
              \
              `path` takes inspect's locator grammar: a file path, \
-             optionally with `lines A..B` or `around N`, or a page key \
-             (next/previous/first/last) returning the last paged window \
-             raw. Use this instead of `shell` + `cat`/`sed -n`/`awk` — \
-             those add line numbers, framing, or formatting noise.".to_string(),
+             optionally with `lines A..B` or `around N` for a line slice, \
+             `symbol <name>[N]` for a named definition's source (.rs/.py/\
+             .sh/.bash), or a page key (next/previous/first/last) \
+             returning the last paged window raw. Use this instead of \
+             `shell` + `cat`/`sed -n`/`awk` — those add line numbers, \
+             framing, or formatting noise.".to_string(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -230,10 +235,12 @@ fn write_spec() -> ToolSpec {
              the whole file; `path lines A..B` replaces lines A..B \
              (line counts may differ — the file grows/shrinks); `path \
              around N` replaces the same window inspect would have shown \
-             around line N; a page key (next/previous/first/last) replaces \
-             the slice the most recent inspect/read paged to. `content` is \
-             the replacement bytes (no line numbers, no framing — write \
-             accepts what read returns). \
+             around line N; `path symbol <name>[N]` replaces the Nth \
+             named definition in a source file (.rs/.py/.sh/.bash — \
+             tree-sitter resolves it); a page key (next/previous/first/\
+             last) replaces the slice the most recent inspect/read paged \
+             to. `content` is the replacement bytes (no line numbers, no \
+             framing — write accepts what read returns). \
              \
              Optimistic concurrency: if you `read` (or `inspect`) the slice \
              earlier in this session and the on-disk contents changed since \
@@ -249,14 +256,13 @@ fn write_spec() -> ToolSpec {
              code-gen tool, etc.) and let it write the file directly. \
              \
              box: locators are inspect-only (staged change sets are \
-             read-only here). Structural locators (functions, paragraphs, \
-             sequence before/after) are a planned extension — V1 covers \
-             whole-file, line-range, around-N, and page-key.".to_string(),
+             read-only here). Sequence-insertion locators (before/after a \
+             named symbol) are a planned extension.".to_string(),
         parameters: json!({
             "type": "object",
             "properties": {
                 "path":    {"type": "string",
-                            "description": "Locator (inspect's grammar): path | path lines A..B | path around N | next/previous/first/last."},
+                            "description": "Locator (inspect's grammar): path | path lines A..B | path around N | path symbol <name>[N] | next/previous/first/last."},
                 "content": {"type": "string",
                             "description": "Replacement bytes for the named slice."},
                 "force":   {"type": "boolean",

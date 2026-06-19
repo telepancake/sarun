@@ -86,3 +86,12 @@ oci-spec = "0.10"
 tar = "0.4"
 flate2 = "1"
 ruzstd = "0.7"
+# Structural editing — tree-sitter + a starter pack of grammars. Drives the
+# inspect/write "symbol" locators (path symbol <name>[N]): inspect lists or
+# focuses named definitions; write splices new content into the symbol's
+# byte range. Grammars are C-only, no extra system deps — cc-rs picks up
+# the zigshim like onig_sys does.
+tree-sitter = "0.25"
+tree-sitter-rust = "0.24"
+tree-sitter-python = "0.25"
+tree-sitter-bash = "0.25"
