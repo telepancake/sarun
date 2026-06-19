@@ -25,13 +25,34 @@ const UI_SOCK_INBOX: &str = "/run/sarun/ui.sock";
 /// the bind-mounted path exists, host socket otherwise. Returns the unwrapped
 /// `r` payload, or an error string.
 fn ctrl_rpc(verb: &str, args: Value) -> Result<Value, String> {
-    let sock: PathBuf = if Path::new(UI_SOCK_INBOX).exists() {
-        PathBuf::from(UI_SOCK_INBOX)
+    // Prefer the in-box FD broker (abstract UDS served by our parent
+    // inner — works in private-netns boxes and leaves no host-path
+    // bind-mount inside the box). Falls back to the bind-mounted ui.sock
+    // for in-box callers whose parent didn't bring up a broker, then to
+    // the host filesystem path.
+    let broker = std::env::var("SARUN_BROKER").ok().filter(|s| !s.is_empty());
+    let mut s = if let Some(name) = broker.as_ref() {
+        match crate::runner::broker_dial(name) {
+            Ok(c) => c,
+            Err(_) => {
+                let sock: PathBuf = if Path::new(UI_SOCK_INBOX).exists() {
+                    PathBuf::from(UI_SOCK_INBOX)
+                } else {
+                    crate::paths::sock_path()
+                };
+                UnixStream::connect(&sock)
+                    .map_err(|e| format!("connect {}: {e}", sock.display()))?
+            }
+        }
     } else {
-        crate::paths::sock_path()
+        let sock: PathBuf = if Path::new(UI_SOCK_INBOX).exists() {
+            PathBuf::from(UI_SOCK_INBOX)
+        } else {
+            crate::paths::sock_path()
+        };
+        UnixStream::connect(&sock)
+            .map_err(|e| format!("connect {}: {e}", sock.display()))?
     };
-    let mut s = UnixStream::connect(&sock)
-        .map_err(|e| format!("connect {}: {e}", sock.display()))?;
     let msg = json!({"type": "ui", "verb": verb, "args": args});
     s.write_all(format!("{msg}\n").as_bytes())
         .map_err(|e| format!("write: {e}"))?;
