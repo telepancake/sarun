@@ -142,7 +142,12 @@ const HINTS: &[Hint] = &[
 /// append to the CURRENT tool result iff:
 ///   * `current_clean` is true (the result we're about to emit is itself
 ///     clean — no error markers);
-///   * at least 4 of the most recent prior tool turns are clean too;
+///   * at least 5 SUBSTANTIVE clean tool turns exist in the last 8 — a
+///     non-trivial result, not a 1-line "ok" or empty body — and at most
+///     2 of those last 8 errored. The "non-trivial result" gate stops the
+///     hint from arming after a write/write/shell streak that hasn't yet
+///     verified anything; the "≤2 errors" relaxation stops it from being
+///     locked out forever by a long-running task with occasional misses;
 ///   * the productive-cluster marker isn't already in any prior turn.
 /// `first_user_id` templates into the suggested backtrack invocation. When
 /// any condition fails, returns an empty string.
@@ -150,13 +155,19 @@ pub fn productive_cluster_append(turns: &[Turn], current_clean: bool,
                                  first_user_id: Option<&str>) -> String {
     if !current_clean { return String::new(); }
     let recent_tools: Vec<&Turn> = turns.iter()
-        .filter(|t| t.kind == "tool").rev().take(4).collect();
-    if recent_tools.len() < 4 { return String::new(); }
-    let prior_clean = recent_tools.iter().all(|t| {
+        .filter(|t| t.kind == "tool").rev().take(8).collect();
+    if recent_tools.len() < 5 { return String::new(); }
+    let mut substantive_clean = 0usize;
+    let mut errs = 0usize;
+    for t in &recent_tools {
         let body = t.read().unwrap_or_default();
-        !looks_failed(&body)
-    });
-    if !prior_clean { return String::new(); }
+        if looks_failed(&body) {
+            errs += 1;
+        } else if is_substantive(&body) {
+            substantive_clean += 1;
+        }
+    }
+    if substantive_clean < 5 || errs > 2 { return String::new(); }
     // Marker dedup against the full session.
     let marker = HINTS.iter().find(|h| h.id == "productive-cluster")
         .map(|h| h.marker).unwrap_or("");
@@ -171,6 +182,25 @@ pub fn productive_cluster_append(turns: &[Turn], current_clean: bool,
     let tid = first_user_id.unwrap_or("<first-user-turn-id>");
     let body = h.body.replace("<TID>", &format!("{tid:?}"));
     format!("\n\n{}\n{body}", h.marker)
+}
+
+/// A tool result is "substantive" when there's something to chew on —
+/// at least a few non-trivial lines that aren't just status framing. We
+/// use this to gate the productive-cluster hint so it doesn't arm after
+/// a write/write/shell streak that produced nothing the model could
+/// verify. The thresholds are deliberately conservative: short status
+/// lines like `write: foo.py: replaced whole file (0 -> 83 lines)` or
+/// the bare `0` rc message from a side-effecty shell call shouldn't
+/// count as "I've verified my work."
+fn is_substantive(content: &str) -> bool {
+    // Strip the harness-injected hint tail (everything after a `--- hint:`
+    // marker line) before counting — those are our own additions, not
+    // signal the model produced.
+    let core = content.split("\n\n--- hint:").next().unwrap_or(content);
+    let trimmed = core.trim();
+    if trimmed.len() < 80 { return false; }
+    let line_count = trimmed.lines().filter(|l| !l.trim().is_empty()).count();
+    line_count >= 3
 }
 
 /// The same "tool result looks like an error" predicate the unproductive
