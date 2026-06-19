@@ -1743,6 +1743,30 @@ fn handle(state: State, conn: UnixStream) {
                         record_brush_prov(&state, &ov, id, payload);
                     }
                 }
+                // FD broker — the inner asks the engine for a fresh
+                // engine connection it can hand to a child via SCM_RIGHTS
+                // (no bind-mount of ui.sock into the box). Engine creates
+                // a socketpair, spawns its own handler on one side, and
+                // sends the other side back over the box-channel as
+                // FRAME_CONN + SCM_RIGHTS. Attribution is intrinsic to
+                // the channel — every fresh conn is for THIS box.
+                for (ft, _) in &frames {
+                    if *ft != crate::frames::FRAME_OPEN_CONN { continue; }
+                    let writer = ov.as_ref().and_then(|o| o.echo_writer(id));
+                    let Some(writer) = writer else { continue; };
+                    let (server_side, runner_side) =
+                        match std::os::unix::net::UnixStream::pair() {
+                            Ok(p) => p,
+                            Err(_) => continue,
+                        };
+                    let st_handler = state.clone();
+                    std::thread::spawn(move || handle(st_handler, server_side));
+                    use std::os::fd::AsRawFd;
+                    send_frame_with_fd(&writer,
+                        &crate::frames::encode(crate::frames::FRAME_CONN, &[]),
+                        runner_side.as_raw_fd());
+                    drop(runner_side); // the receiver dup's it on recvmsg
+                }
                 // oaita API proxy frames. Lazy-init the per-channel mux on
                 // first OPEN so non-api boxes pay nothing. After init,
                 // every FRAME_API_* on this channel feeds the same mux —
@@ -1857,9 +1881,18 @@ pub fn cli_box_op(argv: &[String]) -> i32 {
     } else {
         crate::paths::sock_path()
     };
+    // Prefer the in-box FD broker (abstract UDS — survives private netns,
+    // no host-path bind needed). Falls back to the filesystem socket above.
+    let broker_name = std::env::var("SARUN_BROKER").ok()
+        .filter(|s| !s.is_empty());
+    let dial = || -> std::io::Result<UnixStream> {
+        if let Some(n) = broker_name.as_ref() {
+            if let Ok(c) = crate::runner::broker_dial(n) { return Ok(c); }
+        }
+        UnixStream::connect(&sock)
+    };
     let one = |msg: Value| -> Result<Value, String> {
-        let mut c = UnixStream::connect(&sock)
-            .map_err(|_| "no engine running".to_string())?;
+        let mut c = dial().map_err(|_| "no engine running".to_string())?;
         c.write_all(format!("{msg}\n").as_bytes()).map_err(|e| e.to_string())?;
         let mut line = String::new();
         BufReader::new(&c).read_line(&mut line).map_err(|e| e.to_string())?;
@@ -1953,4 +1986,34 @@ pub fn abstract_listener(sock: &std::path::Path) -> std::io::Result<UnixListener
 /// without crossing files.
 pub fn abstract_name(sock: &std::path::Path) -> String {
     format!("sarun:{}", sock.display())
+}
+
+/// Send a frame over the box-channel WITH an attached fd via SCM_RIGHTS.
+/// Engine-side analogue of runner::send_frame's pidfd path. Best-effort:
+/// a closed/blocked channel silently fails (the receiver will EOF later
+/// and we don't want one slow runner to deadlock the engine).
+fn send_frame_with_fd(channel: &std::sync::Arc<Mutex<UnixStream>>,
+                      frame: &[u8], fd: i32) {
+    use std::os::fd::AsRawFd;
+    let c = channel.lock().unwrap();
+    let conn_fd = c.as_raw_fd();
+    let mut iov = libc::iovec {
+        iov_base: frame.as_ptr() as *mut libc::c_void,
+        iov_len: frame.len(),
+    };
+    let mut cmsg = [0u8; 32];
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cmsg.as_mut_ptr().cast();
+    msg.msg_controllen = unsafe { libc::CMSG_SPACE(4) } as _;
+    unsafe {
+        let cm = libc::CMSG_FIRSTHDR(&msg);
+        (*cm).cmsg_level = libc::SOL_SOCKET;
+        (*cm).cmsg_type = libc::SCM_RIGHTS;
+        (*cm).cmsg_len = libc::CMSG_LEN(4) as _;
+        std::ptr::copy_nonoverlapping((&fd as *const i32).cast(),
+                                       libc::CMSG_DATA(cm), 4);
+        libc::sendmsg(conn_fd, &msg, 0);
+    }
 }

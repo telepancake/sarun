@@ -65,6 +65,25 @@ pub const FRAME_PTY_EOF: u8 = 9;
 pub const FRAME_API_OPEN: u8 = 10;
 pub const FRAME_API_DATA: u8 = 11;
 pub const FRAME_API_CLOSE: u8 = 12;
+//
+// FD broker — the box-channel is the rendezvous for in-box processes that
+// need their OWN fresh engine connection (a nested `sarun run`, an oaita
+// CLI call from a shell, etc.). The inner serves an abstract UDS inside
+// the box's netns; child processes dial it and send a one-byte request;
+// the inner relays the request as FRAME_OPEN_CONN over the box-channel.
+// The engine then creates a fresh handler-side socketpair, spawns its
+// own handler on one half, and sends the OTHER half back as
+// FRAME_CONN (with SCM_RIGHTS attached). The inner forwards the fd to
+// the requesting child via SCM_RIGHTS on the abstract UDS.
+//
+//   FRAME_OPEN_CONN  (inner→engine) empty payload — every box-channel
+//                    has exactly one box id, so attribution is implicit.
+//   FRAME_CONN       (engine→inner) empty payload — the actual fd is
+//                    attached via SCM_RIGHTS on the sendmsg. The inner
+//                    matches it positionally against the in-flight
+//                    request queue.
+pub const FRAME_OPEN_CONN: u8 = 13;
+pub const FRAME_CONN: u8 = 14;
 
 /// Encode `[u32 BE stream_id]` (no body) — for FRAME_API_OPEN and
 /// FRAME_API_CLOSE.

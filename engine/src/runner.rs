@@ -239,10 +239,22 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
     // bind). A top-level runner uses the host filesystem socket OR the
     // abstract socket; abstract is preferred for speed but the filesystem
     // path is the long-term contract for host UIs.
-    let in_box = std::path::Path::new(UI_SOCK_INBOX).exists();
+    // In-box dial order:
+    //   1. SARUN_BROKER (abstract UDS served by our parent inner) — the
+    //      preferred path, works in -n / private-netns boxes too because
+    //      the broker socket lives in the SAME netns as us.
+    //   2. UI_SOCK_INBOX (filesystem-bound host control socket) — fallback
+    //      for nested boxes whose parent didn't bring up a broker.
+    // Host dial order: abstract namespace, then filesystem path.
+    let broker_name = std::env::var("SARUN_BROKER").ok()
+        .filter(|s| !s.is_empty());
+    let in_box = broker_name.is_some()
+        || std::path::Path::new(UI_SOCK_INBOX).exists();
     let sock = if in_box { std::path::PathBuf::from(UI_SOCK_INBOX) }
                else { paths::sock_path() };
-    let conn = match (if in_box {
+    let conn = match (if let Some(name) = broker_name.as_ref() {
+        broker_dial(name).or_else(|_| UnixStream::connect(&sock))
+    } else if in_box {
         UnixStream::connect(&sock)
     } else {
         abstract_connect(&sock).or_else(|_| UnixStream::connect(&sock))
@@ -433,6 +445,14 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
     }
     bwrap.args(["--ro-bind", &sock_src, UI_SOCK_INBOX,
                 "--ro-bind", &self_exe, inner_exe]);
+    // FD broker: pick a per-box abstract-UDS name and propagate it to
+    // the inner AND every child process via --setenv. The inner binds it
+    // (inner_broker_serve), in-box clients dial it (broker_dial). Keying
+    // on the engine-assigned SID gives us a name that's unique across
+    // boxes — important because Host-netns boxes share a single abstract
+    // namespace.
+    let broker_name = format!("sarun-broker:{sid}");
+    bwrap.args(["--setenv", "SARUN_BROKER", &broker_name]);
     // D9 follow-on — NESTED shell IS brush (brush boxes, capture on only).
     // We shadow the box's /bin/sh, /bin/bash (and /usr/bin/{sh,bash}) with the
     // ENGINE binary: the shim (brush_sh, gated on SARUN_BRUSH_SH=1) RUNS the
@@ -653,6 +673,20 @@ pub fn inner(conn_fd: i32, capture: bool, pty: bool, brush: bool,
     // Hold the box-channel fd open (not CLOEXEC) so the engine sees EOF — its
     // teardown signal — only when this process (and CMD) finally exits.
     if conn_fd >= 0 { clear_cloexec(conn_fd); }
+    // FD broker: bind the abstract UDS named by SARUN_BROKER so box-
+    // internal processes (a nested `sarun run`, in-box `oaita`) can ask
+    // for their OWN fresh engine connection without us bind-mounting a
+    // host path inside the box. The actual FRAME_CONN handoff lives in
+    // the mode-specific reader (currently inner_capture); for other
+    // inner modes a FRAME_CONN that arrives is closed dropped (the
+    // broker accept thread still queues callers but won't be drained).
+    if conn_fd >= 0 {
+        if let Ok(name) = std::env::var("SARUN_BROKER") {
+            if !name.is_empty() {
+                inner_broker_serve(conn_fd, &name);
+            }
+        }
+    }
     // --api: spin up the in-box LLM-API proxy listener BEFORE we hand the
     // box channel to the chosen inner mode. The listener owns its own
     // background thread and frames each accepted box-side connection as
@@ -712,6 +746,8 @@ pub fn inner(conn_fd: i32, capture: bool, pty: bool, brush: bool,
 // leads to the engine's control socket.
 
 use std::collections::HashMap;
+use std::collections::VecDeque;
+use std::sync::Mutex;
 use std::sync::OnceLock;
 
 /// Per-process API mux. Box-internal — there is exactly one inner process
@@ -824,6 +860,179 @@ fn runner_api_dispatch(ft: u8, payload: &[u8]) -> bool {
     }
 }
 
+// ── FD broker (runner side) ────────────────────────────────────────────────
+//
+// The inner serves an abstract UDS inside the box's netns for box-internal
+// processes that need their OWN engine connection (a nested `sarun run`, an
+// oaita CLI invocation from a shell, etc.). The abstract name lives in the
+// SARUN_BROKER env var, which bwrap propagates to every child. Protocol:
+//
+//   child → inner   : connect to abstract @SARUN_BROKER; write nothing
+//                     (a connect is the whole request).
+//   inner → engine  : FRAME_OPEN_CONN on the box-channel.
+//   engine → inner  : FRAME_CONN with SCM_RIGHTS-attached fd (the runner
+//                     side of a fresh handler socketpair).
+//   inner → child   : sendmsg the received fd via SCM_RIGHTS on the child's
+//                     conn; close our copy. The child wraps it as a
+//                     UnixStream and does the register handshake on it.
+//
+// FIFO is preserved across both legs so the engine's reply lands at the
+// child that asked for it. Attribution is intrinsic — the channel IS the
+// box.
+
+static BROKER_QUEUE: OnceLock<Mutex<VecDeque<std::os::unix::net::UnixStream>>>
+    = OnceLock::new();
+
+/// Bind the broker's abstract UDS inside the box and spawn the accept thread.
+/// `abstract_name` is the SARUN_BROKER name (bwrap propagated it to us and to
+/// every box child). Idempotent.
+fn inner_broker_serve(conn_fd: i32, abstract_name: &str) {
+    if BROKER_QUEUE.get().is_some() { return; }
+    use std::os::linux::net::SocketAddrExt;
+    let addr = match std::os::unix::net::SocketAddr::from_abstract_name(
+        abstract_name.as_bytes()) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("sarun-engine inner: broker addr: {e}");
+            return;
+        }
+    };
+    let listener = match std::os::unix::net::UnixListener::bind_addr(&addr) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("sarun-engine inner: broker bind {abstract_name}: {e}");
+            return;
+        }
+    };
+    let _ = BROKER_QUEUE.set(Mutex::new(VecDeque::new()));
+    std::thread::spawn(move || {
+        for client in listener.incoming().flatten() {
+            // Queue first, THEN send the request, so the reader's FRAME_CONN
+            // handler is guaranteed to find a waiter.
+            BROKER_QUEUE.get().unwrap().lock().unwrap().push_back(client);
+            send_frame(conn_fd,
+                &crate::frames::encode(crate::frames::FRAME_OPEN_CONN, &[]),
+                None);
+        }
+    });
+}
+
+/// Handle a FRAME_CONN: pop the front-of-queue waiter and forward `fd` to it
+/// via SCM_RIGHTS. Closes our copy. If nothing is waiting (shouldn't happen
+/// in normal flow), drops the fd.
+fn runner_broker_handoff(fd: i32) {
+    let waiter = BROKER_QUEUE.get()
+        .and_then(|q| q.lock().unwrap().pop_front());
+    let Some(client) = waiter else {
+        unsafe { libc::close(fd); }
+        return;
+    };
+    // One-byte body so the SCM cmsg has data to ride on. The child ignores
+    // the byte; it cares only about the attached fd.
+    let body = [0u8; 1];
+    let mut iov = libc::iovec {
+        iov_base: body.as_ptr() as *mut libc::c_void,
+        iov_len: 1,
+    };
+    let mut cmsg = [0u8; 32];
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cmsg.as_mut_ptr().cast();
+    msg.msg_controllen = unsafe { libc::CMSG_SPACE(4) } as _;
+    unsafe {
+        let c = libc::CMSG_FIRSTHDR(&msg);
+        (*c).cmsg_level = libc::SOL_SOCKET;
+        (*c).cmsg_type = libc::SCM_RIGHTS;
+        (*c).cmsg_len = libc::CMSG_LEN(4) as _;
+        std::ptr::copy_nonoverlapping((&fd as *const i32).cast(),
+                                       libc::CMSG_DATA(c), 4);
+        libc::sendmsg(client.as_raw_fd(), &msg, 0);
+        libc::close(fd);
+    }
+}
+
+/// recvmsg analogue of the engine-side helper: read up to `buf.len()` bytes
+/// off `raw` (the box-channel) AND extract the first SCM_RIGHTS fd (a
+/// FRAME_CONN attaches one). Returns the byte count (0 = EOF, <0 = error)
+/// and sets `*fd` if one came in.
+fn recv_box_frame_bytes(raw: i32, buf: &mut [u8], fd: &mut Option<i32>) -> isize {
+    let mut iov = libc::iovec {
+        iov_base: buf.as_mut_ptr().cast(),
+        iov_len: buf.len(),
+    };
+    let mut cmsg = [0u8; 64];
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cmsg.as_mut_ptr().cast();
+    msg.msg_controllen = cmsg.len() as _;
+    let n = unsafe { libc::recvmsg(raw, &mut msg, 0) };
+    if n > 0 {
+        unsafe {
+            let mut c = libc::CMSG_FIRSTHDR(&msg);
+            while !c.is_null() {
+                if (*c).cmsg_level == libc::SOL_SOCKET
+                    && (*c).cmsg_type == libc::SCM_RIGHTS {
+                    let mut got = 0i32;
+                    std::ptr::copy_nonoverlapping(
+                        libc::CMSG_DATA(c), (&mut got as *mut i32).cast(), 4);
+                    if fd.is_none() { *fd = Some(got); }
+                    else { libc::close(got); }
+                }
+                c = libc::CMSG_NXTHDR(&msg, c);
+            }
+        }
+    }
+    n
+}
+
+/// Dial the broker via abstract UDS named by SARUN_BROKER; recvmsg the
+/// SCM_RIGHTS-attached engine conn fd; wrap as a UnixStream. Used by
+/// in-box `sarun run` and any other in-box engine client.
+pub fn broker_dial(abstract_name: &str) -> std::io::Result<UnixStream> {
+    use std::os::fd::FromRawFd;
+    use std::os::linux::net::SocketAddrExt;
+    let addr = std::os::unix::net::SocketAddr::from_abstract_name(
+        abstract_name.as_bytes())?;
+    let conn = UnixStream::connect_addr(&addr)?;
+    // recvmsg the one-byte body + SCM_RIGHTS fd. Loop tolerates EINTR.
+    let mut buf = [0u8; 1];
+    let mut cmsg = [0u8; 64];
+    let mut iov = libc::iovec {
+        iov_base: buf.as_mut_ptr().cast(),
+        iov_len: 1,
+    };
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cmsg.as_mut_ptr().cast();
+    msg.msg_controllen = cmsg.len() as _;
+    let n = unsafe { libc::recvmsg(conn.as_raw_fd(), &mut msg, 0) };
+    if n <= 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut got: Option<i32> = None;
+    unsafe {
+        let mut c = libc::CMSG_FIRSTHDR(&msg);
+        while !c.is_null() {
+            if (*c).cmsg_level == libc::SOL_SOCKET
+                && (*c).cmsg_type == libc::SCM_RIGHTS {
+                let mut f = 0i32;
+                std::ptr::copy_nonoverlapping(
+                    libc::CMSG_DATA(c), (&mut f as *mut i32).cast(), 4);
+                if got.is_none() { got = Some(f); }
+                else { libc::close(f); }
+            }
+            c = libc::CMSG_NXTHDR(&msg, c);
+        }
+    }
+    drop(conn);
+    let fd = got.ok_or_else(|| std::io::Error::new(
+        std::io::ErrorKind::Other, "broker reply: no fd attached"))?;
+    Ok(unsafe { UnixStream::from_raw_fd(fd) })
+}
+
 fn inner_capture(conn_fd: i32, cmd: Vec<String>) -> i32 {
     // Capture via the echo mux: the child's stdout/stderr ARE the box-root sink
     // files, so every write flows THROUGH the overlay (recorded with per-write
@@ -858,12 +1067,23 @@ fn inner_capture(conn_fd: i32, cmd: Vec<String>) -> i32 {
         let mut buf: Vec<u8> = vec![];
         let mut tmp = [0u8; 65536];
         loop {
-            let n = unsafe { libc::read(rfd, tmp.as_mut_ptr().cast(), tmp.len()) };
+            // recvmsg (not plain read) so we can pick up the SCM_RIGHTS fd a
+            // FRAME_CONN brings along. Best effort: at most one fd per recvmsg
+            // — the engine attaches one per sendmsg, so we associate it with
+            // the first FRAME_CONN frame in this batch.
+            let mut got_fd: Option<i32> = None;
+            let n = recv_box_frame_bytes(rfd, &mut tmp, &mut got_fd);
             if n <= 0 { break; }
             buf.extend_from_slice(&tmp[..n as usize]);
             let (frames, used) = crate::frames::decode(&buf);
             buf.drain(..used);
             for (ft, payload) in frames {
+                if ft == crate::frames::FRAME_CONN {
+                    if let Some(fd) = got_fd.take() {
+                        runner_broker_handoff(fd);
+                    }
+                    continue;
+                }
                 if runner_api_dispatch(ft, &payload) { continue; }
                 if ft == crate::frames::FRAME_ECHO && !payload.is_empty() {
                     let realfd = if payload[0] == 1 { 2 } else { 1 };
@@ -874,6 +1094,9 @@ fn inner_capture(conn_fd: i32, cmd: Vec<String>) -> i32 {
                     return;
                 }
             }
+            // A FRAME_CONN sent with no matching waiter (e.g. lost-race or
+            // engine sent an extra) — close the dangling fd rather than leak.
+            if let Some(fd) = got_fd { unsafe { libc::close(fd); } }
         }
     });
     // tty job-control: child in its own group, given the terminal foreground
