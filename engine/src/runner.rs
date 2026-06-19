@@ -505,29 +505,13 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
         // standard PATH on every distro we target.
         bwrap.args(["--ro-bind", &self_exe, "/usr/local/bin/oaita"]);
         bwrap.args(["--ro-bind", &self_exe, "/usr/local/bin/sarun"]);
-        // Forward the trace endpoint into the box. bwrap clears the env
-        // by default; without this --setenv the sub-agent's oaita
-        // process can't find $OAITA_TRACE and its gen.request /
-        // gen.reply events vanish.
-        //
-        // Netns semantics:
-        //   /path     filesystem-socket UDS — works IF we also bind-mount
-        //             the socket file into the box at the same path.
-        //             Abstract @name socket would NOT work because --api
-        //             boxes run in their own netns (NetMode::Off or the
-        //             default Tap, never Host) and abstract Unix is
-        //             netns-scoped.
-        //   @name     would require the box share host netns (NetMode::Host
-        //             at run time). We just forward — build_sink silently
-        //             no-ops when unreachable.
+        // OAITA_TRACE is a master on/off switch the in-box driver checks
+        // before opening a trace emitter conn — value is irrelevant (the
+        // destination is always the engine, reached via the FD broker).
+        // Forward "1" if the host has it set so sub-agent boxes emit too.
         if let Ok(ep) = std::env::var("OAITA_TRACE") {
             if !ep.is_empty() {
-                bwrap.args(["--setenv", "OAITA_TRACE", &ep]);
-                // Filesystem-path UDS: bind the socket file into the box
-                // at the same path so the sub-agent can send to it.
-                if ep.starts_with('/') && std::path::Path::new(&ep).exists() {
-                    bwrap.args(["--ro-bind", &ep, &ep]);
-                }
+                bwrap.args(["--setenv", "OAITA_TRACE", "1"]);
             }
         }
         // Same logic for OAITA_DEPTH — set by the parent's act_script;

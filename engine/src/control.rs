@@ -1648,6 +1648,36 @@ fn handle(state: State, conn: UnixStream) {
             handle_pty_spawn(&msg, &mut writer, reader.buffer().to_vec());
             return;
         }
+        // trace.emit: this conn streams JSONL trace events; we broadcast each
+        // to the current subscribers. trace.subscribe: this conn is added to
+        // the subscriber list and gets every event the engine broadcasts.
+        // Replaces the old OAITA_TRACE datagram socket (one more thing to
+        // bind into every box, one more bwrap setup step to fail). All trace
+        // delivery now rides the engine's own control socket — broker for
+        // in-box emitters, host filesystem for everything else.
+        if msg.get("type").and_then(Value::as_str) == Some("trace.emit") {
+            if let Some(fd) = peer_pidfd.take() { unsafe { libc::close(fd); } }
+            let mut s = String::new();
+            loop {
+                s.clear();
+                match reader.read_line(&mut s) {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {}
+                }
+                if s.trim().is_empty() { continue; }
+                trace_broadcast(s.as_bytes());
+            }
+        }
+        if msg.get("type").and_then(Value::as_str) == Some("trace.subscribe") {
+            if let Some(fd) = peer_pidfd.take() { unsafe { libc::close(fd); } }
+            let _ = writer.write_all(b"{\"ok\":true}\n");
+            let _ = writer.flush();
+            trace_subs().lock().unwrap().push(writer);
+            // The conn lives in the subs list until a broadcast write fails.
+            // We don't need to read anything; drop the reader half explicitly.
+            drop(reader);
+            return;
+        }
         // The oaita API proxy lives on the existing box-channel as new
         // FRAME_API_* frame types — not as a top-level connection type.
         // See the FRAME_API_* handling in the post-register frame loop
@@ -1949,6 +1979,22 @@ pub fn serve(state: State, sock: &std::path::Path) -> std::io::Result<()> {
         std::thread::spawn(move || handle(st, conn));
     }
     Ok(())
+}
+
+/// Trace subscribers — held UnixStream writers, populated by trace.subscribe
+/// connections. A broadcast write that fails (subscriber EOF / closed) drops
+/// the stream from the list on the next pass.
+fn trace_subs() -> &'static Mutex<Vec<UnixStream>> {
+    static SUBS: std::sync::OnceLock<Mutex<Vec<UnixStream>>> =
+        std::sync::OnceLock::new();
+    SUBS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Broadcast one already-newline-terminated event line to every subscriber.
+/// Drops subscribers whose write fails.
+fn trace_broadcast(line: &[u8]) {
+    let mut subs = trace_subs().lock().unwrap();
+    subs.retain_mut(|s| s.write_all(line).is_ok() && s.flush().is_ok());
 }
 
 /// Send a frame over the box-channel WITH an attached fd via SCM_RIGHTS.
