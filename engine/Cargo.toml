@@ -141,3 +141,9 @@ brush-builtins           = { path = "vendor/brush-builtins" }
 brush-coreutils-builtins = { path = "vendor/brush-coreutils-builtins" }
 brush-parser             = { path = "vendor/brush-parser" }
 brush-interactive        = { path = "vendor/brush-interactive" }
+# Vendored, patched fork of uutils' `uu_cat`: adds a logical, injected-I/O
+# entry point (`cat::cat`) that writes the shell's OpenFile sink/source with no
+# process-global stdio, so it can run as an in-process brush builtin while
+# keeping the Linux splice(2) fast path. The retained `uumain` is a thin bridge
+# for the standalone binary / subprocess dispatcher. See vendor/uu_cat/src/cat.rs.
+uu_cat                   = { path = "vendor/uu_cat" }
