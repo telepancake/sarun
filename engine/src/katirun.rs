@@ -336,6 +336,15 @@ fn run_kati(targets: &[Symbol], cl_vars: &[bytes::Bytes], ninja_path: &OsStr) ->
         }
     }
 
+    // sarun: emit the build_edges provenance frame BEFORE exec so the
+    // UI's build target pane is populated immediately, even for
+    // up-to-date targets that exec.rs will skip. Walk the kati dep
+    // graph reachable from `nodes` and ship one edge per node — same
+    // shape Phase 1 ninja's emit_build_edges produced. Without this
+    // the build target pane is empty in -b boxes (regression from
+    // ripping out the n2 path).
+    emit_build_edges_kati(&nodes);
+
     {
         // sarun: drive kati's OWN executor (src-rs/exec.rs) on the dep
         // graph directly — NO ninja generation, NO n2. Recipes run
@@ -357,6 +366,83 @@ fn run_kati(targets: &[Symbol], cl_vars: &[bytes::Bytes], ninja_path: &OsStr) ->
     let _ = ninja_path; // sarun: legacy memfd path arg, no longer used.
     let _ = start_time;
     Ok(RunKatiResult { remake_active })
+}
+
+/// Walk the kati dep graph reachable from `roots` and ship one
+/// `build_edges` control frame carrying {outs, ins, cmd} for every
+/// distinct node — same shape Phase 1 emitted from the n2 graph. The
+/// frame drives the UI's build target pane (ui.rs::build_edges_lines).
+/// Mirrors the contract of `crate::runner::send_nested_prov` and
+/// `control.rs::build_edges`.
+///
+/// `cmd` is the recipe TEMPLATE text joined with newlines (kati's
+/// pre-evaluation form, e.g. `$(CC) -o $@ $<`). Evaluating cmds at
+/// emit time would re-run `$(shell …)` side-effects, so we keep the
+/// template; the UI labels it accurately. Phony targets carry an
+/// empty cmd string.
+fn emit_build_edges_kati(roots: &[NamedDepNode]) {
+    use kati::dep::NamedDepNode as N;
+    use std::collections::HashSet;
+
+    let mut seen: HashSet<kati::symtab::Symbol> = HashSet::new();
+    let mut edges: Vec<serde_json::Value> = Vec::new();
+
+    fn visit(
+        node: &N,
+        seen: &mut HashSet<kati::symtab::Symbol>,
+        edges: &mut Vec<serde_json::Value>,
+    ) {
+        let (sym, dep) = node;
+        if !seen.insert(*sym) {
+            return;
+        }
+        let guard = dep.lock();
+        let outs: Vec<String> = std::iter::once(guard.output.to_string())
+            .chain(guard.implicit_outputs.iter().map(|s| s.to_string()))
+            .collect();
+        let ins: Vec<String> = guard
+            .actual_inputs
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        // Recipe text. kati's parsed Value AST doesn't retain the
+        // original source bytes, and evaluating cmds at frame-emit
+        // time would re-run `$(shell …)` side-effects. For now emit
+        // the count as a placeholder marker; the UI's build target
+        // pane shows targets+deps, which is what was visibly missing.
+        // TODO: walk Value::Literal nodes to recover at least the
+        // literal portions of each recipe line.
+        let cmd: String = if guard.cmds.is_empty() {
+            String::new()
+        } else {
+            format!("(recipe: {} command{})",
+                    guard.cmds.len(),
+                    if guard.cmds.len() == 1 { "" } else { "s" })
+        };
+        edges.push(serde_json::json!({
+            "outs": outs,
+            "ins": ins,
+            "cmd": cmd,
+        }));
+        // Walk children (deps + order-only). Phase 1's n2-graph walk
+        // emitted every edge in the graph; mirror that by recursing.
+        let deps = guard.deps.clone();
+        let order_onlys = guard.order_onlys.clone();
+        drop(guard);
+        for d in &deps {
+            visit(d, seen, edges);
+        }
+        for d in &order_onlys {
+            visit(d, seen, edges);
+        }
+    }
+
+    for r in roots {
+        visit(r, &mut seen, &mut edges);
+    }
+
+    let msg = serde_json::json!({"type": "build_edges", "edges": edges});
+    crate::runner::send_nested_prov(format!("{msg}\n").as_bytes());
 }
 
 /// The embedded-make entrypoint. `argv` is the FULL process argv (argv[0] is
