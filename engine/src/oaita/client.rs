@@ -223,17 +223,11 @@ impl Client {
                     .map_err(|e| format!("set_nonblocking: {e}"))?;
                 let mut stream = UnixStream::from_std(std_stream)
                     .map_err(|e| format!("from_std: {e}"))?;
-                // Include the session name so the engine can debit its
-                // turn budget chain. The session is in OAITA_SESSION env
-                // (set by the cli before run_to_completion); empty if the
-                // call is not from a session-bound oaita process (which
-                // means: no budget check — host tooling stays unmetered).
-                let session_env = std::env::var("OAITA_SESSION")
-                    .unwrap_or_default();
-                let header = format!(
-                    "{{\"type\":\"api.proxy\",\"session\":{}}}\n",
-                    serde_json::Value::String(session_env));
-                stream.write_all(header.as_bytes()).await
+                // Engine derives the box id from the broker handshake
+                // (FD broker hands out conns with a hint_box_id = THIS
+                // box). No session field on the wire — budget identity
+                // is intrinsic to the broker, not client-supplied.
+                stream.write_all(b"{\"type\":\"api.proxy\"}\n").await
                     .map_err(|e| format!("api.proxy header: {e}"))?;
                 let (mut sender, conn) = hyper::client::conn::http1::handshake(
                     TokioIo::new(stream)).await
