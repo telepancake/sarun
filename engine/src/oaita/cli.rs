@@ -62,7 +62,7 @@ struct Parsed {
     pub tool_context: Option<String>,
     pub sarun: Option<String>,
     pub no_sandbox: bool,
-    pub max_steps: u32,
+    pub max_steps: Option<u32>,
     pub type_: String,
     pub slug: Option<String>,
     pub sender: Option<String>,
@@ -77,7 +77,7 @@ fn parse(args: &[String]) -> Result<Parsed, String> {
         model: None, base_url: None, api_key: None,
         capabilities: None, tool_context: None,
         sarun: None, no_sandbox: false,
-        max_steps: 32,
+        max_steps: None,
         type_: "user".to_string(),
         slug: None, sender: None, flags: String::new(), number: None,
         jsonl: None,
@@ -92,9 +92,9 @@ fn parse(args: &[String]) -> Result<Parsed, String> {
             "--tool-context" => p.tool_context = it.next().cloned(),
             "--sarun" => p.sarun = it.next().cloned(),
             "--no-sandbox" => p.no_sandbox = true,
-            "--max-steps" => p.max_steps = it.next()
+            "--max-steps" => p.max_steps = Some(it.next()
                 .ok_or_else(|| "missing N after --max-steps".to_string())?
-                .parse().map_err(|e| format!("--max-steps: {e}"))?,
+                .parse().map_err(|e| format!("--max-steps: {e}"))?),
             "--type" => p.type_ = it.next().cloned()
                 .ok_or_else(|| "missing ROLE after --type".to_string())?,
             "--id" => p.slug = it.next().cloned(),
@@ -146,17 +146,22 @@ fn cmd_run(args: &[String]) -> i32 {
                                        p.capabilities, p.tool_context.clone(),
                                        p.sarun.clone(), p.no_sandbox)
     { Ok(s) => s, Err(e) => { eprintln!("{e}"); return 1; } };
-    // Tell the engine this run is going to count against `p.name`'s pool
-    // AND set OAITA_SESSION so api.proxy conns the driver opens debit it.
-    // `--max-steps N` ADDS N to the session's pool (resume-friendly): a
-    // fresh session is 0 + N = N, a session being resumed gets its
-    // remainder + N.
+    // Set OAITA_SESSION so api.proxy conns the driver opens debit this
+    // session's pool. `--max-steps N` is an OPTIONAL grant: if present
+    // it adds N to the session's pool (resume-friendly — a fresh
+    // session goes 0+N=N, a resumed one extends the remainder by N).
+    // If absent, no grant is sent: the session stays uncapped and only
+    // the caps above it in the chain (parent of a sub-agent, or none
+    // for a top-level run) apply. This matches the asymmetry the user
+    // wants: cli caps are explicit, ask-level caps default to unlimited.
     let target = match crate::oaita::turns::target_segment(&p.name) {
         Ok(t) => t, Err(e) => { eprintln!("{e}"); return 2; }
     };
-    if let Err(e) = budget_grant_via_engine(&target, p.max_steps as i64) {
-        eprintln!("oaita: budget.grant: {e}");
-        return 1;
+    if let Some(n) = p.max_steps {
+        if let Err(e) = budget_grant_via_engine(&target, n as i64) {
+            eprintln!("oaita: budget.grant: {e}");
+            return 1;
+        }
     }
     unsafe { std::env::set_var("OAITA_SESSION", &target); }
     let exe = build_executor(p.no_sandbox, p.sarun);

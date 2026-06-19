@@ -25,10 +25,34 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+/// Where the persisted budget lives — one JSON object keyed by session.
+/// Lives next to the other engine state (sqlar files, sockets); on
+/// process restart we reload from here so granted-but-unspent turns
+/// don't get lost.
+fn store_path() -> std::path::PathBuf {
+    crate::paths::state_home().join("oaita-budgets.json")
+}
+
+fn load_persisted() -> HashMap<String, i64> {
+    let p = store_path();
+    let bytes = match std::fs::read(&p) { Ok(b) => b, Err(_) => return HashMap::new() };
+    serde_json::from_slice(&bytes).unwrap_or_default()
+}
+
+fn persist(state: &HashMap<String, i64>) {
+    let p = store_path();
+    if let Some(parent) = p.parent() { let _ = std::fs::create_dir_all(parent); }
+    let Ok(bytes) = serde_json::to_vec(state) else { return; };
+    // Atomic rename so a partial write can't trash the file.
+    let tmp = p.with_extension("json.tmp");
+    if std::fs::write(&tmp, &bytes).is_err() { return; }
+    let _ = std::fs::rename(&tmp, &p);
+}
+
 fn budget() -> &'static Mutex<HashMap<String, i64>> {
     static B: std::sync::OnceLock<Mutex<HashMap<String, i64>>> =
         std::sync::OnceLock::new();
-    B.get_or_init(|| Mutex::new(HashMap::new()))
+    B.get_or_init(|| Mutex::new(load_persisted()))
 }
 
 fn parent_cache() -> &'static Mutex<HashMap<String, Option<String>>> {
@@ -82,27 +106,41 @@ fn chain_of(session: &str) -> Vec<String> {
 
 /// Grant `amount` more turns to `session`. Additive — resuming a
 /// session via another `oaita run --max-steps N` extends its pool.
+/// Persists the new total so engine restart doesn't lose it.
 pub fn grant(session: &str, amount: i64) {
     let mut b = budget().lock().unwrap();
     *b.entry(session.to_string()).or_insert(0) += amount;
+    persist(&b);
 }
 
-/// Decrement one turn from EVERY session in `session`'s parent chain.
-/// Returns `Ok(())` on success; `Err(exhausted_session)` when any session
-/// in the chain has ≤ 0 turns BEFORE the decrement — names the topmost
-/// (root-most) exhausted session, so the caller can surface the most
-/// useful "where to grant" hint to the model.
+/// Decrement one turn from EVERY capped session in `session`'s parent
+/// chain. A session is "capped" iff it has an entry in the pool — set
+/// by an explicit `grant` (cli `--max-steps`, or an `ask`-level
+/// `max_steps` arg). Sessions WITHOUT an entry are uncapped and pass
+/// through transparently: they neither check nor decrement. That gives
+/// the user's invariant: "ask-level caps default to unlimited; only
+/// the parent's caps apply unless the model sets one explicitly".
+///
+/// Returns `Ok(())` on success; `Err(exhausted_session)` when ANY
+/// capped session in the chain has ≤ 0 turns BEFORE the decrement —
+/// names the topmost (root-most) such session, so the model gets the
+/// most useful "where to grant more" hint.
 pub fn take_chain(session: &str) -> Result<(), String> {
     let chain = chain_of(session);
     let mut b = budget().lock().unwrap();
     for s in chain.iter().rev() {
-        if b.get(s).copied().unwrap_or(0) <= 0 {
-            return Err(s.clone());
+        if let Some(&v) = b.get(s) {
+            if v <= 0 {
+                return Err(s.clone());
+            }
         }
     }
     for s in &chain {
-        *b.entry(s.clone()).or_insert(0) -= 1;
+        if let Some(v) = b.get_mut(s) {
+            *v -= 1;
+        }
     }
+    persist(&b);
     Ok(())
 }
 
