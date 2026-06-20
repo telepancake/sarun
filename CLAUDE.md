@@ -157,7 +157,12 @@ moment it's done.**
   coalesce.
 - [ ] **Container GC.** Each run leaves an at-rest container box (layer reuse
   has landed, so these now accumulate on shared layers); add `oci ps` / `oci rm`
-  (or a prune).
+  (or a prune). Safety foundation is DONE: deleting a box whose children's chain
+  bottoms out closed (no_host) now fails CLOSED, never leaking host fs — a
+  missing parent in the chain is treated as a closure in `overlay.rs`
+  resolve()/scan_dir()/hydrate_chain() (so deleting layer/image boxes under live
+  children is safe; verified by `test_oci.py`). Still needs the verbs + image
+  refcount/cascade.
 - [ ] **`oci build` instructions:** `COPY --from=<stage|image>`; `ADD` URL
   fetch + local-tar auto-extract; glob sources; carry HEALTHCHECK/ONBUILD/
   STOPSIGNAL into the image config (today: warned + skipped).
