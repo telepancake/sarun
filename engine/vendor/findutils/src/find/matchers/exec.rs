@@ -123,6 +123,16 @@ impl Matcher for SingleExecMatcher {
                 }
             }
         }
+        // Route the child's stdout/stderr to the embedder's logical streams when
+        // provided (the in-process builtin dups the shell's logical fds), so
+        // `find … -exec cmd \; > file` / `| next` honor the box's redirects and
+        // pipes. Default (standalone) inherits the process fds, as upstream does.
+        if let Some(s) = matcher_io.deps.child_stdout() {
+            command.stdout(s);
+        }
+        if let Some(s) = matcher_io.deps.child_stderr() {
+            command.stderr(s);
+        }
         match command.status() {
             Ok(status) => status.success(),
             Err(e) => {
@@ -174,6 +184,15 @@ impl MultiExecMatcher {
     }
 
     fn run_command(&self, command: &mut argmax::Command, matcher_io: &mut MatcherIO) {
+        // Same child-stdio routing as the single-exec path: dup the embedder's
+        // logical streams into the batched `-exec … +` child (argmax::Command
+        // forwards stdout/stderr to the inner std Command).
+        if let Some(s) = matcher_io.deps.child_stdout() {
+            command.stdout(s);
+        }
+        if let Some(s) = matcher_io.deps.child_stderr() {
+            command.stderr(s);
+        }
         match command.status() {
             Ok(status) => {
                 if !status.success() {
