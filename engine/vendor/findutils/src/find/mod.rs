@@ -11,7 +11,7 @@ use std::cell::RefCell;
 use std::error::Error;
 #[cfg(unix)]
 use std::io::IsTerminal;
-use std::io::{self, stderr, stdout, BufRead, BufReader, Write};
+use std::io::{self, stderr, stdout, BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::SystemTime;
@@ -69,6 +69,14 @@ pub trait Dependencies {
     /// (the sarun brush builtin) capture them as the shell's logical stderr
     /// instead of the host process's fd 2.
     fn get_error_output(&self) -> &RefCell<dyn Write>;
+    /// Source for bulk stdin reads — currently only `-files0-from -`, which
+    /// slurps the NUL-separated start paths from standard input. Upstream reads
+    /// the process's real `stdin` directly; injecting it lets an in-process
+    /// embedder (the sarun brush builtin) read the shell's LOGICAL stdin instead
+    /// of the host process's fd 0 (reading fd 0 in-process would steal bytes
+    /// from whatever actually owns it). `-ok` responses still go through
+    /// `confirm`, which the embedder also routes to logical stdin.
+    fn get_input(&self) -> &RefCell<dyn Read>;
     fn now(&self) -> SystemTime;
     /// Write `prompt` to stderr and return whether the user's response is
     /// affirmative (starts with 'y' or 'Y').
@@ -84,6 +92,7 @@ pub trait Dependencies {
 pub struct StandardDependencies {
     output: Rc<RefCell<dyn Write>>,
     error_output: Rc<RefCell<dyn Write>>,
+    input: Rc<RefCell<dyn Read>>,
     now: SystemTime,
     /// Open handle to /dev/tty for reading -ok responses, or None when stdin
     /// is not a terminal (pipe/file) or we are on Windows.  Opened once at
@@ -108,6 +117,7 @@ impl StandardDependencies {
         Self {
             output: Rc::new(RefCell::new(stdout())),
             error_output: Rc::new(RefCell::new(stderr())),
+            input: Rc::new(RefCell::new(std::io::stdin())),
             now: SystemTime::now(),
             tty,
         }
@@ -127,6 +137,10 @@ impl Dependencies for StandardDependencies {
 
     fn get_error_output(&self) -> &RefCell<dyn Write> {
         self.error_output.as_ref()
+    }
+
+    fn get_input(&self) -> &RefCell<dyn Read> {
+        self.input.as_ref()
     }
 
     fn now(&self) -> SystemTime {
@@ -167,7 +181,11 @@ struct ParsedInfo {
 }
 
 /// Function to generate a `ParsedInfo` from the strings supplied on the command-line.
-fn parse_args(args: &[&str]) -> Result<ParsedInfo, Box<dyn Error>> {
+///
+/// `input` is the source for any `-files0-from -` bulk stdin read; the caller
+/// supplies the logical stdin (real `stdin` for the standalone binary, the
+/// shell's logical stdin for the in-process builtin).
+fn parse_args(args: &[&str], input: &mut dyn Read) -> Result<ParsedInfo, Box<dyn Error>> {
     let mut paths = vec![];
     let mut i = 0;
     let mut config = Config::default();
@@ -203,7 +221,7 @@ fn parse_args(args: &[&str]) -> Result<ParsedInfo, Box<dyn Error>> {
     if i == paths_start {
         paths.push(".".to_string());
     }
-    let matcher = matchers::build_top_level_matcher(&args[i..], &mut config)?;
+    let matcher = matchers::build_top_level_matcher_with_input(&args[i..], &mut config, input)?;
     if let Some(new_paths) = &config.new_paths {
         if paths.len() == 1 && paths[0] == "." {
             paths.clone_from(new_paths);
@@ -295,7 +313,7 @@ fn process_dir(
 }
 
 fn do_find(args: &[&str], deps: &dyn Dependencies) -> Result<i32, Box<dyn Error>> {
-    let paths_and_matcher = parse_args(args)?;
+    let paths_and_matcher = parse_args(args, &mut *deps.get_input().borrow_mut())?;
     // Emit any non-fatal parse-time diagnostics (e.g. a zero-length name in
     // -files0-from) through the injected error sink, before walking.
     for warning in &paths_and_matcher.config.parse_warnings {
@@ -486,6 +504,7 @@ mod tests {
     pub struct FakeDependencies {
         pub output: RefCell<Cursor<Vec<u8>>>,
         pub error_output: RefCell<Cursor<Vec<u8>>>,
+        input: RefCell<Cursor<Vec<u8>>>,
         now: SystemTime,
         /// Preset responses for confirm(), consumed front-to-back.
         confirm_responses: RefCell<std::collections::VecDeque<bool>>,
@@ -496,9 +515,24 @@ mod tests {
             Self {
                 output: RefCell::new(Cursor::new(Vec::<u8>::new())),
                 error_output: RefCell::new(Cursor::new(Vec::<u8>::new())),
+                input: RefCell::new(Cursor::new(Vec::<u8>::new())),
                 now: SystemTime::now(),
                 confirm_responses: RefCell::new(std::collections::VecDeque::new()),
             }
+        }
+
+        /// Preset the bytes that `get_input` (e.g. `-files0-from -`) will read.
+        pub fn set_input(&self, data: &[u8]) {
+            *self.input.borrow_mut() = Cursor::new(data.to_vec());
+        }
+
+        /// Captured diagnostics, for tests asserting error routing.
+        pub fn get_error_output_as_string(&self) -> String {
+            let mut cursor = self.error_output.borrow_mut();
+            cursor.set_position(0);
+            let mut contents = String::new();
+            cursor.read_to_string(&mut contents).unwrap();
+            contents
         }
 
         pub fn set_time(&mut self, new_time: SystemTime) {
@@ -530,6 +564,10 @@ mod tests {
 
         fn get_error_output(&self) -> &RefCell<dyn Write> {
             &self.error_output
+        }
+
+        fn get_input(&self) -> &RefCell<dyn Read> {
+            &self.input
         }
 
         fn now(&self) -> SystemTime {
@@ -567,14 +605,14 @@ mod tests {
     #[test]
     fn parse_args_handles_single_dash() {
         // Apparently "-" should be treated as a directory name.
-        let parsed_info = super::parse_args(&["-"]).expect("parsing should succeed");
+        let parsed_info = super::parse_args(&["-"], &mut std::io::empty()).expect("parsing should succeed");
         assert_eq!(parsed_info.paths, ["-"]);
     }
 
     #[test]
     fn parse_args_bad_flag() {
         //
-        let result = super::parse_args(&["-asdadsafsfsadcs"]);
+        let result = super::parse_args(&["-asdadsafsfsadcs"], &mut std::io::empty());
         if let Err(e) = result {
             assert_eq!(e.to_string(), "Unrecognized flag: '-asdadsafsfsadcs'");
         } else {
@@ -585,38 +623,67 @@ mod tests {
     #[test]
     fn parse_optimize_flag() {
         let parsed_info =
-            super::parse_args(&["-O0", ".", "-print"]).expect("parsing should succeed");
+            super::parse_args(&["-O0", ".", "-print"], &mut std::io::empty()).expect("parsing should succeed");
         assert_eq!(parsed_info.paths, ["."]);
     }
 
     #[test]
     fn parse_h_flag() {
-        let parsed_info = super::parse_args(&["-H"]).expect("parsing should succeed");
+        let parsed_info = super::parse_args(&["-H"], &mut std::io::empty()).expect("parsing should succeed");
         assert_eq!(parsed_info.config.follow, Follow::Roots);
     }
 
     #[test]
     fn parse_l_flag() {
-        let parsed_info = super::parse_args(&["-L"]).expect("parsing should succeed");
+        let parsed_info = super::parse_args(&["-L"], &mut std::io::empty()).expect("parsing should succeed");
         assert_eq!(parsed_info.config.follow, Follow::Always);
     }
 
     #[test]
     fn parse_p_flag() {
-        let parsed_info = super::parse_args(&["-P"]).expect("parsing should succeed");
+        let parsed_info = super::parse_args(&["-P"], &mut std::io::empty()).expect("parsing should succeed");
         assert_eq!(parsed_info.config.follow, Follow::Never);
     }
 
     #[test]
     fn parse_flag_then_double_dash() {
-        super::parse_args(&["-P", "--"]).expect("parsing should succeed");
+        super::parse_args(&["-P", "--"], &mut std::io::empty()).expect("parsing should succeed");
     }
 
     #[test]
     fn parse_double_dash_then_flag() {
-        super::parse_args(&["--", "-P"])
+        super::parse_args(&["--", "-P"], &mut std::io::empty())
             .err()
             .expect("parsing should fail");
+    }
+
+    #[test]
+    fn diagnostics_route_to_error_output_not_stdout() {
+        // A failing start path must produce an exit code and a message on the
+        // INJECTED error sink, with nothing on stdout.
+        let deps = FakeDependencies::new();
+        let rc = find_main(&["find", "/no/such/path/sarun"], &deps);
+        assert_eq!(rc, 1);
+        assert_eq!(deps.get_output_as_string(), "");
+        assert!(
+            deps.get_error_output_as_string().contains("/no/such/path/sarun"),
+            "diagnostic should land in the injected error sink, got: {:?}",
+            deps.get_error_output_as_string()
+        );
+    }
+
+    #[test]
+    fn files0_from_dash_reads_injected_input_not_process_stdin() {
+        // `-files0-from -` must read the injected logical stdin, not the host
+        // process's fd 0. Feed a NUL-separated start path through get_input.
+        let deps = FakeDependencies::new();
+        deps.set_input(format!("{}\0", fix_up_slashes("./test_data/simple/abbbc")).as_bytes());
+        let rc = find_main(&["find", "-files0-from", "-"], &deps);
+        assert_eq!(rc, 0);
+        assert_eq!(
+            deps.get_output_as_string(),
+            fix_up_slashes("./test_data/simple/abbbc\n")
+        );
     }
 
     #[test]
