@@ -74,40 +74,23 @@ use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use parking_lot::Mutex;
-
-/// Per-box network handle. The TAP fd and netns fd live inside an anchor
-/// child process the engine forked with CLONE_NEWNET; this handle owns the
-/// anchor's pid (it gets killed on Drop, which also frees the netns) plus
-/// the in-engine smoltcp stack runtime for the box.
+/// Per-box networking the engine holds while the box runs: the in-engine
+/// smoltcp stack runtime (its poll thread owns the TAP fd) plus the flow/keylog
+/// paths. The netns + TAP belong to the BOX — the runner created them and the
+/// kernel frees them when the box exits — so the engine forks no process and
+/// holds no netns reference here.
 pub struct NetHandle {
-    pub box_id: u16,            // 12 bits used (0..=4095)
+    pub box_id: u16,
     pub gateway_ip: [u8; 4],    // .0.1
-    pub box_ip: [u8; 4],        // .0.2 (lease)
-    pub anchor_pid: i32,        // child holding the netns alive
-    pub netns_path: PathBuf,    // /proc/<anchor_pid>/ns/net
+    pub box_ip: [u8; 4],        // .0.2
     pub stack: Arc<stack::StackRuntime>,
     pub flows_path: PathBuf,
     pub keylog_path: PathBuf,
-    _drop_guard: Arc<DropGuard>,
-}
-
-struct DropGuard { anchor_pid: Mutex<Option<i32>> }
-impl Drop for DropGuard {
-    fn drop(&mut self) {
-        if let Some(pid) = self.anchor_pid.lock().take() {
-            unsafe { libc::kill(pid, libc::SIGTERM); }
-            // Best-effort reap so the engine doesn't accumulate zombies.
-            let mut status = 0i32;
-            unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG); }
-        }
-    }
 }
 
 /// Global registry — `Net` is held by the engine main loop and one
 /// `NetHandle` per `-n` box is registered while the box runs.
 pub struct Net {
-    inner: Mutex<NetInner>,
     pub ca: Arc<ca::Ca>,
     /// One global banner-prompt queue. Boxes share it: the user sees one
     /// banner at a time regardless of which box's connection triggered
@@ -116,57 +99,23 @@ pub struct Net {
     pub prompts: Arc<prompt::PromptQueue>,
 }
 
-struct NetInner {
-    by_box: std::collections::HashMap<String, Arc<NetHandle>>,
-    next_id: u16,
-}
-
 impl Net {
     pub fn new() -> anyhow::Result<Self> {
         Ok(Self {
-            inner: Mutex::new(NetInner {
-                by_box: Default::default(),
-                next_id: 1, // 0 reserved
-            }),
             ca: Arc::new(ca::Ca::load_or_create()?),
             prompts: prompt::PromptQueue::new(),
         })
     }
-
-    /// Allocate the next free 12-bit box id.
-    pub fn alloc_box_id(&self) -> u16 {
-        let mut g = self.inner.lock();
-        let id = g.next_id;
-        g.next_id = if g.next_id >= 4095 { 1 } else { g.next_id + 1 };
-        id
-    }
-
-    pub fn register(&self, sid: &str, h: Arc<NetHandle>) {
-        self.inner.lock().by_box.insert(sid.into(), h);
-    }
-
-    pub fn unregister(&self, sid: &str) -> Option<Arc<NetHandle>> {
-        self.inner.lock().by_box.remove(sid)
-    }
-
-    pub fn get(&self, sid: &str) -> Option<Arc<NetHandle>> {
-        self.inner.lock().by_box.get(sid).cloned()
-    }
 }
 
-/// Construct a NetHandle from the pieces the tap/stack modules just built.
+/// Construct a NetHandle from the pieces the stack module just built (the TAP
+/// fd was created by the runner and now lives in the stack's poll thread).
 pub fn make_handle(
     box_id: u16, gateway_ip: [u8; 4], box_ip: [u8; 4],
-    anchor_pid: i32, netns_path: PathBuf,
     stack: Arc<stack::StackRuntime>,
     flows_path: PathBuf, keylog_path: PathBuf,
 ) -> NetHandle {
-    let guard = Arc::new(DropGuard { anchor_pid: Mutex::new(Some(anchor_pid)) });
-    NetHandle {
-        box_id, gateway_ip, box_ip, anchor_pid, netns_path, stack,
-        flows_path, keylog_path,
-        _drop_guard: guard,
-    }
+    NetHandle { box_id, gateway_ip, box_ip, stack, flows_path, keylog_path }
 }
 
 #[allow(dead_code)]

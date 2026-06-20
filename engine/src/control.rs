@@ -280,12 +280,12 @@ pub fn broadcast(state: &State, ev: &Value) {
     });
 }
 
-/// Peek any SCM_RIGHTS fds sent with the connection's first bytes (the register
-/// handshake carries the runner's pidfd). KEEP the first fd open and return it
-/// (the caller derives the runner's host pid from it and holds it for `kill`);
-/// close any extras. MSG_PEEK leaves the data bytes queued for the BufReader,
-/// and the real (no-ancillary) read later discards the duplicate fd delivery.
-fn recv_first_fd(conn: &UnixStream) -> Option<i32> {
+/// Peek the SCM_RIGHTS fds sent with the connection's first bytes (the register
+/// handshake carries the runner's pidfd, and for a `tap` box ALSO the runner's
+/// TAP fd as a second fd). Return (pidfd, tap_fd): keep both, close any extras.
+/// MSG_PEEK leaves the data bytes queued for the BufReader, and the real
+/// (no-ancillary) read later discards the duplicate fd delivery.
+fn recv_first_fd(conn: &UnixStream) -> (Option<i32>, Option<i32>) {
     // Wait (bounded) for the first bytes to arrive before peeking: the runner's
     // sendmsg may still be in flight when we accept, and a non-blocking peek
     // that races ahead of it would miss the pidfd — dropping a nested box's
@@ -294,7 +294,7 @@ fn recv_first_fd(conn: &UnixStream) -> Option<i32> {
     let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
     let pr = unsafe { libc::poll(&mut pfd, 1, 30_000) };
     if pr <= 0 {
-        return None;
+        return (None, None);
     }
     let mut fdbuf = [0i32; 8];
     let mut io = [0u8; 1];
@@ -309,9 +309,12 @@ fn recv_first_fd(conn: &UnixStream) -> Option<i32> {
     msg.msg_controllen = cmsg.len() as _;
     let n = unsafe { libc::recvmsg(fd, &mut msg, libc::MSG_PEEK) };
     if n < 0 {
-        return None;
+        return (None, None);
     }
+    // Keep the FIRST fd (pidfd) and the SECOND (tap fd, tap boxes only); close
+    // any beyond.
     let mut first: Option<i32> = None;
+    let mut second: Option<i32> = None;
     unsafe {
         let mut c = libc::CMSG_FIRSTHDR(&msg);
         while !c.is_null() {
@@ -325,6 +328,8 @@ fn recv_first_fd(conn: &UnixStream) -> Option<i32> {
                         data.add(i * 4), (&mut fdbuf[i] as *mut i32).cast(), 4);
                     if first.is_none() {
                         first = Some(fdbuf[i]);
+                    } else if second.is_none() {
+                        second = Some(fdbuf[i]);
                     } else {
                         libc::close(fdbuf[i]);
                     }
@@ -333,14 +338,14 @@ fn recv_first_fd(conn: &UnixStream) -> Option<i32> {
             c = libc::CMSG_NXTHDR(&msg, c);
         }
     }
-    first
+    (first, second)
 }
 
 fn dispatch(state: &State, msg: &Value) -> Value {
     let t = msg.get("type").and_then(Value::as_str).unwrap_or("");
     match t {
         "subscribe" => json!({"ok": true, "_subscribe": true}),
-        "register" => register(state, msg, None),
+        "register" => register(state, msg, None, None),
         "select" => {
             let sid = msg.get("sid").and_then(Value::as_str).map(String::from);
             let boxes = discover::discover();
@@ -618,7 +623,13 @@ fn valid_name(s: &str) -> bool {
 /// derivable enclosing box is an error (the box's pidfd closes on the early
 /// return when the caller's loop tears down). Capture mode stays downgraded in
 /// the ack (no echo/sinks yet — runner behaves as -t passthrough).
-fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
+fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>,
+            tap_fd_raw: Option<i32>) -> Value {
+    // Own the runner's TAP fd (tap mode) so EVERY early-return path below closes
+    // it automatically; it's moved into prepare_net only on the success path.
+    let tap_fd: Option<std::os::fd::OwnedFd> = tap_fd_raw.map(|fd| unsafe {
+        <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd)
+    });
     let ov = state.lock().unwrap().overlay.clone();
     let Some(ov) = ov else {
         if let Some(fd) = peer_pidfd { unsafe { libc::close(fd); } }
@@ -789,12 +800,13 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
     let root = crate::paths::mnt_point().join(id.to_string());
 
     // ── Networking (-n boxes only) ────────────────────────────────────────
-    // For Tap mode: fork the netns anchor, equip its netns with the TAP +
-    // gateway IP, build a StackRuntime + flows log around the TAP fd, write
-    // the augmented CA bundle to a per-box temp path, and return netns_path
-    // + dns_ip + ca_pem_path so the runner can wire bwrap up.
-    let (netns_path, dns_ip, ca_pem_path) =
-        prepare_net(state, id, msg).unwrap_or_default();
+    // Tap mode: the RUNNER already created the netns + TAP and handed us its fd
+    // (SCM_RIGHTS on this register conn). Build the StackRuntime + flows log
+    // around that fd and return dns_ip + the CA bundle CONTENT so the runner can
+    // wire bwrap up (it materializes the CA in its own namespace). The engine
+    // creates no netns/device, so there is no netns_path.
+    let (dns_ip, ca_pem) =
+        prepare_net(state, id, msg, tap_fd).unwrap_or_default();
 
     // D-oci: if any ancestor in the parent chain has an oci_config meta key
     // (stamped by `sarun oci load` on the top layer of an image), surface
@@ -807,9 +819,8 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
     let mut reply = json!({
         "ok": true, "mount": root.to_string_lossy(),
         "shm_dir": backing.to_string_lossy(),
-        "netns_path": netns_path,
         "dns_ip": dns_ip,
-        "ca_pem_path": ca_pem_path,
+        "ca_pem": ca_pem,
         "owner_token": format!("{:032x}", std::process::id() as u128
                                ^ (id as u128) << 64
                                ^ std::time::SystemTime::now()
@@ -888,29 +899,36 @@ fn parse_oci_runtime(cfg_json: &str) -> Option<Value> {
 }
 
 /// Equip a `-n` box's netns and start its smoltcp stack.
-/// Returns (netns_path, dns_ip, augmented_ca_bundle_path) — empty strings
-/// when networking is off/host or anything fails (the caller's bwrap then
-/// falls back to the default behavior the runner chose).
-fn prepare_net(state: &State, id: i64, msg: &Value) -> Option<(String, String, String)> {
+/// Stand up the in-engine smoltcp stack for a `tap` box on the TAP fd the
+/// RUNNER created and handed us (SCM_RIGHTS on the register conn). The engine
+/// creates no netns or device — it only polls the fd. Returns (dns_ip,
+/// augmented_ca_bundle_path); empty strings for off/host. `None` on a real
+/// failure (caller surfaces it — never a silent dead network).
+fn prepare_net(state: &State, id: i64, msg: &Value,
+               tap_fd: Option<std::os::fd::OwnedFd>)
+    -> Option<(String, String)> {
     let net_mode = msg.get("net_mode").and_then(Value::as_str).unwrap_or("off");
-    if net_mode != "tap" { return Some((String::new(), String::new(), String::new())); }
-    // Nested (in-box) launch: the runner already lives INSIDE the enclosing
-    // box, whose own Tap netns the engine equipped when that box started. We do
-    // NOT fork a fresh anchor here: a host /proc/<anchor>/ns/net path is
-    // unreachable from inside the box's pid+mount namespaces, and the sensible
-    // default is for a nested box to SHARE the enclosing box's proxied network
-    // (the runner leaves its netns untouched — see runner.rs Tap/in_box). An
-    // empty netns_path is the signal for that.
-    if msg.get("relname").and_then(Value::as_str).is_some() {
-        return Some((String::new(), String::new(), String::new()));
+    if net_mode != "tap" {
+        drop(tap_fd);   // off / host carry no TAP; close any fd the runner sent
+        return Some((String::new(), String::new()));
     }
-    let net = state.lock().unwrap().net.clone()?;
-    let box_id_u16 = net.alloc_box_id();
-    let subnet = crate::net::subnet::BoxSubnet::new(box_id_u16);
-    let rig = match crate::net::tap::spawn_anchor(subnet) {
-        Ok(r) => r,
-        Err(e) => { eprintln!("sarun-engine: tap anchor failed: {e}"); return None; }
+    // Tap REQUIRES the runner's TAP fd. Missing it is a protocol bug, not a
+    // reason to silently hand the box a dead network — fail loud.
+    let Some(tap_owned) = tap_fd else {
+        eprintln!("sarun-engine: box {id} registered net=tap but sent no TAP fd");
+        return None;
     };
+    let net = match state.lock().unwrap().net.clone() {
+        Some(n) => n,
+        None => {   // tap_owned drops here → fd closed
+            eprintln!("sarun-engine: net stack unavailable; -n refused for box {id}");
+            return None;
+        }
+    };
+    // Fixed addressing — every box's TAP is identical; we key by box id.
+    let box_id_u16 = id as u16;
+    let subnet = crate::net::tap::box_subnet();
+    let gw_mac = crate::net::tap::gateway_mac();
     let box_dir = crate::paths::state_home().join(format!("flows/box{id}"));
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
@@ -919,18 +937,15 @@ fn prepare_net(state: &State, id: i64, msg: &Value) -> Option<(String, String, S
             eprintln!("sarun-engine: flows log: {e}"); return None;
         }
     };
-    let gw_mac = derive_gw_mac(box_id_u16);
     let stack = crate::net::stack::StackRuntime::start(
-        box_id_u16, subnet, gw_mac, rig.mac, rig.tap_fd, flows.clone());
+        box_id_u16, subnet, gw_mac, crate::net::tap::BOX_MAC, tap_owned, flows.clone());
 
-    // Write the augmented CA bundle (host bundle + engine CA appended) once,
-    // under the runner's runtime dir so bwrap can --ro-bind it later.
-    let ca_pem_path = write_augmented_ca_bundle(&net.ca, id)
-        .unwrap_or_default();
+    // The augmented CA bundle (host bundle + engine CA) — sent as CONTENT; the
+    // runner materializes + binds it in its own namespace (works for nested).
+    let ca_pem = augmented_ca_bundle(&net.ca).unwrap_or_default();
 
     let handle = std::sync::Arc::new(crate::net::make_handle(
         box_id_u16, subnet.gateway_ip(), subnet.box_ip(),
-        rig.anchor_pid, rig.netns_path.clone(),
         stack.clone(), flows.path.clone(), flows.keylog_path.clone()));
     state.lock().unwrap().net_handles.insert(id, handle);
 
@@ -952,22 +967,18 @@ fn prepare_net(state: &State, id: i64, msg: &Value) -> Option<(String, String, S
             rt);
     }
 
-    Some((rig.netns_path.to_string_lossy().into_owned(),
-          ipv4_str(subnet.gateway_ip()),
-          ca_pem_path))
+    Some((ipv4_str(subnet.gateway_ip()), ca_pem))
 }
 
 fn ipv4_str(o: [u8; 4]) -> String {
     format!("{}.{}.{}.{}", o[0], o[1], o[2], o[3])
 }
 
-fn derive_gw_mac(box_id: u16) -> [u8; 6] {
-    // Locally-administered unicast; embed the box id so anchor + gateway are
-    // distinguishable on a packet capture.
-    [0x02, 0x73, 0x72, 0x6e, (box_id >> 8) as u8, (box_id & 0xff) as u8]
-}
-
-fn write_augmented_ca_bundle(ca: &crate::net::ca::Ca, box_id: i64) -> Option<String> {
+/// The augmented CA bundle CONTENT (host system bundle + the engine's MITM
+/// root). Returned to the runner, which materializes it in its OWN namespace
+/// and binds it — so it reaches a nested box too (a host path would not). Same
+/// for every box (one engine root), so no per-box keying.
+fn augmented_ca_bundle(ca: &crate::net::ca::Ca) -> Option<String> {
     // Append our root to whichever system bundle exists; if none does, fall
     // back to "just our root" (a self-contained mini-bundle is still trusted).
     let mut bundle = String::new();
@@ -980,11 +991,7 @@ fn write_augmented_ca_bundle(ca: &crate::net::ca::Ca, box_id: i64) -> Option<Str
     }
     if !bundle.ends_with('\n') { bundle.push('\n'); }
     bundle.push_str(&ca.cert_pem);
-    let dir = crate::paths::runtime_home().join("ca");
-    std::fs::create_dir_all(&dir).ok()?;
-    let p = dir.join(format!("box{box_id}.pem"));
-    std::fs::write(&p, bundle).ok()?;
-    Some(p.to_string_lossy().into_owned())
+    Some(bundle)
 }
 
 fn dispatch_ui(state: &State, msg: &Value) -> Value {
@@ -1667,7 +1674,12 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
     // The register handshake carries the runner's pidfd as the connection's
     // first SCM_RIGHTS fd; keep it for host-pid derivation + kill. It belongs
     // to the FIRST message only (a register); close it if that never comes.
-    let mut peer_pidfd = recv_first_fd(&conn);
+    let (mut peer_pidfd, peer_tapfd_raw) = recv_first_fd(&conn);
+    // The TAP fd (tap boxes) rides the register message's SCM_RIGHTS. Own it so
+    // every non-register path drops → closes it; the register call takes it.
+    let mut peer_tapfd: Option<std::os::fd::OwnedFd> = peer_tapfd_raw.map(|fd| unsafe {
+        <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd)
+    });
     let mut reader = BufReader::new(match conn.try_clone() {
         Ok(c) => c,
         Err(_) => {
@@ -1811,7 +1823,9 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
         // See the FRAME_API_* handling in the post-register frame loop
         // below and frames::FRAME_API_{OPEN,DATA,CLOSE}.
         let mut reply = if msg.get("type").and_then(Value::as_str) == Some("register") {
-            register(&state, &msg, peer_pidfd.take())
+            register(&state, &msg, peer_pidfd.take(),
+                     peer_tapfd.take().map(|f|
+                         <std::os::fd::OwnedFd as std::os::fd::IntoRawFd>::into_raw_fd(f)))
         } else if msg.get("type").and_then(Value::as_str) == Some("brush_prov_nested") {
             // D9 nested-shell provenance: a one-shot control message from the
             // brush-sh shim, carrying its OWN pidfd (like register) so we resolve
