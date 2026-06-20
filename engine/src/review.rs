@@ -1128,6 +1128,22 @@ pub fn set_parent_meta(child: i64, new: Option<i64>) -> Result<(), String> {
     Ok(())
 }
 
+/// Mark a child box's sqlar as `no_host_fallback=1` — the closure bit that stops
+/// resolve()/scan_dir() falling absent paths through to the real host. Used by
+/// dissolve(): when the box being freed carried the closure (an OCI image's
+/// --no-parent base), each child must inherit it, or re-parenting onto the
+/// grandparent (often top-level) would silently re-open the child to the host.
+/// The on-disk write is for at-rest children; a live child flips its in-RAM
+/// atomic via BoxState::set_no_host_fallback as well.
+pub fn set_no_host_meta(child: i64) -> Result<(), String> {
+    let cc = open_rw(child).ok_or("child archive unavailable")?;
+    cc.execute(
+        "INSERT OR REPLACE INTO meta(key,value) VALUES('no_host_fallback','1')",
+        [],
+    ).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// All changed paths a box captured (apply- and discard-bound alike) — the set
 /// a child may have inherited a view of through this box.
 pub fn changed_paths(id: i64) -> Vec<String> {

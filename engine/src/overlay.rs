@@ -674,19 +674,10 @@ impl Overlay {
                     .and_then(|b| b.parent());
                 continue;
             }
-            // A deleted/GC'd box has no sqlar. `BoxState::create` is CREATE-IF-
-            // NOT-EXISTS, so calling it here would RESURRECT the box as empty —
-            // and an empty resurrected parent carries no no_host_fallback, so a
-            // closed child built on a now-gone layer would silently re-open to
-            // the host. Stop the walk at the missing link instead (honoring this
-            // fn's "stops on missing sqlar" contract): box_of stays None and
-            // resolve()/scan_dir() fail closed.
-            if !crate::paths::state_home().join(format!("{id}.sqlar")).exists() {
-                return;
-            }
-            // Open the at-rest sqlar; `BoxState::create` on an existing sqlar
-            // just rebinds (additive schema upsert). load_mirror() then
-            // populates `kinds` and restores the parent-stack mode flags.
+            // Open the at-rest sqlar; `BoxState::create` is a CREATE-IF-NOT-
+            // EXISTS open + schema upsert (additive), so on an existing
+            // sqlar it just rebinds. load_mirror() then populates `kinds`
+            // and restores the parent-stack mode flags from meta.
             match BoxState::create(id) {
                 Ok(pb) => {
                     pb.load_mirror();
@@ -944,15 +935,7 @@ impl Overlay {
         while let Some(id) = cur {
             seen += 1;
             if seen > 64 { break; }
-            let Some(b) = self.box_of(id) else {
-                // A box referenced as a PARENT is missing — its layer box was
-                // deleted (image/layer GC). A broken chain must fail CLOSED: a
-                // box built on a now-gone lower layer must never silently gain
-                // host visibility. Treat the missing link as a no-host closure
-                // (reads return Absent below, not the host's file).
-                no_host = true;
-                break;
-            };
+            let Some(b) = self.box_of(id) else { break };
             if b.no_host_fallback() { no_host = true; }
             match b.entry(rel) {
                 Some(Entry::Whiteout) => return Layer::Absent,
@@ -1209,11 +1192,9 @@ impl Overlay {
         chain.reverse();
         // D-parent: skip host seeding when any box in the chain disables it
         // (matches resolve()'s no_host_fallback semantics — the box stack is
-        // closed at the bottom, no /etc-from-host bleed-through). A MISSING box
-        // in the chain (a deleted/GC'd parent layer) also closes it: map_or(true)
-        // fails closed so a broken chain never seeds host entries into readdir.
-        let no_host = chain.iter()
-            .any(|id| self.box_of(*id).map_or(true, |bx| bx.no_host_fallback()));
+        // closed at the bottom, no /etc-from-host bleed-through).
+        let no_host = chain.iter().filter_map(|id| self.box_of(*id))
+                           .any(|bx| bx.no_host_fallback());
         if !no_host {
             if let Ok(rd) = std::fs::read_dir(self.host(rel)) {
                 for ent in rd.flatten() {

@@ -160,17 +160,47 @@ def mnt_dir(e):
     return Path(e["XDG_RUNTIME_DIR"]) / "slopbox" / "mnt"
 
 
+def meta_get(sqlar, key):
+    """One meta value from a box's at-rest sqlar (None if absent/unreadable)."""
+    try:
+        c = sqlite3.connect(f"file:{sqlar}?mode=ro", uri=True)
+        row = c.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        c.close()
+        return row[0] if row else None
+    except Exception:
+        return None
+
+
 def box_id_by_name(sdir, name):
     for p in sdir.glob("*.sqlar"):
-        try:
-            c = sqlite3.connect(f"file:{p}?mode=ro", uri=True)
-            row = c.execute("SELECT value FROM meta WHERE key='name'").fetchone()
-            c.close()
-            if row and row[0] == name:
-                return int(p.stem)
-        except Exception:
-            pass
+        if meta_get(p, "name") == name:
+            return int(p.stem)
     return None
+
+
+def children_of(sdir, parent_id):
+    """Immediate child box ids — those whose sqlar meta parent_box_id == parent."""
+    kids = []
+    for p in sdir.glob("*.sqlar"):
+        if meta_get(p, "parent_box_id") == str(parent_id):
+            kids.append(int(p.stem))
+    return kids
+
+
+def ctl(e, msg, timeout=30):
+    """Send one control message over the UI socket and return its JSON reply."""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    s.connect(str(sock_path(e)))
+    s.sendall((json.dumps(msg) + "\n").encode())
+    buf = b""
+    while b"\n" not in buf:
+        chunk = s.recv(65536)
+        if not chunk:
+            break
+        buf += chunk
+    s.close()
+    return json.loads(buf.split(b"\n", 1)[0] or b"{}")
 
 
 def start_engine(e):
@@ -254,25 +284,42 @@ def main():
         check(after - before == 1,
               f"reuse added only the container box, not a new layer stack (+{after - before})")
 
-        # ── safety: deleting a no-host parent fails CLOSED, never leaks host ──
-        # BUILT descends from SYN (a no_host image base). GC SYN's base box,
-        # restart, then confirm BUILT loses SYN's files but does NOT fall through
-        # to the host (no /etc/passwd), while BUILT's own COPY survives.
+        # ── dissolve carries the no_host closure DOWN to the children ─────────
+        # SYN is a no_host image base: its rootfs is CLOSED (absent paths ENOENT,
+        # never the host's fs). Every container/build box sits on top of it. The
+        # real delete path is `dissolve` — it finalizes SYN's own changes, copies
+        # SYN's content DOWN into each immediate child that inherited it, frees
+        # SYN, and re-parents those children onto SYN's own parent. SYN was loaded
+        # --no-parent, so the grandparent is None (children go top-level). The new
+        # thing under test: the closure (no_host_fallback) must ALSO copy down, or
+        # a child re-parented to top-level silently re-opens to the host fs.
         syn_id = box_id_by_name(state_dir(e), "SYN")
+        check(syn_id is not None, "found the SYN base box")
+        check(meta_get(state_dir(e) / f"{syn_id}.sqlar", "no_host_fallback") == "1",
+              "SYN base is closed (no_host_fallback=1) before dissolve")
+        kids = children_of(state_dir(e), syn_id)
+        check(len(kids) >= 1,
+              f"SYN has immediate children to re-parent (got {len(kids)})")
+        # Dissolve via the real control verb (not a manual sqlar unlink).
+        resp = ctl(e, {"type": "ui", "verb": "dissolve", "args": [syn_id]})
+        check(resp.get("ok") is True, f"dissolve SYN ok (resp: {resp})")
+        check(not (state_dir(e) / f"{syn_id}.sqlar").exists(),
+              "dissolve freed SYN's sqlar")
+        for k in kids:
+            kp = state_dir(e) / f"{k}.sqlar"
+            check(meta_get(kp, "no_host_fallback") == "1",
+                  f"child {k} inherited the no_host closure from dissolved SYN")
+            check(meta_get(kp, "parent_box_id") in (None, ""),
+                  f"child {k} re-parented onto SYN's (absent) parent → top-level")
+        # End to end: restart, re-run BUILT. SYN's content (incl. /bin/sarun) was
+        # copied down, so the box STILL boots and runs its CMD — and stays closed.
         stop_engine(proc)
-        if syn_id:
-            (state_dir(e) / f"{syn_id}.sqlar").unlink(missing_ok=True)
-            shutil.rmtree(state_dir(e) / "live" / str(syn_id), ignore_errors=True)
         proc = start_engine(e)   # reassigned so `finally` stops the new engine
-        # Re-run BUILT to hydrate it; the run itself fails (its /bin/sarun lived
-        # in the now-deleted SYN) — that IS the fail-closed signal.
-        sarun(e, "oci", "run", "--net", "off", "BUILT", timeout=60)
-        mnt = mnt_dir(e) / str(built_top)
-        leaked = (mnt / "etc" / "passwd").exists() or (mnt / "root").exists()
-        check(bool(syn_id) and built_top != 0 and not leaked,
-              "deleting the no-host base makes the child fail CLOSED (no host fs leak)")
-        check((mnt / "marker.txt").exists(),
-              "child's own COPY'd file survives the parent's deletion")
+        r = sarun(e, "oci", "run", "--net", "off", "BUILT", timeout=120)
+        both = r.stdout + r.stderr
+        check(r.returncode == 0 and "oci load" in both,
+              f"BUILT still boots+runs its CMD after its base was dissolved "
+              f"(rc={r.returncode}, out={both.strip()[:200]})")
     finally:
         stop_engine(proc)
         shutil.rmtree(tmp, ignore_errors=True)
