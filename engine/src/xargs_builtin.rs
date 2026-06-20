@@ -33,7 +33,9 @@
 use std::cell::RefCell;
 use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
+use std::process::Stdio;
 
+use brush_core::openfiles::OpenFile;
 use findutils::xargs::XargsIo;
 
 /// xargs's injected logical I/O, bound to one shell command's streams.
@@ -43,8 +45,12 @@ use findutils::xargs::XargsIo;
 /// `take_input` can move it into xargs's `ArgumentReader` exactly once.
 struct BrushXargsIo {
     input: RefCell<Option<Box<dyn Read>>>,
-    output: RefCell<Box<dyn Write>>,
-    error_output: RefCell<Box<dyn Write>>,
+    // The shell's logical stdout/stderr as `OpenFile`s: used both as the sink
+    // for xargs's OWN output/diagnostics (`OpenFile: Write`) and as the source
+    // we dup into spawned children's stdio, so the children honor the box's
+    // redirects and pipes.
+    output: RefCell<OpenFile>,
+    error_output: RefCell<OpenFile>,
 }
 
 impl XargsIo for BrushXargsIo {
@@ -59,12 +65,24 @@ impl XargsIo for BrushXargsIo {
     }
 
     fn output(&self) -> &RefCell<dyn Write> {
-        // RefCell<Box<dyn Write>> unsizes to RefCell<dyn Write>.
+        // RefCell<OpenFile> unsizes to RefCell<dyn Write> (OpenFile: Write).
         &self.output
     }
 
     fn error_output(&self) -> &RefCell<dyn Write> {
         &self.error_output
+    }
+
+    fn child_stdout(&self) -> Option<Stdio> {
+        // Dup the logical stdout for the child: a piped/redirected sink
+        // (PipeWriter/File) is dup'd so `xargs cmd | next` / `> file` work; the
+        // inherited stdout handle yields `inherit`; an fd-less in-memory stream
+        // yields `null` (its bytes can't be handed to a child process).
+        Stdio::try_from(self.output.borrow().clone()).ok()
+    }
+
+    fn child_stderr(&self) -> Option<Stdio> {
+        Stdio::try_from(self.error_output.borrow().clone()).ok()
     }
 }
 
@@ -97,9 +115,12 @@ impl brush_core::builtins::SimpleCommand for XargsBuiltin {
         }
 
         // Logical I/O (owned, Send `OpenFile`s) and the logical working dir,
-        // captured before we leave `context`'s borrow.
-        let out = context.stdout();
-        let err = context.stderr();
+        // captured before we leave `context`'s borrow. stdout/stderr are taken
+        // as `OpenFile`s (not `impl Write`) so they can be both written by xargs
+        // and dup'd into its children; fall back to the process streams if a
+        // descriptor isn't mapped (shouldn't happen for a builtin).
+        let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
+        let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
         let input = context.stdin();
         let cwd = context.shell.working_dir().to_path_buf();
 
@@ -118,8 +139,8 @@ impl brush_core::builtins::SimpleCommand for XargsBuiltin {
 
                 let io = BrushXargsIo {
                     input: RefCell::new(Some(Box::new(input))),
-                    output: RefCell::new(Box::new(out)),
-                    error_output: RefCell::new(Box::new(err)),
+                    output: RefCell::new(out),
+                    error_output: RefCell::new(err),
                 };
                 let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
                 findutils::xargs::xargs_main_with_io(&argv_refs, &io)

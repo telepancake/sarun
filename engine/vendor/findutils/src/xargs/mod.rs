@@ -39,6 +39,16 @@ pub trait XargsIo {
     fn output(&self) -> &RefCell<dyn Write>;
     /// Sink for diagnostics (`-t` command traces, warnings, errors).
     fn error_output(&self) -> &RefCell<dyn Write>;
+    /// Stdio for a spawned child's stdout / stderr. An embedder returns
+    /// `Some(_)` to route the child's output to the shell's logical streams
+    /// (e.g. a dup of a piped/redirected logical fd); the default `None` leaves
+    /// the child inheriting the process fds, matching the standalone binary.
+    fn child_stdout(&self) -> Option<Stdio> {
+        None
+    }
+    fn child_stderr(&self) -> Option<Stdio> {
+        None
+    }
 }
 
 /// The dependencies used when xargs runs as the real standalone executable:
@@ -511,6 +521,19 @@ impl CommandBuilder<'_> {
             let mut err = io.error_output().borrow_mut();
             let _ = writeln!(err, "{command:?}");
             let _ = err.flush();
+        }
+
+        // Route the spawned child's stdout/stderr to the embedder's logical
+        // streams when provided. The in-process builtin dups the shell's
+        // logical fds here, so `xargs cmd > file` / `xargs cmd | next` honor
+        // the box's redirects and pipes. Default (standalone) leaves the child
+        // inheriting the process fds, exactly as upstream does. Set after the
+        // `-t` trace so the verbose output is unchanged.
+        if let Some(s) = io.child_stdout() {
+            command.stdout(s);
+        }
+        if let Some(s) = io.child_stderr() {
+            command.stderr(s);
         }
 
         match &self.options.action {
