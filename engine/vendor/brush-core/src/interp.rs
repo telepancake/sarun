@@ -28,6 +28,23 @@ struct PipelineExecutionContext<'a, SE: extensions::ShellExtensions> {
     process_group_id: Option<i32>,
 }
 
+/// Launch-state overrides that materialize onto a spawned child process at
+/// fork→exec (see `commands::compose_std_command`). These are set by sarun's
+/// in-process exec-wrapper builtins (`nice`/`setsid`/`nohup`): they describe
+/// dispositions that only a real process can carry, so they are applied in the
+/// child between `fork()` and `execve()`. Empty by default — zero effect on the
+/// normal command path. NOT upstream brush.
+#[derive(Clone, Default)]
+pub struct LaunchState {
+    /// Absolute nice value (priority) to apply to the child via `setpriority`
+    /// (`nice`). `None` leaves the inherited priority untouched.
+    pub niceness: Option<i32>,
+    /// Start the child in a new session via `setsid` (`setsid`).
+    pub new_session: bool,
+    /// Set the child's `SIGHUP` disposition to `SIG_IGN` (`nohup`).
+    pub ignore_sighup: bool,
+}
+
 /// Parameters for execution.
 #[derive(Clone, Default)]
 pub struct ExecutionParameters {
@@ -38,6 +55,9 @@ pub struct ExecutionParameters {
     /// Whether `errexit` (exit on error) behavior should be
     /// suppressed in this execution context. Defaults to `false`.
     pub suppress_errexit: bool,
+    /// sarun (NOT upstream brush): launch-state overrides materialized onto a
+    /// spawned child at fork→exec by the in-process exec-wrapper builtins.
+    pub launch_state: LaunchState,
 }
 
 impl ExecutionParameters {

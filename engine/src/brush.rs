@@ -472,6 +472,22 @@ fn box_builtins_opt<SE: brush_core::extensions::ShellExtensions>(
         "printenv".to_string(),
         builtin::<crate::exec_wrappers::PrintenvCommand, SE>(),
     );
+    // Launch-state exec wrappers (`nice`/`setsid`/`nohup`): same clone-and-
+    // dispatch mechanism, but they set a disposition only a real process can
+    // carry (priority / session / SIGHUP) that materializes in the forked child
+    // at exec; see crate::exec_wrappers and brush_core::LaunchState.
+    m.insert(
+        "nice".to_string(),
+        builtin::<crate::exec_wrappers::NiceCommand, SE>(),
+    );
+    m.insert(
+        "setsid".to_string(),
+        builtin::<crate::exec_wrappers::SetsidCommand, SE>(),
+    );
+    m.insert(
+        "nohup".to_string(),
+        builtin::<crate::exec_wrappers::NohupCommand, SE>(),
+    );
     m
 }
 
