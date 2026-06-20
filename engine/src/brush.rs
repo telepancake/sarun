@@ -423,7 +423,7 @@ fn box_builtins<SE: brush_core::extensions::ShellExtensions>()
 fn box_builtins_opt<SE: brush_core::extensions::ShellExtensions>(
     bundle_coreutils: bool,
 ) -> std::collections::HashMap<String, brush_core::builtins::Registration<SE>> {
-    use brush_core::builtins::simple_builtin;
+    use brush_core::builtins::{builtin, simple_builtin};
     let mut m: std::collections::HashMap<String, brush_core::builtins::Registration<SE>>
         = std::collections::HashMap::new();
     if bundle_coreutils {
@@ -456,6 +456,21 @@ fn box_builtins_opt<SE: brush_core::extensions::ShellExtensions>(
     m.insert(
         "xargs".to_string(),
         simple_builtin::<crate::xargs_builtin::XargsBuiltin, SE>(),
+    );
+    // In-process exec-wrapper builtins (`env`, `printenv`). These are launcher
+    // front-ends, not ports: they mutate the shell's LOGICAL launch state
+    // (environment, cwd) on a cloned subshell and dispatch the residual command
+    // through brush itself — so `env FOO=bar find .` runs `find` as the
+    // in-process builtin with the modified logical state, no OS process needed.
+    // Registered after the BashMode extend so they win over the uutils coreutil
+    // wrappers of the same name; see crate::exec_wrappers.
+    m.insert(
+        "env".to_string(),
+        builtin::<crate::exec_wrappers::EnvCommand, SE>(),
+    );
+    m.insert(
+        "printenv".to_string(),
+        builtin::<crate::exec_wrappers::PrintenvCommand, SE>(),
     );
     m
 }
