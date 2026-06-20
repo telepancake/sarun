@@ -1,9 +1,11 @@
 // On-disk box discovery — the Rust counterpart of the Python engine's
 // discover_sessions(): every <box_id>.sqlar under state_home plus every
-// live/<box_id> backing dir IS a box; name/parent come from the sqlar's meta
-// table, the command from the root process row. Read-only.
+// live/<box_id> backing dir IS a box. Each box's full sqlar `meta` table and
+// the root-process argv are read ONCE here (read_box) into Box_; everything
+// else in the engine reads box meta from Box_.meta or the box_meta() one-off,
+// never by opening a sqlar itself. Read-only.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::time::UNIX_EPOCH;
 
@@ -19,30 +21,49 @@ pub struct Box_ {
     pub cmd: Vec<String>,
     pub started: f64,
     pub has_sqlar: bool,
+    /// The box's full sqlar `meta` table (key→value), read once at discovery.
+    /// THE in-memory copy of a box's meta: callers read `oci_reference`,
+    /// `oci_layer_index`, `no_host_fallback`, `oci_config`, etc. from here
+    /// rather than re-opening the sqlar. `name`/`parent` above are just the two
+    /// hottest keys hoisted out of this map for convenience.
+    pub meta: HashMap<String, String>,
 }
 
 fn sqlar_path(box_id: i64) -> std::path::PathBuf {
     paths::state_home().join(format!("{box_id}.sqlar"))
 }
 
-fn read_meta(db: &Path) -> (String, Option<i64>, Vec<String>) {
+/// THE single place anything opens a box's at-rest sqlar to read state: its full
+/// `meta` table plus the root-process argv, in one connection. `discover()`
+/// fills Box_ from it; `box_meta()` is the one-off shorthand.
+fn read_box(box_id: i64) -> (HashMap<String, String>, Vec<String>) {
+    let mut meta = HashMap::new();
     let Ok(conn) = rusqlite::Connection::open_with_flags(
-        db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) else {
-        return (String::new(), None, vec![]);
+        &sqlar_path(box_id), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) else {
+        return (meta, vec![]);
     };
-    let get = |k: &str| -> Option<String> {
-        conn.query_row("SELECT value FROM meta WHERE key=?1", [k],
-                       |r| r.get::<_, String>(0)).ok()
-    };
-    let name = get("name").unwrap_or_default();
-    let parent = get("parent_box_id").and_then(|v| v.parse().ok());
+    if let Ok(mut st) = conn.prepare("SELECT key, value FROM meta") {
+        if let Ok(rows) = st.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        }) {
+            for kv in rows.flatten() { meta.insert(kv.0, kv.1); }
+        }
+    }
     let cmd: Vec<String> = conn
         .query_row("SELECT argv FROM process WHERE root=1 ORDER BY id LIMIT 1",
                    [], |r| r.get::<_, String>(0))
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
-    (name, parent, cmd)
+    (meta, cmd)
+}
+
+/// One-off read of a single box's `meta` map (for callers that don't already
+/// hold the discover() snapshot, e.g. a build seeding config from a base box).
+/// Goes through the same `read_box` reader, so there is exactly one code path
+/// that touches a box sqlar's meta.
+pub fn box_meta(box_id: i64) -> HashMap<String, String> {
+    read_box(box_id).0
 }
 
 fn ctime_of(p: &Path) -> f64 {
@@ -65,10 +86,12 @@ pub fn discover() -> BTreeMap<i64, Box_> {
             }
             let Some(id) = p.file_stem().and_then(|s| s.to_str())
                 .and_then(|s| s.parse::<i64>().ok()) else { continue };
-            let (name, parent, cmd) = read_meta(&p);
+            let (meta, cmd) = read_box(id);
+            let name = meta.get("name").cloned().unwrap_or_default();
+            let parent = meta.get("parent_box_id").and_then(|v| v.parse().ok());
             out.insert(id, Box_ {
                 box_id: id, name, parent, cmd,
-                started: ctime_of(&p), has_sqlar: true,
+                started: ctime_of(&p), has_sqlar: true, meta,
             });
         }
     }
@@ -79,6 +102,7 @@ pub fn discover() -> BTreeMap<i64, Box_> {
             out.entry(id).or_insert_with(|| Box_ {
                 box_id: id, name: String::new(), parent: None, cmd: vec![],
                 started: ctime_of(&ent.path()), has_sqlar: false,
+                meta: HashMap::new(),
             });
         }
     }

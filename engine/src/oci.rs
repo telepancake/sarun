@@ -240,8 +240,9 @@ fn resolve_image_top(reference: &str) -> Result<i64> {
 /// follow_to_top from it reaches that stack's current top.
 fn find_loaded_by_reference(boxes: &std::collections::BTreeMap<i64, crate::discover::Box_>,
                             reference: &str) -> Option<i64> {
-    boxes.keys().copied()
-        .filter(|id| read_box_meta(*id, "oci_reference").as_deref() == Some(reference))
+    boxes.values()
+        .filter(|b| b.meta.get("oci_reference").map(String::as_str) == Some(reference))
+        .map(|b| b.box_id)
         .min()
 }
 
@@ -269,8 +270,11 @@ fn follow_to_top(boxes: &std::collections::BTreeMap<i64, crate::discover::Box_>,
     let mut seen = std::collections::HashSet::new();
     loop {
         if !seen.insert(cur) { break; } // cycle guard
+        // Step to the unique child that is itself an OCI image layer
+        // (loader-stamped `oci_layer_index` meta), skipping run-containers.
         let next = boxes.values()
-            .find(|b| b.parent == Some(cur) && is_oci_layer(b.box_id))
+            .find(|b| b.parent == Some(cur)
+                  && b.meta.contains_key("oci_layer_index"))
             .map(|b| b.box_id);
         match next {
             Some(n) => cur = n,
@@ -278,21 +282,6 @@ fn follow_to_top(boxes: &std::collections::BTreeMap<i64, crate::discover::Box_>,
         }
     }
     cur
-}
-
-/// Is box `id` an OCI image layer (loader-stamped `oci_layer_index` meta)?
-fn is_oci_layer(id: i64) -> bool {
-    read_box_meta(id, "oci_layer_index").is_some()
-}
-
-/// Read one meta value from a box's at-rest sqlar, read-only. Returns None for a
-/// live-only box (no sqlar yet) or a missing key.
-fn read_box_meta(id: i64, key: &str) -> Option<String> {
-    let p = paths::state_home().join(format!("{id}.sqlar"));
-    let conn = rusqlite::Connection::open_with_flags(
-        &p, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
-    conn.query_row("SELECT value FROM meta WHERE key=?1", [key],
-                   |r| r.get::<_, String>(0)).ok()
 }
 
 /// A unique, valid (`valid_name`: uppercase-leading [A-Z0-9-]) container box
@@ -704,8 +693,9 @@ impl Builder {
     }
 
     fn seed_config_from(&mut self, id: i64) {
-        let Some(j) = read_box_meta(id, "oci_config") else { return; };
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(&j) else { return; };
+        let meta = crate::discover::box_meta(id);
+        let Some(j) = meta.get("oci_config") else { return; };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(j) else { return; };
         let Some(inner) = v.get("config") else { return; };
         if let Some(env) = inner.get("Env").and_then(|e| e.as_array()) {
             for e in env {

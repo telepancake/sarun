@@ -431,14 +431,9 @@ impl NestCtx {
         if let Some(cb) = self.live(id) {
             return cb.readonly_parent();
         }
-        let p = crate::paths::state_home().join(format!("{id}.sqlar"));
-        if let Ok(conn) = rusqlite::Connection::open_with_flags(
-            &p, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) {
-            return conn.query_row(
-                "SELECT value FROM meta WHERE key='readonly_parent'", [],
-                |r| r.get::<_, String>(0)).ok().as_deref() == Some("1");
-        }
-        false
+        // At-rest: the single meta reader, no bespoke sqlar open here.
+        crate::discover::box_meta(id).get("readonly_parent")
+            .map(String::as_str) == Some("1")
     }
 }
 
