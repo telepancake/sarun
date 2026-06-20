@@ -1,4 +1,4 @@
-# sarun: trimmed to a find-only library fork of uutils/findutils 0.9.1.
+# sarun: trimmed to a find + xargs library fork of uutils/findutils 0.9.1.
 # The `locate`/`updatedb`/`xargs`/`testing-commandline` binaries, their
 # benches, and the dev-dependencies are removed — the engine consumes only the
 # `find` module as a library (engine/vendor/findutils via a path dependency).
@@ -10,7 +10,7 @@ repository = "https://github.com/uutils/findutils"
 edition = "2021"
 license = "MIT"
 readme = "README.md"
-description = "Rust implementation of GNU findutils (find-only fork for sarun)"
+description = "Rust implementation of GNU findutils (find + xargs fork for sarun)"
 authors = ["uutils developers"]
 
 [dependencies]

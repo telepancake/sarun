@@ -26,7 +26,7 @@ upstream is load-bearing for that; do not "tidy" the base commit.
 | crate | upstream | pinned at | wired into the engine via | what we changed |
 |-------|----------|-----------|---------------------------|-----------------|
 | `uu_cat` | crates.io `uu_cat` (uutils/coreutils) | `0.8.0` | `[patch.crates-io] uu_cat = { path = "vendor/uu_cat" }` in `engine/Cargo.toml` | Injected-I/O entry `cat::cat(out, out_fd, stdin, stdin_fd)` that writes the shell's logical `OpenFile` sink/source with no process-global stdio, keeping the Linux `splice(2)` fast path. A thin `uumain` bridge is retained for the standalone/`--invoke-bundled` path. |
-| `findutils` | github.com/uutils/findutils, tag `0.9.1` | `0.9.1` | `findutils = { path = "vendor/findutils" }` in `engine/Cargo.toml`; builtin in `engine/src/find_builtin.rs`, registered in `engine/src/brush.rs` (`box_builtins_opt`) | Reduced to a **find-only** library (`lib.rs` = `pub mod find;`, the `locate`/`updatedb`/`xargs` modules + bins removed). Added `Dependencies::{get_error_output, get_input}` so diagnostics and the `-files0-from -` read go through the shell's logical stderr/stdin instead of the process fds. The builtin runs `find_main` on a worker thread that `unshare(CLONE_FS)`s + `chdir`s to the shell's logical cwd (see `find_builtin.rs` for that rationale). |
+| `findutils` | github.com/uutils/findutils, tag `0.9.1` | `0.9.1` | `findutils = { path = "vendor/findutils" }` in `engine/Cargo.toml`; builtins in `engine/src/find_builtin.rs` and `engine/src/xargs_builtin.rs`, registered in `engine/src/brush.rs` (`box_builtins_opt`) | Reduced to a **find + xargs** library (`lib.rs` = `pub mod find; pub mod xargs;`; the `locate`/`updatedb`/`testing` modules + bins removed). **find:** added `Dependencies::{get_error_output, get_input}` so diagnostics and the `-files0-from -` read go through the shell's logical stderr/stdin. **xargs:** added an `XargsIo` trait (`take_input`/`output`/`error_output`) so item input and xargs's own output/`-t`/warnings/errors go through the logical streams; `xargs_main_with_io` is the embedder entry. Both builtins run their `_main` on a worker thread that `unshare(CLONE_FS)`s + `chdir`s to the shell's logical cwd (see the builtin files for that rationale). **Known limitation:** the commands `find -exec` / `xargs` *spawn* inherit the engine's real fd 1/2, so a spawned child's stdout/stderr does NOT honor the box's logical pipes/redirects (`xargs cmd > file` / `xargs cmd | downstream` misroute). Pending the child-fd-wiring / in-process-dispatch work. |
 
 Provenance (the exact upstream version) is recorded in each crate's
 **pristine-import commit message**, which is the one true source — find it with:
@@ -42,7 +42,7 @@ message convention.
 ## Updating a vendored crate to a newer upstream
 
 Worked example: bumping `findutils` `0.9.1` → `0.10.0`. (For `uu_cat`, fetch the
-new crate from crates.io instead of git, and skip the find-only trim notes — the
+new crate from crates.io instead of git, and skip the find/xargs trim notes — the
 shape is identical.)
 
 ```bash
@@ -73,8 +73,8 @@ git rebase --onto vendor-bump "$BASE" <work-branch>
 #    Conflicts appear ONLY where 0.10.0 touched the same lines our patches did
 #    (e.g. an upstream refactor of parse_files0_args means the get_input thread
 #    re-applies there). Fix, `git add`, `git rebase --continue`.
-#    The find-only trim (a patch commit) re-applies by deleting locate/updatedb/
-#    xargs from the new upstream; resolve if upstream restructured them.
+#    The find+xargs trim (a patch commit) re-applies by deleting locate/updatedb/
+#    testing from the new upstream; resolve if upstream restructured them.
 
 # 4. Verify (see next section). Then:
 git push --force-with-lease       # base→patches preserved, never squashed
@@ -104,8 +104,9 @@ clean upstream checkout and run there:
 ```bash
 cd /tmp && rm -rf fu-test && git clone --depth 1 --branch 0.10.0 https://github.com/uutils/findutils fu-test
 cp -r ~/sarun/engine/vendor/findutils/src/find/. fu-test/src/find/
-printf 'pub mod find;\n' > fu-test/src/lib.rs      # find-only, so locate/updatedb/xargs don't need updating
-cd fu-test && CARGO_TARGET_DIR=/tmp/fu-test cargo test --lib find::
+cp -r ~/sarun/engine/vendor/findutils/src/xargs/. fu-test/src/xargs/
+printf 'pub mod find;\npub mod xargs;\n' > fu-test/src/lib.rs   # the modules we vendor
+cd fu-test && CARGO_TARGET_DIR=/tmp/fu-test cargo test --lib find:: xargs::
 #   Expect: all green EXCEPT test_no_permission_file_error and
 #   get_or_create_file_test, which fail when run as ROOT (root bypasses
 #   chmod 000) — confirm they fail on pristine too, i.e. not your fault.
