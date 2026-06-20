@@ -24,29 +24,32 @@
 use std::cell::RefCell;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::rc::Rc;
+use std::process::Stdio;
 use std::time::SystemTime;
 
+use brush_core::openfiles::OpenFile;
 use findutils::find::Dependencies;
 
 /// `find`'s injected dependencies, bound to one shell command's logical I/O.
 ///
-/// Built and used entirely on the worker thread, so the non-`Send` `Rc`s never
-/// cross a thread boundary.
+/// Built and used entirely on the worker thread. stdout/stderr are held as
+/// `OpenFile`s so they serve both as find's own write sinks and as the source
+/// we dup into `-exec` children's stdio.
 struct BrushFindDeps {
-    output: Rc<RefCell<dyn Write>>,
-    error_output: Rc<RefCell<dyn Write>>,
+    output: RefCell<OpenFile>,
+    error_output: RefCell<OpenFile>,
     stdin: RefCell<Box<dyn BufRead>>,
     now: SystemTime,
 }
 
 impl Dependencies for BrushFindDeps {
     fn get_output(&self) -> &RefCell<dyn Write> {
-        self.output.as_ref()
+        // RefCell<OpenFile> unsizes to RefCell<dyn Write> (OpenFile: Write).
+        &self.output
     }
 
     fn get_error_output(&self) -> &RefCell<dyn Write> {
-        self.error_output.as_ref()
+        &self.error_output
     }
 
     fn get_input(&self) -> &RefCell<dyn Read> {
@@ -70,6 +73,16 @@ impl Dependencies for BrushFindDeps {
         let mut line = String::new();
         let read = self.stdin.borrow_mut().read_line(&mut line).unwrap_or(0);
         read > 0 && line.trim_start().starts_with(['y', 'Y'])
+    }
+
+    fn child_stdout(&self) -> Option<Stdio> {
+        // Dup the logical stdout for an `-exec` child: a piped/redirected sink
+        // is dup'd, an inherited handle stays inherit, an fd-less stream → null.
+        Stdio::try_from(self.output.borrow().clone()).ok()
+    }
+
+    fn child_stderr(&self) -> Option<Stdio> {
+        Stdio::try_from(self.error_output.borrow().clone()).ok()
     }
 }
 
@@ -102,9 +115,12 @@ impl brush_core::builtins::SimpleCommand for FindBuiltin {
         }
 
         // Logical I/O (owned, Send `OpenFile`s) and the logical working dir,
-        // captured before we leave `context`'s borrow.
-        let out = context.stdout();
-        let err = context.stderr();
+        // captured before we leave `context`'s borrow. stdout/stderr are taken
+        // as `OpenFile`s (not `impl Write`) so they can be both written by find
+        // and dup'd into `-exec` children; fall back to the process streams if a
+        // descriptor isn't mapped (shouldn't happen for a builtin).
+        let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
+        let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
         let input = context.stdin();
         let cwd = context.shell.working_dir().to_path_buf();
 
@@ -121,8 +137,8 @@ impl brush_core::builtins::SimpleCommand for FindBuiltin {
                 }
 
                 let deps = BrushFindDeps {
-                    output: Rc::new(RefCell::new(out)),
-                    error_output: Rc::new(RefCell::new(err)),
+                    output: RefCell::new(out),
+                    error_output: RefCell::new(err),
                     stdin: RefCell::new(Box::new(BufReader::new(input))),
                     now: SystemTime::now(),
                 };

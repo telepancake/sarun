@@ -86,6 +86,16 @@ pub trait Dependencies {
     /// the answer comes from the real terminal even when stdin is redirected;
     /// BSD find reads from stdin unconditionally.
     fn confirm(&self, prompt: &str) -> bool;
+    /// Stdio for a spawned `-exec` child's stdout / stderr. An embedder returns
+    /// `Some(_)` to route the child's output to the shell's logical streams
+    /// (e.g. a dup of a piped/redirected logical fd); the default `None` leaves
+    /// the child inheriting the process fds, matching the standalone binary.
+    fn child_stdout(&self) -> Option<std::process::Stdio> {
+        None
+    }
+    fn child_stderr(&self) -> Option<std::process::Stdio> {
+        None
+    }
 }
 
 /// Struct that holds the dependencies we use when run as the real executable.
