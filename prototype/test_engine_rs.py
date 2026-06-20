@@ -704,6 +704,100 @@ def main():
             m.sync_request(sock, type="ui", verb="reload_rules", args=[])
             m.sync_request(sock, type="ui", verb="delete", args=[cid_])
 
+        # (3) copy-down must NOT disrupt the child's OWN changes, and must carry
+        #     a parent's WHITEOUT down (so an inherited "absent" stays absent).
+        #     Two scenarios, both finalized under a discard rule so nothing
+        #     touches the host — the child's view can only be preserved by a
+        #     correct copy-down that respects every kind of child/parent entry.
+        def build_finished(rid, files, parent=None):
+            """files: list of (rel, content|None) — None ⇒ a whiteout row."""
+            bk = m.live_dir(rid); (bk / "up").mkdir(parents=True)
+            ix = m.Index(bk); w = ix.writer_for(os.getpid())
+            for rel, content in files:
+                if content is None:
+                    ix.set_entry(rel, "whiteout", 0, w, "unlink")
+                else:
+                    ix.set_entry(rel, "file", stat_mod.S_IFREG | 0o644, w, "create")
+                    bp = m.blob_path(ix.box_id, ix.row_id(rel))
+                    bp.parent.mkdir(parents=True, exist_ok=True); bp.write_bytes(content)
+            m.consolidate(str(bk), rid, index=ix); ix.close()
+            shutil.rmtree(bk, ignore_errors=True)
+            if parent is not None:
+                m.sqlar_meta_set(m.sqlar_path(rid), "parent_box_id", parent)
+
+        def is_whiteout(sp, name):
+            md = m.sqlar_mode(sp, name)
+            return md is not None and stat_mod.S_IFMT(md) == stat_mod.S_IFCHR
+
+        drf3 = Path(os.environ["XDG_CONFIG_HOME"]) / "slopbox.RS" / "filerules"
+        drf3.parent.mkdir(parents=True, exist_ok=True)
+        drf3.write_text("discard **/*.inh\n")
+        m.sync_request(sock, type="ui", verb="reload_rules", args=[])
+        # A whiteout only persists (consolidate) when it shadows a real lower —
+        # here the host file at the same path. Create the victims so the child's
+        # and parent's deletions become genuine tombstone rows (a discard rule
+        # keeps dissolve from ever writing the host, so the victims survive).
+        wo_del = Path("/root/cdwo_del.inh"); wo_gp = Path("/root/cdwo_gp.inh")
+        wo_del.write_bytes(b"host-del\n"); wo_gp.write_bytes(b"host-gp\n")
+        try:
+            # ── Scenario A: parent→child, child has its own write + whiteout ──
+            pP, cC = "9700", "9701"
+            build_finished(pP, [("root/keep.inh",     b"p-keep\n"),
+                                ("root/over.inh",     b"p-over\n"),
+                                ("root/cdwo_del.inh", b"p-del\n")])
+            build_finished(cC, [("root/over.inh",     b"c-over\n"),  # child overwrites
+                                ("root/cdwo_del.inh", None)],         # child deletes
+                           parent=pP)
+            spC = m.sqlar_path(cC)
+            check(is_whiteout(spC, "root/cdwo_del.inh"),
+                  "engine-rs: precondition — child's own whiteout persisted in its sqlar")
+            drA = (m.sync_request(sock, type="ui", verb="dissolve", args=[pP])
+                   or {}).get("r") or {}
+            check(drA.get("ok") is True,
+                  "engine-rs: dissolve(parent) with a conflicting child succeeds")
+            # untouched inherited path: copied down verbatim.
+            check(m.sqlar_content(spC, "root/keep.inh") == b"p-keep\n",
+                  "engine-rs: copy-down brings the inherited-only file into the child")
+            # child's own overwrite must WIN — copy-down must not clobber it.
+            check(m.sqlar_content(spC, "root/over.inh") == b"c-over\n",
+                  "engine-rs: copy-down does NOT overwrite the child's own write")
+            # child's own deletion (whiteout) must SURVIVE — not be resurrected
+            # to the parent's file.
+            check(is_whiteout(spC, "root/cdwo_del.inh"),
+                  "engine-rs: copy-down preserves the child's own whiteout "
+                  "(deleted path stays deleted, not resurrected)")
+            check(m.sqlar_meta_get(spC, "parent_box_id") is None,
+                  "engine-rs: conflicting child re-parented to top-level")
+
+            # ── Scenario B: grandparent→parent→child, parent whiteouts a GP file.
+            #    The child inherits 'absent'; dissolving the parent must carry the
+            #    whiteout DOWN, or the grandparent's file would resurrect.
+            gG, pP2, cC2 = "9702", "9703", "9704"
+            build_finished(gG,  [("root/cdwo_gp.inh", b"gp-val\n")])
+            build_finished(pP2, [("root/cdwo_gp.inh", None)], parent=gG)  # parent deletes it
+            build_finished(cC2, [], parent=pP2)                          # child: no own entry
+            spP2 = m.sqlar_path(pP2)
+            check(is_whiteout(spP2, "root/cdwo_gp.inh"),
+                  "engine-rs: precondition — parent's whiteout persisted in its sqlar")
+            drB = (m.sync_request(sock, type="ui", verb="dissolve", args=[pP2])
+                   or {}).get("r") or {}
+            check(drB.get("ok") is True,
+                  "engine-rs: dissolve(parent) carrying a whiteout succeeds")
+            spC2 = m.sqlar_path(cC2)
+            check(m.sqlar_meta_get(spC2, "parent_box_id") == gG,
+                  "engine-rs: child re-parented onto the grandparent")
+            check(is_whiteout(spC2, "root/cdwo_gp.inh"),
+                  "engine-rs: parent's whiteout copied DOWN into the child "
+                  "(inherited 'absent' is preserved, grandparent file not resurrected)")
+            check(m.sqlar_content(m.sqlar_path(gG), "root/cdwo_gp.inh") == b"gp-val\n",
+                  "engine-rs: the grandparent's file is left untouched by the dissolve")
+        finally:
+            wo_del.unlink(missing_ok=True); wo_gp.unlink(missing_ok=True)
+            drf3.unlink(missing_ok=True)
+            m.sync_request(sock, type="ui", verb="reload_rules", args=[])
+            for bid in ("9701", "9702", "9704"):
+                m.sync_request(sock, type="ui", verb="delete", args=[bid])
+
         # ── nested LAUNCH: a box run INSIDE a box parents under it ──────────
         # Real end-to-end of the nested-launch mechanism: a top-level box runs a
         # script that itself invokes `sarun-engine run` (the nested box). Assert

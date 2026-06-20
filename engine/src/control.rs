@@ -551,11 +551,32 @@ fn dissolve(state: &State, id: i64) -> Value {
     // Re-parent the children onto the dissolving box's own parent. For a LIVE
     // child write the meta through its BoxState (one connection); for one at
     // rest write the on-disk sqlar. Also update the overlay's in-RAM parent.
+    //
+    // Closure carry-down: if THIS box held `no_host_fallback` (an OCI image's
+    // --no-parent rootfs base is the only box that does), it was the bottom that
+    // closed the chain for every child. Re-parenting a child onto the
+    // grandparent (None / top-level for a base) would drop that closure and let
+    // resolve()/scan_dir() fall the child's absent paths through to the real
+    // host. So each child inherits the bit — exactly like content copy-down, the
+    // child must keep seeing what it saw before (closed), not gain host fs.
+    let me_no_host =
+        me.meta.get("no_host_fallback").map(String::as_str) == Some("1");
     for &child in &children {
         match ov.as_ref().and_then(|o| o.live_box(child)) {
-            Some(cb) => cb.set_meta("parent_box_id",
-                &grandparent.map(|p| p.to_string()).unwrap_or_default()),
-            None => { let _ = crate::review::set_parent_meta(child, grandparent); }
+            Some(cb) => {
+                cb.set_meta("parent_box_id",
+                    &grandparent.map(|p| p.to_string()).unwrap_or_default());
+                if me_no_host {
+                    cb.set_meta("no_host_fallback", "1");
+                    cb.set_no_host_fallback(true);
+                }
+            }
+            None => {
+                let _ = crate::review::set_parent_meta(child, grandparent);
+                if me_no_host {
+                    let _ = crate::review::set_no_host_meta(child);
+                }
+            }
         }
         if let Some(ov) = &ov {
             ov.set_box_parent(child, grandparent);
