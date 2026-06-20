@@ -22,7 +22,7 @@
 //! process cwd rather than mutating it process-wide.
 
 use std::cell::RefCell;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::rc::Rc;
 use std::time::SystemTime;
@@ -47,6 +47,12 @@ impl Dependencies for BrushFindDeps {
 
     fn get_error_output(&self) -> &RefCell<dyn Write> {
         self.error_output.as_ref()
+    }
+
+    fn get_input(&self) -> &RefCell<dyn Read> {
+        // The shell's logical stdin (also used by `confirm`). `-files0-from -`
+        // reads it instead of the host process's real fd 0.
+        &self.stdin
     }
 
     fn now(&self) -> SystemTime {

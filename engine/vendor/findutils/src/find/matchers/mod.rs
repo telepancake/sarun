@@ -287,7 +287,20 @@ pub fn build_top_level_matcher(
     args: &[&str],
     config: &mut Config,
 ) -> Result<Box<dyn Matcher>, Box<dyn Error>> {
-    let (_, top_level_matcher) = (build_matcher_tree(args, config, 0, false))?;
+    // Default entry: `-files0-from -` bulk reads come from the process's real
+    // stdin. The in-process builtin uses `build_top_level_matcher_with_input`
+    // to supply the shell's logical stdin instead.
+    build_top_level_matcher_with_input(args, config, &mut std::io::stdin().lock())
+}
+
+/// As [`build_top_level_matcher`], but with an explicit source for the
+/// `-files0-from -` bulk stdin read (see `crate::find::Dependencies::get_input`).
+pub fn build_top_level_matcher_with_input(
+    args: &[&str],
+    config: &mut Config,
+    input: &mut dyn Read,
+) -> Result<Box<dyn Matcher>, Box<dyn Error>> {
+    let (_, top_level_matcher) = (build_matcher_tree(args, config, 0, false, input))?;
 
     // if the matcher doesn't have any side-effects, then we default to printing
     if !top_level_matcher.has_side_effects() {
@@ -446,6 +459,7 @@ fn build_matcher_tree(
     config: &mut Config,
     arg_index: usize,
     mut expecting_bracket: bool,
+    input: &mut dyn Read,
 ) -> Result<(usize, Box<dyn Matcher>), Box<dyn Error>> {
     let mut top_level_matcher = ListMatcherBuilder::new();
 
@@ -852,7 +866,8 @@ fn build_matcher_tree(
                 None
             }
             "(" => {
-                let (new_arg_index, sub_matcher) = build_matcher_tree(args, config, i + 1, true)?;
+                let (new_arg_index, sub_matcher) =
+                    build_matcher_tree(args, config, i + 1, true, input)?;
                 i = new_arg_index;
                 Some(sub_matcher)
             }
@@ -1001,7 +1016,7 @@ fn build_matcher_tree(
         ));
     }
     if config.files0_argument.is_some() {
-        parse_files0_args(config)?;
+        parse_files0_args(config, input)?;
     }
     Ok((i, top_level_matcher.build()))
 }
@@ -1010,13 +1025,16 @@ fn build_matcher_tree(
 // This allows users to take the entry point for find from stdin (eg. pipe) or from a text file.
 // eg. dummy | find -files0-from -
 // eg. find -files0-from rust.txt -name "cargo"
-fn parse_files0_args(config: &mut Config) -> Result<(), Box<dyn Error>> {
+fn parse_files0_args(config: &mut Config, input: &mut dyn Read) -> Result<(), Box<dyn Error>> {
     let mode = config.files0_argument.as_ref().unwrap();
     let mut buffer = Vec::new();
     let new_paths = config.new_paths.insert(Vec::new());
 
     if mode == "-" {
-        std::io::stdin().read_to_end(&mut buffer)?;
+        // The caller-supplied logical stdin — NOT `std::io::stdin()`, which in
+        // an in-process embedder would read (and consume) the host process's
+        // real fd 0.
+        input.read_to_end(&mut buffer)?;
     } else {
         let mut file =
             File::open(mode).map_err(|e| format!("cannot open '{}' for reading: {}", mode, e))?;
