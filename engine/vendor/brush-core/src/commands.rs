@@ -292,6 +292,42 @@ pub fn compose_std_command<S: AsRef<OsStr>, SE: extensions::ShellExtensions>(
         }
     }
 
+    // sarun fix (NOT upstream brush): materialize the launch-state overrides set
+    // by the in-process exec-wrapper builtins (nice/setsid/nohup). These are
+    // dispositions only a real process can carry, so they apply in the forked
+    // child just before execve. The common path leaves `launch_state` empty and
+    // skips the hook entirely.
+    //
+    // SAFETY: the closure runs between fork() and execve(). It captures only
+    // small Copy values (no allocation) and calls setsid(2)/sigaction-class
+    // signal(2)/setpriority(2) — all async-signal-safe per POSIX.
+    #[cfg(target_os = "linux")]
+    {
+        let launch = context.params.launch_state.clone();
+        if launch.new_session || launch.ignore_sighup || launch.niceness.is_some() {
+            use std::os::unix::process::CommandExt;
+            unsafe {
+                cmd.pre_exec(move || {
+                    // New session first (also detaches from the controlling tty).
+                    if launch.new_session {
+                        libc::setsid();
+                    }
+                    // Ignore SIGHUP so the child survives a hangup.
+                    if launch.ignore_sighup {
+                        libc::signal(libc::SIGHUP, libc::SIG_IGN);
+                    }
+                    // Best-effort priority: lowering priority (positive nice) is
+                    // unprivileged; raising it may be denied — match `nice` and
+                    // run the command anyway rather than failing the exec.
+                    if let Some(n) = launch.niceness {
+                        libc::setpriority(libc::PRIO_PROCESS, 0, n);
+                    }
+                    Ok(())
+                });
+            }
+        }
+    }
+
     Ok(cmd)
 }
 

@@ -40,8 +40,9 @@
 use std::io::Write;
 
 use brush_core::escape::{self, QuoteMode};
+use brush_core::openfiles::{OpenFile, OpenFiles};
 use brush_core::variables::{ShellValue, ShellVariable};
-use brush_core::{ExecutionResult, builtins};
+use brush_core::{ExecutionParameters, ExecutionResult, Shell, builtins};
 use clap::Parser;
 
 /// `env`'s own error exit status: it could not run the requested command for a
@@ -253,21 +254,56 @@ async fn run_env_plan<SE: brush_core::extensions::ShellExtensions>(
         return Ok(ExecutionResult::success());
     }
 
-    // Run COMMAND through the subshell's full dispatch. The argv is already
-    // word-expanded, so force-quote each piece to round-trip it through
-    // `run_string` without a second expansion. Command lookup (builtin /
-    // function / external) still happens normally.
-    let script = plan
-        .command
+    // Run COMMAND through the subshell's full dispatch.
+    dispatch(subshell, &plan.command, &context.params).await
+}
+
+/// Run an already-word-expanded `COMMAND [ARG]...` through a subshell's full
+/// command dispatch (`run_string`), returning the command's real exit status.
+///
+/// The argv has already been expanded by the time a builtin sees it, so each
+/// piece is force-single-quoted to round-trip through `run_string` (which
+/// re-parses a script string) without a second round of alias/glob/word
+/// splitting — while still allowing normal command lookup (builtin / function /
+/// external). This is the shared tail of every exec-wrapper that ends in "now
+/// run this command": `env`, `nice`, `setsid`, `nohup`.
+async fn dispatch<SE: brush_core::extensions::ShellExtensions>(
+    mut subshell: Shell<SE>,
+    command: &[String],
+    params: &ExecutionParameters,
+) -> Result<ExecutionResult, brush_core::error::Error> {
+    let script = command
         .iter()
         .map(|a| escape::force_quote(a, QuoteMode::SingleQuote))
         .collect::<Vec<_>>()
         .join(" ");
-
     let source_info = subshell.call_stack().current_pos_as_source_info();
-    subshell
-        .run_string(script, &source_info, &context.params)
-        .await
+    subshell.run_string(script, &source_info, params).await
+}
+
+/// Split a raw argv into a leading run of option tokens (anything starting with
+/// `-`, plus a `--` terminator) and the residual `COMMAND [ARG]...`. Returns the
+/// options and the command tail. This is the shape `nice`/`setsid`/`nohup` share:
+/// they take a few of their own flags, then everything from the first operand on
+/// is the command, verbatim. (`env` needs finer control — assignments between
+/// options and command — so it parses its own grammar.)
+fn split_options(args: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut opts = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if a == "--" {
+            i += 1;
+            break;
+        }
+        if a.starts_with('-') && a.len() > 1 {
+            opts.push(a.clone());
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    (opts, args[i..].to_vec())
 }
 
 /// `env` — run a command in a modified environment (or print the environment).
@@ -354,5 +390,213 @@ impl builtins::Command for PrintenvCommand {
         }
         let _ = out.flush();
         Ok(ExecutionResult::new(u8::from(!all_found)))
+    }
+}
+
+// ─── Launch-state wrappers: nice / setsid / nohup ────────────────────────────
+//
+// These three set a *launch-state* override — a disposition only a real process
+// can carry (scheduling priority, session, signal handling) — and then dispatch
+// the command exactly like `env`. The override rides on a cloned
+// `ExecutionParameters` and materializes in the forked child just before execve
+// (see brush_core::commands::compose_std_command, `LaunchState`). For an
+// in-process builtin target there is no exec to materialize onto, so the wrapper
+// is a transparent pass-through in that case — correct: a builtin has no
+// separate process to renice, put in a new session, or shield from SIGHUP. The
+// real targets (`nice make`, `setsid daemon`, `nohup ./server`) are external,
+// where the override applies.
+
+/// `nice` — run a command with an adjusted scheduling priority.
+#[derive(Parser)]
+pub(crate) struct NiceCommand {
+    /// Raw argv; parsed by hand because `-n N` takes a separate value and the
+    /// command keeps its own flags verbatim.
+    #[clap(allow_hyphen_values = true, trailing_var_arg = true)]
+    args: Vec<String>,
+}
+
+impl builtins::Command for NiceCommand {
+    type Error = brush_core::error::Error;
+
+    async fn execute<SE: brush_core::extensions::ShellExtensions>(
+        &self,
+        context: brush_core::commands::ExecutionContext<'_, SE>,
+    ) -> Result<ExecutionResult, Self::Error> {
+        // GNU default adjustment is +10 (lower priority) when none is given.
+        let mut adjustment: i32 = 10;
+        let args = &self.args;
+        let mut i = 0;
+        while i < args.len() {
+            let arg = &args[i];
+            if arg == "--" {
+                i += 1;
+                break;
+            }
+            // --adjustment[=N] / --adjustment N
+            if let Some(rest) = arg.strip_prefix("--adjustment") {
+                let val = if let Some(v) = rest.strip_prefix('=') {
+                    v.to_string()
+                } else {
+                    i += 1;
+                    match args.get(i) {
+                        Some(v) => v.clone(),
+                        None => return nice_usage_error(&context, "option '--adjustment' requires an argument"),
+                    }
+                };
+                match val.parse::<i32>() {
+                    Ok(n) => adjustment = n,
+                    Err(_) => return nice_usage_error(&context, &format!("invalid adjustment '{val}'")),
+                }
+                i += 1;
+                continue;
+            }
+            // -n N  or  -nN
+            if arg == "-n" {
+                i += 1;
+                let val = match args.get(i) {
+                    Some(v) => v.clone(),
+                    None => return nice_usage_error(&context, "option requires an argument -- 'n'"),
+                };
+                match val.parse::<i32>() {
+                    Ok(n) => adjustment = n,
+                    Err(_) => return nice_usage_error(&context, &format!("invalid adjustment '{val}'")),
+                }
+                i += 1;
+                continue;
+            }
+            if let Some(v) = arg.strip_prefix("-n") {
+                match v.parse::<i32>() {
+                    Ok(n) => adjustment = n,
+                    Err(_) => return nice_usage_error(&context, &format!("invalid adjustment '{v}'")),
+                }
+                i += 1;
+                continue;
+            }
+            // Historical bare form: `-NUM` / `--NUM` is an adjustment of NUM.
+            if let Some(body) = arg.strip_prefix('-') {
+                if let Ok(n) = body.trim_start_matches('-').parse::<i32>() {
+                    adjustment = n;
+                    i += 1;
+                    continue;
+                }
+                return nice_usage_error(&context, &format!("invalid option '{arg}'"));
+            }
+            break;
+        }
+
+        let command = args[i..].to_vec();
+
+        // No command: print the shell's current niceness (GNU behavior).
+        if command.is_empty() {
+            let cur = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+            let mut out = context.stdout();
+            let _ = writeln!(out, "{cur}");
+            let _ = out.flush();
+            return Ok(ExecutionResult::success());
+        }
+
+        // Target priority = inherited niceness + adjustment, clamped to the
+        // kernel's [-20, 19] range. Lowering priority is unprivileged; raising
+        // it may be denied in the child, in which case the command still runs.
+        let base = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+        let target = (base + adjustment).clamp(-20, 19);
+
+        let subshell = context.shell.clone();
+        let mut params = context.params.clone();
+        params.launch_state.niceness = Some(target);
+        dispatch(subshell, &command, &params).await
+    }
+}
+
+/// Emit a `nice:`-prefixed diagnostic and return GNU nice's error status (125).
+fn nice_usage_error<SE: brush_core::extensions::ShellExtensions>(
+    context: &brush_core::commands::ExecutionContext<'_, SE>,
+    msg: &str,
+) -> Result<ExecutionResult, brush_core::error::Error> {
+    let mut err = context.stderr();
+    let _ = writeln!(err, "nice: {msg}");
+    Ok(ExecutionResult::new(125))
+}
+
+/// `setsid` — run a command in a new session.
+#[derive(Parser)]
+pub(crate) struct SetsidCommand {
+    #[clap(allow_hyphen_values = true, trailing_var_arg = true)]
+    args: Vec<String>,
+}
+
+impl builtins::Command for SetsidCommand {
+    type Error = brush_core::error::Error;
+
+    async fn execute<SE: brush_core::extensions::ShellExtensions>(
+        &self,
+        context: brush_core::commands::ExecutionContext<'_, SE>,
+    ) -> Result<ExecutionResult, Self::Error> {
+        let (opts, command) = split_options(&self.args);
+        // We always wait for the command (run_string blocks), so `-w`/`--wait`
+        // is the de-facto mode and accepted as a no-op. `-c`/`--ctty` (set the
+        // controlling terminal) and `-f`/`--fork` are accepted but not modeled.
+        for o in &opts {
+            match o.as_str() {
+                "-w" | "--wait" | "-c" | "--ctty" | "-f" | "--fork" => {}
+                other => {
+                    let mut err = context.stderr();
+                    let _ = writeln!(err, "setsid: invalid option '{other}'");
+                    return Ok(ExecutionResult::new(1));
+                }
+            }
+        }
+        if command.is_empty() {
+            let mut err = context.stderr();
+            let _ = writeln!(err, "setsid: no command specified");
+            return Ok(ExecutionResult::new(1));
+        }
+
+        let subshell = context.shell.clone();
+        let mut params = context.params.clone();
+        params.launch_state.new_session = true;
+        dispatch(subshell, &command, &params).await
+    }
+}
+
+/// `nohup` — run a command immune to hangups.
+#[derive(Parser)]
+pub(crate) struct NohupCommand {
+    #[clap(allow_hyphen_values = true, trailing_var_arg = true)]
+    args: Vec<String>,
+}
+
+impl builtins::Command for NohupCommand {
+    type Error = brush_core::error::Error;
+
+    async fn execute<SE: brush_core::extensions::ShellExtensions>(
+        &self,
+        context: brush_core::commands::ExecutionContext<'_, SE>,
+    ) -> Result<ExecutionResult, Self::Error> {
+        let (opts, command) = split_options(&self.args);
+        for o in &opts {
+            // nohup has no options of its own beyond --help/--version.
+            let mut err = context.stderr();
+            let _ = writeln!(err, "nohup: invalid option '{o}'");
+            return Ok(ExecutionResult::new(125));
+        }
+        if command.is_empty() {
+            let mut err = context.stderr();
+            let _ = writeln!(err, "nohup: missing operand");
+            return Ok(ExecutionResult::new(125));
+        }
+
+        let subshell = context.shell.clone();
+        let mut params = context.params.clone();
+        params.launch_state.ignore_sighup = true;
+        // Faithful nohup also redirects stdin from an unreadable source so the
+        // detached command can't steal the box's stdin. The tty-conditional
+        // stdout→nohup.out redirect is intentionally omitted: a box's stdout is
+        // a pipe/file, never a terminal — exactly the case where GNU nohup also
+        // leaves stdout untouched — so there is nothing to redirect here.
+        if let Ok(devnull) = std::fs::File::open("/dev/null") {
+            params.set_fd(OpenFiles::STDIN_FD, OpenFile::from(devnull));
+        }
+        dispatch(subshell, &command, &params).await
     }
 }
