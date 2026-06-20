@@ -66,7 +66,7 @@ pub fn send_nested_prov(line: &[u8]) {
     let Ok(name) = std::env::var("SARUN_BROKER") else { return; };
     let Ok(conn) = broker_dial(&name) else { return; };
     let pidfd = pidfd_open(std::process::id() as i32);
-    send_register(&conn, line, pidfd);
+    send_register(&conn, line, pidfd, None);
     if pidfd >= 0 { unsafe { libc::close(pidfd); } }
     // Drain the engine's one-line ack (best-effort) so it isn't an abrupt RST.
     let mut s = String::new();
@@ -93,27 +93,33 @@ pub fn runner_broker_handoff_pub(fd: i32) { runner_broker_handoff(fd) }
 /// (the wrap-immune identity path) — correct for both top-level and nested
 /// runners, where our own getpid() is a parent-namespace pid the engine can't
 /// use. Returns false on write error.
-fn send_register(conn: &UnixStream, line: &[u8], pidfd: i32) -> bool {
-    if pidfd < 0 {
+fn send_register(conn: &UnixStream, line: &[u8], pidfd: i32, tap_fd: Option<i32>) -> bool {
+    // The engine peeks these in order: fd[0] = pidfd (host-pid identity),
+    // fd[1] = TAP fd for a `tap` box (the netns/device the runner just made).
+    let mut fds: Vec<i32> = Vec::with_capacity(2);
+    if pidfd >= 0 { fds.push(pidfd); }
+    if let Some(t) = tap_fd { fds.push(t); }
+    if fds.is_empty() {
         return conn_write_all(conn, line);
     }
+    let nbytes = (fds.len() * std::mem::size_of::<i32>()) as u32;
     let mut iov = libc::iovec {
         iov_base: line.as_ptr() as *mut libc::c_void,
         iov_len: line.len(),
     };
-    let mut cmsg = [0u8; 32]; // CMSG_SPACE(sizeof(i32)) rounded up
+    let mut cmsg = [0u8; 64]; // CMSG_SPACE(2 * sizeof(i32)) rounded up
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
     msg.msg_control = cmsg.as_mut_ptr().cast();
-    msg.msg_controllen = unsafe { libc::CMSG_SPACE(4) } as _;
+    msg.msg_controllen = unsafe { libc::CMSG_SPACE(nbytes) } as _;
     unsafe {
         let c = libc::CMSG_FIRSTHDR(&msg);
         (*c).cmsg_level = libc::SOL_SOCKET;
         (*c).cmsg_type = libc::SCM_RIGHTS;
-        (*c).cmsg_len = libc::CMSG_LEN(4) as _;
+        (*c).cmsg_len = libc::CMSG_LEN(nbytes) as _;
         std::ptr::copy_nonoverlapping(
-            (&pidfd as *const i32).cast(), libc::CMSG_DATA(c), 4);
+            fds.as_ptr().cast(), libc::CMSG_DATA(c), nbytes as usize);
         libc::sendmsg(conn.as_raw_fd(), &msg, 0) >= 0
     }
 }
@@ -274,12 +280,28 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
     } else {
         reg["session_id"] = json!(name.unwrap_or_default());
     }
+    // Tap mode: WE create the netns + TAP device (the engine creates none) and
+    // hand the engine the TAP fd as register's second SCM_RIGHTS fd. The
+    // unshare(CLONE_NEWNET) moves THIS process into the fresh netns; bwrap,
+    // spawned later WITHOUT --unshare-net, inherits it. Fail LOUD on error —
+    // never silently fall through to some other network.
+    let tap_fd: Option<std::os::fd::OwnedFd> =
+        if net_mode == crate::net::NetMode::Tap {
+            match crate::net::tap::create_netns_tap() {
+                Ok(fd) => Some(fd),
+                Err(e) => { eprintln!("sarun-engine: tap setup failed: {e}"); return 1; }
+            }
+        } else { None };
     let pidfd = pidfd_open(std::process::id() as i32);
-    if !send_register(&conn, format!("{reg}\n").as_bytes(), pidfd) {
+    let tap_raw = tap_fd.as_ref().map(|f| f.as_raw_fd());
+    if !send_register(&conn, format!("{reg}\n").as_bytes(), pidfd, tap_raw) {
         eprintln!("sarun-engine: register write failed");
         return 1;
     }
     if pidfd >= 0 { unsafe { libc::close(pidfd); } }
+    // The engine dup'd the TAP fd via SCM_RIGHTS; close our copy (the device
+    // stays alive on the engine's fd + our netns).
+    drop(tap_fd);
     let mut line = String::new();
     if BufReader::new(&conn).read_line(&mut line).is_err() {
         eprintln!("sarun-engine: register read failed");
@@ -416,6 +438,11 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
     let mut bwrap = Command::new("bwrap");
     bwrap.args(["--bind", &root_src, "/",
                 "--proc", "/proc", "--dev", "/dev",
+                // Expose the TUN device node so a NESTED box can build its own
+                // TAP netns the same way a top-level runner does (it creates the
+                // TAP inside its own network namespace — netns isolation means
+                // this grants no host reach). --dev-bind-try: harmless if absent.
+                "--dev-bind-try", "/dev/net/tun", "/dev/net/tun",
                 "--ro-bind-try", "/sys", "/sys"]);
     // /tmp policy: non-api boxes get the bwrap-private tmpfs (clean
     // isolation, but nothing written there ever reaches the overlay —
@@ -542,72 +569,42 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
     }
     bwrap.args(["--unshare-pid", "--unshare-ipc", "--unshare-uts",
                 "--die-with-parent"]);
-    // Netns dispatch (driven by ack info the engine already prepared based on
-    // the register's net_mode):
+    // Netns dispatch:
     //   Off  → bwrap --unshare-net  (brand new empty netns; dials fail closed)
-    //   Tap  → engine pre-equipped a netns; ack carries its /proc/<a>/ns/net.
-    //          We open the fd here and Command::pre_exec setns(2)'s the bwrap
-    //          child into it. No --unshare-net → inherits the equipped netns.
-    //   Host → no --unshare-net (box shares the engine's host netns).
-    let netns_path = ack.get("netns_path").and_then(Value::as_str)
-        .map(|s| s.to_string());
+    //   Tap  → WE already unshare(CLONE_NEWNET)'d above (create_netns_tap) and
+    //          handed the engine the TAP fd, so this process is ALREADY in the
+    //          equipped netns. bwrap must NOT --unshare-net — it inherits ours.
+    //   Host → no --unshare-net (box shares the launcher's netns).
     let dns_ip = ack.get("dns_ip").and_then(Value::as_str)
         .map(|s| s.to_string()).unwrap_or_default();
-    let ca_pem_path = ack.get("ca_pem_path").and_then(Value::as_str)
+    let ca_pem = ack.get("ca_pem").and_then(Value::as_str)
         .map(|s| s.to_string()).unwrap_or_default();
     match net_mode {
         crate::net::NetMode::Off => { bwrap.arg("--unshare-net"); }
-        crate::net::NetMode::Host => { /* leave host netns */ }
-        crate::net::NetMode::Tap if in_box => {
-            // Nested launch: this runner already lives in the ENCLOSING box's
-            // netns (its Tap netns, equipped by the engine when the parent
-            // box started). A host /proc/<anchor>/ns/net path is unreachable
-            // from inside the box's pid+mount namespaces, so we don't unshare
-            // or setns — the nested box INHERITS the enclosing box's proxied
-            // network, sharing its connectivity. (The engine returns no
-            // netns_path for an in-box Tap registration; see prepare_net.)
-        }
-        crate::net::NetMode::Tap => {
-            if let Some(p) = netns_path.clone() {
-                // Open the netns fd once HERE (parent), then setns in pre_exec
-                // in the child. The fd is kept open for the lifetime of the
-                // bwrap child via FD_CLOEXEC clear → bwrap inherits it.
-                let fd = unsafe { libc::open(
-                    std::ffi::CString::new(p.as_bytes()).unwrap().as_ptr(),
-                    libc::O_RDONLY | libc::O_CLOEXEC) };
-                if fd < 0 {
-                    eprintln!("sarun-engine: open netns {p}: {}",
-                              std::io::Error::last_os_error());
-                    return 1;
-                }
-                use std::os::unix::process::CommandExt;
-                unsafe {
-                    bwrap.pre_exec(move || {
-                        if libc::setns(fd, libc::CLONE_NEWNET) != 0 {
-                            return Err(std::io::Error::last_os_error());
-                        }
-                        Ok(())
-                    });
-                }
-            } else {
-                eprintln!("sarun-engine: -n requested but engine returned no \
-                           netns_path");
-                return 1;
-            }
-        }
+        crate::net::NetMode::Host => { /* leave the launcher's netns */ }
+        crate::net::NetMode::Tap => { /* already in our own TAP netns */ }
     }
-    if !ca_pem_path.is_empty() {
-        // CA bundle augmentation (sakar parity): bind the augmented bundle
-        // over each common system CA path. The env vars need to point at a
-        // path that exists INSIDE the box — use the canonical Debian/Ubuntu
-        // one (it's the most common and we also bind it). We bind it
-        // unconditionally (NOT --ro-bind-try) so the env-var path is
-        // guaranteed to resolve.
+    if !ca_pem.is_empty() {
+        // CA bundle augmentation (sakar parity): the engine sent the bundle
+        // CONTENT, not a host path — materialize it in OUR namespace (host for a
+        // top-level runner, the box's fs for a NESTED one) so the bind source is
+        // always reachable, then bind it over each common system CA path. Fail
+        // LOUD if we can't write it (never silently ship an un-MITM'd box).
+        let ca_tmp = std::env::temp_dir()
+            .join(format!("sarun-ca-{}.pem", std::process::id()));
+        if let Err(e) = std::fs::write(&ca_tmp, ca_pem.as_bytes()) {
+            eprintln!("sarun-engine: write CA bundle {}: {e}", ca_tmp.display());
+            return 1;
+        }
+        let ca_src = ca_tmp.to_string_lossy().into_owned();
+        // The env vars need a path that exists INSIDE the box — use the
+        // canonical Debian/Ubuntu one (most common; also bound). Bound
+        // unconditionally (NOT --ro-bind-try) so the env-var path resolves.
         let canonical_inside = "/etc/ssl/certs/ca-certificates.crt";
-        bwrap.args(["--ro-bind", &ca_pem_path, canonical_inside]);
+        bwrap.args(["--ro-bind", &ca_src, canonical_inside]);
         for tgt in CA_BUNDLE_TARGETS {
             if *tgt == canonical_inside { continue; }
-            bwrap.arg("--ro-bind-try").arg(&ca_pem_path).arg(tgt);
+            bwrap.arg("--ro-bind-try").arg(&ca_src).arg(tgt);
         }
         for (k, v) in [("SSL_CERT_FILE", canonical_inside),
                        ("CURL_CA_BUNDLE", canonical_inside),

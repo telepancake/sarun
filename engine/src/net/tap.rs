@@ -1,176 +1,63 @@
-// Fork a netns-anchor child: it `unshare(CLONE_NEWNET)`s into a fresh netns,
-// brings up loopback, creates a TAP, assigns the gateway IP, sets link up,
-// pins /proc/self/ns/net (so the engine can `setns` later), and ships the
-// TAP fd + a dup of its netns fd back over a socketpair as SCM_RIGHTS. Then
-// it waits on a control-socket EOF (its only purpose now is to keep the
-// netns alive for bwrap to inherit by setns'ing into /proc/<pid>/ns/net).
+// Per-box networking = a fresh network namespace with ONE TAP device wired to
+// a userland smoltcp stack the ENGINE drives. The netns and the TAP are created
+// by the RUNNER, not the engine: the runner is the process that execs bwrap, so
+// it can simply `unshare(CLONE_NEWNET)` and build the TAP right here, hand the
+// TAP fd to the engine over the register channel (SCM_RIGHTS), then exec bwrap
+// WITHOUT --unshare-net so the box inherits the runner's netns. The engine only
+// polls the fd. No forked anchor, no /proc/<pid>/ns/net path handoff.
 //
-// The engine (parent) sends a NetHandle back to runner.rs:
-//   • bwrap is spawned with `setns()` on the anchor's netns_fd before exec;
-//     it does NOT pass --unshare-net, so it inherits the netns the engine
-//     pre-equipped.
-//   • The TAP fd stays in the engine process; smoltcp polls it.
-//
-// Why an anchor child at all: bwrap has no `--netns-fd` flag. To put a
-// process into a pre-existing netns we'd need to be IN that netns when we
-// fork the bwrap child. The anchor model is the simplest way to keep the
-// netns referenced (via /proc/<pid>/ns/net) for as long as the box runs.
+// Every box uses the SAME fixed addresses + MAC: each TAP is alone in its own
+// netns, so there is nothing to disambiguate at L2/L3, and the engine keys each
+// box's stack/flows/pcap by box id, never by address.
 
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::path::PathBuf;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 
 use super::subnet::BoxSubnet;
 
-/// What the engine gets back per box.
-pub struct AnchorRig {
-    pub anchor_pid: i32,
-    pub netns_path: PathBuf,
-    pub tap_fd: OwnedFd,
-    pub tap_name: String,
-    pub mac: [u8; 6],
-}
+/// The fixed subnet every box's TAP is addressed from: box = .0.2, gateway =
+/// .0.1, the synth-DNS pool spread across the rest of the /16. Identical for
+/// every box (netns isolation makes per-box ranges pointless).
+pub const BOX_SUBNET_ID: u16 = 1;
 
-/// Spawn a netns-anchor child for `subnet` and wait for its handoff.
-pub fn spawn_anchor(subnet: BoxSubnet) -> Result<AnchorRig> {
-    // socketpair for the handoff
-    let mut sv = [0i32; 2];
-    let r = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
-                                      0, sv.as_mut_ptr()) };
-    if r != 0 { bail!("socketpair: {}", std::io::Error::last_os_error()); }
-    let parent_sock = unsafe { OwnedFd::from_raw_fd(sv[0]) };
-    let child_sock = unsafe { OwnedFd::from_raw_fd(sv[1]) };
+/// The box-side TAP hardware address. Cosmetic to the engine (smoltcp answers
+/// as the gateway MAC); a stable locally-administered value just so the
+/// interface has one.
+pub const BOX_MAC: [u8; 6] = [0x02, 0x73, 0x72, 0x6e, 0x00, 0x02];
 
-    let mac: [u8; 6] = {
-        use rand::RngCore;
-        let mut buf = [0u8; 6];
-        rand::thread_rng().fill_bytes(&mut buf);
-        // Locally administered, unicast.
-        buf[0] = (buf[0] & 0xFE) | 0x02;
-        buf
-    };
+/// The fixed per-box subnet (see `BOX_SUBNET_ID`).
+pub fn box_subnet() -> BoxSubnet { BoxSubnet::new(BOX_SUBNET_ID) }
 
-    let pid = unsafe { libc::fork() };
-    if pid < 0 { bail!("fork: {}", std::io::Error::last_os_error()); }
-    if pid == 0 {
-        // Child path: never returns (exec or _exit).
-        drop(parent_sock);
-        anchor_child_main(child_sock, subnet, mac);
+/// The gateway MAC: what the engine's smoltcp answers as, AND what the runner
+/// seeds into the box's ARP cache. `StackRuntime::start` must be given the
+/// same value.
+pub fn gateway_mac() -> [u8; 6] { derive_gw_mac(BOX_SUBNET_ID) }
+
+/// RUNNER-side: move THIS process into a fresh network namespace and equip it
+/// with loopback + a TAP at the fixed box address, returning the TAP fd to hand
+/// to the engine (which polls it). The caller then execs bwrap WITHOUT
+/// --unshare-net so the box inherits this netns. Requires CAP_NET_ADMIN /
+/// CAP_SYS_ADMIN in the caller's user namespace — the runner already clears that
+/// bar (its bwrap child `setns`'d a netns before this change).
+pub fn create_netns_tap() -> Result<OwnedFd> {
+    if unsafe { libc::unshare(libc::CLONE_NEWNET) } != 0 {
+        bail!("unshare(CLONE_NEWNET): {}", std::io::Error::last_os_error());
     }
-
-    // Parent: receive (tap_fd, netns_fd) over the socket.
-    drop(child_sock);
-    let (tap_fd, netns_fd, tap_name) = recv_handoff(&parent_sock)
-        .context("recv anchor handoff")?;
-    // We re-open the netns by path (more durable than holding the dup) — the
-    // path is /proc/<pid>/ns/net and stays valid while the anchor is alive.
-    drop(netns_fd); // we only need the path; the anchor keeps the fd open
-    let netns_path = PathBuf::from(format!("/proc/{}/ns/net", pid));
-    Ok(AnchorRig { anchor_pid: pid, netns_path, tap_fd, tap_name, mac })
-}
-
-const TAP_HANDOFF_KIND: u8 = 1;
-
-fn recv_handoff(sock: &OwnedFd) -> Result<(OwnedFd, OwnedFd, String)> {
-    // Frame: 1 byte kind | 4 byte BE name-len | name-bytes | 2 fds via SCM_RIGHTS.
-    let mut buf = [0u8; 5 + 64];
-    let mut iov = libc::iovec {
-        iov_base: buf.as_mut_ptr().cast(),
-        iov_len: buf.len(),
-    };
-    let mut cmsg_buf = [0u8; unsafe { libc::CMSG_SPACE(8) } as usize];
-    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-    msg.msg_iov = &mut iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = cmsg_buf.as_mut_ptr().cast();
-    msg.msg_controllen = cmsg_buf.len() as _;
-    let n = unsafe { libc::recvmsg(sock.as_raw_fd(), &mut msg, 0) };
-    if n < 0 { bail!("recvmsg: {}", std::io::Error::last_os_error()); }
-    if (n as usize) < 5 { bail!("short handoff"); }
-    if buf[0] != TAP_HANDOFF_KIND { bail!("bad handoff kind"); }
-    let nlen = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
-    if 5 + nlen > n as usize { bail!("name overflow"); }
-    let tap_name = std::str::from_utf8(&buf[5..5 + nlen])
-        .context("utf8 tap name")?.to_string();
-    let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
-    if cmsg.is_null() { bail!("no cmsg"); }
-    let (lvl, ty, len) = unsafe { ((*cmsg).cmsg_level, (*cmsg).cmsg_type, (*cmsg).cmsg_len) };
-    if lvl != libc::SOL_SOCKET || ty != libc::SCM_RIGHTS {
-        bail!("unexpected cmsg ({lvl}/{ty})");
-    }
-    let data_len = len as usize - unsafe { libc::CMSG_LEN(0) } as usize;
-    if data_len < 8 { bail!("short cmsg fds"); }
-    let mut fds = [0i32; 2];
-    unsafe {
-        std::ptr::copy_nonoverlapping(libc::CMSG_DATA(cmsg).cast::<i32>(),
-                                      fds.as_mut_ptr(), 2);
-    }
-    let tap = unsafe { OwnedFd::from_raw_fd(fds[0]) };
-    let ns = unsafe { OwnedFd::from_raw_fd(fds[1]) };
-    Ok((tap, ns, tap_name))
-}
-
-/// The anchor child's main. Never returns: either `_exit` on failure or
-/// `pause()` to keep the netns referenced.
-fn anchor_child_main(sock: OwnedFd, subnet: BoxSubnet, mac: [u8; 6]) -> ! {
-    // We are a bare fork() of the engine, so we inherited its SIGTERM/SIGINT
-    // handler (main.rs `on_term`) — which UNLINKS the engine's UI socket and
-    // MNT_DETACHes its FUSE mount before _exit, the graceful-shutdown path. But
-    // the engine SIGTERMs THIS anchor to tear down a box's netns when its
-    // NetHandle drops (box deleted/dissolved/reaped). If we still carried that
-    // handler, the dying anchor would destroy the LIVE engine's socket and
-    // mountpoint — leaving the engine running but unreachable. Reset the fatal
-    // signals to SIG_DFL so our teardown is a plain process death that just
-    // drops the last /proc/<pid>/ns/net reference and frees the netns + TAP.
-    unsafe {
-        libc::signal(libc::SIGTERM, libc::SIG_DFL);
-        libc::signal(libc::SIGINT, libc::SIG_DFL);
-    }
-    let res = (|| -> Result<()> {
-        // 1. Unshare into a new netns.
-        let r = unsafe { libc::unshare(libc::CLONE_NEWNET) };
-        if r != 0 { bail!("unshare(CLONE_NEWNET): {}", std::io::Error::last_os_error()); }
-
-        // 2. Open /proc/self/ns/net to dup back to the parent.
-        let netns = std::fs::File::open("/proc/self/ns/net").context("open ns/net")?;
-        let netns_fd: OwnedFd = netns.into();
-
-        // 3. Bring loopback up + create + configure TAP. The IP that goes
-        //    on the TAP-from-the-box's-perspective is the BOX's address
-        //    (`.0.2`), not the gateway's — the gateway lives on the engine
-        //    side, served entirely by smoltcp's userland stack. We also
-        //    install a default route via the gateway so the box's normal
-        //    dial paths (curl, getaddrinfo, ...) work without dhclient.
-        let tap_name = format!("tap{}", subnet.id);
-        let tap = open_tap(&tap_name).context("open TAP")?;
-        bring_link_up("lo")?;
-        set_mac(&tap_name, mac)?;
-        set_link_up(&tap_name)?;
-        assign_ip(&tap_name, subnet.box_ip(), subnet.box_prefix_len())?;
-        add_default_route(subnet.gateway_ip())?;
-        // Also seed the ARP cache so the first packet doesn't lose time
-        // resolving the gateway MAC. We don't know it from here (it's the
-        // engine's choice), so we install a permanent neighbour entry using
-        // a deterministic engine-side MAC derived from box id (matches the
-        // `derive_gw_mac` in control.rs).
-        let gw_mac = derive_gw_mac(subnet.id);
-        let _ = add_neigh(subnet.gateway_ip(), gw_mac, &tap_name);
-
-        // 4. Hand off (tap_fd, netns_fd) + tap_name.
-        send_handoff(&sock, &tap, &netns_fd, &tap_name)?;
-        Ok(())
-    })();
-    if let Err(e) = res {
-        let msg = format!("anchor child: {e}\n");
-        unsafe { libc::write(2, msg.as_ptr().cast(), msg.len()); }
-        unsafe { libc::_exit(1); }
-    }
-    // 5. Park forever; the engine's drop of NetHandle SIGTERMs us, which
-    //    releases the last /proc/<pid>/ns/net reference and tears the netns
-    //    + TAP down. (We deliberately keep the TAP fd locally too so the
-    //    interface doesn't disappear out from under bwrap.)
-    loop { unsafe { libc::pause(); } }
+    let subnet = box_subnet();
+    let tap_name = "tap0";
+    // The IP on the TAP is the BOX's address (.0.2); the gateway (.0.1) lives on
+    // the engine side, served entirely by smoltcp. A default route via the
+    // gateway makes the box's normal dial paths work without a dhcp client.
+    let tap = open_tap(tap_name)?;
+    bring_link_up("lo")?;
+    set_mac(tap_name, BOX_MAC)?;
+    set_link_up(tap_name)?;
+    assign_ip(tap_name, subnet.box_ip(), subnet.box_prefix_len())?;
+    add_default_route(subnet.gateway_ip())?;
+    // Seed the gateway MAC so the box's first packet doesn't stall on ARP.
+    let _ = add_neigh(subnet.gateway_ip(), gateway_mac(), tap_name);
+    Ok(tap)
 }
 
 fn open_tap(name: &str) -> Result<OwnedFd> {
@@ -347,36 +234,5 @@ fn assign_ip(name: &str, ip: [u8; 4], prefix: u8) -> Result<()> {
     let r = unsafe { libc::ioctl(s.as_raw_fd(), SIOCSIFNETMASK as _, &req) };
     if r < 0 { bail!("SIOCSIFNETMASK({name}): {}", std::io::Error::last_os_error()); }
     let _ = ifflags(name)?; // suppress unused warning if it ever drifts
-    Ok(())
-}
-
-fn send_handoff(sock: &OwnedFd, tap: &OwnedFd, ns: &OwnedFd, name: &str)
-                -> Result<()> {
-    let nb = name.as_bytes();
-    if nb.len() >= 64 { bail!("tap name too long"); }
-    let mut buf = vec![TAP_HANDOFF_KIND];
-    buf.extend_from_slice(&(nb.len() as u32).to_be_bytes());
-    buf.extend_from_slice(nb);
-    let mut iov = libc::iovec {
-        iov_base: buf.as_mut_ptr().cast(),
-        iov_len: buf.len(),
-    };
-    let mut cmsg_buf = [0u8; unsafe { libc::CMSG_SPACE(8) } as usize];
-    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-    msg.msg_iov = &mut iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = cmsg_buf.as_mut_ptr().cast();
-    msg.msg_controllen = cmsg_buf.len() as _;
-    unsafe {
-        let c = libc::CMSG_FIRSTHDR(&msg);
-        (*c).cmsg_level = libc::SOL_SOCKET;
-        (*c).cmsg_type = libc::SCM_RIGHTS;
-        (*c).cmsg_len = libc::CMSG_LEN(8) as _;
-        let fds = [tap.as_raw_fd(), ns.as_raw_fd()];
-        std::ptr::copy_nonoverlapping(fds.as_ptr().cast::<u8>(),
-                                      libc::CMSG_DATA(c), 8);
-    }
-    let r = unsafe { libc::sendmsg(sock.as_raw_fd(), &msg, 0) };
-    if r < 0 { bail!("sendmsg handoff: {}", std::io::Error::last_os_error()); }
     Ok(())
 }
