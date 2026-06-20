@@ -19,6 +19,7 @@ pub use net::NetMode;
 mod brush;
 mod brush_gates;
 mod capture;
+mod exec_wrappers;
 mod find_builtin;
 mod xargs_builtin;
 mod control;
