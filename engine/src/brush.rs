@@ -448,6 +448,15 @@ fn box_builtins_opt<SE: brush_core::extensions::ShellExtensions>(
         "find".to_string(),
         simple_builtin::<crate::find_builtin::FindBuiltin, SE>(),
     );
+    // In-process `xargs` (same vendored findutils fork). Like `find`, it is
+    // neither a bundled coreutil nor a bash builtin, so it is always present and
+    // registered regardless of `bundle_coreutils`. It reads the shell's logical
+    // stdin, writes its logical stdout/stderr, and spawns its child commands in
+    // the shell's logical cwd; see crate::xargs_builtin.
+    m.insert(
+        "xargs".to_string(),
+        simple_builtin::<crate::xargs_builtin::XargsBuiltin, SE>(),
+    );
     m
 }
 
