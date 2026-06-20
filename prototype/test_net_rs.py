@@ -41,7 +41,11 @@ from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
 CRATE = _HERE.parent / "engine"
-BIN = CRATE / "target" / "release" / "sarun"
+# The ONLY build is the fully-static musl binary (see CLAUDE.md). The old
+# `target/release/sarun` glibc path never exists, so pointing BIN at it made
+# every net test silently skip. Build via `make engine` (cargo-zigbuild), not a
+# bare `cargo build` — the latter can't produce the musl binary here.
+BIN = CRATE / "target" / "x86_64-unknown-linux-musl" / "release" / "sarun"
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
@@ -49,9 +53,9 @@ BIN = CRATE / "target" / "release" / "sarun"
 def ensure_binary() -> bool:
     if BIN.exists():
         return True
-    if shutil.which("cargo") is None:
+    if shutil.which("make") is None:
         return False
-    r = subprocess.run(["cargo", "build", "--release"], cwd=CRATE,
+    r = subprocess.run(["make", "engine"], cwd=CRATE.parent,
                        capture_output=True, text=True)
     return r.returncode == 0 and BIN.exists()
 
@@ -572,22 +576,41 @@ def test_n_box_quic_blocked():
         eng.stop()
 
 
-def test_default_no_netns_dials_fail_closed():
-    """No `-n`/`-N` → empty netns, no loopback, no routes. Every dial
-    fails closed. We assert getaddrinfo (no nameserver) AND a raw TCP
-    dial to a public IP both fail."""
+def test_net_off_dials_fail_closed():
+    """`--net off` → empty netns, no loopback, no routes. Every dial fails
+    closed. We assert getaddrinfo (no nameserver) fails. NB: the DEFAULT is
+    now Tap (proxied), so fail-closed is the explicit `off` mode, not "no
+    flags" — see test_default_is_tap below."""
     skip_if_no_binary()
     eng = Engine("TST7")
     try:
         eng.start()
         # No network at all → DNS fails. We expect getent to print
         # nothing and exit non-zero, OR the kernel to refuse the dial.
-        r = eng.run("--", "sh", "-c",
+        r = eng.run("--net", "off", "--", "sh", "-c",
                     "getent hosts example.com; echo exit=$?")
         # The literal "exit=" line is there either way; check that the
         # exit code is non-zero (no resolution possible).
         assert "exit=0" not in r.stdout, \
             f"DNS resolved in an empty netns: {r.stdout!r}"
+    finally:
+        eng.stop()
+
+
+def test_default_is_tap():
+    """No `-n`/`-N`/`--net` → Tap (proxied) by default. The synthetic DNS
+    pool answers any name with a 240/4 (Class E) address, so resolution
+    SUCCEEDS through the engine's stack — the opposite of `--net off`."""
+    skip_if_no_binary()
+    eng = Engine("TST7B")
+    try:
+        eng.start()
+        r = eng.run("--", "sh", "-c",
+                    "getent hosts example.com; echo exit=$?")
+        assert "exit=0" in r.stdout, \
+            f"default box did not resolve through Tap: {r.stdout!r}"
+        assert "240." in r.stdout, \
+            f"default box resolved but not via the synthetic pool: {r.stdout!r}"
     finally:
         eng.stop()
 
