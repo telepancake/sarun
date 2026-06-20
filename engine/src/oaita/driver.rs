@@ -930,10 +930,9 @@ fn dispatch_act(args: &Value, outer: &str, set: &Settings,
     // if the prefix segment can't be resolved (see control.rs:644). One
     // no-op materialization is cheap and idempotent.
     let _ = exe.run(&outer_box, "true", /*discard=*/false, /*api_access=*/false);
-    // act sub-agents are `oaita run` PROCESSES IN A BOX — they need the
-    // engine binary on PATH and proxy access for the LLM call. Pass --api
-    // so the runner binds /usr/local/bin/{oaita,sarun} AND admits the
-    // box on the proxy gate.
+    // act sub-agents are `oaita run` PROCESSES IN A BOX — they re-exec the
+    // engine binary via /proc/self/exe and need proxy access for the LLM
+    // call. Pass --api so the engine admits the box on the proxy gate.
     let r = exe.run(&dotted, &script, false, /*api_access=*/true);
     format_act_result(&r, &inner) + &format_sub_agent_status(outer)
 }

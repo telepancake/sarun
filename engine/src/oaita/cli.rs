@@ -191,21 +191,28 @@ fn cmd_run(args: &[String]) -> i32 {
 /// Host-side `oaita run` shim. Re-execs the SAME oaita command inside a
 /// fresh `OAITA-<NAME>` --api box, with `--inbox` added so the inner
 /// invocation falls through to the driver loop instead of recursing.
-/// In-box, `sarun` resolves through the box's PATH to the FUSE-shadowed
-/// /usr/local/bin/sarun (overlay::is_engine_shadow_path on --api boxes),
-/// so the nested command is the same engine binary the runner exec'd
-/// from /proc/self/fd/N — no bind mounts.
+/// The in-box command is `/proc/self/exe` (the box inner runner's own
+/// executable — the engine binary the runner exec'd from /proc/self/fd/N),
+/// so there is no `sarun`-on-PATH dependency and no FUSE shadow / no
+/// /usr/local in the box.
 fn spawn_in_box(p: &Parsed, original_args: &[String]) -> i32 {
     let target = match crate::oaita::turns::target_segment(&p.name) {
         Ok(t) => t, Err(e) => { eprintln!("{e}"); return 2; }
     };
     let target_box = crate::oaita::exec::box_name(&target);
-    let exe_path = std::env::current_exe()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| "sarun".to_string());
+    // Outer `sarun run` runs in the CURRENT context (host, or a parent box):
+    // /proc/self/exe in-box, else current_exe(). The `--` payload runs in the
+    // NEW box, so it is always /proc/self/exe.
+    let exe_path = if crate::oaita::exec::in_box() {
+        "/proc/self/exe".to_string()
+    } else {
+        std::env::current_exe()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "sarun".to_string())
+    };
     let mut cmd = std::process::Command::new(&exe_path);
     cmd.arg("run").arg("--api").arg(&target_box).arg("--");
-    cmd.arg("sarun").arg("oaita").arg("run").arg("--inbox");
+    cmd.arg("/proc/self/exe").arg("oaita").arg("run").arg("--inbox");
     for a in original_args { cmd.arg(a); }
     match cmd.status() {
         Ok(s) => s.code().unwrap_or(1),

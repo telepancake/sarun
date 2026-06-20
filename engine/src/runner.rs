@@ -470,16 +470,15 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
     } else {
         bwrap.args(["--tmpfs", "/tmp"]);
     }
-    // No bwrap binds for the engine binary, no /run/sarun tmpfs. Two
-    // complementary mechanisms, each where it fits best:
-    //   * The runner exec's `inner` from the inherited fd at /proc/self/fd/N
-    //     (see above). That path is ALWAYS reachable, so a closed OCI rootfs
-    //     (no /run to traverse) starts without depending on any in-box path.
-    //   * For --api boxes (oaita driver + sub-agents), the FUSE overlay
-    //     shadows /usr/local/bin/{oaita,sarun} so in-box PATH lookups for
-    //     `sarun` and `oaita` find the engine binary by name. Same mechanism
-    //     the brush /bin/sh shim uses. Non-api boxes get nothing — they
-    //     never need to invoke the engine by name from inside.
+    // No bwrap binds for the engine binary, no /run/sarun tmpfs, no
+    // /usr/local/bin/{oaita,sarun} FUSE shadow. The runner exec's `inner` from
+    // the inherited fd at /proc/self/fd/N (see above); that path is ALWAYS
+    // reachable, so a closed OCI rootfs (no /run, no /usr/local to traverse)
+    // starts without depending on any in-box path. A nested `sarun`/`oaita`
+    // (the oaita driver + sub-agents, or an interactive brush builtin) re-execs
+    // the inner runner's OWN executable via /proc/self/exe — see
+    // oaita::exec::default_sarun and brush::EngineSelfCommand. (The brush
+    // /bin/sh,make,ninja shadows below are unrelated and stay.)
     // FD broker: pick a per-box abstract-UDS name and propagate it to
     // the inner AND every child process via --setenv. The inner binds it
     // (inner_broker_serve), in-box clients dial it (broker_dial). Keying
@@ -544,10 +543,10 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
         // The in-box client uses OPENAI_BASE_URL to extract a path prefix
         // (`/v1`) for outgoing HTTP request URLs. The host part is
         // irrelevant once `SARUN_BROKER` is set — the dial doesn't use it.
-        // /usr/local/bin/{oaita,sarun} are served by the FUSE overlay for
-        // --api boxes (overlay::is_engine_shadow_path); no bwrap binds.
-        // The in-box vs host dispatch is decided by the `--inbox` cli
-        // flag spawn_in_box passes on its re-exec — not an env marker.
+        // A nested `sarun oaita` re-execs /proc/self/exe (the inner runner's
+        // own binary); no in-box path, no FUSE shadow. The in-box vs host
+        // dispatch is decided by the `--inbox` cli flag spawn_in_box passes
+        // on its re-exec — not an env marker.
         bwrap.args(["--setenv", "OPENAI_BASE_URL", "http://oaita-proxy/v1"]);
     }
     bwrap.args(["--unshare-pid", "--unshare-ipc", "--unshare-uts",

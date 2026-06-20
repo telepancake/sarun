@@ -360,6 +360,10 @@ fn inspect_box(rest: &str, _window: &Window, turns: &[Turn]) -> String {
 }
 
 fn default_sarun() -> String {
+    // In-box: re-exec the inner runner's own executable (the engine binary)
+    // via /proc/self/exe — no `sarun` on PATH, no FUSE shadow. See
+    // crate::oaita::exec::default_sarun.
+    if crate::oaita::exec::in_box() { return "/proc/self/exe".to_string(); }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(stem) = exe.file_name().and_then(|s| s.to_str()) {
             if stem == "sarun" || stem == "sarun-engine" {
