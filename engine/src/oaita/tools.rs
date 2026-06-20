@@ -24,11 +24,9 @@ pub const DEFAULT_CAPABILITIES: &str =
 /// sub-agent is one deeper. Past it `ask` stays VISIBLE in the schema but
 /// returns "too deep" so the model is told the capability exists, just
 /// exhausted, and does the work itself instead of spinning.
-pub fn max_depth() -> u32 {
-    std::env::var("OAITA_MAX_DEPTH").ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(3)
-}
+pub const MAX_DEPTH: u32 = 3;
+
+pub fn max_depth() -> u32 { MAX_DEPTH }
 
 /// Hard ceiling on a tool RESULT turn's size, in bytes. Rendering ladders
 /// fall back to terser forms until one fits; the FULL stream/diff stays in

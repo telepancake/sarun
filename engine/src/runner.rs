@@ -544,36 +544,11 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
         // The in-box client uses OPENAI_BASE_URL to extract a path prefix
         // (`/v1`) for outgoing HTTP request URLs. The host part is
         // irrelevant once `SARUN_BROKER` is set — the dial doesn't use it.
+        // /usr/local/bin/{oaita,sarun} are served by the FUSE overlay for
+        // --api boxes (overlay::is_engine_shadow_path); no bwrap binds.
+        // The in-box vs host dispatch is decided by the `--inbox` cli
+        // flag spawn_in_box passes on its re-exec — not an env marker.
         bwrap.args(["--setenv", "OPENAI_BASE_URL", "http://oaita-proxy/v1"]);
-        // Marker that the in-box oaita cli reads to decide "we're in
-        // the right context, run the driver loop directly". When this
-        // is absent, `oaita run NAME` wraps itself with a fresh
-        // `sarun oaita NAME` (creating a dedicated --api box) before
-        // running the driver. Result: there is no host-side oaita
-        // driver process, only host-side oaita CLI shims that spawn
-        // boxes — same shape as `sarun run -- cmd`.
-        bwrap.args(["--setenv", "OAITA_BOX", "1"]);
-        // /usr/local/bin/{oaita,sarun} are served by the FUSE overlay
-        // for --api boxes (overlay::is_engine_shadow_path). No bwrap
-        // binds — the kernel's PATH lookup goes through the FUSE,
-        // which synthesizes the engine binary's attrs and serves the
-        // file on open.
-        // OAITA_TRACE is a master on/off switch the in-box driver checks
-        // before opening a trace emitter conn — value is irrelevant (the
-        // destination is always the engine, reached via the FD broker).
-        // Forward "1" if the host has it set so sub-agent boxes emit too.
-        if let Ok(ep) = std::env::var("OAITA_TRACE") {
-            if !ep.is_empty() {
-                bwrap.args(["--setenv", "OAITA_TRACE", "1"]);
-            }
-        }
-        // Same logic for OAITA_DEPTH — set by the parent's act_script;
-        // a deeper level needs to see it.
-        if let Ok(d) = std::env::var("OAITA_DEPTH") {
-            if !d.is_empty() {
-                bwrap.args(["--setenv", "OAITA_DEPTH", &d]);
-            }
-        }
     }
     bwrap.args(["--unshare-pid", "--unshare-ipc", "--unshare-uts",
                 "--die-with-parent"]);

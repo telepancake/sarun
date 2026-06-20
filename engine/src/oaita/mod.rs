@@ -26,7 +26,6 @@
 //   tools    — tool registry (act/shell/inspect/read), schema rendering
 //   exec     — executors: SarunExecutor (sarun box -- sh -c), LocalExecutor
 //   inspect  — inspect/read helpers
-//   trace    — flight-recorder JSONL events to $OAITA_TRACE
 //   proxy      — engine-side HTTP server: takes an `api.proxy` conn handed
 //                in via the FD broker, injects upstream auth, forwards to
 //                the configured LLM API, logs to sqlar
@@ -40,12 +39,9 @@ pub mod exec;
 pub mod hints;
 pub mod ids;
 pub mod inspect;
-pub mod pretty;
 pub mod proxy;
-pub mod replay;
 pub mod structural;
 pub mod tools;
-pub mod trace;
 pub mod turns;
 
 /// Detect when this binary was invoked as `oaita` (a symlink to the sarun
