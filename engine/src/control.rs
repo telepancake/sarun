@@ -408,15 +408,11 @@ fn dispatch(state: &State, msg: &Value) -> Value {
                         .and_then(|o| o.live_box(id));
                     match live {
                         Some(cb) => cb.set_meta("name", newname),
-                        None => {
-                            if let Ok(c) = rusqlite::Connection::open(
-                                crate::paths::state_home().join(format!("{id}.sqlar"))) {
-                                let _ = c.execute(
-                                    "INSERT INTO meta(key,value) VALUES('name',?1)
-                                     ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                                    [newname]);
-                            }
-                        }
+                        // At-rest: still go through BoxState::set_meta so every
+                        // box meta WRITE uses one upserting path, live or not.
+                        None => if let Ok(b) = crate::capture::BoxState::create(id) {
+                            b.set_meta("name", newname);
+                        },
                     }
                     broadcast(state, &json!({"type": "session_renamed",
                         "session_id": id.to_string(), "name": newname}));
@@ -730,7 +726,7 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
     // ancestor marked no_host_fallback (e.g. an OCI image's rootfs base) — sees
     // no host filesystem underneath. Surfaced to the runner so it can pick the
     // right default cwd ("/" when there's no host directory to inherit).
-    let no_host = b.no_host_fallback() || chain_has_no_host(parent);
+    let no_host = b.no_host_fallback() || chain_has_no_host(&boxes, parent);
     if let Some(prov) = msg.get("prov") {
         b.root_process(prov, host_pid as i64);
     }
@@ -786,7 +782,7 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
     // image's User — without which `sarun img -- /bin/sh` would inherit
     // the HOST's PATH (pointing at host bins that don't exist in a closed
     // box) and the HOST's cwd (likely a path outside the image).
-    let oci = oci_runtime_from_chain(parent);
+    let oci = oci_runtime_from_chain(&boxes, parent);
     let mut reply = json!({
         "ok": true, "mount": root.to_string_lossy(),
         "shm_dir": backing.to_string_lossy(),
@@ -813,54 +809,39 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
 /// Walk the parent chain looking for an `oci_config` meta entry (stamped by
 /// `sarun oci load` on the image's TOP layer). Returns the parsed runtime
 /// view {env, cwd, cmd, entrypoint, user} the runner uses, or None when the
-/// chain has no OCI ancestor (a non-OCI box). Reads each ancestor's sqlar
-/// meta directly — at-rest boxes that aren't live yet are common here, since
-/// `sarun img.SCRATCH` is the first thing a user does after `oci load`.
-fn oci_runtime_from_chain(parent: Option<i64>) -> Option<Value> {
+/// chain has no OCI ancestor (a non-OCI box). Reads from the discover()
+/// snapshot's `Box_.meta` — no per-hop sqlar opens.
+fn oci_runtime_from_chain(boxes: &std::collections::BTreeMap<i64, discover::Box_>,
+                          parent: Option<i64>) -> Option<Value> {
     let mut cur = parent;
     let mut seen = std::collections::HashSet::new();
-    for _ in 0..64 {
-        let id = cur?;
+    while let Some(id) = cur {
         if !seen.insert(id) { return None; }
-        let sqlar = crate::paths::state_home().join(format!("{id}.sqlar"));
-        let conn = rusqlite::Connection::open_with_flags(
-            &sqlar, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
-        let cfg: Option<String> = conn.query_row(
-            "SELECT value FROM meta WHERE key='oci_config'", [],
-            |r| r.get(0)).ok();
-        if let Some(cfg_json) = cfg {
-            return parse_oci_runtime(&cfg_json);
+        let b = boxes.get(&id)?;
+        if let Some(cfg_json) = b.meta.get("oci_config") {
+            return parse_oci_runtime(cfg_json);
         }
-        let parent_str: Option<String> = conn.query_row(
-            "SELECT value FROM meta WHERE key='parent_box_id'", [],
-            |r| r.get(0)).ok();
-        cur = parent_str.and_then(|s| s.parse::<i64>().ok());
+        cur = b.parent;
     }
     None
 }
 
 /// True if any ancestor in the parent chain (starting at `parent`) is marked
 /// no_host_fallback — i.e. the chain bottoms out closed, with no host
-/// filesystem underneath. Reads each ancestor's sqlar meta directly, the same
-/// way oci_runtime_from_chain walks for oci_config. The box's OWN --no-parent
-/// is handled by the caller via `b.no_host_fallback()`.
-fn chain_has_no_host(parent: Option<i64>) -> bool {
+/// filesystem underneath. Reads `Box_.meta` from the discover() snapshot, the
+/// same way oci_runtime_from_chain walks for oci_config. The box's OWN
+/// --no-parent is handled by the caller via `b.no_host_fallback()`.
+fn chain_has_no_host(boxes: &std::collections::BTreeMap<i64, discover::Box_>,
+                     parent: Option<i64>) -> bool {
     let mut cur = parent;
     let mut seen = std::collections::HashSet::new();
-    for _ in 0..64 {
-        let Some(id) = cur else { return false };
+    while let Some(id) = cur {
         if !seen.insert(id) { return false; }
-        let sqlar = crate::paths::state_home().join(format!("{id}.sqlar"));
-        let Ok(conn) = rusqlite::Connection::open_with_flags(
-            &sqlar, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) else { return false };
-        let nh: Option<String> = conn.query_row(
-            "SELECT value FROM meta WHERE key='no_host_fallback'", [],
-            |r| r.get(0)).ok();
-        if nh.as_deref() == Some("1") { return true; }
-        let parent_str: Option<String> = conn.query_row(
-            "SELECT value FROM meta WHERE key='parent_box_id'", [],
-            |r| r.get(0)).ok();
-        cur = parent_str.and_then(|s| s.parse::<i64>().ok());
+        let Some(b) = boxes.get(&id) else { return false };
+        if b.meta.get("no_host_fallback").map(String::as_str) == Some("1") {
+            return true;
+        }
+        cur = b.parent;
     }
     false
 }
