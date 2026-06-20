@@ -16,7 +16,6 @@ use crate::oaita::exec::{box_name, Executor};
 use crate::oaita::ids::{is_adoptable_slug, new_turn_id};
 use crate::oaita::inspect::{inspect, parse_locator, read_path, write_at_locator};
 use crate::oaita::tools::{tools_array, ExecResult};
-use crate::oaita::trace;
 use crate::oaita::turns::{
     append_turn, assign_slugs, build_messages, load_stitched, load_turns,
     next_number, parse_stitch, session_dir, strip_emitted_turn_id,
@@ -41,20 +40,19 @@ impl Settings {
                    capabilities: Option<String>,
                    tool_context: Option<String>,
                    sarun_override: Option<String>,
-                   no_sandbox: bool)
+                   no_sandbox: bool,
+                   depth: Option<u32>)
         -> Result<Self, String>
     {
         let cfg = Config::load();
         let (model_d, base_d, key_d) = cfg.resolve()?;
-        let depth = std::env::var("OAITA_DEPTH").ok()
-            .and_then(|s| s.parse().ok()).unwrap_or(0);
         Ok(Settings {
             model: model.unwrap_or(model_d),
             base_url: base_url.unwrap_or(base_d),
             api_key: api_key.unwrap_or(key_d),
             capabilities,
             tool_context,
-            depth,
+            depth: depth.unwrap_or(0),
             sarun_override,
             no_sandbox,
         })
@@ -161,17 +159,6 @@ pub fn generate(spec: &str, set: &Settings) -> Result<Vec<PathBuf>, String> {
         }
     }
     let tools = tools_array(set.capabilities.as_deref(), set.depth);
-
-    trace::event("gen.request", json!({
-        "session": &target, "model": &set.model,
-        // The FULL request — what we'd POST to /chat/completions if not
-        // for the trace. Recorded as the replayable record: a fakeserver
-        // can pair this with the matching gen.reply event and serve them
-        // back byte-identical for byte-replay testing.
-        "messages": messages,
-        "tools": tools,
-        "n_messages": messages.len(),
-    }));
 
     let body = json!({
         "model": set.model,
@@ -281,24 +268,6 @@ pub fn generate(spec: &str, set: &Settings) -> Result<Vec<PathBuf>, String> {
         produced.push(path);
     }
 
-    // Full reply for byte-replay: content + assembled tool_calls + finish.
-    // The fakeserver pairs this with the preceding gen.request and serves
-    // it back as a streamed SSE response when the same prompt comes in.
-    let tool_calls_json: Vec<Value> = tool_calls.iter().map(|t| json!({
-        "id": t.id,
-        "type": "function",
-        "function": {
-            "name": t.name,
-            "arguments": t.arguments,
-        },
-    })).collect();
-    trace::event("gen.reply", json!({
-        "session": &target,
-        "content": &body,
-        "tool_calls": tool_calls_json,
-        "finish_reason": finish_reason,
-        "kept_partial": kept_partial,
-    }));
     Ok(produced)
 }
 
@@ -772,9 +741,6 @@ fn cleanup_spawned_subagents(outer: &str) {
             .status();
         // Drop the session folder.
         let _ = std::fs::remove_dir_all(crate::oaita::turns::session_dir(&inner));
-        trace::event("run.subagent_cleaned", json!({
-            "outer": outer, "inner": inner,
-        }));
     }
 }
 
@@ -791,7 +757,6 @@ pub fn evaluate_call(spec: &str, set: &Settings,
         .ok_or_else(|| "no unanswered tool calls".to_string())?;
 
     let (tool, arguments) = parse_call_envelope(&pending.read().map_err(|e| e.to_string())?)?;
-    trace::event("call.eval", json!({"session": &target, "tool": &tool}));
 
     // backtrack is special: it REWRITES this session's turn history in
     // place (removes turns, plants the summary). The pending c.assistant
@@ -854,7 +819,6 @@ pub fn evaluate_call(spec: &str, set: &Settings,
     let name = turn_filename(n, "tool", Some(&slug), None, "");
     let path = session_dir(&target).join(name);
     fs::write(&path, &result_text).map_err(|e| format!("write result: {e}"))?;
-    trace::event("call.result", json!({"session": &target, "tool": &tool, "bytes": result_text.len()}));
     Ok(vec![path])
 }
 
@@ -975,19 +939,22 @@ fn dispatch_act(args: &Value, outer: &str, set: &Settings,
 }
 
 fn act_script(inner: &str, child_depth: u32, max_steps: i64) -> String {
-    // OAITA_DEPTH rides into the child process so its `ask` calls see
-    // the bumped depth (and the exhausted form fires at MAX_DEPTH).
+    // The script runs inside the sub-agent's wrapper box. We invoke
+    // `oaita run` WITHOUT `--inbox` so the inner cmd_run takes the
+    // spawn_in_box path one MORE level down (creating a fresh wrapper
+    // box for the sub-agent). `--depth` carries the bumped nesting
+    // depth so the sub-agent's `ask` calls see it without env-var
+    // smuggling.
     //
-    // --max-steps is always passed (default is 999_999_999 when the
-    // model didn't set one — "uncapped" in practice). The sub-agent's
-    // cli grants this against its OWN box (in-box, broker-hinted) so
-    // the parent doesn't need to know the dotted box name to grant.
+    // --max-steps is always passed (default 999_999_999 — "uncapped"
+    // in practice). The sub-agent's cli grants this against its OWN
+    // box (in-box, broker-hinted) so the parent doesn't need to know
+    // the dotted box name to grant.
     //
     // No `set -e` — we run BOTH commands unconditionally so a budget-
     // exhausted `oaita run` (rc=1) still gets its tail captured.
     format!(
-        "export OAITA_DEPTH={child_depth}\n\
-         oaita run {inner} --max-steps {max_steps}\n\
+        "oaita run {inner} --max-steps {max_steps} --depth {child_depth}\n\
          oaita tail {inner}\n"
     )
 }
@@ -1266,7 +1233,6 @@ pub fn run_to_completion(spec: &str, set: &Settings,
                          -> Result<Vec<PathBuf>, String> {
     let target = target_segment(spec)?;
     let mut produced: Vec<PathBuf> = Vec::new();
-    trace::event("run.start", json!({"session": &target}));
     loop {
         let turns = load_turns(&target);
         // Settled? — last turn is assistant with no p/c/b flags.
@@ -1275,7 +1241,6 @@ pub fn run_to_completion(spec: &str, set: &Settings,
                 && !last.flags.contains('p')
                 && !last.flags.contains('c')
                 && !last.flags.contains('b') {
-                trace::event("run.settled", json!({"session": &target}));
                 cleanup_spawned_subagents(&target);
                 return Ok(produced);
             }
@@ -1294,11 +1259,9 @@ pub fn run_to_completion(spec: &str, set: &Settings,
                 // PAUSED, not done. Preserve everything — sub-agent boxes,
                 // their session dirs, every staged write — so on regrant
                 // the next `oaita run` resumes byte-identical from this
-                // exact point. Cleanup runs ONLY on `run.settled` (a clean
+                // exact point. Cleanup runs ONLY on settlement (a clean
                 // assistant tail), never on budget-503: the principle is
                 // that the model cannot tell a pause/restart happened.
-                trace::event("run.budget_exhausted",
-                    json!({"session": &target, "detail": &e}));
                 return Err(e);
             }
             Err(e) => return Err(e),

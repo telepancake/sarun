@@ -12,7 +12,6 @@ use std::io::Read;
 use crate::oaita::config::Config;
 use crate::oaita::exec::build_executor;
 use crate::oaita::driver::{evaluate_call, generate, run_to_completion, Settings};
-use crate::oaita::trace;
 use crate::oaita::turns::{append_turn, load_turns, target_segment};
 
 /// Default turn budget granted by `oaita run NAME` when the user
@@ -27,16 +26,17 @@ oaita — a resumable OpenAI-compatible chat client (folder-of-turn-files).
 USAGE:
   oaita gen   NAME [--model M] [--base-url URL] [--api-key K] [--capabilities T]
   oaita call  NAME [--tool-context N] [--sarun PATH] [--no-sandbox]
-  oaita run   NAME [--max-steps N] [...common gen flags + tool-ctx flags]
+  oaita run   NAME [--max-steps N] [--depth N] [--inbox] [...common gen flags]
   oaita tail  NAME
-  oaita add   [NAME] [--type ROLE] [--id TURNID] [--from NAME] [--flags F] [--number N]
-  oaita trace [ENDPOINT] [--jsonl FILE]
-  oaita replay --jsonl FILE [--port N] [--once]
-  oaita pretty --jsonl FILE [--session NAME]
+  oaita add   NAME [--type ROLE] [--id TURNID] [--from NAME] [--flags F] [--number N]
   oaita where               (print where oaita.toml is looked up)
 
 NAME may be a dot-stitched spec 'a.b.c' — writes go to the LAST segment;
 earlier segments are PREPENDED as context (composition, not hierarchy).
+
+Internal flags (set by `oaita`'s own re-execs — DO NOT pass by hand):
+  --inbox     this process IS the in-box driver; do not wrap.
+  --depth N   sub-agent nesting depth (parent's `ask` passes it).
 
 Configuration: {config_home}/oaita.toml — see `oaita where`.";
 
@@ -50,9 +50,6 @@ pub fn main(argv: &[String]) -> i32 {
         "run" => cmd_run(&rest),
         "tail" => cmd_tail(&rest),
         "add" => cmd_add(&rest),
-        "trace" => cmd_trace(&rest),
-        "replay" => crate::oaita::replay::run(&rest),
-        "pretty" => crate::oaita::pretty::run(&rest),
         "where" => cmd_where(),
         "-h" | "--help" => { println!("{USAGE}"); 0 }
         other => { eprintln!("oaita: unknown subcommand {other:?}\n{USAGE}"); 2 }
@@ -74,7 +71,13 @@ struct Parsed {
     pub sender: Option<String>,
     pub flags: String,
     pub number: Option<u32>,
-    pub jsonl: Option<String>,
+    /// Internal: set by `spawn_in_box` when re-execing into the wrapper
+    /// box. Presence means "drive directly"; absence means "host shim,
+    /// wrap into a fresh --api box and re-exec".
+    pub inbox: bool,
+    /// Internal: sub-agent nesting depth. `ask` (driver.rs::act_script)
+    /// passes the bumped value when spawning a child.
+    pub depth: Option<u32>,
 }
 
 fn parse(args: &[String]) -> Result<Parsed, String> {
@@ -86,7 +89,8 @@ fn parse(args: &[String]) -> Result<Parsed, String> {
         max_steps: None,
         type_: "user".to_string(),
         slug: None, sender: None, flags: String::new(), number: None,
-        jsonl: None,
+        inbox: false,
+        depth: None,
     };
     let mut it = args.iter().peekable();
     while let Some(a) = it.next() {
@@ -101,6 +105,10 @@ fn parse(args: &[String]) -> Result<Parsed, String> {
             "--max-steps" => p.max_steps = Some(it.next()
                 .ok_or_else(|| "missing N after --max-steps".to_string())?
                 .parse().map_err(|e| format!("--max-steps: {e}"))?),
+            "--inbox" => p.inbox = true,
+            "--depth" => p.depth = Some(it.next()
+                .ok_or_else(|| "missing N after --depth".to_string())?
+                .parse().map_err(|e| format!("--depth: {e}"))?),
             "--type" => p.type_ = it.next().cloned()
                 .ok_or_else(|| "missing ROLE after --type".to_string())?,
             "--id" => p.slug = it.next().cloned(),
@@ -109,7 +117,6 @@ fn parse(args: &[String]) -> Result<Parsed, String> {
             "--number" => p.number = it.next()
                 .ok_or_else(|| "missing N after --number".to_string())?
                 .parse().ok(),
-            "--jsonl" => p.jsonl = it.next().cloned(),
             s if !s.starts_with("--") && p.name.is_empty() => p.name = s.to_string(),
             other => return Err(format!("unknown flag {other:?}")),
         }
@@ -122,7 +129,8 @@ fn cmd_gen(args: &[String]) -> i32 {
     if p.name.is_empty() { eprintln!("gen: missing NAME"); return 2; }
     let set = match Settings::resolve(p.model, p.base_url, p.api_key,
                                        p.capabilities, p.tool_context.clone(),
-                                       p.sarun.clone(), p.no_sandbox)
+                                       p.sarun.clone(), p.no_sandbox,
+                                       p.depth)
     { Ok(s) => s, Err(e) => { eprintln!("{e}"); return 1; } };
     match generate(&p.name, &set) {
         Ok(paths) => report(&paths),
@@ -135,7 +143,8 @@ fn cmd_call(args: &[String]) -> i32 {
     if p.name.is_empty() { eprintln!("call: missing NAME"); return 2; }
     let set = match Settings::resolve(p.model, p.base_url, p.api_key,
                                        p.capabilities, p.tool_context.clone(),
-                                       p.sarun.clone(), p.no_sandbox)
+                                       p.sarun.clone(), p.no_sandbox,
+                                       p.depth)
     { Ok(s) => s, Err(e) => { eprintln!("{e}"); return 1; } };
     let exe = build_executor(p.no_sandbox, p.sarun);
     let exe_ref: Option<&dyn crate::oaita::exec::Executor> = exe.as_deref();
@@ -148,26 +157,23 @@ fn cmd_call(args: &[String]) -> i32 {
 fn cmd_run(args: &[String]) -> i32 {
     let p = match parse(args) { Ok(p) => p, Err(e) => { eprintln!("{e}"); return 2; } };
     if p.name.is_empty() { eprintln!("run: missing NAME"); return 2; }
-    // OAITA_BOX is set by the sarun runner when --api is on. Presence
-    // means "we're inside a dedicated oaita box; run the driver
-    // directly". Absence means "we're a host shim — wrap ourselves in
-    // a fresh `sarun run --api OAITA-<NAME>` and re-exec inside it".
-    // Result: there is no host-side oaita driver process; the cli is
-    // either a thin spawner (host) or the loop body (in-box). Mirrors
-    // `sarun run -- cmd`: host process creates a box and runs the
-    // payload inside.
-    if std::env::var("OAITA_BOX").map(|s| s != "1").unwrap_or(true) {
+    // `--inbox` is the explicit marker that we're already running INSIDE
+    // the agent's wrapper box (set by spawn_in_box on the re-exec).
+    // Without it we're a host shim and must wrap ourselves in a fresh
+    // `sarun run --api OAITA-<NAME>` first. Result: there is no host-
+    // side oaita driver process; the cli is either a thin spawner
+    // (host) or the loop body (in-box). Mirrors `sarun run -- cmd`.
+    if !p.inbox {
         return spawn_in_box(&p, args);
     }
     let set = match Settings::resolve(p.model, p.base_url, p.api_key,
                                        p.capabilities, p.tool_context.clone(),
-                                       p.sarun.clone(), p.no_sandbox)
+                                       p.sarun.clone(), p.no_sandbox,
+                                       p.depth)
     { Ok(s) => s, Err(e) => { eprintln!("{e}"); return 1; } };
     // In-box driver: grant our pool from --max-steps (default
-    // DEFAULT_CLI_MAX_STEPS) using the broker hint as identity. The
-    // sub-agent ask path passes the explicit number via `--max-steps`
-    // on its act_script; top-level wrap passes the original user-
-    // supplied flag (or the default).
+    // DEFAULT_CLI_MAX_STEPS). Empty box name → engine resolves identity
+    // from the broker hint (THIS box).
     let cli_grant = p.max_steps.map(|n| n as i64)
         .unwrap_or(DEFAULT_CLI_MAX_STEPS as i64);
     if let Err(e) = budget_grant_via_engine("", cli_grant) {
@@ -182,16 +188,13 @@ fn cmd_run(args: &[String]) -> i32 {
     }
 }
 
-/// Host-side `oaita run` shim. Materializes the agent's persistent
-/// `OAITA-<NAME>` box via the sarun engine binary, then re-execs the
-/// SAME oaita command inside it. The bwrap setup sets OAITA_BOX=1 so
-/// the inner invocation falls through to the driver loop.
-///
-/// In-box, `sarun` resolves through the box's PATH to the FUSE-
-/// shadowed /usr/local/bin/sarun (overlay::is_engine_shadow_path on
-/// --api boxes), so the nested command is the same engine binary the
-/// runner exec'd from /proc/self/fd/N — no bind mounts, no
-/// /run/sarun anything.
+/// Host-side `oaita run` shim. Re-execs the SAME oaita command inside a
+/// fresh `OAITA-<NAME>` --api box, with `--inbox` added so the inner
+/// invocation falls through to the driver loop instead of recursing.
+/// In-box, `sarun` resolves through the box's PATH to the FUSE-shadowed
+/// /usr/local/bin/sarun (overlay::is_engine_shadow_path on --api boxes),
+/// so the nested command is the same engine binary the runner exec'd
+/// from /proc/self/fd/N — no bind mounts.
 fn spawn_in_box(p: &Parsed, original_args: &[String]) -> i32 {
     let target = match crate::oaita::turns::target_segment(&p.name) {
         Ok(t) => t, Err(e) => { eprintln!("{e}"); return 2; }
@@ -202,7 +205,7 @@ fn spawn_in_box(p: &Parsed, original_args: &[String]) -> i32 {
         .unwrap_or_else(|_| "sarun".to_string());
     let mut cmd = std::process::Command::new(&exe_path);
     cmd.arg("run").arg("--api").arg(&target_box).arg("--");
-    cmd.arg("sarun").arg("oaita").arg("run");
+    cmd.arg("sarun").arg("oaita").arg("run").arg("--inbox");
     for a in original_args { cmd.arg(a); }
     match cmd.status() {
         Ok(s) => s.code().unwrap_or(1),
@@ -262,9 +265,8 @@ fn cmd_tail(args: &[String]) -> i32 {
 
 fn cmd_add(args: &[String]) -> i32 {
     let p = match parse(args) { Ok(p) => p, Err(e) => { eprintln!("{e}"); return 2; } };
-    let name = if p.name.is_empty() {
-        std::env::var("OAITA_SESSION").unwrap_or_else(|_| "default".to_string())
-    } else { p.name };
+    if p.name.is_empty() { eprintln!("add: missing NAME"); return 2; }
+    let name = p.name;
     let mut content = String::new();
     if let Err(e) = std::io::stdin().read_to_string(&mut content) {
         eprintln!("oaita: read stdin: {e}");
@@ -274,20 +276,6 @@ fn cmd_add(args: &[String]) -> i32 {
         Ok(path) => { println!("{}", path.display()); 0 }
         Err(e) => { eprintln!("oaita: add: {e}"); 1 }
     }
-}
-
-fn cmd_trace(args: &[String]) -> i32 {
-    let mut endpoint = "@oaita".to_string();
-    let mut jsonl: Option<String> = None;
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        match a.as_str() {
-            "--jsonl" => jsonl = it.next().cloned(),
-            s if !s.starts_with("--") => endpoint = s.to_string(),
-            other => { eprintln!("trace: unknown flag {other:?}"); return 2; }
-        }
-    }
-    trace::run_collector(&endpoint, jsonl.as_deref())
 }
 
 fn cmd_where() -> i32 {

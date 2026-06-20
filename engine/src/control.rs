@@ -1714,36 +1714,6 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
             handle_pty_spawn(&msg, &mut writer, reader.buffer().to_vec());
             return;
         }
-        // trace.emit: this conn streams JSONL trace events; we broadcast each
-        // to the current subscribers. trace.subscribe: this conn is added to
-        // the subscriber list and gets every event the engine broadcasts.
-        // Replaces the old OAITA_TRACE datagram socket (one more thing to
-        // bind into every box, one more bwrap setup step to fail). All trace
-        // delivery now rides the engine's own control socket — broker for
-        // in-box emitters, host filesystem for everything else.
-        if msg.get("type").and_then(Value::as_str) == Some("trace.emit") {
-            if let Some(fd) = peer_pidfd.take() { unsafe { libc::close(fd); } }
-            let mut s = String::new();
-            loop {
-                s.clear();
-                match reader.read_line(&mut s) {
-                    Ok(0) | Err(_) => return,
-                    Ok(_) => {}
-                }
-                if s.trim().is_empty() { continue; }
-                trace_broadcast(s.as_bytes());
-            }
-        }
-        if msg.get("type").and_then(Value::as_str) == Some("trace.subscribe") {
-            if let Some(fd) = peer_pidfd.take() { unsafe { libc::close(fd); } }
-            let _ = writer.write_all(b"{\"ok\":true}\n");
-            let _ = writer.flush();
-            trace_subs().lock().unwrap().push(writer);
-            // The conn lives in the subs list until a broadcast write fails.
-            // We don't need to read anything; drop the reader half explicitly.
-            drop(reader);
-            return;
-        }
         // api.proxy: LLM-API passthrough conn from an in-box `oaita` client.
         // The conn was dialed via the FD broker (hint_box_id is set to the
         // box that hosts the dialer); the engine accepts HTTP/1.1 on this
@@ -2078,21 +2048,6 @@ pub fn serve(state: State, sock: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Optional engine-owned jsonl file sink. Selected by SARUN_TRACE_JSONL at
-/// engine startup — when set, every broadcast trace event is also appended
-/// here. The engine owning the file means there's no separate collector
-/// process to race with engine startup; whoever wants a recording sets the
-/// env on `sarun serve` and gets one.
-fn trace_file() -> &'static Mutex<Option<std::fs::File>> {
-    static FILE: std::sync::OnceLock<Mutex<Option<std::fs::File>>> =
-        std::sync::OnceLock::new();
-    FILE.get_or_init(|| Mutex::new(
-        std::env::var("SARUN_TRACE_JSONL").ok()
-            .filter(|s| !s.is_empty())
-            .and_then(|p| std::fs::OpenOptions::new()
-                .create(true).append(true).open(p).ok())))
-}
-
 /// A tokio AsyncRead+AsyncWrite that serves a fixed prefix first, then
 /// delegates to the wrapped UnixStream. Used by the `api.proxy` handoff:
 /// the BufReader that read the verb header may have buffered some HTTP
@@ -2145,28 +2100,6 @@ impl tokio::io::AsyncWrite for PrebufferedIo {
     }
 }
 
-/// Trace subscribers — held UnixStream writers, populated by trace.subscribe
-/// connections. A broadcast write that fails (subscriber EOF / closed) drops
-/// the stream from the list on the next pass.
-fn trace_subs() -> &'static Mutex<Vec<UnixStream>> {
-    static SUBS: std::sync::OnceLock<Mutex<Vec<UnixStream>>> =
-        std::sync::OnceLock::new();
-    SUBS.get_or_init(|| Mutex::new(Vec::new()))
-}
-
-/// Broadcast one already-newline-terminated event line to every subscriber
-/// AND append it to the engine's own jsonl sink (if SARUN_TRACE_JSONL was
-/// set). Drops live-stream subscribers whose write fails.
-fn trace_broadcast(line: &[u8]) {
-    if let Ok(mut f) = trace_file().lock() {
-        if let Some(file) = f.as_mut() {
-            let _ = file.write_all(line);
-            let _ = file.flush();
-        }
-    }
-    let mut subs = trace_subs().lock().unwrap();
-    subs.retain_mut(|s| s.write_all(line).is_ok() && s.flush().is_ok());
-}
 
 /// Send a frame over the box-channel WITH an attached fd via SCM_RIGHTS.
 /// Engine-side analogue of runner::send_frame's pidfd path. Best-effort:

@@ -200,10 +200,6 @@ impl Executor for SarunExecutor {
     /// and discard afterwards.
     fn run(&self, box_id: &str, script: &str, discard: bool, api_access: bool) -> ExecResult {
         let target = if discard { "PEEK".to_string() } else { box_id.to_string() };
-        crate::oaita::trace::event("exec.run", serde_json::json!({
-            "box": target, "discard": discard, "api_access": api_access,
-            "script_len": script.len(),
-        }));
         // Discard mode keeps the nested PEEK box (own overlay, then
         // reaped). Non-discard runs DIRECTLY in this wrapper box via
         // the engine binary's `brush-sh` shim — no nested `sarun run`,
@@ -263,89 +259,16 @@ impl Executor for SarunExecutor {
         } else {
             format!("{trimmed}\n\n=== changes ===\n{changes}")
         };
-        crate::oaita::trace::event("exec.done", serde_json::json!({
-            "rc": rc, "bytes": text.len(),
-        }));
         ExecResult { text, raw_output: combined, patch, rc }
     }
 }
 
-/// Trial-runs / tests: no sarun, no overlay. Writes leak to the host —
-/// $OAITA_EXECUTOR=local is opt-in and explicitly NOT a safe substitute.
-pub struct LocalExecutor;
-
-impl Executor for LocalExecutor {
-    fn read_file(&self, _box_id: &str, path: &str) -> std::io::Result<Vec<u8>> {
-        std::fs::read(path)
-    }
-    fn write_file(&self, _box_id: &str, path: &str, bytes: &[u8])
-        -> std::io::Result<()>
-    {
-        if let Some(parent) = std::path::Path::new(path).parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
-        }
-        std::fs::write(path, bytes)
-    }
-    fn list_dir(&self, _box_id: &str, path: &str)
-        -> std::io::Result<Vec<(String, char)>>
-    {
-        let rd = std::fs::read_dir(path)?;
-        let mut out = Vec::new();
-        for e in rd.flatten() {
-            let name = e.file_name().to_string_lossy().into_owned();
-            let k = e.file_type().ok().map(|t| {
-                if t.is_dir() { 'd' }
-                else if t.is_symlink() { 'l' }
-                else if t.is_file() { 'f' }
-                else { 's' }
-            }).unwrap_or('?');
-            out.push((name, k));
-        }
-        Ok(out)
-    }
-    fn path_kind(&self, _box_id: &str, path: &str) -> char {
-        match std::fs::symlink_metadata(path) {
-            Ok(m) if m.file_type().is_symlink() => 'l',
-            Ok(m) if m.is_dir() => 'd',
-            Ok(m) if m.is_file() => 'f',
-            Ok(_) => 's',
-            Err(_) => '?',
-        }
-    }
-
-    fn run(&self, _box_id: &str, script: &str, _discard: bool, _api_access: bool) -> ExecResult {
-        let out = Command::new("sh")
-            .args(["-c", script])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output();
-        let (stdout, stderr, rc) = match out {
-            Ok(o) => (String::from_utf8_lossy(&o.stdout).into_owned(),
-                      String::from_utf8_lossy(&o.stderr).into_owned(),
-                      o.status.code().unwrap_or(-1)),
-            Err(e) => return ExecResult {
-                text: format!("error: {e}"), rc: -1, ..Default::default()
-            },
-        };
-        let combined = format!("{stdout}{stderr}");
-        let trimmed = fit_output(&combined, RESULT_BUDGET);
-        ExecResult { text: trimmed.clone(), raw_output: combined, patch: String::new(), rc }
-    }
-}
-
-/// Build the executor implied by env+args:
-///   --no-sandbox          → None (shell calls error-result back)
-///   $OAITA_EXECUTOR=local → LocalExecutor (UNGATED)
-///   default               → SarunExecutor
+/// Build the executor implied by args. `--no-sandbox` returns None so the
+/// shell/inspect/read/write tools surface an error result back to the model
+/// instead of dispatching ungated host operations.
 pub fn build_executor(no_sandbox: bool, sarun_override: Option<String>)
     -> Option<Box<dyn Executor>>
 {
     if no_sandbox { return None; }
-    if std::env::var("OAITA_EXECUTOR").as_deref() == Ok("local") {
-        return Some(Box::new(LocalExecutor));
-    }
     Some(Box::new(SarunExecutor::new(sarun_override)))
 }
