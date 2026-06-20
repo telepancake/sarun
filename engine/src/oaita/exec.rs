@@ -71,12 +71,12 @@ pub trait Executor: Send + Sync {
     /// describe the staged changes (`patch_text`-style). `box_id` is the
     /// session-derived box name (UPPERCASE — see `box_name`).
     ///
-    /// `api_access` — when true, launch the box with `--api`: the engine
-    /// binary is bound at /usr/local/bin/{oaita,sarun} so an in-box
-    /// `oaita run …` resolves, AND the API proxy admits the box. This is
-    /// what `act` sub-agents need (they ARE `oaita run` processes in a
-    /// box). Plain `shell` tool calls pass false — no need for proxy
-    /// access on user scripts.
+    /// `api_access` — when true, launch the box with `--api`: an in-box
+    /// `oaita run …` resolves (it re-execs /proc/self/exe — see
+    /// `default_sarun`), AND the API proxy admits the box. This is what
+    /// `act` sub-agents need (they ARE `oaita run` processes in a box).
+    /// Plain `shell` tool calls pass false — no need for proxy access on
+    /// user scripts.
     fn run(&self, box_id: &str, script: &str, discard: bool, api_access: bool) -> ExecResult;
 
     /// Read `path` in `box_id`'s merged view. `path` may be absolute or
@@ -129,9 +129,18 @@ fn filter_sarun_noise(stderr: &str) -> String {
         .join("\n")
 }
 
-/// Try `./sarun` first (sibling next to a symlinked oaita); else `sarun` on
-/// PATH; else current_exe (when invoked via subcommand we already ARE sarun).
+/// The engine binary to re-exec for a nested `sarun`/`oaita`.
+///
+/// In-box (SARUN_BROKER set) there is no `sarun` on PATH and no FUSE shadow:
+/// we re-exec the box's inner runner process's own executable, which is the
+/// engine binary, via `/proc/self/exe`. Every in-box process descended from
+/// the inner is itself the engine binary, so this resolves correctly at any
+/// nesting depth without depending on /usr/local or any in-box path.
+///
+/// On the host: `./sarun` next to a symlinked oaita, else `sarun` on PATH,
+/// else current_exe (when invoked via subcommand we already ARE sarun).
 fn default_sarun() -> String {
+    if in_box() { return "/proc/self/exe".to_string(); }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(stem) = exe.file_name().and_then(|s| s.to_str()) {
             if stem == "sarun" || stem == "sarun-engine" {
@@ -144,6 +153,12 @@ fn default_sarun() -> String {
         }
     }
     "sarun".to_string()
+}
+
+/// True when this engine process runs inside a box: the runner sets
+/// SARUN_BROKER (the per-box FD-broker abstract-UDS name) on every box child.
+pub(crate) fn in_box() -> bool {
+    std::env::var("SARUN_BROKER").is_ok_and(|s| !s.is_empty())
 }
 
 impl Executor for SarunExecutor {

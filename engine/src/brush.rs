@@ -337,11 +337,72 @@ impl brush_core::builtins::SimpleCommand for CoreutilWrapper {
     }
 }
 
+/// `sarun` / `oaita` as in-box brush builtins (interactive use). There is no
+/// `sarun` on PATH inside a box and no FUSE shadow under /usr/local: the
+/// builtin re-execs the box inner runner process's OWN executable — the engine
+/// binary, reachable as /proc/self/exe — so typing `sarun …` / `oaita …` in a
+/// brush box shell works with nothing planted in the box filesystem. `oaita`
+/// runs the engine's `oaita` subcommand. The child's std fds are wired from the
+/// brush context's OpenFiles (the box's captured sinks, or a pipe/redirect),
+/// child-local (no process-wide dup2), so it is pipeline-safe.
+struct EngineSelfCommand;
+
+impl EngineSelfCommand {
+    /// A `Stdio` duplicating the raw fd backing `of`, or None to inherit this
+    /// process's fd (the common Stdout/Stderr → sink case). The dup is owned by
+    /// the returned Stdio and closed when the child spawn consumes it.
+    fn stdio_from(of: &Option<brush_core::openfiles::OpenFile>) -> Option<std::process::Stdio> {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        let of = of.as_ref()?;
+        let bf = of.try_borrow_as_fd().ok()?;
+        let dup = unsafe { libc::dup(bf.as_raw_fd()) };
+        if dup < 0 { return None; }
+        Some(unsafe { std::process::Stdio::from(OwnedFd::from_raw_fd(dup)) })
+    }
+}
+
+impl brush_core::builtins::SimpleCommand for EngineSelfCommand {
+    fn get_content(
+        name: &str,
+        _content_type: brush_core::builtins::ContentType,
+        _options: &brush_core::builtins::ContentOptions,
+    ) -> Result<String, brush_core::error::Error> {
+        Ok(format!("{name}: sarun in-box engine builtin\n"))
+    }
+
+    fn execute<SE: brush_core::extensions::ShellExtensions,
+               I: Iterator<Item = S>, S: AsRef<str>>(
+        context: brush_core::commands::ExecutionContext<'_, SE>,
+        args: I,
+    ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
+        let name = context.command_name.clone();
+        // `args` includes the command name as argv[0]; drop it and rebuild the
+        // engine argv. `oaita` becomes the engine's `oaita` subcommand.
+        let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
+        let rest = if argv.is_empty() { vec![] } else { argv.split_off(1) };
+        let mut eargs: Vec<OsString> = Vec::new();
+        if name == "oaita" { eargs.push(OsString::from("oaita")); }
+        eargs.extend(rest);
+
+        let mut cmd = std::process::Command::new("/proc/self/exe");
+        cmd.args(&eargs);
+        if let Some(s) = Self::stdio_from(&context.try_fd(0)) { cmd.stdin(s); }
+        if let Some(s) = Self::stdio_from(&context.try_fd(1)) { cmd.stdout(s); }
+        if let Some(s) = Self::stdio_from(&context.try_fd(2)) { cmd.stderr(s); }
+        let code = match cmd.status() {
+            Ok(s) => s.code().unwrap_or(1),
+            Err(e) => { eprintln!("{name}: cannot exec engine: {e}"); 127 }
+        };
+        Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
+    }
+}
+
 /// The set of builtin registrations every box brush shell installs: bundled
 /// coreutils FIRST, then the BashMode shell builtins OVERWRITE any overlapping
 /// names (so brush's own echo/printf/test/[/pwd/kill/etc. win — they must stay
 /// shell builtins). Coreutils fills in the file utilities brush has no builtin
-/// for (cat ls cp mv rm mkdir wc sort cut tr od stat du df …).
+/// for (cat ls cp mv rm mkdir wc sort cut tr od stat du df …). Finally
+/// `sarun`/`oaita` are added so they resolve in-box without a PATH shadow.
 fn box_builtins<SE: brush_core::extensions::ShellExtensions>()
     -> std::collections::HashMap<String, brush_core::builtins::Registration<SE>> {
     box_builtins_opt(true)
@@ -373,6 +434,10 @@ fn box_builtins_opt<SE: brush_core::extensions::ShellExtensions>(
     }
     // BashMode shell builtins overwrite overlaps (highest priority).
     m.extend(brush_builtins::default_builtins(brush_builtins::BuiltinSet::BashMode));
+    // In-box engine entry points (no PATH shadow): `sarun` / `oaita` re-exec
+    // the inner runner's own binary via /proc/self/exe.
+    m.insert("sarun".to_string(), simple_builtin::<EngineSelfCommand, SE>());
+    m.insert("oaita".to_string(), simple_builtin::<EngineSelfCommand, SE>());
     m
 }
 
