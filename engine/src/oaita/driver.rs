@@ -807,6 +807,31 @@ pub fn evaluate_call(spec: &str, set: &Settings,
 
     let mut result_text = dispatch(&tool, &arguments, &target, set, executor, &turns);
 
+    // Ancestor-cap budget exhaustion bubbling up through an `ask` sub-agent:
+    // the sub-agent itself returned the "budget exhausted at session X" text
+    // where X is NOT the sub-agent's own session (so its own model-set cap is
+    // intact). The PARENT's chain ran out. Per design, the parent model must
+    // not see this — its history stays exactly as it was, the pending tool
+    // call stays unresolved, and on regrant `evaluate_call` re-enters the
+    // same `ask` which resumes the same sub-agent session. Propagate via the
+    // same Err shape `generate` uses so `run_to_completion` exits cleanly
+    // without touching turn history.
+    if tool == "ask" {
+        if let Some(exhausted) = budget_exhausted_session(&result_text) {
+            // The sub-agent's inner session id is encoded in the result
+            // preamble (`[sub-agent session id: ID — …]`) emitted by
+            // format_act_result. If the exhausted session != that inner id,
+            // an ancestor cap fired, not the sub-agent's own cap.
+            let own_cap = result_text.contains(&format!(
+                "[sub-agent session id: {exhausted} —"));
+            if !own_cap {
+                return Err(format!(
+                    "budget exhausted at session \"{exhausted}\" \
+                     (propagated through ask)"));
+            }
+        }
+    }
+
     // Productive-cluster hint: streak-driven append. The hint fires when
     // this result is clean AND the four prior tool results were clean too;
     // its marker stays in context so subsequent results don't repeat it.
@@ -1266,9 +1291,14 @@ pub fn run_to_completion(spec: &str, set: &Settings,
         match generate(spec, set) {
             Ok(mut r) => produced.append(&mut r),
             Err(e) if e.contains("budget exhausted") => {
+                // PAUSED, not done. Preserve everything — sub-agent boxes,
+                // their session dirs, every staged write — so on regrant
+                // the next `oaita run` resumes byte-identical from this
+                // exact point. Cleanup runs ONLY on `run.settled` (a clean
+                // assistant tail), never on budget-503: the principle is
+                // that the model cannot tell a pause/restart happened.
                 trace::event("run.budget_exhausted",
                     json!({"session": &target, "detail": &e}));
-                cleanup_spawned_subagents(&target);
                 return Err(e);
             }
             Err(e) => return Err(e),
