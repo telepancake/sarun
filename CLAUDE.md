@@ -90,6 +90,20 @@ static binary, AFTER `make engine` has set up the zigshim+ziglang once.
 `prototype/test_musl_rs.py` cross-checks the static-linkage guarantee via
 `file` + `ldd`.
 
+## Vendored, patched upstreams (uu_cat, findutils, …)
+Some third-party crates are vendored under `engine/vendor/` as **patched forks**
+so they run as in-process brush builtins (`uu_cat` → `cat`, `findutils` → an
+in-process `find` against the shell's logical I/O + cwd). They are NOT git
+submodules: each is a **pristine-import commit** (upstream verbatim, at a pinned
+release) plus a **never-squashed series of patch commits**, so upstream stays
+pullable — you bump the pristine base and `git rebase` replays the patches.
+**Do not guess this from commit hashes.** The full model, the per-crate
+provenance, the exact update/`rebase --onto` procedure, and the verification net
+(lib build → upstream unit suite via overlay → `make engine` → `brush-sh --`
+box behavior → optional blind review) are documented in
+**`engine/vendor/README.md`** — read it before touching or updating a vendored
+crate.
+
 ## Run the tests
 The Python prototype's tests, the pytest glue (`conftest.py`), and the `bench/`
 harness all live under `prototype/`. Each `test_*.py` is standalone (repo
