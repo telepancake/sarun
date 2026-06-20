@@ -894,6 +894,16 @@ fn parse_oci_runtime(cfg_json: &str) -> Option<Value> {
 fn prepare_net(state: &State, id: i64, msg: &Value) -> Option<(String, String, String)> {
     let net_mode = msg.get("net_mode").and_then(Value::as_str).unwrap_or("off");
     if net_mode != "tap" { return Some((String::new(), String::new(), String::new())); }
+    // Nested (in-box) launch: the runner already lives INSIDE the enclosing
+    // box, whose own Tap netns the engine equipped when that box started. We do
+    // NOT fork a fresh anchor here: a host /proc/<anchor>/ns/net path is
+    // unreachable from inside the box's pid+mount namespaces, and the sensible
+    // default is for a nested box to SHARE the enclosing box's proxied network
+    // (the runner leaves its netns untouched — see runner.rs Tap/in_box). An
+    // empty netns_path is the signal for that.
+    if msg.get("relname").and_then(Value::as_str).is_some() {
+        return Some((String::new(), String::new(), String::new()));
+    }
     let net = state.lock().unwrap().net.clone()?;
     let box_id_u16 = net.alloc_box_id();
     let subnet = crate::net::subnet::BoxSubnet::new(box_id_u16);

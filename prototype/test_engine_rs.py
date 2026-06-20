@@ -9,6 +9,7 @@ sqlar format is read by rusqlite on the other side). Run:
 Skips (passes vacuously) if cargo/the binary are unavailable.
 """
 import json, os, socket, stat as stat_mod, subprocess, sys, tempfile, shutil, time
+import threading
 from pathlib import Path
 from importlib.machinery import SourceFileLoader
 
@@ -73,13 +74,26 @@ def main():
 
         eng = subprocess.Popen([str(BIN), "serve"],
                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        # Drain the engine's stdout/stderr in a thread. The engine logs a line
+        # per box ("box N (overlay root: …) UI connected") and more under -n; an
+        # unread PIPE fills (~64 KiB) and would block the engine on its next
+        # write, freezing its control loop. Draining keeps it flowing across this
+        # long, box-heavy run; the buffer stays for failure diagnostics.
+        eng_out = bytearray()
+        def _drain(p=eng.stdout, buf=eng_out):
+            try:
+                for chunk in iter(lambda: p.read(4096), b""):
+                    buf.extend(chunk)
+            except Exception:
+                pass
+        threading.Thread(target=_drain, daemon=True).start()
         sock = m.sock_path()
         check("slopbox.RS" in sock,
               "engine-rs: socket lives at the NAMESPACED path")
         if not wait_socket(sock):
-            out = eng.stdout.read(2000) if eng.stdout else b""
+            time.sleep(0.3)   # let the drain thread flush the failure output
             raise RuntimeError("rust engine socket never appeared:\n"
-                               + out.decode(errors="replace"))
+                               + bytes(eng_out).decode(errors="replace"))
         check(m.ui_is_running(sock), "engine-rs: ui_is_running sees the engine")
 
         r = subprocess.run([str(BIN), "serve"], capture_output=True,

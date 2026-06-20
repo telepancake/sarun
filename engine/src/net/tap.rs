@@ -114,6 +114,19 @@ fn recv_handoff(sock: &OwnedFd) -> Result<(OwnedFd, OwnedFd, String)> {
 /// The anchor child's main. Never returns: either `_exit` on failure or
 /// `pause()` to keep the netns referenced.
 fn anchor_child_main(sock: OwnedFd, subnet: BoxSubnet, mac: [u8; 6]) -> ! {
+    // We are a bare fork() of the engine, so we inherited its SIGTERM/SIGINT
+    // handler (main.rs `on_term`) — which UNLINKS the engine's UI socket and
+    // MNT_DETACHes its FUSE mount before _exit, the graceful-shutdown path. But
+    // the engine SIGTERMs THIS anchor to tear down a box's netns when its
+    // NetHandle drops (box deleted/dissolved/reaped). If we still carried that
+    // handler, the dying anchor would destroy the LIVE engine's socket and
+    // mountpoint — leaving the engine running but unreachable. Reset the fatal
+    // signals to SIG_DFL so our teardown is a plain process death that just
+    // drops the last /proc/<pid>/ns/net reference and frees the netns + TAP.
+    unsafe {
+        libc::signal(libc::SIGTERM, libc::SIG_DFL);
+        libc::signal(libc::SIGINT, libc::SIG_DFL);
+    }
     let res = (|| -> Result<()> {
         // 1. Unshare into a new netns.
         let r = unsafe { libc::unshare(libc::CLONE_NEWNET) };
