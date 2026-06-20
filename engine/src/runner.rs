@@ -558,6 +558,15 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
     match net_mode {
         crate::net::NetMode::Off => { bwrap.arg("--unshare-net"); }
         crate::net::NetMode::Host => { /* leave host netns */ }
+        crate::net::NetMode::Tap if in_box => {
+            // Nested launch: this runner already lives in the ENCLOSING box's
+            // netns (its Tap netns, equipped by the engine when the parent
+            // box started). A host /proc/<anchor>/ns/net path is unreachable
+            // from inside the box's pid+mount namespaces, so we don't unshare
+            // or setns — the nested box INHERITS the enclosing box's proxied
+            // network, sharing its connectivity. (The engine returns no
+            // netns_path for an in-box Tap registration; see prepare_net.)
+        }
         crate::net::NetMode::Tap => {
             if let Some(p) = netns_path.clone() {
                 // Open the netns fd once HERE (parent), then setns in pre_exec
