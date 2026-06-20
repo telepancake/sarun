@@ -156,6 +156,39 @@ def sarun(e, *args, timeout=180):
                           capture_output=True, text=True, timeout=timeout)
 
 
+def mnt_dir(e):
+    return Path(e["XDG_RUNTIME_DIR"]) / "slopbox" / "mnt"
+
+
+def box_id_by_name(sdir, name):
+    for p in sdir.glob("*.sqlar"):
+        try:
+            c = sqlite3.connect(f"file:{p}?mode=ro", uri=True)
+            row = c.execute("SELECT value FROM meta WHERE key='name'").fetchone()
+            c.close()
+            if row and row[0] == name:
+                return int(p.stem)
+        except Exception:
+            pass
+    return None
+
+
+def start_engine(e):
+    proc = subprocess.Popen([str(ENGINE), "serve"], env=e,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    if not wait_socket(sock_path(e)):
+        out = proc.stdout.read(4000) if proc.stdout else b""
+        raise RuntimeError("engine socket never appeared:\n"
+                           + out.decode(errors="replace"))
+    return proc
+
+
+def stop_engine(proc):
+    proc.send_signal(signal.SIGTERM)
+    try: proc.wait(timeout=10)
+    except Exception: proc.kill()
+
+
 def main():
     if not ENGINE.exists():
         print(f" FAIL  engine binary not built at {ENGINE} — run `make engine` first")
@@ -165,17 +198,12 @@ def main():
     arch = build_archive(str(tmp / "img.tar"), ENGINE)
     print(f"synthetic archive: {arch} ({os.path.getsize(arch)//1024} KiB)")
 
-    proc = subprocess.Popen([str(ENGINE), "serve"], env=e,
-                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     try:
-        if not wait_socket(sock_path(e)):
-            out = b""
-            try: out = proc.stdout.read(4000) if proc.stdout else b""
-            except Exception: pass
-            print(" FAIL  engine socket never appeared:\n" + out.decode(errors="replace"))
-            _fails.append("engine start")
-            return
-
+        proc = start_engine(e)
+    except RuntimeError as ex:
+        print(" FAIL  " + str(ex)); _fails.append("engine start")
+        shutil.rmtree(tmp, ignore_errors=True); sys.exit(1)
+    try:
         # ── load ─────────────────────────────────────────────────────────────
         r = sarun(e, "oci", "load", f"oci-archive:{arch}", "SYN")
         check(r.returncode == 0, f"oci load exits 0 (stderr: {r.stderr.strip()[:200]})")
@@ -201,6 +229,8 @@ def main():
         r = sarun(e, "oci", "build", "--net", "off", "-t", "BUILT", str(ctx))
         check(r.returncode == 0, f"oci build exits 0 (stderr: {r.stderr.strip()[:400]})")
         check("built image 'BUILT'" in r.stdout, "oci build reports built image BUILT")
+        try: built_top = int(r.stdout.split("top box ")[-1].split()[0])
+        except Exception: built_top = 0
         check(any_box_has_file(state_dir(e), "marker.txt"),
               "COPY landed marker.txt in a build layer box")
 
@@ -223,10 +253,28 @@ def main():
               "oci run by ref reused the loaded stack (no re-pull)")
         check(after - before == 1,
               f"reuse added only the container box, not a new layer stack (+{after - before})")
+
+        # ── safety: deleting a no-host parent fails CLOSED, never leaks host ──
+        # BUILT descends from SYN (a no_host image base). GC SYN's base box,
+        # restart, then confirm BUILT loses SYN's files but does NOT fall through
+        # to the host (no /etc/passwd), while BUILT's own COPY survives.
+        syn_id = box_id_by_name(state_dir(e), "SYN")
+        stop_engine(proc)
+        if syn_id:
+            (state_dir(e) / f"{syn_id}.sqlar").unlink(missing_ok=True)
+            shutil.rmtree(state_dir(e) / "live" / str(syn_id), ignore_errors=True)
+        proc = start_engine(e)   # reassigned so `finally` stops the new engine
+        # Re-run BUILT to hydrate it; the run itself fails (its /bin/sarun lived
+        # in the now-deleted SYN) — that IS the fail-closed signal.
+        sarun(e, "oci", "run", "--net", "off", "BUILT", timeout=60)
+        mnt = mnt_dir(e) / str(built_top)
+        leaked = (mnt / "etc" / "passwd").exists() or (mnt / "root").exists()
+        check(bool(syn_id) and built_top != 0 and not leaked,
+              "deleting the no-host base makes the child fail CLOSED (no host fs leak)")
+        check((mnt / "marker.txt").exists(),
+              "child's own COPY'd file survives the parent's deletion")
     finally:
-        proc.send_signal(signal.SIGTERM)
-        try: proc.wait(timeout=10)
-        except Exception: proc.kill()
+        stop_engine(proc)
         shutil.rmtree(tmp, ignore_errors=True)
 
     if _fails:
