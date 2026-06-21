@@ -53,7 +53,11 @@ struct BridgeChild(builtin_exec::ExecTicket);
 
 impl ExecChild for BridgeChild {
     fn wait(self: Box<Self>) -> Result<i32, CommandExecutionError> {
-        Ok(self.0.wait())
+        match self.0.wait() {
+            builtin_exec::Outcome::Code(c) => Ok(c),
+            // run_argv couldn't dispatch it → GNU xargs exit 127, and stop.
+            builtin_exec::Outcome::CouldNotRun => Err(CommandExecutionError::NotFound),
+        }
     }
 }
 

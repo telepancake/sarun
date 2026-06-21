@@ -27,13 +27,22 @@ use brush_core::{ExecutionParameters, Shell};
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
-/// One command for the async executor to run, plus where to send its exit code.
+/// One command for the async executor to run, plus where to send its outcome.
 pub struct ExecRequest {
     argv: Vec<String>,
     /// Working directory for this command (`find -execdir` runs in the entry's
     /// parent). `None` runs it in the shell's own logical cwd.
     cwd: Option<PathBuf>,
-    reply: SyncSender<i32>,
+    reply: SyncSender<Outcome>,
+}
+
+/// The result of running one command through the bridge: its exit code, or
+/// `CouldNotRun` when `run_argv` couldn't dispatch the command at all (not
+/// found / not executable). The two are distinct so xargs can report GNU's exit
+/// 127 (vs 123 for a command that merely *exited* non-zero).
+pub enum Outcome {
+    Code(i32),
+    CouldNotRun,
 }
 
 /// Sync-side handle held by the findutils Io/Deps and its worker thread.
@@ -56,21 +65,27 @@ impl ExecSubmitter {
         ExecTicket { rx }
     }
 
-    /// Submit and block for the exit code — serial execution.
+    /// Submit and block for the exit code — serial execution. A command that
+    /// could not be run is reported as 127 (find has no stop-on-not-found
+    /// semantics; it just treats the -exec as failed).
     pub fn run(&self, argv: &[OsString], cwd: Option<PathBuf>) -> i32 {
-        self.submit(argv, cwd).wait()
+        match self.submit(argv, cwd).wait() {
+            Outcome::Code(c) => c,
+            Outcome::CouldNotRun => 127,
+        }
     }
 }
 
 /// A pending command's result, awaited by blocking the findutils worker thread.
 pub struct ExecTicket {
-    rx: Receiver<i32>,
+    rx: Receiver<Outcome>,
 }
 
 impl ExecTicket {
-    /// Block until the command finishes; 127 if the executor dropped the reply.
-    pub fn wait(self) -> i32 {
-        self.rx.recv().unwrap_or(127)
+    /// Block until the command finishes; `CouldNotRun` if the executor dropped
+    /// the reply (it is gone) — same as a command that couldn't be dispatched.
+    pub fn wait(self) -> Outcome {
+        self.rx.recv().unwrap_or(Outcome::CouldNotRun)
     }
 }
 
@@ -123,11 +138,12 @@ async fn run_one<SE: brush_core::extensions::ShellExtensions>(
     if let Some(dir) = &req.cwd {
         let _ = subshell.set_working_dir(dir);
     }
-    let code = match subshell.run_argv(&req.argv, &params).await {
-        Ok(result) => i32::from(u8::from(result.exit_code)),
-        // A run_argv error (command-not-found, etc.) maps to 127, matching a
-        // failed exec.
-        Err(_) => 127,
+    let outcome = match subshell.run_argv(&req.argv, &params).await {
+        Ok(result) => Outcome::Code(i32::from(u8::from(result.exit_code))),
+        // run_argv could not dispatch the command (not found / not executable):
+        // distinct from a command that ran and exited non-zero, so xargs can
+        // report GNU's 127 rather than 123.
+        Err(_) => Outcome::CouldNotRun,
     };
-    let _ = req.reply.send(code);
+    let _ = req.reply.send(outcome);
 }
