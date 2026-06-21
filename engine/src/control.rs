@@ -1733,19 +1733,48 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
             // hyper has drained the body, so the response goes back as
             // proper HTTP. State is passed through so handle_inner can
             // do the chain walk.
+            // Each early-return path below LOGS into the box's api_log
+            // so a dropped conn isn't silent. Without these, a stuck
+            // broker or a missed runtime surfaced as the inscrutable
+            // "send: error writing a body to connection" on the client
+            // side with NO matching engine-side record of what
+            // happened — the bug the post-mortem on mimo's fft4 ran
+            // into. The status field uses the closest matching HTTP
+            // value (502 = bad gateway, since "we couldn't even start
+            // serving") and the body explains the specific cause.
             let (rt_opt, proxy_opt) = {
                 let s = state.lock().unwrap();
                 (s.net_rt.clone(), s.api_proxy.clone())
             };
-            let (Some(rt), Some(proxy)) = (rt_opt, proxy_opt) else { return; };
+            let (Some(rt), Some(proxy)) = (rt_opt, proxy_opt) else {
+                if let Some(p) = state.lock().unwrap().api_proxy.clone() {
+                    crate::oaita::proxy::log_call(&p, box_id, "POST", "/",
+                        "", 502, &[],
+                        b"engine runtime or proxy unavailable", false);
+                }
+                return;
+            };
             let prebuffered = reader.buffer().to_vec();
             drop(reader);
-            if writer.set_nonblocking(true).is_err() { return; }
+            if writer.set_nonblocking(true).is_err() {
+                crate::oaita::proxy::log_call(&proxy, box_id, "POST", "/",
+                    "", 502, &[],
+                    b"set_nonblocking on api.proxy conn failed", false);
+                return;
+            }
             let std_conn = writer;
             let state_for_proxy = state.clone();
             rt.spawn(async move {
-                let Ok(tokio_conn) =
-                    tokio::net::UnixStream::from_std(std_conn) else { return; };
+                let tokio_conn = match tokio::net::UnixStream::from_std(std_conn) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        crate::oaita::proxy::log_call(&proxy, box_id, "POST",
+                            "/", "", 502, &[],
+                            format!("UnixStream::from_std: {e}").as_bytes(),
+                            false);
+                        return;
+                    }
+                };
                 let io = PrebufferedIo::new(tokio_conn, prebuffered);
                 let _ = crate::oaita::proxy::serve_one_conn_for_box(
                     proxy, state_for_proxy, box_id,

@@ -121,14 +121,6 @@ async fn handle_inner(proxy: Arc<Proxy>, state: crate::control::State,
                       box_id: i64, req: Request<Incoming>)
     -> Result<Response<Body>, std::convert::Infallible>
 {
-    // Box opt-in gate: even if a box gets the socket bound in by mistake, we
-    // refuse traffic from boxes that weren't launched with `--api`. box_id=0
-    // (unattributable peer) is also rejected — only known --api boxes get
-    // through.
-    if box_id == 0 || !proxy.is_enabled(box_id) {
-        return Ok(error_resp(StatusCode::FORBIDDEN,
-                             "this box was not launched with --api"));
-    }
     let method = req.method().to_string();
     // Strip the box-side base path prefix (we set OPENAI_BASE_URL=…/v1 in the
     // box, so the incoming URI looks like `/v1/chat/completions`). The
@@ -139,6 +131,19 @@ async fn handle_inner(proxy: Arc<Proxy>, state: crate::control::State,
     let path = raw_path.strip_prefix("/v1")
         .map(|s| if s.is_empty() { "/" } else { s }.to_string())
         .unwrap_or_else(|| raw_path.clone());
+    // Box opt-in gate: even if a box gets the socket bound in by mistake, we
+    // refuse traffic from boxes that weren't launched with `--api`. box_id=0
+    // (unattributable peer) is also rejected — only known --api boxes get
+    // through. Log the refusal: without it a stuck/intermittent broker
+    // problem looks identical to upstream silence from the model's side
+    // (hyper just surfaces "send: error writing a body to connection"),
+    // and the box has nothing in its api_log to explain why.
+    if box_id == 0 || !proxy.is_enabled(box_id) {
+        let msg = "this box was not launched with --api";
+        log_call(&proxy, box_id, &method, &path, "", 403,
+                 &[], msg.as_bytes(), false);
+        return Ok(error_resp(StatusCode::FORBIDDEN, msg));
+    }
     let (_head, body) = req.into_parts();
     // Drain the request body BEFORE the budget gate. The previous design
     // gated at the raw verb-dispatch layer (control.rs), wrote a 503 over
@@ -150,8 +155,12 @@ async fn handle_inner(proxy: Arc<Proxy>, state: crate::control::State,
     // consumed request — proper HTTP, no mid-write close.
     let body_bytes = match body.collect().await {
         Ok(b) => b.to_bytes(),
-        Err(e) => return Ok(error_resp(StatusCode::BAD_REQUEST,
-            &format!("read body: {e}"))),
+        Err(e) => {
+            let msg = format!("read body: {e}");
+            log_call(&proxy, box_id, &method, &path, "", 400,
+                     &[], msg.as_bytes(), false);
+            return Ok(error_resp(StatusCode::BAD_REQUEST, &msg));
+        }
     };
     let req_json: Value = serde_json::from_slice(&body_bytes).unwrap_or(Value::Null);
     let model = req_json.get("model").and_then(Value::as_str).unwrap_or("").to_string();
@@ -163,14 +172,14 @@ async fn handle_inner(proxy: Arc<Proxy>, state: crate::control::State,
     if let Err(top) = crate::oaita::budget::take_chain(&state, box_id) {
         let msg = format!("budget exhausted at box {top} — grant more turns and resume.");
         log_call(&proxy, box_id, &method, &path, &model, 503,
-                 &body_bytes, msg.as_bytes(), is_stream).await;
+                 &body_bytes, msg.as_bytes(), is_stream);
         return Ok(error_resp(StatusCode::SERVICE_UNAVAILABLE, &msg));
     }
 
     let Some(up) = proxy.upstream.lock().await.clone() else {
         let msg = "oaita.toml not configured: set model + base_url + api_key";
         log_call(&proxy, box_id, &method, &path, &model, 503, &body_bytes,
-                 msg.as_bytes(), is_stream).await;
+                 msg.as_bytes(), is_stream);
         return Ok(error_resp(StatusCode::SERVICE_UNAVAILABLE, msg));
     };
 
@@ -179,7 +188,7 @@ async fn handle_inner(proxy: Arc<Proxy>, state: crate::control::State,
         Err(e) => {
             let msg = format!("proxy: upstream client: {e}");
             log_call(&proxy, box_id, &method, &path, &model, 502,
-                     &body_bytes, msg.as_bytes(), is_stream).await;
+                     &body_bytes, msg.as_bytes(), is_stream);
             return Ok(error_resp(StatusCode::BAD_GATEWAY, &msg));
         }
     };
@@ -208,7 +217,7 @@ async fn proxy_buffered(proxy: Arc<Proxy>, box_id: i64, client: Client,
     match result {
         Ok(resp_bytes) => {
             log_call(&proxy, box_id, &method, &path, &model, 200,
-                     &body, &resp_bytes, false).await;
+                     &body, &resp_bytes, false);
             Response::builder().status(200)
                 .header("Content-Type", "application/json")
                 .body(Full::new(resp_bytes).map_err(|e| match e {}).boxed())
@@ -217,7 +226,7 @@ async fn proxy_buffered(proxy: Arc<Proxy>, box_id: i64, client: Client,
         Err(e) => {
             let msg = format!("upstream: {e}");
             log_call(&proxy, box_id, &method, &path, &model, 502,
-                     &body, msg.as_bytes(), false).await;
+                     &body, msg.as_bytes(), false);
             error_resp(StatusCode::BAD_GATEWAY, &msg)
         }
     }
@@ -244,11 +253,11 @@ async fn proxy_stream(proxy: Arc<Proxy>, box_id: i64, client: Client,
         if let Err(e) = res {
             let _ = tx.send(Err(e.clone()));
             log_call(&proxy_clone, box_id, &method_log, &path_log, &model_log,
-                     502, &body_log, e.as_bytes(), true).await;
+                     502, &body_log, e.as_bytes(), true);
         } else {
             let _ = tx.send(Ok(Bytes::from_static(b"data: [DONE]\n\n")));
             log_call(&proxy_clone, box_id, &method_log, &path_log, &model_log,
-                     200, &body_log, &collected, true).await;
+                     200, &body_log, &collected, true);
         }
     });
     let stream = UnboundedReceiverStream::new(rx).map(|r| r.map(Frame::data));
@@ -260,9 +269,17 @@ async fn proxy_stream(proxy: Arc<Proxy>, box_id: i64, client: Client,
         .unwrap()
 }
 
-async fn log_call(proxy: &Arc<Proxy>, box_id: i64,
-                  method: &str, path: &str, model: &str, status: i32,
-                  req: &[u8], resp: &[u8], stream: bool) {
+/// Append one api_log row for box `box_id`. Public + sync so the raw
+/// verb-dispatch layer in control.rs can call it from the conn-setup
+/// early-return paths (rt/proxy None, set_nonblocking failure, tokio
+/// stream conversion failure) — without it, those paths silently
+/// dropped the conn and the box had nothing in its api_log to explain
+/// why hyper on the client side surfaced "send: error writing a body
+/// to connection". No await: the parking_lot RwLock + rusqlite insert
+/// are both sync.
+pub fn log_call(proxy: &Proxy, box_id: i64,
+                method: &str, path: &str, model: &str, status: i32,
+                req: &[u8], resp: &[u8], stream: bool) {
     let ts = SystemTime::now().duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs_f64()).unwrap_or(0.0);
     let ov = proxy.overlay.read().clone();
