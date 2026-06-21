@@ -17,16 +17,21 @@ the patch series onto it, so a 3-way merge surfaces conflicts **only** where
 upstream changed the same lines we did. Keeping the base byte-identical to
 upstream is load-bearing for that; do not "tidy" the base commit.
 
-> The brush crates (`brush-core`, `brush-builtins`, …) are also vendored here
-> but for a different reason (a pre-release `brush-core` not yet on crates.io);
-> they are not the patched-fork pattern this doc is about.
+> The brush crates (`brush-core`, `brush-builtins`, …) are vendored for a
+> slightly different *reason* — they pin a pre-release brush not yet on
+> crates.io, plus a few sarun patches — but they follow the **same**
+> pristine-import + rebaseable-patch-series discipline as everything else here,
+> so the update procedure below applies to them unchanged. (They are not run as
+> in-process builtins; brush *is* the shell. The vendoring mechanics are
+> identical regardless.)
 
 ## What is vendored, and how it is consumed
 
 | crate | upstream | pinned at | wired into the engine via | what we changed |
 |-------|----------|-----------|---------------------------|-----------------|
 | `uu_cat` | crates.io `uu_cat` (uutils/coreutils) | `0.8.0` | `[patch.crates-io] uu_cat = { path = "vendor/uu_cat" }` in `engine/Cargo.toml` | Injected-I/O entry `cat::cat(out, out_fd, stdin, stdin_fd)` that writes the shell's logical `OpenFile` sink/source with no process-global stdio, keeping the Linux `splice(2)` fast path. A thin `uumain` bridge is retained for the standalone/`--invoke-bundled` path. |
-| `findutils` | github.com/uutils/findutils, tag `0.9.1` | `0.9.1` | `findutils = { path = "vendor/findutils" }` in `engine/Cargo.toml`; builtins in `engine/src/find_builtin.rs` and `engine/src/xargs_builtin.rs`, registered in `engine/src/brush.rs` (`box_builtins_opt`) | Reduced to a **find + xargs** library (`lib.rs` = `pub mod find; pub mod xargs;`; the `locate`/`updatedb`/`testing` modules + bins removed). **find:** added `Dependencies::{get_error_output, get_input}` so diagnostics and the `-files0-from -` read go through the shell's logical stderr/stdin. **xargs:** added an `XargsIo` trait (`take_input`/`output`/`error_output`) so item input and xargs's own output/`-t`/warnings/errors go through the logical streams; `xargs_main_with_io` is the embedder entry. Both builtins run their `_main` on a worker thread that `unshare(CLONE_FS)`s + `chdir`s to the shell's logical cwd (see the builtin files for that rationale). **Known limitation:** the commands `find -exec` / `xargs` *spawn* inherit the engine's real fd 1/2, so a spawned child's stdout/stderr does NOT honor the box's logical pipes/redirects (`xargs cmd > file` / `xargs cmd | downstream` misroute). Pending the child-fd-wiring / in-process-dispatch work. |
+| `findutils` | github.com/uutils/findutils, tag `0.9.1` | `0.9.1` | `findutils = { path = "vendor/findutils" }` in `engine/Cargo.toml`; builtins in `engine/src/find_builtin.rs` and `engine/src/xargs_builtin.rs`, registered in `engine/src/brush.rs` (`box_builtins_opt`) | Reduced to a **find + xargs** library (`lib.rs` = `pub mod find; pub mod xargs;`; the `locate`/`updatedb`/`testing` modules + bins removed). **find:** added `Dependencies::{get_error_output, get_input}` so diagnostics and the `-files0-from -` read go through the shell's logical stderr/stdin. **xargs:** added an `XargsIo` trait (`take_input`/`output`/`error_output`) so item input and xargs's own output/`-t`/warnings/errors go through the logical streams; `xargs_main_with_io` is the embedder entry. Both builtins run their `_main` on a worker thread that `unshare(CLONE_FS)`s + `chdir`s to the shell's logical cwd (see the builtin files for that rationale). The commands `find -exec` / `xargs` *spawn* have their stdout/stderr dup'd from the shell's logical streams (`Dependencies::{child_stdout,child_stderr}` / `XargsIo::{child_stdout,child_stderr}`), so `find … -exec cmd \; > file` and `xargs cmd | downstream` honor the box's redirects and pipes; a standalone build inherits the process fds, as upstream does. |
+| brush crates: `brush-core`, `brush-builtins`, `brush-coreutils-builtins`, `brush-parser`, `brush-interactive` | github.com/reubeno/brush, commit `428f477` (PR #1181 — the `OpenFile`-Arc pipeline fd-leak fix), pre-release ahead of crates.io | `428f477` (`brush-core` 0.5.0 / `brush-parser` 0.4.0 / `brush-builtins` 0.2.0 / `brush-coreutils-builtins` 0.1.0 / `brush-interactive` 0.4.0) | `[patch.crates-io]` redirects in `engine/Cargo.toml` point every `brush-*` name at `vendor/brush-*`, so the whole dep graph resolves to one copy | Three patches over the pristine import: **(1) de-workspace** the crate manifests (inline the `*.workspace = true` metadata, drop `[lints]`, turn `path = "../sibling"` deps into plain versions) so each crate stands alone under `[patch.crates-io]`; **(2) pipeline fd hygiene** in `brush-core` — a `compose_std_command` pre_exec `close_stray_fds` hook (closes CLOEXEC-marked stray fds in the child so pipeline children don't leak a stdin-pipe writer and hang) plus a `spawned_pipeline_stage` flag so the dup2'ing `CoreutilWrapper` stays inert on the concurrent spawn path; **(3) launch-state hooks** in `brush-core` — a `LaunchState` on `ExecutionParameters` and a second pre_exec that materializes nice/setsid/SIGHUP-ignore in the child, for the `nice`/`setsid`/`nohup` exec-wrapper builtins (`engine/src/exec_wrappers.rs`). |
 
 Provenance (the exact upstream version) is recorded in each crate's
 **pristine-import commit message**, which is the one true source — find it with:
@@ -43,7 +48,11 @@ message convention.
 
 Worked example: bumping `findutils` `0.9.1` → `0.10.0`. (For `uu_cat`, fetch the
 new crate from crates.io instead of git, and skip the find/xargs trim notes — the
-shape is identical.)
+shape is identical. For the **brush** crates, clone github.com/reubeno/brush at
+the new commit, refresh all five `vendor/brush-*` directories together in the one
+pristine-import commit — `git log --grep '^vendor: import pristine brush'` finds
+the base — then the rebase replays the de-workspace / fd-hygiene / launch-state
+patches; re-check `engine/Cargo.toml`'s `[patch.crates-io]` versions still match.)
 
 ```bash
 cd ~/sarun
