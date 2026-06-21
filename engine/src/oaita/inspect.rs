@@ -151,7 +151,7 @@ pub fn inspect(locator: &Locator, turns: &[Turn],
         _ => (locator.path.clone(), locator.window.clone()),
     };
     if let Some(rest) = target.strip_prefix("box:") {
-        return inspect_box(rest, &window, turns);
+        return inspect_box(rest, &window, turns, box_id);
     }
     // Structural windows need file bytes regardless of "kind"; route them
     // BEFORE the dir/file dispatch so a stale path_kind cache or a fresh
@@ -314,64 +314,151 @@ fn inspect_file(box_id: &str, executor: &dyn Executor,
     text + &crate::oaita::hints::append(turns, &hint_ids)
 }
 
-fn inspect_box(rest: &str, _window: &Window, turns: &[Turn]) -> String {
+fn inspect_box(rest: &str, _window: &Window, turns: &[Turn],
+               outer_box: &str) -> String {
     // box:<id>           → list the change set as one entry per file
-    // box:<id>/<file>    → page that file's staged diff
-    let (box_id, sub) = match rest.split_once('/') {
+    // box:<id>/<file>    → that file's diff hunks
+    //
+    // Routes through the SAME engine RPCs the UI's changes pane uses
+    // (`view.open("changes", sid, null)` + `view.window`; `review.hunks`
+    // for per-file). Single source of truth — UI and inspect are two
+    // renderers of the same engine-side data, never two parallel
+    // implementations.
+    let (raw_id, sub) = match rest.split_once('/') {
         Some((b, s)) => (b, Some(s)),
         None => (rest, None),
     };
-    // Defer to sarun CLI: `sarun BOX patch` emits the unified diff (the same
-    // verb SarunExecutor uses for staged-change summaries). We don't expose
-    // direct sqlar access here — the box id is the one truthful source.
-    let out = match std::process::Command::new(default_sarun())
-        .args([box_id, "patch"])
-        .output()
-    {
-        Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
-        Err(e) => return format!("inspect: box:{box_id}: cannot reach sarun: {e}"),
+    // Resolve the model-supplied id to a real box display path. The model
+    // typically passes the sub-agent's session id (lowercase, e.g. `ejcoo`)
+    // matching the dispatch_box_resolve convention: prepend `OAITA-` and
+    // nest under our outer box. An already-prefixed `OAITA-X` is taken
+    // at face value (dotted forms included). Either way, resolve to a
+    // numeric box_id via session_dicts.
+    let full_name = resolve_box_name(raw_id, outer_box);
+    let sid = match resolve_sid(&full_name) {
+        Some(id) => id,
+        None => return format!(
+            "inspect: box:{raw_id}: no such box (looked up {full_name:?}). \
+             Sub-agent IDs (e.g. `ejcoo`) are nested under the current \
+             agent — use the bare ID from the `ask` tool result."),
     };
-    let body = if let Some(file) = sub {
-        // Crude per-file slice — find the `+++ b/<file>` chunk and follow it
-        // until the next `diff --git` header.
-        let needle = format!("+++ b/{file}\n");
-        if let Some(start) = out.find(&needle) {
-            let tail = &out[start..];
-            let end = tail[needle.len()..].find("diff --git ")
-                .map(|i| i + needle.len()).unwrap_or(tail.len());
-            tail[..end].to_string()
-        } else {
-            return format!("inspect: box:{box_id}/{file} not in change set");
-        }
-    } else {
-        // List filenames touched.
-        let mut files: Vec<String> = Vec::new();
-        for line in out.lines() {
-            if let Some(rest) = line.strip_prefix("+++ b/") {
-                files.push(rest.to_string());
-            }
-        }
-        if files.is_empty() {
-            return format!("box:{box_id}: empty change set");
-        }
-        format!("box:{box_id}: {} changed files\n{}", files.len(), files.join("\n"))
-    };
-    body + &crate::oaita::hints::append(turns, &["inspect-box"])
+    if let Some(file) = sub {
+        return inspect_box_file(sid, raw_id, file, turns);
+    }
+    inspect_box_changes(sid, raw_id, turns)
 }
 
-fn default_sarun() -> String {
-    // In-box: re-exec the inner runner's own executable (the engine binary)
-    // via /proc/self/exe — no `sarun` on PATH, no FUSE shadow. See
-    // crate::oaita::exec::default_sarun.
-    if crate::oaita::exec::in_box() { return "/proc/self/exe".to_string(); }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(stem) = exe.file_name().and_then(|s| s.to_str()) {
-            if stem == "sarun" || stem == "sarun-engine" {
-                return exe.to_string_lossy().into_owned();
+/// Resolve the model-supplied target to a full sarun display path. Mirrors
+/// the dispatch_box_resolve convention so `inspect box:X` and `apply
+/// target=X` agree on what X means.
+fn resolve_box_name(raw: &str, outer_box: &str) -> String {
+    let up = raw.to_uppercase();
+    let inner = if up.starts_with("OAITA-") { up } else { format!("OAITA-{up}") };
+    format!("{outer_box}.{inner}")
+}
+
+/// Map a display path (dotted box name) to its numeric box_id by consulting
+/// `session_dicts`. Returns None on miss — the caller's error message tells
+/// the model what was looked up.
+fn resolve_sid(display_path: &str) -> Option<i64> {
+    let r = crate::oaita::exec::ctrl_rpc("session_dicts",
+        serde_json::json!([])).ok()?;
+    let arr = r.as_array()?;
+    for v in arr {
+        let path = v.get("path").and_then(serde_json::Value::as_str)?;
+        if path == display_path {
+            let sid_str = v.get("session_id").and_then(serde_json::Value::as_str)?;
+            return sid_str.parse().ok();
+        }
+    }
+    None
+}
+
+/// `box:<id>` — paged list of changed paths, from the same Changes view the
+/// UI shows. Filters out internal directory-connector rows so the model
+/// sees just the leaves it can act on with read/write/apply.
+fn inspect_box_changes(sid: i64, raw_id: &str, turns: &[Turn]) -> String {
+    let opened = match crate::oaita::exec::ctrl_rpc("view.open",
+        serde_json::json!(["changes", sid, serde_json::Value::Null]))
+    {
+        Ok(v) => v,
+        Err(e) => return format!("inspect: box:{raw_id}: view.open: {e}"),
+    };
+    let vid = opened.get("view_id").and_then(serde_json::Value::as_u64).unwrap_or(0);
+    let total = opened.get("total").and_then(serde_json::Value::as_u64)
+        .unwrap_or(0) as usize;
+    let rows = if total == 0 { Vec::new() } else {
+        match crate::oaita::exec::ctrl_rpc("view.window",
+            serde_json::json!([vid, 0, total]))
+        {
+            Ok(v) => v.get("rows").and_then(|r| r.as_array().cloned())
+                      .unwrap_or_default(),
+            Err(_) => Vec::new(),
+        }
+    };
+    let _ = crate::oaita::exec::ctrl_rpc("view.close",
+        serde_json::json!([vid]));
+    // Drop synthetic directory-connector rows; keep file/symlink/deleted
+    // leaves and any xattr children. `kind == "dir"` IS the connector
+    // marker (real directory writes don't surface as their own rows).
+    let leaves: Vec<&serde_json::Value> = rows.iter()
+        .filter(|r| r.get("kind").and_then(serde_json::Value::as_str)
+                   .map(|k| k != "dir").unwrap_or(true))
+        .collect();
+    if leaves.is_empty() {
+        return format!(
+            "box:{raw_id}: no staged changes \
+             (the sub-agent settled without writing anything captured by the overlay)")
+            + &crate::oaita::hints::append(turns, &["inspect-box"]);
+    }
+    let mut out = format!("box:{raw_id}: {} changed path(s)\n\n", leaves.len());
+    for r in &leaves {
+        let path = r.get("path").and_then(serde_json::Value::as_str).unwrap_or("");
+        let kind = r.get("kind").and_then(serde_json::Value::as_str).unwrap_or("?");
+        let size = r.get("size").and_then(serde_json::Value::as_i64).unwrap_or(0);
+        out.push_str(&format!("  {kind:>7}  {size:>8}  {path}\n"));
+    }
+    out + &crate::oaita::hints::append(turns, &["inspect-box"])
+}
+
+/// `box:<id>/<file>` — that file's diff hunks, via the same `review.hunks`
+/// RPC the UI's right-pane diff viewer consumes.
+fn inspect_box_file(sid: i64, raw_id: &str, file: &str, turns: &[Turn]) -> String {
+    let r = match crate::oaita::exec::ctrl_rpc("review.hunks",
+        serde_json::json!([sid.to_string(), file]))
+    {
+        Ok(v) => v,
+        Err(e) => return format!("inspect: box:{raw_id}/{file}: {e}"),
+    };
+    let is_text = r.get("is_text").and_then(serde_json::Value::as_bool).unwrap_or(false);
+    let diff_kind = r.get("diff").and_then(|d| d.get("kind"))
+        .and_then(serde_json::Value::as_str).unwrap_or("");
+    if diff_kind == "error" {
+        let err = r.get("diff").and_then(|d| d.get("error"))
+            .and_then(serde_json::Value::as_str).unwrap_or("not in change set");
+        return format!("inspect: box:{raw_id}/{file}: {err}");
+    }
+    if !is_text {
+        return format!("box:{raw_id}/{file}: binary (no text diff)");
+    }
+    let mut out = format!("box:{raw_id}/{file}: diff\n\n");
+    let empty = vec![];
+    let hunks = r.get("hunks").and_then(serde_json::Value::as_array).unwrap_or(&empty);
+    for hk in hunks {
+        let lines = hk.get("lines").and_then(serde_json::Value::as_array)
+            .unwrap_or(&empty);
+        for line in lines {
+            let Some(pair) = line.as_array() else { continue; };
+            let tag = pair.first().and_then(serde_json::Value::as_str).unwrap_or(" ");
+            let txt = pair.get(1).and_then(serde_json::Value::as_str).unwrap_or("");
+            if tag == "hdr" {
+                out.push_str(&format!("{txt}\n"));
+            } else {
+                out.push_str(&format!("{tag}{txt}\n"));
             }
         }
     }
-    "sarun".to_string()
+    out + &crate::oaita::hints::append(turns, &["inspect-box"])
 }
 
 pub(crate) fn window_indices(window: &Window, n: usize, default_page: usize) -> (usize, usize) {

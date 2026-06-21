@@ -30,7 +30,7 @@ use crate::oaita::tools::{ExecResult, summarize_patch, fit_output,
 /// One synchronous request/reply over the engine control socket. The dial
 /// path is broker-via-SARUN_BROKER when in-box, filesystem host UDS when
 /// not — no fallback chain, no path-presence sniffing.
-fn ctrl_rpc(verb: &str, args: Value) -> Result<Value, String> {
+pub(crate) fn ctrl_rpc(verb: &str, args: Value) -> Result<Value, String> {
     let broker = std::env::var("SARUN_BROKER").ok().filter(|s| !s.is_empty());
     let mut s = if let Some(name) = broker.as_ref() {
         crate::runner::broker_dial(name)
