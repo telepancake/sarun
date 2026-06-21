@@ -57,6 +57,51 @@ pub trait XargsIo {
     fn cwd(&self) -> Option<&std::path::Path> {
         None
     }
+    /// Execute one fully-built command argv, returning a handle to await its exit
+    /// code — OR `None` to fall back to spawning a real `std::process::Command`.
+    /// The in-process embedder returns `Some(_)` to run the command through the
+    /// box's shell (so it may be a builtin / function / script, all snooped),
+    /// instead of `exec`ing a binary. Non-blocking: the returned [`ExecChild`] is
+    /// reaped later, which is what lets `-P` run several at once. Default `None`
+    /// keeps the standalone binary on its `Command` path.
+    fn submit(&self, argv: &[OsString]) -> Option<Box<dyn ExecChild>> {
+        let _ = argv;
+        None
+    }
+}
+
+/// A dispatched xargs command awaiting its exit code. The standalone binary
+/// backs this with a real `std::process::Child`; the in-process embedder backs
+/// it with a brush-dispatched command (see [`XargsIo::submit`]).
+pub trait ExecChild {
+    /// Block until the command finishes and return its exit code (`128 + signo`
+    /// if it was killed by a signal).
+    fn wait(self: Box<Self>) -> Result<i32, CommandExecutionError>;
+}
+
+/// The standalone backing for [`ExecChild`]: a real spawned process.
+struct ProcessChild(Child);
+
+impl ExecChild for ProcessChild {
+    fn wait(mut self: Box<Self>) -> Result<i32, CommandExecutionError> {
+        let status = self.0.wait().map_err(CommandExecutionError::CannotRun)?;
+        Ok(exit_code_of(status))
+    }
+}
+
+/// A process's exit code, encoding signal death as `128 + signo` (as a shell
+/// does), so all callers can reason about a single `i32`.
+fn exit_code_of(status: std::process::ExitStatus) -> i32 {
+    if let Some(code) = status.code() {
+        return code;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        return 128 + status.signal().unwrap_or(0);
+    }
+    #[cfg(not(unix))]
+    -1
 }
 
 /// The dependencies used when xargs runs as the real standalone executable:
@@ -400,9 +445,9 @@ impl CommandResult {
     }
 }
 
-#[allow(dead_code)] // `Killed` variant is never constructed on Windows
+#[allow(dead_code)] // some variants are platform- or path-specific
 #[derive(Debug)]
-enum CommandExecutionError {
+pub enum CommandExecutionError {
     // exit code 255
     UrgentlyFailed,
     Killed { signal: i32 },
@@ -491,66 +536,44 @@ impl CommandBuilder<'_> {
         Ok(())
     }
 
-    /// Build (but do not run) the child Command for a `Command` action. Shared
-    /// by the serial `execute` and the parallel `spawn` paths so they construct
-    /// the child identically (cwd, args, env, stdin, the `-t` trace, the logical
-    /// stdio dup). Only valid for `ExecAction::Command`.
-    fn build_command(&self, io: &dyn XargsIo) -> Command {
+    /// Build the final command argv (program + arguments) for a `Command`
+    /// action, applying any `-I` replacement. This is the exact word list that
+    /// is either handed to the embedder's shell (`XargsIo::submit`) or used to
+    /// spawn a `std::process::Command`. Only valid for `ExecAction::Command`.
+    fn build_argv(&self) -> Vec<OsString> {
         let (entry_point, initial_args): (&OsStr, &[OsString]) = match &self.options.action {
             ExecAction::Command(args) => (&args[0], &args[1..]),
-            ExecAction::Echo => unreachable!("build_command is only for Command actions"),
+            ExecAction::Echo => unreachable!("build_argv is only for Command actions"),
         };
+        let mut argv = vec![entry_point.to_os_string()];
+        if let Some(replace_str) = &self.options.replace {
+            // Replace all occurrences in initial args with the single extra arg
+            // (the `MaxArgsCommandSizeLimiter` guarantees exactly one here).
+            let replacement = self.extra_args[0].to_string_lossy();
+            for arg in initial_args {
+                argv.push(OsString::from(
+                    arg.to_string_lossy().replace(replace_str, &replacement),
+                ));
+            }
+        } else {
+            argv.extend(initial_args.iter().cloned());
+            argv.extend(self.extra_args.iter().cloned());
+        }
+        argv
+    }
 
-        let mut command = Command::new(entry_point);
-
-        // Run the child in the shell's LOGICAL cwd (in-process embedder), so
-        // relative input items and the command resolve against the box's cwd
-        // without the engine touching its own process cwd. No-op for standalone.
+    /// Build (but do not run) a real `std::process::Command` from a prepared
+    /// argv — the standalone binary's path. Applies the logical cwd, env, the
+    /// `close_stdin` flag, and the embedder's stdout/stderr dups.
+    fn build_command(&self, io: &dyn XargsIo, argv: &[OsString]) -> Command {
+        let mut command = Command::new(&argv[0]);
+        command.args(&argv[1..]).env_clear().envs(&self.options.env);
         if let Some(dir) = io.cwd() {
             command.current_dir(dir);
         }
-
-        if let Some(replace_str) = &self.options.replace {
-            // Replace all occurrences in initial args with the extra arg,
-            // Thanks to `MaxArgsCommandSizeLimiter`, we only process a single extra arg here.
-            let replacement = self.extra_args[0].to_string_lossy();
-            let initial_args: Vec<OsString> = initial_args
-                .iter()
-                .map(|arg| {
-                    let arg_str = arg.to_string_lossy();
-                    OsString::from(arg_str.replace(replace_str, &replacement))
-                })
-                .collect();
-
-            command
-                .args(&initial_args)
-                .env_clear()
-                .envs(&self.options.env);
-        } else {
-            // don't do any replacement
-            command
-                .args(initial_args)
-                .args(&self.extra_args)
-                .env_clear()
-                .envs(&self.options.env);
-        }
-
         if self.options.close_stdin {
             command.stdin(Stdio::null());
         }
-
-        if self.options.verbose {
-            let mut err = io.error_output().borrow_mut();
-            let _ = writeln!(err, "{command:?}");
-            let _ = err.flush();
-        }
-
-        // Route the spawned child's stdout/stderr to the embedder's logical
-        // streams when provided. The in-process builtin dups the shell's
-        // logical fds here, so `xargs cmd > file` / `xargs cmd | next` honor
-        // the box's redirects and pipes. Default (standalone) leaves the child
-        // inheriting the process fds, exactly as upstream does. Set after the
-        // `-t` trace so the verbose output is unchanged.
         if let Some(s) = io.child_stdout() {
             command.stdout(s);
         }
@@ -560,34 +583,14 @@ impl CommandBuilder<'_> {
         command
     }
 
-    /// Map a finished child's exit status to a `CommandResult` (success/failure)
-    /// or a hard `CommandExecutionError` (exit 255 = stop, or killed by signal).
-    /// Shared by serial `execute` and parallel reaping so both interpret a
-    /// child's outcome identically.
-    fn map_status(
-        status: std::process::ExitStatus,
-    ) -> Result<CommandResult, CommandExecutionError> {
-        if status.success() {
-            Ok(CommandResult::Success)
-        } else if let Some(err) = status.code() {
-            if err == 255 {
-                Err(CommandExecutionError::UrgentlyFailed)
-            } else {
-                Ok(CommandResult::Failure)
-            }
-        } else {
-            #[cfg(unix)]
-            {
-                use std::os::unix::process::ExitStatusExt;
-                if let Some(signal) = status.signal() {
-                    Err(CommandExecutionError::Killed { signal })
-                } else {
-                    Err(CommandExecutionError::Unknown)
-                }
-            }
-
-            #[cfg(not(unix))]
-            Err(CommandExecutionError::Unknown)
+    /// Map a finished command's exit code to a `CommandResult` or a hard
+    /// `CommandExecutionError`. Exit 255 means "stop now" to xargs; any other
+    /// non-zero (including `128 + signo` for a signal death) is a failure.
+    fn map_code(code: i32) -> Result<CommandResult, CommandExecutionError> {
+        match code {
+            0 => Ok(CommandResult::Success),
+            255 => Err(CommandExecutionError::UrgentlyFailed),
+            _ => Ok(CommandResult::Failure),
         }
     }
 
@@ -607,48 +610,64 @@ impl CommandBuilder<'_> {
         CommandResult::Success
     }
 
-    fn execute(self, io: &dyn XargsIo) -> Result<CommandResult, CommandExecutionError> {
+    /// Begin executing this builder's command, returning a handle to await its
+    /// exit code (`None` for the no-command `echo`, which runs in-process now).
+    /// Does NOT block: the caller waits the [`ExecChild`], which is what lets
+    /// `-P` keep several running at once. Honors the embedder's `submit` hook
+    /// (run through brush) and otherwise spawns a real process. The `-t` trace is
+    /// emitted here so both paths print it.
+    fn dispatch(
+        self,
+        io: &dyn XargsIo,
+    ) -> Result<Option<Box<dyn ExecChild>>, CommandExecutionError> {
         match &self.options.action {
-            ExecAction::Command(_) => match self.build_command(io).status() {
-                Ok(status) => Self::map_status(status),
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    Err(CommandExecutionError::NotFound)
+            ExecAction::Command(_) => {
+                let argv = self.build_argv();
+                if self.options.verbose {
+                    let mut err = io.error_output().borrow_mut();
+                    let line = argv.iter().map(|a| a.to_string_lossy()).collect::<Vec<_>>();
+                    let _ = writeln!(err, "{}", line.join(" "));
+                    let _ = err.flush();
                 }
-                Err(e) => Err(CommandExecutionError::CannotRun(e)),
-            },
-            ExecAction::Echo => Ok(self.run_echo(io)),
-        }
-    }
-
-    /// Parallel (`-P`) dispatch: SPAWN the child and return its handle instead of
-    /// waiting — the caller bounds concurrency and reaps each child by its own
-    /// pid (`Child::wait`), never `waitpid(-1)`, so it is safe in the shared
-    /// engine process (the same model as `cmd & cmd & wait`). Echo has no child:
-    /// it runs in-process now and returns `None`.
-    fn spawn(self, io: &dyn XargsIo) -> Result<Option<Child>, CommandExecutionError> {
-        match &self.options.action {
-            ExecAction::Command(_) => match self.build_command(io).spawn() {
-                Ok(child) => Ok(Some(child)),
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    Err(CommandExecutionError::NotFound)
+                // Embedder: run the command through the box's shell (builtin /
+                // function / external, all snooped). Standalone: spawn a process.
+                if let Some(child) = io.submit(&argv) {
+                    Ok(Some(child))
+                } else {
+                    match self.build_command(io, &argv).spawn() {
+                        Ok(child) => Ok(Some(Box::new(ProcessChild(child)))),
+                        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                            Err(CommandExecutionError::NotFound)
+                        }
+                        Err(e) => Err(CommandExecutionError::CannotRun(e)),
+                    }
                 }
-                Err(e) => Err(CommandExecutionError::CannotRun(e)),
-            },
+            }
             ExecAction::Echo => {
                 self.run_echo(io);
                 Ok(None)
             }
         }
     }
+
+    /// Run this builder's command to completion and map its outcome (serial).
+    fn execute(self, io: &dyn XargsIo) -> Result<CommandResult, CommandExecutionError> {
+        match self.dispatch(io)? {
+            Some(child) => Self::map_code(child.wait()?),
+            None => Ok(CommandResult::Success),
+        }
+    }
 }
 
-/// A bounded pool of concurrently running `-P` children. Concurrency is capped
-/// at `max`; when full, the oldest child is reaped before the next is spawned.
-/// Every reap is a specific-pid `Child::wait`, so the pool never disturbs the
-/// engine's other children — parallel xargs is just `(cmd)& … & wait`.
+/// A bounded pool of concurrently in-flight `-P` commands. Concurrency is capped
+/// at `max`; when full, the oldest in-flight command is reaped before the next
+/// is dispatched. Each child is awaited individually (a specific process for the
+/// standalone binary, a specific brush-dispatched command for the embedder), so
+/// the pool never disturbs anything else — parallel xargs is just
+/// `(cmd)& … & wait`.
 struct ParallelPool {
     max: usize,
-    running: Vec<Child>,
+    running: Vec<Box<dyn ExecChild>>,
     result: CommandResult,
 }
 
@@ -657,18 +676,17 @@ impl ParallelPool {
         Self { max, running: vec![], result: CommandResult::Success }
     }
 
-    /// Reap the OLDEST running child (FIFO), folding its outcome into `result`.
+    /// Reap the OLDEST in-flight command (FIFO), folding its outcome into result.
     fn reap_one(&mut self) -> Result<(), CommandExecutionError> {
         if self.running.is_empty() {
             return Ok(());
         }
-        let mut child = self.running.remove(0);
-        let status = child.wait().map_err(CommandExecutionError::CannotRun)?;
-        self.result.combine(CommandBuilder::map_status(status)?);
+        let child = self.running.remove(0);
+        self.result.combine(CommandBuilder::map_code(child.wait()?)?);
         Ok(())
     }
 
-    /// Spawn `builder`, first reaping down to below the concurrency cap.
+    /// Dispatch `builder`, first reaping down to below the concurrency cap.
     fn dispatch(
         &mut self,
         builder: CommandBuilder,
@@ -677,13 +695,13 @@ impl ParallelPool {
         while self.running.len() >= self.max {
             self.reap_one()?;
         }
-        if let Some(child) = builder.spawn(io)? {
+        if let Some(child) = builder.dispatch(io)? {
             self.running.push(child);
         }
         Ok(())
     }
 
-    /// Wait for every remaining child and return the combined result.
+    /// Wait for every remaining command and return the combined result.
     fn drain(mut self) -> Result<CommandResult, CommandExecutionError> {
         while !self.running.is_empty() {
             self.reap_one()?;
