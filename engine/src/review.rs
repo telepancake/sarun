@@ -406,12 +406,9 @@ impl NestCtx {
         Self { overlay }
     }
 
-    /// `id`'s parent box id: a live box knows its own parent(); else read the
-    /// on-disk sqlar meta.
+    /// `id`'s parent box id, from on-disk discovery (the authoritative sqlar
+    /// meta) — same answer whether or not the box is running.
     fn parent_of(&self, id: i64) -> Option<i64> {
-        if let Some(cb) = self.live(id) {
-            return cb.parent();
-        }
         crate::discover::discover().get(&id).and_then(|b| b.parent)
     }
 
@@ -422,20 +419,17 @@ impl NestCtx {
             .map(|b| b.box_id).collect()
     }
 
-    /// `id`'s live BoxState when the box is currently running, else None.
+    /// `id`'s live BoxState, used ONLY to refresh the in-RAM mirror after a
+    /// write so a running FUSE mount stays coherent — never to change the
+    /// logical read/write result, which is always the sqlar's.
     fn live(&self, id: i64) -> Option<std::sync::Arc<crate::capture::BoxState>> {
         self.overlay.as_ref().and_then(|o| o.live_box(id))
     }
 
-    /// D-parent: is `id`'s `readonly_parent` flag set? A live box answers
-    /// straight from its BoxState; an at-rest box reads the sqlar meta. The
-    /// flag is a child's ATTITUDE toward its parent — it stops `apply` from
-    /// promoting captured changes into the parent box's overlay.
+    /// D-parent: is `id`'s `readonly_parent` flag set? Read from the sqlar meta —
+    /// same answer running or not. The flag is a child's ATTITUDE toward its
+    /// parent; it stops `apply` from promoting captured changes into the parent.
     fn readonly_parent_of(&self, id: i64) -> bool {
-        if let Some(cb) = self.live(id) {
-            return cb.readonly_parent();
-        }
-        // At-rest: the single meta reader, no bespoke sqlar open here.
         crate::discover::box_meta(id).get("readonly_parent")
             .map(String::as_str) == Some("1")
     }
@@ -557,7 +551,6 @@ pub fn apply(id: i64, paths: &Value, ctx: &NestCtx) -> Value {
     // touch the host). The error string is the same shape Python returns so
     // the UI's error pane works uniformly.
     let ro_parent = ctx.readonly_parent_of(id);
-    let resolve = |b: i64| ctx.live(b);
     let mut applied = vec![];
     let mut errors = vec![];
     for rel in paths_arg(id, paths) {
@@ -568,7 +561,7 @@ pub fn apply(id: i64, paths: &Value, ctx: &NestCtx) -> Value {
             Some(p) => {
                 // Nested box: promote into the parent's overlay, not the host.
                 let plive = ctx.live(p);
-                promote_into_parent(id, p, plive.as_deref(), &rel, &resolve)
+                promote_into_parent(id, p, plive.as_deref(), &rel)
             }
             None => materialize(&conn, id, &rel),  // top-level: write the host
         }};
@@ -860,19 +853,15 @@ fn read_src_entry(src: i64, rel: &str) -> Option<SrcEntry> {
     Some(SrcEntry { rowid, mode: mode as u32, mtime, sz, data, opaque, owner, rdev, xattrs })
 }
 
-/// Does `id`'s OWN view (live RAM mirror when running, else at-rest sqlar)
-/// resolve `rel` to "whiteout" (a tombstone), "present" (file/symlink/dir/
-/// special), or None? Mirror of Python ChangeReview._own_kind.
-fn own_kind(id: i64, live: Option<&crate::capture::BoxState>, rel: &str)
-    -> Option<&'static str> {
-    if let Some(cb) = live {
-        use crate::capture::Entry;
-        return match cb.entry(rel) {
-            Some(Entry::Whiteout) => Some("whiteout"),
-            Some(_) => Some("present"),
-            None => None,
-        };
-    }
+/// Does `id`'s OWN view resolve `rel` to "whiteout" (a tombstone), "present"
+/// (file/symlink/dir/special), or None? Mirror of Python ChangeReview._own_kind.
+///
+/// Reads the box's sqlar — the single authoritative store. Every overlay write
+/// (live FUSE handler OR offline promote/copy-down) is write-through to the
+/// sqlar, and a live box's in-RAM `kinds` mirror is a strict subset of it (a
+/// whiteout is an `S_IFCHR` row, etc.), so the answer does NOT depend on whether
+/// a process is running in the box.
+fn own_kind(id: i64, rel: &str) -> Option<&'static str> {
     let conn = open_ro(id)?;
     let mode: u32 = conn.query_row("SELECT mode FROM sqlar WHERE name=?1", [rel],
                                    |r| r.get::<_, i64>(0)).ok().map(|m| m as u32)?;
@@ -885,29 +874,23 @@ fn own_kind(id: i64, live: Option<&crate::capture::BoxState>, rel: &str)
 ///   - no parent (top-level box): whether the host path exists or is a symlink;
 ///   - has parent p: inspect p's OWN entry — a whiteout means deleted (False);
 ///     a present entry means True; no own entry → recurse into p's lower.
-/// `resolve_live(p)` returns p's live BoxState when p is running (so the walk
-/// reads the RAM mirror, not a stale at-rest sqlar), else None. A `seen` set +
-/// depth cap (matching display_path) guard a circular parent chain.
-pub fn lower_has<F>(id: i64, resolve_live: &F, rel: &str) -> bool
-    where F: Fn(i64) -> Option<std::sync::Arc<crate::capture::BoxState>> {
+/// Reads the authoritative sqlar of each box in the chain (parent links from
+/// on-disk discovery), so the result does NOT depend on whether any box in the
+/// chain is running. A `seen` set + depth cap guard a circular parent chain.
+pub fn lower_has(id: i64, rel: &str) -> bool {
     let rel = rel.trim_start_matches('/');
     let boxes = crate::discover::discover();
     let mut cur = id;
     let mut seen = std::collections::HashSet::new();
     for _ in 0..64 {
-        // Parent: a live box knows its own parent(); else read at-rest meta.
-        let psid = match resolve_live(cur) {
-            Some(cb) => cb.parent(),
-            None => boxes.get(&cur).and_then(|b| b.parent),
-        };
-        let Some(psid) = psid else {
+        let Some(psid) = boxes.get(&cur).and_then(|b| b.parent) else {
             let host = Path::new("/").join(rel);
             return host.symlink_metadata().is_ok();
         };
         if !seen.insert(psid) {
             return false; // cycle in the parent chain: stop safely
         }
-        match own_kind(psid, resolve_live(psid).as_deref(), rel) {
+        match own_kind(psid, rel) {
             Some("whiteout") => return false,
             Some(_) => return true,
             None => cur = psid,
@@ -1040,17 +1023,14 @@ fn promote_record(e: &SrcEntry, src: i64, dst: i64,
 /// live BoxState (RAM mirror) when the parent is running. A deletion promotes as
 /// a whiteout iff the PARENT's own lower (its parent chain) still resolves rel to
 /// a present entry; otherwise it drops the parent's own row.
-pub fn promote_into_parent<F>(box_id: i64, parent: i64,
-                              parent_live: Option<&crate::capture::BoxState>,
-                              rel: &str, resolve_live: &F) -> Result<(), String>
-    where F: Fn(i64) -> Option<std::sync::Arc<crate::capture::BoxState>> {
+pub fn promote_into_parent(box_id: i64, parent: i64,
+                           parent_live: Option<&crate::capture::BoxState>,
+                           rel: &str) -> Result<(), String> {
     let rel = rel.trim_start_matches('/');
-    // The source is read from box_id's at-rest sqlar (apply() operates on a
-    // stopped box's archive — see apply()).
     let Some(e) = read_src_entry(box_id, rel) else {
         return Err("not in archive".into());
     };
-    let tombstone_as_whiteout = lower_has(parent, resolve_live, rel);
+    let tombstone_as_whiteout = lower_has(parent, rel);
     promote_record(&e, box_id, parent, parent_live, rel, tombstone_as_whiteout)
 }
 
