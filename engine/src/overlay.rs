@@ -725,6 +725,20 @@ impl Overlay {
         }
     }
 
+    /// The permission bits of the file at `rel` in box `bid`'s merged view, or
+    /// None if it isn't a regular file. Lets a host-side reader (oci build's
+    /// `COPY --from`) preserve a source file's exec bits. Hydrates on demand.
+    pub fn box_file_mode(&self, bid: i64, rel: &str) -> Option<u32> {
+        use std::os::unix::fs::PermissionsExt;
+        self.hydrate_chain(Some(bid));
+        match self.resolve(bid, rel) {
+            Layer::UpperFile { mode, .. } => Some((mode & 0o7777) as u32),
+            Layer::Lower => std::fs::symlink_metadata(self.host(rel)).ok()
+                .map(|m| m.permissions().mode() & 0o7777),
+            _ => None,
+        }
+    }
+
     /// Replace the contents of `rel` in box `bid`'s upper with `bytes`. Stages
     /// the write exactly as a FUSE write would (copy_up → truncate → write →
     /// finalize_file). If the file doesn't exist anywhere, this creates it
