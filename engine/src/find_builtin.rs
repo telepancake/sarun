@@ -30,6 +30,48 @@ use std::time::SystemTime;
 use brush_core::openfiles::OpenFile;
 use findutils::find::Dependencies;
 
+/// Establish the box's logical working directory on the CURRENT worker thread
+/// only, without mutating the engine's process-wide cwd. `unshare(CLONE_FS)`
+/// splits this thread's `fs_struct` (cwd/root/umask) from the rest of the
+/// process — unprivileged, NOT a namespace — after which `chdir` is
+/// thread-local. Shared by the `find` and `xargs` builtins.
+///
+/// If a thread-local cwd CANNOT be established (e.g. a seccomp filter blocks
+/// `unshare`), running in the engine's process cwd would silently walk the
+/// WRONG tree, so this returns an error (the caller refuses and reports it)
+/// UNLESS the process cwd already equals the logical cwd — in which case running
+/// is correct. Returns the bare reason on failure; the caller prefixes the tool
+/// name. (Audit H2: the old code silently fell back to the process cwd.)
+pub(crate) fn establish_thread_cwd(cwd: &std::path::Path) -> Result<(), String> {
+    // SAFETY: unshare with CLONE_FS only detaches this thread's fs context.
+    let owns_cwd = unsafe { libc::unshare(libc::CLONE_FS) } == 0;
+    if owns_cwd {
+        let c = std::ffi::CString::new(cwd.as_os_str().as_bytes())
+            .map_err(|_| "working directory path contains NUL".to_string())?;
+        // Thread-local after the unshare above; never the process cwd.
+        // SAFETY: `c` is a valid NUL-terminated C string.
+        if unsafe { libc::chdir(c.as_ptr()) } != 0 {
+            return Err(format!(
+                "cannot enter box working directory {}: {}",
+                cwd.display(),
+                std::io::Error::last_os_error()
+            ));
+        }
+        return Ok(());
+    }
+    // No thread-local cwd available. Only safe to proceed if the process cwd
+    // already matches the logical cwd; otherwise refuse rather than mislead.
+    let unshare_err = std::io::Error::last_os_error();
+    match std::env::current_dir() {
+        Ok(pcwd) if pcwd == cwd => Ok(()),
+        _ => Err(format!(
+            "cannot establish box working directory {} (unshare(CLONE_FS) failed: \
+             {unshare_err}); refusing to run in the wrong directory",
+            cwd.display()
+        )),
+    }
+}
+
 /// `find`'s injected dependencies, bound to one shell command's logical I/O.
 ///
 /// Built and used entirely on the worker thread. stdout/stderr are held as
@@ -127,13 +169,13 @@ impl brush_core::builtins::SimpleCommand for FindBuiltin {
         let spawned = std::thread::Builder::new()
             .name("sarun-find".into())
             .spawn(move || {
-                // Give this thread its own cwd, then point it at the logical dir.
-                let owns_cwd = unsafe { libc::unshare(libc::CLONE_FS) } == 0;
-                if owns_cwd {
-                    if let Ok(c) = std::ffi::CString::new(cwd.as_os_str().as_bytes()) {
-                        // Thread-local after the unshare above; never the process cwd.
-                        unsafe { libc::chdir(c.as_ptr()) };
-                    }
+                // Give this thread its own cwd pointed at the box's logical dir.
+                // If that can't be established, refuse loudly rather than walk
+                // the engine's cwd and return confidently-wrong results.
+                if let Err(msg) = establish_thread_cwd(&cwd) {
+                    let mut e = err;
+                    let _ = writeln!(e, "find: {msg}");
+                    return 1;
                 }
 
                 let deps = BrushFindDeps {

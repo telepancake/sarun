@@ -32,7 +32,6 @@
 
 use std::cell::RefCell;
 use std::io::{Read, Write};
-use std::os::unix::ffi::OsStrExt;
 use std::process::Stdio;
 
 use brush_core::openfiles::OpenFile;
@@ -127,14 +126,14 @@ impl brush_core::builtins::SimpleCommand for XargsBuiltin {
         let spawned = std::thread::Builder::new()
             .name("sarun-xargs".into())
             .spawn(move || {
-                // Give this thread its own cwd, then point it at the logical dir
-                // so the commands xargs spawns run in the shell's logical cwd.
-                let owns_cwd = unsafe { libc::unshare(libc::CLONE_FS) } == 0;
-                if owns_cwd {
-                    if let Ok(c) = std::ffi::CString::new(cwd.as_os_str().as_bytes()) {
-                        // Thread-local after the unshare above; never the process cwd.
-                        unsafe { libc::chdir(c.as_ptr()) };
-                    }
+                // Give this thread its own cwd pointed at the box's logical dir
+                // so the commands xargs spawns run there. If it can't be
+                // established, refuse loudly rather than spawn children in the
+                // engine's cwd (audit H2).
+                if let Err(msg) = crate::find_builtin::establish_thread_cwd(&cwd) {
+                    let mut e = err;
+                    let _ = writeln!(e, "xargs: {msg}");
+                    return 1;
                 }
 
                 let io = BrushXargsIo {
