@@ -185,10 +185,25 @@ fn save_box(boxname: &str, dest: Option<&str>) -> Result<(String, usize)> {
     let mut cfg: Value = serde_json::from_str(&cfg_json).context("parse oci_config")?;
     if let Value::Object(ref mut m) = cfg {
         m.insert("rootfs".into(), serde_json::json!({
-            "type": "layers", "diff_ids": diff_ids }));
+            "type": "layers", "diff_ids": diff_ids.clone() }));
         m.entry("architecture").or_insert_with(|| Value::String("amd64".into()));
         m.entry("os").or_insert_with(|| Value::String("linux".into()));
-        m.remove("history");   // would no longer match the re-emitted layers
+        // Preserve the build/load history (created_by recipe). It carries no
+        // layer digests, only an ordered empty_layer flag sequence, so it stays
+        // valid across re-emission AS LONG AS its non-empty count matches the
+        // layer count. Pad with generic entries when a box on top (e.g. a
+        // modified container) added layers the history doesn't mention.
+        let hist = m.remove("history").and_then(|h| match h {
+            Value::Array(a) => Some(a), _ => None }).unwrap_or_default();
+        let non_empty = hist.iter()
+            .filter(|e| e.get("empty_layer").and_then(Value::as_bool) != Some(true))
+            .count();
+        let mut hist = hist;
+        for _ in non_empty..diff_ids.len() {
+            hist.push(serde_json::json!({
+                "created_by": "sarun: box changes", "empty_layer": false }));
+        }
+        if !hist.is_empty() { m.insert("history".into(), Value::Array(hist)); }
     }
     let cfg_b = serde_json::to_vec(&cfg).context("serialize config")?;
     let cfg_d = format!("sha256:{}", sha256_hex(&cfg_b));
@@ -1022,6 +1037,15 @@ fn cli_build_worker(args: &[String]) -> i32 {
 use crate::dockerfile::{Cmdline, Instruction};
 use crate::dockerfile::expand;
 
+/// Render a Cmdline as it reads in a Dockerfile, for history/frame text: the
+/// shell form is the raw command string; the exec form is its JSON array.
+fn cmdline_display(c: &Cmdline) -> String {
+    match c {
+        Cmdline::Shell(s) => s.clone(),
+        Cmdline::Exec(args) => serde_json::to_string(args).unwrap_or_default(),
+    }
+}
+
 /// Accumulating build state: the current top layer box, the image config being
 /// assembled, build-time variables (ARG + ENV) for `$VAR` expansion, and the
 /// named-stage table for multi-stage `FROM name` / `FROM … AS name`.
@@ -1052,6 +1076,11 @@ struct Builder {
     step: usize,
     stages: HashMap<String, i64>,
     pending_stage: Option<String>,
+    // OCI config `history` accumulated across instructions (base image's history
+    // seeded first, then one entry per instruction). Layer-creating instructions
+    // are empty_layer=false; config-only ones true. Projected into the image
+    // config so `docker history` (and the Dockerfile emitter) see the recipe.
+    history: Vec<Value>,
 }
 
 impl Builder {
@@ -1070,10 +1099,75 @@ impl Builder {
             healthcheck_raw: None,
             current: None, started: false, step: 0,
             stages: HashMap::new(), pending_stage: None,
+            history: Vec::new(),
         }
     }
 
+    /// Run one instruction, then record it in the build history (and stamp a
+    /// per-box `frame` for layer-creating instructions).
     fn exec(&mut self, instr: &Instruction) -> Result<()> {
+        self.dispatch(instr)?;
+        self.record_history(instr);
+        Ok(())
+    }
+
+    /// Append the instruction to `self.history` (OCI config history) and, for a
+    /// layer-creating instruction, stamp the new box's `frame` meta with the
+    /// structured directive — the per-box record the Dockerfile emitter and the
+    /// interactive authoring/undo path read. FROM/ARG/unsupported add nothing.
+    fn record_history(&mut self, instr: &Instruction) {
+        if !self.started { return; }
+        let (created_by, empty_layer, frame): (String, bool, Option<Value>) = match instr {
+            Instruction::Run(c) => {
+                let t = cmdline_display(c);
+                (format!("RUN {t}"), false,
+                 Some(serde_json::json!({"directives": [{"op": "RUN", "text": t}]})))
+            }
+            Instruction::Copy { sources, dest, from, .. } => {
+                let pfx = from.as_ref().map(|s| format!("--from={s} ")).unwrap_or_default();
+                (format!("COPY {pfx}{} {dest}", sources.join(" ")), false,
+                 Some(serde_json::json!({"directives": [
+                    {"op": "COPY", "src": sources, "dst": dest, "from": from}]})))
+            }
+            Instruction::Add { sources, dest, .. } =>
+                (format!("ADD {} {dest}", sources.join(" ")), false,
+                 Some(serde_json::json!({"directives": [
+                    {"op": "ADD", "src": sources, "dst": dest}]}))),
+            Instruction::Env(p) => (format!("ENV {}",
+                p.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(" ")), true, None),
+            Instruction::Workdir(p) => (format!("WORKDIR {p}"), true, None),
+            Instruction::User(u) => (format!("USER {u}"), true, None),
+            Instruction::Cmd(c) => (format!("CMD {}", cmdline_display(c)), true, None),
+            Instruction::Entrypoint(c) => (format!("ENTRYPOINT {}", cmdline_display(c)), true, None),
+            Instruction::Label(p) => (format!("LABEL {}",
+                p.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(" ")), true, None),
+            Instruction::Expose(s) => (format!("EXPOSE {s}"), true, None),
+            Instruction::Volume(v) => (format!("VOLUME {}", v.join(" ")), true, None),
+            Instruction::Shell(v) => (format!("SHELL {}",
+                serde_json::to_string(v).unwrap_or_default()), true, None),
+            Instruction::Stopsignal(s) => (format!("STOPSIGNAL {s}"), true, None),
+            Instruction::Onbuild(s) => (format!("ONBUILD {s}"), true, None),
+            Instruction::Healthcheck(_) => ("HEALTHCHECK".to_string(), true, None),
+            Instruction::From { .. } | Instruction::Arg { .. }
+            | Instruction::Unsupported { .. } => return,
+        };
+        // `created` (RFC3339) is optional in the OCI spec; omit it rather than
+        // pull in a date dep.
+        self.history.push(serde_json::json!({
+            "created_by": created_by, "empty_layer": empty_layer }));
+        if let Some(frame) = frame {
+            if let Some(id) = self.current {
+                if let Ok(bx) = BoxState::create(id) {
+                    bx.set_meta("frame", &frame.to_string());
+                }
+            }
+        }
+        // Refresh the current box's stamped config so its oci_config carries the
+        // history so far; finish() re-stamps the top with the complete list.
+        self.stamp_current();
+    }
+
+    fn dispatch(&mut self, instr: &Instruction) -> Result<()> {
         match instr {
             Instruction::From { image, platform: _, stage_as } => self.do_from(image, stage_as),
             Instruction::Arg { name, default } => {
@@ -1455,6 +1549,11 @@ impl Builder {
         let meta = crate::discover::box_meta(id);
         let Some(j) = meta.get("oci_config") else { return; };
         let Ok(v) = serde_json::from_str::<serde_json::Value>(j) else { return; };
+        // Seed the base image's history as our prefix so the built image's
+        // `history` is base steps + this build's steps.
+        if let Some(h) = v.get("history").and_then(|x| x.as_array()) {
+            self.history = h.clone();
+        }
         let Some(inner) = v.get("config") else { return; };
         if let Some(env) = inner.get("Env").and_then(|e| e.as_array()) {
             for e in env {
@@ -1533,7 +1632,12 @@ impl Builder {
         } else if let Some(raw) = &self.healthcheck_raw {
             cfg.insert("Healthcheck".into(), raw.clone());
         }
-        serde_json::json!({ "config": cfg }).to_string()
+        let mut top = serde_json::Map::new();
+        top.insert("config".into(), serde_json::Value::Object(cfg));
+        if !self.history.is_empty() {
+            top.insert("history".into(), serde_json::json!(self.history));
+        }
+        serde_json::Value::Object(top).to_string()
     }
 
     fn stamp(&self, id: i64) {

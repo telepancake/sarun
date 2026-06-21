@@ -169,8 +169,16 @@ including closed-rootfs boot, COPY/glob landing, multi-stage `COPY --from`,
   and asserts each inherits no_host=1, re-parents top-level, and the descendant
   still boots (content survived) and stays closed. Still needs the verbs + image
   refcount/cascade.
-- [ ] **Container authoring (commit-style, NOT one-layer-per-pipeline).** With
-  `oci save` landed, the natural way to *make* an image is: run commands in a box
+- [ ] **Container authoring (commit-style, NOT one-layer-per-pipeline).**
+  FOUNDATION DONE: `oci build` writes an OCI config `history` (one entry per
+  instruction; RUN/COPY/ADD = empty_layer=false, config-only = true; base
+  history seeded as the prefix) AND a per-box `frame` meta (`{"directives":[…]}`)
+  on each layer box; `oci save` preserves/pads `history` so it round-trips and
+  `docker history` works (`test_oci.py`). Remaining: the interactive authoring
+  REPL (seal a child box per successful state-changing submission, writing its
+  `frame`; `undo` discards the top box + reseeds the line), a Dockerfile emitter
+  over the chain's `frame`s, and COPY-from-context detection via passthrough
+  reads. With `oci save` landed, the natural way to *make* an image is: run commands in a box
   on top of a base, then `oci save` the box's net changes as ONE layer + config
   (a `docker commit` with sarun's provenance attached). Do NOT make each brush
   pipeline its own image layer — that's layer explosion (a build is thousands of

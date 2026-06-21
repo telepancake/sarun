@@ -371,6 +371,19 @@ def main():
         except Exception: built_top = 0
         check(any_box_has_file(state_dir(e), "marker.txt"),
               "COPY landed marker.txt in a build layer box")
+        # build records an OCI `history` (recipe) in the image config, and a
+        # per-box `frame` directive on each layer box.
+        bt_cfg = meta_get(state_dir(e) / f"{built_top}.sqlar", "oci_config")
+        hist = json.loads(bt_cfg).get("history", []) if bt_cfg else []
+        crt = [h.get("created_by", "") for h in hist]
+        check(any(c.startswith("RUN ") for c in crt)
+              and any(c.startswith("COPY ") for c in crt),
+              f"build wrote an OCI history with RUN + COPY steps (got {crt})")
+        frames = [meta_get(p, "frame") for p in state_dir(e).glob("*.sqlar")]
+        frames = [json.loads(f) for f in frames if f]
+        ops = [d.get("op") for fr in frames for d in fr.get("directives", [])]
+        check("RUN" in ops and "COPY" in ops,
+              f"layer boxes carry per-box `frame` directives (ops={sorted(set(ops))})")
 
         # ── run the built result ─────────────────────────────────────────────
         r = sarun(e, "oci", "run", "--net", "off", "BUILT")
@@ -575,6 +588,12 @@ def main():
         r = sarun(e, "oci", "run", "--net", "off", "BUILTSAVED")
         check(r.returncode == 0 and "oci load" in (r.stdout + r.stderr),
               "the re-loaded saved image runs its CMD (faithful round-trip)")
+        bs_cfg = [json.loads(meta_get(p, "oci_config"))
+                  for p in state_dir(e).glob("*.sqlar") if meta_get(p, "oci_config")]
+        check(any(c.get("history") and
+                  any(h.get("created_by", "").startswith("RUN ") for h in c["history"])
+                  for c in bs_cfg),
+              "save preserved the OCI history (RUN step survives round-trip)")
         # A non-image (or absent) box can't be saved.
         r = sarun(e, "oci", "save", "NOSUCHBOX")
         check(r.returncode != 0, "oci save of an unknown box fails")
