@@ -556,6 +556,29 @@ def main():
               f"cosign: with no policy the same image loads unverified "
               f"(rc={r.returncode})")
 
+        # ── oci save: round-trip an image stack to an oci-archive ─────────────
+        # Export the multi-layer BUILT image, re-load the archive, and run it —
+        # proving the export is a valid, faithful, re-loadable OCI image (layer
+        # chain + config carried forward through the inverse of load's ingest).
+        saved = tmp / "saved.tar"
+        r = sarun(e, "oci", "save", "BUILT", "-o", str(saved))
+        check(r.returncode == 0 and "saved box 'BUILT'" in r.stdout,
+              f"oci save BUILT → oci-archive (rc={r.returncode}, "
+              f"out={r.stdout.strip()[-120:]})")
+        check(saved.exists()
+              and tarfile.open(saved).getnames()[:2] == ["oci-layout", "index.json"],
+              "saved archive is an oci-layout tar")
+        r = sarun(e, "oci", "load", f"oci-archive:{saved}", "BUILTSAVED")
+        check(r.returncode == 0,
+              f"re-load the saved archive (rc={r.returncode}, "
+              f"stderr={r.stderr.strip()[-150:]})")
+        r = sarun(e, "oci", "run", "--net", "off", "BUILTSAVED")
+        check(r.returncode == 0 and "oci load" in (r.stdout + r.stderr),
+              "the re-loaded saved image runs its CMD (faithful round-trip)")
+        # A non-image (or absent) box can't be saved.
+        r = sarun(e, "oci", "save", "NOSUCHBOX")
+        check(r.returncode != 0, "oci save of an unknown box fails")
+
         # ── dissolve carries the no_host closure DOWN to the children ─────────
         # SYN is a no_host image base: its rootfs is CLOSED (absent paths ENOENT,
         # never the host's fs). Every container/build box sits on top of it. The

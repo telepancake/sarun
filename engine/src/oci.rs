@@ -57,6 +57,7 @@ pub fn cli_oci(args: &[String]) -> i32 {
         "load" => cli_load(&args[1..]),
         "run" => cli_run(&args[1..]),
         "build" => cli_build(&args[1..]),
+        "save" => cli_save(&args[1..]),
         // Hidden: the host-side build worker the engine spawns for an in-box
         // `oci build` (see build_in_engine). Not for direct use.
         "__build-worker" => cli_build_worker(&args[1..]),
@@ -69,6 +70,8 @@ pub fn cli_oci(args: &[String]) -> i32 {
             println!("  sarun oci build [-t NAME] [-f FILE] [--net MODE] \
                       [--build-arg K=V]... [CONTEXT]");
             println!("       build an image box stack from a Dockerfile/Containerfile");
+            println!("  sarun oci save <box> [-o FILE.tar]");
+            println!("       export an image/container box stack to an oci-archive");
             println!();
             println!("  ref  e.g. alpine:3.20, ghcr.io/foo/bar:tag,");
             println!("       oci-archive:/path/to.tar, oci-layout:/path/to/dir,");
@@ -81,6 +84,265 @@ pub fn cli_oci(args: &[String]) -> i32 {
             2
         }
     }
+}
+
+// ── `sarun oci save` — the inverse of `oci load` ─────────────────────────────
+// Export a box (an OCI image/container stack from load/build/run) back to an
+// oci-archive: tar of an oci-layout, consumable by `oci load oci-archive:` and
+// by skopeo. Faithful: each box in the parent chain becomes one gzip tar layer
+// (inverting ingest_layer — files/dirs/symlinks/whiteouts/opaque/devices +
+// ownership), and the image config carries forward (rootfs.diff_ids rewritten
+// to the re-emitted layers). Host-side, read-only over at-rest box sqlars. The
+// chain must bottom at a CLOSED base (no_host_fallback) — a host-lower box's
+// diff isn't a standalone image.
+fn cli_save(args: &[String]) -> i32 {
+    let mut boxname: Option<String> = None;
+    let mut dest: Option<String> = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "-o" | "--output" => match it.next() {
+                Some(v) => dest = Some(v.clone()),
+                None => { eprintln!("sarun oci save: {a} needs an argument"); return 2; }
+            },
+            "-h" | "--help" => {
+                println!("usage: sarun oci save <box> [-o FILE.tar]");
+                return 0;
+            }
+            other if boxname.is_none() => boxname = Some(other.to_string()),
+            other => { eprintln!("sarun oci save: unexpected argument '{other}'"); return 2; }
+        }
+    }
+    let Some(boxname) = boxname else {
+        eprintln!("usage: sarun oci save <box> [-o FILE.tar]");
+        return 2;
+    };
+    if in_box() {
+        eprintln!("sarun oci save: run on the host — it reads at-rest box state, \
+                   which a closed box can't see");
+        return 1;
+    }
+    match save_box(&boxname, dest.as_deref()) {
+        Ok((path, n)) => {
+            println!("saved box '{boxname}' → oci-archive '{path}' ({n} layer(s))");
+            0
+        }
+        Err(e) => { eprintln!("sarun oci save: {e:#}"); 1 }
+    }
+}
+
+fn save_box(boxname: &str, dest: Option<&str>) -> Result<(String, usize)> {
+    let boxes = crate::discover::discover();
+    let id = resolve_box(&boxes, boxname)
+        .ok_or_else(|| anyhow!("no such box '{boxname}'"))?;
+    // Walk the parent chain to the root, then reverse → base..top (= layer order).
+    let mut chain = vec![id];
+    let mut cur = id;
+    while let Some(p) = boxes.get(&cur).and_then(|b| b.parent) {
+        chain.push(p);
+        cur = p;
+    }
+    chain.reverse();
+    let base = chain[0];
+    if boxes.get(&base).and_then(|b| b.meta.get("no_host_fallback")).map(String::as_str)
+        != Some("1") {
+        bail!("box '{boxname}' is not a closed image stack (its base falls through \
+               to the host) — `oci save` needs a load/build/run image base");
+    }
+    // The image config: the highest oci_config in the chain (top→base).
+    let cfg_json = chain.iter().rev()
+        .find_map(|b| boxes.get(b).and_then(|x| x.meta.get("oci_config")).cloned())
+        .ok_or_else(|| anyhow!("box '{boxname}' carries no oci_config — not an OCI \
+                                image (load/build it first)"))?;
+
+    let layout = paths::runtime_home()
+        .join(format!("oci-save-{}-{}", std::process::id(), now_ns()));
+    let blobs = layout.join("blobs").join("sha256");
+    std::fs::create_dir_all(&blobs).context("create save layout")?;
+    let _guard = TmpCleanup { dir: layout.clone(), file: layout.join(".none") };
+
+    let mut diff_ids: Vec<String> = Vec::new();
+    let mut layer_descs: Vec<Value> = Vec::new();
+    for &bx in &chain {
+        let tar = build_layer_tar(bx)
+            .with_context(|| format!("export layer box {bx}"))?;
+        diff_ids.push(format!("sha256:{}", sha256_hex(&tar)));
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(),
+                                                    flate2::Compression::default());
+        std::io::Write::write_all(&mut enc, &tar).context("gzip layer")?;
+        let gz = enc.finish().context("finish gzip layer")?;
+        let ldg = format!("sha256:{}", sha256_hex(&gz));
+        std::fs::write(blobs.join(ldg.trim_start_matches("sha256:")), &gz)
+            .context("write layer blob")?;
+        layer_descs.push(serde_json::json!({
+            "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+            "digest": ldg, "size": gz.len(),
+        }));
+    }
+
+    // Config: carry the image config forward, rewriting rootfs.diff_ids to the
+    // re-emitted layers and ensuring architecture/os are present.
+    let mut cfg: Value = serde_json::from_str(&cfg_json).context("parse oci_config")?;
+    if let Value::Object(ref mut m) = cfg {
+        m.insert("rootfs".into(), serde_json::json!({
+            "type": "layers", "diff_ids": diff_ids }));
+        m.entry("architecture").or_insert_with(|| Value::String("amd64".into()));
+        m.entry("os").or_insert_with(|| Value::String("linux".into()));
+        m.remove("history");   // would no longer match the re-emitted layers
+    }
+    let cfg_b = serde_json::to_vec(&cfg).context("serialize config")?;
+    let cfg_d = format!("sha256:{}", sha256_hex(&cfg_b));
+    std::fs::write(blobs.join(cfg_d.trim_start_matches("sha256:")), &cfg_b)
+        .context("write config blob")?;
+
+    let manifest = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {"mediaType": "application/vnd.oci.image.config.v1+json",
+                   "digest": cfg_d, "size": cfg_b.len()},
+        "layers": layer_descs,
+    });
+    let man_b = serde_json::to_vec(&manifest).context("serialize manifest")?;
+    let man_d = format!("sha256:{}", sha256_hex(&man_b));
+    std::fs::write(blobs.join(man_d.trim_start_matches("sha256:")), &man_b)
+        .context("write manifest blob")?;
+
+    let index = serde_json::json!({
+        "schemaVersion": 2,
+        "manifests": [{
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "digest": man_d, "size": man_b.len(),
+            "annotations": {"org.opencontainers.image.ref.name": boxname},
+        }],
+    });
+    std::fs::write(layout.join("index.json"),
+                   serde_json::to_vec(&index).context("serialize index")?)
+        .context("write index.json")?;
+    std::fs::write(layout.join("oci-layout"),
+                   serde_json::json!({"imageLayoutVersion": "1.0.0"}).to_string())
+        .context("write oci-layout")?;
+
+    let dest = dest.map(String::from).unwrap_or_else(|| format!("{boxname}.tar"));
+    _tar_layout_to(&layout, Path::new(&dest)).context("write oci-archive")?;
+    Ok((dest, chain.len()))
+}
+
+/// Build the uncompressed tar of one box's layer (its sqlar diff), inverting
+/// `ingest_layer`: regular files (bytes from the blob pool), dirs (+ a
+/// `.wh..wh..opq` when opaque), symlinks, char/block/fifo devices, and S_IFCHR
+/// whiteout tombstones (→ `.wh.<name>`). Ownership rides along.
+fn build_layer_tar(box_id: i64) -> Result<Vec<u8>> {
+    let sqlar = paths::state_home().join(format!("{box_id}.sqlar"));
+    let conn = rusqlite::Connection::open_with_flags(
+        &sqlar, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("open {}", sqlar.display()))?;
+    let mut tb = tar::Builder::new(Vec::new());
+    let mut st = conn.prepare(
+        "SELECT rowid,name,mode,data,opaque FROM sqlar ORDER BY name")?;
+    let rows: Vec<(i64, String, u32, Option<Vec<u8>>, i64)> = st.query_map([], |r| Ok((
+        r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)? as u32,
+        r.get::<_, Option<Vec<u8>>>(3)?, r.get::<_, i64>(4)?,
+    )))?.filter_map(|r| r.ok()).collect();
+    for (rowid, name, mode, data, opaque) in rows {
+        let kind = mode & 0o170000;
+        let perm = mode & 0o7777;
+        let (uid, gid) = owner_lookup(&conn, &name);
+        if name.is_empty() {
+            // The box-root opaque marker (name="") — emit it at the tar root.
+            if opaque != 0 { append_empty_file(&mut tb, ".wh..wh..opq")?; }
+            continue;
+        }
+        match kind {
+            0o040000 => {   // directory
+                let mut h = tar::Header::new_gnu();
+                h.set_entry_type(tar::EntryType::Directory);
+                h.set_mode(perm); h.set_size(0);
+                h.set_uid(uid as u64); h.set_gid(gid as u64);
+                tb.append_data(&mut h, &name, std::io::empty())?;
+                if opaque != 0 {
+                    append_empty_file(&mut tb, &format!("{name}/.wh..wh..opq"))?;
+                }
+            }
+            0o120000 => {   // symlink — target is the sqlar data
+                let target = String::from_utf8_lossy(&data.unwrap_or_default())
+                    .into_owned();
+                let mut h = tar::Header::new_gnu();
+                h.set_entry_type(tar::EntryType::Symlink);
+                h.set_mode(perm); h.set_size(0);
+                h.set_uid(uid as u64); h.set_gid(gid as u64);
+                tb.append_link(&mut h, &name, &target)?;
+            }
+            0o020000 if rdev_lookup(&conn, &name).is_none() => {
+                // S_IFCHR with no device row = a whiteout tombstone → `.wh.<name>`.
+                append_empty_file(&mut tb, &whiteout_path(&name))?;
+            }
+            0o020000 | 0o060000 | 0o010000 => {   // char / block / fifo device
+                let dev = rdev_lookup(&conn, &name).unwrap_or(0);
+                let et = match kind {
+                    0o020000 => tar::EntryType::Char,
+                    0o060000 => tar::EntryType::Block,
+                    _ => tar::EntryType::Fifo,
+                };
+                let mut h = tar::Header::new_gnu();
+                h.set_entry_type(et);
+                h.set_mode(perm); h.set_size(0);
+                h.set_uid(uid as u64); h.set_gid(gid as u64);
+                let _ = h.set_device_major(((dev >> 8) & 0xfff) as u32);
+                let _ = h.set_device_minor((dev & 0xff) as u32);
+                tb.append_data(&mut h, &name, std::io::empty())?;
+            }
+            _ => {   // regular file — bytes live in the blob pool
+                let bytes = std::fs::read(crate::capture::blob_path(box_id, rowid))
+                    .unwrap_or_default();
+                let mut h = tar::Header::new_gnu();
+                h.set_entry_type(tar::EntryType::Regular);
+                h.set_mode(perm); h.set_size(bytes.len() as u64);
+                h.set_uid(uid as u64); h.set_gid(gid as u64);
+                tb.append_data(&mut h, &name, &bytes[..])?;
+            }
+        }
+    }
+    tb.into_inner().context("finish layer tar")
+}
+
+/// `.wh.<basename>` in the entry's parent directory (AUFS whiteout convention).
+fn whiteout_path(name: &str) -> String {
+    match name.rsplit_once('/') {
+        Some((parent, base)) => format!("{parent}/.wh.{base}"),
+        None => format!(".wh.{name}"),
+    }
+}
+
+fn append_empty_file<W: std::io::Write>(tb: &mut tar::Builder<W>, path: &str)
+    -> Result<()> {
+    let mut h = tar::Header::new_gnu();
+    h.set_entry_type(tar::EntryType::Regular);
+    h.set_mode(0o644); h.set_size(0);
+    tb.append_data(&mut h, path, std::io::empty())?;
+    Ok(())
+}
+
+fn owner_lookup(conn: &rusqlite::Connection, name: &str) -> (u32, u32) {
+    conn.query_row("SELECT uid,gid FROM ownership WHERE name=?1", [name],
+                   |r| Ok((r.get::<_, i64>(0)? as u32, r.get::<_, i64>(1)? as u32)))
+        .unwrap_or((0, 0))
+}
+
+fn rdev_lookup(conn: &rusqlite::Connection, name: &str) -> Option<u64> {
+    conn.query_row("SELECT dev FROM rdev WHERE name=?1", [name],
+                   |r| r.get::<_, i64>(0)).ok().map(|d| d as u64)
+}
+
+/// Tar an oci-layout dir into `dest` (oci-archive format).
+fn _tar_layout_to(layout: &Path, dest: &Path) -> Result<()> {
+    let f = File::create(dest)
+        .with_context(|| format!("create {}", dest.display()))?;
+    let mut tb = tar::Builder::new(f);
+    tb.append_path_with_name(layout.join("oci-layout"), "oci-layout")?;
+    tb.append_path_with_name(layout.join("index.json"), "index.json")?;
+    tb.append_dir_all("blobs", layout.join("blobs"))?;
+    tb.finish()?;
+    Ok(())
 }
 
 fn cli_load(args: &[String]) -> i32 {
