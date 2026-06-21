@@ -179,6 +179,23 @@ including closed-rootfs boot, COPY/glob landing, multi-stage `COPY --from`,
   valid zstd stream so plain-zstd decoding is already correct, just not chunked
   — leave unless a real workload needs the TOC fast path. (`ADD <url>` over
   HTTPS already works via `reqwest` — the auth gap is FROM-pull only.)
+- [ ] **Move the registry pull/unpack into the engine (RPC), keep box exec in
+  the CLI.** Today `oci load/run/build` do the pull IN THE INVOKING PROCESS
+  (`resolve_image_top`/`load`), so an *in-box* `sarun oci` unpacks through the
+  box's netns+FUSE. The pull should be an engine RPC (e.g. an `oci.resolve`
+  verb in `control.rs::dispatch_ui`) so it always runs host-side; the box
+  *execution* (`runner::run`) stays in the CLI process for foreground stdio.
+  Credentials already live host-side (`registry_auth_for` reads the host Docker
+  config; boxes can't read it), so this is an **architecture** cleanup, not a
+  creds-leak fix — it additionally lets `--net off` boxes do registry ops via
+  the engine. **HAZARD (must fix before doing this):** the engine allocates box
+  ids as `max(at-rest sqlars, live overlay ids) + 1` under the state lock
+  (`control.rs:702`), but `oci.rs::next_box_id()` scans at-rest sqlars only —
+  an engine-driven `load()`/`install_chain` would collide with a live box that
+  has no sqlar yet. Thread the engine's synchronized allocator into
+  `install_chain` instead of `next_box_id()`. Validate with `test_oci.py` (it
+  runs `serve`), but note it's sequential so it won't catch the id-alloc race —
+  add a concurrency check. Deferred from the autonomous pass for this reason.
 
 ## Branch / workflow
 Develop on the branch you were told to; commit with clear messages; push only
