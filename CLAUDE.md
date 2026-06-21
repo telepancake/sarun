@@ -179,17 +179,13 @@ including closed-rootfs boot, COPY/glob landing, multi-stage `COPY --from`,
   valid zstd stream so plain-zstd decoding is already correct, just not chunked
   — leave unless a real workload needs the TOC fast path. (`ADD <url>` over
   HTTPS already works via `reqwest` — the auth gap is FROM-pull only.)
-- [ ] **`oci build` context for the IN-BOX case.** The registry pull/unpack now
-  runs host-side in the engine (`oci.load`/`oci.resolve` verbs in
-  `control.rs::dispatch_ui`; the CLI RPCs them via `engine_conn`/`engine_rpc_on`,
-  with a local fallback only on the host when no `serve` is up). `install_chain`
-  uses `mint_box_id()` (scans state_home AND live_home, so no collision with a
-  live box that has no at-rest sqlar yet). But `oci build`'s OWN layer creation
-  (COPY/ADD/RUN-result via `BoxState::create` in the build process) still runs
-  CLI-side, so an *in-box* `oci build` writes those layers through the box's
-  FUSE and reads its context from the box. Moving build's COPY/ADD/RUN-layer
-  creation into the engine too (or shipping the context to it) is the remaining
-  piece; host builds and all of `oci load`/`oci run` are already engine-side.
+All of `oci load`/`run`/`build` are now engine-side: the pull/unpack runs
+host-side (`oci.load`/`oci.resolve` verbs), and an *in-box* `oci build` ships
+its context (gzip-tar) to the engine's `oci.build` verb, which runs the build in
+a host-side worker (`oci __build-worker`) so every layer box lands in engine
+state, not the box's FUSE (`test_oci.py` covers the in-box build). `install_chain`
+uses `mint_box_id()` (scans state_home AND live_home) so engine-side loads can't
+collide with a live box that has no at-rest sqlar yet.
 
 ## Branch / workflow
 Develop on the branch you were told to; commit with clear messages; push only

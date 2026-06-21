@@ -1575,6 +1575,18 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
                 Err(e) => return json!({"ok": false, "error": format!("{e:#}")}),
             }
         }
+        // In-box `oci build`: the CLI ships its context + Dockerfile here so the
+        // build runs host-side (its layer boxes land in engine state, not the
+        // box's FUSE). Returns the worker's output + exit code + top box id.
+        "oci.build" => {
+            let Some(spec) = args.first() else {
+                return json!({"ok": false, "error": "oci.build: missing spec"});
+            };
+            match crate::oci::build_in_engine(spec) {
+                Ok(v) => v,
+                Err(e) => return json!({"ok": false, "error": format!("{e:#}")}),
+            }
+        }
         other => {
             return json!({"ok": false, "error": format!("unknown verb '{other}'")});
         }
