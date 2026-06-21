@@ -384,6 +384,12 @@ def main():
         ops = [d.get("op") for fr in frames for d in fr.get("directives", [])]
         check("RUN" in ops and "COPY" in ops,
               f"layer boxes carry per-box `frame` directives (ops={sorted(set(ops))})")
+        # the Dockerfile emitter reconstructs the recipe from the chain's frames
+        r = sarun(e, "oci", "dockerfile", "BUILT")
+        df = r.stdout
+        check(r.returncode == 0 and df.startswith("FROM ")
+              and "RUN " in df and "COPY " in df and "CMD " in df,
+              f"oci dockerfile reconstructs FROM+RUN+COPY+CMD:\n{df.strip()}")
 
         # ── run the built result ─────────────────────────────────────────────
         r = sarun(e, "oci", "run", "--net", "off", "BUILT")
