@@ -994,6 +994,23 @@ fn augmented_ca_bundle(ca: &crate::net::ca::Ca) -> Option<String> {
     Some(bundle)
 }
 
+/// Engine-startup hook: pre-write the host-side files the FUSE overlay
+/// shadows into every `--api` box. One write per engine lifetime; the
+/// content is engine-wide (the MITM CA is engine-wide, the box-side
+/// gateway IP is the fixed per-subnet value). Boxes never write here;
+/// the path lives under runtime_home alongside `api-box-oaita.toml`.
+pub fn write_api_box_net_shadows(net: &crate::net::Net)
+    -> std::io::Result<()>
+{
+    if let Some(bundle) = augmented_ca_bundle(&net.ca) {
+        std::fs::write(crate::paths::api_box_ca_pem_path(), bundle)?;
+    }
+    let gw = ipv4_str(crate::net::tap::box_subnet().gateway_ip());
+    std::fs::write(crate::paths::api_box_resolv_conf_path(),
+                   format!("nameserver {gw}\n"))?;
+    Ok(())
+}
+
 fn dispatch_ui(state: &State, msg: &Value) -> Value {
     let verb = msg.get("verb").and_then(Value::as_str).unwrap_or("");
     let empty = vec![];

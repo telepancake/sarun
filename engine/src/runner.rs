@@ -32,7 +32,7 @@ const KIDS_DIR: &str = ".slopbox-kids";
 /// coverage as of 2026: Debian/Ubuntu (ca-certificates.crt), RHEL/Fedora
 /// (tls/certs/ca-bundle.crt + the .pem twin), Alpine (cert.pem). `--ro-bind-try`
 /// silently skips paths the box's filesystem doesn't ship.
-const CA_BUNDLE_TARGETS: &[&str] = &[
+pub const CA_BUNDLE_TARGETS: &[&str] = &[
     "/etc/ssl/certs/ca-certificates.crt",
     "/etc/pki/tls/certs/ca-bundle.crt",
     "/etc/pki/tls/certs/ca-bundle.trust.crt",
@@ -567,27 +567,19 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
         crate::net::NetMode::Tap => { /* already in our own TAP netns */ }
     }
     if !ca_pem.is_empty() {
-        // CA bundle augmentation (sakar parity): the engine sent the bundle
-        // CONTENT, not a host path — materialize it in OUR namespace (host for a
-        // top-level runner, the box's fs for a NESTED one) so the bind source is
-        // always reachable, then bind it over each common system CA path. Fail
-        // LOUD if we can't write it (never silently ship an un-MITM'd box).
-        let ca_tmp = std::env::temp_dir()
-            .join(format!("sarun-ca-{}.pem", std::process::id()));
-        if let Err(e) = std::fs::write(&ca_tmp, ca_pem.as_bytes()) {
-            eprintln!("sarun-engine: write CA bundle {}: {e}", ca_tmp.display());
-            return 1;
-        }
-        let ca_src = ca_tmp.to_string_lossy().into_owned();
-        // The env vars need a path that exists INSIDE the box — use the
-        // canonical Debian/Ubuntu one (most common; also bound). Bound
-        // unconditionally (NOT --ro-bind-try) so the env-var path resolves.
+        // CA bundle for the engine's MITM. The engine writes a single
+        // host-side bundle once at startup (paths::api_box_ca_pem_path);
+        // the FUSE overlay shadows /etc/ssl/certs/ca-certificates.crt
+        // (and the rest of CA_BUNDLE_TARGETS) for every `--api` box,
+        // serving the engine's bundle bytes when the box reads them.
+        // Same pattern the safe-oaita.toml shadow uses for --api boxes —
+        // see overlay::Overlay::attr_of / matches_host_oaita_config.
+        //
+        // The runner needs no bwrap binds for any of those paths. We
+        // only set the env vars pointing at the canonical path so tools
+        // that look up SSL_CERT_FILE / CURL_CA_BUNDLE / etc resolve to
+        // it.
         let canonical_inside = "/etc/ssl/certs/ca-certificates.crt";
-        bwrap.args(["--ro-bind", &ca_src, canonical_inside]);
-        for tgt in CA_BUNDLE_TARGETS {
-            if *tgt == canonical_inside { continue; }
-            bwrap.arg("--ro-bind-try").arg(&ca_src).arg(tgt);
-        }
         for (k, v) in [("SSL_CERT_FILE", canonical_inside),
                        ("CURL_CA_BUNDLE", canonical_inside),
                        ("NODE_EXTRA_CA_CERTS", canonical_inside),
@@ -596,16 +588,9 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
             bwrap.args(["--setenv", k, v]);
         }
     }
-    if !dns_ip.is_empty() {
-        // resolv.conf override: the box's stub resolver dials the engine's
-        // gateway IP for DNS. One synthetic file under the runner's tempdir,
-        // bound over /etc/resolv.conf inside the box.
-        let resolv = format!("nameserver {dns_ip}\n");
-        let tmp = std::env::temp_dir().join(format!("sarun-resolv-{}", std::process::id()));
-        let _ = std::fs::write(&tmp, resolv);
-        let tmp_s = tmp.to_string_lossy().into_owned();
-        bwrap.args(["--ro-bind", &tmp_s, "/etc/resolv.conf"]);
-    }
+    // resolv.conf: also a FUSE shadow for --api / Tap boxes — the
+    // overlay synthesizes "nameserver <dns_ip>\n" when the box reads
+    // /etc/resolv.conf. No bwrap bind required.
     bwrap.args(["--chdir", &cwd, "--"]);
     let status = bwrap.args(&inner_args).args(&cmd).status();
     drop(conn); // our copy; inner (in the box) is the channel's sole holder now

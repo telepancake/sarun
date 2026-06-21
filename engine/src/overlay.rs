@@ -427,6 +427,18 @@ impl Overlay {
         rel == stripped
     }
 
+    /// True when `rel` is one of the engine's MITM-CA shadow targets —
+    /// the canonical system CA bundle paths the runner USED to bwrap-
+    /// bind into the box. For `--api` boxes the overlay now serves
+    /// these from the engine's pre-written augmented bundle instead.
+    fn matches_api_box_ca_target(rel: &str) -> bool {
+        for tgt in crate::runner::CA_BUNDLE_TARGETS {
+            let s = tgt.strip_prefix('/').unwrap_or(tgt);
+            if rel == s { return true; }
+        }
+        false
+    }
+
     /// True when `rel` is the substituted oaita.toml OR one of its ancestor
     /// directories — so that the self-hide gate keeps the path TO the file
     /// reachable even when the parent dirs (config_home) are otherwise
@@ -1061,6 +1073,35 @@ impl Overlay {
                 return Some(a);
             }
         }
+        // --api MITM CA bundle: when the box reads any of the canonical
+        // CA bundle paths and the lower (host) would otherwise serve, we
+        // shadow it with the engine's pre-written augmented bundle
+        // (host system + engine MITM root). The runner USED to bwrap-
+        // bind a memfd/tempfile here, but a NESTED runner's `/tmp` is
+        // overlay-captured — those binds left `sarun-ca-{pid}.pem`
+        // noise in the parent box's overlay. Same shape as the
+        // oaita.toml shadow above; the box reads canonical paths and
+        // gets engine-controlled content, no on-disk write or bind.
+        if matches!(layer, Layer::Lower) && b.is_api()
+            && Self::matches_api_box_ca_target(rel) {
+            let safe = crate::paths::api_box_ca_pem_path();
+            if let Ok(md) = std::fs::metadata(&safe) {
+                let mut a = self.attr_from_md(ino, &md);
+                a.kind = FileType::RegularFile;
+                return Some(a);
+            }
+        }
+        // --api resolv.conf: synthetic `nameserver <engine-gateway>\n`
+        // so the box's stub resolver dials the engine's per-box DNS.
+        // Same shadow pattern, same reasons.
+        if matches!(layer, Layer::Lower) && b.is_api() && rel == "etc/resolv.conf" {
+            let safe = crate::paths::api_box_resolv_conf_path();
+            if let Ok(md) = std::fs::metadata(&safe) {
+                let mut a = self.attr_from_md(ino, &md);
+                a.kind = FileType::RegularFile;
+                return Some(a);
+            }
+        }
         // Brush-mode shadow: if the box is -b AND this lookup falls
         // through to the lower (host) AND the rel matches one of the
         // compiled shadow patterns, serve the engine binary's attrs.
@@ -1366,6 +1407,10 @@ impl Filesystem for Overlay {
                 // the rel is the host oaita.toml path.
                 let host = if b.is_api() && Self::matches_host_oaita_config(&rel) {
                     crate::paths::api_box_oaita_toml_path()
+                } else if b.is_api() && Self::matches_api_box_ca_target(&rel) {
+                    crate::paths::api_box_ca_pem_path()
+                } else if b.is_api() && rel == "etc/resolv.conf" {
+                    crate::paths::api_box_resolv_conf_path()
                 } else if b.is_brush() && self.shadow_matches(&rel) {
                     self.shadow_target_path().unwrap_or_else(|| self.host(&rel))
                 } else { self.host(&rel) };
