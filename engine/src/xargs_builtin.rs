@@ -80,7 +80,9 @@ impl XargsIo for BrushXargsIo {
         // instead of spawning a process. The child's cwd, env, and stdio come
         // from the subshell + params the executor runs `run_argv` with — so we
         // do NOT need `cwd`/`child_stdout`/`child_stderr` here.
-        Some(Box::new(BridgeChild(self.submitter.submit(argv))))
+        // xargs commands always run in the shell's logical cwd (no per-command
+        // dir like find -execdir), so pass `None`.
+        Some(Box::new(BridgeChild(self.submitter.submit(argv, None))))
     }
 }
 

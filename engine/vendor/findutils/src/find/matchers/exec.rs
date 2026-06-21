@@ -7,10 +7,25 @@
 use std::cell::RefCell;
 use std::error::Error;
 use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use super::{Matcher, MatcherIO, WalkEntry};
+
+/// sarun: the directory a `-execdir`/`-okdir` command runs in (the entry's
+/// parent), or `None` for the shell's own logical cwd — used both by a normal
+/// `-exec` (the subshell already has the cwd) and the awkward `parent == ""`
+/// case. Mirrors the `current_dir` choices in the process-spawning path.
+fn exec_dir_cwd(exec_in_parent_dir: bool, file_info: &WalkEntry) -> Option<PathBuf> {
+    if !exec_in_parent_dir {
+        return None;
+    }
+    match file_info.path().parent() {
+        None => Some(file_info.path().to_path_buf()), // root "/" → run from "/"
+        Some(p) if p == Path::new("") => None,        // "foo" → avoid chdir("")
+        Some(p) => Some(p.to_path_buf()),
+    }
+}
 
 enum Arg {
     FileArg(Vec<OsString>),
@@ -104,14 +119,26 @@ impl Matcher for SingleExecMatcher {
             }
         }
 
-        let mut command = Command::new(&resolved_executable);
-
+        // The fully-substituted argv (program + each arg, with {} replaced).
+        let mut argv: Vec<OsString> = vec![resolved_executable.clone()];
         for arg in &self.args {
-            match *arg {
-                Arg::LiteralArg(ref a) => command.arg(a.as_os_str()),
-                Arg::FileArg(ref parts) => command.arg(parts.join(path_to_file.as_os_str())),
-            };
+            argv.push(match *arg {
+                Arg::LiteralArg(ref a) => a.clone(),
+                Arg::FileArg(ref parts) => parts.join(path_to_file.as_os_str()),
+            });
         }
+
+        // sarun: run the command through the embedder's shell (builtin /
+        // function / external, snooped) instead of spawning a process. -execdir
+        // runs in the entry's parent dir; a normal -exec runs in the shell's own
+        // logical cwd (cwd == None — the subshell already has it).
+        if matcher_io.deps.exec_via_shell() {
+            let cwd = exec_dir_cwd(self.exec_in_parent_dir, file_info);
+            return matcher_io.deps.run(&argv, cwd.as_deref()) == 0;
+        }
+
+        let mut command = Command::new(&argv[0]);
+        command.args(&argv[1..]);
         if self.exec_in_parent_dir {
             match file_info.path().parent() {
                 None => {
@@ -165,8 +192,13 @@ pub struct MultiExecMatcher {
     executable: String,
     args: Vec<OsString>,
     exec_in_parent_dir: bool,
-    /// Command to build while matching.
+    /// Command to build while matching (the process-spawning / standalone path).
     command: RefCell<Option<argmax::Command>>,
+    /// sarun: accumulated path arguments for the shell-exec path. In-process
+    /// `run_argv` has no `execve` arg-length limit, so we just collect every
+    /// matched path and flush them in one command per batch (a directory for
+    /// `-execdir`, or the whole run for `-exec`).
+    pending: RefCell<Vec<OsString>>,
 }
 
 impl MultiExecMatcher {
@@ -182,7 +214,26 @@ impl MultiExecMatcher {
             args: transformed_args,
             exec_in_parent_dir,
             command: RefCell::new(None),
+            pending: RefCell::new(Vec::new()),
         })
+    }
+
+    /// sarun: flush the accumulated `pending` paths as ONE command through the
+    /// embedder's shell, in `cwd` (the entry's parent for `-execdir`, else the
+    /// logical cwd). A non-zero exit sets find's exit code, matching the
+    /// process-spawning path.
+    fn dispatch_via_shell(&self, cwd: Option<&Path>, matcher_io: &mut MatcherIO) {
+        let pending = std::mem::take(&mut *self.pending.borrow_mut());
+        if pending.is_empty() {
+            return;
+        }
+        let mut argv: Vec<OsString> = Vec::with_capacity(1 + self.args.len() + pending.len());
+        argv.push(OsString::from(&self.executable));
+        argv.extend(self.args.iter().cloned());
+        argv.extend(pending);
+        if matcher_io.deps.run(&argv, cwd) != 0 {
+            matcher_io.set_exit_code(1);
+        }
     }
 
     fn new_command(&self) -> argmax::Command {
@@ -235,6 +286,14 @@ impl Matcher for MultiExecMatcher {
         } else {
             file_info.display_path().to_path_buf()
         };
+
+        // sarun: shell-exec path — just accumulate; flushed per batch in
+        // finished()/finished_dir(). No `execve` arg limit applies in-process.
+        if matcher_io.deps.exec_via_shell() {
+            self.pending.borrow_mut().push(path_to_file.into_os_string());
+            return true;
+        }
+
         let mut command = self.command.borrow_mut();
         let command = command.get_or_insert_with(|| self.new_command());
 
@@ -273,8 +332,12 @@ impl Matcher for MultiExecMatcher {
     }
 
     fn finished_dir(&self, dir: &Path, matcher_io: &mut MatcherIO) {
-        // Dispatch command for -execdir.
+        // Dispatch command for -execdir (one batch per directory).
         if self.exec_in_parent_dir {
+            if matcher_io.deps.exec_via_shell() {
+                self.dispatch_via_shell(Some(dir), matcher_io);
+                return;
+            }
             let mut command = self.command.borrow_mut();
             if let Some(mut command) = command.take() {
                 command.current_dir(Path::new(".").join(dir));
@@ -284,8 +347,12 @@ impl Matcher for MultiExecMatcher {
     }
 
     fn finished(&self, matcher_io: &mut MatcherIO) {
-        // Dispatch command for -exec.
+        // Dispatch command for -exec (one batch for the whole run).
         if !self.exec_in_parent_dir {
+            if matcher_io.deps.exec_via_shell() {
+                self.dispatch_via_shell(None, matcher_io);
+                return;
+            }
             let mut command = self.command.borrow_mut();
             if let Some(mut command) = command.take() {
                 self.run_command(&mut command, matcher_io);
