@@ -15,11 +15,11 @@
 //! environment, traps, and open files, but is NOT a separate OS process (see
 //! `commands::invoke_command_in_subshell_and_get_output`). `env FOO=bar cmd`
 //! must not leak `FOO`/`-C`/etc. into the calling shell, so we clone, apply the
-//! mutations to the clone, and run `COMMAND` on the clone via
-//! `Shell::run_string` (the same primitive `eval` uses) — which goes through the
-//! full builtin/function/external dispatch and returns the command's real exit
-//! status. The clone is dropped afterward, so the mutations vanish exactly when
-//! they should.
+//! mutations to the clone, and run the residual `COMMAND [ARG]...` on the clone
+//! via `Shell::run_argv` — which performs the full function/builtin/external
+//! dispatch on the ALREADY-SPLIT argv (no re-expansion, no re-quoting) and
+//! returns the command's real exit status. The clone is dropped afterward, so
+//! the mutations vanish exactly when they should.
 //!
 //! The mutated logical state materializes onto a real child only at fork→exec,
 //! inside `compose_std_command`: the cloned env becomes the child's `environ`,
@@ -28,18 +28,9 @@
 //! process — and that is correct: the builtin reads the same logical state
 //! directly (`context.shell.working_dir()`, the exported env), so `env -C dir
 //! find .` and `env FOO=bar printenv FOO` both work with no OS process at all.
-//!
-//! ## Quoting the residual argv
-//!
-//! brush has already word-expanded the builtin's argv by the time we see it, so
-//! to run `COMMAND [ARG]...` back through `run_string` (which re-parses a script
-//! string) we force-single-quote every piece. That suppresses a second round of
-//! alias/glob/word-splitting while still allowing normal command lookup —
-//! exactly the "run this argv as a command" semantics `env` wants.
 
 use std::io::Write;
 
-use brush_core::escape::{self, QuoteMode};
 use brush_core::openfiles::{OpenFile, OpenFiles};
 use brush_core::variables::{ShellValue, ShellVariable};
 use brush_core::{ExecutionParameters, ExecutionResult, Shell, builtins};
@@ -259,26 +250,19 @@ async fn run_env_plan<SE: brush_core::extensions::ShellExtensions>(
 }
 
 /// Run an already-word-expanded `COMMAND [ARG]...` through a subshell's full
-/// command dispatch (`run_string`), returning the command's real exit status.
+/// command dispatch, returning the command's real exit status.
 ///
-/// The argv has already been expanded by the time a builtin sees it, so each
-/// piece is force-single-quoted to round-trip through `run_string` (which
-/// re-parses a script string) without a second round of alias/glob/word
-/// splitting — while still allowing normal command lookup (builtin / function /
-/// external). This is the shared tail of every exec-wrapper that ends in "now
-/// run this command": `env`, `nice`, `setsid`, `nohup`.
+/// The argv is already final by the time a builtin sees it, so we hand it
+/// straight to `Shell::run_argv`, which performs lookup + invocation (function /
+/// builtin / external) with NO second round of expansion — no re-quoting, no
+/// `run_string` re-parse. This is the shared tail of every exec-wrapper that
+/// ends in "now run this command": `env`, `nice`, `setsid`, `nohup`.
 async fn dispatch<SE: brush_core::extensions::ShellExtensions>(
     mut subshell: Shell<SE>,
     command: &[String],
     params: &ExecutionParameters,
 ) -> Result<ExecutionResult, brush_core::error::Error> {
-    let script = command
-        .iter()
-        .map(|a| escape::force_quote(a, QuoteMode::SingleQuote))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let source_info = subshell.call_stack().current_pos_as_source_info();
-    subshell.run_string(script, &source_info, params).await
+    subshell.run_argv(command, params).await
 }
 
 /// Split a raw argv into a leading run of option tokens (anything starting with

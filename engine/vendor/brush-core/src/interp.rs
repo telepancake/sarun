@@ -1421,6 +1421,50 @@ async fn execute_command<T: Into<String>>(
     cmd.execute().await
 }
 
+impl<SE: extensions::ShellExtensions> Shell<SE> {
+    /// sarun (NOT upstream brush): run an ALREADY-SPLIT argv as a simple command
+    /// through the shell's full command dispatch — function → builtin → external
+    /// — with **no re-expansion** of the argv (no word splitting, globbing,
+    /// brace/tilde/parameter expansion, alias lookup, or quote processing). This
+    /// is the in-process equivalent of handing a fixed `execvp`-style argv to the
+    /// shell: a function or builtin runs in-process against THIS shell's logical
+    /// state, an external program is spawned through the same path (and box
+    /// snooping) as any other command, and the returned result/exit status and
+    /// observable effects match running the command normally.
+    ///
+    /// The caller picks the shell: pass a `clone()` for subshell semantics (the
+    /// `env`/`nice`/… exec-wrappers do this so command-scoped env/cwd mutations
+    /// vanish afterward), or call on `self` to let effects persist. `args[0]` is
+    /// the command name; `params` carries the logical open files the command's
+    /// stdio resolves against.
+    ///
+    /// Preferred over round-tripping the argv back through `run_string`, which
+    /// re-parses a script string and so forces the caller to re-quote every
+    /// piece to suppress a second expansion pass.
+    pub async fn run_argv(
+        &mut self,
+        argv: &[String],
+        params: &ExecutionParameters,
+    ) -> Result<ExecutionResult, error::Error> {
+        let Some(cmd_name) = argv.first() else {
+            return Ok(ExecutionResult::success());
+        };
+        let cmd_name = cmd_name.clone();
+        // The argv is already final — feed it as literal CommandArg::Strings, so
+        // execute_command performs lookup + invocation but NO expansion.
+        let args: Vec<CommandArg> = argv.iter().cloned().map(CommandArg::String).collect();
+        let context = PipelineExecutionContext {
+            shell: commands::ShellForCommand::ParentShell(self),
+            process_group_id: None,
+        };
+        let spawn_result = execute_command(context, params.clone(), cmd_name, &[], &args).await?;
+        match spawn_result.wait().await? {
+            ExecutionWaitResult::Completed(result) => Ok(result),
+            ExecutionWaitResult::Stopped(_) => Ok(ExecutionResult::stopped()),
+        }
+    }
+}
+
 async fn expand_assignment(
     shell: &mut Shell<impl extensions::ShellExtensions>,
     params: &ExecutionParameters,
