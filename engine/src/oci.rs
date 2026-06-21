@@ -55,6 +55,9 @@ pub fn cli_oci(args: &[String]) -> i32 {
         "load" => cli_load(&args[1..]),
         "run" => cli_run(&args[1..]),
         "build" => cli_build(&args[1..]),
+        // Hidden: the host-side build worker the engine spawns for an in-box
+        // `oci build` (see build_in_engine). Not for direct use.
+        "__build-worker" => cli_build_worker(&args[1..]),
         "-h" | "--help" => {
             println!("usage:");
             println!("  sarun oci load <ref> [NAME]");
@@ -551,33 +554,196 @@ fn cli_build(args: &[String]) -> i32 {
         Ok(t) => t,
         Err(e) => { eprintln!("sarun oci build: read {}: {e}", df_path.display()); return 1; }
     };
-    let df = match crate::dockerfile::Dockerfile::parse(&text) {
-        Ok(d) => d,
-        Err(e) => { eprintln!("sarun oci build: {e}"); return 2; }
-    };
-    if let Err(e) = paths::ensure_dirs() {
-        eprintln!("sarun oci build: {e}");
-        return 1;
+    // In a box the build MUST run host-side in the engine: its layer boxes
+    // (FROM/COPY/ADD/RUN) have to be created in the engine's state, not through
+    // the box's own FUSE (which would make them ephemeral box-overlay files).
+    // Ship the context + Dockerfile to the engine, which runs the build in a
+    // host-side worker and returns its output. On the host we build locally
+    // (live output; unchanged).
+    if in_box() {
+        return build_via_engine(&context, &text, tag, net_mode, &build_args);
     }
     // RUN steps need a live engine to execute in; fail fast with a clear message
     // rather than mid-build.
-    let has_run = df.instructions.iter()
-        .any(|(_, i)| matches!(i, crate::dockerfile::Instruction::Run(_)));
-    if has_run && std::os::unix::net::UnixStream::connect(paths::sock_path()).is_err() {
-        eprintln!("sarun oci build: this Dockerfile has RUN steps, which execute \
-                   in a box — start the sarun engine/UI first \
-                   (control socket {}).", paths::sock_path().display());
-        return 3;
-    }
-    let mut b = Builder::new(context, net_mode, build_args);
-    for (line, instr) in &df.instructions {
-        if let Err(e) = b.exec(instr) {
-            eprintln!("sarun oci build: Dockerfile line {line}: {e:#}");
-            return 1;
+    if let Ok(df) = crate::dockerfile::Dockerfile::parse(&text) {
+        let has_run = df.instructions.iter()
+            .any(|(_, i)| matches!(i, crate::dockerfile::Instruction::Run(_)));
+        if has_run && std::os::unix::net::UnixStream::connect(paths::sock_path()).is_err() {
+            eprintln!("sarun oci build: this Dockerfile has RUN steps, which execute \
+                       in a box — start the sarun engine/UI first \
+                       (control socket {}).", paths::sock_path().display());
+            return 3;
         }
     }
-    match b.finish(tag) {
-        Ok(()) => 0,
+    match run_dockerfile(context, &text, tag, net_mode, build_args) {
+        Ok(_) => 0,
+        Err(e) => { eprintln!("sarun oci build: {e:#}"); 1 }
+    }
+}
+
+/// Run a parsed Dockerfile to completion against `context`, returning the top
+/// layer box id. Shared by the host build and the engine-side build worker.
+fn run_dockerfile(context: PathBuf, text: &str, tag: Option<String>,
+                  net_mode: crate::net::NetMode,
+                  build_args: Vec<(String, String)>) -> Result<i64> {
+    let df = crate::dockerfile::Dockerfile::parse(text).map_err(|e| anyhow!("{e}"))?;
+    paths::ensure_dirs().map_err(|e| anyhow!("ensure dirs: {e}"))?;
+    let mut b = Builder::new(context, net_mode, build_args);
+    for (line, instr) in &df.instructions {
+        b.exec(instr).with_context(|| format!("Dockerfile line {line}"))?;
+    }
+    b.finish(tag)?;
+    b.current.ok_or_else(|| anyhow!("build produced no top box"))
+}
+
+/// In-box `oci build`: pack the context (gzip tar, base64) and ship it with the
+/// Dockerfile to the engine's `oci.build` RPC, which runs the build host-side.
+/// The engine returns the worker's combined output + exit code; we replay both.
+fn build_via_engine(context: &Path, df_text: &str, tag: Option<String>,
+                    net_mode: crate::net::NetMode,
+                    build_args: &[(String, String)]) -> i32 {
+    let tar_b64 = match tar_gz_dir_b64(context) {
+        Ok(s) => s,
+        Err(e) => { eprintln!("sarun oci build: pack context: {e:#}"); return 1; }
+    };
+    let bargs: Vec<Value> = build_args.iter()
+        .map(|(k, v)| serde_json::json!([k, v])).collect();
+    let spec = serde_json::json!([{
+        "context_tar_gz": tar_b64,
+        "dockerfile": df_text,
+        "tag": tag,
+        "net": net_mode.as_str(),
+        "build_args": bargs,
+    }]);
+    let Some(conn) = engine_conn() else {
+        eprintln!("sarun oci build: in a box but the engine broker is unreachable");
+        return 1;
+    };
+    match engine_rpc_on(conn, "oci.build", spec) {
+        Ok(r) => {
+            if let Some(log) = r.get("log").and_then(Value::as_str) { print!("{log}"); }
+            r.get("code").and_then(Value::as_i64).unwrap_or(1) as i32
+        }
+        Err(e) => { eprintln!("sarun oci build: {e}"); 1 }
+    }
+}
+
+/// Pack a directory as a gzip'd tar, base64-encoded — the in-box build context
+/// shipped to the engine.
+fn tar_gz_dir_b64(dir: &Path) -> Result<String> {
+    use base64::{Engine as _, prelude::BASE64_STANDARD};
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(),
+                                               flate2::Compression::default());
+    {
+        let mut tb = tar::Builder::new(&mut gz);
+        tb.append_dir_all(".", dir).context("tar context")?;
+        tb.finish().context("finish tar")?;
+    }
+    Ok(BASE64_STANDARD.encode(gz.finish().context("gzip context")?))
+}
+
+/// The engine-side `oci.build` handler: unpack the shipped context, run the
+/// build in a HOST worker process (`/proc/self/exe oci __build-worker`) so its
+/// layer boxes are created host-side, and return the worker's combined output,
+/// exit code, and top box id. Runs on the connection's own handler thread, so a
+/// long build doesn't block the engine's main loop.
+pub(crate) fn build_in_engine(spec: &Value) -> Result<Value> {
+    use std::process::{Command, Stdio};
+    let tar_b64 = spec.get("context_tar_gz").and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("oci.build: missing context_tar_gz"))?;
+    let df_text = spec.get("dockerfile").and_then(Value::as_str).unwrap_or("");
+    let tag = spec.get("tag").and_then(Value::as_str);
+    let net = spec.get("net").and_then(Value::as_str).unwrap_or("tap");
+    let build_args: Vec<(String, String)> = spec.get("build_args")
+        .and_then(Value::as_array).map(|a| a.iter().filter_map(|kv| {
+            let kv = kv.as_array()?;
+            Some((kv.first()?.as_str()?.to_string(), kv.get(1)?.as_str()?.to_string()))
+        }).collect()).unwrap_or_default();
+
+    let stamp = format!("{}-{}", std::process::id(), now_ns());
+    let ctx = paths::runtime_home().join(format!("oci-build-{stamp}"));
+    std::fs::create_dir_all(&ctx).context("create build context dir")?;
+    let result_file = paths::runtime_home().join(format!("oci-build-{stamp}.json"));
+    let _guard = TmpCleanup { dir: ctx.clone(), file: result_file.clone() };
+    unpack_tar_gz_b64(tar_b64, &ctx)?;
+    let df_path = ctx.join(".sarun-Dockerfile");
+    std::fs::write(&df_path, df_text).context("write shipped Dockerfile")?;
+
+    let mut cmd = Command::new("/proc/self/exe");
+    cmd.arg("oci").arg("__build-worker")
+        .arg("--context").arg(&ctx)
+        .arg("-f").arg(&df_path)
+        .arg("--net").arg(net)
+        .arg("--result-file").arg(&result_file);
+    if let Some(t) = tag { cmd.arg("-t").arg(t); }
+    for (k, v) in &build_args { cmd.arg("--build-arg").arg(format!("{k}={v}")); }
+    let out = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped())
+        .output().context("spawn build worker")?;
+    let mut log = String::from_utf8_lossy(&out.stdout).into_owned();
+    log.push_str(&String::from_utf8_lossy(&out.stderr));
+    let code = out.status.code().unwrap_or(1);
+    let top_id = std::fs::read_to_string(&result_file).ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|v| v.get("top_id").and_then(Value::as_i64));
+    Ok(serde_json::json!({"code": code, "log": log, "top_id": top_id}))
+}
+
+/// Best-effort cleanup of the engine-side build temp dir + result file.
+struct TmpCleanup { dir: PathBuf, file: PathBuf }
+impl Drop for TmpCleanup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+        let _ = std::fs::remove_file(&self.file);
+    }
+}
+
+fn unpack_tar_gz_b64(b64: &str, dest: &Path) -> Result<()> {
+    use base64::{Engine as _, prelude::BASE64_STANDARD};
+    let bytes = BASE64_STANDARD.decode(b64.trim()).context("decode context")?;
+    let gz = flate2::read::GzDecoder::new(&bytes[..]);
+    tar::Archive::new(gz).unpack(dest).context("unpack context")?;
+    Ok(())
+}
+
+/// The hidden build worker: a HOST process the engine spawns so the build's
+/// layer boxes land in the engine's state. Runs the Dockerfile against the
+/// already-unpacked context and writes `{"top_id":N}` to --result-file.
+fn cli_build_worker(args: &[String]) -> i32 {
+    let mut context: Option<String> = None;
+    let mut file: Option<String> = None;
+    let mut tag: Option<String> = None;
+    let mut net_mode = crate::net::NetMode::Tap;
+    let mut build_args: Vec<(String, String)> = Vec::new();
+    let mut result_file: Option<String> = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--context" => context = it.next().cloned(),
+            "-f" | "--file" => file = it.next().cloned(),
+            "-t" | "--tag" => tag = it.next().cloned(),
+            "--result-file" => result_file = it.next().cloned(),
+            "--net" => match it.next().map(String::as_str).and_then(crate::net::NetMode::parse) {
+                Some(nm) => net_mode = nm,
+                None => { eprintln!("__build-worker: bad --net"); return 2; }
+            },
+            "--build-arg" => if let Some((k, v)) = it.next().and_then(|kv| kv.split_once('=')
+                .map(|(k, v)| (k.to_string(), v.to_string()))) { build_args.push((k, v)); },
+            other => { eprintln!("__build-worker: unexpected arg '{other}'"); return 2; }
+        }
+    }
+    let context = PathBuf::from(context.unwrap_or_else(|| ".".to_string()));
+    let df_path = file.map(PathBuf::from).unwrap_or_else(|| context.join("Dockerfile"));
+    let text = match std::fs::read_to_string(&df_path) {
+        Ok(t) => t,
+        Err(e) => { eprintln!("sarun oci build: read {}: {e}", df_path.display()); return 1; }
+    };
+    match run_dockerfile(context, &text, tag, net_mode, build_args) {
+        Ok(top) => {
+            if let Some(rf) = result_file {
+                let _ = std::fs::write(&rf, serde_json::json!({"top_id": top}).to_string());
+            }
+            0
+        }
         Err(e) => { eprintln!("sarun oci build: {e:#}"); 1 }
     }
 }

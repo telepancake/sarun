@@ -414,6 +414,48 @@ def main():
               f"digest coalesce added only the container box, no new layer stack "
               f"(+{after2 - before2})")
 
+        # ── in-box `oci build` runs HOST-SIDE in the engine ───────────────────
+        # An in-box build must create its layer boxes (FROM/COPY/RUN/top) in the
+        # engine's state, not through the box's own FUSE (which would make them
+        # ephemeral). The CLI ships the context to the engine, which builds in a
+        # host-side worker. Context must live on a host path the box can see —
+        # NOT under /tmp (a box masks /tmp with a private tmpfs) — so stage it
+        # under the repo dir, which the box sees via the host lower layer.
+        ibctx = Path(tempfile.mkdtemp(prefix=".inbox-ctx-", dir=str(REPO)))
+        try:
+            (ibctx / "marker.txt").write_text("in-box-built\n")
+            (ibctx / "Dockerfile").write_text(
+                "FROM SYN\n"
+                "COPY marker.txt /ib_marker.txt\n"
+                'RUN ["/bin/sarun", "oci", "--help"]\n'   # exec form, no shell
+                'CMD ["/bin/sarun", "oci", "--help"]\n')
+            before_ib = len(list(state_dir(e).glob("*.sqlar")))
+            # `sarun run BOX -- /proc/self/exe oci build ...`: the box command IS
+            # the engine binary, so the in-box `oci build` exercises the in-box
+            # code path (SARUN_BROKER set → ships to the engine).
+            r = sarun(e, "run", "--net", "off", "TBUILD", "--",
+                      "/proc/self/exe", "oci", "build", "--net", "off",
+                      "-t", "INBOXBUILT", str(ibctx))
+            both = r.stdout + r.stderr
+            check(r.returncode == 0,
+                  f"in-box oci build exits 0 (stderr: {r.stderr.strip()[-300:]})")
+            check("built image 'INBOXBUILT'" in both,
+                  "in-box build reported the built image")
+            check("INBOXBUILT" in box_names(state_dir(e)),
+                  "in-box-built top box persists in HOST state (engine created "
+                  "it, not the box's ephemeral overlay)")
+            check(any_box_has_file(state_dir(e), "ib_marker.txt"),
+                  "in-box COPY landed ib_marker.txt in a HOST build layer")
+            after_ib = len(list(state_dir(e).glob("*.sqlar")))
+            check(after_ib - before_ib >= 3,
+                  f"in-box build added host layer boxes (FROM/COPY/RUN/top) "
+                  f"(+{after_ib - before_ib})")
+            r2 = sarun(e, "oci", "run", "--net", "off", "INBOXBUILT")
+            check(r2.returncode == 0 and "oci load" in (r2.stdout + r2.stderr),
+                  "the in-box-built image runs on the host")
+        finally:
+            shutil.rmtree(ibctx, ignore_errors=True)
+
         # ── dissolve carries the no_host closure DOWN to the children ─────────
         # SYN is a no_host image base: its rootfs is CLOSED (absent paths ENOENT,
         # never the host's fs). Every container/build box sits on top of it. The
