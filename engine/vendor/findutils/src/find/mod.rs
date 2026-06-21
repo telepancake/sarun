@@ -105,6 +105,23 @@ pub trait Dependencies {
     fn cwd(&self) -> Option<&std::path::Path> {
         None
     }
+    /// sarun: when true, `-exec`/`-execdir` runs each built command through the
+    /// embedder's shell (see `run`) instead of spawning a `std::process::Command`
+    /// — so the command may be a shell builtin / function / script, all snooped,
+    /// exactly like the `xargs` builtin. Default `false` keeps the standalone
+    /// binary on its process-spawning path.
+    fn exec_via_shell(&self) -> bool {
+        false
+    }
+    /// sarun: run a fully-built command argv through the embedder's shell,
+    /// returning its exit code (`128 + signo` for a signal death). `cwd` is the
+    /// directory to run it in — `Some(dir)` for `-execdir` (the entry's parent),
+    /// `None` for the shell's own logical cwd. Only called when
+    /// `exec_via_shell()` is `true`; the default never runs.
+    fn run(&self, argv: &[std::ffi::OsString], cwd: Option<&std::path::Path>) -> i32 {
+        let _ = (argv, cwd);
+        127
+    }
 }
 
 /// Struct that holds the dependencies we use when run as the real executable.

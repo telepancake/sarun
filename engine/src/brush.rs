@@ -446,7 +446,7 @@ fn box_builtins_opt<SE: brush_core::extensions::ShellExtensions>(
     // crate::find_builtin.
     m.insert(
         "find".to_string(),
-        simple_builtin::<crate::find_builtin::FindBuiltin, SE>(),
+        builtin::<crate::find_builtin::FindBuiltin, SE>(),
     );
     // In-process `xargs` (same vendored findutils fork). Like `find`, it is
     // neither a bundled coreutil nor a bash builtin, so it is always present and
