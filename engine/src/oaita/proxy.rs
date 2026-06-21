@@ -87,7 +87,15 @@ impl Proxy {
 /// as FRAME_API_DATA on the box-channel; the mux feeds those bytes into a
 /// duplex pipe whose far end is `io`. The box id is known a priori from
 /// the box-channel identity — no peer-pid walk needed.
-pub async fn serve_one_conn_for_box<IO>(proxy: Arc<Proxy>, box_id: i64, io: IO)
+///
+/// `state` is the engine state — needed for the budget chain debit. We do
+/// the debit INSIDE handle_inner (after hyper has collected the request
+/// body) instead of at the raw verb-dispatch level, so a 503 response
+/// goes back through a fully-read request: no client write-after-close,
+/// no `error writing a body to connection` on large prompts.
+pub async fn serve_one_conn_for_box<IO>(proxy: Arc<Proxy>,
+                                        state: crate::control::State,
+                                        box_id: i64, io: IO)
     -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     IO: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
@@ -97,7 +105,8 @@ where
     let proxy2 = proxy.clone();
     let svc = service_fn(move |req| {
         let proxy = proxy2.clone();
-        async move { handle_inner(proxy, box_id, req).await }
+        let state = state.clone();
+        async move { handle_inner(proxy, state, box_id, req).await }
     });
     let _ = http1::Builder::new()
         .keep_alive(false)
@@ -108,7 +117,8 @@ where
 // peer-pid → box-id walking is gone — attribution is now intrinsic to the
 // box-channel the FRAME_API_* stream rides on.
 
-async fn handle_inner(proxy: Arc<Proxy>, box_id: i64, req: Request<Incoming>)
+async fn handle_inner(proxy: Arc<Proxy>, state: crate::control::State,
+                      box_id: i64, req: Request<Incoming>)
     -> Result<Response<Body>, std::convert::Infallible>
 {
     // Box opt-in gate: even if a box gets the socket bound in by mistake, we
@@ -119,9 +129,6 @@ async fn handle_inner(proxy: Arc<Proxy>, box_id: i64, req: Request<Incoming>)
         return Ok(error_resp(StatusCode::FORBIDDEN,
                              "this box was not launched with --api"));
     }
-    // Budget gating is done in control.rs at the `api.proxy` verb
-    // dispatch, BEFORE the conn is handed to hyper — so if we got
-    // here the chain has already been debited.
     let method = req.method().to_string();
     // Strip the box-side base path prefix (we set OPENAI_BASE_URL=…/v1 in the
     // box, so the incoming URI looks like `/v1/chat/completions`). The
@@ -133,6 +140,14 @@ async fn handle_inner(proxy: Arc<Proxy>, box_id: i64, req: Request<Incoming>)
         .map(|s| if s.is_empty() { "/" } else { s }.to_string())
         .unwrap_or_else(|| raw_path.clone());
     let (_head, body) = req.into_parts();
+    // Drain the request body BEFORE the budget gate. The previous design
+    // gated at the raw verb-dispatch layer (control.rs), wrote a 503 over
+    // the conn, and returned — which closed the socket while the client
+    // was still streaming its (potentially large) request body. hyper on
+    // the client side then surfaced "send: error writing a body to
+    // connection" instead of a parseable 503. By collecting the body
+    // here first, the 503 we emit travels back through hyper on a fully-
+    // consumed request — proper HTTP, no mid-write close.
     let body_bytes = match body.collect().await {
         Ok(b) => b.to_bytes(),
         Err(e) => return Ok(error_resp(StatusCode::BAD_REQUEST,
@@ -141,6 +156,16 @@ async fn handle_inner(proxy: Arc<Proxy>, box_id: i64, req: Request<Incoming>)
     let req_json: Value = serde_json::from_slice(&body_bytes).unwrap_or(Value::Null);
     let model = req_json.get("model").and_then(Value::as_str).unwrap_or("").to_string();
     let is_stream = req_json.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    // Budget chain debit. Walks this box's parent_box_id chain, debiting
+    // each capped box; if any ancestor's pool hit zero we return a 503
+    // here instead of forwarding. Logged with status=503 like other
+    // proxy refusals so the model can see the round-trip happened.
+    if let Err(top) = crate::oaita::budget::take_chain(&state, box_id) {
+        let msg = format!("budget exhausted at box {top} — grant more turns and resume.");
+        log_call(&proxy, box_id, &method, &path, &model, 503,
+                 &body_bytes, msg.as_bytes(), is_stream).await;
+        return Ok(error_resp(StatusCode::SERVICE_UNAVAILABLE, &msg));
+    }
 
     let Some(up) = proxy.upstream.lock().await.clone() else {
         let msg = "oaita.toml not configured: set model + base_url + api_key";
