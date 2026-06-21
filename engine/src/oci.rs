@@ -221,12 +221,36 @@ fn resolve_image_top(reference: &str) -> Result<i64> {
         return Ok(follow_to_top(&boxes, start));
     }
     // Image cache — the Docker model: pull once, share the layer boxes across
-    // runs. If a stack with this image reference is already loaded, reuse it as
-    // the parent instead of pulling again; only the per-run container box is new.
+    // runs. v2 keys on the MANIFEST DIGEST: probe the reference's current
+    // manifest digest cheaply (a registry HEAD / a local index.json read — no
+    // layer download), then:
+    //   * reuse any loaded stack with that digest, so name:tag, @digest, and
+    //     archive-vs-layout that point at the same image coalesce onto one stack;
+    //   * a `:tag` that has MOVED (its manifest digest no longer matches the
+    //     loaded stack's) falls through to a fresh pull instead of serving stale.
+    let probed = probe_manifest_digest(reference).ok();
+    if let Some(dg) = probed.as_deref() {
+        if let Some(start) = find_loaded_by_manifest_digest(&boxes, dg) {
+            eprintln!("sarun oci: reusing already-loaded image '{reference}' \
+                       (manifest {dg}, box {start})");
+            return Ok(follow_to_top(&boxes, start));
+        }
+    }
+    // Fall back to the v1 key (exact reference string) — but only honor it when
+    // the probe didn't prove the loaded stack stale. With no probe (offline /
+    // unsupported source) this is exactly the v1 behavior.
     if let Some(start) = find_loaded_by_reference(&boxes, reference) {
-        eprintln!("sarun oci: reusing already-loaded image '{reference}' \
-                   (box {start})");
-        return Ok(follow_to_top(&boxes, start));
+        let stored = boxes.get(&start).and_then(|b| b.meta.get("oci_manifest_digest"));
+        let stale = matches!((probed.as_deref(), stored),
+                             (Some(p), Some(s)) if p != s.as_str());
+        if stale {
+            eprintln!("sarun oci: image '{reference}' tag moved (manifest changed) \
+                       — re-pulling");
+        } else {
+            eprintln!("sarun oci: reusing already-loaded image '{reference}' \
+                       (box {start})");
+            return Ok(follow_to_top(&boxes, start));
+        }
     }
     // Not loaded → treat as an image reference and pull it.
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -239,10 +263,66 @@ fn resolve_image_top(reference: &str) -> Result<i64> {
     Ok(outcome.top_id)
 }
 
+/// Lowest box id of a loaded stack whose `oci_manifest_digest` matches — the
+/// image-cache v2 key. The lowest id is the stack's base.
+fn find_loaded_by_manifest_digest(
+    boxes: &std::collections::BTreeMap<i64, crate::discover::Box_>,
+    digest: &str) -> Option<i64> {
+    if digest.is_empty() { return None; }
+    boxes.values()
+        .filter(|b| b.meta.get("oci_manifest_digest").map(String::as_str) == Some(digest))
+        .map(|b| b.box_id)
+        .min()
+}
+
+/// Cheaply determine `reference`'s current manifest digest WITHOUT downloading
+/// layers: a registry manifest HEAD, or the `index.json` of a local
+/// archive/layout. Used to key the image cache (reuse / moved-tag detection).
+fn probe_manifest_digest(reference: &str) -> Result<String> {
+    if let Some(p) = reference.strip_prefix("oci-archive:") {
+        return archive_index_manifest_digest(Path::new(p));
+    }
+    if let Some(p) = reference.strip_prefix("oci-layout:") {
+        let idx = std::fs::read(Path::new(p).join("index.json"))
+            .with_context(|| format!("read {}/index.json", p))?;
+        return index_manifest_digest(&idx);
+    }
+    // Registry: a cheap manifest fetch (no blobs).
+    let r = Reference::from_str(reference)
+        .with_context(|| format!("parse reference '{reference}'"))?;
+    let auth = registry_auth_for(reference);
+    let client = Client::new(ClientConfig::default());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all().build().context("tokio init")?;
+    rt.block_on(client.fetch_manifest_digest(&r, &auth))
+        .context("fetch manifest digest")
+}
+
+/// Read just `index.json` out of an oci-archive tar (top-level entry) and return
+/// its platform-matched manifest digest — no layer extraction.
+fn archive_index_manifest_digest(path: &Path) -> Result<String> {
+    let file = File::open(path)
+        .with_context(|| format!("open {}", path.display()))?;
+    let mut ar = tar::Archive::new(file);
+    for entry in ar.entries().context("read archive entries")? {
+        let mut e = entry.context("archive entry")?;
+        let ep = e.path().context("entry path")?.into_owned();
+        if ep.file_name().and_then(|s| s.to_str()) == Some("index.json")
+            && ep.components().count() == 1
+        {
+            let mut buf = Vec::new();
+            e.read_to_end(&mut buf).context("read index.json")?;
+            return index_manifest_digest(&buf);
+        }
+    }
+    bail!("oci-archive {} has no top-level index.json", path.display())
+}
+
 /// Lowest box id of an already-loaded stack whose `oci_reference` meta matches
-/// `reference` — the image-cache key (v1 = the exact reference string; v2 would
-/// key on the manifest digest). The lowest id is the stack's base, so
-/// follow_to_top from it reaches that stack's current top.
+/// `reference` — the v1 image-cache key (exact reference string). v2
+/// (find_loaded_by_manifest_digest) keys on the manifest digest and is tried
+/// first; this remains the fallback when no digest probe is available. The
+/// lowest id is the stack's base, so follow_to_top reaches that stack's top.
 fn find_loaded_by_reference(boxes: &std::collections::BTreeMap<i64, crate::discover::Box_>,
                             reference: &str) -> Option<i64> {
     boxes.values()
@@ -1359,6 +1439,11 @@ struct PulledImage {
     layers: Vec<PulledLayer>,
     config_json: String,
     reference: String,
+    /// The image's manifest digest (`sha256:…`). The image-cache v2 key: two
+    /// references that resolve to the same manifest coalesce onto one loaded
+    /// stack, and a `:tag` that has moved (new manifest) re-pulls. Empty when
+    /// the source didn't surface one.
+    manifest_digest: String,
 }
 
 async fn load(reference: &str, name: Option<String>) -> Result<LoadOutcome> {
@@ -1411,6 +1496,8 @@ async fn fetch_registry(reference: &str) -> Result<PulledImage> {
         layers,
         config_json,
         reference: reference.to_string(),
+        // oci-client surfaces the manifest digest it pulled; the cache keys on it.
+        manifest_digest: img.digest.clone().unwrap_or_default(),
     })
 }
 
@@ -1500,21 +1587,8 @@ fn fetch_oci_layout(path: &Path) -> Result<PulledImage> {
     let index_path = path.join("index.json");
     let idx_bytes = std::fs::read(&index_path)
         .with_context(|| format!("read {}", index_path.display()))?;
-    let idx: serde_json::Value = serde_json::from_slice(&idx_bytes)
-        .context("parse index.json")?;
-    let descs = idx.get("manifests").and_then(|v| v.as_array())
-        .ok_or_else(|| anyhow!("index.json has no manifests array"))?;
-    // Multi-arch index: prefer a manifest descriptor matching the host's
-    // architecture+os (e.g. amd64/linux). Falls back to the first descriptor
-    // when none matches — better than failing, in case the index lacks
-    // platform tags (single-arch index, or producer didn't annotate).
-    let (host_arch, host_os) = host_platform();
-    let manifest_digest = descs.iter()
-        .find(|d| matches_platform(d, &host_arch, &host_os))
-        .or_else(|| descs.first())
-        .and_then(|d| d.get("digest").and_then(|v| v.as_str()))
-        .ok_or_else(|| anyhow!("no manifest digest in index.json"))?;
-    let manifest_bytes = read_blob_by_digest(path, manifest_digest)?;
+    let manifest_digest = index_manifest_digest(&idx_bytes)?;
+    let manifest_bytes = read_blob_by_digest(path, &manifest_digest)?;
     let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)
         .context("parse manifest")?;
     let config_desc = manifest.get("config")
@@ -1541,7 +1615,27 @@ fn fetch_oci_layout(path: &Path) -> Result<PulledImage> {
     Ok(PulledImage {
         layers, config_json,
         reference: format!("oci-layout:{}", path.display()),
+        manifest_digest,
     })
+}
+
+/// The platform-matched manifest descriptor digest from an OCI `index.json`.
+/// Shared by the layout loader and the cheap image-cache probe so both agree
+/// on what "this image's manifest digest" is.
+fn index_manifest_digest(idx_bytes: &[u8]) -> Result<String> {
+    let idx: serde_json::Value = serde_json::from_slice(idx_bytes)
+        .context("parse index.json")?;
+    let descs = idx.get("manifests").and_then(|v| v.as_array())
+        .ok_or_else(|| anyhow!("index.json has no manifests array"))?;
+    // Multi-arch index: prefer the host arch+os descriptor; fall back to the
+    // first (single-arch / unannotated index) rather than failing.
+    let (host_arch, host_os) = host_platform();
+    descs.iter()
+        .find(|d| matches_platform(d, &host_arch, &host_os))
+        .or_else(|| descs.first())
+        .and_then(|d| d.get("digest").and_then(|v| v.as_str()))
+        .map(String::from)
+        .ok_or_else(|| anyhow!("no manifest digest in index.json"))
 }
 
 fn fetch_oci_archive(path: &Path) -> Result<PulledImage> {
@@ -1681,6 +1775,9 @@ fn install_chain(image: PulledImage, base_name: Option<String>)
             .with_context(|| format!("create sqlar for box {id}"))?;
         b.set_meta("name", &name);
         b.set_meta("oci_reference", &image.reference);
+        if !image.manifest_digest.is_empty() {
+            b.set_meta("oci_manifest_digest", &image.manifest_digest);
+        }
         b.set_meta("oci_layer_digest", &layer.digest);
         b.set_meta("oci_layer_index", &i.to_string());
         if is_base {

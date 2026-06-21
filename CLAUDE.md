@@ -152,12 +152,6 @@ including closed-rootfs boot, COPY/glob landing, multi-stage `COPY --from`,
 `ADD` tar auto-extract, and STOPSIGNAL/HEALTHCHECK carried into the config.
 **Delete a bullet below the moment it's done.**
 
-- [ ] **Image cache v2 — key on the manifest digest.** v1 is done:
-  `resolve_image_top` → `find_loaded_by_reference` dedups `oci run <ref>` by the
-  exact reference string, so a repeat run shares the loaded layer boxes (only
-  the per-run container box is new; `test_oci.py` asserts it). v2: also key on
-  the manifest digest so a moved `:tag` re-pulls and `name:tag`/`@digest`
-  coalesce.
 - [ ] **Container GC.** Each run leaves an at-rest container box (layer reuse
   has landed, so these now accumulate on shared layers); add `oci ps` / `oci rm`
   (or a prune). Safety foundation is DONE — deletion goes through the existing
