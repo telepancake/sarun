@@ -1547,6 +1547,34 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
             let rel = args.get(1).and_then(Value::as_str).unwrap_or("");
             json!({"kind": ov.box_path_kind(id, rel).to_string()})
         }
+        // OCI registry I/O runs HOST-SIDE in the engine: the CLI (host or
+        // in-box) RPCs these so credentials never enter a box and an in-box
+        // pull doesn't go through the box's netns/FUSE. Box EXECUTION stays in
+        // the caller (runner::run) for foreground stdio. The pull blocks this
+        // connection's own handler thread, not the main loop.
+        "oci.load" => {
+            let Some(reference) = args.first().and_then(Value::as_str) else {
+                return json!({"ok": false, "error": "oci.load: missing reference"});
+            };
+            let name = args.get(1).and_then(Value::as_str).map(String::from);
+            match crate::oci::load_blocking(reference, name) {
+                Ok(o) => json!({
+                    "base_id": o.base_id, "base_name": o.base_name,
+                    "top_id": o.top_id, "top_name": o.top_name,
+                    "n_layers": o.n_layers,
+                }),
+                Err(e) => return json!({"ok": false, "error": format!("{e:#}")}),
+            }
+        }
+        "oci.resolve" => {
+            let Some(reference) = args.first().and_then(Value::as_str) else {
+                return json!({"ok": false, "error": "oci.resolve: missing reference"});
+            };
+            match crate::oci::resolve_image_top_local(reference) {
+                Ok((top, note)) => json!({"top_id": top, "note": note}),
+                Err(e) => return json!({"ok": false, "error": format!("{e:#}")}),
+            }
+        }
         other => {
             return json!({"ok": false, "error": format!("unknown verb '{other}'")});
         }
