@@ -133,7 +133,7 @@ fn cmd_gen(args: &[String]) -> i32 {
                                        p.depth)
     { Ok(s) => s, Err(e) => { eprintln!("{e}"); return 1; } };
     match generate(&p.name, &set) {
-        Ok(paths) => report(&paths),
+        Ok(_) => report(&p.name),
         Err(e) => { eprintln!("oaita: gen: {e}"); 1 }
     }
 }
@@ -149,7 +149,7 @@ fn cmd_call(args: &[String]) -> i32 {
     let exe = build_executor(p.no_sandbox, p.sarun);
     let exe_ref: Option<&dyn crate::oaita::exec::Executor> = exe.as_deref();
     match evaluate_call(&p.name, &set, exe_ref) {
-        Ok(paths) => report(&paths),
+        Ok(_) => report(&p.name),
         Err(e) => { eprintln!("oaita: call: {e}"); 1 }
     }
 }
@@ -183,7 +183,7 @@ fn cmd_run(args: &[String]) -> i32 {
     let exe = build_executor(p.no_sandbox, p.sarun);
     let exe_ref: Option<&dyn crate::oaita::exec::Executor> = exe.as_deref();
     match run_to_completion(&p.name, &set, exe_ref) {
-        Ok(paths) => report(&paths),
+        Ok(_) => report(&p.name),
         Err(e) => { eprintln!("oaita: run: {e}"); 1 }
     }
 }
@@ -299,27 +299,29 @@ fn cmd_where() -> i32 {
     0
 }
 
-/// Print the LAST turn we wrote, if it's a clean assistant tail (no
-/// `p`/`c`/`b` flags). That's the "final answer" of a settled run — the
-/// only thing a programmatic caller (the `ask` tool capturing our stdout)
-/// or an interactive user typing `oaita run NAME` actually wants to see.
-/// Anything else — per-turn write logs, streamed chunks during gen —
-/// would just pollute the caller's view: the turn files on disk are the
-/// canonical record, and a quiet stdout makes oaita behave like every
-/// other CLI in the shell tool's world (`python script.py` prints its
-/// result, not a running commentary).
-fn report(paths: &[std::path::PathBuf]) -> i32 {
-    let Some(last) = paths.last() else { return 0; };
-    let Some(name) = last.file_name().and_then(|s| s.to_str()) else { return 0; };
-    // turn-filename grammar: NNNN[-id[-from]][.flags].<type>. We only
-    // surface clean assistant tails; a `c`/`p`/`b`-flagged turn is mid-
-    // flight (pending call / partial / backtrack waypoint) and the
-    // model's actual answer hasn't been written yet.
-    let parts: Vec<&str> = name.split('.').collect();
-    let n = parts.len();
-    if n < 2 || parts[n - 1] != "assistant" { return 0; }
-    if n >= 3 && !parts[n - 2].is_empty() { return 0; }   // has flags → skip
-    if let Ok(content) = std::fs::read_to_string(last) {
+/// Print the session's CURRENT last turn, if it's a clean assistant tail
+/// (no `p`/`c`/`b` flags). That's the "final answer" of a settled run —
+/// the only thing a programmatic caller (the `ask` tool capturing our
+/// stdout) or an interactive user typing `oaita run NAME` actually wants
+/// to see. Anything else — per-turn write logs, streamed chunks during
+/// gen — would just pollute the caller's view: the turn files on disk
+/// are the canonical record, and a quiet stdout makes oaita behave like
+/// every other CLI in the shell tool's world (`python script.py` prints
+/// its result, not a running commentary).
+///
+/// We read the session's CURRENT last turn rather than the in-process
+/// list of paths we just wrote, because `backtrack(final=true)` rewrites
+/// history — the planted summary that IS the answer was written by the
+/// rewrite, not returned by `evaluate_call`, so it's invisible to a
+/// produced-paths view but visible on disk.
+fn report(name: &str) -> i32 {
+    let Some(last) = crate::oaita::turns::load_turns(name).into_iter().last() else {
+        return 0;
+    };
+    if last.kind != "assistant" { return 0; }
+    if last.flags.contains('p') || last.flags.contains('c')
+       || last.flags.contains('b') { return 0; }
+    if let Ok(content) = last.read() {
         use std::io::Write;
         let _ = std::io::stdout().write_all(content.as_bytes());
         if !content.ends_with('\n') {
