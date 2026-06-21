@@ -70,9 +70,35 @@ pub enum Instruction {
     Expose(String),
     Volume(Vec<String>),
     Shell(Vec<String>),
-    /// A verb Docker knows but we don't act on (MAINTAINER / HEALTHCHECK /
-    /// ONBUILD / STOPSIGNAL). Carried, not dropped, so the builder warns.
+    /// `STOPSIGNAL signal` — carried into the image config's StopSignal.
+    Stopsignal(String),
+    /// `ONBUILD <instruction>` — the trailing instruction text, stored
+    /// verbatim into the image config's OnBuild list (Docker semantics: the
+    /// trigger fires when THIS image is later used as a base, which is out of
+    /// our build's scope, but the image must still carry it faithfully).
+    Onbuild(String),
+    /// `HEALTHCHECK NONE` | `HEALTHCHECK [opts] CMD …` — carried into the
+    /// image config's Healthcheck.
+    Healthcheck(HealthcheckSpec),
+    /// A verb Docker knows but we don't act on (only MAINTAINER now — it maps
+    /// to the deprecated `author` field). Carried, not dropped, so the builder
+    /// warns.
     Unsupported { verb: String, rest: String },
+}
+
+/// Parsed HEALTHCHECK. `none` (from `HEALTHCHECK NONE`) disables an inherited
+/// check; otherwise `test` is the probe command and the options are raw
+/// duration strings (`30s`, `5m`) / retry count, converted to the image
+/// config's nanosecond ints by the builder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HealthcheckSpec {
+    pub none: bool,
+    pub test: Option<Cmdline>,
+    pub interval: Option<String>,
+    pub timeout: Option<String>,
+    pub start_period: Option<String>,
+    pub start_interval: Option<String>,
+    pub retries: Option<u32>,
 }
 
 /// A parsed Dockerfile: the ordered instructions plus the 1-based line each
@@ -325,8 +351,17 @@ fn parse_instruction(verb: &str, rest: &str, line: usize)
                 .ok_or_else(|| err("SHELL requires a JSON array".into()))?;
             Instruction::Shell(v)
         }
+        "STOPSIGNAL" => {
+            let s = rest.trim();
+            if s.is_empty() {
+                return Err(err("STOPSIGNAL requires a signal".into()));
+            }
+            Instruction::Stopsignal(s.to_string())
+        }
+        "ONBUILD" => parse_onbuild(rest, line).map_err(err)?,
+        "HEALTHCHECK" => Instruction::Healthcheck(parse_healthcheck(rest).map_err(err)?),
         // Known to Docker, irrelevant to a from-source build: carry, don't drop.
-        "MAINTAINER" | "HEALTHCHECK" | "ONBUILD" | "STOPSIGNAL" => {
+        "MAINTAINER" => {
             Instruction::Unsupported { verb: verb.to_string(), rest: rest.to_string() }
         }
         other => {
@@ -498,6 +533,76 @@ fn parse_arg(rest: &str) -> Result<Instruction, String> {
         }
         None => Ok(Instruction::Arg { name: rest.to_string(), default: None }),
     }
+}
+
+/// `ONBUILD <instruction>` — the trigger instruction stored verbatim. Docker
+/// forbids chaining (`ONBUILD ONBUILD`) and `ONBUILD FROM`/`ONBUILD MAINTAINER`
+/// (instructions/parse.go). We validate the trailing verb but keep the rest of
+/// the line as-is, since that's what the image config's OnBuild list stores.
+fn parse_onbuild(rest: &str, _line: usize) -> Result<Instruction, String> {
+    let rest = rest.trim();
+    if rest.is_empty() {
+        return Err("ONBUILD requires an instruction".into());
+    }
+    let (verb, _) = split_verb(rest);
+    match verb.as_str() {
+        "ONBUILD" => return Err("Chaining ONBUILD via `ONBUILD ONBUILD` isn't allowed".into()),
+        "FROM" | "MAINTAINER" => return Err(format!("{verb} isn't allowed as an ONBUILD trigger")),
+        _ => {}
+    }
+    Ok(Instruction::Onbuild(rest.to_string()))
+}
+
+/// `HEALTHCHECK NONE` | `HEALTHCHECK [--interval=D] [--timeout=D]
+/// [--start-period=D] [--start-interval=D] [--retries=N] CMD command…`.
+/// Mirrors moby instructions/parse.go: options precede a required `CMD`
+/// keyword; the command after it is shell or exec form.
+fn parse_healthcheck(rest: &str) -> Result<HealthcheckSpec, String> {
+    let trimmed = rest.trim();
+    if trimmed.is_empty() {
+        return Err("HEALTHCHECK requires an argument".into());
+    }
+    if trimmed.eq_ignore_ascii_case("none") {
+        return Ok(HealthcheckSpec {
+            none: true, test: None, interval: None, timeout: None,
+            start_period: None, start_interval: None, retries: None,
+        });
+    }
+    let mut spec = HealthcheckSpec {
+        none: false, test: None, interval: None, timeout: None,
+        start_period: None, start_interval: None, retries: None,
+    };
+    // Strip leading `--opt=val` flags up to the `CMD` keyword.
+    let mut s = trimmed;
+    loop {
+        let t = s.trim_start();
+        let Some(flagrest) = t.strip_prefix("--") else { s = t; break; };
+        let (flag, tail) = match flagrest.find(char::is_whitespace) {
+            Some(i) => (&flagrest[..i], &flagrest[i + 1..]),
+            None => (flagrest, ""),
+        };
+        let (k, v) = flag.split_once('=')
+            .ok_or_else(|| format!("HEALTHCHECK flag --{flag} needs a value"))?;
+        match k {
+            "interval" => spec.interval = Some(v.to_string()),
+            "timeout" => spec.timeout = Some(v.to_string()),
+            "start-period" => spec.start_period = Some(v.to_string()),
+            "start-interval" => spec.start_interval = Some(v.to_string()),
+            "retries" => spec.retries = Some(v.parse()
+                .map_err(|_| format!("HEALTHCHECK --retries wants an integer, got '{v}'"))?),
+            other => return Err(format!("unknown HEALTHCHECK flag --{other}")),
+        }
+        s = tail;
+    }
+    let (kw, cmd) = split_verb(s.trim_start());
+    if kw != "CMD" {
+        return Err("HEALTHCHECK needs `CMD` (or `NONE`)".into());
+    }
+    if cmd.trim().is_empty() {
+        return Err("HEALTHCHECK CMD requires a command".into());
+    }
+    spec.test = Some(parse_cmdline(cmd));
+    Ok(spec)
 }
 
 /// VOLUME accepts a JSON array or whitespace list.
@@ -887,10 +992,38 @@ mod tests {
 
     #[test]
     fn known_but_unsupported_is_carried() {
-        // HEALTHCHECK is a real Docker verb — carried as Unsupported, not an
-        // "unknown instruction" error.
-        let i = parse("HEALTHCHECK CMD curl -f http://localhost/ || exit 1");
+        // MAINTAINER is a real Docker verb we don't act on — carried as
+        // Unsupported, not an "unknown instruction" error.
+        let i = parse("MAINTAINER someone@example.com");
         assert!(matches!(i[0], Instruction::Unsupported { .. }));
+    }
+
+    #[test]
+    fn stopsignal_onbuild_healthcheck_parsed() {
+        assert_eq!(parse("STOPSIGNAL SIGTERM"),
+            vec![Instruction::Stopsignal("SIGTERM".into())]);
+        assert_eq!(parse("ONBUILD RUN make"),
+            vec![Instruction::Onbuild("RUN make".into())]);
+        // HEALTHCHECK NONE disables an inherited check.
+        assert_eq!(parse("HEALTHCHECK NONE"),
+            vec![Instruction::Healthcheck(HealthcheckSpec {
+                none: true, test: None, interval: None, timeout: None,
+                start_period: None, start_interval: None, retries: None })]);
+        // Options + shell-form CMD.
+        assert_eq!(
+            parse("HEALTHCHECK --interval=30s --retries=3 CMD curl -f http://localhost/"),
+            vec![Instruction::Healthcheck(HealthcheckSpec {
+                none: false,
+                test: Some(Cmdline::Shell("curl -f http://localhost/".into())),
+                interval: Some("30s".into()), timeout: None,
+                start_period: None, start_interval: None, retries: Some(3) })]);
+    }
+
+    #[test]
+    fn onbuild_and_healthcheck_errors() {
+        assert!(parse_err("ONBUILD ONBUILD RUN x").msg.contains("Chaining"));
+        assert!(parse_err("ONBUILD FROM x").msg.contains("isn't allowed"));
+        assert!(parse_err("HEALTHCHECK --interval=30s curl x").msg.contains("CMD"));
     }
 
     #[test]

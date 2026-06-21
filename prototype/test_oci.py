@@ -271,6 +271,57 @@ def main():
         check("oci load" in both,
               "oci run BUILT executed its CMD (RUN step kept the chain runnable)")
 
+        # ── build #2: COPY --from, glob, ADD-tar auto-extract, config carry ───
+        # Exercises the v1 build-instruction gaps that were correctness holes:
+        #   * multi-stage `COPY --from=<stage>` (cross-stage merged-view read)
+        #   * glob sources (`COPY *.txt`)
+        #   * ADD of a local .tar.gz AUTO-EXTRACTS (not copied as a blob)
+        #   * STOPSIGNAL + HEALTHCHECK carried into the image config JSON
+        ctx2 = tmp / "ctx2"; ctx2.mkdir()
+        (ctx2 / "a.txt").write_text("aaa\n")
+        (ctx2 / "b.txt").write_text("bbb\n")
+        # a gzip'd tar with one entry `inside.txt` — ADD must extract it.
+        braw = io.BytesIO()
+        with tarfile.open(fileobj=braw, mode="w") as t:
+            data = b"unpacked-content\n"
+            ti = tarfile.TarInfo("inside.txt"); ti.size = len(data); ti.mode = 0o644
+            t.addfile(ti, io.BytesIO(data))
+        (ctx2 / "bundle.tar.gz").write_bytes(gzip.compress(braw.getvalue()))
+        (ctx2 / "Dockerfile").write_text(
+            "FROM SYN AS stage1\n"
+            "COPY a.txt /from_stage/a.txt\n"
+            "FROM SYN\n"
+            "COPY *.txt /globbed/\n"                       # glob
+            "ADD bundle.tar.gz /unpacked/\n"               # tar auto-extract
+            "COPY --from=stage1 /from_stage/a.txt /copied_a.txt\n"  # cross-stage
+            "STOPSIGNAL SIGQUIT\n"
+            "HEALTHCHECK --interval=5s --retries=2 CMD /bin/true\n"
+            'CMD ["/bin/sarun", "oci", "--help"]\n')
+        r = sarun(e, "oci", "build", "--net", "off", "-t", "BUILT2", str(ctx2))
+        check(r.returncode == 0, f"build2 exits 0 (stderr: {r.stderr.strip()[:500]})")
+        try: built2_top = int(r.stdout.split("top box ")[-1].split()[0])
+        except Exception: built2_top = 0
+        check(any_box_has_file(state_dir(e), "globbed/a.txt")
+              and any_box_has_file(state_dir(e), "globbed/b.txt"),
+              "glob COPY *.txt landed a.txt AND b.txt")
+        check(any_box_has_file(state_dir(e), "unpacked/inside.txt"),
+              "ADD bundle.tar.gz AUTO-EXTRACTED (unpacked/inside.txt present, "
+              "not a copied bundle.tar.gz blob)")
+        check(not any_box_has_file(state_dir(e), "unpacked/bundle.tar.gz"),
+              "ADD did NOT copy the tarball itself (it was extracted)")
+        check(any_box_has_file(state_dir(e), "copied_a.txt"),
+              "COPY --from=stage1 read the file from the other stage's view")
+        cfg_raw = meta_get(state_dir(e) / f"{built2_top}.sqlar", "oci_config")
+        cfg = json.loads(cfg_raw).get("config", {}) if cfg_raw else {}
+        check(cfg.get("StopSignal") == "SIGQUIT",
+              f"STOPSIGNAL carried into config (got {cfg.get('StopSignal')!r})")
+        hc = cfg.get("Healthcheck") or {}
+        # Shell-form `CMD /bin/true` → Test ["CMD-SHELL", …] (Docker semantics);
+        # exec form `CMD ["…"]` would be ["CMD", …]. Durations → ns ints.
+        check(hc.get("Test") == ["CMD-SHELL", "/bin/true"]
+              and hc.get("Interval") == 5_000_000_000 and hc.get("Retries") == 2,
+              f"HEALTHCHECK carried into config with ns interval (got {hc!r})")
+
         # ── image cache: oci run by the SAME reference reuses the loaded stack ─
         # SYN was loaded from this archive, so its oci_reference == the archive
         # ref. Running that ref again must reuse the loaded layer boxes — only a

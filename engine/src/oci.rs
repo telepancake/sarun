@@ -13,9 +13,12 @@
 //
 // Scope (v1): public registries (anonymous), local oci-archive: and
 // oci-layout: refs; gzip + zstd + uncompressed layers; PAX/GNU long names;
-// AUFS-style whiteouts (`.wh.<name>`); per-entry uid/gid/xattrs/mtime.
+// AUFS-style whiteouts — both per-sibling tombstones (`.wh.<name>`) and
+// opaque-dir markers (`.wh..wh..opq`, ingested as sqlar.opaque=1 so the
+// overlay hides every lower-layer entry under the dir — see
+// test_oci_layers_rs.py); per-entry uid/gid/xattrs/mtime.
 // Out of scope (v1): private-registry auth, signatures, zstd:chunked
-// streaming, opaque-dir markers (`.wh..wh..opq` — logged + skipped).
+// streaming.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -309,12 +312,15 @@ fn unique_container_name() -> String {
 // at-rest the instant they exit) as the next layer. COPY/ADD ingest the build
 // context straight into a new layer box.
 //
-// Scope (v1): single- and multi-stage (`FROM … AS name`, `FROM name`); RUN
-// (shell + exec form, honoring SHELL); COPY/ADD of local context files+dirs
-// with numeric --chown and octal --chmod; ENV/ARG/WORKDIR/USER/CMD/ENTRYPOINT/
-// LABEL/EXPOSE/VOLUME/SHELL; `-t` tag, `-f` file, `--build-arg`, `--net`.
-// Out of scope (v1): COPY --from=<stage|image>, ADD of URLs / auto-untar,
-// glob sources, HEALTHCHECK/ONBUILD/STOPSIGNAL (warned, skipped).
+// Scope (v1): single- and multi-stage (`FROM … AS name`, `FROM name`,
+// `COPY --from=<stage|image>`); RUN (shell + exec form, honoring SHELL);
+// COPY/ADD of local context files+dirs with numeric --chown and octal --chmod,
+// glob sources, ADD-of-URL fetch and ADD-of-local-tar (gzip/zstd/plain)
+// auto-extract; ENV/ARG/WORKDIR/USER/CMD/ENTRYPOINT/LABEL/EXPOSE/VOLUME/SHELL/
+// STOPSIGNAL/ONBUILD/HEALTHCHECK carried into the image config; `-t` tag,
+// `-f` file, `--build-arg`, `--net`.
+// Out of scope (v1): ADD auto-extract of xz/bzip2 (no bundled decoder — loud
+// bail); private-registry FROM auth.
 fn cli_build(args: &[String]) -> i32 {
     let mut tag: Option<String> = None;
     let mut file: Option<String> = None;
@@ -418,6 +424,13 @@ struct Builder {
     exposed: Vec<String>,
     volumes: Vec<String>,
     shell: Vec<String>,
+    shell_set: bool,
+    stopsignal: Option<String>,
+    onbuild: Vec<String>,
+    healthcheck: Option<crate::dockerfile::HealthcheckSpec>,
+    // A base image's Healthcheck JSON (already nanosecond-form), carried
+    // verbatim unless this build overrides it with its own HEALTHCHECK.
+    healthcheck_raw: Option<serde_json::Value>,
     // build position
     current: Option<i64>,
     started: bool,
@@ -437,6 +450,9 @@ impl Builder {
             cmd: None, entrypoint: None, labels: Vec::new(),
             exposed: Vec::new(), volumes: Vec::new(),
             shell: vec!["/bin/sh".to_string(), "-c".to_string()],
+            shell_set: false,
+            stopsignal: None, onbuild: Vec::new(), healthcheck: None,
+            healthcheck_raw: None,
             current: None, started: false, step: 0,
             stages: HashMap::new(), pending_stage: None,
         }
@@ -458,13 +474,12 @@ impl Builder {
             _ if !self.started => bail!("instruction before any FROM"),
             Instruction::Run(c) => self.do_run(c),
             Instruction::Copy { sources, dest, from, chown, chmod } => {
-                if from.is_some() {
-                    bail!("COPY --from=<stage> is not supported yet (v1)");
-                }
-                self.do_copy(sources, dest, chown.as_deref(), chmod.as_deref(), "COPY")
+                self.do_copy(sources, dest, from.as_deref(),
+                             chown.as_deref(), chmod.as_deref(), false)
             }
             Instruction::Add { sources, dest, chown, chmod } => {
-                self.do_copy(sources, dest, chown.as_deref(), chmod.as_deref(), "ADD")
+                self.do_copy(sources, dest, None,
+                             chown.as_deref(), chmod.as_deref(), true)
             }
             Instruction::Env(pairs) => {
                 for (k, v) in pairs {
@@ -501,6 +516,24 @@ impl Builder {
             }
             Instruction::Shell(v) => {
                 self.shell = v.iter().map(|a| expand(a, &self.vars)).collect();
+                self.shell_set = true;
+                self.stamp_current();
+                Ok(())
+            }
+            Instruction::Stopsignal(s) => {
+                self.stopsignal = Some(expand(s, &self.vars));
+                self.stamp_current();
+                Ok(())
+            }
+            Instruction::Onbuild(s) => {
+                self.onbuild.push(expand(s, &self.vars));
+                self.stamp_current();
+                Ok(())
+            }
+            Instruction::Healthcheck(spec) => {
+                self.healthcheck = Some(spec.clone());
+                self.healthcheck_raw = None; // this build's HEALTHCHECK wins
+                self.stamp_current();
                 Ok(())
             }
             Instruction::Unsupported { verb, .. } => {
@@ -598,8 +631,9 @@ impl Builder {
         Ok(())
     }
 
-    fn do_copy(&mut self, sources: &[String], dest: &str,
-               chown: Option<&str>, chmod: Option<&str>, verb: &str) -> Result<()> {
+    fn do_copy(&mut self, sources: &[String], dest: &str, from: Option<&str>,
+               chown: Option<&str>, chmod: Option<&str>, is_add: bool) -> Result<()> {
+        let verb = if is_add { "ADD" } else { "COPY" };
         let srcs: Vec<String> = sources.iter().map(|s| expand(s, &self.vars)).collect();
         let dst = expand(dest, &self.vars);
         let owner = chown.and_then(parse_chown);
@@ -614,36 +648,145 @@ impl Builder {
         // dest is a directory if it ends in `/` or there are multiple sources.
         let dst_is_dir = dst.ends_with('/') || srcs.len() > 1;
         let dst_rel = self.box_rel(&dst);
-        for src in &srcs {
-            if src.starts_with("http://") || src.starts_with("https://") {
-                bail!("{verb} of a URL ('{src}') is not supported yet (v1)");
-            }
-            let src_abs = self.context.join(src);
-            // Refuse context escapes.
-            let canon_ctx = self.context.canonicalize().unwrap_or(self.context.clone());
-            let canon_src = src_abs.canonicalize()
-                .with_context(|| format!("{verb} source '{src}' not found in context"))?;
-            if !canon_src.starts_with(&canon_ctx) {
-                bail!("{verb} source '{src}' escapes the build context");
-            }
-            if canon_src.is_dir() {
-                // Docker copies the CONTENTS of a source dir into dest.
-                copy_tree(&bx, &canon_src, &dst_rel, owner, mode)?;
-            } else {
-                let target = if dst_is_dir || dst_rel.is_empty() {
-                    let base = canon_src.file_name()
-                        .map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                    if dst_rel.is_empty() { base } else { format!("{dst_rel}/{base}") }
-                } else {
-                    dst_rel.clone()
-                };
-                copy_file(&bx, &canon_src, &target, owner, mode)?;
-            }
+        if let Some(from) = from.map(|f| expand(f, &self.vars)) {
+            self.copy_from_stage(&bx, &from, &srcs, &dst_rel, dst_is_dir, owner, mode)?;
+        } else {
+            self.copy_from_context(&bx, &srcs, &dst_rel, dst_is_dir, owner, mode, is_add)?;
         }
         self.current = Some(id);
         self.stamp(id);
         eprintln!("sarun oci build: {verb} {srcs:?} → {dst} (layer box {id})");
         Ok(())
+    }
+
+    /// COPY/ADD whose sources live in the build context (no `--from`). Handles
+    /// glob expansion, ADD-of-URL fetch, and ADD-of-local-tar auto-extract.
+    fn copy_from_context(&self, bx: &BoxState, srcs: &[String], dst_rel: &str,
+                         dst_is_dir: bool, owner: Option<(u32, u32)>,
+                         mode: Option<u32>, is_add: bool) -> Result<()> {
+        let verb = if is_add { "ADD" } else { "COPY" };
+        let canon_ctx = self.context.canonicalize().unwrap_or_else(|_| self.context.clone());
+        for src in srcs {
+            // ADD <url>: fetch into dest. Docker does NOT auto-extract URL
+            // sources (only local archives), so this is a plain file write.
+            if is_add && (src.starts_with("http://") || src.starts_with("https://")) {
+                let bytes = fetch_url(src)
+                    .with_context(|| format!("ADD fetch '{src}'"))?;
+                let base = url_basename(src);
+                if base.is_empty() {
+                    bail!("ADD URL '{src}' has no filename to write to");
+                }
+                let target = join_dest(dst_rel, dst_is_dir, &base);
+                put_file_bytes(bx, &target, &bytes, mode.unwrap_or(0o644), now_ns())?;
+                if let Some((u, g)) = owner { bx.set_owner(&target, u, g); }
+                continue;
+            }
+            // Local source(s): glob-expand if the pattern has wildcards.
+            let matches: Vec<PathBuf> = if src.contains(['*', '?', '[']) {
+                let m = self.glob_context(src)?;
+                if m.is_empty() {
+                    bail!("{verb} pattern '{src}' matched no files in the build context");
+                }
+                m
+            } else {
+                vec![self.context.join(src)]
+            };
+            for src_abs in matches {
+                let canon_src = src_abs.canonicalize()
+                    .with_context(|| format!("{verb} source '{}' not found in context",
+                                             src_abs.display()))?;
+                if !canon_src.starts_with(&canon_ctx) {
+                    bail!("{verb} source '{}' escapes the build context", src_abs.display());
+                }
+                // ADD auto-extracts a local tar (gzip/zstd/plain) INTO dest.
+                if is_add && canon_src.is_file() {
+                    match archive_kind(&canon_src)? {
+                        ArchiveKind::Tar => {
+                            let blob = std::fs::read(&canon_src)?;
+                            extract_tar_into(bx, &blob, dst_rel, owner, mode)
+                                .with_context(|| format!("ADD extract '{}'",
+                                                         canon_src.display()))?;
+                            continue;
+                        }
+                        ArchiveKind::Unsupported(k) => bail!(
+                            "ADD auto-extract of {k} archives is not supported \
+                             ('{}'); decompress it in the build context first",
+                            canon_src.display()),
+                        ArchiveKind::NotArchive => {} // plain copy below
+                    }
+                }
+                if canon_src.is_dir() {
+                    copy_tree(bx, &canon_src, dst_rel, owner, mode)?;
+                } else {
+                    let base = canon_src.file_name()
+                        .map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    let target = join_dest(dst_rel, dst_is_dir, &base);
+                    copy_file(bx, &canon_src, &target, owner, mode)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `COPY --from=<stage|image> SRC… DST` — read SRC from another stage's (or
+    /// an external image's) MERGED view and stage it into this layer. We reuse
+    /// the Overlay resolver host-side (no FUSE mount) so the parent-chain /
+    /// whiteout / opaque semantics are exactly what a box would see.
+    fn copy_from_stage(&self, bx: &BoxState, from: &str, srcs: &[String],
+                       dst_rel: &str, dst_is_dir: bool, owner: Option<(u32, u32)>,
+                       mode: Option<u32>) -> Result<()> {
+        let src_id = if let Some(&sid) = self.stages.get(from) {
+            sid
+        } else {
+            resolve_image_top(from)
+                .with_context(|| format!("COPY --from={from}"))?
+        };
+        let ov = crate::overlay::Overlay::new(PathBuf::from("/"));
+        for src in srcs {
+            let rel = normalize_rel(src);
+            match ov.box_path_kind(src_id, &rel) {
+                'd' => {
+                    let base_dst = if dst_rel.is_empty() { String::new() }
+                                   else { dst_rel.to_string() };
+                    copy_box_tree(&ov, src_id, &rel, bx, &base_dst, owner, mode)?;
+                }
+                'f' => {
+                    let bytes = ov.box_read_file(src_id, &rel)
+                        .with_context(|| format!("COPY --from={from} read '{src}'"))?;
+                    let src_mode = mode
+                        .or_else(|| ov.box_file_mode(src_id, &rel))
+                        .unwrap_or(0o644);
+                    let base = leaf_name(&rel);
+                    let target = join_dest(dst_rel, dst_is_dir, &base);
+                    put_file_bytes(bx, &target, &bytes, src_mode, now_ns())?;
+                    if let Some((u, g)) = owner { bx.set_owner(&target, u, g); }
+                }
+                'l' => {
+                    let tgt = ov.box_read_file(src_id, &rel)
+                        .with_context(|| format!("COPY --from={from} readlink '{src}'"))?;
+                    let base = leaf_name(&rel);
+                    let target = join_dest(dst_rel, dst_is_dir, &base);
+                    bx.set_symlink(&target,
+                        Path::new(&String::from_utf8_lossy(&tgt).into_owned()), 0);
+                    if let Some((u, g)) = owner { bx.set_owner(&target, u, g); }
+                }
+                _ => bail!("COPY --from={from}: source '{src}' not found"),
+            }
+        }
+        Ok(())
+    }
+
+    /// Glob a context-relative pattern, returning matched absolute paths.
+    fn glob_context(&self, pattern: &str) -> Result<Vec<PathBuf>> {
+        let joined = self.context.join(pattern);
+        let pat = joined.to_string_lossy();
+        let mut out = Vec::new();
+        for entry in glob::glob(&pat)
+            .map_err(|e| anyhow!("bad glob pattern '{pattern}': {e}"))?
+        {
+            if let Ok(p) = entry { out.push(p); }
+        }
+        Ok(out)
     }
 
     /// Resolve a Dockerfile dest path to a box-relative path (relative to the
@@ -690,6 +833,11 @@ impl Builder {
         self.exposed.clear();
         self.volumes.clear();
         self.shell = vec!["/bin/sh".to_string(), "-c".to_string()];
+        self.shell_set = false;
+        self.stopsignal = None;
+        self.onbuild.clear();
+        self.healthcheck = None;
+        self.healthcheck_raw = None;
     }
 
     fn seed_config_from(&mut self, id: i64) {
@@ -719,6 +867,22 @@ impl Builder {
         if let Some(e) = inner.get("Entrypoint").and_then(|x| x.as_array()) {
             self.entrypoint = Some(e.iter().filter_map(|v| v.as_str().map(String::from)).collect());
         }
+        if let Some(sh) = inner.get("Shell").and_then(|x| x.as_array()) {
+            let v: Vec<String> = sh.iter().filter_map(|x| x.as_str().map(String::from)).collect();
+            if !v.is_empty() { self.shell = v; self.shell_set = true; }
+        }
+        if let Some(s) = inner.get("StopSignal").and_then(|x| x.as_str()) {
+            if !s.is_empty() { self.stopsignal = Some(s.to_string()); }
+        }
+        if let Some(ob) = inner.get("OnBuild").and_then(|x| x.as_array()) {
+            self.onbuild = ob.iter().filter_map(|x| x.as_str().map(String::from)).collect();
+        }
+        // Healthcheck is carried as-is from the base (already in nanosecond
+        // form) when this build doesn't override it. Stored back verbatim in
+        // config_json via the raw JSON value.
+        if let Some(hc) = inner.get("Healthcheck") {
+            self.healthcheck_raw = Some(hc.clone());
+        }
     }
 
     fn config_json(&self) -> String {
@@ -743,6 +907,20 @@ impl Builder {
             let m: serde_json::Map<String, serde_json::Value> = self.volumes.iter()
                 .map(|p| (p.clone(), serde_json::json!({}))).collect();
             cfg.insert("Volumes".into(), serde_json::Value::Object(m));
+        }
+        if self.shell_set {
+            cfg.insert("Shell".into(), serde_json::json!(self.shell));
+        }
+        if let Some(s) = &self.stopsignal {
+            cfg.insert("StopSignal".into(), serde_json::json!(s));
+        }
+        if !self.onbuild.is_empty() {
+            cfg.insert("OnBuild".into(), serde_json::json!(self.onbuild));
+        }
+        if let Some(spec) = &self.healthcheck {
+            cfg.insert("Healthcheck".into(), healthcheck_json(spec));
+        } else if let Some(raw) = &self.healthcheck_raw {
+            cfg.insert("Healthcheck".into(), raw.clone());
         }
         serde_json::json!({ "config": cfg }).to_string()
     }
@@ -775,6 +953,75 @@ impl Builder {
         println!("built image '{name}' → top box {top}");
         Ok(())
     }
+}
+
+/// Render a parsed HEALTHCHECK into the OCI image-config `Healthcheck` object.
+/// Durations are stored as nanosecond ints (Go `time.Duration`), the `Test`
+/// array uses Docker's `CMD`/`CMD-SHELL`/`NONE` leading tokens.
+fn healthcheck_json(spec: &crate::dockerfile::HealthcheckSpec) -> serde_json::Value {
+    use crate::dockerfile::Cmdline;
+    if spec.none {
+        return serde_json::json!({ "Test": ["NONE"] });
+    }
+    let test: Vec<String> = match &spec.test {
+        Some(Cmdline::Exec(args)) => {
+            let mut v = vec!["CMD".to_string()];
+            v.extend(args.iter().cloned());
+            v
+        }
+        Some(Cmdline::Shell(s)) => vec!["CMD-SHELL".to_string(), s.clone()],
+        None => vec!["NONE".to_string()],
+    };
+    let mut m = serde_json::Map::new();
+    m.insert("Test".into(), serde_json::json!(test));
+    let mut put_dur = |key: &str, raw: &Option<String>| {
+        if let Some(d) = raw.as_ref().and_then(|s| parse_duration_ns(s)) {
+            m.insert(key.into(), serde_json::json!(d));
+        }
+    };
+    put_dur("Interval", &spec.interval);
+    put_dur("Timeout", &spec.timeout);
+    put_dur("StartPeriod", &spec.start_period);
+    put_dur("StartInterval", &spec.start_interval);
+    if let Some(r) = spec.retries {
+        m.insert("Retries".into(), serde_json::json!(r));
+    }
+    serde_json::Value::Object(m)
+}
+
+/// Parse a Go-style duration (`30s`, `1m30s`, `500ms`, `1h`) into nanoseconds.
+/// Supports unit suffixes ns/us/µs/ms/s/m/h and concatenated terms. Returns
+/// None on any malformed input so the caller simply omits the field.
+fn parse_duration_ns(s: &str) -> Option<i64> {
+    let s = s.trim();
+    if s.is_empty() { return None; }
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    let mut total: i64 = 0;
+    let mut saw_term = false;
+    while i < bytes.len() {
+        // number (digits + optional fraction)
+        let num_start = i;
+        while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') { i += 1; }
+        if i == num_start { return None; }
+        let val: f64 = s[num_start..i].parse().ok()?;
+        // unit
+        let unit_start = i;
+        while i < bytes.len() && !bytes[i].is_ascii_digit() && bytes[i] != b'.' { i += 1; }
+        let unit = &s[unit_start..i];
+        let scale: f64 = match unit {
+            "ns" => 1.0,
+            "us" | "µs" | "μs" => 1_000.0,
+            "ms" => 1_000_000.0,
+            "s" => 1_000_000_000.0,
+            "m" => 60_000_000_000.0,
+            "h" => 3_600_000_000_000.0,
+            _ => return None,
+        };
+        total = total.checked_add((val * scale) as i64)?;
+        saw_term = true;
+    }
+    if saw_term { Some(total) } else { None }
 }
 
 /// Collapse a slash path to a clean box-relative path: drop empty and `.`
@@ -895,6 +1142,212 @@ fn copy_tree(b: &BoxState, src: &Path, dst_rel: &str,
         }
     }
     Ok(())
+}
+
+/// Recursively copy a directory from a SOURCE box's merged view (`ov`,`src_id`,
+/// `src_rel`) into box `b` under `dst_rel` — the box-view analogue of
+/// copy_tree, used by `COPY --from`. Docker copies the source dir's CONTENTS
+/// into dest.
+fn copy_box_tree(ov: &crate::overlay::Overlay, src_id: i64, src_rel: &str,
+                 b: &BoxState, dst_rel: &str, owner: Option<(u32, u32)>,
+                 mode: Option<u32>) -> Result<()> {
+    if !dst_rel.is_empty() { ensure_dir_chain(b, dst_rel); }
+    let entries = ov.box_list_dir(src_id, src_rel)
+        .map_err(|e| anyhow!("list '{src_rel}' in stage: {e}"))?;
+    for (name, kind) in entries {
+        let child_src = if src_rel.is_empty() { name.clone() }
+                        else { format!("{src_rel}/{name}") };
+        let child_dst = if dst_rel.is_empty() { name.clone() }
+                        else { format!("{dst_rel}/{name}") };
+        match kind {
+            'd' => {
+                b.set_dir(&child_dst, 0o755, 0);
+                copy_box_tree(ov, src_id, &child_src, b, &child_dst, owner, mode)?;
+            }
+            'l' => {
+                let tgt = ov.box_read_file(src_id, &child_src)
+                    .map_err(|e| anyhow!("readlink '{child_src}': {e}"))?;
+                b.set_symlink(&child_dst,
+                    Path::new(&String::from_utf8_lossy(&tgt).into_owned()), 0);
+                if let Some((u, g)) = owner { b.set_owner(&child_dst, u, g); }
+            }
+            _ => {
+                let bytes = ov.box_read_file(src_id, &child_src)
+                    .map_err(|e| anyhow!("read '{child_src}': {e}"))?;
+                let m = mode.or_else(|| ov.box_file_mode(src_id, &child_src))
+                    .unwrap_or(0o644);
+                put_file_bytes(b, &child_dst, &bytes, m, now_ns())?;
+                if let Some((u, g)) = owner { b.set_owner(&child_dst, u, g); }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Write `bytes` into box `b` at `target_rel` as a regular file with `mode`,
+/// creating ancestor dirs. The box-bytes analogue of copy_file (used by
+/// ADD-of-URL, ADD-tar-extract, and COPY --from).
+fn put_file_bytes(b: &BoxState, target_rel: &str, bytes: &[u8], mode: u32,
+                  mtime_ns: i64) -> Result<()> {
+    if let Some(parent) = Path::new(target_rel).parent().and_then(|p| p.to_str()) {
+        if !parent.is_empty() { ensure_dir_chain(b, parent); }
+    }
+    let m = mode & 0o7777;
+    let rowid = b.ensure_file_row(target_rel, 0o100000 | m, 0);
+    let bp = crate::capture::blob_path(b.id, rowid);
+    if let Some(p) = bp.parent() { std::fs::create_dir_all(p)?; }
+    std::fs::write(&bp, bytes)
+        .with_context(|| format!("write blob for {target_rel}"))?;
+    let _ = std::fs::set_permissions(&bp, std::fs::Permissions::from_mode(m));
+    b.finalize_file(target_rel, bytes.len() as i64, mtime_ns, 0);
+    Ok(())
+}
+
+/// Join a dest dir/file path with a source leaf name. When `dst_is_dir` the
+/// leaf is appended; otherwise the dest IS the target path (single-file rename).
+fn join_dest(dst_rel: &str, dst_is_dir: bool, base: &str) -> String {
+    if dst_is_dir || dst_rel.is_empty() {
+        if dst_rel.is_empty() { base.to_string() } else { format!("{dst_rel}/{base}") }
+    } else {
+        dst_rel.to_string()
+    }
+}
+
+/// Last path component of a box-relative path (the file/dir basename).
+fn leaf_name(rel: &str) -> String {
+    rel.rsplit('/').next().unwrap_or(rel).to_string()
+}
+
+/// Final path segment of a URL (its filename), query/fragment stripped.
+fn url_basename(url: &str) -> String {
+    let no_q = url.split(['?', '#']).next().unwrap_or(url);
+    no_q.trim_end_matches('/').rsplit('/').next().unwrap_or("").to_string()
+}
+
+fn now_ns() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64).unwrap_or(0)
+}
+
+/// What `archive_kind` decided a local ADD source is.
+enum ArchiveKind {
+    /// A tar stream (plain, gzip, or zstd) — auto-extract it.
+    Tar,
+    /// A recognized but unsupported compression (no decoder) — bail clearly.
+    Unsupported(&'static str),
+    /// Not an archive — ADD copies it as a plain file (like COPY).
+    NotArchive,
+}
+
+/// Sniff a local ADD source's header: Docker auto-extracts a source it
+/// recognizes as a (optionally compressed) tar. We can decode gzip/zstd/plain;
+/// xz/bzip2 are recognized but unsupported (loud bail, never a silent
+/// plain-copy of a tarball the user expected extracted).
+fn archive_kind(path: &Path) -> Result<ArchiveKind> {
+    let mut f = File::open(path)?;
+    let mut head = [0u8; 512];
+    let mut n = 0usize;
+    loop {
+        match f.read(&mut head[n..]) {
+            Ok(0) => break,
+            Ok(k) => { n += k; if n == head.len() { break; } }
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let h = &head[..n];
+    if sniff(h).is_some() {
+        // gzip / zstd magic → treat as a compressed tar (Docker assumes so).
+        return Ok(ArchiveKind::Tar);
+    }
+    if h.len() >= 6 && h[..6] == [0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00] {
+        return Ok(ArchiveKind::Unsupported("xz"));
+    }
+    if h.len() >= 3 && &h[..3] == b"BZh" {
+        return Ok(ArchiveKind::Unsupported("bzip2"));
+    }
+    // Plain tar: the ustar magic lives at offset 257.
+    if h.len() >= 262 && &h[257..262] == b"ustar" {
+        return Ok(ArchiveKind::Tar);
+    }
+    Ok(ArchiveKind::NotArchive)
+}
+
+/// Extract a (optionally compressed) tar `blob` INTO box `b` under `dst_rel`,
+/// the ADD-of-local-tar path. Plain extraction — no AUFS whiteout convention
+/// (a build-context tarball never carries `.wh.` entries). Files/dirs/symlinks
+/// are handled; `--chown`/`--chmod` overrides win over the tar's own metadata.
+fn extract_tar_into(b: &BoxState, blob: &[u8], dst_rel: &str,
+                    owner: Option<(u32, u32)>, mode_override: Option<u32>) -> Result<()> {
+    use std::path::Component;
+    if !dst_rel.is_empty() { ensure_dir_chain(b, dst_rel); }
+    let reader = decompressor(blob, "")?;
+    let mut ar = tar::Archive::new(reader);
+    for entry in ar.entries().context("read tar entries")? {
+        let mut e = entry.context("tar entry")?;
+        let raw = match e.path() { Ok(p) => p.into_owned(), Err(_) => continue };
+        if raw.is_absolute()
+            || raw.components().any(|c| matches!(c, Component::ParentDir | Component::Prefix(_)))
+        { continue; }
+        let rel_s = raw.to_string_lossy();
+        let rel = rel_s.trim_end_matches('/');
+        if rel.is_empty() { continue; }
+        let target = if dst_rel.is_empty() { rel.to_string() }
+                     else { format!("{dst_rel}/{rel}") };
+        let (tmode, mtime_ns, uid, gid, et) = {
+            let h = e.header();
+            (
+                h.mode().unwrap_or(0o644) & 0o7777,
+                (h.mtime().unwrap_or(0) as i64).saturating_mul(1_000_000_000),
+                h.uid().unwrap_or(0) as u32,
+                h.gid().unwrap_or(0) as u32,
+                h.entry_type(),
+            )
+        };
+        let mode = mode_override.unwrap_or(tmode);
+        match et {
+            tar::EntryType::Directory => {
+                if let Some(p) = Path::new(&target).parent().and_then(|p| p.to_str()) {
+                    if !p.is_empty() { ensure_dir_chain(b, p); }
+                }
+                b.set_dir(&target, mode, 0);
+            }
+            tar::EntryType::Regular | tar::EntryType::Continuous => {
+                let mut body = Vec::new();
+                e.read_to_end(&mut body).context("read tar file body")?;
+                put_file_bytes(b, &target, &body, mode, mtime_ns)?;
+            }
+            tar::EntryType::Symlink => {
+                if let Ok(Some(link)) = e.link_name() {
+                    if let Some(p) = Path::new(&target).parent().and_then(|p| p.to_str()) {
+                        if !p.is_empty() { ensure_dir_chain(b, p); }
+                    }
+                    b.set_symlink(&target, &link, 0);
+                }
+            }
+            // Hardlinks/devices/fifos in an ADD tarball are rare; skip rather
+            // than guess. (Layer ingest handles the full set; ADD does not.)
+            _ => continue,
+        }
+        let (u, g) = owner.unwrap_or((uid, gid));
+        if u != 0 || g != 0 { b.set_owner(&target, u, g); }
+    }
+    Ok(())
+}
+
+/// Fetch a URL into memory for `ADD <url>`. Uses reqwest (already in the tree
+/// via oci-client) with platform TLS verification + redirect following.
+fn fetch_url(url: &str) -> Result<Vec<u8>> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all().build().context("build runtime")?;
+    rt.block_on(async {
+        let resp = reqwest::get(url).await.context("GET")?;
+        let status = resp.status();
+        if !status.is_success() {
+            bail!("server returned HTTP {status}");
+        }
+        Ok(resp.bytes().await.context("read body")?.to_vec())
+    })
 }
 
 struct LoadOutcome {

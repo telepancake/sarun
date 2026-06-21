@@ -83,6 +83,12 @@ tui-term = { version = "0.3", features = ["vt100"] }
 #               the static-musl build stays a single binary
 oci-client = { version = "0.17", default-features = false, features = ["rustls-tls"] }
 oci-spec = "0.10"
+# `ADD <url>` in `oci build` fetches over HTTPS. reqwest is already in the tree
+# (oci-client depends on it). We add no TLS feature ourselves: cargo feature
+# unification gives this edge the SAME rustls backend oci-client already enables
+# (which builds on static-musl today), so we don't risk pulling a second/C-based
+# crypto provider. `http2` is additive and harmless.
+reqwest = { version = "0.13", default-features = false, features = ["http2"] }
 tar = "0.4"
 flate2 = "1"
 ruzstd = "0.7"

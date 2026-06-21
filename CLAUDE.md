@@ -136,7 +136,9 @@ there is NO hardcoded venv. Takes a few minutes (real boxes).
 busybox, hello-world): pull/archive/layout → at-rest layer-box stack; run a
 container box on an image's top layer with its config (env/cmd/entrypoint/
 workdir/user); build a Dockerfile (FROM/RUN/COPY/ADD/ENV/ARG/WORKDIR/USER/CMD/
-ENTRYPOINT/LABEL/EXPOSE/VOLUME/SHELL, multi-stage, `-t`). The proxied `Tap`
+ENTRYPOINT/LABEL/EXPOSE/VOLUME/SHELL/STOPSIGNAL/ONBUILD/HEALTHCHECK, multi-stage
+incl. `COPY --from=<stage|image>`, glob sources, `ADD` URL-fetch + local-tar
+auto-extract, `-t`). The proxied `Tap`
 default works *inside* a container too (verified live: a closed alpine box
 fetched example.com over both HTTP and HTTPS-through-MITM — DNS, TCP, and CA
 injection all through the engine's per-box netns, the box's only route out).
@@ -146,8 +148,9 @@ shim (`runner.rs`, via `/proc/self/fd/N`), and the host-visibility cwd default
 (engine `no_host` ack). Regression net: `prototype/test_oci.py` (`make test-oci`)
 synthesizes a scratch oci-archive in-test (rootfs = the static engine binary at
 `/bin/sarun`, no registry/network) and asserts load → run → build → run-result,
-including closed-rootfs boot and that COPY landed. **Delete a bullet below the
-moment it's done.**
+including closed-rootfs boot, COPY/glob landing, multi-stage `COPY --from`,
+`ADD` tar auto-extract, and STOPSIGNAL/HEALTHCHECK carried into the config.
+**Delete a bullet below the moment it's done.**
 
 - [ ] **Image cache v2 — key on the manifest digest.** v1 is done:
   `resolve_image_top` → `find_loaded_by_reference` dedups `oci run <ref>` by the
@@ -169,24 +172,13 @@ moment it's done.**
   and asserts each inherits no_host=1, re-parents top-level, and the descendant
   still boots (content survived) and stays closed. Still needs the verbs + image
   refcount/cascade.
-- [ ] **`oci build` instructions:** `COPY --from=<stage|image>`; `ADD` URL
-  fetch + local-tar auto-extract; glob sources; carry HEALTHCHECK/ONBUILD/
-  STOPSIGNAL into the image config (today: warned + skipped).
 - [ ] **Registry reach:** private-registry auth (`fetch_registry` passes
   `RegistryAuth::Anonymous`); digest/signature verification; `zstd:chunked`
   fast path (currently decoded as plain zstd — correct, just not chunked).
-- [ ] **`--api` `/usr/local/bin/{oaita,sarun}` on scratch/distroless (low pri,
-  maybe wontfix).** These are FUSE shadows (`overlay::is_engine_shadow_path`),
-  no binds. On a closed minimal image with no `/usr/local/bin` the box can't
-  traverse to the shadow leaf — but **sarun never needs it**: its own in-box
-  engine access goes over SCM_RIGHTS (the FD broker / fd-exec'd inner), never a
-  path. Those PATH entries exist only so a *user* inside the box can type
-  `oaita`/`sarun`. If that's wanted on such images, present the ancestor dirs
-  too (as `oaita_config_ancestor_or_self` does for the config path); otherwise
-  leave it.
-- [ ] **Reconcile opaque-whiteout.** `oci.rs` does `set_opaque` for
-  `.wh..wh..opq`, but the file header still calls it "out of scope
-  (logged + skipped)" — verify the behavior, fix whichever is wrong.
+  (`ADD <url>` over HTTPS already works via `reqwest` — this is FROM-pull auth.)
+- [ ] **`ADD` auto-extract of xz/bzip2.** gzip/zstd/plain tar extract; xz and
+  bzip2 are detected and loudly refused (no bundled decoder). Add a pure-Rust
+  xz/bzip2 decoder if a real Dockerfile needs it.
 
 ## Branch / workflow
 Develop on the branch you were told to; commit with clear messages; push only
