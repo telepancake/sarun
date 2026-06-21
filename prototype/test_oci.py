@@ -395,6 +395,25 @@ def main():
         check(after - before == 1,
               f"reuse added only the container box, not a new layer stack (+{after - before})")
 
+        # ── image cache v2: coalesce by MANIFEST DIGEST across ref strings ────
+        # The archive is a tar of an oci-layout. Extracting it yields the SAME
+        # blobs/manifest → the SAME manifest digest as SYN. Running it by a
+        # DIFFERENT reference string (oci-layout:<dir>) must coalesce onto SYN's
+        # already-loaded stack (v2 key), not pull a second copy.
+        lay = tmp / "layout"; lay.mkdir()
+        with tarfile.open(arch) as t:
+            t.extractall(lay)
+        before2 = len(list(state_dir(e).glob("*.sqlar")))
+        r = sarun(e, "oci", "run", "--net", "off", f"oci-layout:{lay}")
+        after2 = len(list(state_dir(e).glob("*.sqlar")))
+        check(r.returncode == 0, f"oci run by layout ref exits 0 (stderr: {r.stderr.strip()[:200]})")
+        check("manifest" in r.stderr and "reusing already-loaded image" in r.stderr,
+              f"oci run by a DIFFERENT ref string coalesced on the manifest digest "
+              f"(stderr: {r.stderr.strip()[:200]})")
+        check(after2 - before2 == 1,
+              f"digest coalesce added only the container box, no new layer stack "
+              f"(+{after2 - before2})")
+
         # ── dissolve carries the no_host closure DOWN to the children ─────────
         # SYN is a no_host image base: its rootfs is CLOSED (absent paths ENOENT,
         # never the host's fs). Every container/build box sits on top of it. The
