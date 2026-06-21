@@ -76,7 +76,10 @@ impl Matcher for SingleExecMatcher {
                 Path::new(".").join(file_info.path())
             }
         } else {
-            file_info.path().to_path_buf()
+            // {} substitutes the DISPLAY (relative) path the user expects; the
+            // child runs in the embedder's logical cwd (set below) so it still
+            // resolves. -execdir keeps the "./basename" + real-parent-cwd form.
+            file_info.display_path().to_path_buf()
         };
 
         let resolved_executable = match self.executable {
@@ -122,6 +125,11 @@ impl Matcher for SingleExecMatcher {
                     command.current_dir(parent);
                 }
             }
+        } else if let Some(d) = matcher_io.deps.cwd() {
+            // sarun: a normal -exec child runs in the embedder's logical cwd, so
+            // the relative {} (display path) resolves there without the engine
+            // ever changing its own process cwd.
+            command.current_dir(d);
         }
         // Route the child's stdout/stderr to the embedder's logical streams when
         // provided (the in-process builtin dups the shell's logical fds), so
@@ -184,6 +192,15 @@ impl MultiExecMatcher {
     }
 
     fn run_command(&self, command: &mut argmax::Command, matcher_io: &mut MatcherIO) {
+        // sarun: a normal `-exec … +` child runs in the embedder's logical cwd
+        // so the relative {} (display) paths resolve. -execdir already set its
+        // own current_dir (the real parent) before calling us, so only do this
+        // for the non-execdir form.
+        if !self.exec_in_parent_dir {
+            if let Some(d) = matcher_io.deps.cwd() {
+                command.current_dir(d);
+            }
+        }
         // Same child-stdio routing as the single-exec path: dup the embedder's
         // logical streams into the batched `-exec … +` child (argmax::Command
         // forwards stdout/stderr to the inner std Command).
@@ -216,7 +233,7 @@ impl Matcher for MultiExecMatcher {
                 Path::new(".").join(file_info.path())
             }
         } else {
-            file_info.path().to_path_buf()
+            file_info.display_path().to_path_buf()
         };
         let mut command = self.command.borrow_mut();
         let command = command.get_or_insert_with(|| self.new_command());

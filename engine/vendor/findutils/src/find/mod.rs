@@ -96,6 +96,15 @@ pub trait Dependencies {
     fn child_stderr(&self) -> Option<std::process::Stdio> {
         None
     }
+    /// The embedder's LOGICAL working directory. When `Some(dir)`, find roots a
+    /// relative start path at `dir` (an absolute walk, so it never depends on or
+    /// mutates the process cwd) and presents paths relative to the start, and
+    /// spawns `-exec` children with `dir` as their cwd. `None` (the standalone
+    /// binary) uses the process cwd as usual. sarun addition — replaces the
+    /// per-thread `unshare(CLONE_FS)` cwd hack with pure logical state.
+    fn cwd(&self) -> Option<&std::path::Path> {
+        None
+    }
 }
 
 /// Struct that holds the dependencies we use when run as the real executable.
@@ -256,7 +265,17 @@ fn process_dir(
     matcher: &dyn matchers::Matcher,
     quit: &mut bool,
 ) -> i32 {
-    let mut walkdir = WalkDir::new(dir)
+    // sarun: when the embedder supplies a logical cwd, root a RELATIVE start
+    // path there with an absolute walk (so the traversal never depends on the
+    // process cwd — no `unshare`/`chdir`), and remap each entry's DISPLAY path
+    // back to the start-relative form the user expects. An absolute start path,
+    // or the standalone binary (cwd == None), is walked as-is.
+    let start = std::path::Path::new(dir);
+    let (walk_root, remap): (PathBuf, Option<PathBuf>) = match deps.cwd() {
+        Some(cwd) if start.is_relative() => (cwd.join(start), Some(start.to_path_buf())),
+        _ => (start.to_path_buf(), None),
+    };
+    let mut walkdir = WalkDir::new(&walk_root)
         .contents_first(config.depth_first)
         .max_depth(config.max_depth)
         .min_depth(config.min_depth)
@@ -281,7 +300,22 @@ fn process_dir(
                 ret = 1;
                 writeln!(&mut *deps.get_error_output().borrow_mut(), "Error: {err}").unwrap();
             }
-            Ok(entry) => {
+            Ok(mut entry) => {
+                // sarun: present this entry relative to the start path (the real
+                // absolute path stays for fs ops); identity when not remapping.
+                if let Some(remap_root) = &remap {
+                    let rel = entry.path().strip_prefix(&walk_root).unwrap_or(entry.path());
+                    // The root entry strips to "" — display it as the start path
+                    // itself (`.`/`sub`), not `./`/`sub/` (a bare join("") would
+                    // append a trailing separator).
+                    let disp = if rel.as_os_str().is_empty() {
+                        remap_root.clone()
+                    } else {
+                        remap_root.join(rel)
+                    };
+                    entry.set_display(disp);
+                }
+
                 let mut matcher_io = matchers::MatcherIO::new(deps);
 
                 let new_dir = entry.path().parent().map(std::path::Path::to_path_buf);
