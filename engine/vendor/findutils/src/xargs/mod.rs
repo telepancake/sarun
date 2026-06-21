@@ -49,6 +49,14 @@ pub trait XargsIo {
     fn child_stderr(&self) -> Option<Stdio> {
         None
     }
+    /// Working directory for spawned children. An embedder returns `Some(_)` to
+    /// run each child in the shell's LOGICAL cwd (so relative input items and the
+    /// command resolve there) without the in-process engine ever changing its own
+    /// process cwd. The default `None` inherits the process cwd, matching the
+    /// standalone binary.
+    fn cwd(&self) -> Option<&std::path::Path> {
+        None
+    }
 }
 
 /// The dependencies used when xargs runs as the real standalone executable:
@@ -487,6 +495,13 @@ impl CommandBuilder<'_> {
         };
 
         let mut command = Command::new(entry_point);
+
+        // Run the child in the shell's LOGICAL cwd (in-process embedder), so
+        // relative input items and the command resolve against the box's cwd
+        // without the engine touching its own process cwd. No-op for standalone.
+        if let Some(dir) = io.cwd() {
+            command.current_dir(dir);
+        }
 
         if let Some(replace_str) = &self.options.replace {
             // Replace all occurrences in initial args with the extra arg,
