@@ -109,7 +109,6 @@ impl<SE: extensions::ShellExtensions> crate::Shell<SE> {
             shell: self,
             command_name,
             params,
-            spawned_pipeline_stage: false,
         };
 
         let command_args = args
