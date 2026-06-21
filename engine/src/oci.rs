@@ -17,8 +17,10 @@
 // opaque-dir markers (`.wh..wh..opq`, ingested as sqlar.opaque=1 so the
 // overlay hides every lower-layer entry under the dir — see
 // test_oci_layers_rs.py); per-entry uid/gid/xattrs/mtime.
-// Out of scope (v1): private-registry auth, signatures, zstd:chunked
-// streaming.
+// Registry auth: credentials come from the host Docker config + credential
+// helpers (registry_auth_for), read host-side, never entering a box.
+// Out of scope (v1): image signature verification (cosign/notary); the
+// zstd:chunked TOC fast path (plain-zstd decode is already correct).
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -318,8 +320,8 @@ fn unique_container_name() -> String {
 // glob sources, ADD-of-URL fetch and ADD-of-local-tar (gzip/zstd/xz/bzip2/
 // plain) auto-extract; ENV/ARG/WORKDIR/USER/CMD/ENTRYPOINT/LABEL/EXPOSE/VOLUME/
 // SHELL/STOPSIGNAL/ONBUILD/HEALTHCHECK carried into the image config; `-t` tag,
-// `-f` file, `--build-arg`, `--net`.
-// Out of scope (v1): private-registry FROM auth.
+// `-f` file, `--build-arg`, `--net`. A `FROM` registry pull authenticates via
+// the host Docker config (see registry_auth_for).
 fn cli_build(args: &[String]) -> i32 {
     let mut tag: Option<String> = None;
     let mut file: Option<String> = None;
@@ -1393,7 +1395,8 @@ async fn fetch_registry(reference: &str) -> Result<PulledImage> {
         ZSTD_LAYER_MEDIA_TYPE,
         DOCKER_LAYER_GZIP_MEDIA_TYPE,
     ];
-    let img = client.pull(&r, &RegistryAuth::Anonymous, accepted).await
+    let auth = registry_auth_for(reference);
+    let img = client.pull(&r, &auth, accepted).await
         .context("pull image")?;
     let mut layers = Vec::with_capacity(img.layers.len());
     for layer in img.layers {
@@ -1409,6 +1412,85 @@ async fn fetch_registry(reference: &str) -> Result<PulledImage> {
         config_json,
         reference: reference.to_string(),
     })
+}
+
+/// Resolve registry credentials for `reference` from the host's Docker config
+/// (`$DOCKER_CONFIG/config.json` or `~/.docker/config.json`) plus credential
+/// helpers. Returns `Anonymous` when nothing is configured for the registry, so
+/// public pulls are unchanged. Credentials are read HOST-side here in the
+/// engine/CLI and never enter a box.
+fn registry_auth_for(reference: &str) -> RegistryAuth {
+    let Ok(r) = Reference::from_str(reference) else { return RegistryAuth::Anonymous; };
+    let host = r.registry().to_string();
+    // Docker Hub creds live under a legacy key in config.json.
+    let mut keys = vec![host.clone()];
+    if matches!(host.as_str(),
+                "docker.io" | "registry-1.docker.io" | "index.docker.io") {
+        keys.push("https://index.docker.io/v1/".to_string());
+    }
+    let Some(cfg) = read_docker_config() else { return RegistryAuth::Anonymous; };
+    // 1. A direct auths[<key>] entry: base64 "user:pass", or username/password.
+    if let Some(auths) = cfg.get("auths").and_then(|v| v.as_object()) {
+        for k in &keys {
+            let Some(entry) = auths.get(k).and_then(|v| v.as_object()) else { continue };
+            if let Some(b64) = entry.get("auth").and_then(|v| v.as_str()) {
+                if let Some((u, p)) = decode_basic_auth(b64) {
+                    return RegistryAuth::Basic(u, p);
+                }
+            }
+            if let (Some(u), Some(p)) = (entry.get("username").and_then(|v| v.as_str()),
+                                         entry.get("password").and_then(|v| v.as_str())) {
+                return RegistryAuth::Basic(u.to_string(), p.to_string());
+            }
+        }
+    }
+    // 2. A credential helper (per-registry credHelpers beats the global credsStore).
+    let helper = cfg.get("credHelpers").and_then(|v| v.as_object())
+        .and_then(|m| keys.iter().find_map(|k| m.get(k)).and_then(|v| v.as_str()))
+        .map(String::from)
+        .or_else(|| cfg.get("credsStore").and_then(|v| v.as_str()).map(String::from));
+    if let Some(helper) = helper {
+        if let Some(auth) = credential_helper_get(&helper, &host) {
+            return auth;
+        }
+    }
+    RegistryAuth::Anonymous
+}
+
+fn read_docker_config() -> Option<serde_json::Value> {
+    let path = std::env::var_os("DOCKER_CONFIG")
+        .map(|d| PathBuf::from(d).join("config.json"))
+        .or_else(|| std::env::var_os("HOME")
+            .map(|h| PathBuf::from(h).join(".docker").join("config.json")))?;
+    serde_json::from_slice(&std::fs::read(&path).ok()?).ok()
+}
+
+fn decode_basic_auth(b64: &str) -> Option<(String, String)> {
+    use base64::{Engine as _, prelude::BASE64_STANDARD};
+    let raw = BASE64_STANDARD.decode(b64.trim()).ok()?;
+    let s = String::from_utf8(raw).ok()?;
+    let (u, p) = s.split_once(':')?;
+    Some((u.to_string(), p.to_string()))
+}
+
+/// Run `docker-credential-<helper> get` with the server on stdin; parse the
+/// `{Username, Secret}` reply into Basic auth. An identity-token result
+/// (`Username == "<token>"`) can't be expressed as Basic, so we skip it.
+fn credential_helper_get(helper: &str, server: &str) -> Option<RegistryAuth> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(format!("docker-credential-{helper}"))
+        .arg("get")
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
+        .spawn().ok()?;
+    child.stdin.take()?.write_all(server.as_bytes()).ok()?;
+    let out = child.wait_with_output().ok()?;
+    if !out.status.success() { return None; }
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    let user = v.get("Username").and_then(|x| x.as_str())?;
+    let secret = v.get("Secret").and_then(|x| x.as_str())?;
+    if user == "<token>" { return None; }
+    Some(RegistryAuth::Basic(user.to_string(), secret.to_string()))
 }
 
 fn fetch_oci_layout(path: &Path) -> Result<PulledImage> {
