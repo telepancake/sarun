@@ -8,7 +8,6 @@
 
 use std::ffi::CStr;
 use std::os::fd::{AsFd, BorrowedFd};
-use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -899,26 +898,10 @@ pub fn lower_has(id: i64, rel: &str) -> bool {
     false // depth exceeded: treat as not found
 }
 
-/// Drop a live box's OWN row + pool blob for `rel` (the live counterpart of the
-/// at-rest row+blob drop). Used when a delete promotes into a destination whose
-/// lower has nothing to shadow, so the destination's own row is removed entirely.
-fn drop_live_entry(cb: &crate::capture::BoxState, rel: &str) {
-    let rowid = {
-        let conn = cb.conn.lock().unwrap();
-        let rid = conn.query_row("SELECT rowid FROM sqlar WHERE name=?1", [rel],
-                                 |r| r.get::<_, i64>(0)).ok();
-        let _ = conn.execute("DELETE FROM sqlar WHERE name=?1", [rel]);
-        rid
-    };
-    cb.forget_kind(rel);
-    if let Some(rid) = rowid {
-        let _ = std::fs::remove_file(blob_path(cb.id, rid));
-    }
-}
-
-/// Write a source entry RECORD into a destination box's overlay (live BoxState
-/// + RAM mirror when running, else the at-rest sqlar). The single write path
-/// shared by dissolve copy-down and nested apply-promote.
+/// Write a source entry RECORD into a destination box's overlay — ONE write path
+/// (the destination's authoritative sqlar) shared by dissolve copy-down and
+/// nested apply-promote, with a live destination's RAM mirror refreshed
+/// afterward. Does not depend on whether a process runs in the destination.
 ///
 /// For a tombstone source (a deletion), `tombstone_as_whiteout` chooses the
 /// outcome: true → write a whiteout into the destination (the deletion must
@@ -930,88 +913,65 @@ fn promote_record(e: &SrcEntry, src: i64, dst: i64,
                   rel: &str, tombstone_as_whiteout: bool) -> Result<(), String> {
     let kind = e.mode & S_IFMT;
 
-    if let Some(cb) = dst_live {
-        // ── live destination: write through the BoxState (conn + RAM mirror) ──
-        match kind {
-            S_IFCHR => {
-                if tombstone_as_whiteout {
-                    cb.set_whiteout(rel, 0);
-                } else {
-                    drop_live_entry(cb, rel);
-                    return Ok(());
-                }
+    // ONE write path: write the destination's authoritative sqlar (a fresh RW
+    // connection — fine for a live box too; SQLite serializes writers and the
+    // box's own writes are autocommit). Whether or not a process is running in
+    // the destination is irrelevant to WHAT is written; a running box just gets
+    // its in-RAM `kinds` mirror refreshed afterward (see the reload_entry tail)
+    // so its FUSE mount serves the new state.
+    let result: Result<(), String> = (|| {
+        let cc = open_rw(dst).ok_or("destination archive unavailable")?;
+        if kind == S_IFCHR && !tombstone_as_whiteout {
+            // Lower has nothing here: drop the destination's own row + blob.
+            if let Some((rowid, _, _)) = row_of(&cc, rel) {
+                consume(&cc, dst, rel, rowid);
             }
-            S_IFLNK => {
-                let tgt = e.data.clone().unwrap_or_default();
-                cb.set_symlink(rel, std::path::Path::new(
-                    std::ffi::OsStr::from_bytes(&tgt)), 0);
-            }
-            0o040000 => cb.set_dir(rel, e.mode & 0o7777, 0),
-            S_IFIFO | S_IFBLK =>
-                cb.set_special(rel, e.mode, e.rdev.unwrap_or(0) as u64, 0),
-            _ => {
-                // regular file: row via the live Index, bytes into the dst pool.
-                let rid = cb.ensure_file_row(rel, e.mode, 0);
-                let s = blob_path(src, e.rowid);
-                let dstb = blob_path(cb.id, rid);
+            return Ok(());
+        }
+        // INSERT OR REPLACE so an apply-promote OVERWRITES the destination's
+        // prior view; drop any stale blob the replaced row named first. (A
+        // copy-down never reaches here for an already-present destination — its
+        // caller guards on has_own.)
+        if let Some((old_rowid, _, _)) = row_of(&cc, rel) {
+            let _ = std::fs::remove_file(blob_path(dst, old_rowid));
+        }
+        cc.execute("INSERT OR REPLACE INTO sqlar(name,mode,mtime,sz,data,opaque) \
+                    VALUES(?1,?2,?3,?4,?5,?6)",
+                   params![rel, e.mode as i64, e.mtime, e.sz, e.data, e.opaque])
+            .map_err(|x| x.to_string())?;
+        let new_rowid = cc.last_insert_rowid();
+        if kind == 0o100000 {
+            let s = blob_path(src, e.rowid);
+            if s.exists() {
+                let dstb = blob_path(dst, new_rowid);
                 if let Some(p) = dstb.parent() {
                     std::fs::create_dir_all(p).map_err(|x| x.to_string())?;
                 }
-                if s.exists() {
-                    std::fs::copy(&s, &dstb).map_err(|x| x.to_string())?;
-                } else if let Some(d) = &e.data {
-                    std::fs::write(&dstb, d).map_err(|x| x.to_string())?;
-                }
-                cb.finalize_file(rel, e.sz, e.mtime, 0);
+                std::fs::copy(&s, &dstb).map_err(|x| x.to_string())?;
             }
         }
-        if let Some((u, g)) = e.owner { cb.set_owner(rel, u as u32, g as u32); }
-        for (k, v) in &e.xattrs { cb.set_xattr(rel, k, v); }
-        return Ok(());
-    }
+        if let Some((u, g)) = e.owner {
+            let _ = cc.execute("INSERT OR REPLACE INTO ownership(name,uid,gid) \
+                                VALUES(?1,?2,?3)", params![rel, u, g]);
+        }
+        if let Some(dev) = e.rdev {
+            let _ = cc.execute("INSERT OR REPLACE INTO rdev(name,dev) VALUES(?1,?2)",
+                               params![rel, dev]);
+        }
+        for (k, v) in &e.xattrs {
+            let _ = cc.execute("INSERT OR REPLACE INTO xattr(name,key,value) \
+                                VALUES(?1,?2,?3)", params![rel, k, v]);
+        }
+        Ok(())
+        // cc is dropped here, releasing the write lock BEFORE the mirror refresh.
+    })();
 
-    // ── at-rest destination: write its on-disk sqlar directly ────────────────
-    let cc = open_rw(dst).ok_or("destination archive unavailable")?;
-    if kind == S_IFCHR && !tombstone_as_whiteout {
-        // Lower has nothing here: drop the destination's own row + blob.
-        if let Some((rowid, _, _)) = row_of(&cc, rel) {
-            consume(&cc, dst, rel, rowid);
-        }
-        return Ok(());
-    }
-    // INSERT OR REPLACE so an apply-promote OVERWRITES the destination's prior
-    // view; drop any stale blob the replaced row named first. (A copy-down never
-    // reaches here for an already-present destination — its caller guards on
-    // has_own.)
-    if let Some((old_rowid, _, _)) = row_of(&cc, rel) {
-        let _ = std::fs::remove_file(blob_path(dst, old_rowid));
-    }
-    cc.execute("INSERT OR REPLACE INTO sqlar(name,mode,mtime,sz,data,opaque) \
-                VALUES(?1,?2,?3,?4,?5,?6)",
-               params![rel, e.mode as i64, e.mtime, e.sz, e.data, e.opaque])
-        .map_err(|x| x.to_string())?;
-    let new_rowid = cc.last_insert_rowid();
-    if kind == 0o100000 {
-        let s = blob_path(src, e.rowid);
-        if s.exists() {
-            let dstb = blob_path(dst, new_rowid);
-            if let Some(p) = dstb.parent() {
-                std::fs::create_dir_all(p).map_err(|x| x.to_string())?;
-            }
-            std::fs::copy(&s, &dstb).map_err(|x| x.to_string())?;
-        }
-    }
-    if let Some((u, g)) = e.owner {
-        let _ = cc.execute("INSERT OR REPLACE INTO ownership(name,uid,gid) \
-                            VALUES(?1,?2,?3)", params![rel, u, g]);
-    }
-    if let Some(dev) = e.rdev {
-        let _ = cc.execute("INSERT OR REPLACE INTO rdev(name,dev) VALUES(?1,?2)",
-                           params![rel, dev]);
-    }
-    for (k, v) in &e.xattrs {
-        let _ = cc.execute("INSERT OR REPLACE INTO xattr(name,key,value) \
-                            VALUES(?1,?2,?3)", params![rel, k, v]);
+    result?;
+    // Cache-coherence, not a behavioral branch: a running destination re-reads
+    // the one row we just wrote into its in-RAM mirror so its FUSE mount is
+    // consistent. An at-rest destination has no mirror — nothing to do.
+    if let Some(cb) = dst_live {
+        cb.reload_entry(rel);
     }
     Ok(())
 }
@@ -1042,23 +1002,21 @@ pub fn promote_into_parent(box_id: i64, parent: i64,
 /// parent's version into the child first. If the child already has its own row
 /// for `rel`, its view is self-contained and we leave it untouched.
 ///
-/// `child_live`: when the child box is RUNNING, its live `BoxState` — the write
-/// goes through that one connection + RAM mirror (so the mounted FUSE view
-/// serves the copied-down entry immediately), never a rival on-disk handle.
-/// When None, the child is at rest and we write its on-disk sqlar directly.
-/// Files copy the parent blob into the child's pool under a fresh rowid;
+/// `child_live` is the child's live `BoxState` when a process is running in it —
+/// used ONLY to refresh the child's RAM mirror after the write (via
+/// promote_record), never to change what is read or written. Whether the child
+/// "has its own entry" is read from its authoritative sqlar regardless. Files
+/// copy the parent blob into the child's pool under a fresh rowid;
 /// symlinks/tombstones/special carry their row data + side tables. A tombstone
 /// copies down AS a whiteout (the child keeps seeing 'absent').
 pub fn copy_down_entry(parent: i64, child: i64, rel: &str,
                        child_live: Option<&crate::capture::BoxState>)
     -> Result<(), String> {
     let rel = rel.trim_start_matches('/');
-    // Child already speaks for this path — its view is self-contained.
-    let has = match child_live {
-        Some(cb) => cb.has_own(rel),
-        None => open_ro(child).and_then(|c| c.query_row(
-            "SELECT 1 FROM sqlar WHERE name=?1", [rel], |_| Ok(())).ok()).is_some(),
-    };
+    // Child already speaks for this path (its own sqlar row exists) — its view
+    // is self-contained, nothing to copy down. Read the sqlar, not a live mirror.
+    let has = open_ro(child).and_then(|c| c.query_row(
+        "SELECT 1 FROM sqlar WHERE name=?1", [rel], |_| Ok(())).ok()).is_some();
     if has {
         return Ok(());
     }
@@ -1426,4 +1384,61 @@ fn which(prog: &str) -> bool {
     std::env::var_os("PATH").map(|paths| {
         std::env::split_paths(&paths).any(|p| p.join(prog).is_file())
     }).unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::capture::{BoxState, Entry};
+
+    /// The unified write path: promoting a change into a LIVE parent box writes
+    /// the parent's authoritative sqlar AND refreshes its in-RAM `kinds` mirror,
+    /// so a running FUSE mount serves the promoted file without caring that the
+    /// write came from review rather than the box's own handler. (Audit: overlay
+    /// read/write must not behave differently based on whether a process runs.)
+    #[test]
+    fn promote_into_live_parent_refreshes_the_ram_mirror() {
+        let tmp = std::env::temp_dir()
+            .join(format!("sarun-promote-{}-{:?}", std::process::id(),
+                          std::time::SystemTime::now()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        // SAFETY: state_home() is derived from XDG_STATE_HOME; no concurrent test
+        // in this binary reads it (the others use temp_dir()).
+        unsafe { std::env::set_var("XDG_STATE_HOME", &tmp); }
+        std::fs::create_dir_all(crate::paths::state_home()).unwrap();
+
+        let (parent_id, child_id) = (9001, 9002);
+        let parent = BoxState::create(parent_id).unwrap(); // the LIVE destination
+        let child = BoxState::create(child_id).unwrap();
+
+        // Child captures a regular-file change: foo.txt = "hi".
+        let rid = child.ensure_file_row("foo.txt", 0o100644, 0);
+        let cblob = crate::capture::blob_path(child_id, rid);
+        std::fs::create_dir_all(cblob.parent().unwrap()).unwrap();
+        std::fs::write(&cblob, b"hi").unwrap();
+        child.finalize_file("foo.txt", 2, 0, 0);
+
+        assert!(parent.entry("foo.txt").is_none(), "precondition: parent empty");
+
+        promote_into_parent(child_id, parent_id, Some(&parent), "foo.txt").unwrap();
+
+        // sqlar got the row...
+        let mode: i64 = {
+            let c = parent.conn.lock().unwrap();
+            c.query_row("SELECT mode FROM sqlar WHERE name='foo.txt'", [], |r| r.get(0))
+                .expect("row in parent sqlar")
+        };
+        assert_eq!(mode as u32 & S_IFMT, 0o100000, "promoted as a regular file");
+
+        // ...AND the live mirror was refreshed with the right rowid + bytes.
+        match parent.entry("foo.txt") {
+            Some(Entry::File { rowid, .. }) => {
+                let pblob = crate::capture::blob_path(parent_id, rowid);
+                assert_eq!(std::fs::read(&pblob).unwrap(), b"hi", "promoted blob copied");
+            }
+            Some(_) => panic!("live parent mirror has wrong entry kind after promote"),
+            None => panic!("live parent mirror NOT refreshed by promote (still absent)"),
+        }
+        std::fs::remove_dir_all(&tmp).ok();
+    }
 }

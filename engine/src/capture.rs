@@ -424,30 +424,7 @@ impl BoxState {
             if let Ok(rows) = rows {
                 for row in rows.flatten() {
                     let (name, mode, sz, data) = row;
-                    let ft = mode & 0o170000;
-                    let entry = if mode == S_IFCHR {
-                        Entry::Whiteout
-                    } else if ft == 0o120000 {
-                        let bytes = data.unwrap_or_default();
-                        let t = String::from_utf8_lossy(&bytes).into_owned();
-                        let _ = sz;
-                        Entry::Symlink { target: PathBuf::from(t) }
-                    } else if ft == 0o040000 {
-                        // D-opaque (OCI): a non-zero opaque column flips the
-                        // dir's mask-lower attitude — when this box appears in
-                        // the chain, the dir's lower-layer contents are wiped.
-                        let opaque: i64 = conn.query_row(
-                            "SELECT opaque FROM sqlar WHERE name=?1", [&name],
-                            |r| r.get(0)).unwrap_or(0);
-                        Entry::Dir { mode, mtime_ns: 0, opaque: opaque != 0 }
-                    } else if ft == 0o010000 || ft == 0o060000 {
-                        Entry::Special { mode, rdev: 0 }
-                    } else {
-                        let rowid: i64 = conn.query_row(
-                            "SELECT rowid FROM sqlar WHERE name=?1", [&name],
-                            |r| r.get(0)).unwrap_or(0);
-                        Entry::File { rowid, mode }
-                    };
+                    let entry = Self::entry_from_row(&conn, &name, mode, sz, data);
                     kinds.insert(name, entry);
                 }
             }
@@ -880,6 +857,57 @@ impl BoxState {
         drop(conn);
         self.kinds.write().unwrap()
             .insert(rel.to_string(), Entry::Symlink { target: target.to_path_buf() });
+    }
+
+    /// Build the in-RAM `kinds` Entry for one sqlar row. The single mapping used
+    /// both by the initial mirror load and by `reload_entry`.
+    fn entry_from_row(conn: &Connection, name: &str, mode: u32, sz: i64,
+                      data: Option<Vec<u8>>) -> Entry {
+        let ft = mode & 0o170000;
+        if mode == S_IFCHR {
+            Entry::Whiteout
+        } else if ft == 0o120000 {
+            let bytes = data.unwrap_or_default();
+            let t = String::from_utf8_lossy(&bytes).into_owned();
+            let _ = sz;
+            Entry::Symlink { target: PathBuf::from(t) }
+        } else if ft == 0o040000 {
+            let opaque: i64 = conn.query_row(
+                "SELECT opaque FROM sqlar WHERE name=?1", [name],
+                |r| r.get(0)).unwrap_or(0);
+            Entry::Dir { mode, mtime_ns: 0, opaque: opaque != 0 }
+        } else if ft == 0o010000 || ft == 0o060000 {
+            Entry::Special { mode, rdev: 0 }
+        } else {
+            let rowid: i64 = conn.query_row(
+                "SELECT rowid FROM sqlar WHERE name=?1", [name],
+                |r| r.get(0)).unwrap_or(0);
+            Entry::File { rowid, mode }
+        }
+    }
+
+    /// Refresh the in-RAM `kinds` mirror entry for ONE path from the
+    /// authoritative sqlar. Called after an OFFLINE write to this box's sqlar
+    /// (apply-promote / copy-down done through a separate connection) so a
+    /// running FUSE mount serves the new state — the write path no longer needs
+    /// to care whether a process is running in the box. If the row is gone, the
+    /// mirror entry is removed. sarun: keeps live/at-rest writes uniform.
+    pub fn reload_entry(&self, rel: &str) {
+        let conn = self.conn.lock().unwrap();
+        let row = conn.query_row(
+            "SELECT mode,sz,data FROM sqlar WHERE name=?1", [rel],
+            |r| Ok((r.get::<_, i64>(0)? as u32, r.get::<_, i64>(1)?,
+                    r.get::<_, Option<Vec<u8>>>(2)?))).ok();
+        let mut kinds = self.kinds.write().unwrap();
+        match row {
+            Some((mode, sz, data)) => {
+                let entry = Self::entry_from_row(&conn, rel, mode, sz, data);
+                kinds.insert(rel.to_string(), entry);
+            }
+            None => {
+                kinds.remove(rel);
+            }
+        }
     }
 
     pub fn set_whiteout(&self, rel: &str, writer: i64) {
