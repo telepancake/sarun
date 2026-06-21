@@ -259,8 +259,8 @@ def any_box_has_file(sdir, rel):
     return False
 
 
-def sarun(e, *args, timeout=180):
-    return subprocess.run([str(ENGINE), *args], env=e,
+def sarun(e, *args, timeout=180, input=None):
+    return subprocess.run([str(ENGINE), *args], env=e, input=input,
                           capture_output=True, text=True, timeout=timeout)
 
 
@@ -390,6 +390,33 @@ def main():
         check(r.returncode == 0 and df.startswith("FROM ")
               and "RUN " in df and "COPY " in df and "CMD " in df,
               f"oci dockerfile reconstructs FROM+RUN+COPY+CMD:\n{df.strip()}")
+
+        # ── oci author: interactive (piped) authoring with undo ───────────────
+        # Each line is one instruction (Dockerfile keyword, or bare → RUN; cd/
+        # export persist). `undo` drops the last instruction AND the box it made.
+        before_auth = len(list(state_dir(e).glob("*.sqlar")))
+        script = ('RUN ["/bin/sarun","oci","--help"]\n'   # box A
+                  'RUN ["/bin/sarun","oci","--help"]\n'   # box B
+                  'undo\n'                                 # delete box B
+                  'ENV AUTHORED=yes\n'
+                  'done\n')
+        r = sarun(e, "oci", "author", "--net", "off", "-t", "AUTH",
+                  "--from", "SYN", input=script)
+        out = r.stdout + r.stderr
+        check(r.returncode == 0 and "undone:" in out,
+              f"oci author session completes (with an undo) (rc={r.returncode})")
+        after_auth = len(list(state_dir(e).glob("*.sqlar")))
+        check(after_auth - before_auth == 2,
+              f"undo deleted the rolled-back RUN's box "
+              f"(net +{after_auth - before_auth}: owned-base + one RUN)")
+        df = sarun(e, "oci", "dockerfile", "AUTH").stdout
+        check(df.startswith("FROM SYN") and df.count("RUN ") == 1
+              and "ENV AUTHORED=yes" in df,
+              f"authored Dockerfile reflects the undo (one RUN + ENV):\n{df.strip()}")
+        check("AUTH" in box_names(state_dir(e)), "authored image AUTH persists")
+        r = sarun(e, "oci", "run", "--net", "off", "AUTH")
+        check(r.returncode == 0 and "oci load" in (r.stdout + r.stderr),
+              "the authored image runs (inherits the base CMD)")
 
         # ── run the built result ─────────────────────────────────────────────
         r = sarun(e, "oci", "run", "--net", "off", "BUILT")
