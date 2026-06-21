@@ -58,6 +58,7 @@ pub fn cli_oci(args: &[String]) -> i32 {
         "run" => cli_run(&args[1..]),
         "build" => cli_build(&args[1..]),
         "save" => cli_save(&args[1..]),
+        "dockerfile" => cli_dockerfile(&args[1..]),
         // Hidden: the host-side build worker the engine spawns for an in-box
         // `oci build` (see build_in_engine). Not for direct use.
         "__build-worker" => cli_build_worker(&args[1..]),
@@ -72,6 +73,8 @@ pub fn cli_oci(args: &[String]) -> i32 {
             println!("       build an image box stack from a Dockerfile/Containerfile");
             println!("  sarun oci save <box> [-o FILE.tar]");
             println!("       export an image/container box stack to an oci-archive");
+            println!("  sarun oci dockerfile <box>");
+            println!("       print the Dockerfile that reconstructs a built/authored box");
             println!();
             println!("  ref  e.g. alpine:3.20, ghcr.io/foo/bar:tag,");
             println!("       oci-archive:/path/to.tar, oci-layout:/path/to/dir,");
@@ -84,6 +87,65 @@ pub fn cli_oci(args: &[String]) -> i32 {
             2
         }
     }
+}
+
+// ── `sarun oci dockerfile` — reconstruct the recipe from a box's frames ──────
+// Walk a built/authored box's chain: the prefix of boxes with no `frame` meta
+// is the FROM'd base image; each box above carries the directives that built it
+// (`frame.directives`, op+text). Print `FROM <base>` + the directive sequence.
+fn cli_dockerfile(args: &[String]) -> i32 {
+    let Some(boxname) = args.iter().find(|a| !a.starts_with('-')) else {
+        eprintln!("usage: sarun oci dockerfile <box>");
+        return 2;
+    };
+    match emit_dockerfile(boxname) {
+        Ok(s) => { print!("{s}"); 0 }
+        Err(e) => { eprintln!("sarun oci dockerfile: {e:#}"); 1 }
+    }
+}
+
+fn emit_dockerfile(boxname: &str) -> Result<String> {
+    let boxes = crate::discover::discover();
+    let id = resolve_box(&boxes, boxname)
+        .ok_or_else(|| anyhow!("no such box '{boxname}'"))?;
+    let mut chain = vec![id];
+    let mut cur = id;
+    while let Some(p) = boxes.get(&cur).and_then(|b| b.parent) { chain.push(p); cur = p; }
+    chain.reverse(); // base..top
+    let has_frame = |b: &i64| boxes.get(b).is_some_and(|x| x.meta.contains_key("frame"));
+    let first_build = chain.iter().position(has_frame);
+    let (base, build): (&[i64], &[i64]) = match first_build {
+        Some(i) => (&chain[..i], &chain[i..]),
+        None => (&chain[..], &[]),
+    };
+    let mut out = String::new();
+    if base.is_empty() {
+        out.push_str("FROM scratch\n");
+    } else {
+        let bt = *base.last().unwrap();
+        let bx = boxes.get(&bt);
+        // Prefer a real registry reference; fall back to the box NAME (which
+        // `oci build`'s FROM resolves) for archive/layout-loaded bases.
+        let from = bx.and_then(|b| b.meta.get("oci_reference"))
+            .filter(|r| !r.starts_with("oci-archive:") && !r.starts_with("oci-layout:"))
+            .cloned()
+            .or_else(|| bx.map(|b| b.name.clone()))
+            .unwrap_or_else(|| bt.to_string());
+        out.push_str(&format!("FROM {from}\n"));
+    }
+    for &bx in build {
+        let Some(fr) = boxes.get(&bx).and_then(|b| b.meta.get("frame")) else { continue };
+        let Ok(v) = serde_json::from_str::<Value>(fr) else { continue };
+        for d in v.get("directives").and_then(Value::as_array).into_iter().flatten() {
+            let op = d.get("op").and_then(Value::as_str).unwrap_or("");
+            let text = d.get("text").and_then(Value::as_str).unwrap_or("");
+            if op.is_empty() { continue; }
+            if text.is_empty() { out.push_str(op); }
+            else { out.push_str(op); out.push(' '); out.push_str(text); }
+            out.push('\n');
+        }
+    }
+    Ok(out)
 }
 
 // ── `sarun oci save` — the inverse of `oci load` ─────────────────────────────
@@ -1081,6 +1143,11 @@ struct Builder {
     // are empty_layer=false; config-only ones true. Projected into the image
     // config so `docker history` (and the Dockerfile emitter) see the recipe.
     history: Vec<Value>,
+    // Per-box directive list (op+text), accumulated against the box that was
+    // current when each instruction ran, stamped as each box's `frame` meta at
+    // finish(). One box = the directives that built it — what the Dockerfile
+    // emitter walks and the interactive authoring/undo path reads.
+    frames: std::collections::HashMap<i64, Vec<Value>>,
 }
 
 impl Builder {
@@ -1100,6 +1167,7 @@ impl Builder {
             current: None, started: false, step: 0,
             stages: HashMap::new(), pending_stage: None,
             history: Vec::new(),
+            frames: std::collections::HashMap::new(),
         }
     }
 
@@ -1117,50 +1185,45 @@ impl Builder {
     /// interactive authoring/undo path read. FROM/ARG/unsupported add nothing.
     fn record_history(&mut self, instr: &Instruction) {
         if !self.started { return; }
-        let (created_by, empty_layer, frame): (String, bool, Option<Value>) = match instr {
-            Instruction::Run(c) => {
-                let t = cmdline_display(c);
-                (format!("RUN {t}"), false,
-                 Some(serde_json::json!({"directives": [{"op": "RUN", "text": t}]})))
-            }
+        // (op, text, empty_layer). `text` is the directive body as it reads in a
+        // Dockerfile (after the keyword) — so `<op> <text>` reconstructs the line.
+        let (op, text, empty_layer): (&str, String, bool) = match instr {
+            Instruction::Run(c) => ("RUN", cmdline_display(c), false),
             Instruction::Copy { sources, dest, from, .. } => {
                 let pfx = from.as_ref().map(|s| format!("--from={s} ")).unwrap_or_default();
-                (format!("COPY {pfx}{} {dest}", sources.join(" ")), false,
-                 Some(serde_json::json!({"directives": [
-                    {"op": "COPY", "src": sources, "dst": dest, "from": from}]})))
+                ("COPY", format!("{pfx}{} {dest}", sources.join(" ")), false)
             }
             Instruction::Add { sources, dest, .. } =>
-                (format!("ADD {} {dest}", sources.join(" ")), false,
-                 Some(serde_json::json!({"directives": [
-                    {"op": "ADD", "src": sources, "dst": dest}]}))),
-            Instruction::Env(p) => (format!("ENV {}",
-                p.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(" ")), true, None),
-            Instruction::Workdir(p) => (format!("WORKDIR {p}"), true, None),
-            Instruction::User(u) => (format!("USER {u}"), true, None),
-            Instruction::Cmd(c) => (format!("CMD {}", cmdline_display(c)), true, None),
-            Instruction::Entrypoint(c) => (format!("ENTRYPOINT {}", cmdline_display(c)), true, None),
-            Instruction::Label(p) => (format!("LABEL {}",
-                p.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(" ")), true, None),
-            Instruction::Expose(s) => (format!("EXPOSE {s}"), true, None),
-            Instruction::Volume(v) => (format!("VOLUME {}", v.join(" ")), true, None),
-            Instruction::Shell(v) => (format!("SHELL {}",
-                serde_json::to_string(v).unwrap_or_default()), true, None),
-            Instruction::Stopsignal(s) => (format!("STOPSIGNAL {s}"), true, None),
-            Instruction::Onbuild(s) => (format!("ONBUILD {s}"), true, None),
-            Instruction::Healthcheck(_) => ("HEALTHCHECK".to_string(), true, None),
+                ("ADD", format!("{} {dest}", sources.join(" ")), false),
+            Instruction::Env(p) => ("ENV",
+                p.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(" "), true),
+            Instruction::Workdir(p) => ("WORKDIR", p.clone(), true),
+            Instruction::User(u) => ("USER", u.clone(), true),
+            Instruction::Cmd(c) => ("CMD", cmdline_display(c), true),
+            Instruction::Entrypoint(c) => ("ENTRYPOINT", cmdline_display(c), true),
+            Instruction::Label(p) => ("LABEL",
+                p.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(" "), true),
+            Instruction::Expose(s) => ("EXPOSE", s.clone(), true),
+            Instruction::Volume(v) => ("VOLUME", v.join(" "), true),
+            Instruction::Shell(v) => ("SHELL",
+                serde_json::to_string(v).unwrap_or_default(), true),
+            Instruction::Stopsignal(s) => ("STOPSIGNAL", s.clone(), true),
+            Instruction::Onbuild(s) => ("ONBUILD", s.clone(), true),
+            Instruction::Healthcheck(_) => ("HEALTHCHECK", String::new(), true),
             Instruction::From { .. } | Instruction::Arg { .. }
             | Instruction::Unsupported { .. } => return,
         };
+        let created_by = if text.is_empty() { op.to_string() }
+                         else { format!("{op} {text}") };
         // `created` (RFC3339) is optional in the OCI spec; omit it rather than
         // pull in a date dep.
         self.history.push(serde_json::json!({
             "created_by": created_by, "empty_layer": empty_layer }));
-        if let Some(frame) = frame {
-            if let Some(id) = self.current {
-                if let Ok(bx) = BoxState::create(id) {
-                    bx.set_meta("frame", &frame.to_string());
-                }
-            }
+        // Attach the directive to the box that was current when it ran. Frames
+        // are stamped in finish().
+        if let Some(id) = self.current {
+            self.frames.entry(id).or_default()
+                .push(serde_json::json!({"op": op, "text": text}));
         }
         // Refresh the current box's stamped config so its oci_config carries the
         // history so far; finish() re-stamps the top with the complete list.
@@ -1288,6 +1351,9 @@ impl Builder {
             None => { bx.set_no_host_fallback(true); bx.set_meta("no_host_fallback", "1"); }
         }
         self.current = Some(id);
+        // Register this build box (even with no directives yet) so it's
+        // recognized as a build step (vs the base image) and gets a `frame`.
+        self.frames.entry(id).or_default();
         self.stamp(id);
         Ok(())
     }
@@ -1657,6 +1723,13 @@ impl Builder {
         }
         let top = self.current.ok_or_else(|| anyhow!("empty build (no FROM)"))?;
         self.stamp(top);
+        // Stamp each build box's accumulated directive list as its `frame` meta.
+        for (id, dirs) in &self.frames {
+            if let Ok(bx) = BoxState::create(*id) {
+                bx.set_meta("frame",
+                            &serde_json::json!({"directives": dirs}).to_string());
+            }
+        }
         let name = if let Some(t) = tag {
             let bx = BoxState::create(top)?;
             bx.set_meta("name", &t);
