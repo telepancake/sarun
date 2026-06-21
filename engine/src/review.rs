@@ -6,9 +6,13 @@
 // apply/discard (host-mutating, need live-connection ownership routing) and
 // the structural-diff job path are deferred to a later milestone.
 
+use std::ffi::CStr;
+use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::path::PathBuf;
+
+use crate::hostfs;
 
 use base64::Engine;
 use rusqlite::Connection;
@@ -450,23 +454,14 @@ fn consume(conn: &Connection, id: i64, rel: &str, rowid: i64) {
 const S_IFIFO: u32 = 0o010000;
 const S_IFBLK: u32 = 0o060000;
 
-fn restore_metadata(conn: &Connection, rel: &str, host: &Path, mtime_ns: i64) {
-    let c = std::ffi::CString::new(host.as_os_str().as_bytes()).unwrap();
+fn restore_metadata_at(conn: &Connection, rel: &str, parent: BorrowedFd, leaf: &CStr, mtime_ns: i64) {
     // mtime (atime = mtime): drives downstream make/rebuild decisions.
-    if mtime_ns > 0 {
-        let ts = libc::timespec {
-            tv_sec: mtime_ns.div_euclid(1_000_000_000),
-            tv_nsec: mtime_ns.rem_euclid(1_000_000_000),
-        };
-        let times = [ts, ts];
-        unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(),
-                                 libc::AT_SYMLINK_NOFOLLOW); }
-    }
+    hostfs::utimens_at(parent, leaf, mtime_ns);
     // owner (best-effort; lchown EPERMs for an unprivileged host user — ignored).
     if let Ok((uid, gid)) = conn.query_row(
         "SELECT uid,gid FROM ownership WHERE name=?1", [rel],
         |r| Ok((r.get::<_,i64>(0)? as u32, r.get::<_,i64>(1)? as u32))) {
-        unsafe { libc::lchown(c.as_ptr(), uid, gid); }
+        hostfs::chown_at(parent, leaf, uid, gid);
     }
     // xattrs.
     if let Ok(mut st) = conn.prepare("SELECT key,value FROM xattr WHERE name=?1") {
@@ -474,8 +469,7 @@ fn restore_metadata(conn: &Connection, rel: &str, host: &Path, mtime_ns: i64) {
             Ok((r.get::<_,String>(0)?, r.get::<_,Vec<u8>>(1)?))) {
             for (k, v) in rows.flatten() {
                 if let Ok(ck) = std::ffi::CString::new(k) {
-                    unsafe { libc::lsetxattr(c.as_ptr(), ck.as_ptr(),
-                        v.as_ptr().cast(), v.len(), 0); }
+                    hostfs::setxattr_at(parent, leaf, &ck, &v);
                 }
             }
         }
@@ -483,52 +477,56 @@ fn restore_metadata(conn: &Connection, rel: &str, host: &Path, mtime_ns: i64) {
 }
 
 fn materialize(conn: &Connection, id: i64, rel: &str) -> Result<(), String> {
+    let root = hostfs::open_root().map_err(|e| format!("open root: {e}"))?;
+    materialize_at(root.as_fd(), conn, id, rel)
+}
+
+/// Write the captured change `rel` onto the host beneath `root`, never following
+/// a symlinked component of `rel` (audit C2: a box-planted symlink must not let
+/// an apply escape onto an arbitrary host path). `root` is `/` in production and
+/// a temp dir under test. Every host mutation goes through `hostfs`'s `*at`
+/// helpers, which resolve the parent with per-component `O_NOFOLLOW` and refuse
+/// to write/delete through a symlink at the leaf.
+fn materialize_at(root: BorrowedFd, conn: &Connection, id: i64, rel: &str) -> Result<(), String> {
     let (rowid, mode, data) = row_of(conn, rel).ok_or("not in archive")?;
     let mtime_ns: i64 = conn.query_row("SELECT mtime FROM sqlar WHERE name=?1", [rel],
                                        |r| r.get(0)).unwrap_or(0);
-    let host = Path::new("/").join(rel);
-    let is_symlink = host.symlink_metadata().map(|m| m.file_type().is_symlink())
-        .unwrap_or(false);
+
     if mode & S_IFMT == S_IFCHR {
-        // char-device row == deletion tombstone (the Python convention).
-        if host.is_dir() && !is_symlink {
-            std::fs::remove_dir_all(&host).map_err(|e| e.to_string())?;
-        } else if host.exists() || is_symlink {
-            std::fs::remove_file(&host).map_err(|e| e.to_string())?;
-        }
+        // char-device row == deletion tombstone (the Python convention). Resolve
+        // WITHOUT creating ancestors; if the parent path doesn't exist (or an
+        // ancestor is a symlink we refuse to follow), there is nothing to
+        // delete — a no-op, matching the old exists()-guarded behavior.
+        let Ok((parent, leaf)) = hostfs::parent_beneath(root, rel, false) else {
+            return Ok(());
+        };
+        hostfs::remove_tree_at(parent.as_fd(), &leaf)?;
         return Ok(());
-    } else if mode & S_IFMT == S_IFLNK {
+    }
+
+    // All creating branches resolve (and create) the parent dirs beneath root,
+    // refusing any symlinked ancestor.
+    let (parent, leaf) = hostfs::parent_beneath(root, rel, true)?;
+    let parent = parent.as_fd();
+
+    if mode & S_IFMT == S_IFLNK {
         let tgt = data.ok_or("symlink row has no target")?;
-        if host.exists() || is_symlink { let _ = std::fs::remove_file(&host); }
-        if let Some(p) = host.parent() { let _ = std::fs::create_dir_all(p); }
-        let t = std::ffi::OsStr::from_bytes(&tgt);
-        std::os::unix::fs::symlink(t, &host).map_err(|e| e.to_string())?;
+        hostfs::symlink_at(parent, &leaf, &tgt)?;
     } else if mode & S_IFMT == 0o040000 {
-        std::fs::create_dir_all(&host).map_err(|e| e.to_string())?;
-        let _ = std::fs::set_permissions(&host,
-            std::fs::Permissions::from_mode(mode & 0o7777));
+        hostfs::mkdir_at(parent, &leaf, mode)?;
     } else if mode & S_IFMT == S_IFIFO || mode & S_IFMT == S_IFBLK {
         // fifo / block device: recreate the node on the host.
-        if host.exists() || is_symlink { let _ = std::fs::remove_file(&host); }
-        if let Some(p) = host.parent() { let _ = std::fs::create_dir_all(p); }
         let rdev: i64 = conn.query_row("SELECT dev FROM rdev WHERE name=?1", [rel],
                                        |r| r.get(0)).unwrap_or(0);
-        let c = std::ffi::CString::new(host.as_os_str().as_bytes()).unwrap();
-        if unsafe { libc::mknod(c.as_ptr(), mode, rdev as libc::dev_t) } != 0 {
-            return Err("mknod failed".into());
-        }
+        hostfs::mknod_at(parent, &leaf, mode, rdev as u64)?;
     } else {
-        if is_symlink { return Err("refusing to write through a symlink".into()); }
-        if let Some(p) = host.parent() { let _ = std::fs::create_dir_all(p); }
         let bytes = match data {
             Some(d) => d,
             None => std::fs::read(blob_path(id, rowid)).map_err(|e| e.to_string())?,
         };
-        std::fs::write(&host, &bytes).map_err(|e| e.to_string())?;
-        let _ = std::fs::set_permissions(&host,
-            std::fs::Permissions::from_mode(mode & 0o7777));
+        hostfs::write_file_at(parent, &leaf, &bytes, mode)?;
     }
-    restore_metadata(conn, rel, &host, mtime_ns);
+    restore_metadata_at(conn, rel, parent, &leaf, mtime_ns);
     Ok(())
 }
 
@@ -677,19 +675,22 @@ fn hunk_groups(id: i64, rel: &str) -> Option<(Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Gr
 /// Write `new_lower` (a sequence of raw byte-lines) to the host at `rel`,
 /// refusing to write through a symlink. Mirror of Python _write_host_hunk.
 fn write_host_hunk(rel: &str, new_lower: &[Vec<u8>]) -> Value {
-    let host = Path::new("/").join(rel);
-    if host.symlink_metadata().map(|m| m.file_type().is_symlink()).unwrap_or(false) {
-        return json!({"ok": false, "error": "refusing to write through a symlink"});
-    }
-    if let Some(p) = host.parent() {
-        if let Err(e) = std::fs::create_dir_all(p) {
-            return json!({"ok": false, "error": e.to_string()});
-        }
-    }
+    // Same symlink-safety as materialize (audit C2): resolve the parent beneath
+    // `/` without following any symlinked component, and refuse to write through
+    // a symlink at the leaf. Preserve the existing file's mode (this is an
+    // in-place text edit, not a fresh capture).
+    let root = match hostfs::open_root() {
+        Ok(r) => r,
+        Err(e) => return json!({"ok": false, "error": format!("open root: {e}")}),
+    };
+    let (parent, leaf) = match hostfs::parent_beneath(root.as_fd(), rel, true) {
+        Ok(x) => x,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
     let bytes: Vec<u8> = new_lower.concat();
-    match std::fs::write(&host, &bytes) {
+    match hostfs::write_file_preserve_mode_at(parent.as_fd(), &leaf, &bytes) {
         Ok(()) => json!({"ok": true}),
-        Err(e) => json!({"ok": false, "error": e.to_string()}),
+        Err(e) => json!({"ok": false, "error": e}),
     }
 }
 

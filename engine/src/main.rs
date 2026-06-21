@@ -29,6 +29,7 @@ mod discover;
 #[allow(dead_code)]
 mod dockerfile;
 mod frames;
+mod hostfs;
 mod katirun;
 mod n2run;
 mod net;
