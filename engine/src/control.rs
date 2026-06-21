@@ -1561,7 +1561,7 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
                 Ok(o) => json!({
                     "base_id": o.base_id, "base_name": o.base_name,
                     "top_id": o.top_id, "top_name": o.top_name,
-                    "n_layers": o.n_layers,
+                    "n_layers": o.n_layers, "verified": o.verified,
                 }),
                 Err(e) => return json!({"ok": false, "error": format!("{e:#}")}),
             }

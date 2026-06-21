@@ -18,8 +18,10 @@
 // overlay hides every lower-layer entry under the dir — see
 // test_oci_layers_rs.py); per-entry uid/gid/xattrs/mtime.
 // Registry auth: credentials come from the host Docker config + credential
-// helpers (registry_auth_for), read host-side, never entering a box.
-// Out of scope (v1): image signature verification (cosign/notary); the
+// helpers (registry_auth_for), read host-side, never entering a box. Key-based
+// cosign signature verification is enforced when {config_home}/cosign.toml
+// covers a reference (see oci_verify; keys read host-side).
+// Out of scope (v1): keyless cosign (Fulcio/Rekor) verification; the
 // zstd:chunked TOC fast path (plain-zstd decode is already correct).
 
 use std::collections::HashMap;
@@ -96,6 +98,10 @@ fn cli_load(args: &[String]) -> i32 {
             match engine_rpc_on(conn, "oci.load",
                                 serde_json::json!([reference, name])) {
                 Ok(r) => {
+                    if r.get("verified").and_then(Value::as_bool) == Some(true) {
+                        eprintln!("sarun oci: cosign signature verified for \
+                                   '{reference}'");
+                    }
                     println!("loaded image '{reference}': base box '{}' (id={}) → \
                               top box '{}' (id={}), {} layer(s)",
                         r.get("base_name").and_then(Value::as_str).unwrap_or("?"),
@@ -121,6 +127,9 @@ fn cli_load(args: &[String]) -> i32 {
     }
     match load_blocking(&reference, name) {
         Ok(r) => {
+            if r.verified {
+                eprintln!("sarun oci: cosign signature verified for '{reference}'");
+            }
             // Spell out both ends of the chain so the user can address the
             // image as either `<base>` (full merged view) or `<base>.L<n>`
             // (a specific layer). Single-layer images have base == top.
@@ -1688,6 +1697,10 @@ pub(crate) struct LoadOutcome {
     pub top_id: i64,
     pub top_name: String,
     pub n_layers: usize,
+    /// True when a cosign trust policy covered this reference and the image's
+    /// signature verified. Surfaced so the CLI can report it on the user's
+    /// terminal (the load itself runs host-side in the engine).
+    pub verified: bool,
 }
 
 /// One pulled layer ready to ingest. media_type drives the decompressor.
@@ -1707,6 +1720,10 @@ struct PulledImage {
     /// stack, and a `:tag` that has moved (new manifest) re-pulls. Empty when
     /// the source didn't surface one.
     manifest_digest: String,
+    /// cosign signatures discovered alongside the image (oci-archive/oci-layout
+    /// index, or the registry `.sig` tag). Verified in `load` when the trust
+    /// policy requires it; otherwise unused.
+    signatures: Vec<crate::oci_verify::CosignSig>,
 }
 
 async fn load(reference: &str, name: Option<String>) -> Result<LoadOutcome> {
@@ -1715,7 +1732,20 @@ async fn load(reference: &str, name: Option<String>) -> Result<LoadOutcome> {
     // temp-layout path, but the image cache (find_loaded_by_reference) dedups on
     // the original string, so normalize it back here.
     image.reference = reference.to_string();
-    install_chain(image, name)
+    // Key-based cosign verification (host-side; keys never enter a box). When the
+    // trust policy covers this reference, the image MUST carry a valid signature
+    // for its manifest digest under the configured key, or the load fails closed.
+    let policy = crate::oci_verify::Policy::load();
+    let verified = if let Some(key) = policy.key_for(reference) {
+        crate::oci_verify::verify(key, &image.manifest_digest, &image.signatures)
+            .map_err(|e| anyhow!("cosign verification failed for '{reference}': {e}"))?;
+        true
+    } else {
+        false
+    };
+    let mut outcome = install_chain(image, name)?;
+    outcome.verified = verified;
+    Ok(outcome)
 }
 
 // ── reference resolution ────────────────────────────────────────────────────
@@ -1755,13 +1785,44 @@ async fn fetch_registry(reference: &str) -> Result<PulledImage> {
     }
     let config_json = String::from_utf8(img.config.data.to_vec())
         .context("config is not utf-8")?;
+    let manifest_digest = img.digest.clone().unwrap_or_default();
+    // Best-effort: fetch any cosign `.sig` artifact for this digest (only used
+    // if the trust policy requires verification — then absence fails closed).
+    let signatures = fetch_registry_sigs(&r, &auth, &manifest_digest).await;
     Ok(PulledImage {
         layers,
         config_json,
         reference: reference.to_string(),
         // oci-client surfaces the manifest digest it pulled; the cache keys on it.
-        manifest_digest: img.digest.clone().unwrap_or_default(),
+        manifest_digest,
+        signatures,
     })
+}
+
+/// Best-effort fetch of the cosign `.sig` artifact for `manifest_digest` from
+/// the same registry/repo (`<repo>:sha256-<hex>.sig`). Returns the signatures it
+/// finds; any error (no signature, network, auth) yields an empty list, which
+/// makes a policy-required verification fail closed rather than pass.
+async fn fetch_registry_sigs(r: &Reference, auth: &RegistryAuth, manifest_digest: &str)
+    -> Vec<crate::oci_verify::CosignSig> {
+    let dhex = manifest_digest.strip_prefix("sha256:").unwrap_or(manifest_digest);
+    if dhex.is_empty() { return vec![]; }
+    let sig_ref_str = format!("{}/{}:sha256-{}.sig", r.registry(), r.repository(), dhex);
+    let Ok(sig_ref) = Reference::from_str(&sig_ref_str) else { return vec![]; };
+    let client = Client::new(ClientConfig::default());
+    let accepted = vec!["application/vnd.dev.cosign.simplesigning.v1+json"];
+    let Ok(img) = client.pull(&sig_ref, auth, accepted).await else { return vec![]; };
+    let mut out = vec![];
+    for layer in img.layers {
+        if let Some(sig) = layer.annotations.as_ref()
+            .and_then(|a| a.get("dev.cosignproject.cosign/signature")) {
+            out.push(crate::oci_verify::CosignSig {
+                payload: layer.data.to_vec(),
+                signature_b64: sig.clone(),
+            });
+        }
+    }
+    out
 }
 
 /// Resolve registry credentials for `reference` from the host's Docker config
@@ -1875,11 +1936,49 @@ fn fetch_oci_layout(path: &Path) -> Result<PulledImage> {
             digest: digest.to_string(),
         });
     }
+    let idx: Value = serde_json::from_slice(&idx_bytes).unwrap_or(Value::Null);
+    let signatures = cosign_sigs_from_layout(path, &idx, &manifest_digest);
     Ok(PulledImage {
         layers, config_json,
         reference: format!("oci-layout:{}", path.display()),
         manifest_digest,
+        signatures,
     })
+}
+
+/// Discover cosign signatures for `manifest_digest` in an oci-layout: an index
+/// manifest descriptor tagged (annotation `org.opencontainers.image.ref.name`)
+/// `sha256-<hex>.sig`, whose layers carry the simple-signing payload (blob) and
+/// the base64 signature (annotation `dev.cosignproject.cosign/signature`).
+fn cosign_sigs_from_layout(path: &Path, idx: &Value, manifest_digest: &str)
+    -> Vec<crate::oci_verify::CosignSig> {
+    let dhex = manifest_digest.strip_prefix("sha256:").unwrap_or(manifest_digest);
+    let want = format!("sha256-{dhex}.sig");
+    let mut out = vec![];
+    let Some(descs) = idx.get("manifests").and_then(|v| v.as_array()) else { return out };
+    for d in descs {
+        let name = d.get("annotations")
+            .and_then(|a| a.get("org.opencontainers.image.ref.name"))
+            .and_then(Value::as_str);
+        if name != Some(want.as_str()) { continue; }
+        let Some(sig_dg) = d.get("digest").and_then(Value::as_str) else { continue };
+        let Ok(mbytes) = read_blob_by_digest(path, sig_dg) else { continue };
+        let Ok(m) = serde_json::from_slice::<Value>(&mbytes) else { continue };
+        for layer in m.get("layers").and_then(|v| v.as_array()).into_iter().flatten() {
+            let sig = layer.get("annotations")
+                .and_then(|a| a.get("dev.cosignproject.cosign/signature"))
+                .and_then(Value::as_str);
+            let blob_dg = layer.get("digest").and_then(Value::as_str);
+            if let (Some(sig), Some(bd)) = (sig, blob_dg) {
+                if let Ok(payload) = read_blob_by_digest(path, bd) {
+                    out.push(crate::oci_verify::CosignSig {
+                        payload, signature_b64: sig.to_string(),
+                    });
+                }
+            }
+        }
+    }
+    out
 }
 
 /// The platform-matched manifest descriptor digest from an OCI `index.json`.
@@ -2055,6 +2154,7 @@ fn install_chain(image: PulledImage, base_name: Option<String>)
         base_id, base_name: base_name_out,
         top_id, top_name,
         n_layers: n,
+        verified: false,   // set by `load` after a policy-required cosign check
     })
 }
 

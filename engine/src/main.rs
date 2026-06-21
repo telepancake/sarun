@@ -31,6 +31,7 @@ mod n2run;
 mod net;
 mod oaita;
 mod oci;
+mod oci_verify;
 mod overlay;
 mod paths;
 mod pty;

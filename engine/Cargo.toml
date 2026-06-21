@@ -101,6 +101,9 @@ bzip2-rs = "0.1"
 # blob's bytes hash to the digest its descriptor claims). Already in the tree
 # transitively via oci-client; named directly so the verification is explicit.
 sha2 = "0.10"
+# Key-based cosign signature verification (configured public key). Pure-Rust
+# RustCrypto ECDSA P-256 + PEM SPKI key parsing — no OpenSSL/C, static-musl safe.
+p256 = { version = "0.13", features = ["ecdsa", "pem"] }
 # Structural editing — tree-sitter + a starter pack of grammars. Drives the
 # inspect/write "symbol" locators (path symbol <name>[N]): inspect lists or
 # focuses named definitions; write splices new content into the symbol's

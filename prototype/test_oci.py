@@ -65,22 +65,24 @@ def wait_socket(sock, timeout=40):
 def _sha(b):  return hashlib.sha256(b).hexdigest()
 
 
-def build_archive(dest_tar, exe_path):
-    """Write a synthetic single-layer oci-archive (a tar of an oci-layout) to
-    `dest_tar`. rootfs = bin/ + bin/sarun (the static engine binary, 0755)."""
-    exe = Path(exe_path).read_bytes()
-    # 1. uncompressed rootfs layer tar
+def _build_layout(layout, exe, extra=None):
+    """Build a synthetic single-layer oci-layout in dir `layout`. rootfs = bin/ +
+    bin/sarun (the engine binary), plus an optional `/marker` file (`extra`,
+    bytes) so callers can vary the image content → a distinct manifest digest.
+    Returns the image's manifest digest ('sha256:…')."""
     raw = io.BytesIO()
     with tarfile.open(fileobj=raw, mode="w") as t:
         d = tarfile.TarInfo("bin"); d.type = tarfile.DIRTYPE; d.mode = 0o755
         t.addfile(d)
         f = tarfile.TarInfo("bin/sarun"); f.size = len(exe); f.mode = 0o755
         t.addfile(f, io.BytesIO(exe))
+        if extra is not None:
+            m = tarfile.TarInfo("marker"); m.size = len(extra); m.mode = 0o644
+            t.addfile(m, io.BytesIO(extra))
     layer_raw = raw.getvalue()
     diff_id = "sha256:" + _sha(layer_raw)
     gz = gzip.compress(layer_raw)
     layer_digest = "sha256:" + _sha(gz)
-    # 2. image config
     config = {
         "architecture": "amd64", "os": "linux",
         "config": {"Cmd": ["/bin/sarun", "oci", "--help"],
@@ -89,7 +91,6 @@ def build_archive(dest_tar, exe_path):
     }
     config_b = json.dumps(config).encode()
     config_digest = "sha256:" + _sha(config_b)
-    # 3. manifest
     manifest = {
         "schemaVersion": 2,
         "mediaType": "application/vnd.oci.image.manifest.v1+json",
@@ -100,28 +101,93 @@ def build_archive(dest_tar, exe_path):
     }
     manifest_b = json.dumps(manifest).encode()
     manifest_digest = "sha256:" + _sha(manifest_b)
-    # 4. index
     index = {
         "schemaVersion": 2,
         "manifests": [{"mediaType": "application/vnd.oci.image.manifest.v1+json",
                        "digest": manifest_digest, "size": len(manifest_b),
                        "platform": {"architecture": "amd64", "os": "linux"}}],
     }
-    # 5. assemble the oci-layout dir
-    layout = Path(tempfile.mkdtemp(prefix="oci-layout-"))
     (layout / "oci-layout").write_text(json.dumps({"imageLayoutVersion": "1.0.0"}))
     (layout / "index.json").write_bytes(json.dumps(index).encode())
     blobs = layout / "blobs" / "sha256"; blobs.mkdir(parents=True)
     (blobs / config_digest.split(":")[1]).write_bytes(config_b)
     (blobs / manifest_digest.split(":")[1]).write_bytes(manifest_b)
     (blobs / layer_digest.split(":")[1]).write_bytes(gz)
-    # 6. tar the layout
+    return manifest_digest
+
+
+def _tar_layout(layout, dest_tar):
     with tarfile.open(dest_tar, "w") as t:
         t.add(layout / "oci-layout", arcname="oci-layout")
         t.add(layout / "index.json", arcname="index.json")
         t.add(layout / "blobs", arcname="blobs")     # recursive
+
+
+def build_archive(dest_tar, exe_path):
+    """Write a synthetic single-layer oci-archive (a tar of an oci-layout)."""
+    layout = Path(tempfile.mkdtemp(prefix="oci-layout-"))
+    _build_layout(layout, Path(exe_path).read_bytes())
+    _tar_layout(layout, dest_tar)
     shutil.rmtree(layout, ignore_errors=True)
     return dest_tar
+
+
+def openssl_keypair(key_path, pub_path):
+    """Generate an ECDSA P-256 keypair via the openssl CLI."""
+    subprocess.run(["openssl", "ecparam", "-genkey", "-name", "prime256v1",
+                    "-noout", "-out", str(key_path)], check=True, capture_output=True)
+    subprocess.run(["openssl", "ec", "-in", str(key_path), "-pubout",
+                    "-out", str(pub_path)], check=True, capture_output=True)
+
+
+def build_signed_archive(dest_tar, exe_path, priv_key, extra):
+    """Build an oci-archive whose image (content varied by `extra`) carries a
+    cosign signature signed with `priv_key`. Returns the manifest digest."""
+    layout = Path(tempfile.mkdtemp(prefix="oci-signed-"))
+    try:
+        md = _build_layout(layout, Path(exe_path).read_bytes(), extra)
+        # cosign simple-signing payload naming this image's manifest digest.
+        payload = json.dumps({
+            "critical": {"identity": {"docker-reference": ""},
+                         "image": {"docker-manifest-digest": md},
+                         "type": "cosign container image signature"},
+            "optional": None,
+        }).encode()
+        pf = layout / "_payload.json"; pf.write_bytes(payload)
+        sig_der = subprocess.run(
+            ["openssl", "dgst", "-sha256", "-sign", str(priv_key), str(pf)],
+            check=True, capture_output=True).stdout
+        pf.unlink()
+        import base64 as _b64
+        sig_b64 = _b64.b64encode(sig_der).decode()
+        blobs = layout / "blobs" / "sha256"
+        cfg = b"{}"; cfg_d = "sha256:" + _sha(cfg)
+        pay_d = "sha256:" + _sha(payload)
+        (blobs / cfg_d.split(":")[1]).write_bytes(cfg)
+        (blobs / pay_d.split(":")[1]).write_bytes(payload)
+        sigman = json.dumps({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {"mediaType": "application/vnd.oci.image.config.v1+json",
+                       "digest": cfg_d, "size": len(cfg)},
+            "layers": [{"mediaType": "application/vnd.dev.cosign.simplesigning.v1+json",
+                        "digest": pay_d, "size": len(payload),
+                        "annotations": {"dev.cosignproject.cosign/signature": sig_b64}}],
+        }).encode()
+        sigman_d = "sha256:" + _sha(sigman)
+        (blobs / sigman_d.split(":")[1]).write_bytes(sigman)
+        idx = json.loads((layout / "index.json").read_text())
+        idx["manifests"].append({
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "digest": sigman_d, "size": len(sigman),
+            "annotations": {"org.opencontainers.image.ref.name":
+                            "sha256-" + md.split(":")[1] + ".sig"},
+        })
+        (layout / "index.json").write_bytes(json.dumps(idx).encode())
+        _tar_layout(layout, dest_tar)
+        return md
+    finally:
+        shutil.rmtree(layout, ignore_errors=True)
 
 
 def build_tampered_layout(exe_path):
@@ -455,6 +521,40 @@ def main():
                   "the in-box-built image runs on the host")
         finally:
             shutil.rmtree(ibctx, ignore_errors=True)
+
+        # ── key-based cosign signature verification ───────────────────────────
+        # A trust policy (cosign.toml) covering a reference makes a valid cosign
+        # signature REQUIRED (fail closed). We sign synthetic archives with
+        # openssl and check: a correctly-signed image loads and is reported
+        # verified; an image signed with the WRONG key is rejected and creates no
+        # box; with no policy, verification is skipped. Distinct image content
+        # (the `extra` marker) gives each archive its own manifest digest so the
+        # image cache doesn't mask a re-verification.
+        keyA = tmp / "a.key"; pubA = tmp / "a.pub"; openssl_keypair(keyA, pubA)
+        keyB = tmp / "b.key"; pubB = tmp / "b.pub"; openssl_keypair(keyB, pubB)
+        cfg_dir = Path(e["XDG_CONFIG_HOME"]) / "slopbox"
+        cfg_dir.mkdir(parents=True, exist_ok=True)
+        cosign_toml = cfg_dir / "cosign.toml"
+        cosign_toml.write_text(
+            f'[[verify]]\nmatch = "oci-archive:"\nkey_file = "{pubA}"\n')
+        good = tmp / "good.tar"; build_signed_archive(good, ENGINE, keyA, b"good-content")
+        bad = tmp / "bad.tar";  build_signed_archive(bad, ENGINE, keyB, b"bad-content")
+        r = sarun(e, "oci", "load", f"oci-archive:{good}", "SIGNGOOD")
+        check(r.returncode == 0 and "cosign signature verified" in r.stderr,
+              f"cosign: correctly-signed image loads + reported verified "
+              f"(rc={r.returncode}, stderr={r.stderr.strip()[-200:]})")
+        r = sarun(e, "oci", "load", f"oci-archive:{bad}", "SIGNBAD")
+        check(r.returncode != 0
+              and "cosign verification failed" in (r.stdout + r.stderr),
+              f"cosign: WRONG-key signature is rejected "
+              f"(rc={r.returncode}, stderr={r.stderr.strip()[-200:]})")
+        check("SIGNBAD" not in box_names(state_dir(e)),
+              "cosign: a rejected image created no box (fail closed)")
+        cosign_toml.unlink()   # no policy → no verification
+        r = sarun(e, "oci", "load", f"oci-archive:{bad}", "SIGNBAD2")
+        check(r.returncode == 0,
+              f"cosign: with no policy the same image loads unverified "
+              f"(rc={r.returncode})")
 
         # ── dissolve carries the no_host closure DOWN to the children ─────────
         # SYN is a no_host image base: its rootfs is CLOSED (absent paths ENOENT,
