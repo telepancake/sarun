@@ -67,6 +67,16 @@ fn prepare_uutil_runtime(util_crate_name: &str) {
     }
 }
 
+/// Initialize uucore's localization bundle for the util implemented by
+/// `util_crate_name` (e.g. `"uu_cat"`), so an embedder that calls that util's
+/// LOGICAL entry point directly — bypassing the `register!` adapter, as the
+/// engine's native injected-I/O `cat` builtin does — still renders `translate!`
+/// messages instead of raw Fluent keys. Mirrors the setup half the generated
+/// adapter runs (sans the stdin/stdout dance), and is idempotent per thread.
+pub fn init_localization(util_crate_name: &str) {
+    prepare_uutil_runtime(util_crate_name);
+}
+
 /// Second half of the `uucore::bin!` body: flush stdout after `uumain`
 /// returns. `bin!` does this before calling `std::process::exit` to work
 /// around <https://github.com/rust-lang/rust/issues/23818>. We do it here so
