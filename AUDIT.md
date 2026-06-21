@@ -38,6 +38,7 @@ integrity), reconciled by hand. Findings verified against code, not comments.
 | H3 | `review.rs` / `control.rs:375,1163` | `apply`/`discard` have **no running-box guard** (unlike `dissolve`). Apply reads `blob_path(id,rowid)` — the same file the live FUSE `write` is mid-`write_at` on — and can stamp a **torn blob** onto the real host. Comment *"apply() operates on a stopped box's archive"* is unenforced. |
 | H4 | `review.rs:453–483` | Metadata restore is fire-and-forget: every `utimensat`/`lchown`/`lsetxattr`/`set_permissions` result dropped. "best-effort" is fairly scoped to *owner* but silently blankets **mode** — a `0600` secret can land world-readable, apply reports success. |
 | H5 | `oci.rs:1074` `read_blob_by_digest` | **Path traversal**: a manifest-supplied digest string is `join`ed onto a host path **without** the `..`/absolute guard the layer-ingest path (`oci.rs:1226`) correctly applies. A crafted/pulled image can read a host file outside the blob store. |
+| H6 | `prototype/test_symlink_escape.py`, `test_write_path_contract.py`, `test_chmod_readonly.py`, `test_changes_view_incremental.py`, `test_table_reconcile.py`, `test_rpane_scroll.py`, `test_ui_smoke.py`, `test_pty_ui_rs.py` | **8 assertion-bearing test files are silently NOT RUN by `make test`** — verified: `pytest --collect-only` yields 0 items from each (all logic under `__main__`, no `def test_*`), and no Makefile target invokes them as scripts. Most damning: `test_symlink_escape.py` is an *adversarial test that exists to prove the daemon never follows a sandbox-planted symlink onto a host target* — the **C2 bug class** — and it runs **never**. (These are prototype tests, so they wouldn't have caught the Rust-engine C2 either; the Rust port has no symlink-escape test at all. Double gap: guard not run, production path never covered.) `conftest.py`'s false-green protection can't help — no collected item ⇒ the hook never fires. |
 
 ## MEDIUM
 
@@ -89,11 +90,16 @@ integrity), reconciled by hand. Findings verified against code, not comments.
 - **Discard never touches the real FS** (`review.rs:595`) — verified.
 - **Copy-up is genuinely lazy CoW** — the lower/host file is only ever read,
   never written, except the explicitly opt-in `-d`/passthrough rule.
-- **Test suite is structurally honest** — `conftest.py` converts the
-  non-raising `check()`/`_fails` idiom into real pytest failures; broad
-  `except` blocks route into `_fails` or are teardown-only; the `make test`
-  exclusions (e2e/pjdfstest/oci) are heavy-but-real suites with their own
-  targets, not hidden failures.
+- **Test suite is *mostly* honest, with one material hole (H6).** `conftest.py`
+  genuinely converts the non-raising `check()`/`_fails` idiom into real pytest
+  failures; broad `except` blocks route into `_fails` or are teardown-only; the
+  explicit `make test` exclusions (e2e/pjdfstest/oci) are heavy-but-real suites
+  with their own targets, not hidden failures; "141 passed" is a plausible,
+  honestly-directioned count (below the 158 collected, the right direction).
+  BUT see H6: 8 real test files contribute **zero** collected items and are
+  invisible to `make test` — including the adversarial symlink-escape guard.
+  So the green number is trustworthy *for what it runs*, and silently blind to
+  those 8 files.
 
 ---
 
@@ -104,4 +110,7 @@ integrity), reconciled by hand. Findings verified against code, not comments.
 3. **H1** — pre-fork fd snapshot or `close_range(2)` over a precomputed keep-set; delete the false SAFETY comment.
 4. **H2 / H3** — make `unshare` failure and live-box apply **fail loudly**, not silently.
 5. **H5** — apply the ingest-path `..`/absolute guard to `read_blob_by_digest`.
-6. Then H4, the MEDIUMs, and the stale-doc cleanups (T2/T3/T5).
+6. **H6** — cheap, high-value: add the missing `def test_*` pytest entry to the 8
+   inert files (the other `*_rs.py` already do this), so `make test` actually
+   runs them; and write a Rust-engine symlink-escape test that exercises C2.
+7. Then H4, the MEDIUMs, and the stale-doc cleanups (T2/T3/T5).
