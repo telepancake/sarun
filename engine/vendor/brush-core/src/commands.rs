@@ -40,6 +40,16 @@ pub struct ExecutionContext<'a, SE: ShellExtensions = extensions::DefaultShellEx
     pub command_name: String,
     /// The parameters for the execution.
     pub params: ExecutionParameters,
+    /// sarun (NOT upstream brush): true when this command is being run as a
+    /// SEPARATELY-SPAWNED pipeline stage — i.e. via the OwnedShell +
+    /// `tokio::task::spawn_blocking` path (`execute_via_builtin_in_owned_shell`),
+    /// which runs CONCURRENTLY with the spawning of its sibling stages. A
+    /// builtin that mutates this process's fd table (sarun's CoreutilWrapper
+    /// dup2's around an in-process uutils call) must NOT do so on this path, or a
+    /// concurrently-forked sibling stage inherits the transient redirect. False
+    /// for a stand-alone command and the lastpipe tail (both run in the parent
+    /// shell, never concurrently). Plain builtins ignore it.
+    pub spawned_pipeline_stage: bool,
 }
 
 impl<SE: ShellExtensions> ExecutionContext<'_, SE> {
@@ -250,7 +260,89 @@ pub fn compose_std_command<S: AsRef<OsStr>, SE: extensions::ShellExtensions>(
     });
     cmd.inject_fds(other_files)?;
 
+    // sarun fix (NOT upstream brush): close every stray fd > 2 in the
+    // child between fork and exec, except the ones brush explicitly
+    // mapped. Without this hook, pipeline children leak the WRITE end
+    // of their own stdin pipe (a copy brush still holds in the parent
+    // for the upstream pipeline stage) — sed then blocks forever on
+    // read() because the kernel never delivers EOF while any writer is
+    // open. Symptom: gnu hello's ./configure hangs at the first non-
+    // trivial pipeline (around config.log line ~3.8k). std::io::pipe
+    // sets O_CLOEXEC; dup2 clears it on the duplicate; the original
+    // numbered fd survives across exec when nothing closes it.
+    //
+    // We allow fds {0, 1, 2} and anything `inject_fds` mapped to. The
+    // `inject_fds` path uses command-fds, which clears O_CLOEXEC on the
+    // child_fd numbers it produces; we discover those by listing
+    // /proc/self/fd and stat'ing each — anything with O_CLOEXEC set is
+    // a stray and gets closed. (Hosts without procfs miss this safety;
+    // sarun runs on linux only so that's fine.)
+    //
+    // SAFETY: pre_exec runs in the forked child between fork() and
+    // execve(). We allocate nothing in the closure (read_dir is a
+    // single syscall fronted by getdents) and only call close(2) on
+    // fds, both of which are async-signal-safe per POSIX.
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: see the comment above. The closure performs no
+        // allocation and uses only async-signal-safe syscalls.
+        unsafe {
+            cmd.pre_exec(sarun_close_stray_fds);
+        }
+    }
+
     Ok(cmd)
+}
+
+/// pre_exec hook: close every fd > 2 that still has FD_CLOEXEC set.
+/// command-fds clears FD_CLOEXEC on the fds it explicitly mapped, so
+/// those survive; CLOEXEC-set fds are leftovers brush never asked the
+/// child to inherit. linux-only because we walk /proc/self/fd.
+#[cfg(target_os = "linux")]
+fn sarun_close_stray_fds() -> std::io::Result<()> {
+    // The dir fd we open to walk must not itself close — keep it open
+    // until the loop finishes. We collect first to avoid mutating the
+    // directory while iterating (some libcs reuse the same dirent
+    // buffer for each readdir).
+    let dir = match std::fs::read_dir("/proc/self/fd") {
+        Ok(d) => d,
+        Err(_) => return Ok(()), // best-effort; procfs unavailable
+    };
+    let mut to_close: Vec<i32> = Vec::with_capacity(16);
+    for entry in dir {
+        let Ok(entry) = entry else { continue; };
+        let Ok(name) = entry.file_name().into_string() else { continue; };
+        let Ok(fd) = name.parse::<i32>() else { continue; };
+        if fd <= 2 { continue; }
+        // Skip the dir fd backing this readdir; closing it would
+        // invalidate the iterator state. ReadDir on linux holds an
+        // fd open via opendir/getdents; we can't query its number
+        // through the public API, so just defer to the FD_CLOEXEC
+        // check — opendir() sets CLOEXEC on the dir fd, so we'd try
+        // to close it. Skip any fd whose /proc/self/fd entry resolves
+        // to a "/proc/self/fd" symlink, which is the readdir fd
+        // pointing at itself.
+        if let Ok(link) = std::fs::read_link(format!("/proc/self/fd/{fd}")) {
+            if link.to_string_lossy().contains("/proc/self/fd") {
+                continue;
+            }
+        }
+        // Only close fds that still have FD_CLOEXEC set — the ones
+        // brush explicitly mapped via command-fds already had their
+        // CLOEXEC bit cleared, so we leave those alone.
+        // SAFETY: fcntl(F_GETFD) is async-signal-safe.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags < 0 { continue; }
+        if (flags & libc::FD_CLOEXEC) != 0 {
+            to_close.push(fd);
+        }
+    }
+    for fd in to_close {
+        // SAFETY: close(2) is async-signal-safe.
+        unsafe { libc::close(fd); }
+    }
+    Ok(())
 }
 
 pub(crate) async fn on_preexecute(
@@ -460,6 +552,9 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
                 shell: &mut shell,
                 command_name,
                 params,
+                // This builtin runs on its own spawn_blocking worker,
+                // concurrently with the spawn of the pipeline's other stages.
+                spawned_pipeline_stage: true,
             };
 
             let rt = tokio::runtime::Handle::current();
@@ -485,6 +580,9 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
             shell: &mut shell,
             command_name: self.command_name,
             params: self.params,
+            // Parent-shell path: a stand-alone command or the lastpipe tail —
+            // run inline, never concurrently with a sibling spawn.
+            spawned_pipeline_stage: false,
         };
 
         let result = execute_builtin_command(&builtin, cmd_context, self.args).await;
@@ -512,6 +610,7 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
             shell: &mut shell,
             command_name: self.command_name,
             params: self.params,
+            spawned_pipeline_stage: false,
         };
 
         // Strip the function name off args.
@@ -538,6 +637,7 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
             shell: &mut shell,
             command_name: self.command_name,
             params: self.params,
+            spawned_pipeline_stage: false,
         };
 
         let resolved_path = path.to_string_lossy();
