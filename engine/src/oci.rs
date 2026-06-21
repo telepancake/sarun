@@ -59,6 +59,7 @@ pub fn cli_oci(args: &[String]) -> i32 {
         "build" => cli_build(&args[1..]),
         "save" => cli_save(&args[1..]),
         "dockerfile" => cli_dockerfile(&args[1..]),
+        "author" => cli_author(&args[1..]),
         // Hidden: the host-side build worker the engine spawns for an in-box
         // `oci build` (see build_in_engine). Not for direct use.
         "__build-worker" => cli_build_worker(&args[1..]),
@@ -75,6 +76,8 @@ pub fn cli_oci(args: &[String]) -> i32 {
             println!("       export an image/container box stack to an oci-archive");
             println!("  sarun oci dockerfile <box>");
             println!("       print the Dockerfile that reconstructs a built/authored box");
+            println!("  sarun oci author -t NAME --from BASE [--net MODE]");
+            println!("       build an image interactively, one instruction per line");
             println!();
             println!("  ref  e.g. alpine:3.20, ghcr.io/foo/bar:tag,");
             println!("       oci-archive:/path/to.tar, oci-layout:/path/to/dir,");
@@ -146,6 +149,155 @@ fn emit_dockerfile(boxname: &str) -> Result<String> {
         }
     }
     Ok(out)
+}
+
+// ── `sarun oci author` — build an image interactively, one instruction/line ──
+// An interactive Dockerfile builder: each submitted line is one instruction run
+// through the same Builder `oci build` uses, so it creates the layer box + the
+// per-box `frame` + history. Bare `cd`/`export` persist as WORKDIR/ENV; any
+// other bare line is a RUN; explicit Dockerfile keywords are parsed as such.
+// `undo` discards the box(es) the last line created and rolls back state;
+// `done`/EOF finalizes the image and prints its Dockerfile. Reads lines from
+// stdin (works piped or at a tty). RUN executes in a box, so a live engine is
+// required — run on the host.
+fn cli_author(args: &[String]) -> i32 {
+    let mut tag: Option<String> = None;
+    let mut from: Option<String> = None;
+    let mut net_mode = crate::net::NetMode::Tap;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "-t" | "--tag" => tag = it.next().cloned(),
+            "--from" => from = it.next().cloned(),
+            "--net" => match it.next().map(String::as_str).and_then(crate::net::NetMode::parse) {
+                Some(nm) => net_mode = nm,
+                None => { eprintln!("sarun oci author: --net wants off|tap|host"); return 2; }
+            },
+            "-h" | "--help" => {
+                println!("usage: sarun oci author -t NAME --from BASE [--net MODE]");
+                println!("  then, one instruction per line on stdin:");
+                println!("    <cmd>            → RUN <cmd>   (bare command)");
+                println!("    cd DIR           → WORKDIR DIR (persists)");
+                println!("    export K=V       → ENV K=V     (persists)");
+                println!("    RUN/COPY/ENV/…   → that Dockerfile instruction");
+                println!("    undo             → drop the last instruction + its layer");
+                println!("    print            → show the Dockerfile so far");
+                println!("    done             → finalize the image (EOF also works)");
+                return 0;
+            }
+            other => { eprintln!("sarun oci author: unexpected argument '{other}'"); return 2; }
+        }
+    }
+    let (Some(tag), Some(from)) = (tag, from) else {
+        eprintln!("usage: sarun oci author -t NAME --from BASE [--net MODE]");
+        return 2;
+    };
+    if in_box() {
+        eprintln!("sarun oci author: run on the host (RUN executes in a box and \
+                   needs the engine)");
+        return 1;
+    }
+    if let Err(e) = paths::ensure_dirs() { eprintln!("sarun oci author: {e}"); return 1; }
+    let mut b = Builder::new(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                             net_mode, Vec::new());
+    if let Err(e) = b.do_from(&from, &None) {
+        eprintln!("sarun oci author: FROM {from}: {e:#}");
+        return 1;
+    }
+    eprintln!("authoring '{tag}' FROM {from} — one instruction per line; \
+               `undo`, `print`, `done`.");
+    let stdin = std::io::stdin();
+    let mut undo: Vec<(Builder, String)> = Vec::new();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match stdin.read_line(&mut line) {
+            Ok(0) => break,           // EOF = done
+            Ok(_) => {}
+            Err(_) => break,
+        }
+        let t = line.trim().to_string();
+        if t.is_empty() { continue; }
+        match t.as_str() {
+            "done" | "save" => break,
+            "print" | "dockerfile" => {
+                b.stamp_frames();
+                match emit_dockerfile(&b.current.map(|c| c.to_string()).unwrap_or_default()) {
+                    Ok(df) => print!("{df}"),
+                    Err(e) => eprintln!("(print: {e})"),
+                }
+            }
+            "undo" => {
+                if let Some((snap, undone)) = undo.pop() {
+                    // Delete any box the undone instruction created (a RUN/COPY
+                    // layer); a config-only instruction created none.
+                    let new_boxes: Vec<i64> = b.frames.keys()
+                        .filter(|k| !snap.frames.contains_key(k)).copied().collect();
+                    for id in new_boxes { delete_box(id); }
+                    b = snap;
+                    eprintln!("undone: {undone}");
+                } else {
+                    eprintln!("nothing to undo");
+                }
+            }
+            _ => {
+                let snap = b.clone();
+                let instr = author_line_to_instruction(&t);
+                match b.exec(&instr) {
+                    Ok(()) => undo.push((snap, t.clone())),
+                    Err(e) => { eprintln!("error: {e:#}"); b = snap; }
+                }
+            }
+        }
+    }
+    match b.finish(Some(tag.clone())) {
+        Ok(()) => {
+            match emit_dockerfile(&tag) {
+                Ok(df) => { println!("--- Dockerfile ---\n{df}"); 0 }
+                Err(_) => 0,
+            }
+        }
+        Err(e) => { eprintln!("sarun oci author: {e:#}"); 1 }
+    }
+}
+
+/// Map one authored prompt line to a Dockerfile instruction: bare `cd`/`export`
+/// persist as WORKDIR/ENV; an explicit Dockerfile keyword is parsed as such;
+/// anything else is a shell-form RUN of the whole line.
+fn author_line_to_instruction(t: &str) -> Instruction {
+    if let Some(p) = t.strip_prefix("cd ") {
+        return Instruction::Workdir(p.trim().to_string());
+    }
+    if let Some(kv) = t.strip_prefix("export ") {
+        if let Some((k, v)) = kv.trim().split_once('=') {
+            return Instruction::Env(vec![(k.trim().to_string(), v.trim().to_string())]);
+        }
+    }
+    const KW: &[&str] = &["RUN", "COPY", "ADD", "ENV", "WORKDIR", "USER", "CMD",
+        "ENTRYPOINT", "LABEL", "EXPOSE", "VOLUME", "SHELL", "STOPSIGNAL", "ARG",
+        "ONBUILD", "HEALTHCHECK"];
+    let kw = t.split_whitespace().next().unwrap_or("").to_uppercase();
+    if KW.contains(&kw.as_str()) {
+        if let Ok(df) = crate::dockerfile::Dockerfile::parse(t) {
+            if let Some((_, instr)) = df.instructions.into_iter().next() {
+                return instr;
+            }
+        }
+    }
+    Instruction::Run(Cmdline::Shell(t.to_string()))
+}
+
+/// Delete an at-rest box created during authoring (undo). Prefer the engine's
+/// reaper; fall back to removing its on-disk state.
+fn delete_box(id: i64) {
+    if let Some(conn) = engine_conn() {
+        if engine_rpc_on(conn, "delete", serde_json::json!([id.to_string()])).is_ok() {
+            return;
+        }
+    }
+    let _ = std::fs::remove_file(paths::state_home().join(format!("{id}.sqlar")));
+    let _ = std::fs::remove_dir_all(paths::state_home().join("blob").join(id.to_string()));
+    let _ = std::fs::remove_dir_all(paths::live_home().join(id.to_string()));
 }
 
 // ── `sarun oci save` — the inverse of `oci load` ─────────────────────────────
@@ -1111,6 +1263,9 @@ fn cmdline_display(c: &Cmdline) -> String {
 /// Accumulating build state: the current top layer box, the image config being
 /// assembled, build-time variables (ARG + ENV) for `$VAR` expansion, and the
 /// named-stage table for multi-stage `FROM name` / `FROM … AS name`.
+/// Clone-able so the interactive author can snapshot state before each
+/// instruction and roll back on `undo`.
+#[derive(Clone)]
 struct Builder {
     context: PathBuf,
     net_mode: crate::net::NetMode,
@@ -1716,6 +1871,16 @@ impl Builder {
         if let Some(c) = self.current { self.stamp(c); }
     }
 
+    /// Stamp each build box's accumulated directive list as its `frame` meta.
+    fn stamp_frames(&self) {
+        for (id, dirs) in &self.frames {
+            if let Ok(bx) = BoxState::create(*id) {
+                bx.set_meta("frame",
+                            &serde_json::json!({"directives": dirs}).to_string());
+            }
+        }
+    }
+
     fn finish(&mut self, tag: Option<String>) -> Result<()> {
         // Close the final stage's AS name too, so `FROM x AS final` is addressable.
         if let (Some(name), Some(cur)) = (self.pending_stage.take(), self.current) {
@@ -1723,13 +1888,7 @@ impl Builder {
         }
         let top = self.current.ok_or_else(|| anyhow!("empty build (no FROM)"))?;
         self.stamp(top);
-        // Stamp each build box's accumulated directive list as its `frame` meta.
-        for (id, dirs) in &self.frames {
-            if let Ok(bx) = BoxState::create(*id) {
-                bx.set_meta("frame",
-                            &serde_json::json!({"directives": dirs}).to_string());
-            }
-        }
+        self.stamp_frames();
         let name = if let Some(t) = tag {
             let bx = BoxState::create(top)?;
             bx.set_meta("name", &t);
