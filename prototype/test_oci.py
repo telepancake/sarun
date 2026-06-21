@@ -287,12 +287,22 @@ def main():
             ti = tarfile.TarInfo("inside.txt"); ti.size = len(data); ti.mode = 0o644
             t.addfile(ti, io.BytesIO(data))
         (ctx2 / "bundle.tar.gz").write_bytes(gzip.compress(braw.getvalue()))
+        # xz and bzip2 tarballs (Docker auto-extracts these too). Written via
+        # tarfile's own w:xz / w:bz2 so the magic bytes are authentic.
+        def _make_tar(path, mode, member, content):
+            with tarfile.open(path, mode=mode) as t:
+                ti = tarfile.TarInfo(member); ti.size = len(content); ti.mode = 0o644
+                t.addfile(ti, io.BytesIO(content))
+        _make_tar(ctx2 / "bundle.tar.xz",  "w:xz",  "inxz.txt", b"xz-content\n")
+        _make_tar(ctx2 / "bundle.tar.bz2", "w:bz2", "inbz.txt", b"bz2-content\n")
         (ctx2 / "Dockerfile").write_text(
             "FROM SYN AS stage1\n"
             "COPY a.txt /from_stage/a.txt\n"
             "FROM SYN\n"
             "COPY *.txt /globbed/\n"                       # glob
-            "ADD bundle.tar.gz /unpacked/\n"               # tar auto-extract
+            "ADD bundle.tar.gz /unpacked/\n"              # gzip tar auto-extract
+            "ADD bundle.tar.xz /unpacked_xz/\n"          # xz tar auto-extract
+            "ADD bundle.tar.bz2 /unpacked_bz2/\n"        # bzip2 tar auto-extract
             "COPY --from=stage1 /from_stage/a.txt /copied_a.txt\n"  # cross-stage
             "STOPSIGNAL SIGQUIT\n"
             "HEALTHCHECK --interval=5s --retries=2 CMD /bin/true\n"
@@ -309,6 +319,14 @@ def main():
               "not a copied bundle.tar.gz blob)")
         check(not any_box_has_file(state_dir(e), "unpacked/bundle.tar.gz"),
               "ADD did NOT copy the tarball itself (it was extracted)")
+        check(any_box_has_file(state_dir(e), "unpacked_xz/inxz.txt")
+              and not any_box_has_file(state_dir(e), "unpacked_xz/bundle.tar.xz"),
+              "ADD bundle.tar.xz AUTO-EXTRACTED (unpacked_xz/inxz.txt present, "
+              "tarball not copied)")
+        check(any_box_has_file(state_dir(e), "unpacked_bz2/inbz.txt")
+              and not any_box_has_file(state_dir(e), "unpacked_bz2/bundle.tar.bz2"),
+              "ADD bundle.tar.bz2 AUTO-EXTRACTED (unpacked_bz2/inbz.txt present, "
+              "tarball not copied)")
         check(any_box_has_file(state_dir(e), "copied_a.txt"),
               "COPY --from=stage1 read the file from the other stage's view")
         cfg_raw = meta_get(state_dir(e) / f"{built2_top}.sqlar", "oci_config")

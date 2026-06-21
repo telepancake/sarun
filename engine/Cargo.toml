@@ -92,6 +92,11 @@ reqwest = { version = "0.13", default-features = false, features = ["http2"] }
 tar = "0.4"
 flate2 = "1"
 ruzstd = "0.7"
+# ADD-of-local-tar auto-extract for the xz / bzip2 cases. Both are pure-Rust
+# (no liblzma / libbz2 C dep), so the static-musl single-binary build is
+# unaffected. Decode-only, which is all ADD needs.
+lzma-rs = "0.3"
+bzip2-rs = "0.1"
 # Structural editing — tree-sitter + a starter pack of grammars. Drives the
 # inspect/write "symbol" locators (path symbol <name>[N]): inspect lists or
 # focuses named definitions; write splices new content into the symbol's

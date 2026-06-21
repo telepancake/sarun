@@ -315,12 +315,11 @@ fn unique_container_name() -> String {
 // Scope (v1): single- and multi-stage (`FROM … AS name`, `FROM name`,
 // `COPY --from=<stage|image>`); RUN (shell + exec form, honoring SHELL);
 // COPY/ADD of local context files+dirs with numeric --chown and octal --chmod,
-// glob sources, ADD-of-URL fetch and ADD-of-local-tar (gzip/zstd/plain)
-// auto-extract; ENV/ARG/WORKDIR/USER/CMD/ENTRYPOINT/LABEL/EXPOSE/VOLUME/SHELL/
-// STOPSIGNAL/ONBUILD/HEALTHCHECK carried into the image config; `-t` tag,
+// glob sources, ADD-of-URL fetch and ADD-of-local-tar (gzip/zstd/xz/bzip2/
+// plain) auto-extract; ENV/ARG/WORKDIR/USER/CMD/ENTRYPOINT/LABEL/EXPOSE/VOLUME/
+// SHELL/STOPSIGNAL/ONBUILD/HEALTHCHECK carried into the image config; `-t` tag,
 // `-f` file, `--build-arg`, `--net`.
-// Out of scope (v1): ADD auto-extract of xz/bzip2 (no bundled decoder — loud
-// bail); private-registry FROM auth.
+// Out of scope (v1): private-registry FROM auth.
 fn cli_build(args: &[String]) -> i32 {
     let mut tag: Option<String> = None;
     let mut file: Option<String> = None;
@@ -698,7 +697,7 @@ impl Builder {
                 if !canon_src.starts_with(&canon_ctx) {
                     bail!("{verb} source '{}' escapes the build context", src_abs.display());
                 }
-                // ADD auto-extracts a local tar (gzip/zstd/plain) INTO dest.
+                // ADD auto-extracts a local tar (gzip/zstd/xz/bzip2/plain).
                 if is_add && canon_src.is_file() {
                     match archive_kind(&canon_src)? {
                         ArchiveKind::Tar => {
@@ -708,10 +707,6 @@ impl Builder {
                                                          canon_src.display()))?;
                             continue;
                         }
-                        ArchiveKind::Unsupported(k) => bail!(
-                            "ADD auto-extract of {k} archives is not supported \
-                             ('{}'); decompress it in the build context first",
-                            canon_src.display()),
                         ArchiveKind::NotArchive => {} // plain copy below
                     }
                 }
@@ -1231,18 +1226,16 @@ fn now_ns() -> i64 {
 
 /// What `archive_kind` decided a local ADD source is.
 enum ArchiveKind {
-    /// A tar stream (plain, gzip, or zstd) — auto-extract it.
+    /// A tar stream (plain, gzip, zstd, xz, or bzip2) — auto-extract it.
     Tar,
-    /// A recognized but unsupported compression (no decoder) — bail clearly.
-    Unsupported(&'static str),
     /// Not an archive — ADD copies it as a plain file (like COPY).
     NotArchive,
 }
 
 /// Sniff a local ADD source's header: Docker auto-extracts a source it
-/// recognizes as a (optionally compressed) tar. We can decode gzip/zstd/plain;
-/// xz/bzip2 are recognized but unsupported (loud bail, never a silent
-/// plain-copy of a tarball the user expected extracted).
+/// recognizes as a (optionally compressed) tar. We decode gzip/zstd/xz/bzip2/
+/// plain — Docker's full set — so a tarball the user expected extracted never
+/// gets silently plain-copied.
 fn archive_kind(path: &Path) -> Result<ArchiveKind> {
     let mut f = File::open(path)?;
     let mut head = [0u8; 512];
@@ -1257,14 +1250,8 @@ fn archive_kind(path: &Path) -> Result<ArchiveKind> {
     }
     let h = &head[..n];
     if sniff(h).is_some() {
-        // gzip / zstd magic → treat as a compressed tar (Docker assumes so).
+        // gzip / zstd / xz / bzip2 magic → a compressed tar (Docker assumes so).
         return Ok(ArchiveKind::Tar);
-    }
-    if h.len() >= 6 && h[..6] == [0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00] {
-        return Ok(ArchiveKind::Unsupported("xz"));
-    }
-    if h.len() >= 3 && &h[..3] == b"BZh" {
-        return Ok(ArchiveKind::Unsupported("bzip2"));
     }
     // Plain tar: the ustar magic lives at offset 257.
     if h.len() >= 262 && &h[257..262] == b"ustar" {
@@ -1857,12 +1844,24 @@ fn decompressor<'a>(blob: &'a [u8], media_type: &str)
                 .map_err(|e| anyhow!("zstd init: {e}"))?;
             Ok(Box::new(d))
         }
+        // xz has no streaming Read adapter in lzma-rs, so decode the whole blob
+        // into memory and hand back a cursor. ADD sources are local files we
+        // already read fully, so this allocates no more than the layer itself.
+        Comp::Xz => {
+            let mut out = Vec::new();
+            let mut input = blob;
+            lzma_rs::xz_decompress(&mut input, &mut out)
+                .map_err(|e| anyhow!("xz decode: {e}"))?;
+            Ok(Box::new(std::io::Cursor::new(out)))
+        }
+        // bzip2-rs DecoderReader streams, borrowing the blob.
+        Comp::Bzip2 => Ok(Box::new(bzip2_rs::DecoderReader::new(blob))),
         Comp::None => Ok(Box::new(blob)),
     }
 }
 
 #[derive(Copy, Clone, Eq, PartialEq)]
-enum Comp { Gzip, Zstd, None }
+enum Comp { Gzip, Zstd, Xz, Bzip2, None }
 
 fn classify(media_type: &str) -> Comp {
     if media_type.ends_with("+gzip") || media_type.ends_with(".gzip") {
@@ -1878,6 +1877,12 @@ fn classify(media_type: &str) -> Comp {
 }
 
 fn sniff(blob: &[u8]) -> Option<Comp> {
+    if blob.len() >= 6 && blob[..6] == [0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00] {
+        return Some(Comp::Xz);
+    }
+    if blob.len() >= 3 && &blob[..3] == b"BZh" {
+        return Some(Comp::Bzip2);
+    }
     if blob.len() >= 4 {
         if blob[0] == 0x1f && blob[1] == 0x8b {
             return Some(Comp::Gzip);
