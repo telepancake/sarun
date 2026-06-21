@@ -18,6 +18,11 @@ brush-builtins = "0.2"
 # brush-builtins uses so the derived `Parser` impl satisfies brush-core's bound.
 clap = { version = "4.6.0", features = ["derive"] }
 brush-coreutils-builtins = { version = "0.1", features = ["coreutils.all"] }
+# Direct dep on uutils' `uu_cat` so the engine can call its injected logical
+# entry point (`uu_cat::cat`) for the native in-process `cat` builtin. The
+# `[patch.crates-io]` below redirects this to our vendored fork (vendor/uu_cat),
+# the same copy brush-coreutils-builtins already pulls in transitively.
+uu_cat = "0.8"
 # Vendored, find-only fork of uutils/findutils 0.9.1: run `find` as an
 # in-process brush builtin against the shell's logical I/O. See vendor/findutils.
 findutils = { path = "vendor/findutils" }

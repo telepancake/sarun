@@ -94,6 +94,7 @@ fn gate_table() -> &'static HashMap<&'static str, CoreutilGate> {
         m.insert("hostname", gate_hostname as CoreutilGate);
         m.insert("sync", gate_sync as CoreutilGate);
         m.insert("uname", gate_uname as CoreutilGate);
+        m.insert("cat", gate_cat as CoreutilGate);
         m
     })
 }
@@ -166,6 +167,52 @@ fn gate_uname(args: &[OsString]) -> bool {
         match b {
             b"-a" | b"-s" | b"-r" | b"-v" | b"-m" | b"-n" | b"-p" | b"-i" | b"-o" => continue,
             _ => return false,
+        }
+    }
+    true
+}
+
+/// `cat [-A -b -e -E -n -s -t -T -u -v] [FILE...]` — concatenate files.
+///
+/// The vendored `uu_cat` fork reproduces GNU's output byte-for-byte for the
+/// full formatting flag set (numbering, `$`-line-ends, `^`/`M-` non-printing
+/// escapes, tab display, blank squeezing) and for the read-error path (it
+/// strips errno to the same "No such file or directory" wording, continues to
+/// the next file, exits non-zero). What it does NOT match is the `--help` /
+/// `--version` text, so reject any `--`-prefixed long option except the audited
+/// formatting ones, and reject any unaudited short flag. Bare `-` is stdin and
+/// passes as a positional.
+fn gate_cat(args: &[OsString]) -> bool {
+    // Long options whose behavior matches GNU (formatting only). `--help` and
+    // `--version` are deliberately absent so their wording falls back to GNU.
+    const SAFE_LONG: &[&[u8]] = &[
+        b"--show-all",
+        b"--number-nonblank",
+        b"--show-ends",
+        b"--number",
+        b"--squeeze-blank",
+        b"--show-tabs",
+        b"--show-nonprinting",
+    ];
+    let mut opts_done = false;
+    for a in args.iter().skip(1) {
+        let b = a.as_bytes();
+        if opts_done {
+            continue; // everything after `--` is a positional file
+        }
+        if b == b"--" {
+            opts_done = true;
+        } else if b == b"-" || !b.starts_with(b"-") {
+            continue; // stdin, or a filename
+        } else if b.starts_with(b"--") {
+            if !SAFE_LONG.contains(&b) {
+                return false; // --help/--version/unknown long option
+            }
+        } else {
+            // A short cluster like `-bn` / `-vET`: every letter must be audited.
+            if !b[1..].iter().all(|c| b"AbeEnstTuv".contains(c)) {
+                return false;
+            }
         }
     }
     true

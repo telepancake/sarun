@@ -337,6 +337,97 @@ impl brush_core::builtins::SimpleCommand for CoreutilWrapper {
     }
 }
 
+/// `cat` as a NATIVE injected-I/O brush builtin.
+///
+/// This is the genuine in-process port, distinct from the generic
+/// [`CoreutilWrapper`]. CoreutilWrapper runs a util's stock `uumain`, which
+/// reads/writes the PROCESS's real fd 0/1/2 — so to aim it at a box sink that
+/// is NOT already fd 1 it must `dup2` around the call ([`with_fd_redirected`]),
+/// a process-global mutation that races concurrent pipeline stages. The
+/// vendored `uu_cat` fork instead exposes `uu_cat::cat(out, out_fd, stdin,
+/// stdin_fd)` — a logical entry that writes the sink we hand it DIRECTLY. So
+/// this builtin:
+///   * never touches the process fd table (no `dup2`) → concurrency-safe, a
+///     pipeline stage can take it; and
+///   * passes the box's logical `OpenFile`s straight through, with their
+///     backing raw fds (when any) so `cat`'s `copy_file_range`/`splice` fast
+///     path still fires.
+/// The per-argv gate ([`crate::brush_gates::gate_cat`]) still guards the tail
+/// of flags where uutils diverges from GNU; a refused argv (or `--help`/
+/// `--version`) falls back to the host binary via [`run_coreutil_external`]
+/// (child-local fds — also no `dup2`).
+struct CatBuiltin;
+
+impl brush_core::builtins::SimpleCommand for CatBuiltin {
+    fn get_content(
+        name: &str,
+        _content_type: brush_core::builtins::ContentType,
+        _options: &brush_core::builtins::ContentOptions,
+    ) -> Result<String, brush_core::error::Error> {
+        Ok(format!("{name}: native injected-I/O cat builtin\n"))
+    }
+
+    fn execute<SE: brush_core::extensions::ShellExtensions,
+               I: Iterator<Item = S>, S: AsRef<str>>(
+        context: brush_core::commands::ExecutionContext<'_, SE>,
+        args: I,
+    ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
+        use std::io::Write;
+        use std::os::fd::BorrowedFd;
+
+        let name = context.command_name.clone();
+        // argv INCLUDING argv[0]=name (brush's convention, and what cat's clap
+        // parser expects). Defensive seed if brush ever hands an empty list.
+        let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
+        if argv.is_empty() { argv.push(OsString::from(&name)); }
+
+        // GATE: flags uutils cat doesn't reproduce GNU-faithfully (and
+        // --help/--version) fall back to the host binary. compose_std_command
+        // wires the child's fds child-locally — still no process-global dup2.
+        if !crate::brush_gates::gate_for(&name)(&argv) {
+            let code = run_coreutil_external(&context, &name, &argv[1..]);
+            return Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8));
+        }
+
+        // Render `translate!` messages (e.g. "Is a directory") instead of raw
+        // Fluent keys — the setup half the bundled-coreutils adapter runs.
+        brush_coreutils_builtins::init_localization("uu_cat");
+
+        // The box's logical sinks/source. We write/read THESE directly; no fd of
+        // this process is redirected. Fall back to real std streams only if the
+        // context has no entry for the fd (shouldn't happen for a box).
+        let mut out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
+        let mut err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
+        let mut inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
+
+        // Backing raw fds for cat's splice fast path / output-is-input guard /
+        // is-terminal check. Captured as plain ints BEFORE the `&mut` borrows so
+        // the BorrowedFds don't alias the OpenFiles; they stay valid because the
+        // OpenFiles outlive the call.
+        let out_raw = out.try_borrow_as_fd().ok().map(|b| b.as_raw_fd());
+        let in_raw = inp.try_borrow_as_fd().ok().map(|b| b.as_raw_fd());
+        // SAFETY: each fd is owned by an OpenFile that lives across the cat call.
+        let out_fd = out_raw.map(|fd| unsafe { BorrowedFd::borrow_raw(fd) });
+        let in_fd = in_raw.map(|fd| unsafe { BorrowedFd::borrow_raw(fd) });
+
+        let code = match uu_cat::cat(argv.into_iter(), &mut out, out_fd, &mut inp, in_fd) {
+            Ok(()) => 0,
+            Err(e) => {
+                // cat() writes nothing to the process stderr; it returns every
+                // diagnostic as the error's Display, already joined with
+                // "\ncat: " for multi-file failures. Prefix the first line to
+                // match GNU's "cat: …", emit it on the LOGICAL stderr, and use
+                // GNU's exit status (1 on any read error).
+                let _ = writeln!(err, "{name}: {e}");
+                let _ = err.flush();
+                1
+            }
+        };
+        let _ = out.flush();
+        Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
+    }
+}
+
 /// `sarun` / `oaita` as in-box brush builtins (interactive use). There is no
 /// `sarun` on PATH inside a box and no FUSE shadow under /usr/local: the
 /// builtin re-execs the box inner runner process's OWN executable — the engine
@@ -431,6 +522,11 @@ fn box_builtins_opt<SE: brush_core::extensions::ShellExtensions>(
         for name in brush_coreutils_builtins::bundled_commands().keys() {
             m.insert(name.clone(), simple_builtin::<CoreutilWrapper, SE>());
         }
+        // `cat` is a NATIVE injected-I/O builtin (writes the box's logical sink
+        // directly, no process-global dup2), so it OVERWRITES the generic
+        // CoreutilWrapper registration the loop just made. Only under
+        // bundle_coreutils — make recipes still use external cat (see above).
+        m.insert("cat".to_string(), simple_builtin::<CatBuiltin, SE>());
     }
     // BashMode shell builtins overwrite overlaps (highest priority).
     m.extend(brush_builtins::default_builtins(brush_builtins::BuiltinSet::BashMode));
