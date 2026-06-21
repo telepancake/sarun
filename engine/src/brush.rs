@@ -455,7 +455,7 @@ fn box_builtins_opt<SE: brush_core::extensions::ShellExtensions>(
     // the shell's logical cwd; see crate::xargs_builtin.
     m.insert(
         "xargs".to_string(),
-        simple_builtin::<crate::xargs_builtin::XargsBuiltin, SE>(),
+        builtin::<crate::xargs_builtin::XargsBuiltin, SE>(),
     );
     // In-process exec-wrapper builtins (`env`, `printenv`). These are launcher
     // front-ends, not ports: they mutate the shell's LOGICAL launch state
