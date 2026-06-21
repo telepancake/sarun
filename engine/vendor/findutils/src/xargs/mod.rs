@@ -74,8 +74,9 @@ pub trait XargsIo {
 /// backs this with a real `std::process::Child`; the in-process embedder backs
 /// it with a brush-dispatched command (see [`XargsIo::submit`]).
 pub trait ExecChild {
-    /// Block until the command finishes and return its exit code (`128 + signo`
-    /// if it was killed by a signal).
+    /// Block until the command finishes. `Ok(code)` is a normal exit; a signal
+    /// death, a not-found command, etc. come back as the matching
+    /// `CommandExecutionError` so xargs reports GNU's 125/126/127 and stops.
     fn wait(self: Box<Self>) -> Result<i32, CommandExecutionError>;
 }
 
@@ -85,23 +86,23 @@ struct ProcessChild(Child);
 impl ExecChild for ProcessChild {
     fn wait(mut self: Box<Self>) -> Result<i32, CommandExecutionError> {
         let status = self.0.wait().map_err(CommandExecutionError::CannotRun)?;
-        Ok(exit_code_of(status))
+        match status.code() {
+            Some(code) => Ok(code),
+            // No exit code → killed by a signal. Preserve the distinction so
+            // xargs stops with GNU's exit 125 (rather than a generic failure).
+            None => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::ExitStatusExt;
+                    Err(CommandExecutionError::Killed {
+                        signal: status.signal().unwrap_or(0),
+                    })
+                }
+                #[cfg(not(unix))]
+                Err(CommandExecutionError::Unknown)
+            }
+        }
     }
-}
-
-/// A process's exit code, encoding signal death as `128 + signo` (as a shell
-/// does), so all callers can reason about a single `i32`.
-fn exit_code_of(status: std::process::ExitStatus) -> i32 {
-    if let Some(code) = status.code() {
-        return code;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt;
-        return 128 + status.signal().unwrap_or(0);
-    }
-    #[cfg(not(unix))]
-    -1
 }
 
 /// The dependencies used when xargs runs as the real standalone executable:
