@@ -91,6 +91,23 @@ pub fn api_box_oaita_toml_path() -> PathBuf {
     runtime_home().join("api-box-oaita.toml")
 }
 
+/// The augmented CA bundle (host system bundle + engine's MITM CA root),
+/// pre-written once at engine startup. The FUSE overlay shadows each of
+/// CA_BUNDLE_TARGETS (engine/src/runner.rs) into `--api` boxes with this
+/// file's bytes, so a box reading `/etc/ssl/certs/ca-certificates.crt`
+/// (etc.) gets the engine-trusted bundle without any bwrap bind or
+/// runner-written on-disk file.
+pub fn api_box_ca_pem_path() -> PathBuf {
+    runtime_home().join("api-box-ca.pem")
+}
+
+/// Synthetic /etc/resolv.conf for `--api` boxes — `nameserver <gw>\n`
+/// where <gw> is the engine's per-box-stack gateway IP. Pre-written at
+/// engine startup; shadowed in by the overlay.
+pub fn api_box_resolv_conf_path() -> PathBuf {
+    runtime_home().join("api-box-resolv.conf")
+}
+
 pub fn mnt_point() -> PathBuf {
     runtime_home().join("mnt")
 }

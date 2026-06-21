@@ -133,7 +133,22 @@ fn serve() -> i32 {
     // ever invoke it. Failure here (e.g. can't write the CA dir) is not
     // fatal: `-n` will refuse at register time, other modes work normally.
     match net::Net::new() {
-        Ok(n) => state.lock().unwrap().net = Some(std::sync::Arc::new(n)),
+        Ok(n) => {
+            // Pre-write the host-side files the FUSE overlay shadows
+            // into `--api` boxes: the augmented CA bundle (host system
+            // bundle + engine's MITM CA root) and a synthetic
+            // /etc/resolv.conf pointing at the engine's per-box stack
+            // gateway. Same shape as the safe-oaita.toml shadow below —
+            // the box reads canonical paths and the overlay serves
+            // engine-controlled content, no bwrap binds, no on-disk
+            // writes by the runner (which for a nested --api box would
+            // land in the parent box's overlay as
+            // `.tmp/N/sarun-ca-*.pem` noise).
+            if let Err(e) = control::write_api_box_net_shadows(&n) {
+                eprintln!("sarun-engine: api-box net shadow files: {e}");
+            }
+            state.lock().unwrap().net = Some(std::sync::Arc::new(n));
+        }
         Err(e) => eprintln!("sarun-engine: net init failed (-n disabled): {e}"),
     }
     // One tokio runtime, multi-thread; long-lived. Dispatcher tasks (one
