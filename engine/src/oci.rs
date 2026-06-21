@@ -30,6 +30,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use anyhow::{Context, Result, anyhow, bail};
+use serde_json::Value;
 use oci_client::Reference;
 use oci_client::client::{Client, ClientConfig, ImageLayer};
 use oci_client::manifest::{
@@ -83,16 +84,39 @@ fn cli_load(args: &[String]) -> i32 {
         return 2;
     };
     let name = args.get(1).cloned();
+    // The pull runs in the ENGINE (host-side): credentials stay out of any box,
+    // and an in-box `sarun oci load` never unpacks through the box's netns+FUSE.
+    // Fall back to a local pull only when no engine is reachable (host, no
+    // `serve`); an in-box caller must use the engine (broker), never local.
+    match engine_conn() {
+        Some(conn) => {
+            match engine_rpc_on(conn, "oci.load",
+                                serde_json::json!([reference, name])) {
+                Ok(r) => {
+                    println!("loaded image '{reference}': base box '{}' (id={}) → \
+                              top box '{}' (id={}), {} layer(s)",
+                        r.get("base_name").and_then(Value::as_str).unwrap_or("?"),
+                        r.get("base_id").and_then(Value::as_i64).unwrap_or(0),
+                        r.get("top_name").and_then(Value::as_str).unwrap_or("?"),
+                        r.get("top_id").and_then(Value::as_i64).unwrap_or(0),
+                        r.get("n_layers").and_then(Value::as_i64).unwrap_or(0));
+                    return 0;
+                }
+                Err(e) => { eprintln!("sarun oci load: {e}"); return 1; }
+            }
+        }
+        None if in_box() => {
+            eprintln!("sarun oci load: in a box but the engine broker is \
+                       unreachable — cannot pull");
+            return 1;
+        }
+        None => {}  // host, no engine: fall through to a local pull
+    }
     if let Err(e) = paths::ensure_dirs() {
         eprintln!("sarun oci load: {e}");
         return 1;
     }
-    let rt = match tokio::runtime::Builder::new_current_thread()
-        .enable_all().build() {
-        Ok(r) => r,
-        Err(e) => { eprintln!("sarun oci load: tokio init: {e}"); return 1; }
-    };
-    match rt.block_on(load(&reference, name)) {
+    match load_blocking(&reference, name) {
         Ok(r) => {
             // Spell out both ends of the chain so the user can address the
             // image as either `<base>` (full merged view) or `<base>.L<n>`
@@ -215,10 +239,85 @@ fn cli_run(args: &[String]) -> i32 {
 /// display path), we walk DOWN its OCI layer children to the topmost layer and
 /// run on that. Otherwise `reference` is an image ref: we load it fresh and use
 /// the loader's reported top box.
+/// True when this process runs inside a box (the runner sets SARUN_BROKER on
+/// every box child). In-box, OCI registry work MUST go through the engine.
+fn in_box() -> bool {
+    std::env::var("SARUN_BROKER").is_ok_and(|s| !s.is_empty())
+}
+
+/// A control-plane connection to the engine: the per-box FD broker in-box, the
+/// filesystem UDS on the host. None when no engine is reachable.
+fn engine_conn() -> Option<std::os::unix::net::UnixStream> {
+    if let Ok(name) = std::env::var("SARUN_BROKER") {
+        if !name.is_empty() {
+            return crate::runner::broker_dial(&name).ok();
+        }
+    }
+    std::os::unix::net::UnixStream::connect(paths::sock_path()).ok()
+}
+
+/// One `{"type":"ui","verb":...}` round trip over `conn`; returns the reply's
+/// `r` payload, or an error carrying the engine's message. The pull can take a
+/// while — there is no read timeout, by design.
+fn engine_rpc_on(mut conn: std::os::unix::net::UnixStream, verb: &str, args: Value)
+    -> Result<Value> {
+    use std::io::{BufRead, BufReader, Write};
+    let msg = serde_json::json!({"type": "ui", "verb": verb, "args": args});
+    conn.write_all(format!("{msg}\n").as_bytes()).context("engine rpc write")?;
+    let mut line = String::new();
+    BufReader::new(&conn).read_line(&mut line).context("engine rpc read")?;
+    let rep: Value = serde_json::from_str(&line).context("engine rpc parse")?;
+    if rep.get("ok").and_then(Value::as_bool) != Some(true) {
+        bail!("{}", rep.get("error").and_then(Value::as_str).unwrap_or("rpc failed"));
+    }
+    Ok(rep.get("r").cloned().unwrap_or(Value::Null))
+}
+
+/// Pull + install an image, blocking on a fresh tokio runtime. The work behind
+/// `oci load` — called directly on the no-engine host fallback, and by the
+/// engine's `oci.load` RPC handler (host-side, where credentials live).
+pub(crate) fn load_blocking(reference: &str, name: Option<String>) -> Result<LoadOutcome> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all().build().context("tokio init")?;
+    rt.block_on(load(reference, name))
+}
+
+/// Resolve `reference` to a runnable image top-box id. The registry pull runs
+/// in the ENGINE: if reachable we RPC `oci.resolve` (so credentials stay
+/// host-side and an in-box caller never pulls through its own netns/FUSE);
+/// otherwise (host, no `serve`) we resolve locally. An in-box caller with no
+/// reachable broker is an error — falling back to a local in-box pull is
+/// exactly what this change removes.
 fn resolve_image_top(reference: &str) -> Result<i64> {
+    if let Some(conn) = engine_conn() {
+        let r = engine_rpc_on(conn, "oci.resolve", serde_json::json!([reference]))
+            .with_context(|| format!("engine resolve '{reference}'"))?;
+        // Surface the engine's reuse/pull note on the caller's terminal (it ran
+        // host-side, so its own eprintln went to the engine log, not here).
+        if let Some(note) = r.get("note").and_then(Value::as_str) {
+            if !note.is_empty() { eprintln!("{note}"); }
+        }
+        return r.get("top_id").and_then(Value::as_i64)
+            .ok_or_else(|| anyhow!("engine oci.resolve returned no top_id"));
+    }
+    if in_box() {
+        bail!("in a box but the engine broker is unreachable — cannot resolve \
+               image '{reference}'");
+    }
+    let (top, note) = resolve_image_top_local(reference)?;
+    if !note.is_empty() { eprintln!("{note}"); }
+    Ok(top)
+}
+
+/// The actual resolution (cache lookup + pull-if-needed), run host-side: by the
+/// engine's `oci.resolve` handler, or directly on the no-engine host fallback.
+/// Returns the top-box id plus a human note (reuse / loaded) for the CALLER to
+/// print — so the message reaches the user's terminal even when this ran in the
+/// engine across an RPC.
+pub(crate) fn resolve_image_top_local(reference: &str) -> Result<(i64, String)> {
     let boxes = crate::discover::discover();
     if let Some(start) = resolve_box(&boxes, reference) {
-        return Ok(follow_to_top(&boxes, start));
+        return Ok((follow_to_top(&boxes, start), String::new()));
     }
     // Image cache — the Docker model: pull once, share the layer boxes across
     // runs. v2 keys on the MANIFEST DIGEST: probe the reference's current
@@ -231,36 +330,34 @@ fn resolve_image_top(reference: &str) -> Result<i64> {
     let probed = probe_manifest_digest(reference).ok();
     if let Some(dg) = probed.as_deref() {
         if let Some(start) = find_loaded_by_manifest_digest(&boxes, dg) {
-            eprintln!("sarun oci: reusing already-loaded image '{reference}' \
-                       (manifest {dg}, box {start})");
-            return Ok(follow_to_top(&boxes, start));
+            let note = format!("sarun oci: reusing already-loaded image \
+                                '{reference}' (manifest {dg}, box {start})");
+            return Ok((follow_to_top(&boxes, start), note));
         }
     }
     // Fall back to the v1 key (exact reference string) — but only honor it when
     // the probe didn't prove the loaded stack stale. With no probe (offline /
     // unsupported source) this is exactly the v1 behavior.
+    let mut prefix = String::new();
     if let Some(start) = find_loaded_by_reference(&boxes, reference) {
         let stored = boxes.get(&start).and_then(|b| b.meta.get("oci_manifest_digest"));
         let stale = matches!((probed.as_deref(), stored),
                              (Some(p), Some(s)) if p != s.as_str());
         if stale {
-            eprintln!("sarun oci: image '{reference}' tag moved (manifest changed) \
-                       — re-pulling");
+            prefix = format!("sarun oci: image '{reference}' tag moved (manifest \
+                              changed) — re-pulling\n");
         } else {
-            eprintln!("sarun oci: reusing already-loaded image '{reference}' \
-                       (box {start})");
-            return Ok(follow_to_top(&boxes, start));
+            let note = format!("sarun oci: reusing already-loaded image \
+                                '{reference}' (box {start})");
+            return Ok((follow_to_top(&boxes, start), note));
         }
     }
     // Not loaded → treat as an image reference and pull it.
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all().build()
-        .context("tokio init")?;
-    let outcome = rt.block_on(load(reference, None))
+    let outcome = load_blocking(reference, None)
         .with_context(|| format!("load image '{reference}'"))?;
-    eprintln!("sarun oci run: loaded image '{reference}' → top box {} ({} layer(s))",
-              outcome.top_id, outcome.n_layers);
-    Ok(outcome.top_id)
+    let note = format!("{prefix}sarun oci run: loaded image '{reference}' → \
+                        top box {} ({} layer(s))", outcome.top_id, outcome.n_layers);
+    Ok((outcome.top_id, note))
 }
 
 /// Lowest box id of a loaded stack whose `oci_manifest_digest` matches — the
@@ -1419,12 +1516,12 @@ fn fetch_url(url: &str) -> Result<Vec<u8>> {
     })
 }
 
-struct LoadOutcome {
-    base_id: i64,
-    base_name: String,
-    top_id: i64,
-    top_name: String,
-    n_layers: usize,
+pub(crate) struct LoadOutcome {
+    pub base_id: i64,
+    pub base_name: String,
+    pub top_id: i64,
+    pub top_name: String,
+    pub n_layers: usize,
 }
 
 /// One pulled layer ready to ingest. media_type drives the decompressor.
@@ -1725,28 +1822,6 @@ fn digest_of(bytes: &[u8]) -> String {
 
 // ── box chain construction ──────────────────────────────────────────────────
 
-/// Mint the next box id. Looks at the highest existing at-rest sqlar id
-/// under state_home. (The engine, when running, allocates from
-/// max(at_rest, live)+1; here we're at-rest-only so it's just at_rest+1.)
-fn next_box_id() -> Result<i64> {
-    let sh = paths::state_home();
-    let mut max: i64 = 0;
-    if let Ok(rd) = std::fs::read_dir(&sh) {
-        for ent in rd.flatten() {
-            let p = ent.path();
-            if p.extension().and_then(|e| e.to_str()) != Some("sqlar") {
-                continue;
-            }
-            if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
-                if let Ok(n) = stem.parse::<i64>() {
-                    if n > max { max = n; }
-                }
-            }
-        }
-    }
-    Ok(max + 1)
-}
-
 fn install_chain(image: PulledImage, base_name: Option<String>)
     -> Result<LoadOutcome>
 {
@@ -1759,7 +1834,12 @@ fn install_chain(image: PulledImage, base_name: Option<String>)
     let mut top_id: i64 = 0;
     let mut top_name = String::new();
     let n = image.layers.len();
-    let mut next_id = next_box_id()?;
+    // mint_box_id() scans BOTH state_home (at-rest) and live_home (a live box's
+    // backing dir, created by `register` at id-allocation time), so an id picked
+    // here can't collide with a running box that has no at-rest sqlar yet. This
+    // is the same allocator the build path uses, and it makes install_chain safe
+    // to run engine-side (the OCI pull RPC), not just in a standalone CLI.
+    let mut next_id = mint_box_id();
     let actual_base_name = base_name.clone();
     for (i, layer) in image.layers.into_iter().enumerate() {
         let id = next_id;
