@@ -184,11 +184,12 @@ pub fn generate(spec: &str, set: &Settings) -> Result<Vec<PathBuf>, String> {
                             content.push_str(c);
                             // Stream-into-target: write the partial whenever
                             // content grows. Resilient resume needs the file
-                            // to reflect what we have RIGHT NOW.
+                            // to reflect what we have RIGHT NOW. We do NOT
+                            // echo chunks to stdout — the persisted turn file
+                            // IS the canonical record, and a chatty stdout
+                            // pollutes anyone capturing this process's
+                            // output (e.g. `ask` running us as a sub-agent).
                             let _ = fs::write(&target_path, &content);
-                            print!("{c}");
-                            use std::io::Write;
-                            let _ = std::io::stdout().flush();
                         }
                     }
                     if let Some(tcs) = d.get("tool_calls").and_then(Value::as_array) {
@@ -950,12 +951,13 @@ fn act_script(inner: &str, child_depth: u32, max_steps: i64) -> String {
     // box (in-box, broker-hinted) so the parent doesn't need to know
     // the dotted box name to grant.
     //
-    // No `set -e` — we run BOTH commands unconditionally so a budget-
-    // exhausted `oaita run` (rc=1) still gets its tail captured.
-    format!(
-        "oaita run {inner} --max-steps {max_steps} --depth {child_depth}\n\
-         oaita tail {inner}\n"
-    )
+    // `oaita run` prints the final settled assistant turn's content on
+    // a clean exit (see cli::report) and is otherwise silent — so the
+    // captured stdout IS the sub-agent's answer. No separate `oaita
+    // tail` needed. Budget-exhausted runs (rc=1) print nothing on
+    // stdout; the parent sees an empty result and the resume hint
+    // appended by format_act_result.
+    format!("oaita run {inner} --max-steps {max_steps} --depth {child_depth}\n")
 }
 
 /// One-line status per spawned sub-agent of `outer` — appended to every

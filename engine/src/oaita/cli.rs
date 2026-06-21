@@ -299,11 +299,32 @@ fn cmd_where() -> i32 {
     0
 }
 
+/// Print the LAST turn we wrote, if it's a clean assistant tail (no
+/// `p`/`c`/`b` flags). That's the "final answer" of a settled run — the
+/// only thing a programmatic caller (the `ask` tool capturing our stdout)
+/// or an interactive user typing `oaita run NAME` actually wants to see.
+/// Anything else — per-turn write logs, streamed chunks during gen —
+/// would just pollute the caller's view: the turn files on disk are the
+/// canonical record, and a quiet stdout makes oaita behave like every
+/// other CLI in the shell tool's world (`python script.py` prints its
+/// result, not a running commentary).
 fn report(paths: &[std::path::PathBuf]) -> i32 {
-    use std::io::Write;
-    let _ = writeln!(std::io::stdout(), "");
-    for p in paths {
-        eprintln!("oaita: wrote {}", p.display());
+    let Some(last) = paths.last() else { return 0; };
+    let Some(name) = last.file_name().and_then(|s| s.to_str()) else { return 0; };
+    // turn-filename grammar: NNNN[-id[-from]][.flags].<type>. We only
+    // surface clean assistant tails; a `c`/`p`/`b`-flagged turn is mid-
+    // flight (pending call / partial / backtrack waypoint) and the
+    // model's actual answer hasn't been written yet.
+    let parts: Vec<&str> = name.split('.').collect();
+    let n = parts.len();
+    if n < 2 || parts[n - 1] != "assistant" { return 0; }
+    if n >= 3 && !parts[n - 2].is_empty() { return 0; }   // has flags → skip
+    if let Ok(content) = std::fs::read_to_string(last) {
+        use std::io::Write;
+        let _ = std::io::stdout().write_all(content.as_bytes());
+        if !content.ends_with('\n') {
+            let _ = writeln!(std::io::stdout());
+        }
     }
     0
 }
