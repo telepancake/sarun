@@ -173,12 +173,14 @@ including closed-rootfs boot, COPY/glob landing, multi-stage `COPY --from`,
   still boots (content survived) and stays closed. Still needs the verbs + image
   refcount/cascade.
 - [ ] **Registry reach:** private-registry auth (`fetch_registry` passes
-  `RegistryAuth::Anonymous`); digest/signature verification; `zstd:chunked`
-  fast path (currently decoded as plain zstd — correct, just not chunked).
-  (`ADD <url>` over HTTPS already works via `reqwest` — this is FROM-pull auth.)
-- [ ] **`ADD` auto-extract of xz/bzip2.** gzip/zstd/plain tar extract; xz and
-  bzip2 are detected and loudly refused (no bundled decoder). Add a pure-Rust
-  xz/bzip2 decoder if a real Dockerfile needs it.
+  `RegistryAuth::Anonymous`); image *signature* verification (cosign/notary).
+  Blob *digest* integrity is DONE — `read_blob_by_digest` hashes each
+  oci-archive/oci-layout blob against its descriptor digest and bails on
+  mismatch (`test_oci.py` tamper case); registry transfers are verified inside
+  oci-client. `zstd:chunked` fast path is intentionally NOT done: the blob is a
+  valid zstd stream so plain-zstd decoding is already correct, just not chunked
+  — leave unless a real workload needs the TOC fast path. (`ADD <url>` over
+  HTTPS already works via `reqwest` — the auth gap is FROM-pull only.)
 
 ## Branch / workflow
 Develop on the branch you were told to; commit with clear messages; push only

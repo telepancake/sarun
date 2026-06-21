@@ -1512,26 +1512,39 @@ fn read_blob_by_digest(layout: &Path, digest: &str) -> Result<Vec<u8>> {
     let (algo, hex) = digest.split_once(':')
         .ok_or_else(|| anyhow!("malformed digest '{digest}'"))?;
     let p = layout.join("blobs").join(algo).join(hex);
-    std::fs::read(&p).with_context(|| format!("read blob {}", p.display()))
+    let bytes = std::fs::read(&p)
+        .with_context(|| format!("read blob {}", p.display()))?;
+    // Content-addressable integrity: the bytes MUST hash to the digest the
+    // descriptor/filename claims. Without this an oci-archive/oci-layout with a
+    // corrupted or swapped blob is accepted silently. (Registry transfers are
+    // verified inside oci-client.) We can hash sha256 — the OCI default; any
+    // other algorithm passes through unverified rather than failing the load.
+    if algo == "sha256" {
+        let actual = sha256_hex(&bytes);
+        if !actual.eq_ignore_ascii_case(hex) {
+            bail!("blob digest mismatch: {} claims {digest} but hashes to \
+                   sha256:{actual}", p.display());
+        }
+    }
+    Ok(bytes)
+}
+
+/// Lowercase hex sha256 of `bytes`.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let d = Sha256::digest(bytes);
+    let mut s = String::with_capacity(64);
+    for b in d { s.push_str(&format!("{b:02x}")); }
+    s
 }
 
 fn digest_of(bytes: &[u8]) -> String {
-    use std::hash::{Hash, Hasher};
-    // We don't need a cryptographic digest — sqlar just records what the
-    // registry/manifest told us the digest was. For the registry-pull path we
-    // get the bytes after `pull()` strips them from the descriptor; we record
-    // a stable but non-crypto fingerprint so users can correlate sqlars to
-    // layers without us pulling in a sha2 crate just for this. Real digest
-    // verification happens inside oci-client.
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    bytes.len().hash(&mut h);
-    if bytes.len() >= 64 {
-        bytes[..32].hash(&mut h);
-        bytes[bytes.len() - 32..].hash(&mut h);
-    } else {
-        bytes.hash(&mut h);
-    }
-    format!("fp:{:016x}", h.finish())
+    // The real layer-blob digest (sha256 of the bytes we received). For the
+    // registry path oci-client has already verified transfer integrity; we
+    // record the digest so users can correlate sqlars to layers and so the
+    // image cache has a real key. Archive/layout layers carry the manifest's
+    // own digest instead (and read_blob_by_digest verifies it).
+    format!("sha256:{}", sha256_hex(bytes))
 }
 
 // ── box chain construction ──────────────────────────────────────────────────

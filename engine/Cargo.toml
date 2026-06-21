@@ -97,6 +97,10 @@ ruzstd = "0.7"
 # unaffected. Decode-only, which is all ADD needs.
 lzma-rs = "0.3"
 bzip2-rs = "0.1"
+# Content-addressable blob integrity for oci-archive/oci-layout loads (verify a
+# blob's bytes hash to the digest its descriptor claims). Already in the tree
+# transitively via oci-client; named directly so the verification is explicit.
+sha2 = "0.10"
 # Structural editing — tree-sitter + a starter pack of grammars. Drives the
 # inspect/write "symbol" locators (path symbol <name>[N]): inspect lists or
 # focuses named definitions; write splices new content into the symbol's

@@ -124,6 +124,48 @@ def build_archive(dest_tar, exe_path):
     return dest_tar
 
 
+def build_tampered_layout(exe_path):
+    """An oci-layout DIR like build_archive's, but the LAYER blob's content is
+    corrupted while its filename stays the true manifest digest — so a
+    digest-verifying loader must reject it. config/manifest stay valid (they're
+    verified first; the loader must reach and fail on the layer)."""
+    exe = Path(exe_path).read_bytes()
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode="w") as t:
+        d = tarfile.TarInfo("bin"); d.type = tarfile.DIRTYPE; d.mode = 0o755; t.addfile(d)
+        f = tarfile.TarInfo("bin/sarun"); f.size = len(exe); f.mode = 0o755
+        t.addfile(f, io.BytesIO(exe))
+    layer_raw = raw.getvalue()
+    diff_id = "sha256:" + _sha(layer_raw)
+    gz = gzip.compress(layer_raw)
+    layer_digest = "sha256:" + _sha(gz)
+    config = {"architecture": "amd64", "os": "linux",
+              "config": {"Cmd": ["/bin/sarun", "oci", "--help"],
+                         "Env": ["PATH=/bin"], "WorkingDir": "/"},
+              "rootfs": {"type": "layers", "diff_ids": [diff_id]}}
+    config_b = json.dumps(config).encode(); config_digest = "sha256:" + _sha(config_b)
+    manifest = {"schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "config": {"mediaType": "application/vnd.oci.image.config.v1+json",
+                           "digest": config_digest, "size": len(config_b)},
+                "layers": [{"mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                            "digest": layer_digest, "size": len(gz)}]}
+    manifest_b = json.dumps(manifest).encode(); manifest_digest = "sha256:" + _sha(manifest_b)
+    index = {"schemaVersion": 2,
+             "manifests": [{"mediaType": "application/vnd.oci.image.manifest.v1+json",
+                            "digest": manifest_digest, "size": len(manifest_b),
+                            "platform": {"architecture": "amd64", "os": "linux"}}]}
+    layout = Path(tempfile.mkdtemp(prefix="oci-tamper-"))
+    (layout / "oci-layout").write_text(json.dumps({"imageLayoutVersion": "1.0.0"}))
+    (layout / "index.json").write_bytes(json.dumps(index).encode())
+    blobs = layout / "blobs" / "sha256"; blobs.mkdir(parents=True)
+    (blobs / config_digest.split(":")[1]).write_bytes(config_b)
+    (blobs / manifest_digest.split(":")[1]).write_bytes(manifest_b)
+    # CORRUPT: filename is the true digest, content is not.
+    (blobs / layer_digest.split(":")[1]).write_bytes(gz + b"corrupted")
+    return layout
+
+
 def box_names(sdir):
     out = set()
     for p in sdir.glob("*.sqlar"):
@@ -380,6 +422,23 @@ def main():
                   f"child {k} inherited the no_host closure from dissolved SYN")
             check(meta_get(kp, "parent_box_id") in (None, ""),
                   f"child {k} re-parented onto SYN's (absent) parent → top-level")
+
+        # ── digest verification: a corrupted layer blob is rejected ───────────
+        # read_blob_by_digest hashes each oci-archive/oci-layout blob and bails
+        # if it doesn't match the digest its descriptor claims — so a corrupted
+        # or swapped blob can't silently become a box.
+        bad = build_tampered_layout(ENGINE)
+        before_bad = set(box_names(state_dir(e)))
+        r = sarun(e, "oci", "load", f"oci-layout:{bad}", "TAMPER")
+        out = (r.stderr + r.stdout).lower()
+        check(r.returncode != 0,
+              f"oci load of a tampered layout FAILS (rc={r.returncode})")
+        check("digest mismatch" in out,
+              f"load rejects the corrupted blob with a digest-mismatch error "
+              f"(stderr: {r.stderr.strip()[:200]})")
+        check(set(box_names(state_dir(e))) == before_bad,
+              "tampered image created no box")
+        shutil.rmtree(bad, ignore_errors=True)
         # End to end: restart, re-run BUILT. SYN's content (incl. /bin/sarun) was
         # copied down, so the box STILL boots and runs its CMD — and stays closed.
         stop_engine(proc)
