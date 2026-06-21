@@ -357,7 +357,7 @@ impl FormatString {
 
 fn get_starting_point(file_info: &WalkEntry) -> &Path {
     file_info
-        .path()
+        .display_path()
         .ancestors()
         .nth(file_info.depth())
         // safe to unwrap: the file's depth should never be longer than its path
@@ -436,7 +436,7 @@ fn format_directive<'entry>(
         // - "." also returns "."
         // - ".." returns "." (???)
         // These are all (thankfully) documented on the find(1) man page.
-        FormatDirective::Dirname => match file_info.path().parent() {
+        FormatDirective::Dirname => match file_info.display_path().parent() {
             None => "".into(),
             Some(p) if p == Path::new("/") => "".into(),
             Some(p) if p == Path::new("") => ".".into(),
@@ -485,7 +485,7 @@ fn format_directive<'entry>(
         FormatDirective::Path {
             strip_starting_point,
         } => file_info
-            .path()
+            .display_path()
             .strip_prefix(if *strip_starting_point {
                 get_starting_point(file_info)
             } else {

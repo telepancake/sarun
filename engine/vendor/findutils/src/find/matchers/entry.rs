@@ -203,6 +203,14 @@ pub struct WalkEntry {
     follow: Follow,
     /// Cached metadata.
     meta: OnceCell<Result<Metadata, WalkError>>,
+    /// sarun: a DISPLAY path that differs from the real (fs) path. When the
+    /// in-process embedder roots the walk at an absolute logical-cwd path so it
+    /// can avoid mutating the engine's process cwd, `path()` stays the real
+    /// absolute path (every `fs` op and cached `metadata` must use it), while
+    /// `display_path()` is the relative form the user expects in `-print`,
+    /// `-path`/`-regex`, `-printf %p/%h`, and `-exec {}`. `None` for the
+    /// standalone binary (display == path).
+    display: Option<PathBuf>,
 }
 
 impl WalkEntry {
@@ -212,6 +220,7 @@ impl WalkEntry {
             inner: Entry::Explicit(path.into(), depth),
             follow,
             meta: OnceCell::new(),
+            display: None,
         }
     }
 
@@ -233,6 +242,7 @@ impl WalkEntry {
                         inner: Entry::WalkDir(entry),
                         follow,
                         meta: OnceCell::new(),
+                        display: None,
                     }
                 };
                 Ok(ret)
@@ -245,6 +255,7 @@ impl WalkEntry {
                             inner: Entry::Explicit(path.into(), depth),
                             follow: Follow::Never,
                             meta: Ok(meta).into(),
+                            display: None,
                         });
                     }
                 }
@@ -255,12 +266,30 @@ impl WalkEntry {
         }
     }
 
-    /// Get the path to this entry.
+    /// Get the REAL path to this entry — the one every filesystem operation and
+    /// the cached `metadata` resolve against. Absolute when the embedder rooted
+    /// the walk at an absolute logical-cwd path.
     pub fn path(&self) -> &Path {
         match &self.inner {
             Entry::Explicit(path, _) => path.as_path(),
             Entry::WalkDir(ent) => ent.path(),
         }
+    }
+
+    /// Get the DISPLAY path — the form shown to the user / matched by `-path` /
+    /// substituted for `-exec {}`. Equals `path()` unless the embedder set a
+    /// distinct display path (see the `display` field). sarun addition.
+    pub fn display_path(&self) -> &Path {
+        match &self.display {
+            Some(p) => p.as_path(),
+            None => self.path(),
+        }
+    }
+
+    /// sarun: override the display path (relative form) while `path()` keeps the
+    /// real absolute path used for fs ops. Set by the embedder's walk driver.
+    pub fn set_display(&mut self, display: PathBuf) {
+        self.display = Some(display);
     }
 
     /// Get the path to this entry.

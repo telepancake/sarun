@@ -1,87 +1,42 @@
 //! In-process `find` builtin for box brush shells.
 //!
 //! Runs the vendored find-only fork of uutils/findutils against the shell's
-//! LOGICAL stdout/stderr/stdin (via a `Dependencies` impl) on a dedicated
-//! worker thread that owns its current directory. Nothing touches the engine's
-//! process-global stdio or cwd, so the result is correct after `cd`/redirects
-//! and safe to run concurrently with sibling builtins.
+//! LOGICAL stdout/stderr/stdin and LOGICAL cwd (via a `Dependencies` impl),
+//! in-process on the calling thread. Nothing touches the engine's process-global
+//! stdio or cwd, so the result is correct after `cd`/redirects.
 //!
-//! ## Why a thread with its own cwd
+//! ## Logical cwd without `unshare` (no per-thread kernel cwd)
 //!
-//! `find` resolves its start paths, every `stat`, and `-exec` child cwd against
-//! the *kernel* current directory, pervasively, through `std::fs`/`walkdir` —
-//! there is no single seam to redirect. brush uses a LOGICAL cwd (it never
-//! `chdir`s the process on `cd`), so to make `find .` walk the right place we
-//! give the worker thread its own cwd: `unshare(CLONE_FS)` splits the thread's
-//! `fs_struct` (cwd/root/umask) from the rest of the process — an unprivileged
-//! operation, NOT a namespace (no `CLONE_NEWNS`/`CLONE_NEWUSER`) — and then
-//! `chdir` to the shell's logical working dir affects only this thread. Sibling
-//! threads and the engine's own cwd are untouched, and `-exec`'s `fork`+`exec`
-//! inherits the thread's logical cwd for free. If `unshare` fails (e.g. a
-//! seccomp filter blocks the syscall) we skip the `chdir` and fall back to the
-//! process cwd rather than mutating it process-wide.
+//! `find` resolves its start paths and `-exec` child cwd against the current
+//! directory. brush keeps a LOGICAL cwd (it never `chdir`s the process on
+//! `cd`). Rather than give the run a private kernel cwd via
+//! `unshare(CLONE_FS)`+`chdir` (a non-generalizing hack), the builtin passes the
+//! logical cwd through `Dependencies::cwd`: the vendored fork roots a relative
+//! start path at that absolute dir (an absolute walk that never reads or mutates
+//! the process cwd) while presenting paths relative to the start, and runs
+//! `-exec` children with that dir as their cwd. Pure logical state, exactly like
+//! the `env`/`nice`/… exec-wrapper builtins — and no cross-thread cwd race.
 
 use std::cell::RefCell;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::ffi::OsStrExt;
 use std::process::Stdio;
 use std::time::SystemTime;
 
 use brush_core::openfiles::OpenFile;
 use findutils::find::Dependencies;
 
-/// Establish the box's logical working directory on the CURRENT worker thread
-/// only, without mutating the engine's process-wide cwd. `unshare(CLONE_FS)`
-/// splits this thread's `fs_struct` (cwd/root/umask) from the rest of the
-/// process — unprivileged, NOT a namespace — after which `chdir` is
-/// thread-local. Shared by the `find` and `xargs` builtins.
-///
-/// If a thread-local cwd CANNOT be established (e.g. a seccomp filter blocks
-/// `unshare`), running in the engine's process cwd would silently walk the
-/// WRONG tree, so this returns an error (the caller refuses and reports it)
-/// UNLESS the process cwd already equals the logical cwd — in which case running
-/// is correct. Returns the bare reason on failure; the caller prefixes the tool
-/// name. (Audit H2: the old code silently fell back to the process cwd.)
-pub(crate) fn establish_thread_cwd(cwd: &std::path::Path) -> Result<(), String> {
-    // SAFETY: unshare with CLONE_FS only detaches this thread's fs context.
-    let owns_cwd = unsafe { libc::unshare(libc::CLONE_FS) } == 0;
-    if owns_cwd {
-        let c = std::ffi::CString::new(cwd.as_os_str().as_bytes())
-            .map_err(|_| "working directory path contains NUL".to_string())?;
-        // Thread-local after the unshare above; never the process cwd.
-        // SAFETY: `c` is a valid NUL-terminated C string.
-        if unsafe { libc::chdir(c.as_ptr()) } != 0 {
-            return Err(format!(
-                "cannot enter box working directory {}: {}",
-                cwd.display(),
-                std::io::Error::last_os_error()
-            ));
-        }
-        return Ok(());
-    }
-    // No thread-local cwd available. Only safe to proceed if the process cwd
-    // already matches the logical cwd; otherwise refuse rather than mislead.
-    let unshare_err = std::io::Error::last_os_error();
-    match std::env::current_dir() {
-        Ok(pcwd) if pcwd == cwd => Ok(()),
-        _ => Err(format!(
-            "cannot establish box working directory {} (unshare(CLONE_FS) failed: \
-             {unshare_err}); refusing to run in the wrong directory",
-            cwd.display()
-        )),
-    }
-}
-
-/// `find`'s injected dependencies, bound to one shell command's logical I/O.
-///
-/// Built and used entirely on the worker thread. stdout/stderr are held as
-/// `OpenFile`s so they serve both as find's own write sinks and as the source
-/// we dup into `-exec` children's stdio.
+/// `find`'s injected dependencies, bound to one shell command's logical I/O and
+/// logical cwd. stdout/stderr are held as `OpenFile`s so they serve both as
+/// find's own write sinks and as the source we dup into `-exec` children's
+/// stdio. `cwd` is the shell's LOGICAL working dir: find roots a relative start
+/// path there (absolute walk, paths presented relative) and runs `-exec`
+/// children there — no process/thread cwd is ever touched.
 struct BrushFindDeps {
     output: RefCell<OpenFile>,
     error_output: RefCell<OpenFile>,
     stdin: RefCell<Box<dyn BufRead>>,
     now: SystemTime,
+    cwd: std::path::PathBuf,
 }
 
 impl Dependencies for BrushFindDeps {
@@ -126,6 +81,12 @@ impl Dependencies for BrushFindDeps {
     fn child_stderr(&self) -> Option<Stdio> {
         Stdio::try_from(self.error_output.borrow().clone()).ok()
     }
+
+    fn cwd(&self) -> Option<&std::path::Path> {
+        // The shell's logical cwd: find resolves relative start paths against it
+        // and runs -exec children there, without any process/thread chdir.
+        Some(&self.cwd)
+    }
 }
 
 /// brush `SimpleCommand` that runs `find` in-process.
@@ -166,35 +127,24 @@ impl brush_core::builtins::SimpleCommand for FindBuiltin {
         let input = context.stdin();
         let cwd = context.shell.working_dir().to_path_buf();
 
-        let spawned = std::thread::Builder::new()
-            .name("sarun-find".into())
-            .spawn(move || {
-                // Give this thread its own cwd pointed at the box's logical dir.
-                // If that can't be established, refuse loudly rather than walk
-                // the engine's cwd and return confidently-wrong results.
-                if let Err(msg) = establish_thread_cwd(&cwd) {
-                    let mut e = err;
-                    let _ = writeln!(e, "find: {msg}");
-                    return 1;
-                }
-
-                let deps = BrushFindDeps {
-                    output: RefCell::new(out),
-                    error_output: RefCell::new(err),
-                    stdin: RefCell::new(Box::new(BufReader::new(input))),
-                    now: SystemTime::now(),
-                };
-                let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-                findutils::find::find_main(&argv_refs, &deps)
-            });
-
-        // A spawn failure (resource exhaustion) or a panic inside find_main both
-        // surface as a generic failure exit; find_main itself never panics on
-        // normal input (it returns an exit code).
-        let code = match spawned {
-            Ok(handle) => handle.join().unwrap_or(1),
-            Err(_) => 1,
+        // Run find in-process on THIS thread — no `unshare`/`chdir`. find roots
+        // a relative start path at the logical `cwd` (an absolute walk that
+        // never reads or mutates the engine's process cwd) and runs -exec
+        // children there, via `Dependencies::cwd`. `catch_unwind` keeps a panic
+        // in find_main from unwinding into brush; find_main otherwise returns an
+        // exit code.
+        let deps = BrushFindDeps {
+            output: RefCell::new(out),
+            error_output: RefCell::new(err),
+            stdin: RefCell::new(Box::new(BufReader::new(input))),
+            now: SystemTime::now(),
+            cwd,
         };
+        let code = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+            findutils::find::find_main(&argv_refs, &deps)
+        }))
+        .unwrap_or(1);
         Ok(brush_core::results::ExecutionResult::new(
             (code & 0xff) as u8,
         ))

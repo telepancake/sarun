@@ -47,7 +47,7 @@ impl Printer {
         match write!(
             out,
             "{}{}",
-            file_info.path().to_string_lossy(),
+            file_info.display_path().to_string_lossy(),
             self.delimiter
         ) {
             Ok(_) => {}
@@ -56,7 +56,7 @@ impl Printer {
                     writeln!(
                         &mut *matcher_io.deps.get_error_output().borrow_mut(),
                         "Error writing {:?} for {}",
-                        file_info.path().to_string_lossy(),
+                        file_info.display_path().to_string_lossy(),
                         e
                     )
                     .unwrap();

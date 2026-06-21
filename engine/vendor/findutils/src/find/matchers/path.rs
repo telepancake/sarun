@@ -22,7 +22,7 @@ impl PathMatcher {
 
 impl Matcher for PathMatcher {
     fn matches(&self, file_info: &WalkEntry, _: &mut MatcherIO) -> bool {
-        let path = file_info.path().to_string_lossy();
+        let path = file_info.display_path().to_string_lossy();
         self.pattern.matches(&path)
     }
 }
