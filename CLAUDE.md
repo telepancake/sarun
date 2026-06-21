@@ -138,7 +138,10 @@ container box on an image's top layer with its config (env/cmd/entrypoint/
 workdir/user); build a Dockerfile (FROM/RUN/COPY/ADD/ENV/ARG/WORKDIR/USER/CMD/
 ENTRYPOINT/LABEL/EXPOSE/VOLUME/SHELL/STOPSIGNAL/ONBUILD/HEALTHCHECK, multi-stage
 incl. `COPY --from=<stage|image>`, glob sources, `ADD` URL-fetch + local-tar
-auto-extract, `-t`). The proxied `Tap`
+auto-extract, `-t`); and `oci save <box> [-o FILE.tar]` — the inverse of load,
+exporting an image/container box stack back to an oci-archive (each chain box →
+one gzip layer, inverting `ingest_layer`; rootfs.diff_ids rewritten; round-trips
+load→save→load, `test_oci.py`). The proxied `Tap`
 default works *inside* a container too (verified live: a closed alpine box
 fetched example.com over both HTTP and HTTPS-through-MITM — DNS, TCP, and CA
 injection all through the engine's per-box netns, the box's only route out).
@@ -166,6 +169,17 @@ including closed-rootfs boot, COPY/glob landing, multi-stage `COPY --from`,
   and asserts each inherits no_host=1, re-parents top-level, and the descendant
   still boots (content survived) and stays closed. Still needs the verbs + image
   refcount/cascade.
+- [ ] **Container authoring (commit-style, NOT one-layer-per-pipeline).** With
+  `oci save` landed, the natural way to *make* an image is: run commands in a box
+  on top of a base, then `oci save` the box's net changes as ONE layer + config
+  (a `docker commit` with sarun's provenance attached). Do NOT make each brush
+  pipeline its own image layer — that's layer explosion (a build is thousands of
+  pipelines, most empty; temp-then-delete churn bloats earlier layers; registries
+  cap ~127). Keep brush's per-pipeline FRAME_PROV for REVIEW/audit, but emit
+  COARSE image layers. Worth adding: a `-t NAME`/config-override on `oci save`
+  (set Cmd/Env/Entrypoint at commit time), and optional explicit `LAYER`/
+  checkpoint markers for user-controlled layer boundaries. `--squash` to collapse
+  a multi-layer stack to one is a cheap follow-on (save already re-emits layers).
 - [ ] **Registry reach:** *keyless* cosign (Fulcio/Rekor) verification is the
   remaining piece (needs trust-root + transparency-log infra; untestable
   hermetically). Key-based cosign verification is DONE — a `cosign.toml` trust
