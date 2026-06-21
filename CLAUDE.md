@@ -166,8 +166,14 @@ including closed-rootfs boot, COPY/glob landing, multi-stage `COPY --from`,
   and asserts each inherits no_host=1, re-parents top-level, and the descendant
   still boots (content survived) and stays closed. Still needs the verbs + image
   refcount/cascade.
-- [ ] **Registry reach:** image *signature* verification (cosign/notary) is the
-  remaining piece (needs trust-policy/key infra). Private-registry auth is DONE
+- [ ] **Registry reach:** *keyless* cosign (Fulcio/Rekor) verification is the
+  remaining piece (needs trust-root + transparency-log infra; untestable
+  hermetically). Key-based cosign verification is DONE — a `cosign.toml` trust
+  policy (`{config_home}/cosign.toml`, reference-prefix → ECDSA P-256 public
+  key) makes a valid signature REQUIRED and fails closed; signatures are read
+  from the oci-archive/oci-layout index or the registry `.sig` tag and verified
+  host-side (`oci_verify`, `test_oci.py` accept/reject cases). Private-registry
+  auth is DONE
   — `registry_auth_for` resolves credentials from the host Docker config
   (`auths` base64 / username+password) and credential helpers
   (`credHelpers`/`credsStore` → `docker-credential-*`), read host-side and

@@ -74,6 +74,13 @@ pub fn oaita_config_path() -> PathBuf {
     config_home().join("oaita.toml")
 }
 
+/// `cosign.toml` — the OCI image-signature trust policy (key-based cosign
+/// verification). Lives at `{config_home}/cosign.toml`. Read host-side in the
+/// engine pull path; never enters a box.
+pub fn cosign_config_path() -> PathBuf {
+    config_home().join("cosign.toml")
+}
+
 /// Where oaita sessions live: one folder per session under here. Mirrors the
 /// Python prototype's `$XDG_STATE_HOME/oaita/<name>/` layout but lives under
 /// sarun's own state root so removing sarun's state removes oaita's too.
