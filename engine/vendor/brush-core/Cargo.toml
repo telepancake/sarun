@@ -2,19 +2,17 @@
 name = "brush-core"
 description = "Reusable core of a POSIX/bash shell (used by brush-shell)"
 version = "0.5.0"
-categories.workspace = true
-edition.workspace = true
-keywords.workspace = true
-license.workspace = true
-readme.workspace = true
-repository.workspace = true
-rust-version.workspace = true
+categories = ["command-line-utilities", "development-tools"]
+edition = "2024"
+keywords = ["cli", "shell", "sh", "bash", "script"]
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/reubeno/brush"
+rust-version = "1.88.0"
 
 [lib]
 bench = false
 
-[lints]
-workspace = true
 
 [features]
 default = []
@@ -24,7 +22,7 @@ experimental-parser = ["brush-parser/winnow-parser"]
 [dependencies]
 async-recursion = "1.1.1"
 async-trait = "0.1.89"
-brush-parser = { version = "^0.4.0", path = "../brush-parser" }
+brush-parser = { version = "0.4" }
 bon = "3.9.1"
 cached = "0.59.0"
 cfg-if = "1.0.4"

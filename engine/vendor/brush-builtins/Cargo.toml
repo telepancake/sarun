@@ -2,13 +2,13 @@
 name = "brush-builtins"
 description = "Builtins for a POSIX/bash shell (used by brush-shell)"
 version = "0.2.0"
-categories.workspace = true
-edition.workspace = true
-keywords.workspace = true
-license.workspace = true
-readme.workspace = true
-repository.workspace = true
-rust-version.workspace = true
+categories = ["command-line-utilities", "development-tools"]
+edition = "2024"
+keywords = ["cli", "shell", "sh", "bash", "script"]
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/reubeno/brush"
+rust-version = "1.88.0"
 
 [lib]
 bench = false
@@ -124,12 +124,10 @@ default = [
 'builtin.unset' = []
 'builtin.wait' = []
 
-[lints]
-workspace = true
 
 [dependencies]
-brush-core = { version = "^0.5.0", path = "../brush-core" }
-brush-parser = { version = "^0.4.0", path = "../brush-parser" }
+brush-core = { version = "^0.5.0" }
+brush-parser = { version = "^0.4.0" }
 cfg-if = "1.0.4"
 chrono = "0.4.44"
 clap = { version = "4.6.0", features = ["derive", "wrap_help"] }
