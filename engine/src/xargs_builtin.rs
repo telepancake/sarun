@@ -1,11 +1,10 @@
 //! In-process `xargs` builtin for box brush shells.
 //!
 //! Runs the vendored find-and-xargs fork of uutils/findutils against the
-//! shell's LOGICAL stdin/stdout/stderr (via an `XargsIo` impl) on a dedicated
-//! worker thread that owns its current directory. Nothing touches the engine's
-//! process-global stdio or cwd, so xargs reads the right pipe, prints to the
-//! box's streams, and spawns its children in the shell's logical cwd — and it
-//! is safe to run concurrently with sibling builtins.
+//! shell's LOGICAL stdin/stdout/stderr (via an `XargsIo` impl), in-process on
+//! the calling thread. Nothing touches the engine's process-global stdio or
+//! cwd, so xargs reads the right pipe, prints to the box's streams, and spawns
+//! its children in the shell's logical cwd.
 //!
 //! ## Why logical stdin matters most here
 //!
@@ -17,18 +16,16 @@
 //! shell's logical stdin. (`-a/--arg-file` still reads the named file, same as
 //! upstream.)
 //!
-//! ## Why a thread with its own cwd
+//! ## Logical cwd for spawned children (no `unshare`)
 //!
 //! The commands xargs spawns run via `std::process::Command`, which resolves
 //! relative program paths and the child's cwd against the *kernel* current
-//! directory. brush uses a LOGICAL cwd (it never `chdir`s the process on `cd`),
-//! so — exactly as `find_builtin` does for `-exec` — we run xargs on a worker
-//! thread that `unshare(CLONE_FS)`s (an unprivileged split of this thread's
-//! cwd/root/umask from the rest of the process, NOT a namespace) and then
-//! `chdir`s to the shell's logical dir. The spawned children inherit that cwd
-//! for free; sibling threads and the engine's own cwd are untouched. If
-//! `unshare` fails (e.g. a seccomp filter) we skip the `chdir` and fall back to
-//! the process cwd rather than mutating it process-wide.
+//! directory. brush keeps a LOGICAL cwd (it never `chdir`s the process on
+//! `cd`), so xargs passes that logical dir as each child's `current_dir` via
+//! `XargsIo::cwd` — pure launch state materialized at spawn, exactly like the
+//! `env`/`nice`/… exec-wrapper builtins. The engine's process cwd is never
+//! read or mutated, so there is no per-thread `unshare(CLONE_FS)` hack and no
+//! cross-thread cwd race.
 
 use std::cell::RefCell;
 use std::io::{Read, Write};
@@ -37,11 +34,12 @@ use std::process::Stdio;
 use brush_core::openfiles::OpenFile;
 use findutils::xargs::XargsIo;
 
-/// xargs's injected logical I/O, bound to one shell command's streams.
+/// xargs's injected logical I/O + logical cwd, bound to one shell command.
 ///
-/// Built and used entirely on the worker thread, so the non-`Send` trait
-/// objects never cross a thread boundary. `input` is held in an `Option` so
-/// `take_input` can move it into xargs's `ArgumentReader` exactly once.
+/// `input` is held in an `Option` so `take_input` can move it into xargs's
+/// `ArgumentReader` exactly once. `cwd` is the shell's LOGICAL working dir,
+/// applied to spawned children so they run there without the engine ever
+/// changing its own process cwd (no `unshare`/`chdir`).
 struct BrushXargsIo {
     input: RefCell<Option<Box<dyn Read>>>,
     // The shell's logical stdout/stderr as `OpenFile`s: used both as the sink
@@ -50,6 +48,7 @@ struct BrushXargsIo {
     // redirects and pipes.
     output: RefCell<OpenFile>,
     error_output: RefCell<OpenFile>,
+    cwd: std::path::PathBuf,
 }
 
 impl XargsIo for BrushXargsIo {
@@ -82,6 +81,11 @@ impl XargsIo for BrushXargsIo {
 
     fn child_stderr(&self) -> Option<Stdio> {
         Stdio::try_from(self.error_output.borrow().clone()).ok()
+    }
+
+    fn cwd(&self) -> Option<&std::path::Path> {
+        // Spawned children run in the shell's logical cwd (no process chdir).
+        Some(&self.cwd)
     }
 }
 
@@ -123,35 +127,22 @@ impl brush_core::builtins::SimpleCommand for XargsBuiltin {
         let input = context.stdin();
         let cwd = context.shell.working_dir().to_path_buf();
 
-        let spawned = std::thread::Builder::new()
-            .name("sarun-xargs".into())
-            .spawn(move || {
-                // Give this thread its own cwd pointed at the box's logical dir
-                // so the commands xargs spawns run there. If it can't be
-                // established, refuse loudly rather than spawn children in the
-                // engine's cwd (audit H2).
-                if let Err(msg) = crate::find_builtin::establish_thread_cwd(&cwd) {
-                    let mut e = err;
-                    let _ = writeln!(e, "xargs: {msg}");
-                    return 1;
-                }
-
-                let io = BrushXargsIo {
-                    input: RefCell::new(Some(Box::new(input))),
-                    output: RefCell::new(out),
-                    error_output: RefCell::new(err),
-                };
-                let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-                findutils::xargs::xargs_main_with_io(&argv_refs, &io)
-            });
-
-        // A spawn failure (resource exhaustion) or a panic inside xargs both
-        // surface as a generic failure exit; xargs_main_with_io itself returns
-        // an exit code rather than exiting the process.
-        let code = match spawned {
-            Ok(handle) => handle.join().unwrap_or(1),
-            Err(_) => 1,
+        // Run xargs in-process on THIS thread — no `unshare`/`chdir`. The box's
+        // logical cwd is applied to spawned children via `XargsIo::cwd`
+        // (compose-time launch state), so xargs never touches the engine's
+        // process cwd. `catch_unwind` keeps a panic in xargs from unwinding into
+        // brush; xargs_main_with_io otherwise returns an exit code.
+        let io = BrushXargsIo {
+            input: RefCell::new(Some(Box::new(input))),
+            output: RefCell::new(out),
+            error_output: RefCell::new(err),
+            cwd,
         };
+        let code = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+            findutils::xargs::xargs_main_with_io(&argv_refs, &io)
+        }))
+        .unwrap_or(1);
         Ok(brush_core::results::ExecutionResult::new(
             (code & 0xff) as u8,
         ))
