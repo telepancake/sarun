@@ -2,14 +2,14 @@
 name = "brush-interactive"
 description = "Interactive layer of brush-shell"
 version = "0.4.0"
-authors.workspace = true
-categories.workspace = true
-edition.workspace = true
-keywords.workspace = true
-license.workspace = true
-readme.workspace = true
-repository.workspace = true
-rust-version.workspace = true
+authors = ["reuben olinsky"]
+categories = ["command-line-utilities", "development-tools"]
+edition = "2024"
+keywords = ["cli", "shell", "sh", "bash", "script"]
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/reubeno/brush"
+rust-version = "1.88.0"
 
 [lib]
 bench = false
@@ -22,13 +22,11 @@ minimal = []
 reedline = ["dep:reedline", "dep:nu-ansi-term", "completion", "highlighting"]
 highlighting = []
 
-[lints]
-workspace = true
 
 [dependencies]
 bon = "3.9.1"
-brush-parser = { version = "^0.4.0", path = "../brush-parser" }
-brush-core = { version = "^0.5.0", path = "../brush-core" }
+brush-parser = { version = "^0.4.0" }
+brush-core = { version = "^0.5.0" }
 crossterm = { version = "0.29.0", features = ["serde"], optional = true }
 indexmap = "2.13.0"
 nu-ansi-term = { version = "0.50.3", optional = true }

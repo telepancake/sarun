@@ -2,13 +2,13 @@
 name = "brush-coreutils-builtins"
 description = "Optional coreutils builtins for brush-shell (powered by uutils/coreutils)"
 version = "0.1.0"
-categories.workspace = true
-edition.workspace = true
-keywords.workspace = true
-license.workspace = true
-readme.workspace = true
-repository.workspace = true
-rust-version.workspace = true
+categories = ["command-line-utilities", "development-tools"]
+edition = "2024"
+keywords = ["cli", "shell", "sh", "bash", "script"]
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/reubeno/brush"
+rust-version = "1.88.0"
 
 [lib]
 bench = false
@@ -187,8 +187,6 @@ default = []
 'coreutils.whoami' = ["dep:uu_whoami"]
 'coreutils.yes' = ["dep:uu_yes"]
 
-[lints]
-workspace = true
 
 [dependencies]
 uucore = { version = "0.8.0", default-features = false }
