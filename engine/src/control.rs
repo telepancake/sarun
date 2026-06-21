@@ -1724,23 +1724,15 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
         if msg.get("type").and_then(Value::as_str) == Some("api.proxy") {
             if let Some(fd) = peer_pidfd.take() { unsafe { libc::close(fd); } }
             let Some(box_id) = hint_box_id else { return; };
-            // Budget gate: walk this box's parent_box_id chain, debit each
-            // capped box, 503 the conn directly if any ancestor's pool
-            // hit zero. Identity is the broker's hint — the box id is
-            // already authenticated by the FD broker handshake, so no
-            // `session` field on the wire (and no spoofing path).
-            if let Err(top) = crate::oaita::budget::take_chain(&state, box_id) {
-                let body = format!("budget exhausted at box {top} \
-                    — grant more turns and resume.");
-                let resp = format!(
-                    "HTTP/1.1 503 Service Unavailable\r\n\
-                     Content-Length: {}\r\n\
-                     Content-Type: text/plain\r\n\
-                     Connection: close\r\n\r\n{}",
-                    body.len(), body);
-                let _ = writer.write_all(resp.as_bytes());
-                return;
-            }
+            // No early budget gate here. We used to debit + write a 503
+            // over the raw socket if the chain was exhausted, which closed
+            // the conn while the client was still streaming its request
+            // body — hyper on the client side then surfaced "send: error
+            // writing a body to connection" instead of a parseable 503.
+            // The debit + 503 now lives inside proxy::handle_inner, AFTER
+            // hyper has drained the body, so the response goes back as
+            // proper HTTP. State is passed through so handle_inner can
+            // do the chain walk.
             let (rt_opt, proxy_opt) = {
                 let s = state.lock().unwrap();
                 (s.net_rt.clone(), s.api_proxy.clone())
@@ -1750,12 +1742,14 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
             drop(reader);
             if writer.set_nonblocking(true).is_err() { return; }
             let std_conn = writer;
+            let state_for_proxy = state.clone();
             rt.spawn(async move {
                 let Ok(tokio_conn) =
                     tokio::net::UnixStream::from_std(std_conn) else { return; };
                 let io = PrebufferedIo::new(tokio_conn, prebuffered);
                 let _ = crate::oaita::proxy::serve_one_conn_for_box(
-                    proxy, box_id, hyper_util::rt::TokioIo::new(io)).await;
+                    proxy, state_for_proxy, box_id,
+                    hyper_util::rt::TokioIo::new(io)).await;
             });
             return;
         }
