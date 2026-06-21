@@ -172,8 +172,12 @@ including closed-rootfs boot, COPY/glob landing, multi-stage `COPY --from`,
   and asserts each inherits no_host=1, re-parents top-level, and the descendant
   still boots (content survived) and stays closed. Still needs the verbs + image
   refcount/cascade.
-- [ ] **Registry reach:** private-registry auth (`fetch_registry` passes
-  `RegistryAuth::Anonymous`); image *signature* verification (cosign/notary).
+- [ ] **Registry reach:** image *signature* verification (cosign/notary) is the
+  remaining piece (needs trust-policy/key infra). Private-registry auth is DONE
+  — `registry_auth_for` resolves credentials from the host Docker config
+  (`auths` base64 / username+password) and credential helpers
+  (`credHelpers`/`credsStore` → `docker-credential-*`), read host-side and
+  never entering a box; absent config falls back to anonymous.
   Blob *digest* integrity is DONE — `read_blob_by_digest` hashes each
   oci-archive/oci-layout blob against its descriptor digest and bails on
   mismatch (`test_oci.py` tamper case); registry transfers are verified inside
