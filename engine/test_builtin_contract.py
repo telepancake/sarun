@@ -163,6 +163,23 @@ CASES = [
     ("tac --help",       "tac --help",                "tac",  "external"),
     ("nl -s:: (multi)",  "nl -s :: v.txt",            "nl",   "external"),
     ("head -n0b (suffix)", "head -n0b v.txt",         "head", "external"),
+    # ── wave 2 ──
+    ("basename",         "basename /a/b/c.txt .txt",  "basename", "inproc"),
+    ("dirname",          "dirname /a/b/c",            "dirname",  "inproc"),
+    ("seq",              "seq 1 5",                   "seq",      "inproc"),
+    ("expr",             "expr 2 + 3",                "expr",     "inproc"),
+    ("tr",               "printf abc | tr a-z A-Z",   "tr",       "inproc"),
+    ("cut",              "printf 'a:b:c\\n' | cut -d: -f2", "cut", "inproc"),
+    ("uniq",             "printf 'a\\na\\nb\\n' | uniq", "uniq",  "inproc"),
+    ("sort",             "printf 'b\\na\\n' | sort",  "sort",     "inproc"),
+    ("basename --version", "basename --version",      "basename", "external"),
+    ("dirname --version",  "dirname --version",       "dirname",  "external"),
+    ("seq --version",      "seq --version",           "seq",      "external"),
+    ("expr --help",        "expr --help",             "expr",     "external"),
+    ("tr --help",          "tr --help",               "tr",       "external"),
+    ("cut --version",      "cut --version",           "cut",      "external"),
+    ("uniq --version",     "uniq --version",          "uniq",     "external"),
+    ("sort -R (random)",   "printf 'b\\na\\n' | sort -R", "sort", "external"),
 ]
 
 
@@ -184,6 +201,11 @@ NO_FD0_CASES = [
     ("head -n1 < file",   "head -n1 < v.txt"),
     ("wc -l < file",      "wc -l < v.txt"),
     ("cat < file",        "cat < v.txt"),
+    # ── wave 2 filters (piped stdin) ──
+    ("printf|tr",         "printf abc | tr a-z A-Z"),
+    ("printf|cut",        "printf 'a:b:c\\n' | cut -d: -f2"),
+    ("printf|uniq",       "printf 'a\\na\\nb\\n' | uniq"),
+    ("printf|sort",       "printf 'b\\na\\n' | sort"),
 ]
 
 
@@ -209,6 +231,12 @@ EXIT_CASES = [
     ("[ -f nope ]",     "[ -f nope ]",       1),
     ("head missing rc", "head nope.txt",     1),
     ("wc -l rc",        "wc -l v.txt",       0),
+    # expr's exit codes are load-bearing: 0 if result non-null/non-zero, 1 if
+    # null/zero, 2 if invalid.
+    ("expr 5",          "expr 5",            0),
+    ("expr 0",          "expr 0",            1),
+    ("expr 1 = 2",      "expr 1 = 2",        1),
+    ("expr 1 = 1",      "expr 1 = 1",        0),
 ]
 
 
@@ -271,6 +299,16 @@ CASES_IO = [
     ("tac file",        "tac v.txt"),
     ("cat file",        "cat v.txt"),
     ("tac|head pipe",   "tac v.txt | head -n1"),
+    # ── wave 2 (content + destination vs GNU) ──
+    ("basename",        "basename /a/b/c.txt .txt"),
+    ("dirname",         "dirname /a/b/c"),
+    ("seq",             "seq 1 5"),
+    ("expr",            "expr 2 + 3"),
+    ("tr a-z A-Z",      "printf abc | tr a-z A-Z"),
+    ("cut -d: -f2",     "printf 'a:b:c\\n' | cut -d: -f2"),
+    ("uniq",            "printf 'a\\na\\nb\\n' | uniq"),
+    ("sort",            "printf 'b\\na\\nb\\n' | sort"),
+    ("sort|uniq -c",    "printf 'b\\na\\nb\\n' | sort | uniq -c"),
 ]
 
 
