@@ -405,20 +405,19 @@ fn emit_build_edges_kati(roots: &[NamedDepNode]) {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        // Recipe text. kati's parsed Value AST doesn't retain the
-        // original source bytes, and evaluating cmds at frame-emit
-        // time would re-run `$(shell …)` side-effects. For now emit
-        // the count as a placeholder marker; the UI's build target
-        // pane shows targets+deps, which is what was visibly missing.
-        // TODO: walk Value::Literal nodes to recover at least the
-        // literal portions of each recipe line.
-        let cmd: String = if guard.cmds.is_empty() {
-            String::new()
-        } else {
-            format!("(recipe: {} command{})",
-                    guard.cmds.len(),
-                    if guard.cmds.len() == 1 { "" } else { "s" })
-        };
+        // Recipe text. Evaluating cmds at frame-emit time would re-run
+        // `$(shell …)` and other macro side effects, so we reconstruct the
+        // make-SOURCE form statically instead (Value::static_string: literal
+        // bytes verbatim, variable/function refs rendered back to their `$(…)`
+        // surface form, automatic vars as `$@`/`$<`). No evaluation, no side
+        // effects — faithful to the literal command bytes, which is what the
+        // provenance/UI panes want. Each recipe line is one cmd; join with \n.
+        let cmd: String = guard
+            .cmds
+            .iter()
+            .map(|c| c.static_string())
+            .collect::<Vec<_>>()
+            .join("\n");
         edges.push(serde_json::json!({
             "outs": outs,
             "ins": ins,
