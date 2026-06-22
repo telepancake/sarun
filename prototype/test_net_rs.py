@@ -45,7 +45,7 @@ CRATE = _HERE.parent / "engine"
 # `target/release/sarun` glibc path never exists, so pointing BIN at it made
 # every net test silently skip. Build via `make engine` (cargo-zigbuild), not a
 # bare `cargo build` — the latter can't produce the musl binary here.
-BIN = CRATE / "target" / "x86_64-unknown-linux-musl" / "release" / "sarun"
+BIN = CRATE / "target" / "x86_64-unknown-linux-musl" / "release" / "libtestsarun.py"
 
 
 # ── helpers ────────────────────────────────────────────────────────────────

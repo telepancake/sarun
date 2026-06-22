@@ -55,7 +55,7 @@ def main():
                 ("XDG_CONFIG_HOME","c"),("XDG_DATA_HOME","d")):
         os.environ[k]=str(tmp/s)
     os.environ["SLOPBOX_NS"]="PJD"; (tmp/"run").mkdir(parents=True)
-    m = SourceFileLoader("slopbox","/home/user/sarun/prototype/sarun").load_module()
+    m = SourceFileLoader("slopbox","/home/user/sarun/prototype/libtestsarun.py").load_module()
     m.ensure_dirs()
     eng = subprocess.Popen([str(BIN),"serve"],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
     try:

@@ -38,7 +38,7 @@ from pathlib import Path
 from importlib.machinery import SourceFileLoader
 
 _HERE = Path(__file__).resolve().parent
-SARUN = str(_HERE / "sarun")
+SARUN = str(_HERE / "libtestsarun.py")
 PYBIN = sys.executable
 CRATE = _HERE.parent / "engine"
 BIN = CRATE / "target/x86_64-unknown-linux-musl/release/sarun"

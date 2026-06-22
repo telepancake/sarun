@@ -10,7 +10,7 @@ import os, socket, subprocess, sys, tempfile, shutil, time
 from pathlib import Path
 from importlib.machinery import SourceFileLoader
 
-SARUN = "/home/user/sarun/prototype/sarun"
+SARUN = "/home/user/sarun/prototype/libtestsarun.py"
 ENG = Path("/home/user/sarun/engine/target/x86_64-unknown-linux-musl/release/sarun")
 
 _fails = []
