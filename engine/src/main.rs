@@ -71,6 +71,25 @@ extern "C" fn on_term(_sig: i32) {
     unsafe { libc::_exit(0) };
 }
 
+fn top_level_help() -> &'static str {
+    "sarun — run a command over a copy-on-write overlay of your filesystem,\n\
+     capturing its writes, processes, and output for review before they touch the host.\n\
+     \n\
+     usage:\n  \
+       sarun                              start the engine (if needed) + interactive UI\n  \
+       sarun attach [--sock PATH]         interactive UI against a running engine\n  \
+       sarun serve                        run the engine headless (no UI)\n  \
+       sarun run [FLAGS] [NAME] -- CMD    run CMD in a sandbox box (needs a running engine/UI)\n  \
+       sarun oci <load|run|build|save|dockerfile|author> ...   OCI images (`sarun oci -h`)\n  \
+       sarun oaita <gen|run|call|tail|add|where> NAME          LLM chat/agent runner (`oaita -h`)\n  \
+       sarun --once --sock PATH           render one UI frame and exit (headless)\n\
+     \n\
+     run FLAGS:\n  \
+       -n / -N / --net off|tap|host   per-box networking (default: tap, a proxied per-box netns)\n  \
+       -t passthrough   -d direct (no overlay)   -e record-env   -b brush-shell   -p pty\n  \
+       -C DIR   --no-parent   --readonly-parent   --api (oaita proxy)\n"
+}
+
 fn serve() -> i32 {
     // rustls 0.23 requires an explicit process-level CryptoProvider when more
     // than one is in the dependency graph — ours has both `ring` (our direct
@@ -411,8 +430,9 @@ fn main() {
         // auto-spawning the engine when its socket is down.
         None => std::process::exit(ui_launch(&argv)),
         Some("attach") => std::process::exit(ui_launch(&argv[1..])),
-        Some("--once") | Some("--sock") | Some("-h") | Some("--help") =>
+        Some("--once") | Some("--sock") =>
             std::process::exit(ui_launch(&argv)),
+        Some("-h") | Some("--help") => { print!("{}", top_level_help()); std::process::exit(0); }
         // `engine` is the headless-serve alias Python uses; `serve` still works.
         Some("engine") | Some("serve") => std::process::exit(serve()),
         // ruletest <rulesfile> <rel> <box> <exe> <cwd> [argv...] — test hook for
@@ -535,6 +555,12 @@ fn main() {
                     "--api" => api = true,
                     _ => if name.is_none() { name = Some(a.clone()); },
                 }
+            }
+            if cmd.is_empty() && !api {
+                eprintln!("usage: sarun run [FLAGS] [NAME] -- CMD...   (needs a running engine/UI)\n\
+                    \x20 flags: -n/-N/--net off|tap|host  -t passthrough  -d direct  -e record-env\n\
+                    \x20        -b brush-shell  -p pty  -C DIR  --no-parent  --readonly-parent  --api");
+                std::process::exit(2);
             }
             std::process::exit(runner::run(name, passthrough, direct, env,
                 pty, brush, api, no_parent, readonly_parent, chdir,
