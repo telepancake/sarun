@@ -28,7 +28,7 @@ use thiserror::Error;
 
 use platform::copy_on_write;
 use uucore::display::Quotable;
-use uucore::error::{UError, UResult, UUsageError, set_exit_code};
+use uucore::error::{UError, UResult, USimpleError, UUsageError, set_exit_code};
 #[cfg(unix)]
 use uucore::fs::make_fifo;
 use uucore::fs::{
@@ -40,15 +40,91 @@ use uucore::{backup_control, update_control};
 // These are exposed for projects (e.g. nushell) that want to create an `Options` value, which
 // requires these enum.
 pub use uucore::{backup_control::BackupMode, update_control::UpdateMode};
-use uucore::{
-    format_usage, parser::shortcut_value_parser::ShortcutValueParser, prompt_yes, show_error,
-    show_warning,
-};
+use uucore::{format_usage, parser::shortcut_value_parser::ShortcutValueParser, prompt_yes};
 
 use crate::copydir::copy_directory;
 
-mod copydir;
 mod platform;
+
+// ── Injected-I/O plumbing for the in-process brush builtin ───────────────────
+//
+// The in-process [`cp`] entry below never touches the process's own fd 1/2.
+// `cp` is invoked on a FRESH worker thread per call (see the engine's
+// `run_coreutil_localized`), so these thread-locals are effectively per-instance
+// state: a logical stdout buffer (`CP_OUT`), a logical stderr buffer (`CP_ERR`),
+// and a deferred exit code (`CP_EXIT`). The crate-local `cp_out!` / `show` /
+// `show_error` / `show_warning` macros below REPLACE the upstream `println!`
+// sites and SHADOW the uucore diagnostic macros so nothing in the `copy` path
+// reaches process-global stdio or the process-global `EXIT_CODE`. The [`cp`]
+// entry drains `CP_OUT`/`CP_ERR` into the shell's logical sinks and surfaces
+// `CP_EXIT` as the returned status. The standalone-binary path still goes
+// through [`uumain`] (retained below), which uses real process stdio.
+thread_local! {
+    /// Logical stdout buffer; flushed to the injected `out` at the end of [`cp`].
+    static CP_OUT: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Logical stderr buffer; flushed to the injected `err` at the end of [`cp`].
+    static CP_ERR: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Deferred non-fatal exit code, set by the local `show!`/`show_error!`.
+    static CP_EXIT: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
+}
+
+/// Write `format!`-style output (with a trailing newline) into the logical
+/// stdout buffer instead of the process's fd 1. Replaces upstream `println!`.
+macro_rules! cp_out {
+    ($($args:tt)*) => ({
+        use std::io::Write as _;
+        $crate::CP_OUT.with(|b| {
+            let _ = writeln!(b.borrow_mut(), $($args)*);
+        });
+    });
+}
+
+/// Shadows [`uucore::show!`]: records the error's exit code into `CP_EXIT` and
+/// writes `<util_name>: <err>` to the logical stderr buffer (never fd 2, never
+/// the process-global exit code).
+macro_rules! show {
+    ($err:expr) => ({
+        #[allow(unused_imports)]
+        use uucore::error::UError as _;
+        use std::io::Write as _;
+        let e = $err;
+        $crate::CP_EXIT.with(|c| c.set(e.code()));
+        $crate::CP_ERR.with(|b| {
+            let _ = writeln!(b.borrow_mut(), "{}: {e}", uucore::util_name());
+        });
+    });
+}
+
+/// Shadows [`uucore::show_error!`]: writes `<util_name>: <msg>` to the logical
+/// stderr buffer and records exit code 1 into `CP_EXIT`.
+macro_rules! show_error {
+    ($($args:tt)+) => ({
+        use std::io::Write as _;
+        $crate::CP_EXIT.with(|c| c.set(1));
+        $crate::CP_ERR.with(|b| {
+            let mut b = b.borrow_mut();
+            let _ = write!(b, "{}: ", uucore::util_name());
+            let _ = writeln!(b, $($args)+);
+        });
+    });
+}
+
+/// Shadows [`uucore::show_warning!`]: writes `<util_name>: warning: <msg>` to
+/// the logical stderr buffer. A warning does not change the exit code.
+macro_rules! show_warning {
+    ($($args:tt)+) => ({
+        use std::io::Write as _;
+        $crate::CP_ERR.with(|b| {
+            let mut b = b.borrow_mut();
+            let _ = write!(b, "{}: warning: ", uucore::util_name());
+            let _ = writeln!(b, $($args)+);
+        });
+    });
+}
+
+// Declared AFTER the local macros above so `copydir` (a child module) inherits
+// them via textual macro scope, shadowing the uucore originals there too.
+mod copydir;
 
 #[derive(Debug, Error)]
 pub enum CpError {
@@ -449,7 +525,7 @@ impl Display for SparseDebug {
 /// no hard link or symbolic link is required, and data copy is required.
 /// It prints the debug information of the offload, reflink, and sparse detection actions.
 fn show_debug(copy_debug: &CopyDebug) {
-    println!(
+    cp_out!(
         "{}",
         translate!("cp-debug-copy-offload", "offload" => copy_debug.offload, "reflink" => copy_debug.reflink, "sparse" => copy_debug.sparse_detection)
     );
@@ -809,6 +885,99 @@ pub fn uu_app() -> Command {
         )
 }
 
+/// Logical entry point for the in-process brush `cp` builtin.
+///
+/// Mirrors [`uumain`]'s body (parse → [`Options::from_matches`] → extract the
+/// path operands → [`parse_path_args`] → [`copy`]) but adapts it to the engine's
+/// in-process model in two ways:
+///
+/// * **Logical cwd.** brush keeps a logical working directory and NEVER `chdir`s
+///   the process, while `cp` runs on a transient worker thread. So every
+///   RELATIVE path operand (and a `-t`/`--target-directory` value) is resolved
+///   against the shell's `cwd` here, not against the process cwd.
+/// * **Logical I/O.** This never touches the process's fd 0/1/2. Verbose/debug
+///   output goes to the thread-local `CP_OUT`, diagnostics to `CP_ERR`, and the
+///   non-fatal exit code to `CP_EXIT` (all via the crate-local macros). On the
+///   way out, `CP_OUT` is copied to the injected `out`, `CP_ERR` to `err`, and
+///   the status is surfaced as the returned `UResult`. `cp` reads no stdin.
+///
+/// A fatal error from [`copy`] is written to `err` and returned as a `UError`
+/// carrying its code. A non-fatal `NotAllFilesCopied` (or any diagnostic that
+/// set `CP_EXIT`) becomes exit 1, matching GNU/uutils `cp`.
+pub fn cp(
+    args: impl uucore::Args,
+    cwd: &Path,
+    out: &mut dyn io::Write,
+    err: &mut dyn io::Write,
+) -> UResult<()> {
+    // Fresh logical-I/O state for this invocation.
+    CP_OUT.with(|b| b.borrow_mut().clear());
+    CP_ERR.with(|b| b.borrow_mut().clear());
+    CP_EXIT.with(|c| c.set(0));
+
+    let matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+
+    let mut options = Options::from_matches(&matches)?;
+
+    if options.overwrite == OverwriteMode::NoClobber && options.backup != BackupMode::None {
+        return Err(UUsageError::new(
+            EXIT_ERR,
+            translate!("cp-error-backup-mutually-exclusive"),
+        ));
+    }
+
+    // Resolve relative path operands against the shell's LOGICAL cwd (the
+    // process is never chdir'd to it). Absolute operands are left untouched.
+    let abs = |p: PathBuf| -> PathBuf {
+        if p.is_relative() {
+            cwd.join(p)
+        } else {
+            p
+        }
+    };
+
+    let paths: Vec<PathBuf> = matches
+        .get_many::<OsString>(options::PATHS)
+        .map(|v| v.map(PathBuf::from).map(abs).collect())
+        .unwrap_or_default();
+
+    // Same treatment for an explicit `-t`/`--target-directory` value.
+    if let Some(dir) = options.target_dir.take() {
+        options.target_dir = Some(abs(dir));
+    }
+
+    let (sources, target) = parse_path_args(paths, &options)?;
+
+    let copy_result = copy(&sources, &target, &options);
+
+    // Drain the logical buffers to the injected sinks regardless of outcome.
+    let produced_out = CP_OUT.with(|b| std::mem::take(&mut *b.borrow_mut()));
+    let produced_err = CP_ERR.with(|b| std::mem::take(&mut *b.borrow_mut()));
+    let _ = out.write_all(&produced_out);
+    let _ = out.flush();
+    let _ = err.write_all(&produced_err);
+    let _ = err.flush();
+
+    let deferred = CP_EXIT.with(std::cell::Cell::get);
+
+    match copy_result {
+        Err(CpError::NotAllFilesCopied) => {
+            // Non-fatal: exit 1, no extra message (matches GNU cp / uumain).
+            Err(USimpleError::new(EXIT_ERR, String::new()))
+        }
+        Err(error) => {
+            // Fatal bubbled-up error: surface it on the logical err and return
+            // it with its proper code.
+            let code = error.code();
+            let _ = writeln!(err, "{}: {error}", uucore::util_name());
+            let _ = err.flush();
+            Err(USimpleError::new(if code == 0 { 1 } else { code }, String::new()))
+        }
+        Ok(()) if deferred != 0 => Err(USimpleError::new(deferred, String::new())),
+        Ok(()) => Ok(()),
+    }
+}
+
 #[uucore::main]
 pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     let matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
@@ -834,8 +1003,11 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
             // Error::NotAllFilesCopied is non-fatal, but the error
             // code should still be EXIT_ERR as does GNU cp
         } else {
-            // Else we caught a fatal bubbled-up error, log it to stderr
-            show_error!("{error}");
+            // Else we caught a fatal bubbled-up error, log it to stderr.
+            // The standalone binary path uses REAL process stderr (the
+            // crate-local `show_error!` would route into the unused CP_ERR
+            // buffer), so call the uucore macro by its full path here.
+            uucore::show_error!("{error}");
         }
         set_exit_code(EXIT_ERR);
     }
@@ -1641,7 +1813,7 @@ impl OverwriteMode {
         match self {
             Self::NoClobber => {
                 if debug {
-                    println!("{}", translate!("cp-debug-skipped", "path" => path.quote()));
+                    cp_out!("{}", translate!("cp-debug-skipped", "path" => path.quote()));
                 }
                 Err(CpError::Skipped(false))
             }
@@ -2027,7 +2199,7 @@ fn handle_existing_dest(
 
     if options.update == UpdateMode::None {
         if options.debug {
-            println!("skipped {}", dest.quote());
+            cp_out!("skipped {}", dest.quote());
         }
         return Err(CpError::Skipped(false));
     }
@@ -2132,7 +2304,7 @@ fn delete_path(path: &Path, options: &Options) -> CopyResult<()> {
     match fs::remove_file(path) {
         Ok(()) => {
             if options.verbose {
-                println!(
+                cp_out!(
                     "{}",
                     translate!("cp-verbose-removed", "path" => path.quote())
                 );
@@ -2213,11 +2385,11 @@ fn print_paths(parents: bool, source: &Path, dest: &Path) {
         //     a/b -> d/a/b
         //
         for (x, y) in aligned_ancestors(source, dest) {
-            println!("{} -> {}", x.display(), y.display());
+            cp_out!("{} -> {}", x.display(), y.display());
         }
     }
 
-    println!("{}", context_for(source, dest));
+    cp_out!("{}", context_for(source, dest));
 }
 
 /// Handles the copy mode for a file copy operation.
@@ -2301,7 +2473,7 @@ fn handle_copy_mode(
                     }
                     UpdateMode::None => {
                         if options.debug {
-                            println!("skipped {}", dest.quote());
+                            cp_out!("skipped {}", dest.quote());
                         }
 
                         return Ok(PerformedAction::Skipped);

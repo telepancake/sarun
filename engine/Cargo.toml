@@ -39,6 +39,10 @@ uu_tr = "0.8"
 uu_cut = "0.8"
 uu_uniq = "0.8"
 uu_sort = "0.8"
+# Same injected-I/O treatment, plus a logical-cwd rewrite: `cp` resolves its
+# relative path operands against the shell's logical cwd (the process is never
+# chdir'd). Logical entry `uu_cp::cp(args, cwd, out, err)`.
+uu_cp = "0.8"
 # Vendored, find-only fork of uutils/findutils 0.9.1: run `find` as an
 # in-process brush builtin against the shell's logical I/O. See vendor/findutils.
 findutils = { path = "vendor/findutils" }
@@ -190,6 +194,7 @@ uu_tr                    = { path = "vendor/uu_tr" }
 uu_cut                   = { path = "vendor/uu_cut" }
 uu_uniq                  = { path = "vendor/uu_uniq" }
 uu_sort                  = { path = "vendor/uu_sort" }
+uu_cp                    = { path = "vendor/uu_cp" }
 # Vendored, patched fork of uucore 0.8.0 — the shared uutils library that backs
 # every uu_* builtin's localization. The 13 in-process coreutil builtins each
 # run on a fresh thread that calls `init_localization("uu_X")`

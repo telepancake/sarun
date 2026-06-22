@@ -159,6 +159,11 @@ INPROC = [
     ("cut",      "printf 'a:b:c\\n' | cut -d: -f2"),
     ("uniq",     "printf 'a\\na\\nb\\n' | uniq"),
     ("sort",     "sort s.txt"),
+    # cp is a file-op builtin: its contract is "no forked /usr/bin/cp". The
+    # relative operands resolve against the shell's logical cwd (the cp port
+    # rewrites them), so a bare `cp a b` here copies within the box cwd.
+    ("cp",       "cp v.txt vc.txt"),
+    ("cp cwd",   "cd sub && cp ../v.txt out.txt"),
     # multi-stage all-builtin pipelines stay fully in-process
     ("sort|uniq -c", "sort s.txt | uniq -c"),
     ("tac|head",     "tac v.txt | head -n1"),
