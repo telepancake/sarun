@@ -187,6 +187,12 @@ CASES = [
     ("cut -f3-1 (decreasing)",   "cut -f3-1 v.txt",                       "cut",  "external"),
     ("tr a-z [:upper:] (misalign)", "printf x | tr a-z '[:upper:]'",      "tr",   "external"),
     ("tr canonical pair",        "printf b | tr '[:lower:]' '[:upper:]'", "tr",   "inproc"),
+    # batch-2 blind-review findings (expr/seq):
+    ("expr +1=1 (leading+)",     "expr +1 = 1",                           "expr", "external"),
+    ("expr substr overflow",     "expr substr abcdef 1 99999999999999999999", "expr", "external"),
+    ("expr bignum (in-proc)",    "expr 99999999999999999999 + 1",         "expr", "inproc"),
+    ("seq opt-after-operand",    "seq 1 -s, 3",                           "seq",  "external"),
+    ("seq -s, before operands",  "seq -s, 1 3",                           "seq",  "inproc"),
 ]
 
 
@@ -316,6 +322,9 @@ CASES_IO = [
     ("uniq",            "printf 'a\\na\\nb\\n' | uniq"),
     ("sort",            "printf 'b\\na\\nb\\n' | sort"),
     ("sort|uniq -c",    "printf 'b\\na\\nb\\n' | sort | uniq -c"),
+    ("expr bignum +",   "expr 99999999999999999999 + 1"),
+    ("seq -s, before",  "seq -s, 1 3"),
+    ("tr canonical",    "printf b | tr '[:lower:]' '[:upper:]'"),
 ]
 
 
