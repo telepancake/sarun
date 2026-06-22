@@ -15,7 +15,65 @@ a clean FAILED with those messages. Standalone runs don't load conftest, so
 their existing `_fails`/`sys.exit` path is unaffected; modules that don't use the
 pattern are ignored.
 """
+import os
+import subprocess
+from pathlib import Path
+
 import pytest
+
+
+# ── Process-env hygiene ──────────────────────────────────────────────────────
+# Most `test_*_rs.py` modules point the box at a per-test temp tree by assigning
+# `os.environ["XDG_STATE_HOME"] = …` (and XDG_RUNTIME_DIR / XDG_CONFIG_HOME /
+# XDG_DATA_HOME / SLOPBOX_NS) directly, and only ever `pop("SLOPBOX_NS")` in
+# their teardown — the XDG vars are never restored. That mutation is
+# PROCESS-GLOBAL, so it leaks into every later test in the same worker. The
+# nastiest symptom: a later test that shells out to `make engine` inherits a
+# stale temp `XDG_DATA_HOME`, so `uv tool`/cargo-zigbuild resolve to the temp
+# dir and recompile the whole crate graph COLD instead of reusing engine/target
+# — and under `pytest -n auto` several workers do it at once, turning a
+# minutes-long suite into a build-bound one.
+#
+# Fix it once, centrally: snapshot os.environ around every test and restore it
+# afterward, so each test starts from the real environment no matter what ran
+# before. (Standalone `python test_X.py` runs don't load conftest, so their own
+# behavior is unchanged.)
+@pytest.fixture(autouse=True)
+def _restore_os_environ():
+    saved = dict(os.environ)
+    try:
+        yield
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+
+
+# ── Build the engine binary exactly once, serialized ─────────────────────────
+# Each `*_rs` test's own `ensure_binary()` calls `make engine` on demand when
+# the static musl binary is missing. Under `pytest -n auto` multiple workers hit
+# that simultaneously and stampede `cargo zigbuild` into the one shared
+# engine/target. Pre-build it once here, before any test body runs, behind a
+# cross-process file lock: the first worker to grab the lock builds (with the
+# real environment, since this runs before any test mutates it), the rest block
+# then find the finished binary and skip. A pre-existing binary is a no-op.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_ENGINE_BIN = _REPO_ROOT / "engine/target/x86_64-unknown-linux-musl/release/sarun"
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _engine_binary_built():
+    import fcntl
+    if _ENGINE_BIN.exists():
+        return
+    target = _REPO_ROOT / "engine" / "target"
+    target.mkdir(parents=True, exist_ok=True)
+    with open(target / ".sarun-build.lock", "w") as lockf:
+        fcntl.flock(lockf, fcntl.LOCK_EX)
+        try:
+            if not _ENGINE_BIN.exists():
+                subprocess.run(["make", "engine"], cwd=_REPO_ROOT, check=False)
+        finally:
+            fcntl.flock(lockf, fcntl.LOCK_UN)
 
 
 @pytest.hookimpl(hookwrapper=True)
