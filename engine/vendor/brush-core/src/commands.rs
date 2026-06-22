@@ -271,26 +271,14 @@ pub fn compose_std_command<S: AsRef<OsStr>, SE: extensions::ShellExtensions>(
     // sets O_CLOEXEC; dup2 clears it on the duplicate; the original
     // numbered fd survives across exec when nothing closes it.
     //
-    // We allow fds {0, 1, 2} and anything `inject_fds` mapped to. The
-    // `inject_fds` path uses command-fds, which clears O_CLOEXEC on the
-    // child_fd numbers it produces; we discover those by listing
-    // /proc/self/fd and stat'ing each — anything with O_CLOEXEC set is
-    // a stray and gets closed. (Hosts without procfs miss this safety;
-    // sarun runs on linux only so that's fine.)
-    //
-    // SAFETY: pre_exec runs in the forked child between fork() and
-    // execve(). We allocate nothing in the closure (read_dir is a
-    // single syscall fronted by getdents) and only call close(2) on
-    // fds, both of which are async-signal-safe per POSIX.
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::process::CommandExt;
-        // SAFETY: see the comment above. The closure performs no
-        // allocation and uses only async-signal-safe syscalls.
-        unsafe {
-            cmd.pre_exec(sarun_close_stray_fds);
-        }
-    }
+    // Stray inherited fds are handled by the kernel: every fd with O_CLOEXEC
+    // set is closed automatically on execve. The fds we deliberately keep —
+    // {0, 1, 2} and the child_fd numbers `inject_fds` produces — have their
+    // O_CLOEXEC bit cleared (command-fds does this), so they survive exec.
+    // No pre_exec fd-walk is needed, and one would be unsafe anyway: a closure
+    // running between fork() and execve() in a multithreaded process must not
+    // allocate (it can deadlock on the malloc lock held by another thread at
+    // fork time), which a /proc/self/fd walk does.
 
     // sarun fix (NOT upstream brush): materialize the launch-state overrides set
     // by the in-process exec-wrapper builtins (nice/setsid/nohup). These are
@@ -336,50 +324,6 @@ pub fn compose_std_command<S: AsRef<OsStr>, SE: extensions::ShellExtensions>(
 /// those survive; CLOEXEC-set fds are leftovers brush never asked the
 /// child to inherit. linux-only because we walk /proc/self/fd.
 #[cfg(target_os = "linux")]
-fn sarun_close_stray_fds() -> std::io::Result<()> {
-    // The dir fd we open to walk must not itself close — keep it open
-    // until the loop finishes. We collect first to avoid mutating the
-    // directory while iterating (some libcs reuse the same dirent
-    // buffer for each readdir).
-    let dir = match std::fs::read_dir("/proc/self/fd") {
-        Ok(d) => d,
-        Err(_) => return Ok(()), // best-effort; procfs unavailable
-    };
-    let mut to_close: Vec<i32> = Vec::with_capacity(16);
-    for entry in dir {
-        let Ok(entry) = entry else { continue; };
-        let Ok(name) = entry.file_name().into_string() else { continue; };
-        let Ok(fd) = name.parse::<i32>() else { continue; };
-        if fd <= 2 { continue; }
-        // Skip the dir fd backing this readdir; closing it would
-        // invalidate the iterator state. ReadDir on linux holds an
-        // fd open via opendir/getdents; we can't query its number
-        // through the public API, so just defer to the FD_CLOEXEC
-        // check — opendir() sets CLOEXEC on the dir fd, so we'd try
-        // to close it. Skip any fd whose /proc/self/fd entry resolves
-        // to a "/proc/self/fd" symlink, which is the readdir fd
-        // pointing at itself.
-        if let Ok(link) = std::fs::read_link(format!("/proc/self/fd/{fd}")) {
-            if link.to_string_lossy().contains("/proc/self/fd") {
-                continue;
-            }
-        }
-        // Only close fds that still have FD_CLOEXEC set — the ones
-        // brush explicitly mapped via command-fds already had their
-        // CLOEXEC bit cleared, so we leave those alone.
-        // SAFETY: fcntl(F_GETFD) is async-signal-safe.
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-        if flags < 0 { continue; }
-        if (flags & libc::FD_CLOEXEC) != 0 {
-            to_close.push(fd);
-        }
-    }
-    for fd in to_close {
-        // SAFETY: close(2) is async-signal-safe.
-        unsafe { libc::close(fd); }
-    }
-    Ok(())
-}
 
 pub(crate) async fn on_preexecute(
     cmd: &mut commands::SimpleCommand<'_, impl extensions::ShellExtensions>,

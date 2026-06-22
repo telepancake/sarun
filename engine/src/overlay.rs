@@ -7,8 +7,8 @@
 //        provenance) and from then on writes are ordinary pwrites to the blob.
 //   D4 — every non-empty file's bytes live as a pool blob (data-NULL row);
 //        a box is at rest the moment it stops — no consolidate phase.
-// m3a scope: lookup/getattr/readdir(plus)/readlink/open/create/read/write/
-// truncate/mkdir/unlink/rmdir/symlink. rename is ENOSYS for now (m3b).
+// Implemented: lookup/getattr/readdir(plus)/readlink/open/create/read/write/
+// truncate/mkdir/unlink/rmdir/symlink/rename.
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -2068,8 +2068,8 @@ impl Filesystem for Overlay {
 
     fn statfs(&self, _req: &Request, _ino: INodeNo, reply: fuser::ReplyStatfs) {
         // Report the lower filesystem's real numbers (df, build free-space checks).
-        let c = std::ffi::CString::new(self.inner.lower.as_os_str()
-            .as_encoded_bytes()).unwrap();
+        let Ok(c) = std::ffi::CString::new(self.inner.lower.as_os_str()
+            .as_encoded_bytes()) else { reply.error(Errno::EINVAL); return; };
         let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
         if unsafe { libc::statvfs(c.as_ptr(), &mut s) } == 0 {
             reply.statfs(s.f_blocks as u64, s.f_bfree as u64, s.f_bavail as u64,
