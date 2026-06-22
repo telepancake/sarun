@@ -377,7 +377,6 @@ pub fn decorate(id: i64, rel: &str) -> Value {
 }
 
 // ── host-mutating review actions (top-level boxes; nested promotion deferred) ──
-use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
 
 fn open_rw(id: i64) -> Option<Connection> {

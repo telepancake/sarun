@@ -341,7 +341,7 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
     }
     let mount = ack.get("mount").and_then(Value::as_str).unwrap_or("").to_string();
     let sid = ack.get("session_id").and_then(Value::as_str).unwrap_or("?").to_string();
-    let box_name_str = ack.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+    let _box_name_str = ack.get("name").and_then(Value::as_str).unwrap_or("").to_string();
     // Pulled up so `inner_args` (built earlier) can pass `--api` straight
     // to the inner; the later `--api` block re-uses this same value.
     let api_on = ack.get("api").and_then(Value::as_bool).unwrap_or(false);
@@ -581,7 +581,7 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
     //          handed the engine the TAP fd, so this process is ALREADY in the
     //          equipped netns. bwrap must NOT --unshare-net — it inherits ours.
     //   Host → no --unshare-net (box shares the launcher's netns).
-    let dns_ip = ack.get("dns_ip").and_then(Value::as_str)
+    let _dns_ip = ack.get("dns_ip").and_then(Value::as_str)
         .map(|s| s.to_string()).unwrap_or_default();
     let ca_pem = ack.get("ca_pem").and_then(Value::as_str)
         .map(|s| s.to_string()).unwrap_or_default();

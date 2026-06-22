@@ -6,7 +6,7 @@
 // Errors from either side trigger a graceful shutdown of the other.
 
 use anyhow::Result;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
 use super::bridge::SmoltcpStream;

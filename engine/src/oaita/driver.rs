@@ -586,10 +586,9 @@ fn backtrack_behavioural_announcement(target: &str) -> Option<String> {
     let recent_tools: Vec<&crate::oaita::turns::Turn> =
         turns.iter().filter(|t| t.kind == "tool").rev().take(5).collect();
     let mut errs = 0;
-    let mut cleans = 0;
     for t in &recent_tools {
         let content = t.read().unwrap_or_default();
-        if tool_result_looks_failed(&content) { errs += 1; } else { cleans += 1; }
+        if tool_result_looks_failed(&content) { errs += 1; }
     }
     // The productive-cluster case is now handled by the hint mechanism
     // (see hints::productive_cluster_append). evaluate_call appends the
