@@ -667,8 +667,18 @@ fn paths_arg(id: i64, paths: &Value) -> Vec<String> {
 /// box created (no host file) or one with no recorded capture mtime is NOT
 /// considered stale. Conservative: only refuses on a positive staleness signal,
 /// so the normal apply path (host unchanged) is untouched.
+///
+/// The guard is about not clobbering newer host CONTENT with a stale box write,
+/// so it applies only to content rows. A tombstone (S_IFCHR deletion) carries no
+/// content and a fixed `mtime=0`, so the mtime comparison is meaningless for it
+/// (it would otherwise refuse every deletion, since any live host file is newer
+/// than 0); deletions are never gated here.
 fn host_changed_since_capture(id: i64, rel: &str) -> bool {
     let rel = rel.trim_start_matches('/');
+    let Some((_, mode, _)) = open_ro(id).and_then(|c| row_of(&c, rel)) else {
+        return false;
+    };
+    if mode & S_IFMT == S_IFCHR { return false; } // deletion tombstone: not gated
     let host = Path::new("/").join(rel);
     let Ok(md) = host.symlink_metadata() else { return false };
     let Some(cap_ns) = current_mtime(id, rel) else { return false };
