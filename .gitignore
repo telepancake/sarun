@@ -6,3 +6,10 @@ __pycache__/
 # Scratch dir for `sarun run -b -C <dir> -- make` smoke tests when iterating
 # on box-mode kati behavior (see kati corpus runner work).
 /.corpus-staging/
+
+# Guard against stray cargo prototypes left at the repo root by subagents
+# (the real manifest is engine/Cargo.toml). Keeps the worktree clean.
+/Cargo.toml
+/Cargo.lock
+/src/
+/target/
