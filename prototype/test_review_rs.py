@@ -17,7 +17,7 @@ import tempfile, shutil, time
 from pathlib import Path
 from importlib.machinery import SourceFileLoader
 
-SARUN = "/home/user/sarun/prototype/sarun"
+SARUN = "/home/user/sarun/prototype/libtestsarun.py"
 CRATE = Path(__file__).resolve().parent.parent / "engine"
 BIN = CRATE / "target/x86_64-unknown-linux-musl/release/sarun"
 

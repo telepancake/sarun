@@ -27,7 +27,7 @@ import os, socket, subprocess, sys, tempfile, shutil, time, stat as st
 from pathlib import Path
 from importlib.machinery import SourceFileLoader
 
-SARUN = "/home/user/sarun/prototype/sarun"
+SARUN = "/home/user/sarun/prototype/libtestsarun.py"
 CRATE = Path("/home/user/sarun/engine")
 BIN = CRATE / "target/x86_64-unknown-linux-musl/release/sarun"
 WROOT = Path("/root/wl_rs")          # host scratch, visible in the box overlay
