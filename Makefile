@@ -66,6 +66,10 @@ test: ## Run the test suite (pytest-xdist; build the engine first; excludes test
 test-oci: ## Run the hermetic OCI tests (synthetic archive; real engine; needs `make engine`)
 	prototype/test_oci.py
 
+.PHONY: test-contract
+test-contract: ## Syscall-level (strace) contract test for the native builtins (needs `make engine` + strace)
+	uv run --with pytest python engine/test_builtin_contract.py
+
 # ---- Housekeeping ---------------------------------------------------------
 
 .PHONY: clean
