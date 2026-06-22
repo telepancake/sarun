@@ -107,11 +107,26 @@ impl Localizer {
     }
 }
 
-// Cache localizer. FluentResource cannot be shared between threads while FluentBundle can be shared
-static UUCORE_FLUENT: OnceLock<FluentResource> = OnceLock::new();
-static CHECKSUM_FLUENT: OnceLock<FluentResource> = OnceLock::new();
-static UTIL_FLUENT: OnceLock<FluentResource> = OnceLock::new();
+// Cache localizer. FluentResource cannot be shared between threads while
+// FluentBundle can be shared.
+//
+// sarun patch: these embedded-resource caches are PER-THREAD, not process
+// global. Stock uucore made them process-global `OnceLock<FluentResource>`,
+// which is correct for the one-util-per-process design uutils ships, but
+// breaks an embedder that runs several distinct utils in one process (each on
+// its own thread). The first util to run pinned, say, UTIL_FLUENT to its own
+// `.ftl`; every later util then got that first util's resource back from the
+// cache, so its bundle lacked its own `translate!` keys and it emitted raw
+// Fluent keys (e.g. `tac: tac-error-open-error`). Making the caches
+// thread-local means each util's thread parses and caches ITS OWN resources,
+// with no cross-thread contamination. The cached value is a leaked Box so it
+// satisfies the `'static` lifetime `FluentBundle::add_resource_overriding`
+// needs and outlives the thread-local LOCALIZER bundle that borrows it (both
+// live until the thread exits). At most three small resources leak per thread.
 thread_local! {
+    static UUCORE_FLUENT: OnceLock<&'static FluentResource> = const { OnceLock::new() };
+    static CHECKSUM_FLUENT: OnceLock<&'static FluentResource> = const { OnceLock::new() };
+    static UTIL_FLUENT: OnceLock<&'static FluentResource> = const { OnceLock::new() };
     static LOCALIZER: OnceLock<Localizer> = const { OnceLock::new() };
 }
 
@@ -224,14 +239,21 @@ fn init_localization(
     Ok(())
 }
 
-/// Helper function to parse FluentResource from content string
+/// Helper function to parse FluentResource from content string.
+///
+/// sarun patch: `cache` is a thread-local `OnceLock<&'static FluentResource>`
+/// (see the thread_local block above) rather than a process-global
+/// `OnceLock<FluentResource>`, so each thread caches its own resources and
+/// utils run in the same process can't contaminate each other's bundles. The
+/// resource is leaked once per thread to get the `'static` lifetime the shared
+/// `FluentBundle` requires; the cached `&'static` is then cheaply copied out.
 fn parse_fluent_resource(
     content: &str,
-    cache: &'static OnceLock<FluentResource>,
+    cache: &'static std::thread::LocalKey<OnceLock<&'static FluentResource>>,
 ) -> Result<&'static FluentResource, LocalizationError> {
-    // global cache breaks unit tests
+    // per-thread cache breaks unit tests (they re-parse in one thread)
     if cfg!(not(test)) {
-        if let Some(res) = cache.get() {
+        if let Some(res) = cache.with(|c| c.get().copied()) {
             return Ok(res);
         }
     }
@@ -254,11 +276,12 @@ fn parse_fluent_resource(
             }
         },
     )?;
-    // global cache breaks unit tests
+    let leaked: &'static FluentResource = Box::leak(Box::new(resource));
+    // per-thread cache breaks unit tests
     if cfg!(not(test)) {
-        Ok(cache.get_or_init(|| resource))
+        Ok(cache.with(|c| *c.get_or_init(|| leaked)))
     } else {
-        Ok(Box::leak(Box::new(resource)))
+        Ok(leaked)
     }
 }
 

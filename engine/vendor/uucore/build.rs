@@ -248,16 +248,18 @@ fn embed_static_utility_locales(
     for entry in entries {
         let file_name = entry.file_name();
         if let Some(dir_name) = file_name.to_str() {
-            // Match uu_<util>-<version>
-            if let Some((util_part, _)) = dir_name.split_once('-') {
-                if let Some(util_name) = util_part.strip_prefix("uu_") {
-                    embed_component_locales(
-                        embedded_file,
-                        locales_to_embed,
-                        util_name,
-                        |locale| entry.path().join(format!("locales/{locale}.ftl")),
-                    )?;
-                }
+            // Match a sibling utility crate directory. On a crates.io build the
+            // siblings are registry checkouts named `uu_<util>-<version>`; in
+            // sarun's vendor tree they are path forks named plainly `uu_<util>`
+            // (no version suffix). sarun patch: accept both — strip the optional
+            // `-<version>` tail, then the `uu_` prefix, so the vendored forks'
+            // `locales/*.ftl` get embedded too (without this, a vendored uucore
+            // embeds no per-util strings and every util prints raw Fluent keys).
+            let util_part = dir_name.split_once('-').map_or(dir_name, |(head, _)| head);
+            if let Some(util_name) = util_part.strip_prefix("uu_") {
+                embed_component_locales(embedded_file, locales_to_embed, util_name, |locale| {
+                    entry.path().join(format!("locales/{locale}.ftl"))
+                })?;
             }
         }
     }
