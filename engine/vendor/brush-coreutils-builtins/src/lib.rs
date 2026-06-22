@@ -61,6 +61,14 @@ fn prepare_uutil_runtime(util_crate_name: &str) {
     uucore::panic::preserve_inherited_sigpipe();
     uucore::panic::mute_sigpipe_panic();
     let localization_name = uucore::get_canonical_util_name(util_crate_name);
+    // sarun patch: set the per-thread utility name so utils that print
+    // diagnostics through `uucore::util_name()` (e.g. wc, sort, tr) show their
+    // own name rather than the host process's argv[0] ("sarun"). uucore derives
+    // util_name() process-globally from argv[0] — correct for the
+    // one-util-per-process model but wrong for an embedder running each util on
+    // its own thread. `localization_name` is already the canonical util name
+    // (uu_wc -> "wc", alias map applied), exactly what we want here.
+    uucore::set_utility_name(localization_name);
     if let Err(err) = uucore::locale::setup_localization(localization_name) {
         eprintln!("brush: could not initialize localization for '{localization_name}': {err}");
         std::process::exit(99);
