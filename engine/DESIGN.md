@@ -120,16 +120,7 @@ the protocol is the only contract, terminal-emulation crates (vt100/termwiz)
 cover the PTY-pane feature, and ratatui's TestBackend covers headless golden
 tests. The PTY/tmux feature (engine-held PTYs over the existing mux frames)
 slots naturally after m3.
-VERIFIED (ptyspike/): the full stack — portable-pty 0.9 (spawn on a PTY) ->
-vt100 0.16 (emulate to a screen grid) -> tui-term 0.3 (ratatui widget) ->
-ratatui 0.30 TestBackend — drives a real child process and renders it
-HEADLESSLY, with escape-sequence emulation and the input direction both
-proven. So the m5 UI half is de-risked (Zellij/wezterm use the same stack);
-the remaining unknowns are engine-side (PTY allocation + bidirectional mux
-frames, which depend on capture mode being ported — currently downgraded
-since m3b). Order: finish engine port -> Rust mux/capture -> PTY boxes ->
-ratatui client with tui-term panes. Building the pane before the client = twice.
-DONE (first cut): the engine-held PTY + its ratatui pane. A `pty_spawn` control
+The engine-held PTY + its ratatui pane. A `pty_spawn` control
 connection (control.rs `handle_pty_spawn`) makes the engine spawn a command on a
 portable-pty PTY it OWNS (pty.rs `serve_pty`) and mux the master ↔ the client
 over three new frames (frames.rs): FRAME_PTY_DATA (7, both directions — raw PTY
@@ -168,8 +159,8 @@ These are not alternatives — sarun wants all three, composed:
 
   - FUSE capture — ALWAYS on. Captures the syscalls of arbitrary spawned
     binaries (cc/ld/python); it is the only layer that sees them. The base.
-  - PTY mode — toggle, for interactive tty boxes (ptyspike stack; engine-held
-    PTYs). Off → today's headless captured stdout/stderr.
+  - PTY mode — toggle, for interactive tty boxes (engine-held PTYs).
+    Off → today's headless captured stdout/stderr.
   - brush shell — toggle, for the box's shell being our embedded brush
     (brush-core/brush-parser, verified embeddable). Sits ABOVE FUSE: it adds
     semantic context FUSE can't recover, and removes the sh-storm FUSE would
