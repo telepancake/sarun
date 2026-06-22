@@ -21,6 +21,9 @@ impl DhcpServer {
         let mut dec = Decoder::new(raw);
         let req = Message::decode(&mut dec).context("decode dhcp")?;
         if req.opcode() != Opcode::BootRequest { return Ok(None); }
+        // A BOOTREQUEST without an explicit DHCP message-type option is legacy
+        // BOOTP; treating it as Discover is the correct default, not a dropped
+        // error (genuine decode failures already returned via `?` above).
         let mt = req.opts().msg_type().unwrap_or(MessageType::Discover);
         match mt {
             MessageType::Discover => Ok(Some(self.reply(&req, MessageType::Offer)?)),

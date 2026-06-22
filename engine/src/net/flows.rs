@@ -196,6 +196,9 @@ fn which(cmd: &str) -> bool {
 
 /// Newest pcapng/keys pair for a box.
 fn find_flows_files(box_state_root: &Path) -> Option<(PathBuf, PathBuf)> {
+    // A missing/unreadable box dir or unreadable entry simply means "no flows
+    // here" → None, which the caller turns into a clear "no flows files for
+    // this box" error. So returning None on read failure is correct, not silent.
     let mut entries: Vec<PathBuf> = std::fs::read_dir(box_state_root).ok()?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().is_some_and(|e| e == "pcapng"))
@@ -223,6 +226,11 @@ const PACKET_FIELDS: &[&str] = &[
 fn parse_flow_rows(out: &str) -> Vec<FlowRow> {
     out.lines().filter_map(|line| {
         let mut it = line.split('\t');
+        // tshark `-T fields` emits one tab-separated cell per requested field,
+        // EMPTY when a field doesn't apply to that packet (a TCP frame has no
+        // http.host, etc). So `unwrap_or("")`/`unwrap_or(default)` below is the
+        // correct representation of an absent field, not a swallowed parse error.
+        // A row whose frame.number won't parse is header/junk — drop it via `?`.
         let frame: u64 = it.next()?.parse().ok()?;
         let t: f64 = it.next()?.parse().unwrap_or(0.0);
         let src = it.next().unwrap_or("").to_string();
@@ -245,6 +253,8 @@ fn parse_flow_rows(out: &str) -> Vec<FlowRow> {
 fn parse_packet_rows(out: &str) -> Vec<PacketRow> {
     out.lines().filter_map(|line| {
         let mut it = line.split('\t');
+        // Same as parse_flow_rows: empty cells = absent fields (expected); the
+        // frame.number `?`/`ok()?` gate drops non-data lines.
         let frame: u64 = it.next()?.parse().ok()?;
         let t: f64 = it.next()?.parse().unwrap_or(0.0);
         let src = it.next().unwrap_or("").to_string();

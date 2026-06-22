@@ -53,23 +53,45 @@ impl DnsServer {
 
     /// Handle a raw UDP DNS request and produce a response or None for drop.
     pub fn handle(&self, raw: &[u8]) -> Option<Vec<u8>> {
+        // A malformed query / one with no question is dropped silently — that
+        // is correct, RFC-conformant DNS server behavior, not a swallowed error.
         let msg = Message::from_slice(raw).ok()?;
         let q = msg.first_question()?;
         let qname = q.qname().to_string();
         let qtype = q.qtype();
 
-        let mut builder = MessageBuilder::new_vec().start_answer(&msg, domain::base::iana::Rcode::NOERROR).ok()?;
+        // Builder failures below are NOT expected and would silently drop the
+        // reply → the box's resolve times out mysteriously. Log them so a
+        // failed answer is visible.
+        let mut builder = match MessageBuilder::new_vec()
+            .start_answer(&msg, domain::base::iana::Rcode::NOERROR) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("sarun-engine: net: dns start_answer {qname}: {e}");
+                return None;
+            }
+        };
         if qtype == Rtype::A {
             if let Some(ip) = self.alloc_for(&qname) {
                 let addr = std::net::Ipv4Addr::from(ip);
-                builder.push((q.qname(), 30u32, A::new(addr))).ok()?;
+                if let Err(e) = builder.push((q.qname(), 30u32, A::new(addr))) {
+                    eprintln!("sarun-engine: net: dns push A {qname}: {e}");
+                    return None;
+                }
             }
         } else if qtype == Rtype::AAAA {
             // Empty NOERROR; the client will fall back to A.
         } else {
             // SERVFAIL for anything else.
-            let mut b = MessageBuilder::new_vec().start_answer(&msg,
-                domain::base::iana::Rcode::SERVFAIL).ok()?;
+            let b = match MessageBuilder::new_vec()
+                .start_answer(&msg, domain::base::iana::Rcode::SERVFAIL) {
+                Ok(b) => b, // finish() consumes self; no `mut` needed
+                Err(e) => {
+                    eprintln!("sarun-engine: net: dns start_answer(servfail) \
+                               {qname}: {e}");
+                    return None;
+                }
+            };
             return Some(b.finish());
         }
         Some(builder.finish())

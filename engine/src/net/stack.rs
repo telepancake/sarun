@@ -119,12 +119,23 @@ impl StackRuntime {
 
     pub fn register_rx(&self, handle: SocketHandle,
                        tx: std::sync::mpsc::Sender<Vec<u8>>) {
-        let _ = self.cmd_tx.send(Cmd::RegisterRx { handle, tx });
+        // A send failure means the poll thread is gone (box stack torn down);
+        // surface it — silently dropping leaves a connection that never
+        // receives bytes and mysteriously stalls.
+        if let Err(e) = self.cmd_tx.send(Cmd::RegisterRx { handle, tx }) {
+            eprintln!("sarun-engine: net: register_rx on dead poll thread: {e}");
+        }
     }
     pub fn write(&self, handle: SocketHandle, data: Vec<u8>) {
-        let _ = self.cmd_tx.send(Cmd::Write { handle, data });
+        // Same: a dead poll thread silently swallowing writes manifests later
+        // as a hung/half-open connection. Log it instead.
+        if let Err(e) = self.cmd_tx.send(Cmd::Write { handle, data }) {
+            eprintln!("sarun-engine: net: write on dead poll thread: {e}");
+        }
     }
     pub fn close(&self, handle: SocketHandle) {
+        // Best-effort: if the poll thread is already gone the socket is gone
+        // too, so a failed close is genuinely nothing to act on. Ignore.
         let _ = self.cmd_tx.send(Cmd::Close { handle });
     }
 }
@@ -157,6 +168,9 @@ impl Device for TapPhy {
         };
         if n <= 0 { return None; }
         buf.truncate(n as usize);
+        // pcap capture is observability-only and must never break the
+        // datapath; this is also the per-frame hot path, so logging here
+        // would flood. A record error is intentionally dropped.
         let _ = self.flows.record(&buf);
         Some((TapRx { buf },
               TapTx { fd: self.fd, flows: &self.flows, mtu: self.mtu }))
@@ -178,8 +192,19 @@ impl<'a> TxToken for TapTx<'a> {
         let len = len.min(self.mtu + 14);
         let mut buf = vec![0u8; len];
         let r = f(&mut buf);
+        // pcap capture is observability-only / per-frame hot path — drop a
+        // record error rather than break or flood the datapath (see receive()).
         let _ = self.flows.record(&buf);
-        unsafe { libc::write(self.fd, buf.as_ptr().cast(), buf.len()); }
+        // A short TAP write desyncs the box's L2 stream; surface it. Cannot
+        // recover here (smoltcp owns retransmit), but it must not be invisible.
+        let n = unsafe { libc::write(self.fd, buf.as_ptr().cast(), buf.len()) };
+        if n < 0 {
+            eprintln!("sarun-engine: net: TAP write failed: {}",
+                      std::io::Error::last_os_error());
+        } else if (n as usize) < buf.len() {
+            eprintln!("sarun-engine: net: short TAP write {}/{}",
+                      n, buf.len());
+        }
         r
     }
 }
@@ -198,8 +223,13 @@ fn run_poll_loop(rt: Arc<StackRuntime>, tap_fd: OwnedFd,
     let now = || SmolInstant::from_millis(started.elapsed().as_millis() as i64);
     let mut iface = Interface::new(cfg, &mut phy, now());
     iface.update_ip_addrs(|addrs| {
-        let _ = addrs.push(IpCidr::new(
-            IpAddress::Ipv4(Ipv4Address::from(rt.gateway_ip)), 16));
+        // One-time stack setup: if the gateway address won't bind, the whole
+        // box network is dead — surface it instead of starting a silent
+        // black-hole stack. (push fails only on a full fixed-capacity store.)
+        if addrs.push(IpCidr::new(
+            IpAddress::Ipv4(Ipv4Address::from(rt.gateway_ip)), 16)).is_err() {
+            eprintln!("sarun-engine: net: failed to assign gateway IP to iface");
+        }
     });
     // any_ip = "process packets to ANY routable unicast address, not just
     // the one configured on the interface". The synth-pool IPs are not
@@ -208,8 +238,12 @@ fn run_poll_loop(rt: Arc<StackRuntime>, tap_fd: OwnedFd,
     // every Class E address back through our own gateway IP — smoltcp's
     // any_ip path then sees "next-hop is myself" and terminates locally.
     iface.set_any_ip(true);
-    iface.routes_mut().add_default_ipv4_route(
-        Ipv4Address::from(rt.gateway_ip)).ok();
+    // The default route is what makes the any_ip catch-all terminate locally;
+    // without it every box SYN to a synth IP is dropped. Surface a failure.
+    if let Err(e) = iface.routes_mut().add_default_ipv4_route(
+        Ipv4Address::from(rt.gateway_ip)) {
+        eprintln!("sarun-engine: net: add default route failed: {e}");
+    }
 
     let mut sockets = SocketSet::new(vec![]);
 
@@ -222,7 +256,11 @@ fn run_poll_loop(rt: Arc<StackRuntime>, tap_fd: OwnedFd,
         let tx = udp::PacketBuffer::new(
             vec![udp::PacketMetadata::EMPTY; 8], vec![0u8; UDP_BUF]);
         let mut s = udp::Socket::new(rx, tx);
-        let _ = s.bind(IpListenEndpoint { addr: None, port: 67 });
+        // If the DHCP server can't bind :67 the box never gets a lease — fail
+        // loudly rather than start a stack that silently can't hand out IPs.
+        if let Err(e) = s.bind(IpListenEndpoint { addr: None, port: 67 }) {
+            eprintln!("sarun-engine: net: DHCP bind :67 failed: {e}");
+        }
         sockets.add(s)
     };
 
@@ -234,10 +272,14 @@ fn run_poll_loop(rt: Arc<StackRuntime>, tap_fd: OwnedFd,
         let tx = udp::PacketBuffer::new(
             vec![udp::PacketMetadata::EMPTY; 16], vec![0u8; UDP_BUF]);
         let mut s = udp::Socket::new(rx, tx);
-        let _ = s.bind(IpListenEndpoint {
+        // If the synthetic DNS can't bind :53 the box can't resolve anything —
+        // surface it rather than black-hole every lookup.
+        if let Err(e) = s.bind(IpListenEndpoint {
             addr: Some(IpAddress::Ipv4(Ipv4Address::from(rt.gateway_ip))),
             port: 53,
-        });
+        }) {
+            eprintln!("sarun-engine: net: DNS bind :53 failed: {e}");
+        }
         sockets.add(s)
     };
 
@@ -258,7 +300,14 @@ fn run_poll_loop(rt: Arc<StackRuntime>, tap_fd: OwnedFd,
             match cmd {
                 Cmd::Write { handle, data } => {
                     let s = sockets.get_mut::<tcp::Socket>(handle);
-                    if s.can_send() { let _ = s.send_slice(&data); }
+                    // A send_slice error here means box-bound bytes were lost
+                    // (closed/aborted socket); surface so a truncated response
+                    // isn't a silent mystery.
+                    if s.can_send() {
+                        if let Err(e) = s.send_slice(&data) {
+                            eprintln!("sarun-engine: net: tcp send_slice: {e}");
+                        }
+                    }
                 }
                 Cmd::Close { handle } => {
                     let s = sockets.get_mut::<tcp::Socket>(handle);
@@ -268,7 +317,8 @@ fn run_poll_loop(rt: Arc<StackRuntime>, tap_fd: OwnedFd,
             }
         }
 
-        // 2. Drive smoltcp.
+        // 2. Drive smoltcp. poll() returns a bool "did anything change",
+        //    not a Result — discarding it is correct (we poll on a fixed tick).
         let _ = iface.poll(now(), &mut phy, &mut sockets);
 
         // 3. DHCP: any waiting request → reply.
@@ -286,8 +336,14 @@ fn run_poll_loop(rt: Arc<StackRuntime>, tap_fd: OwnedFd,
                     let mut out = udp::UdpMetadata::from(dst);
                     out.local_address = Some(IpAddress::Ipv4(
                         Ipv4Address::from(rt.gateway_ip)));
-                    let _ = s.send_slice(&reply, out);
+                    // A dropped DHCP reply leaves the box without a lease;
+                    // surface it.
+                    if let Err(e) = s.send_slice(&reply, out) {
+                        eprintln!("sarun-engine: net: DHCP reply send: {e}");
+                    }
                 }
+                // meta (the request's source endpoint) is unused: DHCP replies
+                // always go to the broadcast address built above.
                 let _ = meta;
             }
         }
@@ -304,7 +360,11 @@ fn run_poll_loop(rt: Arc<StackRuntime>, tap_fd: OwnedFd,
             }
             for (reply, dst) in to_send {
                 let out: udp::UdpMetadata = dst.into();
-                let _ = s.send_slice(&reply, out);
+                // A dropped DNS reply makes the box's resolve fail/time out;
+                // surface it.
+                if let Err(e) = s.send_slice(&reply, out) {
+                    eprintln!("sarun-engine: net: DNS reply send: {e}");
+                }
             }
         }
 
@@ -328,7 +388,12 @@ fn run_poll_loop(rt: Arc<StackRuntime>, tap_fd: OwnedFd,
         }
         for (h, port, acc) in to_claim {
             claimed.insert(h);
-            let _ = accept_tx.send(acc);
+            // A send failure means the dispatcher receiver is gone, so this
+            // accepted connection will never be serviced — surface it.
+            if let Err(e) = accept_tx.send(acc) {
+                eprintln!("sarun-engine: net: accept handoff dropped \
+                           (dispatcher gone): {e}");
+            }
             listen_pool.push_back((add_listener(&mut sockets, port), port));
         }
         // GC: drop oldest unclaimed-but-stale listeners if pool blows up.
@@ -350,10 +415,23 @@ fn run_poll_loop(rt: Arc<StackRuntime>, tap_fd: OwnedFd,
             }
             let s = sockets.get_mut::<tcp::Socket>(h);
             while s.can_recv() {
-                let chunk = s.recv(|buf| (buf.len(), buf.to_vec()))
-                    .unwrap_or_default();
+                let chunk = match s.recv(|buf| (buf.len(), buf.to_vec())) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        // A recv error on an established socket is a real
+                        // datapath fault, not just "no data"; surface and stop
+                        // draining this socket this tick.
+                        eprintln!("sarun-engine: net: tcp recv: {e}");
+                        break;
+                    }
+                };
                 if chunk.is_empty() { break; }
-                let _ = tx.send(chunk);
+                // A send failure means the per-conn consumer (SmoltcpStream
+                // relay) is gone; drop the route so we stop trying.
+                if tx.send(chunk).is_err() {
+                    rx_map.remove(&h);
+                    break;
+                }
             }
         }
 
@@ -367,7 +445,10 @@ fn add_listener(sockets: &mut SocketSet, port: u16) -> SocketHandle {
     let mut s = tcp::Socket::new(rx, tx);
     // Listen at any local address (we own the whole /16) on this specific
     // port. smoltcp won't accept a 0-port listen, hence the per-port pool.
-    let _ = s.listen(IpListenEndpoint { addr: None, port });
+    // A listen failure means this pool slot won't accept SYNs — surface it.
+    if let Err(e) = s.listen(IpListenEndpoint { addr: None, port }) {
+        eprintln!("sarun-engine: net: listen on port {port}: {e}");
+    }
     sockets.add(s)
 }
 

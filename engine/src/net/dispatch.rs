@@ -137,6 +137,8 @@ fn append_rule_line(line: &str) -> std::io::Result<()> {
     let dir = crate::paths::config_home();
     std::fs::create_dir_all(&dir)?;
     let path = dir.join("filerules");
+    // No prior rules file → start from empty content; this is the first saved
+    // rule, not a swallowed read error.
     let prev = std::fs::read_to_string(&path).unwrap_or_default();
     let tmp = dir.join("filerules.tmp");
     {
@@ -144,7 +146,12 @@ fn append_rule_line(line: &str) -> std::io::Result<()> {
             .create(true).truncate(true).write(true).open(&tmp)?;
         f.write_all(line.as_bytes())?;
         f.write_all(prev.as_bytes())?;
-        f.sync_all().ok();
+        // Best-effort durability: the atomic rename below is what guarantees a
+        // reader never sees a half-written file; an fsync failure here only
+        // weakens crash-durability of a UI-saved rule, so surface but proceed.
+        if let Err(e) = f.sync_all() {
+            eprintln!("sarun-engine: net: fsync filerules.tmp: {e}");
+        }
     }
     std::fs::rename(tmp, path)
 }

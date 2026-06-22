@@ -45,6 +45,9 @@ fn err_response(status: hyper::StatusCode, msg: &str) -> Response<ProxyBody> {
               .map_err(|never| -> Box<dyn std::error::Error + Send + Sync> { match never {} })
               .boxed())
         .unwrap_or_else(|_| {
+            // Building an empty-body response is infallible in practice; this
+            // arm only exists to satisfy the Result. `msg` is purely advisory
+            // and intentionally unused on this fallback path.
             let _ = msg;
             let mut r = Response::new(empty_body());
             *r.status_mut() = status;
@@ -68,6 +71,8 @@ async fn proxy_request(scheme: &'static str, default_port: u16,
         .or_else(|| req.uri().authority().map(|a| a.as_str().to_string()))
         .ok_or_else(|| anyhow!("no Host"))?;
     let (host_only, port) = match host.rsplit_once(':') {
+        // A non-numeric port suffix (or none) falls back to the scheme default
+        // — a deliberate, correct lenient parse, not a swallowed error.
         Some((h, p)) => (h.to_string(), p.parse::<u16>().unwrap_or(default_port)),
         None => (host.clone(), default_port),
     };
@@ -84,13 +89,24 @@ async fn proxy_request(scheme: &'static str, default_port: u16,
             .with_context(|| format!("tls handshake {host_only}"))?;
         let io = TokioIo::new(tls);
         let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await?;
-        tokio::spawn(async move { let _ = conn.await; });
+        // Drive the upstream HTTP/1 connection. An error here (upstream reset
+        // mid-response, etc.) is a real fault behind a body that may already
+        // be streaming to the box — log it instead of vanishing.
+        tokio::spawn(async move {
+            if let Err(e) = conn.await {
+                eprintln!("sarun-engine: net: mitm upstream https conn: {e}");
+            }
+        });
         let resp = sender.send_request(req).await?;
         Ok(resp.map(|b| b.map_err(|e| Box::new(e) as _).boxed()))
     } else {
         let io = TokioIo::new(tcp);
         let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await?;
-        tokio::spawn(async move { let _ = conn.await; });
+        tokio::spawn(async move {
+            if let Err(e) = conn.await {
+                eprintln!("sarun-engine: net: mitm upstream http conn: {e}");
+            }
+        });
         let resp = sender.send_request(req).await?;
         Ok(resp.map(|b| b.map_err(|e| Box::new(e) as _).boxed()))
     }
@@ -110,7 +126,11 @@ pub async fn serve_http(box_side: SmoltcpStream, _host_hint: &str,
     });
     let conn = hyper::server::conn::http1::Builder::new()
         .serve_connection(io, svc);
-    let _ = conn.await;
+    // A box-side connection error (client hangup mid-request, framing error)
+    // is surfaced rather than swallowed so a broken proxy session is visible.
+    if let Err(e) = conn.await {
+        eprintln!("sarun-engine: net: mitm box-side http conn: {e}");
+    }
     Ok(())
 }
 
@@ -148,7 +168,10 @@ pub async fn serve_https(box_side: SmoltcpStream, host: &str,
     });
     let conn = hyper::server::conn::http1::Builder::new()
         .serve_connection(io, svc);
-    let _ = conn.await;
+    // Same as serve_http: surface a box-side TLS/HTTP connection error.
+    if let Err(e) = conn.await {
+        eprintln!("sarun-engine: net: mitm box-side https conn: {e}");
+    }
     Ok(())
 }
 
@@ -160,6 +183,8 @@ pub fn build_upstream_client_config() -> Arc<rustls::ClientConfig> {
     // found it — but we don't depend on that crate; instead we load the
     // most common paths ourselves. Failure → empty store; HTTPS dials will
     // get UnknownIssuer until the user provides one. Pragmatic, not perfect.
+    let mut added = 0usize;
+    let mut rejected = 0usize;
     for p in &[
         "/etc/ssl/certs/ca-certificates.crt",
         "/etc/pki/tls/certs/ca-bundle.crt",
@@ -168,10 +193,23 @@ pub fn build_upstream_client_config() -> Arc<rustls::ClientConfig> {
         if let Ok(pem) = std::fs::read(p) {
             let mut s = pem.as_slice();
             for c in rustls_pemfile_certs(&mut s) {
-                let _ = roots.add(c);
+                // A single malformed cert in the bundle shouldn't abort the
+                // load, but tally rejects so a silently-thinned trust store
+                // (→ UnknownIssuer for some upstreams) is diagnosable.
+                if roots.add(c).is_ok() { added += 1; } else { rejected += 1; }
             }
             break;
         }
+    }
+    if rejected > 0 {
+        eprintln!("sarun-engine: net: {rejected} upstream CA cert(s) rejected \
+                   while loading trust store");
+    }
+    if added == 0 {
+        // No roots → every HTTPS upstream dial fails UnknownIssuer. This is a
+        // serious, otherwise-mysterious condition; make it loud.
+        eprintln!("sarun-engine: net: WARNING no upstream CA roots loaded — \
+                   HTTPS MITM upstream dials will fail to verify");
     }
     let cfg = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
@@ -184,6 +222,9 @@ pub fn build_upstream_client_config() -> Arc<rustls::ClientConfig> {
 fn rustls_pemfile_certs(input: &mut &[u8])
     -> Vec<rustls::pki_types::CertificateDer<'static>>
 {
+    // PEM is ASCII; a non-UTF8 bundle is malformed and yields no certs. The
+    // caller (build_upstream_client_config) already warns loudly when zero
+    // roots end up loaded, so the empty fallback here is safe.
     let s = std::str::from_utf8(input).unwrap_or("");
     let mut out = vec![];
     let mut acc = String::new();
@@ -224,7 +265,12 @@ impl rustls::KeyLog for KeyLogFile {
         use std::io::Write;
         let cr = hex(client_random);
         let s = hex(secret);
-        let _ = writeln!(self.file.lock(), "{label} {cr} {s}");
+        // A keylog write failure means this connection won't decrypt in the
+        // flows pane later; surface it (called a handful of times per conn, not
+        // per packet, so this won't flood).
+        if let Err(e) = writeln!(self.file.lock(), "{label} {cr} {s}") {
+            eprintln!("sarun-engine: net: keylog write: {e}");
+        }
     }
 }
 

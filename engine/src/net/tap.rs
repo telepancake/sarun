@@ -56,7 +56,11 @@ pub fn create_netns_tap() -> Result<OwnedFd> {
     assign_ip(tap_name, subnet.box_ip(), subnet.box_prefix_len())?;
     add_default_route(subnet.gateway_ip())?;
     // Seed the gateway MAC so the box's first packet doesn't stall on ARP.
-    let _ = add_neigh(subnet.gateway_ip(), gateway_mac(), tap_name);
+    // Best-effort by design (the box would ARP-resolve anyway), but a failure
+    // can flag a permissions/kernel issue worth seeing — log, don't abort.
+    if let Err(e) = add_neigh(subnet.gateway_ip(), gateway_mac(), tap_name) {
+        eprintln!("sarun-engine: net: ARP seed for gateway failed: {e}");
+    }
     Ok(tap)
 }
 
@@ -116,7 +120,11 @@ fn set_link_up(name: &str) -> Result<()> {
     write_name(&mut req.name, name)?;
     const SIOCGIFFLAGS: libc::c_ulong = 0x8913;
     const SIOCSIFFLAGS: libc::c_ulong = 0x8914;
-    let _ = unsafe { libc::ioctl(s.as_raw_fd(), SIOCGIFFLAGS as _, &mut req) };
+    // Read existing flags first so the SET below preserves them. If the GET
+    // fails we'd otherwise SET from a zeroed struct, clobbering every other
+    // flag on the interface — bail instead of silently doing that.
+    let g = unsafe { libc::ioctl(s.as_raw_fd(), SIOCGIFFLAGS as _, &mut req) };
+    if g < 0 { bail!("SIOCGIFFLAGS up({name}): {}", std::io::Error::last_os_error()); }
     req.flags |= 0x1; // IFF_UP
     let r = unsafe { libc::ioctl(s.as_raw_fd(), SIOCSIFFLAGS as _, &mut req) };
     if r < 0 { bail!("SIOCSIFFLAGS up({name}): {}", std::io::Error::last_os_error()); }
