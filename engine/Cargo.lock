@@ -7845,8 +7845,6 @@ dependencies = [
 [[package]]
 name = "uucore"
 version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "07d779636d827cde4100f0e65ff3fd23b0b1f1195055475c6e6813d425f30c8e"
 dependencies = [
  "base64-simd",
  "bigdecimal",

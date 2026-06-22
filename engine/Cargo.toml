@@ -190,3 +190,17 @@ uu_tr                    = { path = "vendor/uu_tr" }
 uu_cut                   = { path = "vendor/uu_cut" }
 uu_uniq                  = { path = "vendor/uu_uniq" }
 uu_sort                  = { path = "vendor/uu_sort" }
+# Vendored, patched fork of uucore 0.8.0 — the shared uutils library that backs
+# every uu_* builtin's localization. The 13 in-process coreutil builtins each
+# run on a fresh thread that calls `init_localization("uu_X")`
+# (brush-coreutils-builtins → uucore::locale::setup_localization). Stock uucore
+# was designed for ONE util per process: its embedded-Fluent-resource caches
+# (UUCORE_FLUENT/CHECKSUM_FLUENT/UTIL_FLUENT) are PROCESS-GLOBAL OnceLocks, so
+# the first util to run pins UTIL_FLUENT to its own .ftl and every later util on
+# any thread gets that first util's bundle — its own translate! keys aren't
+# found, so it emits raw Fluent keys (e.g. `tac: tac-error-open-error`). The
+# vendored fork makes those caches thread-local so each util's thread builds and
+# looks up ITS OWN bundle. Only crates.io uucore 0.8.0 is redirected here; the
+# 0.9.0 copy pulled in by vendored findutils is a different version and stays on
+# the registry, unaffected (a [patch] only matches the version it provides).
+uucore                   = { path = "vendor/uucore" }
