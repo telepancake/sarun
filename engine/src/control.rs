@@ -2151,7 +2151,13 @@ pub fn cli_box_op(argv: &[String]) -> i32 {
         }
         Some("rename") => {
             let new = argv.get(2).map(String::as_str).unwrap_or("");
-            report(one(json!({"type": "rename", "sid": name, "name": new})))
+            match one(json!({"type": "rename", "sid": name, "name": new})) {
+                Ok(v) if v.get("ok").and_then(Value::as_bool) == Some(true) => {
+                    println!("renamed box {name} -> {new}");
+                    0
+                }
+                other => report(other),
+            }
         }
         Some("patch") => {
             match one(json!({"type": "patch", "sid": name})) {
