@@ -1,19 +1,17 @@
 #!/usr/bin/env python3
-"""m5 spike: the RUST UI client (ui/) rendered headlessly against a live engine.
-Proves a Rust client speaks the wire protocol, fetches real box state, and
-renders it with ratatui into a buffer we assert on — no terminal. Python
-orchestrates; both the engine and the ui client are black-box binaries. Run:
+"""The Rust UI rendered headlessly against a live engine. The UI lives in the
+engine binary (engine/src/ui.rs); `sarun --once --sock PATH` renders one frame
+to a ratatui TestBackend, prints it, and exits. Proves the client speaks the
+wire protocol, fetches real box state, and renders it — no terminal. Run:
     uv run --with "pyfuse3>=3.2" --with "trio>=0.22" --with "wcmatch>=8.4" \
       --with "python-magic>=0.4" python test_ui_rs.py
-Skips if cargo / the binaries are unavailable.
 """
 import os, socket, subprocess, sys, tempfile, shutil, time
 from pathlib import Path
 from importlib.machinery import SourceFileLoader
 
 SARUN = "/home/user/sarun/prototype/sarun"
-ENG = Path("/home/user/sarun/engine/target/x86_64-unknown-linux-musl/release/sarun-engine")
-UI = Path("/home/user/sarun/ui/target/x86_64-unknown-linux-musl/release/sarun-ui")
+ENG = Path("/home/user/sarun/engine/target/x86_64-unknown-linux-musl/release/sarun")
 
 _fails = []
 def check(c, m):
@@ -40,9 +38,7 @@ def wait_socket(s, t=30):
 
 
 def main():
-    if not (build(ENG.parents[1], ENG) and build(UI.parents[1], UI)):
-        print("  ok  ui-rs: cargo/binaries unavailable — SKIP\n\nUI-RS PASS (skipped)")
-        return 0
+    assert build(ENG.parents[1], ENG), f"engine binary missing: {ENG} — run `make engine`"
     tmp=Path(tempfile.mkdtemp(prefix="uirs-"))
     for k,s in (('XDG_STATE_HOME','state'),('XDG_RUNTIME_DIR','run'),
                 ('XDG_CONFIG_HOME','c'),('XDG_DATA_HOME','d')): os.environ[k]=str(tmp/s)
@@ -55,18 +51,18 @@ def main():
         sock=m.sock_path()
         if not wait_socket(sock): raise RuntimeError("engine socket never came up")
         # empty render first: the UI talks to the engine and draws the frame
-        r=subprocess.run([str(UI),'--once','--sock',sock],
+        r=subprocess.run([str(ENG),'--once','--sock',sock],
                          capture_output=True,text=True,timeout=30)
         check(r.returncode==0, f"ui-rs: --once exits 0 (got {r.returncode}: {r.stderr[-200:]})")
         check("sarun" in r.stdout and "boxes" in r.stdout,
               "ui-rs: rendered the boxes pane frame (ratatui -> buffer)")
-        check("PATH" in r.stdout and "STATUS" in r.stdout,
+        check("Name" in r.stdout and "PID" in r.stdout and "Cmd" in r.stdout,
               "ui-rs: header row rendered")
         check("(no boxes)" in r.stdout, "ui-rs: empty state shown with no boxes")
         # now create a box and re-render: it must appear in the frame
         rep=m.sync_request(sock,type="ui",verb="box_new",args=[])
         bid=rep["r"]["sid"]
-        r=subprocess.run([str(UI),'--once','--sock',sock],
+        r=subprocess.run([str(ENG),'--once','--sock',sock],
                          capture_output=True,text=True,timeout=30)
         check(bid in r.stdout,
               "ui-rs: the live box appears in the rendered frame over the wire")
