@@ -23,6 +23,13 @@ brush-coreutils-builtins = { version = "0.1", features = ["coreutils.all"] }
 # `[patch.crates-io]` below redirects this to our vendored fork (vendor/uu_cat),
 # the same copy brush-coreutils-builtins already pulls in transitively.
 uu_cat = "0.8"
+# More uutils crates ported the same way (vendored fork + injected-I/O logical
+# entry) so they run as NATIVE in-process brush builtins — pipeline-safe, no
+# dup2. Each is redirected to its vendored fork by `[patch.crates-io]` below.
+uu_head = "0.8"
+uu_wc = "0.8"
+uu_nl = "0.8"
+uu_tac = "0.8"
 # Vendored, find-only fork of uutils/findutils 0.9.1: run `find` as an
 # in-process brush builtin against the shell's logical I/O. See vendor/findutils.
 findutils = { path = "vendor/findutils" }
@@ -159,3 +166,10 @@ brush-interactive        = { path = "vendor/brush-interactive" }
 # keeping the Linux splice(2) fast path. The retained `uumain` is a thin bridge
 # for the standalone binary / subprocess dispatcher. See vendor/uu_cat/src/cat.rs.
 uu_cat                   = { path = "vendor/uu_cat" }
+# Same injected-I/O treatment as uu_cat: a logical entry that writes the shell's
+# OpenFile sink/source with no process-global stdio, consumed by the native
+# Head/Wc/Nl/Tac builtins in src/brush.rs (gated in src/brush_gates.rs).
+uu_head                  = { path = "vendor/uu_head" }
+uu_wc                    = { path = "vendor/uu_wc" }
+uu_nl                    = { path = "vendor/uu_nl" }
+uu_tac                   = { path = "vendor/uu_tac" }
