@@ -1,116 +1,114 @@
-# sarun codebase audit — serious issues and the comments that excuse them
+# sarun audit — open issues
 
-Adversarial audit, four parallel deep passes (overlay/apply data-loss; engine
-concurrency/control plane; repo-wide guard-comment hunt; oaita secrets + test
-integrity), reconciled by hand. Findings verified against code, not comments.
+Status of the earlier adversarial audit, reconciled against the current code.
+Findings verified in the source, not from comments. Fixed and deliberate items
+are recorded so they aren't re-flagged; the rest are genuinely open.
 
-## Meta (own it first)
+## Fixed
 
-- The most dangerous findings sit behind confident `SAFETY` / "refusing to" /
-  "best-effort" comments that assert the exact guarantee the code does not
-  deliver. That is the anti-pattern flagged: documentation that excuses a bug
-  instead of the bug being fixed.
-- Two of these are **mine, this session**: the `unshare(CLONE_FS)` "fall back to
-  process cwd" comments (H2), and I re-committed `close_stray_fds` (H1) in the
-  vendoring reconstruction *with an approving commit message* instead of
-  flagging its false safety claim.
-- My own keyword-based "guard hunt" sub-pass concluded the anti-pattern was
-  "essentially absent / culture is fail-loud." The passes that traced the data
-  path found the opposite. The charitable keyword read is itself the failure
-  mode — its conclusion is discarded here.
+- **C2 (ancestor symlink escape on apply).** `review.rs` materialize now resolves
+  every parent component with `O_NOFOLLOW` via `hostfs::parent_beneath`, so a
+  box-planted `etc -> /` can no longer redirect a write onto the host. (The
+  truncate-in-place residue is still open — see C2' below.)
+- **H1 (fork/exec malloc deadlock).** `sarun_close_stray_fds` was removed: it
+  only closed `FD_CLOEXEC` fds, which the kernel already closes on `execve`, so
+  it was redundant; its `read_dir`/`format!`/`Vec` allocations ran between
+  `fork()` and `execve()` and could deadlock on the malloc lock. The false
+  "allocate nothing / async-signal-safe" comment is gone with it.
+- **H2 (silent wrong-directory in find/xargs).** The `unshare(CLONE_FS)` hack is
+  gone; `find`/`xargs` resolve against the shell's logical cwd
+  (`Dependencies::cwd`). No fallback, no silent wrong directory.
+- **H5 (OCI digest path traversal).** `read_blob_by_digest` now rejects digest
+  components containing `/`, `\`, NUL, `.`, or `..` before joining them onto the
+  blob path, and no longer returns unverified bytes for non-sha256 algorithms.
+- **L1 (statfs NUL panic).** `statfs` returns `EINVAL` instead of `unwrap()`-ing
+  a `CString::new` failure on an interior-NUL path.
+- **T2 (stale "rename is ENOSYS").** The overlay header comment matched an
+  unimplemented state; rename is implemented, the comment is corrected.
+- **Net datapath for Tap boxes (was not in the original audit).** A regular `-n`
+  box reached the network through the engine's MITM proxy + synthetic DNS, but
+  the overlay shadowed `/etc/resolv.conf` and the CA bundle only for `--api`
+  boxes — so every non-oaita Tap box failed DNS (`getent` exit 2) and HTTPS
+  (untrusted MITM cert). Both shadows now fire for any Tap box (`is_tap`).
+- **Test binary paths (part of T4).** `pjdfstest_rs` pointed `BIN` at a
+  non-existent `prototype/engine/...` path; `struct_rs`/`workloads_rs`/`ui_rs`
+  pointed at `release/sarun-engine` (the binary is `sarun`) and `ui_rs` drove a
+  phantom `sarun-ui`. All never found a binary, so they ran `make engine` every
+  time and then fake-green-skipped or timed out. Fixed to drive `sarun`; they now
+  test for real.
 
----
+## Deliberate (not a bug; now documented)
 
-## CRITICAL — data loss / durability
+- **C1 (capture DB `synchronous=OFF`).** This sqlar holds a box's captured writes
+  in escrow; the host is never touched until an explicit apply, so an OS crash
+  can only lose or corrupt an in-progress, re-runnable box — never host data.
+  `OFF` avoids an fsync per write on the high-volume capture path. WAL/NORMAL
+  would add fsync latency and `-wal`/`-shm` side files for durability this store
+  does not need. Justified in a comment at `capture.rs`. (If durability of a
+  finished, kept-but-unapplied box ever matters, the fix is one fsync at box
+  finalization, not per-txn `synchronous=NORMAL`.) M5 (`overlay.rs` dropped
+  `sync_all`) is the same tradeoff.
 
-| ID | Location | Issue |
-|----|----------|-------|
-| C1 | `capture.rs:365` | Capture DB opens `journal_mode=DELETE; synchronous=OFF`. The *only* store holding a box's captured work is **not crash-durable** — an OS crash/power-loss after a write is "captured" can leave the sqlar **corrupt**, not just missing its last txn. Blobs are never `fsync`'d. No comment justifies the `OFF`. |
-| C2 | `review.rs:485–533` | Apply/materialize **writes through symlinked parent directories**. The guard only checks the *final* component. Apply order is `ORDER BY name`, so a box capturing `etc -> /` then `etc/evil` materializes the symlink first, then writes `etc/evil` **onto `/evil` on the real host**. Comment: *"refusing to write through a symlink"* — false for ancestors. Also `std::fs::write` truncate-in-place (no temp+rename, no fsync): an error mid-write destroys prior content. |
-| C3 | `review.rs:550–588` | Multi-path apply has **no atomicity, no rollback**. Materialize-then-consume per path; if path 3/10 errors, 1–2 are on the real FS and consumed, 3–10 pending. A coherent change set can end half-applied with no "nothing happened" outcome. |
+## Open — correctness / data path
 
-## HIGH — correctness
+- **C2' (`review.rs` materialize).** `std::fs::write` truncates in place: an error
+  mid-write destroys prior content, and there is no temp-then-rename. (Ancestor
+  symlink escape is fixed; this atomicity gap is not.)
+- **C3 (`review.rs` apply).** Multi-path apply has no atomicity and no rollback:
+  materialize-then-consume per path, so an error at path N leaves 1..N-1 on the
+  host and consumed, N.. pending. No "nothing happened" outcome.
+- **H3 (`review.rs`/`control.rs`).** `apply`/`discard` have no running-box guard
+  (unlike `dissolve`): they read `blob_path(id,rowid)` — the file the live FUSE
+  write is mid-`write_at` on — and can stamp a torn blob onto the host.
+- **H4 (`review.rs` metadata restore).** Mode is applied at create
+  (`hostfs::write_file_at(..., mode)`); owner and xattr restore drop their
+  results. The owner drop is legitimately best-effort (lchown EPERMs unprivileged),
+  but a failed `setxattr` is silently lost.
+- **M1.** Apply has no clobber/staleness check: a host file changed between
+  capture and apply is silently overwritten (the `stale` flag is UI-advisory).
+- **M2.** Single-instance guard is TOCTOU (`connect().is_ok()` probe, then a
+  later `remove_file`+`bind`): two engines on one `XDG_RUNTIME_DIR` can race.
+- **M3.** `brush.rs` CoreutilWrapper's process-global `dup2(fd 1/2)` is narrowed
+  by `spawned_pipeline_stage` but still races non-pipeline sibling threads.
+- **M4.** `control.rs` uses `state.lock().unwrap()` with no `catch_unwind`: one
+  panic under the lock poisons it → permanent control-plane outage.
+- **M6.** Passthrough/`-d` write swallows `create_dir_all` errors then opens for
+  write; a partial host dir tree can be left on a write the box thinks failed.
 
-| ID | Location | Issue |
-|----|----------|-------|
-| H1 | `brush-core/src/commands.rs` `sarun_close_stray_fds` | SAFETY comment claims *"allocate nothing … async-signal-safe."* The closure runs `read_dir` + `Vec::with_capacity` + `into_string` + `read_link(format!())` **between `fork()` and `execve()`** in a multithreaded process → child can **deadlock on the malloc lock before exec**. Fires for every external command a box forks. *(Re-blessed by me in the reconstruction.)* |
-| H2 | `find_builtin.rs:131`, `xargs_builtin.rs:132` | `unshare(CLONE_FS)` failure → `find .` walks the **engine daemon's `$HOME`**, `xargs` children run there, **exit 0, no error**. Trips for every find/xargs under any seccomp profile filtering `unshare`. Comment *"fall back to the process cwd"* hides a silent wrong-directory bug. *(Mine, this session.)* |
-| H3 | `review.rs` / `control.rs:375,1163` | `apply`/`discard` have **no running-box guard** (unlike `dissolve`). Apply reads `blob_path(id,rowid)` — the same file the live FUSE `write` is mid-`write_at` on — and can stamp a **torn blob** onto the real host. Comment *"apply() operates on a stopped box's archive"* is unenforced. |
-| H4 | `review.rs:453–483` | Metadata restore is fire-and-forget: every `utimensat`/`lchown`/`lsetxattr`/`set_permissions` result dropped. "best-effort" is fairly scoped to *owner* but silently blankets **mode** — a `0600` secret can land world-readable, apply reports success. |
-| H5 | `oci.rs:1074` `read_blob_by_digest` | **Path traversal**: a manifest-supplied digest string is `join`ed onto a host path **without** the `..`/absolute guard the layer-ingest path (`oci.rs:1226`) correctly applies. A crafted/pulled image can read a host file outside the blob store. |
-| H6 | `prototype/test_symlink_escape.py`, `test_write_path_contract.py`, `test_chmod_readonly.py`, `test_changes_view_incremental.py`, `test_table_reconcile.py`, `test_rpane_scroll.py`, `test_ui_smoke.py`, `test_pty_ui_rs.py` | **8 assertion-bearing test files are silently NOT RUN by `make test`** — verified: `pytest --collect-only` yields 0 items from each (all logic under `__main__`, no `def test_*`), and no Makefile target invokes them as scripts. Most damning: `test_symlink_escape.py` is an *adversarial test that exists to prove the daemon never follows a sandbox-planted symlink onto a host target* — the **C2 bug class** — and it runs **never**. (These are prototype tests, so they wouldn't have caught the Rust-engine C2 either; the Rust port has no symlink-escape test at all. Double gap: guard not run, production path never covered.) `conftest.py`'s false-green protection can't help — no collected item ⇒ the hook never fires. |
+## Open — robustness
 
-## MEDIUM
+- **L2.** Apply path-shape safety rests on FUSE rows not containing `..`; an OCI/
+  tar import that admits `..` would reopen host traversal.
+- **L3 (`frames.rs`).** The u32 frame length is trusted with no cap; a box can
+  grow a per-channel buffer toward 4 GiB.
+- **L4.** `libc::write`/`read` return values are ignored on some echo/PTY/frame
+  paths; a short write silently truncates output or desyncs the frame stream.
+- **L5 (`control.rs`).** `shutdown` SIGTERMs self and returns ok; in-flight
+  apply/register on other threads race teardown.
+- **T1.** `(code & 0xff)` + `.code().unwrap_or(...)` collapse signal deaths
+  (SIGSEGV/SIGKILL) into bogus exit codes in find/xargs/brush/runner.
 
-| ID | Location | Issue |
-|----|----------|-------|
-| M1 | `review.rs` | No clobber/staleness check on apply (the `stale` flag is UI-advisory only): a real file changed between capture and apply is silently overwritten. A directory tombstone → `remove_dir_all` on the live host path with no scope check. |
-| M2 | `main.rs:86` + `control.rs` | Single-instance guard is TOCTOU: `connect().is_ok()` probe, then much later `remove_file`+`bind`. Two engines on the same `XDG_RUNTIME_DIR` can steal the socket and corrupt each other's mount/overlay. |
-| M3 | `brush.rs:167` | CoreutilWrapper's process-global `dup2(fd 1/2)` is narrowed by `spawned_pipeline_stage` but still races *non-pipeline* sibling threads (FUSE serve, ECHO reader, find/xargs workers) in the same address space. |
-| M4 | `control.rs` (pervasive) | `state.lock().unwrap()` everywhere, no `catch_unwind` around connection handlers. One panic under the lock **poisons it → permanent control-plane outage** while the process keeps running. |
-| M5 | `overlay.rs:1981` | `let _ = f.sync_all()` — an in-box program's successful `fsync()` doesn't guarantee the captured copy hit disk (compounds C1). |
-| M6 | `overlay.rs:1329` | Passthrough/`-d direct` swallows `create_dir_all` errors then opens for write; a partially-created real-host dir tree can be left behind on a write the box thinks failed. |
+## Open — tests
 
-## LOW
+- **T4 (fake-green skips).** Beyond the binary-path fixes above, most `*_rs.py`
+  still `return 0` ("PASS (skipped)") when the binary can't be built. In this
+  container the binary always builds, so the skip only ever masks breakage; it
+  should fail loud instead.
+- **H6 (inert test files).** `test_symlink_escape.py`, `test_write_path_contract.py`,
+  `test_chmod_readonly.py`, `test_changes_view_incremental.py`,
+  `test_table_reconcile.py`, `test_rpane_scroll.py`, `test_ui_smoke.py` expose no
+  `def test_*`, so `make test` collects nothing from them. They test the Python
+  prototype overlay/UI; their engine-relevant coverage (the symlink-escape guard
+  especially, given C2) needs a Rust-engine equivalent.
+- **`make test` has no `--timeout`.** A hanging test hangs the suite forever
+  (pytest-timeout is installed but never passed `--timeout`).
+- **Brush coreutil gate gap.** `test_make_rs`/`test_n2_rs`/`test_brush_link_rs`/
+  `test_brush_nested_sh_rs` assert `cp` runs as an in-process builtin, but `cp`
+  has no `brush_gates.rs` gate (gates default to forking the host binary). The
+  recipes run correctly via external `cp`; the in-process assertions are ahead of
+  the implementation.
 
-- **L1** `review.rs:516,454`, overlay `statfs` — `CString::new(path).unwrap()` panics the handler thread on an interior-NUL path.
-- **L2** `review.rs:535` — apply path-shape safety rests on the *incidental* property that FUSE rows can't contain `..`; a future capture source (OCI/tar import) admitting `..` reopens host traversal.
-- **L3** `frames.rs:114` — frame length field trusted (u32); a box dribbling a `0xFFFFFFFF` header grows the per-channel buffer toward 4 GiB. No max-frame cap.
-- **L4** `runner.rs:621,968,1186,1196`, `brush.rs:731,783` — `libc::write/read` return values ignored on echo/PTY/frame paths; a short write silently truncates captured output or desyncs the length-prefixed frame stream.
-- **L5** `control.rs:434` — `shutdown` SIGTERMs self and returns `ok`; in-flight apply/register on other threads race the teardown (acknowledged in-comment, not mitigated).
+## Open — tech debt
 
-## TECH-DEBT / STALE DOC
-
-- **T1** `find_builtin.rs:157`, `xargs_builtin.rs:157`, `brush.rs:297/336`, `runner.rs` — `(code & 0xff)` + `.code().unwrap_or(1/127)` collapse signal deaths (SIGSEGV/SIGKILL) into bogus exit codes; a capture/provenance tool records a lie about *why* a command died.
-- **T2** `overlay.rs:11` — module header still says *"rename is ENOSYS for now"*; rename is fully implemented at `overlay.rs:2024`.
-- **T3** `CLAUDE.md` — claims `make test` excludes only `test_e2e.py` + `test_pjdfstest.py`; the Makefile also ignores **`test_oci.py`**. `test_pjdfstest.py` docstring still carries a stale `/home/user/venv` example.
-- **T4** ~23 `prototype/test_*_rs.py` — self-report `PASS (skipped)` and `return 0` when the Rust binary can't be built; green is **vacuous in a toolchain-less env** (real here because the binary is built).
-- **T5** `engine/vendor/findutils/Cargo.lock` — gitignored but regenerated; recurring "accidental artifact" that just blocked the rebase. Never fixed at the root.
-
-## The guard-comments themselves (the load-bearing lies)
-
-1. `commands.rs` close_stray_fds — *"allocate nothing … async-signal-safe"* → allocates + `opendir`/`readlink` (H1).
-2. `review.rs` materialize — *"refusing to write through a symlink"* → not for parent dirs (C2).
-3. `find_builtin.rs`/`xargs_builtin.rs` — *"fall back to the process cwd"* → silent wrong-directory (H2). **Mine.**
-4. `review.rs` metadata — *"best-effort"* (owner) silently covering mode (H4).
-5. `overlay.rs:11` — *"rename is ENOSYS for now"* → implemented (T2).
-
----
-
-## Verified CLEAN (reported honestly, not everything is broken)
-
-- **Secrets — oaita proxy is clean.** The upstream `api_key` lives only in host
-  memory (`oaita/config.rs`, `proxy.rs`); the box-visible `oaita.toml` is a
-  FUSE-substituted safe file with **no key** (`main.rs:161`, `overlay.rs:423`);
-  the `Bearer` header is attached **only host-side** after the UDS crossing
-  (`client.rs:202`); box env carries only `OPENAI_BASE_URL` + `SARUN_BROKER`, no
-  key; the `api_log` sqlar lives in an engine dir hidden from boxes
-  (`is_engine_path`), and the key is never a logged column. TLS is properly
-  verified (rustls `RootCertStore`, **no** `danger_accept_invalid_certs`).
-- **Discard never touches the real FS** (`review.rs:595`) — verified.
-- **Copy-up is genuinely lazy CoW** — the lower/host file is only ever read,
-  never written, except the explicitly opt-in `-d`/passthrough rule.
-- **Test suite is *mostly* honest, with one material hole (H6).** `conftest.py`
-  genuinely converts the non-raising `check()`/`_fails` idiom into real pytest
-  failures; broad `except` blocks route into `_fails` or are teardown-only; the
-  explicit `make test` exclusions (e2e/pjdfstest/oci) are heavy-but-real suites
-  with their own targets, not hidden failures; "141 passed" is a plausible,
-  honestly-directioned count (below the 158 collected, the right direction).
-  BUT see H6: 8 real test files contribute **zero** collected items and are
-  invisible to `make test` — including the adversarial symlink-escape guard.
-  So the green number is trustworthy *for what it runs*, and silently blind to
-  those 8 files.
-
----
-
-## Suggested fix order (highest stakes first)
-
-1. **C1** — `synchronous=NORMAL` + WAL; fsync blobs before reporting "captured".
-2. **C2** — verify every ancestor (or `O_NOFOLLOW` per component) + write-temp-then-rename in materialize.
-3. **H1** — pre-fork fd snapshot or `close_range(2)` over a precomputed keep-set; delete the false SAFETY comment.
-4. **H2 / H3** — make `unshare` failure and live-box apply **fail loudly**, not silently.
-5. **H5** — apply the ingest-path `..`/absolute guard to `read_blob_by_digest`.
-6. **H6** — cheap, high-value: add the missing `def test_*` pytest entry to the 8
-   inert files (the other `*_rs.py` already do this), so `make test` actually
-   runs them; and write a Rust-engine symlink-escape test that exercises C2.
-7. Then H4, the MEDIUMs, and the stale-doc cleanups (T2/T3/T5).
+- **T5.** `engine/vendor/findutils/Cargo.lock` is gitignored but regenerated; it
+  recurs as an accidental artifact and blocks rebases.
