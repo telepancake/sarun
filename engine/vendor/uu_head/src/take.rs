@@ -37,7 +37,11 @@ impl TakeAllBuffer {
         }
     }
 
-    fn write_bytes_exact(&mut self, writer: &mut impl Write, bytes: usize) -> std::io::Result<()> {
+    fn write_bytes_exact(
+        &mut self,
+        writer: &mut (impl Write + ?Sized),
+        bytes: usize,
+    ) -> std::io::Result<()> {
         let buffer_to_write = &self.remaining_buffer()[..bytes];
         writer.write_all(buffer_to_write)?;
         self.start_index += bytes;
@@ -45,7 +49,7 @@ impl TakeAllBuffer {
         Ok(())
     }
 
-    fn write_all(&mut self, writer: &mut impl Write) -> std::io::Result<usize> {
+    fn write_all(&mut self, writer: &mut (impl Write + ?Sized)) -> std::io::Result<usize> {
         let remaining_bytes = self.remaining_bytes();
         self.write_bytes_exact(writer, remaining_bytes)?;
         Ok(remaining_bytes)
@@ -53,7 +57,7 @@ impl TakeAllBuffer {
 
     fn write_bytes_limit(
         &mut self,
-        writer: &mut impl Write,
+        writer: &mut (impl Write + ?Sized),
         max_bytes: usize,
     ) -> std::io::Result<usize> {
         let bytes_to_write = self.remaining_bytes().min(max_bytes);
@@ -93,7 +97,7 @@ impl TakeAllBuffer {
 /// 4 - Go back to (1).
 pub fn copy_all_but_n_bytes(
     reader: &mut impl Read,
-    writer: &mut impl Write,
+    writer: &mut (impl Write + ?Sized),
     n: usize,
 ) -> std::io::Result<usize> {
     let mut buffers: VecDeque<TakeAllBuffer> = VecDeque::new();
@@ -180,7 +184,7 @@ impl TakeAllLinesBuffer {
 
     fn write_lines(
         &mut self,
-        writer: &mut impl Write,
+        writer: &mut (impl Write + ?Sized),
         max_lines: usize,
         separator: u8,
     ) -> std::io::Result<BytesAndLines> {
@@ -248,7 +252,7 @@ impl TakeAllLinesBuffer {
 /// Note that lines will regularly straddle multiple [`TakeAllLinesBuffer`] instances. The `partial_line`
 /// flag on [`TakeAllLinesBuffer`] tracks this, and we use that to ensure that we write out enough
 /// lines in the case that the input file doesn't end with a `separator` character.
-pub fn copy_all_but_n_lines<R: Read, W: Write>(
+pub fn copy_all_but_n_lines<R: Read, W: Write + ?Sized>(
     mut reader: R,
     writer: &mut W,
     n: usize,
