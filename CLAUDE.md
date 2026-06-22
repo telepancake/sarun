@@ -1,9 +1,9 @@
 # Working on sarun
 
 This repo runs and tests in this container with `uv` plus a few apt packages
-(below). Python deps install themselves from `prototype/sarun`'s PEP 723 header
-on first run — no venv, no pip. If something looks like it needs a venv or a
-manual install, that's a stale artifact; fix it.
+(below). The tests pull their Python deps via `uv run --with …` (see the test
+target) — no venv, no pip. If something looks like it needs a venv or a manual
+install, that's a stale artifact; fix it.
 
 ## What sarun is
 
@@ -34,15 +34,16 @@ On top of that base it also has:
   `Bearer` header after the box boundary, and the box's `oaita.toml` is
   FUSE-shadowed to a keyless copy pointed at the in-engine proxy.
 
-## The two `sarun` binaries
+## The binary and the test library
 
-- **`engine/target/x86_64-unknown-linux-musl/release/sarun`** — the Rust port.
-  The production target: a full standalone UI + engine.
-- **`prototype/sarun`** — the original Python single-file app (a `uv` script).
-  The Rust port was built against it. It is still load-bearing as the **test
-  harness**: every `prototype/test_*.py` imports it (`SourceFileLoader`) for the
-  wire-protocol client (`sync_request`), the sqlar readers (`sqlar_content`,
-  `sqlar_mode`, …), and the path helpers.
+- **`engine/target/x86_64-unknown-linux-musl/release/sarun`** — the program. A
+  full standalone UI + engine. This is the only thing that runs.
+- **`prototype/libtestsarun.py`** — NOT a program; the test-support library the
+  engine tests import (`SourceFileLoader`) for the wire-protocol client
+  (`sync_request`, `RemoteSupervisor`), the sqlar readers/writers used to build
+  box fixtures (`Index`, `consolidate`, `sqlar_*`), and the rules/hunks parity
+  helpers. It was carved from the original Python prototype (now deleted; the
+  app/UI/overlay are in git history).
 
 `sakar` (top level, its own `test_sakar*.py`) is a separate sibling tool — do
 NOT touch it when working on sarun.
@@ -64,14 +65,11 @@ file engine/target/x86_64-unknown-linux-musl/release/sarun   # "statically linke
 ## Run
 
 ```
-make run        # the Rust binary if built, else prototype/sarun
-make run-py     # always the prototype
-prototype/sarun -h
-prototype/sarun -- some cmd     # run `some cmd` in a sandbox (needs the UI running)
+make engine      # build ./sarun (the symlink)
+make run         # start the engine + UI
+./sarun -h       # full command surface
+./sarun run -- some cmd     # run `some cmd` in a sandbox (needs the UI running)
 ```
-
-The prototype's first run builds a patched pyfuse3 (~25 s, then cached) — needs
-network + a C toolchain. `make warmup` pays this once.
 
 ## System dependencies
 
@@ -80,20 +78,17 @@ apt-get install -y libfuse3-dev fuse3 pkg-config bubblewrap gcc
 apt-get install -y iproute2 tshark          # only for the network tests
 ```
 
-The pyfuse3 build needs `fuse3`/`pkg-config`/`gcc`; boxes need `bwrap`; the
-`test_net_rs.py` box datapath needs `ip` (iproute2) and the flow tests need
-`tshark`.
+Boxes need `bwrap` and `fusermount3` (the `fuse3` package); the `test_net_rs.py`
+box datapath needs `ip` (iproute2) and the flow tests need `tshark`.
 
 ## Run the tests
 
 `make test` runs the suite from `prototype/` (real FUSE mounts, real bwrap, real
-network) excluding `test_e2e.py`, `test_pjdfstest.py`, and `test_oci.py` (each
-has its own target). Build the engine first so the `*_rs.py` tests have a binary
-to drive.
+network) excluding `test_oci.py` (its own target). Build the engine first so the
+`*_rs.py` tests have a binary to drive.
 
 ```
 make test           # the whole suite
-make test-e2e       # end-to-end: real UI + real boxes
 make test-oci       # hermetic OCI tests (synthetic archive; needs `make engine`)
 ```
 
@@ -125,5 +120,5 @@ unpushed commit is unsynced risk. Push every logical commit immediately
 
 ## The one rule
 
-Before claiming something can't run, run it. `prototype/sarun -h`, `make`, and
+Before claiming something can't run, run it. `make engine`, `./sarun -h`, and
 `make test` all work from a clean checkout here.

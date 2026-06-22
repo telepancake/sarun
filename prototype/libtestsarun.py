@@ -23,6 +23,8 @@ import hashlib
 
 import json
 
+import magic   # python-magic; used by the file-type / struct helpers
+
 import os
 
 import re

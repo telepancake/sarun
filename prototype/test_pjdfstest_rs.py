@@ -15,7 +15,7 @@ from importlib.machinery import SourceFileLoader
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "bench"))
 import extsuite
-from test_pjdfstest import parse_failures, GROUPS  # reuse parser + group list
+from extsuite import parse_failures, GROUPS  # parser + group list
 
 BIN = Path(__file__).resolve().parent.parent / "engine/target/x86_64-unknown-linux-musl/release/sarun"
 PYBASELINE = Path("bench/pjdfstest_baseline.txt")
