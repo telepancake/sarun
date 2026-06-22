@@ -168,6 +168,30 @@ fn clear_cloexec(fd: i32) {
     }
 }
 
+/// Write ALL of `data` to `fd`, looping over partial writes (audit L4). A bare
+/// `libc::write` may write fewer bytes than requested — a short write on the
+/// length-prefixed box channel desyncs the frame stream, and a short write on a
+/// replay/echo fd silently truncates the box's visible output. Retries EINTR;
+/// returns false on a real error or EOF (write returning 0), so callers can
+/// stop instead of spinning. Async-signal-unsafe (fine: never called between
+/// fork and exec).
+fn write_all_fd(fd: i32, data: &[u8]) -> bool {
+    let mut off = 0usize;
+    while off < data.len() {
+        let n = unsafe {
+            libc::write(fd, data[off..].as_ptr().cast(), data.len() - off)
+        };
+        if n < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EINTR) { continue; }
+            return false; // real write error (EPIPE, EBADF, …)
+        }
+        if n == 0 { return false; } // no progress: treat as EOF
+        off += n as usize;
+    }
+    true
+}
+
 // ── tty job-control (interactive boxes) ──────────────────────────────────────
 // We are PID 1 in the box's pid namespace, so process-group ids put on the
 // controlling terminal are namespace-local — which lets a job-control shell
@@ -603,7 +627,10 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
 /// Send one frame (optionally with our pidfd as SCM_RIGHTS) over the box channel.
 fn send_frame(conn_fd: i32, frame: &[u8], pidfd: Option<i32>) {
     let Some(fd) = pidfd else {
-        unsafe { libc::write(conn_fd, frame.as_ptr().cast(), frame.len()); }
+        // No ancillary fd: a plain stream write, but it MUST go out whole — a
+        // short write here desyncs the length-prefixed channel for every later
+        // frame. Loop until fully written (audit L4).
+        let _ = write_all_fd(conn_fd, frame);
         return;
     };
     let mut iov = libc::iovec {
@@ -950,8 +977,9 @@ fn inner_capture(conn_fd: i32, cmd: Vec<String>) -> i32 {
                 }
                 if ft == crate::frames::FRAME_ECHO && !payload.is_empty() {
                     let realfd = if payload[0] == 1 { 2 } else { 1 };
-                    unsafe { libc::write(realfd, payload[1..].as_ptr().cast(),
-                                         payload.len() - 1); }
+                    // Replay the full echo: a short write would silently truncate
+                    // the box's live, upward-chaining output (audit L4).
+                    let _ = write_all_fd(realfd, &payload[1..]);
                 } else if ft == crate::frames::FRAME_ECHO_DONE {
                     done2.store(true, std::sync::atomic::Ordering::SeqCst);
                     return;
@@ -1168,7 +1196,9 @@ fn inner_pty(conn_fd: i32, cmd: Vec<String>) -> i32 {
             if n <= 0 { master_eof = true; }
             else {
                 let s = &b[..n as usize];
-                unsafe { libc::write(1, s.as_ptr().cast(), s.len()); }
+                // Full write to the live tty: a short write would drop part of
+                // the child's terminal output (audit L4).
+                let _ = write_all_fd(1, s);
                 // Recorded copy: a real write through the FUSE sink (captured).
                 let _ = (&sink).write_all(s);
             }
@@ -1178,8 +1208,11 @@ fn inner_pty(conn_fd: i32, cmd: Vec<String>) -> i32 {
         if stdin_open && fds[1].revents & libc::POLLIN != 0 {
             let mut b = [0u8; 65536];
             let n = unsafe { libc::read(stdin_fd, b.as_mut_ptr().cast(), b.len()) };
-            if n > 0 { unsafe { libc::write(master, b.as_ptr().cast(), n as usize); } }
-            else { stdin_open = false; } // EOF
+            if n > 0 {
+                // Feed every keystroke byte to the pty master; a short write
+                // would drop input the child never sees (audit L4).
+                let _ = write_all_fd(master, &b[..n as usize]);
+            } else { stdin_open = false; } // EOF
         }
         if stdin_open && fds[1].revents & (libc::POLLHUP | libc::POLLERR
                                            | libc::POLLNVAL) != 0 {

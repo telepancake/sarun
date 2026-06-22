@@ -144,6 +144,22 @@ impl brush_core::builtins::Command for FindBuiltin {
             Ok(handle) => handle.join().unwrap_or(1),
             Err(_) => 1,
         };
-        Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
+        Ok(brush_core::results::ExecutionResult::new(exit_code_to_u8(code)))
     }
+}
+
+/// Narrow find's `i32` exit code to the `u8` an `ExecutionResult` carries
+/// WITHOUT fabricating a bogus value for a signal death.
+///
+/// The vendored findutils already follows the GNU convention internally: a
+/// child killed by signal N is reported as `128 + N` (see `find/mod.rs`'s `run`
+/// doc and xargs's `map_code`). Those land in 129..=255, which fit a `u8`
+/// verbatim. The old `(code & 0xff) as u8` was wrong for any code outside
+/// 0..=255 — a negative sentinel or an over-wide value would wrap to an
+/// unrelated small number (e.g. a hypothetical `256+N` collapsing to `N`, a
+/// "success"-looking code). Clamp instead: anything that doesn't fit a `u8`
+/// becomes 255 (a generic failure), so a real exit/signal code is preserved and
+/// an out-of-range one can never masquerade as a different, plausible status.
+fn exit_code_to_u8(code: i32) -> u8 {
+    u8::try_from(code).unwrap_or(255)
 }

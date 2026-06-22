@@ -95,6 +95,7 @@ fn gate_table() -> &'static HashMap<&'static str, CoreutilGate> {
         m.insert("sync", gate_sync as CoreutilGate);
         m.insert("uname", gate_uname as CoreutilGate);
         m.insert("cat", gate_cat as CoreutilGate);
+        m.insert("cp", gate_cp as CoreutilGate);
         m
     })
 }
@@ -222,3 +223,105 @@ fn gate_cat(args: &[OsString]) -> bool {
 // One function per util, alphabetical. Register the new fn in
 // `gate_table()` above. Leave a 2-3 line comment explaining what
 // shapes the gate accepts and which uutils divergences it dodges.
+
+/// `cp [-r|-R|--recursive] [-p|--preserve-mode/ownership/timestamps]
+/// [-a|--archive] [-f|--force] [-d] [-H] [-L] [-P] [-T] [-t DIR]
+/// [-v|--verbose] [-n|--no-clobber] [--] SRC... DST` — copy files.
+///
+/// What this gate ACCEPTS is a deliberately small, conservative slice where
+/// `uu_cp` reproduces GNU `cp`'s observable effect (the bytes/metadata of the
+/// copied file) faithfully for the plain copy shapes our build-recipe workloads
+/// use — primarily `cp SRC DST` and `cp SRC... DIR`, plus the recurse/preserve
+/// flag cluster (`-r`/`-R`/`-a`/`-p`/`-d`/`-f`/`-T`/`-H`/`-L`/`-P`/`-t`/`-v`
+/// and their audited long forms). On THESE argvs a successful copy lands
+/// byte-identical content and the documented metadata, which is all the
+/// provenance/capture path observes.
+///
+/// What it REFUSES (→ fall back to fork+exec of GNU `cp`):
+///   * `--help` / `--version` — uutils' wording diverges from GNU's.
+///   * `-i`/`--interactive`, `--backup`/`-b`, `--reflink`, `--sparse`,
+///     `-u`/`--update`, `-l`/`--link`, `-s`/`--symbolic-link`,
+///     `-x`/`--one-file-system`, `-S`/`--suffix`, `-Z`/`--context`,
+///     `--attributes-only`, `--copy-contents`, `--no-clobber` long quirks,
+///     `--parents`, `--no-target-directory` long edge, and ANY long option we
+///     have not explicitly listed as SAFE. These either differ from GNU in
+///     output/prompting/heuristics or are simply un-audited here, so they go
+///     to the host binary which IS GNU.
+///   * combined short clusters whose every letter is not in the audited set
+///     (e.g. `-ri` mixes safe `-r` with unsafe `-i`).
+///   * an `=`-valued long option we have not audited (`--preserve=…` carries a
+///     GNU-specific attribute grammar — refuse, let host cp handle it).
+///
+/// IMPORTANT: this gate is a static argv predicate; it cannot see whether the
+/// copy will SUCCEED. uutils' ERROR messages diverge from GNU (the uucore
+/// Fluent localization cache, see brush.rs::box_builtins_opt). That is
+/// acceptable here only because the in-process path is taken solely for these
+/// simple argvs and the callers that opt cp in either don't compare cp's
+/// stderr against GNU or run cp only on inputs expected to exist. BEHAVIORALLY
+/// UNVERIFIED in this container (box-spawning tests can't run here); correctness
+/// rests on the argv categorization above + a clean compile.
+fn gate_cp(args: &[OsString]) -> bool {
+    // Long options whose effect matches GNU for a plain copy. `--help`,
+    // `--version`, and every attribute-grammar/backup/reflink/update/link
+    // option are deliberately ABSENT so they fall back to GNU cp.
+    const SAFE_LONG: &[&[u8]] = &[
+        b"--recursive",
+        b"--archive",
+        b"--preserve",        // bare --preserve (default attr set) only; `--preserve=…` refused below
+        b"--no-dereference",
+        b"--dereference",
+        b"--force",
+        b"--target-directory", // `--target-directory=DIR` handled via `=` split below
+        b"--no-target-directory",
+        b"--verbose",
+        b"--",
+    ];
+    // Short flags (single letters) whose effect matches GNU for a plain copy.
+    const SAFE_SHORT: &[u8] = b"rRapdfHLPTv";
+
+    let mut opts_done = false;
+    for a in args.iter().skip(1) {
+        let b = a.as_bytes();
+        if opts_done {
+            continue; // positional path after `--`
+        }
+        if b == b"--" {
+            opts_done = true;
+        } else if b == b"-" || !b.starts_with(b"-") {
+            continue; // a path (bare `-` is just a filename to cp)
+        } else if b.starts_with(b"--") {
+            // Split a possible `--opt=value`. We accept ONLY the audited bare
+            // long options; any `=`-valued form (e.g. `--preserve=mode`,
+            // `--target-directory=DIR` we have not audited the grammar of) is
+            // refused so GNU cp parses it.
+            if b.contains(&b'=') {
+                return false;
+            }
+            if !SAFE_LONG.contains(&b) {
+                return false; // --help/--version/unknown/un-audited long option
+            }
+            // `--target-directory` (bare) takes the NEXT arg as its dir; that
+            // arg is a path, consumed by the loop as a positional — fine.
+        } else {
+            // Short cluster `-rp`, `-a`, etc. Every letter must be audited.
+            // `-t` takes an argument (the target dir); if `-t` is the LAST
+            // letter of this cluster, the next token is its value (a path,
+            // consumed normally). We do NOT special-case attached values like
+            // `-tDIR` — refuse a `t` that is not the cluster's final letter so
+            // we never misread an attached value as more flags.
+            let letters = &b[1..];
+            for (i, c) in letters.iter().enumerate() {
+                if *c == b't' {
+                    if i != letters.len() - 1 {
+                        return false; // attached value `-tDIR` — let host cp parse
+                    }
+                    continue;
+                }
+                if !SAFE_SHORT.contains(c) {
+                    return false; // an un-audited short flag
+                }
+            }
+        }
+    }
+    true
+}
