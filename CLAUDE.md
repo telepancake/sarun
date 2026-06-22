@@ -52,8 +52,10 @@ NOT touch it when working on sarun.
 
 The only build is a fully-static musl binary, via `cargo-zigbuild` + `ziglang`
 from `uv` (no `apt` toolchain). `engine/.cargo/config.toml` sets the musl target
-as default, so plain `cargo build --release` inside `engine/` also produces it
-once `make engine` has set up the zigshim.
+as the default, but plain `cargo build`/`cargo test` do NOT work — there is no
+`musl-gcc` on this system, so the C deps (rusqlite's bundled SQLite) won't
+compile. Use `cargo zigbuild` (which supplies the compiler/linker) or `make
+engine`.
 
 ```
 make engine

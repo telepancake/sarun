@@ -205,10 +205,9 @@ self-authored conformance tests share the author's blind spots.
 The engine builds only as a fully-static x86_64 musl binary, via
 `cargo-zigbuild` + `ziglang` from `uv` (no `apt` toolchain). The dynamic glibc
 path is gone. `engine/.cargo/config.toml` sets `build.target` to the musl
-triple, so plain `cargo build --release` inside `engine/` also produces it once
-`make engine` has set up the zigshim (`engine/target/zigshim/musl-gcc` →
-`zig cc -target x86_64-linux-musl`, which keeps cc-rs happy for the C deps —
-rusqlite's bundled SQLite, onig_sys). One musl source fix: `msg_controllen` is
-`socklen_t` on glibc but `size_t` on musl, so the `msg.msg_controllen` casts in
-`control.rs` use `as _`. `prototype/test_musl_rs.py` checks the static-linkage
-guarantee (`file` + `ldd`).
+triple, but plain `cargo build`/`cargo test` do NOT work — there is no
+`musl-gcc`, so the C deps (rusqlite's bundled SQLite, onig_sys) won't compile.
+`cargo zigbuild` supplies the compiler/linker (`zig cc`); use it or `make
+engine`. One musl source fix: `msg_controllen` is `socklen_t` on glibc but
+`size_t` on musl, so the `msg.msg_controllen` casts in `control.rs` use `as _`.
+`prototype/test_musl_rs.py` checks the static-linkage guarantee (`file` + `ldd`).
