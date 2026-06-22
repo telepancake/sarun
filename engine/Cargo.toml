@@ -30,6 +30,15 @@ uu_head = "0.8"
 uu_wc = "0.8"
 uu_nl = "0.8"
 uu_tac = "0.8"
+# Wave 2 (same injected-I/O treatment): arg→stdout tinies + filters.
+uu_basename = "0.8"
+uu_dirname = "0.8"
+uu_seq = "0.8"
+uu_expr = "0.8"
+uu_tr = "0.8"
+uu_cut = "0.8"
+uu_uniq = "0.8"
+uu_sort = "0.8"
 # Vendored, find-only fork of uutils/findutils 0.9.1: run `find` as an
 # in-process brush builtin against the shell's logical I/O. See vendor/findutils.
 findutils = { path = "vendor/findutils" }
@@ -173,3 +182,11 @@ uu_head                  = { path = "vendor/uu_head" }
 uu_wc                    = { path = "vendor/uu_wc" }
 uu_nl                    = { path = "vendor/uu_nl" }
 uu_tac                   = { path = "vendor/uu_tac" }
+uu_basename              = { path = "vendor/uu_basename" }
+uu_dirname               = { path = "vendor/uu_dirname" }
+uu_seq                   = { path = "vendor/uu_seq" }
+uu_expr                  = { path = "vendor/uu_expr" }
+uu_tr                    = { path = "vendor/uu_tr" }
+uu_cut                   = { path = "vendor/uu_cut" }
+uu_uniq                  = { path = "vendor/uu_uniq" }
+uu_sort                  = { path = "vendor/uu_sort" }
