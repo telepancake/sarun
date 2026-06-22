@@ -6,11 +6,11 @@
 use clap::{Arg, ArgAction, Command};
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, BufWriter, Read, Write, stdin, stdout};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 use uucore::display::Quotable;
-use uucore::error::{FromIo, UResult, USimpleError, set_exit_code};
-use uucore::{format_usage, show_error, translate};
+use uucore::error::{FromIo, UResult, USimpleError};
+use uucore::{format_usage, translate};
 
 mod helper;
 
@@ -213,8 +213,24 @@ pub mod options {
     pub const NUMBER_WIDTH: &str = "number-width";
 }
 
-#[uucore::main]
-pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+/// Logical entry point for the bundled `nl` builtin.
+///
+/// Unlike upstream's `uumain`, this never touches the process's own stdio: it
+/// numbers input lines onto the shell's logical output sink (`out`), routes its
+/// own diagnostics to the logical error sink (`err`), and reads `-`/stdin from
+/// the shell's logical input source (`stdin`). `nl` does line-buffered reads and
+/// writes with no `splice`/`copy_file_range` fast path and no self-overwrite or
+/// is-terminal check, so it needs NO backing raw descriptor — the `out_fd`/
+/// `stdin_fd` parameters `cat` carries are deliberately omitted here. It holds
+/// no process-global state (the directory-error exit is collected locally and
+/// returned, not stored in uucore's global `set_exit_code`), so it is safe to
+/// run as a concurrent pipeline stage.
+pub fn nl(
+    args: impl uucore::Args,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    stdin: &mut dyn Read,
+) -> UResult<()> {
     let matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
 
     let mut settings = Settings::default();
@@ -240,28 +256,74 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
 
     let mut stats = Stats::new(settings.starting_line_number);
 
+    // A single 32K-buffered writer over the logical sink persists across every
+    // input file (upstream re-created one BufWriter<Stdout> per file; the
+    // numbering state in `stats` already carries across files, so a shared
+    // writer is behavior-identical and flushes once at the end).
+    let mut writer = BufWriter::new(out);
+
+    // Directory targets are non-fatal in GNU `nl`: it prints a diagnostic, sets
+    // the exit status to 1, and continues with the remaining files. Upstream
+    // used `show_error!` (process stderr) + `set_exit_code` (a uucore global);
+    // both are process-global and unsafe for an in-process builtin, so we route
+    // the message to the logical `err` sink and remember the failure locally,
+    // surfacing it as the returned exit status after all files are processed.
+    let mut had_dir_error = false;
+
     for file in &files {
         if file == "-" {
-            let mut buffer = BufReader::new(stdin());
-            nl(&mut buffer, &mut stats, &settings)?;
+            let mut buffer = BufReader::new(&mut *stdin);
+            nl_buffer(&mut buffer, &mut writer, &mut stats, &settings)?;
         } else {
             let path = Path::new(file);
 
             if path.is_dir() {
-                show_error!(
-                    "{}",
+                writeln!(
+                    err,
+                    "{}: {}",
+                    uucore::util_name(),
                     translate!("nl-error-is-directory", "path" => path.maybe_quote())
-                );
-                set_exit_code(1);
+                )
+                .map_err_context(|| translate!("nl-error-could-not-write"))?;
+                had_dir_error = true;
             } else {
                 let reader = File::open(path).map_err_context(|| file.maybe_quote().to_string())?;
                 let mut buffer = BufReader::new(reader);
-                nl(&mut buffer, &mut stats, &settings)?;
+                nl_buffer(&mut buffer, &mut writer, &mut stats, &settings)?;
             }
         }
     }
 
-    Ok(())
+    writer
+        .flush()
+        .map_err_context(|| translate!("nl-error-could-not-write"))?;
+
+    if had_dir_error {
+        Err(USimpleError::new(1, String::new()))
+    } else {
+        Ok(())
+    }
+}
+
+/// Descriptor-based entry point for the standalone `nl` binary.
+///
+/// Here the process's own fd 0/1/2 *are* the intended I/O, so this is a thin
+/// bridge that locks them and hands them to [`nl`]. The in-process brush builtin
+/// must NOT route through here — it calls [`nl`] directly with the shell's
+/// logical sinks/source, so it never touches process-global stdio.
+#[uucore::main]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    let stderr = io::stderr();
+    let mut err = stderr.lock();
+    let stdin = io::stdin();
+    let mut input = stdin.lock();
+    let result = nl(args, &mut out, &mut err, &mut input);
+    // GNU `nl` flushes stdout before exiting; the logical entry already flushed
+    // its BufWriter, but the locked Stdout itself is line-buffered, so flush.
+    let _ = out.flush();
+    result
 }
 
 pub fn uu_app() -> Command {
@@ -379,9 +441,18 @@ fn write_line(writer: &mut impl Write, line: &[u8]) -> io::Result<()> {
     writeln!(writer)
 }
 
-/// `nl` implements the main functionality for an individual buffer.
-fn nl<T: Read>(reader: &mut BufReader<T>, stats: &mut Stats, settings: &Settings) -> UResult<()> {
-    let mut writer = BufWriter::new(stdout());
+/// `nl_buffer` implements the main functionality for an individual buffer.
+///
+/// The numbering logic below is byte-for-byte the upstream per-file `nl`; the
+/// only adaptation is that the output sink is the caller's logical `writer`
+/// (threaded in) instead of a freshly-created `BufWriter<Stdout>`, so it never
+/// touches the process's fd 1.
+fn nl_buffer<T: Read>(
+    reader: &mut BufReader<T>,
+    writer: &mut impl Write,
+    stats: &mut Stats,
+    settings: &Settings,
+) -> UResult<()> {
     let mut current_numbering_style = &settings.body_numbering;
     let mut line = Vec::new();
 
@@ -445,7 +516,7 @@ fn nl<T: Read>(reader: &mut BufReader<T>, stats: &mut Stats, settings: &Settings
                 };
                 settings
                     .number_format
-                    .format_to(&mut writer, line_number, settings.number_width)
+                    .format_to(writer, line_number, settings.number_width)
                     .map_err_context(|| translate!("nl-error-could-not-write"))?;
                 writer
                     .write_all(settings.number_separator.as_encoded_bytes())
@@ -457,13 +528,10 @@ fn nl<T: Read>(reader: &mut BufReader<T>, stats: &mut Stats, settings: &Settings
                     .write_all(prefix.as_bytes())
                     .map_err_context(|| translate!("nl-error-could-not-write"))?;
             }
-            write_line(&mut writer, &line)
+            write_line(writer, &line)
                 .map_err_context(|| translate!("nl-error-could-not-write"))?;
         }
     }
-    writer
-        .flush()
-        .map_err_context(|| translate!("nl-error-could-not-write"))?;
     Ok(())
 }
 
@@ -493,5 +561,52 @@ mod test {
         assert_eq!(helper(NumberFormat::RightZero, -12, 1), "-12");
         assert_eq!(helper(NumberFormat::RightZero, 12, 4), "0012");
         assert_eq!(helper(NumberFormat::RightZero, -12, 4), "-012");
+    }
+
+    /// In-memory exercise of the injected-I/O `nl` entry: no process fd 0/1/2 is
+    /// touched — output goes to a `Vec<u8>`, diagnostics to another `Vec<u8>`,
+    /// and stdin is a `&[u8]`. Asserts the numbered output for the `-` (stdin)
+    /// default body-numbering and that nothing leaks to the error sink.
+    #[test]
+    fn test_nl_injected_io() {
+        let input: &[u8] = b"alpha\n\nbeta\n";
+        let mut reader = input;
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+
+        // argv[0] = "nl", no flags -> default: body numbering = NonEmpty,
+        // width 6, right-justified, tab separator, start 1, increment 1.
+        let args = ["nl"].iter().map(|s| OsString::from(*s));
+        nl(args, &mut out, &mut err, &mut reader).unwrap();
+
+        // Blank line is NOT numbered under the NonEmpty default; it gets the
+        // 7-space (width+1) prefix.
+        assert_eq!(
+            out,
+            b"     1\talpha\n       \n     2\tbeta\n".to_vec(),
+            "got: {:?}",
+            String::from_utf8_lossy(&out)
+        );
+        assert!(err.is_empty(), "unexpected diagnostics: {err:?}");
+    }
+
+    /// `-b a` (number all lines, including the blank one) onto an in-memory sink.
+    #[test]
+    fn test_nl_injected_io_number_all() {
+        let input: &[u8] = b"alpha\n\nbeta\n";
+        let mut reader = input;
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+
+        let args = ["nl", "-b", "a"].iter().map(|s| OsString::from(*s));
+        nl(args, &mut out, &mut err, &mut reader).unwrap();
+
+        assert_eq!(
+            out,
+            b"     1\talpha\n     2\t\n     3\tbeta\n".to_vec(),
+            "got: {:?}",
+            String::from_utf8_lossy(&out)
+        );
+        assert!(err.is_empty());
     }
 }
