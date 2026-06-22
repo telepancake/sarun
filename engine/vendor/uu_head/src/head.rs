@@ -18,7 +18,6 @@ use thiserror::Error;
 use uucore::display::Quotable;
 use uucore::error::{FromIo, UError, UResult, USimpleError};
 use uucore::line_ending::LineEnding;
-use uucore::show;
 use uucore::translate;
 
 const BUF_SIZE: usize = 65536;
@@ -459,6 +458,13 @@ fn uu_head(
     stdin_fd: Option<BorrowedFd<'_>>,
 ) -> UResult<()> {
     let mut first = true;
+    // sarun: per-file errors are ACCUMULATED and returned (mirroring the uu_cat
+    // port), NOT emitted via uucore's `show!` — which writes the process's real
+    // fd 2 and mutates the process-global exit code, both forbidden for an
+    // in-process builtin (it would leak to the engine's stderr and corrupt a
+    // concurrent pipeline stage's exit status). The caller writes the returned
+    // diagnostic to the box's LOGICAL stderr and uses the returned exit code.
+    let mut error_messages: Vec<String> = Vec::new();
     for file in &options.files {
         let res = if file == "-" {
             if (options.files.len() > 1 && !options.quiet) || options.verbose {
@@ -505,18 +511,19 @@ fn uu_head(
             Ok(())
         } else {
             if Path::new(file).is_dir() {
-                show!(USimpleError::new(
-                    1,
-                    translate!("head-error-reading-file", "name" => file.quote(), "err" => "Is a directory")
+                error_messages.push(translate!(
+                    "head-error-reading-file", "name" => file.quote(), "err" => "Is a directory"
                 ));
                 continue;
             }
             let mut file_handle = match File::open(file) {
                 Ok(f) => f,
                 Err(err) => {
-                    show!(err.map_err_context(
-                        || translate!("head-error-cannot-open", "name" => file.quote())
-                    ));
+                    error_messages.push(
+                        err.map_err_context(
+                            || translate!("head-error-cannot-open", "name" => file.quote())
+                        ).to_string(),
+                    );
                     continue;
                 }
             };
@@ -525,7 +532,7 @@ fn uu_head(
                     writeln!(out)?;
                 }
                 write!(out, "==> ")?;
-                write_verbatim(out, file).unwrap();
+                write_verbatim(out, file)?;
                 writeln!(out, " <==")?;
             }
             head_file(&mut file_handle, options, out)?;
@@ -541,11 +548,14 @@ fn uu_head(
         }
         first = false;
     }
-    // Even though this is returning `Ok`, it is possible that a call
-    // to `show!()` and thus a call to `set_exit_code()` has been
-    // called above. If that happens, then this process will exit with
-    // a non-zero exit code.
-    Ok(())
+    // sarun: if any file failed, return the accumulated diagnostics joined the
+    // same way uu_cat does (continuation lines re-prefixed with "head: " by the
+    // caller). GNU `head` exits 1 on any read/open error regardless of count.
+    if error_messages.is_empty() {
+        Ok(())
+    } else {
+        Err(USimpleError::new(1, error_messages.join("\nhead: ")))
+    }
 }
 
 /// Logical entry point for the bundled `head` builtin.
