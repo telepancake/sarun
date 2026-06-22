@@ -188,6 +188,69 @@ impl Value {
             Value::Func { loc, .. } => Some(loc.clone()),
         }
     }
+
+    /// Reconstruct an approximate make-SOURCE representation of this value
+    /// WITHOUT evaluating it — no variable lookups, no `$(shell …)`/macro
+    /// side effects. Literals are emitted verbatim; variable and function
+    /// references are rendered back into their `$(…)` surface form (a single
+    /// character name as `$X`, e.g. `$@`/`$<`). Used to surface recipe text
+    /// for provenance/UI when running the recipe's macros would be unsafe
+    /// (see `is_func`). This is lossy for whitespace inside `$(…)` but
+    /// faithful to the literal command bytes, which is what callers want.
+    pub fn static_string(&self) -> String {
+        let mut s = String::new();
+        self.write_static(&mut s);
+        s
+    }
+
+    fn write_static(&self, out: &mut String) {
+        fn name_ref(out: &mut String, name: &str) {
+            if name.len() == 1 {
+                out.push('$');
+                out.push_str(name);
+            } else {
+                out.push_str("$(");
+                out.push_str(name);
+                out.push(')');
+            }
+        }
+        match self {
+            Value::Literal(_, lit) => out.push_str(&String::from_utf8_lossy(lit)),
+            Value::List(_, vec) => {
+                for v in vec {
+                    v.write_static(out);
+                }
+            }
+            Value::SymRef(_, sym) => {
+                name_ref(out, &String::from_utf8_lossy(&sym.as_bytes()));
+            }
+            Value::VarRef(_, var) => {
+                let mut inner = String::new();
+                var.write_static(&mut inner);
+                name_ref(out, &inner);
+            }
+            Value::VarSubst {
+                name, pat, subst, ..
+            } => {
+                out.push_str("$(");
+                name.write_static(out);
+                out.push(':');
+                pat.write_static(out);
+                out.push('=');
+                subst.write_static(out);
+                out.push(')');
+            }
+            Value::Func { fi, args, .. } => {
+                out.push_str("$(");
+                out.push_str(&String::from_utf8_lossy(fi.name));
+                for (i, a) in args.iter().enumerate() {
+                    out.push(if i == 0 { ' ' } else { ',' });
+                    a.write_static(out);
+                }
+                out.push(')');
+            }
+        }
+    }
 }
 
 fn close_paren(c: u8) -> Option<u8> {
