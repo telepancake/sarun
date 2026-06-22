@@ -2776,6 +2776,20 @@ fn read_blob_by_digest(layout: &Path, digest: &str) -> Result<Vec<u8>> {
     // digest is "sha256:<hex>"; the blob lives at blobs/sha256/<hex>.
     let (algo, hex) = digest.split_once(':')
         .ok_or_else(|| anyhow!("malformed digest '{digest}'"))?;
+    // A manifest-supplied digest is untrusted: both components index into a host
+    // path, so reject anything that isn't a bare path segment or that could
+    // traverse out of the blob store (path separators, `..`, NUL, empties).
+    let ok_segment = |s: &str| {
+        !s.is_empty()
+            && !s.contains('/')
+            && !s.contains('\\')
+            && !s.contains('\0')
+            && s != "."
+            && s != ".."
+    };
+    if !ok_segment(algo) || !ok_segment(hex) {
+        bail!("refusing unsafe digest path component in '{digest}'");
+    }
     let p = layout.join("blobs").join(algo).join(hex);
     let bytes = std::fs::read(&p)
         .with_context(|| format!("read blob {}", p.display()))?;

@@ -362,6 +362,15 @@ impl BoxState {
     pub fn create(id: i64) -> rusqlite::Result<Self> {
         let db = paths::state_home().join(format!("{id}.sqlar"));
         let conn = Connection::open(&db)?;
+        // synchronous=OFF is deliberate, not an oversight. This sqlar holds a
+        // box's captured writes in escrow for review; the host is never touched
+        // until an explicit apply. An OS crash/power loss can therefore only
+        // lose or corrupt an in-progress, re-runnable box — never host data — so
+        // crash-durability is not a requirement here. OFF avoids an fsync per
+        // write on the hot capture path (a build copies up tens of thousands of
+        // files); WAL/NORMAL would add fsync latency plus -wal/-shm side files
+        // (extra peak disk, no longer a single file while live) to buy
+        // durability this store does not need.
         conn.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=OFF;")?;
         conn.execute_batch(SCHEMA)?;
         conn.pragma_update(None, "user_version", 1)?;
