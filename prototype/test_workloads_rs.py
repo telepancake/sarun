@@ -112,9 +112,7 @@ def tail(s, n=400):
 
 def main():
     if not ensure_binary():
-        print("  ok  workloads-rs: cargo/binary unavailable — SKIP")
-        print("\nWORKLOADS-RS PASS (skipped)")
-        return 0
+        raise SystemExit("test_workloads_rs: engine binary unavailable — run `make engine`")
 
     # tools needed by some workloads — skip individually if absent
     has = {t: shutil.which(t) is not None

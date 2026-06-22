@@ -147,14 +147,10 @@ def depth_writers(m, path, by_id):
 
 def main():
     if not ensure_binary():
-        print("  ok  proc-forest-rs: cargo/binary unavailable — SKIP")
-        print("\nPROC-FOREST-RS PASS (skipped)")
-        return 0
+        raise SystemExit("test_proc_forest_rs: engine binary unavailable — run `make engine`")
     # FUSE/bwrap availability (real box): if missing, skip cleanly.
     if shutil.which("bwrap") is None or not Path("/dev/fuse").exists():
-        print("  ok  proc-forest-rs: bwrap/FUSE unavailable — SKIP")
-        print("\nPROC-FOREST-RS PASS (skipped)")
-        return 0
+        raise SystemExit("test_proc_forest_rs: FUSE/bwrap unavailable")
 
     tmp = Path(tempfile.mkdtemp(prefix="forestrs-"))
     env = dict(os.environ)

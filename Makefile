@@ -100,6 +100,7 @@ test: ## Run the Python test suite (parallel via pytest-xdist; excludes test_e2e
 	  --with "textual>=0.60" --with "wcmatch>=8.4" --with "pyfuse3>=3.2" \
 	  --with "trio>=0.22" --with "python-magic>=0.4" \
 	  pytest -q -p no:cacheprovider -n auto --dist=loadscope \
+	  --timeout=180 --timeout-method=signal \
 	  --ignore=test_e2e.py --ignore=test_pjdfstest.py --ignore=test_oci.py
 
 .PHONY: test-e2e

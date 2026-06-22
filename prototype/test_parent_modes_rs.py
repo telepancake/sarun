@@ -101,9 +101,7 @@ def make_finished_box(m, sid, entries, parent=None, meta=None):
 
 def main():
     if not ensure_binary():
-        print("  ok  parent-modes-rs: cargo/binary unavailable — SKIP")
-        print("\nPARENT-MODES-RS PASS (skipped)")
-        return 0
+        raise SystemExit("test_parent_modes_rs: engine binary unavailable — run `make engine`")
     tmp = Path(tempfile.mkdtemp(prefix="pmrs-"))
     for k, sub in (("XDG_STATE_HOME", "state"), ("XDG_RUNTIME_DIR", "run"),
                    ("XDG_CONFIG_HOME", "config"), ("XDG_DATA_HOME", "data")):

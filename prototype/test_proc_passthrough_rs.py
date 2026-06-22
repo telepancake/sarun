@@ -59,8 +59,7 @@ def wait_socket(sock, timeout=30):
 
 def main():
     if not ensure_binary():
-        print("  ok  proc-pt: cargo/binary unavailable — SKIP")
-        print("\nPROC-PT PASS (skipped)"); return 0
+        raise SystemExit("test_proc_passthrough_rs: engine binary unavailable — run `make engine`")
     tmp = Path(tempfile.mkdtemp(prefix="proc-pt-"))
     for k, sub in (("XDG_STATE_HOME", "st"), ("XDG_RUNTIME_DIR", "rn"),
                    ("XDG_CONFIG_HOME", "cf"), ("XDG_DATA_HOME", "d")):

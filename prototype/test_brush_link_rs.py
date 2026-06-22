@@ -75,9 +75,7 @@ def latest_sqlar(m):
 
 def main():
     if not ensure_binary():
-        print("  ok  brush-link-rs: cargo/binary unavailable — SKIP")
-        print("\nBRUSH-LINK-RS PASS (skipped)")
-        return 0
+        raise SystemExit("test_brush_link_rs: engine binary unavailable — run `make engine`")
     tmp = Path(tempfile.mkdtemp(prefix="brushlinkrs-"))
     for k, sub in (("XDG_STATE_HOME", "state"), ("XDG_RUNTIME_DIR", "run"),
                    ("XDG_CONFIG_HOME", "config"), ("XDG_DATA_HOME", "data")):

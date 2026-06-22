@@ -123,9 +123,7 @@ def run_box(name, ninja_dir, *extra):
 
 def main():
     if not ensure_binary():
-        print("  ok  n2-rs: cargo/binary unavailable — SKIP")
-        print("\nN2-RS PASS (skipped)")
-        return 0
+        raise SystemExit("test_n2_rs: engine binary unavailable — run `make engine`")
     tmp = Path(tempfile.mkdtemp(prefix="n2rs-"))
     for k, sub in (("XDG_STATE_HOME", "state"), ("XDG_RUNTIME_DIR", "run"),
                    ("XDG_CONFIG_HOME", "config"), ("XDG_DATA_HOME", "data")):

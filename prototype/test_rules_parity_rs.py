@@ -128,8 +128,7 @@ TARGETS = [
 
 def main():
     if not ensure_binary():
-        print("  ok  rules-parity: cargo/binary unavailable — SKIP")
-        print("\nRULES-PARITY PASS (skipped)"); return 0
+        raise SystemExit("test_rules_parity_rs: engine binary unavailable — run `make engine`")
     m = SourceFileLoader("slopbox", SARUN).load_module()
 
     def py_decide(text, rel, box, exe, cwd, argv):

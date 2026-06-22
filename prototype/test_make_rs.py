@@ -143,9 +143,7 @@ def edge_for(edges, base):
 
 def main():
     if not ensure_binary():
-        print("  ok  make-rs: cargo/binary unavailable — SKIP")
-        print("\nMAKE-RS PASS (skipped)")
-        return 0
+        raise SystemExit("test_make_rs: engine binary unavailable — run `make engine`")
     tmp = Path(tempfile.mkdtemp(prefix="makers-"))
     for k, sub in (("XDG_STATE_HOME", "state"), ("XDG_RUNTIME_DIR", "run"),
                    ("XDG_CONFIG_HOME", "config"), ("XDG_DATA_HOME", "data")):
