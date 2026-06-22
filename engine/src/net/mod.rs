@@ -60,8 +60,6 @@ pub mod tap;
 pub mod stack;
 pub mod dhcp;
 pub mod dns;
-pub mod tcp;
-pub mod udp;
 pub mod mitm;
 pub mod l4;
 pub mod flows;
@@ -70,26 +68,11 @@ pub mod prompt;
 pub mod bridge;
 pub mod dispatch;
 
-use std::os::fd::OwnedFd;
-use std::path::PathBuf;
 use std::sync::Arc;
 
-/// Per-box networking the engine holds while the box runs: the in-engine
-/// smoltcp stack runtime (its poll thread owns the TAP fd) plus the flow/keylog
-/// paths. The netns + TAP belong to the BOX — the runner created them and the
-/// kernel frees them when the box exits — so the engine forks no process and
-/// holds no netns reference here.
-pub struct NetHandle {
-    pub box_id: u16,
-    pub gateway_ip: [u8; 4],    // .0.1
-    pub box_ip: [u8; 4],        // .0.2
-    pub stack: Arc<stack::StackRuntime>,
-    pub flows_path: PathBuf,
-    pub keylog_path: PathBuf,
-}
-
-/// Global registry — `Net` is held by the engine main loop and one
-/// `NetHandle` per `-n` box is registered while the box runs.
+/// Global per-engine networking state — held by the engine main loop. The
+/// per-box smoltcp stack is owned by its own poll thread (driven by the box's
+/// TAP fd) and dispatcher task; the engine keeps no per-box handle.
 pub struct Net {
     pub ca: Arc<ca::Ca>,
     /// One global banner-prompt queue. Boxes share it: the user sees one
@@ -108,15 +91,3 @@ impl Net {
     }
 }
 
-/// Construct a NetHandle from the pieces the stack module just built (the TAP
-/// fd was created by the runner and now lives in the stack's poll thread).
-pub fn make_handle(
-    box_id: u16, gateway_ip: [u8; 4], box_ip: [u8; 4],
-    stack: Arc<stack::StackRuntime>,
-    flows_path: PathBuf, keylog_path: PathBuf,
-) -> NetHandle {
-    NetHandle { box_id, gateway_ip, box_ip, stack, flows_path, keylog_path }
-}
-
-#[allow(dead_code)]
-pub fn unused(_: OwnedFd) {}

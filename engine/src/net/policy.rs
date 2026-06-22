@@ -27,12 +27,6 @@ pub struct NetSubject {
     pub arg: String,
 }
 
-pub const NET_KINDS: &[&str] = &[
-    "host", "port", "scheme", "sni",
-    "http_path", "http_method", "http_status",
-    "proto", "box", "exe", "cwd", "arg",
-];
-
 /// Default-ALLOW for net rules — an empty rule set means the proxy works
 /// out of the box. To block, write a `discard host:bad.com` line in the
 /// same filerules file the file-rule UI edits. First-match wins; rules

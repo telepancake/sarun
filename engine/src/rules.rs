@@ -39,19 +39,6 @@ pub const NET_KINDS: &[&str] = &[
     "proto", "box", "exe", "cwd", "arg",
 ];
 
-/// All kinds the parser/UI recognizes. The file format is one rule per
-/// line and is round-trip-compatible across contexts: a rule whose clauses
-/// only reference FILE_KINDS is "file-only" and is consulted by the file
-/// review/finalize path; one referencing any NET_KINDS is consulted at
-/// connection gate time. Mixed-kind rules act on both contexts and the
-/// caller picks the relevant subject.
-pub fn all_kinds() -> Vec<&'static str> {
-    let mut v: Vec<&'static str> = FILE_KINDS.iter().copied().collect();
-    for k in NET_KINDS { if !v.contains(k) { v.push(k); } }
-    v
-}
-
-pub fn is_net_kind(k: &str) -> bool { NET_KINDS.contains(&k) }
 
 #[cfg(test)]
 mod parse_net_rules {

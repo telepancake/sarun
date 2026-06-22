@@ -64,17 +64,11 @@ pub struct AcceptedConn {
     pub handle: SocketHandle,
     pub dst_ip: [u8; 4],
     pub dst_port: u16,
-    pub src_ip: [u8; 4],
-    pub src_port: u16,
 }
 
 pub struct StackRuntime {
-    pub box_id: u16,
-    pub subnet: BoxSubnet,
     pub gateway_ip: [u8; 4],
-    pub box_ip: [u8; 4],
     pub dns: Arc<DnsServer>,
-    pub flows: Arc<FlowsLog>,
     accept_rx: Mutex<Option<std::sync::mpsc::Receiver<AcceptedConn>>>,
     cmd_tx: std::sync::mpsc::Sender<Cmd>,
 }
@@ -90,14 +84,12 @@ impl StackRuntime {
                  box_mac: [u8; 6], tap_fd: OwnedFd,
                  flows: Arc<FlowsLog>) -> Arc<Self> {
         let dns = Arc::new(DnsServer::new(subnet));
-        let dhcp = DhcpServer { subnet, server_mac: gateway_mac };
+        let dhcp = DhcpServer { subnet };
         let (accept_tx, accept_rx) = std::sync::mpsc::channel();
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
         let me = Arc::new(Self {
-            box_id, subnet,
-            gateway_ip: subnet.gateway_ip(), box_ip: subnet.box_ip(),
+            gateway_ip: subnet.gateway_ip(),
             dns: dns.clone(),
-            flows: flows.clone(),
             accept_rx: Mutex::new(Some(accept_rx)),
             cmd_tx,
         });
@@ -374,14 +366,10 @@ fn run_poll_loop(rt: Arc<StackRuntime>, tap_fd: OwnedFd,
             if claimed.contains(&handle) { continue; }
             let s = sockets.get_mut::<tcp::Socket>(handle);
             if s.is_active() && s.state() == tcp::State::Established {
-                let local = s.local_endpoint();
-                let remote = s.remote_endpoint();
-                if let (Some(l), Some(r)) = (local, remote) {
+                if let Some(l) = s.local_endpoint() {
                     let dst_ip = ip_octets(l.addr);
-                    let src_ip = ip_octets(r.addr);
                     to_claim.push((handle, port, AcceptedConn {
                         handle, dst_ip, dst_port: l.port,
-                        src_ip, src_port: r.port,
                     }));
                 }
             }
@@ -453,8 +441,7 @@ fn add_listener(sockets: &mut SocketSet, port: u16) -> SocketHandle {
 }
 
 fn ip_octets(addr: IpAddress) -> [u8; 4] {
-    match addr {
-        IpAddress::Ipv4(v) => v.octets(),
-        _ => [0, 0, 0, 0],
-    }
+    // smoltcp is built IPv4-only here, so IpAddress has the single Ipv4 variant.
+    let IpAddress::Ipv4(v) = addr;
+    v.octets()
 }

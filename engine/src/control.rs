@@ -34,12 +34,10 @@ pub struct Shared {
     /// filter, so view.window is a cheap slice.
     pub views: crate::views::Registry,
     pub next_view_id: u64,
-    /// Per-box networking handles (`-n` mode only). Engine-owned: the runner
-    /// asks for one in the register handshake and we hand back the netns path
-    /// + gateway/box IPs; the handle stays alive (poll thread running, TAP
-    /// fd open, netns anchor child SIGTERM-ed on Drop) until the box reaps.
+    /// Per-box networking (`-n` mode only): the engine's CA + prompt queue. The
+    /// per-box smoltcp stack is owned by its poll thread (driven by the box's
+    /// TAP fd) and its dispatcher task; the engine keeps no handle to reap.
     pub net: Option<std::sync::Arc<crate::net::Net>>,
-    pub net_handles: std::collections::HashMap<i64, std::sync::Arc<crate::net::NetHandle>>,
     /// Long-lived tokio runtime handle used by the dispatcher tasks (one
     /// per-conn task per box). One runtime is plenty: the network is rarely
     /// the bottleneck, and a single runtime keeps reasoning about lifetimes
@@ -499,10 +497,6 @@ fn arg_sid(args: &[Value]) -> Option<i64> {
 /// Unconditionally remove a box: drop it from the overlay, delete its sqlar +
 /// backing + pool blobs, broadcast session_removed. The `delete` verb's body.
 fn reap(state: &State, id: i64) {
-    // Drop the NetHandle (Tap mode only) — the Drop impl SIGTERM's the
-    // netns anchor, which releases the last reference to /proc/<a>/ns/net
-    // and tears down the netns + TAP. Idempotent: no-op for Off / Host.
-    let _ = lock(state).net_handles.remove(&id);
     if let Some(ov) = lock(state).overlay.clone() {
         ov.remove_box(id);
     }
@@ -974,11 +968,6 @@ fn prepare_net(state: &State, id: i64, msg: &Value,
     // The augmented CA bundle (host bundle + engine CA) — sent as CONTENT; the
     // runner materializes + binds it in its own namespace (works for nested).
     let ca_pem = augmented_ca_bundle(&net.ca).unwrap_or_default();
-
-    let handle = std::sync::Arc::new(crate::net::make_handle(
-        box_id_u16, subnet.gateway_ip(), subnet.box_ip(),
-        stack.clone(), flows.path.clone(), flows.keylog_path.clone()));
-    lock(state).net_handles.insert(id, handle);
 
     // Start the per-box dispatcher: it pulls AcceptedConn off the stack's
     // accept channel and routes each new connection to the right handler

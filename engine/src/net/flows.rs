@@ -25,7 +25,6 @@ use pcap_file::pcapng::blocks::enhanced_packet::EnhancedPacketBlock;
 use pcap_file::DataLink;
 
 pub struct FlowsLog {
-    pub path: PathBuf,
     pub keylog_path: PathBuf,
     writer: Mutex<PcapNgWriter<std::fs::File>>,
     started_ns: u128,
@@ -50,7 +49,7 @@ impl FlowsLog {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos()).unwrap_or(0);
         Ok(Arc::new(Self {
-            path, keylog_path,
+            keylog_path,
             writer: Mutex::new(w),
             started_ns,
         }))

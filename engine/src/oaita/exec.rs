@@ -213,8 +213,7 @@ impl Executor for SarunExecutor {
     /// wrapper's overlay. For discard calls, spawn a `PEEK` child via
     /// `sarun run -b PEEK -- …` (relname → parented to this wrapper)
     /// and discard afterwards.
-    fn run(&self, box_id: &str, script: &str, discard: bool, api_access: bool) -> ExecResult {
-        let target = if discard { "PEEK".to_string() } else { box_id.to_string() };
+    fn run(&self, _box_id: &str, script: &str, discard: bool, api_access: bool) -> ExecResult {
         // Discard mode keeps the nested PEEK box (own overlay, then
         // reaped). Non-discard runs DIRECTLY in this wrapper box via
         // the engine binary's `brush-sh` shim — no nested `sarun run`,

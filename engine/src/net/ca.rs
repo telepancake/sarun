@@ -30,9 +30,7 @@ pub struct Ca {
 }
 
 pub struct Leaf {
-    pub cert_chain_pem: String,
     pub cert_der: Vec<u8>,
-    pub key_pem: String,
     pub key_der: Vec<u8>,
 }
 
@@ -106,12 +104,9 @@ impl Ca {
 
         let leaf_key = KeyPair::generate()?;
         let cert = params.signed_by(&leaf_key, &self.cert, &self.key)?;
-        let cert_pem = cert.pem();
-        let cert_chain_pem = format!("{}{}", cert_pem, self.cert_pem);
         let cert_der = cert.der().to_vec();
-        let key_pem = leaf_key.serialize_pem();
         let key_der = leaf_key.serialize_der().to_vec();
-        let leaf = Arc::new(Leaf { cert_chain_pem, cert_der, key_pem, key_der });
+        let leaf = Arc::new(Leaf { cert_der, key_der });
         self.leaves.lock().insert(host.to_string(), leaf.clone());
         Ok(leaf)
     }

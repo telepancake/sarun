@@ -5,14 +5,14 @@ deliberate items are recorded so they aren't re-flagged; the rest are open.
 
 ## Verification status (read first)
 
-Most of the fixes below change box-spawning / host-mutating paths. In this
-container the test harness suppresses stdout/exit for commands that spawn
-namespaces + a FUSE mount, so they are **compile-verified and unit-test-verified
-(102 engine unit tests pass, incl. the `hostfs` symlink-safety set), but NOT
-run-verified end-to-end.** Before trusting the apply/net/brush behavior, run
-`make test` (and `make test-oci`) in an environment where box output isn't
-swallowed. The last *observed* full run was 154 passed / 4 brush-gap, before the
-prototype removal and these fixes.
+Run-verified end-to-end: `make test` is **23 passed / 14 skipped / 3 brush-gap**
+(`test_make_rs`, `test_brush_link_rs`, `test_brush_nested_sh_rs` — see below),
+`make test-oci` PASS, and 99 engine unit tests pass. The fixes below are live,
+not just compile-checked.
+
+Fixing M1 surfaced a regression it introduced (it gated *deletions* — see Fixed);
+caught and fixed by `test_engine_rs` / `test_nested_apply_rs` once the suite was
+actually run.
 
 ## Fixed
 
@@ -37,10 +37,22 @@ prototype removal and these fixes.
   Rust-engine test that apply must not follow a box-planted ancestor symlink onto
   the host (the C2 class). The old inert Python guards were deleted with the
   prototype; this one is collected by `make test`.
-- **M1** apply refuses a host file newer than capture. **M2** single-instance
-  guard is an exclusive `flock`, not a TOCTOU connect-probe. **M4** a `lock()`
-  helper recovers a poisoned mutex and connection handlers run under
-  `catch_unwind`.
+- **M1** apply refuses a host file newer than capture — but only for *content*
+  rows. The first cut also gated deletions (a tombstone row carries `mtime=0`, so
+  any live host file is "newer" and every unlink was refused);
+  `host_changed_since_capture` now skips tombstone (`S_IFCHR`) rows. **M2**
+  single-instance guard is an exclusive `flock`, not a TOCTOU connect-probe.
+  **M4** a `lock()` helper recovers a poisoned mutex and connection handlers run
+  under `catch_unwind`.
+- **M6** passthrough/`-d` writes (`overlay.rs`) surface `create_dir_all` and
+  `open` errors as the real errno instead of swallowing them and returning a
+  blanket `EACCES`.
+- **L2** apply path-shape safety no longer rests on FUSE rows lacking `..`:
+  `hostfs::safe_components` unconditionally rejects `..`/`.`/empty/interior-NUL
+  for every host mutation (unit test `rejects_dotdot_components`), so an
+  OCI/tar import admitting `..` cannot reopen host traversal.
+- **CLI rename** `sarun NAME rename NEW` now echoes the new name on success
+  (it silently succeeded before), matching `apply`/`patch`.
 - **L1** statfs returns EINVAL instead of panicking on an interior-NUL path.
   **L3** the u32 frame length is capped. **L4** short `read`/`write` returns on
   the runner's echo/PTY/frame paths are handled.
@@ -69,14 +81,22 @@ prototype removal and these fixes.
 - **C3** multi-path apply still has no atomicity/rollback across paths (a
   documented `TODO` in review.rs) — if path N errors, 1..N-1 are already on the
   host. A real transaction is a larger redesign.
+- **L5** `shutdown` SIGTERMs self and returns ok; in-flight apply/register on
+  other threads race teardown. The dangerous case (a torn host file) is already
+  prevented by C2′ (apply writes a temp + atomic rename, so a mid-apply SIGTERM
+  leaves a stray temp, never a corrupt target); the residual race only fails an
+  in-flight `register` during an explicit shutdown. A clean drain barrier is a
+  larger change, deferred.
+
+## Brush (deferred to a focused session)
+
+- **gate_cp** behavioral faithfulness is unverified; `test_make_rs`,
+  `test_brush_link_rs`, `test_brush_nested_sh_rs` still fail (they assert
+  coreutils run as in-process brush builtins).
 - **M3** brush's process-global `dup2(fd 1/2)` races sibling threads — documented
   in `brush.rs`, not fixed (deep concurrency change).
-- **M6** passthrough/`-d` write swallows `create_dir_all` errors then opens for
-  write (`overlay.rs`) — can leave a partial host dir tree.
-- **L2** apply path-shape safety rests on FUSE rows lacking `..`; an OCI/tar
-  import admitting `..` would reopen host traversal.
-- **L5** `shutdown` SIGTERMs self and returns ok; in-flight apply/register on
-  other threads race teardown.
+- One dead-code warning remains by design: `brush.rs::box_builtins` (the
+  coreutils-gating wrapper) is unused pending the gate work.
 
 ## Tech debt
 

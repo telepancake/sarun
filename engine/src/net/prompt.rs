@@ -42,14 +42,6 @@ impl Verdict {
                   "deny_save"  => Some(Verdict::DenySave),
                   _ => None }
     }
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Verdict::YesOnce => "yes_once",
-            Verdict::NoOnce  => "no_once",
-            Verdict::AllowSave => "allow_save",
-            Verdict::DenySave  => "deny_save",
-        }
-    }
     pub fn is_allow(self) -> bool {
         matches!(self, Verdict::YesOnce | Verdict::AllowSave)
     }

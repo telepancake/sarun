@@ -207,9 +207,6 @@ impl BoxState {
     pub fn set_readonly_parent(&self, on: bool) {
         self.readonly_parent.store(on, std::sync::atomic::Ordering::Relaxed);
     }
-    pub fn readonly_parent(&self) -> bool {
-        self.readonly_parent.load(std::sync::atomic::Ordering::Relaxed)
-    }
     pub fn set_no_host_fallback(&self, on: bool) {
         self.no_host_fallback.store(on, std::sync::atomic::Ordering::Relaxed);
     }
@@ -1042,15 +1039,6 @@ impl BoxState {
                        |r| r.get::<_, String>(0)).ok()
     }
 
-    /// True if this (live) box has its OWN entry for `rel` — i.e. it copied-up,
-    /// wrote, deleted, or otherwise spoke for the path itself, so its merged
-    /// view is self-contained and a parent copy-down must NOT override it. The
-    /// in-RAM `kinds` mirror is authoritative for a live box (every write
-    /// updates it in lockstep with the row).
-    pub fn has_own(&self, rel: &str) -> bool {
-        self.kinds.read().unwrap().contains_key(rel)
-    }
-
     /// The box's ROOT process row (root=1): the `sarun -- cmd` runner itself, the
     /// top of this launch's process forest and the bubble-walk boundary. Provenance
     /// comes from the register message body (exe/cwd/argv); `host_pid` is the runner's
@@ -1160,13 +1148,6 @@ impl BoxState {
 
     pub fn entry(&self, rel: &str) -> Option<Entry> {
         self.kinds.read().unwrap().get(rel).cloned()
-    }
-
-    /// Drop `rel` from the live RAM mirror only (the on-disk row/blob is handled
-    /// by the caller). Used when a delete promotes into a parent whose lower has
-    /// nothing to shadow, so the parent's own row is removed entirely.
-    pub fn forget_kind(&self, rel: &str) {
-        self.kinds.write().unwrap().remove(rel);
     }
 
     /// Direct overlay children of dir `rel`: (whiteout names, present names).
