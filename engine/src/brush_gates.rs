@@ -799,6 +799,12 @@ const TR_SAFE_CLASSES: &[&[u8]] = &[
 /// GNU-identically (excludes overflowing octal escapes and SET2 classes
 /// other than upper/lower — both diverge in stderr wording).
 fn tr_set_is_safe(s: &[u8], is_set2: bool) -> bool {
+    // A LONE trailing backslash (odd run of trailing `\`): GNU warns for ANY set
+    // ("unescaped backslash at end of string"); uutils only warns for SET1, so a
+    // trailing `\` in SET2 diverges (stderr). Reject either way → host fallback.
+    if s.iter().rev().take_while(|&&c| c == b'\\').count() % 2 == 1 {
+        return false;
+    }
     let mut i = 0;
     while i < s.len() {
         match s[i] {
@@ -824,8 +830,14 @@ fn tr_set_is_safe(s: &[u8], is_set2: bool) -> bool {
                         if !TR_SAFE_CLASSES.contains(&name) {
                             return false; // unknown/empty class name wording
                         }
-                        if is_set2 && name != b"upper" && name != b"lower" {
-                            return false; // "string2"/"set2" wording in SET2
+                        if is_set2 {
+                            // ANY class in SET2 diverges: a non-upper/lower class
+                            // is rejected by uutils with different wording, and a
+                            // MISALIGNED [:upper:]/[:lower:] gives a divergent
+                            // "misaligned" message. The one valid case — the
+                            // canonical [:lower:]↔[:upper:] pair — is whitelisted
+                            // in gate_tr before this is ever called for SET2.
+                            return false;
                         }
                         i += 2 + end + 2; // consume "[:name:]"
                     }
@@ -841,29 +853,35 @@ fn tr_set_is_safe(s: &[u8], is_set2: bool) -> bool {
 }
 
 fn gate_tr(args: &[OsString]) -> bool {
-    let mut positional = 0usize; // count of SET operands seen so far
+    // Collect the positional SETs (in tr, '-' is a LITERAL set member, not a
+    // stdin marker) and validate flags inline.
+    let mut sets: Vec<&[u8]> = Vec::new();
     for a in args.iter().skip(1) {
         let b = a.as_bytes();
         if b == b"-" || !b.starts_with(b"-") {
-            // A positional SET. In tr, '-' is a LITERAL set member (no stdin
-            // meaning), so it counts as a positional too. The 2nd positional is
-            // SET2, where the class rule is tightened (see tr_set_is_safe).
-            positional += 1;
-            if !tr_set_is_safe(b, positional == 2) {
-                return false;
-            }
+            sets.push(b);
         } else if b.starts_with(b"--") {
-            // Only the audited long flags are safe; --help/--version/unknown out.
             match b {
                 b"--complement" | b"--delete"
                 | b"--squeeze-repeats" | b"--truncate-set1" => continue,
-                _ => return false,
+                _ => return false, // --help/--version/unknown
             }
-        } else {
-            // Short cluster: every letter must be an audited flag.
-            if !b[1..].iter().all(|c| b"cCdst".contains(c)) {
-                return false;
-            }
+        } else if !b[1..].iter().all(|c| b"cCdst".contains(c)) {
+            return false; // unaudited short letter
+        }
+    }
+    // The ONLY GNU-faithful use of [:upper:]/[:lower:] in SET2 is the canonical
+    // case-conversion pair; tr_set_is_safe rejects every other SET2 class, so
+    // whitelist exactly that pair here.
+    if sets.len() == 2
+        && ((sets[0] == b"[:lower:]" && sets[1] == b"[:upper:]")
+            || (sets[0] == b"[:upper:]" && sets[1] == b"[:lower:]"))
+    {
+        return true;
+    }
+    for (i, s) in sets.iter().enumerate() {
+        if !tr_set_is_safe(s, i == 1) {
+            return false;
         }
     }
     true
@@ -880,13 +898,27 @@ fn gate_cut(args: &[OsString]) -> bool {
             let parts: Vec<&[u8]> = spec.split(|&c| c == b'-').collect();
             if parts.len() > 2 { return false; }              // "1-2-3"
             let mut saw_num = false;
-            for p in &parts {
+            let mut ends: [Option<usize>; 2] = [None, None];
+            for (idx, p) in parts.iter().enumerate() {
                 if p.is_empty() { continue; }                 // open end "-5"/"5-"
                 if !p.iter().all(u8::is_ascii_digit) { return false; }
-                if p.iter().all(|&c| c == b'0') { return false; } // "0" / "00"
+                // Parse as usize: an out-of-range magnitude diverges from GNU
+                // ("field number is too large" vs uutils' "failed to parse").
+                let n: usize = match std::str::from_utf8(p).ok()
+                    .and_then(|s| s.parse::<usize>().ok()) {
+                    Some(n) => n,
+                    None => return false,                     // overflow
+                };
+                if n == 0 { return false; }                   // "0"
+                ends[idx] = Some(n);
                 saw_num = true;
             }
             if !saw_num { return false; }                     // bare "-" / ""
+            // A closed DECREASING range ("3-1") is "invalid decreasing range" in
+            // GNU but a different message in uutils — fall back to the host.
+            if let (Some(lo), Some(hi)) = (ends[0], ends[1]) {
+                if hi < lo { return false; }
+            }
         }
         true
     }
@@ -1075,6 +1107,11 @@ fn gate_uniq(args: &[OsString]) -> bool {
                     b'd' | b'u' | b'i' | b'z' => i += 1,
                     b'D' => { all_repeated_flag = true; i += 1; } // bare -D only
                     b'f' | b's' | b'w' => {
+                        // uutils' clap accepts a value-flag's GLUED value only when
+                        // it leads the cluster (`-f1`); `-cf1` errors ("a value is
+                        // required") while GNU accepts it. So require f/s/w to be
+                        // the FIRST cluster letter; otherwise fall back to host.
+                        if i != 0 { return false; }
                         // value = rest of cluster (`-f1`) or next token (`-f 1`).
                         let val: &[u8] = if i + 1 < rest.len() {
                             &rest[i + 1..]
@@ -1100,6 +1137,22 @@ fn gate_uniq(args: &[OsString]) -> bool {
 }
 
 fn gate_sort(args: &[OsString]) -> bool {
+    // LOCALE GUARD. uu_sort is built with the `i18n-collator` default feature, so
+    // its default string compare uses ICU collation under a UTF-8 non-C locale,
+    // diverging from GNU's byte sort. Only the C/POSIX collation locale (byte
+    // order) is reproducible in-process; anything else falls back to the host.
+    // The locale comes from the ENGINE process env (LC_ALL > LC_COLLATE > LANG).
+    fn collation_is_c() -> bool {
+        let pick = |k| std::env::var(k).ok().filter(|s| !s.is_empty());
+        let v = pick("LC_ALL").or_else(|| pick("LC_COLLATE"))
+            .or_else(|| pick("LANG")).unwrap_or_default();
+        let base = v.split(['.', '@']).next().unwrap_or("");
+        base.is_empty() || base == "C" || base == "POSIX"
+    }
+    if !collation_is_c() {
+        return false;
+    }
+
     // Long options that are safe as bare flags (no value).
     const SAFE_LONG_BARE: &[&[u8]] = &[
         b"--reverse", b"--unique", b"--ignore-leading-blanks",
@@ -1146,6 +1199,11 @@ fn gate_sort(args: &[OsString]) -> bool {
         }
         if b == b"--" {
             opts_done = true;
+        } else if b.first() == Some(&b'+') && b.get(1).is_some_and(u8::is_ascii_digit) {
+            // Obsolete `+POS[-POS]` key syntax: the gate can't validate the key's
+            // mode modifiers (and a string +POS key inherits the locale risk), so
+            // route it to the host for parity with the `-k` policy.
+            return false;
         } else if b == b"-" || !b.starts_with(b"-") {
             continue; // stdin, or a filename
         } else if b.starts_with(b"--") {

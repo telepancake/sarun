@@ -180,6 +180,13 @@ CASES = [
     ("cut --version",      "cut --version",           "cut",      "external"),
     ("uniq --version",     "uniq --version",          "uniq",     "external"),
     ("sort -R (random)",   "printf 'b\\na\\n' | sort -R", "sort", "external"),
+    # gate-hardening regression guards (batch-1 blind-review findings) — each
+    # divergent shape must now route to the host binary (execve), while the one
+    # valid lookalike (tr canonical case pair) stays in-process.
+    ("uniq -cf1 (cluster val)",  "printf 'x\\nx\\n' | uniq -cf1",        "uniq", "external"),
+    ("cut -f3-1 (decreasing)",   "cut -f3-1 v.txt",                       "cut",  "external"),
+    ("tr a-z [:upper:] (misalign)", "printf x | tr a-z '[:upper:]'",      "tr",   "external"),
+    ("tr canonical pair",        "printf b | tr '[:lower:]' '[:upper:]'", "tr",   "inproc"),
 ]
 
 
