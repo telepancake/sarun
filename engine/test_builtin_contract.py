@@ -223,6 +223,53 @@ def check_io(label, script, cwd):
     return problems
 
 
+# EXISTING in-process surface (shell builtins + find/xargs/env exec-wrappers).
+# These must run FULLY in-process: the engine is the ONLY thing that ever
+# execve's (execve_basenames empty), and nothing dup2's onto fd 0/1/2. This
+# covers the "runs other builtins/scripts in-process" half of the contract:
+# `find -exec cat`, `xargs cat`, and `env A=1 echo` each dispatch their
+# sub-command THROUGH brush (the cat/echo builtin), so no binary is forked.
+PURE_CASES = [
+    ("echo (shell builtin)",          "echo hello"),
+    ("printf (shell builtin)",        "printf '%s-%d\\n' a 5"),
+    ("pwd (shell builtin)",           "pwd"),
+    ("true (shell builtin)",          "true"),
+    ("find (in-process)",             "find . -maxdepth 1 -type f -name v.txt"),
+    ("find -exec cat (sub via brush)", "find . -name v.txt -exec cat {} ';'"),
+    ("xargs cat (sub via brush)",     "printf v.txt | xargs cat"),
+    ("env A=1 echo (sub via brush)",  "env A=1 echo hi"),
+    ("env A=1 printenv (sub via brush)", "env A=1 printenv A"),
+]
+
+
+def check_pure(label, script, cwd):
+    """A fully in-process command: NOTHING but the engine binary is execve'd, and
+    no dup2/dup3 onto fd 0/1/2. Proves the sub-command (cat/echo/printenv) ran as
+    an in-process builtin via brush, not a forked binary."""
+    _, trace = run_trace(script, cwd)
+    problems = []
+    execd = execve_basenames(trace)
+    if execd:
+        problems.append(f"unexpected execve(s) {sorted(execd)} (expected fully "
+                        f"in-process)")
+    if dup_onto_std_count(trace):
+        problems.append(f"{dup_onto_std_count(trace)} dup2/dup3 onto fd 0/1/2")
+    return problems
+
+
+# Content+destination for the existing in-process surface (skip pwd/true: pwd's
+# logical-vs-physical path can differ on symlinked tmp, true has no output).
+CASES_IO_EXISTING = [
+    ("echo",                "echo hello"),
+    ("printf",              "printf '%s-%d\\n' a 5"),
+    ("find single",         "find . -maxdepth 1 -type f -name v.txt"),
+    ("find -exec cat",      "find . -name v.txt -exec cat {} ';'"),
+    ("xargs cat",           "printf v.txt | xargs cat"),
+    ("env A=1 echo",        "env A=1 echo hi"),
+    ("env A=1 printenv A",  "env A=1 printenv A"),
+]
+
+
 def run_all():
     _require()
     with tempfile.TemporaryDirectory() as cwd:
@@ -234,6 +281,11 @@ def run_all():
         results.append(("pipeline tac|head [inproc]", check_pipeline_inprocess(cwd)))
         results.append(("cat splice fast path", check_cat_splice(cwd)))
         for label, script in CASES_IO:
+            results.append((f"{label} [io: fd+content]", check_io(label, script, cwd)))
+        # Existing in-process surface: shell builtins + find/xargs/env.
+        for label, script in PURE_CASES:
+            results.append((f"{label} [pure in-proc]", check_pure(label, script, cwd)))
+        for label, script in CASES_IO_EXISTING:
             results.append((f"{label} [io: fd+content]", check_io(label, script, cwd)))
     return results
 
