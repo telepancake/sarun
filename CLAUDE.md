@@ -98,12 +98,10 @@ Each `test_*.py` is standalone (`check()`/`_fails` + `__main__`) and
 pytest-compatible; `conftest.py` turns the non-raising `check()` idiom into real
 pytest failures. The deps each file needs are in its module docstring.
 
-Known-failing today: the brush-coreutil tests (`test_make_rs`, `test_n2_rs`,
-`test_brush_link_rs`, `test_brush_nested_sh_rs`) assert that `cp` runs as an
-in-process brush builtin, but `cp` has no entry in `brush_gates.rs` (gates
-default to forking the host binary; only the utils listed there run in-process).
-That gate is unwritten, so those assertions fail — the tests are ahead of the
-implementation.
+Box-spawning tests can't be run in some sandboxed harnesses (their stdout/exit
+get suppressed); they need a real environment with FUSE + bwrap. The engine's
+non-box unit tests (`cargo zigbuild --tests` then run the binary) always work and
+are the quick check for UI/logic/rules changes.
 
 ## Vendored, patched upstreams
 
