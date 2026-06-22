@@ -82,6 +82,51 @@ def dup_onto_std_count(trace):
     return len(DUP_ON_STD.findall(trace))
 
 
+# write(FD, ... — the fd a write() targeted.
+WRITE_FD = re.compile(r'\bwrite\((\d+),')
+
+
+def run_redirected(script, cwd):
+    """Run `<script> >OUT 2>ERR` under strace -e trace=write; return
+    (trace, out_bytes, err_bytes). With both std streams redirected to FILES, the
+    box's logical sinks are fds OTHER than the process's 0/1/2 — so any write() the
+    trace shows to fd 1 or fd 2 is a process-global leak (the bug class the
+    differential tests, which capture process stdout/stderr, cannot see)."""
+    o = tempfile.NamedTemporaryFile(prefix="bo_", dir=cwd, delete=False); o.close()
+    e = tempfile.NamedTemporaryFile(prefix="be_", dir=cwd, delete=False); e.close()
+    tf = tempfile.NamedTemporaryFile(prefix="wtr_", suffix=".strace", delete=False)
+    tf.close()
+    try:
+        full = f"{script} >{o.name} 2>{e.name}"
+        subprocess.run(
+            ["strace", "-f", "-qq", "-e", "trace=write", "-s", "65536",
+             "-o", tf.name, BIN, "brush-sh", "--", "sh", "-c", full],
+            cwd=cwd, capture_output=True, timeout=60,
+        )
+        with open(tf.name, encoding="utf-8", errors="replace") as fh:
+            trace = fh.read()
+        with open(o.name, "rb") as fh:
+            out = fh.read()
+        with open(e.name, "rb") as fh:
+            err = fh.read()
+        return trace, out, err
+    finally:
+        for p in (o.name, e.name, tf.name):
+            os.unlink(p)
+
+
+def gnu_ref(script, cwd):
+    """The host (GNU coreutils) reference for `script`: its stdout/stderr bytes."""
+    p = subprocess.run(["sh", "-c", script], cwd=cwd, capture_output=True,
+                       timeout=60)
+    return p.stdout, p.stderr
+
+
+def writes_to_std(trace):
+    """Count write() syscalls in the trace that targeted process fd 1 or 2."""
+    return sum(1 for fd in WRITE_FD.findall(trace) if fd in ("1", "2"))
+
+
 # (label, script, util, mode) — mode "inproc" or "external".
 CASES = [
     # In-process: gate accepts -> util runs inside the engine.
@@ -145,6 +190,39 @@ def check_cat_splice(cwd):
     return []
 
 
+# In-process argvs to check for content+destination via strace write capture.
+# (label, script). stdout AND stderr are redirected to files by run_redirected,
+# so a proper builtin writes ONLY the logical-sink fds — never process fd 1/2.
+CASES_IO = [
+    ("head -n2",        "head -n2 v.txt"),
+    ("head -c5 pipe",   "printf abcdefgh | head -c5"),
+    ("head missing",    "head nope.txt"),          # diagnostic must hit logical err
+    ("wc -lc",          "wc -lc v.txt"),
+    ("nl file",         "nl v.txt"),
+    ("tac file",        "tac v.txt"),
+    ("cat file",        "cat v.txt"),
+    ("tac|head pipe",   "tac v.txt | head -n1"),
+]
+
+
+def check_io(label, script, cwd):
+    """strace write-capture: with stdout/stderr redirected to files, assert the
+    builtin makes NO write() to process fd 1/2 (no global-state leak), and the
+    sink files match the GNU reference byte-for-byte (right content, right fd)."""
+    trace, out, err = run_redirected(script, cwd)
+    g_out, g_err = gnu_ref(script, cwd)
+    problems = []
+    leaks = writes_to_std(trace)
+    if leaks:
+        problems.append(f"{leaks} write() to process fd 1/2 with both streams "
+                        f"redirected (logical-sink leak)")
+    if out != g_out:
+        problems.append(f"stdout != GNU: box={out!r} gnu={g_out!r}")
+    if err != g_err:
+        problems.append(f"stderr != GNU: box={err!r} gnu={g_err!r}")
+    return problems
+
+
 def run_all():
     _require()
     with tempfile.TemporaryDirectory() as cwd:
@@ -155,6 +233,8 @@ def run_all():
             results.append((f"{label} [{mode}]", probs))
         results.append(("pipeline tac|head [inproc]", check_pipeline_inprocess(cwd)))
         results.append(("cat splice fast path", check_cat_splice(cwd)))
+        for label, script in CASES_IO:
+            results.append((f"{label} [io: fd+content]", check_io(label, script, cwd)))
     return results
 
 
