@@ -141,13 +141,13 @@ use std::ffi::OsString;
 /// POSIX/GNU "death by signal" convention (T1).
 ///
 /// `ExitStatus::code()` returns `None` when the child was KILLED BY A SIGNAL
-/// (SIGSEGV, SIGKILL, SIGPIPE, …) rather than exiting normally. The old code
-/// here collapsed that case with `.code().unwrap_or(127)` (or `_or(1)`), which
-/// reports a bogus "exited 127" for a process that actually CRASHED — masking
-/// the death and giving `$?`/the recipe runner a wrong, non-signal value. Bash
-/// and GNU tools report a signal death as `128 + signo`, so a SIGSEGV (11)
-/// surfaces as 139 and a SIGINT (2) as 130. Reproduce that here so a coreutil
-/// that segfaults / is killed propagates a faithful exit code through brush.
+/// (SIGSEGV, SIGKILL, SIGPIPE, …) rather than exiting normally. Collapsing that
+/// case with `.code().unwrap_or(…)` reports a bogus "exited N" for a process
+/// that actually CRASHED — masking the death and giving `$?`/the recipe runner a
+/// wrong, non-signal value. Bash and GNU tools report a signal death as
+/// `128 + signo`, so a SIGSEGV (11) surfaces as 139 and a SIGINT (2) as 130.
+/// Reproduce that here so a child that segfaults / is killed propagates a
+/// faithful exit code through brush (used by the engine re-exec builtin).
 fn child_exit_code(status: std::process::ExitStatus) -> i32 {
     use std::os::unix::process::ExitStatusExt;
     if let Some(code) = status.code() {
@@ -162,250 +162,37 @@ fn child_exit_code(status: std::process::ExitStatus) -> i32 {
     }
 }
 
-/// A uutils coreutil (`fn(Vec<OsString>) -> i32`) wrapped as a brush-core
-/// `SimpleCommand` so it runs IN-PROCESS as a brush builtin.
-///
-/// THE CORRECTNESS TRAP: a uutils `uumain` writes the PROCESS's real fd 1/2 —
-/// it ignores brush's in-memory `OpenFiles`. So `execute` inspects the brush
-/// `context`'s stdout/stderr OpenFile and, if it is backed by a real fd that is
-/// NOT already 1/2 (a pipe stage, a `> file` redirect, …), dup2's that fd onto
-/// 1/2 for the duration of the call, then restores the saved 1/2. If stdout is
-/// the plain `Stdout` (fd 1 already → the FUSE sink) we call directly. If the
-/// OpenFile is an in-memory `Stream` with no raw fd (`try_borrow_as_fd` errors)
-/// uutils CANNOT be pointed at it, so we error visibly rather than silently
-/// write to the wrong fd — that path does not arise for box capture (sinks and
-/// pipes are all real fds) but we refuse it loudly if it ever does.
-struct CoreutilWrapper;
-
-impl CoreutilWrapper {
-    /// Look up the coreutil fn for `name` (the registered builtin name) from the
-    /// bundled table. Built once per call; the table is tiny (<100 fn ptrs).
-    fn lookup(name: &str) -> Option<fn(Vec<OsString>) -> i32> {
-        brush_coreutils_builtins::bundled_commands().get(name).copied()
-    }
-}
-
-/// Redirect `target_fd` (1 or 2) to the raw fd backing `of` for the duration of
-/// `run`, restoring the original afterwards. Returns the run's value. If `of`
-/// already maps to `target_fd` (the common Stdout/Stderr → sink case) nothing is
-/// dup'd. Returns Err with a visible message if `of` has no usable raw fd.
-///
-/// KNOWN RACE — M3 (deferred; see engine AUDIT.md "M3"). `dup2(target_fd)` /
-/// the saved-fd restore here mutate the PROCESS-GLOBAL fd table, not a thread-
-/// or child-local one. The window between the `dup2` above and the restore
-/// below is a critical section over fd 1 (or 2) shared by EVERY thread in this
-/// engine process. The caller (`CoreutilWrapper::execute`) already removes the
-/// worst offender: it routes a `context.spawned_pipeline_stage` coreutil to the
-/// child-local external path (`run_coreutil_external`) instead of here, so a
-/// coreutil running CONCURRENTLY with its sibling pipeline-stage spawns never
-/// enters this function. But that guard is necessary, not sufficient: a
-/// NON-pipeline sibling thread (another box's brush shell, a background async
-/// task, a second concurrent in-process recipe) that reads/writes fd 1/2 during
-/// this window still sees the transiently-redirected fd, or races the restore.
-///
-/// A correct fix is invasive and deliberately NOT attempted here: it means
-/// removing process-global fd mutation entirely — either give each coreutil a
-/// child-local fd setup the way `run_coreutil_external`/`CatBuiltin` already do
-/// (port more utils to logical-I/O entry points, the `uu_cat::cat(out, …)`
-/// model) so no `dup2` of the shared table is needed, OR serialize all
-/// in-process coreutil execution behind a process-wide fd-table mutex (kills the
-/// concurrency this path exists for). Both are larger than this change's scope;
-/// the narrow `spawned_pipeline_stage` guard makes the common configure/make
-/// workload correct, and the residual cross-thread race is logged as M3 to be
-/// addressed with the broader logical-I/O port, not patched riskily here.
-fn with_fd_redirected<R>(
-    target_fd: i32,
-    of: &brush_core::openfiles::OpenFile,
-    run: impl FnOnce() -> R,
-) -> Result<R, String> {
-    // The raw fd brush would have uutils write to. Stream has none.
-    let borrowed = of.try_borrow_as_fd().map_err(|_| {
-        format!("coreutil output fd {target_fd} is an in-memory stream with no \
-                 raw fd; cannot run uutils against it")
-    })?;
-    let src = borrowed.as_raw_fd();
-    if src == target_fd {
-        // Already the right fd (e.g. Stdout == fd 1 == the FUSE sink). No dup.
-        return Ok(run());
-    }
-    // Save the current target fd, point it at `src`, run, restore.
-    let saved = unsafe { libc::dup(target_fd) };
-    if saved < 0 {
-        return Err(format!("coreutil: dup(save fd {target_fd}) failed"));
-    }
-    if unsafe { libc::dup2(src, target_fd) } < 0 {
-        unsafe { libc::close(saved); }
-        return Err(format!("coreutil: dup2 onto fd {target_fd} failed"));
-    }
-    let r = run();
-    unsafe {
-        // Best-effort restore; flush is the uutils adapter's job (it does).
-        libc::dup2(saved, target_fd);
-        libc::close(saved);
-    }
-    Ok(r)
-}
-
-/// Shell out to the host binary for a coreutil — when its gate refuses the argv,
-/// or when it is a separately-spawned (concurrent) pipeline stage where the
-/// in-process uumain path's process-wide fd redirect would race the sibling
-/// spawns.
-///
-/// We delegate to brush's OWN external-command composer, `compose_std_command`,
-/// so a forked coreutil inherits the shell state EXACTLY like any other external
-/// brush runs — there is one definition of "how a child sees the shell" and we
-/// reuse it instead of re-deriving it piecemeal. That single function already
-/// applies: the shell's LOGICAL cwd and exported environment (brush keeps both
-/// logical — it never chdir's the process or mutates its env), std fd 0/1/2 plus
-/// the command's injected fd>=3 redirections, argv[0], and the stray-fd close
-/// hook. It is all child-local (no process-wide dup2), so it is safe on the
-/// spawn_blocking pipeline worker, and it is the same battle-tested path every
-/// external pipeline stage (cc, sed, …) already takes. `args` is argv WITHOUT
-/// the leading command name (compose adds argv[0] itself). Returns the child's
-/// exit code (low 8 bits); a compose or spawn failure returns 127.
-fn run_coreutil_external<SE: brush_core::extensions::ShellExtensions>(
-    context: &brush_core::commands::ExecutionContext<'_, SE>,
-    name: &str,
-    args: &[OsString],
+/// Run a native coreutil entry on a FRESH thread so it gets its own thread-local
+/// uucore localization bundle. uucore caches a util's Fluent strings in a
+/// thread-local `LOCALIZER` behind a thread-local "already set" guard, so the
+/// FIRST util to run on a thread wins the slot and any later DIFFERENT util would
+/// emit raw Fluent keys (e.g. `head-error-cannot-open`). A new thread per
+/// invocation gives each util a clean slot — and a thread is far cheaper than the
+/// fork+exec it replaces. Returns the util's exit code (1 on spawn/join failure).
+fn run_coreutil_localized(
+    util: &'static str,
+    body: impl FnOnce() -> i32 + Send + 'static,
 ) -> i32 {
-    let mut cmd = match brush_core::commands::compose_std_command(
-        context, name, name, args, /* empty_env = */ false,
-    ) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("/bin/sh: line 1: {name}: {e}");
-            return 127;
-        }
-    };
-    match cmd.status() {
-        // T1: honour signal deaths (128 + signo) instead of collapsing them to 127.
-        Ok(s) => child_exit_code(s),
-        Err(e) => {
-            eprintln!("/bin/sh: line 1: {name}: command not found ({e})");
-            127
-        }
+    match std::thread::Builder::new()
+        .name(format!("sarun-{util}"))
+        .spawn(move || {
+            brush_coreutils_builtins::init_localization(util);
+            body()
+        }) {
+        Ok(h) => h.join().unwrap_or(1),
+        Err(_) => 1,
     }
 }
 
-impl brush_core::builtins::SimpleCommand for CoreutilWrapper {
-    fn get_content(
-        name: &str,
-        _content_type: brush_core::builtins::ContentType,
-        _options: &brush_core::builtins::ContentOptions,
-    ) -> Result<String, brush_core::error::Error> {
-        Ok(format!("{name}: bundled uutils/coreutils builtin\n"))
-    }
-
-    fn execute<SE: brush_core::extensions::ShellExtensions,
-               I: Iterator<Item = S>, S: AsRef<str>>(
-        context: brush_core::commands::ExecutionContext<'_, SE>,
-        args: I,
-    ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
-        let name = context.command_name.clone();
-        let Some(func) = CoreutilWrapper::lookup(&name) else {
-            // Should not happen: we only register names present in the table.
-            eprintln!("sarun-engine brush: coreutil '{name}' not in bundled table");
-            return Ok(brush_core::results::ExecutionResult::new(127));
-        };
-        // argv as OsString. brush passes `args` INCLUDING the command name as
-        // the first element (CommandArg "including the command itself" — see
-        // brush_core::commands::ExecutionContext::args), which is exactly the
-        // argv[0]=util-name uutils expects, so we do NOT prepend `name` again.
-        // Defensive: if brush ever hands an empty list, seed argv[0]=name.
-        let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
-        if argv.is_empty() { argv.push(OsString::from(&name)); }
-
-        // sarun: per-util GATE. The bundled uutils diverges from GNU
-        // coreutils on flags, locale-sensitive output, and a tail of
-        // corner cases. crate::brush_gates::gate_for(name) returns a
-        // per-util predicate: true means uutils faithfully handles
-        // THIS specific argv → call uumain in-process; false (default)
-        // → fall back to fork+exec of the host binary, which IS the
-        // GNU implementation. Most utils start at gate_false until an
-        // agent audits them and writes a tighter gate (see
-        // brush_gates.rs's module-level docs).
-        let gate = crate::brush_gates::gate_for(&name);
-
-        // sarun: CONCURRENT-PIPELINE-STAGE guard. The in-process uumain path below
-        // points the PROCESS's real fd 0/1/2 at the brush OpenFiles via
-        // with_fd_redirected (a process-wide dup2). That is safe for a stand-alone
-        // command, but NOT when this coreutil is a separately-spawned pipeline
-        // stage: brush runs it on a tokio spawn_blocking worker CONCURRENTLY with
-        // spawning the sibling stages, so a transient fd redirect leaks into a
-        // just-forked sibling (the configure/make hang; see run_coreutil_external).
-        // brush tells us this directly via context.spawned_pipeline_stage (true
-        // only on the OwnedShell + spawn_blocking path) — the RIGHT signal, vs.
-        // guessing from fd type, which would wrongly fire on a stand-alone command
-        // that merely inherited a pipe as its stdout (e.g. the whole box piped into
-        // another process). A concurrent stage takes the external host binary,
-        // which wires the child's fds without mutating this process's fd table. We
-        // OR with the gate so a pipeline stage shells out even if its gate is true.
-        if context.spawned_pipeline_stage || !gate(&argv) {
-            // compose_std_command adds argv[0] itself, so pass argv WITHOUT the
-            // leading command name; it derives cwd/env/fds from the context.
-            let code = run_coreutil_external(&context, &name, &argv[1..]);
-            return Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8));
-        }
-
-        // In-process uumain path (gate said true AND not a concurrent pipeline
-        // stage). Resolve the brush context's stdin/stdout/stderr OpenFiles so we
-        // can point the PROCESS's real fd 0/1/2 at them around the uumain call — a
-        // uutils uumain reads/writes the real fds, ignoring brush's OpenFiles.
-        // Where the OpenFile already maps to the same fd (the common
-        // Stdout==1 / Stderr==2 / Stdin==0 sink case) with_fd_redirected is a
-        // no-op; where it is a File (`> file`) it dup2's around the call. This
-        // path only handles 0/1/2 (uutils uses no other fds); pipe stages and any
-        // exec-3<… cases already went external above with full fd inheritance.
-        let in_ = context.try_fd(0);
-        let out = context.try_fd(1);
-        let err = context.try_fd(2);
-
-        // Redirect fd N to `of` (if present) around `run`; map a redirect failure
-        // to a visible message + exit 1. Returns the uumain exit code.
-        fn step(
-            fd: i32,
-            of: &Option<brush_core::openfiles::OpenFile>,
-            run: impl FnOnce() -> i32,
-        ) -> i32 {
-            match of {
-                Some(of) => match with_fd_redirected(fd, of, run) {
-                    Ok(c) => c,
-                    Err(msg) => { eprintln!("sarun-engine brush: {msg}"); 1 }
-                },
-                // No entry for this fd → leave the process fd as-is.
-                None => run(),
-            }
-        }
-
-        // Nest fd 2 (outer) → fd 1 → fd 0 (inner) → uumain.
-        let code = step(2, &err, || {
-            step(1, &out, || {
-                step(0, &in_, || func(argv))
-            })
-        });
-        Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
-    }
-}
-
-/// `cat` as a NATIVE injected-I/O brush builtin.
+/// `cat` — NATIVE in-process brush builtin over the vendored `uu_cat` fork.
 ///
-/// This is the genuine in-process port, distinct from the generic
-/// [`CoreutilWrapper`]. CoreutilWrapper runs a util's stock `uumain`, which
-/// reads/writes the PROCESS's real fd 0/1/2 — so to aim it at a box sink that
-/// is NOT already fd 1 it must `dup2` around the call ([`with_fd_redirected`]),
-/// a process-global mutation that races concurrent pipeline stages. The
-/// vendored `uu_cat` fork instead exposes `uu_cat::cat(out, out_fd, stdin,
-/// stdin_fd)` — a logical entry that writes the sink we hand it DIRECTLY. So
-/// this builtin:
-///   * never touches the process fd table (no `dup2`) → concurrency-safe, a
-///     pipeline stage can take it; and
-///   * passes the box's logical `OpenFile`s straight through, with their
-///     backing raw fds (when any) so `cat`'s `copy_file_range`/`splice` fast
-///     path still fires.
-/// The per-argv gate ([`crate::brush_gates::gate_cat`]) still guards the tail
-/// of flags where uutils diverges from GNU; a refused argv (or `--help`/
-/// `--version`) falls back to the host binary via [`run_coreutil_external`]
-/// (child-local fds — also no `dup2`).
+/// Runs uutils' `cat` IN-PROCESS, UNCONDITIONALLY: it reads/logical stdin and writes the box's
+/// logical `OpenFile` sink/source directly — no process-global stdio, no `dup2`,
+/// so it is safe as a concurrent pipeline stage. There is no per-argv gate and no
+/// fork-to-the-box's-binary fallback; the vendored fork is patched to match
+/// POSIX/GNU where uutils diverged, and otherwise behaves as uutils (this box's
+/// coreutils IS uutils). The call runs on a fresh thread for localization
+/// isolation — see [`run_coreutil_localized`].
 struct CatBuiltin;
 
 impl brush_core::builtins::SimpleCommand for CatBuiltin {
@@ -422,75 +209,46 @@ impl brush_core::builtins::SimpleCommand for CatBuiltin {
         context: brush_core::commands::ExecutionContext<'_, SE>,
         args: I,
     ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
-        use std::io::Write;
-        use std::os::fd::BorrowedFd;
-
         let name = context.command_name.clone();
-        // argv INCLUDING argv[0]=name (brush's convention, and what cat's clap
-        // parser expects). Defensive seed if brush ever hands an empty list.
         let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
         if argv.is_empty() { argv.push(OsString::from(&name)); }
 
-        // GATE: flags uutils cat doesn't reproduce GNU-faithfully (and
-        // --help/--version) fall back to the host binary. compose_std_command
-        // wires the child's fds child-locally — still no process-global dup2.
-        if !crate::brush_gates::gate_for(&name)(&argv) {
-            let code = run_coreutil_external(&context, &name, &argv[1..]);
-            return Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8));
-        }
+        let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
+        let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
+        let inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
 
-        // Render `translate!` messages (e.g. "Is a directory") instead of raw
-        // Fluent keys — the setup half the bundled-coreutils adapter runs.
-        brush_coreutils_builtins::init_localization("uu_cat");
-
-        // The box's logical sinks/source. We write/read THESE directly; no fd of
-        // this process is redirected. Fall back to real std streams only if the
-        // context has no entry for the fd (shouldn't happen for a box).
-        let mut out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
-        let mut err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
-        let mut inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
-
-        // Backing raw fds for cat's splice fast path / output-is-input guard /
-        // is-terminal check. Captured as plain ints BEFORE the `&mut` borrows so
-        // the BorrowedFds don't alias the OpenFiles; they stay valid because the
-        // OpenFiles outlive the call.
-        let out_raw = out.try_borrow_as_fd().ok().map(|b| b.as_raw_fd());
-        let in_raw = inp.try_borrow_as_fd().ok().map(|b| b.as_raw_fd());
-        // SAFETY: each fd is owned by an OpenFile that lives across the cat call.
-        let out_fd = out_raw.map(|fd| unsafe { BorrowedFd::borrow_raw(fd) });
-        let in_fd = in_raw.map(|fd| unsafe { BorrowedFd::borrow_raw(fd) });
-
-        let code = match uu_cat::cat(argv.into_iter(), &mut out, out_fd, &mut inp, in_fd) {
-            Ok(()) => 0,
-            Err(e) => {
-                // cat() writes nothing to the process stderr; it returns every
-                // diagnostic as the error's Display, already joined with
-                // "\ncat: " for multi-file failures. Prefix the first line to
-                // match GNU's "cat: …", emit it on the LOGICAL stderr, and use
-                // GNU's exit status (1 on any read error).
-                let _ = writeln!(err, "{name}: {e}");
-                let _ = err.flush();
-                1
-            }
-        };
-        let _ = out.flush();
+        let code = run_coreutil_localized("uu_cat", move || {
+            use std::io::Write;
+            use std::os::fd::{AsRawFd, BorrowedFd};
+            let mut out = out;
+            let mut err = err;
+            let mut inp = inp;
+            let out_raw = out.try_borrow_as_fd().ok().map(|b| b.as_raw_fd());
+            let in_raw = inp.try_borrow_as_fd().ok().map(|b| b.as_raw_fd());
+            // SAFETY: each fd is owned by an OpenFile that lives across the call.
+            let out_fd = out_raw.map(|fd| unsafe { BorrowedFd::borrow_raw(fd) });
+            let in_fd = in_raw.map(|fd| unsafe { BorrowedFd::borrow_raw(fd) });
+            let r = match uu_cat::cat(argv.into_iter(), &mut out, out_fd, &mut inp, in_fd) {
+                Ok(()) => 0,
+                Err(e) => { let _ = writeln!(err, "{name}: {e}"); 1 }
+            };
+            let _ = out.flush();
+            let _ = err.flush();
+            r
+        });
         Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
     }
 }
 
-/// `head` as a NATIVE injected-I/O brush builtin.
+/// `head` — NATIVE in-process brush builtin over the vendored `uu_head` fork.
 ///
-/// Same model as [`CatBuiltin`]: the vendored `uu_head` fork exposes
-/// `uu_head::head(args, out, out_fd, stdin, stdin_fd)` — a logical entry that
-/// writes the sink we hand it DIRECTLY and reads the source we hand it, never
-/// touching the process fd table. So this builtin never `dup2`s (concurrency-safe,
-/// a pipeline stage can take it) and passes the box's logical `OpenFile`s straight
-/// through with their backing raw fds (when any) so head's seek-preserving stdin
-/// path still fires. `head` has no splice fast path, so `out_fd` is handed across
-/// for signature parity and ignored; `stdin_fd` is used. The per-argv gate
-/// ([`crate::brush_gates::gate_head`]) guards the flags where uutils diverges from
-/// GNU; a refused argv (`--help`/`--version`/`--presume-input-pipe`/unaudited)
-/// falls back to the host binary via [`run_coreutil_external`].
+/// Runs uutils' `head` IN-PROCESS, UNCONDITIONALLY: it reads/logical stdin and writes the box's
+/// logical `OpenFile` sink/source directly — no process-global stdio, no `dup2`,
+/// so it is safe as a concurrent pipeline stage. There is no per-argv gate and no
+/// fork-to-the-box's-binary fallback; the vendored fork is patched to match
+/// POSIX/GNU where uutils diverged, and otherwise behaves as uutils (this box's
+/// coreutils IS uutils). The call runs on a fresh thread for localization
+/// isolation — see [`run_coreutil_localized`].
 struct HeadBuiltin;
 
 impl brush_core::builtins::SimpleCommand for HeadBuiltin {
@@ -507,65 +265,46 @@ impl brush_core::builtins::SimpleCommand for HeadBuiltin {
         context: brush_core::commands::ExecutionContext<'_, SE>,
         args: I,
     ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
-        use std::io::Write;
-        use std::os::fd::BorrowedFd;
-
         let name = context.command_name.clone();
-        // argv INCLUDING argv[0]=name (brush's convention, and what head's clap
-        // parser + obsolete-syntax arg_iterate expect). Defensive seed.
         let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
         if argv.is_empty() { argv.push(OsString::from(&name)); }
 
-        // GATE: flags uutils head doesn't reproduce GNU-faithfully (and
-        // --help/--version/--presume-input-pipe) fall back to the host binary.
-        if !crate::brush_gates::gate_for(&name)(&argv) {
-            let code = run_coreutil_external(&context, &name, &argv[1..]);
-            return Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8));
-        }
+        let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
+        let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
+        let inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
 
-        brush_coreutils_builtins::init_localization("uu_head");
-
-        // The box's logical sinks/source — written/read directly, no dup2.
-        let mut out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
-        let mut err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
-        let mut inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
-
-        // Backing raw fds captured as plain ints BEFORE the &mut borrows. head
-        // ignores out_fd (no splice path) but uses in_fd (seek-preserving stdin).
-        let out_raw = out.try_borrow_as_fd().ok().map(|b| b.as_raw_fd());
-        let in_raw = inp.try_borrow_as_fd().ok().map(|b| b.as_raw_fd());
-        // SAFETY: each fd is owned by an OpenFile that lives across the head call.
-        let out_fd = out_raw.map(|fd| unsafe { BorrowedFd::borrow_raw(fd) });
-        let in_fd = in_raw.map(|fd| unsafe { BorrowedFd::borrow_raw(fd) });
-
-        let code = match uu_head::head(argv.into_iter(), &mut out, out_fd, &mut inp, in_fd) {
-            Ok(()) => 0,
-            Err(e) => {
-                // head() writes nothing to the process stderr; it returns its
-                // diagnostic as the error's Display. Prefix the program name to
-                // match GNU's "head: …", emit it on the LOGICAL stderr.
-                let _ = writeln!(err, "{name}: {e}");
-                let _ = err.flush();
-                1
-            }
-        };
-        let _ = out.flush();
+        let code = run_coreutil_localized("uu_head", move || {
+            use std::io::Write;
+            use std::os::fd::{AsRawFd, BorrowedFd};
+            let mut out = out;
+            let mut err = err;
+            let mut inp = inp;
+            let out_raw = out.try_borrow_as_fd().ok().map(|b| b.as_raw_fd());
+            let in_raw = inp.try_borrow_as_fd().ok().map(|b| b.as_raw_fd());
+            // SAFETY: each fd is owned by an OpenFile that lives across the call.
+            let out_fd = out_raw.map(|fd| unsafe { BorrowedFd::borrow_raw(fd) });
+            let in_fd = in_raw.map(|fd| unsafe { BorrowedFd::borrow_raw(fd) });
+            let r = match uu_head::head(argv.into_iter(), &mut out, out_fd, &mut inp, in_fd) {
+                Ok(()) => 0,
+                Err(e) => { let _ = writeln!(err, "{name}: {e}"); 1 }
+            };
+            let _ = out.flush();
+            let _ = err.flush();
+            r
+        });
         Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
     }
 }
 
-/// `wc` as a NATIVE injected-I/O brush builtin.
+/// `wc` — NATIVE in-process brush builtin over the vendored `uu_wc` fork.
 ///
-/// Like [`CatBuiltin`], the genuine in-process port: writes the box's logical
-/// sink DIRECTLY (no `dup2`, pipeline-safe) and routes diagnostics to the box's
-/// logical stderr. The vendored `uu_wc` fork exposes
-/// `uu_wc::wc(args, out, out_fd, err, stdin, stdin_fd)` — `out_fd` is accepted for
-/// parity and ignored (wc has no output-fd fast path); `stdin_fd` drives the `-c`
-/// fstat/splice fast path when a real descriptor exists. The per-argv gate
-/// ([`crate::brush_gates::gate_wc`]) guards the flags/shapes where uutils diverges
-/// from GNU (words/chars/max-line-length under this locale, multi-counter stdin
-/// column width, `--help`/`--version`); a refused argv falls back to the host
-/// binary via [`run_coreutil_external`].
+/// Runs uutils' `wc` IN-PROCESS, UNCONDITIONALLY: it reads/logical stdin and writes the box's
+/// logical `OpenFile` sink/source directly — no process-global stdio, no `dup2`,
+/// so it is safe as a concurrent pipeline stage. There is no per-argv gate and no
+/// fork-to-the-box's-binary fallback; the vendored fork is patched to match
+/// POSIX/GNU where uutils diverged, and otherwise behaves as uutils (this box's
+/// coreutils IS uutils). The call runs on a fresh thread for localization
+/// isolation — see [`run_coreutil_localized`].
 struct WcBuiltin;
 
 impl brush_core::builtins::SimpleCommand for WcBuiltin {
@@ -582,54 +321,46 @@ impl brush_core::builtins::SimpleCommand for WcBuiltin {
         context: brush_core::commands::ExecutionContext<'_, SE>,
         args: I,
     ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
-        use std::io::Write;
-        use std::os::fd::BorrowedFd;
-
         let name = context.command_name.clone();
         let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
         if argv.is_empty() { argv.push(OsString::from(&name)); }
 
-        // GATE: flags/shapes uutils wc doesn't reproduce GNU-faithfully (and
-        // --help/--version) fall back to the host binary, child-local fds.
-        if !crate::brush_gates::gate_for(&name)(&argv) {
-            let code = run_coreutil_external(&context, &name, &argv[1..]);
-            return Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8));
-        }
+        let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
+        let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
+        let inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
 
-        brush_coreutils_builtins::init_localization("uu_wc");
-
-        let mut out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
-        let mut err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
-        let mut inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
-
-        let out_raw = out.try_borrow_as_fd().ok().map(|b| b.as_raw_fd());
-        let in_raw = inp.try_borrow_as_fd().ok().map(|b| b.as_raw_fd());
-        // SAFETY: each fd is owned by an OpenFile that lives across the wc call.
-        let out_fd = out_raw.map(|fd| unsafe { BorrowedFd::borrow_raw(fd) });
-        let in_fd = in_raw.map(|fd| unsafe { BorrowedFd::borrow_raw(fd) });
-
-        let code = match uu_wc::wc(argv.into_iter(), &mut out, out_fd, &mut err, &mut inp, in_fd) {
-            Ok(()) => 0,
-            // wc() writes every diagnostic to the logical `err` itself and
-            // returns only the exit code (its UError message is empty), so just
-            // propagate the status. GNU exits 1 on any open/read error.
-            Err(e) => e.code(),
-        };
-        let _ = out.flush();
-        let _ = err.flush();
+        let code = run_coreutil_localized("uu_wc", move || {
+            use std::io::Write;
+            use std::os::fd::{AsRawFd, BorrowedFd};
+            let mut out = out;
+            let mut err = err;
+            let mut inp = inp;
+            let out_raw = out.try_borrow_as_fd().ok().map(|b| b.as_raw_fd());
+            let in_raw = inp.try_borrow_as_fd().ok().map(|b| b.as_raw_fd());
+            // SAFETY: each fd is owned by an OpenFile that lives across the call.
+            let out_fd = out_raw.map(|fd| unsafe { BorrowedFd::borrow_raw(fd) });
+            let in_fd = in_raw.map(|fd| unsafe { BorrowedFd::borrow_raw(fd) });
+            let r = match uu_wc::wc(argv.into_iter(), &mut out, out_fd, &mut err, &mut inp, in_fd) {
+                Ok(()) => 0,
+                Err(e) => e.code(),
+            };
+            let _ = out.flush();
+            let _ = err.flush();
+            r
+        });
         Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
     }
 }
 
-/// `nl` as a NATIVE injected-I/O brush builtin.
+/// `nl` — NATIVE in-process brush builtin over the vendored `uu_nl` fork.
 ///
-/// Like [`CatBuiltin`], the genuine in-process port. The vendored `uu_nl` fork
-/// exposes `uu_nl::nl(args, out, err, stdin)` — a logical entry that writes the
-/// sink we hand it DIRECTLY and reads the source we hand it. `nl` has no splice
-/// fast path, so (unlike `cat`) it needs no backing raw fd. Never `dup2`s →
-/// concurrency-safe. The per-argv gate ([`crate::brush_gates::gate_nl`]) guards
-/// the flags/values where uutils diverges from GNU; a refused argv (or
-/// `--help`/`--version`) falls back to the host binary via [`run_coreutil_external`].
+/// Runs uutils' `nl` IN-PROCESS, UNCONDITIONALLY: it reads/logical stdin and writes the box's
+/// logical `OpenFile` sink/source directly — no process-global stdio, no `dup2`,
+/// so it is safe as a concurrent pipeline stage. There is no per-argv gate and no
+/// fork-to-the-box's-binary fallback; the vendored fork is patched to match
+/// POSIX/GNU where uutils diverged, and otherwise behaves as uutils (this box's
+/// coreutils IS uutils). The call runs on a fresh thread for localization
+/// isolation — see [`run_coreutil_localized`].
 struct NlBuiltin;
 
 impl brush_core::builtins::SimpleCommand for NlBuiltin {
@@ -646,56 +377,44 @@ impl brush_core::builtins::SimpleCommand for NlBuiltin {
         context: brush_core::commands::ExecutionContext<'_, SE>,
         args: I,
     ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
-        use std::io::Write;
-
         let name = context.command_name.clone();
         let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
         if argv.is_empty() { argv.push(OsString::from(&name)); }
 
-        // GATE: argvs uutils nl doesn't reproduce GNU-faithfully (and
-        // --help/--version) fall back to the host binary.
-        if !crate::brush_gates::gate_for(&name)(&argv) {
-            let code = run_coreutil_external(&context, &name, &argv[1..]);
-            return Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8));
-        }
+        let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
+        let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
+        let inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
 
-        brush_coreutils_builtins::init_localization("uu_nl");
-
-        let mut out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
-        let mut err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
-        let mut inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
-
-        // No backing-fd capture: nl needs no raw descriptor (no splice path).
-        let code = match uu_nl::nl(argv.into_iter(), &mut out, &mut err, &mut inp) {
-            Ok(()) => 0,
-            Err(e) => {
-                // nl() routes its directory diagnostic to `err` itself and
-                // returns USimpleError(1, "") for that path (empty message). A
-                // clap/parse error carries real text; surface it on the LOGICAL
-                // stderr, prefixed to match GNU's "nl: …". Use the error's code.
-                let msg = e.to_string();
-                if !msg.is_empty() {
-                    let _ = writeln!(err, "{name}: {msg}");
+        let code = run_coreutil_localized("uu_nl", move || {
+            use std::io::Write;
+            let mut out = out;
+            let mut err = err;
+            let mut inp = inp;
+            let r = match uu_nl::nl(argv.into_iter(), &mut out, &mut err, &mut inp) {
+                Ok(()) => 0,
+                Err(e) => {
+                    let msg = e.to_string();
+                    if !msg.is_empty() { let _ = writeln!(err, "{name}: {msg}"); }
+                    e.code()
                 }
-                let _ = err.flush();
-                e.code()
-            }
-        };
-        let _ = out.flush();
+            };
+            let _ = out.flush();
+            let _ = err.flush();
+            r
+        });
         Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
     }
 }
 
-/// `tac` as a NATIVE injected-I/O brush builtin.
+/// `tac` — NATIVE in-process brush builtin over the vendored `uu_tac` fork.
 ///
-/// Like [`CatBuiltin`], the genuine in-process port. The vendored `uu_tac` fork
-/// exposes `uu_tac::tac(args, out, err, stdin)` — a logical entry that writes the
-/// sink we hand it DIRECTLY. Never `dup2`s → concurrency-safe. `tac` buffers the
-/// WHOLE input before emitting (last line first), so unlike `cat` there is no
-/// splice fast path and no backing raw fd is needed: the logical `stdin` reader is
-/// drained into memory. The per-argv gate ([`crate::brush_gates::gate_tac`])
-/// guards the flags where uutils diverges from GNU; a refused argv (or
-/// `--help`/`--version`) falls back to the host binary via [`run_coreutil_external`].
+/// Runs uutils' `tac` IN-PROCESS, UNCONDITIONALLY: it reads/logical stdin and writes the box's
+/// logical `OpenFile` sink/source directly — no process-global stdio, no `dup2`,
+/// so it is safe as a concurrent pipeline stage. There is no per-argv gate and no
+/// fork-to-the-box's-binary fallback; the vendored fork is patched to match
+/// POSIX/GNU where uutils diverged, and otherwise behaves as uutils (this box's
+/// coreutils IS uutils). The call runs on a fresh thread for localization
+/// isolation — see [`run_coreutil_localized`].
 struct TacBuiltin;
 
 impl brush_core::builtins::SimpleCommand for TacBuiltin {
@@ -712,268 +431,44 @@ impl brush_core::builtins::SimpleCommand for TacBuiltin {
         context: brush_core::commands::ExecutionContext<'_, SE>,
         args: I,
     ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
-        use std::io::Write;
-
         let name = context.command_name.clone();
         let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
         if argv.is_empty() { argv.push(OsString::from(&name)); }
 
-        // GATE: flags uutils tac doesn't reproduce GNU-faithfully (and
-        // --help/--version) fall back to the host binary.
-        if !crate::brush_gates::gate_for(&name)(&argv) {
-            let code = run_coreutil_external(&context, &name, &argv[1..]);
-            return Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8));
-        }
+        let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
+        let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
+        let inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
 
-        brush_coreutils_builtins::init_localization("uu_tac");
-
-        let mut out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
-        let mut err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
-        let mut inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
-
-        // tac buffers the whole input — no splice fast path — so NO backing raw
-        // fds are needed (unlike CatBuiltin). tac() reads `inp` to EOF.
-        let code = match uu_tac::tac(argv.into_iter(), &mut out, &mut err, &mut inp) {
-            Ok(()) => 0,
-            // tac() already wrote every per-file diagnostic to the LOGICAL `err`
-            // (prefixed "tac: ") and returns an empty-message error carrying GNU's
-            // status (1). A clap/usage error carries its own message — surface it.
-            Err(e) => {
-                let msg = e.to_string();
-                if !msg.is_empty() {
-                    let _ = writeln!(err, "{name}: {msg}");
+        let code = run_coreutil_localized("uu_tac", move || {
+            use std::io::Write;
+            let mut out = out;
+            let mut err = err;
+            let mut inp = inp;
+            let r = match uu_tac::tac(argv.into_iter(), &mut out, &mut err, &mut inp) {
+                Ok(()) => 0,
+                Err(e) => {
+                    let msg = e.to_string();
+                    if !msg.is_empty() { let _ = writeln!(err, "{name}: {msg}"); }
+                    e.code()
                 }
-                let _ = err.flush();
-                e.code()
-            }
-        };
-        let _ = out.flush();
+            };
+            let _ = out.flush();
+            let _ = err.flush();
+            r
+        });
         Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
     }
 }
 
-/// `basename` as a NATIVE injected-I/O brush builtin (vendored uu_basename fork).
+/// `tr` — NATIVE in-process brush builtin over the vendored `uu_tr` fork.
 ///
-/// Like [`CatBuiltin`], the genuine in-process port: writes the box's logical
-/// sink/stderr DIRECTLY (no `dup2`, pipeline-safe) with no stdin.
-/// The per-argv gate ([`crate::brush_gates::gate_basename`]) keeps the flags/shapes
-/// where uutils diverges from GNU on the host binary via [`run_coreutil_external`].
-struct BasenameBuiltin;
-
-impl brush_core::builtins::SimpleCommand for BasenameBuiltin {
-    fn get_content(
-        name: &str,
-        _content_type: brush_core::builtins::ContentType,
-        _options: &brush_core::builtins::ContentOptions,
-    ) -> Result<String, brush_core::error::Error> {
-        Ok(format!("{name}: native injected-I/O basename builtin\n"))
-    }
-
-    fn execute<SE: brush_core::extensions::ShellExtensions,
-               I: Iterator<Item = S>, S: AsRef<str>>(
-        context: brush_core::commands::ExecutionContext<'_, SE>,
-        args: I,
-    ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
-        use std::io::Write;
-
-        let name = context.command_name.clone();
-        let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
-        if argv.is_empty() { argv.push(OsString::from(&name)); }
-
-        if !crate::brush_gates::gate_for(&name)(&argv) {
-            let code = run_coreutil_external(&context, &name, &argv[1..]);
-            return Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8));
-        }
-
-        brush_coreutils_builtins::init_localization("uu_basename");
-
-        let mut out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
-        let mut err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
-        let code = match uu_basename::basename(argv.into_iter(), &mut out, &mut err) {
-            Ok(()) => 0,
-            // Diagnostics already went to the logical `err` (or are carried in
-            // the error message); surface a non-empty message and use the
-            // util's own exit code (1 for most, 1/2 for expr).
-            Err(e) => {
-                let msg = e.to_string();
-                if !msg.is_empty() { let _ = writeln!(err, "{name}: {msg}"); }
-                let _ = err.flush();
-                e.code()
-            }
-        };
-        let _ = out.flush();
-        Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
-    }
-}
-
-/// `dirname` as a NATIVE injected-I/O brush builtin (vendored uu_dirname fork).
-///
-/// Like [`CatBuiltin`], the genuine in-process port: writes the box's logical
-/// sink/stderr DIRECTLY (no `dup2`, pipeline-safe) with no stdin.
-/// The per-argv gate ([`crate::brush_gates::gate_dirname`]) keeps the flags/shapes
-/// where uutils diverges from GNU on the host binary via [`run_coreutil_external`].
-struct DirnameBuiltin;
-
-impl brush_core::builtins::SimpleCommand for DirnameBuiltin {
-    fn get_content(
-        name: &str,
-        _content_type: brush_core::builtins::ContentType,
-        _options: &brush_core::builtins::ContentOptions,
-    ) -> Result<String, brush_core::error::Error> {
-        Ok(format!("{name}: native injected-I/O dirname builtin\n"))
-    }
-
-    fn execute<SE: brush_core::extensions::ShellExtensions,
-               I: Iterator<Item = S>, S: AsRef<str>>(
-        context: brush_core::commands::ExecutionContext<'_, SE>,
-        args: I,
-    ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
-        use std::io::Write;
-
-        let name = context.command_name.clone();
-        let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
-        if argv.is_empty() { argv.push(OsString::from(&name)); }
-
-        if !crate::brush_gates::gate_for(&name)(&argv) {
-            let code = run_coreutil_external(&context, &name, &argv[1..]);
-            return Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8));
-        }
-
-        brush_coreutils_builtins::init_localization("uu_dirname");
-
-        let mut out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
-        let mut err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
-        let code = match uu_dirname::dirname(argv.into_iter(), &mut out, &mut err) {
-            Ok(()) => 0,
-            // Diagnostics already went to the logical `err` (or are carried in
-            // the error message); surface a non-empty message and use the
-            // util's own exit code (1 for most, 1/2 for expr).
-            Err(e) => {
-                let msg = e.to_string();
-                if !msg.is_empty() { let _ = writeln!(err, "{name}: {msg}"); }
-                let _ = err.flush();
-                e.code()
-            }
-        };
-        let _ = out.flush();
-        Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
-    }
-}
-
-/// `seq` as a NATIVE injected-I/O brush builtin (vendored uu_seq fork).
-///
-/// Like [`CatBuiltin`], the genuine in-process port: writes the box's logical
-/// sink/stderr DIRECTLY (no `dup2`, pipeline-safe) with no stdin.
-/// The per-argv gate ([`crate::brush_gates::gate_seq`]) keeps the flags/shapes
-/// where uutils diverges from GNU on the host binary via [`run_coreutil_external`].
-struct SeqBuiltin;
-
-impl brush_core::builtins::SimpleCommand for SeqBuiltin {
-    fn get_content(
-        name: &str,
-        _content_type: brush_core::builtins::ContentType,
-        _options: &brush_core::builtins::ContentOptions,
-    ) -> Result<String, brush_core::error::Error> {
-        Ok(format!("{name}: native injected-I/O seq builtin\n"))
-    }
-
-    fn execute<SE: brush_core::extensions::ShellExtensions,
-               I: Iterator<Item = S>, S: AsRef<str>>(
-        context: brush_core::commands::ExecutionContext<'_, SE>,
-        args: I,
-    ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
-        use std::io::Write;
-
-        let name = context.command_name.clone();
-        let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
-        if argv.is_empty() { argv.push(OsString::from(&name)); }
-
-        if !crate::brush_gates::gate_for(&name)(&argv) {
-            let code = run_coreutil_external(&context, &name, &argv[1..]);
-            return Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8));
-        }
-
-        brush_coreutils_builtins::init_localization("uu_seq");
-
-        let mut out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
-        let mut err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
-        let code = match uu_seq::seq(argv.into_iter(), &mut out, &mut err) {
-            Ok(()) => 0,
-            // Diagnostics already went to the logical `err` (or are carried in
-            // the error message); surface a non-empty message and use the
-            // util's own exit code (1 for most, 1/2 for expr).
-            Err(e) => {
-                let msg = e.to_string();
-                if !msg.is_empty() { let _ = writeln!(err, "{name}: {msg}"); }
-                let _ = err.flush();
-                e.code()
-            }
-        };
-        let _ = out.flush();
-        Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
-    }
-}
-
-/// `expr` as a NATIVE injected-I/O brush builtin (vendored uu_expr fork).
-///
-/// Like [`CatBuiltin`], the genuine in-process port: writes the box's logical
-/// sink/stderr DIRECTLY (no `dup2`, pipeline-safe) with no stdin.
-/// The per-argv gate ([`crate::brush_gates::gate_expr`]) keeps the flags/shapes
-/// where uutils diverges from GNU on the host binary via [`run_coreutil_external`].
-struct ExprBuiltin;
-
-impl brush_core::builtins::SimpleCommand for ExprBuiltin {
-    fn get_content(
-        name: &str,
-        _content_type: brush_core::builtins::ContentType,
-        _options: &brush_core::builtins::ContentOptions,
-    ) -> Result<String, brush_core::error::Error> {
-        Ok(format!("{name}: native injected-I/O expr builtin\n"))
-    }
-
-    fn execute<SE: brush_core::extensions::ShellExtensions,
-               I: Iterator<Item = S>, S: AsRef<str>>(
-        context: brush_core::commands::ExecutionContext<'_, SE>,
-        args: I,
-    ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
-        use std::io::Write;
-
-        let name = context.command_name.clone();
-        let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
-        if argv.is_empty() { argv.push(OsString::from(&name)); }
-
-        if !crate::brush_gates::gate_for(&name)(&argv) {
-            let code = run_coreutil_external(&context, &name, &argv[1..]);
-            return Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8));
-        }
-
-        brush_coreutils_builtins::init_localization("uu_expr");
-
-        let mut out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
-        let mut err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
-        let code = match uu_expr::expr(argv.into_iter(), &mut out, &mut err) {
-            Ok(()) => 0,
-            // Diagnostics already went to the logical `err` (or are carried in
-            // the error message); surface a non-empty message and use the
-            // util's own exit code (1 for most, 1/2 for expr).
-            Err(e) => {
-                let msg = e.to_string();
-                if !msg.is_empty() { let _ = writeln!(err, "{name}: {msg}"); }
-                let _ = err.flush();
-                e.code()
-            }
-        };
-        let _ = out.flush();
-        Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
-    }
-}
-
-/// `tr` as a NATIVE injected-I/O brush builtin (vendored uu_tr fork).
-///
-/// Like [`CatBuiltin`], the genuine in-process port: writes the box's logical
-/// sink/stderr DIRECTLY (no `dup2`, pipeline-safe) and reads the logical stdin.
-/// The per-argv gate ([`crate::brush_gates::gate_tr`]) keeps the flags/shapes
-/// where uutils diverges from GNU on the host binary via [`run_coreutil_external`].
+/// Runs uutils' `tr` IN-PROCESS, UNCONDITIONALLY: it reads/logical stdin and writes the box's
+/// logical `OpenFile` sink/source directly — no process-global stdio, no `dup2`,
+/// so it is safe as a concurrent pipeline stage. There is no per-argv gate and no
+/// fork-to-the-box's-binary fallback; the vendored fork is patched to match
+/// POSIX/GNU where uutils diverged, and otherwise behaves as uutils (this box's
+/// coreutils IS uutils). The call runs on a fresh thread for localization
+/// isolation — see [`run_coreutil_localized`].
 struct TrBuiltin;
 
 impl brush_core::builtins::SimpleCommand for TrBuiltin {
@@ -990,45 +485,44 @@ impl brush_core::builtins::SimpleCommand for TrBuiltin {
         context: brush_core::commands::ExecutionContext<'_, SE>,
         args: I,
     ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
-        use std::io::Write;
-
         let name = context.command_name.clone();
         let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
         if argv.is_empty() { argv.push(OsString::from(&name)); }
 
-        if !crate::brush_gates::gate_for(&name)(&argv) {
-            let code = run_coreutil_external(&context, &name, &argv[1..]);
-            return Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8));
-        }
+        let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
+        let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
+        let inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
 
-        brush_coreutils_builtins::init_localization("uu_tr");
-
-        let mut out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
-        let mut err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
-        let mut inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
-        let code = match uu_tr::tr(argv.into_iter(), &mut out, &mut err, &mut inp) {
-            Ok(()) => 0,
-            // Diagnostics already went to the logical `err` (or are carried in
-            // the error message); surface a non-empty message and use the
-            // util's own exit code (1 for most, 1/2 for expr).
-            Err(e) => {
-                let msg = e.to_string();
-                if !msg.is_empty() { let _ = writeln!(err, "{name}: {msg}"); }
-                let _ = err.flush();
-                e.code()
-            }
-        };
-        let _ = out.flush();
+        let code = run_coreutil_localized("uu_tr", move || {
+            use std::io::Write;
+            let mut out = out;
+            let mut err = err;
+            let mut inp = inp;
+            let r = match uu_tr::tr(argv.into_iter(), &mut out, &mut err, &mut inp) {
+                Ok(()) => 0,
+                Err(e) => {
+                    let msg = e.to_string();
+                    if !msg.is_empty() { let _ = writeln!(err, "{name}: {msg}"); }
+                    e.code()
+                }
+            };
+            let _ = out.flush();
+            let _ = err.flush();
+            r
+        });
         Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
     }
 }
 
-/// `cut` as a NATIVE injected-I/O brush builtin (vendored uu_cut fork).
+/// `cut` — NATIVE in-process brush builtin over the vendored `uu_cut` fork.
 ///
-/// Like [`CatBuiltin`], the genuine in-process port: writes the box's logical
-/// sink/stderr DIRECTLY (no `dup2`, pipeline-safe) and reads the logical stdin.
-/// The per-argv gate ([`crate::brush_gates::gate_cut`]) keeps the flags/shapes
-/// where uutils diverges from GNU on the host binary via [`run_coreutil_external`].
+/// Runs uutils' `cut` IN-PROCESS, UNCONDITIONALLY: it reads/logical stdin and writes the box's
+/// logical `OpenFile` sink/source directly — no process-global stdio, no `dup2`,
+/// so it is safe as a concurrent pipeline stage. There is no per-argv gate and no
+/// fork-to-the-box's-binary fallback; the vendored fork is patched to match
+/// POSIX/GNU where uutils diverged, and otherwise behaves as uutils (this box's
+/// coreutils IS uutils). The call runs on a fresh thread for localization
+/// isolation — see [`run_coreutil_localized`].
 struct CutBuiltin;
 
 impl brush_core::builtins::SimpleCommand for CutBuiltin {
@@ -1045,45 +539,44 @@ impl brush_core::builtins::SimpleCommand for CutBuiltin {
         context: brush_core::commands::ExecutionContext<'_, SE>,
         args: I,
     ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
-        use std::io::Write;
-
         let name = context.command_name.clone();
         let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
         if argv.is_empty() { argv.push(OsString::from(&name)); }
 
-        if !crate::brush_gates::gate_for(&name)(&argv) {
-            let code = run_coreutil_external(&context, &name, &argv[1..]);
-            return Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8));
-        }
+        let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
+        let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
+        let inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
 
-        brush_coreutils_builtins::init_localization("uu_cut");
-
-        let mut out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
-        let mut err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
-        let mut inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
-        let code = match uu_cut::cut(argv.into_iter(), &mut out, &mut err, &mut inp) {
-            Ok(()) => 0,
-            // Diagnostics already went to the logical `err` (or are carried in
-            // the error message); surface a non-empty message and use the
-            // util's own exit code (1 for most, 1/2 for expr).
-            Err(e) => {
-                let msg = e.to_string();
-                if !msg.is_empty() { let _ = writeln!(err, "{name}: {msg}"); }
-                let _ = err.flush();
-                e.code()
-            }
-        };
-        let _ = out.flush();
+        let code = run_coreutil_localized("uu_cut", move || {
+            use std::io::Write;
+            let mut out = out;
+            let mut err = err;
+            let mut inp = inp;
+            let r = match uu_cut::cut(argv.into_iter(), &mut out, &mut err, &mut inp) {
+                Ok(()) => 0,
+                Err(e) => {
+                    let msg = e.to_string();
+                    if !msg.is_empty() { let _ = writeln!(err, "{name}: {msg}"); }
+                    e.code()
+                }
+            };
+            let _ = out.flush();
+            let _ = err.flush();
+            r
+        });
         Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
     }
 }
 
-/// `uniq` as a NATIVE injected-I/O brush builtin (vendored uu_uniq fork).
+/// `uniq` — NATIVE in-process brush builtin over the vendored `uu_uniq` fork.
 ///
-/// Like [`CatBuiltin`], the genuine in-process port: writes the box's logical
-/// sink/stderr DIRECTLY (no `dup2`, pipeline-safe) and reads the logical stdin.
-/// The per-argv gate ([`crate::brush_gates::gate_uniq`]) keeps the flags/shapes
-/// where uutils diverges from GNU on the host binary via [`run_coreutil_external`].
+/// Runs uutils' `uniq` IN-PROCESS, UNCONDITIONALLY: it reads/logical stdin and writes the box's
+/// logical `OpenFile` sink/source directly — no process-global stdio, no `dup2`,
+/// so it is safe as a concurrent pipeline stage. There is no per-argv gate and no
+/// fork-to-the-box's-binary fallback; the vendored fork is patched to match
+/// POSIX/GNU where uutils diverged, and otherwise behaves as uutils (this box's
+/// coreutils IS uutils). The call runs on a fresh thread for localization
+/// isolation — see [`run_coreutil_localized`].
 struct UniqBuiltin;
 
 impl brush_core::builtins::SimpleCommand for UniqBuiltin {
@@ -1100,45 +593,44 @@ impl brush_core::builtins::SimpleCommand for UniqBuiltin {
         context: brush_core::commands::ExecutionContext<'_, SE>,
         args: I,
     ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
-        use std::io::Write;
-
         let name = context.command_name.clone();
         let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
         if argv.is_empty() { argv.push(OsString::from(&name)); }
 
-        if !crate::brush_gates::gate_for(&name)(&argv) {
-            let code = run_coreutil_external(&context, &name, &argv[1..]);
-            return Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8));
-        }
+        let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
+        let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
+        let inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
 
-        brush_coreutils_builtins::init_localization("uu_uniq");
-
-        let mut out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
-        let mut err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
-        let mut inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
-        let code = match uu_uniq::uniq(argv.into_iter(), &mut out, &mut err, &mut inp) {
-            Ok(()) => 0,
-            // Diagnostics already went to the logical `err` (or are carried in
-            // the error message); surface a non-empty message and use the
-            // util's own exit code (1 for most, 1/2 for expr).
-            Err(e) => {
-                let msg = e.to_string();
-                if !msg.is_empty() { let _ = writeln!(err, "{name}: {msg}"); }
-                let _ = err.flush();
-                e.code()
-            }
-        };
-        let _ = out.flush();
+        let code = run_coreutil_localized("uu_uniq", move || {
+            use std::io::Write;
+            let mut out = out;
+            let mut err = err;
+            let mut inp = inp;
+            let r = match uu_uniq::uniq(argv.into_iter(), &mut out, &mut err, &mut inp) {
+                Ok(()) => 0,
+                Err(e) => {
+                    let msg = e.to_string();
+                    if !msg.is_empty() { let _ = writeln!(err, "{name}: {msg}"); }
+                    e.code()
+                }
+            };
+            let _ = out.flush();
+            let _ = err.flush();
+            r
+        });
         Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
     }
 }
 
-/// `sort` as a NATIVE injected-I/O brush builtin (vendored uu_sort fork).
+/// `sort` — NATIVE in-process brush builtin over the vendored `uu_sort` fork.
 ///
-/// Like [`CatBuiltin`], the genuine in-process port: writes the box's logical
-/// sink/stderr DIRECTLY (no `dup2`, pipeline-safe) and reads the logical stdin.
-/// The per-argv gate ([`crate::brush_gates::gate_sort`]) keeps the flags/shapes
-/// where uutils diverges from GNU on the host binary via [`run_coreutil_external`].
+/// Runs uutils' `sort` IN-PROCESS, UNCONDITIONALLY: it reads/logical stdin and writes the box's
+/// logical `OpenFile` sink/source directly — no process-global stdio, no `dup2`,
+/// so it is safe as a concurrent pipeline stage. There is no per-argv gate and no
+/// fork-to-the-box's-binary fallback; the vendored fork is patched to match
+/// POSIX/GNU where uutils diverged, and otherwise behaves as uutils (this box's
+/// coreutils IS uutils). The call runs on a fresh thread for localization
+/// isolation — see [`run_coreutil_localized`].
 struct SortBuiltin;
 
 impl brush_core::builtins::SimpleCommand for SortBuiltin {
@@ -1155,39 +647,242 @@ impl brush_core::builtins::SimpleCommand for SortBuiltin {
         context: brush_core::commands::ExecutionContext<'_, SE>,
         args: I,
     ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
-        use std::io::Write;
-
         let name = context.command_name.clone();
         let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
         if argv.is_empty() { argv.push(OsString::from(&name)); }
 
-        if !crate::brush_gates::gate_for(&name)(&argv) {
-            let code = run_coreutil_external(&context, &name, &argv[1..]);
-            return Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8));
-        }
+        let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
+        let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
+        let inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
 
-        brush_coreutils_builtins::init_localization("uu_sort");
-
-        let mut out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
-        let mut err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
-        let mut inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
-        let code = match uu_sort::sort(argv.into_iter(), &mut out, &mut err, &mut inp) {
-            Ok(()) => 0,
-            // Diagnostics already went to the logical `err` (or are carried in
-            // the error message); surface a non-empty message and use the
-            // util's own exit code (1 for most, 1/2 for expr).
-            Err(e) => {
-                let msg = e.to_string();
-                if !msg.is_empty() { let _ = writeln!(err, "{name}: {msg}"); }
-                let _ = err.flush();
-                e.code()
-            }
-        };
-        let _ = out.flush();
+        let code = run_coreutil_localized("uu_sort", move || {
+            use std::io::Write;
+            let mut out = out;
+            let mut err = err;
+            let mut inp = inp;
+            let r = match uu_sort::sort(argv.into_iter(), &mut out, &mut err, &mut inp) {
+                Ok(()) => 0,
+                Err(e) => {
+                    let msg = e.to_string();
+                    if !msg.is_empty() { let _ = writeln!(err, "{name}: {msg}"); }
+                    e.code()
+                }
+            };
+            let _ = out.flush();
+            let _ = err.flush();
+            r
+        });
         Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
     }
 }
 
+/// `basename` — NATIVE in-process brush builtin over the vendored `uu_basename` fork.
+///
+/// Runs uutils' `basename` IN-PROCESS, UNCONDITIONALLY: it reads/writes the box's
+/// logical `OpenFile` sink/source directly — no process-global stdio, no `dup2`,
+/// so it is safe as a concurrent pipeline stage. There is no per-argv gate and no
+/// fork-to-the-box's-binary fallback; the vendored fork is patched to match
+/// POSIX/GNU where uutils diverged, and otherwise behaves as uutils (this box's
+/// coreutils IS uutils). The call runs on a fresh thread for localization
+/// isolation — see [`run_coreutil_localized`].
+struct BasenameBuiltin;
+
+impl brush_core::builtins::SimpleCommand for BasenameBuiltin {
+    fn get_content(
+        name: &str,
+        _content_type: brush_core::builtins::ContentType,
+        _options: &brush_core::builtins::ContentOptions,
+    ) -> Result<String, brush_core::error::Error> {
+        Ok(format!("{name}: native injected-I/O basename builtin\n"))
+    }
+
+    fn execute<SE: brush_core::extensions::ShellExtensions,
+               I: Iterator<Item = S>, S: AsRef<str>>(
+        context: brush_core::commands::ExecutionContext<'_, SE>,
+        args: I,
+    ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
+        let name = context.command_name.clone();
+        let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
+        if argv.is_empty() { argv.push(OsString::from(&name)); }
+
+        let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
+        let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
+
+        let code = run_coreutil_localized("uu_basename", move || {
+            use std::io::Write;
+            let mut out = out;
+            let mut err = err;
+            let r = match uu_basename::basename(argv.into_iter(), &mut out, &mut err) {
+                Ok(()) => 0,
+                Err(e) => {
+                    let msg = e.to_string();
+                    if !msg.is_empty() { let _ = writeln!(err, "{name}: {msg}"); }
+                    e.code()
+                }
+            };
+            let _ = out.flush();
+            let _ = err.flush();
+            r
+        });
+        Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
+    }
+}
+
+/// `dirname` — NATIVE in-process brush builtin over the vendored `uu_dirname` fork.
+///
+/// Runs uutils' `dirname` IN-PROCESS, UNCONDITIONALLY: it reads/writes the box's
+/// logical `OpenFile` sink/source directly — no process-global stdio, no `dup2`,
+/// so it is safe as a concurrent pipeline stage. There is no per-argv gate and no
+/// fork-to-the-box's-binary fallback; the vendored fork is patched to match
+/// POSIX/GNU where uutils diverged, and otherwise behaves as uutils (this box's
+/// coreutils IS uutils). The call runs on a fresh thread for localization
+/// isolation — see [`run_coreutil_localized`].
+struct DirnameBuiltin;
+
+impl brush_core::builtins::SimpleCommand for DirnameBuiltin {
+    fn get_content(
+        name: &str,
+        _content_type: brush_core::builtins::ContentType,
+        _options: &brush_core::builtins::ContentOptions,
+    ) -> Result<String, brush_core::error::Error> {
+        Ok(format!("{name}: native injected-I/O dirname builtin\n"))
+    }
+
+    fn execute<SE: brush_core::extensions::ShellExtensions,
+               I: Iterator<Item = S>, S: AsRef<str>>(
+        context: brush_core::commands::ExecutionContext<'_, SE>,
+        args: I,
+    ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
+        let name = context.command_name.clone();
+        let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
+        if argv.is_empty() { argv.push(OsString::from(&name)); }
+
+        let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
+        let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
+
+        let code = run_coreutil_localized("uu_dirname", move || {
+            use std::io::Write;
+            let mut out = out;
+            let mut err = err;
+            let r = match uu_dirname::dirname(argv.into_iter(), &mut out, &mut err) {
+                Ok(()) => 0,
+                Err(e) => {
+                    let msg = e.to_string();
+                    if !msg.is_empty() { let _ = writeln!(err, "{name}: {msg}"); }
+                    e.code()
+                }
+            };
+            let _ = out.flush();
+            let _ = err.flush();
+            r
+        });
+        Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
+    }
+}
+
+/// `seq` — NATIVE in-process brush builtin over the vendored `uu_seq` fork.
+///
+/// Runs uutils' `seq` IN-PROCESS, UNCONDITIONALLY: it reads/writes the box's
+/// logical `OpenFile` sink/source directly — no process-global stdio, no `dup2`,
+/// so it is safe as a concurrent pipeline stage. There is no per-argv gate and no
+/// fork-to-the-box's-binary fallback; the vendored fork is patched to match
+/// POSIX/GNU where uutils diverged, and otherwise behaves as uutils (this box's
+/// coreutils IS uutils). The call runs on a fresh thread for localization
+/// isolation — see [`run_coreutil_localized`].
+struct SeqBuiltin;
+
+impl brush_core::builtins::SimpleCommand for SeqBuiltin {
+    fn get_content(
+        name: &str,
+        _content_type: brush_core::builtins::ContentType,
+        _options: &brush_core::builtins::ContentOptions,
+    ) -> Result<String, brush_core::error::Error> {
+        Ok(format!("{name}: native injected-I/O seq builtin\n"))
+    }
+
+    fn execute<SE: brush_core::extensions::ShellExtensions,
+               I: Iterator<Item = S>, S: AsRef<str>>(
+        context: brush_core::commands::ExecutionContext<'_, SE>,
+        args: I,
+    ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
+        let name = context.command_name.clone();
+        let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
+        if argv.is_empty() { argv.push(OsString::from(&name)); }
+
+        let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
+        let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
+
+        let code = run_coreutil_localized("uu_seq", move || {
+            use std::io::Write;
+            let mut out = out;
+            let mut err = err;
+            let r = match uu_seq::seq(argv.into_iter(), &mut out, &mut err) {
+                Ok(()) => 0,
+                Err(e) => {
+                    let msg = e.to_string();
+                    if !msg.is_empty() { let _ = writeln!(err, "{name}: {msg}"); }
+                    e.code()
+                }
+            };
+            let _ = out.flush();
+            let _ = err.flush();
+            r
+        });
+        Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
+    }
+}
+
+/// `expr` — NATIVE in-process brush builtin over the vendored `uu_expr` fork.
+///
+/// Runs uutils' `expr` IN-PROCESS, UNCONDITIONALLY: it reads/writes the box's
+/// logical `OpenFile` sink/source directly — no process-global stdio, no `dup2`,
+/// so it is safe as a concurrent pipeline stage. There is no per-argv gate and no
+/// fork-to-the-box's-binary fallback; the vendored fork is patched to match
+/// POSIX/GNU where uutils diverged, and otherwise behaves as uutils (this box's
+/// coreutils IS uutils). The call runs on a fresh thread for localization
+/// isolation — see [`run_coreutil_localized`].
+struct ExprBuiltin;
+
+impl brush_core::builtins::SimpleCommand for ExprBuiltin {
+    fn get_content(
+        name: &str,
+        _content_type: brush_core::builtins::ContentType,
+        _options: &brush_core::builtins::ContentOptions,
+    ) -> Result<String, brush_core::error::Error> {
+        Ok(format!("{name}: native injected-I/O expr builtin\n"))
+    }
+
+    fn execute<SE: brush_core::extensions::ShellExtensions,
+               I: Iterator<Item = S>, S: AsRef<str>>(
+        context: brush_core::commands::ExecutionContext<'_, SE>,
+        args: I,
+    ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
+        let name = context.command_name.clone();
+        let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
+        if argv.is_empty() { argv.push(OsString::from(&name)); }
+
+        let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
+        let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
+
+        let code = run_coreutil_localized("uu_expr", move || {
+            use std::io::Write;
+            let mut out = out;
+            let mut err = err;
+            let r = match uu_expr::expr(argv.into_iter(), &mut out, &mut err) {
+                Ok(()) => 0,
+                Err(e) => {
+                    let msg = e.to_string();
+                    if !msg.is_empty() { let _ = writeln!(err, "{name}: {msg}"); }
+                    e.code()
+                }
+            };
+            let _ = out.flush();
+            let _ = err.flush();
+            r
+        });
+        Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
+    }
+}
 
 /// `sarun` / `oaita` as in-box brush builtins (interactive use). There is no
 /// `sarun` on PATH inside a box and no FUSE shadow under /usr/local: the
@@ -1281,18 +976,14 @@ fn box_builtins_opt<SE: brush_core::extensions::ShellExtensions>(
     let mut m: std::collections::HashMap<String, brush_core::builtins::Registration<SE>>
         = std::collections::HashMap::new();
     if bundle_coreutils {
-        // Coreutils first (lowest priority).
-        for name in brush_coreutils_builtins::bundled_commands().keys() {
-            m.insert(name.clone(), simple_builtin::<CoreutilWrapper, SE>());
-        }
-        // `cat` is a NATIVE injected-I/O builtin (writes the box's logical sink
-        // directly, no process-global dup2), so it OVERWRITES the generic
-        // CoreutilWrapper registration the loop just made. Only under
-        // bundle_coreutils — make recipes still use external cat (see above).
+        // NATIVE injected-I/O builtins: each runs the vendored uutils fork
+        // IN-PROCESS against the box's logical OpenFile sink/source (no dup2, no
+        // process-global stdio, pipeline-safe). They run unconditionally — there
+        // is no per-argv gate and no fork-to-the-box's-binary fallback; the
+        // vendored forks are patched to match POSIX/GNU where uutils diverged.
+        // `bundle_coreutils` (false for make recipes) still selects whether these
+        // are bundled at all, to dodge uucore's process-global localization cache.
         m.insert("cat".to_string(), simple_builtin::<CatBuiltin, SE>());
-        // Same native injected-I/O treatment (no dup2, pipeline-safe), each
-        // overwriting the generic CoreutilWrapper registration the loop made.
-        // Per-argv gates (brush_gates.rs) keep divergent flags on the host binary.
         m.insert("head".to_string(), simple_builtin::<HeadBuiltin, SE>());
         m.insert("wc".to_string(), simple_builtin::<WcBuiltin, SE>());
         m.insert("nl".to_string(), simple_builtin::<NlBuiltin, SE>());
@@ -1306,25 +997,6 @@ fn box_builtins_opt<SE: brush_core::extensions::ShellExtensions>(
     m.insert("uniq".to_string(), simple_builtin::<UniqBuiltin, SE>());
     m.insert("sort".to_string(), simple_builtin::<SortBuiltin, SE>());
     }
-    // sarun: `cp` is bundled IN-PROCESS even when the broad coreutils bundle is
-    // OFF (the make-recipe / kati path passes bundle_coreutils=false to dodge
-    // the uucore Fluent localization OnceLock — see this fn's doc above).
-    // Bundling ONE util does not re-open that hazard: the localization global
-    // only governs IN-PROCESS uutils, and with the broad bundle off `cp` is the
-    // SOLE in-process uutil, so it can poison nothing else (every OTHER util in
-    // a make recipe still forks the GNU host binary, which renders its own
-    // messages). gate_cp keeps this conservative — only the simple plain-copy
-    // argvs (`cp SRC DST`, `cp SRC... DIR`, the audited -r/-a/-p/… cluster) run
-    // in-process; anything it refuses (--help/--version, --preserve= grammars,
-    // backup/reflink/interactive, …) falls back to GNU `cp` via
-    // run_coreutil_external. This makes a build recipe's `cp $< $@` run in this
-    // process (no /usr/bin/cp fork) for BOTH the n2 (bundle=true) and kati
-    // (bundle=false) recipe paths. No CatBuiltin-style native variant: `cp` does
-    // not stream the box's logical stdout sink (it operates on named paths via
-    // the FUSE overlay), so the generic CoreutilWrapper is the right wrapper.
-    // If bundle_coreutils was true the loop above already inserted this same
-    // registration; re-inserting is idempotent.
-    m.insert("cp".to_string(), simple_builtin::<CoreutilWrapper, SE>());
     // BashMode shell builtins overwrite overlaps (highest priority).
     m.extend(brush_builtins::default_builtins(brush_builtins::BuiltinSet::BashMode));
     // In-box engine entry points (no PATH shadow): `sarun` / `oaita` re-exec
