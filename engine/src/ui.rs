@@ -3601,8 +3601,22 @@ fn help_lines() -> Vec<Line<'static>> {
         t(""),
         h("Navigation & filters"),
         t("  j/k or ↓/↑  move       Enter  open the selection in the next pane"),
-        t("  R  refresh             q      quit (stops the engine)"),
-        t("                          d      detach (leaves the engine running)"),
+        t("  PageUp/PageDown  page   ctrl+↑/↓  reorder a rule (on Rules)"),
+    ]);
+    // The per-pane action keys are GENERATED from PANE_ACTION_KEYS — the same
+    // table `dispatch_pane_key` runs. Every binding with a help string surfaces
+    // here exactly once; keys can never drift from their documentation. (The
+    // None-help entries — the j/k/Tab/Enter nav block — are described in prose
+    // just above, since they read as a group, not one line each.)
+    v.push(h("Actions (per-pane keys)"));
+    for (key, _, _, help) in PANE_ACTION_KEYS {
+        if let Some(desc) = help {
+            v.push(t(&format!("  {}  {desc}", key.label())));
+        }
+    }
+    v.extend(vec![
+        t(""),
+        h("Filters"),
         t("  /  filter the active pane with a clause editor. Filter KINDS:"),
         d("     path  — match the changed file's path (changes pane)"),
         d("     box   — match the box name"),
@@ -3615,8 +3629,6 @@ fn help_lines() -> Vec<Line<'static>> {
         d("       Esc drops such a generated filter."),
         t(""),
         h("Reviewing changes"),
-        t("  a  apply selected change / whole box     x  discard it"),
-        t("  A  apply ALL the box's changes           X  discard ALL"),
         t("  In the DIFF pane, a TEXT change is shown as unified-diff hunks:"),
         t("    ↑/↓  move the hunk cursor (▶)  ·  a  apply this hunk to the host"),
         t("    x or d  discard this hunk (revert it in the box)"),
@@ -3625,9 +3637,22 @@ fn help_lines() -> Vec<Line<'static>> {
         t("  type is sniffed and a differ (readelf/ar/unzip/tar) runs in a"),
         t("  sandbox off the render path. Unrecognized types get a hexdump."),
         t(""),
+        h("Confirm prompts (y/n)"),
+    ]);
+    // The destructive-action prompts (K/D/Z) pop a Confirm modal whose keys are
+    // GENERATED from CONFIRM_KEYS — same single-source-of-truth principle.
+    {
+        let keys = |want: fn(&ConfirmKey) -> bool| CONFIRM_KEYS.iter()
+            .filter(|(_, a, _)| want(a))
+            .map(|(k, _, _)| k.label())
+            .collect::<Vec<_>>().join("/");
+        let yes = keys(|a| matches!(a, ConfirmKey::Yes));
+        let no = keys(|a| matches!(a, ConfirmKey::No));
+        v.push(t(&format!("  {yes}  confirm the action     {no}  cancel")));
+    }
+    v.extend(vec![
+        t(""),
         h("Boxes & nesting"),
-        t("  K  kill box (SIGTERM, y/n)    D  delete box + captures (y/n)"),
-        t("  Z  dissolve box (y/n)         r  rename box"),
         d("  A box may be NESTED inside another: applying a nested box promotes"),
         d("  its changes into the PARENT box (still pending), not the host;"),
         d("  discarding copies the change DOWN into immediate child boxes."),
@@ -3840,6 +3865,198 @@ const PANE_KEYS: &[(char, Pane, &str, PaneVis, &str)] = &[
     ('A', Pane::ApiLogs,    "Api",     PaneVis::Always,            "the --api oaita proxy log"),
     ('?', Pane::Help,       "Help",    PaneVis::Always,            "this help"),
 ];
+
+// ── keybindings as data: the remaining contexts ─────────────────────────────
+//
+// `PANE_KEYS` above made the top-level pane accelerators a single declarative
+// table (menubar + dispatch + help all derive from it). The rest of the UI's
+// key handling — the Confirm modal and the main loop's per-pane action keys —
+// used to be scattered inline `match KeyCode` arms, so a key, its behavior, and
+// its help text lived in three places and could drift. The model below applies
+// the same pattern to those contexts: a `Key` matcher, per-context tables
+// mapping key -> action, a table-lookup dispatch, and help text GENERATED from
+// the tables (see `help_lines`).
+//
+// The text-entry modals (RuleForm / PtyCmd) and the stateful editors
+// (Search / ActionMenu) are NOT tabled: their "keys" are free-text editing
+// (every Char appends to a buffer) or cursor motion over per-modal state, which
+// a (key -> fixed action) table can't faithfully express. They keep their
+// hand-written handlers; only the genuinely enumerable contexts move to tables.
+
+/// A logical key for table matching — the subset of `crossterm::KeyCode` the
+/// table-driven contexts bind. Char matching is case-sensitive (so 'a' and 'A'
+/// are distinct, as the apply-one vs apply-all split needs).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Key { Char(char), Esc, Enter, Tab }
+
+impl Key {
+    /// Match against a real crossterm event code. False for codes this matcher
+    /// doesn't model (the caller falls through to non-table handling).
+    fn matches(self, code: crossterm::event::KeyCode) -> bool {
+        use crossterm::event::KeyCode;
+        match self {
+            Key::Char(c) => code == KeyCode::Char(c),
+            Key::Esc => code == KeyCode::Esc,
+            Key::Enter => code == KeyCode::Enter,
+            Key::Tab => code == KeyCode::Tab,
+        }
+    }
+    /// Human label for help/hint rendering (mirrors how `PANE_KEYS` prints its
+    /// accelerator char in the generated help index).
+    fn label(self) -> String {
+        match self {
+            Key::Char(c) => c.to_string(),
+            Key::Esc => "Esc".into(),
+            Key::Enter => "Enter".into(),
+            Key::Tab => "Tab".into(),
+        }
+    }
+}
+
+/// What a Confirm-modal key does. The y/n/Esc contract lived inline in
+/// `handle_modal_key`; now it's the `CONFIRM_KEYS` table.
+#[derive(Clone, Copy)]
+enum ConfirmKey { Yes, No }
+
+/// The Confirm modal's keymap: 'y'/'Y' run the pending destructive action,
+/// 'n'/'N'/Esc cancel. Anything else re-arms the modal (the dispatcher's "no
+/// match" path). The modal's help line is generated from this table.
+const CONFIRM_KEYS: &[(Key, ConfirmKey, &str)] = &[
+    (Key::Char('y'), ConfirmKey::Yes, "confirm"),
+    (Key::Char('Y'), ConfirmKey::Yes, "confirm"),
+    (Key::Char('n'), ConfirmKey::No,  "cancel"),
+    (Key::Char('N'), ConfirmKey::No,  "cancel"),
+    (Key::Esc,       ConfirmKey::No,  "cancel"),
+];
+
+/// Whether a `PaneAction` is gated on the focused pane. `Any` runs regardless;
+/// `On(pane)` only fires when `app.focus == pane`. The table is consulted in
+/// order, so a guarded entry listed first shadows a bare entry on the same key.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PaneGate { Any, On(Pane) }
+
+/// Actions reachable from the main key loop (outside any modal / PTY / menu-nav
+/// capture). Each variant is one mutation on `App`, so the dispatcher runs it
+/// from a table lookup without holding pane-specific data — the same shape as
+/// `go_to_pane` for the pane accelerators.
+#[derive(Clone, Copy)]
+enum PaneAction {
+    Quit, Detach,
+    MoveDown, MoveUp, NextPane, Open,
+    ApplyHunk, DiscardHunk, ApplyFile, DiscardFile, ApplyAll, DiscardAll,
+    ConfirmKill, ConfirmDelete, ConfirmDissolve,
+    NewRule, DeleteRule, StartRename,
+    ToggleFilter, Refresh, ActionMenu,
+}
+
+/// The main-loop pane keymap. ORDER MATTERS, and reproduces the original inline
+/// arm precedence exactly: guarded (`On(pane)`) entries that must win over a
+/// bare key are listed BEFORE the bare entry for that key, and the dispatcher
+/// returns on the first gate-satisfied match. So 'a' = apply-hunk on Hunks else
+/// apply-file; 'x' = discard-hunk on Hunks else discard-file; 'd' = discard-hunk
+/// on Hunks, delete-rule on Rules, else detach; 'n' = new-rule on Rules (the
+/// bare 'n' is taken by the banner-prompt steal handled before dispatch).
+///
+/// `help` is the one-line description, or `None` for keys documented as a group
+/// in prose (the j/k move + Tab + Enter navigation block). Keys that need
+/// context a flat table can't carry stay inline and are noted at the call site:
+/// ctrl+arrow rule reorder, PageUp/PageDown, the pane accelerators routed
+/// through `dispatch_menubar_key`, Esc (clear generated filter / close packets),
+/// and the banner-prompt y/n/a/d steal.
+const PANE_ACTION_KEYS: &[(Key, PaneGate, PaneAction, Option<&str>)] = &[
+    (Key::Char('q'), PaneGate::Any,             PaneAction::Quit,            Some("quit (stops the engine)")),
+    (Key::Char('j'), PaneGate::Any,             PaneAction::MoveDown,        None),
+    (Key::Char('k'), PaneGate::Any,             PaneAction::MoveUp,          None),
+    (Key::Tab,       PaneGate::Any,             PaneAction::NextPane,        None),
+    (Key::Enter,     PaneGate::Any,             PaneAction::Open,            None),
+    (Key::Char('m'), PaneGate::Any,             PaneAction::ActionMenu,      Some("actions popup for the selected row")),
+    (Key::Char('a'), PaneGate::On(Pane::Hunks), PaneAction::ApplyHunk,       None),
+    (Key::Char('x'), PaneGate::On(Pane::Hunks), PaneAction::DiscardHunk,     None),
+    (Key::Char('d'), PaneGate::On(Pane::Hunks), PaneAction::DiscardHunk,     None),
+    (Key::Char('a'), PaneGate::Any,             PaneAction::ApplyFile,       Some("apply selected change / whole box")),
+    (Key::Char('x'), PaneGate::Any,             PaneAction::DiscardFile,     Some("discard selected change / whole box")),
+    (Key::Char('A'), PaneGate::Any,             PaneAction::ApplyAll,        Some("apply ALL the box's changes")),
+    (Key::Char('X'), PaneGate::Any,             PaneAction::DiscardAll,      Some("discard ALL the box's changes")),
+    (Key::Char('K'), PaneGate::Any,             PaneAction::ConfirmKill,     Some("kill box (SIGTERM, y/n)")),
+    (Key::Char('D'), PaneGate::Any,             PaneAction::ConfirmDelete,   Some("delete box + captures (y/n)")),
+    (Key::Char('Z'), PaneGate::Any,             PaneAction::ConfirmDissolve, Some("dissolve box (y/n)")),
+    (Key::Char('n'), PaneGate::On(Pane::Rules), PaneAction::NewRule,         Some("new rule (on Rules)")),
+    (Key::Char('d'), PaneGate::On(Pane::Rules), PaneAction::DeleteRule,      Some("delete rule (on Rules)")),
+    (Key::Char('d'), PaneGate::Any,             PaneAction::Detach,          Some("detach (leaves the engine running)")),
+    (Key::Char('/'), PaneGate::Any,             PaneAction::ToggleFilter,    Some("filter the active pane")),
+    (Key::Char('r'), PaneGate::Any,             PaneAction::StartRename,     Some("rename box")),
+    (Key::Char('R'), PaneGate::Any,             PaneAction::Refresh,         Some("refresh")),
+];
+
+/// Run a `PaneAction` against the app. Bodies are moved verbatim from the
+/// original inline arms — same semantics, one place now.
+fn run_pane_action(app: &mut App, action: PaneAction) {
+    match action {
+        PaneAction::Quit => { shutdown_rpc(&app.sock); app.should_quit = true; }
+        PaneAction::Detach => app.should_quit = true,
+        PaneAction::MoveDown => app.move_down(),
+        PaneAction::MoveUp => app.move_up(),
+        PaneAction::NextPane => app.next_pane(),
+        PaneAction::Open => {
+            if app.focus == Pane::Rules {
+                let cur = app.rules.get(app.sel_rule).cloned().unwrap_or_default();
+                app.modal = Some(Modal::RuleForm { buf: cur, editing: Some(app.sel_rule) });
+            } else {
+                app.open();
+            }
+        }
+        PaneAction::ApplyHunk => app.apply_hunk(),
+        PaneAction::DiscardHunk => app.discard_hunk(),
+        PaneAction::ApplyFile => app.apply(),
+        PaneAction::DiscardFile => app.discard(),
+        PaneAction::ApplyAll => app.apply_all(),
+        PaneAction::DiscardAll => app.discard_all(),
+        PaneAction::ConfirmKill => app.modal = Some(Modal::Confirm {
+            prompt: "Kill (SIGTERM) the selected box?".into(),
+            action: ConfirmAction::Kill,
+        }),
+        PaneAction::ConfirmDelete => app.modal = Some(Modal::Confirm {
+            prompt: "Delete the selected box and its captures?".into(),
+            action: ConfirmAction::Delete,
+        }),
+        PaneAction::ConfirmDissolve => app.modal = Some(Modal::Confirm {
+            prompt: "Dissolve the selected box (unmount/cleanup)?".into(),
+            action: ConfirmAction::Dissolve,
+        }),
+        PaneAction::NewRule => app.modal = Some(Modal::RuleForm {
+            buf: String::new(), editing: None }),
+        PaneAction::DeleteRule => app.delete_rule(),
+        PaneAction::StartRename => app.renaming = Some(String::new()),
+        PaneAction::ToggleFilter => app.toggle_filter(),
+        PaneAction::Refresh => {
+            app.refresh_sessions();
+            app.load_changes();
+            app.load_rules();
+            app.status = "refreshed".into();
+        }
+        PaneAction::ActionMenu => {
+            if let Some((title, items)) = pane_action_menu(app) {
+                app.modal = Some(Modal::ActionMenu { title, items, sel: 0 });
+            } else {
+                app.status = "no actions for this row yet".into();
+            }
+        }
+    }
+}
+
+/// Table-driven dispatch for a main-loop key. Walks `PANE_ACTION_KEYS` in order,
+/// runs the first entry whose key matches AND whose gate is satisfied, returns
+/// true. Returns false when nothing matched (the caller then handles the keys
+/// that need richer context inline). The per-pane-action analogue of
+/// `dispatch_menubar_key`.
+fn dispatch_pane_key(app: &mut App, code: crossterm::event::KeyCode) -> bool {
+    for (key, gate, action, _) in PANE_ACTION_KEYS {
+        if !key.matches(code) { continue; }
+        let ok = match gate { PaneGate::Any => true, PaneGate::On(p) => app.focus == *p };
+        if ok { run_pane_action(app, *action); return true; }
+    }
+    false
+}
 
 /// Top menubar: pane chips with their letter accelerators (derived from
 /// `PANE_KEYS`). The active pane reverses; chips that would lead to an empty
@@ -5479,13 +5696,16 @@ fn handle_modal_key(app: &mut App, code: crossterm::event::KeyCode,
     use crossterm::event::KeyModifiers;
     let Some(modal) = app.modal.take() else { return };
     match modal {
-        Modal::Confirm { prompt, action } => match code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => app.run_confirm(action),
-            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
-                app.status = "cancelled".into();
+        Modal::Confirm { prompt, action } => {
+            // y/n/Esc is a fully enumerable keymap → driven from CONFIRM_KEYS
+            // (the same table that generates the modal's help line). On no
+            // match the modal re-arms, exactly as the old `_ =>` arm did.
+            match CONFIRM_KEYS.iter().find(|(k, _, _)| k.matches(code)) {
+                Some((_, ConfirmKey::Yes, _)) => app.run_confirm(action),
+                Some((_, ConfirmKey::No, _)) => app.status = "cancelled".into(),
+                None => app.modal = Some(Modal::Confirm { prompt, action }),
             }
-            _ => app.modal = Some(Modal::Confirm { prompt, action }),
-        },
+        }
         Modal::Search { view, kinds, mut rows, mut sel, mut field } => {
             let ctrl = mods.contains(KeyModifiers::CONTROL);
             // ^s / Enter → commit; Esc → cancel (no change). All else edits rows.
@@ -5980,34 +6200,29 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                         _ => {}
                     }
                 }
+                // The per-pane action keys are now a single table
+                // (`PANE_ACTION_KEYS` → `dispatch_pane_key`), the same
+                // keybindings-as-data shape as `PANE_KEYS`. A handful of keys
+                // carry context a flat table can't express and stay inline
+                // BEFORE the table lookup, so their precedence is preserved:
+                //   * ctrl+↑/↓ rule reorder (must beat the plain ↑/↓ move),
+                //   * arrow ↑/↓ and PageUp/PageDown motion (non-Char codes the
+                //     table doesn't model; ↑/↓ mirror k/j),
+                //   * the b/c/p/o/… pane accelerators, routed through
+                //     `dispatch_menubar_key` so they can't diverge from F9 nav,
+                //   * Esc/Backspace popping the packet drill-down, and plain Esc
+                //     clearing a generated (cross-nav) filter.
+                // Everything else (q, a/x/d, A/X, K/D/Z, n, r/R, /, m, Tab,
+                // Enter, j/k) flows through the table.
                 match k.code {
-                    // 'q' stops the engine too (mirrors the Python prototype's
-                    // contract — q is QUIT, not detach). 'd' detaching is
-                    // matched LATER, after the pane-specific 'd' bindings
-                    // (discard_hunk on Hunks, delete_rule on Rules) have had
-                    // their guards checked.
-                    KeyCode::Char('q') => {
-                        shutdown_rpc(&app.sock);
-                        app.should_quit = true;
-                    }
                     // ctrl+up / ctrl+down reorder the selected file rule (before
                     // the plain move arm, which also matches Up/Down).
                     KeyCode::Up if ctrl && app.focus == Pane::Rules => app.move_rule(-1),
                     KeyCode::Down if ctrl && app.focus == Pane::Rules => app.move_rule(1),
-                    KeyCode::Char('j') | KeyCode::Down => app.move_down(),
-                    KeyCode::Char('k') | KeyCode::Up => app.move_up(),
+                    KeyCode::Down => app.move_down(),
+                    KeyCode::Up => app.move_up(),
                     KeyCode::PageDown => app.page_down(),
                     KeyCode::PageUp => app.page_up(),
-                    KeyCode::Tab => app.next_pane(),
-                    KeyCode::Enter => {
-                        if app.focus == Pane::Rules {
-                            // edit selected rule
-                            let cur = app.rules.get(app.sel_rule).cloned().unwrap_or_default();
-                            app.modal = Some(Modal::RuleForm { buf: cur, editing: Some(app.sel_rule) });
-                        } else {
-                            app.open();
-                        }
-                    }
                     // pane switches; c/p/o cross-navigate (install a generated
                     // ids filter on the destination from the cursor).
                     // Every letter chip snaps focus back to the LEFT list and
@@ -6023,57 +6238,6 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                     // to the flows list, keeping its cursor + detail state.
                     KeyCode::Esc | KeyCode::Backspace if app.focus == Pane::Packets =>
                         app.close_packets(),
-                    // In the diff pane, a/x/d are PER-HUNK; elsewhere they act on
-                    // the selected change / whole box.
-                    // 'm' opens the context-menu popup for the
-                    // currently-selected row. Per-pane action list +
-                    // hints come from pane_action_menu(); pressing m
-                    // on a pane with no contextual actions (Procs /
-                    // Outputs / Pipelines / BuildEdges today) is a
-                    // no-op with a status note.
-                    KeyCode::Char('m') => {
-                        if let Some((title, items)) = pane_action_menu(&app) {
-                            app.modal = Some(Modal::ActionMenu {
-                                title, items, sel: 0,
-                            });
-                        } else {
-                            app.status = "no actions for this row yet".into();
-                        }
-                    }
-                    KeyCode::Char('a') if app.focus == Pane::Hunks => app.apply_hunk(),
-                    KeyCode::Char('x') | KeyCode::Char('d') if app.focus == Pane::Hunks => app.discard_hunk(),
-                    KeyCode::Char('a') => app.apply(),
-                    KeyCode::Char('x') => app.discard(),
-                    // batch apply/discard of the WHOLE box (Python A/X).
-                    KeyCode::Char('A') => app.apply_all(),
-                    KeyCode::Char('X') => app.discard_all(),
-                    KeyCode::Char('K') => {
-                        app.modal = Some(Modal::Confirm {
-                            prompt: "Kill (SIGTERM) the selected box?".into(),
-                            action: ConfirmAction::Kill,
-                        })
-                    }
-                    KeyCode::Char('D') => {
-                        app.modal = Some(Modal::Confirm {
-                            prompt: "Delete the selected box and its captures?".into(),
-                            action: ConfirmAction::Delete,
-                        })
-                    }
-                    KeyCode::Char('Z') => {
-                        app.modal = Some(Modal::Confirm {
-                            prompt: "Dissolve the selected box (unmount/cleanup)?".into(),
-                            action: ConfirmAction::Dissolve,
-                        })
-                    }
-                    KeyCode::Char('n') if app.focus == Pane::Rules => {
-                        app.modal = Some(Modal::RuleForm { buf: String::new(), editing: None });
-                    }
-                    KeyCode::Char('d') if app.focus == Pane::Rules => app.delete_rule(),
-                    // Plain 'd' (no Hunks/Rules guard above caught it) =
-                    // detach: close just the UI, leave the engine running so
-                    // a later `sarun` reattaches to it.
-                    KeyCode::Char('d') => app.should_quit = true,
-                    KeyCode::Char('/') => app.toggle_filter(),
                     KeyCode::Esc => {
                         // esc clears a generated (cross-nav) filter on the focused pane.
                         if let Some(v) = app.focus_filter_view() {
@@ -6082,14 +6246,8 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                             }
                         }
                     }
-                    KeyCode::Char('r') => app.renaming = Some(String::new()),
-                    KeyCode::Char('R') => {
-                        app.refresh_sessions();
-                        app.load_changes();
-                        app.load_rules();
-                        app.status = "refreshed".into();
-                    }
-                    _ => {}
+                    // The table handles the rest; unmatched keys are no-ops.
+                    code => { dispatch_pane_key(&mut app, code); }
                 }
             }
         }
@@ -7094,10 +7252,12 @@ mod tests {
         assert!(!eval_clauses(&no, std::slice::from_ref(&ids_clause)));
     }
 
-    #[test]
-    fn help_pane_lists_keybindings() {
-        // pure render; no engine needed.
-        let mut app = App {
+    /// An App with no socket and all state empty — built by struct literal so
+    /// it never RPCs (unlike `App::new`, which calls refresh/load on construct).
+    /// For the pure-render and pure-dispatch keybinding tests that must run with
+    /// no live engine.
+    fn headless_app() -> App {
+        App {
             sock: String::new(),
             sessions: vec![],
             changes: vec![],
@@ -7146,10 +7306,19 @@ mod tests {
             packet_detail: String::new(), packet_detail_frame: 0,
             packets_stream: -1,
             pending_prompt: None,
-        };
+        }
+    }
+
+    #[test]
+    fn help_pane_lists_keybindings() {
+        // pure render; no engine needed.
+        let mut app = headless_app();
         app.focus = Pane::Help;
-        // render tall enough to fit the full manual (it scrolls in a real term).
-        let buf = render_to_string(&app, 100, 80).unwrap();
+        // Render tall enough to fit the WHOLE generated manual (it scrolls in a
+        // real term). The keybindings-as-data sections (pane index + the
+        // generated per-pane action + confirm blocks) push the manual past 80
+        // rows, so render extra-tall to assert every generated line is present.
+        let buf = render_to_string(&app, 120, 120).unwrap();
         assert!(buf.contains("help"), "help pane title missing:\n{buf}");
         assert!(buf.contains("apply") && buf.contains("discard"), "help should mention apply/discard:\n{buf}");
         assert!(buf.contains("processes"), "help should mention the processes pane:\n{buf}");
@@ -7165,6 +7334,108 @@ mod tests {
             assert!(buf.contains(&format!("{key}  {desc}")),
                     "help pane index missing generated line for {key:?}:\n{buf}");
         }
+        // The remaining contexts' help must ALSO be generated from their tables,
+        // not hardcoded prose. Every PANE_ACTION_KEYS entry with a help string
+        // must surface as a "<key>  <desc>" line — the exact format help_lines
+        // emits. (None-help entries are the nav block documented in prose.)
+        for (key, _, _, help) in PANE_ACTION_KEYS {
+            if let Some(desc) = help {
+                let want = format!("{}  {desc}", key.label());
+                assert!(buf.contains(&want),
+                        "help missing generated pane-action line {want:?}:\n{buf}");
+            }
+        }
+        // The Confirm modal's y/n keymap is generated from CONFIRM_KEYS too: the
+        // 'y'/'Y' (confirm) and 'n'/'N'/Esc (cancel) labels must appear joined
+        // exactly as help_lines builds them, so the prompt help can't drift from
+        // the table the modal actually dispatches.
+        let yes = CONFIRM_KEYS.iter().filter(|(_, a, _)| matches!(a, ConfirmKey::Yes))
+            .map(|(k, _, _)| k.label()).collect::<Vec<_>>().join("/");
+        let no = CONFIRM_KEYS.iter().filter(|(_, a, _)| matches!(a, ConfirmKey::No))
+            .map(|(k, _, _)| k.label()).collect::<Vec<_>>().join("/");
+        assert!(buf.contains(&format!("{yes}  confirm the action")),
+                "help missing generated confirm-keys (yes={yes:?}):\n{buf}");
+        assert!(buf.contains(&format!("{no}  cancel")),
+                "help missing generated confirm-keys (no={no:?}):\n{buf}");
+    }
+
+    /// The keybindings-as-data dispatch is exercised directly (no live engine):
+    /// the Confirm modal's y/n/Esc keymap routes through CONFIRM_KEYS, and the
+    /// per-pane action keys route through PANE_ACTION_KEYS. Both only touch
+    /// engine-free actions here (open/cancel a modal, set detach/rename state),
+    /// so this is a pure unit test of the table lookup + precedence.
+    #[test]
+    fn keymap_tables_dispatch_modal_and_pane_keys() {
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyModifiers;
+        let none = KeyModifiers::empty();
+
+        // ── Confirm modal (CONFIRM_KEYS) ──
+        // a cancel key ('n') clears the modal and notes "cancelled".
+        let mut app = headless_app();
+        app.modal = Some(Modal::Confirm {
+            prompt: "Delete?".into(), action: ConfirmAction::Delete });
+        handle_modal_key(&mut app, KeyCode::Char('n'), none);
+        assert!(app.modal.is_none(), "'n' should dismiss the Confirm modal");
+        assert_eq!(app.status, "cancelled");
+        // Esc is also a cancel key in the table.
+        app.modal = Some(Modal::Confirm {
+            prompt: "Delete?".into(), action: ConfirmAction::Delete });
+        handle_modal_key(&mut app, KeyCode::Esc, none);
+        assert!(app.modal.is_none(), "Esc should dismiss the Confirm modal");
+        // a key NOT in the table re-arms the modal (the old `_ =>` arm).
+        app.modal = Some(Modal::Confirm {
+            prompt: "Delete?".into(), action: ConfirmAction::Delete });
+        handle_modal_key(&mut app, KeyCode::Char('z'), none);
+        assert!(matches!(app.modal, Some(Modal::Confirm { .. })),
+                "an unbound key must leave the Confirm modal up");
+
+        // ── per-pane action keys (PANE_ACTION_KEYS) ──
+        // 'K' opens a Kill Confirm; 'D' a Delete Confirm; 'Z' a Dissolve one.
+        for (key, want) in [
+            ('K', ConfirmAction::Kill),
+            ('D', ConfirmAction::Delete),
+            ('Z', ConfirmAction::Dissolve),
+        ] {
+            let mut app = headless_app();
+            app.focus = Pane::Sessions;
+            assert!(dispatch_pane_key(&mut app, KeyCode::Char(key)),
+                    "'{key}' must be handled by the pane-key table");
+            match app.modal {
+                Some(Modal::Confirm { action, .. }) => assert!(action == want,
+                    "'{key}' opened the wrong Confirm action"),
+                _ => panic!("'{key}' should open a Confirm modal"),
+            }
+        }
+
+        // gate precedence: 'd' on Rules deletes the rule (no engine here, so we
+        // assert it is NOT treated as detach), while 'd' elsewhere = detach.
+        let mut app = headless_app();
+        app.focus = Pane::Changes;
+        assert!(dispatch_pane_key(&mut app, KeyCode::Char('d')));
+        assert!(app.should_quit, "'d' off Hunks/Rules must detach (set should_quit)");
+        let mut app = headless_app();
+        app.focus = Pane::Rules; // 'd' here is the guarded delete-rule, not detach
+        assert!(dispatch_pane_key(&mut app, KeyCode::Char('d')));
+        assert!(!app.should_quit, "'d' on Rules must NOT detach");
+
+        // 'n' on Rules opens the new-rule form (guarded entry wins).
+        let mut app = headless_app();
+        app.focus = Pane::Rules;
+        assert!(dispatch_pane_key(&mut app, KeyCode::Char('n')));
+        assert!(matches!(app.modal, Some(Modal::RuleForm { editing: None, .. })),
+                "'n' on Rules should open a blank RuleForm");
+
+        // 'r' starts a rename (engine-free state toggle).
+        let mut app = headless_app();
+        app.focus = Pane::Sessions;
+        assert!(dispatch_pane_key(&mut app, KeyCode::Char('r')));
+        assert!(app.renaming.is_some(), "'r' should enter rename mode");
+
+        // an unbound key returns false (caller handles it inline / no-op).
+        let mut app = headless_app();
+        assert!(!dispatch_pane_key(&mut app, KeyCode::Char('§')),
+                "an unbound key must not be claimed by the pane-key table");
     }
 
     /// Helper: select the box (and change) whose path matches `pred`, returning
