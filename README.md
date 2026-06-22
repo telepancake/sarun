@@ -5,11 +5,22 @@ but capture everything it writes for review before any of it touches the host.
 Not a container — the program runs as you, against your real filesystem, only
 through a copy-on-write overlay.
 
-## Two roles, one binary
+## Commands
 
-- `sarun` with no command starts the UI/server.
-- `sarun -- <cmd>` runs `<cmd>` in a sandbox. This requires the UI to be
-  running and fails fast if it isn't.
+- `sarun` — start the engine (if needed) and the interactive UI.
+- `sarun run -- <cmd>` — run `<cmd>` in a sandbox box (needs a running
+  engine/UI; fails fast otherwise). Flags select networking (`-n`/`-N`/`--net`),
+  capture mode (`-t`/`-d`/`-e`), the brush shell (`-b`), a PTY (`-p`), and more.
+- `sarun <NAME> apply|discard|rename NEW|patch` — operate on a box from the CLI
+  instead of the UI.
+- `sarun oci load|run|build|save|dockerfile|author …` — work with OCI images
+  (pull/unpack, run a container box, build a Dockerfile, commit a box back).
+- `sarun oaita gen|run|call|tail|add|where NAME` — a resumable
+  OpenAI-compatible chat/agent runner; inside an `--api` box it reaches the model
+  through the engine's proxy, which holds the API key host-side so the box never
+  sees it. (Also reachable as an `oaita` symlink.)
+
+Run `sarun -h` for the full surface.
 
 ## How a box runs
 
