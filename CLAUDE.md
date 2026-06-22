@@ -190,9 +190,11 @@ including closed-rootfs boot, COPY/glob landing, multi-stage `COPY --from`,
   the box's `frame` as `copy_hint`; `oci dockerfile` surfaces it as a commented
   `#COPY <host-source> <path>` line the author can uncomment + edit if those
   files came from the host (`test_oci.py` injects a hint and asserts the emit;
-  `paths_lcp` has Rust unit tests). Remaining: a reedline tty front-end for line
-  editing/history (the core reads plain stdin lines, which works piped or at a
-  tty). With `oci save` landed, the natural way to *make* an image is: run commands in a box
+  `paths_lcp` has Rust unit tests). The reedline tty front-end is DONE too:
+  `oci author` at a tty reads through reedline (`AuthorLines`/`AuthorPrompt` in
+  oci.rs — line editing, in-session history, reverse-search, `author> ` prompt,
+  Ctrl-C cancels a line / Ctrl-D finalizes); piped input still uses plain stdin
+  so scripts and `test_oci.py` are unchanged. With `oci save` landed, the natural way to *make* an image is: run commands in a box
   on top of a base, then `oci save` the box's net changes as ONE layer + config
   (a `docker commit` with sarun's provenance attached). Do NOT make each brush
   pipeline its own image layer — that's layer explosion (a build is thousands of
