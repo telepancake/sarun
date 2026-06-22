@@ -82,15 +82,27 @@ fn serve() -> i32 {
     // any box networking starts. Idempotent: a redundant install is harmless.
     let _ = rustls::crypto::ring::default_provider().install_default();
     let sock = paths::sock_path();
-    // Single-instance guard FIRST, before any self-heal — a live socket
-    // means another engine is up, and we must not touch its mountpoint.
-    // Python uses the same semantics: a live socket means an instance is
-    // running; a dead file is stale and replaced.
-    if std::os::unix::net::UnixStream::connect(&sock).is_ok() {
-        eprintln!("sarun-engine: an engine/UI is already running \
-                   (control socket {}).", sock.display());
-        return 4;
-    }
+    // Single-instance guard FIRST, before any self-heal — we must not touch
+    // another live engine's mountpoint/socket. Audit M2: the old guard was
+    // TOCTOU (`connect(sock).is_ok()` probe, then a much-later remove+bind in
+    // control::serve), so two engines launched together could both pass the
+    // probe and race the bind. Take an exclusive advisory `flock` on a lock
+    // file beside the socket instead — the kernel grants it to exactly one
+    // process and auto-releases it on exit (even a crash), so a stale lock
+    // never survives a dead daemon. KEEP `_instance_lock` bound for the whole
+    // serve() scope; dropping it would release the lock.
+    let _instance_lock = match control::acquire_instance_lock(&sock) {
+        Ok(control::InstanceLock::Held(fd)) => fd,
+        Ok(control::InstanceLock::AlreadyRunning) => {
+            eprintln!("sarun-engine: an engine/UI is already running \
+                       (control socket {}).", sock.display());
+            return 4;
+        }
+        Err(e) => {
+            eprintln!("sarun-engine: cannot take instance lock: {e}");
+            return 1;
+        }
+    };
     // No live engine — safe to clean up after a previous crashed one. A
     // stale FUSE mount at mnt_point() makes ensure_dirs() fail with
     // EEXIST: stat() on a dead-daemon FUSE mount returns ENOTCONN, so

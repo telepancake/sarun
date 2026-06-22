@@ -7,7 +7,8 @@
 // the structural-diff job path are deferred to a later milestone.
 
 use std::ffi::CStr;
-use std::os::fd::{AsFd, BorrowedFd};
+use std::ffi::CString;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -447,26 +448,149 @@ fn consume(conn: &Connection, id: i64, rel: &str, rowid: i64) {
 const S_IFIFO: u32 = 0o010000;
 const S_IFBLK: u32 = 0o060000;
 
-fn restore_metadata_at(conn: &Connection, rel: &str, parent: BorrowedFd, leaf: &CStr, mtime_ns: i64) {
+/// `lsetxattr` on the leaf beneath the already-resolved `parent` dir fd,
+/// surfacing the OS error instead of dropping it (audit H4). Mirrors
+/// `hostfs::setxattr_at` byte for byte (the same `/proc/self/fd/<parent>/<leaf>`
+/// confinement that does not follow the final symlink), except it returns a
+/// Result so a failed restore can abort the apply rather than be silently lost.
+/// Lives here (not hostfs) only because hostfs is out of scope for this change.
+fn setxattr_at_checked(parent: BorrowedFd, name: &CStr, key: &CStr, val: &[u8])
+    -> Result<(), String> {
+    let leaf = name.to_str().map_err(|_| "non-utf8 leaf name".to_string())?;
+    let path = format!("/proc/self/fd/{}/{}", parent.as_raw_fd(), leaf);
+    let cpath = CString::new(path).map_err(|_| "NUL in xattr path".to_string())?;
+    // SAFETY: valid C strings and byte buffer.
+    let r = unsafe {
+        libc::lsetxattr(cpath.as_ptr(), key.as_ptr(),
+                        val.as_ptr().cast(), val.len(), 0)
+    };
+    if r != 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    Ok(())
+}
+
+/// Atomically write `bytes` (with exact `mode`) to the leaf `name` beneath the
+/// already-resolved `parent` dir fd (audit C2'): write a sibling temp file in
+/// the SAME directory, fsync it, then `renameat` it over the target — so an
+/// error mid-write can never truncate or corrupt the host file that's already
+/// there. On any failure the temp is unlinked and prior host content is
+/// untouched. The C2 ancestor-symlink guard is preserved by the caller, which
+/// resolved `parent` with per-component O_NOFOLLOW; this helper only ever
+/// touches names directly under that fd. As the OLD `hostfs::write_file_at`
+/// did, a pre-existing SYMLINK at the leaf is refused (we must not replace a
+/// box-planted symlink with content — that was the C2-class escape the leaf
+/// O_NOFOLLOW check guarded against), so we lstat first and bail on a symlink.
+fn write_file_atomic_at(parent: BorrowedFd, name: &CStr, bytes: &[u8], mode: u32)
+    -> Result<(), String> {
+    // Refuse to clobber a symlink leaf (parity with write_file_at's O_NOFOLLOW
+    // open, which errored on an existing symlink rather than following it).
+    if let Some(st) = hostfs::lstat_at(parent, name) {
+        if st.st_mode & libc::S_IFMT == libc::S_IFLNK {
+            return Err("refusing to overwrite a symlink leaf".into());
+        }
+    }
+    // Unique sibling temp name under the SAME parent dir (same filesystem → the
+    // rename is atomic). Created O_EXCL|O_NOFOLLOW so it can never race onto an
+    // attacker-planted name or symlink.
+    let leaf = name.to_str().map_err(|_| "non-utf8 leaf name".to_string())?;
+    let tmp_name = format!(".sarun-apply-tmp-{}-{}-{}",
+        std::process::id(), apply_tmp_seq(), leaf);
+    // Cap the length so a very long leaf can't push us past NAME_MAX (255).
+    let tmp_name: String = tmp_name.chars().take(250).collect();
+    let ctmp = CString::new(tmp_name).map_err(|_| "NUL in temp name".to_string())?;
+    let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL
+        | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // SAFETY: valid dirfd and C string; variadic mode arg for O_CREAT.
+    let fd = unsafe { libc::openat(parent.as_raw_fd(), ctmp.as_ptr(), flags, mode & 0o7777) };
+    if fd < 0 {
+        return Err(format!("create temp: {}", std::io::Error::last_os_error()));
+    }
+    // SAFETY: fresh owned fd; File takes ownership and closes it on drop.
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    // Helper to clean up the temp on any failure below.
+    let cleanup = || { let _ = hostfs::unlink_at(parent, &ctmp); };
+    let write_res = (|| -> Result<(), String> {
+        use std::io::Write;
+        let mut f = std::fs::File::from(owned);
+        f.write_all(bytes).map_err(|e| format!("write temp: {e}"))?;
+        // O_CREAT's mode is umask-masked, so set the exact mode explicitly and
+        // surface any failure (audit H4: a 0600 file must not land world-readable).
+        // SAFETY: valid open fd.
+        if unsafe { libc::fchmod(f.as_raw_fd(), mode & 0o7777) } != 0 {
+            return Err(format!("set mode: {}", std::io::Error::last_os_error()));
+        }
+        // Flush the data to disk before the rename so a crash can't leave a
+        // renamed-but-empty file shadowing the prior content.
+        f.flush().map_err(|e| format!("flush temp: {e}"))?;
+        // SAFETY: valid open fd.
+        if unsafe { libc::fsync(f.as_raw_fd()) } != 0 {
+            return Err(format!("fsync temp: {}", std::io::Error::last_os_error()));
+        }
+        Ok(())
+    })();
+    if let Err(e) = write_res {
+        cleanup();
+        return Err(e);
+    }
+    // Atomic replace. renameat never follows a symlink at either end, so the
+    // target is replaced as a whole — no write-through-symlink escape.
+    // SAFETY: valid dirfds and C strings.
+    let r = unsafe {
+        libc::renameat(parent.as_raw_fd(), ctmp.as_ptr(),
+                       parent.as_raw_fd(), name.as_ptr())
+    };
+    if r != 0 {
+        let e = std::io::Error::last_os_error();
+        cleanup();
+        return Err(format!("rename temp into place: {e}"));
+    }
+    Ok(())
+}
+
+/// Monotonic counter making each apply temp file name unique within this process.
+fn apply_tmp_seq() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(1);
+    N.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Restore mtime / owner / xattrs onto a just-materialized leaf. Audit H4:
+/// xattr (and mode, set at create time in hostfs) failures must NOT be reported
+/// as a successful apply — they are surfaced as an Err. Owner is legitimately
+/// best-effort: an unprivileged host user's `lchown` EPERMs on a uid/gid it
+/// can't assign, so a failed owner restore is INTENTIONALLY swallowed (the
+/// content is correct; only the recorded uid/gid couldn't be reproduced).
+/// xattrs, by contrast, can carry security-relevant state (capabilities, ACLs,
+/// SELinux labels), so a dropped setxattr is a real divergence — collected and
+/// returned.
+fn restore_metadata_at(conn: &Connection, rel: &str, parent: BorrowedFd, leaf: &CStr, mtime_ns: i64)
+    -> Result<(), String> {
     // mtime (atime = mtime): drives downstream make/rebuild decisions.
     hostfs::utimens_at(parent, leaf, mtime_ns);
-    // owner (best-effort; lchown EPERMs for an unprivileged host user — ignored).
+    // owner: best-effort. lchown EPERMs for an unprivileged host user (it cannot
+    // give a file away to another uid/gid), which is the common case here, so a
+    // failure is expected and deliberately ignored — see the doc comment above.
     if let Ok((uid, gid)) = conn.query_row(
         "SELECT uid,gid FROM ownership WHERE name=?1", [rel],
         |r| Ok((r.get::<_,i64>(0)? as u32, r.get::<_,i64>(1)? as u32))) {
         hostfs::chown_at(parent, leaf, uid, gid);
     }
-    // xattrs.
+    // xattrs: surface failures. A dropped setxattr can silently lose a security
+    // attribute (file caps / ACL / label), so the FIRST failure aborts and is
+    // returned rather than logged-and-forgotten.
     if let Ok(mut st) = conn.prepare("SELECT key,value FROM xattr WHERE name=?1") {
         if let Ok(rows) = st.query_map([rel], |r|
             Ok((r.get::<_,String>(0)?, r.get::<_,Vec<u8>>(1)?))) {
             for (k, v) in rows.flatten() {
-                if let Ok(ck) = std::ffi::CString::new(k) {
-                    hostfs::setxattr_at(parent, leaf, &ck, &v);
-                }
+                let ck = CString::new(k.clone())
+                    .map_err(|_| format!("xattr key '{k}' contains NUL"))?;
+                setxattr_at_checked(parent, leaf, &ck, &v)
+                    .map_err(|e| format!("setxattr '{k}': {e}"))?;
             }
         }
     }
+    Ok(())
 }
 
 fn materialize(conn: &Connection, id: i64, rel: &str) -> Result<(), String> {
@@ -517,9 +641,14 @@ fn materialize_at(root: BorrowedFd, conn: &Connection, id: i64, rel: &str) -> Re
             Some(d) => d,
             None => std::fs::read(blob_path(id, rowid)).map_err(|e| e.to_string())?,
         };
-        hostfs::write_file_at(parent, &leaf, &bytes, mode)?;
+        // Audit C2': atomic temp-then-rename in the SAME parent dir (resolved
+        // above with per-component O_NOFOLLOW), so an error mid-write can never
+        // truncate or corrupt the host file already there.
+        write_file_atomic_at(parent, &leaf, &bytes, mode)?;
     }
-    restore_metadata_at(conn, rel, parent, &leaf, mtime_ns);
+    // Audit H4: a metadata-restore failure (xattr / mode) must NOT be reported
+    // as a successful apply, so it propagates.
+    restore_metadata_at(conn, rel, parent, &leaf, mtime_ns)?;
     Ok(())
 }
 
@@ -532,12 +661,43 @@ fn paths_arg(id: i64, paths: &Value) -> Vec<String> {
         .collect()).unwrap_or_default()
 }
 
+/// Audit M1: has the real host file at `rel` changed since this box captured it?
+/// True when the host path exists and its mtime is strictly newer than the
+/// mtime stored in the box's sqlar (the moment of capture). Same comparison the
+/// `decorate` `stale` flag uses, lifted into a hard pre-apply gate. A path the
+/// box created (no host file) or one with no recorded capture mtime is NOT
+/// considered stale. Conservative: only refuses on a positive staleness signal,
+/// so the normal apply path (host unchanged) is untouched.
+fn host_changed_since_capture(id: i64, rel: &str) -> bool {
+    let rel = rel.trim_start_matches('/');
+    let host = Path::new("/").join(rel);
+    let Ok(md) = host.symlink_metadata() else { return false };
+    let Some(cap_ns) = current_mtime(id, rel) else { return false };
+    use std::os::unix::fs::MetadataExt;
+    let host_ns = md.mtime() * 1_000_000_000 + md.mtime_nsec();
+    host_ns > cap_ns
+}
+
 /// apply == PROMOTE into the parent overlay (a nested box) or WRITE the host
 /// (a top-level box). Mirror of Python ChangeReview.apply. For each path: a box
 /// WITH a parent promotes the captured change into the parent's overlay (a
 /// pending change in the parent box), routed through the parent's live BoxState
 /// when running, else its at-rest sqlar; a TOP-LEVEL box materializes the change
 /// onto the real host. On success the path is consumed from this box's archive.
+///
+/// Audit H3: this reads the box's pool blobs, which a live FUSE write may be
+/// mid-`write_at` on, so it must only run on a STOPPED box. The running-box
+/// guard lives at the control-plane callers (control.rs `apply`/`discard` and
+/// `review.apply`/`review.discard`), where the engine's `box_pids` live-set is
+/// in reach — mirroring how `dissolve` guards itself.
+///
+/// TODO (audit C3): this multi-path apply is NOT transactional. It
+/// materializes-then-consumes per path, so an error at path N leaves
+/// 1..N-1 already written to the host AND consumed from the archive, with N..
+/// still pending — there is no "nothing happened" rollback. A full fix
+/// (stage all paths, then commit-or-rollback as one unit) is a large redesign
+/// deliberately deferred; the per-path staleness guard below at least refuses
+/// to silently clobber a host file that changed since capture.
 pub fn apply(id: i64, paths: &Value, ctx: &NestCtx) -> Value {
     let Some(conn) = open_rw(id) else {
         return json!({"applied": [], "errors": [{"path": "", "error": "no archive"}]});
@@ -562,7 +722,21 @@ pub fn apply(id: i64, paths: &Value, ctx: &NestCtx) -> Value {
                 let plive = ctx.live(p);
                 promote_into_parent(id, p, plive.as_deref(), &rel)
             }
-            None => materialize(&conn, id, &rel),  // top-level: write the host
+            None => {
+                // Top-level: write the real host. Audit M1 — refuse to silently
+                // overwrite a host file that changed AFTER this box captured it
+                // (the host mtime is newer than the stored capture mtime). The
+                // `decorate` stale flag is the same advisory the UI shows; here
+                // it becomes a hard refusal so a concurrent edit isn't clobbered
+                // without the user knowing. The user can re-capture / re-run to
+                // pick up the new baseline.
+                if host_changed_since_capture(id, &rel) {
+                    Err("host file changed since capture (stale); apply refused \
+                         — re-run the box to pick up the new contents".into())
+                } else {
+                    materialize(&conn, id, &rel)
+                }
+            }
         }};
         match result {
             Ok(()) => {
