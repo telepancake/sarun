@@ -732,6 +732,16 @@ fn gate_seq(args: &[OsString]) -> bool {
         }
         if b == b"--" { opts_done = true; continue; }
 
+        // seq uses clap `trailing_var_arg`: once a positional operand has been
+        // seen, uutils treats every later token as ANOTHER operand (erroring on
+        // an option), while GNU permutes options anywhere — so an option after an
+        // operand diverges (stderr wording, and `-s,`-style parse). Route those
+        // to the host. A negative-NUMBER token (`-5`) is an operand, not an
+        // option, so it falls through to is_int_operand below.
+        if operands > 0 && b.starts_with(b"-") && b != b"-" && !is_int_operand(b) {
+            return false;
+        }
+
         if b == b"-w" || b == b"--equal-width" {
             continue;
         }
@@ -774,14 +784,45 @@ fn gate_seq(args: &[OsString]) -> bool {
 }
 
 fn gate_expr(args: &[OsString]) -> bool {
-    // The single, narrow exclusion: the version/help banners. expr treats its
-    // operands positionally (allow_hyphen_values), so `--help`/`--version` are
-    // only special as a *sole* argument (GNU: `expr --help foo` evaluates the
-    // string "--help"). Refuse exactly that shape; everything else is SAFE.
+    // The version/help banners: expr treats its operands positionally
+    // (allow_hyphen_values), so `--help`/`--version` are only special as a *sole*
+    // argument (GNU: `expr --help foo` evaluates the string "--help").
     let operands = &args[1..];
     if operands.len() == 1 {
         let b = operands[0].as_bytes();
         if b == b"--help" || b == b"--version" {
+            return false;
+        }
+    }
+
+    // An integer literal: optional sign, then ≥1 ASCII digit, all digits.
+    fn int_literal(b: &[u8]) -> bool {
+        let d = match b.first() {
+            Some(b'-' | b'+') => &b[1..],
+            _ => b,
+        };
+        !d.is_empty() && d.iter().all(u8::is_ascii_digit)
+    }
+
+    // `substr` with an out-of-range POS/LEN diverges (GNU clamps to the string
+    // end; uutils returns empty + exit 1) because uutils evaluates substr offsets
+    // in fixed-width arithmetic, not the BigInt it uses for `+`/`-`/`*`. Normal
+    // bignum ARITHMETIC matches GNU, so only gate this when `substr` is present.
+    let has_substr = operands.iter().any(|a| a.as_bytes() == b"substr");
+
+    for a in operands {
+        let b = a.as_bytes();
+        // HOLE 1: a leading-`+` integer literal (`+5`). uutils parses it as a
+        // positive integer (BigInt accepts the sign); GNU does not — it treats
+        // `+5` as a non-integer string, flipping arithmetic/comparison results
+        // AND the exit code. The bare `+` operator (len 1) is unaffected.
+        if b.len() > 1 && b[0] == b'+' && b[1].is_ascii_digit() {
+            return false;
+        }
+        // HOLE 2: an integer operand that overflows i64 while `substr` is in play.
+        if has_substr && int_literal(b)
+            && std::str::from_utf8(b).ok().and_then(|s| s.parse::<i64>().ok()).is_none()
+        {
             return false;
         }
     }
