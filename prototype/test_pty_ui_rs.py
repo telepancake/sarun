@@ -164,9 +164,7 @@ def _json_argv(argv):
 
 def main():
     if not ensure_binary():
-        print("  ok  pty-ui-rs: cargo/binary unavailable — SKIP")
-        print("\nPTY-UI-RS PASS (skipped)")
-        return 0
+        raise SystemExit("test_pty_ui_rs: engine binary unavailable — run `make engine`")
 
     tmp = Path(tempfile.mkdtemp(prefix="ptyui-"))
     for k, sub in (("XDG_STATE_HOME", "state"), ("XDG_RUNTIME_DIR", "run"),

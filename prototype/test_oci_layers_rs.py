@@ -185,9 +185,7 @@ def build_layout(out: Path):
 
 def main():
     if not ensure_binary():
-        print("  ok  oci-layers-rs: cargo/binary unavailable — SKIP")
-        print("\nOCI-LAYERS-RS PASS (skipped)")
-        return 0
+        raise SystemExit("test_oci_layers_rs: engine binary unavailable — run `make engine`")
     tmp = Path(tempfile.mkdtemp(prefix="ocilrs-"))
     for k, sub in (("XDG_STATE_HOME", "state"), ("XDG_RUNTIME_DIR", "run"),
                    ("XDG_CONFIG_HOME", "config"), ("XDG_DATA_HOME", "data")):

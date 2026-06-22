@@ -83,9 +83,7 @@ def make_finished_box(m, sid, entries, parent=None):
 
 def main():
     if not ensure_binary():
-        print("  ok  nested-apply-rs: cargo/binary unavailable — SKIP")
-        print("\nNESTED-APPLY-RS PASS (skipped)")
-        return 0
+        raise SystemExit("test_nested_apply_rs: engine binary unavailable — run `make engine`")
     tmp = Path(tempfile.mkdtemp(prefix="nestrs-"))
     for k, sub in (("XDG_STATE_HOME", "state"), ("XDG_RUNTIME_DIR", "run"),
                    ("XDG_CONFIG_HOME", "config"), ("XDG_DATA_HOME", "data")):

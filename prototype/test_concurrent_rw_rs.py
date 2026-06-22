@@ -63,8 +63,7 @@ def wait_socket(sock, timeout=30):
 
 def main():
     if not ensure_binary():
-        print("  ok  crw-rs: cargo/binary unavailable — SKIP")
-        print("\nCRW-RS PASS (skipped)"); return 0
+        raise SystemExit("test_concurrent_rw_rs: engine binary unavailable — run `make engine`")
     tmp = Path(tempfile.mkdtemp(prefix="crw-"))
     for k, sub in (("XDG_STATE_HOME", "st"), ("XDG_RUNTIME_DIR", "rn"),
                    ("XDG_CONFIG_HOME", "cf"), ("XDG_DATA_HOME", "d")):

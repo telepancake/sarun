@@ -129,13 +129,9 @@ def _drainable(fd):
 
 def main():
     if not ensure_binary():
-        print("  ok  pty-rs: cargo/binary unavailable — SKIP")
-        print("\nPTY-RS PASS (skipped)")
-        return 0
+        raise SystemExit("test_pty_rs: engine binary unavailable — run `make engine`")
     if not fuse_ok():
-        print("  ok  pty-rs: /dev/fuse or bwrap unavailable — SKIP")
-        print("\nPTY-RS PASS (skipped)")
-        return 0
+        raise SystemExit("test_pty_rs: FUSE/bwrap unavailable")
     tmp = Path(tempfile.mkdtemp(prefix="ptyrs-"))
     for k, sub in (("XDG_STATE_HOME", "state"), ("XDG_RUNTIME_DIR", "run"),
                    ("XDG_CONFIG_HOME", "config"), ("XDG_DATA_HOME", "data")):
