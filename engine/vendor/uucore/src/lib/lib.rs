@@ -352,8 +352,38 @@ static UTIL_NAME: LazyLock<String> = LazyLock::new(|| {
         .into_owned()
 });
 
+thread_local! {
+    // sarun patch: per-thread override for `util_name()`. Stock uucore derives
+    // the utility name once, process-globally, from argv[0] — fine for the
+    // one-util-per-process model. An embedder that runs several utils in one
+    // process (each on its own thread) would otherwise see every util's
+    // diagnostics prefixed with the host's argv[0] (e.g. `sarun: ...` instead
+    // of `wc: ...`) for the utils that print via `util_name()` directly. When
+    // set, this thread-local takes precedence; unset, behavior is unchanged.
+    // The String is leaked once per thread so `util_name()` can keep returning
+    // `&'static str` (it outlives the util's short-lived thread).
+    static UTIL_NAME_OVERRIDE: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+}
+
+/// Set a per-thread override for [`util_name`]. Intended for embedders that run
+/// a utility's logical entry point on a dedicated thread within a long-lived
+/// process whose argv[0] is not the utility's name. Passing an empty string
+/// clears the override for the current thread.
+pub fn set_utility_name(name: &str) {
+    UTIL_NAME_OVERRIDE.with(|c| {
+        if name.is_empty() {
+            c.set(None);
+        } else {
+            c.set(Some(Box::leak(name.to_string().into_boxed_str())));
+        }
+    });
+}
+
 /// Derive the utility name.
 pub fn util_name() -> &'static str {
+    if let Some(name) = UTIL_NAME_OVERRIDE.with(std::cell::Cell::get) {
+        return name;
+    }
     &UTIL_NAME
 }
 
