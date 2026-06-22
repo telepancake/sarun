@@ -1,20 +1,27 @@
 #!/usr/bin/env python3
-"""Syscall-level CONTRACT test for the native injected-I/O brush builtins.
+"""Syscall-level CONTRACT test for the native in-process coreutil builtins.
 
-The differential tests prove a builtin's *output* matches GNU. They cannot prove
-the *contract* that makes it a "proper builtin":
+The differential tests prove a builtin's *output* matches GNU on a given input.
+They cannot prove the *contract* that makes it a real in-process builtin (and not
+a fake one that secretly forks). There are no gates and no fork-to-the-box's-
+binary fallback any more: each of the 13 (`cat head wc nl tac basename dirname
+seq expr tr cut uniq sort`) runs uutils IN-PROCESS, unconditionally. This test
+asserts, at the syscall level:
 
-  1. parallel-safe / runs IN-PROCESS  -> the util is NOT `execve`'d when its argv
-     passes the gate (it really ran inside the engine, no fork);
-  2. no global-state trampling        -> NO `dup2`/`dup3` onto the process's
-     fd 0/1/2 around the call;
-  3. correct with EXTERNAL processes   -> a gate-REFUSED argv DOES `execve` the
-     host binary (fork+exec fallback);
-  4. cat keeps its splice(2) fast path -> `splice` fires for a file source.
-
-Those are syscall-level facts, so we assert them by running each case under
-`strace` and parsing the trace. This is the programmatic version of the manual
-`strace` check the porting story describes.
+  1. IN-PROCESS         -> the util is NEVER `execve`'d (it ran inside the engine,
+                           no fork);
+  2. no fd trampling    -> NO `dup2`/`dup3` onto the process's fd 0/1/2;
+  3. right fd + content -> with both std streams redirected, NO write() hits the
+                           process's fd 1/2 (no logical-sink leak), and the sink
+                           bytes match the GNU reference for normal inputs;
+  4. logical stdin      -> a piped / `< file` builtin reads the pipe/file fd, never
+                           the engine's real fd 0 (the data-corruption bug class);
+  5. LOCALIZATION       -> running many distinct utils in ONE process renders every
+                           util's own messages (no raw Fluent keys like
+                           `tac-error-open-error`) with the correct program name
+                           (`wc:` not `sarun:`) — the uucore-per-thread fix;
+  6. exit codes         -> true/false/[/expr/… return the right status;
+  7. cat splice          -> `splice(2)` still fires for a file source.
 
 Standalone:  engine/test_builtin_contract.py        (prints CONTRACT PASS/FAIL)
 pytest:      uv run --with pytest pytest engine/test_builtin_contract.py
@@ -33,14 +40,19 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 BIN = os.path.join(HERE, "target/x86_64-unknown-linux-musl/release/sarun")
 
-# Syscalls we care about. `clone`/`vfork`/`fork` would reveal an unexpected
-# child; `execve` reveals fork+exec of a util; `dup2`/`dup3` reveal fd-table
-# trampling; `splice` is cat's fast path.
+# Syscalls we care about. `execve` reveals fork+exec of a util; `dup2`/`dup3`
+# reveal fd-table trampling; `splice` is cat's fast path; clone/fork would reveal
+# an unexpected child.
 TRACE = "execve,dup2,dup3,splice,clone,vfork,fork"
 
 EXECVE_PROG = re.compile(r'execve\("([^"]*)"')
-# dup2(old, new) / dup3(old, new, flags): new == 0/1/2 is a std-fd redirect.
 DUP_ON_STD = re.compile(r'\bdup3?\([0-9]+,\s*([012])\b')
+WRITE_FD = re.compile(r'\bwrite\((\d+),')
+READ_FD0 = re.compile(r'\bread\(0,')
+
+# The 13 native in-process coreutil builtins.
+UTILS = ["cat", "head", "wc", "nl", "tac", "basename", "dirname", "seq",
+         "expr", "tr", "cut", "uniq", "sort"]
 
 
 def _require():
@@ -50,68 +62,40 @@ def _require():
         raise RuntimeError(f"engine binary missing: {BIN} (run `make engine`)")
 
 
-def run_trace(script, cwd):
-    """Run `BIN brush-sh -- sh -c <script>` under strace; return (out, trace)."""
-    tf = tempfile.NamedTemporaryFile(prefix="contract_", suffix=".strace",
-                                     delete=False)
+def run_trace(script, cwd, traceset=TRACE):
+    """Run `BIN brush-sh -- sh -c <script>` under strace; return the trace text."""
+    tf = tempfile.NamedTemporaryFile(prefix="ct_", suffix=".strace", delete=False)
     tf.close()
     try:
-        proc = subprocess.run(
-            ["strace", "-f", "-qq", "-e", f"trace={TRACE}", "-o", tf.name,
+        subprocess.run(
+            ["strace", "-f", "-qq", "-e", f"trace={traceset}", "-o", tf.name,
              BIN, "brush-sh", "--", "sh", "-c", script],
             cwd=cwd, capture_output=True, text=True, timeout=60,
         )
         with open(tf.name, encoding="utf-8", errors="replace") as fh:
-            trace = fh.read()
-        return proc.stdout, trace
+            return fh.read()
     finally:
         os.unlink(tf.name)
 
 
 def execve_basenames(trace):
     """Program basenames execve'd, EXCLUDING the engine binary itself."""
-    names = set()
-    for prog in EXECVE_PROG.findall(trace):
-        base = os.path.basename(prog)
-        if base != "sarun":
-            names.add(base)
-    return names
+    return {os.path.basename(p) for p in EXECVE_PROG.findall(trace)
+            if os.path.basename(p) != "sarun"}
 
 
 def dup_onto_std_count(trace):
     return len(DUP_ON_STD.findall(trace))
 
 
-# write(FD, ... — the fd a write() targeted.
-WRITE_FD = re.compile(r'\bwrite\((\d+),')
-# read(0, ... — a read of the engine's REAL fd 0. A piped-stdin builtin must read
-# the pipe fd, never fd 0 (reading fd 0 steals bytes from whatever owns the
-# engine's stdin — the find -files0-from / xargs data-corruption bug class).
-READ_FD0 = re.compile(r'\bread\(0,')
-
-
-def run_trace_set(script, cwd, traceset):
-    """Run the box command under strace tracing `traceset`; return (trace, rc)."""
-    tf = tempfile.NamedTemporaryFile(prefix="ts_", suffix=".strace", delete=False)
-    tf.close()
-    try:
-        p = subprocess.run(
-            ["strace", "-f", "-qq", "-e", f"trace={traceset}", "-o", tf.name,
-             BIN, "brush-sh", "--", "sh", "-c", script],
-            cwd=cwd, capture_output=True, timeout=60,
-        )
-        with open(tf.name, encoding="utf-8", errors="replace") as fh:
-            return fh.read(), p.returncode
-    finally:
-        os.unlink(tf.name)
+def writes_to_std(trace):
+    return sum(1 for fd in WRITE_FD.findall(trace) if fd in ("1", "2"))
 
 
 def run_redirected(script, cwd):
-    """Run `<script> >OUT 2>ERR` under strace -e trace=write; return
-    (trace, out_bytes, err_bytes). With both std streams redirected to FILES, the
-    box's logical sinks are fds OTHER than the process's 0/1/2 — so any write() the
-    trace shows to fd 1 or fd 2 is a process-global leak (the bug class the
-    differential tests, which capture process stdout/stderr, cannot see)."""
+    """Run `<script> >OUT 2>ERR` under strace; return (trace, out_bytes, err_bytes).
+    With both std streams redirected to FILES, the box's logical sinks are fds
+    OTHER than 0/1/2 — so any write() to fd 1/2 is a process-global leak."""
     o = tempfile.NamedTemporaryFile(prefix="bo_", dir=cwd, delete=False); o.close()
     e = tempfile.NamedTemporaryFile(prefix="be_", dir=cwd, delete=False); e.close()
     tf = tempfile.NamedTemporaryFile(prefix="wtr_", suffix=".strace", delete=False)
@@ -136,209 +120,69 @@ def run_redirected(script, cwd):
 
 
 def gnu_ref(script, cwd):
-    """The host (GNU coreutils) reference for `script`: its stdout/stderr bytes."""
-    p = subprocess.run(["sh", "-c", script], cwd=cwd, capture_output=True,
-                       timeout=60)
+    """The host (GNU coreutils) reference for `script`: stdout/stderr bytes."""
+    p = subprocess.run(["sh", "-c", script], cwd=cwd, capture_output=True, timeout=60)
     return p.stdout, p.stderr
 
 
-def writes_to_std(trace):
-    """Count write() syscalls in the trace that targeted process fd 1 or 2."""
-    return sum(1 for fd in WRITE_FD.findall(trace) if fd in ("1", "2"))
+def box_run(script, cwd):
+    """Run the box command, return (stdout+stderr text, exit code)."""
+    p = subprocess.run([BIN, "brush-sh", "--", "sh", "-c", script],
+                       cwd=cwd, capture_output=True, text=True, timeout=60)
+    return p.stdout + p.stderr, p.returncode
 
 
-# (label, script, util, mode) — mode "inproc" or "external".
-CASES = [
-    # In-process: gate accepts -> util runs inside the engine.
-    ("cat file",      "cat v.txt",            "cat",  "inproc"),
-    ("head -n2",      "head -n2 v.txt",       "head", "inproc"),
-    ("head -c5 pipe", "printf abcdefgh | head -c5", "head", "inproc"),
-    ("wc -l",         "wc -l v.txt",          "wc",   "inproc"),
-    ("wc -c pipe",    "printf abc | wc -c",   "wc",   "inproc"),
-    ("nl file",       "nl v.txt",             "nl",   "inproc"),
-    ("tac file",      "tac v.txt",            "tac",  "inproc"),
-    # Gate fallback: divergent argv -> fork+exec the host binary.
-    ("wc -w (locale)",   "printf 'a b c\\n' | wc -w", "wc",   "external"),
-    ("head --version",   "head --version",            "head", "external"),
-    ("tac --help",       "tac --help",                "tac",  "external"),
-    ("nl -s:: (multi)",  "nl -s :: v.txt",            "nl",   "external"),
-    ("head -n0b (suffix)", "head -n0b v.txt",         "head", "external"),
-    # ── wave 2 ──
-    ("basename",         "basename /a/b/c.txt .txt",  "basename", "inproc"),
-    ("dirname",          "dirname /a/b/c",            "dirname",  "inproc"),
-    ("seq",              "seq 1 5",                   "seq",      "inproc"),
-    ("expr",             "expr 2 + 3",                "expr",     "inproc"),
-    ("tr",               "printf abc | tr a-z A-Z",   "tr",       "inproc"),
-    ("cut",              "printf 'a:b:c\\n' | cut -d: -f2", "cut", "inproc"),
-    ("uniq",             "printf 'a\\na\\nb\\n' | uniq", "uniq",  "inproc"),
-    ("sort",             "printf 'b\\na\\n' | sort",  "sort",     "inproc"),
-    ("basename --version", "basename --version",      "basename", "external"),
-    ("dirname --version",  "dirname --version",       "dirname",  "external"),
-    ("seq --version",      "seq --version",           "seq",      "external"),
-    ("expr --help",        "expr --help",             "expr",     "external"),
-    ("tr --help",          "tr --help",               "tr",       "external"),
-    ("cut --version",      "cut --version",           "cut",      "external"),
-    ("uniq --version",     "uniq --version",          "uniq",     "external"),
-    ("sort -R (random)",   "printf 'b\\na\\n' | sort -R", "sort", "external"),
-    # gate-hardening regression guards (batch-1 blind-review findings) — each
-    # divergent shape must now route to the host binary (execve), while the one
-    # valid lookalike (tr canonical case pair) stays in-process.
-    ("uniq -cf1 (cluster val)",  "printf 'x\\nx\\n' | uniq -cf1",        "uniq", "external"),
-    ("cut -f3-1 (decreasing)",   "cut -f3-1 v.txt",                       "cut",  "external"),
-    ("tr a-z [:upper:] (misalign)", "printf x | tr a-z '[:upper:]'",      "tr",   "external"),
-    ("tr canonical pair",        "printf b | tr '[:lower:]' '[:upper:]'", "tr",   "inproc"),
-    # batch-2 blind-review findings (expr/seq):
-    ("expr +1=1 (leading+)",     "expr +1 = 1",                           "expr", "external"),
-    ("expr substr overflow",     "expr substr abcdef 1 99999999999999999999", "expr", "external"),
-    ("expr bignum (in-proc)",    "expr 99999999999999999999 + 1",         "expr", "inproc"),
-    ("seq opt-after-operand",    "seq 1 -s, 3",                           "seq",  "external"),
-    ("seq -s, before operands",  "seq -s, 1 3",                           "seq",  "inproc"),
-]
-
-
+# ── fixtures ─────────────────────────────────────────────────────────────────
 def _setup(cwd):
     with open(os.path.join(cwd, "v.txt"), "w") as fh:
         fh.write("one\ntwo\nthree\nfour\n")
-    os.mkdir(os.path.join(cwd, "sub"))  # for the logical-cwd `cd sub` case
+    with open(os.path.join(cwd, "s.txt"), "w") as fh:
+        fh.write("b\na\nb\nc\na\n")
+    os.mkdir(os.path.join(cwd, "sub"))
 
 
-# Piped-stdin cases: the builtin must read the PIPE, never the engine's real
-# fd 0, and stay in-process. (label, script)
-NO_FD0_CASES = [
-    ("printf|head -n1",   'printf "a\\nb\\nc\\n" | head -n1'),
-    ("printf|wc -c",      "printf abc | wc -c"),
-    ("echo|cat|wc -c",    "echo hi | cat | wc -c"),
-    ("printf|tac",        'printf "a\\nb\\n" | tac'),
-    ("printf|nl",         'printf "a\\nb\\n" | nl'),
-    # `< file` stdin redirection: the builtin reads the FILE fd, not fd 0.
-    ("head -n1 < file",   "head -n1 < v.txt"),
-    ("wc -l < file",      "wc -l < v.txt"),
-    ("cat < file",        "cat < v.txt"),
-    # ── wave 2 filters (piped stdin) ──
-    ("printf|tr",         "printf abc | tr a-z A-Z"),
-    ("printf|cut",        "printf 'a:b:c\\n' | cut -d: -f2"),
-    ("printf|uniq",       "printf 'a\\na\\nb\\n' | uniq"),
-    ("printf|sort",       "printf 'b\\na\\n' | sort"),
+# ── 1+2+3: each builtin runs in-process, no fd trampling, content == GNU ──────
+# (label, script) — normal inputs whose uutils output equals GNU.
+INPROC = [
+    ("cat",      "cat v.txt"),
+    ("head",     "head -n2 v.txt"),
+    ("wc",       "wc -l v.txt"),
+    ("nl",       "nl v.txt"),
+    ("tac",      "tac v.txt"),
+    ("basename", "basename /a/b.c .c"),
+    ("dirname",  "dirname /a/b/c"),
+    ("seq",      "seq 1 5"),
+    ("expr",     "expr 2 + 3"),
+    ("tr",       "printf abc | tr a-z A-Z"),
+    ("cut",      "printf 'a:b:c\\n' | cut -d: -f2"),
+    ("uniq",     "printf 'a\\na\\nb\\n' | uniq"),
+    ("sort",     "sort s.txt"),
+    # multi-stage all-builtin pipelines stay fully in-process
+    ("sort|uniq -c", "sort s.txt | uniq -c"),
+    ("tac|head",     "tac v.txt | head -n1"),
+    ("echo|cat|wc",  "echo hi | cat | wc -c"),
 ]
 
 
-def check_no_fd0(label, script, cwd):
-    """A piped-stdin builtin reads the pipe, NEVER the engine's fd 0, and runs
-    fully in-process (no execve)."""
-    trace, _ = run_trace_set(script, cwd, "read,execve")
+def check_inproc(label, script, cwd):
+    """No execve of any util (fully in-process) and no dup2/dup3 onto fd 0/1/2."""
+    trace = run_trace(script, cwd)
     problems = []
-    n = len(READ_FD0.findall(trace))
-    if n:
-        problems.append(f"{n} read() of the engine's fd 0 (logical-stdin leak)")
     execd = execve_basenames(trace)
     if execd:
-        problems.append(f"unexpected execve(s) {sorted(execd)}")
+        problems.append(f"unexpected execve(s) {sorted(execd)} (must be in-process)")
+    if dup_onto_std_count(trace):
+        problems.append(f"{dup_onto_std_count(trace)} dup2/dup3 onto fd 0/1/2")
     return problems
-
-
-# Exit-code correctness for in-process builtins. (label, script, expected_code)
-EXIT_CASES = [
-    ("true",            "true",              0),
-    ("false",           "false",             1),
-    ("[ -f v.txt ]",    "[ -f v.txt ]",      0),
-    ("[ -f nope ]",     "[ -f nope ]",       1),
-    ("head missing rc", "head nope.txt",     1),
-    ("wc -l rc",        "wc -l v.txt",       0),
-    # expr's exit codes are load-bearing: 0 if result non-null/non-zero, 1 if
-    # null/zero, 2 if invalid.
-    ("expr 5",          "expr 5",            0),
-    ("expr 0",          "expr 0",            1),
-    ("expr 1 = 2",      "expr 1 = 2",        1),
-    ("expr 1 = 1",      "expr 1 = 1",        0),
-]
-
-
-def check_exit(label, script, expected, cwd):
-    p = subprocess.run([BIN, "brush-sh", "--", "sh", "-c", script],
-                       cwd=cwd, capture_output=True, timeout=60)
-    if p.returncode != expected:
-        return [f"exit {p.returncode}, expected {expected}"]
-    return []
-
-
-def check_case(label, script, util, mode, cwd):
-    _, trace = run_trace(script, cwd)
-    execd = execve_basenames(trace)
-    dups = dup_onto_std_count(trace)
-    problems = []
-    if mode == "inproc":
-        if util in execd:
-            problems.append(f"{util} was execve'd (expected in-process); "
-                            f"execve set={sorted(execd)}")
-        if dups:
-            problems.append(f"{dups} dup2/dup3 onto fd 0/1/2 (expected 0)")
-    else:  # external
-        if util not in execd:
-            problems.append(f"{util} was NOT execve'd (expected host fallback); "
-                            f"execve set={sorted(execd)}")
-    return problems
-
-
-def check_pipeline_inprocess(cwd):
-    """tac | head: a two-stage in-process pipeline forks NEITHER util."""
-    _, trace = run_trace("tac v.txt | head -n1", cwd)
-    execd = execve_basenames(trace)
-    bad = {u for u in ("tac", "head") if u in execd}
-    if bad:
-        return [f"pipeline tac|head execve'd {sorted(bad)} (expected both in-process)"]
-    return []
-
-
-def check_cat_splice(cwd):
-    """cat keeps its splice(2) fast path for a real file source into a pipe."""
-    big = os.path.join(cwd, "big.txt")
-    with open(big, "w") as fh:
-        fh.write("x" * (256 * 1024))
-    _, trace = run_trace("cat big.txt | cat > /dev/null", cwd)
-    if "splice(" not in trace:
-        return ["cat did not use splice() for a file source (fast path lost)"]
-    return []
-
-
-# In-process argvs to check for content+destination via strace write capture.
-# (label, script). stdout AND stderr are redirected to files by run_redirected,
-# so a proper builtin writes ONLY the logical-sink fds — never process fd 1/2.
-CASES_IO = [
-    ("head -n2",        "head -n2 v.txt"),
-    ("head -c5 pipe",   "printf abcdefgh | head -c5"),
-    ("head missing",    "head nope.txt"),          # diagnostic must hit logical err
-    ("wc -lc",          "wc -lc v.txt"),
-    ("nl file",         "nl v.txt"),
-    ("tac file",        "tac v.txt"),
-    ("cat file",        "cat v.txt"),
-    ("tac|head pipe",   "tac v.txt | head -n1"),
-    # ── wave 2 (content + destination vs GNU) ──
-    ("basename",        "basename /a/b/c.txt .txt"),
-    ("dirname",         "dirname /a/b/c"),
-    ("seq",             "seq 1 5"),
-    ("expr",            "expr 2 + 3"),
-    ("tr a-z A-Z",      "printf abc | tr a-z A-Z"),
-    ("cut -d: -f2",     "printf 'a:b:c\\n' | cut -d: -f2"),
-    ("uniq",            "printf 'a\\na\\nb\\n' | uniq"),
-    ("sort",            "printf 'b\\na\\nb\\n' | sort"),
-    ("sort|uniq -c",    "printf 'b\\na\\nb\\n' | sort | uniq -c"),
-    ("expr bignum +",   "expr 99999999999999999999 + 1"),
-    ("seq -s, before",  "seq -s, 1 3"),
-    ("tr canonical",    "printf b | tr '[:lower:]' '[:upper:]'"),
-]
 
 
 def check_io(label, script, cwd):
-    """strace write-capture: with stdout/stderr redirected to files, assert the
-    builtin makes NO write() to process fd 1/2 (no global-state leak), and the
-    sink files match the GNU reference byte-for-byte (right content, right fd)."""
+    """Redirected: NO write() to process fd 1/2 (no leak), and sink == GNU."""
     trace, out, err = run_redirected(script, cwd)
     g_out, g_err = gnu_ref(script, cwd)
     problems = []
-    leaks = writes_to_std(trace)
-    if leaks:
-        problems.append(f"{leaks} write() to process fd 1/2 with both streams "
-                        f"redirected (logical-sink leak)")
+    if writes_to_std(trace):
+        problems.append(f"{writes_to_std(trace)} write() to process fd 1/2 (leak)")
     if out != g_out:
         problems.append(f"stdout != GNU: box={out!r} gnu={g_out!r}")
     if err != g_err:
@@ -346,64 +190,110 @@ def check_io(label, script, cwd):
     return problems
 
 
-# EXISTING in-process surface (shell builtins + find/xargs/env exec-wrappers).
-# These must run FULLY in-process: the engine is the ONLY thing that ever
-# execve's (execve_basenames empty), and nothing dup2's onto fd 0/1/2. This
-# covers the "runs other builtins/scripts in-process" half of the contract:
-# `find -exec cat`, `xargs cat`, and `env A=1 echo` each dispatch their
-# sub-command THROUGH brush (the cat/echo builtin), so no binary is forked.
-PURE_CASES = [
-    ("echo (shell builtin)",          "echo hello"),
-    ("printf (shell builtin)",        "printf '%s-%d\\n' a 5"),
-    ("pwd (shell builtin)",           "pwd"),
-    ("true (shell builtin)",          "true"),
-    ("find (in-process)",             "find . -maxdepth 1 -type f -name v.txt"),
-    ("find -exec cat (sub via brush)", "find . -name v.txt -exec cat {} ';'"),
-    ("xargs cat (sub via brush)",     "printf v.txt | xargs cat"),
-    ("env A=1 echo (sub via brush)",  "env A=1 echo hi"),
-    ("env A=1 printenv (sub via brush)", "env A=1 printenv A"),
-    (": (no-op builtin)",             ":"),
-    ("[ test builtin )",              "[ -f v.txt ] && echo yes"),
-    ("export + printenv (in-proc)",   "export X=42; printenv X"),
-    ("cd sub + pwd (logical cwd)",    "cd sub && pwd"),
-    ("echo|cat|wc 3-stage (in-proc)", "echo hi | cat | wc -c"),
-    # exec-wrappers dispatch their residual THROUGH brush: a builtin command runs
-    # in-process (no fork). (The nice/setsid/nohup disposition is materialized in
-    # the forked child only for an EXTERNAL residual, at exec.)
-    ("nice <builtin> (via brush)",    "nice -n 5 cat v.txt"),
-    ("setsid <builtin> (via brush)",  "setsid cat v.txt"),
-    ("nohup <builtin> (via brush)",   "nohup cat v.txt"),
+# ── 4: logical stdin — a piped / `< file` builtin never reads the engine's fd 0 ─
+NO_FD0 = [
+    ("printf|head", 'printf "a\\nb\\nc\\n" | head -n1'),
+    ("printf|wc",   "printf abc | wc -c"),
+    ("printf|tac",  'printf "a\\nb\\n" | tac'),
+    ("printf|nl",   'printf "a\\nb\\n" | nl'),
+    ("printf|tr",   "printf abc | tr a-z A-Z"),
+    ("printf|cut",  "printf 'a:b:c\\n' | cut -d: -f2"),
+    ("printf|uniq", "printf 'a\\na\\nb\\n' | uniq"),
+    ("printf|sort", "printf 'b\\na\\n' | sort"),
+    ("head < file", "head -n1 < v.txt"),
+    ("cat < file",  "cat < v.txt"),
+]
+
+
+def check_no_fd0(label, script, cwd):
+    trace = run_trace(script, cwd, "read,execve")
+    problems = []
+    n = len(READ_FD0.findall(trace))
+    if n:
+        problems.append(f"{n} read() of the engine's fd 0 (logical-stdin leak)")
+    if execve_basenames(trace):
+        problems.append(f"unexpected execve(s) {sorted(execve_basenames(trace))}")
+    return problems
+
+
+# ── 5: localization — many utils in ONE process, every message renders ────────
+# An error-triggering command per util (each writes a diagnostic to stderr).
+ERR_CMDS = [
+    "cat /nope", "head /nope", "wc /nope", "nl /nopedir", "tac /nope",
+    "basename", "dirname", "seq", "expr 1 +", "tr", "cut -f1 /nope",
+    "uniq /nope", "sort /nope",
+]
+# A raw Fluent key looks like `tac-error-open-error` / `expr-error-missing-...`:
+# a util name followed by `-` then lowercase. Rendered English messages never do.
+RAW_KEY = re.compile(r'\b(' + "|".join(UTILS) + r')-[a-z]')
+
+
+def check_localization_session(order_label, cmds, cwd):
+    """Run all the error commands in ONE box process; assert every diagnostic is
+    a rendered message (no raw Fluent keys) with the correct program name."""
+    script = "; ".join(f"{c} 2>&1" for c in cmds)
+    text, _ = box_run(script, cwd)
+    problems = []
+    keys = RAW_KEY.findall(text)
+    if keys:
+        problems.append(f"raw Fluent key(s) for: {sorted(set(keys))} — localization "
+                        f"corrupted in a multi-util session\n--- output ---\n{text}")
+    if re.search(r'(?m)^sarun:', text):
+        problems.append(f"wrong program-name prefix 'sarun:' (should be the util)\n{text}")
+    return problems
+
+
+# ── 6: exit codes ─────────────────────────────────────────────────────────────
+EXIT_CASES = [
+    ("true", "true", 0), ("false", "false", 1),
+    ("[ -f v.txt ]", "[ -f v.txt ]", 0), ("[ -f nope ]", "[ -f nope ]", 1),
+    ("head missing", "head /nope", 1), ("wc -l ok", "wc -l v.txt", 0),
+    ("expr 5", "expr 5", 0), ("expr 0", "expr 0", 1),
+    ("expr 1=2", "expr 1 = 2", 1), ("expr 1=1", "expr 1 = 1", 0),
+]
+
+
+def check_exit(label, script, expected, cwd):
+    _, rc = box_run(script, cwd)
+    return [] if rc == expected else [f"exit {rc}, expected {expected}"]
+
+
+# ── 7 + existing surface: brush builtins, find/xargs/env, splice ──────────────
+PURE = [
+    ("echo (builtin)",        "echo hello"),
+    ("printf (builtin)",      "printf '%s-%d\\n' a 5"),
+    ("pwd (builtin)",         "pwd"),
+    (": (builtin)",           ":"),
+    ("[ test (builtin)",      "[ -f v.txt ] && echo yes"),
+    ("export+printenv",       "export X=42; printenv X"),
+    ("cd sub + pwd",          "cd sub && pwd"),
+    ("find (in-process)",     "find . -maxdepth 1 -type f -name v.txt"),
+    ("find -exec cat",        "find . -name v.txt -exec cat {} ';'"),
+    ("xargs cat",             "printf v.txt | xargs cat"),
+    ("env A=1 echo",          "env A=1 echo hi"),
+    ("env A=1 printenv",      "env A=1 printenv A"),
+    ("nice <builtin>",        "nice -n 5 cat v.txt"),
+    ("setsid <builtin>",      "setsid cat v.txt"),
+    ("nohup <builtin>",       "nohup cat v.txt"),
 ]
 
 
 def check_pure(label, script, cwd):
-    """A fully in-process command: NOTHING but the engine binary is execve'd, and
-    no dup2/dup3 onto fd 0/1/2. Proves the sub-command (cat/echo/printenv) ran as
-    an in-process builtin via brush, not a forked binary."""
-    _, trace = run_trace(script, cwd)
+    trace = run_trace(script, cwd)
     problems = []
-    execd = execve_basenames(trace)
-    if execd:
-        problems.append(f"unexpected execve(s) {sorted(execd)} (expected fully "
-                        f"in-process)")
+    if execve_basenames(trace):
+        problems.append(f"unexpected execve(s) {sorted(execve_basenames(trace))}")
     if dup_onto_std_count(trace):
         problems.append(f"{dup_onto_std_count(trace)} dup2/dup3 onto fd 0/1/2")
     return problems
 
 
-# Content+destination for the existing in-process surface (skip pwd/true: pwd's
-# logical-vs-physical path can differ on symlinked tmp, true has no output).
-CASES_IO_EXISTING = [
-    ("echo",                "echo hello"),
-    ("printf",              "printf '%s-%d\\n' a 5"),
-    ("find single",         "find . -maxdepth 1 -type f -name v.txt"),
-    ("find -exec cat",      "find . -name v.txt -exec cat {} ';'"),
-    ("xargs cat",           "printf v.txt | xargs cat"),
-    ("env A=1 echo",        "env A=1 echo hi"),
-    ("env A=1 printenv A",  "env A=1 printenv A"),
-    ("echo|cat|wc -c",      "echo hi | cat | wc -c"),
-    ("export + printenv",   "export X=42; printenv X"),
-]
+def check_cat_splice(cwd):
+    big = os.path.join(cwd, "big.txt")
+    with open(big, "w") as fh:
+        fh.write("x" * (256 * 1024))
+    trace = run_trace("cat big.txt | cat > /dev/null", cwd)
+    return [] if "splice(" in trace else ["cat did not use splice() (fast path lost)"]
 
 
 def run_all():
@@ -411,24 +301,21 @@ def run_all():
     with tempfile.TemporaryDirectory() as cwd:
         _setup(cwd)
         results = []
-        for label, script, util, mode in CASES:
-            probs = check_case(label, script, util, mode, cwd)
-            results.append((f"{label} [{mode}]", probs))
-        results.append(("pipeline tac|head [inproc]", check_pipeline_inprocess(cwd)))
-        results.append(("cat splice fast path", check_cat_splice(cwd)))
-        for label, script in CASES_IO:
+        for label, script in INPROC:
+            results.append((f"{label} [in-process]", check_inproc(label, script, cwd)))
+        for label, script in INPROC:
             results.append((f"{label} [io: fd+content]", check_io(label, script, cwd)))
-        # Existing in-process surface: shell builtins + find/xargs/env.
-        for label, script in PURE_CASES:
-            results.append((f"{label} [pure in-proc]", check_pure(label, script, cwd)))
-        for label, script in CASES_IO_EXISTING:
-            results.append((f"{label} [io: fd+content]", check_io(label, script, cwd)))
-        # Logical-stdin: a piped builtin must never read the engine's fd 0.
-        for label, script in NO_FD0_CASES:
+        for label, script in NO_FD0:
             results.append((f"{label} [no fd0 read]", check_no_fd0(label, script, cwd)))
-        # Exit-code correctness.
+        results.append(("localization: forward session",
+                        check_localization_session("fwd", ERR_CMDS, cwd)))
+        results.append(("localization: reverse session",
+                        check_localization_session("rev", list(reversed(ERR_CMDS)), cwd)))
         for label, script, code in EXIT_CASES:
             results.append((f"{label} [exit={code}]", check_exit(label, script, code, cwd)))
+        for label, script in PURE:
+            results.append((f"{label} [pure in-proc]", check_pure(label, script, cwd)))
+        results.append(("cat splice fast path", check_cat_splice(cwd)))
     return results
 
 
@@ -445,19 +332,17 @@ def _emit(results):
     return failed
 
 
-# ── pytest entry points ──────────────────────────────────────────────────────
-def test_builtin_syscall_contract():
+def test_builtin_contract():
     results = run_all()
-    failed = [(l, p) for l, p in results if p]
-    assert not failed, "contract violations:\n" + "\n".join(
-        f"{l}: {p}" for l, p in failed)
+    bad = [(l, p) for l, p in results if p]
+    assert not bad, "contract violations:\n" + "\n".join(f"{l}: {p}" for l, p in bad)
 
 
 if __name__ == "__main__":
     res = run_all()
-    n_fail = _emit(res)
+    n = _emit(res)
     print()
-    if n_fail:
-        print(f"CONTRACT FAIL ({n_fail} case(s))")
+    if n:
+        print(f"CONTRACT FAIL ({n} case(s))")
         sys.exit(1)
     print(f"CONTRACT PASS ({len(res)} cases)")
