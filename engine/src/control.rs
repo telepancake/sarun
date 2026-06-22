@@ -96,7 +96,7 @@ fn ppid_of(pid: i32) -> i32 {
 /// box never supplies its own parent. None if no enclosing box is found.
 fn derive_parent_box(state: &State, host_pid: i32) -> Option<i64> {
     let map: std::collections::HashMap<i32, i64> = {
-        let s = state.lock().unwrap();
+        let s = lock(state);
         s.box_runpids.iter().map(|(b, p)| (*p, *b)).collect()
     };
     if map.is_empty() || host_pid <= 1 {
@@ -121,6 +121,20 @@ fn derive_parent_box(state: &State, host_pid: i32) -> Option<i64> {
 }
 
 pub type State = Arc<Mutex<Shared>>;
+
+/// Lock the shared state, RECOVERING from a poisoned mutex (audit M4). One
+/// panic while a `state.lock()` guard was held used to poison the mutex
+/// permanently: every later `lock(state)` would then panic, taking
+/// down the whole control plane (a single bad connection handler → engine-wide
+/// outage). The `Shared` struct holds plain collections + handles, so a panic
+/// mid-mutation leaves it structurally intact (at worst a half-finished insert),
+/// not memory-unsafe — so recovering the guard via `into_inner()` and carrying
+/// on is the right call here. Connection handlers also run under `catch_unwind`
+/// (see `handle`), so a panicking handler is contained instead of unwinding out
+/// of its thread; this lock recovery is the second half of the same defense.
+fn lock(state: &State) -> std::sync::MutexGuard<'_, Shared> {
+    state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 // The old api-proxy attribution shim (peer-pid → box-id lookup) was removed
 // when the proxy moved onto the box-channel — attribution is now intrinsic
@@ -196,7 +210,7 @@ fn brush_prov_nested(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Val
     let Some(id) = derive_parent_box(state, host_pid) else {
         return json!({"ok": false, "error": "no enclosing box"});
     };
-    let ov = state.lock().unwrap().overlay.clone();
+    let ov = lock(state).overlay.clone();
     let records = msg.get("records").and_then(Value::as_array);
     let Some(records) = records else {
         return json!({"ok": false, "error": "no records"});
@@ -250,7 +264,7 @@ fn build_edges(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
     let Some(id) = derive_parent_box(state, host_pid) else {
         return json!({"ok": false, "error": "no enclosing box"});
     };
-    let ov = state.lock().unwrap().overlay.clone();
+    let ov = lock(state).overlay.clone();
     let Some(edges) = msg.get("edges").and_then(Value::as_array) else {
         return json!({"ok": false, "error": "no edges"});
     };
@@ -273,7 +287,7 @@ fn build_edges(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
 
 pub fn broadcast(state: &State, ev: &Value) {
     let data = format!("{ev}\n");
-    let mut s = state.lock().unwrap();
+    let mut s = lock(state);
     s.subscribers.retain(|conn| {
         let mut c = conn;
         c.write_all(data.as_bytes()).is_ok()
@@ -351,7 +365,7 @@ fn dispatch(state: &State, msg: &Value) -> Value {
             let boxes = discover::discover();
             match sid.as_deref().and_then(|s| resolve(&boxes, s)) {
                 Some(id) => {
-                    state.lock().unwrap().selected = Some(id.to_string());
+                    lock(state).selected = Some(id.to_string());
                     json!({"ok": true, "sid": id.to_string()})
                 }
                 None => json!({"ok": false,
@@ -376,10 +390,12 @@ fn dispatch(state: &State, msg: &Value) -> Value {
             let boxes = discover::discover();
             match msg.get("sid").and_then(Value::as_str)
                 .and_then(|s| resolve(&boxes, s)) {
+                Some(id) if box_is_running(state, id) => json!({"ok": false,
+                    "error": "box is running; stop it first"}),
                 Some(id) => {
                     let all = Value::Null; // CLI applies/discards the whole box
                     let ctx = crate::review::NestCtx::new(
-                        state.lock().unwrap().overlay.clone());
+                        lock(state).overlay.clone());
                     let (r, n) = if t == "apply" {
                         let r = crate::review::apply(id, &all, &ctx);
                         let n = r.get("applied").and_then(Value::as_array)
@@ -409,7 +425,7 @@ fn dispatch(state: &State, msg: &Value) -> Value {
                     // Route the meta write through the LIVE BoxState when the box
                     // is running (one connection — never a rival on-disk handle
                     // racing the serve thread); otherwise write the at-rest sqlar.
-                    let live = state.lock().unwrap().overlay.clone()
+                    let live = lock(state).overlay.clone()
                         .and_then(|o| o.live_box(id));
                     match live {
                         Some(cb) => cb.set_meta("name", newname),
@@ -461,7 +477,7 @@ fn find_named_child(boxes: &std::collections::BTreeMap<i64, discover::Box_>,
 }
 
 fn selected_sid(state: &State) -> Option<i64> {
-    state.lock().unwrap().selected.as_ref()
+    lock(state).selected.as_ref()
         .and_then(|s| s.parse::<i64>().ok())
 }
 
@@ -486,8 +502,8 @@ fn reap(state: &State, id: i64) {
     // Drop the NetHandle (Tap mode only) — the Drop impl SIGTERM's the
     // netns anchor, which releases the last reference to /proc/<a>/ns/net
     // and tears down the netns + TAP. Idempotent: no-op for Off / Host.
-    let _ = state.lock().unwrap().net_handles.remove(&id);
-    if let Some(ov) = state.lock().unwrap().overlay.clone() {
+    let _ = lock(state).net_handles.remove(&id);
+    if let Some(ov) = lock(state).overlay.clone() {
         ov.remove_box(id);
     }
     let _ = std::fs::remove_file(crate::paths::state_home()
@@ -515,7 +531,7 @@ fn reap(state: &State, id: i64) {
 /// on-disk handle racing the serve thread. Only the dissolving box itself must
 /// be stopped (its archive is rewritten by finalize).
 fn dissolve(state: &State, id: i64) -> Value {
-    if state.lock().unwrap().box_pids.contains_key(&id) {
+    if lock(state).box_pids.contains_key(&id) {
         return json!({"ok": false, "error": "box is running; stop it first"});
     }
     let boxes = discover::discover();
@@ -525,7 +541,7 @@ fn dissolve(state: &State, id: i64) -> Value {
     let grandparent = me.parent;
     let children: Vec<i64> = boxes.values()
         .filter(|b| b.parent == Some(id)).map(|b| b.box_id).collect();
-    let ov = state.lock().unwrap().overlay.clone();
+    let ov = lock(state).overlay.clone();
     // Copy-down: snapshot this box's contributed view into each child that has
     // no entry of its own, so dissolving the parent doesn't change what the
     // child sees. A live child's copy-down goes through its live BoxState.
@@ -594,6 +610,16 @@ fn dissolve(state: &State, id: i64) -> Value {
            "reparented": children})
 }
 
+/// Audit H3: apply/discard read the box's pool blobs (`blob_path(id, rowid)`) —
+/// the exact files a LIVE FUSE write may be mid-`write_at` on. Reading one of
+/// those while it's being written stamps a TORN blob onto the host. So, like
+/// `dissolve`, apply/discard refuse a still-running box: the box must be stopped
+/// (its writers quiesced) before its captured changes are applied or discarded.
+/// True == running (caller should refuse). Mirrors dissolve's `box_pids` check.
+fn box_is_running(state: &State, id: i64) -> bool {
+    lock(state).box_pids.contains_key(&id)
+}
+
 /// After apply/discard, reap the box if it has no remaining changes.
 fn drop_if_empty(state: &State, id: i64) {
     if crate::review::session_changes(id).as_array().map(|a| a.is_empty())
@@ -630,7 +656,7 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>,
     let tap_fd: Option<std::os::fd::OwnedFd> = tap_fd_raw.map(|fd| unsafe {
         <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd)
     });
-    let ov = state.lock().unwrap().overlay.clone();
+    let ov = lock(state).overlay.clone();
     let Some(ov) = ov else {
         if let Some(fd) = peer_pidfd { unsafe { libc::close(fd); } }
         return json!({"ok": false, "error": "overlay mount is not available"});
@@ -695,7 +721,7 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>,
             rerun = true;
         }
     }
-    if rerun && state.lock().unwrap().box_pids.contains_key(&existing_id.unwrap()) {
+    if rerun && lock(state).box_pids.contains_key(&existing_id.unwrap()) {
         if let Some(fd) = peer_pidfd { unsafe { libc::close(fd); } }
         return json!({"ok": false, "error": "slopbox is already running"});
     }
@@ -768,7 +794,7 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>,
         b.root_process(prov, host_pid as i64);
     }
     {
-        let mut s = state.lock().unwrap();
+        let mut s = lock(state);
         if host_pid > 0 { s.box_runpids.insert(id, host_pid); }
         // Hold a pidfd on the runner so `kill` can signal it pid-reuse-safely.
         // Prefer the runner's own pidfd (valid across pid namespaces); else open
@@ -785,7 +811,7 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>,
     // the runner-pid map the proxy uses for peer attribution.
     let want_api = msg.get("want_api").and_then(Value::as_bool).unwrap_or(false);
     if want_api {
-        if let Some(p) = state.lock().unwrap().api_proxy.clone() {
+        if let Some(p) = lock(state).api_proxy.clone() {
             p.enable_box(id);
         }
     }
@@ -923,7 +949,7 @@ fn prepare_net(state: &State, id: i64, msg: &Value,
         eprintln!("sarun-engine: box {id} registered net=tap but sent no TAP fd");
         return None;
     };
-    let net = match state.lock().unwrap().net.clone() {
+    let net = match lock(state).net.clone() {
         Some(n) => n,
         None => {   // tap_owned drops here → fd closed
             eprintln!("sarun-engine: net stack unavailable; -n refused for box {id}");
@@ -952,7 +978,7 @@ fn prepare_net(state: &State, id: i64, msg: &Value,
     let handle = std::sync::Arc::new(crate::net::make_handle(
         box_id_u16, subnet.gateway_ip(), subnet.box_ip(),
         stack.clone(), flows.path.clone(), flows.keylog_path.clone()));
-    state.lock().unwrap().net_handles.insert(id, handle);
+    lock(state).net_handles.insert(id, handle);
 
     // Start the per-box dispatcher: it pulls AcceptedConn off the stack's
     // accept channel and routes each new connection to the right handler
@@ -963,7 +989,7 @@ fn prepare_net(state: &State, id: i64, msg: &Value,
     // trust roots don't vary by box).
     let keylog = crate::net::mitm::KeyLogFile::new(&flows.keylog_path).ok();
     let upstream_tls = crate::net::mitm::build_upstream_client_config();
-    if let (Some(rt), Some(keylog)) = (state.lock().unwrap().net_rt.clone(), keylog) {
+    if let (Some(rt), Some(keylog)) = (lock(state).net_rt.clone(), keylog) {
         crate::net::dispatch::Dispatcher::start(
             stack.clone(), stack.dns.clone(),
             format!("box{id}"),
@@ -1030,7 +1056,7 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
             // boxes view's "recently changed" panel and the procs view's
             // active-set behavior).
             let runpids: std::collections::HashMap<i64, i32> =
-                state.lock().unwrap().box_runpids.clone();
+                lock(state).box_runpids.clone();
             Value::Array(boxes.values().map(|b| {
                 let mut sd = discover::session_dict(&boxes, b);
                 if let Some(&pid) = runpids.get(&b.box_id) {
@@ -1058,7 +1084,7 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
         },
         "select" => {
             if let Some(id) = arg_sid(args) {
-                state.lock().unwrap().selected = Some(id.to_string());
+                lock(state).selected = Some(id.to_string());
             }
             json!({"ok": true})
         }
@@ -1110,7 +1136,7 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
             // strict-active behavior would need engine-level exit
             // detection (a separate ticket).
             let live_sids: std::collections::HashSet<i64> =
-                state.lock().unwrap().box_runpids.keys().copied().collect();
+                lock(state).box_runpids.keys().copied().collect();
             match arg_sid(args) {
                 Some(id) if live_sids.contains(&id) => discover::processes(id),
                 _ => Value::Null,
@@ -1142,7 +1168,7 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
         },
         "kill" => match arg_sid(args) {
             Some(id) => {
-                let fd = state.lock().unwrap().box_pids.get(&id).copied();
+                let fd = lock(state).box_pids.get(&id).copied();
                 match fd {
                     Some(fd) => { pidfd_signal(fd, libc::SIGTERM); json!({"ok": true}) }
                     None => json!({"ok": false, "error": "box not running"}),
@@ -1155,7 +1181,7 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
             None => json!({"ok": false, "error": "no slopbox"}),
         },
         "reload_rules" => {
-            if let Some(ov) = state.lock().unwrap().overlay.clone() {
+            if let Some(ov) = lock(state).overlay.clone() {
                 ov.reload_rules();
             }
             json!(null)
@@ -1168,7 +1194,7 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
         "open_files" => json!([]),
         "review_state" => json!({
             "consolidating": [], "consolidated": [],
-            "selected": state.lock().unwrap().selected,
+            "selected": lock(state).selected,
         }),
         "review_live" => json!(false),
         "review.session_changes" => match arg_sid(args) {
@@ -1183,18 +1209,26 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
             }
         }
         "review.apply" => match arg_sid(args) {
+            // Audit H3: refuse a still-running box — its captured blobs may be
+            // mid-write, so applying could stamp a torn blob onto the host.
+            Some(id) if box_is_running(state, id) => json!({"applied": [],
+                "errors": [{"path": "", "error": "box is running; stop it first"}]}),
             Some(id) => {
                 let ctx = crate::review::NestCtx::new(
-                    state.lock().unwrap().overlay.clone());
+                    lock(state).overlay.clone());
                 let r = crate::review::apply(id,
                     args.get(1).unwrap_or(&Value::Null), &ctx);
                 drop_if_empty(state, id); r }
             None => json!({"applied": [], "errors": []}),
         },
         "review.discard" => match arg_sid(args) {
+            // Audit H3: same running-box guard as apply (discard reads the same
+            // blobs to copy them DOWN into children before dropping the row).
+            Some(id) if box_is_running(state, id) => json!({"discarded": [],
+                "errors": [{"path": "", "error": "box is running; stop it first"}]}),
             Some(id) => {
                 let ctx = crate::review::NestCtx::new(
-                    state.lock().unwrap().overlay.clone());
+                    lock(state).overlay.clone());
                 let r = crate::review::discard(id,
                     args.get(1).unwrap_or(&Value::Null), &ctx);
                 drop_if_empty(state, id); r }
@@ -1283,7 +1317,7 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
             let sid = args.get(1).and_then(|v| v.as_i64()
                 .or_else(|| v.as_str().and_then(|s| s.parse().ok()))).unwrap_or(0);
             let filter = args.get(2).cloned().unwrap_or(Value::Null);
-            let mut s = state.lock().unwrap();
+            let mut s = lock(state);
             let Shared { views, next_view_id, .. } = &mut *s;
             crate::views::open(views, next_view_id, kind, sid, &filter)
         }
@@ -1291,18 +1325,18 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
             let vid = args.first().and_then(Value::as_u64).unwrap_or(0);
             let start = args.get(1).and_then(Value::as_u64).unwrap_or(0) as usize;
             let size = args.get(2).and_then(Value::as_u64).unwrap_or(0) as usize;
-            let s = state.lock().unwrap();
+            let s = lock(state);
             crate::views::window(&s.views, vid, start, size)
         }
         "view.filter" => {
             let vid = args.first().and_then(Value::as_u64).unwrap_or(0);
             let filter = args.get(1).cloned().unwrap_or(Value::Null);
-            let mut s = state.lock().unwrap();
+            let mut s = lock(state);
             crate::views::set_filter(&mut s.views, vid, &filter)
         }
         "view.close" => {
             let vid = args.first().and_then(Value::as_u64).unwrap_or(0);
-            let mut s = state.lock().unwrap();
+            let mut s = lock(state);
             crate::views::close(&mut s.views, vid)
         }
         // At-rest-the-instant-it-exits Rust box (DESIGN.md D4): no consolidate
@@ -1317,7 +1351,7 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
         "box_new" => {
             // m3a: create a box and expose <mnt>/<id> — the overlay-core path
             // (the full runner register handshake is m3b).
-            let ov = state.lock().unwrap().overlay.clone();
+            let ov = lock(state).overlay.clone();
             let Some(ov) = ov else {
                 return json!({"ok": false, "error": "overlay not mounted"});
             };
@@ -1395,7 +1429,7 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
         //   on shutdown; while inactive, dispatcher Ask short-circuits to
         //   deny so no connection wedges on an absent UI.
         "prompts.peek" => {
-            match state.lock().unwrap().net.clone() {
+            match lock(state).net.clone() {
                 Some(net) => match net.prompts.peek() {
                     Some(ask) => json!({"ok": true, "ask": {
                         "id": ask.id, "box": ask.box_name,
@@ -1413,7 +1447,7 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
             let Some(verdict) = crate::net::prompt::Verdict::parse(v) else {
                 return json!({"ok": false, "error": "bad verdict"});
             };
-            match state.lock().unwrap().net.clone() {
+            match lock(state).net.clone() {
                 Some(net) => {
                     let ok = net.prompts.answer(id, verdict);
                     // Net rules are reloaded from disk by the dispatcher on
@@ -1430,7 +1464,7 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
         }
         "prompts.ui_active" => {
             let on = args.first().and_then(Value::as_bool).unwrap_or(false);
-            if let Some(net) = state.lock().unwrap().net.clone() {
+            if let Some(net) = lock(state).net.clone() {
                 net.prompts.mark_ui_active(on);
             }
             json!({"ok": true})
@@ -1464,7 +1498,7 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
             return json!({"ok": true, "r": Value::Null});
         }
         "box_drop" => {
-            let ov = state.lock().unwrap().overlay.clone();
+            let ov = lock(state).overlay.clone();
             if let (Some(ov), Some(id)) = (ov, arg_sid(args)) {
                 ov.remove_box(id);
             }
@@ -1476,7 +1510,7 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
         //    no subprocess. args: [name_or_id, path_rel_to_root, (write only)
         //    base64-bytes]. path must NOT start with '/'.
         "box_file_read" => {
-            let ov = state.lock().unwrap().overlay.clone();
+            let ov = lock(state).overlay.clone();
             let Some(ov) = ov else {
                 return json!({"ok": false, "error": "overlay not available"});
             };
@@ -1496,7 +1530,7 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
             }
         }
         "box_file_write" => {
-            let ov = state.lock().unwrap().overlay.clone();
+            let ov = lock(state).overlay.clone();
             let Some(ov) = ov else {
                 return json!({"ok": false, "error": "overlay not available"});
             };
@@ -1520,7 +1554,7 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
             }
         }
         "box_dir_list" => {
-            let ov = state.lock().unwrap().overlay.clone();
+            let ov = lock(state).overlay.clone();
             let Some(ov) = ov else {
                 return json!({"ok": false, "error": "overlay not available"});
             };
@@ -1539,7 +1573,7 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
             }
         }
         "box_path_kind" => {
-            let ov = state.lock().unwrap().overlay.clone();
+            let ov = lock(state).overlay.clone();
             let Some(ov) = ov else {
                 return json!({"ok": false, "error": "overlay not available"});
             };
@@ -1729,7 +1763,24 @@ fn handle_pty_spawn(msg: &Value, writer: &mut UnixStream, prebuf: Vec<u8>) {
 /// passthrough needs to know which box's apikey/admission to use); other
 /// verbs derive identity via SCM_RIGHTS pidfd as before.
 fn handle(state: State, conn: UnixStream) {
-    handle_with_box(state, conn, None)
+    handle_guarded(state, conn, None)
+}
+
+/// Panic-isolating wrapper around `handle_with_box` (audit M4). A panic in a
+/// connection handler must not escape its thread (which would, combined with a
+/// held `state` lock, poison the shared mutex and take down every other
+/// connection). `catch_unwind` contains the panic here; paired with `lock()`'s
+/// poison recovery, one bad handler can no longer wedge the control plane. We
+/// assert unwind-safety because the recovery path (lock() via into_inner)
+/// tolerates a possibly-half-updated `Shared`, and a dropped UnixStream is fine.
+fn handle_guarded(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        handle_with_box(state, conn, hint_box_id)
+    }));
+    if r.is_err() {
+        eprintln!("sarun-engine: control connection handler panicked; \
+                   connection dropped (engine continues)");
+    }
 }
 
 fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
@@ -1805,11 +1856,11 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
             // value (502 = bad gateway, since "we couldn't even start
             // serving") and the body explains the specific cause.
             let (rt_opt, proxy_opt) = {
-                let s = state.lock().unwrap();
+                let s = lock(&state);
                 (s.net_rt.clone(), s.api_proxy.clone())
             };
             let (Some(rt), Some(proxy)) = (rt_opt, proxy_opt) else {
-                if let Some(p) = state.lock().unwrap().api_proxy.clone() {
+                if let Some(p) = lock(&state).api_proxy.clone() {
                     crate::oaita::proxy::log_call(&p, box_id, "POST", "/",
                         "", 502, &[],
                         b"engine runtime or proxy unavailable", false);
@@ -1909,7 +1960,7 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
             // then read MUTE/UNMUTE frames from --inner: MUTE carries --inner's
             // pidfd (SCM_RIGHTS) → resolve its host pid and mute it (its echo
             // readback is not re-recorded); UNMUTE / EOF unmutes. EOF = teardown.
-            let ov = state.lock().unwrap().overlay.clone();
+            let ov = lock(&state).overlay.clone();
             if let Some(ov) = ov.as_ref() {
                 if let Ok(w) = writer.try_clone() {
                     ov.set_echo(id, Arc::new(Mutex::new(w)));
@@ -1981,7 +2032,7 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
                         };
                     let st_handler = state.clone();
                     let box_id_hint = id;
-                    std::thread::spawn(move || handle_with_box(
+                    std::thread::spawn(move || handle_guarded(
                         st_handler, server_side, Some(box_id_hint)));
                     use std::os::fd::AsRawFd;
                     send_frame_with_fd(&writer,
@@ -2015,7 +2066,7 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
                 ov.remove_box(id);
             }
             {
-                let mut s = state.lock().unwrap();
+                let mut s = lock(&state);
                 if let Some(fd) = s.box_pids.remove(&id) {
                     unsafe { libc::close(fd); }
                 }
@@ -2031,7 +2082,7 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
         if subscribe {
             // The connection becomes a one-way event feed: park it in the
             // subscriber list; broadcast() writes to it and prunes on error.
-            state.lock().unwrap().subscribers.push(writer);
+            lock(&state).subscribers.push(writer);
             return;
         }
     }
@@ -2121,7 +2172,57 @@ pub fn cli_box_op(argv: &[String]) -> i32 {
     }
 }
 
+/// Outcome of the single-instance lock attempt (audit M2).
+pub enum InstanceLock {
+    /// We hold the exclusive lock; KEEP this fd alive for the engine's whole
+    /// lifetime (dropping it / exiting releases the kernel `flock`).
+    Held(std::os::fd::OwnedFd),
+    /// Another engine already holds the lock — this process must not start.
+    AlreadyRunning,
+}
+
+/// Acquire the single-instance lock atomically (audit M2). The old guard was
+/// TOCTOU: `connect(sock).is_ok()` probed for a live socket, then — much later,
+/// after self-heal — `serve()` did `remove_file(sock)` + `bind(sock)`. Two
+/// engines launched together could BOTH see no live socket (neither had bound
+/// yet), both proceed, then both remove + bind, last-writer-wins, leaving one
+/// engine serving on an unlinked socket nobody can reach.
+///
+/// Instead, take an exclusive `flock(LOCK_EX|LOCK_NB)` on a dedicated lock file
+/// next to the socket BEFORE doing anything. The kernel grants it to exactly one
+/// process; a second engine gets `EWOULDBLOCK` and bails. The lock is advisory
+/// but every engine goes through this same path, and it is released
+/// automatically by the kernel when the holding process exits (even on crash),
+/// so no stale lock survives a dead daemon — strictly better than the
+/// remove-then-bind dance for liveness detection.
+pub fn acquire_instance_lock(sock: &std::path::Path) -> std::io::Result<InstanceLock> {
+    use std::os::fd::AsRawFd;
+    // The lock file lives beside the socket; ensure its dir exists (serve() runs
+    // this before ensure_dirs()).
+    if let Some(dir) = sock.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let lock_path = sock.with_extension("lock");
+    let f = std::fs::OpenOptions::new()
+        .create(true).read(true).write(true)
+        .open(&lock_path)?;
+    // SAFETY: f.as_raw_fd() is a valid open fd for the duration of the call.
+    let r = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if r != 0 {
+        let e = std::io::Error::last_os_error();
+        if matches!(e.raw_os_error(), Some(libc::EWOULDBLOCK)) {
+            return Ok(InstanceLock::AlreadyRunning);
+        }
+        return Err(e);
+    }
+    Ok(InstanceLock::Held(f.into()))
+}
+
 pub fn serve(state: State, sock: &std::path::Path) -> std::io::Result<()> {
+    // The instance lock (acquire_instance_lock, called by main::serve) already
+    // guaranteed we're the only engine, so removing a stale socket here is safe:
+    // any file at `sock` is a leftover from a dead daemon (a live one would hold
+    // the lock). Bind under the lock so no second engine can race the rebind.
     let _ = std::fs::remove_file(sock);
     let listener = UnixListener::bind(sock)?;
     let mode = std::os::unix::fs::PermissionsExt::from_mode(0o600);
