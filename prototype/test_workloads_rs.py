@@ -29,7 +29,7 @@ from importlib.machinery import SourceFileLoader
 
 SARUN = "/home/user/sarun/prototype/sarun"
 CRATE = Path("/home/user/sarun/engine")
-BIN = CRATE / "target/x86_64-unknown-linux-musl/release/sarun-engine"
+BIN = CRATE / "target/x86_64-unknown-linux-musl/release/sarun"
 WROOT = Path("/root/wl_rs")          # host scratch, visible in the box overlay
 QPREFIX = "root/wl_rs/"              # how WROOT paths appear in the sqlar
 
