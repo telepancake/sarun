@@ -2108,6 +2108,25 @@ impl App {
         self.right_scroll = 0;
     }
 
+    /// Switch to a top-level pane (the `PANE_KEYS` accelerators route here via
+    /// `dispatch_menubar_key`). The filterable views (changes/procs/outputs/api)
+    /// go through `nav` so cross-pane filters resolve; the rest set focus and
+    /// load their data. PTY is handled in the dispatcher (its selection logic).
+    fn go_to_pane(&mut self, pane: Pane) {
+        self.snap_left();
+        match pane {
+            Pane::Changes   => { self.nav(Pane::Changes);   self.load_changes_if_needed(); }
+            Pane::Processes => { self.nav(Pane::Processes); self.load_processes_if_needed(); }
+            Pane::Outputs   => { self.nav(Pane::Outputs);   self.load_outputs_if_needed(); }
+            Pane::ApiLogs   => { self.nav(Pane::ApiLogs);   self.load_api_logs_if_needed(); }
+            Pane::Flows     => { self.focus = Pane::Flows;      self.load_flows(); }
+            Pane::Pipelines => { self.focus = Pane::Pipelines;  self.load_pipelines(); }
+            Pane::BuildEdges=> { self.focus = Pane::BuildEdges; self.load_build_edges(); }
+            Pane::Help      => { self.focus = Pane::Help; self.out_scroll = 0; }
+            other           => { self.focus = other; }
+        }
+    }
+
     /// Tab swaps the active PANE inside the current view — never the view
     /// itself. The letter chips (b/c/p/o/l/g/e/?) switch views.
     ///   * Changes ↔ Hunks: a special case — the right pane (diff) has
@@ -3559,7 +3578,7 @@ fn help_lines() -> Vec<Line<'static>> {
     let h = |s: &str| Line::from(Span::styled(s.to_string(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
     let t = |s: &str| Line::from(s.to_string());
     let d = |s: &str| Line::from(Span::styled(s.to_string(), Style::default().fg(Color::DarkGray)));
-    vec![
+    let mut v = vec![
         h("sarun — sandboxed run → inspect → apply/discard"),
         t(""),
         h("The loop"),
@@ -3573,18 +3592,12 @@ fn help_lines() -> Vec<Line<'static>> {
         d("  in-process proxy (DNS + HTTPS MITM); --net off = closed, -N = host net."),
         t(""),
         h("Panes (Tab cycles; or jump directly)"),
-        t("  b  boxes/sessions      the list of boxes (path · id · status · cmd)"),
-        t("  c  changes             files the box wrote (Enter → its diff)"),
-        t("  p  processes           the captured process TREE (exe · argv · env)"),
-        t("  o  outputs             decoded stdout/stderr transcript"),
-        t("  l  pipeLines           shell pipelines brush ran inside a -b box,"),
-        d("     with their parsed structure and the process rows they spawned"),
-        t("  g  build Graph         parsed ninja/make build edges from a -b box,"),
-        d("     including up-to-date targets that never executed"),
-        t("  e  file rules          the ordered apply/discard/passthrough rules"),
-        t("  ?  this help"),
-        t("  P  open an engine-held PTY — a live interactive shell pane"),
-        d("     keys go to the box · Ctrl-] / F12 / Esc-Esc detaches back to the UI"),
+    ];
+    // The pane index is GENERATED from PANE_KEYS — the same table that drives
+    // the menubar and the key dispatch. Keys live in one place, never in prose.
+    v.extend(PANE_KEYS.iter().map(|(k, _, _, _, desc)| t(&format!("  {k}  {desc}"))));
+    v.push(d("     in a PTY pane: keys go to the box · Ctrl-] / F12 / Esc-Esc detaches"));
+    v.extend(vec![
         t(""),
         h("Navigation & filters"),
         t("  j/k or ↓/↑  move       Enter  open the selection in the next pane"),
@@ -3631,7 +3644,8 @@ fn help_lines() -> Vec<Line<'static>> {
         t("  'exe:**/gcc' / 'box:WORK' combined with and/or/not. Rules are"),
         t("  evaluated TOP → BOTTOM and the FIRST match wins; saving any edit"),
         t("  rewrites the filerules file and reloads it in the engine."),
-    ]
+    ]);
+    v
 }
 
 /// Render the active modal centered over the body. Returns the area consumed.
@@ -3805,39 +3819,41 @@ fn view_of_pane(p: Pane) -> Option<(char, &'static str, FilterView)> {
     }
 }
 
-/// Top menubar: pane chips with their letter accelerators. The
-/// active pane reverses; chips that would lead to an empty pane for
-/// this box are dimmed (procs/outputs/pipes/build) or hidden (same
-/// rule as the old keybar). PTY chip shows when any PTY is open.
-/// Visible top-level menu chips for the current state. The same list
-/// drives both the menubar render and F9 menu-nav dispatch — one
-/// source of truth so they can't drift.
+/// When a pane chip is visible in the menubar.
+enum PaneVis { Always, Data(&'static str), Pty }
+
+/// The single source of truth for the top-level pane keys: accelerator, the
+/// pane it selects, the menubar label, when its chip shows, and the one-line
+/// help text. The menubar render, the key dispatch (`dispatch_menubar_key` →
+/// `App::go_to_pane`), and the help index all derive from this — so a key, a
+/// label, and its documentation can never drift apart.
+const PANE_KEYS: &[(char, Pane, &str, PaneVis, &str)] = &[
+    ('b', Pane::Sessions,   "Boxes",   PaneVis::Always,            "boxes/sessions — the box list (path · id · status · cmd)"),
+    ('c', Pane::Changes,    "Changes", PaneVis::Always,            "changes — files the box wrote (Enter → its diff)"),
+    ('p', Pane::Processes,  "Procs",   PaneVis::Data("processes"), "processes — the captured process TREE (exe · argv · env)"),
+    ('o', Pane::Outputs,    "Outputs", PaneVis::Data("outputs"),   "outputs — decoded stdout/stderr transcript"),
+    ('l', Pane::Pipelines,  "Pipes",   PaneVis::Data("pipelines"), "pipeLines — shell pipelines a -b box ran (parsed structure)"),
+    ('g', Pane::BuildEdges, "Build",   PaneVis::Data("edges"),     "build Graph — parsed ninja/make build edges from a -b box"),
+    ('f', Pane::Flows,      "Flows",   PaneVis::Always,            "network flows — tshark-decoded HTTP/TLS from a -n box's pcap"),
+    ('e', Pane::Rules,      "Rules",   PaneVis::Always,            "file rules — the ordered apply/discard/passthrough rules"),
+    ('P', Pane::Pty,        "PTYs",    PaneVis::Pty,               "open an engine-held PTY — a live interactive shell pane"),
+    ('A', Pane::ApiLogs,    "Api",     PaneVis::Always,            "the --api oaita proxy log"),
+    ('?', Pane::Help,       "Help",    PaneVis::Always,            "this help"),
+];
+
+/// Top menubar: pane chips with their letter accelerators (derived from
+/// `PANE_KEYS`). The active pane reverses; chips that would lead to an empty
+/// pane for this box are dimmed/hidden by their `PaneVis`. The same list drives
+/// the menubar render, F9 menu-nav dispatch, and the help index — one source of
+/// truth so they can't drift.
 fn menubar_chips(app: &App) -> Vec<(char, &'static str)> {
     let has = |k: &str| app.box_summary.get(k)
         .and_then(Value::as_array).map(|a| !a.is_empty()).unwrap_or(false);
-    let show_procs    = has("processes") || app.focus == Pane::Processes;
-    let show_outputs  = has("outputs")   || app.focus == Pane::Outputs;
-    let show_pipes    = has("pipelines") || app.focus == Pane::Pipelines;
-    let show_build    = has("edges")     || app.focus == Pane::BuildEdges;
-    let show_flows    = has("flows")     || app.focus == Pane::Flows;
-    let any_pty       = !app.ptys.is_empty();
-    [
-        Some(('b', "Boxes")),
-        Some(('c', "Changes")),
-        if show_procs   { Some(('p', "Procs"))   } else { None },
-        if show_outputs { Some(('o', "Outputs")) } else { None },
-        if show_pipes   { Some(('l', "Pipes"))   } else { None },
-        if show_build   { Some(('g', "Build"))   } else { None },
-        // Always-on: the pane works for any -n box, and the "no flows
-        // yet" placeholder explains itself when pressed on a -N / off box.
-        Some(('f', "Flows")),
-        Some(('e', "Rules")),
-        if any_pty { Some(('P', "PTYs")) } else { None },
-        // oaita api-proxy log: shown for any box that's currently focused,
-        // even if it has no rows yet (the placeholder explains itself).
-        Some(('A', "Api")),
-        Some(('?', "Help")),
-    ].into_iter().flatten().collect()
+    PANE_KEYS.iter().filter(|(_, pane, _, vis, _)| match vis {
+        PaneVis::Always => true,
+        PaneVis::Data(k) => has(k) || app.focus == *pane,
+        PaneVis::Pty => !app.ptys.is_empty(),
+    }).map(|(key, _, label, _, _)| (*key, *label)).collect()
 }
 
 fn menubar_spans(app: &App) -> Vec<Span<'static>> {
@@ -5436,52 +5452,24 @@ fn run_action(app: &mut App, a: Action) {
 }
 
 fn dispatch_menubar_key(app: &mut App, k: char) {
-    match k {
-        'b' => { app.snap_left(); app.focus = Pane::Sessions; }
-        'c' => { app.snap_left(); app.nav(Pane::Changes);
-                 app.load_changes_if_needed(); }
-        'p' => { app.snap_left(); app.nav(Pane::Processes);
-                 app.load_processes_if_needed(); }
-        'o' => { app.snap_left(); app.nav(Pane::Outputs);
-                 app.load_outputs_if_needed(); }
-        // 'A' (capital) — `--api` proxy log pane. New rows arrive via the
-        // `api_log_added` subscribe event; the load only fires on demand
-        // (or when the focused box changes).
-        'A' => { app.snap_left(); app.nav(Pane::ApiLogs);
-                 app.load_api_logs_if_needed(); }
-        // -n network flows: tshark-decoded HTTP/TLS list from the box's
-        // pcapng (engine runs tshark sandboxed). The detail (right) pane
-        // shows tshark -V for the selected frame.
-        'f' => {
-            app.snap_left();
-            app.focus = Pane::Flows;
-            app.load_flows();
-        }
-        'l' => {
-            app.snap_left();
-            app.focus = Pane::Pipelines;
-            app.load_pipelines();
-        }
-        'g' => {
-            app.snap_left();
-            app.focus = Pane::BuildEdges;
-            app.load_build_edges();
-        }
-        'e' => { app.snap_left(); app.focus = Pane::Rules; }
-        '?' => { app.snap_left(); app.focus = Pane::Help; app.out_scroll = 0; }
-        'P' => {
-            let any_live = app.ptys.iter().any(|p| !p.eof);
-            if any_live {
-                if app.cur_pty().map(|p| p.eof).unwrap_or(true) {
-                    if let Some((i, _)) = app.ptys.iter().enumerate()
-                        .find(|(_, p)| !p.eof) { app.sel_pty = i; }
-                }
-                app.focus = Pane::Pty;
-            } else {
-                app.modal = Some(Modal::PtyCmd { buf: pty_default_cmd() });
+    // PTY is special: focus a live PTY if one's open, else prompt for the
+    // login command. Every other accelerator routes through the PANE_KEYS
+    // table to `go_to_pane`, so the binding lives in exactly one place.
+    if k == 'P' {
+        let any_live = app.ptys.iter().any(|p| !p.eof);
+        if any_live {
+            if app.cur_pty().map(|p| p.eof).unwrap_or(true) {
+                if let Some((i, _)) = app.ptys.iter().enumerate()
+                    .find(|(_, p)| !p.eof) { app.sel_pty = i; }
             }
+            app.focus = Pane::Pty;
+        } else {
+            app.modal = Some(Modal::PtyCmd { buf: pty_default_cmd() });
         }
-        _ => {}
+        return;
+    }
+    if let Some((_, pane, _, _, _)) = PANE_KEYS.iter().find(|e| e.0 == k) {
+        app.go_to_pane(*pane);
     }
 }
 
@@ -7171,6 +7159,12 @@ mod tests {
         assert!(buf.contains("hunk"), "manual should mention per-hunk apply:\n{buf}");
         assert!(buf.contains("passthrough"), "manual should document rule actions:\n{buf}");
         assert!(buf.contains("ctrl+"), "manual should mention rule reorder:\n{buf}");
+        // The pane index must be GENERATED from PANE_KEYS — every accelerator
+        // and its description present, never hardcoded prose that can drift.
+        for (key, _, _, _, desc) in PANE_KEYS {
+            assert!(buf.contains(&format!("{key}  {desc}")),
+                    "help pane index missing generated line for {key:?}:\n{buf}");
+        }
     }
 
     /// Helper: select the box (and change) whose path matches `pred`, returning
