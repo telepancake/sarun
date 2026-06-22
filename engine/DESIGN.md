@@ -9,24 +9,14 @@ pure socket client. The wire protocol (JSON lines over the control socket, the
 the ONLY contract between them. Everything behind the socket is private and
 may change freely: there are no users to migrate (D8).
 
-## D2 · Milestones
-- **m1 (done):** multithreaded read-only passthrough (fuser 0.17, n_threads).
-  Scaling proof vs the Python engine: bench/parallel_metadata.py — 4
-  concurrent cold git-status walks: python 1.69 s, rust 1t 0.21 s, rust 8t
-  0.14 s. The durable language factor is ~3× (fuse-overlayfs comparison);
-  threading is the rest. Honest target for m3: full semantics at ≤2× native
-  under `make -j8`.
-- **m2:** control socket speaking the existing protocol + namespace-aware
-  paths ($SLOPBOX_NS, same layout rules as the Python engine), until the
-  Python conformance tests (test_remote_ui_control_plane, test_attach_remote,
-  the e2e engine section) pass against the Rust binary unmodified.
-- **m3:** overlay + capture semantics, driven black-box by the behavioral
-  suite (e2e, pjdfstest, attach parity). Format-groveling Python unit tests
-  are implementation tests of the OLD engine and retire with it.
-- **m4+:** musl static link (the static-link half is DONE — see "m4 status"
-  below); the Python file becomes UI client + bootstrap (fetch-or-build the
-  engine binary, hash-keyed cache — the same mechanism that builds patched
-  pyfuse3 today). The pyfuse3 patch dies at m3.
+## D2 · Status
+The port is complete: the musl engine is the standalone production binary
+(multithreaded FUSE passthrough, the control protocol with `$SLOPBOX_NS`
+namespacing, overlay + capture semantics, its own ratatui UI). The Python
+prototype was NOT retired as originally planned — it remains the test harness
+the `*_rs.py` tests import (wire client + sqlar readers) and still builds patched
+pyfuse3 on first run. The behavioral suites (e2e, pjdfstest, the `*_rs.py`
+tests) drive the Rust binary directly.
 
 ## D3 · Writes are writes — and capture is LAZY (first-write, not open)
 No write buffers, no buffer→row reconciliation. But ALL capture cost
@@ -113,14 +103,15 @@ artifact is an export operation, not a rest form.
   deliberate m4+ experiment, NOT m3: it requires writing an allocator, and
   per-file blobs delegate allocation to the host fs.
 
-## D7 · UI language
-Textual client stays through m2-m4 as reference implementation and test rig
-(headless Pilot parity suite). A ratatui client is an optional m5 — by then
-the protocol is the only contract, terminal-emulation crates (vt100/termwiz)
-cover the PTY-pane feature, and ratatui's TestBackend covers headless golden
-tests. The PTY/tmux feature (engine-held PTYs over the existing mux frames)
-slots naturally after m3.
-The engine-held PTY + its ratatui pane. A `pty_spawn` control
+## D7 · UI
+Two clients speak the wire protocol: the Python Textual client (`prototype/sarun`,
+also the test rig via its headless Pilot suite) and the Rust ratatui client in
+the engine binary (`engine/src/ui.rs` — `sarun` with no args, or
+`sarun --once --sock PATH` for a headless one-frame render the tests assert on,
+covered by `test_ui_rs.py`). The protocol is the only contract between them;
+terminal-emulation crates (vt100/tui-term) back the PTY pane.
+
+The engine-held PTY + its ratatui pane: a `pty_spawn` control
 connection (control.rs `handle_pty_spawn`) makes the engine spawn a command on a
 portable-pty PTY it OWNS (pty.rs `serve_pty`) and mux the master ↔ the client
 over three new frames (frames.rs): FRAME_PTY_DATA (7, both directions — raw PTY
@@ -204,119 +195,20 @@ Design constraints:
 Ordering: strictly after the engine port + Rust capture/mux are done. This is a
 visibility/perf enhancement on a working base, not a milestone dependency.
 
-## D10 · Known gaps from the adversarial audit (2026-06-14) — DO NOT trust green alone
+## D10 · Known gaps
 
-A skeptical re-audit (after `dissolve` was found hollow + rigged-green) classified
-the port honestly. Recorded so these aren't lost behind a passing test count:
+Open correctness, data-path, and test gaps are tracked in `../AUDIT.md`
+(reconciled against the code). Audit before trusting the green test count:
+self-authored conformance tests share the author's blind spots.
 
-CONFIRMED:
- - C1 apply metadata restoration: mtime restore is now tested (cross-checked) and
-   works. owner/xattr restore use Rust-ONLY side tables (xattr/ownership/rdev) that
-   the Python schema lacks — so they restore nothing for Python-written boxes and a
-   Python client won't restore them from a Rust box. This is an asymmetric,
-   Rust-only extension (acceptable per D8 zero-users, but the "Python clients work
-   unmodified" claim does NOT hold for owner/xattr). owner/xattr apply-restore
-   remain effectively untested (chown is squashed; no setfattr probe).
- - C2 nested boxes: read-through-parent and dissolve copy-down are now DONE.
-   resolve(bid, rel) walks the parent chain (whiteout→Absent, own entry→that,
-   else parent, root→host); attr/copy-up/readdir all use it, proven by a real
-   invariant test (child reads + copies up FROM a parent-only file). dissolve of
-   a box WITH children no longer refuses: it copies every path the parent
-   captured DOWN into each child lacking its own entry (review::copy_down_entry),
-   so the child's merged view survives the parent being freed, then re-parents
-   the children onto the dissolving box's own parent (overlay.set_box_parent +
-   sqlar meta) — tested on the finished-box path with a discard rule (the file
-   never hits the host, so only copy-down can preserve the child's view).
-   Nested LAUNCH is now DONE too: the runner detects in-box by the presence of
-   the engine socket bind-mounted at /tmp/.slopbox/ui.sock (it forwards that
-   socket into every box), sends a single-segment `relname` plus its own pidfd
-   over SCM_RIGHTS, and roots bwrap by binding the parent-exposed
-   /<KIDS_DIR>/<id>. The engine derives the host pid from the pidfd
-   (/proc/self/fdinfo) and the enclosing box from the /proc PPid ancestry
-   (box_runpids map) — never trusting any pid/sid from the message body — then
-   parents the new box under it. Tested end-to-end (test_engine_rs nested
-   section): a box run inside a box parents under the enclosing box and reads a
-   parent-only file through read-through-parent. NOTE: the register fd-peek must
-   poll for the bytes first — a non-blocking peek races the runner's sendmsg and
-   silently drops the pidfd, which then mis-derives the parent (fixed).
-   LIVE-child copy-down is now correct too: dissolve no longer refuses a running
-   child — copy_down_entry and the re-parent meta write route through the live
-   BoxState (its one connection + RAM `kinds` mirror via overlay.live_box) when
-   the child is mounted, so the running FUSE view serves the copied-down entry
-   immediately (no rival on-disk handle racing the serve thread). Tested: a file
-   written only in the parent overlay, never touched by a LIVE child, still
-   reads through the child's mount after the parent is dissolved (discard rule,
-   so only copy-down can preserve it). The same fix retires S5: the `rename`
-   verb now writes the name meta through the live BoxState when the box is
-   running, not a second connection.
-
-   Echo chaining is now DONE — the nested cluster is complete. Capture switched
-   from teeing to the live-echo mux: --inner makes the box-root sink files its
-   child's stdout/stderr (every write flows through the overlay, recorded with
-   per-write pid attribution) and the engine frames those bytes back as ECHO
-   over the box's one muxed connection; --inner replays them to its real fd 1/2.
-   For a NESTED box that fd 1/2 is the parent's sink, so the child's output
-   chains UP level by level to the top-level terminal. MUTE/UNMUTE solve the
-   re-capture problem: --inner sends a MUTE frame carrying its own pidfd; the
-   engine resolves its host tgid and, while muted, ECHOes that pid's sink writes
-   onward but does NOT record them — so a child's readback passing up through an
-   ancestor sink is captured exactly once, at its origin box, never multiplied.
-   ECHO_DONE (sent when the box's last sink releases at child exit) lets --inner
-   drain the tail without truncation before closing. Tested: a nested child's
-   stdout marker chains to the top-level runner, is recorded in the CHILD box,
-   and is NOT re-recorded in the PARENT (MUTE). The PTY/tmux feature (D7/D9) now
-   has its mux foundation.
-
-WEAK TESTS (not proven wrong, but self-graded by shape, not Python-equality):
- - S1 hunks: NOW cross-checked against Python's _build_hunks_display byte-for-byte
-   on a 2-hunk change (fixed). But similar(Myers) vs difflib(Ratcliff-Obershelp)
-   can diverge on repeated/moved lines — equality holds on tested inputs only.
-   struct_finish and patch_text are still shape-only.
- - S2 proc_info/writer_id/first_writer_id: shape-only, and tested on a single-writer
-   box where first==last (a swapped writer/last_writer mapping would pass).
- - S3 capture provenance first-vs-last-writer: never exercised (single writer).
- - S4 untested code: process_env, box_drop, special-node (fifo/dev) APPLY path,
-   the top-level control-type CLI variants beyond patch/rename.
- - S5 FIXED: rename of a LIVE box (and dissolve copy-down / re-parent into a live
-   child) now route through the live BoxState's one connection + RAM mirror
-   (overlay.live_box), not a rival on-disk handle. Live paths are tested.
-
-THE REAL FIX (methodological): self-authored conformance tests share the author's
-blind spots (dissolve proved it). The port should be re-grounded on (a) cross-engine
-EQUALITY checks against the Python functions on the same sqlar (done for hunks; do
-for proc_info/session_changes/struct/patch), and (b) the actual Python behavioral
-suite + pjdfstest run against the Rust mount — which has NEVER been done. Until then,
-treat the conformance green count as necessary, not sufficient.
-
-## m4 status — fully-static musl binary (DONE)
-The engine builds as a fully-static x86_64 musl binary with no dynamic libc, a
-truly portable single executable. The DEFAULT `cargo build --release` is
-unchanged (dynamic glibc, what the test harness builds).
-
-Build:
-```
-rustup target add x86_64-unknown-linux-musl   # rust-std for musl
-apt-get install -y musl-tools                  # provides musl-gcc
-cd engine && cargo build --release --target x86_64-unknown-linux-musl
-```
-`engine/.cargo/config.toml` scopes the musl-only setup so the default target is
-untouched: it sets `linker = "musl-gcc"` for the musl target and
-`CC_x86_64-unknown-linux-musl = "musl-gcc"` so the `cc` crate compiles
-rusqlite's bundled SQLite C with the musl ABI (the one real sticking point —
-fuser/libc were fine). One source fix was needed for musl: `msg_controllen` is
-`socklen_t` (u32) on glibc but `size_t` (usize) on musl, so the two
-`msg.msg_controllen = cmsg.len()` assignments in `src/control.rs` now cast
-`as _` (target-correct, ABI-neutral on glibc).
-
-Proof (this machine):
-```
-$ file   target/x86_64-unknown-linux-musl/release/sarun
-… ELF 64-bit … static-pie linked … statically linked
-$ ldd    target/x86_64-unknown-linux-musl/release/sarun
-        statically linked
-```
-~4.8 MB (vs ~4.7 MB glibc dynamic). VERIFIED it still WORKS statically:
-`sarun engine` brings up its control socket and a real `sarun run -- echo …`
-box runs against it and exits 0 — FUSE mount + bwrap function under the static
-binary. Guarded by the standalone `test_musl_rs.py` (self-skips with a clear
-message when the musl target hasn't been built — never a fake pass).
+## Build — fully-static musl binary (the only build)
+The engine builds only as a fully-static x86_64 musl binary, via
+`cargo-zigbuild` + `ziglang` from `uv` (no `apt` toolchain). The dynamic glibc
+path is gone. `engine/.cargo/config.toml` sets `build.target` to the musl
+triple, so plain `cargo build --release` inside `engine/` also produces it once
+`make engine` has set up the zigshim (`engine/target/zigshim/musl-gcc` →
+`zig cc -target x86_64-linux-musl`, which keeps cc-rs happy for the C deps —
+rusqlite's bundled SQLite, onig_sys). One musl source fix: `msg_controllen` is
+`socklen_t` on glibc but `size_t` on musl, so the `msg.msg_controllen` casts in
+`control.rs` use `as _`. `prototype/test_musl_rs.py` checks the static-linkage
+guarantee (`file` + `ldd`).
