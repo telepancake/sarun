@@ -179,6 +179,16 @@ struct FhInner {
     upper: bool,
     dirty: bool,
     last_pid: u32,
+    // TGID of the last data writer, resolved AT WRITE TIME (while the writer is
+    // still alive). In-process pipeline stages (brush builtins / bundled
+    // coreutils) run on a transient worker thread that has already exited by
+    // release(); resolving the writer lazily from `last_pid` there would read a
+    // vanished /proc/<tid> and mint a phantom, parentless process row. Capturing
+    // the long-lived process TGID here attributes the write to the owning
+    // process (the brush --inner), which the process forest and the
+    // brush↔pipeline linkage (finalize_brush_links) both rely on. 0 until the
+    // first data write; release() only consults it when `dirty`, so 0 is safe.
+    last_tgid: u32,
     sink: Option<i32>, // Some(stream) → writes go to the outputs table, not a blob
     passthrough: bool, // writes go straight to the real host file (uncaptured)
     // Kernel passthrough backing registration; kept alive as long as the fd
@@ -1374,7 +1384,7 @@ impl Filesystem for Overlay {
             self.note_sink_open(bid);
             let n = self.reg_fh(FhInner {
                 box_id: bid, rel, file: None, upper: false, dirty: false,
-                last_pid: req.pid(), sink: Some(stream), passthrough: false, _backing: None });
+                last_pid: req.pid(), last_tgid: 0, sink: Some(stream), passthrough: false, _backing: None });
             return reply.opened(FileHandle(n), FopenFlags::empty());
         }
         let want_write = !matches!(flags.acc_mode(),
@@ -1394,7 +1404,7 @@ impl Filesystem for Overlay {
                 Ok(f) => {
                     let n = self.reg_fh(FhInner {
                         box_id: bid, rel, file: Some(f), upper: true, dirty: false,
-                        last_pid: req.pid(), sink: None, passthrough: true, _backing: None });
+                        last_pid: req.pid(), last_tgid: 0, sink: None, passthrough: true, _backing: None });
                     return reply.opened(FileHandle(n), FopenFlags::empty());
                 }
                 Err(e) => return reply.error(Errno::from(e)),
@@ -1457,7 +1467,7 @@ impl Filesystem for Overlay {
                 if let Ok(backing) = reply.open_backing(f) {
                     let n = self.reg_fh(FhInner {
                         box_id: bid, rel, file, upper, dirty: false,
-                        last_pid: req.pid(), sink: None, passthrough: false,
+                        last_pid: req.pid(), last_tgid: 0, sink: None, passthrough: false,
                         _backing: None });
                     reply.opened_passthrough(FileHandle(n), FopenFlags::empty(),
                                              &backing);
@@ -1470,7 +1480,7 @@ impl Filesystem for Overlay {
             }
         }
         let n = self.reg_fh(FhInner {
-            box_id: bid, rel, file, upper, dirty: false, last_pid: req.pid(), sink: None, passthrough: false, _backing: None });
+            box_id: bid, rel, file, upper, dirty: false, last_pid: req.pid(), last_tgid: 0, sink: None, passthrough: false, _backing: None });
         reply.opened(FileHandle(n), FopenFlags::FOPEN_KEEP_CACHE);
     }
 
@@ -1506,7 +1516,7 @@ impl Filesystem for Overlay {
                     attr.perm = (mode & 0o7777) as u16;
                     let n = self.reg_fh(FhInner {
                         box_id: bid, rel, file: Some(f), upper: true, dirty: false,
-                        last_pid: req.pid(), sink: None, passthrough: true, _backing: None });
+                        last_pid: req.pid(), last_tgid: 0, sink: None, passthrough: true, _backing: None });
                     return reply.created(&TTL, &attr, Generation(0),
                                          FileHandle(n), FopenFlags::empty());
                 }
@@ -1533,7 +1543,7 @@ impl Filesystem for Overlay {
         self.push_event(bid, rel.clone(), "create");
         let n = self.reg_fh(FhInner {
             box_id: bid, rel, file: Some(f), upper: true,
-            dirty: true, last_pid: req.pid(), sink: None, passthrough: false, _backing: None });
+            dirty: true, last_pid: req.pid(), last_tgid: 0, sink: None, passthrough: false, _backing: None });
         reply.created(&TTL, &attr, Generation(0), FileHandle(n),
                       FopenFlags::empty());
     }
@@ -1605,7 +1615,15 @@ impl Filesystem for Overlay {
             }
         }
         h.inner.dirty = true;
-        h.inner.last_pid = req.pid();
+        let wpid = req.pid();
+        // Resolve TID→TGID NOW, while the writer is alive (see `last_tgid`).
+        // Only when the raw writer pid changes — consecutive writes from the
+        // same fd share a pid, so this is a single /proc read per distinct
+        // writer, not per write op.
+        if wpid != h.inner.last_pid || h.inner.last_tgid == 0 {
+            h.inner.last_tgid = tgid_of(wpid);
+        }
+        h.inner.last_pid = wpid;
         let Some(f) = h.inner.file.as_ref() else {
             return reply.error(Errno::EBADF);
         };
@@ -1636,7 +1654,11 @@ impl Filesystem for Overlay {
                 self.note_sink_release(h.inner.box_id);
             } else if h.inner.dirty && !h.inner.passthrough {
                 if let Some(b) = self.box_of(h.inner.box_id) {
-                    let writer = b.writer_for(h.inner.last_pid);
+                    // last_tgid was resolved at write time (alive); fall back to
+                    // last_pid only for the degenerate no-distinct-writer case.
+                    let wid = if h.inner.last_tgid != 0 { h.inner.last_tgid }
+                              else { h.inner.last_pid };
+                    let writer = b.writer_for(wid);
                     if let Some(md) = h.inner.file.as_ref()
                         .and_then(|f| f.metadata().ok()) {
                         b.finalize_file(&h.inner.rel, md.size() as i64,
