@@ -4,7 +4,7 @@
 // file that was distributed with this source code.
 // spell-checker:ignore (ToDO) bigdecimal extendedbigdecimal numberparse hexadecimalfloat biguint
 use std::ffi::{OsStr, OsString};
-use std::io::{BufWriter, Write, stdout};
+use std::io::{BufWriter, Write};
 
 use clap::{Arg, ArgAction, Command};
 use num_bigint::BigUint;
@@ -92,8 +92,21 @@ fn select_precision(
     }
 }
 
-#[uucore::main]
-pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+/// Logical entry point for the bundled `seq` builtin.
+///
+/// Unlike upstream's `uumain`, this never touches the process's own stdio: it
+/// streams the number sequence to the shell's logical output sink (`out`) and
+/// routes diagnostics to the logical error sink (`err`). `seq` reads no input,
+/// so there is no stdin seam. The fast integer code path is preserved — it is
+/// simply pointed at `out` (wrapped in a `BufWriter`) instead of `stdout()`, so
+/// the kernel-friendly preformatted-buffer writer still applies. It holds no
+/// process-global state and never `dup2`s, so it is concurrency-safe beside
+/// other in-process builtins.
+pub fn seq(
+    args: impl uucore::Args,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> UResult<()> {
     let matches =
         uucore::clap_localization::handle_clap_result(uu_app(), split_short_args_with_value(args))?;
 
@@ -208,23 +221,46 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
         &format,
         fast_allowed,
         padding,
+        out,
     );
 
     match result {
         Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => {
+        Err(io_err) if io_err.kind() == std::io::ErrorKind::BrokenPipe => {
             // GNU seq prints the Broken pipe message but still exits with status 0
             // unless SIGPIPE was explicitly ignored, in which case it should fail.
-            let err = err.map_err_context(|| "write error".into());
-            uucore::show_error!("{err}");
+            // Diagnostic goes to the LOGICAL error sink (never the process's fd 2),
+            // prefixed to match GNU's "seq: …" exactly as `uucore::show_error!`
+            // would. We never call the live `show_error!`/`set_exit_code` globals;
+            // the SIGPIPE-ignored case is surfaced as a returned error instead.
+            let mapped = io_err.map_err_context(|| "write error".into());
+            let _ = writeln!(err, "{}: {mapped}", uucore::util_name());
+            let _ = err.flush();
             #[cfg(unix)]
             if signals::sigpipe_was_ignored() {
-                uucore::error::set_exit_code(1);
+                return Err(uucore::error::USimpleError::new(1, String::new()));
             }
             Ok(())
         }
-        Err(err) => Err(err.map_err_context(|| "write error".into())),
+        Err(io_err) => Err(io_err.map_err_context(|| "write error".into())),
     }
+}
+
+/// Descriptor-based entry point for the standalone `seq` binary and the
+/// `--invoke-bundled` subprocess dispatcher.
+///
+/// In those contexts the process's own fd 1/2 *are* the intended sinks, so this
+/// is a thin bridge that locks the process stdio and hands it to [`seq`]. The
+/// in-process brush builtin must NOT route through here — it calls [`seq`]
+/// directly with the shell's logical sinks, so it never touches process-global
+/// stdio.
+#[uucore::main]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    let stderr = std::io::stderr();
+    let mut err = stderr.lock();
+    seq(args, &mut out, &mut err)
 }
 
 pub fn uu_app() -> Command {
@@ -354,9 +390,12 @@ fn print_seq(
     format: &Format<num_format::Float, &ExtendedBigDecimal>,
     fast_allowed: bool,
     padding: usize, // Used by fast path only
+    out: &mut dyn Write,
 ) -> std::io::Result<()> {
-    let stdout = stdout().lock();
-    let mut stdout = BufWriter::new(stdout);
+    // Wrap the LOGICAL sink in the same 8 KiB BufWriter upstream wrapped around
+    // `stdout().lock()`, so the fast preformatted-buffer path keeps its batching
+    // and the byte stream is identical. We never open the process's stdout.
+    let mut stdout = BufWriter::new(out);
     let (first, increment, last) = range;
 
     if fast_allowed {
@@ -399,4 +438,88 @@ fn print_seq(
     }
     stdout.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    //! In-memory tests for the logical [`seq`] entry: it must stream the number
+    //! sequence to the injected `out` sink and never touch the process stdio.
+    use super::seq;
+
+    /// Drive `seq` with an argv (sans command name) against `Vec<u8>` sinks.
+    /// Mirrors how the brush builtin calls it: argv[0] is the command name.
+    fn run(args: &[&str]) -> (String, String, bool) {
+        let mut argv: Vec<std::ffi::OsString> = vec!["seq".into()];
+        argv.extend(args.iter().map(std::ffi::OsString::from));
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        let ok = seq(argv.into_iter(), &mut out, &mut err).is_ok();
+        (
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err).unwrap(),
+            ok,
+        )
+    }
+
+    #[test]
+    fn single_bound() {
+        let (out, err, ok) = run(&["3"]);
+        assert!(ok);
+        assert_eq!(out, "1\n2\n3\n");
+        assert!(err.is_empty());
+    }
+
+    #[test]
+    fn two_bounds() {
+        let (out, _, ok) = run(&["2", "5"]);
+        assert!(ok);
+        assert_eq!(out, "2\n3\n4\n5\n");
+    }
+
+    #[test]
+    fn step() {
+        let (out, _, ok) = run(&["1", "2", "9"]);
+        assert!(ok);
+        assert_eq!(out, "1\n3\n5\n7\n9\n");
+    }
+
+    #[test]
+    fn separator() {
+        let (out, _, ok) = run(&["-s", ",", "1", "4"]);
+        assert!(ok);
+        assert_eq!(out, "1,2,3,4\n");
+    }
+
+    #[test]
+    fn equal_width() {
+        let (out, _, ok) = run(&["-w", "8", "10"]);
+        assert!(ok);
+        assert_eq!(out, "08\n09\n10\n");
+    }
+
+    #[test]
+    fn empty_range() {
+        // first > last with positive step → no output, exit 0.
+        let (out, err, ok) = run(&["5", "1"]);
+        assert!(ok);
+        assert!(out.is_empty());
+        assert!(err.is_empty());
+    }
+
+    #[test]
+    fn negative_step() {
+        let (out, _, ok) = run(&["3", "-1", "1"]);
+        assert!(ok);
+        assert_eq!(out, "3\n2\n1\n");
+    }
+
+    #[test]
+    fn zero_increment_errors() {
+        // GNU: "seq: invalid Zero increment value: '0'" → error returned, no
+        // output. We assert the error is RETURNED (not written to fd 2) and the
+        // out sink stayed empty.
+        let (out, _err, ok) = run(&["1", "0", "5"]);
+        assert!(!ok);
+        assert!(out.is_empty());
+    }
 }
