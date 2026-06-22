@@ -89,7 +89,7 @@ sleep 0.3
 
 
 def run_box(env, name):
-    r = subprocess.run([PYBIN, SARUN, name, "--", "sh", "-c", WORKLOAD],
+    r = subprocess.run([str(BIN), "run", name, "--", "sh", "-c", WORKLOAD],
                        env=env, capture_output=True, text=True, timeout=180)
     if r.returncode != 0:
         raise RuntimeError(f"box run failed ({r.returncode}): {r.stderr[-500:]}")

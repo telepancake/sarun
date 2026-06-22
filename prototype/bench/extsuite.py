@@ -1,3 +1,4 @@
+import re
 """Shared plumbing for the external filesystem test batteries (pjdfstest, fsx).
 
 These suites need a REAL kernel FUSE mount (they run external binaries that do
@@ -20,11 +21,8 @@ import subprocess
 import sys
 import tempfile
 import contextlib
-from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
-SARUN = os.environ.get("SARUN_PATH",
-                       str(Path(__file__).resolve().parent.parent / "sarun"))
 CACHE = Path(os.environ.get("SARUN_TEST_CACHE",
                             os.path.join(tempfile.gettempdir(), "sarun-test-suites")))
 
@@ -120,38 +118,8 @@ def require_fuse():
         skip("/dev/fuse missing — container has no FUSE device (cannot be apt-installed)")
 
 
-def load_sarun():
-    # load_module() registers in sys.modules (needed for @dataclass introspection).
-    return SourceFileLoader("sarunmod", SARUN).load_module()
 
 
-@contextlib.contextmanager
-def overlay_session():
-    """Mount the real multiplexed overlay under a throwaway XDG root, register one
-    session, and yield its box root (the merged view of /). Tears the mount down on
-    exit. Raises if the mount can't come up."""
-    sarun = load_sarun()
-    tmproot = tempfile.mkdtemp(prefix="extsuite-")
-    os.environ["XDG_STATE_HOME"] = os.path.join(tmproot, "state")
-    os.environ["XDG_RUNTIME_DIR"] = os.path.join(tmproot, "run")
-    os.makedirs(os.environ["XDG_STATE_HOME"], exist_ok=True)
-    os.makedirs(os.environ["XDG_RUNTIME_DIR"], exist_ok=True)
-    mount = sarun.OverlayMount(sarun.mnt_point(), lower="/")
-    if not mount.start():
-        shutil.rmtree(tmproot, ignore_errors=True)
-        raise RuntimeError(f"overlay mount failed: {mount._start_error}")
-    try:
-        sid = str(sarun.mint_box_id())
-        backing = sarun.live_dir(sid)
-        (backing / "up").mkdir(parents=True, exist_ok=True)
-        mount.add_session(sid, backing / "up", sarun.Index(backing))
-        yield str(sarun.mnt_point() / sid)
-    finally:
-        try:
-            mount.stop()
-        except Exception:
-            pass
-        shutil.rmtree(tmproot, ignore_errors=True)
 
 
 def _git_checkout(url, commit, dest):
@@ -190,21 +158,52 @@ def ensure_pjdfstest():
     return root / "tests", binary
 
 
-def ensure_fsx():
-    """Return a built fsx binary path, or skip()."""
-    pre = os.environ.get("FSX_BIN")
-    if pre and os.access(pre, os.X_OK):
-        return Path(pre)
-    require_tools("cc", "curl")
-    CACHE.mkdir(parents=True, exist_ok=True)
-    src = CACHE / "fsx-linux.c"
-    binary = CACHE / "fsx"
-    if not binary.exists():
-        if not src.exists():
-            r = subprocess.run(["curl", "-fsSL", FSX_URL, "-o", str(src)])
-            if r.returncode != 0:
-                skip("could not fetch fsx source")
-        r = subprocess.run(["cc", "-O2", "-o", str(binary), str(src)])
-        if r.returncode != 0:
-            skip("fsx build failed")
-    return binary
+
+
+# ── pjdfstest result parsing (moved here from the deleted test_pjdfstest.py) ──
+GROUPS = ["open", "truncate", "ftruncate", "unlink", "mkdir", "rmdir",
+          "rename", "symlink", "link", "utimensat", "chmod", "mkfifo"]
+
+
+def _expand(spec):
+    """'18-23, 25-27, 33' -> [18,19,20,21,22,23,25,26,27,33]"""
+    out = []
+    for part in spec.replace(",", " ").split():
+        if "-" in part:
+            a, b = part.split("-", 1)
+            if a.isdigit() and b.isdigit():
+                out.extend(range(int(a), int(b) + 1))
+        elif part.isdigit():
+            out.append(int(part))
+    return out
+
+
+def parse_failures(output):
+    """Per-assertion signatures: {'open/07.t#3', ...}. A file that ends dubious
+    (non-zero wait status — a crash/hang) yields 'group/NN.t#WSTAT'."""
+    sigs = set()
+    cur = None
+    collecting = False
+    file_re = re.compile(r"/tests/(\S+\.t)\s+\(Wstat:\s*(\d+).*?Failed:\s*(\d+)?")
+    failed_re = re.compile(r"^\s*Failed tests?:\s*(.*)$")
+    cont_re = re.compile(r"^\s+[\d,\-\s]+$")
+    for line in output.splitlines():
+        m = file_re.search(line)
+        if m:
+            cur = m.group(1)
+            collecting = False
+            if m.group(2) != "0":
+                sigs.add(f"{cur}#WSTAT")
+            continue
+        fm = failed_re.match(line)
+        if fm and cur:
+            collecting = True
+            for n in _expand(fm.group(1)):
+                sigs.add(f"{cur}#{n}")
+            continue
+        if collecting and cur and line.strip() and cont_re.match(line):
+            for n in _expand(line):
+                sigs.add(f"{cur}#{n}")
+            continue
+        collecting = False
+    return sigs

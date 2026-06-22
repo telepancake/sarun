@@ -227,17 +227,17 @@ def main():
             host_keep.unlink(missing_ok=True)
             host_gone.unlink(missing_ok=True)
 
-        # ── m3b: the REAL python runner (bwrap + --inner) against rust ──────
+        # ── box run with a deletion: tombstone, argv provenance, mount cleanup ─
         victim = Path("/root/m3b_victim.txt")
         out_host = Path("/root/m3b_out.txt")
         victim.write_bytes(b"v\n"); out_host.unlink(missing_ok=True)
         try:
             r = subprocess.run(
-                [sys.executable, SARUN, "RSE2E", "--", "sh", "-c",
+                [str(BIN), "run", "RSE2E", "--", "sh", "-c",
                  "echo rust-box > /root/m3b_out.txt && rm /root/m3b_victim.txt"],
                 capture_output=True, text=True, timeout=120)
             check(r.returncode == 0,
-                  f"engine-rs: python runner exits 0 against rust engine "
+                  f"engine-rs: box run exits 0 "
                   f"(got {r.returncode}: {r.stderr[-300:]})")
             check(not out_host.exists() and victim.exists(),
                   "engine-rs: box writes captured, host untouched")
@@ -462,16 +462,16 @@ def main():
         finally:
             xh.unlink(missing_ok=True)
 
-        # ── CLI verbs via the REAL slopbox CLI against the Rust engine ──────
+        # ── CLI box-op verbs (sarun <NAME> patch|rename via cli_box_op) ─────
         env = dict(os.environ)
-        r = subprocess.run([sys.executable, SARUN, "RSBOX", "patch"],
+        r = subprocess.run([str(BIN), "RSBOX", "patch"],
                            env=env, capture_output=True, text=True, timeout=30)
         check(r.returncode == 0 and "rust!" in r.stdout,
-              "engine-rs: `slopbox RSBOX patch` prints the diff via the Rust engine")
-        r = subprocess.run([sys.executable, SARUN, "RSBOX", "rename", "RENAMED2"],
+              "engine-rs: `sarun RSBOX patch` prints the diff")
+        r = subprocess.run([str(BIN), "RSBOX", "rename", "RENAMED2"],
                            env=env, capture_output=True, text=True, timeout=30)
         check(r.returncode == 0 and "RENAMED2" in r.stdout,
-              "engine-rs: `slopbox RSBOX rename` works via the Rust engine")
+              "engine-rs: `sarun RSBOX rename` works")
         check(m.sqlar_meta_get(m.sqlar_path(sid), "name") == "RENAMED2",
               "engine-rs: rename persisted the new NAME to meta")
 
