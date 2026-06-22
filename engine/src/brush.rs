@@ -31,12 +31,12 @@
 // IN-PROCESS too (no fork of /usr/bin/cat). Shell builtins WIN for overlapping
 // names (we install coreutils FIRST, then let the BashMode set overwrite the
 // overlaps), so brush's own `test`/`[`/`echo`/`printf`/`pwd`/`kill` stay shell
-// builtins. A uutils uumain writes the PROCESS's real fd 1/2 (it ignores brush's
-// in-memory OpenFiles), so the wrapper dup2's the context's stdout/stderr fd
-// onto 1/2 around the call — see CoreutilWrapper below. shell_builder_common()
-// is the one place all three shells (top-level box, nested sh, nested bash) get
-// their builtins, so capture/coreutils/builtin-set policy lives in exactly one
-// spot.
+// builtins. The native coreutil builtins call each uutils crate's injected
+// logical entry (writing brush's in-memory OpenFiles directly) on a fresh thread
+// via run_coreutil_localized — no dup2 of the process fd 1/2, pipeline-safe.
+// shell_builder_common() is the one place all three shells (top-level box,
+// nested sh, nested bash) get their builtins, so capture/coreutils/builtin-set
+// policy lives in exactly one spot.
 //
 // brush↔PROCESS LINKAGE (D9, DONE — see capture.rs):
 //   Every command brush fork/execs is a child of THIS --inner process (the brush
@@ -2037,9 +2037,10 @@ pub fn run_recipe_in_process_opt(
                 }
             };
             // Point brush's fd 1 AND fd 2 at the SAME pipe write end (merged).
-            // PipeWriter is fd-backed, so a uutils coreutil's CoreutilWrapper
-            // dup2's that fd onto the process 1/2 around its uumain call too —
-            // builtins, coreutils and any forked binary all land on the pipe.
+            // The native coreutil builtins write brush's logical OpenFiles, so
+            // pointing those at this pipe routes their output here; brush
+            // builtins and any forked binary (whose inherited fd 1/2 are this
+            // pipe) all land on the pipe too.
             let w2 = match writer.try_clone() {
                 Ok(w) => w,
                 Err(e) => { eprintln!("sarun-engine n2: pipe clone: {e}"); return 127; }
