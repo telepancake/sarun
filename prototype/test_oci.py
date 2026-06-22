@@ -279,6 +279,15 @@ def meta_get(sqlar, key):
         return None
 
 
+def meta_set(sqlar, key, value):
+    """Write one meta value into a box's at-rest sqlar (upsert)."""
+    c = sqlite3.connect(str(sqlar))
+    c.execute("INSERT INTO meta(key,value) VALUES(?,?) "
+              "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+    c.commit()
+    c.close()
+
+
 def box_id_by_name(sdir, name):
     for p in sdir.glob("*.sqlar"):
         if meta_get(p, "name") == name:
@@ -390,6 +399,26 @@ def main():
         check(r.returncode == 0 and df.startswith("FROM ")
               and "RUN " in df and "COPY " in df and "CMD " in df,
               f"oci dockerfile reconstructs FROM+RUN+COPY+CMD:\n{df.strip()}")
+
+        # ── COPY hint: a RUN box that wrote files gets an advisory `#COPY` ─────
+        # The author/build path computes this from the box's own writes (the
+        # longest common path); here we inject the hint onto a RUN box's frame
+        # and assert the emitter surfaces it as a commented, editable line.
+        hinted = None
+        for p in state_dir(e).glob("*.sqlar"):
+            fr = meta_get(p, "frame")
+            if not fr:
+                continue
+            frj = json.loads(fr)
+            if any(d.get("op") == "RUN" for d in frj.get("directives", [])):
+                frj["copy_hint"] = "/opt/app"
+                meta_set(p, "frame", json.dumps(frj))
+                hinted = int(p.stem)
+                break
+        check(hinted is not None, "found a RUN layer box to attach a COPY hint to")
+        df = sarun(e, "oci", "dockerfile", "BUILT").stdout
+        check("#COPY <host-source> /opt/app" in df,
+              f"oci dockerfile surfaces the advisory #COPY hint:\n{df.strip()}")
 
         # ── oci author: interactive (piped) authoring with undo ───────────────
         # Each line is one instruction (Dockerfile keyword, or bare → RUN; cd/

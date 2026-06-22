@@ -183,9 +183,16 @@ including closed-rootfs boot, COPY/glob landing, multi-stage `COPY --from`,
   parsed as such), each run through the Builder so it makes a layer box + frame;
   `undo` rolls back state and deletes the box the last instruction created;
   `done`/EOF finalizes + prints the Dockerfile (`test_oci.py` drives a piped
-  session incl. undo). Remaining: COPY-from-context detection via passthrough
-  reads, and a reedline tty front-end for line editing/history (the core reads
-  plain stdin lines, which works piped or at a tty). With `oci save` landed, the natural way to *make* an image is: run commands in a box
+  session incl. undo). The COPY hint is DONE too: after an authored RUN, the
+  box's own writes are reduced to their longest common path (`box_write_lcp` →
+  `paths_lcp`, one read-only pass over the layer sqlar — exact for a single
+  file, the shared dir for a bundle, dropped when scattered to "/"), stamped on
+  the box's `frame` as `copy_hint`; `oci dockerfile` surfaces it as a commented
+  `#COPY <host-source> <path>` line the author can uncomment + edit if those
+  files came from the host (`test_oci.py` injects a hint and asserts the emit;
+  `paths_lcp` has Rust unit tests). Remaining: a reedline tty front-end for line
+  editing/history (the core reads plain stdin lines, which works piped or at a
+  tty). With `oci save` landed, the natural way to *make* an image is: run commands in a box
   on top of a base, then `oci save` the box's net changes as ONE layer + config
   (a `docker commit` with sarun's provenance attached). Do NOT make each brush
   pipeline its own image layer — that's layer explosion (a build is thousands of

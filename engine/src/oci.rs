@@ -147,6 +147,14 @@ fn emit_dockerfile(boxname: &str) -> Result<String> {
             else { out.push_str(op); out.push(' '); out.push_str(text); }
             out.push('\n');
         }
+        // Advisory: the longest common path this box's RUN wrote to. If those
+        // files actually came from the host, the author can uncomment this and
+        // fill in the source. A guess, not a directive — hence the comment.
+        if let Some(h) = v.get("copy_hint").and_then(Value::as_str) {
+            if !h.is_empty() {
+                out.push_str(&format!("#COPY <host-source> {h}\n"));
+            }
+        }
     }
     Ok(out)
 }
@@ -244,7 +252,20 @@ fn cli_author(args: &[String]) -> i32 {
                 let snap = b.clone();
                 let instr = author_line_to_instruction(&t);
                 match b.exec(&instr) {
-                    Ok(()) => undo.push((snap, t.clone())),
+                    Ok(()) => {
+                        // A RUN that wrote files gets an advisory COPY hint: the
+                        // longest common path of this box's own writes. Cheap
+                        // (one pass over the new layer); skipped when scattered.
+                        if matches!(instr, Instruction::Run(_)) {
+                            if let Some(id) = b.current {
+                                let h = box_write_lcp(id);
+                                if !h.is_empty() && h != "/" {
+                                    b.copy_hints.insert(id, h);
+                                }
+                            }
+                        }
+                        undo.push((snap, t.clone()));
+                    }
                     Err(e) => { eprintln!("error: {e:#}"); b = snap; }
                 }
             }
@@ -560,6 +581,51 @@ fn owner_lookup(conn: &rusqlite::Connection, name: &str) -> (u32, u32) {
 fn rdev_lookup(conn: &rusqlite::Connection, name: &str) -> Option<u64> {
     conn.query_row("SELECT dev FROM rdev WHERE name=?1", [name],
                    |r| r.get::<_, i64>(0)).ok().map(|d| d as u64)
+}
+
+/// Component-wise longest common prefix of a set of paths. A single path is its
+/// own LCP (so a one-file write yields that exact file); fully divergent paths
+/// yield "" (the worst case the caller treats as "no useful hint").
+fn paths_lcp(paths: &[String]) -> String {
+    let mut it = paths.iter();
+    let Some(first) = it.next() else { return String::new() };
+    let mut prefix: Vec<&str> = first.split('/').collect();
+    for p in it {
+        let comps: Vec<&str> = p.split('/').collect();
+        let n = prefix.iter().zip(comps.iter()).take_while(|(a, b)| a == b).count();
+        prefix.truncate(n);
+        if prefix.is_empty() { break; }
+    }
+    prefix.join("/")
+}
+
+/// The longest common path of a box's own writes — one read-only pass over its
+/// layer (cheap). Directories, whiteout tombstones, and the root opaque marker
+/// don't count as writes (a `mkdir -p` shouldn't drag the prefix up a level and
+/// spoil the single-file case). Returns an absolute path, or "" when there are
+/// no file writes or they're too scattered to share a prefix.
+fn box_write_lcp(box_id: i64) -> String {
+    let sqlar = paths::state_home().join(format!("{box_id}.sqlar"));
+    let Ok(conn) = rusqlite::Connection::open_with_flags(
+        &sqlar, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) else { return String::new() };
+    let Ok(mut st) = conn.prepare("SELECT name,mode FROM sqlar") else {
+        return String::new();
+    };
+    let Ok(rows) = st.query_map([], |r| Ok((
+        r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u32))) else {
+        return String::new();
+    };
+    let mut names = Vec::new();
+    for (name, mode) in rows.flatten() {
+        if name.is_empty() { continue; }
+        let kind = mode & 0o170000;
+        if kind == 0o040000 { continue; }                                   // dir
+        if kind == 0o020000 && rdev_lookup(&conn, &name).is_none() { continue; } // whiteout
+        names.push(name);
+    }
+    if names.is_empty() { return String::new(); }
+    let lcp = paths_lcp(&names);
+    if lcp.is_empty() { String::new() } else { format!("/{lcp}") }
 }
 
 /// Tar an oci-layout dir into `dest` (oci-archive format).
@@ -1303,6 +1369,11 @@ struct Builder {
     // finish(). One box = the directives that built it — what the Dockerfile
     // emitter walks and the interactive authoring/undo path reads.
     frames: std::collections::HashMap<i64, Vec<Value>>,
+    // Per-box COPY hint: the longest common path of the box's own writes (one
+    // pass over its layer, cheap). Emitted as a commented `#COPY` line so an
+    // author can uncomment + set the source if those files came from the host.
+    // Set only for authored RUN steps; empty / "/" (scattered writes) is skipped.
+    copy_hints: std::collections::HashMap<i64, String>,
 }
 
 impl Builder {
@@ -1323,6 +1394,7 @@ impl Builder {
             stages: HashMap::new(), pending_stage: None,
             history: Vec::new(),
             frames: std::collections::HashMap::new(),
+            copy_hints: std::collections::HashMap::new(),
         }
     }
 
@@ -1872,11 +1944,18 @@ impl Builder {
     }
 
     /// Stamp each build box's accumulated directive list as its `frame` meta.
+    /// A box's COPY hint (longest common path of its own writes), when present,
+    /// rides along so the Dockerfile emitter can surface a commented `#COPY`.
     fn stamp_frames(&self) {
         for (id, dirs) in &self.frames {
             if let Ok(bx) = BoxState::create(*id) {
-                bx.set_meta("frame",
-                            &serde_json::json!({"directives": dirs}).to_string());
+                let mut frame = serde_json::json!({"directives": dirs});
+                if let Some(h) = self.copy_hints.get(id) {
+                    if !h.is_empty() {
+                        frame["copy_hint"] = serde_json::Value::String(h.clone());
+                    }
+                }
+                bx.set_meta("frame", &frame.to_string());
             }
         }
     }
@@ -3028,4 +3107,43 @@ fn sniff(blob: &[u8]) -> Option<Comp> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::paths_lcp;
+
+    fn v(xs: &[&str]) -> Vec<String> { xs.iter().map(|s| s.to_string()).collect() }
+
+    #[test]
+    fn lcp_single_path_is_itself() {
+        assert_eq!(paths_lcp(&v(&["app/bin/tool"])), "app/bin/tool");
+    }
+
+    #[test]
+    fn lcp_shared_dir() {
+        assert_eq!(paths_lcp(&v(&["app/a", "app/b", "app/c"])), "app");
+    }
+
+    #[test]
+    fn lcp_nested_common() {
+        assert_eq!(paths_lcp(&v(&["app/src/x", "app/src/y"])), "app/src");
+    }
+
+    #[test]
+    fn lcp_divergent_is_empty() {
+        assert_eq!(paths_lcp(&v(&["etc/x", "usr/y"])), "");
+    }
+
+    #[test]
+    fn lcp_no_partial_component_match() {
+        // "app" and "apple" share no path component even though they share a
+        // string prefix — LCP is component-wise, so this degrades to "".
+        assert_eq!(paths_lcp(&v(&["app/x", "apple/y"])), "");
+    }
+
+    #[test]
+    fn lcp_empty_input() {
+        assert_eq!(paths_lcp(&[]), "");
+    }
 }
