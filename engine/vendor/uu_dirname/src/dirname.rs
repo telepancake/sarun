@@ -6,8 +6,7 @@
 use clap::{Arg, ArgAction, Command};
 use std::borrow::Cow;
 use std::ffi::OsString;
-#[cfg(unix)]
-use uucore::display::print_verbatim;
+use std::io::Write;
 use uucore::error::{UResult, UUsageError};
 use uucore::format_usage;
 use uucore::line_ending::LineEnding;
@@ -99,8 +98,31 @@ fn dirname_string_manipulation(path_bytes: &[u8]) -> Cow<'_, [u8]> {
     Cow::Borrowed(b".")
 }
 
-#[uucore::main(no_signals)]
-pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+/// Logical entry point for the bundled `dirname` builtin.
+///
+/// Unlike upstream's `uumain`, this never touches the process's own stdio: it
+/// drives `dirname` against the shell's logical output sink (`out`) and routes
+/// any diagnostic to the logical error sink (`err`) — and otherwise RETURNS the
+/// error as a `UResult` (the caller decides how to render it). It holds no
+/// process-global state and never `dup2`s, so it is safe to run in-process
+/// beside other commands.
+///
+/// `dirname` reads NO stdin; it writes each computed parent directory to `out`.
+/// On Unix the result is raw path bytes (matching upstream's `print_verbatim`,
+/// which is just `stdout().write_all(bytes)` on Unix) followed by the
+/// `line_ending` (newline, or NUL under `-z`/`--zero`). Output is byte-for-byte
+/// identical to upstream — only the *destination* changed.
+pub fn dirname(
+    args: impl uucore::Args,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> UResult<()> {
+    // `err` is reserved for the same role as upstream's stderr (clap usage/help
+    // text), but uucore renders clap errors itself via the returned UResult, so
+    // on the live path there is currently nothing to write here. Bind it so the
+    // signature stays uniform with the other injected-I/O builtins.
+    let _ = &err;
+
     let matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
 
     let line_ending = LineEnding::from_zero_flag(matches.get_flag(options::ZERO));
@@ -119,27 +141,34 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
         let path_bytes = uucore::os_str_as_bytes(path.as_os_str()).unwrap_or(&[]);
         let result = dirname_string_manipulation(path_bytes);
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::ffi::OsStrExt;
-            let result_os = std::ffi::OsStr::from_bytes(&result);
-            print_verbatim(result_os).unwrap();
-        }
-        #[cfg(not(unix))]
-        {
-            // On non-Unix, fall back to lossy conversion
-            if let Ok(s) = std::str::from_utf8(&result) {
-                print!("{s}");
-            } else {
-                // Fallback for non-UTF-8 paths on non-Unix systems
-                print!(".");
-            }
-        }
+        // Upstream writes `result` to stdout via `print_verbatim`, which on Unix
+        // is exactly `stdout().write_all(result_bytes)`. We write the same bytes
+        // to the injected logical sink instead. Any write error is RETURNED.
+        out.write_all(&result)?;
 
-        print!("{line_ending}");
+        // `line_ending` is `Display`; upstream `print!("{line_ending}")`s it. It
+        // is always plain ASCII ('\n' or '\0'), so formatting and writing its
+        // bytes is byte-for-byte identical, with no process stdio.
+        write!(out, "{line_ending}")?;
     }
 
     Ok(())
+}
+
+/// Descriptor-based entry point for the standalone `dirname` binary.
+///
+/// In that context the process's own fd 1/2 *are* the intended sinks, so this is
+/// a thin bridge that locks the real `stdout`/`stderr` and hands them to
+/// [`dirname`]. The in-process brush builtin must NOT route through here — it
+/// calls [`dirname`] directly with the shell's logical sinks, so it never
+/// touches process-global stdio.
+#[uucore::main(no_signals)]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    let stderr = std::io::stderr();
+    let mut err = stderr.lock();
+    dirname(args, &mut out, &mut err)
 }
 
 pub fn uu_app() -> Command {
@@ -165,4 +194,77 @@ pub fn uu_app() -> Command {
                 .value_hint(clap::ValueHint::AnyPath)
                 .value_parser(clap::value_parser!(OsString)),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dirname;
+
+    /// Drive the logical entry with `Vec<u8>` sinks (no process stdio) and
+    /// return (stdout, stderr, ok).
+    fn run(args: &[&str]) -> (String, String, bool) {
+        let argv: Vec<std::ffi::OsString> = std::iter::once("dirname")
+            .chain(args.iter().copied())
+            .map(std::ffi::OsString::from)
+            .collect();
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        let res = dirname(argv.into_iter(), &mut out, &mut err);
+        (
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err).unwrap(),
+            res.is_ok(),
+        )
+    }
+
+    #[test]
+    fn basic() {
+        let (out, err, ok) = run(&["/a/b/c"]);
+        assert!(ok);
+        assert_eq!(out, "/a/b\n");
+        assert_eq!(err, "");
+    }
+
+    #[test]
+    fn multiple_operands() {
+        let (out, _err, ok) = run(&["a/b", "c/d"]);
+        assert!(ok);
+        assert_eq!(out, "a\nc\n");
+    }
+
+    #[test]
+    fn zero_separator() {
+        let (out, _err, ok) = run(&["-z", "a/b", "c/d"]);
+        assert!(ok);
+        assert_eq!(out, "a\0c\0");
+    }
+
+    #[test]
+    fn no_slash_is_dot() {
+        let (out, _err, ok) = run(&["foo"]);
+        assert!(ok);
+        assert_eq!(out, ".\n");
+    }
+
+    #[test]
+    fn root_and_trailing_slashes() {
+        assert_eq!(run(&["/"]).0, "/\n");
+        assert_eq!(run(&["/a/b/"]).0, "/a\n");
+        assert_eq!(run(&["a//b"]).0, "a\n");
+    }
+
+    #[test]
+    fn double_dash_terminator() {
+        let (out, _err, ok) = run(&["--", "-x/y"]);
+        assert!(ok);
+        assert_eq!(out, "-x\n");
+    }
+
+    #[test]
+    fn missing_operand_is_err_and_writes_nothing() {
+        let (out, err, ok) = run(&[]);
+        assert!(!ok);
+        assert_eq!(out, "");
+        assert_eq!(err, "");
+    }
 }
