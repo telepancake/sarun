@@ -159,15 +159,71 @@ fn emit_dockerfile(boxname: &str) -> Result<String> {
     Ok(out)
 }
 
+/// The `oci author` REPL's prompt: `author> ` (and `::: ` for continuation,
+/// `(search)> ` while reverse-searching history).
+struct AuthorPrompt;
+impl reedline::Prompt for AuthorPrompt {
+    fn render_prompt_left(&self) -> std::borrow::Cow<str> { "author".into() }
+    fn render_prompt_right(&self) -> std::borrow::Cow<str> { "".into() }
+    fn render_prompt_indicator(&self, _: reedline::PromptEditMode)
+        -> std::borrow::Cow<str> { "> ".into() }
+    fn render_prompt_multiline_indicator(&self) -> std::borrow::Cow<str> { "::: ".into() }
+    fn render_prompt_history_search_indicator(&self, _: reedline::PromptHistorySearch)
+        -> std::borrow::Cow<str> { "(search)> ".into() }
+}
+
+/// Where the authoring REPL reads instruction lines from. At a tty we use
+/// reedline (line editing + in-session history + reverse-search); piped or
+/// redirected input falls back to plain stdin so scripts/tests are unchanged.
+/// History is in-memory only — no file is written (authoring shouldn't leave a
+/// shell-history trail, and the prototype keeps history off in this mode too).
+enum AuthorLines {
+    Tty(Box<reedline::Reedline>, AuthorPrompt),
+    Pipe(std::io::Stdin, String),
+}
+impl AuthorLines {
+    fn new() -> Self {
+        use std::io::IsTerminal;
+        if std::io::stdin().is_terminal() {
+            AuthorLines::Tty(Box::new(reedline::Reedline::create()), AuthorPrompt)
+        } else {
+            AuthorLines::Pipe(std::io::stdin(), String::new())
+        }
+    }
+    /// The next line, or None when the session should end (EOF / Ctrl-D). A
+    /// Ctrl-C at the tty cancels the current line (returns an empty string the
+    /// caller skips) rather than quitting.
+    fn next_line(&mut self) -> Option<String> {
+        match self {
+            AuthorLines::Tty(ed, prompt) => match ed.read_line(prompt) {
+                Ok(reedline::Signal::Success(s)) => Some(s),
+                Ok(reedline::Signal::CtrlC) => Some(String::new()),
+                Ok(reedline::Signal::CtrlD) => None,
+                Ok(_) => None,   // Signal is #[non_exhaustive]
+                Err(_) => None,
+            },
+            AuthorLines::Pipe(stdin, buf) => {
+                buf.clear();
+                match stdin.read_line(buf) {
+                    Ok(0) => None,
+                    Ok(_) => Some(std::mem::take(buf)),
+                    Err(_) => None,
+                }
+            }
+        }
+    }
+}
+
 // ── `sarun oci author` — build an image interactively, one instruction/line ──
 // An interactive Dockerfile builder: each submitted line is one instruction run
 // through the same Builder `oci build` uses, so it creates the layer box + the
 // per-box `frame` + history. Bare `cd`/`export` persist as WORKDIR/ENV; any
 // other bare line is a RUN; explicit Dockerfile keywords are parsed as such.
 // `undo` discards the box(es) the last line created and rolls back state;
-// `done`/EOF finalizes the image and prints its Dockerfile. Reads lines from
-// stdin (works piped or at a tty). RUN executes in a box, so a live engine is
-// required — run on the host.
+// `done`/EOF finalizes the image and prints its Dockerfile. At a tty it reads
+// through reedline (line editing + history + reverse-search); piped input uses
+// plain stdin, so scripts behave identically. RUN executes in a box, so a live
+// engine is required — run on the host.
 fn cli_author(args: &[String]) -> i32 {
     let mut tag: Option<String> = None;
     let mut from: Option<String> = None;
@@ -214,16 +270,10 @@ fn cli_author(args: &[String]) -> i32 {
     }
     eprintln!("authoring '{tag}' FROM {from} — one instruction per line; \
                `undo`, `print`, `done`.");
-    let stdin = std::io::stdin();
+    let mut lines = AuthorLines::new();
     let mut undo: Vec<(Builder, String)> = Vec::new();
-    let mut line = String::new();
     loop {
-        line.clear();
-        match stdin.read_line(&mut line) {
-            Ok(0) => break,           // EOF = done
-            Ok(_) => {}
-            Err(_) => break,
-        }
+        let Some(line) = lines.next_line() else { break };   // EOF / Ctrl-D = done
         let t = line.trim().to_string();
         if t.is_empty() { continue; }
         match t.as_str() {
