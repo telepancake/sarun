@@ -38,10 +38,6 @@ impl BoxSubnet {
 
     pub fn netmask(self) -> [u8; 4] { [255, 255, 0, 0] }
 
-    /// /16 — what the engine-side smoltcp Interface claims (so it can
-    /// receive packets destined to any synth-pool IP).
-    pub fn engine_prefix_len(self) -> u8 { 16 }
-
     /// /30 — what the BOX's kernel sees on the TAP. With only .0.1 (gw)
     /// and .0.2 (box) in the subnet, anything else (including synth pool
     /// IPs) routes via the default route → gateway → engine. Without this
@@ -60,11 +56,6 @@ impl BoxSubnet {
         Some([a, b, (off >> 8) as u8, (off & 0xff) as u8])
     }
 
-    /// True if `ip` lies inside the box's /16 (i.e. smoltcp should claim it).
-    pub fn contains(self, ip: [u8; 4]) -> bool {
-        let (a, b) = self.octets_prefix();
-        ip[0] == a && ip[1] == b
-    }
 }
 
 #[cfg(test)]
@@ -98,13 +89,5 @@ mod tests {
         let s = BoxSubnet::new(1);
         assert!(s.synth_ip(65278).is_some());
         assert!(s.synth_ip(65279).is_none());
-    }
-
-    #[test]
-    fn contains_only_own_slash16() {
-        let s = BoxSubnet::new(3);
-        assert!(s.contains([240, 3, 99, 7]));
-        assert!(!s.contains([240, 4, 0, 0]));
-        assert!(!s.contains([241, 3, 0, 0]));
     }
 }

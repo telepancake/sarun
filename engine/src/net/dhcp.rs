@@ -13,7 +13,6 @@ use super::subnet::BoxSubnet;
 
 pub struct DhcpServer {
     pub subnet: BoxSubnet,
-    pub server_mac: [u8; 6],
 }
 
 impl DhcpServer {

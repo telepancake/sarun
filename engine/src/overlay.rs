@@ -1385,7 +1385,11 @@ impl Filesystem for Overlay {
             // passthrough rule: writes go straight to the REAL host file, never
             // captured. Open (creating) the host path directly.
             let host = self.host(&rel);
-            if let Some(p) = host.parent() { let _ = std::fs::create_dir_all(p); }
+            if let Some(p) = host.parent() {
+                if let Err(e) = std::fs::create_dir_all(p) {
+                    return reply.error(Errno::from(e));
+                }
+            }
             match OpenOptions::new().read(true).write(true).create(true).open(&host) {
                 Ok(f) => {
                     let n = self.reg_fh(FhInner {
@@ -1393,7 +1397,7 @@ impl Filesystem for Overlay {
                         last_pid: req.pid(), sink: None, passthrough: true, _backing: None });
                     return reply.opened(FileHandle(n), FopenFlags::empty());
                 }
-                Err(_) => return reply.error(Errno::EACCES),
+                Err(e) => return reply.error(Errno::from(e)),
             }
         }
         // resolve() so a child opening a file that lives in its PARENT box (or
@@ -1486,7 +1490,11 @@ impl Filesystem for Overlay {
             // passthrough (file rule, or -d whole-box direct): create the file on
             // the REAL host, uncaptured.
             let host = self.host(&rel);
-            if let Some(p) = host.parent() { let _ = std::fs::create_dir_all(p); }
+            if let Some(p) = host.parent() {
+                if let Err(e) = std::fs::create_dir_all(p) {
+                    return reply.error(Errno::from(e));
+                }
+            }
             match OpenOptions::new().read(true).write(true).create(true)
                 .truncate(true).open(&host) {
                 Ok(f) => {
@@ -1502,7 +1510,7 @@ impl Filesystem for Overlay {
                     return reply.created(&TTL, &attr, Generation(0),
                                          FileHandle(n), FopenFlags::empty());
                 }
-                Err(_) => return reply.error(Errno::EACCES),
+                Err(e) => return reply.error(Errno::from(e)),
             }
         }
         let writer = b.writer_for(req.pid());
@@ -1685,7 +1693,7 @@ impl Filesystem for Overlay {
                     TimeOrNow::Now => SystemTime::now(),
                 };
                 let d = st.duration_since(UNIX_EPOCH).unwrap_or_default();
-                let ts = libc::timespec { tv_sec: d.as_secs() as libc::time_t,
+                let ts = libc::timespec { tv_sec: d.as_secs() as _,
                                           tv_nsec: d.subsec_nanos() as i64 };
                 let times = [ts, ts];
                 unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(),

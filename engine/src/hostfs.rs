@@ -206,35 +206,6 @@ pub fn remove_tree_at(parent: BorrowedFd, name: &CStr) -> Result<(), String> {
 }
 
 /// Write `bytes` to the leaf `name` beneath `parent`, refusing to follow a
-/// symlink at the leaf (`O_NOFOLLOW`), then set its mode exactly. A failure to
-/// set the mode is returned as an error rather than silently dropped (audit
-/// H4: a 0600 file must not silently land world-readable).
-pub fn write_file_at(
-    parent: BorrowedFd,
-    name: &CStr,
-    bytes: &[u8],
-    mode: u32,
-) -> Result<(), String> {
-    let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-    // SAFETY: valid dirfd and C string; variadic mode arg for O_CREAT.
-    let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags, mode & 0o7777) };
-    if fd < 0 {
-        // ELOOP here == the leaf is an existing symlink: refuse (the C2 guard).
-        return Err(format!("open for write: {}", std::io::Error::last_os_error()));
-    }
-    // SAFETY: fresh owned fd; File takes ownership and closes it on drop.
-    let mut f = unsafe { File::from_raw_fd(fd) };
-    f.write_all(bytes).map_err(|e| format!("write: {e}"))?;
-    // O_CREAT's mode is umask-masked and ignored for an existing file, so set
-    // the exact mode explicitly and surface any failure.
-    // SAFETY: valid open fd.
-    if unsafe { libc::fchmod(f.as_raw_fd(), mode & 0o7777) } != 0 {
-        return Err(format!("set mode: {}", std::io::Error::last_os_error()));
-    }
-    Ok(())
-}
-
-/// Write `bytes` to the leaf `name` beneath `parent`, refusing to follow a
 /// symlink at the leaf, WITHOUT changing the mode — an existing file keeps its
 /// permissions, a newly-created one gets `0o666 & ~umask` (matching the old
 /// `std::fs::write`). Used by the per-hunk apply, which edits an existing host
@@ -337,29 +308,6 @@ pub fn chown_at(parent: BorrowedFd, name: &CStr, uid: u32, gid: u32) {
     }
 }
 
-/// `lsetxattr`-equivalent on the leaf, addressed via `/proc/self/fd/<parent>` so
-/// it stays confined to the already-resolved parent dir (no ancestor re-walk).
-pub fn setxattr_at(parent: BorrowedFd, name: &CStr, key: &CStr, val: &[u8]) {
-    let leaf = match name.to_str() {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-    let path = format!("/proc/self/fd/{}/{}", parent.as_raw_fd(), leaf);
-    let Ok(cpath) = CString::new(path) else { return };
-    // LSETXATTR via the /proc/self/fd/<parent>/<leaf> path: the parent fd is the
-    // confined real dir, and lsetxattr does not follow the final symlink.
-    // SAFETY: valid C strings and byte buffer.
-    unsafe {
-        libc::lsetxattr(
-            cpath.as_ptr(),
-            key.as_ptr(),
-            val.as_ptr().cast(),
-            val.len(),
-            0,
-        );
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,19 +318,6 @@ mod tests {
             .join(format!("{:?}", std::time::SystemTime::now()));
         std::fs::create_dir_all(&p).unwrap();
         p
-    }
-
-    #[test]
-    fn writes_a_plain_file_with_exact_mode() {
-        let root = tmpdir();
-        let rfd = open_dir(&root).unwrap();
-        let (parent, leaf) = parent_beneath(rfd.as_fd(), "a/b/c.txt", true).unwrap();
-        write_file_at(parent.as_fd(), &leaf, b"hello", 0o600).unwrap();
-        let f = root.join("a/b/c.txt");
-        assert_eq!(std::fs::read(&f).unwrap(), b"hello");
-        use std::os::unix::fs::PermissionsExt;
-        assert_eq!(std::fs::metadata(&f).unwrap().permissions().mode() & 0o7777, 0o600);
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -397,21 +332,6 @@ mod tests {
         let err = parent_beneath(rfd.as_fd(), "link/x", true).unwrap_err();
         assert!(err.contains("open dir"), "expected symlink refusal, got: {err}");
         assert!(!secret.join("x").exists(), "wrote through the symlink!");
-        std::fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
-    fn refuses_write_onto_a_symlink_leaf() {
-        // root/f -> root/target ; write_file_at on f must refuse (O_NOFOLLOW).
-        let root = tmpdir();
-        let target = root.join("target");
-        std::fs::write(&target, b"ORIGINAL").unwrap();
-        std::os::unix::fs::symlink(&target, root.join("f")).unwrap();
-        let rfd = open_dir(&root).unwrap();
-        let (parent, leaf) = parent_beneath(rfd.as_fd(), "f", false).unwrap();
-        let err = write_file_at(parent.as_fd(), &leaf, b"OVERWRITE", 0o644).unwrap_err();
-        assert!(err.contains("open for write"), "got: {err}");
-        assert_eq!(std::fs::read(&target).unwrap(), b"ORIGINAL", "wrote through leaf symlink!");
         std::fs::remove_dir_all(&root).ok();
     }
 

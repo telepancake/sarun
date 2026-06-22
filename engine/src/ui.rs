@@ -162,14 +162,6 @@ fn spawn_subscriber(sock: &str, tx: mpsc::Sender<Value>) {
 /// SUBJECT_KINDS / FILE_KINDS and FILTERABLE.
 const FILE_FILTER_KINDS: &[&str] = &["path", "box", "exe", "cwd", "arg"];
 const SUBJECT_FILTER_KINDS: &[&str] = &["box", "exe", "cwd", "arg"];
-/// '/' on the flows / packets pane gets the net field set: the user can
-/// filter the pane by host / port / scheme / sni / http_path / http_method
-/// / http_status, plus the shared exe / cwd / arg / box vocabulary.
-const NET_FILTER_KINDS: &[&str] = &[
-    "host", "port", "scheme", "sni",
-    "http_path", "http_method", "http_status",
-    "box", "exe", "cwd", "arg",
-];
 
 /// Which list view a '/' filter applies to. Sessions/Hunks/Rules/Help/Pty are
 /// not filterable.

@@ -32,8 +32,6 @@ impl DnsServer {
         }))}
     }
 
-    pub fn snapshot(&self) -> Arc<Mutex<State>> { self.state.clone() }
-
     /// Allocate or look up the synthetic IP for `host` (lowercased).
     fn alloc_for(&self, host: &str) -> Option<[u8; 4]> {
         let host = host.trim_end_matches('.').to_ascii_lowercase();
