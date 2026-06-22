@@ -152,6 +152,7 @@ pub struct BoxState {
     // config path so a box can't read the host's real api_key by `cat`ing
     // the file. Mirrors is_brush.
     is_api: std::sync::atomic::AtomicBool,
+    is_tap: std::sync::atomic::AtomicBool,
     // brush↔process link inputs: (brushprov row id, literal WRITE-redirect target
     // paths the pipeline opens for output). Collected as each FRAME_PROV arrives,
     // consumed at teardown (finalize_brush_links). The link is EXACT and race
@@ -230,6 +231,12 @@ impl BoxState {
     }
     pub fn is_api(&self) -> bool {
         self.is_api.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    pub fn set_is_tap(&self, on: bool) {
+        self.is_tap.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub fn is_tap(&self) -> bool {
+        self.is_tap.load(std::sync::atomic::Ordering::Relaxed)
     }
     pub fn set_brush_host_tgid(&self, tgid: u32) {
         self.brush_host_tgid.store(tgid, std::sync::atomic::Ordering::Relaxed);
@@ -391,6 +398,7 @@ impl BoxState {
             brush_host_tgid: std::sync::atomic::AtomicU32::new(0),
             brush_links: Mutex::new(vec![]),
             is_api: std::sync::atomic::AtomicBool::new(false),
+            is_tap: std::sync::atomic::AtomicBool::new(false),
         })
     }
 

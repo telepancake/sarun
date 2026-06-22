@@ -1096,7 +1096,7 @@ impl Overlay {
         // noise in the parent box's overlay. Same shape as the
         // oaita.toml shadow above; the box reads canonical paths and
         // gets engine-controlled content, no on-disk write or bind.
-        if matches!(layer, Layer::Lower) && b.is_api()
+        if matches!(layer, Layer::Lower) && b.is_tap()
             && Self::matches_api_box_ca_target(rel) {
             let safe = crate::paths::api_box_ca_pem_path();
             if let Ok(md) = std::fs::metadata(&safe) {
@@ -1108,7 +1108,7 @@ impl Overlay {
         // --api resolv.conf: synthetic `nameserver <engine-gateway>\n`
         // so the box's stub resolver dials the engine's per-box DNS.
         // Same shadow pattern, same reasons.
-        if matches!(layer, Layer::Lower) && b.is_api() && rel == "etc/resolv.conf" {
+        if matches!(layer, Layer::Lower) && b.is_tap() && rel == "etc/resolv.conf" {
             let safe = crate::paths::api_box_resolv_conf_path();
             if let Ok(md) = std::fs::metadata(&safe) {
                 let mut a = self.attr_from_md(ino, &md);
@@ -1421,9 +1421,9 @@ impl Filesystem for Overlay {
                 // the rel is the host oaita.toml path.
                 let host = if b.is_api() && Self::matches_host_oaita_config(&rel) {
                     crate::paths::api_box_oaita_toml_path()
-                } else if b.is_api() && Self::matches_api_box_ca_target(&rel) {
+                } else if b.is_tap() && Self::matches_api_box_ca_target(&rel) {
                     crate::paths::api_box_ca_pem_path()
-                } else if b.is_api() && rel == "etc/resolv.conf" {
+                } else if b.is_tap() && rel == "etc/resolv.conf" {
                     crate::paths::api_box_resolv_conf_path()
                 } else if b.is_brush() && self.shadow_matches(&rel) {
                     self.shadow_target_path().unwrap_or_else(|| self.host(&rel))

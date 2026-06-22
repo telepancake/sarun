@@ -735,6 +735,11 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>,
     b.set_direct(direct);
     b.set_is_brush(msg.get("want_brush").and_then(Value::as_bool).unwrap_or(false));
     b.set_is_api(msg.get("want_api").and_then(Value::as_bool).unwrap_or(false));
+    // Tap boxes reach the network through the engine's MITM proxy + synthetic
+    // DNS, so they need the engine's CA appended to their trust store and their
+    // resolver pointed at the gateway. The overlay serves both as shadows gated
+    // on this flag (see overlay.rs).
+    b.set_is_tap(msg.get("net_mode").and_then(Value::as_str) == Some("tap"));
     b.set_meta("name", &name);
     // D-parent: `want_no_parent` strips any kernel-derived parent AND closes
     // the lower chain so reads never fall through to the real host. It's the
