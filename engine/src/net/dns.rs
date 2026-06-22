@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use domain::base::{Message, MessageBuilder, Rtype, ToName};
+use domain::base::{Message, MessageBuilder, Rtype};
 use domain::rdata::A;
 use parking_lot::Mutex;
 

@@ -163,13 +163,13 @@ fn emit_dockerfile(boxname: &str) -> Result<String> {
 /// `(search)> ` while reverse-searching history).
 struct AuthorPrompt;
 impl reedline::Prompt for AuthorPrompt {
-    fn render_prompt_left(&self) -> std::borrow::Cow<str> { "author".into() }
-    fn render_prompt_right(&self) -> std::borrow::Cow<str> { "".into() }
+    fn render_prompt_left(&self) -> std::borrow::Cow<'_, str> { "author".into() }
+    fn render_prompt_right(&self) -> std::borrow::Cow<'_, str> { "".into() }
     fn render_prompt_indicator(&self, _: reedline::PromptEditMode)
-        -> std::borrow::Cow<str> { "> ".into() }
-    fn render_prompt_multiline_indicator(&self) -> std::borrow::Cow<str> { "::: ".into() }
+        -> std::borrow::Cow<'_, str> { "> ".into() }
+    fn render_prompt_multiline_indicator(&self) -> std::borrow::Cow<'_, str> { "::: ".into() }
     fn render_prompt_history_search_indicator(&self, _: reedline::PromptHistorySearch)
-        -> std::borrow::Cow<str> { "(search)> ".into() }
+        -> std::borrow::Cow<'_, str> { "(search)> ".into() }
 }
 
 /// Where the authoring REPL reads instruction lines from. At a tty we use
