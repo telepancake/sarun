@@ -76,8 +76,12 @@ fn count_bytes_using_splice(fd: &impl AsFd) -> Result<usize, usize> {
 pub(crate) fn count_bytes_fast<T: WordCountable>(handle: &mut T) -> (usize, Option<io::Error>) {
     let mut byte_count = 0;
 
+    // The fstat/seek/splice fast paths below need a real descriptor. A logical
+    // in-memory source (the injected brush stdin with no backing fd) reports a
+    // negative raw fd; skip straight to the read loop for it. `BorrowedFd`
+    // forbids -1, so we must not even construct one in that case.
     #[cfg(unix)]
-    {
+    if handle.as_raw_fd() >= 0 {
         let fd = handle.as_fd();
         if let Ok(stat) = rustix::fs::fstat(fd) {
             // If the file is regular, then the `st_size` should hold
