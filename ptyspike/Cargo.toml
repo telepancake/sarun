@@ -1,9 +1,0 @@
-[package]
-name = "ptyspike"
-version = "0.0.0"
-edition = "2021"
-
-[dependencies]
-portable-pty = "0.9.0"
-ratatui = "0.30.1"
-tui-term = { version = "0.3.4", features = ["vt100"] }
