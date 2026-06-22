@@ -88,6 +88,9 @@ impl PromptQueue {
             // dispatcher's tokio task wakes up and tears the conn down.
             let mut g = self.inner.lock();
             while let Some(p) = g.queue.pop_front() {
+                // Fire-and-forget by design: the dispatcher waiter may have
+                // already hit its 60s timeout and dropped the receiver, in
+                // which case the conn is being torn down anyway. Safe to ignore.
                 let _ = p.tx.send(Verdict::NoOnce);
             }
         }
@@ -135,6 +138,8 @@ impl PromptQueue {
         let mut g = self.inner.lock();
         if g.queue.front().map(|p| p.ask.id) != Some(id) { return false; }
         let p = g.queue.pop_front().unwrap();
+        // Fire-and-forget by design: if the dispatcher waiter already timed out
+        // and dropped its receiver, the answer is simply moot. Safe to ignore.
         let _ = p.tx.send(verdict);
         true
     }
