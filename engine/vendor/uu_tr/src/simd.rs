@@ -60,10 +60,12 @@ pub fn process_single_delete(input: &[u8], output: &mut Vec<u8>, delete_char: u8
 }
 
 /// Unified I/O processing for all operations
+// sarun: `W: ?Sized` so the in-process builtin can pass a `&mut dyn Write` (the
+// box's logical sink) directly. The body is byte-for-byte upstream.
 pub fn process_input<R, W, P>(input: &mut R, output: &mut W, processor: &P) -> UResult<()>
 where
     R: BufRead,
-    W: Write,
+    W: Write + ?Sized,
     P: ChunkProcessor + ?Sized,
 {
     const BUFFER_SIZE: usize = 32768;
@@ -90,8 +92,9 @@ where
 }
 
 /// Helper function to handle platform-specific write operations
+// sarun: `W: ?Sized` to accept a `&mut dyn Write`. Body unchanged.
 #[inline]
-pub fn write_output<W: Write>(output: &mut W, buf: &[u8]) -> UResult<()> {
+pub fn write_output<W: Write + ?Sized>(output: &mut W, buf: &[u8]) -> UResult<()> {
     #[cfg(not(target_os = "windows"))]
     return output
         .write_all(buf)

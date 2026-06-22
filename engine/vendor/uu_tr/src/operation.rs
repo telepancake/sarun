@@ -24,7 +24,36 @@ use std::{
 use uucore::error::{FromIo, UError, UResult};
 use uucore::translate;
 
-use uucore::show_warning;
+// sarun: upstream emitted the "ambiguous octal escape"/"invalid utf8" parse
+// warning via `uucore::show_warning!`, which writes the PROCESS's real fd 2 —
+// forbidden for an in-process builtin (it would leak onto the engine's stderr
+// and corrupt a concurrent pipeline stage). These warnings originate deep
+// inside the nom SET parsers (`Sequence::from_str` and friends), whose
+// signatures must stay byte-for-byte pristine so upstream remains rebasable, so
+// we cannot thread a `&mut dyn Write` sink down through every combinator.
+//
+// Instead the warning text is pushed onto a per-thread buffer here; the logical
+// `tr()` entry drains that buffer to the injected `err` sink immediately after
+// parsing the sets (see `tr.rs::drain_parse_warnings`). The warning STRINGS are
+// identical to upstream's (same `translate!` keys, same `<name>: warning: …`
+// shaping applied at drain time), so observable behavior — including the
+// byte-for-byte wording GNU emits — is preserved; only the destination moves
+// from the process global to the shell's logical stderr.
+use std::cell::RefCell;
+
+thread_local! {
+    /// Parse-time warnings collected during `Sequence::from_str`, drained to the
+    /// logical `err` sink by the `tr()` entry. Each entry is the already-formatted
+    /// message body (no `<name>: warning: ` prefix — that is added at drain time
+    /// to match upstream's `show_warning!`).
+    pub(crate) static PARSE_WARNINGS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Record a parse-time warning for later drain to the logical `err` sink.
+/// Replaces upstream's `show_warning!` at the SET-parsing sites.
+pub(crate) fn push_parse_warning(msg: String) {
+    PARSE_WARNINGS.with(|w| w.borrow_mut().push(msg));
+}
 
 /// Common trait for operations that can process chunks of data
 pub trait ChunkProcessor {
@@ -385,15 +414,19 @@ impl Sequence {
                 let str_to_parse = std::str::from_utf8(out).unwrap();
                 let result = u8::from_str_radix(str_to_parse, 8).ok();
                 if result.is_none() {
+                    // sarun: route the parse warning to the per-thread buffer
+                    // (drained to the logical `err` sink by `tr()`), NOT the
+                    // process's fd 2 via `show_warning!`. The message body is
+                    // byte-for-byte upstream's; the `<name>: warning: ` prefix is
+                    // reattached at drain time.
                     if let Ok(origin_octal) = std::str::from_utf8(input) {
                         let actual_octal_tail: &str = std::str::from_utf8(&input[0..2]).unwrap();
                         let outstand_char: char = char::from_u32(input[2] as u32).unwrap();
-                        show_warning!(
-                            "{}",
+                        push_parse_warning(
                             translate!("tr-warning-ambiguous-octal-escape", "origin_octal" => origin_octal, "actual_octal_tail" => actual_octal_tail, "outstand_char" => outstand_char)
                         );
                     } else {
-                        show_warning!("{}", translate!("tr-warning-invalid-utf8"));
+                        push_parse_warning(translate!("tr-warning-invalid-utf8"));
                     }
                 }
                 result
@@ -728,11 +761,13 @@ impl SymbolTranslator for SqueezeOperation {
     }
 }
 
+// sarun: `W: ?Sized` so the in-process builtin can pass a `&mut dyn Write`
+// (the box's logical sink) directly. The body is byte-for-byte upstream.
 pub fn translate_input<T, R, W>(input: &mut R, output: &mut W, mut translator: T) -> UResult<()>
 where
     T: SymbolTranslator,
     R: BufRead,
-    W: Write,
+    W: Write + ?Sized,
 {
     const BUFFER_SIZE: usize = 32768; // Large buffer for better throughput
     let mut buf = [0; BUFFER_SIZE];
@@ -763,8 +798,9 @@ where
 }
 
 /// Platform-specific flush operation
+// sarun: `W: ?Sized` to accept a `&mut dyn Write`. Body unchanged.
 #[inline]
-pub fn flush_output<W: Write>(output: &mut W) -> UResult<()> {
+pub fn flush_output<W: Write + ?Sized>(output: &mut W) -> UResult<()> {
     #[cfg(not(target_os = "windows"))]
     return output
         .flush()
