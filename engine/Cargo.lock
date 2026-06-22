@@ -5351,6 +5351,7 @@ dependencies = [
  "tui-term",
  "uu_basename",
  "uu_cat",
+ "uu_cp",
  "uu_cut",
  "uu_dirname",
  "uu_expr",
@@ -6903,8 +6904,6 @@ dependencies = [
 [[package]]
 name = "uu_cp"
 version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "37ee02f3f636a8623ec3ed03c54d615070da244dc0f4651956c01532cce8181b"
 dependencies = [
  "clap",
  "filetime",

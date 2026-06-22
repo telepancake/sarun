@@ -676,6 +676,66 @@ impl brush_core::builtins::SimpleCommand for SortBuiltin {
     }
 }
 
+/// `cp` — NATIVE in-process brush builtin over the vendored `uu_cp` fork.
+///
+/// Runs uutils' `cp` IN-PROCESS, UNCONDITIONALLY: it writes the box's logical
+/// `OpenFile` sink/source directly — no process-global stdio, no `dup2`, so it
+/// is safe as a concurrent pipeline stage. There is no per-argv gate and no
+/// fork-to-the-box's-binary fallback; the box's coreutils IS uutils. Unlike the
+/// other coreutils builtins, `cp` operates on FILE OPERANDS, so it also needs
+/// the shell's LOGICAL cwd: brush keeps a logical working directory and never
+/// `chdir`s the process, while `cp` runs on a transient worker thread. The
+/// logical entry [`uu_cp::cp`] resolves every relative operand (and `-t`)
+/// against that `cwd`. `cp` reads no stdin. The call runs on a fresh thread for
+/// localization isolation — see [`run_coreutil_localized`].
+struct CpBuiltin;
+
+impl brush_core::builtins::SimpleCommand for CpBuiltin {
+    fn get_content(
+        name: &str,
+        _content_type: brush_core::builtins::ContentType,
+        _options: &brush_core::builtins::ContentOptions,
+    ) -> Result<String, brush_core::error::Error> {
+        Ok(format!("{name}: native injected-I/O cp builtin\n"))
+    }
+
+    fn execute<SE: brush_core::extensions::ShellExtensions,
+               I: Iterator<Item = S>, S: AsRef<str>>(
+        context: brush_core::commands::ExecutionContext<'_, SE>,
+        args: I,
+    ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
+        let name = context.command_name.clone();
+        let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
+        if argv.is_empty() { argv.push(OsString::from(&name)); }
+
+        // The shell's LOGICAL cwd, captured BEFORE we move into the worker
+        // closure: `cp`'s relative operands resolve against this, not the
+        // process cwd (the process is never chdir'd to it).
+        let cwd = context.shell.working_dir().to_path_buf();
+
+        let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
+        let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
+
+        let code = run_coreutil_localized("uu_cp", move || {
+            use std::io::Write;
+            let mut out = out;
+            let mut err = err;
+            let r = match uu_cp::cp(argv.into_iter(), &cwd, &mut out, &mut err) {
+                Ok(()) => 0,
+                Err(e) => {
+                    let msg = e.to_string();
+                    if !msg.is_empty() { let _ = writeln!(err, "{name}: {msg}"); }
+                    e.code()
+                }
+            };
+            let _ = out.flush();
+            let _ = err.flush();
+            r
+        });
+        Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
+    }
+}
+
 /// `basename` — NATIVE in-process brush builtin over the vendored `uu_basename` fork.
 ///
 /// Runs uutils' `basename` IN-PROCESS, UNCONDITIONALLY: it reads/writes the box's
@@ -997,6 +1057,16 @@ fn box_builtins_opt<SE: brush_core::extensions::ShellExtensions>(
     m.insert("uniq".to_string(), simple_builtin::<UniqBuiltin, SE>());
     m.insert("sort".to_string(), simple_builtin::<SortBuiltin, SE>());
     }
+    // `cp` is registered REGARDLESS of `bundle_coreutils` (unlike the coreutils
+    // above, which the make-recipe path gates off). Make recipes routinely call
+    // `cp`, and forking the host `/usr/bin/cp` would escape the box's logical
+    // cwd/I/O; the localization-cache hazard that gated the others does not apply
+    // here because `cp` runs on its own fresh thread (`run_coreutil_localized`)
+    // and uucore's Fluent caches are thread-local — so it gets its own message
+    // bundle with no cross-util poisoning. It is registered before the BashMode
+    // extend so a bash `cp` builtin (there is none) could still win; in practice
+    // BashMode defines no `cp`, so this in-process builtin is what runs.
+    m.insert("cp".to_string(), simple_builtin::<CpBuiltin, SE>());
     // BashMode shell builtins overwrite overlaps (highest priority).
     m.extend(brush_builtins::default_builtins(brush_builtins::BuiltinSet::BashMode));
     // In-box engine entry points (no PATH shadow): `sarun` / `oaita` re-exec

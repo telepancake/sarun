@@ -21,7 +21,9 @@ use uucore::error::UIoError;
 use uucore::fs::{
     FileInformation, MissingHandling, ResolveMode, canonicalize, path_ends_with_terminator,
 };
-use uucore::show;
+// `show!` is provided by the crate-local macro defined in `cp.rs` (which routes
+// to the logical stderr buffer instead of process fd 2); do NOT import the
+// uucore `show!` here or it would shadow the local one.
 use uucore::translate;
 use uucore::uio_error;
 use walkdir::{DirEntry, WalkDir};
@@ -211,7 +213,7 @@ impl Entry {
                 && !exists(context.target).is_ok_and(identity)
             {
                 if let Err(e) = fs::create_dir_all(context.target) {
-                    eprintln!(
+                    show_error!(
                         "{}",
                         translate!("cp-error-failed-to-create-directory", "error" => e)
                     );
@@ -290,7 +292,7 @@ fn copy_direntry(
                 Some(&entry.source_absolute),
             )?;
             if options.verbose {
-                println!(
+                cp_out!(
                     "{}",
                     context_for(&entry.source_relative, &entry.local_to_target)
                 );
@@ -411,7 +413,7 @@ pub(crate) fn copy_directory(
                 //     a/b -> d/a/b
                 //
                 for (x, y) in aligned_ancestors(root, &target.join(root)) {
-                    println!("{} -> {}", x.display(), y.display());
+                    cp_out!("{} -> {}", x.display(), y.display());
                 }
             }
 
