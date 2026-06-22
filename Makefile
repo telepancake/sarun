@@ -71,8 +71,9 @@ sarun-help: ## Show the prototype's CLI help (prototype/sarun -h)
 # pip install anything.
 
 .PHONY: deps
-deps: ## Install system packages (libfuse3-dev, fuse3, pkg-config, bubblewrap)
-	apt-get install -y libfuse3-dev fuse3 pkg-config bubblewrap
+deps: ## Install system packages (FUSE, bubblewrap, gcc; iproute2 + tshark for net tests)
+	apt-get install -y libfuse3-dev fuse3 pkg-config bubblewrap gcc
+	apt-get install -y iproute2 tshark   # only needed by test_net_rs.py
 
 # ---- Rust port ------------------------------------------------------------
 #
@@ -95,7 +96,7 @@ engine: ## Build the Rust port (fully-static musl binary; cargo-zigbuild + zig)
 # ---- Tests ----------------------------------------------------------------
 
 .PHONY: test
-test: ## Run the Python test suite (parallel via pytest-xdist; excludes test_e2e.py and pjdfstest)
+test: ## Run the test suite (pytest-xdist; excludes test_e2e.py, test_pjdfstest.py, test_oci.py)
 	cd prototype && uv run --with pytest --with pytest-xdist --with pytest-timeout \
 	  --with "textual>=0.60" --with "wcmatch>=8.4" --with "pyfuse3>=3.2" \
 	  --with "trio>=0.22" --with "python-magic>=0.4" \

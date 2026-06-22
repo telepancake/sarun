@@ -50,7 +50,7 @@ const DOCKER_LAYER_GZIP_MEDIA_TYPE: &str =
 /// CLI dispatch: `sarun oci <subverb> <args...>`.
 pub fn cli_oci(args: &[String]) -> i32 {
     let Some(sub) = args.first().map(String::as_str) else {
-        eprintln!("usage: sarun oci <load|run> ...");
+        eprintln!("usage: sarun oci <load|run|build|save|dockerfile|author> ...  (`sarun oci -h`)");
         return 2;
     };
     match sub {
