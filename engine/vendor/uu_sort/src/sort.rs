@@ -36,7 +36,8 @@ use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::hash::{Hash, Hasher};
-use std::io::{BufRead, BufReader, BufWriter, Read, Write, stdin, stdout};
+use std::cell::RefCell;
+use std::io::{BufRead, BufReader, BufWriter, Cursor, Read, Write};
 use std::num::IntErrorKind;
 #[cfg(not(target_os = "wasi"))]
 use std::num::NonZero;
@@ -61,13 +62,121 @@ use uucore::parser::num_parser::{ExtendedParser, ExtendedParserError};
 use uucore::parser::parse_size::{ParseSizeError, Parser};
 use uucore::parser::shortcut_value_parser::ShortcutValueParser;
 use uucore::posix::{MODERN, TRADITIONAL};
-use uucore::show_error;
 use uucore::translate;
 use uucore::version_cmp::version_cmp;
 use uucore::{format_usage, i18n};
 
 use crate::buffer_hint::automatic_buffer_size;
 use crate::tmp_dir::TmpDirWrapper;
+
+// ── Injected-I/O plumbing for the in-process brush builtin ───────────────────
+//
+// The in-process `sort(...)` entry below never touches the process's own fd
+// 0/1/2. Instead it routes the logical stdin/stdout through two thread-local
+// "channels" that the deep, hard-to-thread call sites (`open("-")` and
+// `Output::into_write()` with no `-o FILE`) read from / write to.
+//
+// Why thread-locals and not extra parameters: `open()` returns
+// `Box<dyn Read + Send>` and is invoked lazily from the multi-threaded external
+// sort, so an injected `&mut dyn Read` (neither `Send` nor `'static`) cannot be
+// handed through. `sort` is inherently a buffer-the-whole-input utility, so we
+// drain the injected `stdin` fully into an owned `Vec<u8>` ONCE up front and let
+// every `open("-")` hand back an independent `Cursor` over that buffer (GNU/uutils
+// already reopen each input, so multiple "-" operands each see the full bytes —
+// matching the descriptor case where re-`stdin()` would too). Output is buffered
+// into an owned `Vec<u8>` on the main thread (all of `print_sorted` / merge write
+// on the main thread, after the parallel sort) and copied to the injected `out`
+// once the run finishes. An explicit `-o FILE` still writes that file by path and
+// bypasses this buffer entirely, exactly as upstream.
+thread_local! {
+    /// Bytes drained from the injected `stdin`, shared by every `open("-")`.
+    static SORT_STDIN: RefCell<Option<std::sync::Arc<Vec<u8>>>> = const { RefCell::new(None) };
+    /// Buffer that the no-`-o` `Output` writer appends to; flushed to the
+    /// injected `out` at the end of [`sort`].
+    static SORT_STDOUT: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
+}
+
+/// A `Write` sink that appends to the thread-local `SORT_STDOUT` buffer. Used as
+/// the default-output target instead of `std::io::stdout()` so the builtin never
+/// writes to process fd 1.
+struct LogicalStdout;
+
+impl Write for LogicalStdout {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        SORT_STDOUT.with(|cell| {
+            let mut b = cell.borrow_mut();
+            b.get_or_insert_with(Vec::new).extend_from_slice(buf);
+        });
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Logical entry point for the bundled `sort` builtin.
+///
+/// Unlike upstream's [`uumain`], this never touches the process's own stdio. The
+/// default output sink is the shell's logical `out`, diagnostics go to `err`, and
+/// the default / `-` input is read from the injected `stdin`. An explicit
+/// `-o FILE` still writes that file by path (output buffer untouched).
+///
+/// Implementation note: stdin is drained into an owned buffer and exposed to the
+/// deep `open("-")` call sites via a thread-local (`open` must yield
+/// `Box<dyn Read + Send>` for the multi-threaded external sort, so the injected
+/// non-`Send` reader cannot be threaded through directly); default output is
+/// buffered into a thread-local and copied to `out` at the end. Both thread-locals
+/// are cleared on the way out so the builtin holds no cross-call process state.
+/// The `--debug` warnings, which upstream emits via `show_error!` to process
+/// stderr, are routed to the injected `err` here.
+pub fn sort(
+    args: impl uucore::Args,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    stdin: &mut dyn Read,
+) -> UResult<()> {
+    // Drain the injected stdin once; share it with every `open("-")`.
+    let mut buf = Vec::new();
+    stdin
+        .read_to_end(&mut buf)
+        .map_err(|e| USimpleError::new(2, format!("sort: read error: {e}")))?;
+    SORT_STDIN.with(|cell| *cell.borrow_mut() = Some(std::sync::Arc::new(buf)));
+    SORT_STDOUT.with(|cell| *cell.borrow_mut() = Some(Vec::new()));
+
+    let result = sort_inner(args, err);
+
+    // Flush buffered default output to the injected `out`, then clear state.
+    let produced =
+        SORT_STDOUT.with(|cell| cell.borrow_mut().take().unwrap_or_default());
+    SORT_STDIN.with(|cell| *cell.borrow_mut() = None);
+    if let Err(e) = out.write_all(&produced) {
+        return Err(USimpleError::new(2, format!("sort: write error: {e}")));
+    }
+    let _ = out.flush();
+    result
+}
+
+/// Returns an independent reader over the buffered injected stdin.
+///
+/// Each `open("-")` gets its own `Cursor` over the same shared `Arc<Vec<u8>>`,
+/// so multiple `-` operands each see the full input (matching the descriptor
+/// case where re-`stdin()` would reread the same fd). `Arc<Vec<u8>>` is `Send`,
+/// satisfying `open`'s `Box<dyn Read + Send>` return type without any `unsafe`.
+fn logical_stdin() -> Box<dyn Read + Send> {
+    let bytes = SORT_STDIN
+        .with(|cell| cell.borrow().clone())
+        .unwrap_or_default();
+    Box::new(Cursor::new(SharedBytes(bytes)))
+}
+
+/// A `Vec<u8>` behind an `Arc`, made `AsRef<[u8]>` so a `Cursor` can read it
+/// without cloning the bytes.
+struct SharedBytes(std::sync::Arc<Vec<u8>>);
+impl AsRef<[u8]> for SharedBytes {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+}
 
 mod options {
     pub mod modes {
@@ -256,7 +365,9 @@ impl Output {
                 let _ = file.set_len(0);
                 Box::new(file)
             }
-            None => Box::new(stdout()),
+            // Default output goes to the shell's logical `out` (buffered in the
+            // thread-local and flushed by `sort`), never to process fd 1.
+            None => Box::new(LogicalStdout),
         })
     }
 
@@ -1810,7 +1921,16 @@ fn emit_debug_warnings(
     settings: &GlobalSettings,
     flags: &GlobalOptionFlags,
     legacy_warnings: &[LegacyKeyWarning],
+    err: &mut dyn Write,
 ) {
+    // Shadow the process-stderr `show_error!` with one that routes to the
+    // injected `err` sink, so the in-process builtin never touches fd 2.
+    macro_rules! show_error {
+        ($($args:tt)+) => {{
+            let _ = write!(err, "{}: ", uucore::util_name());
+            let _ = writeln!(err, $($args)+);
+        }};
+    }
     if locale_failed_to_set() {
         show_error!("{}", translate!("sort-warning-failed-to-set-locale"));
     }
@@ -1994,9 +2114,27 @@ fn emit_debug_warnings(
     }
 }
 
+/// Descriptor-based entry point for the standalone `sort` binary and the
+/// `--invoke-bundled` subprocess dispatcher.
+///
+/// In those contexts the process's own fd 0/1/2 *are* the intended input,
+/// output, and diagnostics, so this is a thin bridge that hands them to
+/// [`sort`]. The in-process brush builtin must NOT route through here — it calls
+/// [`sort`] directly with the shell's logical sinks/source, so it never touches
+/// process-global stdio.
 #[uucore::main]
-#[allow(clippy::cognitive_complexity)]
 pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    let stderr = std::io::stderr();
+    let mut err = stderr.lock();
+    let stdin = std::io::stdin();
+    let mut input = stdin.lock();
+    sort(args, &mut out, &mut err, &mut input)
+}
+
+#[allow(clippy::cognitive_complexity)]
+fn sort_inner(args: impl uucore::Args, err: &mut dyn Write) -> UResult<()> {
     let mut settings = GlobalSettings {
         numeric_locale: detect_numeric_locale(),
         ..Default::default()
@@ -2173,8 +2311,10 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
         match n_merge.parse::<usize>() {
             Ok(parsed_value) => {
                 if parsed_value < 2 {
-                    show_error!(
-                        "{}",
+                    let _ = writeln!(
+                        err,
+                        "{}: {}",
+                        uucore::util_name(),
                         translate!("sort-invalid-batch-size-arg", "arg" => n_merge)
                     );
                     return Err(UUsageError::new(
@@ -2193,7 +2333,7 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
 
                     #[cfg(target_os = "linux")]
                     {
-                        show_error!("{batch_too_large}");
+                        let _ = writeln!(err, "{}: {batch_too_large}", uucore::util_name());
 
                         translate!(
                             "sort-maximum-batch-size-rlimit",
@@ -2334,7 +2474,7 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
 
     if settings.debug {
         let global_flags = GlobalOptionFlags::from_matches(&matches);
-        emit_debug_warnings(&settings, &global_flags, &legacy_warnings);
+        emit_debug_warnings(&settings, &global_flags, &legacy_warnings, err);
     }
 
     // Initialize locale collation if needed (UTF-8 locales)
@@ -3150,8 +3290,8 @@ fn print_sorted<'a, T: Iterator<Item = &'a Line<'a>>>(
 fn open(path: impl AsRef<OsStr>) -> UResult<Box<dyn Read + Send>> {
     let path = path.as_ref();
     if path == STDIN_FILE {
-        let stdin = stdin();
-        return Ok(Box::new(stdin) as Box<dyn Read + Send>);
+        // Read the shell's logical stdin (buffered once by `sort`), never fd 0.
+        return Ok(logical_stdin());
     }
 
     let path = Path::new(path);
@@ -3169,8 +3309,8 @@ fn open_with_open_failed_error(path: impl AsRef<OsStr>) -> UResult<Box<dyn Read 
     // On error, returns an OpenFailed error instead of a ReadFailed error
     let path = path.as_ref();
     if path == STDIN_FILE {
-        let stdin = stdin();
-        return Ok(Box::new(stdin) as Box<dyn Read + Send>);
+        // Read the shell's logical stdin (buffered once by `sort`), never fd 0.
+        return Ok(logical_stdin());
     }
 
     let path = Path::new(path);
@@ -3328,5 +3468,127 @@ mod tests {
         for input in &invalid_input {
             assert!(GlobalSettings::parse_byte_count(input).is_err());
         }
+    }
+}
+
+// ── injected-I/O smoke tests (the in-process brush builtin path) ──
+// Drive the public `sort(...)` entry with in-memory Vec<u8> out/err and a
+// `&[u8]` stdin, asserting sorted bytes — no process fd is touched.
+#[cfg(test)]
+mod tests_injected_io {
+    use super::sort;
+
+    fn run(args: &[&str], input: &[u8]) -> (Vec<u8>, Vec<u8>, i32) {
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        let mut stdin: &[u8] = input;
+        let argv = std::iter::once(std::ffi::OsString::from("sort"))
+            .chain(args.iter().map(|s| std::ffi::OsString::from(*s)));
+        let code = match sort(argv, &mut out, &mut err, &mut stdin) {
+            Ok(()) => 0,
+            Err(e) => e.code(),
+        };
+        (out, err, code)
+    }
+
+    #[test]
+    fn test_inmem_basic() {
+        let (out, err, code) = run(&[], b"b\na\nc\n");
+        assert_eq!(out, b"a\nb\nc\n");
+        assert!(err.is_empty());
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn test_inmem_reverse() {
+        let (out, _err, code) = run(&["-r"], b"a\nb\nc\n");
+        assert_eq!(out, b"c\nb\na\n");
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn test_inmem_unique() {
+        let (out, _err, code) = run(&["-u"], b"b\na\nb\na\n");
+        assert_eq!(out, b"a\nb\n");
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn test_inmem_numeric() {
+        let (out, _err, code) = run(&["-n"], b"10\n2\n1\n");
+        assert_eq!(out, b"1\n2\n10\n");
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn test_inmem_reverse_numeric() {
+        let (out, _err, code) = run(&["-rn"], b"2\n10\n1\n");
+        assert_eq!(out, b"10\n2\n1\n");
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn test_inmem_key2() {
+        let (out, _err, code) = run(&["-k2"], b"x 3\ny 1\nz 2\n");
+        assert_eq!(out, b"y 1\nz 2\nx 3\n");
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn test_inmem_field_sep_key2() {
+        let (out, _err, code) = run(&["-t:", "-k2"], b"x:3\ny:1\nz:2\n");
+        assert_eq!(out, b"y:1\nz:2\nx:3\n");
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn test_inmem_no_trailing_newline() {
+        let (out, _err, code) = run(&[], b"b\na\nc");
+        assert_eq!(out, b"a\nb\nc\n");
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn test_inmem_empty() {
+        let (out, err, code) = run(&[], b"");
+        assert!(out.is_empty());
+        assert!(err.is_empty());
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn test_inmem_blank_lines() {
+        let (out, _err, code) = run(&[], b"b\n\na\n\n");
+        assert_eq!(out, b"\n\na\nb\n");
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn test_inmem_check_ok() {
+        // -c: in order => exit 0, no output
+        let (out, err, code) = run(&["-c"], b"a\nb\nc\n");
+        assert!(out.is_empty());
+        assert!(err.is_empty());
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn test_inmem_check_fail() {
+        // -c: out of order => exit 1. The "disorder" diagnostic is RETURNED as a
+        // UError (code 1, rendered by the caller), never written to `err`/fd 2 by
+        // the builtin itself. So `out` and `err` are both empty here and the
+        // non-zero code is the signal.
+        let (out, err, code) = run(&["-c"], b"b\na\n");
+        assert!(out.is_empty());
+        assert!(err.is_empty());
+        assert_eq!(code, 1);
+    }
+
+    #[test]
+    fn test_inmem_merge_explicit_stdin() {
+        // -m with "-" reads the (already sorted) injected stdin.
+        let (out, _err, code) = run(&["-m", "-"], b"a\nb\nc\n");
+        assert_eq!(out, b"a\nb\nc\n");
+        assert_eq!(code, 0);
     }
 }
