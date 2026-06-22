@@ -153,6 +153,8 @@ INPROC = [
     ("dirname",  "dirname /a/b/c"),
     ("seq",      "seq 1 5"),
     ("expr",     "expr 2 + 3"),
+    ("expr +1=1","expr +1 = 1"),
+    ("expr substr ovf", "expr substr abcdef 1 99999999999999999999"),
     ("tr",       "printf abc | tr a-z A-Z"),
     ("cut",      "printf 'a:b:c\\n' | cut -d: -f2"),
     ("uniq",     "printf 'a\\na\\nb\\n' | uniq"),
@@ -250,6 +252,11 @@ EXIT_CASES = [
     ("head missing", "head /nope", 1), ("wc -l ok", "wc -l v.txt", 0),
     ("expr 5", "expr 5", 0), ("expr 0", "expr 0", 1),
     ("expr 1=2", "expr 1 = 2", 1), ("expr 1=1", "expr 1 = 1", 0),
+    # regression guards for the uu_expr fork patch (leading-+ and substr-overflow
+    # now match GNU in-process — no gate fallback exists):
+    ("expr +1=1 (leading+)", "expr +1 = 1", 1),
+    ("expr +5+1 (non-int)",  "expr +5 + 1", 2),
+    ("expr substr overflow", "expr substr abcdef 1 99999999999999999999", 0),
 ]
 
 
