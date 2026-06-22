@@ -84,6 +84,26 @@ def dup_onto_std_count(trace):
 
 # write(FD, ... — the fd a write() targeted.
 WRITE_FD = re.compile(r'\bwrite\((\d+),')
+# read(0, ... — a read of the engine's REAL fd 0. A piped-stdin builtin must read
+# the pipe fd, never fd 0 (reading fd 0 steals bytes from whatever owns the
+# engine's stdin — the find -files0-from / xargs data-corruption bug class).
+READ_FD0 = re.compile(r'\bread\(0,')
+
+
+def run_trace_set(script, cwd, traceset):
+    """Run the box command under strace tracing `traceset`; return (trace, rc)."""
+    tf = tempfile.NamedTemporaryFile(prefix="ts_", suffix=".strace", delete=False)
+    tf.close()
+    try:
+        p = subprocess.run(
+            ["strace", "-f", "-qq", "-e", f"trace={traceset}", "-o", tf.name,
+             BIN, "brush-sh", "--", "sh", "-c", script],
+            cwd=cwd, capture_output=True, timeout=60,
+        )
+        with open(tf.name, encoding="utf-8", errors="replace") as fh:
+            return fh.read(), p.returncode
+    finally:
+        os.unlink(tf.name)
 
 
 def run_redirected(script, cwd):
@@ -149,6 +169,51 @@ CASES = [
 def _setup(cwd):
     with open(os.path.join(cwd, "v.txt"), "w") as fh:
         fh.write("one\ntwo\nthree\nfour\n")
+    os.mkdir(os.path.join(cwd, "sub"))  # for the logical-cwd `cd sub` case
+
+
+# Piped-stdin cases: the builtin must read the PIPE, never the engine's real
+# fd 0, and stay in-process. (label, script)
+NO_FD0_CASES = [
+    ("printf|head -n1",   'printf "a\\nb\\nc\\n" | head -n1'),
+    ("printf|wc -c",      "printf abc | wc -c"),
+    ("echo|cat|wc -c",    "echo hi | cat | wc -c"),
+    ("printf|tac",        'printf "a\\nb\\n" | tac'),
+    ("printf|nl",         'printf "a\\nb\\n" | nl'),
+]
+
+
+def check_no_fd0(label, script, cwd):
+    """A piped-stdin builtin reads the pipe, NEVER the engine's fd 0, and runs
+    fully in-process (no execve)."""
+    trace, _ = run_trace_set(script, cwd, "read,execve")
+    problems = []
+    n = len(READ_FD0.findall(trace))
+    if n:
+        problems.append(f"{n} read() of the engine's fd 0 (logical-stdin leak)")
+    execd = execve_basenames(trace)
+    if execd:
+        problems.append(f"unexpected execve(s) {sorted(execd)}")
+    return problems
+
+
+# Exit-code correctness for in-process builtins. (label, script, expected_code)
+EXIT_CASES = [
+    ("true",            "true",              0),
+    ("false",           "false",             1),
+    ("[ -f v.txt ]",    "[ -f v.txt ]",      0),
+    ("[ -f nope ]",     "[ -f nope ]",       1),
+    ("head missing rc", "head nope.txt",     1),
+    ("wc -l rc",        "wc -l v.txt",       0),
+]
+
+
+def check_exit(label, script, expected, cwd):
+    p = subprocess.run([BIN, "brush-sh", "--", "sh", "-c", script],
+                       cwd=cwd, capture_output=True, timeout=60)
+    if p.returncode != expected:
+        return [f"exit {p.returncode}, expected {expected}"]
+    return []
 
 
 def check_case(label, script, util, mode, cwd):
@@ -239,6 +304,11 @@ PURE_CASES = [
     ("xargs cat (sub via brush)",     "printf v.txt | xargs cat"),
     ("env A=1 echo (sub via brush)",  "env A=1 echo hi"),
     ("env A=1 printenv (sub via brush)", "env A=1 printenv A"),
+    (": (no-op builtin)",             ":"),
+    ("[ test builtin )",              "[ -f v.txt ] && echo yes"),
+    ("export + printenv (in-proc)",   "export X=42; printenv X"),
+    ("cd sub + pwd (logical cwd)",    "cd sub && pwd"),
+    ("echo|cat|wc 3-stage (in-proc)", "echo hi | cat | wc -c"),
 ]
 
 
@@ -267,6 +337,8 @@ CASES_IO_EXISTING = [
     ("xargs cat",           "printf v.txt | xargs cat"),
     ("env A=1 echo",        "env A=1 echo hi"),
     ("env A=1 printenv A",  "env A=1 printenv A"),
+    ("echo|cat|wc -c",      "echo hi | cat | wc -c"),
+    ("export + printenv",   "export X=42; printenv X"),
 ]
 
 
@@ -287,6 +359,12 @@ def run_all():
             results.append((f"{label} [pure in-proc]", check_pure(label, script, cwd)))
         for label, script in CASES_IO_EXISTING:
             results.append((f"{label} [io: fd+content]", check_io(label, script, cwd)))
+        # Logical-stdin: a piped builtin must never read the engine's fd 0.
+        for label, script in NO_FD0_CASES:
+            results.append((f"{label} [no fd0 read]", check_no_fd0(label, script, cwd)))
+        # Exit-code correctness.
+        for label, script, code in EXIT_CASES:
+            results.append((f"{label} [exit={code}]", check_exit(label, script, code, cwd)))
     return results
 
 
