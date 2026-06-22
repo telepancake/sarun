@@ -9,10 +9,10 @@ use bstr::io::BufReadExt;
 use clap::{Arg, ArgAction, ArgMatches, Command, builder::ValueParser};
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, IsTerminal, Read, Write, stdin, stdout};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 use uucore::display::Quotable;
-use uucore::error::{FromIo, UResult, USimpleError, set_exit_code};
+use uucore::error::{FromIo, UResult, USimpleError};
 use uucore::line_ending::LineEnding;
 use uucore::os_str_as_bytes;
 
@@ -20,7 +20,7 @@ use self::searcher::Searcher;
 use matcher::{ExactMatcher, Matcher, WhitespaceMatcher};
 use uucore::ranges::Range;
 use uucore::translate;
-use uucore::{format_usage, show_error, show_if_err};
+use uucore::format_usage;
 
 mod matcher;
 mod searcher;
@@ -440,16 +440,39 @@ fn cut_fields<R: Read, W: Write>(
     }
 }
 
-fn cut_files<'a, I>(filenames: I, mode: &Mode)
+/// Drive the cutting `mode` over `filenames`, writing to the shell's logical
+/// output sink and reading `-`/stdin from the shell's logical input source.
+///
+/// sarun: this replaces upstream's `cut_files`, which created its own
+/// `BufWriter<Stdout>` (gated on `stdout().is_terminal()`), read `stdin()`, and
+/// reported per-file errors through `show_error!` + `set_exit_code(1)`. All three
+/// touch PROCESS globals — fd 1, fd 0, and uucore's global exit code — which is
+/// forbidden for an in-process builtin: it would corrupt a neighbor pipeline
+/// stage's stdio and exit status. Here the writer wraps the caller's logical
+/// `out`, `-`/stdin reads the caller's logical `stdin`, and per-file diagnostics
+/// are ACCUMULATED (mirroring the uu_head port) and returned as a single
+/// `USimpleError(1, …)` after all files are processed; the cutting logic below is
+/// byte-for-byte the upstream `cut_files` body.
+fn cut_files<'a, I>(
+    filenames: I,
+    mode: &Mode,
+    out: &mut dyn Write,
+    stdin: &mut dyn Read,
+) -> UResult<()>
 where
     I: IntoIterator<Item = &'a OsString>,
 {
     let mut stdin_read = false;
-    let mut out: Box<dyn Write> = if stdout().is_terminal() {
-        Box::new(stdout())
-    } else {
-        Box::new(BufWriter::new(stdout())) as Box<dyn Write>
-    };
+    // A single buffered writer over the logical sink persists across every input
+    // file (upstream did the same). The terminal-vs-pipe branch upstream only
+    // chose whether to wrap stdout in a BufWriter; here the sink is a logical
+    // stream with no is-terminal notion, so we always buffer and flush at the
+    // end — behavior-identical to the non-terminal upstream path.
+    let mut out = BufWriter::new(out);
+
+    // sarun: per-file errors are collected here instead of `show_error!` +
+    // `set_exit_code(1)` and surfaced as the returned exit status/diagnostic.
+    let mut error_messages: Vec<String> = Vec::new();
 
     for filename in filenames {
         if filename == "-" {
@@ -457,45 +480,52 @@ where
                 continue;
             }
 
-            show_if_err!(match mode {
-                Mode::Bytes(ranges, opts) => cut_bytes(stdin(), &mut out, ranges, opts),
-                Mode::Characters(ranges, opts) => cut_bytes(stdin(), &mut out, ranges, opts),
-                Mode::Fields(ranges, opts) => cut_fields(stdin(), &mut out, ranges, opts),
-            });
+            let res = match mode {
+                Mode::Bytes(ranges, opts) => cut_bytes(&mut *stdin, &mut out, ranges, opts),
+                Mode::Characters(ranges, opts) => cut_bytes(&mut *stdin, &mut out, ranges, opts),
+                Mode::Fields(ranges, opts) => cut_fields(&mut *stdin, &mut out, ranges, opts),
+            };
+            if let Err(e) = res {
+                error_messages.push(e.to_string());
+            }
 
             stdin_read = true;
         } else {
             let path = Path::new(filename);
 
             if path.is_dir() {
-                show_error!(
+                error_messages.push(format!(
                     "{}: {}",
                     filename.maybe_quote(),
                     translate!("cut-error-is-directory")
-                );
-                set_exit_code(1);
+                ));
                 continue;
             }
 
-            show_if_err!(
-                File::open(path)
-                    .map_err_context(|| filename.maybe_quote().to_string())
-                    .and_then(|file| {
-                        match &mode {
-                            Mode::Bytes(ranges, opts) | Mode::Characters(ranges, opts) => {
-                                cut_bytes(file, &mut out, ranges, opts)
-                            }
-                            Mode::Fields(ranges, opts) => cut_fields(file, &mut out, ranges, opts),
-                        }
-                    })
-            );
+            let res = File::open(path)
+                .map_err_context(|| filename.maybe_quote().to_string())
+                .and_then(|file| match &mode {
+                    Mode::Bytes(ranges, opts) | Mode::Characters(ranges, opts) => {
+                        cut_bytes(file, &mut out, ranges, opts)
+                    }
+                    Mode::Fields(ranges, opts) => cut_fields(file, &mut out, ranges, opts),
+                });
+            if let Err(e) = res {
+                error_messages.push(e.to_string());
+            }
         }
     }
 
-    show_if_err!(
-        out.flush()
-            .map_err_context(|| translate!("cut-error-write-error"))
-    );
+    out.flush()
+        .map_err_context(|| translate!("cut-error-write-error"))?;
+
+    if error_messages.is_empty() {
+        Ok(())
+    } else {
+        // GNU `cut` exits 1 on any read/open error. The caller re-prefixes
+        // continuation lines with "cut: " when it writes this to logical stderr.
+        Err(USimpleError::new(1, error_messages.join("\ncut: ")))
+    }
 }
 
 /// Get delimiter and output delimiter from `-d`/`--delimiter` and `--output-delimiter` options respectively
@@ -563,8 +593,37 @@ mod options {
     pub const NOTHING: &str = "nothing";
 }
 
-#[uucore::main]
-pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+/// Logical entry point for the bundled `cut` builtin.
+///
+/// Unlike upstream's `uumain`, this never touches the process's own stdio. It
+/// cuts the selected byte/char/field columns onto the shell's logical output sink
+/// (`out`), routes its own diagnostics to the logical error sink (`err`), and
+/// reads `-`/stdin from the shell's logical input source (`stdin`).
+///
+/// `cut` does buffered byte/field reads and `write_all`s — there is NO
+/// `splice`/`copy_file_range` fast path, no self-overwrite check, and no
+/// is-terminal branch that needs a real descriptor, so (unlike `cat`) it needs
+/// NO backing raw descriptor: the `out_fd`/`stdin_fd` parameters `cat` carries
+/// are deliberately omitted. It holds no process-global state — the per-file
+/// failure that upstream stored in uucore's global `set_exit_code` is collected
+/// locally and returned — so it is safe to run as a concurrent pipeline stage.
+///
+/// `cut` never writes diagnostics MID-run (the only per-file failures are
+/// open/read/is-directory errors, accumulated and returned), so `err` is accepted
+/// for signature parity with the other ports and is currently unused inside this
+/// entry; the caller surfaces the returned message on logical stderr.
+///
+/// The argument/mode parsing below (including the `-d=` obsolete-form rewrite and
+/// every mode-conflict diagnostic) is byte-for-byte the upstream `uumain` body;
+/// only the final dispatch is rerouted from `cut_files(files, &mode)` to the
+/// logical `cut_files(files, &mode, out, stdin)`, and clap/parse errors are
+/// returned (the caller writes them to logical stderr) instead of being printed.
+pub fn cut(
+    args: impl uucore::Args,
+    out: &mut dyn Write,
+    _err: &mut dyn Write,
+    stdin: &mut dyn Read,
+) -> UResult<()> {
     // GNU `cut` supports `-d=` to set the delimiter to `=`.
     // Clap parsing is limited in this situation, see:
     // https://github.com/uutils/coreutils/issues/2424#issuecomment-863825242
@@ -674,9 +733,34 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     #[allow(clippy::unwrap_used, reason = "clap provides '-' by default")]
     let files = matches.get_many::<OsString>(options::FILE).unwrap();
 
-    cut_files(files, &mode);
+    cut_files(files, &mode, out, stdin)
+}
 
-    Ok(())
+/// Descriptor-based entry point for the standalone `cut` binary.
+///
+/// Here the process's own fd 0/1/2 *are* the intended I/O, so this is a thin
+/// bridge that locks them and hands them to [`cut`]. The in-process brush builtin
+/// must NOT route through here — it calls [`cut`] directly with the shell's
+/// logical sinks/source, so it never touches process-global stdio.
+#[uucore::main]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    let stderr = io::stderr();
+    let mut err = stderr.lock();
+    let stdin = io::stdin();
+    let mut input = stdin.lock();
+    // NOTE: the returned `UError` is printed by the `#[uucore::main]` macro
+    // itself (with the "cut: " prefix), so this bridge must NOT print it again —
+    // the in-process brush builtin, which does NOT go through this macro, is the
+    // one that writes the returned message to its LOGICAL stderr. `err` is the
+    // standalone process's fd 2, handed to `cut` for signature parity (cut never
+    // writes diagnostics mid-run, so it is currently unused inside `cut`).
+    let result = cut(args, &mut out, &mut err, &mut input);
+    // The logical entry already flushed its BufWriter; the locked Stdout itself
+    // is line-buffered, so flush before exit to mirror GNU `cut`.
+    let _ = out.flush();
+    result
 }
 
 pub fn uu_app() -> Command {
@@ -778,4 +862,68 @@ pub fn uu_app() -> Command {
                 .help("(ignored)")
                 .action(ArgAction::SetTrue),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// In-memory exercise of the injected-I/O `cut` entry: no process fd 0/1/2 is
+    /// touched — output goes to a `Vec<u8>`, diagnostics to another `Vec<u8>`, and
+    /// stdin is a `&[u8]`. Covers `-f` field selection over the default stdin (`-`)
+    /// path and asserts nothing leaks to the error sink.
+    #[test]
+    fn test_cut_injected_io_fields() {
+        let input: &[u8] = b"a:b:c\nd:e:f\n";
+        let mut reader = input;
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+
+        // argv[0] = "cut", select field 2 with ':' delimiter; no file -> stdin.
+        let args = ["cut", "-d:", "-f2"].iter().map(|s| OsString::from(*s));
+        cut(args, &mut out, &mut err, &mut reader).unwrap();
+
+        assert_eq!(
+            out,
+            b"b\ne\n".to_vec(),
+            "got: {:?}",
+            String::from_utf8_lossy(&out)
+        );
+        assert!(err.is_empty(), "unexpected diagnostics: {err:?}");
+    }
+
+    /// `-b` byte ranges + `--complement` over an in-memory sink.
+    #[test]
+    fn test_cut_injected_io_bytes_complement() {
+        let input: &[u8] = b"abcdef\n";
+        let mut reader = input;
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+
+        // Keep bytes 2-4 complemented -> drop 2..=4, keep 1,5,6 -> "aef".
+        let args = ["cut", "-b", "2-4", "--complement"]
+            .iter()
+            .map(|s| OsString::from(*s));
+        cut(args, &mut out, &mut err, &mut reader).unwrap();
+
+        assert_eq!(out, b"aef\n".to_vec());
+        assert!(err.is_empty());
+    }
+
+    /// `-s` suppresses lines with no delimiter; the delimited line still prints.
+    #[test]
+    fn test_cut_injected_io_only_delimited() {
+        let input: &[u8] = b"no-delim\nx:y\n";
+        let mut reader = input;
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+
+        let args = ["cut", "-d:", "-f1", "-s"]
+            .iter()
+            .map(|s| OsString::from(*s));
+        cut(args, &mut out, &mut err, &mut reader).unwrap();
+
+        assert_eq!(out, b"x\n".to_vec());
+        assert!(err.is_empty());
+    }
 }
