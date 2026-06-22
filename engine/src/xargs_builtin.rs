@@ -144,6 +144,22 @@ impl brush_core::builtins::Command for XargsBuiltin {
             Ok(handle) => handle.join().unwrap_or(1),
             Err(_) => 1,
         };
-        Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
+        Ok(brush_core::results::ExecutionResult::new(exit_code_to_u8(code)))
     }
+}
+
+/// Narrow xargs's `i32` exit code to the `u8` an `ExecutionResult` carries
+/// WITHOUT fabricating a bogus value for a signal death.
+///
+/// The vendored findutils follows the GNU convention internally: a command
+/// killed by signal N is reported as `128 + N` (xargs's `map_code` does exactly
+/// this), and GNU xargs's own status codes (123/124/125/126/127) all fit a
+/// `u8`. The old `(code & 0xff) as u8` was wrong for any code outside 0..=255 —
+/// it would wrap an out-of-range value (negative sentinel, `256+N`, …) to an
+/// unrelated small number that could look like success or a different status.
+/// Clamp instead: anything that doesn't fit a `u8` becomes 255 (generic
+/// failure), preserving every real exit/signal code and never disguising an
+/// out-of-range one as a plausible status.
+fn exit_code_to_u8(code: i32) -> u8 {
+    u8::try_from(code).unwrap_or(255)
 }

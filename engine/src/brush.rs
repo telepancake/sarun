@@ -137,6 +137,31 @@ use serde_json::Value;
 
 use std::ffi::OsString;
 
+/// Map a finished child's `ExitStatus` to a shell exit code, honouring the
+/// POSIX/GNU "death by signal" convention (T1).
+///
+/// `ExitStatus::code()` returns `None` when the child was KILLED BY A SIGNAL
+/// (SIGSEGV, SIGKILL, SIGPIPE, …) rather than exiting normally. The old code
+/// here collapsed that case with `.code().unwrap_or(127)` (or `_or(1)`), which
+/// reports a bogus "exited 127" for a process that actually CRASHED — masking
+/// the death and giving `$?`/the recipe runner a wrong, non-signal value. Bash
+/// and GNU tools report a signal death as `128 + signo`, so a SIGSEGV (11)
+/// surfaces as 139 and a SIGINT (2) as 130. Reproduce that here so a coreutil
+/// that segfaults / is killed propagates a faithful exit code through brush.
+fn child_exit_code(status: std::process::ExitStatus) -> i32 {
+    use std::os::unix::process::ExitStatusExt;
+    if let Some(code) = status.code() {
+        code
+    } else if let Some(sig) = status.signal() {
+        // Signal death: GNU/bash convention is 128 + signal number.
+        128 + sig
+    } else {
+        // Neither a normal exit nor a signal (should not happen on Unix); fall
+        // back to a generic failure rather than inventing a success.
+        127
+    }
+}
+
 /// A uutils coreutil (`fn(Vec<OsString>) -> i32`) wrapped as a brush-core
 /// `SimpleCommand` so it runs IN-PROCESS as a brush builtin.
 ///
@@ -164,6 +189,30 @@ impl CoreutilWrapper {
 /// `run`, restoring the original afterwards. Returns the run's value. If `of`
 /// already maps to `target_fd` (the common Stdout/Stderr → sink case) nothing is
 /// dup'd. Returns Err with a visible message if `of` has no usable raw fd.
+///
+/// KNOWN RACE — M3 (deferred; see engine AUDIT.md "M3"). `dup2(target_fd)` /
+/// the saved-fd restore here mutate the PROCESS-GLOBAL fd table, not a thread-
+/// or child-local one. The window between the `dup2` above and the restore
+/// below is a critical section over fd 1 (or 2) shared by EVERY thread in this
+/// engine process. The caller (`CoreutilWrapper::execute`) already removes the
+/// worst offender: it routes a `context.spawned_pipeline_stage` coreutil to the
+/// child-local external path (`run_coreutil_external`) instead of here, so a
+/// coreutil running CONCURRENTLY with its sibling pipeline-stage spawns never
+/// enters this function. But that guard is necessary, not sufficient: a
+/// NON-pipeline sibling thread (another box's brush shell, a background async
+/// task, a second concurrent in-process recipe) that reads/writes fd 1/2 during
+/// this window still sees the transiently-redirected fd, or races the restore.
+///
+/// A correct fix is invasive and deliberately NOT attempted here: it means
+/// removing process-global fd mutation entirely — either give each coreutil a
+/// child-local fd setup the way `run_coreutil_external`/`CatBuiltin` already do
+/// (port more utils to logical-I/O entry points, the `uu_cat::cat(out, …)`
+/// model) so no `dup2` of the shared table is needed, OR serialize all
+/// in-process coreutil execution behind a process-wide fd-table mutex (kills the
+/// concurrency this path exists for). Both are larger than this change's scope;
+/// the narrow `spawned_pipeline_stage` guard makes the common configure/make
+/// workload correct, and the residual cross-thread race is logged as M3 to be
+/// addressed with the broader logical-I/O port, not patched riskily here.
 fn with_fd_redirected<R>(
     target_fd: i32,
     of: &brush_core::openfiles::OpenFile,
@@ -229,7 +278,8 @@ fn run_coreutil_external<SE: brush_core::extensions::ShellExtensions>(
         }
     };
     match cmd.status() {
-        Ok(s) => s.code().unwrap_or(127),
+        // T1: honour signal deaths (128 + signo) instead of collapsing them to 127.
+        Ok(s) => child_exit_code(s),
         Err(e) => {
             eprintln!("/bin/sh: line 1: {name}: command not found ({e})");
             127
@@ -481,7 +531,9 @@ impl brush_core::builtins::SimpleCommand for EngineSelfCommand {
         if let Some(s) = Self::stdio_from(&context.try_fd(1)) { cmd.stdout(s); }
         if let Some(s) = Self::stdio_from(&context.try_fd(2)) { cmd.stderr(s); }
         let code = match cmd.status() {
-            Ok(s) => s.code().unwrap_or(1),
+            // T1: a signal death of the re-exec'd engine reports 128 + signo,
+            // not a bogus "exited 1".
+            Ok(s) => child_exit_code(s),
             Err(e) => { eprintln!("{name}: cannot exec engine: {e}"); 127 }
         };
         Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
@@ -528,6 +580,25 @@ fn box_builtins_opt<SE: brush_core::extensions::ShellExtensions>(
         // bundle_coreutils — make recipes still use external cat (see above).
         m.insert("cat".to_string(), simple_builtin::<CatBuiltin, SE>());
     }
+    // sarun: `cp` is bundled IN-PROCESS even when the broad coreutils bundle is
+    // OFF (the make-recipe / kati path passes bundle_coreutils=false to dodge
+    // the uucore Fluent localization OnceLock — see this fn's doc above).
+    // Bundling ONE util does not re-open that hazard: the localization global
+    // only governs IN-PROCESS uutils, and with the broad bundle off `cp` is the
+    // SOLE in-process uutil, so it can poison nothing else (every OTHER util in
+    // a make recipe still forks the GNU host binary, which renders its own
+    // messages). gate_cp keeps this conservative — only the simple plain-copy
+    // argvs (`cp SRC DST`, `cp SRC... DIR`, the audited -r/-a/-p/… cluster) run
+    // in-process; anything it refuses (--help/--version, --preserve= grammars,
+    // backup/reflink/interactive, …) falls back to GNU `cp` via
+    // run_coreutil_external. This makes a build recipe's `cp $< $@` run in this
+    // process (no /usr/bin/cp fork) for BOTH the n2 (bundle=true) and kati
+    // (bundle=false) recipe paths. No CatBuiltin-style native variant: `cp` does
+    // not stream the box's logical stdout sink (it operates on named paths via
+    // the FUSE overlay), so the generic CoreutilWrapper is the right wrapper.
+    // If bundle_coreutils was true the loop above already inserted this same
+    // registration; re-inserting is idempotent.
+    m.insert("cp".to_string(), simple_builtin::<CoreutilWrapper, SE>());
     // BashMode shell builtins overwrite overlaps (highest priority).
     m.extend(brush_builtins::default_builtins(brush_builtins::BuiltinSet::BashMode));
     // In-box engine entry points (no PATH shadow): `sarun` / `oaita` re-exec
@@ -822,7 +893,21 @@ fn stage_record(cmd: &brush_parser::ast::Command) -> Value {
 /// Send a FRAME_PROV frame carrying one provenance JSON object over the box
 /// channel. Best-effort: a blocked/closed channel must not abort the box.
 fn send_prov(conn_fd: i32, rec: &Value) {
-    let payload = serde_json::to_vec(rec).unwrap_or_default();
+    // A serialization failure here used to `unwrap_or_default()` to an EMPTY
+    // payload and ship it as a FRAME_PROV anyway — the engine would then decode
+    // an empty/invalid provenance record, silently CORRUPTING the box's
+    // provenance with a phantom empty pipeline. `Value` is in-memory and should
+    // always serialize, so a failure is genuinely exceptional; log it and DROP
+    // the frame rather than emitting a malformed one. (Provenance is advisory:
+    // a missing row is recoverable, a corrupt row is not.)
+    let payload = match serde_json::to_vec(rec) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("sarun-engine brush: dropping provenance frame, \
+                       JSON serialize failed: {e}");
+            return;
+        }
+    };
     let frame = crate::frames::encode(crate::frames::FRAME_PROV, &payload);
     unsafe { libc::write(conn_fd, frame.as_ptr().cast(), frame.len()); }
 }

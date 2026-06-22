@@ -108,9 +108,28 @@ pub fn echo_payload(stream: u8, data: &[u8]) -> Vec<u8> {
     v
 }
 
+/// Maximum total-len (type byte + payload) we will accept for one frame. The
+/// wire prefix is a raw u32, so without a cap a box could declare a length up
+/// toward 4 GiB and the reader's accumulator would keep growing as it waits for
+/// the (never-arriving) rest of the frame — a memory-exhaustion lever from
+/// inside the box (audit L3). Every legitimate frame is small: control frames
+/// are a handful of bytes, and the largest payloads (ECHO / PTY_DATA) are
+/// bounded by the readers' 64 KiB recv buffers. 16 MiB is far above any real
+/// frame yet far below a buffer-growth DoS, so an over-cap length can only be a
+/// bug or an attack.
+pub const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
+
 /// Decode as many whole frames as `buf` holds. Returns (frames, consumed) where
 /// `consumed` is the number of leading bytes that formed whole frames; the
 /// caller keeps `buf[consumed..]` as the partial-frame remainder for next time.
+///
+/// A declared total-len exceeding [`MAX_FRAME_LEN`] is rejected rather than
+/// trusted: we never allocate (or wait to accumulate) an oversized payload.
+/// Such a length means the stream is corrupt or hostile, so we stop and report
+/// the WHOLE buffer as consumed — the caller drains its accumulator (bounding
+/// its memory) and the now-desynced connection drops on its next read. This is
+/// the only safe move on a length-prefixed stream once a frame boundary is no
+/// longer trustworthy; silently skipping the header would just desync further.
 pub fn decode(buf: &[u8]) -> (Vec<(u8, Vec<u8>)>, usize) {
     let mut out = vec![];
     let mut i = 0usize;
@@ -118,6 +137,12 @@ pub fn decode(buf: &[u8]) -> (Vec<(u8, Vec<u8>)>, usize) {
     while n - i >= 4 {
         let tot = u32::from_be_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]])
             as usize;
+        if tot > MAX_FRAME_LEN {
+            // Oversized declared length: refuse it. Consume everything so the
+            // caller's accumulator cannot grow toward 4 GiB waiting for bytes
+            // that must not be allocated.
+            return (out, n);
+        }
         if n - (i + 4) < tot {
             break; // partial frame: stop, keep remainder
         }
