@@ -5350,6 +5350,10 @@ dependencies = [
  "tree-sitter-rust",
  "tui-term",
  "uu_cat",
+ "uu_head",
+ "uu_nl",
+ "uu_tac",
+ "uu_wc",
 ]
 
 [[package]]
@@ -7136,8 +7140,6 @@ dependencies = [
 [[package]]
 name = "uu_head"
 version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "584ec5c7cc8dea56ff27caebab105b78230d071a72da32c46942383afae63ba7"
 dependencies = [
  "clap",
  "fluent",
@@ -7285,8 +7287,6 @@ dependencies = [
 [[package]]
 name = "uu_nl"
 version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "45b97f35bfc870d794a8e344814168ccabe3cd6d99a034f2b1cfbe397b50111b"
 dependencies = [
  "clap",
  "fluent",
@@ -7634,8 +7634,6 @@ dependencies = [
 [[package]]
 name = "uu_tac"
 version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dd42244db1f0b0cb96d427c615c0625b37ba9531932daa7e3d16da9b341eb7b6"
 dependencies = [
  "clap",
  "fluent",
@@ -7817,8 +7815,6 @@ dependencies = [
 [[package]]
 name = "uu_wc"
 version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1259afb879ebe4a9c5bc5e969b7806fbeaaea0e3a4c765c602258aaaee5f1b57"
 dependencies = [
  "bytecount",
  "clap",

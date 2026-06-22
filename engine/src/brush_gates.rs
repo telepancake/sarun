@@ -219,6 +219,337 @@ fn gate_cat(args: &[OsString]) -> bool {
     true
 }
 
+/// `head [-c [-]NUM] [-n [-]NUM] [-q] [-v] [-z] [FILE...]` — first lines/bytes.
+///
+/// The vendored `uu_head` fork reproduces GNU 9.4 byte-for-byte (stdout AND exit
+/// code) across the full functional flag set — verified by an 80-case
+/// differential battery (positive/negative `-n`/`-c`, `--lines`/`--bytes`,
+/// `=`-joined values, `-q`/`--quiet`/`--silent`, `-v`/`--verbose`,
+/// `-z`/`--zero-terminated`, obsolete `-NUM[bkmcqvz]` syntax, short clusters,
+/// multi-file `==>` headers, empty/no-newline/large/binary/NUL inputs).
+///
+/// EXCLUDED (divergent or unaudited) — fall back to host binary:
+///   --help, --version        (uutils wording != GNU)
+///   --presume-input-pipe     (uutils-internal hidden flag; GNU rejects it)
+///   `-nq`/`-cq` (non-numeric attached value to -n/-c): uutils accepts (exit 0),
+///   GNU errors (exit 1) — so an attached -c/-n value is accepted only if it
+///   begins with `-` or a digit.
+fn gate_head(args: &[OsString]) -> bool {
+    const SAFE_LONG_BARE: &[&[u8]] = &[
+        b"--quiet",
+        b"--silent",
+        b"--verbose",
+        b"--zero-terminated",
+    ];
+    const SAFE_LONG_VALUED: &[&[u8]] = &[b"--bytes", b"--lines"];
+
+    let mut it = args.iter().skip(1).peekable();
+    let mut opts_done = false;
+    while let Some(a) = it.next() {
+        let b = a.as_bytes();
+        if opts_done {
+            continue; // positional file after `--`
+        }
+        if b == b"--" {
+            opts_done = true;
+        } else if b == b"-" || !b.starts_with(b"-") {
+            continue; // stdin, or a filename
+        } else if b.starts_with(b"--") {
+            let head = match b.iter().position(|&c| c == b'=') {
+                Some(eq) => &b[..eq],
+                None => b,
+            };
+            let has_eq = head.len() != b.len();
+            if SAFE_LONG_BARE.contains(&head) {
+                if has_eq {
+                    return false; // a bare flag doesn't take `=value`
+                }
+            } else if SAFE_LONG_VALUED.contains(&head) {
+                if !has_eq {
+                    // value is the next token; consume it.
+                    if it.next().is_none() {
+                        return false;
+                    }
+                }
+            } else {
+                return false; // --help/--version/--presume-input-pipe/unknown
+            }
+        } else {
+            // Short form. Either obsolete `-NUM…` (a digit right after `-`) or a
+            // cluster of audited letters.
+            let rest = &b[1..];
+            if rest.first().is_some_and(u8::is_ascii_digit) {
+                continue; // obsolete `-5`, `-2c`, … (differential-tested)
+            }
+            let mut i = 0;
+            let mut consumed_next = false;
+            while i < rest.len() {
+                match rest[i] {
+                    b'q' | b'v' | b'z' => i += 1,
+                    b'c' | b'n' => {
+                        if i + 1 < rest.len() {
+                            // attached value `-n5`/`-n-1`/`-c2b`: must look
+                            // numeric (a leading `-` or digit). Rejects `-nq`/`-cq`.
+                            let v = &rest[i + 1..];
+                            if !(v[0] == b'-' || v[0].is_ascii_digit()) {
+                                return false;
+                            }
+                            i = rest.len();
+                        } else {
+                            consumed_next = true;
+                            i += 1;
+                        }
+                    }
+                    _ => return false, // unaudited short letter
+                }
+            }
+            if consumed_next && it.next().is_none() {
+                return false; // `-n` with no following value
+            }
+        }
+    }
+    true
+}
+
+/// `wc [-c -l] [--bytes --lines] [--total=auto|always|only|never] [FILE...]`
+///
+/// SAFE (verified byte-for-byte equal to GNU /usr/bin/wc in this container's
+/// C/POSIX locale): `-c`/`--bytes` and `-l`/`--lines` (both locale-independent,
+/// so they match on ASCII or multibyte input), `--total=auto|always|only|never`,
+/// and at least one explicit FILE arg OR a single counter on stdin.
+///
+/// EXCLUDED (uutils diverges — fall back to host binary): `-w`/`--words`,
+/// `-m`/`--chars`, `-L`/`--max-line-length`, and the DEFAULT no-count case
+/// (uutils always Unicode-decodes while GNU in C locale counts bytes / splits on
+/// whitespace bytes); multi-counter reads from stdin (uutils forces width 7,
+/// GNU sizes from a regular file behind `< file`); `--files0-from`, `--debug`,
+/// `--help`, `--version`, and any unaudited option.
+fn gate_wc(args: &[OsString]) -> bool {
+    let mut n_counters: u32 = 0;          // distinct counters requested
+    let mut have_file = false;            // a real path positional (not '-')
+    let mut have_explicit_stdin = false;  // a '-' token
+    let mut opts_done = false;
+
+    const SAFE_LONG: &[&[u8]] = &[b"--bytes", b"--lines"];
+
+    for a in args.iter().skip(1) {
+        let b = a.as_bytes();
+        if opts_done {
+            if b == b"-" { have_explicit_stdin = true; } else { have_file = true; }
+            continue;
+        }
+        if b == b"--" {
+            opts_done = true;
+        } else if b == b"-" {
+            have_explicit_stdin = true;
+        } else if !b.starts_with(b"-") {
+            have_file = true;
+        } else if b.starts_with(b"--") {
+            if SAFE_LONG.contains(&b) {
+                n_counters += 1;
+            } else if b == b"--total" || b.starts_with(b"--total=") {
+                continue; // total policy: safe, not a counter
+            } else {
+                return false; // --words/--chars/--max-line-length/--help/…
+            }
+        } else {
+            // short cluster: every letter must be an audited-safe counter.
+            for c in &b[1..] {
+                match c {
+                    b'c' | b'l' => n_counters += 1,
+                    _ => return false, // -w / -m / -L / unknown short flag
+                }
+            }
+        }
+    }
+
+    if n_counters == 0 {
+        return false; // default implies words, which diverges
+    }
+    if n_counters > 1 && (!have_file || have_explicit_stdin) {
+        return false; // multi-counter stdin column-width divergence
+    }
+    true
+}
+
+/// `nl [-b STYLE] [-f STYLE] [-h STYLE] [-d CC] [-n FORMAT] [-w N] [-s STR]
+///    [-v N] [-i N] [-l N] [-p] [FILE]` — number lines.
+///
+/// The vendored `uu_nl` fork reproduces GNU's numbered output byte-for-byte for
+/// the full formatting set and the single-file read-error / directory-target
+/// paths. EXCLUDED: `--help`/`--version` (text); a value-flag whose value is a
+/// SEPARATED leading-dash token (`-v -3`, `-w -5`) which clap rejects though GNU
+/// accepts (attached `-v-3`/`-v=-3`/`--long=-3` are fine); an INVALID style/
+/// format/width value (wording differs); and 2+ FILE operands (uutils aborts on a
+/// missing file mid-list while GNU continues — the gate can't stat at parse time).
+fn gate_nl(args: &[OsString]) -> bool {
+    fn is_style(v: &[u8]) -> bool {
+        matches!(v, b"a" | b"t" | b"n") || v.first() == Some(&b'p')
+    }
+    fn is_format(v: &[u8]) -> bool { matches!(v, b"ln" | b"rn" | b"rz") }
+    fn is_pos_int(v: &[u8]) -> bool {
+        !v.is_empty() && v.iter().all(u8::is_ascii_digit)
+    }
+    fn is_nonzero_width(v: &[u8]) -> bool { is_pos_int(v) && v != b"0" }
+
+    let mut opts_done = false;
+    let mut operands = 0usize;
+    let mut i = 1;
+    while i < args.len() {
+        let b = args[i].as_bytes();
+        if opts_done {
+            operands += 1;
+            if operands > 1 { return false; }
+            i += 1;
+            continue;
+        }
+        if b == b"--" { opts_done = true; i += 1; continue; }
+        if b == b"-" || !b.starts_with(b"-") {
+            operands += 1;
+            if operands > 1 { return false; }
+            i += 1;
+            continue;
+        }
+
+        if b.starts_with(b"--") {
+            let (name, attached): (&[u8], Option<&[u8]>) =
+                match b.iter().position(|&c| c == b'=') {
+                    Some(p) => (&b[..p], Some(&b[p + 1..])),
+                    None => (b, None),
+                };
+            macro_rules! value {
+                () => {{
+                    match attached {
+                        Some(v) => v,
+                        None => {
+                            i += 1;
+                            if i >= args.len() { return false; }
+                            args[i].as_bytes()
+                        }
+                    }
+                }};
+            }
+            match name {
+                b"--body-numbering" | b"--footer-numbering" | b"--header-numbering" => {
+                    let v = value!();
+                    if v.starts_with(b"-") || !is_style(v) { return false; }
+                }
+                b"--number-format" => {
+                    let v = value!();
+                    if v.starts_with(b"-") || !is_format(v) { return false; }
+                }
+                b"--number-width" => {
+                    let v = value!();
+                    if v.starts_with(b"-") || !is_nonzero_width(v) { return false; }
+                }
+                b"--line-increment" | b"--join-blank-lines"
+                | b"--starting-line-number" => {
+                    let v = value!();
+                    if v.starts_with(b"-") || !is_pos_int(v) { return false; }
+                }
+                b"--section-delimiter" | b"--number-separator" => {
+                    let _ = value!(); // any string value is fine
+                }
+                b"--no-renumber" => {} // takes no value
+                _ => return false, // --help/--version/unknown long option
+            }
+            i += 1;
+            continue;
+        }
+
+        // Short option (possibly with an attached value, e.g. `-ba`, `-w3`).
+        let body = &b[1..];
+        let c = body[0];
+        let rest = &body[1..]; // attached value, if any
+        match c {
+            b'p' => { if !rest.is_empty() { return false; } } // -p takes no value
+            b'b' | b'f' | b'h' | b'n' | b'i' | b'l' | b'v' | b'w' | b's' | b'd' => {
+                let owned;
+                let v: &[u8] = if rest.is_empty() {
+                    i += 1;
+                    if i >= args.len() { return false; }
+                    owned = args[i].as_bytes().to_vec();
+                    &owned
+                } else {
+                    rest
+                };
+                let ok = match c {
+                    b'b' | b'f' | b'h' => !v.starts_with(b"-") && is_style(v),
+                    b'n' => !v.starts_with(b"-") && is_format(v),
+                    b'w' => !v.starts_with(b"-") && is_nonzero_width(v),
+                    b'i' | b'l' | b'v' => !v.starts_with(b"-") && is_pos_int(v),
+                    b's' | b'd' => true, // any string value
+                    _ => false,
+                };
+                if !ok { return false; }
+            }
+            _ => return false, // unaudited short flag
+        }
+        i += 1;
+    }
+    true
+}
+
+/// `tac [-b] [-r] [-s SEP] [FILE...]` — reverse-concatenate lines.
+///
+/// uutils matches GNU byte-for-byte for the real work. SAFE: `-b`/`--before`,
+/// `-r`/`--regex` (valid regexes match GNU exactly; only the *error* text differs
+/// on a malformed regex, and exit code agrees at 1), `-s STR`/`--separator=STR`
+/// (incl. `-sSTR`, clustered `-brs:`). EXCLUDED: `--help`/`--version` (branding);
+/// any unaudited long option; and a REPEATED `-s`/`--separator` — GNU lets the
+/// last win (exit 0) while uutils errors "cannot be used multiple times" (exit 1),
+/// a genuine exit-code divergence, so reject >1 occurrence.
+fn gate_tac(args: &[OsString]) -> bool {
+    const SAFE_LONG: &[&[u8]] = &[b"--before", b"--regex"];
+    let mut opts_done = false;
+    let mut sep_count = 0usize; // number of -s / --separator occurrences
+
+    let mut it = args.iter().skip(1);
+    while let Some(a) = it.next() {
+        let b = a.as_bytes();
+        if opts_done {
+            continue; // positional file after `--`
+        }
+        if b == b"--" {
+            opts_done = true;
+        } else if b == b"-" || !b.starts_with(b"-") {
+            continue; // stdin, or a filename
+        } else if b == b"--separator" {
+            sep_count += 1;
+            let _ = it.next(); // value is the next token; consume it
+        } else if b.starts_with(b"--separator=") {
+            sep_count += 1;
+        } else if b.starts_with(b"--") {
+            if !SAFE_LONG.contains(&b) {
+                return false; // --help/--version/unaudited long opt
+            }
+        } else {
+            // A short cluster like "-b", "-r", "-br", "-s:", "-brs:".
+            let cluster = &b[1..];
+            let mut i = 0;
+            while i < cluster.len() {
+                match cluster[i] {
+                    b'b' | b'r' => i += 1,
+                    b's' => {
+                        sep_count += 1;
+                        if i + 1 < cluster.len() {
+                            i = cluster.len(); // value attached, cluster done
+                        } else {
+                            let _ = it.next(); // value is next token
+                            i += 1;
+                        }
+                    }
+                    _ => return false, // unaudited short flag
+                }
+            }
+        }
+        if sep_count > 1 {
+            return false; // repeated separator diverges from GNU
+        }
+    }
+    sep_count <= 1
+}
+
 // ── agents add per-util gates BELOW this line ────────────────────────
 // One function per util, alphabetical. Register the new fn in
 // `gate_table()` above. Leave a 2-3 line comment explaining what
