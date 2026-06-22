@@ -180,6 +180,10 @@ NO_FD0_CASES = [
     ("echo|cat|wc -c",    "echo hi | cat | wc -c"),
     ("printf|tac",        'printf "a\\nb\\n" | tac'),
     ("printf|nl",         'printf "a\\nb\\n" | nl'),
+    # `< file` stdin redirection: the builtin reads the FILE fd, not fd 0.
+    ("head -n1 < file",   "head -n1 < v.txt"),
+    ("wc -l < file",      "wc -l < v.txt"),
+    ("cat < file",        "cat < v.txt"),
 ]
 
 
@@ -309,6 +313,12 @@ PURE_CASES = [
     ("export + printenv (in-proc)",   "export X=42; printenv X"),
     ("cd sub + pwd (logical cwd)",    "cd sub && pwd"),
     ("echo|cat|wc 3-stage (in-proc)", "echo hi | cat | wc -c"),
+    # exec-wrappers dispatch their residual THROUGH brush: a builtin command runs
+    # in-process (no fork). (The nice/setsid/nohup disposition is materialized in
+    # the forked child only for an EXTERNAL residual, at exec.)
+    ("nice <builtin> (via brush)",    "nice -n 5 cat v.txt"),
+    ("setsid <builtin> (via brush)",  "setsid cat v.txt"),
+    ("nohup <builtin> (via brush)",   "nohup cat v.txt"),
 ]
 
 
