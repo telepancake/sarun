@@ -162,13 +162,10 @@ fn child_exit_code(status: std::process::ExitStatus) -> i32 {
     }
 }
 
-/// Run a native coreutil entry on a FRESH thread so it gets its own thread-local
-/// uucore localization bundle. uucore caches a util's Fluent strings in a
-/// thread-local `LOCALIZER` behind a thread-local "already set" guard, so the
-/// FIRST util to run on a thread wins the slot and any later DIFFERENT util would
-/// emit raw Fluent keys (e.g. `head-error-cannot-open`). A new thread per
-/// invocation gives each util a clean slot — and a thread is far cheaper than the
-/// fork+exec it replaces. Returns the util's exit code (1 on spawn/join failure).
+/// Run a coreutil on a fresh thread so it gets its own thread-local uucore Fluent bundle.
+/// uucore's thread-local `LOCALIZER` has a "set once per thread" guard: the first util to
+/// run on a thread wins the slot, so any second distinct util would emit raw Fluent keys
+/// (e.g. `head-error-cannot-open`). Returns the util's exit code (1 on spawn/join failure).
 fn run_coreutil_localized(
     util: &'static str,
     body: impl FnOnce() -> i32 + Send + 'static,
@@ -184,15 +181,8 @@ fn run_coreutil_localized(
     }
 }
 
-/// `cat` — NATIVE in-process brush builtin over the vendored `uu_cat` fork.
-///
-/// Runs uutils' `cat` IN-PROCESS, UNCONDITIONALLY: it reads/logical stdin and writes the box's
-/// logical `OpenFile` sink/source directly — no process-global stdio, no `dup2`,
-/// so it is safe as a concurrent pipeline stage. There is no per-argv gate and no
-/// fork-to-the-box's-binary fallback; the vendored fork is patched to match
-/// POSIX/GNU where uutils diverged, and otherwise behaves as uutils (this box's
-/// coreutils IS uutils). The call runs on a fresh thread for localization
-/// isolation — see [`run_coreutil_localized`].
+/// `cat` — STREAM template: injected logical stdin/stdout with the `splice(2)` fast path intact.
+/// See [`run_coreutil_localized`] for the thread-per-call localization isolation.
 struct CatBuiltin;
 
 impl brush_core::builtins::SimpleCommand for CatBuiltin {
@@ -240,15 +230,7 @@ impl brush_core::builtins::SimpleCommand for CatBuiltin {
     }
 }
 
-/// `head` — NATIVE in-process brush builtin over the vendored `uu_head` fork.
-///
-/// Runs uutils' `head` IN-PROCESS, UNCONDITIONALLY: it reads/logical stdin and writes the box's
-/// logical `OpenFile` sink/source directly — no process-global stdio, no `dup2`,
-/// so it is safe as a concurrent pipeline stage. There is no per-argv gate and no
-/// fork-to-the-box's-binary fallback; the vendored fork is patched to match
-/// POSIX/GNU where uutils diverged, and otherwise behaves as uutils (this box's
-/// coreutils IS uutils). The call runs on a fresh thread for localization
-/// isolation — see [`run_coreutil_localized`].
+/// `head` — STREAM template: injected logical stdin/stdout/stderr. See [`run_coreutil_localized`].
 struct HeadBuiltin;
 
 impl brush_core::builtins::SimpleCommand for HeadBuiltin {
@@ -296,13 +278,7 @@ impl brush_core::builtins::SimpleCommand for HeadBuiltin {
     }
 }
 
-/// `tail` — NATIVE in-process brush builtin over the vendored `uu_tail` fork.
-///
-/// STREAM template, like [`HeadBuiltin`]: it reads the box's logical stdin and
-/// writes its logical stdout/stderr directly — no process-global stdio, no
-/// `dup2`, pipeline-safe — with no logical-cwd seam (operands are opened by
-/// literal path). The call runs on a fresh thread for localization isolation —
-/// see [`run_coreutil_localized`].
+/// `tail` — STREAM template like [`HeadBuiltin`]. See [`run_coreutil_localized`].
 struct TailBuiltin;
 
 impl brush_core::builtins::SimpleCommand for TailBuiltin {
@@ -354,15 +330,7 @@ impl brush_core::builtins::SimpleCommand for TailBuiltin {
     }
 }
 
-/// `wc` — NATIVE in-process brush builtin over the vendored `uu_wc` fork.
-///
-/// Runs uutils' `wc` IN-PROCESS, UNCONDITIONALLY: it reads/logical stdin and writes the box's
-/// logical `OpenFile` sink/source directly — no process-global stdio, no `dup2`,
-/// so it is safe as a concurrent pipeline stage. There is no per-argv gate and no
-/// fork-to-the-box's-binary fallback; the vendored fork is patched to match
-/// POSIX/GNU where uutils diverged, and otherwise behaves as uutils (this box's
-/// coreutils IS uutils). The call runs on a fresh thread for localization
-/// isolation — see [`run_coreutil_localized`].
+/// `wc` — STREAM template like [`HeadBuiltin`]. See [`run_coreutil_localized`].
 struct WcBuiltin;
 
 impl brush_core::builtins::SimpleCommand for WcBuiltin {
@@ -410,15 +378,7 @@ impl brush_core::builtins::SimpleCommand for WcBuiltin {
     }
 }
 
-/// `nl` — NATIVE in-process brush builtin over the vendored `uu_nl` fork.
-///
-/// Runs uutils' `nl` IN-PROCESS, UNCONDITIONALLY: it reads/logical stdin and writes the box's
-/// logical `OpenFile` sink/source directly — no process-global stdio, no `dup2`,
-/// so it is safe as a concurrent pipeline stage. There is no per-argv gate and no
-/// fork-to-the-box's-binary fallback; the vendored fork is patched to match
-/// POSIX/GNU where uutils diverged, and otherwise behaves as uutils (this box's
-/// coreutils IS uutils). The call runs on a fresh thread for localization
-/// isolation — see [`run_coreutil_localized`].
+/// `nl` — STREAM template like [`HeadBuiltin`]. See [`run_coreutil_localized`].
 struct NlBuiltin;
 
 impl brush_core::builtins::SimpleCommand for NlBuiltin {
@@ -464,15 +424,7 @@ impl brush_core::builtins::SimpleCommand for NlBuiltin {
     }
 }
 
-/// `tac` — NATIVE in-process brush builtin over the vendored `uu_tac` fork.
-///
-/// Runs uutils' `tac` IN-PROCESS, UNCONDITIONALLY: it reads/logical stdin and writes the box's
-/// logical `OpenFile` sink/source directly — no process-global stdio, no `dup2`,
-/// so it is safe as a concurrent pipeline stage. There is no per-argv gate and no
-/// fork-to-the-box's-binary fallback; the vendored fork is patched to match
-/// POSIX/GNU where uutils diverged, and otherwise behaves as uutils (this box's
-/// coreutils IS uutils). The call runs on a fresh thread for localization
-/// isolation — see [`run_coreutil_localized`].
+/// `tac` — STREAM template like [`HeadBuiltin`]. See [`run_coreutil_localized`].
 struct TacBuiltin;
 
 impl brush_core::builtins::SimpleCommand for TacBuiltin {
@@ -518,15 +470,7 @@ impl brush_core::builtins::SimpleCommand for TacBuiltin {
     }
 }
 
-/// `tr` — NATIVE in-process brush builtin over the vendored `uu_tr` fork.
-///
-/// Runs uutils' `tr` IN-PROCESS, UNCONDITIONALLY: it reads/logical stdin and writes the box's
-/// logical `OpenFile` sink/source directly — no process-global stdio, no `dup2`,
-/// so it is safe as a concurrent pipeline stage. There is no per-argv gate and no
-/// fork-to-the-box's-binary fallback; the vendored fork is patched to match
-/// POSIX/GNU where uutils diverged, and otherwise behaves as uutils (this box's
-/// coreutils IS uutils). The call runs on a fresh thread for localization
-/// isolation — see [`run_coreutil_localized`].
+/// `tr` — STREAM template like [`HeadBuiltin`]. See [`run_coreutil_localized`].
 struct TrBuiltin;
 
 impl brush_core::builtins::SimpleCommand for TrBuiltin {
@@ -572,15 +516,7 @@ impl brush_core::builtins::SimpleCommand for TrBuiltin {
     }
 }
 
-/// `cut` — NATIVE in-process brush builtin over the vendored `uu_cut` fork.
-///
-/// Runs uutils' `cut` IN-PROCESS, UNCONDITIONALLY: it reads/logical stdin and writes the box's
-/// logical `OpenFile` sink/source directly — no process-global stdio, no `dup2`,
-/// so it is safe as a concurrent pipeline stage. There is no per-argv gate and no
-/// fork-to-the-box's-binary fallback; the vendored fork is patched to match
-/// POSIX/GNU where uutils diverged, and otherwise behaves as uutils (this box's
-/// coreutils IS uutils). The call runs on a fresh thread for localization
-/// isolation — see [`run_coreutil_localized`].
+/// `cut` — STREAM template like [`HeadBuiltin`]. See [`run_coreutil_localized`].
 struct CutBuiltin;
 
 impl brush_core::builtins::SimpleCommand for CutBuiltin {
@@ -626,15 +562,7 @@ impl brush_core::builtins::SimpleCommand for CutBuiltin {
     }
 }
 
-/// `uniq` — NATIVE in-process brush builtin over the vendored `uu_uniq` fork.
-///
-/// Runs uutils' `uniq` IN-PROCESS, UNCONDITIONALLY: it reads/logical stdin and writes the box's
-/// logical `OpenFile` sink/source directly — no process-global stdio, no `dup2`,
-/// so it is safe as a concurrent pipeline stage. There is no per-argv gate and no
-/// fork-to-the-box's-binary fallback; the vendored fork is patched to match
-/// POSIX/GNU where uutils diverged, and otherwise behaves as uutils (this box's
-/// coreutils IS uutils). The call runs on a fresh thread for localization
-/// isolation — see [`run_coreutil_localized`].
+/// `uniq` — STREAM template like [`HeadBuiltin`]. See [`run_coreutil_localized`].
 struct UniqBuiltin;
 
 impl brush_core::builtins::SimpleCommand for UniqBuiltin {
@@ -680,15 +608,7 @@ impl brush_core::builtins::SimpleCommand for UniqBuiltin {
     }
 }
 
-/// `sort` — NATIVE in-process brush builtin over the vendored `uu_sort` fork.
-///
-/// Runs uutils' `sort` IN-PROCESS, UNCONDITIONALLY: it reads/logical stdin and writes the box's
-/// logical `OpenFile` sink/source directly — no process-global stdio, no `dup2`,
-/// so it is safe as a concurrent pipeline stage. There is no per-argv gate and no
-/// fork-to-the-box's-binary fallback; the vendored fork is patched to match
-/// POSIX/GNU where uutils diverged, and otherwise behaves as uutils (this box's
-/// coreutils IS uutils). The call runs on a fresh thread for localization
-/// isolation — see [`run_coreutil_localized`].
+/// `sort` — STREAM template like [`HeadBuiltin`]. See [`run_coreutil_localized`].
 struct SortBuiltin;
 
 impl brush_core::builtins::SimpleCommand for SortBuiltin {
@@ -734,18 +654,8 @@ impl brush_core::builtins::SimpleCommand for SortBuiltin {
     }
 }
 
-/// `cp` — NATIVE in-process brush builtin over the vendored `uu_cp` fork.
-///
-/// Runs uutils' `cp` IN-PROCESS, UNCONDITIONALLY: it writes the box's logical
-/// `OpenFile` sink/source directly — no process-global stdio, no `dup2`, so it
-/// is safe as a concurrent pipeline stage. There is no per-argv gate and no
-/// fork-to-the-box's-binary fallback; the box's coreutils IS uutils. Unlike the
-/// other coreutils builtins, `cp` operates on FILE OPERANDS, so it also needs
-/// the shell's LOGICAL cwd: brush keeps a logical working directory and never
-/// `chdir`s the process, while `cp` runs on a transient worker thread. The
-/// logical entry [`uu_cp::cp`] resolves every relative operand (and `-t`)
-/// against that `cwd`. `cp` reads no stdin. The call runs on a fresh thread for
-/// localization isolation — see [`run_coreutil_localized`].
+/// `cp` — FILESYSTEM template: resolves relative operands against the shell's logical cwd
+/// (captured before the worker thread runs; the process is never `chdir`'d). See [`run_coreutil_localized`].
 struct CpBuiltin;
 
 impl brush_core::builtins::SimpleCommand for CpBuiltin {
@@ -794,13 +704,7 @@ impl brush_core::builtins::SimpleCommand for CpBuiltin {
     }
 }
 
-/// Define a FILESYSTEM-template builtin (like [`CpBuiltin`]): the util operates
-/// on file operands, so it takes the shell's LOGICAL cwd and resolves relative
-/// operands against it (the process is never `chdir`'d), and routes its
-/// verbose/diagnostic output through the shell's logical out/err. It reads no
-/// stdin. `$entry` is the vendored crate's `(args, cwd, out, err)` logical entry.
-/// Runs on a fresh thread for localization isolation — see
-/// [`run_coreutil_localized`].
+/// FILESYSTEM-template builtin (like [`CpBuiltin`]): no stdin, `(args, cwd, out, err)` entry.
 macro_rules! fs_builtin {
     ($builtin:ident, $util:literal, $entry:path, $thread:literal) => {
         struct $builtin;
@@ -852,12 +756,8 @@ macro_rules! fs_builtin {
 fs_builtin!(MkdirBuiltin, "mkdir", uu_mkdir::mkdir_main, "uu_mkdir");
 fs_builtin!(RmdirBuiltin, "rmdir", uu_rmdir::rmdir_main, "uu_rmdir");
 
-/// `touch` — FILESYSTEM-template builtin like [`CpBuiltin`]. Distinct from the
-/// [`fs_builtin!`] shape because a `-` operand targets the box's LOGICAL fd 1
-/// (passed as a raw fd so `touch -` updates the logical stdout's referent, not
-/// the engine's process fd 1). Operands resolve against the logical cwd;
-/// diagnostics route through the logical err. Reads no stdin. Runs on a fresh
-/// thread for localization isolation — see [`run_coreutil_localized`].
+/// `touch` — FILESYSTEM template. Distinct from [`fs_builtin!`]: a `-` operand passes the logical
+/// fd 1 as a raw fd (so `touch -` updates the logical stdout's referent, not the engine's fd 1).
 struct TouchBuiltin;
 
 impl brush_core::builtins::SimpleCommand for TouchBuiltin {
@@ -906,9 +806,8 @@ impl brush_core::builtins::SimpleCommand for TouchBuiltin {
     }
 }
 
-/// Like [`fs_builtin`] but the util ALSO reads the shell's LOGICAL stdin: `rm
-/// -i`/`mv -i` read the y/N overwrite answer from there, NEVER the engine's fd
-/// 0. `$entry` is the crate's `(args, cwd, out, err, stdin)` logical entry.
+/// Like [`fs_builtin`] but `$entry` takes `(args, cwd, out, err, stdin)`: `rm -i`/`mv -i`
+/// read the y/N answer from the shell's logical stdin, never the engine's fd 0.
 macro_rules! fs_builtin_stdin {
     ($builtin:ident, $util:literal, $entry:path, $thread:literal) => {
         struct $builtin;
@@ -964,29 +863,16 @@ fs_builtin_stdin!(RmBuiltin, "rm", uu_rm::rm_main, "uu_rm");
 fs_builtin_stdin!(MvBuiltin, "mv", uu_mv::mv_main, "uu_mv");
 fs_builtin_stdin!(LnBuiltin, "ln", uu_ln::ln_main, "uu_ln");
 
-// readlink/realpath/mktemp resolve relative operands against the shell's logical
-// cwd and write the logical sinks; they read no stdin, so they share the
-// [`fs_builtin!`] (cwd, no stdin) shape with the same `(args, cwd, out, err)`
-// entry.
 fs_builtin!(ReadlinkBuiltin, "readlink", uu_readlink::readlink, "uu_readlink");
 fs_builtin!(RealpathBuiltin, "realpath", uu_realpath::realpath, "uu_realpath");
 fs_builtin!(MktempBuiltin, "mktemp", uu_mktemp::mktemp_main, "uu_mktemp");
 
-// chmod/install mutate or create paths from file operands; chown changes owner
-// (as non-root it commonly fails — faithfully reported). All resolve relative
-// operands against the shell's logical cwd via their `(args, cwd, out, err)` entry.
 fs_builtin!(ChmodBuiltin, "chmod", uu_chmod::chmod_main, "uu_chmod");
 fs_builtin!(ChownBuiltin, "chown", uu_chown::chown_main, "uu_chown");
 fs_builtin!(InstallBuiltin, "install", uu_install::install_main, "uu_install");
 
-/// `tee` — NATIVE in-process brush builtin over the vendored `uu_tee` fork.
-///
-/// Combines the STREAM and CWD templates: it reads the box's logical stdin
-/// (never the engine's fd 0) and writes its logical stdout AND its file operands
-/// (relative ones resolved against the shell's LOGICAL cwd — the process is
-/// never `chdir`'d), with diagnostics on the logical stderr. The logical entry
-/// is [`uu_tee::tee_main`]. The call runs on a fresh thread for localization
-/// isolation — see [`run_coreutil_localized`].
+/// `tee` — STREAM + CWD: reads logical stdin, writes logical stdout AND file operands
+/// (relative ones resolved against the shell's logical cwd). See [`run_coreutil_localized`].
 struct TeeBuiltin;
 
 impl brush_core::builtins::SimpleCommand for TeeBuiltin {
@@ -1033,15 +919,7 @@ impl brush_core::builtins::SimpleCommand for TeeBuiltin {
     }
 }
 
-/// `basename` — NATIVE in-process brush builtin over the vendored `uu_basename` fork.
-///
-/// Runs uutils' `basename` IN-PROCESS, UNCONDITIONALLY: it reads/writes the box's
-/// logical `OpenFile` sink/source directly — no process-global stdio, no `dup2`,
-/// so it is safe as a concurrent pipeline stage. There is no per-argv gate and no
-/// fork-to-the-box's-binary fallback; the vendored fork is patched to match
-/// POSIX/GNU where uutils diverged, and otherwise behaves as uutils (this box's
-/// coreutils IS uutils). The call runs on a fresh thread for localization
-/// isolation — see [`run_coreutil_localized`].
+/// `basename` — no stdin, no cwd; writes logical out/err. See [`run_coreutil_localized`].
 struct BasenameBuiltin;
 
 impl brush_core::builtins::SimpleCommand for BasenameBuiltin {
@@ -1085,15 +963,7 @@ impl brush_core::builtins::SimpleCommand for BasenameBuiltin {
     }
 }
 
-/// `dirname` — NATIVE in-process brush builtin over the vendored `uu_dirname` fork.
-///
-/// Runs uutils' `dirname` IN-PROCESS, UNCONDITIONALLY: it reads/writes the box's
-/// logical `OpenFile` sink/source directly — no process-global stdio, no `dup2`,
-/// so it is safe as a concurrent pipeline stage. There is no per-argv gate and no
-/// fork-to-the-box's-binary fallback; the vendored fork is patched to match
-/// POSIX/GNU where uutils diverged, and otherwise behaves as uutils (this box's
-/// coreutils IS uutils). The call runs on a fresh thread for localization
-/// isolation — see [`run_coreutil_localized`].
+/// `dirname` — no stdin, no cwd; writes logical out/err. See [`run_coreutil_localized`].
 struct DirnameBuiltin;
 
 impl brush_core::builtins::SimpleCommand for DirnameBuiltin {
@@ -1137,15 +1007,7 @@ impl brush_core::builtins::SimpleCommand for DirnameBuiltin {
     }
 }
 
-/// `seq` — NATIVE in-process brush builtin over the vendored `uu_seq` fork.
-///
-/// Runs uutils' `seq` IN-PROCESS, UNCONDITIONALLY: it reads/writes the box's
-/// logical `OpenFile` sink/source directly — no process-global stdio, no `dup2`,
-/// so it is safe as a concurrent pipeline stage. There is no per-argv gate and no
-/// fork-to-the-box's-binary fallback; the vendored fork is patched to match
-/// POSIX/GNU where uutils diverged, and otherwise behaves as uutils (this box's
-/// coreutils IS uutils). The call runs on a fresh thread for localization
-/// isolation — see [`run_coreutil_localized`].
+/// `seq` — no stdin, no cwd; writes logical out/err. See [`run_coreutil_localized`].
 struct SeqBuiltin;
 
 impl brush_core::builtins::SimpleCommand for SeqBuiltin {
@@ -1189,15 +1051,7 @@ impl brush_core::builtins::SimpleCommand for SeqBuiltin {
     }
 }
 
-/// `expr` — NATIVE in-process brush builtin over the vendored `uu_expr` fork.
-///
-/// Runs uutils' `expr` IN-PROCESS, UNCONDITIONALLY: it reads/writes the box's
-/// logical `OpenFile` sink/source directly — no process-global stdio, no `dup2`,
-/// so it is safe as a concurrent pipeline stage. There is no per-argv gate and no
-/// fork-to-the-box's-binary fallback; the vendored fork is patched to match
-/// POSIX/GNU where uutils diverged, and otherwise behaves as uutils (this box's
-/// coreutils IS uutils). The call runs on a fresh thread for localization
-/// isolation — see [`run_coreutil_localized`].
+/// `expr` — no stdin, no cwd; writes logical out/err. See [`run_coreutil_localized`].
 struct ExprBuiltin;
 
 impl brush_core::builtins::SimpleCommand for ExprBuiltin {
@@ -1241,12 +1095,7 @@ impl brush_core::builtins::SimpleCommand for ExprBuiltin {
     }
 }
 
-/// Define a NATIVE in-process brush builtin over a vendored uutils info-util fork
-/// whose logical entry is `(args, out, err) -> UResult` and reads NO stdin (the
-/// `uname`/`nproc`/`id`/`whoami` shape). Same contract as the stream/arg builtins
-/// above: writes the box's logical sinks (no process-global stdio, no `dup2`,
-/// pipeline-safe), runs on a fresh thread for localization isolation (see
-/// [`run_coreutil_localized`]). `$entry` is the crate's `(args, out, err)` entry.
+/// Info-util builtin (`uname`/`nproc`/`id`/`whoami` shape): `(args, out, err)` entry, no stdin, no cwd.
 macro_rules! info_builtin {
     ($builtin:ident, $util:literal, $entry:path, $thread:literal) => {
         struct $builtin;
@@ -1361,29 +1210,20 @@ impl brush_core::builtins::SimpleCommand for EngineSelfCommand {
     }
 }
 
-/// The set of builtin registrations every box brush shell installs: bundled
-/// coreutils FIRST, then the BashMode shell builtins OVERWRITE any overlapping
-/// names (so brush's own echo/printf/test/[/pwd/kill/etc. win — they must stay
-/// shell builtins). Coreutils fills in the file utilities brush has no builtin
-/// for (cat ls cp mv rm mkdir wc sort cut tr od stat du df …). Finally
-/// `sarun`/`oaita` are added so they resolve in-box without a PATH shadow.
+/// All box brush shell builtin registrations with `bundle_coreutils=true`.
 fn box_builtins<SE: brush_core::extensions::ShellExtensions>()
     -> std::collections::HashMap<String, brush_core::builtins::Registration<SE>> {
     box_builtins_opt(true)
 }
 
-/// Same as [`box_builtins`] but lets the caller exclude bundled uutils
-/// coreutils. The make-recipe path passes `bundle_coreutils=false` so
-/// `cp`/`mkdir`/`ls`/etc. fall through to fork+exec of the host binary.
-/// Reason: uutils localization caches each util's FluentResource in a
-/// process-global `OnceLock` (see uucore::locale::UTIL_FLUENT); the
-/// FIRST util to run on the engine wins that slot for the process's
-/// lifetime, and every subsequent util's `translate!()` lookup against
-/// keys missing from the cached bundle returns the raw key (e.g.
-/// `cp-error-cannot-stat`). For interactive boxes (Phase 1, n2 ninja
-/// recipes) we keep bundled coreutils for in-process speed; for make
-/// recipes we trade speed for bash-compatible output. Standalone rkati
-/// has no in-process shell so this divergence didn't exist there.
+/// Same as [`box_builtins`] but gates the bundled stream/filter coreutils
+/// (`cat`/`head`/`sort`/etc.) behind `bundle_coreutils`. When false (make-recipe
+/// path), those fall through to fork+exec of the host binary. The gate exists
+/// because uucore's process-global `OnceLock`s for Fluent localization mean the
+/// first util to run on the engine poisons later utils' message bundles
+/// (`cp-error-cannot-stat` raw keys). Filesystem-op builtins (`cp`/`rm`/`mv`/…)
+/// are registered unconditionally — each runs on its own thread (uucore's
+/// thread-local Fluent cache gives it its own bundle, so no cross-util poisoning).
 fn box_builtins_opt<SE: brush_core::extensions::ShellExtensions>(
     bundle_coreutils: bool,
 ) -> std::collections::HashMap<String, brush_core::builtins::Registration<SE>> {
@@ -1391,66 +1231,42 @@ fn box_builtins_opt<SE: brush_core::extensions::ShellExtensions>(
     let mut m: std::collections::HashMap<String, brush_core::builtins::Registration<SE>>
         = std::collections::HashMap::new();
     if bundle_coreutils {
-        // NATIVE injected-I/O builtins: each runs the vendored uutils fork
-        // IN-PROCESS against the box's logical OpenFile sink/source (no dup2, no
-        // process-global stdio, pipeline-safe). They run unconditionally — there
-        // is no per-argv gate and no fork-to-the-box's-binary fallback; the
-        // vendored forks are patched to match POSIX/GNU where uutils diverged.
-        // `bundle_coreutils` (false for make recipes) still selects whether these
-        // are bundled at all, to dodge uucore's process-global localization cache.
+        // Gated by `bundle_coreutils` (false for make recipes) to dodge uucore's
+        // process-global localization OnceLock — these share the same cache slot.
         m.insert("cat".to_string(), simple_builtin::<CatBuiltin, SE>());
         m.insert("head".to_string(), simple_builtin::<HeadBuiltin, SE>());
         m.insert("tail".to_string(), simple_builtin::<TailBuiltin, SE>());
         m.insert("wc".to_string(), simple_builtin::<WcBuiltin, SE>());
         m.insert("nl".to_string(), simple_builtin::<NlBuiltin, SE>());
         m.insert("tac".to_string(), simple_builtin::<TacBuiltin, SE>());
-    m.insert("basename".to_string(), simple_builtin::<BasenameBuiltin, SE>());
-    m.insert("dirname".to_string(), simple_builtin::<DirnameBuiltin, SE>());
-    m.insert("seq".to_string(), simple_builtin::<SeqBuiltin, SE>());
-    m.insert("expr".to_string(), simple_builtin::<ExprBuiltin, SE>());
-    m.insert("tr".to_string(), simple_builtin::<TrBuiltin, SE>());
-    m.insert("cut".to_string(), simple_builtin::<CutBuiltin, SE>());
-    m.insert("uniq".to_string(), simple_builtin::<UniqBuiltin, SE>());
-    m.insert("sort".to_string(), simple_builtin::<SortBuiltin, SE>());
-        // Pure stdout info utils (no stdin, no cwd): read read-only system/identity
-        // info, write the box's logical sinks. Same `bundle_coreutils` gate (they
-        // share uucore's localization with cat/head).
+        m.insert("basename".to_string(), simple_builtin::<BasenameBuiltin, SE>());
+        m.insert("dirname".to_string(), simple_builtin::<DirnameBuiltin, SE>());
+        m.insert("seq".to_string(), simple_builtin::<SeqBuiltin, SE>());
+        m.insert("expr".to_string(), simple_builtin::<ExprBuiltin, SE>());
+        m.insert("tr".to_string(), simple_builtin::<TrBuiltin, SE>());
+        m.insert("cut".to_string(), simple_builtin::<CutBuiltin, SE>());
+        m.insert("uniq".to_string(), simple_builtin::<UniqBuiltin, SE>());
+        m.insert("sort".to_string(), simple_builtin::<SortBuiltin, SE>());
         m.insert("uname".to_string(), simple_builtin::<UnameBuiltin, SE>());
         m.insert("nproc".to_string(), simple_builtin::<NprocBuiltin, SE>());
         m.insert("id".to_string(), simple_builtin::<IdBuiltin, SE>());
         m.insert("whoami".to_string(), simple_builtin::<WhoamiBuiltin, SE>());
     }
-    // `cp` is registered REGARDLESS of `bundle_coreutils` (unlike the coreutils
-    // above, which the make-recipe path gates off). Make recipes routinely call
-    // `cp`, and forking the host `/usr/bin/cp` would escape the box's logical
-    // cwd/I/O; the localization-cache hazard that gated the others does not apply
-    // here because `cp` runs on its own fresh thread (`run_coreutil_localized`)
-    // and uucore's Fluent caches are thread-local — so it gets its own message
-    // bundle with no cross-util poisoning. It is registered before the BashMode
-    // extend so a bash `cp` builtin (there is none) could still win; in practice
-    // BashMode defines no `cp`, so this in-process builtin is what runs.
+    // Filesystem-op builtins registered regardless of `bundle_coreutils`: make
+    // recipes call them, they run on their own fresh thread (uucore's thread-local
+    // Fluent caches give each an uncontaminated bundle), and the logical-cwd seam
+    // matters for in-process speed + execution-model consistency.
     m.insert("cp".to_string(), simple_builtin::<CpBuiltin, SE>());
-    // Filesystem-op builtins registered REGARDLESS of `bundle_coreutils`, for the
-    // same reasons as `cp`: make recipes call them, they honor the box's logical
-    // cwd/I/O, and each runs on its own fresh thread so uucore's thread-local
-    // Fluent caches give it an uncontaminated message bundle.
     m.insert("mkdir".to_string(), simple_builtin::<MkdirBuiltin, SE>());
     m.insert("rmdir".to_string(), simple_builtin::<RmdirBuiltin, SE>());
     m.insert("rm".to_string(), simple_builtin::<RmBuiltin, SE>());
     m.insert("mv".to_string(), simple_builtin::<MvBuiltin, SE>());
     m.insert("ln".to_string(), simple_builtin::<LnBuiltin, SE>());
     m.insert("touch".to_string(), simple_builtin::<TouchBuiltin, SE>());
-    // Path-resolving + stream builtins registered REGARDLESS of `bundle_coreutils`,
-    // for the same reasons as `cp`: they appear in configure/build scripts, honor
-    // the box's logical cwd/I/O (and, for `tee`, logical stdin), and each runs on
-    // its own fresh thread so uucore's thread-local Fluent caches give it an
-    // uncontaminated message bundle.
     m.insert("readlink".to_string(), simple_builtin::<ReadlinkBuiltin, SE>());
     m.insert("realpath".to_string(), simple_builtin::<RealpathBuiltin, SE>());
     m.insert("mktemp".to_string(), simple_builtin::<MktempBuiltin, SE>());
     m.insert("tee".to_string(), simple_builtin::<TeeBuiltin, SE>());
-    // chmod/chown/install: filesystem-op builtins like `cp`, registered
-    // regardless of `bundle_coreutils` (build/install recipes lean on them).
     m.insert("chmod".to_string(), simple_builtin::<ChmodBuiltin, SE>());
     m.insert("chown".to_string(), simple_builtin::<ChownBuiltin, SE>());
     m.insert("install".to_string(), simple_builtin::<InstallBuiltin, SE>());
@@ -1460,32 +1276,18 @@ fn box_builtins_opt<SE: brush_core::extensions::ShellExtensions>(
     // the inner runner's own binary via /proc/self/exe.
     m.insert("sarun".to_string(), simple_builtin::<EngineSelfCommand, SE>());
     m.insert("oaita".to_string(), simple_builtin::<EngineSelfCommand, SE>());
-    // In-process `find` (vendored find-only findutils fork). It is neither a
-    // bundled coreutil nor a bash builtin, so it is always present and never
-    // overwritten — registered regardless of `bundle_coreutils` (find does not
-    // share the uucore Fluent localization cache that gated coreutils for make
-    // recipes). It runs against the shell's logical I/O and logical cwd; see
-    // crate::find_builtin.
+    // find/xargs: vendored findutils fork; always present (not under bundle_coreutils).
+    // See crate::find_builtin and crate::xargs_builtin.
     m.insert(
         "find".to_string(),
         builtin::<crate::find_builtin::FindBuiltin, SE>(),
     );
-    // In-process `xargs` (same vendored findutils fork). Like `find`, it is
-    // neither a bundled coreutil nor a bash builtin, so it is always present and
-    // registered regardless of `bundle_coreutils`. It reads the shell's logical
-    // stdin, writes its logical stdout/stderr, and spawns its child commands in
-    // the shell's logical cwd; see crate::xargs_builtin.
     m.insert(
         "xargs".to_string(),
         builtin::<crate::xargs_builtin::XargsBuiltin, SE>(),
     );
-    // In-process exec-wrapper builtins (`env`, `printenv`). These are launcher
-    // front-ends, not ports: they mutate the shell's LOGICAL launch state
-    // (environment, cwd) on a cloned subshell and dispatch the residual command
-    // through brush itself — so `env FOO=bar find .` runs `find` as the
-    // in-process builtin with the modified logical state, no OS process needed.
-    // Registered after the BashMode extend so they win over the uutils coreutil
-    // wrappers of the same name; see crate::exec_wrappers.
+    // env/printenv: launcher front-ends that mutate the shell's logical env/cwd on a
+    // cloned subshell, then dispatch through brush. See crate::exec_wrappers.
     m.insert(
         "env".to_string(),
         builtin::<crate::exec_wrappers::EnvCommand, SE>(),
@@ -1494,10 +1296,8 @@ fn box_builtins_opt<SE: brush_core::extensions::ShellExtensions>(
         "printenv".to_string(),
         builtin::<crate::exec_wrappers::PrintenvCommand, SE>(),
     );
-    // Launch-state exec wrappers (`nice`/`setsid`/`nohup`): same clone-and-
-    // dispatch mechanism, but they set a disposition only a real process can
-    // carry (priority / session / SIGHUP) that materializes in the forked child
-    // at exec; see crate::exec_wrappers and brush_core::LaunchState.
+    // nice/setsid/nohup: same clone-and-dispatch, but set a disposition that only
+    // materializes in a forked child (priority/session/SIGHUP); see brush_core::LaunchState.
     m.insert(
         "nice".to_string(),
         builtin::<crate::exec_wrappers::NiceCommand, SE>(),
