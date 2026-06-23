@@ -239,6 +239,14 @@ fn embed_static_utility_locales(
         Path::new(&manifest_dir).join(format!("locales/{locale}.ftl"))
     })?;
 
+    // sarun patch: rerun when a sibling `uu_*` crate is ADDED or removed.
+    // `embed_component_locales` already emits `rerun-if-changed` per embedded
+    // `.ftl`, but that only tracks locale files present at the last build — a
+    // newly vendored util's directory would otherwise not invalidate this cached
+    // build script, leaving its locales unembedded so it prints raw Fluent keys.
+    // Watching the parent dir makes cargo rerun on the new directory entry.
+    println!("cargo:rerun-if-changed={}", registry_dir.display());
+
     // Collect and sort for deterministic builds
     let mut entries: Vec<_> = std::fs::read_dir(registry_dir)?
         .filter_map(Result::ok)
