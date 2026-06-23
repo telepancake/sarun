@@ -5356,6 +5356,7 @@ dependencies = [
  "uu_dirname",
  "uu_expr",
  "uu_head",
+ "uu_ln",
  "uu_mkdir",
  "uu_mv",
  "uu_nl",
@@ -7193,8 +7194,6 @@ dependencies = [
 [[package]]
 name = "uu_ln"
 version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6f18b16fa96dc02278b48660b06697e824332f4ed5e8d98b74eacf18342af0ff"
 dependencies = [
  "clap",
  "fluent",

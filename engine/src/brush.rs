@@ -908,6 +908,7 @@ macro_rules! fs_builtin_stdin {
 
 fs_builtin_stdin!(RmBuiltin, "rm", uu_rm::rm_main, "uu_rm");
 fs_builtin_stdin!(MvBuiltin, "mv", uu_mv::mv_main, "uu_mv");
+fs_builtin_stdin!(LnBuiltin, "ln", uu_ln::ln_main, "uu_ln");
 
 /// `basename` — NATIVE in-process brush builtin over the vendored `uu_basename` fork.
 ///
@@ -1249,6 +1250,7 @@ fn box_builtins_opt<SE: brush_core::extensions::ShellExtensions>(
     m.insert("rmdir".to_string(), simple_builtin::<RmdirBuiltin, SE>());
     m.insert("rm".to_string(), simple_builtin::<RmBuiltin, SE>());
     m.insert("mv".to_string(), simple_builtin::<MvBuiltin, SE>());
+    m.insert("ln".to_string(), simple_builtin::<LnBuiltin, SE>());
     // BashMode shell builtins overwrite overlaps (highest priority).
     m.extend(brush_builtins::default_builtins(brush_builtins::BuiltinSet::BashMode));
     // In-box engine entry points (no PATH shadow): `sarun` / `oaita` re-exec
