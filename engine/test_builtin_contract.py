@@ -297,12 +297,21 @@ EXIT_CASES = [
     ("mkdir -p ok", "mkdir -p md_exit", 0), ("mkdir bad parent", "mkdir /nope/deep", 1),
     ("rmdir ok", "mkdir -p rd_exit && rmdir rd_exit", 0),
     ("rmdir missing", "rmdir /nope/deep", 1),
+    # rmdir -p must walk only the OPERAND's own ancestors (a/b, a), not the cwd
+    # or its filesystem ancestors — exit 0, and `a` is gone (regression: a
+    # cwd-joined operand previously walked up to / and failed).
+    ("rmdir -p", "mkdir -p rdp/x/y && rmdir -p rdp/x/y && [ ! -d rdp ]", 0),
     ("rm ok", "printf x > rm_exit && rm rm_exit", 0),
     ("rm missing", "rm /nope/deep", 1), ("rm -f missing", "rm -f /nope/deep", 0),
     ("mv ok", "printf x > mv_exit && mv mv_exit mv_exit2 && rm -f mv_exit2", 0),
     ("mv missing", "mv /nope/deep /also/nope", 1),
     ("ln ok", "printf x > ln_exit && ln -s ln_exit ln_exit_l && rm -f ln_exit ln_exit_l", 0),
     ("ln missing", "ln /nope/deep /also/nope", 1),
+    # `ln -s` stores the target operand VERBATIM (POSIX): a relative target must
+    # stay relative, not be cwd-rewritten to absolute (regression guard). The
+    # readlink output must equal the literal `tgt`, so exit 0 iff unchanged.
+    ("ln -s relative target verbatim",
+     "ln -sf tgt lnrel && [ \"$(readlink lnrel)\" = tgt ] && rm -f lnrel", 0),
     ("touch ok", "touch tch_exit", 0), ("touch bad dir", "touch /nope/deep", 1),
     ("expr 5", "expr 5", 0), ("expr 0", "expr 0", 1),
     ("expr 1=2", "expr 1 = 2", 1), ("expr 1=1", "expr 1 = 1", 0),
