@@ -6,6 +6,7 @@
 // spell-checker:ignore (API) nodename osname sysname (options) mnrsv mnrsvo
 
 use std::ffi::{OsStr, OsString};
+use std::io::Write;
 
 use clap::{Arg, ArgAction, Command};
 use platform_info::{PlatformInfo, PlatformInfoAPI, UNameAPI};
@@ -117,6 +118,52 @@ pub struct Options {
     pub processor: bool,
     pub hardware_platform: bool,
     pub os: bool,
+}
+
+/// Logical entry point for the in-process brush builtin.
+///
+/// `uname` reads no stdin; it reads read-only system info (uname(2)) and writes
+/// the assembled line to the injected `out` sink (verbatim, trailing newline) —
+/// never the process's global stdout. `err` is accepted for the engine's uniform
+/// `(args, out, err)` entry shape; uname emits no diagnostics of its own
+/// (failures are returned).
+pub fn uname_main(
+    args: impl uucore::Args,
+    out: &mut dyn Write,
+    _err: &mut dyn Write,
+) -> UResult<()> {
+    let matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+
+    let options = Options {
+        all: matches.get_flag(options::ALL),
+        kernel_name: matches.get_flag(options::KERNEL_NAME),
+        nodename: matches.get_flag(options::NODENAME),
+        kernel_release: matches.get_flag(options::KERNEL_RELEASE),
+        kernel_version: matches.get_flag(options::KERNEL_VERSION),
+        machine: matches.get_flag(options::MACHINE),
+        processor: matches.get_flag(options::PROCESSOR),
+        hardware_platform: matches.get_flag(options::HARDWARE_PLATFORM),
+        os: matches.get_flag(options::OS),
+    };
+    let output = UNameOutput::new(&options)?;
+    write_verbatim(out, output.display().as_os_str())
+        .map_err(|e| USimpleError::new(1, e.to_string()))?;
+    Ok(())
+}
+
+/// Write `text` verbatim with a trailing newline, mirroring upstream's
+/// `println_verbatim` but to the injected sink (Unix preserves the raw bytes).
+fn write_verbatim(out: &mut dyn Write, text: &OsStr) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        out.write_all(text.as_bytes())?;
+    }
+    #[cfg(not(unix))]
+    {
+        out.write_all(text.to_string_lossy().as_bytes())?;
+    }
+    out.write_all(b"\n")
 }
 
 #[uucore::main(no_signals)]
