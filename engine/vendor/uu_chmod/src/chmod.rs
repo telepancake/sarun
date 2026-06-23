@@ -8,20 +8,88 @@
 use clap::{Arg, ArgAction, Command};
 use std::ffi::OsString;
 use std::fs;
+use std::io;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 use uucore::display::Quotable;
-use uucore::error::{ExitCode, UError, UResult, USimpleError, UUsageError, set_exit_code};
+use uucore::error::{ExitCode, UError, UResult, USimpleError, UUsageError};
 use uucore::fs::display_permissions_unix;
 use uucore::mode;
 use uucore::perms::{TraverseSymlinks, configure_symlink_and_recursion};
 
 #[cfg(all(unix, not(target_os = "redox")))]
 use uucore::safe_traversal::{DirFd, SymlinkBehavior};
-use uucore::{format_usage, show, show_error};
+use uucore::format_usage;
 
 use uucore::translate;
+
+// ── Injected-I/O plumbing for the in-process brush builtin ───────────────────
+//
+// FILESYSTEM template, mirroring uu_cp / uu_mkdir: [`chmod_main`] resolves every
+// relative file operand (and `--reference`) against the shell's LOGICAL cwd (the
+// process is never `chdir`'d), and routes all output to the shell's logical
+// sinks. `chmod` runs on a FRESH worker thread per call (the engine's
+// `run_coreutil_localized`), so these thread-locals are per-instance:
+// `CHMOD_OUT` buffers verbose/changes output, `CHMOD_ERR` diagnostics,
+// `CHMOD_EXIT` the deferred exit code. The crate-local `chmod_out!` macro
+// REPLACES the upstream `println!` sites; `show!` / `show_error!` SHADOW uucore's
+// (which write fd 2); `set_exit_code` SHADOWS uucore's (which sets the
+// process-global `EXIT_CODE`) so the bare `set_exit_code(1)` sites in `chmod`
+// defer onto `CHMOD_EXIT` instead. Both the logical entry and standalone
+// [`uumain`] drain the buffers (the latter to real stdio), so standalone
+// behavior is unchanged.
+thread_local! {
+    static CHMOD_OUT: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    static CHMOD_ERR: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    static CHMOD_EXIT: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
+}
+
+/// Write `format!`-style output (with a trailing newline) into [`CHMOD_OUT`]
+/// instead of the process's fd 1. Replaces upstream `println!`.
+macro_rules! chmod_out {
+    ($($args:tt)*) => ({
+        use std::io::Write as _;
+        $crate::CHMOD_OUT.with(|b| {
+            let _ = writeln!(b.borrow_mut(), $($args)*);
+        });
+    });
+}
+
+/// Shadows [`uucore::show!`]: records the error's code into [`CHMOD_EXIT`] and
+/// writes `<util_name>: <err>` to the logical stderr buffer (never fd 2).
+macro_rules! show {
+    ($err:expr) => {{
+        #[allow(unused_imports)]
+        use uucore::error::UError as _;
+        use std::io::Write as _;
+        let e = $err;
+        $crate::CHMOD_EXIT.with(|c| c.set(e.code()));
+        $crate::CHMOD_ERR.with(|b| {
+            let _ = writeln!(b.borrow_mut(), "{}: {e}", uucore::util_name());
+        });
+    }};
+}
+
+/// Shadows [`uucore::show_error!`]: writes `<util_name>: <msg>` to the logical
+/// stderr buffer and records exit code 1 into [`CHMOD_EXIT`].
+macro_rules! show_error {
+    ($($args:tt)+) => {{
+        use std::io::Write as _;
+        $crate::CHMOD_EXIT.with(|c| c.set(1));
+        $crate::CHMOD_ERR.with(|b| {
+            let mut b = b.borrow_mut();
+            let _ = write!(b, "{}: ", uucore::util_name());
+            let _ = writeln!(b, $($args)+);
+        });
+    }};
+}
+
+/// Shadows [`uucore::error::set_exit_code`]: defers the code onto the per-call
+/// [`CHMOD_EXIT`] instead of uucore's process-global `EXIT_CODE`.
+fn set_exit_code(code: i32) {
+    CHMOD_EXIT.with(|c| c.set(code));
+}
 
 #[derive(Debug, Error)]
 enum ChmodError {
@@ -109,22 +177,89 @@ fn extract_negative_modes(mut args: impl uucore::Args) -> (Option<String>, Vec<O
     (parsed_cmode, clean_args)
 }
 
+/// Logical entry point for the in-process brush `chmod` builtin.
+///
+/// Mirrors [`uumain`] but (1) resolves every relative file operand and the
+/// `--reference` RFILE against the shell's LOGICAL `cwd` (the process is never
+/// `chdir`'d), and (2) never touches process fd 1/2 — verbose/changes output
+/// drains to `out`, diagnostics to `err`, the deferred exit code surfaces as the
+/// returned status.
+pub fn chmod_main(
+    args: impl uucore::Args,
+    cwd: &Path,
+    out: &mut dyn io::Write,
+    err: &mut dyn io::Write,
+) -> UResult<()> {
+    CHMOD_OUT.with(|b| b.borrow_mut().clear());
+    CHMOD_ERR.with(|b| b.borrow_mut().clear());
+    CHMOD_EXIT.with(|c| c.set(0));
+
+    let result = run(args, Some(cwd));
+
+    let produced_out = CHMOD_OUT.with(|b| std::mem::take(&mut *b.borrow_mut()));
+    let produced_err = CHMOD_ERR.with(|b| std::mem::take(&mut *b.borrow_mut()));
+    let _ = out.write_all(&produced_out);
+    let _ = out.flush();
+    let _ = err.write_all(&produced_err);
+    let _ = err.flush();
+
+    let deferred = CHMOD_EXIT.with(std::cell::Cell::get);
+    match result {
+        Ok(()) if deferred != 0 => Err(USimpleError::new(deferred, String::new())),
+        other => other,
+    }
+}
+
 #[uucore::main]
 pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+    CHMOD_OUT.with(|b| b.borrow_mut().clear());
+    CHMOD_ERR.with(|b| b.borrow_mut().clear());
+    CHMOD_EXIT.with(|c| c.set(0));
+
+    let result = run(args, None);
+
+    let produced_out = CHMOD_OUT.with(|b| std::mem::take(&mut *b.borrow_mut()));
+    let produced_err = CHMOD_ERR.with(|b| std::mem::take(&mut *b.borrow_mut()));
+    let _ = io::Write::write_all(&mut io::stdout(), &produced_out);
+    let _ = io::Write::write_all(&mut io::stderr(), &produced_err);
+
+    let deferred = CHMOD_EXIT.with(std::cell::Cell::get);
+    match result {
+        Ok(()) if deferred != 0 => Err(USimpleError::new(deferred, String::new())),
+        other => other,
+    }
+}
+
+/// Shared body of [`chmod_main`] and [`uumain`]. When `cwd` is `Some`, relative
+/// file operands and the `--reference` RFILE are rooted at the shell's logical
+/// cwd; when `None` (standalone) they resolve against the process cwd, as
+/// upstream.
+fn run(args: impl uucore::Args, cwd: Option<&Path>) -> UResult<()> {
     let (parsed_cmode, args) = extract_negative_modes(args.skip(1)); // skip binary name
     let matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+
+    // Resolve a relative path operand against the logical cwd when one is given.
+    let abs = |p: PathBuf| -> PathBuf {
+        match cwd {
+            Some(cwd) if p.is_relative() => cwd.join(p),
+            _ => p,
+        }
+    };
 
     let changes = matches.get_flag(options::CHANGES);
     let quiet = matches.get_flag(options::QUIET);
     let verbose = matches.get_flag(options::VERBOSE);
     let preserve_root = matches.get_flag(options::PRESERVE_ROOT);
     let fmode = match matches.get_one::<OsString>(options::REFERENCE) {
-        Some(fref) => match fs::metadata(fref) {
-            Ok(meta) => Some(meta.mode() & 0o7777),
-            Err(_) => {
-                return Err(ChmodError::CannotStat(fref.into()).into());
+        Some(fref) => {
+            let fref = abs(PathBuf::from(fref));
+            match fs::metadata(&fref) {
+                Ok(meta) => Some(meta.mode() & 0o7777),
+                Err(_) => {
+                    return Err(ChmodError::CannotStat(fref).into());
+                }
             }
-        },
+        }
         None => None,
     };
 
@@ -136,13 +271,16 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     };
     let mut files: Vec<OsString> = matches
         .get_many::<OsString>(options::FILE)
-        .map(|v| v.cloned().collect())
+        .map(|v| {
+            v.map(|f| abs(PathBuf::from(f)).into_os_string())
+                .collect()
+        })
         .unwrap_or_default();
     let cmode = if fmode.is_some() {
         // "--reference" and MODE are mutually exclusive
         // if "--reference" was used MODE needs to be interpreted as another FILE
         // it wasn't possible to implement this behavior directly with clap
-        files.push(OsString::from(cmode));
+        files.push(abs(PathBuf::from(cmode)).into_os_string());
         None
     } else {
         Some(cmode)
@@ -316,12 +454,12 @@ impl Chmoder {
             let new_permissions = display_permissions_unix(new_mode, false);
 
             if new_mode != old_mode {
-                println!(
+                chmod_out!(
                     "mode of {} changed from {old_mode:04o} ({current_permissions}) to {new_mode:04o} ({new_permissions})",
                     file_path.quote(),
                 );
             } else if self.verbose {
-                println!(
+                chmod_out!(
                     "mode of {} retained as {old_mode:04o} ({current_permissions})",
                     file_path.quote(),
                 );
@@ -381,7 +519,7 @@ impl Chmoder {
                     }
 
                     if self.verbose {
-                        println!(
+                        chmod_out!(
                             "{}",
                             translate!("chmod-verbose-failed-dangling", "file" => filename.quote())
                         );
@@ -592,7 +730,7 @@ impl Chmoder {
         let follow_symlinks = self.dereference;
         if let Err(_e) = dir_fd.chmod_at(entry_name, new_mode, follow_symlinks.into()) {
             if self.verbose {
-                println!(
+                chmod_out!(
                     "failed to change mode of {} to {new_mode:o}",
                     file_path.quote(),
                 );
@@ -627,7 +765,7 @@ impl Chmoder {
                 // Handle dangling symlinks or other errors
                 return if file.is_symlink() && !dereference {
                     if self.verbose {
-                        println!(
+                        chmod_out!(
                             "neither symbolic link {} nor referent has been changed",
                             file.quote()
                         );
@@ -655,7 +793,7 @@ impl Chmoder {
                 // so changing them has no effect. We skip this operation for compatibility.
                 // Note that "chmod without dereferencing" effectively does nothing on symlinks.
                 if self.verbose {
-                    println!(
+                    chmod_out!(
                         "neither symbolic link {} nor referent has been changed",
                         file.quote()
                     );
@@ -687,7 +825,7 @@ impl Chmoder {
                 show_error!("{err}");
             }
             if self.verbose {
-                println!(
+                chmod_out!(
                     "failed to change mode of file {} from {fperm:04o} ({}) to {mode:04o} ({})",
                     file.quote(),
                     display_permissions_unix(fperm, false),
