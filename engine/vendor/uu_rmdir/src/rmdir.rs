@@ -135,7 +135,7 @@ fn run(args: impl uucore::Args, cwd: Option<&Path>) -> UResult<()> {
         .collect();
 
     for path in dirs.iter().map(PathBuf::as_path) {
-        if let Err(error) = remove(path, opts) {
+        if let Err(error) = remove(path, opts, cwd) {
             let Error { error, path } = error;
 
             if opts.ignore && dir_not_empty(&error, path) {
@@ -193,12 +193,19 @@ struct Error<'a> {
     path: &'a Path,
 }
 
-fn remove(mut path: &Path, opts: Opts) -> Result<(), Error<'_>> {
+fn remove<'a>(mut path: &'a Path, opts: Opts, boundary: Option<&Path>) -> Result<(), Error<'a>> {
     remove_single(path, opts)?;
     if opts.parents {
         while let Some(new) = path.parent() {
             path = new;
             if path.as_os_str().is_empty() {
+                break;
+            }
+            // When operands were resolved against the shell's LOGICAL cwd
+            // (`boundary`), `rmdir -p a/b/c` must walk only the OPERAND's own
+            // ancestors (a/b, a) — not the cwd or its filesystem ancestors, which
+            // GNU never touches. Stop once we reach the cwd boundary.
+            if boundary.is_some_and(|b| path == b) {
                 break;
             }
             remove_single(path, opts)?;

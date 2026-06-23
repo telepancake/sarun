@@ -851,7 +851,60 @@ macro_rules! fs_builtin {
 
 fs_builtin!(MkdirBuiltin, "mkdir", uu_mkdir::mkdir_main, "uu_mkdir");
 fs_builtin!(RmdirBuiltin, "rmdir", uu_rmdir::rmdir_main, "uu_rmdir");
-fs_builtin!(TouchBuiltin, "touch", uu_touch::touch_main, "uu_touch");
+
+/// `touch` — FILESYSTEM-template builtin like [`CpBuiltin`]. Distinct from the
+/// [`fs_builtin!`] shape because a `-` operand targets the box's LOGICAL fd 1
+/// (passed as a raw fd so `touch -` updates the logical stdout's referent, not
+/// the engine's process fd 1). Operands resolve against the logical cwd;
+/// diagnostics route through the logical err. Reads no stdin. Runs on a fresh
+/// thread for localization isolation — see [`run_coreutil_localized`].
+struct TouchBuiltin;
+
+impl brush_core::builtins::SimpleCommand for TouchBuiltin {
+    fn get_content(
+        name: &str,
+        _content_type: brush_core::builtins::ContentType,
+        _options: &brush_core::builtins::ContentOptions,
+    ) -> Result<String, brush_core::error::Error> {
+        Ok(format!("{name}: native injected-I/O touch builtin\n"))
+    }
+
+    fn execute<SE: brush_core::extensions::ShellExtensions,
+               I: Iterator<Item = S>, S: AsRef<str>>(
+        context: brush_core::commands::ExecutionContext<'_, SE>,
+        args: I,
+    ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
+        let name = context.command_name.clone();
+        let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
+        if argv.is_empty() { argv.push(OsString::from(&name)); }
+
+        let cwd = context.shell.working_dir().to_path_buf();
+        let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
+        let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
+
+        let code = run_coreutil_localized("uu_touch", move || {
+            use std::io::Write;
+            use std::os::fd::AsRawFd;
+            let out = out;
+            let mut err = err;
+            // The logical fd 1's raw descriptor, for a `-` operand only; the
+            // descriptor is borrowed for the call's duration (the OpenFile lives
+            // across it).
+            let out_fd = out.try_borrow_as_fd().ok().map(|b| b.as_raw_fd());
+            let r = match uu_touch::touch_main(argv.into_iter(), &cwd, out_fd, &mut err) {
+                Ok(()) => 0,
+                Err(e) => {
+                    let msg = e.to_string();
+                    if !msg.is_empty() { let _ = writeln!(err, "{name}: {msg}"); }
+                    e.code()
+                }
+            };
+            let _ = err.flush();
+            r
+        });
+        Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
+    }
+}
 
 /// Like [`fs_builtin`] but the util ALSO reads the shell's LOGICAL stdin: `rm
 /// -i`/`mv -i` read the y/N overwrite answer from there, NEVER the engine's fd

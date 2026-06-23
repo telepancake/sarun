@@ -55,6 +55,10 @@ use crate::error::TouchError;
 thread_local! {
     static TOUCH_ERR: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
     static TOUCH_EXIT: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
+    /// Backing fd of the shell's logical stdout for the current call, so a `-`
+    /// operand targets the box's logical fd 1, not the engine's process fd 1.
+    /// `-1` => unset (standalone binary uses real `/dev/stdout`).
+    static TOUCH_OUT_FD: std::cell::Cell<i32> = const { std::cell::Cell::new(-1) };
 }
 
 /// Shadows [`uucore::show!`]: records the error's code into [`TOUCH_EXIT`] and
@@ -234,14 +238,16 @@ fn shr2(s: &str) -> String {
 pub fn touch_main(
     args: impl uucore::Args,
     cwd: &Path,
-    _out: &mut dyn std::io::Write,
+    out_fd: Option<i32>,
     err: &mut dyn std::io::Write,
 ) -> UResult<()> {
     TOUCH_ERR.with(|b| b.borrow_mut().clear());
     TOUCH_EXIT.with(|c| c.set(0));
+    TOUCH_OUT_FD.with(|c| c.set(out_fd.unwrap_or(-1)));
 
     let result = run(args, Some(cwd));
 
+    TOUCH_OUT_FD.with(|c| c.set(-1));
     let produced = TOUCH_ERR.with(|b| std::mem::take(&mut *b.borrow_mut()));
     let _ = err.write_all(&produced);
     let _ = err.flush();
@@ -901,6 +907,16 @@ fn parse_timestamp(s: &str) -> UResult<FileTime> {
 /// from the stdout handle.
 #[cfg_attr(not(windows), expect(clippy::unnecessary_wraps))]
 fn pathbuf_from_stdout() -> Result<PathBuf, TouchError> {
+    #[cfg(unix)]
+    {
+        // In logical mode a `-` operand targets the box's LOGICAL fd 1 (set by
+        // [`touch_main`]), reached via /proc/self/fd/<fd> — NOT the engine's
+        // process fd 1 that `/dev/stdout` would resolve to.
+        let logical_fd = TOUCH_OUT_FD.with(std::cell::Cell::get);
+        if logical_fd >= 0 {
+            return Ok(PathBuf::from(format!("/proc/self/fd/{logical_fd}")));
+        }
+    }
     #[cfg(all(unix, not(target_os = "android")))]
     {
         Ok(PathBuf::from("/dev/stdout"))

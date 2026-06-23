@@ -228,16 +228,36 @@ fn run(args: impl uucore::Args, cwd: Option<&Path>) -> UResult<()> {
         }
     };
 
+    let symbolic = matches.get_flag(options::SYMBOLIC);
+    let has_target_dir = matches.contains_id(options::TARGET_DIRECTORY);
+
     /* the list of files */
 
-    let paths: Vec<PathBuf> = matches
+    // Logical-cwd resolution of the operands. For a SYMBOLIC link the source
+    // operand(s) are link TEXT stored verbatim (POSIX), NOT paths to resolve —
+    // rewriting them would turn a relative symlink into an absolute one and
+    // change its meaning. So when `-s` is set we leave the sources untouched and
+    // resolve only the destination: the last operand (the link name / target
+    // dir) in the non-`-t` forms; with `-t` every operand is a source, so none
+    // are resolved (the `-t` value itself is resolved below). Hard links take
+    // real paths, so all operands resolve.
+    let raw: Vec<PathBuf> = matches
         .get_many::<OsString>(ARG_FILES)
         .unwrap()
         .map(PathBuf::from)
-        .map(abs)
         .collect();
-
-    let symbolic = matches.get_flag(options::SYMBOLIC);
+    let last = raw.len().saturating_sub(1);
+    let paths: Vec<PathBuf> = raw
+        .into_iter()
+        .enumerate()
+        .map(|(i, p)| {
+            if !symbolic || (!has_target_dir && i == last) {
+                abs(p)
+            } else {
+                p
+            }
+        })
+        .collect();
 
     let overwrite_mode = if matches.get_flag(options::FORCE) {
         OverwriteMode::Force
