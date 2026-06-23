@@ -5358,6 +5358,7 @@ dependencies = [
  "uu_head",
  "uu_mkdir",
  "uu_nl",
+ "uu_rm",
  "uu_rmdir",
  "uu_seq",
  "uu_sort",
@@ -7431,8 +7432,6 @@ dependencies = [
 [[package]]
 name = "uu_rm"
 version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e5985b6455293340223b85ecdcd9d97010a75ed6aac50558c0cd0c1b3138e71c"
 dependencies = [
  "clap",
  "fluent",
