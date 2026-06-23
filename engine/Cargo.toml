@@ -52,6 +52,7 @@ uu_rmdir = "0.8"
 uu_rm = "0.8"
 uu_mv = "0.8"
 uu_ln = "0.8"
+uu_touch = "0.8"
 # Vendored, find-only fork of uutils/findutils 0.9.1: run `find` as an
 # in-process brush builtin against the shell's logical I/O. See vendor/findutils.
 findutils = { path = "vendor/findutils" }
@@ -210,6 +211,7 @@ uu_rmdir                 = { path = "vendor/uu_rmdir" }
 uu_rm                    = { path = "vendor/uu_rm" }
 uu_mv                    = { path = "vendor/uu_mv" }
 uu_ln                    = { path = "vendor/uu_ln" }
+uu_touch                 = { path = "vendor/uu_touch" }
 # Vendored, patched fork of uucore 0.8.0 — the shared uutils library that backs
 # every uu_* builtin's localization. The 13 in-process coreutil builtins each
 # run on a fresh thread that calls `init_localization("uu_X")`

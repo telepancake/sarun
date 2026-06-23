@@ -53,7 +53,8 @@ READ_FD0 = re.compile(r'\bread\(0,')
 # The native in-process coreutil builtins under test (the stream/filter group
 # plus the filesystem-op group cp/mkdir/rmdir/rm/mv/ln).
 UTILS = ["cat", "head", "tail", "wc", "nl", "tac", "basename", "dirname", "seq",
-         "expr", "tr", "cut", "uniq", "sort", "mkdir", "rmdir", "rm", "mv", "ln"]
+         "expr", "tr", "cut", "uniq", "sort", "mkdir", "rmdir", "rm", "mv", "ln",
+         "touch"]
 
 
 def _require():
@@ -188,6 +189,10 @@ INPROC = [
     # the logical cwd. Self-contained create+link+cleanup so the runs are idempotent.
     ("ln -s",    "printf x > ln_a && ln -sf ln_a ln_a_l && [ -L ln_a_l ] && rm -f ln_a ln_a_l"),
     ("ln cwd",   "cd sub && printf x > ln_b && ln -sf ln_b ln_b_l && [ -L ln_b_l ] && rm -f ln_b ln_b_l"),
+    # touch is a file-op builtin like cp; relative operands resolve against the
+    # logical cwd. Touching is idempotent (no output) so runs are repeatable.
+    ("touch",    "touch tch_a"),
+    ("touch cwd","cd sub && touch tch_b && [ -e tch_b ]"),
     # multi-stage all-builtin pipelines stay fully in-process
     ("sort|uniq -c", "sort s.txt | uniq -c"),
     ("tac|head",     "tac v.txt | head -n1"),
@@ -261,6 +266,7 @@ ERR_CMDS = [
     "basename", "dirname", "seq", "expr 1 +", "tr", "cut -f1 /nope",
     "uniq /nope", "sort /nope", "mkdir /nope/deep", "rmdir /nope/deep",
     "rm /nope/deep", "mv /nope/deep /also/nope", "ln /nope/deep /also/nope",
+    "touch /nope/deep",
 ]
 # A raw Fluent key looks like `tac-error-open-error` / `expr-error-missing-...`:
 # a util name followed by `-` then lowercase. Rendered English messages never do.
@@ -297,6 +303,7 @@ EXIT_CASES = [
     ("mv missing", "mv /nope/deep /also/nope", 1),
     ("ln ok", "printf x > ln_exit && ln -s ln_exit ln_exit_l && rm -f ln_exit ln_exit_l", 0),
     ("ln missing", "ln /nope/deep /also/nope", 1),
+    ("touch ok", "touch tch_exit", 0), ("touch bad dir", "touch /nope/deep", 1),
     ("expr 5", "expr 5", 0), ("expr 0", "expr 0", 1),
     ("expr 1=2", "expr 1 = 2", 1), ("expr 1=1", "expr 1 = 1", 0),
     # regression guards for the uu_expr fork patch (leading-+ and substr-overflow
