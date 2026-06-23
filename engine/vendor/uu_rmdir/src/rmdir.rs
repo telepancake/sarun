@@ -9,13 +9,50 @@ use clap::builder::ValueParser;
 use clap::{Arg, ArgAction, Command};
 use std::ffi::OsString;
 use std::fs::{read_dir, remove_dir};
-use std::io;
-use std::path::Path;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use uucore::display::Quotable;
-use uucore::error::{UResult, set_exit_code, strip_errno};
+use uucore::error::{UResult, USimpleError, strip_errno};
 use uucore::translate;
 
-use uucore::{format_usage, show_error};
+use uucore::format_usage;
+
+// ── Injected-I/O plumbing for the in-process brush builtin ───────────────────
+//
+// FILESYSTEM template, mirroring uu_cp: [`rmdir_main`] resolves every relative
+// operand against the shell's LOGICAL cwd (the process is never `chdir`'d) and
+// routes output to the shell's logical sinks. Runs on a FRESH worker thread per
+// call (the engine's `run_coreutil_localized`), so these thread-locals are
+// per-instance: `RMDIR_OUT` buffers verbose output, `RMDIR_ERR` diagnostics,
+// `RMDIR_EXIT` the deferred exit code. The crate-local `show_error!` and
+// `set_exit_code` shims below SHADOW uucore's (which write fd 2 + the process-
+// global exit code); the verbose `println!` site targets `RMDIR_OUT`. Both the
+// logical entry and standalone [`uumain`] drain the buffers, so standalone
+// behavior is unchanged.
+thread_local! {
+    static RMDIR_OUT: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    static RMDIR_ERR: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    static RMDIR_EXIT: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
+}
+
+/// Route the deferred exit code into [`RMDIR_EXIT`] instead of uucore's
+/// process-global `EXIT_CODE`.
+fn set_exit_code(code: i32) {
+    RMDIR_EXIT.with(|c| c.set(code));
+}
+
+/// Shadows [`uucore::show_error!`]: writes `<util_name>: <msg>` to the logical
+/// stderr buffer (never fd 2).
+macro_rules! show_error {
+    ($($args:tt)+) => {{
+        use std::io::Write as _;
+        $crate::RMDIR_ERR.with(|b| {
+            let mut b = b.borrow_mut();
+            let _ = write!(b, "{}: ", uucore::util_name());
+            let _ = writeln!(b, $($args)+);
+        });
+    }};
+}
 
 static OPT_IGNORE_FAIL_NON_EMPTY: &str = "ignore-fail-on-non-empty";
 static OPT_PARENTS: &str = "parents";
@@ -23,8 +60,62 @@ static OPT_VERBOSE: &str = "verbose";
 
 static ARG_DIRS: &str = "dirs";
 
+/// Logical entry point for the in-process brush `rmdir` builtin.
+///
+/// Mirrors [`uumain`] but (1) resolves every relative directory operand against
+/// the shell's LOGICAL `cwd` (the process is never `chdir`'d), and (2) never
+/// touches process fd 1/2 — verbose output drains to `out`, diagnostics to
+/// `err`, the deferred exit code surfaces as the returned status.
+pub fn rmdir_main(
+    args: impl uucore::Args,
+    cwd: &Path,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> UResult<()> {
+    RMDIR_OUT.with(|b| b.borrow_mut().clear());
+    RMDIR_ERR.with(|b| b.borrow_mut().clear());
+    RMDIR_EXIT.with(|c| c.set(0));
+
+    let result = run(args, Some(cwd));
+
+    let produced_out = RMDIR_OUT.with(|b| std::mem::take(&mut *b.borrow_mut()));
+    let produced_err = RMDIR_ERR.with(|b| std::mem::take(&mut *b.borrow_mut()));
+    let _ = out.write_all(&produced_out);
+    let _ = out.flush();
+    let _ = err.write_all(&produced_err);
+    let _ = err.flush();
+
+    let deferred = RMDIR_EXIT.with(std::cell::Cell::get);
+    match result {
+        Ok(()) if deferred != 0 => Err(USimpleError::new(deferred, String::new())),
+        other => other,
+    }
+}
+
 #[uucore::main]
 pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+    RMDIR_OUT.with(|b| b.borrow_mut().clear());
+    RMDIR_ERR.with(|b| b.borrow_mut().clear());
+    RMDIR_EXIT.with(|c| c.set(0));
+
+    let result = run(args, None);
+
+    let produced_out = RMDIR_OUT.with(|b| std::mem::take(&mut *b.borrow_mut()));
+    let produced_err = RMDIR_ERR.with(|b| std::mem::take(&mut *b.borrow_mut()));
+    let _ = io::stdout().write_all(&produced_out);
+    let _ = io::stderr().write_all(&produced_err);
+
+    let deferred = RMDIR_EXIT.with(std::cell::Cell::get);
+    match result {
+        Ok(()) if deferred != 0 => Err(USimpleError::new(deferred, String::new())),
+        other => other,
+    }
+}
+
+/// Shared body of [`rmdir_main`] and [`uumain`]. With `cwd` `Some`, relative
+/// operands root at the shell's logical cwd; with `None` (standalone) they
+/// resolve against the process cwd, as upstream.
+fn run(args: impl uucore::Args, cwd: Option<&Path>) -> UResult<()> {
     let matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
 
     let opts = Opts {
@@ -33,11 +124,17 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
         verbose: matches.get_flag(OPT_VERBOSE),
     };
 
-    for path in matches
+    let dirs: Vec<PathBuf> = matches
         .get_many::<OsString>(ARG_DIRS)
         .unwrap_or_default()
-        .map(Path::new)
-    {
+        .map(PathBuf::from)
+        .map(|p| match cwd {
+            Some(cwd) if p.is_relative() => cwd.join(p),
+            _ => p,
+        })
+        .collect();
+
+    for path in dirs.iter().map(PathBuf::as_path) {
         if let Err(error) = remove(path, opts) {
             let Error { error, path } = error;
 
@@ -112,10 +209,13 @@ fn remove(mut path: &Path, opts: Opts) -> Result<(), Error<'_>> {
 
 fn remove_single(path: &Path, opts: Opts) -> Result<(), Error<'_>> {
     if opts.verbose {
-        println!(
-            "{}",
-            translate!("rmdir-verbose-removing-directory", "util_name" => "rmdir", "path" => path.quote())
-        );
+        RMDIR_OUT.with(|b| {
+            let _ = writeln!(
+                b.borrow_mut(),
+                "{}",
+                translate!("rmdir-verbose-removing-directory", "util_name" => "rmdir", "path" => path.quote())
+            );
+        });
     }
     remove_dir(path).map_err(|error| Error { error, path })
 }

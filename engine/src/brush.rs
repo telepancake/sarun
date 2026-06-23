@@ -850,6 +850,7 @@ macro_rules! fs_builtin {
 }
 
 fs_builtin!(MkdirBuiltin, "mkdir", uu_mkdir::mkdir_main, "uu_mkdir");
+fs_builtin!(RmdirBuiltin, "rmdir", uu_rmdir::rmdir_main, "uu_rmdir");
 
 /// `basename` — NATIVE in-process brush builtin over the vendored `uu_basename` fork.
 ///
@@ -1188,6 +1189,7 @@ fn box_builtins_opt<SE: brush_core::extensions::ShellExtensions>(
     // cwd/I/O, and each runs on its own fresh thread so uucore's thread-local
     // Fluent caches give it an uncontaminated message bundle.
     m.insert("mkdir".to_string(), simple_builtin::<MkdirBuiltin, SE>());
+    m.insert("rmdir".to_string(), simple_builtin::<RmdirBuiltin, SE>());
     // BashMode shell builtins overwrite overlaps (highest priority).
     m.extend(brush_builtins::default_builtins(brush_builtins::BuiltinSet::BashMode));
     // In-box engine entry points (no PATH shadow): `sarun` / `oaita` re-exec

@@ -48,6 +48,7 @@ uu_cp = "0.8"
 # a `<name>_main(args, cwd, out, err)` logical entry. Redirected to the vendored
 # forks by `[patch.crates-io]` below.
 uu_mkdir = "0.8"
+uu_rmdir = "0.8"
 # Vendored, find-only fork of uutils/findutils 0.9.1: run `find` as an
 # in-process brush builtin against the shell's logical I/O. See vendor/findutils.
 findutils = { path = "vendor/findutils" }
@@ -202,6 +203,7 @@ uu_uniq                  = { path = "vendor/uu_uniq" }
 uu_sort                  = { path = "vendor/uu_sort" }
 uu_cp                    = { path = "vendor/uu_cp" }
 uu_mkdir                 = { path = "vendor/uu_mkdir" }
+uu_rmdir                 = { path = "vendor/uu_rmdir" }
 # Vendored, patched fork of uucore 0.8.0 — the shared uutils library that backs
 # every uu_* builtin's localization. The 13 in-process coreutil builtins each
 # run on a fresh thread that calls `init_localization("uu_X")`
