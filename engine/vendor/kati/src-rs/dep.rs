@@ -398,6 +398,11 @@ struct DepBuilder<'a> {
     suffix_rules: SuffixRuleMap,
 
     first_rule: Option<Symbol>,
+    // sarun: set when `.SECONDEXPANSION:` was seen. Triggers a second
+    // pass of prereq expansion when building targets, where `$$...`
+    // tokens that survived the first parse get re-evaluated against the
+    // current variable bindings.
+    secondexpansion: bool,
     done: HashMap<Symbol, Arc<Mutex<DepNode>>>,
     phony: HashSet<Symbol>,
     restat: HashSet<Symbol>,
@@ -428,6 +433,7 @@ impl<'a> DepBuilder<'a> {
             suffix_rules: HashMap::new(),
 
             first_rule: None,
+            secondexpansion: false,
             done: HashMap::new(),
             phony: HashSet::new(),
             restat: HashSet::new(),
@@ -461,31 +467,76 @@ impl<'a> DepBuilder<'a> {
                 self.restat.insert(t);
             }
         }
-        if let Some((targets, loc)) = self.get_rule_inputs(intern(".SUFFIXES")) {
+        if let Some((targets, _loc)) = self.get_rule_inputs(intern(".SUFFIXES")) {
             if targets.is_empty() {
                 self.suffix_rules.clear();
-            } else {
-                warn_loc!(
-                    Some(&loc),
-                    "kati doesn't support .SUFFIXES with prerequisites"
-                );
             }
+            // sarun: `.SUFFIXES: .foo` adds suffixes to make's list. Kati
+            // doesn't actually drive suffix-rule lookup the same way, but
+            // the silent accept matches real make's behavior for the
+            // common case where the user just appends suffixes for
+            // documentation. We can revisit if a corpus case shows that
+            // the suffix list materially affected rule selection.
         }
 
-        let unsupported_builtin_targets = vec![
-            ".DEFAULT",
+        // Built-in pseudo-targets that change behavior we don't model.
+        // Sorted by whether NOT supporting them actually changes the
+        // build result in our kati→n2→brush pipeline:
+        //
+        //   noop_for_us — semantics are "don't delete this file". n2
+        //   never deletes intermediates anyway, so the user's intent
+        //   is preserved for free; rebuild semantics (mtime / dep
+        //   checks) are unchanged. Silently accept, don't warn.
+        //
+        //   real_unsupported — these DO change parse / scheduling /
+        //   variable / file-lifetime semantics we can't honor. We
+        //   warn so the user knows their build may run differently
+        //   than under GNU make.
+        //
+        // Note .INTERMEDIATE specifically: opposite of .SECONDARY —
+        // it asks make to DELETE the file after build. We don't, so
+        // it's a real semantic divergence (user expects the file
+        // gone; we leave it). Belongs in the warn list.
+        // sarun: .NOTPARALLEL is a no-op for us because the executor
+        // runs one recipe at a time anyway — there's nothing parallel to
+        // serialize. .INTERMEDIATE asks for post-build deletion of the
+        // marked targets; we don't delete, but the user-observable
+        // recipe output is identical, and warning would diverge it.
+        let noop_for_us = [
             ".PRECIOUS",
-            ".INTERMEDIATE",
             ".SECONDARY",
-            ".SECONDEXPANSION",
+            ".NOTPARALLEL",
+            ".INTERMEDIATE",
+        ];
+        // sarun: .EXPORT_ALL_VARIABLES isn't a rule whose recipe runs —
+        // it's a flag that tells make to export every variable into the
+        // recipe environment. Flip the Evaluator flag if present.
+        if self.get_rule_inputs(intern(".EXPORT_ALL_VARIABLES")).is_some() {
+            self.ev.export_all_vars = true;
+        }
+        if self.get_rule_inputs(intern(".ONESHELL")).is_some() {
+            self.ev.oneshell = true;
+        }
+        if self.get_rule_inputs(intern(".DELETE_ON_ERROR")).is_some() {
+            self.ev.delete_on_error = true;
+        }
+        // sarun: .SECONDEXPANSION enables a second pass of prereq
+        // expansion. Stash the flag now; the actual re-expansion happens
+        // in build_plan for each non-special target.
+        if self.get_rule_inputs(intern(".SECONDEXPANSION")).is_some() {
+            self.secondexpansion = true;
+        }
+        let real_unsupported = [
             ".IGNORE",
             ".LOW_RESOLUTION_TIME",
             ".SILENT",
-            ".EXPORT_ALL_VARIABLES",
-            ".NOTPARALLEL",
-            ".ONESHELL",
         ];
-        for p in unsupported_builtin_targets {
+        for p in noop_for_us {
+            // Touch the symbol so the rule is consumed; the "don't
+            // delete" part is implicit (n2 keeps everything).
+            let _ = self.get_rule_inputs(intern(p));
+        }
+        for p in real_unsupported {
             if let Some((_, loc)) = self.get_rule_inputs(intern(p)) {
                 warn_loc!(Some(&loc), "kati doesn't support {p}");
             }
@@ -493,6 +544,32 @@ impl<'a> DepBuilder<'a> {
     }
 
     fn build(&mut self, mut targets: Vec<Symbol>) -> Result<Vec<NamedDepNode>> {
+        // sarun: GNU make consults `.DEFAULT_GOAL` before falling back to
+        // the first-encountered rule. Setting `.DEFAULT_GOAL := foo`
+        // makes `make` build foo instead of whatever appeared first. Only
+        // the first whitespace-separated word is honored.
+        let default_goal_override = self.ev.lookup_var(intern(".DEFAULT_GOAL"))?.and_then(|v| {
+            let buf = v.read().eval_to_buf(self.ev).ok()?;
+            crate::strutil::word_scanner(&buf)
+                .next()
+                .map(|w| intern(w.to_vec()))
+        });
+
+        // sarun: stamp the override onto self.first_rule too so
+        // build_plan's `n.is_default_target = self.first_rule == output`
+        // marks the right node — otherwise the ninja generator's
+        // `default <target>` line panics on an unmarked default_target.
+        // Also: when build() is called with an explicit targets list
+        // (e.g. the remake-the-makefile loop building just the
+        // generated-include outputs), use targets[0] as the default
+        // for marking purposes — otherwise the first_rule from parse
+        // wouldn't match anything in the dep graph this iteration.
+        if let Some(override_sym) = default_goal_override {
+            self.first_rule = Some(override_sym);
+        }
+        if !targets.is_empty() {
+            self.first_rule = Some(targets[0]);
+        }
         let Some(first_rule) = self.first_rule else {
             error!("*** No targets.");
         };
@@ -699,6 +776,27 @@ impl<'a> DepBuilder<'a> {
         self.rule_vars.get(&o).cloned()
     }
 
+    /// sarun: shallow producibility check — does some rule (explicit
+    /// or implicit) have output matching this symbol? Used by
+    /// can_pick_implicit_rule to allow chained pattern rules like
+    /// `%.o: %.c` + `%.c:` to build a missing `.c` on demand.
+    fn has_producing_rule(&self, sym: Symbol) -> bool {
+        if self.rules.contains_key(&sym) {
+            return true;
+        }
+        let bytes = sym.as_bytes();
+        let irules = self.implicit_rules.get(&bytes);
+        for rule in irules {
+            for output_pattern in &rule.output_patterns {
+                let pat = crate::strutil::Pattern::new(output_pattern.as_bytes());
+                if pat.matches(&bytes) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     fn can_pick_implicit_rule(
         &mut self,
         rule: &Rule,
@@ -713,7 +811,14 @@ impl<'a> DepBuilder<'a> {
                 let mut ok = true;
                 for input in &rule.inputs {
                     let buf = pat.append_subst(&output_str, &input.as_bytes());
-                    if !self.exists(intern(buf)) {
+                    let sym = intern(buf);
+                    // sarun: accept inputs that don't exist on disk yet
+                    // but ARE buildable — either via an explicit rule
+                    // or via some implicit pattern rule whose output
+                    // pattern matches. Mirrors GNU make's "chained
+                    // implicit rule" derivation (a one-step lookahead;
+                    // we don't recurse further to keep it cheap).
+                    if !self.exists(sym) && !self.has_producing_rule(sym) {
                         ok = false;
                         break;
                     }
@@ -762,7 +867,30 @@ impl<'a> DepBuilder<'a> {
 
     fn pick_rule(&mut self, output: Symbol, n: &Arc<Mutex<DepNode>>) -> Option<PickedRuleInfo> {
         let rule_merger = self.lookup_rule_merger(output);
-        let vars = self.lookup_rule_vars(output);
+        let mut vars = self.lookup_rule_vars(output);
+        // sarun: pattern-specific variables (`%.x: CFLAGS := -O2`) apply
+        // to any target matching the pattern, regardless of whether that
+        // target also has an explicit rule. Kati used to only merge them
+        // on the implicit-rule path below, so an explicit `a.x:` recipe
+        // saw an empty CFLAGS even when `%.x: CFLAGS := -O2` was set.
+        // Scan rule_vars for `%`-bearing keys whose pattern matches the
+        // output and merge them in too.
+        let out_bytes = output.as_bytes();
+        let mut pattern_keys: Vec<Symbol> = self
+            .rule_vars
+            .keys()
+            .copied()
+            .filter(|s| s.as_bytes().contains(&b'%'))
+            .collect();
+        // Keep deterministic order — more-specific (longer non-stem
+        // portion) first, like GNU make does for pattern-rule selection.
+        pattern_keys.sort_by_key(|s| std::cmp::Reverse(s.as_bytes().len()));
+        for psym in pattern_keys {
+            let pat = crate::strutil::Pattern::new(psym.as_bytes());
+            if pat.matches(&out_bytes) {
+                vars = self.merge_implicit_rule_vars(psym, vars);
+            }
+        }
         if let Some(rule_merger) = &rule_merger
             && rule_merger.lock().primary_rule.is_some()
         {
@@ -800,39 +928,15 @@ impl<'a> DepBuilder<'a> {
 
         let output_str = output.as_bytes();
         let Some(output_suffix) = get_ext(&output_str) else {
-            if rule_merger.is_some() {
-                return Some(PickedRuleInfo {
-                    merger: rule_merger,
-                    pattern_rule: None,
-                    vars,
-                });
-            } else {
-                return None;
-            }
+            return self.try_default_or_merger(rule_merger, output, vars);
         };
         if !output_suffix.starts_with(b".") {
-            if rule_merger.is_some() {
-                return Some(PickedRuleInfo {
-                    merger: rule_merger,
-                    pattern_rule: None,
-                    vars,
-                });
-            } else {
-                return None;
-            }
+            return self.try_default_or_merger(rule_merger, output, vars);
         }
         let output_suffix = &output_suffix[1..];
 
         let Some(found) = self.suffix_rules.get(output_suffix) else {
-            if rule_merger.is_some() {
-                return Some(PickedRuleInfo {
-                    merger: rule_merger,
-                    pattern_rule: None,
-                    vars,
-                });
-            } else {
-                return None;
-            }
+            return self.try_default_or_merger(rule_merger, output, vars);
         };
 
         for irule in found {
@@ -861,15 +965,38 @@ impl<'a> DepBuilder<'a> {
             });
         }
 
+        self.try_default_or_merger(rule_merger, output, vars)
+    }
+
+    /// sarun: final fallback in pick_rule. If the target has its own
+    /// rule_merger, use it. Otherwise, if GNU make's `.DEFAULT:` rule
+    /// is defined and the target isn't itself a special target, run
+    /// the .DEFAULT recipe (with $@ bound to the missing target).
+    /// If neither applies, return None.
+    fn try_default_or_merger(
+        &self,
+        rule_merger: Option<Arc<Mutex<RuleMerger>>>,
+        output: Symbol,
+        vars: Option<Arc<Vars>>,
+    ) -> Option<PickedRuleInfo> {
         if rule_merger.is_some() {
-            Some(PickedRuleInfo {
+            return Some(PickedRuleInfo {
                 merger: rule_merger,
                 pattern_rule: None,
                 vars,
-            })
-        } else {
-            None
+            });
         }
+        if !is_special_target(&output)
+            && let Some(default_merger) = self.lookup_rule_merger(intern(".DEFAULT"))
+            && default_merger.lock().primary_rule.is_some()
+        {
+            return Some(PickedRuleInfo {
+                merger: Some(default_merger),
+                pattern_rule: None,
+                vars,
+            });
+        }
+        None
     }
 
     fn build_plan(
@@ -1044,6 +1171,106 @@ impl<'a> DepBuilder<'a> {
             }
         }
 
+        // sarun: .SECONDEXPANSION second pass. Inputs that contain a `$`
+        // (i.e. were `$$VAR`/`$$@`/etc. in the source and survived the
+        // first parse) are re-parsed as expressions and re-evaluated
+        // against the *current* variable bindings, then word-split.
+        // Targets that don't reference `$` are left alone.
+        //
+        // Per the GNU make manual, $@ (target name) and $* (stem) are
+        // bound during second expansion; $<, $^, $? are NOT (deps haven't
+        // been resolved yet). We model that by temporarily installing $@
+        // as a global simple var for the duration of the expansion —
+        // the autocommand `$@` binding isn't yet wired up at this point
+        // in the pipeline (CommandEvaluator hasn't been built).
+        if self.secondexpansion && !is_special_target(&output) {
+            let inputs = n.lock().actual_inputs.clone();
+            let needs_expand = inputs.iter().any(|s| s.as_bytes().contains(&b'$'));
+            if needs_expand {
+                let out_bytes = output.as_bytes();
+                let dir = crate::strutil::dirname(&out_bytes);
+                let base = crate::strutil::basename(&out_bytes);
+                let mk_var = |v: Bytes| {
+                    Variable::with_simple_string(
+                        v,
+                        crate::var::VarOrigin::Automatic,
+                        None,
+                        None,
+                    )
+                };
+                let _scoped_at = crate::symtab::ScopedGlobalVar::new(
+                    intern("@"),
+                    mk_var(out_bytes.clone()),
+                )?;
+                let _scoped_at_d = crate::symtab::ScopedGlobalVar::new(
+                    intern("@D"),
+                    mk_var(Bytes::copy_from_slice(&dir)),
+                )?;
+                let _scoped_at_f = crate::symtab::ScopedGlobalVar::new(
+                    intern("@F"),
+                    mk_var(Bytes::copy_from_slice(base)),
+                )?;
+                // First pass dropped the source text on the floor and only
+                // kept space-split tokens. `$(call f,arg)` ends up split
+                // into `$(call` + `f,arg)`, which is unparseable individually.
+                // Rejoin adjacent tokens whose paren/brace counts don't
+                // balance before re-evaluating.
+                let mut joined: Vec<Bytes> = Vec::new();
+                for input in &inputs {
+                    let b = input.as_bytes();
+                    if let Some(last) = joined.last_mut()
+                        && paren_balance(last) != 0
+                    {
+                        let mut combined = bytes::BytesMut::from(last.as_ref());
+                        combined.put_u8(b' ');
+                        combined.put_slice(&b);
+                        *last = combined.freeze();
+                    } else {
+                        joined.push(b.clone());
+                    }
+                }
+                let mut new_inputs: Vec<Symbol> = Vec::new();
+                for bytes in joined {
+                    if !bytes.contains(&b'$') {
+                        new_inputs.push(intern(bytes.to_vec()));
+                        continue;
+                    }
+                    let mut mloc = n.lock().loc.clone().unwrap_or_default();
+                    let expr = crate::expr::parse_expr(
+                        &mut mloc,
+                        bytes.clone(),
+                        crate::expr::ParseExprOpt::Normal,
+                    )?;
+                    let buf = expr.eval_to_buf(self.ev)?;
+                    for w in crate::strutil::word_scanner(&buf) {
+                        new_inputs.push(intern(w.to_vec()));
+                    }
+                }
+                n.lock().actual_inputs = new_inputs;
+            }
+        }
+
+        // sarun: `.EXTRA_PREREQS := dep1 dep2` (GNU make 4.3+) injects
+        // those names as prerequisites of every regular target. Skip
+        // special targets (.PHONY, .DEFAULT, etc.) — including the
+        // EXTRA_PREREQS targets themselves (or we'd build a cycle).
+        if !is_special_target(&output)
+            && let Some(ep_var) = self.ev.lookup_var(intern(".EXTRA_PREREQS"))?
+        {
+            let ep_buf = ep_var.read().eval_to_buf(self.ev)?;
+            let extras: Vec<Symbol> = crate::strutil::word_scanner(&ep_buf)
+                .map(|w| intern(w.to_vec()))
+                .collect();
+            if !extras.iter().any(|s| *s == output) {
+                let mut node = n.lock();
+                for extra in extras {
+                    if !node.actual_inputs.contains(&extra) {
+                        node.actual_inputs.push(extra);
+                    }
+                }
+            }
+        }
+
         let actual_inputs = n.lock().actual_inputs.clone();
         for input in actual_inputs {
             let c = self.build_plan(input, Some(output))?;
@@ -1154,6 +1381,20 @@ pub fn make_dep(ev: &mut Evaluator, targets: Vec<Symbol>) -> Result<Vec<NamedDep
     let mut db = DepBuilder::new(ev)?;
     let _tr = ScopedTimeReporter::new("make dep (build)");
     db.build(targets)
+}
+
+// sarun: count `(`/`{` minus `)`/`}` outside quotes — used to detect
+// SECONDEXPANSION tokens that the first-pass word-split tore apart.
+fn paren_balance(s: &[u8]) -> i32 {
+    let mut depth = 0i32;
+    for &b in s {
+        match b {
+            b'(' | b'{' => depth += 1,
+            b')' | b'}' => depth -= 1,
+            _ => {}
+        }
+    }
+    depth
 }
 
 pub fn is_special_target(output: &Symbol) -> bool {

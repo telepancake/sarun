@@ -1,0 +1,2 @@
+all:
+	@echo target-percent=[$%]

@@ -1,4 +1,3 @@
-# TODO: Fix.
 
 test:
 	echo $(value @)
