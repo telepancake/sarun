@@ -7,7 +7,7 @@
 
 use clap::builder::{TypedValueParser, ValueParserFactory};
 use clap::{Arg, ArgAction, ArgMatches, Command};
-use uucore::display::{Quotable, println_verbatim};
+use uucore::display::Quotable;
 use uucore::error::{FromIo, UError, UResult, UUsageError};
 use uucore::format_usage;
 use uucore::translate;
@@ -366,8 +366,38 @@ impl ValueParserFactory for OptionalPathBufParser {
     }
 }
 
+/// Logical entry point for the in-process brush `mktemp` builtin.
+///
+/// Mirrors [`uumain`] but (1) creates the temp file/dir under the shell's
+/// LOGICAL `cwd` when the resolved target directory is relative (the process is
+/// never `chdir`'d) — while still PRINTING the template-relative name GNU
+/// prints — and (2) writes the created name to the injected `out` instead of
+/// process fd 1. `mktemp`'s diagnostics surface as the returned `UResult`, which
+/// the engine writes to its logical stderr; `err` is accepted for parity with
+/// the other file-op builtins and to flush on the way out.
+pub fn mktemp_main(
+    args: impl uucore::Args,
+    cwd: &Path,
+    out: &mut dyn std::io::Write,
+    err: &mut dyn std::io::Write,
+) -> UResult<()> {
+    let result = run(args, Some(cwd), out);
+    let _ = out.flush();
+    let _ = err.flush();
+    result
+}
+
 #[uucore::main]
 pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+    let mut out = std::io::stdout();
+    run(args, None, &mut out)
+}
+
+/// Shared body of [`mktemp_main`] and [`uumain`]. When `cwd` is `Some`, a
+/// relative target directory is rooted at the shell's logical cwd for creation
+/// (the printed name stays template-relative); when `None` (standalone) creation
+/// is against the process cwd, as upstream. The created name is written to `out`.
+fn run(args: impl uucore::Args, cwd: Option<&Path>, out: &mut dyn std::io::Write) -> UResult<()> {
     let args: Vec<_> = args.collect();
     let matches = match uu_app().try_get_matches_from(&args) {
         Ok(m) => m,
@@ -421,7 +451,7 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     let res = if dry_run {
         Ok(dry_exec(&tmpdir, &prefix, rand, &suffix))
     } else {
-        exec(&tmpdir, &prefix, rand, &suffix, make_dir)
+        exec(cwd, &tmpdir, &prefix, rand, &suffix, make_dir)
     };
 
     let res = if suppress_file_err {
@@ -430,7 +460,11 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     } else {
         res
     };
-    println_verbatim(res?).map_err_context(|| translate!("mktemp-error-failed-print"))
+    let path = res?;
+    use std::os::unix::ffi::OsStrExt as _;
+    out.write_all(path.as_os_str().as_bytes())
+        .and_then(|()| out.write_all(b"\n"))
+        .map_err_context(|| translate!("mktemp-error-failed-print"))
 }
 
 pub fn uu_app() -> Command {
@@ -598,11 +632,26 @@ fn make_temp_file(dir: &Path, prefix: &str, rand: usize, suffix: &str) -> UResul
     }
 }
 
-fn exec(dir: &Path, prefix: &str, rand: usize, suffix: &str, make_dir: bool) -> UResult<PathBuf> {
+fn exec(
+    cwd: Option<&Path>,
+    dir: &Path,
+    prefix: &str,
+    rand: usize,
+    suffix: &str,
+    make_dir: bool,
+) -> UResult<PathBuf> {
+    // The directory `mktemp` actually creates in. When `cwd` is `Some` and `dir`
+    // is relative, root it at the shell's logical cwd (the process is never
+    // `chdir`'d); the PRINTED name below still uses the original `dir` so the
+    // output matches the template GNU prints.
+    let create_dir = match cwd {
+        Some(cwd) if dir.is_relative() => cwd.join(dir),
+        _ => dir.to_path_buf(),
+    };
     let path = if make_dir {
-        make_temp_dir(dir, prefix, rand, suffix)?
+        make_temp_dir(&create_dir, prefix, rand, suffix)?
     } else {
-        make_temp_file(dir, prefix, rand, suffix)?
+        make_temp_file(&create_dir, prefix, rand, suffix)?
     };
 
     // Get just the last component of the path to the created
@@ -641,10 +690,12 @@ pub fn mktemp(options: &Options) -> UResult<PathBuf> {
     } = Params::from(options.clone())?;
 
     // Create the temporary file or directory, or simulate creating it.
+    // `None` cwd: this public library API resolves against the process cwd, as
+    // upstream (the logical-cwd seam is reached only via `mktemp_main`).
     if options.dry_run {
         Ok(dry_exec(&tmpdir, &prefix, rand, &suffix))
     } else {
-        exec(&tmpdir, &prefix, rand, &suffix, options.directory)
+        exec(None, &tmpdir, &prefix, rand, &suffix, options.directory)
     }
 }
 
