@@ -14,13 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{
-    collections::HashMap,
-    ffi::OsStr,
-    os::unix::ffi::{OsStrExt, OsStringExt},
-    sync::Arc,
-    time::SystemTime,
-};
+use std::{collections::HashMap, ffi::OsStr, os::unix::ffi::OsStrExt, sync::Arc, time::SystemTime};
 
 use anyhow::Result;
 use bytes::Bytes;
@@ -31,8 +25,7 @@ use crate::{
     dep::{DepNode, NamedDepNode},
     error,
     eval::{Evaluator, FrameType},
-    expr::Evaluable,
-    fileutil::{RedirectStderr, get_timestamp, run_command, run_with_installed_runner},
+    fileutil::{RedirectStderr, get_timestamp, run_command},
     flags::FLAGS,
     log,
     symtab::Symbol,
@@ -153,126 +146,34 @@ impl<'a> Executor<'a> {
             return Ok(output_ts);
         }
 
-        // sarun: target-specific exported vars (`target: export VAR := …`)
-        // — push them into the process env for the duration of THIS
-        // target's commands, restore after. Single-threaded so the
-        // env-swap is safe.
-        let mut env_restores: Vec<(std::ffi::OsString, Option<std::ffi::OsString>)> = Vec::new();
-        if let Some(rule_vars) = n.lock().rule_vars.clone() {
-            let entries: Vec<(crate::symtab::Symbol, crate::var::Var)> =
-                rule_vars.0.lock().iter().map(|(s, v)| (*s, v.clone())).collect();
-            for (sym, var) in entries {
-                let do_export = var.read().exported;
-                let key = std::ffi::OsString::from_vec(sym.as_bytes().to_vec());
-                if !do_export {
-                    continue;
-                }
-                let value_bytes = var.read().eval_to_buf(self.ce.ev)?;
-                let prev = std::env::var_os(&key);
-                env_restores.push((key.clone(), prev));
-                // SAFETY: single-threaded recipe loop.
-                unsafe {
-                    std::env::set_var(
-                        &key,
-                        <std::ffi::OsStr as OsStrExt>::from_bytes(&value_bytes),
-                    );
-                }
-            }
-        }
-
-        let mut commands = self.ce.eval(n)?;
-        // sarun: .ONESHELL — fuse all commands into one shell invocation
-        // so variable/cwd state persists across recipe lines. The first
-        // command's flags (echo, ignore_error) apply to the whole block.
-        if self.ce.ev.oneshell && commands.len() > 1 {
-            use bytes::{BufMut, BytesMut};
-            let mut combined = BytesMut::new();
-            let first_echo = commands[0].echo;
-            let first_ignore = commands[0].ignore_error;
-            let first_output = commands[0].output;
-            for (i, c) in commands.iter().enumerate() {
-                if i > 0 {
-                    combined.put_u8(b'\n');
-                }
-                combined.put_slice(&c.cmd);
-            }
-            commands = vec![crate::command::Command {
-                output: first_output,
-                cmd: combined.freeze(),
-                echo: first_echo,
-                ignore_error: first_ignore,
-                force_no_subshell: false,
-            }];
-        }
+        let commands = self.ce.eval(n)?;
         for command in commands {
             self.num_commands += 1;
             if command.echo {
                 println!("{}", String::from_utf8_lossy(&command.cmd));
             }
             if !FLAGS.is_dry_run {
-                // sarun: prefer the embedder's in-process runner (brush)
-                // when installed; fall back to fork+exec /bin/sh otherwise.
-                // The installed runner returns only an exit code, not a
-                // signal-bearing ExitStatus — fine because the box's brush
-                // path has no SIGINT/SIGQUIT signaling distinct from a
-                // non-zero code.
-                let (ok, output, code_for_msg) =
-                    if let Some((code, out)) =
-                        run_with_installed_runner(&self.shell, self.shellflag, &command.cmd)
-                    {
-                        (code == 0, out, code)
-                    } else {
-                        let (status, out) = run_command(
-                            &self.shell,
-                            self.shellflag,
-                            &command.cmd,
-                            RedirectStderr::Stdout,
-                        )?;
-                        (status.success(), out, status.code().unwrap_or(1))
-                    };
+                let (status, output) = run_command(
+                    &self.shell,
+                    self.shellflag,
+                    &command.cmd,
+                    RedirectStderr::Stdout,
+                )?;
                 print!("{}", String::from_utf8_lossy(&output));
-                if !ok {
+                if !status.success() {
                     if command.ignore_error {
                         eprintln!(
                             "[{}] Error {} (ignored)",
                             command.output,
-                            code_for_msg
+                            status.code().unwrap_or(1)
                         )
                     } else {
-                        // sarun: .DELETE_ON_ERROR — remove the target's
-                        // partially-created output file before bailing,
-                        // and announce it the way GNU make does (with
-                        // the same `*** ` prefix and after the Error
-                        // line). Phony targets are never on-disk so
-                        // skip them.
-                        eprintln!(
+                        error!(
                             "*** [{}] Error {}",
                             command.output,
-                            code_for_msg
+                            status.code().unwrap_or(1)
                         );
-                        if self.ce.ev.delete_on_error && !n.lock().is_phony {
-                            let out_bytes = command.output.as_bytes();
-                            let path = OsStr::from_bytes(&out_bytes);
-                            if std::fs::exists(path).unwrap_or(false) {
-                                eprintln!(
-                                    "*** Deleting file \"{}\"",
-                                    String::from_utf8_lossy(&out_bytes)
-                                );
-                                let _ = std::fs::remove_file(path);
-                            }
-                        }
-                        std::process::exit(2);
                     }
-                }
-            }
-        }
-
-        for (key, prev) in env_restores.into_iter().rev() {
-            // SAFETY: single-threaded.
-            unsafe {
-                match prev {
-                    Some(v) => std::env::set_var(&key, v),
-                    None => std::env::remove_var(&key),
                 }
             }
         }
@@ -287,18 +188,9 @@ pub fn exec(roots: Vec<NamedDepNode>, ev: &mut Evaluator) -> Result<()> {
     for (_sym, root) in &roots {
         executor.exec_node(root, None)?;
     }
-    // sarun: emit "Nothing to be done" only for roots whose rule has no
-    // commands at all (or which had no rule). If the rule had commands
-    // but they were skipped because the file was up-to-date, GNU make
-    // stays silent under -s (or prints "<target> is up to date"
-    // otherwise); kati's old unconditional message diverged on every
-    // benign incremental rebuild.
     if executor.num_commands == 0 {
-        for (sym, root) in roots {
-            let node = root.lock();
-            if node.cmds.is_empty() {
-                println!("kati: Nothing to be done for `{sym}'.")
-            }
+        for (sym, _) in roots {
+            println!("kati: Nothing to be done for `{sym}'.")
         }
     }
     Ok(())

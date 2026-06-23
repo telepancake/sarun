@@ -14,10 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// sarun: dropped jemalloc + gperf + the `#![deny(warnings)]` lint that turns
-// every future upstream change into a compile error for us.
-
+// TODO: Add docs
 #![allow(missing_docs)]
+// These are the lints enabled by default in Android
+// #![deny(missing_docs)]
+#![deny(warnings)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(clippy::undocumented_unsafe_blocks)]
 
@@ -29,6 +30,9 @@ use std::sync::Arc;
 use anyhow::{Result, bail};
 use bytes::{BufMut, Bytes, BytesMut};
 use parking_lot::Mutex;
+
+#[cfg(feature = "gperf")]
+use gperftools::{HEAP_PROFILER, PROFILER};
 
 use kati::dep::{NamedDepNode, make_dep};
 use kati::fileutil::clear_glob_cache;
@@ -48,6 +52,15 @@ use kati::flags::FLAGS;
 use kati::symtab::{Symbol, intern, join_symbols};
 use kati::timeutil::ScopedTimeReporter;
 
+#[cfg(all(not(feature = "gperf"), target_os = "linux"))]
+use tikv_jemallocator::Jemalloc;
+
+// Use jemalloc for better performance, but gperftools will use tcmalloc for
+// heap debugging.
+#[cfg(all(not(feature = "gperf"), target_os = "linux"))]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
+
 fn read_bootstrap_makefile(targets: &[Symbol]) -> Result<Arc<Mutex<Vec<Stmt>>>> {
     let mut bootstrap = BytesMut::new();
     bootstrap.put_slice(b"CC?=cc\n");
@@ -57,28 +70,22 @@ fn read_bootstrap_makefile(targets: &[Symbol]) -> Result<Arc<Mutex<Vec<Stmt>>>> 
         bootstrap.put_slice(b"CXX?=g++\n");
     }
     bootstrap.put_slice(b"AR?=ar\n");
-    // sarun: upstream pins 4.2.1 for Android-build stability; we declared
-    // GNU make 4.3 (Ubuntu 22.04 LTS) as our compat target, so report that.
-    bootstrap.put_slice(b"MAKE_VERSION?=4.3\n");
-    // sarun: MAKELEVEL tracks recursion depth across sub-makes. Real make
-    // reads it from the environment (default 0), reports it via $(MAKELEVEL),
-    // and bumps it by 1 in every recipe environment so child make
-    // invocations see the next level. Mirror that here.
-    {
-        let level = std::env::var("MAKELEVEL")
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or(0);
-        bootstrap.put_slice(format!("MAKELEVEL:={level}\n").as_bytes());
-    }
+    // Pretend to be GNU make 4.2.1, for compatibility.
+    bootstrap.put_slice(b"MAKE_VERSION?=4.2.1\n");
     bootstrap.put_slice(b"KATI?=ckati\n");
+    // Overwrite $SHELL environment variable.
     bootstrap.put_slice(b"SHELL=/bin/sh\n");
+    // TODO: Add more builtin vars.
 
     if !FLAGS.no_builtin_rules {
+        // http://www.gnu.org/software/make/manual/make.html#Catalogue-of-Rules
+        // The document above is actually not correct. See default.c:
+        // http://git.savannah.gnu.org/cgit/make.git/tree/default.c?id=4.1
         bootstrap.put_slice(b".c.o:\n");
         bootstrap.put_slice(b"\t$(CC) $(CFLAGS) $(CPPFLAGS) $(TARGET_ARCH) -c -o $@ $<\n");
         bootstrap.put_slice(b".cc.o:\n");
         bootstrap.put_slice(b"\t$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(TARGET_ARCH) -c -o $@ $<\n");
+        // TODO: Add more builtin rules.
     }
     if FLAGS.generate_ninja {
         bootstrap.put_slice(format!("MAKE?=make -j{}\n", FLAGS.num_jobs.max(1)).as_bytes());
@@ -122,11 +129,8 @@ fn run(targets: &[Symbol], cl_vars: &Vec<Bytes>, orig_args: OsString) -> Result<
 
     let mut ev = Evaluator::new();
     ev.start()?;
-    // sarun: GNU make's MAKEFILE_LIST has no leading space — the main
-    // makefile is the very first word. Kati used to seed it with " name",
-    // which leaked an extra space into any recipe that referenced
-    // $(MAKEFILE_LIST) (e.g. `echo  Makefile` instead of `echo Makefile`).
     let mut makefile_list = BytesMut::new();
+    makefile_list.put_u8(b' ');
     makefile_list.put_slice(FLAGS.makefile.lock().clone().unwrap().as_bytes());
     intern("MAKEFILE_LIST").set_global_var(
         Variable::with_simple_string(
@@ -219,35 +223,6 @@ fn run(targets: &[Symbol], cl_vars: &Vec<Bytes>, orig_args: OsString) -> Result<
         ev.dump_include_json(filename)?;
     }
 
-    // sarun: GNU make's "remake the makefile" loop, step 1 of 2.
-    // Before we do dep analysis on the user's targets, check whether
-    // any required `include` was deferred during parse and is producible
-    // by a rule we have. If so, fold those names into the targets list
-    // for the single make_dep call below, exec the resulting nodes
-    // (which build the missing includes), and then re-exec ourselves
-    // with the same args — the second invocation parses with the
-    // freshly-generated content visible. Guard against infinite
-    // re-exec via SARUN_KATI_REMAKE_DEPTH (capped at 5).
-    let mut remake_targets: Vec<Symbol> = Vec::new();
-    {
-        let pending = std::mem::take(&mut ev.pending_remake_includes);
-        for (loc, name) in &pending {
-            let sym = intern(name.as_bytes().to_vec());
-            if ev.rules.iter().any(|r| r.outputs.contains(&sym)) {
-                remake_targets.push(sym);
-            } else {
-                // Missing required include with no matching rule. Emit a
-                // single line matching upstream kati's `error_loc!` shape;
-                // the corpus normalizer rolls real make's follow-up
-                // "*** No rule to make target X" line into the same.
-                let pat_str = String::from_utf8_lossy(name.as_bytes());
-                eprintln!("{loc}: {pat_str}: No such file or directory");
-                std::process::exit(2);
-            }
-        }
-    }
-    let remake_active = !remake_targets.is_empty();
-
     let nodes: Vec<NamedDepNode>;
     {
         let _frame = ev.enter(
@@ -256,58 +231,11 @@ fn run(targets: &[Symbol], cl_vars: &Vec<Bytes>, orig_args: OsString) -> Result<
             Loc::default(),
         );
         let _tr = ScopedTimeReporter::new("make dep time");
-        // When remaking, we only want to build the remake targets in
-        // this invocation; the user's real targets get built in the
-        // re-exec'd process.
-        let dep_targets = if remake_active {
-            remake_targets.clone()
-        } else {
-            targets.to_owned()
-        };
-        nodes = make_dep(&mut ev, dep_targets)?;
+        nodes = make_dep(&mut ev, targets.to_owned())?;
     }
 
     if FLAGS.is_syntax_check_only {
         return Ok(0);
-    }
-
-    if remake_active {
-        let depth: u32 = std::env::var("SARUN_KATI_REMAKE_DEPTH")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        if depth >= 5 {
-            eprintln!(
-                "*** kati: remake-the-makefile loop exceeded 5 iterations (still missing: {:?})",
-                remake_targets
-            );
-            std::process::exit(2);
-        }
-        // Build the remake targets.
-        {
-            let _frame = ev.enter(
-                FrameType::Phase,
-                Bytes::from_static(b"*remake*"),
-                Loc::default(),
-            );
-            kati::exec::exec(nodes, &mut ev)?;
-        }
-        // Re-exec ourselves with the same args. GLOB_CACHE et al. reset
-        // naturally because it's a fresh process. Use current_exe() for
-        // the actual binary path (argv[0] might be "make" via FUSE shadow
-        // / Command::arg0, which would PATH-resolve to a different
-        // binary), and preserve the original argv[0] for the new
-        // process.
-        let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
-        let argv0 = argv.first().cloned().unwrap_or_default();
-        let exe = std::env::current_exe().unwrap_or_else(|_| argv0.clone().into());
-        let mut cmd = std::process::Command::new(&exe);
-        std::os::unix::process::CommandExt::arg0(&mut cmd, &argv0);
-        cmd.args(argv.iter().skip(1));
-        cmd.env("SARUN_KATI_REMAKE_DEPTH", (depth + 1).to_string());
-        let err = std::os::unix::process::CommandExt::exec(&mut cmd);
-        eprintln!("*** kati: failed to re-exec for remake: {err}");
-        std::process::exit(2);
     }
 
     if FLAGS.generate_ninja {
@@ -320,36 +248,6 @@ fn run(targets: &[Symbol], cl_vars: &Vec<Bytes>, orig_args: OsString) -> Result<
         generate_ninja(&nodes, &mut ev, orig_args.as_bytes(), start_time)?;
         ev.finish()?;
         return Ok(0);
-    }
-
-    // sarun: bump MAKELEVEL by 1 in the recipe environment so any sub-make
-    // launched from a recipe sees the next level. Matches real make.
-    {
-        let level = std::env::var("MAKELEVEL")
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or(0);
-        // SAFETY: single-threaded at this point in the pipeline.
-        unsafe {
-            std::env::set_var("MAKELEVEL", (level + 1).to_string());
-        }
-    }
-
-    // sarun: `.EXPORT_ALL_VARIABLES:` makes every make-defined variable
-    // visible to recipe environments. Stage them all here, before the
-    // explicit-exports loop (which can still override with unexport).
-    if ev.export_all_vars {
-        let all = kati::symtab::get_symbol_names(|v| {
-            !matches!(
-                v.read().origin(),
-                kati::var::VarOrigin::Default | kati::var::VarOrigin::Automatic
-            )
-        });
-        for (sym, _name) in all {
-            if !ev.exports.contains_key(&sym) {
-                ev.exports.insert(sym, true);
-            }
-        }
     }
 
     for (name, export) in ev.exports.clone() {
@@ -435,11 +333,33 @@ fn main() {
             handle_realpath(std::env::args().skip(2).collect());
             return;
         } else if arg == "--dump_stamp_tool" {
+            // Unfortunately, this can easily be confused with --dump_kati_stamp,
+            // which prints debug info about the stamp while executing a normal kati
+            // run. This tool flag only dumps information, and doesn't run the rest of
+            // kati.
             if let Err(err) = stamp_dump_main() {
                 eprintln!("{err}");
                 std::process::exit(1);
             }
             return;
+        }
+    }
+
+    #[cfg(feature = "gperf")]
+    {
+        if let Some(path) = &FLAGS.cpu_profile_path {
+            PROFILER
+                .lock()
+                .unwrap()
+                .start(std::ffi::CString::new(path.as_bytes()).unwrap())
+                .unwrap();
+        }
+        if let Some(path) = &FLAGS.memory_profile_path {
+            HEAP_PROFILER
+                .lock()
+                .unwrap()
+                .start(std::ffi::CString::new(path.as_bytes()).unwrap())
+                .unwrap();
         }
     }
 
@@ -466,6 +386,15 @@ fn main() {
             1
         }
     };
+    #[cfg(feature = "gperf")]
+    {
+        if FLAGS.cpu_profile_path.is_some() {
+            PROFILER.lock().unwrap().stop().unwrap();
+        }
+        if FLAGS.memory_profile_path.is_some() {
+            HEAP_PROFILER.lock().unwrap().stop().unwrap();
+        }
+    }
     kati::stats::report_all_stats();
     std::process::exit(ret);
 }

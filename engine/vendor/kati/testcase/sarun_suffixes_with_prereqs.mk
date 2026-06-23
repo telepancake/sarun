@@ -1,2 +1,0 @@
-.SUFFIXES: .foo
-all: ; @:

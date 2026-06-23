@@ -514,25 +514,9 @@ fn or_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> Res
 
 fn value_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> Result<()> {
     let var_name = args[0].eval_to_buf(ev)?;
-    let Some(var) = ev.lookup_var(intern(var_name.clone()))? else {
+    let Some(var) = ev.lookup_var(intern(var_name))? else {
         return Ok(());
     };
-    // sarun: real make treats $(value <auto>) specially. Plain auto-vars
-    // ($@/$</$^/$?/$*/$+/$%/$|) return the evaluated value (the literal
-    // target name etc.), while the @D/@F dirname/basename variants
-    // return the make-internal macro form that derives them from the
-    // bare letter. Variable::string handles the latter; for the former
-    // we just evaluate.
-    let bytes = var_name.as_ref();
-    let needs_eval = bytes.len() == 1
-        && matches!(
-            bytes[0],
-            b'@' | b'<' | b'^' | b'?' | b'*' | b'+' | b'%' | b'|'
-        );
-    if needs_eval && matches!(var.read().origin(), crate::var::VarOrigin::Automatic) {
-        var.read().eval(ev, out)?;
-        return Ok(());
-    }
     out.put_slice(&var.read().string()?);
     Ok(())
 }
@@ -570,7 +554,7 @@ fn has_no_io_in_shell_script(cmd: &[u8]) -> bool {
     false
 }
 
-pub fn shell_func_impl(
+fn shell_func_impl(
     shell: &[u8],
     shellflag: &[u8],
     cmd: &Bytes,
@@ -667,19 +651,17 @@ fn shell_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> 
     let cmd = args[0].eval_to_buf(ev)?;
     if ev.avoid_io && !has_no_io_in_shell_script(&cmd) {
         if ev.eval_depth > 1 {
-            // sarun: real make happily runs $(shell) inside other
-            // constructs ($(if $(shell ...), …)). Kati's
-            // ninja-generation mode delays I/O to keep build.ninja
-            // cacheable — but we'd rather match make than be cacheable
-            // here. Fall through to the actual run path so the result
-            // is folded into the surrounding construct's evaluation.
-        } else {
-            let cmd = strip_shell_comment(cmd);
-            out.put_slice(b"$(");
-            out.put_slice(&cmd);
-            out.put_u8(b')');
-            return Ok(());
+            error_loc!(
+                ev.loc.as_ref(),
+                "kati doesn't support passing results of $(shell) to other make constructs: {}",
+                String::from_utf8_lossy(&cmd)
+            );
         }
+        let cmd = strip_shell_comment(cmd);
+        out.put_slice(b"$(");
+        out.put_slice(&cmd);
+        out.put_u8(b')');
+        return Ok(());
     }
 
     let loc = ev.loc.clone().unwrap_or_default();
