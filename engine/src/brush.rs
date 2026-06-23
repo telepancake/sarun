@@ -851,6 +851,7 @@ macro_rules! fs_builtin {
 
 fs_builtin!(MkdirBuiltin, "mkdir", uu_mkdir::mkdir_main, "uu_mkdir");
 fs_builtin!(RmdirBuiltin, "rmdir", uu_rmdir::rmdir_main, "uu_rmdir");
+fs_builtin!(TouchBuiltin, "touch", uu_touch::touch_main, "uu_touch");
 
 /// Like [`fs_builtin`] but the util ALSO reads the shell's LOGICAL stdin: `rm
 /// -i`/`mv -i` read the y/N overwrite answer from there, NEVER the engine's fd
@@ -1251,6 +1252,7 @@ fn box_builtins_opt<SE: brush_core::extensions::ShellExtensions>(
     m.insert("rm".to_string(), simple_builtin::<RmBuiltin, SE>());
     m.insert("mv".to_string(), simple_builtin::<MvBuiltin, SE>());
     m.insert("ln".to_string(), simple_builtin::<LnBuiltin, SE>());
+    m.insert("touch".to_string(), simple_builtin::<TouchBuiltin, SE>());
     // BashMode shell builtins overwrite overlaps (highest priority).
     m.extend(brush_builtins::default_builtins(brush_builtins::BuiltinSet::BashMode));
     // In-box engine entry points (no PATH shadow): `sarun` / `oaita` re-exec

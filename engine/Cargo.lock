@@ -5366,6 +5366,7 @@ dependencies = [
  "uu_sort",
  "uu_tac",
  "uu_tail",
+ "uu_touch",
  "uu_tr",
  "uu_uniq",
  "uu_wc",
@@ -7679,8 +7680,6 @@ dependencies = [
 [[package]]
 name = "uu_touch"
 version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af40dcd9620f96ec09f2439d29d0ed8b5afc496bb25d1b7a4970416bf4c5b72b"
 dependencies = [
  "clap",
  "filetime",
