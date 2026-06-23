@@ -52,7 +52,7 @@ READ_FD0 = re.compile(r'\bread\(0,')
 
 # The 13 native in-process coreutil builtins.
 UTILS = ["cat", "head", "tail", "wc", "nl", "tac", "basename", "dirname", "seq",
-         "expr", "tr", "cut", "uniq", "sort", "mkdir", "rmdir"]
+         "expr", "tr", "cut", "uniq", "sort", "mkdir", "rmdir", "rm"]
 
 
 def _require():
@@ -174,6 +174,10 @@ INPROC = [
     # the box run and the GNU reference run leave no residue and produce no output.
     ("rmdir",    "mkdir -p rd_a && rmdir rd_a"),
     ("rmdir cwd","cd sub && mkdir -p rd_b && rmdir rd_b && [ ! -d rd_b ]"),
+    # rm is a file-op builtin like cp; self-contained create+remove so box and
+    # GNU reference runs are idempotent. `rm` reads logical stdin only for `-i`.
+    ("rm",       "printf x > rm_a && rm rm_a"),
+    ("rm cwd",   "cd sub && printf x > rm_b && rm rm_b && [ ! -e rm_b ]"),
     # multi-stage all-builtin pipelines stay fully in-process
     ("sort|uniq -c", "sort s.txt | uniq -c"),
     ("tac|head",     "tac v.txt | head -n1"),
@@ -221,6 +225,9 @@ NO_FD0 = [
     ("head < file", "head -n1 < v.txt"),
     ("tail < file", "tail -n1 < v.txt"),
     ("cat < file",  "cat < v.txt"),
+    # rm reads the logical stdin only for `-i`; a plain piped rm must not touch
+    # the engine's fd 0 (it reads its `<` redirect / pipe fd or nothing).
+    ("printf|rm",   "printf y | (printf x > rm_fd0 && rm rm_fd0)"),
 ]
 
 
@@ -241,6 +248,7 @@ ERR_CMDS = [
     "cat /nope", "head /nope", "tail /nope", "wc /nope", "nl /nopedir", "tac /nope",
     "basename", "dirname", "seq", "expr 1 +", "tr", "cut -f1 /nope",
     "uniq /nope", "sort /nope", "mkdir /nope/deep", "rmdir /nope/deep",
+    "rm /nope/deep",
 ]
 # A raw Fluent key looks like `tac-error-open-error` / `expr-error-missing-...`:
 # a util name followed by `-` then lowercase. Rendered English messages never do.
@@ -271,6 +279,8 @@ EXIT_CASES = [
     ("mkdir -p ok", "mkdir -p md_exit", 0), ("mkdir bad parent", "mkdir /nope/deep", 1),
     ("rmdir ok", "mkdir -p rd_exit && rmdir rd_exit", 0),
     ("rmdir missing", "rmdir /nope/deep", 1),
+    ("rm ok", "printf x > rm_exit && rm rm_exit", 0),
+    ("rm missing", "rm /nope/deep", 1), ("rm -f missing", "rm -f /nope/deep", 0),
     ("expr 5", "expr 5", 0), ("expr 0", "expr 0", 1),
     ("expr 1=2", "expr 1 = 2", 1), ("expr 1=1", "expr 1 = 1", 0),
     # regression guards for the uu_expr fork patch (leading-+ and substr-overflow
