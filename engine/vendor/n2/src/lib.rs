@@ -3,26 +3,32 @@ mod db;
 mod densemap;
 mod depfile;
 mod eval;
-pub mod graph; // sarun: pub so the engine can walk the build graph for build_edges
+mod graph;
 mod hash;
 pub mod load;
 pub mod parse;
-pub mod process; // sarun: pub so the engine can install the in-process executor hook
+mod process;
 #[cfg(unix)]
 mod process_posix;
-// sarun: process_win dropped — this fork is unix-only.
+#[cfg(windows)]
+mod process_win;
 mod progress;
 mod progress_dumb;
 mod progress_fancy;
 pub mod run;
 pub mod scanner;
-pub mod signal; // sarun: pub so the engine can suppress n2's SIGINT handler
+mod signal;
 mod smallmap;
 mod task;
 mod terminal;
 mod trace;
 mod work;
 
-// sarun: the upstream jemalloc #[global_allocator] block is dropped — the
-// vendored fork is lib-only with the jemalloc feature removed, so the host
-// binary owns the allocator.
+#[cfg(feature = "jemalloc")]
+#[cfg(not(any(miri, windows, target_arch = "wasm32")))]
+use jemallocator::Jemalloc;
+
+#[cfg(feature = "jemalloc")]
+#[cfg(not(any(miri, windows, target_arch = "wasm32")))]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
