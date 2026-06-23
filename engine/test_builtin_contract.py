@@ -4,8 +4,7 @@
 The differential tests prove a builtin's *output* matches GNU on a given input.
 They cannot prove the *contract* that makes it a real in-process builtin (and not
 a fake one that secretly forks). There are no gates and no fork-to-the-box's-
-binary fallback any more: each of the 14 (`cat head tail wc nl tac basename
-dirname seq expr tr cut uniq sort`) runs uutils IN-PROCESS, unconditionally. This test
+binary fallback: every util in UTILS runs uutils IN-PROCESS, unconditionally. This test
 asserts, at the syscall level:
 
   1. IN-PROCESS         -> the util is NEVER `execve`'d (it ran inside the engine,
