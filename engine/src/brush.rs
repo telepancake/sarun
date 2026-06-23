@@ -296,6 +296,64 @@ impl brush_core::builtins::SimpleCommand for HeadBuiltin {
     }
 }
 
+/// `tail` — NATIVE in-process brush builtin over the vendored `uu_tail` fork.
+///
+/// STREAM template, like [`HeadBuiltin`]: it reads the box's logical stdin and
+/// writes its logical stdout/stderr directly — no process-global stdio, no
+/// `dup2`, pipeline-safe — with no logical-cwd seam (operands are opened by
+/// literal path). The call runs on a fresh thread for localization isolation —
+/// see [`run_coreutil_localized`].
+struct TailBuiltin;
+
+impl brush_core::builtins::SimpleCommand for TailBuiltin {
+    fn get_content(
+        name: &str,
+        _content_type: brush_core::builtins::ContentType,
+        _options: &brush_core::builtins::ContentOptions,
+    ) -> Result<String, brush_core::error::Error> {
+        Ok(format!("{name}: native injected-I/O tail builtin\n"))
+    }
+
+    fn execute<SE: brush_core::extensions::ShellExtensions,
+               I: Iterator<Item = S>, S: AsRef<str>>(
+        context: brush_core::commands::ExecutionContext<'_, SE>,
+        args: I,
+    ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
+        let name = context.command_name.clone();
+        let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
+        if argv.is_empty() { argv.push(OsString::from(&name)); }
+
+        let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
+        let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
+        let inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
+
+        let code = run_coreutil_localized("uu_tail", move || {
+            use std::io::Write;
+            use std::os::fd::{AsRawFd, BorrowedFd};
+            let mut out = out;
+            let mut err = err;
+            let mut inp = inp;
+            let out_raw = out.try_borrow_as_fd().ok().map(|b| b.as_raw_fd());
+            let in_raw = inp.try_borrow_as_fd().ok().map(|b| b.as_raw_fd());
+            // SAFETY: each fd is owned by an OpenFile that lives across the call.
+            let out_fd = out_raw.map(|fd| unsafe { BorrowedFd::borrow_raw(fd) });
+            let in_fd = in_raw.map(|fd| unsafe { BorrowedFd::borrow_raw(fd) });
+            let r = match uu_tail::tail(argv.into_iter(), &mut out, out_fd, &mut err, &mut inp, in_fd) {
+                Ok(()) => 0,
+                Err(e) => {
+                    let msg = e.to_string();
+                    if !msg.is_empty() { let _ = writeln!(err, "{name}: {msg}"); }
+                    e.code()
+                }
+            };
+            let _ = out.flush();
+            let _ = err.flush();
+            r
+        });
+        Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
+    }
+}
+
 /// `wc` — NATIVE in-process brush builtin over the vendored `uu_wc` fork.
 ///
 /// Runs uutils' `wc` IN-PROCESS, UNCONDITIONALLY: it reads/logical stdin and writes the box's
@@ -1045,6 +1103,7 @@ fn box_builtins_opt<SE: brush_core::extensions::ShellExtensions>(
         // are bundled at all, to dodge uucore's process-global localization cache.
         m.insert("cat".to_string(), simple_builtin::<CatBuiltin, SE>());
         m.insert("head".to_string(), simple_builtin::<HeadBuiltin, SE>());
+        m.insert("tail".to_string(), simple_builtin::<TailBuiltin, SE>());
         m.insert("wc".to_string(), simple_builtin::<WcBuiltin, SE>());
         m.insert("nl".to_string(), simple_builtin::<NlBuiltin, SE>());
         m.insert("tac".to_string(), simple_builtin::<TacBuiltin, SE>());

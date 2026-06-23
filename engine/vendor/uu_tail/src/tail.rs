@@ -33,13 +33,171 @@ use std::fs::File;
 use std::io::{self, BufReader, BufWriter, ErrorKind, Read, Seek, SeekFrom, Write, stdin, stdout};
 use std::path::{Path, PathBuf};
 use uucore::display::Quotable;
-use uucore::error::{FromIo, UResult, USimpleError, set_exit_code};
+use uucore::error::{FromIo, UResult, USimpleError};
 use uucore::translate;
 
-use uucore::{show, show_error};
+// ── Injected-I/O plumbing for the in-process brush builtin ───────────────────
+//
+// `tail` is the STREAM template (like `cat`/`head`): it has NO logical-cwd seam
+// (every operand is opened by literal path), only logical stdio. But unlike
+// `cat`/`head`, tail's data and diagnostic writes are scattered across
+// `tail.rs`/`paths.rs`/`follow/` and reach process `stdout()`/`stderr()` deep
+// inside helpers that are awkward to thread an `out`/`err` argument through. So
+// the [`tail`] entry installs the injected sinks into thread-locals for the
+// duration of the call (the builtin runs on a FRESH worker thread per call —
+// see the engine's `run_coreutil_localized` — so these are per-instance state),
+// and the crate-local `show!`/`show_error!`/`show_warning!` macros plus the
+// [`LogicalStdout`] writer below route through them. The standalone-binary path
+// goes through [`uumain`], where the thread-locals are unset and everything
+// falls back to the real process stdio, preserving upstream behavior.
+thread_local! {
+    /// Injected logical stdout for the current call; `None` => real `stdout()`.
+    static TAIL_OUT: std::cell::Cell<Option<*mut (dyn Write + 'static)>> =
+        const { std::cell::Cell::new(None) };
+    /// Logical stderr buffer; flushed to the injected `err` at the end of [`tail`].
+    static TAIL_ERR: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Deferred non-fatal exit code, set by the local `show!`/`show_error!`.
+    static TAIL_EXIT: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
+}
 
+/// A `Write` that targets the call's injected logical stdout (via [`TAIL_OUT`])
+/// or, when none is installed (standalone binary), the process's real stdout.
+/// Replaces the `stdout()` data sinks so tail's output flows to the box's
+/// logical sink with no process-global stdio.
+pub(crate) struct LogicalStdout;
+
+impl Write for LogicalStdout {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        TAIL_OUT.with(|c| match c.get() {
+            // SAFETY: the pointer is set by [`tail`] from a `&mut dyn Write`
+            // that outlives the call, and cleared before it returns.
+            Some(p) => unsafe { (*p).write(buf) },
+            None => stdout().write(buf),
+        })
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        TAIL_OUT.with(|c| match c.get() {
+            Some(p) => unsafe { (*p).flush() },
+            None => stdout().flush(),
+        })
+    }
+}
+
+/// `set_exit_code` shim: route the deferred exit code into [`TAIL_EXIT`] so the
+/// in-process builtin never touches uucore's process-global `EXIT_CODE`.
+pub(crate) fn set_exit_code(code: i32) {
+    TAIL_EXIT.with(|c| c.set(code));
+}
+
+/// Shadows [`uucore::show!`]: records the error's code into [`TAIL_EXIT`] and
+/// writes `<util_name>: <err>` to the logical stderr buffer.
+macro_rules! show {
+    ($err:expr) => {{
+        #[allow(unused_imports)]
+        use uucore::error::UError as _;
+        use std::io::Write as _;
+        let e = $err;
+        $crate::TAIL_EXIT.with(|c| c.set(e.code()));
+        $crate::TAIL_ERR.with(|b| {
+            let _ = writeln!(b.borrow_mut(), "{}: {e}", uucore::util_name());
+        });
+    }};
+}
+
+/// Shadows [`uucore::show_error!`]: writes `<util_name>: <msg>` to the logical
+/// stderr buffer (never fd 2).
+macro_rules! show_error {
+    ($($args:tt)+) => {{
+        use std::io::Write as _;
+        $crate::TAIL_ERR.with(|b| {
+            let mut b = b.borrow_mut();
+            let _ = write!(b, "{}: ", uucore::util_name());
+            let _ = writeln!(b, $($args)+);
+        });
+    }};
+}
+pub(crate) use show_error;
+
+/// Shadows [`uucore::show_warning!`]: writes `<util_name>: <msg>` to the logical
+/// stderr buffer. A warning does not change the exit code.
+macro_rules! show_warning {
+    ($($args:tt)+) => {{
+        use std::io::Write as _;
+        $crate::TAIL_ERR.with(|b| {
+            let mut b = b.borrow_mut();
+            let _ = write!(b, "{}: ", uucore::util_name());
+            let _ = writeln!(b, $($args)+);
+        });
+    }};
+}
+pub(crate) use show_warning;
+
+/// Descriptor-based entry point for the standalone `tail` binary.
+///
+/// The thread-locals above are unset here, so [`LogicalStdout`] writes the real
+/// process stdout and the diagnostic buffer is drained to real stderr at the
+/// end — the process's own fd 0/1/2 ARE the intended streams. The in-process
+/// brush builtin must NOT route through here; it calls [`tail`] directly with
+/// the shell's logical sinks.
 #[uucore::main]
 pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+    TAIL_ERR.with(|b| b.borrow_mut().clear());
+    TAIL_EXIT.with(|c| c.set(0));
+    let mut input = stdin();
+    let r = run(args, &mut input);
+    let produced = TAIL_ERR.with(|b| std::mem::take(&mut *b.borrow_mut()));
+    let _ = io::stderr().write_all(&produced);
+    let deferred = TAIL_EXIT.with(std::cell::Cell::get);
+    match r {
+        Ok(()) if deferred != 0 => Err(USimpleError::new(deferred, String::new())),
+        other => other,
+    }
+}
+
+/// Logical entry point for the in-process brush `tail` builtin.
+///
+/// Drives `tail` against the shell's logical output sink (via [`LogicalStdout`]
+/// + [`TAIL_OUT`]), the logical input source (`stdin`), and a logical stderr
+/// buffer drained to `err`. `out_fd`/`stdin_fd` are accepted for signature
+/// parity with the other STREAM-template builtins; tail has no splice fast path,
+/// and reads stdin through the injected reader. Returns a non-zero status when a
+/// diagnostic set [`TAIL_EXIT`] (matching GNU/uutils tail's exit 1 on a per-file
+/// error). Holds no process-global state once the thread-locals are cleared.
+pub fn tail(
+    args: impl uucore::Args,
+    out: &mut dyn Write,
+    out_fd: Option<std::os::fd::BorrowedFd<'_>>,
+    err: &mut dyn Write,
+    stdin: &mut dyn Read,
+    stdin_fd: Option<std::os::fd::BorrowedFd<'_>>,
+) -> UResult<()> {
+    let _ = (out_fd, stdin_fd);
+    TAIL_ERR.with(|b| b.borrow_mut().clear());
+    TAIL_EXIT.with(|c| c.set(0));
+    // Erase `out`'s lifetime into the thread-local. SAFETY: the pointer is
+    // cleared (set to None) below, before `tail` returns and thus before `out`
+    // is dropped, so no read of TAIL_OUT can outlive the borrow.
+    let out_ptr: *mut (dyn Write + 'static) =
+        unsafe { std::mem::transmute::<*mut dyn Write, *mut (dyn Write + 'static)>(out) };
+    TAIL_OUT.with(|c| c.set(Some(out_ptr)));
+
+    let result = run(args, stdin);
+
+    TAIL_OUT.with(|c| c.set(None));
+    let produced = TAIL_ERR.with(|b| std::mem::take(&mut *b.borrow_mut()));
+    let _ = err.write_all(&produced);
+    let _ = err.flush();
+
+    let deferred = TAIL_EXIT.with(std::cell::Cell::get);
+    match result {
+        Ok(()) if deferred != 0 => Err(USimpleError::new(deferred, String::new())),
+        other => other,
+    }
+}
+
+/// Shared body of [`uumain`] and [`tail`]: parse args and run the tail, reading
+/// piped/`-` input from `input` (the logical stdin source).
+fn run(args: impl uucore::Args, input: &mut dyn Read) -> UResult<()> {
     let settings = parse_args(args)?;
 
     settings.check_warnings();
@@ -57,10 +215,10 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
         args::VerificationResult::Ok => {}
     }
 
-    uu_tail(&settings)
+    uu_tail(&settings, input)
 }
 
-fn uu_tail(settings: &Settings) -> UResult<()> {
+fn uu_tail(settings: &Settings, input_src: &mut dyn Read) -> UResult<()> {
     let mut printer = HeaderPrinter::new(settings.verbose, true);
     let mut observer = Observer::from(settings);
 
@@ -80,10 +238,10 @@ fn uu_tail(settings: &Settings) -> UResult<()> {
     for input in &settings.inputs.clone() {
         match input.kind() {
             InputKind::Stdin => {
-                tail_stdin(settings, &mut printer, input, &mut observer)?;
+                tail_stdin(settings, &mut printer, input, &mut observer, input_src)?;
             }
             InputKind::File(path) if cfg!(unix) && path == &PathBuf::from(text::DEV_STDIN) => {
-                tail_stdin(settings, &mut printer, input, &mut observer)?;
+                tail_stdin(settings, &mut printer, input, &mut observer, input_src)?;
             }
             InputKind::File(path) => {
                 tail_file(settings, &mut printer, input, path, &mut observer, 0)?;
@@ -252,6 +410,7 @@ fn tail_stdin(
     header_printer: &mut HeaderPrinter,
     input: &Input,
     observer: &mut Observer,
+    input_src: &mut dyn Read,
 ) -> UResult<()> {
     // on macOS, resolve() will always return None for stdin,
     // we need to detect if stdin is a directory ourselves.
@@ -322,7 +481,7 @@ fn tail_stdin(
                 );
             }
         } else {
-            let mut reader = BufReader::new(stdin());
+            let mut reader = BufReader::new(input_src);
             unbounded_tail(&mut reader, settings)?;
         }
     }
@@ -503,7 +662,7 @@ fn bounded_tail(file: &mut File, settings: &Settings) {
 }
 
 fn unbounded_tail<T: Read>(reader: &mut BufReader<T>, settings: &Settings) -> UResult<()> {
-    let mut writer = BufWriter::new(stdout().lock());
+    let mut writer = BufWriter::new(LogicalStdout);
     match &settings.mode {
         FilterMode::Lines(Signum::Negative(count), sep) => {
             let mut chunks = chunks::LinesChunkBuffer::new(*sep, *count);
@@ -585,8 +744,7 @@ where
     R: Read + ?Sized,
 {
     // Print the target section of the file.
-    let stdout = stdout();
-    let mut stdout = stdout.lock();
+    let mut stdout = LogicalStdout;
     if let Some(limit) = limit {
         let mut reader = file.take(limit);
         io::copy(&mut reader, &mut stdout).unwrap();

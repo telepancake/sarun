@@ -5360,6 +5360,7 @@ dependencies = [
  "uu_seq",
  "uu_sort",
  "uu_tac",
+ "uu_tail",
  "uu_tr",
  "uu_uniq",
  "uu_wc",
@@ -7644,8 +7645,6 @@ dependencies = [
 [[package]]
 name = "uu_tail"
 version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f492ecc70829e2deb6cb815b6927dd78ac4c1b0c027819870a5d25de589e31e1"
 dependencies = [
  "clap",
  "fluent",

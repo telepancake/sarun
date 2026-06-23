@@ -4,8 +4,8 @@
 The differential tests prove a builtin's *output* matches GNU on a given input.
 They cannot prove the *contract* that makes it a real in-process builtin (and not
 a fake one that secretly forks). There are no gates and no fork-to-the-box's-
-binary fallback any more: each of the 13 (`cat head wc nl tac basename dirname
-seq expr tr cut uniq sort`) runs uutils IN-PROCESS, unconditionally. This test
+binary fallback any more: each of the 14 (`cat head tail wc nl tac basename
+dirname seq expr tr cut uniq sort`) runs uutils IN-PROCESS, unconditionally. This test
 asserts, at the syscall level:
 
   1. IN-PROCESS         -> the util is NEVER `execve`'d (it ran inside the engine,
@@ -51,7 +51,7 @@ WRITE_FD = re.compile(r'\bwrite\((\d+),')
 READ_FD0 = re.compile(r'\bread\(0,')
 
 # The 13 native in-process coreutil builtins.
-UTILS = ["cat", "head", "wc", "nl", "tac", "basename", "dirname", "seq",
+UTILS = ["cat", "head", "tail", "wc", "nl", "tac", "basename", "dirname", "seq",
          "expr", "tr", "cut", "uniq", "sort"]
 
 
@@ -146,6 +146,7 @@ def _setup(cwd):
 INPROC = [
     ("cat",      "cat v.txt"),
     ("head",     "head -n2 v.txt"),
+    ("tail",     "tail -n2 v.txt"),
     ("wc",       "wc -l v.txt"),
     ("nl",       "nl v.txt"),
     ("tac",      "tac v.txt"),
@@ -200,6 +201,7 @@ def check_io(label, script, cwd):
 # ── 4: logical stdin — a piped / `< file` builtin never reads the engine's fd 0 ─
 NO_FD0 = [
     ("printf|head", 'printf "a\\nb\\nc\\n" | head -n1'),
+    ("printf|tail", 'printf "a\\nb\\nc\\n" | tail -n1'),
     ("printf|wc",   "printf abc | wc -c"),
     ("printf|tac",  'printf "a\\nb\\n" | tac'),
     ("printf|nl",   'printf "a\\nb\\n" | nl'),
@@ -208,6 +210,7 @@ NO_FD0 = [
     ("printf|uniq", "printf 'a\\na\\nb\\n' | uniq"),
     ("printf|sort", "printf 'b\\na\\n' | sort"),
     ("head < file", "head -n1 < v.txt"),
+    ("tail < file", "tail -n1 < v.txt"),
     ("cat < file",  "cat < v.txt"),
 ]
 
@@ -226,7 +229,7 @@ def check_no_fd0(label, script, cwd):
 # ── 5: localization — many utils in ONE process, every message renders ────────
 # An error-triggering command per util (each writes a diagnostic to stderr).
 ERR_CMDS = [
-    "cat /nope", "head /nope", "wc /nope", "nl /nopedir", "tac /nope",
+    "cat /nope", "head /nope", "tail /nope", "wc /nope", "nl /nopedir", "tac /nope",
     "basename", "dirname", "seq", "expr 1 +", "tr", "cut -f1 /nope",
     "uniq /nope", "sort /nope",
 ]
@@ -254,7 +257,8 @@ def check_localization_session(order_label, cmds, cwd):
 EXIT_CASES = [
     ("true", "true", 0), ("false", "false", 1),
     ("[ -f v.txt ]", "[ -f v.txt ]", 0), ("[ -f nope ]", "[ -f nope ]", 1),
-    ("head missing", "head /nope", 1), ("wc -l ok", "wc -l v.txt", 0),
+    ("head missing", "head /nope", 1), ("tail missing", "tail /nope", 1),
+    ("wc -l ok", "wc -l v.txt", 0),
     ("expr 5", "expr 5", 0), ("expr 0", "expr 0", 1),
     ("expr 1=2", "expr 1 = 2", 1), ("expr 1=1", "expr 1 = 1", 0),
     # regression guards for the uu_expr fork patch (leading-+ and substr-overflow

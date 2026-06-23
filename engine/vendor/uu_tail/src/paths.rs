@@ -133,7 +133,9 @@ impl HeaderPrinter {
 
     pub fn print(&mut self, string: &str) {
         if self.verbose {
-            println!(
+            use std::io::Write as _;
+            let _ = writeln!(
+                crate::LogicalStdout,
                 "{}==> {string} <==",
                 if self.first_header { "" } else { "\n" },
             );
