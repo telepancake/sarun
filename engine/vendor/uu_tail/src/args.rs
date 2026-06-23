@@ -18,7 +18,8 @@ use uucore::parser::parse_size::ParseSizeError;
 use uucore::parser::parse_time;
 use uucore::parser::shortcut_value_parser::ShortcutValueParser;
 use uucore::translate;
-use uucore::{format_usage, show_warning};
+use crate::show_warning;
+use uucore::format_usage;
 
 pub mod options {
     pub mod verbosity {

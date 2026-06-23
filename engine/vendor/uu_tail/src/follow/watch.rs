@@ -14,12 +14,13 @@ use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, channel};
 use uucore::display::Quotable;
-use uucore::error::{UResult, USimpleError, set_exit_code};
+use crate::set_exit_code;
+use uucore::error::{UResult, USimpleError};
 #[cfg(target_os = "linux")]
 use uucore::signals::ensure_stdout_not_broken;
 use uucore::translate;
 
-use uucore::show_error;
+use crate::show_error;
 
 pub struct WatcherRx {
     watcher: Box<dyn Watcher>,
