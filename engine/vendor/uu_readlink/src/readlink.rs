@@ -9,7 +9,7 @@ use clap::{Arg, ArgAction, Command};
 use std::env;
 use std::ffi::OsString;
 use std::fs;
-use std::io::{Write, stdout};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use uucore::display::Quotable;
 use uucore::error::{FromIo, UResult, UUsageError};
@@ -17,7 +17,34 @@ use uucore::fs::{MissingHandling, ResolveMode, canonicalize};
 use uucore::libc::EINVAL;
 use uucore::line_ending::LineEnding;
 use uucore::translate;
-use uucore::{format_usage, show_error};
+use uucore::format_usage;
+
+// ── Injected-I/O plumbing for the in-process brush builtin ───────────────────
+//
+// CWD template, mirroring uu_realpath: [`readlink`] resolves every relative
+// operand against the shell's LOGICAL cwd (the process is never `chdir`'d), and
+// writes resolved paths to the injected logical stdout, diagnostics to the
+// injected stderr. `readlink` runs on a FRESH worker thread per call (the
+// engine's `run_coreutil_localized`), so this thread-local err buffer is
+// per-instance. The crate-local `show_error!` SHADOWS uucore's (which writes fd
+// 2); both the logical entry and the standalone [`uumain`] drain it (the latter
+// to real stderr), so standalone behavior is unchanged.
+thread_local! {
+    static RL_ERR: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Shadows [`uucore::show_error!`]: writes `<util_name>: <msg>` to the logical
+/// stderr buffer instead of process fd 2.
+macro_rules! show_error {
+    ($($args:tt)+) => ({
+        use std::io::Write as _;
+        $crate::RL_ERR.with(|b| {
+            let mut b = b.borrow_mut();
+            let _ = write!(b, "{}: ", uucore::util_name());
+            let _ = writeln!(b, $($args)+);
+        });
+    });
+}
 
 const OPT_CANONICALIZE: &str = "canonicalize";
 const OPT_CANONICALIZE_MISSING: &str = "canonicalize-missing";
@@ -30,8 +57,40 @@ const OPT_ZERO: &str = "zero";
 
 const ARG_FILES: &str = "files";
 
+/// Logical entry point for the in-process brush `readlink` builtin.
+///
+/// Mirrors [`uumain`] but (1) resolves every relative operand against the
+/// shell's LOGICAL `cwd` (the process is never `chdir`'d), and (2) never touches
+/// process fd 1/2 — resolved paths go to `out`, diagnostics to `err`.
+pub fn readlink(
+    args: impl uucore::Args,
+    cwd: &Path,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> UResult<()> {
+    RL_ERR.with(|b| b.borrow_mut().clear());
+    let result = run(args, Some(cwd), out);
+    let produced_err = RL_ERR.with(|b| std::mem::take(&mut *b.borrow_mut()));
+    let _ = out.flush();
+    let _ = err.write_all(&produced_err);
+    let _ = err.flush();
+    result
+}
+
 #[uucore::main(no_signals)]
 pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+    RL_ERR.with(|b| b.borrow_mut().clear());
+    let mut out = std::io::stdout();
+    let result = run(args, None, &mut out);
+    let produced_err = RL_ERR.with(|b| std::mem::take(&mut *b.borrow_mut()));
+    let _ = std::io::stderr().write_all(&produced_err);
+    result
+}
+
+/// Shared body of [`readlink`] and [`uumain`]. When `cwd` is `Some`, relative
+/// operands are rooted at the shell's logical cwd; when `None` (standalone) they
+/// resolve against the process cwd, as upstream.
+fn run(args: impl uucore::Args, cwd: Option<&Path>, out: &mut dyn Write) -> UResult<()> {
     let matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
 
     let mut no_trailing_delimiter = matches.get_flag(OPT_NO_NEWLINE);
@@ -60,7 +119,14 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
 
     let files: Vec<PathBuf> = matches
         .get_many::<OsString>(ARG_FILES)
-        .map(|v| v.map(PathBuf::from).collect())
+        .map(|v| {
+            v.map(PathBuf::from)
+                .map(|p| match cwd {
+                    Some(cwd) if p.is_relative() => cwd.join(p),
+                    _ => p,
+                })
+                .collect()
+        })
         .unwrap_or_default();
 
     if files.is_empty() {
@@ -90,7 +156,7 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
 
         match path_result {
             Ok(path) => {
-                show(&path, line_ending).map_err_context(String::new)?;
+                show(out, &path, line_ending).map_err_context(String::new)?;
             }
             Err(err) => {
                 if !verbose {
@@ -185,10 +251,18 @@ pub fn uu_app() -> Command {
         )
 }
 
-fn show(path: &Path, line_ending: Option<LineEnding>) -> std::io::Result<()> {
-    uucore::display::print_verbatim(path)?;
+fn show(
+    out: &mut dyn Write,
+    path: &Path,
+    line_ending: Option<LineEnding>,
+) -> std::io::Result<()> {
+    // Write the path's raw bytes (preserving non-UTF-8 names) to the injected
+    // logical stdout, the same information `uucore::display::print_verbatim`
+    // writes to fd 1 in the standalone path.
+    use std::os::unix::ffi::OsStrExt as _;
+    out.write_all(path.as_os_str().as_bytes())?;
     if let Some(line_ending) = line_ending {
-        write!(stdout(), "{line_ending}")?;
+        write!(out, "{line_ending}")?;
     }
-    stdout().flush()
+    out.flush()
 }
