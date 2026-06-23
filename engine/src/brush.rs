@@ -964,6 +964,75 @@ fs_builtin_stdin!(RmBuiltin, "rm", uu_rm::rm_main, "uu_rm");
 fs_builtin_stdin!(MvBuiltin, "mv", uu_mv::mv_main, "uu_mv");
 fs_builtin_stdin!(LnBuiltin, "ln", uu_ln::ln_main, "uu_ln");
 
+// readlink/realpath/mktemp resolve relative operands against the shell's logical
+// cwd and write the logical sinks; they read no stdin, so they share the
+// [`fs_builtin!`] (cwd, no stdin) shape with the same `(args, cwd, out, err)`
+// entry.
+fs_builtin!(ReadlinkBuiltin, "readlink", uu_readlink::readlink, "uu_readlink");
+fs_builtin!(RealpathBuiltin, "realpath", uu_realpath::realpath, "uu_realpath");
+fs_builtin!(MktempBuiltin, "mktemp", uu_mktemp::mktemp_main, "uu_mktemp");
+
+// chmod/install mutate or create paths from file operands; chown changes owner
+// (as non-root it commonly fails — faithfully reported). All resolve relative
+// operands against the shell's logical cwd via their `(args, cwd, out, err)` entry.
+fs_builtin!(ChmodBuiltin, "chmod", uu_chmod::chmod_main, "uu_chmod");
+fs_builtin!(ChownBuiltin, "chown", uu_chown::chown_main, "uu_chown");
+fs_builtin!(InstallBuiltin, "install", uu_install::install_main, "uu_install");
+
+/// `tee` — NATIVE in-process brush builtin over the vendored `uu_tee` fork.
+///
+/// Combines the STREAM and CWD templates: it reads the box's logical stdin
+/// (never the engine's fd 0) and writes its logical stdout AND its file operands
+/// (relative ones resolved against the shell's LOGICAL cwd — the process is
+/// never `chdir`'d), with diagnostics on the logical stderr. The logical entry
+/// is [`uu_tee::tee_main`]. The call runs on a fresh thread for localization
+/// isolation — see [`run_coreutil_localized`].
+struct TeeBuiltin;
+
+impl brush_core::builtins::SimpleCommand for TeeBuiltin {
+    fn get_content(
+        name: &str,
+        _content_type: brush_core::builtins::ContentType,
+        _options: &brush_core::builtins::ContentOptions,
+    ) -> Result<String, brush_core::error::Error> {
+        Ok(format!("{name}: native injected-I/O tee builtin\n"))
+    }
+
+    fn execute<SE: brush_core::extensions::ShellExtensions,
+               I: Iterator<Item = S>, S: AsRef<str>>(
+        context: brush_core::commands::ExecutionContext<'_, SE>,
+        args: I,
+    ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
+        let name = context.command_name.clone();
+        let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
+        if argv.is_empty() { argv.push(OsString::from(&name)); }
+
+        let cwd = context.shell.working_dir().to_path_buf();
+        let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
+        let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
+        let inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
+
+        let code = run_coreutil_localized("uu_tee", move || {
+            use std::io::Write;
+            let mut out = out;
+            let mut err = err;
+            let mut inp = inp;
+            let r = match uu_tee::tee_main(argv.into_iter(), &cwd, &mut out, &mut err, &mut inp) {
+                Ok(()) => 0,
+                Err(e) => {
+                    let msg = e.to_string();
+                    if !msg.is_empty() { let _ = writeln!(err, "{name}: {msg}"); }
+                    e.code()
+                }
+            };
+            let _ = out.flush();
+            let _ = err.flush();
+            r
+        });
+        Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
+    }
+}
+
 /// `basename` — NATIVE in-process brush builtin over the vendored `uu_basename` fork.
 ///
 /// Runs uutils' `basename` IN-PROCESS, UNCONDITIONALLY: it reads/writes the box's
@@ -1172,6 +1241,64 @@ impl brush_core::builtins::SimpleCommand for ExprBuiltin {
     }
 }
 
+/// Define a NATIVE in-process brush builtin over a vendored uutils info-util fork
+/// whose logical entry is `(args, out, err) -> UResult` and reads NO stdin (the
+/// `uname`/`nproc`/`id`/`whoami` shape). Same contract as the stream/arg builtins
+/// above: writes the box's logical sinks (no process-global stdio, no `dup2`,
+/// pipeline-safe), runs on a fresh thread for localization isolation (see
+/// [`run_coreutil_localized`]). `$entry` is the crate's `(args, out, err)` entry.
+macro_rules! info_builtin {
+    ($builtin:ident, $util:literal, $entry:path, $thread:literal) => {
+        struct $builtin;
+
+        impl brush_core::builtins::SimpleCommand for $builtin {
+            fn get_content(
+                name: &str,
+                _content_type: brush_core::builtins::ContentType,
+                _options: &brush_core::builtins::ContentOptions,
+            ) -> Result<String, brush_core::error::Error> {
+                Ok(format!("{name}: native injected-I/O {} builtin\n", $util))
+            }
+
+            fn execute<SE: brush_core::extensions::ShellExtensions,
+                       I: Iterator<Item = S>, S: AsRef<str>>(
+                context: brush_core::commands::ExecutionContext<'_, SE>,
+                args: I,
+            ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
+                let name = context.command_name.clone();
+                let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
+                if argv.is_empty() { argv.push(OsString::from(&name)); }
+
+                let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
+                let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
+
+                let code = run_coreutil_localized($thread, move || {
+                    use std::io::Write;
+                    let mut out = out;
+                    let mut err = err;
+                    let r = match $entry(argv.into_iter(), &mut out, &mut err) {
+                        Ok(()) => 0,
+                        Err(e) => {
+                            let msg = e.to_string();
+                            if !msg.is_empty() { let _ = writeln!(err, "{name}: {msg}"); }
+                            e.code()
+                        }
+                    };
+                    let _ = out.flush();
+                    let _ = err.flush();
+                    r
+                });
+                Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
+            }
+        }
+    };
+}
+
+info_builtin!(UnameBuiltin, "uname", uu_uname::uname_main, "uu_uname");
+info_builtin!(NprocBuiltin, "nproc", uu_nproc::nproc_main, "uu_nproc");
+info_builtin!(IdBuiltin, "id", uu_id::id_main, "uu_id");
+info_builtin!(WhoamiBuiltin, "whoami", uu_whoami::whoami_main, "uu_whoami");
+
 /// `sarun` / `oaita` as in-box brush builtins (interactive use). There is no
 /// `sarun` on PATH inside a box and no FUSE shadow under /usr/local: the
 /// builtin re-execs the box inner runner process's OWN executable — the engine
@@ -1285,6 +1412,13 @@ fn box_builtins_opt<SE: brush_core::extensions::ShellExtensions>(
     m.insert("cut".to_string(), simple_builtin::<CutBuiltin, SE>());
     m.insert("uniq".to_string(), simple_builtin::<UniqBuiltin, SE>());
     m.insert("sort".to_string(), simple_builtin::<SortBuiltin, SE>());
+        // Pure stdout info utils (no stdin, no cwd): read read-only system/identity
+        // info, write the box's logical sinks. Same `bundle_coreutils` gate (they
+        // share uucore's localization with cat/head).
+        m.insert("uname".to_string(), simple_builtin::<UnameBuiltin, SE>());
+        m.insert("nproc".to_string(), simple_builtin::<NprocBuiltin, SE>());
+        m.insert("id".to_string(), simple_builtin::<IdBuiltin, SE>());
+        m.insert("whoami".to_string(), simple_builtin::<WhoamiBuiltin, SE>());
     }
     // `cp` is registered REGARDLESS of `bundle_coreutils` (unlike the coreutils
     // above, which the make-recipe path gates off). Make recipes routinely call
@@ -1306,6 +1440,20 @@ fn box_builtins_opt<SE: brush_core::extensions::ShellExtensions>(
     m.insert("mv".to_string(), simple_builtin::<MvBuiltin, SE>());
     m.insert("ln".to_string(), simple_builtin::<LnBuiltin, SE>());
     m.insert("touch".to_string(), simple_builtin::<TouchBuiltin, SE>());
+    // Path-resolving + stream builtins registered REGARDLESS of `bundle_coreutils`,
+    // for the same reasons as `cp`: they appear in configure/build scripts, honor
+    // the box's logical cwd/I/O (and, for `tee`, logical stdin), and each runs on
+    // its own fresh thread so uucore's thread-local Fluent caches give it an
+    // uncontaminated message bundle.
+    m.insert("readlink".to_string(), simple_builtin::<ReadlinkBuiltin, SE>());
+    m.insert("realpath".to_string(), simple_builtin::<RealpathBuiltin, SE>());
+    m.insert("mktemp".to_string(), simple_builtin::<MktempBuiltin, SE>());
+    m.insert("tee".to_string(), simple_builtin::<TeeBuiltin, SE>());
+    // chmod/chown/install: filesystem-op builtins like `cp`, registered
+    // regardless of `bundle_coreutils` (build/install recipes lean on them).
+    m.insert("chmod".to_string(), simple_builtin::<ChmodBuiltin, SE>());
+    m.insert("chown".to_string(), simple_builtin::<ChownBuiltin, SE>());
+    m.insert("install".to_string(), simple_builtin::<InstallBuiltin, SE>());
     // BashMode shell builtins overwrite overlaps (highest priority).
     m.extend(brush_builtins::default_builtins(brush_builtins::BuiltinSet::BashMode));
     // In-box engine entry points (no PATH shadow): `sarun` / `oaita` re-exec

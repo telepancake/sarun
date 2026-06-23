@@ -54,7 +54,8 @@ READ_FD0 = re.compile(r'\bread\(0,')
 # plus the filesystem-op group cp/mkdir/rmdir/rm/mv/ln).
 UTILS = ["cat", "head", "tail", "wc", "nl", "tac", "basename", "dirname", "seq",
          "expr", "tr", "cut", "uniq", "sort", "mkdir", "rmdir", "rm", "mv", "ln",
-         "touch"]
+         "touch", "readlink", "realpath", "mktemp", "tee", "chmod", "chown",
+         "install", "uname", "nproc", "id", "whoami"]
 
 
 def _require():
@@ -140,6 +141,16 @@ def _setup(cwd):
         fh.write("one\ntwo\nthree\nfour\n")
     with open(os.path.join(cwd, "s.txt"), "w") as fh:
         fh.write("b\na\nb\nc\na\n")
+    # chmod target with a known starting mode (so `chmod 600` is a no-op the
+    # second time the same script runs, keeping box==GNU differential stable).
+    m = os.path.join(cwd, "m.txt")
+    with open(m, "w") as fh:
+        fh.write("x\n")
+    os.chmod(m, 0o600)
+    # symlink for readlink (its target is what readlink prints; deterministic)
+    link = os.path.join(cwd, "lnk")
+    if not os.path.lexists(link):
+        os.symlink("v.txt", link)
     os.mkdir(os.path.join(cwd, "sub"))
 
 
@@ -193,10 +204,57 @@ INPROC = [
     # logical cwd. Touching is idempotent (no output) so runs are repeatable.
     ("touch",    "touch tch_a"),
     ("touch cwd","cd sub && touch tch_b && [ -e tch_b ]"),
+    # readlink/realpath are path-op builtins: relative operands resolve against
+    # the shell's logical cwd (the ports rewrite them). readlink prints a link's
+    # target; realpath prints an absolute resolved path. Both match GNU here.
+    ("readlink", "readlink lnk"),
+    ("readlink cwd", "cd sub && readlink ../lnk"),
+    ("realpath", "realpath v.txt"),
+    ("realpath cwd", "cd sub && realpath ../v.txt"),
+    # tee is a stream+file-op builtin: it copies stdin to stdout AND its file
+    # operand (resolved against the logical cwd). The STDOUT bytes match GNU; the
+    # written file is a side effect (check_io compares only stdout/stderr).
+    ("tee",      "printf payload | tee teeout.txt"),
+    ("tee cwd",  "cd sub && printf X | tee tee_rel.txt"),
+    # chmod/chown/install are file-op builtins like cp: relative operands resolve
+    # against the shell's logical cwd (their ports rewrite them). Scripts are
+    # idempotent / no-op so the box run and the GNU reference run (same script,
+    # same cwd) match. `m.txt` starts at 600, so `chmod 600` produces no output.
+    ("chmod",    "chmod 600 m.txt"),
+    ("chmod cwd","cd sub && chmod 700 . && chmod 755 ."),
+    # `chown --reference=F F` sets F's owner to its own — a no-op even as
+    # non-root (no EPERM, no output, exit 0) and with no `$(...)` subshell (whose
+    # cmdsubst-pipe write(1) the strace check would misread as a fd-1 leak). Also
+    # exercises the `--reference` RFILE logical-cwd seam.
+    ("chown",    "chown --reference=m.txt m.txt"),
+    ("chown cwd","cd sub && chown --reference=../m.txt ../m.txt"),
+    # install copies + sets mode; `-d` makes dirs. Both idempotent here.
+    ("install",  "install -m 600 v.txt iv.txt"),
+    ("install -d","install -d id_a"),
+    ("install cwd","cd sub && install -m 644 ../v.txt iout.txt"),
+    # Pure stdout info utils. The differential GNU reference runs the same script
+    # in the same process environment, so the host-variable values (uid, username,
+    # cpu count) match the box's in-process output. `uname -s` is the stable
+    # "Linux"; `id -u`/`whoami`/`nproc` resolve the box's real identity/sysinfo.
+    ("uname -s", "uname -s"),
+    ("nproc",    "nproc"),
+    ("id -u",    "id -u"),
+    ("id -un",   "id -un"),
+    ("whoami",   "whoami"),
     # multi-stage all-builtin pipelines stay fully in-process
     ("sort|uniq -c", "sort s.txt | uniq -c"),
     ("tac|head",     "tac v.txt | head -n1"),
     ("echo|cat|wc",  "echo hi | cat | wc -c"),
+    ("echo|tee|cat", "echo hi | tee teep.txt | cat"),
+]
+
+# In-process-ONLY cases (NOT GNU-equality checked): mktemp's output is a random
+# name, so it can't be compared byte-for-byte against a GNU reference. We still
+# assert it runs in-process with no fd trampling, and (via the cwd variant) that
+# its relative template/created file honor the shell's logical cwd.
+INPROC_ONLY = [
+    ("mktemp",     "mktemp mt.XXXXXX"),
+    ("mktemp cwd", "cd sub && mktemp mt.XXXXXX"),
 ]
 
 
@@ -245,6 +303,10 @@ NO_FD0 = [
     ("printf|rm",   "printf y | (printf x > rm_fd0 && rm rm_fd0)"),
     ("printf|mv",   "printf y | (printf x > mv_fd0 && mv mv_fd0 mv_fd0b && rm -f mv_fd0b)"),
     ("printf|ln",   "printf y | (printf x > ln_fd0 && ln -sf ln_fd0 ln_fd0l && rm -f ln_fd0 ln_fd0l)"),
+    # tee reads its stdin (the data-corruption class for an in-process builtin):
+    # it must read the pipe/file fd, never the engine's real fd 0.
+    ("printf|tee",  "printf abc | tee t_fd0.txt"),
+    ("tee < file",  "tee t_fd0b.txt < v.txt"),
 ]
 
 
@@ -267,6 +329,10 @@ ERR_CMDS = [
     "uniq /nope", "sort /nope", "mkdir /nope/deep", "rmdir /nope/deep",
     "rm /nope/deep", "mv /nope/deep /also/nope", "ln /nope/deep /also/nope",
     "touch /nope/deep",
+    "readlink -v .", "realpath /no/such/deep/path",
+    "mktemp /no/such/dir/fooXXXX", "tee /no/such/dir/f.txt",
+    "chmod 600 /nope", "chown root /nope", "install /nope /also/nope",
+    "id nosuchuser_zzz", "nproc --ignore=notanumber", "id -n",
 ]
 # A raw Fluent key looks like `tac-error-open-error` / `expr-error-missing-...`:
 # a util name followed by `-` then lowercase. Rendered English messages never do.
@@ -320,6 +386,16 @@ EXIT_CASES = [
     ("expr +1=1 (leading+)", "expr +1 = 1", 1),
     ("expr +5+1 (non-int)",  "expr +5 + 1", 2),
     ("expr substr overflow", "expr substr abcdef 1 99999999999999999999", 0),
+    # file-op builtins: success vs. missing-operand / no-such-file
+    ("chmod ok", "chmod 600 m.txt", 0), ("chmod missing", "chmod 600 /nope", 1),
+    ("chown self ok", "chown --reference=m.txt m.txt", 0), ("chown missing", "chown root /nope", 1),
+    ("install ok", "install -m 600 v.txt iexit.txt", 0),
+    ("install -d ok", "install -d id_exit", 0),
+    ("install bad", "install /nope /also/nope", 1),
+    # info utils: success, and a bad operand (unknown user) is exit 1
+    ("uname -s ok", "uname -s", 0), ("nproc ok", "nproc", 0),
+    ("id -u ok", "id -u", 0), ("whoami ok", "whoami", 0),
+    ("id no such user", "id nosuchuser_zzz", 1),
 ]
 
 
@@ -375,6 +451,8 @@ def run_all():
             results.append((f"{label} [in-process]", check_inproc(label, script, cwd)))
         for label, script in INPROC:
             results.append((f"{label} [io: fd+content]", check_io(label, script, cwd)))
+        for label, script in INPROC_ONLY:
+            results.append((f"{label} [in-process]", check_inproc(label, script, cwd)))
         for label, script in NO_FD0:
             results.append((f"{label} [no fd0 read]", check_no_fd0(label, script, cwd)))
         results.append(("localization: forward session",
