@@ -852,56 +852,62 @@ macro_rules! fs_builtin {
 fs_builtin!(MkdirBuiltin, "mkdir", uu_mkdir::mkdir_main, "uu_mkdir");
 fs_builtin!(RmdirBuiltin, "rmdir", uu_rmdir::rmdir_main, "uu_rmdir");
 
-/// `rm` — FILESYSTEM-template builtin like [`CpBuiltin`], but it also reads the
-/// shell's LOGICAL stdin: `rm -i` reads the y/N answer from there, NEVER the
-/// engine's fd 0. Operands resolve against the logical cwd; verbose output and
-/// prompt/diagnostic text route through the logical out/err. Runs on a fresh
-/// thread for localization isolation — see [`run_coreutil_localized`].
-struct RmBuiltin;
+/// Like [`fs_builtin`] but the util ALSO reads the shell's LOGICAL stdin: `rm
+/// -i`/`mv -i` read the y/N overwrite answer from there, NEVER the engine's fd
+/// 0. `$entry` is the crate's `(args, cwd, out, err, stdin)` logical entry.
+macro_rules! fs_builtin_stdin {
+    ($builtin:ident, $util:literal, $entry:path, $thread:literal) => {
+        struct $builtin;
 
-impl brush_core::builtins::SimpleCommand for RmBuiltin {
-    fn get_content(
-        name: &str,
-        _content_type: brush_core::builtins::ContentType,
-        _options: &brush_core::builtins::ContentOptions,
-    ) -> Result<String, brush_core::error::Error> {
-        Ok(format!("{name}: native injected-I/O rm builtin\n"))
-    }
+        impl brush_core::builtins::SimpleCommand for $builtin {
+            fn get_content(
+                name: &str,
+                _content_type: brush_core::builtins::ContentType,
+                _options: &brush_core::builtins::ContentOptions,
+            ) -> Result<String, brush_core::error::Error> {
+                Ok(format!("{name}: native injected-I/O {} builtin\n", $util))
+            }
 
-    fn execute<SE: brush_core::extensions::ShellExtensions,
-               I: Iterator<Item = S>, S: AsRef<str>>(
-        context: brush_core::commands::ExecutionContext<'_, SE>,
-        args: I,
-    ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
-        let name = context.command_name.clone();
-        let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
-        if argv.is_empty() { argv.push(OsString::from(&name)); }
+            fn execute<SE: brush_core::extensions::ShellExtensions,
+                       I: Iterator<Item = S>, S: AsRef<str>>(
+                context: brush_core::commands::ExecutionContext<'_, SE>,
+                args: I,
+            ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
+                let name = context.command_name.clone();
+                let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
+                if argv.is_empty() { argv.push(OsString::from(&name)); }
 
-        let cwd = context.shell.working_dir().to_path_buf();
-        let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
-        let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
-        let inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
+                let cwd = context.shell.working_dir().to_path_buf();
+                let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
+                let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
+                let inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
 
-        let code = run_coreutil_localized("uu_rm", move || {
-            use std::io::Write;
-            let mut out = out;
-            let mut err = err;
-            let stdin_src: Box<dyn std::io::BufRead> = Box::new(std::io::BufReader::new(inp));
-            let r = match uu_rm::rm_main(argv.into_iter(), &cwd, &mut out, &mut err, stdin_src) {
-                Ok(()) => 0,
-                Err(e) => {
-                    let msg = e.to_string();
-                    if !msg.is_empty() { let _ = writeln!(err, "{name}: {msg}"); }
-                    e.code()
-                }
-            };
-            let _ = out.flush();
-            let _ = err.flush();
-            r
-        });
-        Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
-    }
+                let code = run_coreutil_localized($thread, move || {
+                    use std::io::Write;
+                    let mut out = out;
+                    let mut err = err;
+                    let stdin_src: Box<dyn std::io::BufRead> =
+                        Box::new(std::io::BufReader::new(inp));
+                    let r = match $entry(argv.into_iter(), &cwd, &mut out, &mut err, stdin_src) {
+                        Ok(()) => 0,
+                        Err(e) => {
+                            let msg = e.to_string();
+                            if !msg.is_empty() { let _ = writeln!(err, "{name}: {msg}"); }
+                            e.code()
+                        }
+                    };
+                    let _ = out.flush();
+                    let _ = err.flush();
+                    r
+                });
+                Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
+            }
+        }
+    };
 }
+
+fs_builtin_stdin!(RmBuiltin, "rm", uu_rm::rm_main, "uu_rm");
+fs_builtin_stdin!(MvBuiltin, "mv", uu_mv::mv_main, "uu_mv");
 
 /// `basename` — NATIVE in-process brush builtin over the vendored `uu_basename` fork.
 ///
@@ -1242,6 +1248,7 @@ fn box_builtins_opt<SE: brush_core::extensions::ShellExtensions>(
     m.insert("mkdir".to_string(), simple_builtin::<MkdirBuiltin, SE>());
     m.insert("rmdir".to_string(), simple_builtin::<RmdirBuiltin, SE>());
     m.insert("rm".to_string(), simple_builtin::<RmBuiltin, SE>());
+    m.insert("mv".to_string(), simple_builtin::<MvBuiltin, SE>());
     // BashMode shell builtins overwrite overlaps (highest priority).
     m.extend(brush_builtins::default_builtins(brush_builtins::BuiltinSet::BashMode));
     // In-box engine entry points (no PATH shadow): `sarun` / `oaita` re-exec
