@@ -78,10 +78,6 @@ pub struct Variable {
 
     pub assign_op: Option<AssignOp>,
     pub readonly: bool,
-    /// sarun: target-specific export marker. Set when a rule writes
-    /// `target: export VAR := …`. The recipe-runner pushes such vars
-    /// into the child env for that target's commands only.
-    pub exported: bool,
     pub deprecated: Option<Arc<String>>,
     obsolete: Option<Arc<String>>,
 
@@ -97,20 +93,6 @@ pub enum InnerVar {
     AutoCommand(Symbol, AutoCommandVar),
     ShellStatus,
     VariableNames { name: Bytes, all: bool },
-}
-
-// sarun: cheap shallow emptiness check for `+=` to mirror GNU make's
-// "no separator when prior value is empty" rule. Only looks at literally
-// empty AST nodes — won't peer into $(funcs) or var refs, which is fine
-// because those don't normally appear as the *whole* of an initializing
-// `X=` assignment (and matching real make in those edge cases would
-// require an eval, which is too expensive at append time).
-fn is_value_empty(v: &Arc<Value>) -> bool {
-    match v.as_ref() {
-        Value::Literal(_, b) => b.is_empty(),
-        Value::List(_, xs) => xs.iter().all(is_value_empty),
-        _ => false,
-    }
 }
 
 impl Variable {
@@ -169,22 +151,14 @@ impl Variable {
                 panic!("append_var should not be used when immediate_eval returns true")
             }
             InnerVar::Recursive { v: prev, .. } => {
-                // sarun: GNU make omits the separator when the existing value
-                // is empty (manual §6.6.1 "appending"). Skip it for literally
-                // empty prev — match the rule cheaply at append time without
-                // forcing eval.
-                if is_value_empty(prev) {
-                    *prev = v;
-                } else {
-                    *prev = Arc::new(Value::List(
-                        prev.loc(),
-                        vec![
-                            prev.clone(),
-                            Arc::new(Value::Literal(None, Bytes::from_static(b" "))),
-                            v,
-                        ],
-                    ));
-                }
+                *prev = Arc::new(Value::List(
+                    prev.loc(),
+                    vec![
+                        prev.clone(),
+                        Arc::new(Value::Literal(None, Bytes::from_static(b" "))),
+                        v,
+                    ],
+                ));
                 self.definition = Some(frame);
             }
             InnerVar::AutoCommand(sym, _) => {
@@ -198,27 +172,19 @@ impl Variable {
     pub fn append_str(&mut self, buf: &Bytes, frame: Arc<Frame>) -> Result<()> {
         match &mut self.value {
             InnerVar::Simple(s) => {
-                // sarun: ditto — no leading separator when the prior value is
-                // empty.
-                if !s.is_empty() {
-                    s.push(b' ');
-                }
+                s.push(b' ');
                 s.extend_from_slice(buf);
                 self.definition = Some(frame);
             }
             InnerVar::Recursive { v: prev, .. } => {
-                if is_value_empty(prev) {
-                    *prev = Arc::new(Value::Literal(None, buf.clone()));
-                } else {
-                    *prev = Arc::new(Value::List(
-                        prev.loc(),
-                        vec![
-                            prev.clone(),
-                            Arc::new(Value::Literal(None, Bytes::from_static(b" "))),
-                            Arc::new(Value::Literal(None, buf.clone())),
-                        ],
-                    ));
-                }
+                *prev = Arc::new(Value::List(
+                    prev.loc(),
+                    vec![
+                        prev.clone(),
+                        Arc::new(Value::Literal(None, Bytes::from_static(b" "))),
+                        Arc::new(Value::Literal(None, buf.clone())),
+                    ],
+                ));
                 self.definition = Some(frame);
             }
             InnerVar::AutoCommand(sym, _) => {
@@ -259,31 +225,7 @@ impl Variable {
             InnerVar::Simple(s) => Cow::Borrowed(s.as_slice()),
             InnerVar::Recursive { v: _, orig } => Cow::Borrowed(orig),
             InnerVar::AutoCommand(sym, _) => {
-                // sarun: GNU make's $(value <auto>) returns the literal
-                // unexpanded form. For plain $@/$</$^/etc. that's just
-                // "$<sym>". For the D/F variants make uses a derived
-                // macro form internally — reproduce those so the test
-                // corpus's value_at.mk passes.
-                let bytes = sym.as_bytes();
-                let bytes_slice: &[u8] = &bytes;
-                if bytes_slice.ends_with(b"D") && bytes_slice.len() >= 2 {
-                    let base = &bytes_slice[..bytes_slice.len() - 1];
-                    return Ok(Cow::Owned(
-                        format!(
-                            "$(patsubst %/,%,$(dir ${}))",
-                            String::from_utf8_lossy(base)
-                        )
-                        .into_bytes(),
-                    ));
-                }
-                if bytes_slice.ends_with(b"F") && bytes_slice.len() >= 2 {
-                    let base = &bytes_slice[..bytes_slice.len() - 1];
-                    return Ok(Cow::Owned(
-                        format!("$(notdir ${})", String::from_utf8_lossy(base))
-                            .into_bytes(),
-                    ));
-                }
-                Cow::Owned(format!("${}", String::from_utf8_lossy(bytes_slice)).into_bytes())
+                error!("$(value {sym}) is not implemented yet");
             }
             InnerVar::ShellStatus => {
                 Cow::Owned(if let Some(status) = SHELL_STATUS.lock().as_ref() {
@@ -307,7 +249,6 @@ impl Variable {
             origin,
             assign_op: None,
             readonly: false,
-            exported: false,
             deprecated: None,
             obsolete: None,
             visibility_prefix: None,
@@ -327,7 +268,6 @@ impl Variable {
             origin,
             assign_op: None,
             readonly: false,
-            exported: false,
             deprecated: None,
             obsolete: None,
             visibility_prefix: None,
@@ -349,7 +289,6 @@ impl Variable {
             origin,
             assign_op: None,
             readonly: false,
-            exported: false,
             deprecated: None,
             obsolete: None,
             visibility_prefix: None,
@@ -370,7 +309,6 @@ impl Variable {
             origin,
             assign_op: None,
             readonly: false,
-            exported: false,
             deprecated: None,
             obsolete: None,
             visibility_prefix: None,
@@ -385,7 +323,6 @@ impl Variable {
             origin: VarOrigin::Automatic,
             assign_op: None,
             readonly: false,
-            exported: false,
             deprecated: None,
             obsolete: None,
             visibility_prefix: None,
@@ -400,7 +337,6 @@ impl Variable {
             origin: VarOrigin::Override,
             assign_op: Some(AssignOp::ColonEq),
             readonly: true,
-            exported: false,
             deprecated: None,
             obsolete: None,
             visibility_prefix: None,
@@ -415,7 +351,6 @@ impl Variable {
             origin: VarOrigin::Override,
             assign_op: Some(AssignOp::ColonEq),
             readonly: true,
-            exported: false,
             deprecated: None,
             obsolete: None,
             visibility_prefix: None,
@@ -530,7 +465,9 @@ impl Vars {
             }
             match orig.read().origin() {
                 VarOrigin::Override | VarOrigin::EnvironmentOverride => return Ok(()),
-                // sarun: see symtab.rs — Automatic is overridable.
+                VarOrigin::Automatic => {
+                    error!("overriding automatic variable is not implemented yet");
+                }
                 _ => {}
             }
             *orig = var;

@@ -21,6 +21,7 @@ use std::{collections::HashSet, fmt::Debug, sync::Arc};
 
 use crate::{
     dep::DepNode,
+    error_loc,
     eval::Evaluator,
     exec::ExecStatus,
     expr::Evaluable,
@@ -48,13 +49,7 @@ enum AutoCommand {
     Plus,
     Star,
     Question { found_new_inputs: Arc<Mutex<bool>> },
-    // sarun: $% — archive member name when target is `lib.a(member)`.
-    // For non-archive targets (everything we deal with) real make
-    // returns the empty string, which is a useful no-op for portable
-    // makefiles that test $% defensively.
-    Percent,
-    // sarun: $| — order-only prerequisites of the current target.
-    Pipe,
+    NotImplemented,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -164,15 +159,12 @@ impl AutoCommandVar {
                     }
                 }
             }
-            AutoCommand::Percent => {
-                // Non-archive target: empty string. We don't model archive
-                // members at all, so this is the universally-correct value.
-            }
-            AutoCommand::Pipe => {
-                let mut ww = WordWriter::new(out);
-                for ai in current_dep_node.actual_order_only_inputs.iter() {
-                    ww.write(&ai.as_bytes())
-                }
+            AutoCommand::NotImplemented => {
+                error_loc!(
+                    ev.loc.as_ref(),
+                    "Automatic variable `${}' isn't supported yet",
+                    self.sym
+                );
             }
         }
         Ok(())
@@ -235,8 +227,9 @@ impl<'a> CommandEvaluator<'a> {
         ret.register_autocommand('+', AutoCommand::Plus)?;
         ret.register_autocommand('*', AutoCommand::Star)?;
         ret.register_autocommand('?', AutoCommand::Question { found_new_inputs })?;
-        ret.register_autocommand('%', AutoCommand::Percent)?;
-        ret.register_autocommand('|', AutoCommand::Pipe)?;
+        // TODO: Implement them.
+        ret.register_autocommand('%', AutoCommand::NotImplemented)?;
+        ret.register_autocommand('|', AutoCommand::NotImplemented)?;
         Ok(ret)
     }
 
