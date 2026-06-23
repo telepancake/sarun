@@ -39,14 +39,65 @@ use std::io::{self, Write};
 use uucore::display::Quotable;
 use uucore::entries::{self, Group, Locate, Passwd};
 use uucore::error::UResult;
-use uucore::error::{USimpleError, set_exit_code};
+use uucore::error::USimpleError;
 pub use uucore::libc;
 use uucore::libc::{getlogin, uid_t};
 use uucore::line_ending::LineEnding;
 use uucore::translate;
 
+use uucore::format_usage;
 use uucore::process::{getegid, geteuid, getgid, getuid};
-use uucore::{format_usage, show_error};
+
+// ── Injected-I/O plumbing for the in-process brush builtin ───────────────────
+//
+// INFO template: `id` reads read-only identity info (uid/gid/passwd) and writes
+// to stdout, with diagnostics + a deferred exit code (e.g. an unknown user).
+// Upstream reaches `io::stdout().lock()`, `show_error!`, and uucore's process-
+// global `set_exit_code` directly — all forbidden for an in-process builtin.
+// Each call runs on a FRESH worker thread (the engine's `run_coreutil_localized`),
+// so these thread-locals are per-instance: `ID_OUT` buffers stdout, `ID_ERR`
+// diagnostics, `ID_EXIT` the deferred code. `IdOut` is the `Write` sink that the
+// upstream `lock` sites target; the crate-local `show_error!`/`set_exit_code`
+// shims SHADOW uucore's. Both the logical [`id_main`] and standalone [`uumain`]
+// drain the buffers, so standalone behavior is unchanged.
+thread_local! {
+    static ID_OUT: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    static ID_ERR: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    static ID_EXIT: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
+}
+
+/// A `Write` sink targeting the thread-local [`ID_OUT`] buffer, used wherever
+/// upstream wrote to `io::stdout().lock()`.
+struct IdOut;
+
+impl Write for IdOut {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        ID_OUT.with(|b| b.borrow_mut().extend_from_slice(buf));
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Route the deferred exit code into [`ID_EXIT`] instead of uucore's
+/// process-global `EXIT_CODE`.
+fn set_exit_code(code: i32) {
+    ID_EXIT.with(|c| c.set(code));
+}
+
+/// Shadows [`uucore::show_error!`]: writes `<util_name>: <msg>` to the logical
+/// stderr buffer (never fd 2).
+macro_rules! show_error {
+    ($($args:tt)+) => {{
+        use std::io::Write as _;
+        $crate::ID_ERR.with(|b| {
+            let mut b = b.borrow_mut();
+            let _ = write!(b, "{}: ", uucore::util_name());
+            let _ = writeln!(b, $($args)+);
+        });
+    }};
+}
 
 macro_rules! cstr2cow {
     ($v:expr) => {
@@ -121,11 +172,60 @@ struct State {
     user_specified: bool,
 }
 
+/// Logical entry point for the in-process brush builtin.
+///
+/// `id` reads no stdin; it writes identity info to the injected `out` sink and
+/// any diagnostics to `err` — never the process's fd 1/2 — and surfaces the
+/// deferred exit code (e.g. an unknown user) as the returned status.
+pub fn id_main(
+    args: impl uucore::Args,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> UResult<()> {
+    ID_OUT.with(|b| b.borrow_mut().clear());
+    ID_ERR.with(|b| b.borrow_mut().clear());
+    ID_EXIT.with(|c| c.set(0));
+
+    let result = run(args);
+
+    let produced_out = ID_OUT.with(|b| std::mem::take(&mut *b.borrow_mut()));
+    let produced_err = ID_ERR.with(|b| std::mem::take(&mut *b.borrow_mut()));
+    let _ = out.write_all(&produced_out);
+    let _ = out.flush();
+    let _ = err.write_all(&produced_err);
+    let _ = err.flush();
+
+    let deferred = ID_EXIT.with(std::cell::Cell::get);
+    match result {
+        Ok(()) if deferred != 0 => Err(USimpleError::new(deferred, String::new())),
+        other => other,
+    }
+}
+
 #[uucore::main(no_signals)]
-#[allow(clippy::cognitive_complexity)]
 pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+    ID_OUT.with(|b| b.borrow_mut().clear());
+    ID_ERR.with(|b| b.borrow_mut().clear());
+    ID_EXIT.with(|c| c.set(0));
+
+    let result = run(args);
+
+    let produced_out = ID_OUT.with(|b| std::mem::take(&mut *b.borrow_mut()));
+    let produced_err = ID_ERR.with(|b| std::mem::take(&mut *b.borrow_mut()));
+    let _ = io::stdout().write_all(&produced_out);
+    let _ = io::stderr().write_all(&produced_err);
+
+    let deferred = ID_EXIT.with(std::cell::Cell::get);
+    match result {
+        Ok(()) if deferred != 0 => Err(USimpleError::new(deferred, String::new())),
+        other => other,
+    }
+}
+
+#[allow(clippy::cognitive_complexity)]
+fn run(args: impl uucore::Args) -> UResult<()> {
     let matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
-    let mut lock = io::stdout().lock();
+    let mut lock = IdOut;
 
     let users: Vec<String> = matches
         .get_many::<String>(options::ARG_USERS)
@@ -472,7 +572,7 @@ pub fn uu_app() -> Command {
 }
 
 fn pretty(possible_pw: Option<Passwd>) -> io::Result<()> {
-    let mut lock = io::stdout().lock();
+    let mut lock = IdOut;
 
     if let Some(p) = possible_pw {
         writeln!(
@@ -543,7 +643,7 @@ fn pline(possible_uid: Option<uid_t>) -> io::Result<()> {
     let pw = Passwd::locate(uid)?;
 
     writeln!(
-        io::stdout().lock(),
+        IdOut,
         "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
         pw.name,
         pw.user_passwd.unwrap_or_default(),
@@ -570,7 +670,7 @@ fn pline(possible_uid: Option<uid_t>) -> io::Result<()> {
     let pw = Passwd::locate(uid)?;
 
     writeln!(
-        io::stdout().lock(),
+        IdOut,
         "{}:{}:{}:{}:{}:{}:{}",
         pw.name,
         pw.user_passwd.unwrap_or_default(),
@@ -604,7 +704,7 @@ fn auditid() -> io::Result<()> {
 )))]
 fn auditid() -> io::Result<()> {
     use std::mem::MaybeUninit;
-    let mut lock = io::stdout().lock();
+    let mut lock = IdOut;
 
     let mut auditinfo: MaybeUninit<audit::c_auditinfo_addr_t> = MaybeUninit::uninit();
     let address = auditinfo.as_mut_ptr();
@@ -630,7 +730,7 @@ fn id_print(state: &State, groups: &[u32]) -> io::Result<()> {
     let euid = state.ids.as_ref().unwrap().euid;
     let egid = state.ids.as_ref().unwrap().egid;
 
-    let mut lock = io::stdout().lock();
+    let mut lock = IdOut;
 
     write!(
         lock,
