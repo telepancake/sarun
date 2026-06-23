@@ -15,6 +15,8 @@ use std::path::{Path, PathBuf};
 
 use uucore::display::Quotable;
 
+use crate::mv_eprintln;
+
 /// Tracks hardlinks during cross-partition moves to preserve them
 #[derive(Debug, Default)]
 pub struct HardlinkTracker {
@@ -126,7 +128,7 @@ impl HardlinkTracker {
             Err(e) => {
                 // Gracefully handle metadata errors by logging and continuing without hardlink tracking
                 if options.verbose {
-                    eprintln!("warning: cannot get metadata for {}: {e}", source.quote());
+                    mv_eprintln!("warning: cannot get metadata for {}: {e}", source.quote());
                 }
                 return None;
             }
@@ -144,7 +146,7 @@ impl HardlinkTracker {
 
             if has_hardlinks {
                 if options.verbose {
-                    eprintln!(
+                    mv_eprintln!(
                         "preserving hardlink {} -> {} (hardlinked)",
                         source.quote(),
                         existing_path.quote()
@@ -179,7 +181,7 @@ impl HardlinkGroupScanner {
             if let Err(e) = self.scan_single_path(file) {
                 if options.verbose {
                     // Only show warnings for verbose mode
-                    eprintln!("warning: failed to scan {}: {e}", file.quote());
+                    mv_eprintln!("warning: failed to scan {}: {e}", file.quote());
                 }
                 // For non-verbose mode, silently continue for missing files
                 // This provides graceful degradation - we'll lose hardlink info for this file
@@ -192,7 +194,7 @@ impl HardlinkGroupScanner {
         if options.verbose {
             let stats = self.stats();
             if stats.total_groups > 0 {
-                eprintln!(
+                mv_eprintln!(
                     "found {} hardlink groups with {} total files",
                     stats.total_groups, stats.total_files
                 );
