@@ -53,6 +53,30 @@ uu_rm = "0.8"
 uu_mv = "0.8"
 uu_ln = "0.8"
 uu_touch = "0.8"
+# Path-resolving + stream coreutils, same logical-cwd + injected-I/O treatment
+# as cp. `readlink`/`realpath`/`mktemp` resolve relative operands against the
+# shell's logical cwd (process is never chdir'd) and write the logical sinks;
+# `tee` additionally reads the logical stdin and writes its file operands.
+# Logical entries `uu_readlink::readlink`, `uu_realpath::realpath`,
+# `uu_mktemp::mktemp_main`, `uu_tee::tee_main`.
+uu_mktemp = "0.8"
+uu_readlink = "0.8"
+uu_realpath = "0.8"
+uu_tee = "0.8"
+# Metadata-op file builtins, same logical-cwd + injected-I/O treatment as cp;
+# each has a `<name>_main(args, cwd, out, err)` logical entry (`chown` routes
+# through the patched `uucore::perms::chown_base_io`).
+uu_chmod = "0.8"
+uu_chown = "0.8"
+uu_install = "0.8"
+# Pure stdout info utils (no stdin, no cwd): read read-only system/identity info
+# and write the box's logical out/err. Logical entries
+# `uu_uname::uname_main` / `uu_nproc::nproc_main` / `uu_id::id_main` /
+# `uu_whoami::whoami_main` (all `(args, out, err)`).
+uu_uname = "0.8"
+uu_nproc = "0.8"
+uu_id = "0.8"
+uu_whoami = "0.8"
 # Vendored, find-only fork of uutils/findutils 0.9.1: run `find` as an
 # in-process brush builtin against the shell's logical I/O. See vendor/findutils.
 findutils = { path = "vendor/findutils" }
@@ -212,6 +236,17 @@ uu_rm                    = { path = "vendor/uu_rm" }
 uu_mv                    = { path = "vendor/uu_mv" }
 uu_ln                    = { path = "vendor/uu_ln" }
 uu_touch                 = { path = "vendor/uu_touch" }
+uu_mktemp                = { path = "vendor/uu_mktemp" }
+uu_readlink              = { path = "vendor/uu_readlink" }
+uu_realpath              = { path = "vendor/uu_realpath" }
+uu_tee                   = { path = "vendor/uu_tee" }
+uu_chmod                 = { path = "vendor/uu_chmod" }
+uu_chown                 = { path = "vendor/uu_chown" }
+uu_install               = { path = "vendor/uu_install" }
+uu_uname                 = { path = "vendor/uu_uname" }
+uu_nproc                 = { path = "vendor/uu_nproc" }
+uu_id                    = { path = "vendor/uu_id" }
+uu_whoami                = { path = "vendor/uu_whoami" }
 # Vendored, patched fork of uucore 0.8.0 — the shared uutils library that backs
 # every uu_* builtin's localization. The 13 in-process coreutil builtins each
 # run on a fresh thread that calls `init_localization("uu_X")`
