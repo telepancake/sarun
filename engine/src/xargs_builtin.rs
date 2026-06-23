@@ -1,30 +1,23 @@
 //! In-process `xargs` builtin for box brush shells.
 //!
-//! Runs the vendored find-and-xargs fork of uutils/findutils against the shell's
-//! LOGICAL stdin/stdout/stderr, and — crucially — runs each command it builds
-//! THROUGH BRUSH rather than `exec`ing a binary. So `… | xargs cmd` honors shell
-//! builtins, functions, and scripts, with the box's snooping, exactly like
-//! `env`/`nice` do (see `crate::exec_wrappers` and `Shell::run_argv`).
+//! Runs the vendored findutils fork against the shell's LOGICAL
+//! stdin/stdout/stderr, routing each command through brush (`Shell::run_argv`)
+//! so builtins/functions/scripts are honored, exactly like `env`/`nice`.
 //!
-//! ## Why logical stdin matters most here
+//! ## Why logical stdin matters
 //!
-//! xargs's primary input is stdin: it reads NUL/whitespace-separated items and
-//! builds command lines from them. In-process, `std::io::stdin()` is the
-//! ENGINE's real fd 0 — a control channel, a parent pipe, another box's stream —
-//! so reading it would steal bytes from whatever owns it. The vendored patch
-//! routes the item read through `XargsIo::take_input`, which here yields the
-//! shell's logical stdin.
+//! xargs reads NUL/whitespace-separated items from stdin. In-process,
+//! `std::io::stdin()` is the engine's real fd 0 — reading it steals bytes from
+//! whatever owns it (control channel, parent pipe). The vendored patch routes
+//! reads through `XargsIo::take_input`, which yields the shell's logical stdin.
 //!
-//! ## Running commands through brush (the sync→async bridge)
+//! ## sync→async bridge
 //!
-//! findutils is synchronous; `Shell::run_argv` is async and must run on the
-//! builtin's task (the shell isn't `Send`). So findutils runs on a worker
-//! THREAD, submitting each built argv over a channel; an async executor on this
-//! task runs it via `run_argv` on a subshell clone and replies with the exit
-//! code (see `crate::builtin_exec`). `-P` parallelism is just the executor
-//! running several submissions at once — `(cmd)& … & wait`. Nothing touches the
-//! engine's process-global stdio or cwd; each command runs in the shell's
-//! logical cwd because its subshell carries it.
+//! findutils is synchronous; `Shell::run_argv` is async on a non-`Send` shell.
+//! findutils runs on a worker thread, submitting each built argv over a channel;
+//! the async executor runs each via `run_argv` on a subshell clone and replies
+//! with the exit code (see `builtin_exec`). `-P` parallelism = executor
+//! concurrency. Nothing touches process-global stdio or cwd.
 
 use std::cell::RefCell;
 use std::io::{Read, Write};
@@ -35,12 +28,9 @@ use findutils::xargs::{CommandExecutionError, ExecChild, XargsIo};
 
 use crate::builtin_exec;
 
-/// xargs's injected logical I/O plus the execution submitter.
-///
-/// `input` is held in an `Option` so `take_input` can move it into xargs's
-/// `ArgumentReader` exactly once. `output`/`error_output` are xargs's OWN sinks
-/// (the no-command `echo`, `-t` traces, warnings). `submitter` hands each built
-/// command to the async executor that runs it through brush.
+/// xargs's injected logical I/O and execution submitter.
+/// `input` is `Option` so `take_input` can move it exactly once into xargs's
+/// `ArgumentReader`. `output`/`error_output` are xargs's own sinks (`-t`, warnings).
 struct BrushXargsIo {
     input: RefCell<Option<Box<dyn Read>>>,
     output: RefCell<OpenFile>,
@@ -48,7 +38,7 @@ struct BrushXargsIo {
     submitter: builtin_exec::ExecSubmitter,
 }
 
-/// A command dispatched through brush, awaited by blocking on its reply channel.
+/// Pending command: blocks on its reply channel for the exit code.
 struct BridgeChild(builtin_exec::ExecTicket);
 
 impl ExecChild for BridgeChild {
@@ -63,8 +53,7 @@ impl ExecChild for BridgeChild {
 
 impl XargsIo for BrushXargsIo {
     fn take_input(&self) -> Box<dyn Read> {
-        // Hand xargs the shell's logical stdin (consulted once, only when no
-        // `-a/--arg-file` is given). A second call sees EOF, never the engine fd.
+        // Logical stdin, moved once; a second call sees EOF (never the engine fd).
         self.input
             .borrow_mut()
             .take()
@@ -80,20 +69,16 @@ impl XargsIo for BrushXargsIo {
     }
 
     fn submit(&self, argv: &[std::ffi::OsString]) -> Option<Box<dyn ExecChild>> {
-        // Run the command through brush (builtin / function / external, snooped)
-        // instead of spawning a process. The child's cwd, env, and stdio come
-        // from the subshell + params the executor runs `run_argv` with — so we
-        // do NOT need `cwd`/`child_stdout`/`child_stderr` here.
-        // xargs commands always run in the shell's logical cwd (no per-command
-        // dir like find -execdir), so pass `None`.
+        // Run through brush (builtin/function/external) in the shell's logical
+        // cwd (xargs has no per-command dir like -execdir; pass None).
         Some(Box::new(BridgeChild(self.submitter.submit(argv, None))))
     }
 }
 
-/// `xargs` — build and run command lines from stdin items, through brush.
+/// `xargs` — build and run command lines from stdin items through brush.
 #[derive(Parser)]
 pub(crate) struct XargsBuiltin {
-    /// All arguments collected raw; the findutils fork parses xargs's grammar.
+    /// Raw argv; the findutils fork parses xargs's grammar.
     #[clap(allow_hyphen_values = true, trailing_var_arg = true)]
     args: Vec<String>,
 }
@@ -105,18 +90,17 @@ impl brush_core::builtins::Command for XargsBuiltin {
         &self,
         context: brush_core::commands::ExecutionContext<'_, SE>,
     ) -> Result<brush_core::results::ExecutionResult, Self::Error> {
-        // xargs_main_with_io treats argv[0] as the program name and parses the
-        // rest; rebuild the full argv from the command name + collected args.
+        // xargs_main_with_io treats argv[0] as the program name; prepend it.
         let mut argv: Vec<String> = vec![context.command_name.clone()];
         argv.extend(self.args.iter().cloned());
 
-        // Logical I/O captured as owned, Send values for the worker thread.
+        // Capture logical I/O as owned Send values for the worker thread.
         let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
         let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
         let input = context.stdin();
 
-        // The execution bridge: findutils (on the thread) submits argvs; the
-        // executor (awaited below) runs each through `run_argv` on a subshell.
+        // Execution bridge: findutils (thread) submits argvs; executor runs each
+        // through run_argv on a subshell clone.
         let (submitter, rx) = builtin_exec::channel();
 
         let worker = std::thread::Builder::new()
@@ -130,16 +114,14 @@ impl brush_core::builtins::Command for XargsBuiltin {
                 };
                 let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
                 findutils::xargs::xargs_main_with_io(&argv_refs, &io)
-                // `io` (and its `submitter`) drops here → the executor's channel
-                // closes → `run_executor` returns.
+                // io (and submitter) drop here → channel closes → run_executor returns.
             });
 
-        // Drive the executor until the worker finishes and its submitter drops.
+        // Drive the executor until the worker finishes and the submitter drops.
         builtin_exec::run_executor(rx, context.shell, &context.params).await;
 
-        // The worker has effectively finished (it dropped the submitter); join to
-        // collect its exit code. A panic inside xargs surfaces as a generic
-        // failure, the same isolation the old worker thread gave.
+        // Worker has finished (submitter dropped); join for exit code.
+        // A panic inside xargs surfaces as a generic failure (isolation intact).
         let code = match worker {
             Ok(handle) => handle.join().unwrap_or(1),
             Err(_) => 1,
@@ -148,18 +130,11 @@ impl brush_core::builtins::Command for XargsBuiltin {
     }
 }
 
-/// Narrow xargs's `i32` exit code to the `u8` an `ExecutionResult` carries
-/// WITHOUT fabricating a bogus value for a signal death.
-///
-/// The vendored findutils follows the GNU convention internally: a command
-/// killed by signal N is reported as `128 + N` (xargs's `map_code` does exactly
-/// this), and GNU xargs's own status codes (123/124/125/126/127) all fit a
-/// `u8`. The old `(code & 0xff) as u8` was wrong for any code outside 0..=255 —
-/// it would wrap an out-of-range value (negative sentinel, `256+N`, …) to an
-/// unrelated small number that could look like success or a different status.
-/// Clamp instead: anything that doesn't fit a `u8` becomes 255 (generic
-/// failure), preserving every real exit/signal code and never disguising an
-/// out-of-range one as a plausible status.
+/// Narrow xargs's `i32` exit code to `u8`. The vendored findutils follows the GNU
+/// signal convention (killed by signal N → `128 + N`; xargs's own codes
+/// 123/124/125/126/127 all fit). `(code & 0xff) as u8` was wrong for out-of-range
+/// values (negative sentinel, `256+N` → wraps to an unrelated small number).
+/// Clamp: out-of-range → 255 (generic failure).
 fn exit_code_to_u8(code: i32) -> u8 {
     u8::try_from(code).unwrap_or(255)
 }
