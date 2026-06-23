@@ -43,6 +43,10 @@ pub enum AssignOp {
     ColonEq,
     PlusEq,
     QuestionEq,
+    // sarun: `!=` shell-assign (GNU make 4.0+). RHS is run through the
+    // shell at assignment time; output is stored as a simply-expanded
+    // value with internal newlines converted to spaces.
+    BangEq,
 }
 
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
@@ -181,6 +185,17 @@ impl AssignStmt {
     pub fn get_lhs_symbol(&self, ev: &mut Evaluator) -> Result<Symbol> {
         if let Value::Literal(_, v) = &*self.lhs {
             if v.is_empty() {
+                error_loc!(Some(&self.loc), "*** empty variable name.");
+            }
+            // sarun: literal whitespace inside the LHS bytes (e.g. `X Y := zz`)
+            // is invalid per GNU make. Check only the literal-LHS path —
+            // names that came from $(expansion) are unaffected, so the
+            // legitimate `$(pf) := PASS` case where $(pf) expands to
+            // something containing colons or spaces still works. Skip
+            // for `export X Y Z := val` (multi-target export) which is
+            // legitimate even though LHS has whitespace.
+            let in_export = self.directive.is_some_and(|d| d.export);
+            if !in_export && v.iter().any(|b| matches!(b, b' ' | b'\t')) {
                 error_loc!(Some(&self.loc), "*** empty variable name.");
             }
 
@@ -356,6 +371,50 @@ impl ExportStmt {
             orig: Bytes::new(),
             expr,
             is_export,
+        })
+    }
+}
+
+// sarun: `undefine NAME...` (GNU make 3.82+). Removes a variable so
+// $(flavor X) returns "undefined" and $(origin X) returns "undefined".
+// `override undefine` removes a variable even if it was set on the
+// command line.
+pub struct UndefineStmt {
+    loc: Loc,
+    orig: Bytes,
+    pub expr: Arc<Value>,
+    pub is_override: bool,
+}
+
+impl Statement for UndefineStmt {
+    fn loc(&self) -> Loc {
+        self.loc.clone()
+    }
+    fn orig(&self) -> Bytes {
+        self.orig.clone()
+    }
+    fn eval(&self, ev: &mut Evaluator) -> Result<()> {
+        ev.eval_undefine(self)
+    }
+}
+
+impl Debug for UndefineStmt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "UndefineStmt({:?}, override={}, loc={})",
+            self.expr, self.is_override, self.loc
+        )
+    }
+}
+
+impl UndefineStmt {
+    pub fn new(loc: Loc, expr: Arc<Value>, is_override: bool) -> Arc<UndefineStmt> {
+        Arc::new(UndefineStmt {
+            loc,
+            orig: Bytes::new(),
+            expr,
+            is_override,
         })
     }
 }

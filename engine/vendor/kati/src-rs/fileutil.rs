@@ -28,6 +28,60 @@ use std::{
 use anyhow::Result;
 use bytes::{BufMut, Bytes, BytesMut};
 use memchr::memchr2;
+
+// sarun: hook for embedders (the sarun engine) to substitute their own
+// recipe runner — runs the shell command IN-PROCESS via embedded brush
+// instead of fork+exec'ing /bin/sh. Returns the recipe's exit code; the
+// merged stdout+stderr bytes are pushed through `output_cb` as they
+// arrive. When `None` (rkati standalone), `exec.rs` falls back to the
+// classic `run_command()` path below. The closure form (boxed) lets
+// callers capture a tokio runtime / oneshot context without making
+// kati depend on brush.
+pub enum RecipeRunnerDecision {
+    /// Hook ran the command; here's the exit code. Merged stdout+stderr
+    /// went through the `output_cb` the hook was invoked with — kati
+    /// doesn't reaccumulate it.
+    Ran { code: i32 },
+    /// Hook declined (e.g. SHELL not a /bin/sh-shaped shell); let
+    /// `exec.rs` fall through to the classic fork+exec path.
+    Passthrough,
+}
+
+pub type RecipeRunner = Box<
+    dyn Fn(&[u8] /* shell */, &[u8] /* shellflag */, &[u8] /* cmd */, &mut dyn FnMut(&[u8]))
+        -> RecipeRunnerDecision
+        + Send
+        + Sync
+        + 'static,
+>;
+
+static RECIPE_RUNNER: parking_lot::Mutex<Option<RecipeRunner>> =
+    parking_lot::Mutex::new(None);
+
+/// Install an in-process recipe runner. exec.rs will consult it before
+/// fork+exec'ing /bin/sh; the runner may handle the command (returning
+/// Ran) or decline and fall back to the classic path (Passthrough).
+/// Idempotent; last call wins.
+pub fn install_recipe_runner(f: RecipeRunner) {
+    *RECIPE_RUNNER.lock() = Some(f);
+}
+
+/// Run `cmd` through the installed in-process runner, if any. Returns
+/// `Some((exit_code, merged_output))` when the hook handled the command,
+/// `None` when no hook is installed OR the hook declined.
+pub fn run_with_installed_runner(
+    shell: &[u8],
+    shellflag: &[u8],
+    cmd: &[u8],
+) -> Option<(i32, Vec<u8>)> {
+    let guard = RECIPE_RUNNER.lock();
+    let runner = guard.as_ref()?;
+    let mut out = Vec::new();
+    match runner(shell, shellflag, cmd, &mut |b| out.extend_from_slice(b)) {
+        RecipeRunnerDecision::Ran { code } => Some((code, out)),
+        RecipeRunnerDecision::Passthrough => None,
+    }
+}
 use parking_lot::Mutex;
 
 use crate::log;

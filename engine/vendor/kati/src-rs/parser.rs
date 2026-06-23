@@ -17,7 +17,7 @@ limitations under the License.
 use std::sync::Arc;
 
 use anyhow::Result;
-use bytes::{Buf, Bytes};
+use bytes::{Buf, BufMut, Bytes};
 use memchr::{memchr, memchr3};
 use parking_lot::Mutex;
 
@@ -27,7 +27,7 @@ use crate::{
     loc::Loc,
     stmt::{
         AssignDirective, AssignOp, AssignStmt, CommandStmt, CondOp, ExportStmt, IfStmt,
-        IncludeStmt, RuleSep, RuleStmt, Stmt,
+        IncludeStmt, RuleSep, RuleStmt, Stmt, UndefineStmt,
     },
     strutil::{
         find_end_of_line, find_outside_paren, trim_left_space, trim_right_space, trim_space,
@@ -54,9 +54,13 @@ struct Parser {
     out_stmts: Arc<Mutex<Vec<Stmt>>>,
 
     define_name: Option<Bytes>,
+    define_op: AssignOp,
     num_define_nest: i32,
     define_start: usize,
     define_start_line: i32,
+    /// sarun: .RECIPEPREFIX value — the char that marks a recipe line.
+    /// Defaults to TAB; user can change it via `.RECIPEPREFIX := <char>`.
+    recipe_prefix: u8,
 
     orig_line_with_directives: Option<Bytes>,
     current_directive: Option<AssignDirective>,
@@ -79,9 +83,11 @@ impl Parser {
             out_stmts: stmts,
 
             define_name: None,
+            define_op: AssignOp::Eq,
             num_define_nest: 0,
             define_start: 0,
             define_start_line: 0,
+            recipe_prefix: b'\t',
 
             orig_line_with_directives: None,
             current_directive: None,
@@ -144,7 +150,13 @@ impl Parser {
 
         self.current_directive = None;
 
-        if line.starts_with(b"\t") && self.after_rule {
+        // sarun: .RECIPEPREFIX changes the leading char that marks a
+        // recipe line (default \t). The parser tracks the current
+        // value because the test happens at parse time.
+        if self.after_rule
+            && !line.is_empty()
+            && line[0] == self.recipe_prefix
+        {
             let loc = self.loc.clone();
             let mut mutable_loc = self.loc.clone();
             let expr = parse_expr(&mut mutable_loc, line.slice(1..), ParseExprOpt::Command)?;
@@ -279,6 +291,20 @@ impl Parser {
         let orig_rhs = line.slice_ref(assign.rhs);
         let rhs = parse_expr(&mut mutable_loc, orig_rhs.clone(), ParseExprOpt::Normal)?;
 
+        // sarun: .RECIPEPREFIX changes the leading char that marks a
+        // recipe line. Track it at parse time because the test happens
+        // before any eval — only the immediately-expanded form (`:=`)
+        // with a literal RHS is honored (matches GNU make's behavior;
+        // empty RHS restores TAB).
+        if assign.op == AssignOp::ColonEq && assign.lhs == b".RECIPEPREFIX" {
+            let trimmed = trim_space(assign.rhs);
+            self.recipe_prefix = if trimmed.is_empty() {
+                b'\t'
+            } else {
+                trimmed[0]
+            };
+        }
+
         self.after_rule = false;
         self.out_stmts.lock().push(AssignStmt::new(
             assign_loc,
@@ -307,7 +333,16 @@ impl Parser {
         if line.is_empty() {
             error_loc!(Some(&self.loc), "*** empty variable name.");
         }
-        self.define_name = Some(line);
+        // sarun: GNU make 3.82+ accepts `define NAME OP` where OP is one of
+        // `=`, `:=`, `::=`, `?=`, `+=`. Detect the trailing op so we drive
+        // the right path in the evaluator (simple-expand at define-time for
+        // `:=`, append for `+=`, etc). Without this kati treated everything
+        // as plain `=` and discarded the operator suffix as part of the name,
+        // which silently broke `define X :=` (the name was "X :=" instead
+        // of "X", and lookup of "X" returned undefined).
+        let (name, op) = split_define_assign_op(&line);
+        self.define_name = Some(line.slice_ref(name));
+        self.define_op = op;
         self.num_define_nest = 1;
         self.define_start = 0;
         self.define_start_line = self.loc.line;
@@ -360,11 +395,12 @@ impl Parser {
             lhs,
             rhs,
             orig_rhs,
-            AssignOp::Eq,
+            self.define_op,
             self.current_directive,
             false,
         ));
         self.define_name = None;
+        self.define_op = AssignOp::Eq;
         Ok(())
     }
 
@@ -407,8 +443,31 @@ impl Parser {
         let mut mutable_loc = loc.clone();
         let lhs;
         let rhs;
-        if line.first() == Some(&b'(') && line.last() == Some(&b')') {
-            line = line.slice(1..line.len() - 1);
+        // sarun: GNU make accepts trailing extraneous text after the
+        // closing paren of `ifeq (lhs, rhs)` (it warns). Kati used to
+        // require the last char to be `)`, which fell through to the
+        // quoted-form parser and hard-errored. Find the matching `)`
+        // by counting parens; anything after is left in `line` for the
+        // trailing-warn block at the bottom.
+        if line.first() == Some(&b'(') {
+            let mut depth = 0i32;
+            let mut close = None;
+            for (i, &b) in line.iter().enumerate() {
+                if b == b'(' {
+                    depth += 1;
+                } else if b == b')' {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(i);
+                        break;
+                    }
+                }
+            }
+            let Some(close) = close else {
+                error_loc!(Some(&self.loc), "*** invalid syntax in conditional.");
+            };
+            let trailing = line.slice(close + 1..);
+            line = line.slice(1..close);
             let terms = vec![b','];
             let mut n;
             (n, lhs) = parse_expr_impl(
@@ -432,6 +491,14 @@ impl Parser {
                 true,
             )?;
             line = line.slice_ref(trim_left_space(&line[n.min(line.len())..]));
+            // sarun: any text past the matching `)` is "extraneous" —
+            // surface it to the trailing-warn block below.
+            if !trailing.is_empty() {
+                let mut combined = bytes::BytesMut::new();
+                combined.put_slice(&line);
+                combined.put_slice(&trailing);
+                line = combined.freeze();
+            }
         } else {
             if line.is_empty() {
                 error_loc!(Some(&self.loc), "*** invalid syntax in conditional.");
@@ -504,7 +571,9 @@ impl Parser {
     fn parse_endif(&mut self, line: Bytes) -> Result<()> {
         self.check_if_stack("endif")?;
         if !line.is_empty() {
-            error_loc!(Some(&self.loc), "extraneous text after `endif` directive");
+            // sarun: matches `else`/`ifeq`/`endef` siblings (warn, not
+            // error). Real make also warns rather than fatally exits.
+            warn_loc!(Some(&self.loc), "extraneous text after `endif' directive");
         }
         let num_nest = self.if_stack.last().unwrap().num_nest;
         for _ in 0..=num_nest {
@@ -564,6 +633,22 @@ impl Parser {
         self.create_export(line, false)
     }
 
+    fn parse_undefine(&mut self, line: Bytes) -> Result<()> {
+        if line.is_empty() {
+            error_loc!(Some(&self.loc), "*** empty variable name.");
+        }
+        let is_override = self
+            .current_directive
+            .is_some_and(|d| d.is_override);
+        let loc = self.loc.clone();
+        let mut mutable_loc = loc.clone();
+        let expr = parse_expr(&mut mutable_loc, line, ParseExprOpt::Normal)?;
+        self.out_stmts
+            .lock()
+            .push(UndefineStmt::new(loc, expr, is_override));
+        Ok(())
+    }
+
     fn check_if_stack(&self, keyword: &'static str) -> Result<()> {
         if self.if_stack.is_empty() {
             error_loc!(Some(&self.loc), "*** extraneous `{keyword}'.");
@@ -604,6 +689,7 @@ impl Parser {
             b"override" => self.parse_override(rest)?,
             b"export" => self.parse_export(rest)?,
             b"unexport" => self.parse_unexport(&rest)?,
+            b"undefine" => self.parse_undefine(rest)?,
             _ => return Ok(false),
         }
         Ok(true)
@@ -630,7 +716,12 @@ impl Parser {
         match directive {
             b"define" => self.parse_define(rest)?,
             b"override" => self.parse_override(rest)?,
-            b"export" => self.parse_export(rest)?,
+            // sarun: when we're already inside `export`, a second `export`
+            // word is the name of a variable being exported (real make
+            // tolerates a variable literally called `export`). Don't
+            // recurse — let the caller treat the line as the var-name.
+            b"export" if !self.is_in_export() => self.parse_export(rest)?,
+            b"undefine" => self.parse_undefine(rest)?,
             _ => return Ok(false),
         }
         Ok(true)
@@ -663,6 +754,35 @@ fn parse_buf_no_stats_impl(
     Ok(stmts)
 }
 
+/// sarun: parse the header of `define NAME [OP]` — strip the trailing
+/// assignment operator (if any) and return (name_slice, op). Recognizes
+/// `=`, `:=`, `::=`, `?=`, `+=`. `::=` is treated as `:=` (POSIX form;
+/// kati already lacks `:::=` which is make-4.4-only). When no operator
+/// suffix is present, returns (trimmed_line, AssignOp::Eq).
+pub fn split_define_assign_op(line: &[u8]) -> (&[u8], AssignOp) {
+    let trimmed = trim_right_space(line);
+    if let Some(rest) = trimmed.strip_suffix(b"=") {
+        let rest_t = trim_right_space(rest);
+        if let Some(name) = rest_t.strip_suffix(b"::") {
+            return (trim_right_space(name), AssignOp::ColonEq);
+        }
+        if let Some(name) = rest_t.strip_suffix(b":") {
+            return (trim_right_space(name), AssignOp::ColonEq);
+        }
+        if let Some(name) = rest_t.strip_suffix(b"+") {
+            return (trim_right_space(name), AssignOp::PlusEq);
+        }
+        if let Some(name) = rest_t.strip_suffix(b"?") {
+            return (trim_right_space(name), AssignOp::QuestionEq);
+        }
+        if let Some(name) = rest_t.strip_suffix(b"!") {
+            return (trim_right_space(name), AssignOp::BangEq);
+        }
+        return (rest_t, AssignOp::Eq);
+    }
+    (trimmed, AssignOp::Eq)
+}
+
 pub struct ParsedAssign<'a> {
     pub lhs: &'a [u8],
     pub rhs: &'a [u8],
@@ -681,6 +801,9 @@ pub fn parse_assign_statement(line: &[u8], sep: usize) -> ParsedAssign<'_> {
     } else if lhs.ends_with(b"?") {
         lhs = &lhs[..lhs.len() - 1];
         op = AssignOp::QuestionEq;
+    } else if lhs.ends_with(b"!") {
+        lhs = &lhs[..lhs.len() - 1];
+        op = AssignOp::BangEq;
     }
     lhs = trim_space(lhs);
     let rhs = trim_left_space(&line[line.len().min(sep + 1)..]);

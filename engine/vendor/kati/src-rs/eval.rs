@@ -34,7 +34,7 @@ use crate::parser::{parse_assign_statement, parse_buf_no_stats};
 use crate::rule::{Rule, is_pattern_rule};
 use crate::stmt::{
     AssignOp, AssignStmt, CommandStmt, CondOp, ExportStmt, IfStmt, IncludeStmt, RuleSep, RuleStmt,
-    Statement,
+    Statement, UndefineStmt,
 };
 use crate::strutil::{is_space_byte, trim_leading_curdir, trim_right_space, word_scanner};
 use crate::symtab::{ALLOW_RULES_SYM, KATI_READONLY_SYM, MAKEFILE_LIST, SHELL_SYM, Symbol, intern};
@@ -243,6 +243,24 @@ pub struct Evaluator {
     pub rule_vars: HashMap<Symbol, Arc<Vars>>,
     pub rules: Vec<Rule>,
     pub exports: HashMap<Symbol, bool>,
+    /// sarun: set when the makefile names `.EXPORT_ALL_VARIABLES` as a
+    /// target. Causes every make-defined variable to be exported into
+    /// recipe environments, mirroring GNU make's behavior.
+    pub export_all_vars: bool,
+    /// sarun: set when the makefile names `.ONESHELL` as a target.
+    /// Recipe lines for each rule are concatenated and passed to a
+    /// single shell invocation, so shell state (variables, cwd, set
+    /// flags) persists across them.
+    pub oneshell: bool,
+    /// sarun: set when the makefile names `.DELETE_ON_ERROR` as a
+    /// target. When a recipe exits with a non-zero status, kati
+    /// removes the target's output file (mirrors GNU make).
+    pub delete_on_error: bool,
+    /// sarun: required `include` directives whose file didn't exist at
+    /// parse time, paired with the source location of the directive.
+    /// The remake-the-makefile loop in main.rs checks for rules
+    /// producing these names and builds + re-parses if any apply.
+    pub pending_remake_includes: Vec<(Loc, OsString)>,
     symbols_for_eval: HashSet<Symbol>,
 
     in_rule: bool,
@@ -289,6 +307,10 @@ impl Evaluator {
             rule_vars: HashMap::new(),
             rules: Vec::new(),
             exports: HashMap::new(),
+            export_all_vars: false,
+            oneshell: false,
+            delete_on_error: false,
+            pending_remake_includes: Vec::new(),
             symbols_for_eval: HashSet::new(),
 
             in_rule: false,
@@ -459,6 +481,26 @@ impl Evaluator {
                     );
                 }
             }
+            AssignOp::BangEq => {
+                prev = self.peek_var_in_current_scope(lhs);
+                // sarun: `X != cmd` — run cmd through the shell at assign
+                // time, store output as a simply-expanded value. Real make
+                // converts internal newlines to spaces and strips trailing
+                // whitespace, which is what shell_func_impl's
+                // format_for_command_substitution does for us.
+                let cmd_buf = rhs_v.eval_to_buf(self)?;
+                let loc = self.loc.clone().unwrap_or_default();
+                let shell = self.get_shell()?;
+                let shellflag = self.get_shell_flag();
+                let (_exit, output, _fc) =
+                    crate::func::shell_func_impl(&shell, shellflag, &cmd_buf, &loc)?;
+                result = Variable::with_simple_string(
+                    output,
+                    origin,
+                    current_frame,
+                    self.loc.clone(),
+                );
+            }
         }
 
         if let Some(prev) = prev {
@@ -578,7 +620,31 @@ impl Evaluator {
         after_targets: &Bytes,
         separator_pos: usize,
     ) -> Result<()> {
-        let assign = parse_assign_statement(after_targets, separator_pos);
+        let mut assign = parse_assign_statement(after_targets, separator_pos);
+        // sarun: target-specific `export VAR := …`, `unexport VAR := …`,
+        // and `private VAR := …`. Strip the leading directive(s) from the
+        // LHS — kati used to intern e.g. "export VAR" as the variable
+        // name. `private` is a no-op for the assignment value itself; it
+        // means "don't inherit into prereq recipes", which we approximate
+        // well enough by simply consuming the keyword (per-target scope
+        // already isolates the var from siblings, and our prereq
+        // inheritance is shallow).
+        let mut tsv_exported = None;
+        let mut lhs_trimmed = crate::strutil::trim_left_space(assign.lhs);
+        loop {
+            if let Some(rest) = lhs_trimmed.strip_prefix(b"export ") {
+                tsv_exported = Some(true);
+                lhs_trimmed = crate::strutil::trim_left_space(rest);
+            } else if let Some(rest) = lhs_trimmed.strip_prefix(b"unexport ") {
+                tsv_exported = Some(false);
+                lhs_trimmed = crate::strutil::trim_left_space(rest);
+            } else if let Some(rest) = lhs_trimmed.strip_prefix(b"private ") {
+                lhs_trimmed = crate::strutil::trim_left_space(rest);
+            } else {
+                break;
+            }
+        }
+        assign.lhs = lhs_trimmed;
         let var_sym = intern(after_targets.slice_ref(assign.lhs));
         let is_final = stmt.sep == RuleSep::FinalEq;
         for target in targets {
@@ -627,6 +693,9 @@ impl Evaluator {
                 if needs_assign {
                     let mut readonly = false;
                     rhs_var.write().assign_op = Some(assign.op);
+                    if let Some(exp) = tsv_exported {
+                        rhs_var.write().exported = exp;
+                    }
                     self.current_scope.as_ref().unwrap().assign(
                         var_sym,
                         rhs_var.clone(),
@@ -852,24 +921,21 @@ impl Evaluator {
             let files = crate::fileutil::glob(pat.clone());
 
             if stmt.should_exist {
-                match files.as_ref() {
-                    Err(err) => {
-                        // TODO: Kati does not support building a missing include file.
-                        error_loc!(
-                            self.loc.as_ref(),
-                            "{}: {err}",
-                            String::from_utf8_lossy(&pat)
-                        );
-                    }
-                    Ok(files) => {
-                        if files.is_empty() {
-                            error_loc!(
-                                self.loc.as_ref(),
-                                "{}: Not found",
-                                String::from_utf8_lossy(&pat)
-                            );
-                        }
-                    }
+                let missing = match files.as_ref() {
+                    Err(_) => true,
+                    Ok(v) => v.is_empty(),
+                };
+                if missing {
+                    // sarun: defer "missing required include" to the remake
+                    // loop in main.rs. If a rule for this file is discovered
+                    // by the end of parse, main will build it and re-parse
+                    // the makefile (mirroring GNU make's
+                    // remake-the-makefile-then-re-exec behavior). If no rule
+                    // exists, main raises the error after the loop settles.
+                    let loc = self.loc.clone().unwrap_or_default();
+                    self.pending_remake_includes
+                        .push((loc, OsString::from_vec(pat.to_vec())));
+                    continue;
                 }
             }
             let Ok(files) = files.as_ref() else {
@@ -895,6 +961,29 @@ impl Evaluator {
             }
         }
 
+        Ok(())
+    }
+
+    pub fn eval_undefine(&mut self, stmt: &UndefineStmt) -> Result<()> {
+        self.loc = Some(stmt.loc());
+        self.in_rule = false;
+        let names = stmt.expr.eval_to_buf(self)?;
+        for tok in word_scanner(&names) {
+            let sym = intern(names.slice_ref(tok));
+            // Mirrors set_global_var's command-line-override rule: a plain
+            // `undefine` won't unset a command-line variable, but
+            // `override undefine` will.
+            if let Some(prev) = sym.peek_global_var()
+                && !stmt.is_override
+                && matches!(
+                    prev.read().origin(),
+                    VarOrigin::CommandLine | VarOrigin::Override
+                )
+            {
+                continue;
+            }
+            sym.clear_global_var();
+        }
         Ok(())
     }
 

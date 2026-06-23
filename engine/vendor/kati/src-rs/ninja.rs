@@ -46,6 +46,22 @@ use crate::{
 };
 use crate::{error, file_cache};
 
+// sarun: shell-quote `s` into `out` using POSIX single-quote rules —
+// wrap in `'...'` and replace any embedded `'` with `'"'"'`. Used by
+// gen_shell_script's recipe-echo synthesis so the printed text matches
+// the recipe text verbatim regardless of metacharacters.
+fn emit_shell_single_quoted(s: &[u8], out: &mut BytesMut) {
+    out.put_u8(b'\'');
+    for &b in s {
+        if b == b'\'' {
+            out.put_slice(b"'\"'\"'");
+        } else {
+            out.put_u8(b);
+        }
+    }
+    out.put_u8(b'\'');
+}
+
 fn find_command_line_flag(cmd: &[u8], name: &[u8]) -> Option<usize> {
     match memmem::find(cmd, name) {
         Some(0) => None,
@@ -380,6 +396,7 @@ impl<'a> NinjaGenerator<'a> {
     }
 
     fn gen_shell_script(
+        &self,
         name: &Bytes,
         commands: &Vec<Command>,
         cmd_buf: &mut BytesMut,
@@ -390,7 +407,15 @@ impl<'a> NinjaGenerator<'a> {
         for c in commands {
             let inp = c.cmd.slice_ref(c.cmd.trim_ascii_start());
 
-            let needs_subshell = (command_count > 1 || c.ignore_error) && !c.force_no_subshell;
+            // sarun: .ONESHELL — all recipe lines share one shell, so
+            // they MUST NOT be wrapped in `()` (which would isolate
+            // variable / cwd / set-flag state) and MUST be joined by
+            // newlines (not `&&`, so each runs even if a prior one
+            // failed — matching the make manual's semantics under
+            // .ONESHELL).
+            let oneshell = self.ce.ev.oneshell;
+            let needs_subshell = !oneshell
+                && ((command_count > 1 || c.ignore_error) && !c.force_no_subshell);
 
             let mut translated = Self::translate_command(inp);
             if FLAGS.detect_android_echo
@@ -409,11 +434,38 @@ impl<'a> NinjaGenerator<'a> {
             }
 
             if !cmd_buf.is_empty() {
-                cmd_buf.put_slice(b" && ");
+                // sarun: with .ONESHELL active and no subshells, commands
+                // ride on one ninja-recipe line, separated by `; ` (don't
+                // abort on prior failure — matches bash's default
+                // behavior the .ONESHELL semantics rest on). A literal
+                // newline here is rejected by n2's ninja parser.
+                cmd_buf.put_slice(if oneshell { b" ; " } else { b" && " });
             }
 
             if needs_subshell {
                 cmd_buf.put_u8(b'(');
+            }
+
+            // sarun: GNU make echoes each recipe line BEFORE running it
+            // unless the `@` prefix was set. Kati's ninja generator
+            // hands the command line off to ninja/n2 which runs but
+            // doesn't echo, so the user loses the recipe-as-it-runs
+            // trace.
+            //
+            // Without .ONESHELL: per-command — c.echo decides.
+            // With .ONESHELL: per the manual, the first character of
+            // the recipe decides; @/-/+ on later lines is just data,
+            // not a prefix. So under oneshell we echo every command
+            // when commands[0].echo is true.
+            let should_echo = if oneshell {
+                commands.first().map(|c0| c0.echo).unwrap_or(true)
+            } else {
+                c.echo
+            };
+            if should_echo {
+                cmd_buf.put_slice(b"printf '%s\\n' ");
+                emit_shell_single_quoted(&translated, cmd_buf);
+                cmd_buf.put_slice(b" ; ");
             }
 
             cmd_buf.put_slice(&translated);
@@ -475,12 +527,50 @@ impl<'a> NinjaGenerator<'a> {
 
             let mut description = Bytes::from_static(b"build $out");
             let mut cmd_buf = BytesMut::new();
-            Self::gen_shell_script(
+            self.gen_shell_script(
                 &node.output.as_bytes(),
                 commands,
                 &mut cmd_buf,
                 &mut description,
             );
+            // sarun: target-specific exported vars (`target: export V := …`)
+            // need to be in the recipe's environment. The executor-side
+            // fix in exec.rs only covers rkati's standalone executor;
+            // the kati→n2 pipeline emits ninja and lets n2 run it, so we
+            // bake `export NAME='value'; ` into the recipe text instead.
+            if let Some(rule_vars) = &node.rule_vars {
+                let mut prefix = BytesMut::new();
+                let entries: Vec<(crate::symtab::Symbol, crate::var::Var)> = rule_vars
+                    .0
+                    .lock()
+                    .iter()
+                    .map(|(s, v)| (*s, v.clone()))
+                    .collect();
+                for (sym, var) in entries {
+                    if !var.read().exported {
+                        continue;
+                    }
+                    let value = var.read().eval_to_buf(self.ce.ev)?;
+                    prefix.put_slice(sym.as_bytes().as_ref());
+                    prefix.put_slice(b"=");
+                    // Shell-quote: wrap in '...' with embedded ' escaped.
+                    prefix.put_u8(b'\'');
+                    for &b in &value {
+                        if b == b'\'' {
+                            prefix.put_slice(b"'\"'\"'");
+                        } else {
+                            prefix.put_u8(b);
+                        }
+                    }
+                    prefix.put_slice(b"'; export ");
+                    prefix.put_slice(sym.as_bytes().as_ref());
+                    prefix.put_slice(b"; ");
+                }
+                if !prefix.is_empty() {
+                    prefix.put_slice(&cmd_buf);
+                    cmd_buf = prefix;
+                }
+            }
             out.write_all(b" description = ")?;
             out.write_all(&description)?;
             out.write_all(b"\n")?;
@@ -564,6 +654,20 @@ impl<'a> NinjaGenerator<'a> {
             out.write_all(b" ")?;
             out.write_all(&Self::escape_build_target(*s))?;
         }
+        // sarun: inject the top-level Makefile as an IMPLICIT input on
+        // every non-phony rule with a real (file) target. This is what
+        // GNU make does internally and what makes "no prereqs, file
+        // exists" mean "up to date" — n2 has no other way to decide
+        // staleness for a prereq-less rule, so without this every such
+        // rule rebuilds on every invocation (visible to the user as
+        // duplicated recipe output on incremental builds, divergent
+        // from the standalone rkati path).
+        if !node.is_phony
+            && let Some(makefile) = FLAGS.makefile.lock().as_ref()
+        {
+            write!(out, " | ")?;
+            out.write_all(makefile.as_bytes())?;
+        }
         if !node.order_onlys.is_empty() {
             write!(out, " ||")?;
             for (s, _) in &node.order_onlys {
@@ -623,8 +727,18 @@ impl<'a> NinjaGenerator<'a> {
     }
 
     fn generate_ninja(&mut self) -> Result<()> {
+        // sarun: emit to the default computed filename (real-kati behaviour).
+        let path = get_ninja_filename();
+        self.generate_ninja_to(&path)
+    }
+
+    // sarun: emit the ninja graph to an EXPLICIT output path. The body is the
+    // original generate_ninja() verbatim except the File::create target is the
+    // caller-supplied `path` (so sarun can pass /proc/self/fd/<memfd>) rather
+    // than the computed ./build<suffix>.ninja. No other behaviour changed.
+    fn generate_ninja_to(&mut self, path: &OsStr) -> Result<()> {
         let _tr = ScopedTimeReporter::new("ninja gen (emit)");
-        let out = std::fs::File::create(get_ninja_filename())?;
+        let out = std::fs::File::create(path)?;
         let mut out = std::io::BufWriter::new(out);
 
         write!(out, "# Generated by kati unknown\n\n")?;
@@ -854,6 +968,23 @@ pub fn generate_ninja(
 ) -> Result<()> {
     let mut ng = NinjaGenerator::new(CommandEvaluator::new(ev)?, start_time)?;
     ng.generate(nodes, orig_args)?;
+    Ok(())
+}
+
+// sarun: generate ONLY the ninja graph, to an EXPLICIT output path, skipping the
+// companion shell-script / .kati_stamp files real-kati's generate() also writes.
+// sarun passes /proc/self/fd/<memfd> here so the ninja is handed back purely
+// in-memory — nothing is written to the box filesystem and there is no temp file
+// to clean up. Mirrors generate()'s populate-then-emit but emits to `path`.
+pub fn generate_ninja_to_path(
+    nodes: &Vec<NamedDepNode>,
+    ev: &mut Evaluator,
+    start_time: SystemTime,
+    path: &std::ffi::OsStr,
+) -> Result<()> {
+    let mut ng = NinjaGenerator::new(CommandEvaluator::new(ev)?, start_time)?;
+    ng.populate_ninja_nodes(nodes)?;
+    ng.generate_ninja_to(path)?;
     Ok(())
 }
 

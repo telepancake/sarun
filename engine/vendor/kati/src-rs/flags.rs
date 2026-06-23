@@ -29,8 +29,25 @@ use crate::{
 use bytes::Bytes;
 use parking_lot::Mutex;
 
+// sarun: an explicit args override. When set (before FLAGS is first read), the
+// global FLAGS is built from THESE args instead of env::args_os(). sarun's
+// embedded `make` path uses this to drive kati in ninja-generation mode against
+// a synthesized argv (--ninja injected, makefile/targets/VAR=val translated
+// from the box's make argv) without having to be the real process argv0.
+pub static FLAGS_ARGS_OVERRIDE: std::sync::OnceLock<Vec<OsString>> = std::sync::OnceLock::new();
+
+/// sarun: install the args FLAGS should parse. Must be called BEFORE the first
+/// access to FLAGS (it is a LazyLock; the first deref freezes the value). Returns
+/// Err(()) if the override was already set.
+pub fn install_args(args: Vec<OsString>) -> Result<(), ()> {
+    FLAGS_ARGS_OVERRIDE.set(args).map_err(|_| ())
+}
+
 pub static FLAGS: LazyLock<Flags> = LazyLock::new(|| {
-    if cfg!(test) {
+    if let Some(args) = FLAGS_ARGS_OVERRIDE.get() {
+        // sarun: explicit override wins (see install_args).
+        Flags::from_args(args.clone())
+    } else if cfg!(test) {
         Flags::default()
     } else {
         Flags::from_args(env::args_os().collect())

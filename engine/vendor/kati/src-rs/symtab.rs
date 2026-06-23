@@ -90,6 +90,15 @@ impl Symbol {
         let mut r = SYMTAB.lock();
         r.set_global_var(self, var, is_override, readonly)
     }
+    /// sarun: drop a variable's binding so `$(flavor X)` returns
+    /// "undefined". Used by the `undefine` directive (GNU make 3.82+).
+    pub fn clear_global_var(&self) {
+        let mut r = SYMTAB.lock();
+        let idx = self.0.get();
+        if idx < r.symbol_data.len() {
+            r.symbol_data[idx] = None;
+        }
+    }
 }
 
 pub struct ScopedGlobalVar {
@@ -216,8 +225,12 @@ impl Symtab {
             if origin == VarOrigin::CommandLine && var.read().origin() == VarOrigin::File {
                 return Ok(());
             }
+            // sarun: $(eval) inside $(call) often does `1:=newval` to
+            // rebind the call arg. Real make accepts the override; when
+            // the surrounding ScopedGlobalVar later drops, the original
+            // Automatic binding is restored.
             if origin == VarOrigin::Automatic {
-                error!("overriding automatic variable is not implemented yet");
+                // fall through — overwrite the entry below.
             }
         }
         *entry = Some(var);
