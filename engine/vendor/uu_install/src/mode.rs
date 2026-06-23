@@ -13,12 +13,15 @@ use uucore::translate;
 #[cfg(any(unix, target_os = "redox"))]
 pub fn chmod(path: &Path, mode: u32) -> Result<(), ()> {
     use std::os::unix::fs::PermissionsExt;
-    use uucore::{display::Quotable, show_error};
+    use uucore::display::Quotable;
+    // Routed through the crate's logical stderr buffer (see
+    // `install::buffer_error`), not uucore's `show_error!` (which writes fd 2);
+    // the in-process builtin must never touch process stdio.
     fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|err| {
-        show_error!(
+        crate::buffer_error(format_args!(
             "{}",
             translate!("install-error-chmod-failed-detailed", "path" => path.maybe_quote(), "error" => err)
-        );
+        ));
     })
 }
 

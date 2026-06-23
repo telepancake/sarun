@@ -16,7 +16,7 @@ use std::ffi::OsString;
 use std::fmt::Debug;
 use std::fs::{self, metadata};
 use std::fs::{File, OpenOptions};
-use std::io::{Write, stdout};
+use std::io::{self, Write};
 use std::path::{MAIN_SEPARATOR, Path, PathBuf};
 use std::process;
 use thiserror::Error;
@@ -24,7 +24,7 @@ use uucore::backup_control::{self, BackupMode};
 use uucore::buf_copy::copy_stream;
 use uucore::display::Quotable;
 use uucore::entries::{grp2gid, usr2uid};
-use uucore::error::{FromIo, UError, UResult, UUsageError};
+use uucore::error::{FromIo, UError, UResult, USimpleError, UUsageError};
 use uucore::fs::dir_strip_dot_for_creation;
 use uucore::perms::{Verbosity, VerbosityLevel, wrap_chown};
 use uucore::process::{getegid, geteuid};
@@ -36,7 +36,98 @@ use uucore::selinux::{
     selinux_error_description, set_selinux_security_context,
 };
 use uucore::translate;
-use uucore::{format_usage, show, show_error, show_if_err};
+use uucore::format_usage;
+
+// ── Injected-I/O plumbing for the in-process brush builtin ───────────────────
+//
+// FILESYSTEM template, mirroring uu_cp / uu_mkdir: [`install_main`] resolves
+// every relative path operand (and `-t`/`--target-directory`) against the
+// shell's LOGICAL cwd (the process is never `chdir`'d), and routes all output to
+// the shell's logical sinks. `install` runs on a FRESH worker thread per call
+// (the engine's `run_coreutil_localized`), so these thread-locals are
+// per-instance: `INSTALL_OUT` buffers verbose output, `INSTALL_ERR`
+// diagnostics, `INSTALL_EXIT` the deferred exit code. The crate-local `show!` /
+// `show_error!` / `show_if_err!` macros below SHADOW uucore's (which write fd 2
+// + the process-global exit code), `set_exit_code` SHADOWS uucore's, and the
+// verbose `writeln!(stdout(), …)` sites target [`InstallOut`]. Both the logical
+// entry and standalone [`uumain`] drain the buffers (the latter to real stdio),
+// so standalone behavior is unchanged.
+thread_local! {
+    static INSTALL_OUT: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    static INSTALL_ERR: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    static INSTALL_EXIT: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
+}
+
+/// `Write` sink for verbose output; buffers into [`INSTALL_OUT`] (drained to the
+/// logical or real stdout by the entry point). Replaces upstream's
+/// `writeln!(stdout(), …)`.
+struct InstallOut;
+impl Write for InstallOut {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        INSTALL_OUT.with(|b| b.borrow_mut().extend_from_slice(buf));
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Shadows [`uucore::show!`]: records the error's code into [`INSTALL_EXIT`] and
+/// writes `<util_name>: <err>` to the logical stderr buffer (never fd 2).
+macro_rules! show {
+    ($err:expr) => {{
+        #[allow(unused_imports)]
+        use uucore::error::UError as _;
+        use std::io::Write as _;
+        let e = $err;
+        $crate::INSTALL_EXIT.with(|c| c.set(e.code()));
+        $crate::INSTALL_ERR.with(|b| {
+            let _ = writeln!(b.borrow_mut(), "{}: {e}", uucore::util_name());
+        });
+    }};
+}
+
+/// Shadows [`uucore::show_error!`]: writes `<util_name>: <msg>` to the logical
+/// stderr buffer and records exit code 1 into [`INSTALL_EXIT`].
+macro_rules! show_error {
+    ($($args:tt)+) => {{
+        use std::io::Write as _;
+        $crate::INSTALL_EXIT.with(|c| c.set(1));
+        $crate::INSTALL_ERR.with(|b| {
+            let mut b = b.borrow_mut();
+            let _ = write!(b, "{}: ", uucore::util_name());
+            let _ = writeln!(b, $($args)+);
+        });
+    }};
+}
+
+/// Shadows [`uucore::show_if_err!`], routing through the crate-local `show!`.
+macro_rules! show_if_err {
+    ($res:expr) => {{
+        if let Err(e) = $res {
+            show!(e);
+        }
+    }};
+}
+
+/// Shadows [`uucore::error::set_exit_code`]: defers the code onto the per-call
+/// [`INSTALL_EXIT`] instead of uucore's process-global `EXIT_CODE`.
+fn set_exit_code(code: i32) {
+    INSTALL_EXIT.with(|c| c.set(code));
+}
+
+/// Buffered `<util_name>: <msg>` diagnostic for the child [`mode`] module, which
+/// (unlike the rest of this crate) is declared before the crate-local
+/// `show_error!` macro and so cannot reach it by textual scope. Same effect:
+/// records exit code 1 and writes to [`INSTALL_ERR`] (never fd 2).
+pub(crate) fn buffer_error(args: std::fmt::Arguments) {
+    INSTALL_EXIT.with(|c| c.set(1));
+    INSTALL_ERR.with(|b| {
+        let mut b = b.borrow_mut();
+        let _ = write!(b, "{}: ", uucore::util_name());
+        let _ = writeln!(b, "{args}");
+    });
+}
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
@@ -175,16 +266,93 @@ static ARG_FILES: &str = "files";
 ///
 /// Returns a program return code.
 ///
+/// Logical entry point for the in-process brush `install` builtin.
+///
+/// Mirrors [`uumain`] but (1) resolves every relative path operand and the
+/// `-t`/`--target-directory` value against the shell's LOGICAL `cwd` (the process
+/// is never `chdir`'d), and (2) never touches process fd 1/2 — verbose output
+/// drains to `out`, diagnostics to `err`, the deferred exit code surfaces as the
+/// returned status.
+pub fn install_main(
+    args: impl uucore::Args,
+    cwd: &Path,
+    out: &mut dyn io::Write,
+    err: &mut dyn io::Write,
+) -> UResult<()> {
+    INSTALL_OUT.with(|b| b.borrow_mut().clear());
+    INSTALL_ERR.with(|b| b.borrow_mut().clear());
+    INSTALL_EXIT.with(|c| c.set(0));
+
+    let result = run(args, Some(cwd));
+
+    let produced_out = INSTALL_OUT.with(|b| std::mem::take(&mut *b.borrow_mut()));
+    let produced_err = INSTALL_ERR.with(|b| std::mem::take(&mut *b.borrow_mut()));
+    let _ = out.write_all(&produced_out);
+    let _ = out.flush();
+    let _ = err.write_all(&produced_err);
+    let _ = err.flush();
+
+    let deferred = INSTALL_EXIT.with(std::cell::Cell::get);
+    match result {
+        Ok(()) if deferred != 0 => Err(USimpleError::new(deferred, String::new())),
+        other => other,
+    }
+}
+
 #[uucore::main]
 pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+    INSTALL_OUT.with(|b| b.borrow_mut().clear());
+    INSTALL_ERR.with(|b| b.borrow_mut().clear());
+    INSTALL_EXIT.with(|c| c.set(0));
+
+    let result = run(args, None);
+
+    let produced_out = INSTALL_OUT.with(|b| std::mem::take(&mut *b.borrow_mut()));
+    let produced_err = INSTALL_ERR.with(|b| std::mem::take(&mut *b.borrow_mut()));
+    let _ = io::Write::write_all(&mut io::stdout(), &produced_out);
+    let _ = io::Write::write_all(&mut io::stderr(), &produced_err);
+
+    let deferred = INSTALL_EXIT.with(std::cell::Cell::get);
+    match result {
+        Ok(()) if deferred != 0 => Err(USimpleError::new(deferred, String::new())),
+        other => other,
+    }
+}
+
+/// Shared body of [`install_main`] and [`uumain`]. When `cwd` is `Some`, relative
+/// path operands and the `-t` target dir are rooted at the shell's logical cwd;
+/// when `None` (standalone) they resolve against the process cwd, as upstream.
+fn run(args: impl uucore::Args, cwd: Option<&Path>) -> UResult<()> {
     let matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+
+    // Resolve a relative path operand against the logical cwd when one is given.
+    let abs = |p: PathBuf| -> PathBuf {
+        match cwd {
+            Some(cwd) if p.is_relative() => cwd.join(p),
+            _ => p,
+        }
+    };
 
     let paths: Vec<OsString> = matches
         .get_many::<OsString>(ARG_FILES)
-        .map(|v| v.cloned().collect())
+        .map(|v| {
+            v.map(|f| abs(PathBuf::from(f)).into_os_string())
+                .collect()
+        })
         .unwrap_or_default();
 
-    let behavior = behavior(&matches)?;
+    let mut behavior = behavior(&matches)?;
+
+    // Same treatment for an explicit `-t`/`--target-directory` value (stored as a
+    // String in `Behavior`); leave absolute targets untouched.
+    if let Some(dir) = behavior.target_dir.take() {
+        behavior.target_dir = Some(
+            abs(PathBuf::from(dir))
+                .into_os_string()
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
 
     match behavior.main_function {
         MainFunction::Directory => directory(&paths, &behavior),
@@ -497,7 +665,7 @@ fn directory(paths: &[OsString], b: &Behavior) -> UResult<()> {
 
                 if b.verbose {
                     writeln!(
-                        stdout(),
+                        InstallOut,
                         "{}",
                         translate!("install-verbose-creating-directory", "path" => path_to_create.quote())
                     )?;
@@ -506,7 +674,7 @@ fn directory(paths: &[OsString], b: &Behavior) -> UResult<()> {
 
             if mode::chmod(path, b.mode()).is_err() {
                 // Error messages are printed by the mode::chmod function!
-                uucore::error::set_exit_code(1);
+                set_exit_code(1);
                 continue;
             }
 
@@ -659,7 +827,7 @@ fn standard(mut paths: Vec<OsString>, b: &Behavior) -> UResult<()> {
                         if !result.is_dir() {
                             // Don't display when the directory already exists
                             writeln!(
-                                stdout(),
+                                InstallOut,
                                 "{}",
                                 translate!("install-verbose-creating-directory-step", "path" => result.quote())
                             )?;
@@ -854,7 +1022,7 @@ fn chown_optional_user_group(path: &Path, b: &Behavior) -> UResult<()> {
         Err(e) => return Err(InstallError::MetadataFailed(e).into()),
     };
     match wrap_chown(path, &meta, owner_id, group_id, false, verbosity) {
-        Ok(msg) if b.verbose && !msg.is_empty() => writeln!(stdout(), "chown: {msg}")?,
+        Ok(msg) if b.verbose && !msg.is_empty() => writeln!(InstallOut, "chown: {msg}")?,
         Ok(_) => {}
         Err(e) => return Err(InstallError::ChownFailed(path.to_path_buf(), e).into()),
     }
@@ -877,7 +1045,7 @@ fn perform_backup(to: &Path, b: &Behavior) -> UResult<Option<PathBuf>> {
     if to.exists() {
         if b.verbose {
             writeln!(
-                stdout(),
+                InstallOut,
                 "{}",
                 translate!("install-verbose-removed", "path" => to.quote())
             )?;
@@ -1106,14 +1274,14 @@ fn finalize_installed_file(
     }
 
     if b.verbose {
-        write!(stdout(), "{} -> {}", from.quote(), to.quote())?;
+        write!(InstallOut, "{} -> {}", from.quote(), to.quote())?;
         match backup_path {
             Some(path) => writeln!(
-                stdout(),
+                InstallOut,
                 " {}",
                 translate!("install-verbose-backup", "backup" => path.quote())
             )?,
-            None => writeln!(stdout())?,
+            None => writeln!(InstallOut)?,
         }
     }
 
