@@ -16,10 +16,11 @@ use uucore::translate;
 static OPT_ALL: &str = "all";
 static OPT_IGNORE: &str = "ignore";
 
-#[uucore::main(no_signals)]
-pub fn uumain(args: impl uucore::Args) -> UResult<()> {
-    let matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
-
+/// Compute the CPU count to report, applying the `--all`/`--ignore` flags and the
+/// OpenMP env-var overrides. Factored out of `uumain` so the standalone binary
+/// and the in-process [`nproc_main`] share identical logic; only the output sink
+/// differs.
+fn count_cores(matches: &clap::ArgMatches) -> UResult<usize> {
     let ignore = match matches.get_one::<String>(OPT_IGNORE) {
         Some(numstr) => match numstr.trim().parse::<usize>() {
             Ok(num) => num,
@@ -77,6 +78,31 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     } else {
         cores -= ignore;
     }
+    Ok(cores)
+}
+
+/// Logical entry point for the in-process brush builtin.
+///
+/// `nproc` reads no stdin; it computes the CPU count and writes `"{cores}\n"` to
+/// the injected `out` sink — never the process's global stdout. `err` is accepted
+/// for the engine's uniform `(args, out, err)` entry shape; nproc emits no
+/// diagnostics of its own (failures are returned).
+pub fn nproc_main(
+    args: impl uucore::Args,
+    out: &mut dyn Write,
+    _err: &mut dyn Write,
+) -> UResult<()> {
+    let matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+    let cores = count_cores(&matches)?;
+    out.write_all(format!("{cores}\n").as_bytes())
+        .map_err(|e| USimpleError::new(1, e.to_string()))?;
+    Ok(())
+}
+
+#[uucore::main(no_signals)]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+    let matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+    let cores = count_cores(&matches)?;
     //discard error about stdout flush
     stdout()
         .lock()
