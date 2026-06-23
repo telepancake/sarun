@@ -45,15 +45,6 @@ impl<K: Index, V> DenseMap<K, V> {
         K::from(self.vec.len())
     }
 
-    // sarun: expose count + a value iterator so the engine can walk every Build
-    // in the loaded graph for the `build_edges` provenance frame.
-    pub fn len(&self) -> usize {
-        self.vec.len()
-    }
-    pub fn iter(&self) -> impl Iterator<Item = &V> {
-        self.vec.iter()
-    }
-
     pub fn push(&mut self, val: V) -> K {
         let id = self.next_id();
         self.vec.push(val);

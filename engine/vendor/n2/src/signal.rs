@@ -16,12 +16,6 @@ extern "C" fn sigint_handler(_sig: libc::c_int) {
 
 #[cfg(unix)]
 pub fn register_sigint() {
-    // sarun: when n2 is embedded in the engine, the box's own signal setup owns
-    // SIGINT — n2 installing a SA_RESETHAND handler here would race/override it.
-    // Suppress n2's handler whenever the in-process executor is active.
-    if crate::process::executor().is_some() {
-        return;
-    }
     // Safety: registering a signal handler is libc unsafe code.
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();

@@ -1,28 +1,18 @@
-# sarun: vendored, lib-only patched fork of n2 (github.com/evmar/n2).
-# Pinned upstream commit: b1fead52ccda0c497d816696f23f4099c3e8ec1f
-#
-# Why vendored: sarun embeds n2 IN-PROCESS and replaces n2's per-recipe
-# `/bin/sh -c` posix_spawn with an in-process embedded-brush executor (see
-# the `// sarun:` patch in src/process_posix.rs). All other n2 sources are
-# byte-for-byte upstream so this fork stays auditable / re-syncable.
-#
-# Changes vs upstream, all marked `// sarun:`:
-#   * Cargo.toml: lib-only (dropped [[bin]], benches, jemalloc — `default`
-#     feature is now empty, matching `--no-default-features`); windows-sys
-#     target dep dropped (we only build unix).
-#   * lib.rs: dropped the jemalloc global_allocator block and process_win mod.
-#   * process_posix.rs: run_command routes to a global executor hook when set.
-#   * signal.rs: register_sigint is a no-op when the embedded hook is active.
 [package]
 name = "n2"
 version = "0.1.0"
+categories = ["development-tools", "development-tools::build-utils"]
 edition = "2021"
+exclude = [".github/*", ".vscode/*"]
+homepage = "https://github.com/evmar/n2"
+keywords = ["ninja", "build"]
 license = "Apache-2.0"
-description = "a ninja compatible build system (sarun vendored lib-only fork)"
-
-[lib]
-name = "n2"
-path = "src/lib.rs"
+readme = "README.md"
+repository = "https://github.com/evmar/n2"
+# https://github.com/evmar/n2/issues/74
+# Note: if we bump this, may need to bump .github/workflows/ci.yml version too.
+rust-version = "1.81.0"
+description = "a ninja compatible build system"
 
 [dependencies]
 anyhow = "1.0"
@@ -30,6 +20,37 @@ lexopt = "0.3.0"
 libc = "0.2"
 rustc-hash = "1.1.0"
 
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "0.48"
+features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_System_Console",
+  "Win32_System_Diagnostics_Debug",
+  "Win32_System_Pipes",
+  "Win32_System_Threading",
+]
+
+[target.'cfg(not(any(windows, target_arch = "wasm32")))'.dependencies]
+jemallocator = { version = "0.5", optional = true }
+
+[dev-dependencies]
+divan = "0.1.16"
+tempfile = "3.6.0"
+
+[profile.release]
+debug = true
+lto = true
+
+[[bench]]
+name = "parse"
+harness = false
+
+[[bench]]
+name = "canon"
+harness = false
+
 [features]
-default = []
+default = ["jemalloc"]
+jemalloc = ["jemallocator"]
 crlf = []

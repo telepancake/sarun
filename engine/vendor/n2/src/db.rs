@@ -92,26 +92,6 @@ impl Writer {
         Ok(w)
     }
 
-    // sarun: a fresh, EMPTY db backed by an anonymous in-memory file
-    // (memfd_create) instead of an on-disk .n2_db. Used by load::read_from_content
-    // so sarun's embedded `make`→kati→n2 path runs WITHOUT touching the box
-    // filesystem (no .n2_db, no build.ninja temp). The fd auto-frees on close.
-    // The db starts empty (no prior build records), so every target is treated
-    // as out-of-date on this run — correct for a one-shot in-process build that
-    // has no persisted state.
-    pub fn in_memory() -> std::io::Result<Self> {
-        // SAFETY: memfd_create with a valid NUL-terminated name and MFD_CLOEXEC.
-        let fd = unsafe { libc::memfd_create(c"n2-db".as_ptr(), libc::MFD_CLOEXEC) };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        // SAFETY: fd is a fresh owned descriptor returned by memfd_create.
-        let f = unsafe { <File as std::os::fd::FromRawFd>::from_raw_fd(fd) };
-        let mut w = Self::from_opened(IdMap::default(), f);
-        w.write_signature()?;
-        Ok(w)
-    }
-
     fn from_opened(ids: IdMap, w: File) -> Self {
         Writer { ids, w }
     }
