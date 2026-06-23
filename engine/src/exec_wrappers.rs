@@ -1,33 +1,24 @@
-//! In-process exec-wrapper builtins for box brush shells.
+//! In-process exec-wrapper builtins (`env`, `nice`, `setsid`, `nohup`).
 //!
-//! `env` (and its relatives) are not algorithms to port — they are *launcher
-//! front-ends*. Each one parses a few options, mutates the LOGICAL launch state
-//! the box brush shell already maintains (environment, working directory, and
-//! later signal dispositions / niceness / session), and then hands the residual
-//! `COMMAND [ARG]...` to the shell's own command dispatch. There is nothing of
-//! uutils worth keeping here: the uutils `env` is ~all `execvp`/`setenv`
-//! plumbing that we would delete wholesale, because in-process the launch state
-//! is brush's, not libc's. So these are written fresh against brush's seams.
+//! Each parses a few options, mutates the LOGICAL launch state brush maintains
+//! (env, cwd, signal dispositions, niceness, session), then hands the residual
+//! `COMMAND [ARG]...` to the shell's dispatch. Written fresh against brush's
+//! seams — uutils' `env` is all `execvp`/`setenv` plumbing that would be deleted
+//! wholesale; in-process, launch state is brush's, not libc's.
 //!
-//! ## The mechanism: clone the shell, mutate the clone, run through dispatch
+//! ## Mechanism: clone, mutate, dispatch
 //!
-//! A brush subshell is `shell.clone()` — it carries the logical cwd, the logical
-//! environment, traps, and open files, but is NOT a separate OS process (see
-//! `commands::invoke_command_in_subshell_and_get_output`). `env FOO=bar cmd`
-//! must not leak `FOO`/`-C`/etc. into the calling shell, so we clone, apply the
-//! mutations to the clone, and run the residual `COMMAND [ARG]...` on the clone
-//! via `Shell::run_argv` — which performs the full function/builtin/external
-//! dispatch on the ALREADY-SPLIT argv (no re-expansion, no re-quoting) and
-//! returns the command's real exit status. The clone is dropped afterward, so
-//! the mutations vanish exactly when they should.
+//! `shell.clone()` is a subshell: it carries the logical cwd/env/traps/open-files
+//! but is NOT a separate OS process. We clone, apply mutations, and run the
+//! residual argv via `Shell::run_argv` — full function/builtin/external dispatch
+//! on the ALREADY-SPLIT argv (no re-expansion). The clone drops afterward so
+//! mutations vanish exactly when they should.
 //!
-//! The mutated logical state materializes onto a real child only at fork→exec,
-//! inside `compose_std_command`: the cloned env becomes the child's `environ`,
-//! the cloned cwd becomes its `current_dir`. For an in-process target (a brush
-//! builtin like `find`/`xargs`/`echo`) there is nothing to materialize onto a
-//! process — and that is correct: the builtin reads the same logical state
-//! directly (`context.shell.working_dir()`, the exported env), so `env -C dir
-//! find .` and `env FOO=bar printenv FOO` both work with no OS process at all.
+//! For a forked child, the mutated state materializes at fork→exec in
+//! `compose_std_command` (cloned env → `environ`, cloned cwd → `current_dir`).
+//! For an in-process builtin there is no process to materialize onto — correct:
+//! the builtin reads logical state directly, so `env -C dir find .` and
+//! `env FOO=bar printenv FOO` work with no OS process.
 
 use std::io::Write;
 
@@ -36,12 +27,10 @@ use brush_core::variables::{ShellValue, ShellVariable};
 use brush_core::{ExecutionParameters, ExecutionResult, Shell, builtins};
 use clap::Parser;
 
-/// `env`'s own error exit status: it could not run the requested command for a
-/// reason of its own (bad option, unusable `-C` directory). Matches GNU env.
+/// `env`'s own error status (bad option, unusable `-C`). Matches GNU env.
 const ENV_FAILURE: u8 = 125;
 
-/// A `NAME=VALUE` assignment token split into its parts, or `None` if the token
-/// is not a valid assignment (and therefore begins the `COMMAND`).
+/// Split a `NAME=VALUE` token, or `None` if not a valid assignment (starts COMMAND).
 fn parse_assignment(token: &str) -> Option<(String, String)> {
     let (name, value) = token.split_once('=')?;
     if brush_core::env::valid_variable_name(name) {
@@ -51,8 +40,8 @@ fn parse_assignment(token: &str) -> Option<(String, String)> {
     }
 }
 
-/// The parsed shape of an `env` invocation: the launch-state mutations to apply,
-/// plus the residual command (empty ⇒ print the resulting environment).
+/// Parsed `env` invocation: launch-state mutations + residual command
+/// (empty ⇒ print the resulting environment).
 struct EnvPlan {
     ignore_env: bool,
     unset: Vec<String>,
@@ -63,13 +52,9 @@ struct EnvPlan {
 }
 
 impl EnvPlan {
-    /// Parse `env`'s grammar by hand:
-    /// `env [-i] [-u NAME]... [-C DIR] [-0] [--] [NAME=VALUE]... [COMMAND [ARG]...]`.
-    ///
-    /// clap can't model this (options stop at the first operand, then the
-    /// command keeps its own flags verbatim), so the builtin collects the raw
-    /// argv and we walk it: an option phase, then `NAME=VALUE` assignments, then
-    /// everything else is the command and its arguments untouched.
+    /// Hand-parse `env [-i] [-u NAME]... [-C DIR] [-0] [--] [NAME=VALUE]... [COMMAND [ARG]...]`.
+    /// clap can't model this (options stop at first operand; command keeps its own flags).
+    /// Walks the argv: option phase → `NAME=VALUE` assignments → command verbatim.
     fn parse(args: &[String]) -> Result<Self, String> {
         let mut plan = EnvPlan {
             ignore_env: false,
@@ -81,14 +66,13 @@ impl EnvPlan {
         };
 
         let mut i = 0;
-        // Option phase.
-        while i < args.len() {
+        while i < args.len() { // option phase
             let arg = &args[i];
             if arg == "--" {
                 i += 1;
                 break;
             }
-            // A bare "-" is GNU's shorthand for -i.
+            // bare "-" is GNU shorthand for -i
             if arg == "-" {
                 plan.ignore_env = true;
                 i += 1;
@@ -160,12 +144,11 @@ impl EnvPlan {
                 i += 1;
                 continue;
             }
-            // First non-option token: assignments/command begin here.
+            // first non-option: assignments/command begin
             break;
         }
 
-        // Assignment phase: consume `NAME=VALUE` tokens until the first one that
-        // is not a valid assignment — that token starts the command.
+        // Assignment phase: consume NAME=VALUE tokens until the first non-assignment.
         while i < args.len() {
             match parse_assignment(&args[i]) {
                 Some(pair) => {
@@ -181,20 +164,17 @@ impl EnvPlan {
     }
 }
 
-/// Shared core for the `env` family: apply the plan's launch-state mutations to
-/// a freshly cloned subshell, then either print the resulting environment (no
-/// command) or run the command through that subshell's dispatch.
+/// Apply the plan's mutations to a cloned subshell, then print the environment
+/// (no command) or dispatch the command through the subshell.
 async fn run_env_plan<SE: brush_core::extensions::ShellExtensions>(
     plan: EnvPlan,
     context: brush_core::commands::ExecutionContext<'_, SE>,
 ) -> Result<ExecutionResult, brush_core::error::Error> {
-    // Clone the calling shell into a subshell: the mutations below land on the
-    // clone and are discarded when it drops, so nothing leaks to the caller.
+    // Clone into a subshell: mutations land on the clone and vanish when it drops.
     let mut subshell = context.shell.clone();
 
-    // -i / bare '-' : start from an empty *exported* environment. We unexport
-    // rather than delete, so the shell's own internal variables keep working
-    // in-process while a materialized child still sees an empty `environ`.
+    // -i / '-': empty the exported environment. Unexport (not delete) so
+    // internal shell variables keep working; a child still sees an empty environ.
     if plan.ignore_env {
         let names: Vec<String> = subshell
             .env()
@@ -202,28 +182,27 @@ async fn run_env_plan<SE: brush_core::extensions::ShellExtensions>(
             .map(|(k, _)| k.clone())
             .collect();
         for n in &names {
-            // get_mut yields (scope, &mut var); we only need the variable.
+            // get_mut → (scope, &mut var); we only need the variable.
             if let Some((_, var)) = subshell.env_mut().get_mut(n) {
                 var.unexport();
             }
         }
     }
 
-    // -u NAME : remove the variable entirely.
+    // -u NAME: remove the variable entirely.
     for name in &plan.unset {
         let _ = subshell.env_mut().unset(name);
     }
 
-    // NAME=VALUE : set and export, so both in-process builtins and any
-    // materialized child observe it.
+    // NAME=VALUE: set and export (visible to in-process builtins and forked children).
     for (name, value) in &plan.assignments {
         let mut var = ShellVariable::new(ShellValue::String(value.clone()));
         var.export();
         subshell.env_mut().set_global(name.clone(), var)?;
     }
 
-    // -C DIR : change the subshell's logical working directory. Materializes as
-    // the child's cwd at exec, and is read directly by in-process builtins.
+    // -C DIR: change the subshell's logical cwd; materializes at exec for forked
+    // children, read directly by in-process builtins.
     if let Some(dir) = &plan.chdir {
         if let Err(e) = subshell.set_working_dir(dir) {
             let mut err = context.stderr();
@@ -232,8 +211,7 @@ async fn run_env_plan<SE: brush_core::extensions::ShellExtensions>(
         }
     }
 
-    // No command: print the resulting environment, one `NAME=VALUE` per line
-    // (NUL-terminated with -0). Both borrows of `subshell` are immutable.
+    // No command: print the resulting environment, one NAME=VALUE per line (-0 → NUL).
     if plan.command.is_empty() {
         let terminator = if plan.null_terminate { '\0' } else { '\n' };
         let mut out = context.stdout();
@@ -245,18 +223,13 @@ async fn run_env_plan<SE: brush_core::extensions::ShellExtensions>(
         return Ok(ExecutionResult::success());
     }
 
-    // Run COMMAND through the subshell's full dispatch.
+    // Run the command through the subshell's full dispatch.
     dispatch(subshell, &plan.command, &context.params).await
 }
 
-/// Run an already-word-expanded `COMMAND [ARG]...` through a subshell's full
-/// command dispatch, returning the command's real exit status.
-///
-/// The argv is already final by the time a builtin sees it, so we hand it
-/// straight to `Shell::run_argv`, which performs lookup + invocation (function /
-/// builtin / external) with NO second round of expansion — no re-quoting, no
-/// `run_string` re-parse. This is the shared tail of every exec-wrapper that
-/// ends in "now run this command": `env`, `nice`, `setsid`, `nohup`.
+/// Run an already-expanded `COMMAND [ARG]...` through a subshell via
+/// `Shell::run_argv` (function/builtin/external dispatch, no re-expansion).
+/// Shared tail for `env`, `nice`, `setsid`, `nohup`.
 async fn dispatch<SE: brush_core::extensions::ShellExtensions>(
     mut subshell: Shell<SE>,
     command: &[String],
@@ -265,12 +238,9 @@ async fn dispatch<SE: brush_core::extensions::ShellExtensions>(
     subshell.run_argv(command, params).await
 }
 
-/// Split a raw argv into a leading run of option tokens (anything starting with
-/// `-`, plus a `--` terminator) and the residual `COMMAND [ARG]...`. Returns the
-/// options and the command tail. This is the shape `nice`/`setsid`/`nohup` share:
-/// they take a few of their own flags, then everything from the first operand on
-/// is the command, verbatim. (`env` needs finer control — assignments between
-/// options and command — so it parses its own grammar.)
+/// Split argv into leading option tokens (starting with `-`, up to `--`) and
+/// the residual command. Shape shared by `nice`/`setsid`/`nohup` (unlike `env`,
+/// which needs assignments between options and command).
 fn split_options(args: &[String]) -> (Vec<String>, Vec<String>) {
     let mut opts = Vec::new();
     let mut i = 0;
@@ -290,11 +260,11 @@ fn split_options(args: &[String]) -> (Vec<String>, Vec<String>) {
     (opts, args[i..].to_vec())
 }
 
-/// `env` — run a command in a modified environment (or print the environment).
+/// `env` — run a command in a modified environment, or print the environment.
 #[derive(Parser)]
 pub(crate) struct EnvCommand {
-    /// All arguments, collected raw; `env`'s grammar is parsed by hand because
-    /// option processing must stop at the command and leave its flags intact.
+    /// Raw argv; `env`'s grammar is parsed by hand (option stop at first operand;
+    /// command keeps its own flags).
     #[clap(allow_hyphen_values = true, trailing_var_arg = true)]
     args: Vec<String>,
 }
@@ -318,12 +288,8 @@ impl builtins::Command for EnvCommand {
     }
 }
 
-/// `printenv` — print all (or named) environment variables.
-///
-/// Shares nothing of `env`'s command-running path: it only ever reports the
-/// shell's logical exported environment, so it reads it directly off the
-/// (unmodified) calling shell. With names, prints each named variable's value;
-/// exit status is 1 if any requested name is unset.
+/// `printenv` — print all (or named) exported environment variables.
+/// With names, exit 1 if any is unset (GNU printenv).
 #[derive(Parser)]
 pub(crate) struct PrintenvCommand {
     /// End each output line with NUL, not newline.
@@ -354,9 +320,8 @@ impl builtins::Command for PrintenvCommand {
             return Ok(ExecutionResult::success());
         }
 
-        // With names: print each value; missing any ⇒ exit 1 (GNU printenv).
-        // Only *exported* variables count as the environment, so look the name
-        // up among the exported set rather than all shell variables.
+        // With names: print each value; missing any → exit 1 (GNU printenv).
+        // Only exported variables count; look up in iter_exported, not all vars.
         let mut all_found = true;
         for name in &self.names {
             match context
@@ -378,23 +343,15 @@ impl builtins::Command for PrintenvCommand {
 }
 
 // ─── Launch-state wrappers: nice / setsid / nohup ────────────────────────────
-//
-// These three set a *launch-state* override — a disposition only a real process
-// can carry (scheduling priority, session, signal handling) — and then dispatch
-// the command exactly like `env`. The override rides on a cloned
-// `ExecutionParameters` and materializes in the forked child just before execve
-// (see brush_core::commands::compose_std_command, `LaunchState`). For an
-// in-process builtin target there is no exec to materialize onto, so the wrapper
-// is a transparent pass-through in that case — correct: a builtin has no
-// separate process to renice, put in a new session, or shield from SIGHUP. The
-// real targets (`nice make`, `setsid daemon`, `nohup ./server`) are external,
-// where the override applies.
+// Each sets a `LaunchState` override on a cloned `ExecutionParameters` that
+// materializes just before execve in `compose_std_command`. For in-process
+// builtin targets there is no exec, so the wrapper is a transparent pass-through
+// — correct (a builtin has no process to renice/session/SIGHUP-shield).
 
 /// `nice` — run a command with an adjusted scheduling priority.
 #[derive(Parser)]
 pub(crate) struct NiceCommand {
-    /// Raw argv; parsed by hand because `-n N` takes a separate value and the
-    /// command keeps its own flags verbatim.
+    /// Raw argv; `-n N` takes a separate value and the command keeps its own flags.
     #[clap(allow_hyphen_values = true, trailing_var_arg = true)]
     args: Vec<String>,
 }
@@ -406,7 +363,7 @@ impl builtins::Command for NiceCommand {
         &self,
         context: brush_core::commands::ExecutionContext<'_, SE>,
     ) -> Result<ExecutionResult, Self::Error> {
-        // GNU default adjustment is +10 (lower priority) when none is given.
+        // GNU default: +10 (lower priority).
         let mut adjustment: i32 = 10;
         let args = &self.args;
         let mut i = 0;
@@ -416,7 +373,7 @@ impl builtins::Command for NiceCommand {
                 i += 1;
                 break;
             }
-            // --adjustment[=N] / --adjustment N
+            // --adjustment[=N] or --adjustment N
             if let Some(rest) = arg.strip_prefix("--adjustment") {
                 let val = if let Some(v) = rest.strip_prefix('=') {
                     v.to_string()
@@ -434,7 +391,7 @@ impl builtins::Command for NiceCommand {
                 i += 1;
                 continue;
             }
-            // -n N  or  -nN
+            // -n N or -nN
             if arg == "-n" {
                 i += 1;
                 let val = match args.get(i) {
@@ -456,7 +413,7 @@ impl builtins::Command for NiceCommand {
                 i += 1;
                 continue;
             }
-            // Historical bare form: `-NUM` / `--NUM` is an adjustment of NUM.
+            // Historical: `-NUM` / `--NUM` is an adjustment of NUM.
             if let Some(body) = arg.strip_prefix('-') {
                 if let Ok(n) = body.trim_start_matches('-').parse::<i32>() {
                     adjustment = n;
@@ -470,7 +427,7 @@ impl builtins::Command for NiceCommand {
 
         let command = args[i..].to_vec();
 
-        // No command: print the shell's current niceness (GNU behavior).
+        // No command: print current niceness (GNU behavior).
         if command.is_empty() {
             let cur = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
             let mut out = context.stdout();
@@ -479,9 +436,8 @@ impl builtins::Command for NiceCommand {
             return Ok(ExecutionResult::success());
         }
 
-        // Target priority = inherited niceness + adjustment, clamped to the
-        // kernel's [-20, 19] range. Lowering priority is unprivileged; raising
-        // it may be denied in the child, in which case the command still runs.
+        // Target = inherited niceness + adjustment, clamped to [-20, 19].
+        // Raising priority may be denied in the child; the command still runs.
         let base = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
         let target = (base + adjustment).clamp(-20, 19);
 
@@ -517,9 +473,8 @@ impl builtins::Command for SetsidCommand {
         context: brush_core::commands::ExecutionContext<'_, SE>,
     ) -> Result<ExecutionResult, Self::Error> {
         let (opts, command) = split_options(&self.args);
-        // We always wait for the command (run_string blocks), so `-w`/`--wait`
-        // is the de-facto mode and accepted as a no-op. `-c`/`--ctty` (set the
-        // controlling terminal) and `-f`/`--fork` are accepted but not modeled.
+        // run_argv always waits, so -w/--wait is a no-op; -c/--ctty and -f/--fork
+        // are accepted but not modeled.
         for o in &opts {
             match o.as_str() {
                 "-w" | "--wait" | "-c" | "--ctty" | "-f" | "--fork" => {}
@@ -573,11 +528,9 @@ impl builtins::Command for NohupCommand {
         let subshell = context.shell.clone();
         let mut params = context.params.clone();
         params.launch_state.ignore_sighup = true;
-        // Faithful nohup also redirects stdin from an unreadable source so the
-        // detached command can't steal the box's stdin. The tty-conditional
-        // stdout→nohup.out redirect is intentionally omitted: a box's stdout is
-        // a pipe/file, never a terminal — exactly the case where GNU nohup also
-        // leaves stdout untouched — so there is nothing to redirect here.
+        // Redirect stdin from /dev/null so the detached command can't steal box stdin.
+        // stdout→nohup.out is intentionally omitted: a box's stdout is always a
+        // pipe/file (never a terminal), which is exactly when GNU nohup leaves it.
         if let Ok(devnull) = std::fs::File::open("/dev/null") {
             params.set_fd(OpenFiles::STDIN_FD, OpenFile::from(devnull));
         }
