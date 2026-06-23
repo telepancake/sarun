@@ -8,7 +8,7 @@
 use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::io::{Error, ErrorKind, Read, Result, Write, stderr, stdin, stdout};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use uucore::display::Quotable;
 use uucore::error::{UResult, strip_errno};
 use uucore::translate;
@@ -22,10 +22,35 @@ use uucore::signals::ensure_stdout_not_broken;
 #[cfg(unix)]
 use uucore::signals::{disable_pipe_errors, ignore_interrupts};
 
-#[uucore::main]
-pub fn uumain(args: impl uucore::Args) -> UResult<()> {
-    let matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+// ── Injected-I/O plumbing for the in-process brush builtin ───────────────────
+//
+// STREAM + CWD template: [`tee_main`] reads the shell's LOGICAL stdin, writes
+// the shell's LOGICAL stdout AND its file operands (relative ones rooted at the
+// shell's LOGICAL cwd — the process is never `chdir`'d), and routes diagnostics
+// to the shell's LOGICAL stderr. `tee` runs on a FRESH worker thread per call
+// (the engine's `run_coreutil_localized`), so this thread-local err buffer is
+// per-instance. The crate-local `tee_err!` SHADOWS the upstream
+// `writeln!(stderr(), …)` sites; both [`tee_main`] and the standalone
+// [`uumain`] drain it (the latter to real stderr), so standalone behavior is
+// unchanged. The logical stdout/stdin are passed by reference, carried as the
+// borrowed [`Writer::Logical`] first writer and the [`NamedReader`] source.
+thread_local! {
+    static TEE_ERR: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
 
+/// Buffers a `format!`-style diagnostic (with a trailing newline) into the
+/// logical stderr buffer. Replaces the upstream `writeln!(stderr(), …)` sites.
+macro_rules! tee_err {
+    ($($args:tt)+) => ({
+        use std::io::Write as _;
+        $crate::TEE_ERR.with(|b| {
+            let _ = writeln!(b.borrow_mut(), $($args)+);
+        });
+    });
+}
+
+/// Build [`Options`] from parsed args, shared by [`tee_main`] and [`uumain`].
+fn options_from(matches: &clap::ArgMatches) -> Options {
     let append = matches.get_flag(options::APPEND);
     let ignore_interrupts = matches.get_flag(options::IGNORE_INTERRUPTS);
     let ignore_pipe_errors = matches.get_flag(options::IGNORE_PIPE_ERRORS);
@@ -45,18 +70,68 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
         .map(|v| v.cloned().collect())
         .unwrap_or_default();
 
-    let options = Options {
+    Options {
         append,
         ignore_interrupts,
         ignore_pipe_errors,
         files,
         output_error,
-    };
-
-    tee(&options).map_err(|_| 1.into())
+    }
 }
 
-fn tee(options: &Options) -> Result<()> {
+/// Logical entry point for the in-process brush `tee` builtin.
+///
+/// Reads from `inp` (the shell's logical stdin — never the engine's fd 0),
+/// writes to `out` (the shell's logical stdout) AND to the file operands
+/// (relative ones rooted at `cwd`), with diagnostics drained to `err`.
+pub fn tee_main(
+    args: impl uucore::Args,
+    cwd: &Path,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    inp: &mut dyn Read,
+) -> UResult<()> {
+    TEE_ERR.with(|b| b.borrow_mut().clear());
+    let matches = match uucore::clap_localization::handle_clap_result(uu_app(), args) {
+        Ok(m) => m,
+        Err(e) => {
+            let produced = TEE_ERR.with(|b| std::mem::take(&mut *b.borrow_mut()));
+            let _ = err.write_all(&produced);
+            let _ = err.flush();
+            return Err(e);
+        }
+    };
+    let options = options_from(&matches);
+    let res = tee(&options, Some(cwd), out, inp);
+    let produced = TEE_ERR.with(|b| std::mem::take(&mut *b.borrow_mut()));
+    let _ = out.flush();
+    let _ = err.write_all(&produced);
+    let _ = err.flush();
+    res.map_err(|_| 1.into())
+}
+
+#[uucore::main]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+    TEE_ERR.with(|b| b.borrow_mut().clear());
+    let matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+    let options = options_from(&matches);
+    let mut out = stdout();
+    let mut inp = stdin();
+    let res = tee(&options, None, &mut out, &mut inp);
+    let produced = TEE_ERR.with(|b| std::mem::take(&mut *b.borrow_mut()));
+    let _ = stderr().write_all(&produced);
+    res.map_err(|_| 1.into())
+}
+
+/// `tee`'s core copy loop. `cwd` (when `Some`) roots relative file operands at
+/// the shell's logical cwd; `out` is the logical stdout writer (the first
+/// [`NamedWriter`]); `inp` is the logical stdin source.
+fn tee(
+    options: &Options,
+    cwd: Option<&Path>,
+    out: &mut dyn Write,
+    inp: &mut dyn Read,
+) -> Result<()> {
     #[cfg(unix)]
     {
         // ErrorKind::Other is raised by MultiWriter when all writers have exited.
@@ -72,7 +147,7 @@ fn tee(options: &Options) -> Result<()> {
     let mut writers: Vec<NamedWriter> = options
         .files
         .iter()
-        .filter_map(|file| open(file, options.append, options.output_error.as_ref()))
+        .filter_map(|file| open(file, cwd, options.append, options.output_error.as_ref()))
         .collect::<Result<Vec<NamedWriter>>>()?;
     let had_open_errors = writers.len() != options.files.len();
 
@@ -80,12 +155,12 @@ fn tee(options: &Options) -> Result<()> {
         0,
         NamedWriter {
             name: translate!("tee-standard-output").into(),
-            inner: Writer::Stdout(stdout()),
+            inner: Writer::Logical(out),
         },
     );
 
     let mut output = MultiWriter::new(writers, options.output_error.clone());
-    let input = NamedReader { inner: stdin() };
+    let input = NamedReader { inner: inp };
 
     #[cfg(target_os = "linux")]
     if options.ignore_pipe_errors && !ensure_stdout_not_broken()? && output.writers.len() == 1 {
@@ -164,12 +239,18 @@ fn copy(mut input: impl Read, mut output: impl Write) -> Result<usize> {
 /// Tries to open the indicated file and return it. Reports an error if that's not possible.
 /// If that error should lead to program termination, this function returns Some(Err()),
 /// otherwise it returns None.
-fn open(
+fn open<'a>(
     name: &OsString,
+    cwd: Option<&Path>,
     append: bool,
     output_error: Option<&OutputErrorMode>,
-) -> Option<Result<NamedWriter>> {
-    let path = PathBuf::from(name);
+) -> Option<Result<NamedWriter<'a>>> {
+    // Root a relative file operand at the shell's logical cwd (the process is
+    // never `chdir`'d); the diagnostic name stays the operand as given.
+    let path = match cwd {
+        Some(cwd) if Path::new(name).is_relative() => cwd.join(name),
+        _ => PathBuf::from(name),
+    };
     let mut options = OpenOptions::new();
     let mode = if append {
         options.append(true)
@@ -182,7 +263,7 @@ fn open(
             name: name.clone(),
         })),
         Err(f) => {
-            let _ = writeln!(stderr(), "{}: {f}", name.maybe_quote());
+            tee_err!("{}: {f}", name.maybe_quote());
             match output_error {
                 Some(OutputErrorMode::Exit | OutputErrorMode::ExitNoPipe) => Some(Err(f)),
                 _ => None,
@@ -191,14 +272,14 @@ fn open(
     }
 }
 
-struct MultiWriter {
-    writers: Vec<NamedWriter>,
+struct MultiWriter<'a> {
+    writers: Vec<NamedWriter<'a>>,
     output_error_mode: Option<OutputErrorMode>,
     ignored_errors: usize,
 }
 
-impl MultiWriter {
-    fn new(writers: Vec<NamedWriter>, output_error_mode: Option<OutputErrorMode>) -> Self {
+impl<'a> MultiWriter<'a> {
+    fn new(writers: Vec<NamedWriter<'a>>, output_error_mode: Option<OutputErrorMode>) -> Self {
         Self {
             writers,
             output_error_mode,
@@ -219,33 +300,33 @@ fn process_error(
 ) -> Result<()> {
     match mode {
         Some(OutputErrorMode::Warn) => {
-            let _ = writeln!(stderr(), "{}: {f}", writer.name.maybe_quote());
+            tee_err!("{}: {f}", writer.name.maybe_quote());
             *ignored_errors += 1;
             Ok(())
         }
         Some(OutputErrorMode::WarnNoPipe) | None => {
             if f.kind() != ErrorKind::BrokenPipe {
-                let _ = writeln!(stderr(), "{}: {f}", writer.name.maybe_quote());
+                tee_err!("{}: {f}", writer.name.maybe_quote());
                 *ignored_errors += 1;
             }
             Ok(())
         }
         Some(OutputErrorMode::Exit) => {
-            let _ = writeln!(stderr(), "{}: {f}", writer.name.maybe_quote());
+            tee_err!("{}: {f}", writer.name.maybe_quote());
             Err(f)
         }
         Some(OutputErrorMode::ExitNoPipe) => {
             if f.kind() == ErrorKind::BrokenPipe {
                 Ok(())
             } else {
-                let _ = writeln!(stderr(), "{}: {f}", writer.name.maybe_quote());
+                tee_err!("{}: {f}", writer.name.maybe_quote());
                 Err(f)
             }
         }
     }
 }
 
-impl Write for MultiWriter {
+impl Write for MultiWriter<'_> {
     fn write(&mut self, buf: &[u8]) -> Result<usize> {
         let mut aborted = None;
         let mode = self.output_error_mode.clone();
@@ -304,33 +385,36 @@ impl Write for MultiWriter {
     }
 }
 
-enum Writer {
+enum Writer<'a> {
     File(std::fs::File),
-    Stdout(std::io::Stdout),
+    /// The shell's logical stdout, borrowed for the duration of the `tee` call.
+    /// Replaces the upstream `Stdout` variant on the in-process path; the
+    /// standalone [`uumain`] passes `std::io::stdout()` here by reference.
+    Logical(&'a mut dyn Write),
 }
 
-impl Write for Writer {
+impl Write for Writer<'_> {
     fn write(&mut self, buf: &[u8]) -> Result<usize> {
         match self {
             Self::File(f) => f.write(buf),
-            Self::Stdout(s) => s.write(buf),
+            Self::Logical(s) => s.write(buf),
         }
     }
 
     fn flush(&mut self) -> Result<()> {
         match self {
             Self::File(f) => f.flush(),
-            Self::Stdout(s) => s.flush(),
+            Self::Logical(s) => s.flush(),
         }
     }
 }
 
-struct NamedWriter {
-    inner: Writer,
+struct NamedWriter<'a> {
+    inner: Writer<'a>,
     pub name: OsString,
 }
 
-impl Write for NamedWriter {
+impl Write for NamedWriter<'_> {
     fn write(&mut self, buf: &[u8]) -> Result<usize> {
         self.inner.write(buf)
     }
@@ -340,16 +424,15 @@ impl Write for NamedWriter {
     }
 }
 
-struct NamedReader {
-    inner: std::io::Stdin,
+struct NamedReader<'a> {
+    inner: &'a mut dyn Read,
 }
 
-impl Read for NamedReader {
+impl Read for NamedReader<'_> {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
         match self.inner.read(buf) {
             Err(f) => {
-                let _ = writeln!(
-                    stderr(),
+                tee_err!(
                     "tee: {}",
                     translate!("tee-error-stdin", "error" => strip_errno(&f))
                 );
