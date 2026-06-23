@@ -151,6 +151,12 @@ fn pipe2() -> anyhow::Result<[libc::c_int; 2]> {
 }
 
 pub fn run_command(cmdline: &str, mut output_cb: impl FnMut(&[u8])) -> anyhow::Result<Termination> {
+    // sarun: if the host installed an in-process executor, route the recipe to
+    // it (embedded brush) and NEVER posix_spawn /bin/sh. The byte/Termination
+    // contract below is reproduced exactly by the executor.
+    if let Some(exec) = crate::process::executor() {
+        return Ok(exec(cmdline, &mut output_cb));
+    }
     // Spawn the subprocess using posix_spawn with output redirected to the pipe.
     // We don't use Rust's process spawning because of issue #14 and because
     // we want to feed both stdout and stderr into the same pipe, which cannot
