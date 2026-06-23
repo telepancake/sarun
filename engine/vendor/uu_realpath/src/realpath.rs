@@ -11,19 +11,58 @@ use clap::{
 };
 use std::{
     ffi::{OsStr, OsString},
-    io::{Write, stdout},
+    io::Write,
     path::{Path, PathBuf},
 };
 use uucore::fs::make_path_relative_to;
 use uucore::translate;
 use uucore::{
-    display::{Quotable, print_verbatim},
+    display::Quotable,
     error::{FromIo, UResult},
     format_usage,
     fs::{MissingHandling, ResolveMode, canonicalize},
     line_ending::LineEnding,
-    show_if_err,
 };
+
+// ── Injected-I/O plumbing for the in-process brush builtin ───────────────────
+//
+// CWD template, mirroring uu_cp: [`realpath`] resolves every relative operand
+// against the shell's LOGICAL cwd (the process is never `chdir`'d) and writes
+// resolved paths to the injected logical stdout, diagnostics to the injected
+// stderr. `realpath` runs on a FRESH worker thread per call (the engine's
+// `run_coreutil_localized`), so these thread-locals are per-instance: `RP_ERR`
+// buffers diagnostics, `RP_EXIT` the deferred exit code set by the crate-local
+// `show!`/`show_if_err!` (which SHADOW uucore's, that write fd 2 + the process-
+// global exit code). Both the logical entry and standalone [`uumain`] drain the
+// buffer and surface the exit code, so standalone behavior is unchanged.
+thread_local! {
+    static RP_ERR: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    static RP_EXIT: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
+}
+
+/// Shadows [`uucore::show!`]: records the error's code into [`RP_EXIT`] and
+/// writes `<util_name>: <err>` to the logical stderr buffer.
+macro_rules! show {
+    ($err:expr) => {{
+        #[allow(unused_imports)]
+        use uucore::error::UError as _;
+        use std::io::Write as _;
+        let e = $err;
+        $crate::RP_EXIT.with(|c| c.set(e.code()));
+        $crate::RP_ERR.with(|b| {
+            let _ = writeln!(b.borrow_mut(), "{}: {e}", uucore::util_name());
+        });
+    }};
+}
+
+/// Shadows [`uucore::show_if_err!`], routing through the crate-local `show!`.
+macro_rules! show_if_err {
+    ($res:expr) => {{
+        if let Err(e) = $res {
+            show!(e);
+        }
+    }};
+}
 
 const OPT_QUIET: &str = "quiet";
 const OPT_STRIP: &str = "strip";
@@ -71,16 +110,66 @@ impl ValueParserFactory for NonEmptyOsStringParser {
     }
 }
 
+/// Logical entry point for the in-process brush `realpath` builtin.
+///
+/// Mirrors [`uumain`] but (1) resolves every relative operand (and the
+/// `--relative-to`/`--relative-base` values) against the shell's LOGICAL `cwd`
+/// (the process is never `chdir`'d), and (2) never touches process fd 1/2 —
+/// resolved paths go to `out`, diagnostics to `err`, the deferred exit code is
+/// surfaced as the returned status.
+pub fn realpath(
+    args: impl uucore::Args,
+    cwd: &Path,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> UResult<()> {
+    RP_ERR.with(|b| b.borrow_mut().clear());
+    RP_EXIT.with(|c| c.set(0));
+    let result = run(args, Some(cwd), out);
+    let produced_err = RP_ERR.with(|b| std::mem::take(&mut *b.borrow_mut()));
+    let _ = out.flush();
+    let _ = err.write_all(&produced_err);
+    let _ = err.flush();
+    let deferred = RP_EXIT.with(std::cell::Cell::get);
+    match result {
+        Ok(()) if deferred != 0 => Err(deferred.into()),
+        other => other,
+    }
+}
+
 #[uucore::main(no_signals)]
 pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+    RP_ERR.with(|b| b.borrow_mut().clear());
+    RP_EXIT.with(|c| c.set(0));
+    let mut out = std::io::stdout();
+    let result = run(args, None, &mut out);
+    let produced_err = RP_ERR.with(|b| std::mem::take(&mut *b.borrow_mut()));
+    let _ = std::io::stderr().write_all(&produced_err);
+    let deferred = RP_EXIT.with(std::cell::Cell::get);
+    match result {
+        Ok(()) if deferred != 0 => Err(deferred.into()),
+        other => other,
+    }
+}
+
+/// Shared body of [`realpath`] and [`uumain`]. When `cwd` is `Some`, relative
+/// operands are rooted at the shell's logical cwd; when `None` (standalone) they
+/// resolve against the process cwd, as upstream.
+fn run(args: impl uucore::Args, cwd: Option<&Path>, out: &mut dyn Write) -> UResult<()> {
     let matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
 
     /*  the list of files */
+
+    let root = |p: PathBuf| match cwd {
+        Some(cwd) if p.is_relative() => cwd.join(p),
+        _ => p,
+    };
 
     let paths: Vec<PathBuf> = matches
         .get_many::<OsString>(ARG_FILES)
         .unwrap()
         .map(PathBuf::from)
+        .map(root)
         .collect();
 
     let strip = matches.get_flag(OPT_STRIP);
@@ -105,9 +194,11 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     } else {
         ResolveMode::Physical
     };
-    let (relative_to, relative_base) = prepare_relative_options(&matches, can_mode, resolve_mode)?;
+    let (relative_to, relative_base) =
+        prepare_relative_options(&matches, cwd, can_mode, resolve_mode)?;
     for path in &paths {
         let result = resolve_path(
+            out,
             path,
             line_ending,
             resolve_mode,
@@ -222,15 +313,24 @@ pub fn uu_app() -> Command {
 /// otherwise nullify their value.
 fn prepare_relative_options(
     matches: &ArgMatches,
+    cwd: Option<&Path>,
     can_mode: MissingHandling,
     resolve_mode: ResolveMode,
 ) -> UResult<(Option<PathBuf>, Option<PathBuf>)> {
+    // Root a relative `--relative-*` value at the shell's logical cwd, the same
+    // way the path operands are rooted in `run`.
+    let root = |p: PathBuf| match cwd {
+        Some(cwd) if p.is_relative() => cwd.join(p),
+        _ => p,
+    };
     let relative_to = matches
         .get_one::<OsString>(OPT_RELATIVE_TO)
-        .map(PathBuf::from);
+        .map(PathBuf::from)
+        .map(root);
     let relative_base = matches
         .get_one::<OsString>(OPT_RELATIVE_BASE)
-        .map(PathBuf::from);
+        .map(PathBuf::from)
+        .map(root);
     let relative_to = canonicalize_relative_option(relative_to, can_mode, resolve_mode)?;
     let relative_base = canonicalize_relative_option(relative_base, can_mode, resolve_mode)?;
     if let (Some(base), Some(to)) = (relative_base.as_deref(), relative_to.as_deref()) {
@@ -289,6 +389,7 @@ fn canonicalize_relative(
 /// This function returns an error if there is a problem resolving
 /// symbolic links.
 fn resolve_path(
+    out: &mut dyn Write,
     p: &Path,
     line_ending: LineEnding,
     resolve: ResolveMode,
@@ -300,8 +401,12 @@ fn resolve_path(
 
     let abs = process_relative(abs, relative_base, relative_to);
 
-    print_verbatim(abs)?;
-    stdout().write_all(&[line_ending.into()])?;
+    // Write the resolved path's raw bytes (preserving non-UTF-8 names) to the
+    // injected logical stdout — the same information `print_verbatim` writes to
+    // fd 1 in the standalone path.
+    use std::os::unix::ffi::OsStrExt as _;
+    out.write_all(abs.as_os_str().as_bytes())?;
+    out.write_all(&[line_ending.into()])?;
     Ok(())
 }
 
