@@ -10,7 +10,6 @@
 use crate::display::Quotable;
 use crate::error::{UResult, USimpleError, strip_errno};
 pub use crate::features::entries;
-use crate::show_error;
 
 use clap::{Arg, ArgMatches, Command};
 
@@ -32,6 +31,58 @@ use std::os::unix::fs::MetadataExt;
 
 use std::os::unix::ffi::OsStrExt;
 use std::path::{MAIN_SEPARATOR, Path};
+
+// ── Injected-I/O plumbing for the in-process brush chown/chgrp builtins ──────
+//
+// `chown`'s file iteration, diagnostics, and verbose output all live in
+// [`ChownExecutor`] here (shared with `chgrp`), not in the per-util crate. So
+// the logical-I/O seam lives here too: when [`chown_base_io`] enables capture
+// for the duration of `executor.exec()`, the crate-local `show_error!` /
+// `perms_out!` macros below buffer into these thread-locals instead of touching
+// process fd 1/2; [`chown_base_io`] then drains them to the shell's logical
+// sinks. When capture is OFF (the standalone binary path, and every other
+// caller of `perms` such as `chmod`), the macros fall through to the real
+// `crate::show_error!` / `println!`, so non-chown behavior is byte-for-byte
+// unchanged. Capture is per-thread, matching the one-fresh-thread-per-call model
+// of `run_coreutil_localized`.
+thread_local! {
+    static PERMS_CAPTURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static PERMS_OUT: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    static PERMS_ERR: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Shadows [`crate::show_error!`] within this module: buffers `<util_name>: …`
+/// into [`PERMS_ERR`] while capture is active, else delegates to the real macro
+/// (process fd 2).
+macro_rules! show_error {
+    ($($args:tt)+) => {{
+        if PERMS_CAPTURE.with(std::cell::Cell::get) {
+            use std::io::Write as _;
+            PERMS_ERR.with(|b| {
+                let mut b = b.borrow_mut();
+                let _ = write!(b, "{}: ", $crate::util_name());
+                let _ = writeln!(b, $($args)+);
+            });
+        } else {
+            $crate::show_error!($($args)+);
+        }
+    }};
+}
+
+/// Replaces upstream `println!` within this module: buffers into [`PERMS_OUT`]
+/// while capture is active, else writes the process's real stdout.
+macro_rules! perms_out {
+    ($($args:tt)*) => {{
+        if PERMS_CAPTURE.with(std::cell::Cell::get) {
+            use std::io::Write as _;
+            PERMS_OUT.with(|b| {
+                let _ = writeln!(b.borrow_mut(), $($args)*);
+            });
+        } else {
+            println!($($args)*);
+        }
+    }};
+}
 
 /// The various level of verbosity
 #[derive(PartialEq, Eq, Clone, Debug)]
@@ -289,7 +340,7 @@ impl ChownExecutor {
         let path = root.as_ref();
         let Some(meta) = self.obtain_meta(path, self.dereference) else {
             if self.verbosity.level == VerbosityLevel::Verbose {
-                println!(
+                perms_out!(
                     "failed to change ownership of {} to {}",
                     path.quote(),
                     self.raw_owner
@@ -685,9 +736,9 @@ impl ChownExecutor {
                 _ => entries::uid2usr(uid).unwrap_or_else(|_| uid.to_string()),
             };
             if self.verbosity.groups_only {
-                println!("group of {} retained as {ownership}", path.quote());
+                perms_out!("group of {} retained as {ownership}", path.quote());
             } else {
-                println!("ownership of {} retained as {ownership}", path.quote());
+                perms_out!("ownership of {} retained as {ownership}", path.quote());
             }
         }
     }
@@ -848,13 +899,73 @@ pub fn configure_symlink_and_recursion(
 /// `parse_gid_uid_and_filter` will be called to obtain the target gid and uid, and the filter,
 /// from `ArgMatches`.
 /// `groups_only` determines whether verbose output will only mention the group.
-#[allow(clippy::cognitive_complexity)]
 pub fn chown_base(
+    command: Command,
+    args: impl crate::Args,
+    add_arg_if_not_reference: &'static str,
+    parse_gid_uid_and_filter: GidUidFilterOwnerParser,
+    groups_only: bool,
+) -> UResult<()> {
+    chown_base_impl(
+        command,
+        args,
+        add_arg_if_not_reference,
+        parse_gid_uid_and_filter,
+        groups_only,
+        None,
+    )
+}
+
+/// In-process entry for the brush `chown`/`chgrp` builtin: like [`chown_base`]
+/// but resolves relative file operands against the shell's LOGICAL `cwd` (the
+/// process is never `chdir`'d) and drains this module's logical buffers to the
+/// injected `out`/`err` instead of process fd 1/2. The `--reference` RFILE (read
+/// inside `parse_gid_uid_and_filter`) is resolved by the caller before this
+/// runs.
+pub fn chown_base_io(
+    command: Command,
+    args: impl crate::Args,
+    add_arg_if_not_reference: &'static str,
+    parse_gid_uid_and_filter: GidUidFilterOwnerParser,
+    groups_only: bool,
+    cwd: &Path,
+    out: &mut dyn std::io::Write,
+    err: &mut dyn std::io::Write,
+) -> UResult<()> {
+    PERMS_OUT.with(|b| b.borrow_mut().clear());
+    PERMS_ERR.with(|b| b.borrow_mut().clear());
+    PERMS_CAPTURE.with(|c| c.set(true));
+
+    let result = chown_base_impl(
+        command,
+        args,
+        add_arg_if_not_reference,
+        parse_gid_uid_and_filter,
+        groups_only,
+        Some(cwd),
+    );
+
+    PERMS_CAPTURE.with(|c| c.set(false));
+    let produced_out = PERMS_OUT.with(|b| std::mem::take(&mut *b.borrow_mut()));
+    let produced_err = PERMS_ERR.with(|b| std::mem::take(&mut *b.borrow_mut()));
+    let _ = out.write_all(&produced_out);
+    let _ = out.flush();
+    let _ = err.write_all(&produced_err);
+    let _ = err.flush();
+    result
+}
+
+/// Shared body of [`chown_base`] and [`chown_base_io`]. When `cwd` is `Some`,
+/// relative file operands are rooted at the shell's logical cwd; when `None`
+/// (standalone) they resolve against the process cwd, as upstream.
+#[allow(clippy::cognitive_complexity)]
+fn chown_base_impl(
     mut command: Command,
     args: impl crate::Args,
     add_arg_if_not_reference: &'static str,
     parse_gid_uid_and_filter: GidUidFilterOwnerParser,
     groups_only: bool,
+    cwd: Option<&Path>,
 ) -> UResult<()> {
     let args: Vec<_> = args.collect();
     let mut reference = false;
@@ -893,7 +1004,13 @@ pub fn chown_base(
 
     let files: Vec<OsString> = matches
         .get_many::<OsString>(options::ARG_FILES)
-        .map(|v| v.cloned().collect())
+        .map(|v| {
+            v.map(|f| match cwd {
+                Some(cwd) if Path::new(f).is_relative() => cwd.join(f).into_os_string(),
+                _ => f.clone(),
+            })
+            .collect()
+        })
         .unwrap_or_default();
 
     let preserve_root = matches.get_flag(options::preserve_root::PRESERVE);

@@ -8,7 +8,7 @@
 use uucore::display::Quotable;
 pub use uucore::entries::{self, Group, Locate, Passwd};
 use uucore::format_usage;
-use uucore::perms::{GidUidOwnerFilter, IfFrom, chown_base, options};
+use uucore::perms::{GidUidOwnerFilter, IfFrom, chown_base, chown_base_io, options};
 use uucore::show_warning;
 use uucore::translate;
 
@@ -17,7 +17,28 @@ use uucore::error::{FromIo, UResult, USimpleError};
 use clap::{Arg, ArgAction, ArgMatches, Command};
 
 use std::fs;
+use std::io;
 use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
+
+// The logical-cwd seam (see [`chown_main`]). `parse_gid_uid_and_filter` is passed
+// to `chown_base*` as a bare fn pointer, so the cwd needed to resolve a relative
+// `--reference` RFILE cannot be threaded through its signature; instead the entry
+// stashes it here for the duration of the call. chown runs on a fresh worker
+// thread per invocation, so this thread-local is per-instance. `None` = the
+// standalone path (resolve against the process cwd, as upstream).
+thread_local! {
+    static CHOWN_CWD: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Resolve a `--reference` RFILE against the logical cwd when one is set.
+fn ref_path(file: &str) -> PathBuf {
+    CHOWN_CWD.with(|c| match &*c.borrow() {
+        Some(cwd) if Path::new(file).is_relative() => cwd.join(file),
+        _ => PathBuf::from(file),
+    })
+}
 
 fn parse_gid_uid_and_filter(matches: &ArgMatches) -> UResult<GidUidOwnerFilter> {
     let filter = if let Some(spec) = matches.get_one::<String>(options::FROM) {
@@ -35,7 +56,7 @@ fn parse_gid_uid_and_filter(matches: &ArgMatches) -> UResult<GidUidOwnerFilter> 
     let dest_gid: Option<u32>;
     let raw_owner: String;
     if let Some(file) = matches.get_one::<String>(options::REFERENCE) {
-        let meta = fs::metadata(file).map_err_context(
+        let meta = fs::metadata(ref_path(file)).map_err_context(
             || translate!("chown-error-failed-to-get-attributes", "file" => file.quote()),
         )?;
         let gid = meta.gid();
@@ -62,6 +83,36 @@ fn parse_gid_uid_and_filter(matches: &ArgMatches) -> UResult<GidUidOwnerFilter> 
         raw_owner,
         filter,
     })
+}
+
+/// Logical entry point for the in-process brush `chown` builtin.
+///
+/// Mirrors [`uumain`] but routes through [`chown_base_io`], which resolves
+/// relative file operands against the shell's LOGICAL `cwd` (the process is
+/// never `chdir`'d) and drains chown's diagnostics/verbose output (all produced
+/// inside `uucore::perms`) to the injected `out`/`err` rather than process fd
+/// 1/2. The relative `--reference` RFILE is resolved via the [`CHOWN_CWD`] seam.
+/// Note: as a non-root caller, the underlying `chown(2)` commonly fails with
+/// EPERM — that diagnostic is surfaced faithfully (GNU/uutils behavior).
+pub fn chown_main(
+    args: impl uucore::Args,
+    cwd: &Path,
+    out: &mut dyn io::Write,
+    err: &mut dyn io::Write,
+) -> UResult<()> {
+    CHOWN_CWD.with(|c| *c.borrow_mut() = Some(cwd.to_path_buf()));
+    let result = chown_base_io(
+        uu_app(),
+        args,
+        options::ARG_OWNER,
+        parse_gid_uid_and_filter,
+        false,
+        cwd,
+        out,
+        err,
+    );
+    CHOWN_CWD.with(|c| *c.borrow_mut() = None);
+    result
 }
 
 #[uucore::main]
