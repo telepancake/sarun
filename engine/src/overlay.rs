@@ -1604,11 +1604,19 @@ impl Filesystem for Overlay {
         // caller pid. If the pool is empty we DEFER the reply (block the read)
         // until a release frees one — unless the handle is O_NONBLOCK, in which
         // case the pool denies it with EAGAIN at once.
-        if let Some(&nonblock) = self.inner.jobserver_fhs.read().unwrap().get(&u64::from(fh)) {
-            let pid = req.pid() as i32;
+        let jsfh = self.inner.jobserver_fhs.read().unwrap().get(&u64::from(fh)).copied();
+        if let Some(nonblock) = jsfh {
+            // Key by the process (TGID), so acquire and release agree and the
+            // pidfd reaper can watch a real process. A thread's read maps to its
+            // owning process.
+            let pid = tgid_of(req.pid()) as i32;
             let r = Box::new(SlipReplyData(Some(reply)));
-            // Watch handling (per-pid reaping) lands in the reaping increment.
-            let _ = crate::slippool::global().lock().unwrap().acquire(pid, r, nonblock);
+            let watch = crate::slippool::global().lock().unwrap().acquire(pid, r, nonblock);
+            // Drop the pool lock (above) BEFORE registering the watch — watch may
+            // itself reap (taking the pool lock) if the pid already exited.
+            if let crate::slippool::Watch::Pid(p) = watch {
+                crate::slippool::watch_pid(p);
+            }
             return;
         }
         let fhs = self.inner.fhs.read().unwrap();
@@ -1634,7 +1642,7 @@ impl Filesystem for Overlay {
         // (its deferred read reply is fulfilled inside release) or back to the
         // pool. We accept the full byte count regardless of payload.
         if self.inner.jobserver_fhs.read().unwrap().contains_key(&u64::from(fh)) {
-            let pid = req.pid() as i32;
+            let pid = tgid_of(req.pid()) as i32;
             let _ = crate::slippool::global().lock().unwrap().release(pid);
             return reply.written(data.len() as u32);
         }
