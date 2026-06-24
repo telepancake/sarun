@@ -28,7 +28,7 @@
 // NO-FALLBACK (D9): anything kati cannot parse/evaluate or execute is a VISIBLE
 // error and a non-zero exit. We NEVER silently exec the real `make`.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::sync::Arc;
 
@@ -188,7 +188,11 @@ struct RunKatiResult {
     remake_active: bool,
 }
 
-fn run_kati(targets: &[Symbol], cl_vars: &[bytes::Bytes]) -> anyhow::Result<RunKatiResult> {
+fn run_kati(
+    targets: &[Symbol],
+    cl_vars: &[bytes::Bytes],
+    makefile: &OsStr,
+) -> anyhow::Result<RunKatiResult> {
     let mut ev = Evaluator::new();
     ev.start()?;
 
@@ -197,7 +201,7 @@ fn run_kati(targets: &[Symbol], cl_vars: &[bytes::Bytes]) -> anyhow::Result<RunK
     // " name" form leaked an extra space into recipes that referenced
     // $(MAKEFILE_LIST).
     let mut makefile_list = BytesMut::new();
-    makefile_list.put_slice(FLAGS.makefile.lock().clone().unwrap().as_bytes());
+    makefile_list.put_slice(makefile.as_bytes());
     ev.set_global_var(
         intern("MAKEFILE_LIST"),
         Variable::with_simple_string(
@@ -254,9 +258,8 @@ fn run_kati(targets: &[Symbol], cl_vars: &[bytes::Bytes]) -> anyhow::Result<RunK
     ev.in_toplevel_makefile();
     {
         let _eval_frame = ev.enter(FrameType::Phase, bytes::Bytes::from_static(b"*parse*"), Loc::default());
-        let makefile = FLAGS.makefile.lock().clone().unwrap();
         let _file_frame = ev.enter(FrameType::Parse, bytes::Bytes::from(makefile.as_bytes().to_vec()), Loc::default());
-        let Some(mk) = kati::file_cache::get_makefile(&makefile, &ev.working_dir)? else {
+        let Some(mk) = kati::file_cache::get_makefile(makefile, &ev.working_dir)? else {
             anyhow::bail!("makefile not found");
         };
         let stmts = mk.stmts.lock();
@@ -522,30 +525,41 @@ pub fn make_main(argv: &[String]) -> i32 {
         }
     }
 
-    // 3. Synthesize + install the kati argv (forces --ninja). MUST happen before
-    //    any FLAGS access. A refused flag is a visible error, no fallback.
+    // 3. Synthesize the kati argv (forces --ninja). Install it into the global
+    //    FLAGS for the immutable mode-switches; this is idempotent — a repeated
+    //    install in the same process (a second in-process make) is tolerated,
+    //    the mode-switches are identical. The PER-INSTANCE inputs (makefile,
+    //    targets, cl_vars, working_dir) come from a LOCAL Flags parsed from the
+    //    same argv, so multiple makes sharing one process don't collide on them.
+    //    A refused flag is a visible error, no fallback.
     let kargv = match kati_argv(argv) {
         Ok(v) => v,
         Err(msg) => { eprintln!("{msg}"); return 2; }
     };
-    if kati::flags::install_args(kargv).is_err() {
-        eprintln!("sarun-engine make: kati flags already initialized (internal error)");
-        return 2;
-    }
+    let _ = kati::flags::install_args(kargv.clone());
+    let flags = kati::flags::Flags::from_args(kargv);
 
     // 4. kati needs a makefile; if none was given on the argv, discover the
     //    default like real make/kati (GNUmakefile / makefile / Makefile).
-    if FLAGS.makefile.lock().is_none() {
-        let mut mf = FLAGS.makefile.lock();
-        for cand in ["GNUmakefile", "makefile", "Makefile"] {
-            if std::fs::metadata(cand).is_ok() { *mf = Some(OsString::from(cand)); break; }
+    let makefile: OsString = match flags.makefile.lock().clone() {
+        Some(m) => m,
+        None => {
+            let mut found = None;
+            for cand in ["GNUmakefile", "makefile", "Makefile"] {
+                if std::fs::metadata(cand).is_ok() {
+                    found = Some(OsString::from(cand));
+                    break;
+                }
+            }
+            match found {
+                Some(m) => m,
+                None => {
+                    eprintln!("sarun-engine make: no makefile found (and none given with -f)");
+                    return 2;
+                }
+            }
         }
-        if mf.is_none() {
-            drop(mf);
-            eprintln!("sarun-engine make: no makefile found (and none given with -f)");
-            return 2;
-        }
-    }
+    };
 
     // 4b. If `-f <file>` named a missing makefile, emit gnu-shaped error
     //     output and exit 2 so a recipe like `$(MAKE) -f missing.mk` running
@@ -562,18 +576,15 @@ pub fn make_main(argv: &[String]) -> i32 {
     //     target" pair is what survives the corpus runner's make[N]:
     //     Entering/Leaving strip anyway.
     {
-        let mf_lock = FLAGS.makefile.lock();
-        if let Some(makefile) = mf_lock.as_ref() {
-            if std::fs::metadata(makefile).is_err() {
-                let display = makefile.to_string_lossy();
-                // No " Stop." suffix: rkati standalone doesn't emit it,
-                // so kati_norms doesn't strip it; gnu does emit it but
-                // make_norms strips it. Matching rkati's no-Stop form is
-                // what makes box ↔ gnu (post-norms) line up.
-                eprintln!("make: {display}: No such file or directory");
-                eprintln!("make: *** No rule to make target '{display}'.");
-                return 2;
-            }
+        if std::fs::metadata(&makefile).is_err() {
+            let display = makefile.to_string_lossy();
+            // No " Stop." suffix: rkati standalone doesn't emit it, so
+            // kati_norms doesn't strip it; gnu does emit it but make_norms
+            // strips it. Matching rkati's no-Stop form is what makes box ↔ gnu
+            // (post-norms) line up.
+            eprintln!("make: {display}: No such file or directory");
+            eprintln!("make: *** No rule to make target '{display}'.");
+            return 2;
         }
     }
 
@@ -585,9 +596,9 @@ pub fn make_main(argv: &[String]) -> i32 {
     //    so every recipe stays in this process. NO ninja generation, NO
     //    n2 — the box pipeline is byte-identical to standalone rkati on
     //    corpus tests.
-    let targets: Vec<Symbol> = FLAGS.targets.clone();
-    let cl_vars: Vec<bytes::Bytes> = FLAGS.cl_vars.clone();
-    let run_result = match run_kati(&targets, &cl_vars) {
+    let targets: Vec<Symbol> = flags.targets.clone();
+    let cl_vars: Vec<bytes::Bytes> = flags.cl_vars.clone();
+    let run_result = match run_kati(&targets, &cl_vars, &makefile) {
         Ok(r) => r,
         Err(e) => {
             for cause in e.chain() {
