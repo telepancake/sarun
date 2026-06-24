@@ -687,6 +687,20 @@ pub fn make_builtin(
         }
     }
 
+    // Per-build jobserver: an explicit -jN on make enables parallelism and
+    // creates (once) the shared token pool, so this build's recipes — and any
+    // `gcc -flto=jobserver` / sub-make they fork — draw from one N-bounded pool.
+    // Plain `make` (no -j) is serial like GNU make and starts no pool, leaving a
+    // nested `ninja` free to parallelize on its own. A recursive sub-make lands
+    // here again but `ensure` is idempotent — it inherits the pool, never resizes
+    // it.
+    if let Some(n) = crate::jobserver::explicit_jobs(argv) {
+        if n > 1 {
+            crate::jobserver::request_jobs(n);
+            crate::jobserver::ensure();
+        }
+    }
+
     let kargv = match kati_argv(argv) {
         Ok(v) => v,
         Err(msg) => {
