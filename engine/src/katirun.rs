@@ -198,7 +198,8 @@ fn run_kati(targets: &[Symbol], cl_vars: &[bytes::Bytes]) -> anyhow::Result<RunK
     // $(MAKEFILE_LIST).
     let mut makefile_list = BytesMut::new();
     makefile_list.put_slice(FLAGS.makefile.lock().clone().unwrap().as_bytes());
-    intern("MAKEFILE_LIST").set_global_var(
+    ev.set_global_var(
+        intern("MAKEFILE_LIST"),
         Variable::with_simple_string(
             makefile_list.freeze(),
             VarOrigin::File,
@@ -211,7 +212,8 @@ fn run_kati(targets: &[Symbol], cl_vars: &[bytes::Bytes]) -> anyhow::Result<RunK
     for (k, v) in std::env::vars_os() {
         let v = bytes::Bytes::from(v.as_bytes().to_vec());
         let val = Arc::new(Value::Literal(None, v.clone()));
-        intern(k.as_bytes().to_vec()).set_global_var(
+        ev.set_global_var(
+            intern(k.as_bytes().to_vec()),
             Variable::new_recursive(val, VarOrigin::Environment, Some(ev.current_frame()), None, v),
             false,
             None,
@@ -306,7 +308,7 @@ fn run_kati(targets: &[Symbol], cl_vars: &[bytes::Bytes]) -> anyhow::Result<RunK
     // each ninja recipe's command line. Mirrors what main.rs does for
     // the standalone rkati path.
     if ev.export_all_vars {
-        let all = kati::symtab::get_symbol_names(|v| {
+        let all = ev.get_symbol_names(|v| {
             !matches!(
                 v.read().origin(),
                 kati::var::VarOrigin::Default | kati::var::VarOrigin::Automatic

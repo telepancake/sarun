@@ -1199,14 +1199,17 @@ impl<'a> DepBuilder<'a> {
                     )
                 };
                 let _scoped_at = crate::symtab::ScopedGlobalVar::new(
+                    self.ev.global_vars.clone(),
                     intern("@"),
                     mk_var(out_bytes.clone()),
                 )?;
                 let _scoped_at_d = crate::symtab::ScopedGlobalVar::new(
+                    self.ev.global_vars.clone(),
                     intern("@D"),
                     mk_var(Bytes::copy_from_slice(&dir)),
                 )?;
                 let _scoped_at_f = crate::symtab::ScopedGlobalVar::new(
+                    self.ev.global_vars.clone(),
                     intern("@F"),
                     mk_var(Bytes::copy_from_slice(base)),
                 )?;

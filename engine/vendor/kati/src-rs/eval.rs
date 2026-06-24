@@ -39,7 +39,7 @@ use crate::stmt::{
 use crate::strutil::{is_space_byte, trim_leading_curdir, trim_right_space, word_scanner};
 use crate::symtab::{ALLOW_RULES_SYM, KATI_READONLY_SYM, MAKEFILE_LIST, SHELL_SYM, Symbol, intern};
 use crate::var::{Var, VarOrigin, Variable, Vars};
-use crate::{collect_stats_with_slow_report, error_loc, file_cache, log, warn_loc};
+use crate::{collect_stats_with_slow_report, error, error_loc, file_cache, log, warn_loc};
 
 pub enum RulesAllowed {
     Allowed,
@@ -241,6 +241,16 @@ static USED_UNDEFINED_VARS: LazyLock<Mutex<HashSet<Symbol>>> =
 
 pub struct Evaluator {
     pub rule_vars: HashMap<Symbol, Arc<Vars>>,
+    /// sarun: per-instance global variable bindings, indexed by Symbol id.
+    /// Moved off the process-global symbol table (symtab `symbol_data`) so each
+    /// Evaluator — i.e. each make invocation — owns its OWN global namespace.
+    /// That is both the correct sub-make semantics (a sub-make starts fresh,
+    /// inheriting only exported env) and the prerequisite for running multiple
+    /// kati instances in one process without their variables colliding. The
+    /// interner (name<->id) stays global in symtab; only the bindings are
+    /// per-instance. Behind Arc<Mutex> so a ScopedGlobalVar can restore its
+    /// saved binding on Drop without needing an &Evaluator.
+    pub global_vars: Arc<Mutex<Vec<Option<Var>>>>,
     pub rules: Vec<Rule>,
     pub exports: HashMap<Symbol, bool>,
     /// sarun: set when the makefile names `.EXPORT_ALL_VARIABLES` as a
@@ -303,8 +313,9 @@ impl Default for Evaluator {
 
 impl Evaluator {
     pub fn new() -> Self {
-        Self {
+        let ev = Self {
             rule_vars: HashMap::new(),
+            global_vars: Arc::new(Mutex::new(Vec::new())),
             rules: Vec::new(),
             exports: HashMap::new(),
             export_all_vars: false,
@@ -343,7 +354,129 @@ impl Evaluator {
             profiled_files: Vec::new(),
 
             is_evaluating_command: false,
+        };
+        ev.seed_special_vars();
+        ev
+    }
+
+    /// sarun: seed the builtin special variables that used to be installed
+    /// process-globally by Symtab::new(). Now each Evaluator seeds them into
+    /// its own per-instance global namespace, so behavior is identical for a
+    /// single instance but instances no longer share these bindings.
+    fn seed_special_vars(&self) {
+        let _ = self.set_global_var(intern(".SHELLSTATUS"), Variable::new_shell_status_var(), false, None);
+        let _ = self.set_global_var(
+            intern(".VARIABLES"),
+            Variable::new_variable_names(b".VARIABLES", true),
+            false,
+            None,
+        );
+        let _ = self.set_global_var(
+            intern(".KATI_SYMBOLS"),
+            Variable::new_variable_names(b".KATI_SYMBOLS", false),
+            false,
+            None,
+        );
+    }
+
+    /// sarun: read a global variable binding (peek — no env-use tracking).
+    pub fn peek_global_var(&self, sym: Symbol) -> Option<Var> {
+        let store = self.global_vars.lock();
+        store.get(sym.index())?.clone()
+    }
+
+    /// sarun: read a global variable binding, tracking env-var use (mirrors
+    /// the old Symbol::get_global_var).
+    pub fn get_global_var(&self, sym: Symbol) -> Option<Var> {
+        let v = {
+            let store = self.global_vars.lock();
+            store.get(sym.index())?.clone()?
+        };
+        match v.read().origin() {
+            VarOrigin::Environment | VarOrigin::EnvironmentOverride => {
+                crate::var::USED_ENV_VARS.lock().insert(sym);
+            }
+            _ => {}
         }
+        Some(v)
+    }
+
+    /// sarun: drop a binding (the `undefine` directive). Was
+    /// Symbol::clear_global_var.
+    pub fn clear_global_var(&self, sym: Symbol) {
+        let mut store = self.global_vars.lock();
+        let idx = sym.index();
+        if idx < store.len() {
+            store[idx] = None;
+        }
+    }
+
+    /// sarun: assign a global variable, honoring make's precedence rules
+    /// (readonly, command-line/override beats file, automatic is overwritable).
+    /// Ported verbatim from the old Symtab::set_global_var.
+    pub fn set_global_var(
+        &self,
+        sym: Symbol,
+        var: Var,
+        is_override: bool,
+        readonly: Option<&mut bool>,
+    ) -> Result<()> {
+        let mut store = self.global_vars.lock();
+        let idx = sym.index();
+        if idx >= store.len() {
+            store.resize(idx + 1, None);
+        }
+        let entry = store.get_mut(idx).unwrap();
+        if let Some(orig) = entry {
+            if orig.read().readonly {
+                if let Some(readonly) = readonly {
+                    *readonly = true;
+                } else {
+                    error!("*** cannot assign to readonly variable: {sym}");
+                }
+                return Ok(());
+            } else if let Some(readonly) = readonly {
+                *readonly = false;
+            }
+            let origin = orig.read().origin();
+            if !is_override
+                && (origin == VarOrigin::Override || origin == VarOrigin::EnvironmentOverride)
+            {
+                return Ok(());
+            }
+            if origin == VarOrigin::CommandLine && var.read().origin() == VarOrigin::File {
+                return Ok(());
+            }
+            // sarun: $(eval) inside $(call) often does `1:=newval` to rebind the
+            // call arg. Real make accepts the override; when the surrounding
+            // ScopedGlobalVar later drops, the original Automatic binding is
+            // restored.
+            if origin == VarOrigin::Automatic {
+                // fall through — overwrite the entry below.
+            }
+        }
+        *entry = Some(var);
+        Ok(())
+    }
+
+    /// sarun: enumerate per-instance global bindings passing `filter`, paired
+    /// with their interned names. Feeds `.VARIABLES`/`.KATI_SYMBOLS` and
+    /// `.EXPORT_ALL_VARIABLES`. Was the free fn symtab::get_symbol_names, which
+    /// walked the global symbol_data; now walks this Evaluator's bindings.
+    pub fn get_symbol_names<T: Fn(Var) -> bool>(&self, filter: T) -> Vec<(Symbol, Bytes)> {
+        let store = self.global_vars.lock();
+        store
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, slot)| {
+                let var = slot.clone()?;
+                if !filter(var) {
+                    return None;
+                }
+                let sym = Symbol::from_index(idx)?;
+                Some((sym, sym.as_bytes()))
+            })
+            .collect()
     }
 
     pub fn start(&mut self) -> Result<()> {
@@ -523,7 +656,7 @@ impl Evaluator {
             let rhs = stmt.rhs.eval_to_buf(self)?;
             for name in word_scanner(&rhs) {
                 let name = intern(rhs.slice_ref(name));
-                let Some(var) = name.get_global_var() else {
+                let Some(var) = self.get_global_var(name) else {
                     error_loc!(self.loc.as_ref(), "*** unknown variable: {name}");
                 };
                 var.write().readonly = true;
@@ -541,7 +674,7 @@ impl Evaluator {
         )?;
         if needs_assign {
             let mut readonly = false;
-            lhs.set_global_var(var.clone(), is_override, Some(&mut readonly))?;
+            self.set_global_var(lhs, var.clone(), is_override, Some(&mut readonly))?;
             if readonly {
                 error_loc!(
                     self.loc.as_ref(),
@@ -887,7 +1020,8 @@ impl Evaluator {
         if let Some(var_list) = self.lookup_var(*MAKEFILE_LIST)? {
             var_list.write().append_str(&v, self.current_frame())?;
         } else {
-            MAKEFILE_LIST.set_global_var(
+            self.set_global_var(
+                *MAKEFILE_LIST,
                 Variable::with_simple_string(
                     v,
                     VarOrigin::File,
@@ -973,7 +1107,7 @@ impl Evaluator {
             // Mirrors set_global_var's command-line-override rule: a plain
             // `undefine` won't unset a command-line variable, but
             // `override undefine` will.
-            if let Some(prev) = sym.peek_global_var()
+            if let Some(prev) = self.peek_global_var(sym)
                 && !stmt.is_override
                 && matches!(
                     prev.read().origin(),
@@ -982,7 +1116,7 @@ impl Evaluator {
             {
                 continue;
             }
-            sym.clear_global_var();
+            self.clear_global_var(sym);
         }
         Ok(())
     }
@@ -1027,7 +1161,7 @@ impl Evaluator {
     }
 
     pub fn lookup_var_global(&self, name: Symbol) -> Option<Var> {
-        let v = name.get_global_var();
+        let v = self.get_global_var(name);
         if v.is_none() {
             USED_UNDEFINED_VARS.lock().insert(name);
         }
@@ -1143,7 +1277,7 @@ impl Evaluator {
         }
 
         if result.is_none() {
-            result = name.peek_global_var();
+            result = self.peek_global_var(name);
         }
 
         result
@@ -1164,7 +1298,7 @@ impl Evaluator {
         if let Some(current_scope) = &self.current_scope {
             current_scope.peek(name)
         } else {
-            name.peek_global_var()
+            self.peek_global_var(name)
         }
     }
 

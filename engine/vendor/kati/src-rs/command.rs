@@ -251,7 +251,7 @@ impl<'a> CommandEvaluator<'a> {
                 current_dep_node: self.current_dep_node.clone(),
             },
         );
-        sym.set_global_var(v, false, None)?;
+        self.ev.set_global_var(sym, v, false, None)?;
         let sym = intern(format!("{c}D"));
         let v = Variable::new_autocommand(
             sym,
@@ -262,7 +262,7 @@ impl<'a> CommandEvaluator<'a> {
                 current_dep_node: self.current_dep_node.clone(),
             },
         );
-        sym.set_global_var(v, false, None)?;
+        self.ev.set_global_var(sym, v, false, None)?;
         let sym = intern(format!("{c}F"));
         let v = Variable::new_autocommand(
             sym,
@@ -273,7 +273,7 @@ impl<'a> CommandEvaluator<'a> {
                 current_dep_node: self.current_dep_node.clone(),
             },
         );
-        sym.set_global_var(v, false, None)?;
+        self.ev.set_global_var(sym, v, false, None)?;
         Ok(())
     }
 

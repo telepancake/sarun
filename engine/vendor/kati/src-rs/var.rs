@@ -33,7 +33,6 @@ use crate::{
     eval::Frame,
     loc::Loc,
     strutil::{WordWriter, has_path_prefix},
-    symtab::get_symbol_names,
     warn_loc,
 };
 use crate::{
@@ -453,7 +452,7 @@ impl Evaluable for Variable {
             }
             InnerVar::VariableNames { all, .. } => {
                 let mut ww = WordWriter::new(out);
-                let symbols = get_symbol_names(|var| {
+                let symbols = ev.get_symbol_names(|var| {
                     if var.read().obsolete() {
                         return false;
                     }
@@ -461,7 +460,7 @@ impl Evaluable for Variable {
                 });
                 for (sym, entry) in symbols {
                     if !*all
-                        && let Some(var) = sym.peek_global_var()
+                        && let Some(var) = ev.peek_global_var(sym)
                         && var.read().is_func()
                     {
                         continue;

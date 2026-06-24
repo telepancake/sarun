@@ -762,7 +762,7 @@ fn call_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> R
     loop {
         let tmpvar_name_sym = intern(format!("{i}"));
         if let Some(a) = av.get(i - 1) {
-            sv.push(ScopedGlobalVar::new(tmpvar_name_sym, a.clone())?);
+            sv.push(ScopedGlobalVar::new(ev.global_vars.clone(), tmpvar_name_sym, a.clone())?);
         } else {
             // We need to blank further automatic vars
             let Some(v) = ev.lookup_var(tmpvar_name_sym)? else {
@@ -773,7 +773,7 @@ fn call_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> R
             }
 
             let v = Variable::new_simple(VarOrigin::Automatic, None, None);
-            sv.push(ScopedGlobalVar::new(tmpvar_name_sym, v)?);
+            sv.push(ScopedGlobalVar::new(ev.global_vars.clone(), tmpvar_name_sym, v)?);
         }
         i += 1;
     }
@@ -804,7 +804,7 @@ fn foreach_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -
     for tok in word_scanner(&list) {
         let tok = list.slice_ref(tok);
         let v = Variable::with_simple_string(tok, VarOrigin::Automatic, None, None);
-        let _sv = ScopedGlobalVar::new(varname, v)?;
+        let _sv = ScopedGlobalVar::new(ev.global_vars.clone(), varname, v)?;
         ww.maybe_add_space();
         args[2].eval(ev, ww.out)?;
     }
@@ -1045,7 +1045,7 @@ fn deprecated_var_func(
             None => {
                 let v =
                     Variable::new_simple(VarOrigin::File, Some(ev.current_frame()), ev.loc.clone());
-                sym.set_global_var(v.clone(), false, None)?;
+                ev.set_global_var(sym, v.clone(), false, None)?;
                 v
             }
         };
@@ -1091,7 +1091,7 @@ fn obsolete_var_func(args: &[Arc<Value>], ev: &mut Evaluator, _out: &mut dyn Buf
             None => {
                 let v =
                     Variable::new_simple(VarOrigin::File, Some(ev.current_frame()), ev.loc.clone());
-                sym.set_global_var(v.clone(), false, None)?;
+                ev.set_global_var(sym, v.clone(), false, None)?;
                 v
             }
         };
@@ -1226,7 +1226,7 @@ fn foreach_sep_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMu
     for tok in word_scanner(&list) {
         let tok = list.slice_ref(tok);
         let v = Variable::with_simple_string(tok, VarOrigin::Automatic, None, None);
-        let _sv = ScopedGlobalVar::new(varname, v)?;
+        let _sv = ScopedGlobalVar::new(ev.global_vars.clone(), varname, v)?;
         ww.maybe_add_separator(&separator);
         args[3].eval(ev, ww.out)?;
     }
@@ -1291,7 +1291,7 @@ fn visibility_prefix_func(
     } else {
         // If variable is not defined, create an empty variable.
         let v = Variable::new_simple(VarOrigin::File, Some(ev.current_frame()), ev.loc.clone());
-        sym.set_global_var(v.clone(), false, None)?;
+        ev.set_global_var(sym, v.clone(), false, None)?;
         v
     };
     if !prefixes.is_empty() {
