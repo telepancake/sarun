@@ -317,6 +317,30 @@ def main():
         check(count_basename(sp6, "make") == 0,
               f"case6: recursive $(MAKE) stayed in-process — no `make` process "
               f"row (count={count_basename(sp6, 'make')}); a fork would show one")
+
+        # ── CASE 7: self-generating include (remake) handled IN-PROCESS ─────
+        # `include gen.mk` where gen.mk doesn't exist but has a rule: GNU make
+        # builds gen.mk, then re-parses the makefile with it visible. The shadow
+        # path re-execs the engine; the builtin does it in-process (build the
+        # include, drop the makefile cache, re-run kati). Proof: GENVAR defined
+        # ONLY in the generated gen.mk reaches the `all` recipe on the reparse.
+        (work / "out7.txt").unlink(missing_ok=True)
+        (work / "gen.mk").unlink(missing_ok=True)
+        (work / "Makefile").write_text(
+            "include gen.mk\n"
+            "all:\n\techo $(GENVAR) > out7.txt\n"
+            "gen.mk:\n\techo GENVAR := remade > gen.mk\n")
+        r = run_make("MAKE7", work)
+        check(r.returncode == 0,
+              f"case7: remake box exits 0 (got {r.returncode}: {r.stderr[-600:]})")
+        sp7 = latest_sqlar(m)
+        rel7 = str((work / "out7.txt").resolve()).lstrip("/")
+        check(m.sqlar_content(sp7, rel7) == b"remade\n",
+              f"case7: reparse saw the generated include (GENVAR='remade') "
+              f"({m.sqlar_content(sp7, rel7)!r})")
+        check(count_basename(sp7, "make") == 0,
+              f"case7: remake stayed in-process — no `make` process row "
+              f"(count={count_basename(sp7, 'make')})")
     finally:
         if eng is not None and eng.poll() is None:
             eng.terminate()

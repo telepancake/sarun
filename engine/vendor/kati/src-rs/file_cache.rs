@@ -78,6 +78,16 @@ pub fn get_makefile(filename: &OsStr, base_dir: &Path) -> Result<Option<Arc<Make
     CACHE.lock().get_makefile(filename, &open_path)
 }
 
+/// sarun: drop all cached parsed makefiles (and extra-dep names) so the next
+/// parse re-reads from disk. The in-process make builtin calls this between
+/// remake-the-makefile iterations — the in-process analogue of the shadow
+/// path's self-re-exec — so a regenerated `include` becomes visible on reparse.
+pub fn clear() {
+    let mut m = CACHE.lock();
+    m.cache.clear();
+    m.extra_file_deps.clear();
+}
+
 pub fn add_extra_file_dep(filename: OsString) {
     CACHE.lock().extra_file_deps.insert(filename);
 }

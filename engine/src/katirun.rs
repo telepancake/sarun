@@ -739,7 +739,26 @@ pub fn make_builtin(
 
     let targets: Vec<Symbol> = flags.targets.clone();
     let cl_vars: Vec<bytes::Bytes> = flags.cl_vars.clone();
-    let result = run_kati(&targets, &cl_vars, &makefile, &working_dir);
+
+    // GNU make's remake-the-makefile loop, IN-PROCESS. run_kati builds any
+    // required `include` targets that didn't exist at parse time and reports
+    // remake_active; the shadow path re-execs the engine to re-parse with the
+    // generated content visible, but a builtin can't re-exec the brush process.
+    // Instead we drop the makefile cache (so the regenerated include is re-read)
+    // and re-run kati, up to a small cap — matching SARUN_KATI_REMAKE_DEPTH.
+    let mut result = run_kati(&targets, &cl_vars, &makefile, &working_dir);
+    let mut remake_depth = 0u32;
+    while matches!(&result, Ok(r) if r.remake_active) && remake_depth < 5 {
+        remake_depth += 1;
+        // Drop BOTH caches: the makefile cache (so the regenerated include is
+        // re-parsed) AND the glob cache (eval_include probes existence via
+        // glob(); the first parse cached the missing include as absent, which
+        // would otherwise make the re-parse believe it's still missing and loop
+        // forever).
+        kati::file_cache::clear();
+        kati::fileutil::clear_glob_cache();
+        result = run_kati(&targets, &cl_vars, &makefile, &working_dir);
+    }
 
     kati::exec::set_recipe_out(prev_out);
     crate::brush::set_box_recipe_cwd(prev_cwd);
@@ -747,15 +766,7 @@ pub fn make_builtin(
     match result {
         Ok(r) => {
             if r.remake_active {
-                // The shadow path re-execs the engine to re-parse with the
-                // generated includes; a builtin can't re-exec the brush process.
-                // Until an in-process remake loop lands, surface this VISIBLY
-                // rather than silently producing a stale build.
-                let _ = writeln!(
-                    err,
-                    "sarun-engine make: self-generating includes (remake) not yet \
-                     supported by the in-process builtin"
-                );
+                let _ = writeln!(err, "*** kati: remake-the-makefile loop exceeded 5 iterations");
                 return 2;
             }
             let _ = out.flush();
