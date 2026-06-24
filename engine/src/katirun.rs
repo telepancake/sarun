@@ -25,18 +25,6 @@
 // `FLAGS.generate_ninja` is inert — only the standalone main.rs/ninja.rs paths
 // consult it, never run_kati — so forcing it is a harmless no-op.)
 //
-// CONCURRENCY / PROCESS-GLOBAL STATE: kati's FLAGS (an install-once LazyLock),
-// the process environment (MAKELEVEL + exported make vars, set via std::env
-// below), the process cwd (set_current_dir for -C), and kati's global
-// symtab/interner are ALL process-global, single-instance state. This path
-// therefore assumes ONE kati evaluation per process at a time. To let multiple
-// kati instances run concurrently in a single process — so parallel/recursive
-// sub-makes could launch their subshells IN-PROCESS rather than each via a
-// fresh engine process — that global state must first be converted to
-// per-instance (instance-scoped or thread-local) state; until then concurrent
-// in-process instances would race on and corrupt each other's
-// flags/env/cwd/symbols.
-//
 // NO-FALLBACK (D9): anything kati cannot parse/evaluate or execute is a VISIBLE
 // error and a non-zero exit. We NEVER silently exec the real `make`.
 
