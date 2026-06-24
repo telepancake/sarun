@@ -690,7 +690,9 @@ impl<'a> Work<'a> {
                 if dirs.iter().any(|&p| p == parent) {
                     continue;
                 }
-                std::fs::create_dir_all(parent)?;
+                // sarun: resolve against the logical build dir so output
+                // directories are created under the brush context's dir.
+                std::fs::create_dir_all(crate::graph::resolve_cwd(parent))?;
                 dirs.push(parent);
             }
         }

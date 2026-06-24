@@ -59,10 +59,13 @@ fn read_depfile(path: &Path) -> anyhow::Result<Vec<String>> {
 }
 
 fn write_rspfile(rspfile: &RspFile) -> anyhow::Result<()> {
-    if let Some(parent) = rspfile.path.parent() {
+    // sarun: resolve against the logical build dir so the in-process `ninja`
+    // builtin writes response files into the brush context's dir.
+    let path = crate::graph::resolve_cwd(&rspfile.path);
+    if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&rspfile.path, &rspfile.content)?;
+    std::fs::write(&path, &rspfile.content)?;
     Ok(())
 }
 
@@ -219,7 +222,12 @@ impl Runner {
 
         let tid = self.tids.claim();
         let tx = self.tx.clone();
+        // sarun: each task runs on a fresh thread, so the logical build dir
+        // (a thread-local) must be carried over — recipe execution, rspfile
+        // writes, and depfile reads all resolve relative paths against it.
+        let cwd = crate::graph::get_cwd();
         std::thread::spawn(move || {
+            crate::graph::set_cwd(cwd);
             let start = Instant::now();
             let result = run_task(
                 &cmdline,

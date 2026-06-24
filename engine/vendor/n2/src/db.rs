@@ -324,6 +324,9 @@ impl<'a> Reader<'a> {
 
 /// Opens or creates an on-disk database, loading its state into the provided Graph.
 pub fn open(path: &Path, graph: &mut Graph, hashes: &mut Hashes) -> anyhow::Result<Writer> {
+    // sarun: resolve against the logical build dir so the in-process `ninja`
+    // builtin reads/writes .n2_db under the brush context's dir.
+    let path = &crate::graph::resolve_cwd(path);
     match std::fs::OpenOptions::new()
         .read(true)
         .append(true)
