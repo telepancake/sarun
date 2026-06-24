@@ -135,6 +135,12 @@ def run_make(name, work, *extra):
         capture_output=True, text=True, timeout=180)
 
 
+def run_ninja(name, work, *extra):
+    return subprocess.run(
+        [str(BIN), "run", "-b", name, "-C", str(work), "--", "ninja", *extra],
+        capture_output=True, text=True, timeout=180)
+
+
 def edge_for(edges, base):
     """All edges whose any output's basename == base."""
     return [(o, i, c) for (o, i, c) in (edges or [])
@@ -341,6 +347,27 @@ def main():
         check(count_basename(sp7, "make") == 0,
               f"case7: remake stayed in-process — no `make` process row "
               f"(count={count_basename(sp7, 'make')})")
+
+        # ── CASE 8: top-level `ninja` runs IN-PROCESS via the ninja builtin ──
+        # brush dispatches `ninja` to the in-process n2 builtin: the build runs
+        # in the engine process (zero `ninja` rows), the recipe goes through
+        # brush (no /bin/sh), and the output file is produced.
+        (work / "nout.txt").unlink(missing_ok=True)
+        (work / "build.ninja").write_text(
+            "rule e\n  command = echo ninjaok > $out\n"
+            "build nout.txt: e\n")
+        r = run_ninja("NINJA8", work)
+        check(r.returncode == 0,
+              f"case8: ninja box exits 0 (got {r.returncode}: {r.stderr[-600:]})")
+        sp8 = latest_sqlar(m)
+        rel8 = str((work / "nout.txt").resolve()).lstrip("/")
+        check(m.sqlar_content(sp8, rel8) == b"ninjaok\n",
+              f"case8: ninja built nout.txt in-process ({m.sqlar_content(sp8, rel8)!r})")
+        check(not has_external(sp8, "sh"),
+              "case8: NO /bin/sh process row — ninja recipe ran in-process")
+        check(count_basename(sp8, "ninja") == 0,
+              f"case8: no `ninja` process row — ran via the in-process builtin "
+              f"(count={count_basename(sp8, 'ninja')})")
     finally:
         if eng is not None and eng.poll() is None:
             eng.terminate()
