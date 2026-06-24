@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{ffi::OsStr, os::unix::ffi::OsStrExt, sync::Arc};
+use std::{ffi::OsStr, os::unix::ffi::OsStrExt, path::Path, sync::Arc};
 
 use anyhow::Result;
 use bytes::Bytes;
@@ -32,14 +32,21 @@ pub struct Makefile {
 }
 
 impl Makefile {
-    pub fn from_file(filename: &OsStr) -> Result<Option<Arc<Makefile>>> {
-        if !std::fs::exists(filename)? {
+    /// sarun: `display_name` is recorded for Locs / `$(MAKEFILE_LIST)` verbatim
+    /// (usually the relative name the makefile referenced); `open_path` is where
+    /// the bytes are actually read — the display name resolved against the
+    /// Evaluator's logical `working_dir`. Splitting the two lets an in-process
+    /// make read a makefile relative to a logical cwd without touching the
+    /// process cwd, while keeping path strings in output unchanged. With
+    /// `working_dir == process cwd` the two name the same file.
+    pub fn from_file(display_name: &OsStr, open_path: &Path) -> Result<Option<Arc<Makefile>>> {
+        if !std::fs::exists(open_path)? {
             return Ok(None);
         }
 
-        let buf = Bytes::from(std::fs::read(filename)?);
+        let buf = Bytes::from(std::fs::read(open_path)?);
 
-        let filename = intern(filename.as_bytes().to_vec());
+        let filename = intern(display_name.as_bytes().to_vec());
         let stmts = parse_file(&buf, filename)?;
 
         Ok(Some(Arc::new(Makefile { filename, stmts })))

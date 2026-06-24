@@ -207,7 +207,7 @@ fn run(targets: &[Symbol], cl_vars: &Vec<Bytes>, orig_args: OsString) -> Result<
             Bytes::from(makefile.as_bytes().to_vec()),
             Loc::default(),
         );
-        let Some(mk) = kati::file_cache::get_makefile(&makefile)? else {
+        let Some(mk) = kati::file_cache::get_makefile(&makefile, &ev.working_dir)? else {
             bail!("makefile not found")
         };
         let stmts = mk.stmts.lock();

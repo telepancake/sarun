@@ -256,7 +256,7 @@ fn run_kati(targets: &[Symbol], cl_vars: &[bytes::Bytes]) -> anyhow::Result<RunK
         let _eval_frame = ev.enter(FrameType::Phase, bytes::Bytes::from_static(b"*parse*"), Loc::default());
         let makefile = FLAGS.makefile.lock().clone().unwrap();
         let _file_frame = ev.enter(FrameType::Parse, bytes::Bytes::from(makefile.as_bytes().to_vec()), Loc::default());
-        let Some(mk) = kati::file_cache::get_makefile(&makefile)? else {
+        let Some(mk) = kati::file_cache::get_makefile(&makefile, &ev.working_dir)? else {
             anyhow::bail!("makefile not found");
         };
         let stmts = mk.stmts.lock();
