@@ -508,6 +508,25 @@ def main():
         mf = mf.decode() if mf else ""
         check("--jobserver-auth=" in mf or "--jobserver-fds=" in mf,
               f"case13: recipe MAKEFLAGS carries the jobserver (mf={mf!r})")
+
+        # ── CASE 14: the engine-global slip pool is reachable as a FUSE file ───
+        # A box reads the synthetic /.slopbox-jobserver: the read() is a FUSE op
+        # the engine handles as a slip ACQUIRE, handing back one token byte from
+        # the machine-wide pool (slippool). This proves the FUSE-mediated pool is
+        # live end-to-end (lookup → open → read=acquire) with per-op caller-pid
+        # mediation — the foundation external `gcc -flto` and the in-process
+        # schedulers will all draw from. (Pool is CPU-count by default, so the
+        # first acquire always succeeds; bound/reaping behaviour is unit-tested in
+        # slippool and exercised under real concurrency in the client increment.)
+        r = subprocess.run(
+            [str(BIN), "run", "-b", "JS14", "-C", str(work),
+             "--", "head", "-c", "1", "/.slopbox-jobserver"],
+            capture_output=True, text=True, timeout=60)
+        check(r.returncode == 0,
+              f"case14: jobserver read box exits 0 (got {r.returncode}: {r.stderr[-400:]})")
+        check("+" in r.stdout,
+              f"case14: read() of the FUSE jobserver acquired a slip byte "
+              f"(stdout={r.stdout!r})")
     finally:
         if eng is not None and eng.poll() is None:
             eng.terminate()

@@ -25,6 +25,25 @@
 #![allow(dead_code)]
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::{Mutex, OnceLock};
+
+/// The one engine-global pool, created on first use, sized to the machine.
+static POOL: OnceLock<Mutex<Pool>> = OnceLock::new();
+
+/// Machine capacity = CPU count, or `SARUN_JOBS` if set (>0) — the latter lets
+/// tests pin the pool to a known small size for deterministic bound checks.
+pub fn slots() -> usize {
+    std::env::var("SARUN_JOBS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |p| p.get()))
+}
+
+/// The engine-global slip pool (one per `serve` process → shared by all boxes).
+pub fn global() -> &'static Mutex<Pool> {
+    POOL.get_or_init(|| Mutex::new(Pool::new(slots())))
+}
 
 /// The single byte handed out per slip. Value is arbitrary (single-pool
 /// protocol); a client writes back whatever it read.
