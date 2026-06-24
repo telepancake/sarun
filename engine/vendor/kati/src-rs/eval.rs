@@ -1017,7 +1017,7 @@ impl Evaluator {
         let filename = OsString::from_vec(fname.to_vec());
         collect_stats_with_slow_report!("included makefiles", &filename);
 
-        let Some(mk) = file_cache::get_makefile(&filename)? else {
+        let Some(mk) = file_cache::get_makefile(&filename, &self.working_dir)? else {
             error_loc!(
                 self.loc.as_ref(),
                 "{} does not exist",
