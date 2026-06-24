@@ -3,31 +3,44 @@
 // =1, exactly like the ninja/sh shadows). main() detects argv0 basename == make
 // /gmake BEFORE its normal dispatch and lands here, which:
 //   1. drives a vendored fork of kati (github.com/google/kati src-rs/) IN-PROCESS
-//      to PARSE the box's Makefile and GENERATE a ninja graph;
-//   2. hands that ninja graph — purely IN-MEMORY, via a memfd, NEVER a disk
-//      build.ninja temp — to the already-embedded n2 (Phase 1) to EXECUTE;
-//   3. routes every recipe through embedded brush in THIS process (Phase 1's
-//      brush::n2_executor) — no /bin/sh fork, no engine re-exec;
-//   4. emits a `build_edges` provenance frame for the generated graph (the same
-//      frame/table/verb Phase 1's ninja path uses), capturing EVERY edge
-//      including up-to-date targets n2 will skip.
-//
-// THE HANDOFF (user-mandated, no disk temp file): kati's generate_ninja writes
-// the ninja to a FILE PATH (there is no in-memory-string API). We give it the
-// path `/proc/self/fd/<memfd>` of an anonymous memfd_create(2) file, let kati
-// write there, lseek to 0, read the bytes back into a String, and feed that to
-// n2's in-memory loader (n2::load::read_from_content). The memfd auto-frees on
-// close — nothing is written to the box filesystem, nothing to clean up.
+//      to PARSE the box's Makefile, run dependency analysis, and EXECUTE the dep
+//      graph via kati's OWN executor (src-rs/exec.rs) — sequential, declaration
+//      order, mtime-based staleness, i.e. standalone rkati semantics. NO ninja
+//      graph is generated and NO n2 is involved. (An earlier design had kati
+//      emit a ninja graph in-memory and handed it to the embedded n2 to run;
+//      that handoff is gone — kati executes directly now.)
+//   2. routes every recipe through embedded brush in THIS process via the
+//      `install_recipe_runner` hook — no /bin/sh fork, no engine re-exec —
+//      unless SHELL is non-POSIX, in which case the runner declines
+//      (Passthrough) and kati's exec.rs uses the classic fork+exec path.
+//   3. emits a `build_edges` provenance frame for the dep graph (the same
+//      frame/table/verb Phase 1's ninja path used), capturing EVERY edge
+//      including up-to-date targets exec.rs will skip.
 //
 // kati's FLAGS is a process-global LazyLock parsed from argv. We can't be argv0
-// `make`-with-flags, so we synthesize the argv kati should parse (--ninja forced
-// on, the box's -f/-C/targets/VAR=val translated through) and install it via the
-// vendored `kati::flags::install_args` hook BEFORE the first FLAGS access.
+// `make`-with-flags, so we synthesize the argv kati should parse (the box's
+// -f/-C/targets/VAR=val translated through) and install it via the vendored
+// `kati::flags::install_args` hook BEFORE the first FLAGS access. (We still
+// inject `--ninja` into that synthesized argv, but in THIS direct-execute path
+// `FLAGS.generate_ninja` is inert — only the standalone main.rs/ninja.rs paths
+// consult it, never run_kati — so forcing it is a harmless no-op.)
 //
-// NO-FALLBACK (D9): anything kati cannot parse/evaluate, or n2 cannot run, is a
-// VISIBLE error and a non-zero exit. We NEVER silently exec the real `make`.
+// CONCURRENCY / PROCESS-GLOBAL STATE: kati's FLAGS (an install-once LazyLock),
+// the process environment (MAKELEVEL + exported make vars, set via std::env
+// below), the process cwd (set_current_dir for -C), and kati's global
+// symtab/interner are ALL process-global, single-instance state. This path
+// therefore assumes ONE kati evaluation per process at a time. To let multiple
+// kati instances run concurrently in a single process — so parallel/recursive
+// sub-makes could launch their subshells IN-PROCESS rather than each via a
+// fresh engine process — that global state must first be converted to
+// per-instance (instance-scoped or thread-local) state; until then concurrent
+// in-process instances would race on and corrupt each other's
+// flags/env/cwd/symbols.
+//
+// NO-FALLBACK (D9): anything kati cannot parse/evaluate or execute is a VISIBLE
+// error and a non-zero exit. We NEVER silently exec the real `make`.
 
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::sync::Arc;
 
@@ -56,15 +69,18 @@ pub fn is_make_invocation() -> bool {
 }
 
 /// Translate the box's `make` argv into the argv our vendored kati should parse.
-/// We FORCE `--ninja` (kati must emit a graph, not execute), drop make-only flags
-/// kati does not understand (e.g. -j is parsed by kati's own -j handling so we
-/// keep numeric ones), and pass through -f/-C/targets/VAR=val. argv0 is kept as
-/// the original program name (kati uses it only for subkati_args propagation).
+/// We inject `--ninja` (a no-op in our direct-execute path — `FLAGS.generate_ninja`
+/// is read only by the standalone main.rs/ninja.rs paths, never by run_kati — kept
+/// for parity with the argv kati historically parsed), drop make-only flags kati
+/// does not understand (e.g. -j is parsed by kati's own -j handling so we keep
+/// numeric ones), and pass through -f/-C/targets/VAR=val. argv0 is kept as the
+/// original program name (kati uses it only for subkati_args propagation).
 /// Returns Err(msg) for a flag we deliberately refuse (visible, no fallback).
 fn kati_argv(argv: &[String]) -> Result<Vec<OsString>, String> {
     let mut out: Vec<OsString> = Vec::new();
     // argv0 — kati needs *some* program name; its basename is irrelevant here.
     out.push(OsString::from(argv.first().cloned().unwrap_or_else(|| "make".into())));
+    // Inert in our direct-execute path (see fn doc); kept for argv parity.
     out.push(OsString::from("--ninja"));
 
     let mut i = 1;
@@ -169,22 +185,22 @@ fn read_bootstrap_makefile(targets: &[Symbol]) -> anyhow::Result<Arc<Mutex<Vec<k
     )
 }
 
-/// Run kati: bootstrap + command-line vars + parse the Makefile + dependency
-/// analysis + generate the ninja graph into `ninja_path` (our memfd path). This
-/// is a faithful port of upstream kati main.rs `run()` restricted to the
-/// generate-ninja branch (the only mode sarun uses). Returns Ok on success.
-/// Result of run_kati. `remake_active` means the makefile had at least
-/// one required `include` of a file that the same makefile has a rule
-/// for; n2 will build the include target(s) first, then the caller
-/// re-execs the engine so the next invocation parses with the
-/// freshly-generated content visible (GNU make's remake-the-makefile
-/// loop).
+/// Run kati end-to-end: bootstrap + command-line vars + parse the Makefile +
+/// dependency analysis + EXECUTE the dep graph via kati's own executor
+/// (kati::exec::exec). A port of upstream kati main.rs `run()`, but driving
+/// kati's executor directly instead of generating a ninja graph — sarun
+/// executes in-process and does not emit ninja. Returns Ok on success.
+///
+/// `remake_active` (in the returned RunKatiResult) means the makefile had at
+/// least one required `include` of a file the same makefile has a rule for;
+/// kati's executor builds the include target(s) first, then the caller re-execs
+/// the engine so the next invocation parses with the freshly-generated content
+/// visible (GNU make's remake-the-makefile loop).
 struct RunKatiResult {
     remake_active: bool,
 }
 
-fn run_kati(targets: &[Symbol], cl_vars: &[bytes::Bytes], ninja_path: &OsStr) -> anyhow::Result<RunKatiResult> {
-    let start_time = std::time::SystemTime::now();
+fn run_kati(targets: &[Symbol], cl_vars: &[bytes::Bytes]) -> anyhow::Result<RunKatiResult> {
     let mut ev = Evaluator::new();
     ev.start()?;
 
@@ -363,8 +379,6 @@ fn run_kati(targets: &[Symbol], cl_vars: &[bytes::Bytes], ninja_path: &OsStr) ->
         kati::exec::exec(nodes, &mut ev)?;
         ev.finish()?;
     }
-    let _ = ninja_path; // sarun: legacy memfd path arg, no longer used.
-    let _ = start_time;
     Ok(RunKatiResult { remake_active })
 }
 
@@ -579,12 +593,11 @@ pub fn make_main(argv: &[String]) -> i32 {
     //    normally fork+exec /bin/sh per recipe. We installed
     //    brush::run_recipe_in_process as kati's in-process runner above,
     //    so every recipe stays in this process. NO ninja generation, NO
-    //    n2 — the box pipeline is now byte-identical to standalone rkati
-    //    on corpus tests. The `ninja_path` arg is vestigial; pass an
-    //    empty OsStr.
+    //    n2 — the box pipeline is byte-identical to standalone rkati on
+    //    corpus tests.
     let targets: Vec<Symbol> = FLAGS.targets.clone();
     let cl_vars: Vec<bytes::Bytes> = FLAGS.cl_vars.clone();
-    let run_result = match run_kati(&targets, &cl_vars, OsStr::new("")) {
+    let run_result = match run_kati(&targets, &cl_vars) {
         Ok(r) => r,
         Err(e) => {
             for cause in e.chain() {
