@@ -19,13 +19,13 @@
 //! deferred `ReplyData` in a `SlipReply` and call [`Pool::acquire`] / [`release`];
 //! the teardown path (control.rs) and the pidfd reaper call [`reap_pid`].
 
-// Foundation increment: the pool logic and its unit tests land first; the FUSE
-// handlers, pidfd reaper, and box wiring that call into it follow. Allow the
-// not-yet-wired items until then.
+// Foundation increment: the pool logic and its unit tests landed first; the FUSE
+// handlers and pidfd reaper are now wired. `reap_box` and the cfg(test) helpers
+// are the only not-yet-called items.
 #![allow(dead_code)]
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// The one engine-global pool, created on first use, sized to the machine.
 static POOL: OnceLock<Mutex<Pool>> = OnceLock::new();
@@ -43,6 +43,114 @@ pub fn slots() -> usize {
 /// The engine-global slip pool (one per `serve` process → shared by all boxes).
 pub fn global() -> &'static Mutex<Pool> {
     POOL.get_or_init(|| Mutex::new(Pool::new(slots())))
+}
+
+// ── Reaper ───────────────────────────────────────────────────────────────────
+//
+// A slip read into a process's memory is lost if that process dies without
+// writing it back (the classic GNU-make pipe leak). Because every acquire is a
+// FUSE op, the engine knows the holder pid; here we watch each holder with a
+// pidfd and, when the kernel signals its exit, return its slips to the pool. This
+// is event-driven (no /proc polling) and naturally covers whole-box teardown —
+// every process exit reaps. Granted-to-waiters happen inside reap_pid.
+
+struct Reaper {
+    epfd: i32,
+    /// holder pid -> its pidfd (so we can EPOLL_CTL_DEL + close on exit). Also
+    /// the dedup set: a pid present here is already watched.
+    watched: Mutex<HashMap<i32, i32>>,
+}
+
+static REAPER: OnceLock<Arc<Reaper>> = OnceLock::new();
+
+fn pidfd_open(pid: i32) -> i32 {
+    unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as i32 }
+}
+
+fn reaper() -> &'static Arc<Reaper> {
+    REAPER.get_or_init(|| {
+        let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+        let r = Arc::new(Reaper { epfd, watched: Mutex::new(HashMap::new()) });
+        let r2 = r.clone();
+        std::thread::Builder::new()
+            .name("slip-reaper".into())
+            .spawn(move || r2.run())
+            .ok();
+        r
+    })
+}
+
+impl Reaper {
+    /// epoll loop: a watched pidfd becomes readable when its process exits.
+    fn run(&self) {
+        let mut events = [libc::epoll_event { events: 0, u64: 0 }; 64];
+        loop {
+            let n = unsafe {
+                libc::epoll_wait(self.epfd, events.as_mut_ptr(), events.len() as i32, -1)
+            };
+            if n < 0 {
+                // EINTR or a torn-down epfd: brief pause, then retry.
+                continue;
+            }
+            for ev in &events[..n as usize] {
+                let pid = ev.u64 as i32;
+                // Stop watching: DEL + close the pidfd before reaping.
+                if let Some(pidfd) = self.watched.lock().unwrap().remove(&pid) {
+                    unsafe {
+                        libc::epoll_ctl(self.epfd, libc::EPOLL_CTL_DEL, pidfd, std::ptr::null_mut());
+                        libc::close(pidfd);
+                    }
+                }
+                // Return the dead pid's slips to the pool (handing any to blocked
+                // waiters). Those waiters were watched when they queued.
+                let _granted = global().lock().unwrap().reap_pid(pid);
+            }
+        }
+    }
+
+    /// Begin watching `pid` for exit (idempotent). If the pid is already gone,
+    /// reap it now.
+    fn watch(&self, pid: i32) {
+        {
+            let w = self.watched.lock().unwrap();
+            if w.contains_key(&pid) {
+                return;
+            }
+        }
+        let pidfd = pidfd_open(pid);
+        if pidfd < 0 {
+            // Already exited (ESRCH) between acquire and here — reap immediately.
+            global().lock().unwrap().reap_pid(pid);
+            return;
+        }
+        let mut w = self.watched.lock().unwrap();
+        // Re-check under the lock (another thread may have just added it).
+        if w.contains_key(&pid) {
+            unsafe { libc::close(pidfd) };
+            return;
+        }
+        let mut ev = libc::epoll_event {
+            events: libc::EPOLLIN as u32,
+            u64: pid as u64,
+        };
+        let rc = unsafe { libc::epoll_ctl(self.epfd, libc::EPOLL_CTL_ADD, pidfd, &mut ev) };
+        if rc < 0 {
+            // Couldn't register (e.g. already-ready immediately on a fast exit):
+            // close and reap now rather than leak the slip.
+            unsafe { libc::close(pidfd) };
+            drop(w);
+            global().lock().unwrap().reap_pid(pid);
+            return;
+        }
+        w.insert(pid, pidfd);
+    }
+}
+
+/// Watch `pid` so its slips are reaped when it exits. Call after an acquire that
+/// attributed (or queued) a slip to the pid. Must NOT be called while holding the
+/// pool lock (it may itself reap, taking that lock).
+pub fn watch_pid(pid: i32) {
+    reaper().watch(pid);
 }
 
 /// The single byte handed out per slip. Value is arbitrary (single-pool

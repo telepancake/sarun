@@ -155,6 +155,10 @@ def main():
                    ("XDG_CONFIG_HOME", "config"), ("XDG_DATA_HOME", "data")):
         os.environ[k] = str(tmp / sub)
     os.environ["SLOPBOX_NS"] = "RS"
+    # Pin the engine-global slip pool to 1 so the parallelism/reaping cases are
+    # deterministic: n2's implicit token + this 1 pool slip → peak 2 under -j2
+    # (case 12), and a single leaked slip exhausts the pool (case 15).
+    os.environ["SARUN_JOBS"] = "1"
     m = SourceFileLoader("slopbox", SARUN).load_module()
     m.ensure_dirs()
     eng = None
@@ -527,6 +531,28 @@ def main():
         check("+" in r.stdout,
               f"case14: read() of the FUSE jobserver acquired a slip byte "
               f"(stdout={r.stdout!r})")
+
+        # ── CASE 15: a dead holder's leaked slip is REAPED ─────────────────────
+        # The pool is pinned to 1 slip. Box A acquires it (read 1 byte) and exits
+        # WITHOUT writing it back — a leak that a raw GNU-make pipe could never
+        # recover. The engine watches the holder pid with a pidfd; on its exit the
+        # slip returns to the pool. Box B then acquires the SAME (only) slip: if it
+        # gets a byte, the leak was reaped; if reaping failed the pool is empty and
+        # B's blocking read would hang (caught by the timeout).
+        a = subprocess.run(
+            [str(BIN), "run", "-b", "JSA15", "-C", str(work),
+             "--", "head", "-c", "1", "/.slopbox-jobserver"],
+            capture_output=True, text=True, timeout=60)
+        check("+" in a.stdout,
+              f"case15: box A acquired the only slip (stdout={a.stdout!r})")
+        # Box B can only succeed if A's leaked slip was reclaimed on A's exit.
+        b = subprocess.run(
+            [str(BIN), "run", "-b", "JSB15", "-C", str(work),
+             "--", "head", "-c", "1", "/.slopbox-jobserver"],
+            capture_output=True, text=True, timeout=60)
+        check("+" in b.stdout,
+              f"case15: box B re-acquired the slip → A's leak was reaped "
+              f"(stdout={b.stdout!r}, rc={b.returncode})")
     finally:
         if eng is not None and eng.poll() is None:
             eng.terminate()
