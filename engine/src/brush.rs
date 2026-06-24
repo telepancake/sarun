@@ -1181,6 +1181,22 @@ impl brush_core::builtins::SimpleCommand for MakeBuiltin {
         }
         // Logical cwd from the brush context — NOT the process cwd.
         let cwd = context.shell.working_dir().to_path_buf();
+        // Seed the make from THIS subshell's exported env, not the process env.
+        // The parent make applied its exports to this subshell via the recipe's
+        // export prefix, so iter_exported() here = the base box env + the
+        // parent's exports — exactly what a forked child make would inherit, and
+        // without any make ever mutating the shared process env.
+        let shell_ref = &*context.shell;
+        let seed_env: Vec<(std::ffi::OsString, std::ffi::OsString)> = shell_ref
+            .env()
+            .iter_exported()
+            .map(|(k, v)| {
+                (
+                    std::ffi::OsString::from(k.clone()),
+                    std::ffi::OsString::from(v.value().to_cow_str(shell_ref).into_owned()),
+                )
+            })
+            .collect();
         // fd 1/2 twice each: one handle for make's own messages, one as the
         // recipe/diagnostic sink kati writes through (set_recipe_out/err).
         let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
@@ -1188,7 +1204,7 @@ impl brush_core::builtins::SimpleCommand for MakeBuiltin {
         let recipe_out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
         let recipe_err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
         let code = crate::katirun::make_builtin(
-            &argv, &cwd, out, err, Box::new(recipe_out), Box::new(recipe_err),
+            &argv, &cwd, &seed_env, out, err, Box::new(recipe_out), Box::new(recipe_err),
         );
         Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
     }

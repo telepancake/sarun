@@ -583,6 +583,7 @@ pub fn shell_func_impl(
     shellflag: &[u8],
     cmd: &Bytes,
     loc: &Loc,
+    box_prefix: &[u8],
 ) -> Result<(i32, Bytes, Option<FindCommand>)> {
     log!("ShellFunc: {:?}", cmd);
 
@@ -594,6 +595,17 @@ pub fn shell_func_impl(
     }
 
     collect_stats_with_slow_report!("func shell time", OsStr::from_bytes(cmd));
+    // box mode: prepend the make's exported-var prefix so $(shell) sees the
+    // make's `export`s (in-process, where we can't stage them into the process
+    // env). Applied to the run subshell, never to the find-emulator parse above.
+    let cmd: Bytes = if box_prefix.is_empty() {
+        cmd.clone()
+    } else {
+        let mut v = box_prefix.to_vec();
+        v.extend_from_slice(cmd);
+        Bytes::from(v)
+    };
+    let cmd = &cmd;
     let (status, output) = run_command(shell, shellflag, cmd, RedirectStderr::None)?;
     let output = Bytes::from(format_for_command_substitution(output));
 
@@ -693,8 +705,9 @@ fn shell_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> 
     let loc = ev.loc.clone().unwrap_or_default();
     let shell = ev.get_shell()?;
     let shellflag = ev.get_shell_flag();
+    let box_prefix = ev.box_export_prefix.clone();
 
-    let (exit_code, output, fc) = shell_func_impl(&shell, shellflag, &cmd, &loc)?;
+    let (exit_code, output, fc) = shell_func_impl(&shell, shellflag, &cmd, &loc, &box_prefix)?;
     out.put_slice(&output);
     if should_store_command_result(&cmd) {
         COMMAND_RESULTS.lock().push(CommandResult {
@@ -735,8 +748,9 @@ fn shell_no_rerun_func(
     let loc = ev.loc.clone().unwrap_or_default();
     let shell = ev.get_shell()?;
     let shellflag = ev.get_shell_flag();
+    let box_prefix = ev.box_export_prefix.clone();
 
-    let (exit_code, output, _) = shell_func_impl(&shell, shellflag, &cmd, &loc)?;
+    let (exit_code, output, _) = shell_func_impl(&shell, shellflag, &cmd, &loc, &box_prefix)?;
     out.put_slice(&output);
     set_shell_status_var(exit_code);
     Ok(())
