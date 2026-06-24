@@ -30,6 +30,7 @@ mod discover;
 mod dockerfile;
 mod frames;
 mod hostfs;
+mod jobserver;
 mod katirun;
 mod n2run;
 mod net;
