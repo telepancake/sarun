@@ -141,6 +141,19 @@ fn serve() -> i32 {
         eprintln!("sarun-engine: cannot create instance dirs: {e}");
         return 1;
     }
+    // Bind the control socket NOW, under the instance lock and before the FUSE
+    // mount / the rest of init. This is the fix for the startup race: the socket
+    // file must only appear once it is a live listening socket, so a client that
+    // connects during startup queues in the backlog (served when the accept loop
+    // runs) instead of racing a stale socket left by a dead daemon. Held until
+    // control::serve consumes it below.
+    let listener = match control::bind_listener(&sock) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("sarun-engine: cannot bind control socket {}: {e}", sock.display());
+            return 1;
+        }
+    };
     let c = std::ffi::CString::new(sock.as_os_str().as_encoded_bytes()).unwrap();
     let _ = SOCK_FOR_SIGNAL.set(c);
     let mc = std::ffi::CString::new(mnt.as_os_str().as_encoded_bytes()).unwrap();
@@ -291,7 +304,7 @@ fn serve() -> i32 {
             }
         });
     }
-    let rc = match control::serve(state, &sock) {
+    let rc = match control::serve(state, listener) {
         Ok(()) => 0,
         Err(e) => {
             eprintln!("sarun-engine: serve failed: {e}");

@@ -129,7 +129,10 @@ fn kati_argv(argv: &[String]) -> Result<Vec<OsString>, String> {
 /// kati's bootstrap makefile (ported from upstream main.rs read_bootstrap_makefile).
 /// Seeds CC/CXX/AR/MAKE/SHELL and the builtin .c.o/.cc.o suffix rules so ordinary
 /// Makefiles relying on implicit rules work. Returns the parsed bootstrap stmts.
-fn read_bootstrap_makefile(targets: &[Symbol]) -> anyhow::Result<Arc<Mutex<Vec<kati::stmt::Stmt>>>> {
+fn read_bootstrap_makefile(
+    targets: &[Symbol],
+    working_dir: &std::path::Path,
+) -> anyhow::Result<Arc<Mutex<Vec<kati::stmt::Stmt>>>> {
     let mut bootstrap = BytesMut::new();
     bootstrap.put_slice(b"CC?=cc\n");
     bootstrap.put_slice(b"CXX?=g++\n");
@@ -164,8 +167,11 @@ fn read_bootstrap_makefile(targets: &[Symbol]) -> anyhow::Result<Arc<Mutex<Vec<k
     bootstrap.put_slice(b"MAKECMDGOALS?=");
     bootstrap.put(join_symbols(targets, b" "));
     bootstrap.put_u8(b'\n');
+    // CURDIR is the make's logical working dir (the brush context's cwd / -C
+    // target), NOT the engine's process cwd — a Makefile computes srctree and
+    // resolves `include`s against it (e.g. busybox's Kbuild).
     bootstrap.put_slice(b"CURDIR:=");
-    bootstrap.put_slice(std::env::current_dir()?.as_os_str().as_bytes());
+    bootstrap.put_slice(working_dir.as_os_str().as_bytes());
     bootstrap.put_u8(b'\n');
     kati::parser::parse_buf(
         &bootstrap.freeze(),
@@ -230,7 +236,7 @@ fn run_kati(
         )?;
     }
 
-    let bootstrap_asts = read_bootstrap_makefile(targets)?;
+    let bootstrap_asts = read_bootstrap_makefile(targets, working_dir)?;
     // sarun: bootstrap captured the current MAKELEVEL above. Bump env
     // for any recipe-spawned sub-make so it sees the next level.
     // SAFETY: single-threaded at this point in the pipeline.
