@@ -387,6 +387,59 @@ def main():
         check(count_basename(sp9, "make") == 0,
               f"case9: nested make stayed in-process; engine survived the failure "
               f"(make rows={count_basename(sp9, 'make')})")
+
+        # ── CASE 10: `ninja -C subdir` — logical cwd, no engine chdir ────────
+        # The build dir differs from the box command's cwd. The in-process n2
+        # builtin must stat inputs, read build.ninja, and run the recipe against
+        # `subdir` WITHOUT chdir'ing the engine (n2::graph::set_cwd threads it as
+        # a logical cwd). The output lands under subdir/.
+        sub = work / "nsub"
+        shutil.rmtree(sub, ignore_errors=True)
+        sub.mkdir(parents=True, exist_ok=True)
+        (sub / "build.ninja").write_text(
+            "rule e\n  command = echo subninjaok > $out\n"
+            "build sout.txt: e\n")
+        r = run_ninja("NINJA10", work, "-C", "nsub")
+        check(r.returncode == 0,
+              f"case10: ninja -C box exits 0 (got {r.returncode}: {r.stderr[-600:]})")
+        sp10 = latest_sqlar(m)
+        rel10 = str((sub / "sout.txt").resolve()).lstrip("/")
+        check(m.sqlar_content(sp10, rel10) == b"subninjaok\n",
+              f"case10: ninja -C built subdir output via logical cwd "
+              f"({m.sqlar_content(sp10, rel10)!r})")
+        check(count_basename(sp10, "ninja") == 0,
+              f"case10: no `ninja` process row — ran via the in-process builtin "
+              f"(count={count_basename(sp10, 'ninja')})")
+
+        # ── CASE 11: PARALLEL sub-makes — in-process, no races, no globals ───
+        # `make -j2` fires two recursive sub-makes concurrently, each building a
+        # distinct target in its own subdir. De-globalized kati (per-Evaluator
+        # vars + working_dir, reentrant recipe runner) must run them in the SAME
+        # process without clobbering each other's state or deadlocking. Both
+        # outputs appear; no `make` process row; engine survives.
+        for d, txt in (("p1", "one"), ("p2", "two")):
+            pd = work / d
+            shutil.rmtree(pd, ignore_errors=True)
+            pd.mkdir(parents=True, exist_ok=True)
+            (pd / "Makefile").write_text(
+                f"o.txt:\n\techo {txt} > $@\n")
+        (work / "Makefile").write_text(
+            "all: a b\n"
+            "a:\n\t$(MAKE) -C p1\n"
+            "b:\n\t$(MAKE) -C p2\n")
+        r = run_make("MAKE11", work, "-j2")
+        check(r.returncode == 0,
+              f"case11: parallel sub-makes exit 0 (got {r.returncode}: {r.stderr[-600:]})")
+        sp11 = latest_sqlar(m)
+        rel_a = str((work / "p1" / "o.txt").resolve()).lstrip("/")
+        rel_b = str((work / "p2" / "o.txt").resolve()).lstrip("/")
+        check(m.sqlar_content(sp11, rel_a) == b"one\n",
+              f"case11: parallel sub-make p1 built ({m.sqlar_content(sp11, rel_a)!r})")
+        check(m.sqlar_content(sp11, rel_b) == b"two\n",
+              f"case11: parallel sub-make p2 built ({m.sqlar_content(sp11, rel_b)!r})")
+        check(count_basename(sp11, "make") == 0,
+              f"case11: parallel sub-makes stayed in-process "
+              f"(make rows={count_basename(sp11, 'make')})")
     finally:
         if eng is not None and eng.poll() is None:
             eng.terminate()
