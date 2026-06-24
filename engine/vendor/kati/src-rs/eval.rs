@@ -251,6 +251,14 @@ pub struct Evaluator {
     /// per-instance. Behind Arc<Mutex> so a ScopedGlobalVar can restore its
     /// saved binding on Drop without needing an &Evaluator.
     pub global_vars: Arc<Mutex<Vec<Option<Var>>>>,
+    /// sarun: per-instance logical working directory. kati's path-resolving
+    /// boundaries (makefile read, `include`, `$(wildcard)`/`$(abspath)`/
+    /// `$(realpath)`/`$(file)`, the find emulator root) resolve relative paths
+    /// against THIS instead of the process cwd, so an in-process `make` builtin
+    /// can run against the brush shell's logical cwd without `chdir`-ing the
+    /// process — and concurrent instances in different directories don't race
+    /// on it. Seeded from the process cwd so standalone rkati is unchanged.
+    pub working_dir: std::path::PathBuf,
     pub rules: Vec<Rule>,
     pub exports: HashMap<Symbol, bool>,
     /// sarun: set when the makefile names `.EXPORT_ALL_VARIABLES` as a
@@ -316,6 +324,7 @@ impl Evaluator {
         let ev = Self {
             rule_vars: HashMap::new(),
             global_vars: Arc::new(Mutex::new(Vec::new())),
+            working_dir: std::env::current_dir().unwrap_or_default(),
             rules: Vec::new(),
             exports: HashMap::new(),
             export_all_vars: false,
