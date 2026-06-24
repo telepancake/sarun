@@ -772,6 +772,24 @@ pub fn make_builtin(
     let targets: Vec<Symbol> = flags.targets.clone();
     let cl_vars: Vec<bytes::Bytes> = flags.cl_vars.clone();
 
+    // Each `$(MAKE)` is logically a fresh make PROCESS — it must see the current
+    // filesystem, not a snapshot another make took earlier. But unlike the
+    // standalone rkati binary (one OS process per make), every in-process make
+    // in a box shares ONE process and ONE set of process-global caches: the glob
+    // cache (kati::fileutil) and the parsed-makefile cache (kati::file_cache).
+    // Those caches outlive each make invocation, so a stale entry leaks across
+    // makes. Concretely: `make defconfig` runs before `.config` exists, so the
+    // top makefile's `-include .config` globs it as ABSENT and caches that; the
+    // later build (and its per-directory sub-makes) then read the stale "missing"
+    // and every `obj-$(CONFIG_*)` collapses to empty → empty lib.a archives →
+    // link fails with hundreds of undefined `*_main` symbols. (busybox; the
+    // failure is deterministic at -j1 and intermittent under -j as the shared
+    // caches also race between concurrent sub-makes.) Drop both at entry so this
+    // make starts from a clean, current view — matching GNU make's per-process
+    // filesystem caching.
+    kati::file_cache::clear();
+    kati::fileutil::clear_glob_cache();
+
     // GNU make's remake-the-makefile loop, IN-PROCESS. run_kati builds any
     // required `include` targets that didn't exist at parse time and reports
     // remake_active; the shadow path re-execs the engine to re-parse with the

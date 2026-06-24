@@ -605,6 +605,37 @@ def main():
         fout = m.sqlar_content(sp17, str((od / "final.out").resolve()).lstrip("/"))
         check(fout == b"depdata\n",
               f"case17: final ran after its prereq dep under -j (final.out={fout!r})")
+
+        # ── CASE 18: a later in-process make sees a file an earlier one made ──
+        # Every $(MAKE) in a box runs in ONE shared engine process, so kati's
+        # process-global glob/file caches outlive each invocation. The first make
+        # here `-include cfg.mk` while it's ABSENT (poisoning the glob cache with
+        # "missing"), then its recipe GENERATES cfg.mk. A second make must re-see
+        # cfg.mk and pick up VAL — exactly busybox's `make defconfig` (writes
+        # .config) then `make` (reads it). Without clearing the caches at each
+        # make's entry, the second make reads the stale "missing" and VAL is
+        # empty (busybox: empty lib.a archives → link fails). Both makes run in
+        # ONE box (one process) via a single `sh -c`.
+        cc = work / "cache"
+        shutil.rmtree(cc, ignore_errors=True)
+        cc.mkdir(parents=True, exist_ok=True)
+        (cc / "gen.mk").write_text(
+            "-include cfg.mk\n"
+            "all:\n\t@echo 'VAL := yes' > cfg.mk\n")
+        (cc / "use.mk").write_text(
+            "-include cfg.mk\n"
+            "all:\n\t@echo \"VAL=[$(VAL)]\" > result.txt\n")
+        r = subprocess.run(
+            [str(BIN), "run", "-b", "MAKE18", "-C", str(cc), "--",
+             "sh", "-c", "make -f gen.mk && make -f use.mk"],
+            capture_output=True, text=True, timeout=180)
+        check(r.returncode == 0,
+              f"case18: two-make box exits 0 (got {r.returncode}: {r.stderr[-600:]})")
+        sp18 = latest_sqlar(m)
+        res = m.sqlar_content(sp18, str((cc / "result.txt").resolve()).lstrip("/"))
+        check(res == b"VAL=[yes]\n",
+              f"case18: 2nd make saw the file the 1st made (no stale glob cache); "
+              f"result.txt={res!r} (want b'VAL=[yes]\\n'; stale cache → b'VAL=[]\\n')")
     finally:
         if eng is not None and eng.poll() is None:
             eng.terminate()
