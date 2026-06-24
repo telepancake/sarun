@@ -39,6 +39,41 @@ use crate::{
     warn,
 };
 
+thread_local! {
+    // sarun: when set, recipe stdout is written HERE instead of the process
+    // stdout. An in-process `make` builtin sets this to a writer over its brush
+    // ExecutionContext's fd 1, so a recursive/nested make's recipe output flows
+    // up the brush pipe chain rather than escaping to the real terminal.
+    // Default None → the shadow/standalone path prints to process stdout exactly
+    // as before. kati runs recipes synchronously on the make's own thread, so a
+    // thread-local is the correct scope (concurrent makes are on other threads).
+    static RECIPE_OUT: std::cell::RefCell<Option<Box<dyn std::io::Write>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// sarun: install (or clear) the thread-local recipe-output sink, returning the
+/// previous value so a nested make can save/restore it. Pass None to reset.
+pub fn set_recipe_out(
+    w: Option<Box<dyn std::io::Write>>,
+) -> Option<Box<dyn std::io::Write>> {
+    RECIPE_OUT.with(|c| std::mem::replace(&mut *c.borrow_mut(), w))
+}
+
+/// sarun: emit a recipe's captured stdout — to the thread-local sink if a make
+/// builtin installed one, else to the process stdout (unchanged default).
+fn emit_recipe_output(output: &[u8]) {
+    RECIPE_OUT.with(|c| {
+        let mut slot = c.borrow_mut();
+        if let Some(w) = slot.as_mut() {
+            use std::io::Write;
+            let _ = w.write_all(output);
+            let _ = w.flush();
+        } else {
+            print!("{}", String::from_utf8_lossy(output));
+        }
+    });
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ExecStatus {
     Processing,
@@ -230,7 +265,7 @@ impl<'a> Executor<'a> {
                         )?;
                         (status.success(), out, status.code().unwrap_or(1))
                     };
-                print!("{}", String::from_utf8_lossy(&output));
+                emit_recipe_output(&output);
                 if !ok {
                     if command.ignore_error {
                         eprintln!(

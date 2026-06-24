@@ -1150,6 +1150,46 @@ fn box_builtins<SE: brush_core::extensions::ShellExtensions>()
 /// wins the slot; others emit raw keys like `cp-error-cannot-stat`). Filesystem-op builtins
 /// (`cp`/`rm`/`mv`/…) are always registered — each runs on its own fresh thread, getting its
 /// own Fluent bundle via the thread-local localization fix in vendored uucore.
+/// `make`/`gmake` — embedded GNU make (in-process kati). Dispatched whenever
+/// brush itself runs make (a recipe's recursive `$(MAKE)`, or `make` invoked by
+/// a configure/cmake shell step), so it stays in THIS process at the brush
+/// context's logical cwd instead of re-exec'ing the engine via the FUSE shadow.
+/// The top-level `make` (spawned by the box runner) still goes through the
+/// shadow/`main()` path — both share kati; this is just the in-process door.
+struct MakeBuiltin;
+
+impl brush_core::builtins::SimpleCommand for MakeBuiltin {
+    fn get_content(
+        name: &str,
+        _content_type: brush_core::builtins::ContentType,
+        _options: &brush_core::builtins::ContentOptions,
+    ) -> Result<String, brush_core::error::Error> {
+        Ok(format!("{name}: embedded GNU make (in-process kati)\n"))
+    }
+
+    fn execute<SE: brush_core::extensions::ShellExtensions,
+               I: Iterator<Item = S>, S: AsRef<str>>(
+        context: brush_core::commands::ExecutionContext<'_, SE>,
+        args: I,
+    ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
+        // `args` already includes argv[0] (the command name), like the coreutil
+        // builtins — use it directly; only synthesize a name if somehow empty.
+        let name = context.command_name.clone();
+        let mut argv: Vec<String> = args.map(|a| a.as_ref().to_string()).collect();
+        if argv.is_empty() {
+            argv.push(name);
+        }
+        // Logical cwd from the brush context — NOT the process cwd.
+        let cwd = context.shell.working_dir().to_path_buf();
+        // fd 1 twice: one handle for make's own messages, one as the recipe sink.
+        let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
+        let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
+        let recipe_out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
+        let code = crate::katirun::make_builtin(&argv, &cwd, out, err, Box::new(recipe_out));
+        Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
+    }
+}
+
 fn box_builtins_opt<SE: brush_core::extensions::ShellExtensions>(
     bundle_coreutils: bool,
 ) -> std::collections::HashMap<String, brush_core::builtins::Registration<SE>> {
@@ -1193,6 +1233,10 @@ fn box_builtins_opt<SE: brush_core::extensions::ShellExtensions>(
     m.insert("chmod".to_string(), simple_builtin::<ChmodBuiltin, SE>());
     m.insert("chown".to_string(), simple_builtin::<ChownBuiltin, SE>());
     m.insert("install".to_string(), simple_builtin::<InstallBuiltin, SE>());
+    // Embedded GNU make: keeps recursive `$(MAKE)` and configure/cmake-invoked
+    // make IN-PROCESS (see MakeBuiltin) instead of re-exec'ing the engine.
+    m.insert("make".to_string(), simple_builtin::<MakeBuiltin, SE>());
+    m.insert("gmake".to_string(), simple_builtin::<MakeBuiltin, SE>());
     // BashMode shell builtins overwrite any overlapping coreutil names (highest priority).
     m.extend(brush_builtins::default_builtins(brush_builtins::BuiltinSet::BashMode));
     // In-box engine entry points via /proc/self/exe (no PATH shadow needed).
@@ -1995,6 +2039,23 @@ fn split_words(s: &str) -> Vec<String> {
     words
 }
 
+thread_local! {
+    /// sarun: working directory for in-process recipes. An in-process
+    /// `make`/`ninja` builtin sets this to its logical working_dir so recipes
+    /// run THERE without mutating the process cwd (which would race other
+    /// in-process instances). None → process cwd, i.e. the shadow/top-level
+    /// path where the box already chdir'd appropriately. Same thread as the
+    /// build that set it (recipes are dispatched synchronously per build).
+    static BOX_RECIPE_CWD: std::cell::RefCell<Option<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// sarun: set (or clear) the thread-local in-process-recipe working dir,
+/// returning the previous value so a nested build can save/restore it.
+pub fn set_box_recipe_cwd(cwd: Option<std::path::PathBuf>) -> Option<std::path::PathBuf> {
+    BOX_RECIPE_CWD.with(|c| std::mem::replace(&mut *c.borrow_mut(), cwd))
+}
+
 /// Run one n2 recipe through embedded brush, merging stdout+stderr into
 /// `output_cb` (n2's contract). Returns the recipe's exit code.
 pub fn run_recipe_in_process(cmdline: &str, output_cb: &mut dyn FnMut(&[u8])) -> i32 {
@@ -2021,7 +2082,10 @@ pub fn run_recipe_in_process_opt(
         Err(e) => { output_cb(format!("sarun-engine n2: pipe: {e}\n").as_bytes()); return 127; }
     };
 
-    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
+    let cwd = BOX_RECIPE_CWD
+        .with(|c| c.borrow().clone())
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| std::path::PathBuf::from("/"));
     let recipe_owned = recipe.clone();
     // Run brush on a worker thread so this (n2 scheduler) thread can drain the
     // pipe concurrently — a finite pipe buffer would otherwise deadlock.
