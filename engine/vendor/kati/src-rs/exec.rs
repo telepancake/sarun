@@ -143,7 +143,7 @@ impl<'a> Executor<'a> {
             .enter(FrameType::Exec, output_str.clone(), loc.unwrap_or_default());
 
         self.done.insert(output, ExecStatus::Processing);
-        let output_timestamp = get_timestamp(&output_str)?;
+        let output_timestamp = get_timestamp(&output_str, &self.ce.ev.working_dir)?;
         let output_ts = ExecStatus::Timestamp(output_timestamp);
 
         log!(

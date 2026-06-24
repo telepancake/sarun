@@ -152,12 +152,15 @@ impl AutoCommandVar {
                     }
                 } else {
                     let mut ww = WordWriter::new(out);
-                    let target_age =
-                        ExecStatus::Timestamp(get_timestamp(&current_dep_node.output.as_bytes())?);
+                    let target_age = ExecStatus::Timestamp(get_timestamp(
+                        &current_dep_node.output.as_bytes(),
+                        &ev.working_dir,
+                    )?);
                     for ai in current_dep_node.actual_inputs.iter() {
                         let ai_str = ai.as_bytes();
                         if seen.insert(*ai)
-                            && ExecStatus::Timestamp(get_timestamp(&ai_str)?) > target_age
+                            && ExecStatus::Timestamp(get_timestamp(&ai_str, &ev.working_dir)?)
+                                > target_age
                         {
                             ww.write(&ai_str)
                         }
