@@ -121,6 +121,10 @@ struct Inner {
     next_ino: AtomicU64,
     fhs: RwLock<HashMap<u64, Mutex<Fh>>>,
     next_fh: AtomicU64,
+    // Open handles to the synthetic JOBSERVER file: fh -> is-O_NONBLOCK. Kept
+    // apart from `fhs` (no blob/file behind them) so read/write dispatch to the
+    // slip pool instead of a backing file.
+    jobserver_fhs: RwLock<HashMap<u64, bool>>,
     rules: RwLock<crate::rules::Rules>,  // passthrough decisions (reload verb)
     /// Lazy shadowing for -b boxes: at lookup/open time, if the
     /// box-relative path matches one of the compiled glob patterns,
@@ -196,6 +200,25 @@ struct FhInner {
     _backing: Option<fuser::BackingId>,
 }
 
+/// Bridges a deferred FUSE read reply into the slip pool. The pool calls exactly
+/// one of grant/deny_again, fulfilling the read that was blocked acquiring a slip
+/// (grant → one byte; deny_again → EAGAIN for an O_NONBLOCK caller, or when the
+/// waiting pid was reaped). `ReplyData` is `Send`, so the pool can hold it across
+/// threads and reply later from a release/reap.
+struct SlipReplyData(Option<fuser::ReplyData>);
+impl crate::slippool::SlipReply for SlipReplyData {
+    fn grant(mut self: Box<Self>) {
+        if let Some(r) = self.0.take() {
+            r.data(&[crate::slippool::SLIP]);
+        }
+    }
+    fn deny_again(mut self: Box<Self>) {
+        if let Some(r) = self.0.take() {
+            r.error(Errno::EAGAIN);
+        }
+    }
+}
+
 // Reserved box-root paths: the box's stdout/stderr write THROUGH these, and the
 // overlay routes the bytes to the outputs table (per-write pid attribution).
 // They resolve by exact lookup but are never listed in readdir.
@@ -205,6 +228,13 @@ const SINK_STDERR: &str = ".slopbox-stderr";
 // routing to that child's real overlay-root inode (the nested-launch bind
 // target). Reachable by explicit lookup; never listed in the box-root readdir.
 const KIDS_DIR: &str = ".slopbox-kids";
+
+// Synthetic jobserver token file at each box root. read() acquires one slip from
+// the engine-global pool (blocking until one frees, unless the fd is O_NONBLOCK),
+// write() releases one. Reached by explicit lookup; never listed in readdir.
+// Because every op is a FUSE request, the engine sees the caller pid and can keep
+// a per-pid ledger + reap leaked slips on exit (slippool.rs).
+const JOBSERVER: &str = ".slopbox-jobserver";
 
 fn sink_stream(rel: &str) -> Option<i32> {
     match rel {
@@ -368,6 +398,7 @@ impl Overlay {
             next_ino: AtomicU64::new(2),
             fhs: RwLock::new(HashMap::new()),
             next_fh: AtomicU64::new(1),
+            jobserver_fhs: RwLock::new(HashMap::new()),
             rules: RwLock::new(crate::rules::Rules::load()),
             echo: RwLock::new(HashMap::new()),
             sink_open: Mutex::new(HashMap::new()),
@@ -1318,7 +1349,7 @@ impl Filesystem for Overlay {
         let rel = if prel.is_empty() { name.to_string() }
                   else { format!("{prel}/{name}") };
         let ino = self.ino_for(&(bid, rel.clone()));
-        if prel.is_empty() && sink_stream(&rel).is_some() {
+        if prel.is_empty() && (sink_stream(&rel).is_some() || rel == JOBSERVER) {
             return reply.entry(&TTL, &self.synth_file_attr(ino), Generation(0));
         }
         // Engine self-hide: sarun's own host dirs are invisible to boxes.
@@ -1346,7 +1377,7 @@ impl Filesystem for Overlay {
         if bid == 0 || rel.is_empty() || rel == KIDS_DIR {
             return reply.attr(&TTL, &self.synth_dir_attr(u64::from(ino), 0o40755, 0));
         }
-        if sink_stream(&rel).is_some() {
+        if sink_stream(&rel).is_some() || rel == JOBSERVER {
             return reply.attr(&TTL, &self.synth_file_attr(u64::from(ino)));
         }
         let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
@@ -1377,6 +1408,22 @@ impl Filesystem for Overlay {
             return reply.error(Errno::ENOENT);
         };
         let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
+        if rel == JOBSERVER {
+            // A handle on the slip pool. read() acquires, write() releases. Record
+            // whether this handle is O_NONBLOCK so read() knows to defer (block)
+            // or fail with EAGAIN when the pool is empty.
+            let nonblock = flags.0 & libc::O_NONBLOCK != 0;
+            let n = self.inner.next_fh.fetch_add(1, Ordering::Relaxed);
+            self.inner.jobserver_fhs.write().unwrap().insert(n, nonblock);
+            // DIRECT_IO so the kernel always dispatches read/write to us (the
+            // synthetic file reports size 0; without this the kernel would serve
+            // a read as immediate EOF). NONSEEKABLE: it is a token stream, not a
+            // seekable file — clients must not offset into it.
+            return reply.opened(
+                FileHandle(n),
+                FopenFlags::FOPEN_DIRECT_IO | FopenFlags::FOPEN_NONSEEKABLE,
+            );
+        }
         if let Some(stream) = sink_stream(&rel) {
             // stdout/stderr sink: a write-only channel into the outputs table
             // (+ the live echo readback). Count it so the last release flushes
@@ -1548,11 +1595,22 @@ impl Filesystem for Overlay {
                       FopenFlags::empty());
     }
 
-    fn read(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, offset: u64,
+    fn read(&self, req: &Request, _ino: INodeNo, fh: FileHandle, offset: u64,
             size: u32, _flags: OpenFlags, _lo: Option<LockOwner>, reply: ReplyData) {
         // The daemon served this read (a passthrough'd read never reaches here —
         // the kernel serves it directly). Counter is test observability.
         self.inner.daemon_reads.fetch_add(1, Ordering::Relaxed);
+        // Slip-pool acquire: a read on the JOBSERVER file claims one slip for the
+        // caller pid. If the pool is empty we DEFER the reply (block the read)
+        // until a release frees one — unless the handle is O_NONBLOCK, in which
+        // case the pool denies it with EAGAIN at once.
+        if let Some(&nonblock) = self.inner.jobserver_fhs.read().unwrap().get(&u64::from(fh)) {
+            let pid = req.pid() as i32;
+            let r = Box::new(SlipReplyData(Some(reply)));
+            // Watch handling (per-pid reaping) lands in the reaping increment.
+            let _ = crate::slippool::global().lock().unwrap().acquire(pid, r, nonblock);
+            return;
+        }
         let fhs = self.inner.fhs.read().unwrap();
         let Some(h) = fhs.get(&u64::from(fh)) else {
             return reply.error(Errno::EBADF);
@@ -1571,6 +1629,15 @@ impl Filesystem for Overlay {
     fn write(&self, req: &Request, _ino: INodeNo, fh: FileHandle, offset: u64,
              data: &[u8], _wf: fuser::WriteFlags, _flags: OpenFlags,
              _lo: Option<LockOwner>, reply: ReplyWrite) {
+        // Slip-pool release: a write on the JOBSERVER file returns one slip the
+        // caller pid holds. The freed slip is handed to the next blocked acquirer
+        // (its deferred read reply is fulfilled inside release) or back to the
+        // pool. We accept the full byte count regardless of payload.
+        if self.inner.jobserver_fhs.read().unwrap().contains_key(&u64::from(fh)) {
+            let pid = req.pid() as i32;
+            let _ = crate::slippool::global().lock().unwrap().release(pid);
+            return reply.written(data.len() as u32);
+        }
         let fhs = self.inner.fhs.read().unwrap();
         let Some(h) = fhs.get(&u64::from(fh)) else {
             return reply.error(Errno::EBADF);
@@ -1644,6 +1711,12 @@ impl Filesystem for Overlay {
     fn release(&self, _req: &Request, _ino: INodeNo, fh: FileHandle,
                _flags: OpenFlags, _lo: Option<LockOwner>, _flush: bool,
                reply: ReplyEmpty) {
+        // Closing a JOBSERVER handle: just drop it. Any slips the pid still holds
+        // are reclaimed by pid-exit / box-teardown reaping, not fd close (a
+        // process may legitimately close and reopen the handle mid-build).
+        if self.inner.jobserver_fhs.write().unwrap().remove(&u64::from(fh)).is_some() {
+            return reply.ok();
+        }
         let h = self.inner.fhs.write().unwrap().remove(&u64::from(fh));
         if let Some(h) = h {
             let h = h.into_inner().unwrap();
