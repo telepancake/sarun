@@ -17,7 +17,7 @@ limitations under the License.
 use std::{
     collections::HashMap,
     ffi::OsStr,
-    os::unix::ffi::{OsStrExt, OsStringExt},
+    os::unix::ffi::OsStrExt,
     sync::Arc,
     time::SystemTime,
 };
@@ -34,7 +34,6 @@ use crate::{
     expr::Evaluable,
     fileutil::{RedirectStderr, get_timestamp, run_command, run_with_installed_runner},
     flags::FLAGS,
-    log,
     symtab::Symbol,
     warn,
 };
@@ -143,10 +142,160 @@ impl PartialOrd for ExecStatus {
 
 struct Executor<'a> {
     ce: CommandEvaluator<'a>,
-    done: HashMap<Symbol, ExecStatus>,
     shell: Bytes,
     shellflag: &'static [u8],
     num_commands: u64,
+}
+
+// ── Parallel scheduler ───────────────────────────────────────────────────────
+//
+// sarun: kati's executor walks the dep DAG and runs each target's recipe. The
+// recursive `exec_node` below does that serially. The scheduler here is the
+// SAME engine driven by a dependency-count ready-queue instead of recursion, so
+// independent targets' recipes can run concurrently — in parallel brush
+// subshells — bounded by the engine slip pool. The Evaluator is not Send, so the
+// make thread keeps it and does ALL walking + command EVALUATION; only the
+// concrete command strings are dispatched to worker threads.
+//
+// Conformance: every node is given its DFS POST-ORDER rank (the order the
+// recursion would finish it), and ready nodes are selected lowest-rank-first.
+// At cap=1 that reproduces the recursion's exact execution order — so the serial
+// corpus is unaffected — while cap>1 fans out independent ready nodes.
+
+#[derive(PartialEq, Eq)]
+enum PState {
+    Pending,
+    Done,
+}
+
+/// A ready node, ordered for a MIN-heap by DFS post-order rank (ranks are unique,
+/// so the Symbol never participates in the comparison — it need not be Ord).
+#[derive(PartialEq, Eq)]
+struct Ready {
+    rank: usize,
+    sym: Symbol,
+}
+impl Ord for Ready {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Reversed so BinaryHeap (a max-heap) yields the lowest rank first.
+        other.rank.cmp(&self.rank)
+    }
+}
+impl PartialOrd for Ready {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+struct PNode {
+    node: Arc<Mutex<DepNode>>,
+    /// Build-deps: regular deps + order-only deps whose file is absent, by output.
+    deps: Vec<Symbol>,
+    dependents: Vec<Symbol>,
+    unfinished: usize,
+    /// DFS post-order rank (selection order; cap=1 ⇒ recursion order).
+    rank: usize,
+    /// Set once the node completes (its file's pre-run timestamp, matching
+    /// exec_node's recorded ExecStatus).
+    result: Option<ExecStatus>,
+    state: PState,
+}
+
+/// A node's concrete recipe, ready to run on a worker (no Evaluator needed).
+struct RunReq {
+    output: Symbol,
+    commands: Vec<crate::command::Command>,
+    /// Target-specific exported vars (`target: export VAR := …`), applied to each
+    /// command's subshell as a non-echoed `export` prefix. Pre-evaluated by the
+    /// make thread (process env can't be used — parallel recipes would race it).
+    exports: Vec<(Bytes, Bytes)>,
+    /// The make's working_dir (path bytes), passed to the in-process runner so a
+    /// recipe runs at the right cwd on its worker thread (explicit, not via a
+    /// make-thread thread-local the worker wouldn't see).
+    cwd: Bytes,
+    /// The pre-run output timestamp to record as this node's result on success.
+    result_ts: ExecStatus,
+}
+
+/// Build the `export NAME='value'` prefix (newline-terminated) for a target's
+/// exported vars, single-quote-escaping the values. Applied to each command's
+/// run input but never echoed.
+fn exports_prefix(exports: &[(Bytes, Bytes)]) -> Vec<u8> {
+    let mut p = Vec::new();
+    for (name, val) in exports {
+        p.extend_from_slice(b"export ");
+        p.extend_from_slice(name);
+        p.extend_from_slice(b"='");
+        for &b in val.iter() {
+            if b == b'\'' {
+                p.extend_from_slice(b"'\\''");
+            } else {
+                p.push(b);
+            }
+        }
+        p.extend_from_slice(b"'\n");
+    }
+    p
+}
+
+/// What a worker produced running a node's recipe.
+struct NodeRun {
+    output: Symbol,
+    out: Vec<u8>,
+    ignored: Vec<(Symbol, i32)>,
+    failure: Option<(Symbol, i32)>,
+    result_ts: ExecStatus,
+}
+
+/// Run a node's concrete commands in sequence on a worker thread, capturing the
+/// merged output. Stops at the first non-ignored failure. Needs no Evaluator.
+fn run_node_commands(
+    shell: &[u8],
+    shellflag: &'static [u8],
+    req: RunReq,
+) -> NodeRun {
+    let mut out = Vec::new();
+    let mut ignored = Vec::new();
+    let mut failure = None;
+    let prefix = exports_prefix(&req.exports);
+    let cwd = req.cwd;
+    for command in req.commands {
+        if command.echo {
+            out.extend_from_slice(&command.cmd);
+            out.push(b'\n');
+        }
+        if FLAGS.is_dry_run {
+            continue;
+        }
+        // Run input = the exports prefix + the command (the prefix is applied to
+        // the subshell but not echoed above).
+        let run_input: Bytes = if prefix.is_empty() {
+            command.cmd.clone()
+        } else {
+            let mut v = prefix.clone();
+            v.extend_from_slice(&command.cmd);
+            Bytes::from(v)
+        };
+        let (ok, o, code) =
+            if let Some((code, o)) = run_with_installed_runner(shell, shellflag, &run_input, &cwd) {
+                (code == 0, o, code)
+            } else {
+                match run_command(shell, shellflag, &run_input, RedirectStderr::Stdout) {
+                    Ok((status, o)) => (status.success(), o, status.code().unwrap_or(1)),
+                    Err(e) => (false, format!("{e}\n").into_bytes(), 1),
+                }
+            };
+        out.extend_from_slice(&o);
+        if !ok {
+            if command.ignore_error {
+                ignored.push((command.output, code));
+            } else {
+                failure = Some((command.output, code));
+                break;
+            }
+        }
+    }
+    NodeRun { output: req.output, out, ignored, failure, result_ts: req.result_ts }
 }
 
 impl<'a> Executor<'a> {
@@ -155,113 +304,152 @@ impl<'a> Executor<'a> {
         let shellflag = ev.get_shell_flag();
         Ok(Executor {
             ce: CommandEvaluator::new(ev)?,
-            done: HashMap::new(),
             shell,
             shellflag,
             num_commands: 0,
         })
     }
 
-    fn exec_node(
-        &mut self,
-        n: &Arc<Mutex<DepNode>>,
-        needed_by: Option<&[u8]>,
-    ) -> Result<ExecStatus> {
-        let output = n.lock().output;
-        let output_str = output.as_bytes();
-        if let Some(found) = self.done.get(&output) {
-            if found == &ExecStatus::Processing {
-                warn!(
-                    "Circular {} <- {} dependency dropped.",
-                    String::from_utf8_lossy(needed_by.unwrap_or(b"(null)")),
-                    output
-                )
-            }
-            return Ok(*found);
-        }
-        let loc = n.lock().loc.clone();
-        let _frame = self
-            .ce
-            .ev
-            .enter(FrameType::Exec, output_str.clone(), loc.unwrap_or_default());
 
-        self.done.insert(output, ExecStatus::Processing);
+    /// Discover all reachable nodes in exec_node's child order (order-only deps
+    /// whose file exists are skipped; a back-edge to an in-progress node is
+    /// dropped, matching the recursion's circular-dependency drop), assigning
+    /// each its DFS post-order rank and its build-deps.
+    fn discover(
+        &self,
+        n: &Arc<Mutex<DepNode>>,
+        graph: &mut HashMap<Symbol, PNode>,
+        visiting: &mut std::collections::HashSet<Symbol>,
+        rank: &mut usize,
+    ) {
+        let sym = n.lock().output;
+        if graph.contains_key(&sym) {
+            return;
+        }
+        visiting.insert(sym);
+        let (order, deps) = {
+            let g = n.lock();
+            (g.order_onlys.clone(), g.deps.clone())
+        };
+        let mut build_deps: Vec<Symbol> = Vec::new();
+        for (_, d) in order {
+            let dout = d.lock().output;
+            if std::fs::exists(OsStr::from_bytes(&dout.as_bytes())).unwrap_or(false) {
+                continue;
+            }
+            if visiting.contains(&dout) {
+                // back-edge: drop it (matches exec_node's Processing-node drop),
+                // emitting the same warning so output is identical to serial.
+                warn!("Circular {sym} <- {dout} dependency dropped.");
+                continue;
+            }
+            build_deps.push(dout);
+            self.discover(&d, graph, visiting, rank);
+        }
+        for (_, d) in deps {
+            let dout = d.lock().output;
+            if visiting.contains(&dout) {
+                warn!("Circular {sym} <- {dout} dependency dropped.");
+                continue;
+            }
+            build_deps.push(dout);
+            self.discover(&d, graph, visiting, rank);
+        }
+        let r = *rank;
+        *rank += 1;
+        visiting.remove(&sym);
+        graph.insert(
+            sym,
+            PNode {
+                node: n.clone(),
+                deps: build_deps,
+                dependents: Vec::new(),
+                unfinished: 0,
+                rank: r,
+                result: None,
+                state: PState::Pending,
+            },
+        );
+    }
+
+    /// Evaluate a ready node (make thread): compute its timestamp + up-to-date
+    /// status from its now-complete deps, and either mark it done (no run) or
+    /// produce its concrete recipe for dispatch. Mirrors exec_node's per-node
+    /// logic. Returns (result timestamp, Some(run request) when commands run).
+    fn prepare_node(
+        &mut self,
+        graph: &HashMap<Symbol, PNode>,
+        sym: Symbol,
+    ) -> Result<(ExecStatus, Option<RunReq>)> {
+        let n = graph[&sym].node.clone();
+        let output = sym;
+        let output_str = output.as_bytes();
+        let loc = n.lock().loc.clone();
+        let _frame =
+            self.ce
+                .ev
+                .enter(FrameType::Exec, output_str.clone(), loc.unwrap_or_default());
         let output_timestamp = get_timestamp(&output_str, &self.ce.ev.working_dir)?;
         let output_ts = ExecStatus::Timestamp(output_timestamp);
-
-        log!(
-            "ExecNode: {output} for {}",
-            String::from_utf8_lossy(needed_by.unwrap_or(b"(null)"))
-        );
-
-        if !n.lock().has_rule && output_timestamp.is_none() && !n.lock().is_phony {
-            if let Some(needed_by) = needed_by {
+        let (has_rule, is_phony) = {
+            let g = n.lock();
+            (g.has_rule, g.is_phony)
+        };
+        if !has_rule && output_timestamp.is_none() && !is_phony {
+            if let Some(nb) = graph[&sym].dependents.first().map(|d| d.as_bytes()) {
                 error!(
                     "*** No rule to make target '{output}', needed by '{}'.",
-                    String::from_utf8_lossy(needed_by)
+                    String::from_utf8_lossy(&nb)
                 );
             } else {
                 error!("*** No rule to make target '{output}'");
             }
         }
-
         let mut latest = ExecStatus::Processing;
-        let order_onlys = n.lock().order_onlys.clone();
-        for (_, d) in order_onlys {
-            let dep_out = d.lock().output.as_bytes();
-            if std::fs::exists(OsStr::from_bytes(&dep_out))? {
-                continue;
-            }
-            let ts = self.exec_node(&d, Some(&output_str))?;
-            if latest < ts {
-                latest = ts;
+        for d in &graph[&sym].deps {
+            if let Some(r) = graph.get(d).and_then(|p| p.result) {
+                if latest < r {
+                    latest = r;
+                }
             }
         }
-
-        let deps = n.lock().deps.clone();
-        for (_, d) in deps {
-            let ts = self.exec_node(&d, Some(&output_str))?;
-            if latest < ts {
-                latest = ts;
-            }
+        if output_ts >= latest && !is_phony {
+            return Ok((output_ts, None));
         }
-
-        if output_ts >= latest && !n.lock().is_phony {
-            self.done.insert(output, output_ts);
-            return Ok(output_ts);
+        let (commands, exports) = self.eval_node_commands(&n)?;
+        if commands.is_empty() {
+            return Ok((output_ts, None));
         }
+        let cwd = Bytes::from(self.ce.ev.working_dir.as_os_str().as_bytes().to_vec());
+        Ok((
+            output_ts,
+            Some(RunReq { output, commands, exports, cwd, result_ts: output_ts }),
+        ))
+    }
 
-        // sarun: target-specific exported vars (`target: export VAR := …`)
-        // — push them into the process env for the duration of THIS
-        // target's commands, restore after. Single-threaded so the
-        // env-swap is safe.
-        let mut env_restores: Vec<(std::ffi::OsString, Option<std::ffi::OsString>)> = Vec::new();
+    /// Evaluate a node's recipe to concrete commands (+ its exported rule vars),
+    /// applying .ONESHELL fusing. The make thread owns the Evaluator, so this is
+    /// serial across nodes.
+    fn eval_node_commands(
+        &mut self,
+        n: &Arc<Mutex<DepNode>>,
+    ) -> Result<(Vec<crate::command::Command>, Vec<(Bytes, Bytes)>)> {
+        let mut exports: Vec<(Bytes, Bytes)> = Vec::new();
         if let Some(rule_vars) = n.lock().rule_vars.clone() {
-            let entries: Vec<(crate::symtab::Symbol, crate::var::Var)> =
+            let entries: Vec<(Symbol, crate::var::Var)> =
                 rule_vars.0.lock().iter().map(|(s, v)| (*s, v.clone())).collect();
-            for (sym, var) in entries {
-                let do_export = var.read().exported;
-                let key = std::ffi::OsString::from_vec(sym.as_bytes().to_vec());
-                if !do_export {
+            for (symv, var) in entries {
+                if !var.read().exported {
                     continue;
                 }
-                let value_bytes = var.read().eval_to_buf(self.ce.ev)?;
-                let prev = std::env::var_os(&key);
-                env_restores.push((key.clone(), prev));
-                // SAFETY: single-threaded recipe loop.
-                unsafe {
-                    std::env::set_var(
-                        &key,
-                        <std::ffi::OsStr as OsStrExt>::from_bytes(&value_bytes),
-                    );
-                }
+                let val = var.read().eval_to_buf(self.ce.ev)?;
+                exports.push((
+                    Bytes::from(symv.as_bytes().to_vec()),
+                    Bytes::from(val.to_vec()),
+                ));
             }
         }
-
         let mut commands = self.ce.eval(n)?;
-        // sarun: .ONESHELL — fuse all commands into one shell invocation
-        // so variable/cwd state persists across recipe lines. The first
-        // command's flags (echo, ignore_error) apply to the whole block.
         if self.ce.ev.oneshell && commands.len() > 1 {
             use bytes::{BufMut, BytesMut};
             let mut combined = BytesMut::new();
@@ -282,99 +470,201 @@ impl<'a> Executor<'a> {
                 force_no_subshell: false,
             }];
         }
-        for command in commands {
-            self.num_commands += 1;
-            if command.echo {
-                println!("{}", String::from_utf8_lossy(&command.cmd));
+        Ok((commands, exports))
+    }
+
+    /// Mark `sym` done with timestamp `ts`, then release any dependents whose
+    /// last dep just completed (pushing them onto the ready heap by rank).
+    fn finish_node(
+        &self,
+        graph: &mut HashMap<Symbol, PNode>,
+        sym: Symbol,
+        ts: ExecStatus,
+        ready: &mut std::collections::BinaryHeap<Ready>,
+        done_count: &mut usize,
+    ) {
+        {
+            let p = graph.get_mut(&sym).unwrap();
+            if p.state == PState::Done {
+                return;
             }
-            if !FLAGS.is_dry_run {
-                // sarun: prefer the embedder's in-process runner (brush)
-                // when installed; fall back to fork+exec /bin/sh otherwise.
-                // The installed runner returns only an exit code, not a
-                // signal-bearing ExitStatus — fine because the box's brush
-                // path has no SIGINT/SIGQUIT signaling distinct from a
-                // non-zero code.
-                let (ok, output, code_for_msg) =
-                    if let Some((code, out)) =
-                        run_with_installed_runner(&self.shell, self.shellflag, &command.cmd)
-                    {
-                        (code == 0, out, code)
-                    } else {
-                        let (status, out) = run_command(
-                            &self.shell,
-                            self.shellflag,
-                            &command.cmd,
-                            RedirectStderr::Stdout,
-                        )?;
-                        (status.success(), out, status.code().unwrap_or(1))
-                    };
-                emit_recipe_output(&output);
-                if !ok {
-                    if command.ignore_error {
-                        emit_recipe_err(&format!(
-                            "[{}] Error {} (ignored)",
-                            command.output, code_for_msg
-                        ));
-                    } else {
-                        // sarun: .DELETE_ON_ERROR — remove the target's
-                        // partially-created output file before bailing, and
-                        // announce it the way GNU make does (the `*** ` prefix,
-                        // after the Error line). Phony targets are never on-disk
-                        // so skip them. The output path resolves against the
-                        // Evaluator's working_dir (a -C sub-make's outputs live
-                        // there, not at the process cwd).
-                        emit_recipe_err(&format!(
-                            "*** [{}] Error {}",
-                            command.output, code_for_msg
-                        ));
-                        if self.ce.ev.delete_on_error && !n.lock().is_phony {
-                            let out_bytes = command.output.as_bytes();
-                            let rel = OsStr::from_bytes(&out_bytes);
-                            let path = self.ce.ev.working_dir.join(rel);
-                            if std::fs::exists(&path).unwrap_or(false) {
-                                emit_recipe_err(&format!(
-                                    "*** Deleting file \"{}\"",
-                                    String::from_utf8_lossy(&out_bytes)
-                                ));
-                                let _ = std::fs::remove_file(&path);
-                            }
-                        }
-                        // sarun: was std::process::exit(2) — that would kill the
-                        // engine when running as an in-process builtin. Propagate
-                        // instead; make_main/make_builtin return the code, and
-                        // the standalone rkati main downcasts it to its exit.
-                        return Err(BuildFailed(2).into());
+            p.result = Some(ts);
+            p.state = PState::Done;
+        }
+        *done_count += 1;
+        let dependents = graph[&sym].dependents.clone();
+        for dep in dependents {
+            let now_ready = {
+                let dp = graph.get_mut(&dep).unwrap();
+                if dp.unfinished > 0 {
+                    dp.unfinished -= 1;
+                }
+                dp.unfinished == 0 && dp.state != PState::Done
+            };
+            if now_ready {
+                let r = graph[&dep].rank;
+                ready.push(Ready { rank: r, sym: dep });
+            }
+        }
+    }
+
+    /// The dependency-count scheduler: evaluate ready nodes (lowest DFS-rank
+    /// first), dispatch their recipes to worker threads bounded by `cap` and (if
+    /// present) the engine slip pool, and complete dependents as runs finish.
+    /// At cap=1 this is byte-identical in order to the recursive `exec_node`.
+    fn exec_graph(
+        &mut self,
+        roots: Vec<NamedDepNode>,
+        cap: usize,
+        client: Option<crate::jobserver::Client>,
+    ) -> Result<()> {
+        use std::collections::{BinaryHeap, HashSet};
+
+        let mut graph: HashMap<Symbol, PNode> = HashMap::new();
+        let mut rank = 0usize;
+        let mut visiting: HashSet<Symbol> = HashSet::new();
+        for (_, root) in &roots {
+            self.discover(root, &mut graph, &mut visiting, &mut rank);
+        }
+        let edges: Vec<(Symbol, Vec<Symbol>)> =
+            graph.iter().map(|(s, p)| (*s, p.deps.clone())).collect();
+        for (s, deps) in &edges {
+            graph.get_mut(s).unwrap().unfinished = deps.len();
+        }
+        for (s, deps) in &edges {
+            for d in deps {
+                if let Some(dp) = graph.get_mut(d) {
+                    dp.dependents.push(*s);
+                }
+            }
+        }
+
+        let mut ready: BinaryHeap<Ready> = BinaryHeap::new();
+        for (s, p) in &graph {
+            if p.unfinished == 0 {
+                ready.push(Ready { rank: p.rank, sym: *s });
+            }
+        }
+        let mut run_queue: BinaryHeap<Ready> = BinaryHeap::new();
+        let mut reqs: HashMap<Symbol, RunReq> = HashMap::new();
+        let (tx, rx) = std::sync::mpsc::channel::<(NodeRun, Option<u8>)>();
+        let mut running = 0usize;
+        let mut failed: Option<i32> = None;
+        let mut done_count = 0usize;
+        let total = graph.len();
+
+        loop {
+            // 1. Evaluate ready nodes on the make thread (serial) → done or queued.
+            while failed.is_none() {
+                let Some(Ready { sym, .. }) = ready.pop() else { break };
+                let (ts, runreq) = self.prepare_node(&graph, sym)?;
+                match runreq {
+                    None => self.finish_node(&mut graph, sym, ts, &mut ready, &mut done_count),
+                    Some(req) => {
+                        self.num_commands += req.commands.len() as u64;
+                        let r = graph[&sym].rank;
+                        reqs.insert(sym, req);
+                        run_queue.push(Ready { rank: r, sym });
                     }
                 }
             }
-        }
-
-        for (key, prev) in env_restores.into_iter().rev() {
-            // SAFETY: single-threaded.
-            unsafe {
-                match prev {
-                    Some(v) => std::env::set_var(&key, v),
-                    None => std::env::remove_var(&key),
+            // 2. Dispatch queued recipes, bounded by cap and the slip pool.
+            while running < cap {
+                let Some(sym) = run_queue.peek().map(|r| r.sym) else { break };
+                // First concurrent run uses the implicit token; the rest acquire
+                // a slip from the shared pool (when one is advertised).
+                let slip = if running == 0 {
+                    None
+                } else if let Some(c) = &client {
+                    match c.try_acquire() {
+                        Some(t) => Some(t),
+                        None => break,
+                    }
+                } else {
+                    None
+                };
+                run_queue.pop();
+                let req = reqs.remove(&sym).unwrap();
+                let shell = self.shell.clone();
+                let shellflag = self.shellflag;
+                let txc = tx.clone();
+                std::thread::spawn(move || {
+                    let r = run_node_commands(&shell, shellflag, req);
+                    let _ = txc.send((r, slip));
+                });
+                running += 1;
+            }
+            // 3. Termination.
+            if running == 0 {
+                if !ready.is_empty() || !run_queue.is_empty() {
+                    continue;
                 }
+                if let Some(code) = failed {
+                    return Err(BuildFailed(code).into());
+                }
+                if done_count < total {
+                    error!(
+                        "*** Circular dependency detected -- {} target(s) unbuilt.",
+                        total - done_count
+                    );
+                }
+                break;
+            }
+            // 4. Wait for a recipe to finish; emit its output, handle failure.
+            let (run, slip) = rx.recv().unwrap();
+            running -= 1;
+            if let (Some(c), Some(t)) = (&client, slip) {
+                c.release(t);
+            }
+            emit_recipe_output(&run.out);
+            for (o, c) in &run.ignored {
+                emit_recipe_err(&format!("[{o}] Error {c} (ignored)"));
+            }
+            if let Some((o, code)) = run.failure {
+                emit_recipe_err(&format!("*** [{o}] Error {code}"));
+                if self.ce.ev.delete_on_error {
+                    let is_phony = graph[&run.output].node.lock().is_phony;
+                    if !is_phony {
+                        let out_bytes = o.as_bytes();
+                        let path = self.ce.ev.working_dir.join(OsStr::from_bytes(&out_bytes));
+                        if std::fs::exists(&path).unwrap_or(false) {
+                            emit_recipe_err(&format!(
+                                "*** Deleting file \"{}\"",
+                                String::from_utf8_lossy(&out_bytes)
+                            ));
+                            let _ = std::fs::remove_file(&path);
+                        }
+                    }
+                }
+                failed = Some(2);
+                // Stop launching new work; drain in-flight runs, then bail.
+                ready.clear();
+                run_queue.clear();
+            } else {
+                self.finish_node(&mut graph, run.output, run.result_ts, &mut ready, &mut done_count);
             }
         }
-
-        self.done.insert(output, output_ts);
-        Ok(output_ts)
+        Ok(())
     }
 }
 
 pub fn exec(roots: Vec<NamedDepNode>, ev: &mut Evaluator) -> Result<()> {
     let mut executor = Executor::new(ev)?;
-    for (_sym, root) in &roots {
-        executor.exec_node(root, None)?;
-    }
+    // One engine: a dependency-count scheduler with a worker cap. Parallel only
+    // when -j>1 was explicitly requested; bounded by the engine slip pool when
+    // one is advertised (sarun box), else by the local cap alone (standalone,
+    // like make's own jobserver). No -j ⇒ cap 1 ⇒ serial, byte-identical order
+    // to the old recursion — so the rkati↔make corpus is unaffected.
+    let client = crate::jobserver::Client::from_env();
+    // Parallel when -j>1 was requested OR a parent advertised a jobserver in
+    // MAKEFLAGS (a sub-make inherits parallelism, like GNU make). Plain standalone
+    // `make` with no jobserver stays serial (cap 1), so the corpus is unaffected.
+    let parallel = FLAGS.jobs_explicit || client.is_some();
+    let cap = if parallel { FLAGS.num_jobs.max(1) } else { 1 };
+    let client = if cap > 1 { client } else { None };
+    executor.exec_graph(roots.clone(), cap, client)?;
     // sarun: emit "Nothing to be done" only for roots whose rule has no
-    // commands at all (or which had no rule). If the rule had commands
-    // but they were skipped because the file was up-to-date, GNU make
-    // stays silent under -s (or prints "<target> is up to date"
-    // otherwise); kati's old unconditional message diverged on every
-    // benign incremental rebuild.
+    // commands at all (or which had no rule).
     if executor.num_commands == 0 {
         for (sym, root) in roots {
             let node = root.lock();

@@ -470,7 +470,7 @@ fn emit_build_edges_kati(roots: &[NamedDepNode]) {
 /// as gnu make / standalone rkati do. Process-global + idempotent (last wins);
 /// safe to call from both the shadow entry and the builtin.
 fn install_make_recipe_runner() {
-    kati::fileutil::install_recipe_runner(Arc::new(|shell, _shellflag, cmd, output_cb| {
+    kati::fileutil::install_recipe_runner(Arc::new(|shell, _shellflag, cmd, cwd, output_cb| {
         use kati::fileutil::RecipeRunnerDecision;
         let shell_base = std::path::Path::new(std::ffi::OsStr::from_bytes(shell))
             .file_name()
@@ -483,6 +483,12 @@ fn install_make_recipe_runner() {
         let s = std::str::from_utf8(cmd)
             .map(std::borrow::Cow::Borrowed)
             .unwrap_or_else(|_| String::from_utf8_lossy(cmd));
+        // The recipe cwd is threaded EXPLICITLY from kati (the make's working_dir)
+        // rather than read from a make-thread thread-local — under -j the recipe
+        // runs on a worker thread that wouldn't see it. Set it for THIS worker
+        // thread around the run (save/restore so nested makes nest cleanly).
+        let cwd_path = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(cwd));
+        let prev = crate::brush::set_box_recipe_cwd(Some(cwd_path));
         // bundle_coreutils=false: see brush::box_builtins_opt. uutils
         // localization caches each util's FluentResource in a process-
         // global OnceLock; the first util to run owns it, every later
@@ -490,6 +496,7 @@ fn install_make_recipe_runner() {
         // `cp-error-cannot-stat`). For make recipes we accept the
         // fork+exec overhead in exchange for bash-compatible stderr.
         let code = crate::brush::run_recipe_in_process_opt(&s, output_cb, false);
+        crate::brush::set_box_recipe_cwd(prev);
         RecipeRunnerDecision::Ran { code }
     }));
 }
