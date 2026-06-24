@@ -2216,7 +2216,14 @@ fn emit_bash_compat(line: &[u8], output_cb: &mut dyn FnMut(&[u8])) {
 /// (no signal path for a brush recipe; n2's SIGINT handling is suppressed in
 /// embedded mode).
 pub fn n2_executor(cmdline: &str, output_cb: &mut dyn FnMut(&[u8])) -> n2::process::Termination {
-    if run_recipe_in_process(cmdline, output_cb) == 0 {
+    // n2 runs each recipe on a fresh worker thread that carries n2's logical
+    // build dir (graph::set_cwd). Mirror it into the recipe cwd so the brush
+    // shell runs the command from the build dir (this thread's BOX_RECIPE_CWD
+    // is otherwise unset). Restore on the way out.
+    let prev = set_box_recipe_cwd(n2::graph::get_cwd());
+    let code = run_recipe_in_process(cmdline, output_cb);
+    set_box_recipe_cwd(prev);
+    if code == 0 {
         n2::process::Termination::Success
     } else {
         n2::process::Termination::Failure

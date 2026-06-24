@@ -113,15 +113,14 @@ pub fn n2_main(argv: &[String]) -> i32 {
 /// make_builtin. Dispatched when brush runs `ninja` (a recipe's `ninja`, or a
 /// cmake/configure step), so it stays in THIS process. Drives n2 via the
 /// already-`pub` in-memory entries (`load::read` + `run_state`) instead of
-/// `n2::run::run()` (which reads the PROCESS argv) — recipes route through the
-/// brush executor at the build dir (BOX_RECIPE_CWD).
+/// `n2::run::run()` (which reads the PROCESS argv).
 ///
-/// LIMITATION (logical cwd): n2 stats files and prints progress against the
-/// PROCESS cwd/stdout, so this is only correct when the build dir IS the process
-/// cwd and ninja is the top-level box command (its stdout reaches the box). A
-/// recursive/`-C`/recipe-nested ninja whose build dir differs is rejected with a
-/// visible error pending the n2 logical-cwd + output-routing de-globalization
-/// (n2's stat is centralized at graph::stat, so that is the tractable next step).
+/// Logical cwd: rather than chdir the engine, the build dir is threaded into n2
+/// as a thread-local (`n2::graph::set_cwd`) that every filesystem touch resolves
+/// relative paths against (stat, build-file/depfile reads, .n2_db, rspfiles,
+/// output dirs). The same dir is set as the recipe cwd (`BOX_RECIPE_CWD`) so a
+/// recipe's commands run through brush at the build dir. A `-C <dir>` shifts the
+/// build dir; relative `-C` joins onto `base_cwd` (the brush context's dir).
 pub fn ninja_builtin(
     argv: &[String],
     base_cwd: &std::path::Path,
@@ -132,6 +131,9 @@ pub fn ninja_builtin(
 
     let mut build_file = String::from("build.ninja");
     let mut targets: Vec<String> = Vec::new();
+    // The logical build dir, shifted by each `-C` (relative ones chain, exactly
+    // as real ninja applies repeated -C left to right).
+    let mut build_dir = base_cwd.to_path_buf();
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
@@ -147,12 +149,10 @@ pub fn ninja_builtin(
                 i += 2;
             }
             "-C" => {
-                let _ = writeln!(
-                    err,
-                    "ninja: the in-process builtin does not support -C yet \
-                     (logical cwd pending)"
-                );
-                return 1;
+                if let Some(dir) = argv.get(i + 1) {
+                    build_dir = build_dir.join(dir);
+                }
+                i += 2;
             }
             // Flags that take a value: skip the value too (best-effort).
             "-j" | "-k" | "-l" | "-d" | "-t" | "-w" => i += 2,
@@ -164,39 +164,31 @@ pub fn ninja_builtin(
         }
     }
 
-    // n2 resolves/stats relative to the PROCESS cwd; only safe when that IS the
-    // build dir (the top-level box ninja). Reject otherwise, visibly.
-    let proc_cwd = std::env::current_dir().unwrap_or_default();
-    if base_cwd != proc_cwd {
-        let _ = writeln!(
-            err,
-            "ninja: the in-process builtin requires the build dir to be the \
-             process cwd (logical cwd not yet supported)"
-        );
-        return 1;
-    }
+    // Thread the build dir into n2 so every filesystem touch (stat, build-file
+    // and depfile reads, .n2_db, rspfiles, output dirs) resolves against it
+    // without the engine chdir'ing. n2 carries this onto each recipe's worker
+    // thread, and n2_executor derives the recipe's run cwd from it. Saved and
+    // restored so a nested or sibling build is unaffected.
+    let prev_cwd = n2::graph::set_cwd(Some(build_dir.clone()));
 
-    let bf = base_cwd.join(&build_file);
-    let bf_str = bf.to_string_lossy().into_owned();
-    emit_build_edges(&bf_str);
+    // build_file resolves against build_dir via n2's now-cwd-aware reads, so
+    // pass it as-is (relative or absolute).
+    emit_build_edges(&build_file);
 
-    let prev = crate::brush::set_box_recipe_cwd(Some(base_cwd.to_path_buf()));
-    let state = match n2::load::read(&bf_str) {
-        Ok(s) => s,
-        Err(e) => {
-            let _ = writeln!(err, "ninja: {e:#}");
-            crate::brush::set_box_recipe_cwd(prev);
-            return 1;
-        }
+    let result = match n2::load::read(&build_file) {
+        Ok(state) => n2::run::run_state(state, &targets),
+        Err(e) => Err(e),
     };
-    let code = match n2::run::run_state(state, &targets) {
+
+    n2::graph::set_cwd(prev_cwd);
+
+    let code = match result {
         Ok(c) => c,
         Err(e) => {
             let _ = writeln!(err, "ninja: {e:#}");
             1
         }
     };
-    crate::brush::set_box_recipe_cwd(prev);
     let _ = out.flush();
     code
 }
