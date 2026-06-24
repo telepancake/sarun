@@ -128,7 +128,8 @@ fn run(targets: &[Symbol], cl_vars: &Vec<Bytes>, orig_args: OsString) -> Result<
     // $(MAKEFILE_LIST) (e.g. `echo  Makefile` instead of `echo Makefile`).
     let mut makefile_list = BytesMut::new();
     makefile_list.put_slice(FLAGS.makefile.lock().clone().unwrap().as_bytes());
-    intern("MAKEFILE_LIST").set_global_var(
+    ev.set_global_var(
+        intern("MAKEFILE_LIST"),
         Variable::with_simple_string(
             makefile_list.freeze(),
             VarOrigin::File,
@@ -141,7 +142,8 @@ fn run(targets: &[Symbol], cl_vars: &Vec<Bytes>, orig_args: OsString) -> Result<
     for (k, v) in std::env::vars_os() {
         let v = Bytes::from(v.as_bytes().to_vec());
         let val = Arc::new(Value::Literal(None, v.clone()));
-        intern(k.as_bytes().to_vec()).set_global_var(
+        ev.set_global_var(
+            intern(k.as_bytes().to_vec()),
             Variable::new_recursive(
                 val,
                 VarOrigin::Environment,
@@ -339,7 +341,7 @@ fn run(targets: &[Symbol], cl_vars: &Vec<Bytes>, orig_args: OsString) -> Result<
     // visible to recipe environments. Stage them all here, before the
     // explicit-exports loop (which can still override with unexport).
     if ev.export_all_vars {
-        let all = kati::symtab::get_symbol_names(|v| {
+        let all = ev.get_symbol_names(|v| {
             !matches!(
                 v.read().origin(),
                 kati::var::VarOrigin::Default | kati::var::VarOrigin::Automatic

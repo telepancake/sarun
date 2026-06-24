@@ -18,14 +18,11 @@ use std::{
     collections::HashMap,
     fmt::{Debug, Display},
     num::NonZeroUsize,
-    sync::LazyLock,
+    sync::{Arc, LazyLock},
     vec,
 };
 
-use crate::{
-    error,
-    var::{Var, VarOrigin, Variable},
-};
+use crate::var::Var;
 use anyhow::Result;
 use bytes::{BufMut, Bytes, BytesMut};
 use parking_lot::Mutex;
@@ -62,74 +59,58 @@ impl Symbol {
         r.symbols[self.0.get()].clone()
     }
 
-    pub fn peek_global_var(&self) -> Option<Var> {
-        let r = SYMTAB.lock();
-        r.symbol_data.get(self.0.get())?.clone()
+    /// sarun: the interned id, used to index an Evaluator's per-instance
+    /// global-variable store (see Evaluator::global_vars). The variable
+    /// bindings used to live here in the symtab; they now live per-Evaluator.
+    pub fn index(&self) -> usize {
+        self.0.get()
     }
 
-    pub fn get_global_var(&self) -> Option<Var> {
-        let v = {
-            let r = SYMTAB.lock();
-            r.symbol_data.get(self.0.get())?.clone()?
-        };
-        match v.read().origin() {
-            VarOrigin::Environment | VarOrigin::EnvironmentOverride => {
-                crate::var::USED_ENV_VARS.lock().insert(*self);
-            }
-            _ => {}
-        }
-        Some(v)
-    }
-
-    pub fn set_global_var(
-        &self,
-        var: Var,
-        is_override: bool,
-        readonly: Option<&mut bool>,
-    ) -> Result<()> {
-        let mut r = SYMTAB.lock();
-        r.set_global_var(self, var, is_override, readonly)
-    }
-    /// sarun: drop a variable's binding so `$(flavor X)` returns
-    /// "undefined". Used by the `undefine` directive (GNU make 3.82+).
-    pub fn clear_global_var(&self) {
-        let mut r = SYMTAB.lock();
-        let idx = self.0.get();
-        if idx < r.symbol_data.len() {
-            r.symbol_data[idx] = None;
-        }
+    /// sarun: rebuild a Symbol from an id produced by `index()`. None for id 0
+    /// (the reserved empty symbol).
+    pub fn from_index(idx: usize) -> Option<Symbol> {
+        Some(Symbol(NonZeroUsize::new(idx)?))
     }
 }
 
+/// sarun: a temporary override of a global variable binding, restored on Drop.
+/// Operates on an Evaluator's per-instance store (an Arc<Mutex<…>> handle to
+/// Evaluator::global_vars) so the Drop restore needs no &Evaluator — which is
+/// what lets it survive `?`-early-returns. Used for $@/$(D)/$(F) under
+/// .SECONDEXPANSION and for foreach/call temp vars.
 pub struct ScopedGlobalVar {
-    sym: Symbol,
+    store: Arc<Mutex<Vec<Option<Var>>>>,
+    idx: usize,
     orig: Option<Var>,
 }
 
 impl ScopedGlobalVar {
-    pub fn new(sym: Symbol, var: Var) -> Result<Self> {
-        let orig = sym.peek_global_var();
-        let mut symtab = SYMTAB.lock();
-        let idx = sym.0.get();
-        if idx >= symtab.symbol_data.len() {
-            symtab.symbol_data.resize(idx + 1, None);
-        }
-        symtab.symbol_data[idx] = Some(var);
-        Ok(Self { sym, orig })
+    pub fn new(store: Arc<Mutex<Vec<Option<Var>>>>, sym: Symbol, var: Var) -> Result<Self> {
+        let idx = sym.index();
+        let orig = {
+            let mut s = store.lock();
+            if idx >= s.len() {
+                s.resize(idx + 1, None);
+            }
+            let orig = s[idx].clone();
+            s[idx] = Some(var);
+            orig
+        };
+        Ok(Self { store, idx, orig })
     }
 }
 
 impl Drop for ScopedGlobalVar {
     fn drop(&mut self) {
-        let mut r = SYMTAB.lock();
-        let idx = self.sym.0.get();
-        r.symbol_data[idx] = self.orig.clone();
+        let mut s = self.store.lock();
+        if self.idx < s.len() {
+            s[self.idx] = self.orig.clone();
+        }
     }
 }
 
 struct Symtab {
     symbols: Vec<Bytes>,
-    symbol_data: Vec<Option<Var>>,
     symtab: HashMap<Bytes, Symbol>,
 }
 
@@ -137,7 +118,6 @@ impl Symtab {
     fn new() -> Self {
         let mut symtab = Self {
             symbols: vec![Bytes::new()],
-            symbol_data: vec![],
             symtab: HashMap::new(),
         };
         for i in 1u8..=255 {
@@ -147,35 +127,10 @@ impl Symtab {
             symtab.symbols.push(name.clone());
             symtab.symtab.insert(name, sym);
         }
-
-        let shell_status_sym = symtab.intern(".SHELLSTATUS");
-        symtab
-            .set_global_var(
-                &shell_status_sym,
-                Variable::new_shell_status_var(),
-                false,
-                None,
-            )
-            .unwrap();
-        let variables_sym = symtab.intern(".VARIABLES");
-        symtab
-            .set_global_var(
-                &variables_sym,
-                Variable::new_variable_names(b".VARIABLES", true),
-                false,
-                None,
-            )
-            .unwrap();
-        let symbols_sym = symtab.intern(".KATI_SYMBOLS");
-        symtab
-            .set_global_var(
-                &symbols_sym,
-                Variable::new_variable_names(b".KATI_SYMBOLS", false),
-                false,
-                None,
-            )
-            .unwrap();
-
+        // sarun: the builtin special vars (.SHELLSTATUS/.VARIABLES/.KATI_SYMBOLS)
+        // are no longer seeded here. Variable bindings are per-Evaluator now, so
+        // Evaluator::seed_special_vars installs them; the symtab is purely the
+        // name<->id interner.
         symtab
     }
 
@@ -193,49 +148,6 @@ impl Symtab {
         sym
     }
 
-    fn set_global_var(
-        &mut self,
-        sym: &Symbol,
-        var: Var,
-        is_override: bool,
-        readonly: Option<&mut bool>,
-    ) -> Result<()> {
-        let idx = sym.0.get();
-        if idx >= self.symbol_data.len() {
-            self.symbol_data.resize(idx + 1, None);
-        }
-        let entry = self.symbol_data.get_mut(idx).unwrap();
-        if let Some(orig) = entry {
-            if orig.read().readonly {
-                if let Some(readonly) = readonly {
-                    *readonly = true;
-                } else {
-                    error!("*** cannot assign to readonly variable: {sym}");
-                }
-                return Ok(());
-            } else if let Some(readonly) = readonly {
-                *readonly = false;
-            }
-            let origin = orig.read().origin();
-            if !is_override
-                && (origin == VarOrigin::Override || origin == VarOrigin::EnvironmentOverride)
-            {
-                return Ok(());
-            }
-            if origin == VarOrigin::CommandLine && var.read().origin() == VarOrigin::File {
-                return Ok(());
-            }
-            // sarun: $(eval) inside $(call) often does `1:=newval` to
-            // rebind the call arg. Real make accepts the override; when
-            // the surrounding ScopedGlobalVar later drops, the original
-            // Automatic binding is restored.
-            if origin == VarOrigin::Automatic {
-                // fall through — overwrite the entry below.
-            }
-        }
-        *entry = Some(var);
-        Ok(())
-    }
 }
 
 pub fn intern<T: Into<Bytes> + AsRef<[u8]>>(s: T) -> Symbol {
@@ -255,21 +167,6 @@ pub fn join_symbols(symbols: &[Symbol], sep: &[u8]) -> Bytes {
         r.put_slice(&s.as_bytes());
     }
     r.freeze()
-}
-
-pub fn get_symbol_names<T: Fn(Var) -> bool>(filter: T) -> Vec<(Symbol, Bytes)> {
-    let s = SYMTAB.lock();
-    s.symbols
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, str)| {
-            let var = s.symbol_data.get(idx)?.clone()?;
-            if !filter(var) {
-                return None;
-            }
-            Some((Symbol(NonZeroUsize::new(idx).unwrap()), str.clone()))
-        })
-        .collect::<Vec<_>>()
 }
 
 pub fn symbol_count() -> usize {
