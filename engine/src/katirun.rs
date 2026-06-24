@@ -192,8 +192,14 @@ fn run_kati(
     targets: &[Symbol],
     cl_vars: &[bytes::Bytes],
     makefile: &OsStr,
+    working_dir: &std::path::Path,
 ) -> anyhow::Result<RunKatiResult> {
     let mut ev = Evaluator::new();
+    // sarun: the Evaluator seeds working_dir from the process cwd; override it
+    // with the caller's logical working dir. For the shadow path this equals the
+    // process cwd; for the in-process builtin it's the make's dir resolved from
+    // -C against the brush context's cwd (no process chdir).
+    ev.working_dir = working_dir.to_path_buf();
     ev.start()?;
 
     // sarun: GNU make's MAKEFILE_LIST has no leading space — the main
@@ -451,23 +457,20 @@ fn emit_build_edges_kati(roots: &[NamedDepNode]) {
     crate::runner::send_nested_prov(format!("{msg}\n").as_bytes());
 }
 
-/// The embedded-make entrypoint. `argv` is the FULL process argv (argv[0] is
-/// `make`/`gmake`). Returns the process exit code.
-pub fn make_main(argv: &[String]) -> i32 {
-    // 1. Install brush as kati's in-process recipe runner so kati::exec::exec
-    //    runs every recipe IN-PROCESS via embedded brush (NO fork+exec of
-    //    /bin/sh per recipe; NO ninja+n2 layer in the box make path). Captures
-    //    merged stdout+stderr through brush's pipe machinery and forwards to
-    //    THIS process's stdout — kati's exec.rs then `print!`s those bytes,
-    //    matching standalone rkati's byte-for-byte recipe output.
-    //
-    //    Honors `SHELL := ...` from the makefile: if SHELL is anything other
-    //    than a /bin/sh-shaped path (sh, bash, dash, ash, ksh, zsh), the
-    //    runner declines (returns Passthrough) and kati's exec.rs falls back
-    //    to the classic fork+exec path — so makefiles that use SHELL=echo or
-    //    SHELL=/path/to/custom-tool still work the way gnu make and standalone
-    //    rkati do.
-    kati::fileutil::install_recipe_runner(Box::new(|shell, _shellflag, cmd, output_cb| {
+/// Install brush as kati's in-process recipe runner so kati::exec::exec runs
+/// every recipe IN-PROCESS via embedded brush (NO fork+exec of /bin/sh per
+/// recipe). Merged stdout+stderr flow through brush's pipe machinery to the
+/// `output_cb` kati provides; kati then routes them via `emit_recipe_output`
+/// (process stdout for the shadow path, or an in-process builtin's logical
+/// stdout when one set the thread-local sink).
+///
+/// Honors `SHELL := ...`: anything other than a /bin/sh-shaped path (sh, bash,
+/// dash, ash, ksh, zsh) makes the runner decline (Passthrough) so kati's
+/// exec.rs falls back to fork+exec — makefiles using SHELL=echo etc. still work
+/// as gnu make / standalone rkati do. Process-global + idempotent (last wins);
+/// safe to call from both the shadow entry and the builtin.
+fn install_make_recipe_runner() {
+    kati::fileutil::install_recipe_runner(Arc::new(|shell, _shellflag, cmd, output_cb| {
         use kati::fileutil::RecipeRunnerDecision;
         let shell_base = std::path::Path::new(std::ffi::OsStr::from_bytes(shell))
             .file_name()
@@ -489,6 +492,12 @@ pub fn make_main(argv: &[String]) -> i32 {
         let code = crate::brush::run_recipe_in_process_opt(&s, output_cb, false);
         RecipeRunnerDecision::Ran { code }
     }));
+}
+
+/// The embedded-make entrypoint. `argv` is the FULL process argv (argv[0] is
+/// `make`/`gmake`). Returns the process exit code.
+pub fn make_main(argv: &[String]) -> i32 {
+    install_make_recipe_runner();
 
     // 2. Recognized make pseudo-actions BEFORE kati's flags parser sees them
     //    (kati panics on anything it doesn't recognize, e.g. --version). The
@@ -598,7 +607,10 @@ pub fn make_main(argv: &[String]) -> i32 {
     //    corpus tests.
     let targets: Vec<Symbol> = flags.targets.clone();
     let cl_vars: Vec<bytes::Bytes> = flags.cl_vars.clone();
-    let run_result = match run_kati(&targets, &cl_vars, &makefile) {
+    // sarun: shadow/main() path — working dir is the process cwd (already
+    // chdir'd for -C above), so this matches the Evaluator's own default.
+    let shadow_cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
+    let run_result = match run_kati(&targets, &cl_vars, &makefile, &shadow_cwd) {
         Ok(r) => r,
         Err(e) => {
             for cause in e.chain() {
@@ -635,4 +647,125 @@ pub fn make_main(argv: &[String]) -> i32 {
         return 2;
     }
     code
+}
+
+/// In-process `make`/`gmake` brush builtin entry. Unlike `make_main` (the
+/// shadow/process path), this runs make WITHOUT mutating process state: the
+/// working dir comes from the brush ExecutionContext (resolved with -C, no
+/// chdir) and recipe output is routed to the context's fd 1 — so a recursive
+/// `$(MAKE)` in a recipe, or `make` invoked by a configure/cmake script, stays
+/// in THIS process at the right directory instead of re-exec'ing the engine.
+///
+/// `base_cwd` is the brush shell's logical cwd; `out`/`err` are its fd 1/2;
+/// `recipe_out` is a second handle on fd 1 used as the recipe-output sink.
+pub fn make_builtin(
+    argv: &[String],
+    base_cwd: &std::path::Path,
+    mut out: impl std::io::Write,
+    mut err: impl std::io::Write,
+    recipe_out: Box<dyn std::io::Write>,
+) -> i32 {
+    install_make_recipe_runner();
+
+    // make pseudo-actions handled before kati's flag parser (which panics on
+    // unknown flags). --version short-circuits to the gnu-shaped banner.
+    for a in argv.iter().skip(1) {
+        if a == "--version" || a == "-v" {
+            let _ = writeln!(out, "GNU Make 4.3");
+            let _ = writeln!(out, "Built for x86_64-pc-linux-gnu");
+            let _ = writeln!(out, "Copyright (C) 1988-2020 Free Software Foundation, Inc.");
+            let _ = writeln!(out, "License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>");
+            let _ = writeln!(out, "This is free software: you are free to change and redistribute it.");
+            let _ = writeln!(out, "There is NO WARRANTY, to the extent permitted by law.");
+            return 0;
+        }
+    }
+
+    let kargv = match kati_argv(argv) {
+        Ok(v) => v,
+        Err(msg) => {
+            let _ = writeln!(err, "{msg}");
+            return 2;
+        }
+    };
+    let _ = kati::flags::install_args(kargv.clone());
+    let flags = kati::flags::Flags::from_args(kargv);
+
+    // Resolve -C against the context cwd (NO process chdir). flags.working_dir
+    // is kati's parsed -C value.
+    let mut working_dir = base_cwd.to_path_buf();
+    if let Some(c) = &flags.working_dir {
+        let p = std::path::Path::new(c);
+        working_dir = if p.is_absolute() { p.to_path_buf() } else { working_dir.join(p) };
+    }
+
+    // Makefile: explicit -f, else discover GNUmakefile/makefile/Makefile in the
+    // working dir. Stored as the name kati interns (relative); the fs read
+    // resolves it against working_dir (Evaluator.working_dir / file_cache).
+    let makefile: OsString = match flags.makefile.lock().clone() {
+        Some(m) => m,
+        None => {
+            let mut found = None;
+            for cand in ["GNUmakefile", "makefile", "Makefile"] {
+                if std::fs::metadata(working_dir.join(cand)).is_ok() {
+                    found = Some(OsString::from(cand));
+                    break;
+                }
+            }
+            match found {
+                Some(m) => m,
+                None => {
+                    let _ = writeln!(
+                        err,
+                        "sarun-engine make: no makefile found (and none given with -f)"
+                    );
+                    return 2;
+                }
+            }
+        }
+    };
+    if std::fs::metadata(working_dir.join(&makefile)).is_err() {
+        let display = makefile.to_string_lossy();
+        let _ = writeln!(err, "make: {display}: No such file or directory");
+        let _ = writeln!(err, "make: *** No rule to make target '{display}'.");
+        return 2;
+    }
+
+    // Route recipe stdout to the context's fd 1 and recipes' cwd to working_dir
+    // for the duration of THIS make; save/restore so a nested recursive $(MAKE)
+    // (which lands here again, on its own brush worker thread) nests cleanly.
+    let prev_out = kati::exec::set_recipe_out(Some(recipe_out));
+    let prev_cwd = crate::brush::set_box_recipe_cwd(Some(working_dir.clone()));
+
+    let targets: Vec<Symbol> = flags.targets.clone();
+    let cl_vars: Vec<bytes::Bytes> = flags.cl_vars.clone();
+    let result = run_kati(&targets, &cl_vars, &makefile, &working_dir);
+
+    kati::exec::set_recipe_out(prev_out);
+    crate::brush::set_box_recipe_cwd(prev_cwd);
+
+    match result {
+        Ok(r) => {
+            if r.remake_active {
+                // The shadow path re-execs the engine to re-parse with the
+                // generated includes; a builtin can't re-exec the brush process.
+                // Until an in-process remake loop lands, surface this VISIBLY
+                // rather than silently producing a stale build.
+                let _ = writeln!(
+                    err,
+                    "sarun-engine make: self-generating includes (remake) not yet \
+                     supported by the in-process builtin"
+                );
+                return 2;
+            }
+            let _ = out.flush();
+            0
+        }
+        Err(e) => {
+            for cause in e.chain() {
+                let _ = writeln!(err, "{cause}");
+            }
+            1
+        }
+    }
 }

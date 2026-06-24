@@ -179,12 +179,13 @@ def main():
               "case1: NO /bin/sh process row — recipe ran in-process (no shell fork)")
         check(not has_external(sp1, "echo"),
               "case1: NO external echo process row")
-        # The box's top-level command `make` IS the shadowed engine binary
-        # running kati in-process — so EXACTLY ONE `make` process row exists (the
-        # top-level shadow itself); a real-make fallback would fork a SECOND.
-        check(count_basename(sp1, "make") == 1,
-              f"case1: exactly one `make` row — the top-level shadow, no forked "
-              f"real make (kati ran in-process) (count={count_basename(sp1, 'make')})")
+        # In a -b box the top-level `make` is dispatched to the in-process make
+        # BUILTIN (brush), so kati runs inside the engine process — there is NO
+        # separate `make` process at all. ZERO `make` rows; any fork (a real
+        # make, or a fallback) would show at least one.
+        check(count_basename(sp1, "make") == 0,
+              f"case1: no `make` process row — make ran fully in-process via the "
+              f"builtin (count={count_basename(sp1, 'make')})")
 
         # ── CASE 2: coreutil recipe (cp) in-process ─────────────────────────
         (work / "src.txt").write_text("payload\n")
@@ -291,6 +292,31 @@ def main():
         check(count_basename(sp5, "make") <= 1,
               f"case5: at most one `make` row (the top-level shadow) — NO real "
               f"`make` forked as fallback (count={count_basename(sp5, 'make')})")
+
+        # ── CASE 6: recursive $(MAKE) stays IN-PROCESS via the make builtin ──
+        # The top-level make (the box's shadowed engine) runs a recipe that
+        # invokes a sub-make. brush dispatches that `make` to the in-process
+        # MakeBuiltin instead of exec'ing the shadowed /usr/bin/make — so the
+        # sub-make runs in THIS process: exactly ONE `make` row total (not two),
+        # and the sub-make's recipe runs correctly at the right directory.
+        (work / "subout.txt").unlink(missing_ok=True)
+        (work / "sub.mk").write_text("sub:\n\techo subok > subout.txt\n")
+        (work / "Makefile").write_text("all:\n\t$(MAKE) -f sub.mk\n")
+        r = run_make("MAKE6", work)
+        check(r.returncode == 0,
+              f"case6: recursive make box exits 0 (got {r.returncode}: {r.stderr[-600:]})")
+        sp6 = latest_sqlar(m)
+        rels = str((work / "subout.txt").resolve()).lstrip("/")
+        check(m.sqlar_content(sp6, rels) == b"subok\n",
+              f"case6: sub-make ran in-process (subout.txt='subok') "
+              f"({m.sqlar_content(sp6, rels)!r})")
+        # ZERO make rows: BOTH the top-level make and the recursive $(MAKE)
+        # dispatched to the in-process builtin. Without the builtin the recursive
+        # $(MAKE) would fork a second engine-as-make (a `make` row); with it the
+        # whole recursive build stays in one process.
+        check(count_basename(sp6, "make") == 0,
+              f"case6: recursive $(MAKE) stayed in-process — no `make` process "
+              f"row (count={count_basename(sp6, 'make')}); a fork would show one")
     finally:
         if eng is not None and eng.poll() is None:
             eng.terminate()

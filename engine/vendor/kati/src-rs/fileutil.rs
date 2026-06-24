@@ -48,7 +48,11 @@ pub enum RecipeRunnerDecision {
     Passthrough,
 }
 
-pub type RecipeRunner = Box<
+// sarun: Arc (not Box) so run_with_installed_runner can clone the runner out
+// and RELEASE the lock before invoking it — a recursive in-process make's
+// recipes re-enter run_with_installed_runner, and holding this non-reentrant
+// lock across the call would deadlock.
+pub type RecipeRunner = Arc<
     dyn Fn(&[u8] /* shell */, &[u8] /* shellflag */, &[u8] /* cmd */, &mut dyn FnMut(&[u8]))
         -> RecipeRunnerDecision
         + Send
@@ -75,8 +79,10 @@ pub fn run_with_installed_runner(
     shellflag: &[u8],
     cmd: &[u8],
 ) -> Option<(i32, Vec<u8>)> {
-    let guard = RECIPE_RUNNER.lock();
-    let runner = guard.as_ref()?;
+    // sarun: clone the runner Arc and RELEASE the lock before invoking it. The
+    // runner may run a recursive in-process make whose recipes re-enter here;
+    // holding this non-reentrant lock across the call would deadlock.
+    let runner = RECIPE_RUNNER.lock().as_ref()?.clone();
     let mut out = Vec::new();
     match runner(shell, shellflag, cmd, &mut |b| out.extend_from_slice(b)) {
         RecipeRunnerDecision::Ran { code } => Some((code, out)),
