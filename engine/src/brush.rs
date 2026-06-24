@@ -1601,7 +1601,11 @@ pub fn inner_brush(conn_fd: i32, cmd: Vec<String>) -> i32 {
     // 2. Run through embedded brush (async; tokio multi-thread runtime).
     //    Parse errors and execution errors surface visibly.
     let script = script_from_argv(&cmd);
+    // 64 MiB worker stacks: the box's top command may be a `make` whose kati
+    // parse/eval recurses deeply on big Makefiles (busybox/kernel), overflowing
+    // the default 2 MiB tokio worker stack.
     let rt = tokio::runtime::Builder::new_multi_thread()
+        .thread_stack_size(64 * 1024 * 1024)
         .enable_all().build();
     let code = match rt {
         Ok(rt) => rt.block_on(run_brush(conn_fd, script)),
@@ -2003,7 +2007,10 @@ static N2_RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock
 
 fn n2_runtime() -> Option<&'static tokio::runtime::Runtime> {
     N2_RT.get_or_init(|| {
+        // 64 MiB worker stacks: recipes run here may be recursive sub-makes whose
+        // kati parse recurses deeply; the default 2 MiB tokio stack overflows.
         tokio::runtime::Builder::new_multi_thread()
+            .thread_stack_size(64 * 1024 * 1024)
             .enable_all().build()
             .expect("sarun-engine n2: tokio runtime")
     });

@@ -92,6 +92,19 @@ impl DepNode {
     }
 }
 
+// sarun: per-thread build_plan recursion depth, to catch runaway dependency
+// chains (deep or non-terminating implicit/suffix-rule searches) before they
+// overflow the stack.
+thread_local! {
+    static DEP_RECURSION: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+struct DepRecursionGuard;
+impl Drop for DepRecursionGuard {
+    fn drop(&mut self) {
+        DEP_RECURSION.with(|c| c.set(c.get().saturating_sub(1)));
+    }
+}
+
 fn replace_suffix(s: Symbol, newsuf: &Symbol) -> Symbol {
     let s = s.as_bytes();
     let s = strip_ext(&s);
@@ -618,9 +631,22 @@ impl<'a> DepBuilder<'a> {
     }
 
     fn exists(&self, target: Symbol) -> bool {
-        self.rules.contains_key(&target)
-            || self.phony.contains(&target)
-            || std::fs::exists(OsStr::from_bytes(&target.as_bytes())).is_ok_and(|v| v)
+        if self.rules.contains_key(&target) || self.phony.contains(&target) {
+            return true;
+        }
+        // sarun: resolve the on-disk check against the make's logical working_dir
+        // (the box context / -C dir), NOT the engine's process cwd — a relative
+        // target like `scripts/kconfig/zconf.tab.c_shipped` lives under the build
+        // dir. Without this, the shipped-file existence check fails and the
+        // pattern-rule chain that would copy it is wrongly rejected.
+        let bytes = target.as_bytes();
+        let p = std::path::Path::new(OsStr::from_bytes(&bytes));
+        let path = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            self.ev.working_dir.join(p)
+        };
+        std::fs::exists(&path).is_ok_and(|v| v)
     }
 
     fn get_rule_inputs(&self, s: Symbol) -> Option<(Vec<Symbol>, Loc)> {
@@ -780,13 +806,23 @@ impl<'a> DepBuilder<'a> {
     /// or implicit) have output matching this symbol? Used by
     /// can_pick_implicit_rule to allow chained pattern rules like
     /// `%.o: %.c` + `%.c:` to build a missing `.c` on demand.
-    fn has_producing_rule(&self, sym: Symbol) -> bool {
+    /// Like a plain producing-rule check but ignores implicit rules whose output
+    /// patterns equal `except`. sarun: GNU make forbids using a pattern rule more
+    /// than once in a chain of implicit rules — so when deciding whether a
+    /// pattern rule's prerequisite is itself makeable, that SAME rule must not
+    /// count as its producer. Without this, a self-feeding pattern like Kbuild's
+    /// `$(obj)/%: $(src)/%_shipped` recurses forever (foo → foo_shipped →
+    /// foo_shipped_shipped → …) until the stack overflows.
+    fn has_producing_rule_except(&self, sym: Symbol, except: &[Symbol]) -> bool {
         if self.rules.contains_key(&sym) {
             return true;
         }
         let bytes = sym.as_bytes();
         let irules = self.implicit_rules.get(&bytes);
         for rule in irules {
+            if !except.is_empty() && rule.output_patterns.as_slice() == except {
+                continue;
+            }
             for output_pattern in &rule.output_patterns {
                 let pat = crate::strutil::Pattern::new(output_pattern.as_bytes());
                 if pat.matches(&bytes) {
@@ -814,11 +850,16 @@ impl<'a> DepBuilder<'a> {
                     let sym = intern(buf);
                     // sarun: accept inputs that don't exist on disk yet
                     // but ARE buildable — either via an explicit rule
-                    // or via some implicit pattern rule whose output
+                    // or via some OTHER implicit pattern rule whose output
                     // pattern matches. Mirrors GNU make's "chained
                     // implicit rule" derivation (a one-step lookahead;
-                    // we don't recurse further to keep it cheap).
-                    if !self.exists(sym) && !self.has_producing_rule(sym) {
+                    // we don't recurse further to keep it cheap). Excluding
+                    // THIS rule's own patterns enforces "no pattern rule twice
+                    // in a chain" — else a self-feeding rule like
+                    // `$(obj)/%: $(src)/%_shipped` would recurse forever.
+                    if !self.exists(sym)
+                        && !self.has_producing_rule_except(sym, &rule.output_patterns)
+                    {
                         ok = false;
                         break;
                     }
@@ -1005,6 +1046,20 @@ impl<'a> DepBuilder<'a> {
         needed_by: Option<Symbol>,
     ) -> Result<Arc<Mutex<DepNode>>> {
         log!("BuildPlan: {output} for {needed_by:?}");
+
+        // sarun: guard runaway dependency recursion (deep/implicit-rule chains)
+        // before it overflows the stack; report the target chain instead of
+        // aborting the process.
+        DEP_RECURSION.with(|c| c.set(c.get() + 1));
+        let _dg = DepRecursionGuard;
+        let dep_depth = DEP_RECURSION.with(|c| c.get());
+        if dep_depth > 800 {
+            return Err(anyhow::anyhow!(
+                "dependency recursion exceeded 800 building '{output}' (needed by {:?}) \
+                 — likely an implicit/suffix-rule chain that never terminates",
+                needed_by
+            ));
+        }
 
         if let Some(found) = self.done.get(&output) {
             return Ok(found.clone());

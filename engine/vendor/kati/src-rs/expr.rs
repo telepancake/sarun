@@ -81,8 +81,48 @@ pub enum Value {
     },
 }
 
+// sarun: guard against runaway expansion recursion (a self-referential variable
+// or macro) BEFORE it overflows the stack. Counts nested Value::eval calls on
+// this thread; on exceeding the limit, bail with a diagnostic naming the
+// construct, instead of aborting the whole process with a stack overflow. The
+// limit is well above any legitimate makefile expansion depth yet below the
+// frame count that exhausts the (64 MiB) recipe-thread stack.
+thread_local! {
+    static EVAL_RECURSION: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+const EVAL_RECURSION_LIMIT: u32 = 6000;
+
+struct EvalDepthGuard;
+impl Drop for EvalDepthGuard {
+    fn drop(&mut self) {
+        EVAL_RECURSION.with(|c| c.set(c.get().saturating_sub(1)));
+    }
+}
+
 impl Evaluable for Value {
     fn eval(&self, ev: &mut Evaluator, out: &mut dyn BufMut) -> Result<()> {
+        let depth = EVAL_RECURSION.with(|c| {
+            let d = c.get() + 1;
+            c.set(d);
+            d
+        });
+        let _g = EvalDepthGuard;
+        if depth > EVAL_RECURSION_LIMIT {
+            let what = match self {
+                Value::Func { fi, .. } => {
+                    format!("$({} …)", String::from_utf8_lossy(fi.name))
+                }
+                Value::SymRef(_, sym) => format!("$({sym})"),
+                Value::VarRef(..) => "a computed variable reference".to_string(),
+                Value::VarSubst { .. } => "a $(var:pat=subst) reference".to_string(),
+                _ => "an expression".to_string(),
+            };
+            return Err(anyhow::anyhow!(
+                "evaluation recursion exceeded {EVAL_RECURSION_LIMIT} expanding \
+                 {what} (at {:?}) — likely a self-referential variable or macro",
+                ev.loc
+            ));
+        }
         match self {
             Value::Literal(_, lit) => out.put_slice(lit),
             Value::List(_, vec) => {
