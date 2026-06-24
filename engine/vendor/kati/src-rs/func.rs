@@ -459,7 +459,15 @@ fn realpath_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) 
     let mut ww = WordWriter::new(out);
     for tok in word_scanner(&text) {
         let tok = <OsStr as OsStrExt>::from_bytes(tok);
-        if let Ok(path) = std::fs::canonicalize(tok) {
+        // sarun: resolve relative names against the logical working_dir before
+        // canonicalizing (was implicitly the process cwd). Identical when
+        // working_dir == cwd.
+        let probe = if std::path::Path::new(tok).is_absolute() {
+            std::path::PathBuf::from(tok)
+        } else {
+            ev.working_dir.join(tok)
+        };
+        if let Ok(path) = std::fs::canonicalize(&probe) {
             ww.write(path.as_os_str().as_bytes());
         }
     }
@@ -470,7 +478,7 @@ fn abspath_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -
     let text = args[0].eval_to_buf(ev)?;
     let mut ww = WordWriter::new(out);
     for tok in word_scanner(&text) {
-        ww.write(&crate::strutil::abs_path(tok)?);
+        ww.write(&crate::strutil::abs_path(tok, &ev.working_dir)?);
     }
     Ok(())
 }
@@ -884,7 +892,15 @@ fn file_read_func(
     out: &mut dyn BufMut,
     rerun: bool,
 ) -> Result<()> {
-    if !std::fs::exists(filename)? {
+    // sarun: read relative to the logical working_dir, not the process cwd.
+    // The recorded command/result keeps the original name. Identical when
+    // working_dir == cwd.
+    let open_path = if std::path::Path::new(filename).is_absolute() {
+        std::path::PathBuf::from(filename)
+    } else {
+        ev.working_dir.join(filename)
+    };
+    if !std::fs::exists(&open_path)? {
         if should_store_command_result(filename.as_bytes()) {
             COMMAND_RESULTS.lock().push(CommandResult {
                 op: CommandOp::ReadMissing,
@@ -899,7 +915,7 @@ fn file_read_func(
         return Ok(());
     }
 
-    let mut buf = std::fs::read(filename)?;
+    let mut buf = std::fs::read(&open_path)?;
     if buf.ends_with(b"\n") {
         buf.pop();
     }

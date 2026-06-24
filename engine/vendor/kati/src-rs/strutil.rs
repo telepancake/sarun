@@ -17,7 +17,7 @@ limitations under the License.
 use anyhow::Result;
 use bytes::{BufMut, Bytes, BytesMut};
 use memchr::{memchr, memchr2, memmem, memrchr};
-use std::{borrow::Cow, env::current_dir, os::unix::ffi::OsStrExt};
+use std::{borrow::Cow, os::unix::ffi::OsStrExt, path::Path};
 
 pub fn is_space(c: char) -> bool {
     ('\t'..='\r').contains(&c) || c == ' '
@@ -382,11 +382,14 @@ pub fn normalize_path(mut o: &[u8]) -> Bytes {
     ret.into()
 }
 
-pub fn abs_path(s: &[u8]) -> Result<Bytes> {
+/// sarun: `base` is the logical working directory to resolve a relative path
+/// against (the Evaluator's working_dir) — was the process cwd. Absolute paths
+/// ignore it. With base == process cwd the result is unchanged.
+pub fn abs_path(s: &[u8], base: &Path) -> Result<Bytes> {
     if s.starts_with(b"/") {
         return Ok(normalize_path(s));
     }
-    let mut o = BytesMut::from(current_dir()?.as_os_str().as_bytes());
+    let mut o = BytesMut::from(base.as_os_str().as_bytes());
     if !s.is_empty() {
         o.put_u8(b'/');
         o.put_slice(s);
