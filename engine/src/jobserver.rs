@@ -112,6 +112,8 @@ pub fn ensure() -> &'static JobServer {
 }
 
 /// The jobserver if it has been created, else None (no build has started one).
+/// Used by the upcoming FUSE-mediated/reaping layer to reach the live pool.
+#[allow(dead_code)]
 pub fn get() -> Option<&'static JobServer> {
     JOBSERVER.get()
 }
@@ -151,14 +153,21 @@ impl JobServer {
     }
 
     /// Total slots (N). 1 ⇒ serial.
+    #[allow(dead_code)]
     pub fn jobs(&self) -> usize {
         self.jobs
     }
 
+    // The acquire/release/fd primitives below are the in-engine client entry
+    // points the upcoming FUSE-mediated, per-pid-attributed pool will drive
+    // (the current consumers — n2 and forked tools — read MAKEFLAGS and touch
+    // the fds directly, so the engine itself does not yet call these).
+    #[allow(dead_code)]
     pub fn read_fd(&self) -> i32 {
         self.read_fd
     }
 
+    #[allow(dead_code)]
     pub fn write_fd(&self) -> i32 {
         self.write_fd
     }
@@ -191,6 +200,7 @@ impl JobServer {
     /// the poll and the read and briefly block us; in practice external grabbers
     /// are rare and also reading, so the byte is there. Correctness (the ≤N
     /// bound and deadlock-freedom) does not depend on the race never happening.
+    #[allow(dead_code)]
     pub fn try_acquire(&self) -> Option<u8> {
         if self.read_fd < 0 || self.jobs <= 1 {
             return None;
@@ -206,6 +216,7 @@ impl JobServer {
     }
 
     /// Return a previously-acquired token to the pool.
+    #[allow(dead_code)]
     pub fn release(&self, token: u8) {
         if self.write_fd < 0 {
             return;

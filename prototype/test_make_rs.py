@@ -445,6 +445,69 @@ def main():
         check(count_basename(sp11, "make") == 0,
               f"case11: both sub-makes stayed in-process, no state clobber "
               f"(make rows={count_basename(sp11, 'make')})")
+
+        # ── CASE 12: ninja -j2 runs recipes IN PARALLEL, bounded by the pool ──
+        # The jobserver makes embedded n2 actually concurrent (the forced -j1 is
+        # lifted under a pool) AND caps it: with -j2 over 4 targets that each
+        # stamp their own start/end wall-clock, the max overlap must be exactly 2
+        # — proving real parallelism (>1) and that the N-token pool bounds it
+        # (not >2). Each recipe writes its OWN .start/.end files (no shared state,
+        # so the measurement itself can't race).
+        js = work / "js"
+        shutil.rmtree(js, ignore_errors=True)
+        js.mkdir(parents=True, exist_ok=True)
+        rule = ("rule slow\n"
+                "  command = date +%s.%N > $out.start ; sleep 0.4 ; "
+                "date +%s.%N > $out.end ; echo ok > $out\n")
+        builds = "".join(f"build t{i}.o: slow\n" for i in range(4))
+        (js / "build.ninja").write_text(rule + builds)
+        r = run_ninja("NINJA12", js, "-j2")
+        check(r.returncode == 0,
+              f"case12: ninja -j2 box exits 0 (got {r.returncode}: {r.stderr[-600:]})")
+        sp12 = latest_sqlar(m)
+
+        def stamp(name):
+            rel = str((js / name).resolve()).lstrip("/")
+            c = m.sqlar_content(sp12, rel)
+            return float(c.strip()) if c else None
+
+        intervals = []
+        for i in range(4):
+            s, e = stamp(f"t{i}.o.start"), stamp(f"t{i}.o.end")
+            if s is not None and e is not None:
+                intervals.append((s, e))
+        # Max concurrency = peak number of intervals overlapping at any instant.
+        events = sorted([(s, 1) for s, _ in intervals] + [(e, -1) for _, e in intervals])
+        cur = peak = 0
+        for _, d in events:
+            cur += d
+            peak = max(peak, cur)
+        check(len(intervals) == 4,
+              f"case12: all 4 recipes stamped start+end (got {len(intervals)})")
+        check(peak >= 2,
+              f"case12: recipes ran IN PARALLEL — embedded n2 -j1 is lifted "
+              f"(peak concurrency={peak})")
+        check(peak <= 2,
+              f"case12: parallelism BOUNDED by the -j2 jobserver pool "
+              f"(peak concurrency={peak}, must be <= 2)")
+        check(count_basename(sp12, "ninja") == 0,
+              f"case12: still in-process (ninja rows={count_basename(sp12, 'ninja')})")
+
+        # ── CASE 13: the jobserver is advertised to recipes via MAKEFLAGS ──────
+        # A parallel `make -j2` must export a jobserver in MAKEFLAGS so that
+        # external consumers a recipe forks (e.g. `gcc -flto=jobserver`) draw from
+        # the SAME pool. Capture what a recipe sees in $MAKEFLAGS and assert the
+        # jobserver auth token is present.
+        (work / "mf.mk").write_text(
+            "all:\n\techo \"[$(MAKEFLAGS)]\" > mf.out\n")
+        r = run_make("MAKE13", work, "-j2", "-f", "mf.mk")
+        check(r.returncode == 0,
+              f"case13: make -j2 box exits 0 (got {r.returncode}: {r.stderr[-600:]})")
+        sp13 = latest_sqlar(m)
+        mf = m.sqlar_content(sp13, str((work / "mf.out").resolve()).lstrip("/"))
+        mf = mf.decode() if mf else ""
+        check("--jobserver-auth=" in mf or "--jobserver-fds=" in mf,
+              f"case13: recipe MAKEFLAGS carries the jobserver (mf={mf!r})")
     finally:
         if eng is not None and eng.poll() is None:
             eng.terminate()
