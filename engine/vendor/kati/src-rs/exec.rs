@@ -40,18 +40,21 @@ use crate::{
 };
 
 thread_local! {
-    // sarun: when set, recipe stdout is written HERE instead of the process
-    // stdout. An in-process `make` builtin sets this to a writer over its brush
-    // ExecutionContext's fd 1, so a recursive/nested make's recipe output flows
-    // up the brush pipe chain rather than escaping to the real terminal.
-    // Default None → the shadow/standalone path prints to process stdout exactly
-    // as before. kati runs recipes synchronously on the make's own thread, so a
-    // thread-local is the correct scope (concurrent makes are on other threads).
+    // sarun: when set, recipe stdout (and $(info)) is written HERE instead of
+    // process stdout; RECIPE_ERR likewise for recipe-failure lines, warnings and
+    // $(warning). An in-process `make` builtin sets these to writers over its
+    // brush ExecutionContext's fd 1/2, so a recursive/nested make's output flows
+    // up the brush pipe chain rather than escaping to the real terminal. Default
+    // None → the shadow/standalone path uses process stdout/stderr exactly as
+    // before. kati runs a make synchronously on one thread, so thread-local is
+    // the correct scope (concurrent makes are on other threads).
     static RECIPE_OUT: std::cell::RefCell<Option<Box<dyn std::io::Write>>> =
+        const { std::cell::RefCell::new(None) };
+    static RECIPE_ERR: std::cell::RefCell<Option<Box<dyn std::io::Write>>> =
         const { std::cell::RefCell::new(None) };
 }
 
-/// sarun: install (or clear) the thread-local recipe-output sink, returning the
+/// sarun: install (or clear) the thread-local recipe-stdout sink, returning the
 /// previous value so a nested make can save/restore it. Pass None to reset.
 pub fn set_recipe_out(
     w: Option<Box<dyn std::io::Write>>,
@@ -59,9 +62,16 @@ pub fn set_recipe_out(
     RECIPE_OUT.with(|c| std::mem::replace(&mut *c.borrow_mut(), w))
 }
 
-/// sarun: emit a recipe's captured stdout — to the thread-local sink if a make
-/// builtin installed one, else to the process stdout (unchanged default).
-fn emit_recipe_output(output: &[u8]) {
+/// sarun: install (or clear) the thread-local recipe-stderr/diagnostics sink.
+pub fn set_recipe_err(
+    w: Option<Box<dyn std::io::Write>>,
+) -> Option<Box<dyn std::io::Write>> {
+    RECIPE_ERR.with(|c| std::mem::replace(&mut *c.borrow_mut(), w))
+}
+
+/// sarun: emit to the thread-local stdout sink if a make builtin installed one,
+/// else to process stdout (unchanged default). Used for recipe stdout + $(info).
+pub(crate) fn emit_recipe_output(output: &[u8]) {
     RECIPE_OUT.with(|c| {
         let mut slot = c.borrow_mut();
         if let Some(w) = slot.as_mut() {
@@ -73,6 +83,39 @@ fn emit_recipe_output(output: &[u8]) {
         }
     });
 }
+
+/// sarun: emit a diagnostic line (recipe-failure, warning, $(warning)) to the
+/// thread-local stderr sink if set, else process stderr. A trailing newline is
+/// appended (callers pass an unterminated line, matching eprintln!).
+pub fn emit_recipe_err(line: &str) {
+    RECIPE_ERR.with(|c| {
+        let mut slot = c.borrow_mut();
+        if let Some(w) = slot.as_mut() {
+            use std::io::Write;
+            let _ = w.write_all(line.as_bytes());
+            let _ = w.write_all(b"\n");
+            let _ = w.flush();
+        } else {
+            eprintln!("{line}");
+        }
+    });
+}
+
+/// sarun: a recipe failed. Propagated (instead of the old `std::process::exit`)
+/// so the in-process make builtin doesn't kill the whole engine process — it
+/// unwinds to make_main/make_builtin, which return `code`. The user-facing
+/// `*** [target] Error N` line is emitted (via emit_recipe_err) before this is
+/// returned, so callers must NOT re-print it.
+#[derive(Debug, Clone, Copy)]
+pub struct BuildFailed(pub i32);
+
+impl std::fmt::Display for BuildFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "build failed (exit {})", self.0)
+    }
+}
+
+impl std::error::Error for BuildFailed {}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ExecStatus {
@@ -268,35 +311,39 @@ impl<'a> Executor<'a> {
                 emit_recipe_output(&output);
                 if !ok {
                     if command.ignore_error {
-                        eprintln!(
+                        emit_recipe_err(&format!(
                             "[{}] Error {} (ignored)",
-                            command.output,
-                            code_for_msg
-                        )
+                            command.output, code_for_msg
+                        ));
                     } else {
                         // sarun: .DELETE_ON_ERROR — remove the target's
-                        // partially-created output file before bailing,
-                        // and announce it the way GNU make does (with
-                        // the same `*** ` prefix and after the Error
-                        // line). Phony targets are never on-disk so
-                        // skip them.
-                        eprintln!(
+                        // partially-created output file before bailing, and
+                        // announce it the way GNU make does (the `*** ` prefix,
+                        // after the Error line). Phony targets are never on-disk
+                        // so skip them. The output path resolves against the
+                        // Evaluator's working_dir (a -C sub-make's outputs live
+                        // there, not at the process cwd).
+                        emit_recipe_err(&format!(
                             "*** [{}] Error {}",
-                            command.output,
-                            code_for_msg
-                        );
+                            command.output, code_for_msg
+                        ));
                         if self.ce.ev.delete_on_error && !n.lock().is_phony {
                             let out_bytes = command.output.as_bytes();
-                            let path = OsStr::from_bytes(&out_bytes);
-                            if std::fs::exists(path).unwrap_or(false) {
-                                eprintln!(
+                            let rel = OsStr::from_bytes(&out_bytes);
+                            let path = self.ce.ev.working_dir.join(rel);
+                            if std::fs::exists(&path).unwrap_or(false) {
+                                emit_recipe_err(&format!(
                                     "*** Deleting file \"{}\"",
                                     String::from_utf8_lossy(&out_bytes)
-                                );
-                                let _ = std::fs::remove_file(path);
+                                ));
+                                let _ = std::fs::remove_file(&path);
                             }
                         }
-                        std::process::exit(2);
+                        // sarun: was std::process::exit(2) — that would kill the
+                        // engine when running as an in-process builtin. Propagate
+                        // instead; make_main/make_builtin return the code, and
+                        // the standalone rkati main downcasts it to its exit.
+                        return Err(BuildFailed(2).into());
                     }
                 }
             }

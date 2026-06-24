@@ -68,7 +68,7 @@ macro_rules! log_stat {
 #[macro_export]
 macro_rules! warn {
     ($fmt:expr $(, $($arg:tt)*)?) => {
-        eprintln!($fmt, $($($arg)*)?)
+        $crate::exec::emit_recipe_err(&format!($fmt, $($($arg)*)?))
     };
 }
 
@@ -76,7 +76,7 @@ macro_rules! warn {
 macro_rules! kati_warn {
     ($fmt:expr $(, $($arg:tt)*)?) => {
         if $crate::flags::FLAGS.enable_kati_warnings {
-            eprintln!($fmt, $($($arg)*)?)
+            $crate::exec::emit_recipe_err(&format!($fmt, $($($arg)*)?))
         }
     };
 }
@@ -132,7 +132,7 @@ fn color_error_log(loc: Option<&crate::loc::Loc>, msg: String) -> anyhow::Error 
 
 fn color_warn_log(loc: Option<&crate::loc::Loc>, msg: String) {
     let Some(loc) = loc else {
-        eprintln!("{msg}");
+        crate::exec::emit_recipe_err(&msg);
         return;
     };
 
@@ -140,8 +140,10 @@ fn color_warn_log(loc: Option<&crate::loc::Loc>, msg: String) {
         let mut filtered = trim_prefix_str(&msg, "*warning*: ");
         filtered = trim_prefix_str(filtered, "warning: ");
 
-        eprintln!("{BOLD}{loc}: {MAGENTA}warning: {RESET}{BOLD}{filtered}{RESET}")
+        crate::exec::emit_recipe_err(&format!(
+            "{BOLD}{loc}: {MAGENTA}warning: {RESET}{BOLD}{filtered}{RESET}"
+        ))
     } else {
-        eprintln!("{loc}: {msg}")
+        crate::exec::emit_recipe_err(&format!("{loc}: {msg}"))
     }
 }

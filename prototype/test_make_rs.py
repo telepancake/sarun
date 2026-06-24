@@ -368,6 +368,25 @@ def main():
         check(count_basename(sp8, "ninja") == 0,
               f"case8: no `ninja` process row — ran via the in-process builtin "
               f"(count={count_basename(sp8, 'ninja')})")
+
+        # ── CASE 9: failing recipe in a NESTED make — engine survives ───────
+        # A recursive sub-make whose recipe fails. kati used std::process::exit
+        # on recipe failure, which (as an in-process builtin) would kill the
+        # whole engine; it now propagates BuildFailed instead. So: the box exits
+        # non-zero CLEANLY, the `*** [target] Error N` line is routed up (fd 2),
+        # and the sub-make stayed in-process (no `make` row, and no engine death).
+        (work / "fail.mk").write_text("boom:\n\tfalse\n")
+        (work / "Makefile").write_text("all:\n\t$(MAKE) -f fail.mk\n")
+        r = run_make("MAKE9", work)
+        check(r.returncode != 0,
+              f"case9: failing nested make → non-zero exit (got {r.returncode})")
+        out_err = r.stdout + r.stderr
+        check("Error 1" in out_err or "Error 2" in out_err,
+              f"case9: recipe-failure line routed up (out+err tail={out_err[-300:]!r})")
+        sp9 = latest_sqlar(m)
+        check(count_basename(sp9, "make") == 0,
+              f"case9: nested make stayed in-process; engine survived the failure "
+              f"(make rows={count_basename(sp9, 'make')})")
     finally:
         if eng is not None and eng.poll() is None:
             eng.terminate()
