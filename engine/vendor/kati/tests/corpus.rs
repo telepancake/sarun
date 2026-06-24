@@ -262,6 +262,16 @@ fn corpus_pass_rate() {
     let mut tally = Tally::default();
     let mut failures = Vec::new();
     let only = std::env::var("KATI_CORPUS_ONLY").ok();
+    // sarun: parallel-conformance mode. When set, each case is ALSO run with
+    // rkati -j4 and its output compared (order-independent) to the rkati -j1 run.
+    // make's contract is that -jN produces the same result as -j1, so this
+    // validates the parallel scheduler against the same conformance the corpus
+    // already pins for serial. Recipe output interleaves under -j, so the compare
+    // is on sorted lines, not raw order.
+    let parallel = std::env::var("KATI_CORPUS_PARALLEL").is_ok();
+    let mut par_pass = 0usize;
+    let mut par_fail = 0usize;
+    let mut par_mismatch: Vec<String> = Vec::new();
 
     for entry in &entries {
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -359,6 +369,51 @@ fn corpus_pass_rate() {
             eprintln!("--- rk norm ---\n{rk_norm}");
         }
 
+        // sarun: parallel-conformance — re-run with -j4 from the same initial
+        // state and assert order-independent output equivalence to the -j1 run.
+        // Only meaningful for cases rkati matches make on (the serial baseline);
+        // an xfail case has no trustworthy baseline to compare against.
+        if parallel && xfail.is_none() {
+            // Wipe the -j1 rkati artifacts, leaving the Makefile + staged symlinks.
+            for e in std::fs::read_dir(workdir.path()).unwrap().flatten() {
+                if e.file_name() == "Makefile" {
+                    continue;
+                }
+                if e.file_type().map(|t| t.is_symlink()).unwrap_or(false) {
+                    continue;
+                }
+                let p = e.path();
+                if p.is_dir() {
+                    let _ = std::fs::remove_dir_all(&p);
+                } else {
+                    let _ = std::fs::remove_file(&p);
+                }
+            }
+            let mut pj_cmd = Command::new(&rkati);
+            std::os::unix::process::CommandExt::arg0(&mut pj_cmd, "make");
+            pj_cmd.env("MAKEFLAGS", "SHELL=/bin/bash");
+            pj_cmd.arg("-j4");
+            let (pj_out, _) = run_with_timeout(pj_cmd, workdir.path());
+            let pj_norm = normalize(&String::from_utf8_lossy(&pj_out), &kati_norms());
+            // Output interleaves under -j, so compare on sorted lines. No -jN
+            // normalization: $(MAKE) must NOT embed the job count (it rides
+            // MAKEFLAGS, like GNU make), so a sub-make recipe echoes identically
+            // at -j1 and -j4 — this pass is what proves that.
+            let norm_par = |s: &str| {
+                let mut v: Vec<&str> = s.lines().collect();
+                v.sort_unstable();
+                v.join("\n")
+            };
+            if norm_par(&rk_norm) == norm_par(&pj_norm) {
+                par_pass += 1;
+            } else {
+                par_fail += 1;
+                if par_mismatch.len() < 25 {
+                    par_mismatch.push(name.clone());
+                }
+            }
+        }
+
         let matched = mk_norm == rk_norm;
         match (matched, xfail.is_some()) {
             (true, false) => tally.pass += 1,
@@ -386,6 +441,19 @@ fn corpus_pass_rate() {
         "    fail={} xfail={} xpass={} skipped={}",
         tally.fail, tally.xfail, tally.xfail_unexpected_pass, tally.skipped
     );
+    if parallel {
+        println!(
+            "KATI_PARALLEL_EQUIV={}/{} (rkati -j4 output == -j1, order-independent)",
+            par_pass,
+            par_pass + par_fail
+        );
+        if !par_mismatch.is_empty() {
+            println!("    parallel mismatches (up to 25):");
+            for f in &par_mismatch {
+                println!("        {f}");
+            }
+        }
+    }
     if !failures.is_empty() {
         println!("    first failing (up to 25):");
         for f in &failures {
@@ -405,8 +473,20 @@ fn corpus_pass_rate() {
         }
     }
 
-    // The test never fails the suite — its purpose is to print a number, not
-    // gate CI. To enforce a minimum pass rate, set KATI_COMPAT_MIN=N.
+    // Parallel conformance is a HARD gate when enabled (KATI_CORPUS_PARALLEL=1):
+    // every case rkati matches make on serially must produce identical output at
+    // -j4 (order-independent). This is how parallel-scheduler conformance is
+    // covered — transitively, rkati -j4 == rkati -j1 == make.
+    if parallel {
+        assert_eq!(
+            par_fail, 0,
+            "parallel conformance regression: {} case(s) where rkati -j4 != -j1: {:?}",
+            par_fail, par_mismatch
+        );
+    }
+
+    // The serial pass never fails the suite by default — its purpose is to print
+    // a number. To enforce a minimum pass rate, set KATI_COMPAT_MIN=N.
     if let Ok(min) = std::env::var("KATI_COMPAT_MIN") {
         let min: usize = min.parse().expect("KATI_COMPAT_MIN must be integer");
         assert!(

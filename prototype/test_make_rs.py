@@ -551,6 +551,60 @@ def main():
         check("+" in b.stdout,
               f"case15: box B re-acquired the slip → A's leak was reaped "
               f"(stdout={b.stdout!r}, rc={b.returncode})")
+
+        # ── CASE 16: `make -j2` runs recipes IN PARALLEL, bounded by the pool ──
+        # The make analogue of case 12: kati's scheduler dispatches the two
+        # independent targets' recipes to worker threads. With -j2 over two
+        # timestamping targets the max overlap must be exactly 2 — real
+        # parallelism (>1), bounded by n2's implicit token + the 1-slip pool.
+        mj = work / "mj"
+        shutil.rmtree(mj, ignore_errors=True)
+        mj.mkdir(parents=True, exist_ok=True)
+        (mj / "Makefile").write_text(
+            "all: a b\n"
+            "a:\n\tdate +%s.%N > a.start ; sleep 0.4 ; date +%s.%N > a.end\n"
+            "b:\n\tdate +%s.%N > b.start ; sleep 0.4 ; date +%s.%N > b.end\n")
+        r = run_make("MAKE16", mj, "-j2")
+        check(r.returncode == 0,
+              f"case16: make -j2 box exits 0 (got {r.returncode}: {r.stderr[-600:]})")
+        sp16 = latest_sqlar(m)
+
+        def mstamp(name):
+            c = m.sqlar_content(sp16, str((mj / name).resolve()).lstrip("/"))
+            return float(c.strip()) if c else None
+        ivals = []
+        for t in ("a", "b"):
+            s, e = mstamp(f"{t}.start"), mstamp(f"{t}.end")
+            if s is not None and e is not None:
+                ivals.append((s, e))
+        evs = sorted([(s, 1) for s, _ in ivals] + [(e, -1) for _, e in ivals])
+        cur = peak = 0
+        for _, d in evs:
+            cur += d
+            peak = max(peak, cur)
+        check(len(ivals) == 2 and peak == 2,
+              f"case16: make recipes ran in parallel, bounded (intervals={len(ivals)} "
+              f"peak={peak}, want 2)")
+        check(count_basename(sp16, "make") == 0,
+              f"case16: parallel make stayed in-process (make rows={count_basename(sp16,'make')})")
+
+        # ── CASE 17: dependency ordering is respected under -j ─────────────────
+        # `final` depends on `dep`; final's recipe READS the file dep's recipe
+        # writes. Even at -j4 the scheduler must run dep to completion before
+        # final, so final sees dep's output (no race).
+        od = work / "ord"
+        shutil.rmtree(od, ignore_errors=True)
+        od.mkdir(parents=True, exist_ok=True)
+        (od / "Makefile").write_text(
+            "final: dep\n\tcat dep.out > final.out\n"
+            "dep:\n\techo depdata > dep.out\n")
+        r = run_make("MAKE17", od, "-j4", "final")
+        check(r.returncode == 0,
+              f"case17: ordered make exits 0 (got {r.returncode}: {r.stderr[-600:]})")
+        sp17 = latest_sqlar(m)
+        fout = m.sqlar_content(sp17, str((od / "final.out").resolve()).lstrip("/"))
+        check(fout == b"depdata\n",
+              f"case17: final ran after its prereq dep under -j (final.out={fout!r})")
     finally:
         if eng is not None and eng.poll() is None:
             eng.terminate()
