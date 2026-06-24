@@ -43,6 +43,7 @@ mod pty;
 mod review;
 mod rules;
 mod runner;
+mod slippool;
 mod ui;
 mod views;
 
