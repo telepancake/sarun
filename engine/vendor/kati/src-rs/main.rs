@@ -462,10 +462,18 @@ fn main() {
     let ret = match run(&FLAGS.targets, &FLAGS.cl_vars, orig_args) {
         Ok(ret) => ret,
         Err(err) => {
-            for cause in err.chain() {
-                eprintln!("{cause}");
+            // sarun: a recipe failure already printed `*** [target] Error N`
+            // (exec.rs now propagates BuildFailed instead of std::process::exit
+            // so an in-process builtin survives); preserve its exit code here
+            // for the standalone rkati without re-printing.
+            if let Some(bf) = err.downcast_ref::<kati::exec::BuildFailed>() {
+                bf.0
+            } else {
+                for cause in err.chain() {
+                    eprintln!("{cause}");
+                }
+                1
             }
-            1
         }
     };
     kati::stats::report_all_stats();

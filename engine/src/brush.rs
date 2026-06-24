@@ -1181,11 +1181,15 @@ impl brush_core::builtins::SimpleCommand for MakeBuiltin {
         }
         // Logical cwd from the brush context — NOT the process cwd.
         let cwd = context.shell.working_dir().to_path_buf();
-        // fd 1 twice: one handle for make's own messages, one as the recipe sink.
+        // fd 1/2 twice each: one handle for make's own messages, one as the
+        // recipe/diagnostic sink kati writes through (set_recipe_out/err).
         let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
         let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
         let recipe_out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
-        let code = crate::katirun::make_builtin(&argv, &cwd, out, err, Box::new(recipe_out));
+        let recipe_err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
+        let code = crate::katirun::make_builtin(
+            &argv, &cwd, out, err, Box::new(recipe_out), Box::new(recipe_err),
+        );
         Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
     }
 }

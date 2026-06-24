@@ -850,7 +850,10 @@ fn info_func(args: &[Arc<Value>], ev: &mut Evaluator, _out: &mut dyn BufMut) -> 
         s.put_u8(b'"');
         ev.delayed_output_commands.push(s.freeze());
     } else {
-        println!("{}", String::from_utf8_lossy(&a));
+        // sarun: $(info) goes to the logical stdout sink (the make builtin's
+        // context fd 1 when set, else process stdout) — same channel as recipe
+        // stdout — so a nested make's $(info) doesn't escape the brush pipe.
+        crate::exec::emit_recipe_output(format!("{}\n", String::from_utf8_lossy(&a)).as_bytes());
     }
     Ok(())
 }

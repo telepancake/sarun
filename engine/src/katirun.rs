@@ -613,6 +613,11 @@ pub fn make_main(argv: &[String]) -> i32 {
     let run_result = match run_kati(&targets, &cl_vars, &makefile, &shadow_cwd) {
         Ok(r) => r,
         Err(e) => {
+            // Recipe failure already printed its `*** [target] Error N`; just
+            // surface the code (was std::process::exit(2) inside exec).
+            if let Some(bf) = e.downcast_ref::<kati::exec::BuildFailed>() {
+                return bf.0;
+            }
             for cause in e.chain() {
                 eprintln!("{cause}");
             }
@@ -664,6 +669,7 @@ pub fn make_builtin(
     mut out: impl std::io::Write,
     mut err: impl std::io::Write,
     recipe_out: Box<dyn std::io::Write>,
+    recipe_err: Box<dyn std::io::Write>,
 ) -> i32 {
     install_make_recipe_runner();
 
@@ -735,6 +741,7 @@ pub fn make_builtin(
     // for the duration of THIS make; save/restore so a nested recursive $(MAKE)
     // (which lands here again, on its own brush worker thread) nests cleanly.
     let prev_out = kati::exec::set_recipe_out(Some(recipe_out));
+    let prev_err = kati::exec::set_recipe_err(Some(recipe_err));
     let prev_cwd = crate::brush::set_box_recipe_cwd(Some(working_dir.clone()));
 
     let targets: Vec<Symbol> = flags.targets.clone();
@@ -761,6 +768,7 @@ pub fn make_builtin(
     }
 
     kati::exec::set_recipe_out(prev_out);
+    kati::exec::set_recipe_err(prev_err);
     crate::brush::set_box_recipe_cwd(prev_cwd);
 
     match result {
@@ -773,6 +781,11 @@ pub fn make_builtin(
             0
         }
         Err(e) => {
+            // A recipe failure already emitted its `*** [target] Error N` line
+            // (routed to fd 2); just surface the exit code, don't re-print.
+            if let Some(bf) = e.downcast_ref::<kati::exec::BuildFailed>() {
+                return bf.0;
+            }
             for cause in e.chain() {
                 let _ = writeln!(err, "{cause}");
             }
