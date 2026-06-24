@@ -1190,6 +1190,38 @@ impl brush_core::builtins::SimpleCommand for MakeBuiltin {
     }
 }
 
+/// `ninja` — embedded n2 (in-process). Dispatched when brush runs `ninja` (a
+/// cmake/configure step, or a recipe), so a top-level box ninja stays in this
+/// process. See katirun::ninja_builtin for the current logical-cwd limitation.
+struct NinjaBuiltin;
+
+impl brush_core::builtins::SimpleCommand for NinjaBuiltin {
+    fn get_content(
+        name: &str,
+        _content_type: brush_core::builtins::ContentType,
+        _options: &brush_core::builtins::ContentOptions,
+    ) -> Result<String, brush_core::error::Error> {
+        Ok(format!("{name}: embedded ninja (in-process n2)\n"))
+    }
+
+    fn execute<SE: brush_core::extensions::ShellExtensions,
+               I: Iterator<Item = S>, S: AsRef<str>>(
+        context: brush_core::commands::ExecutionContext<'_, SE>,
+        args: I,
+    ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
+        let name = context.command_name.clone();
+        let mut argv: Vec<String> = args.map(|a| a.as_ref().to_string()).collect();
+        if argv.is_empty() {
+            argv.push(name);
+        }
+        let cwd = context.shell.working_dir().to_path_buf();
+        let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
+        let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
+        let code = crate::n2run::ninja_builtin(&argv, &cwd, out, err);
+        Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
+    }
+}
+
 fn box_builtins_opt<SE: brush_core::extensions::ShellExtensions>(
     bundle_coreutils: bool,
 ) -> std::collections::HashMap<String, brush_core::builtins::Registration<SE>> {
@@ -1237,6 +1269,7 @@ fn box_builtins_opt<SE: brush_core::extensions::ShellExtensions>(
     // make IN-PROCESS (see MakeBuiltin) instead of re-exec'ing the engine.
     m.insert("make".to_string(), simple_builtin::<MakeBuiltin, SE>());
     m.insert("gmake".to_string(), simple_builtin::<MakeBuiltin, SE>());
+    m.insert("ninja".to_string(), simple_builtin::<NinjaBuiltin, SE>());
     // BashMode shell builtins overwrite any overlapping coreutil names (highest priority).
     m.extend(brush_builtins::default_builtins(brush_builtins::BuiltinSet::BashMode));
     // In-box engine entry points via /proc/self/exe (no PATH shadow needed).

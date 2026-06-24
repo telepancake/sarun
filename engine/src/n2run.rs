@@ -108,3 +108,95 @@ pub fn n2_main(argv: &[String]) -> i32 {
         }
     }
 }
+
+/// In-process `ninja` brush builtin entry — the n2 analogue of katirun's
+/// make_builtin. Dispatched when brush runs `ninja` (a recipe's `ninja`, or a
+/// cmake/configure step), so it stays in THIS process. Drives n2 via the
+/// already-`pub` in-memory entries (`load::read` + `run_state`) instead of
+/// `n2::run::run()` (which reads the PROCESS argv) — recipes route through the
+/// brush executor at the build dir (BOX_RECIPE_CWD).
+///
+/// LIMITATION (logical cwd): n2 stats files and prints progress against the
+/// PROCESS cwd/stdout, so this is only correct when the build dir IS the process
+/// cwd and ninja is the top-level box command (its stdout reaches the box). A
+/// recursive/`-C`/recipe-nested ninja whose build dir differs is rejected with a
+/// visible error pending the n2 logical-cwd + output-routing de-globalization
+/// (n2's stat is centralized at graph::stat, so that is the tractable next step).
+pub fn ninja_builtin(
+    argv: &[String],
+    base_cwd: &std::path::Path,
+    mut out: impl std::io::Write,
+    mut err: impl std::io::Write,
+) -> i32 {
+    n2::process::set_executor(crate::brush::n2_executor);
+
+    let mut build_file = String::from("build.ninja");
+    let mut targets: Vec<String> = Vec::new();
+    let mut i = 1;
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "--version" => {
+                // CMake gates on a Ninja version; match n2's fake_ninja_compat.
+                let _ = writeln!(out, "1.10.2");
+                return 0;
+            }
+            "-f" => {
+                if let Some(f) = argv.get(i + 1) {
+                    build_file = f.clone();
+                }
+                i += 2;
+            }
+            "-C" => {
+                let _ = writeln!(
+                    err,
+                    "ninja: the in-process builtin does not support -C yet \
+                     (logical cwd pending)"
+                );
+                return 1;
+            }
+            // Flags that take a value: skip the value too (best-effort).
+            "-j" | "-k" | "-l" | "-d" | "-t" | "-w" => i += 2,
+            s if s.starts_with('-') => i += 1,
+            s => {
+                targets.push(s.to_string());
+                i += 1;
+            }
+        }
+    }
+
+    // n2 resolves/stats relative to the PROCESS cwd; only safe when that IS the
+    // build dir (the top-level box ninja). Reject otherwise, visibly.
+    let proc_cwd = std::env::current_dir().unwrap_or_default();
+    if base_cwd != proc_cwd {
+        let _ = writeln!(
+            err,
+            "ninja: the in-process builtin requires the build dir to be the \
+             process cwd (logical cwd not yet supported)"
+        );
+        return 1;
+    }
+
+    let bf = base_cwd.join(&build_file);
+    let bf_str = bf.to_string_lossy().into_owned();
+    emit_build_edges(&bf_str);
+
+    let prev = crate::brush::set_box_recipe_cwd(Some(base_cwd.to_path_buf()));
+    let state = match n2::load::read(&bf_str) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = writeln!(err, "ninja: {e:#}");
+            crate::brush::set_box_recipe_cwd(prev);
+            return 1;
+        }
+    };
+    let code = match n2::run::run_state(state, &targets) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = writeln!(err, "ninja: {e:#}");
+            1
+        }
+    };
+    crate::brush::set_box_recipe_cwd(prev);
+    let _ = out.flush();
+    code
+}
