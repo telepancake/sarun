@@ -19,6 +19,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::{
     collections::HashMap,
     ffi::{CStr, CString, OsStr},
+    path::Path,
     process::{Command, ExitStatus},
     slice,
     sync::{Arc, LazyLock},
@@ -168,22 +169,51 @@ pub type GlobResults = Arc<Result<Vec<Bytes>, std::io::Error>>;
 pub static GLOB_CACHE: LazyLock<Mutex<HashMap<Bytes, GlobResults>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-pub fn glob(pat: Bytes) -> GlobResults {
+/// sarun: `base` is the logical working directory (the Evaluator's working_dir).
+/// A relative pattern is globbed against it instead of the process cwd: we glob
+/// the resolved ABSOLUTE pattern, then strip the `base/` prefix so matches keep
+/// the pattern's original relative form — so $(wildcard) output is unchanged
+/// when base == process cwd. Absolute patterns pass through untouched. The
+/// cache keys by the resolved pattern, so the same relative pattern in two
+/// different working dirs gets its own (correct) entry.
+pub fn glob(pat: Bytes, base: &Path) -> GlobResults {
+    let is_abs = pat.starts_with(b"/");
+    let (resolved, strip_len): (Bytes, usize) = if is_abs {
+        (pat.clone(), 0)
+    } else {
+        let base_bytes = base.as_os_str().as_bytes();
+        let mut r = BytesMut::with_capacity(base_bytes.len() + 1 + pat.len());
+        r.put_slice(base_bytes);
+        r.put_u8(b'/');
+        r.put_slice(&pat);
+        (r.freeze(), base_bytes.len() + 1)
+    };
+
     let mut cache = GLOB_CACHE.lock();
-    if let Some(entry) = cache.get(&pat) {
+    if let Some(entry) = cache.get(&resolved) {
         return entry.clone();
     }
+    let strip = |f: Bytes| -> Bytes {
+        if strip_len > 0 && f.len() >= strip_len {
+            f.slice(strip_len..)
+        } else {
+            f
+        }
+    };
     let glob = Arc::new(
-        if pat.contains(&b'?') || pat.contains(&b'*') || pat.contains(&b'[') || pat.contains(&b'\\')
+        if resolved.contains(&b'?')
+            || resolved.contains(&b'*')
+            || resolved.contains(&b'[')
+            || resolved.contains(&b'\\')
         {
-            libc_glob(&pat)
-        } else if let Err(err) = std::fs::metadata(<OsStr as OsStrExt>::from_bytes(&pat)) {
+            libc_glob(&resolved).map(|files| files.into_iter().map(strip).collect())
+        } else if let Err(err) = std::fs::metadata(<OsStr as OsStrExt>::from_bytes(&resolved)) {
             Err(err)
         } else {
             Ok(vec![pat.clone()])
         },
     );
-    cache.insert(pat, glob.clone());
+    cache.insert(resolved, glob.clone());
     glob
 }
 

@@ -369,7 +369,7 @@ fn wildcard_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) 
     let mut ww = WordWriter::new(out);
     for tok in word_scanner(&pat) {
         let tok = pat.slice_ref(tok);
-        let files = crate::fileutil::glob(tok);
+        let files = crate::fileutil::glob(tok, &ev.working_dir);
         if let Ok(files) = files.as_ref() {
             for f in files {
                 ww.write(f);
