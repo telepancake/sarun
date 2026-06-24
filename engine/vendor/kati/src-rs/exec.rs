@@ -588,10 +588,17 @@ impl<'a> Executor<'a> {
                 let shell = self.shell.clone();
                 let shellflag = self.shellflag;
                 let txc = tx.clone();
-                std::thread::spawn(move || {
-                    let r = run_node_commands(&shell, shellflag, req);
-                    let _ = txc.send((r, slip));
-                });
+                // Large stack: a recipe may be a recursive sub-make whose kati
+                // parse/eval recurses deeply on big Makefiles (busybox/kernel).
+                // The default 2 MiB spawned-thread stack overflows there; ckati
+                // relies on the 8 MiB main-thread stack. 64 MiB is ample.
+                std::thread::Builder::new()
+                    .stack_size(64 * 1024 * 1024)
+                    .spawn(move || {
+                        let r = run_node_commands(&shell, shellflag, req);
+                        let _ = txc.send((r, slip));
+                    })
+                    .expect("spawn recipe worker");
                 running += 1;
             }
             // 3. Termination.

@@ -2125,8 +2125,12 @@ pub fn run_recipe_in_process_opt(
         .unwrap_or_else(|| std::path::PathBuf::from("/"));
     let recipe_owned = recipe.clone();
     // Run brush on a worker thread so this (n2 scheduler) thread can drain the
-    // pipe concurrently — a finite pipe buffer would otherwise deadlock.
-    let exec = std::thread::spawn(move || {
+    // pipe concurrently — a finite pipe buffer would otherwise deadlock. Large
+    // stack: a recipe can be a recursive in-process make whose kati parse/eval
+    // recurses deeply on big Makefiles, overflowing the default 2 MiB stack.
+    let exec = std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || {
         rt.block_on(async move {
             let mut shell = match build_box_shell_full(
                 true, None, None, Some(cwd), false, bundle_coreutils,
@@ -2165,7 +2169,7 @@ pub fn run_recipe_in_process_opt(
             }
             // shell and PipeWriter clones drop here → write end closed → drain sees EOF.
         })
-    });
+    }).expect("spawn brush recipe thread");
 
     // Drain the merged pipe into n2's output_cb. n2 writes to the terminal;
     // we previously also teed to the FUSE sink, causing double output — removed.

@@ -2213,15 +2213,24 @@ pub fn acquire_instance_lock(sock: &std::path::Path) -> std::io::Result<Instance
     Ok(InstanceLock::Held(f.into()))
 }
 
-pub fn serve(state: State, sock: &std::path::Path) -> std::io::Result<()> {
-    // The instance lock (acquire_instance_lock, called by main::serve) already
-    // guaranteed we're the only engine, so removing a stale socket here is safe:
-    // any file at `sock` is a leftover from a dead daemon (a live one would hold
-    // the lock). Bind under the lock so no second engine can race the rebind.
+/// Bind the control socket. Done EARLY in serve startup (before the FUSE mount
+/// and the rest of init) so the socket file only ever appears once it is a live,
+/// listening socket — a client that connects during startup queues in the listen
+/// backlog and is served once the accept loop runs, instead of racing a stale
+/// socket file (the old code printed "listening" and ran init while the previous
+/// daemon's dead socket still sat at `sock`, so a waiter could connect to it and
+/// see ECONNREFUSED). The instance lock (acquire_instance_lock) is already held,
+/// so removing a leftover socket from a dead daemon is safe here.
+pub fn bind_listener(sock: &std::path::Path) -> std::io::Result<UnixListener> {
     let _ = std::fs::remove_file(sock);
     let listener = UnixListener::bind(sock)?;
     let mode = std::os::unix::fs::PermissionsExt::from_mode(0o600);
     std::fs::set_permissions(sock, mode)?;
+    Ok(listener)
+}
+
+/// Run the accept loop on an already-bound listener (see [`bind_listener`]).
+pub fn serve(state: State, listener: UnixListener) -> std::io::Result<()> {
     for conn in listener.incoming().flatten() {
         let st = state.clone();
         std::thread::spawn(move || handle(st, conn));
