@@ -1061,7 +1061,7 @@ impl Evaluator {
         let pats = stmt.expr.eval_to_buf(self)?;
         for pat in word_scanner(&pats) {
             let pat = pats.slice_ref(pat);
-            let files = crate::fileutil::glob(pat.clone());
+            let files = crate::fileutil::glob(pat.clone(), &self.working_dir);
 
             if stmt.should_exist {
                 let missing = match files.as_ref() {

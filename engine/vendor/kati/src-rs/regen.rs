@@ -268,7 +268,9 @@ impl StampChecker {
 
     fn check_glob_result(gr: &GlobResult, err: &mut String) -> bool {
         collect_stats!("glob time (regen)");
-        let files = glob(gr.pat.clone());
+        // sarun: regen runs without an Evaluator (no logical working_dir), so
+        // glob against the process cwd — its historical behavior.
+        let files = glob(gr.pat.clone(), &std::env::current_dir().unwrap_or_default());
         let needs_regen = if let Ok(files) = files.as_ref() {
             files != &gr.result
         } else {
