@@ -1746,6 +1746,15 @@ pub fn brush_sh(argv: &[String]) -> i32 {
     let (script_src, dollar0, positional): (String, String, Vec<String>);
     if have_c {
         // `sh [-flags] -c SCRIPT [name [args...]]`
+        // glibc's popen (and POSIX `sh -c -- cmd`) inserts a `--` option
+        // terminator between `-c` and the script so a command beginning with
+        // `-` can't be mistaken for a flag. The flag loop above breaks out the
+        // instant it sees `-c`, so that `--` lands here unconsumed — skip a
+        // single leading one, else SCRIPT becomes the literal `--` and brush
+        // runs it as a command ("command not found: --").
+        if argv.get(idx).map(String::as_str) == Some("--") {
+            idx += 1;
+        }
         let Some(s) = argv.get(idx).cloned() else {
             eprintln!("sarun-engine brush-sh: -c requires a SCRIPT argument");
             return 2;
