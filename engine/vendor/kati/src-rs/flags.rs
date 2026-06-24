@@ -138,7 +138,13 @@ fn parse_command_line_option_with_arg(
 }
 
 impl Flags {
-    fn from_args(args: Vec<OsString>) -> Flags {
+    /// sarun: pub so an embedder can parse a per-instance Flags from a
+    /// synthesized argv instead of relying solely on the install-once global
+    /// FLAGS — needed when multiple make invocations share one process (the
+    /// in-process `make` builtin). The global FLAGS still supplies the
+    /// immutable mode-switches; per-instance INPUTS (makefile/targets/cl_vars/
+    /// working_dir) come from a local Flags so concurrent makes don't collide.
+    pub fn from_args(args: Vec<OsString>) -> Flags {
         let mut iter = args.into_iter();
         let mut flags = Flags::default();
         flags.subkati_args.push(iter.next().unwrap());
