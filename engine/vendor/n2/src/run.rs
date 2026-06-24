@@ -114,7 +114,7 @@ fn embedded_parallelism() -> anyhow::Result<usize> {
     if crate::process::executor().is_none() {
         return default_parallelism();
     }
-    if crate::jobserver::Client::from_env().is_some() {
+    if crate::jobserver::Client::present() {
         Ok(crate::jobserver::Client::jobs_hint().unwrap_or(default_parallelism()?))
     } else {
         Ok(1)
