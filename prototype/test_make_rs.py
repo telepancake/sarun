@@ -411,12 +411,17 @@ def main():
               f"case10: no `ninja` process row — ran via the in-process builtin "
               f"(count={count_basename(sp10, 'ninja')})")
 
-        # ── CASE 11: PARALLEL sub-makes — in-process, no races, no globals ───
-        # `make -j2` fires two recursive sub-makes concurrently, each building a
-        # distinct target in its own subdir. De-globalized kati (per-Evaluator
-        # vars + working_dir, reentrant recipe runner) must run them in the SAME
-        # process without clobbering each other's state or deadlocking. Both
-        # outputs appear; no `make` process row; engine survives.
+        # ── CASE 11: multiple recursive sub-makes share the process safely ──
+        # NOT a parallelism test: kati's exec.rs is a single-threaded recipe
+        # loop and the exec path never consumes -j (num_jobs only feeds ninja
+        # generation), so `-j2` is a no-op here and the two sub-makes run
+        # SEQUENTIALLY on one thread. What this checks is the de-globalization
+        # that PARALLELISM WOULD LATER DEPEND ON: two independent recursive
+        # $(MAKE)s in the same process must not clobber each other's per-Evaluator
+        # state (vars + working_dir) and the reentrant recipe runner must not
+        # deadlock on re-entry. Both outputs appear; no `make` row; engine lives.
+        # (True race-freedom under concurrency is untestable until the in-process
+        # executor's forced -j1 is lifted — see the jobserver gap.)
         for d, txt in (("p1", "one"), ("p2", "two")):
             pd = work / d
             shutil.rmtree(pd, ignore_errors=True)
@@ -429,16 +434,16 @@ def main():
             "b:\n\t$(MAKE) -C p2\n")
         r = run_make("MAKE11", work, "-j2")
         check(r.returncode == 0,
-              f"case11: parallel sub-makes exit 0 (got {r.returncode}: {r.stderr[-600:]})")
+              f"case11: two sub-makes exit 0 (got {r.returncode}: {r.stderr[-600:]})")
         sp11 = latest_sqlar(m)
         rel_a = str((work / "p1" / "o.txt").resolve()).lstrip("/")
         rel_b = str((work / "p2" / "o.txt").resolve()).lstrip("/")
         check(m.sqlar_content(sp11, rel_a) == b"one\n",
-              f"case11: parallel sub-make p1 built ({m.sqlar_content(sp11, rel_a)!r})")
+              f"case11: recursive sub-make p1 built ({m.sqlar_content(sp11, rel_a)!r})")
         check(m.sqlar_content(sp11, rel_b) == b"two\n",
-              f"case11: parallel sub-make p2 built ({m.sqlar_content(sp11, rel_b)!r})")
+              f"case11: recursive sub-make p2 built ({m.sqlar_content(sp11, rel_b)!r})")
         check(count_basename(sp11, "make") == 0,
-              f"case11: parallel sub-makes stayed in-process "
+              f"case11: both sub-makes stayed in-process, no state clobber "
               f"(make rows={count_basename(sp11, 'make')})")
     finally:
         if eng is not None and eng.poll() is None:
