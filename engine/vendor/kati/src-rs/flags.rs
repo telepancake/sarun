@@ -258,6 +258,12 @@ impl Flags {
                         };
                         flags.num_jobs = num_jobs;
                         flags.jobs_explicit = true;
+                        // sarun: -j does NOT belong in $(MAKE) — GNU make keeps the
+                        // job count out of the MAKE variable (it rides MAKEFLAGS /
+                        // the jobserver instead). subkati_args feeds $(MAKE), so
+                        // don't propagate -j into it, or a `$(MAKE) …` recipe would
+                        // echo `make -jN …` and diverge from make.
+                        should_propagate = false;
                     } else if let Some(arg) =
                         parse_command_line_option_with_arg("--remote_num_jobs", &arg, &mut iter)
                     {
