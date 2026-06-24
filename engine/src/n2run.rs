@@ -129,13 +129,14 @@ pub fn ninja_builtin(
 ) -> i32 {
     n2::process::set_executor(crate::brush::n2_executor);
 
-    // Per-build jobserver. ninja is parallel by default (CPU count), overridable
-    // by -jN. `ensure` is idempotent: if a parallel `make` already created the
-    // pool, this ninja inherits and shares it rather than opening a second one.
-    crate::jobserver::request_jobs(
+    // Advertise the engine-global slip pool into MAKEFLAGS for this build. ninja
+    // is parallel by default (CPU count), overridable by -jN; that count is the
+    // LOCAL runner cap (n2::jobserver::jobs_hint), while the machine-wide pool
+    // does the real bounding. Idempotent: a ninja under a parallel make inherits
+    // that make's advertisement and shares the same pool.
+    crate::jobserver::advertise(
         crate::jobserver::explicit_jobs(argv).unwrap_or_else(crate::jobserver::cpu_count),
     );
-    crate::jobserver::ensure();
 
     let mut build_file = String::from("build.ninja");
     let mut targets: Vec<String> = Vec::new();
