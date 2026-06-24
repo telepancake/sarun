@@ -199,6 +199,13 @@ fn run_kati(
     cl_vars: &[bytes::Bytes],
     makefile: &OsStr,
     working_dir: &std::path::Path,
+    // The environment this make starts from. The shadow/main path passes the
+    // process env (std::env); the in-process `make` builtin passes the brush
+    // subshell's exported env (which carries the PARENT make's exports applied
+    // via the recipe prefix). We never read std::env directly for the make's
+    // variables here — many makes share one engine process, so that would mix
+    // their environments.
+    seed_env: &[(std::ffi::OsString, std::ffi::OsString)],
 ) -> anyhow::Result<RunKatiResult> {
     let mut ev = Evaluator::new();
     // sarun: the Evaluator seeds working_dir from the process cwd; override it
@@ -225,7 +232,7 @@ fn run_kati(
         false,
         None,
     )?;
-    for (k, v) in std::env::vars_os() {
+    for (k, v) in seed_env {
         let v = bytes::Bytes::from(v.as_bytes().to_vec());
         let val = Arc::new(Value::Literal(None, v.clone()));
         ev.set_global_var(
@@ -235,20 +242,36 @@ fn run_kati(
             None,
         )?;
     }
+    // MAKEFLAGS is the jobserver's channel: jobserver::advertise() wrote the
+    // current `--jobserver-auth=…` into the PROCESS env just before this call
+    // (in make_builtin), which is AFTER seed_env was captured. Pull the live
+    // value so $(MAKEFLAGS) — and any sub-make that inherits it — sees the
+    // jobserver. This is the one var that legitimately rides std::env (the
+    // jobserver's existing design); a single read of a near-constant value.
+    if let Some(mf) = std::env::var_os("MAKEFLAGS") {
+        let v = bytes::Bytes::from(mf.as_bytes().to_vec());
+        let val = Arc::new(Value::Literal(None, v.clone()));
+        ev.set_global_var(
+            intern(b"MAKEFLAGS".to_vec()),
+            Variable::new_recursive(val, VarOrigin::Environment, Some(ev.current_frame()), None, v),
+            false,
+            None,
+        )?;
+    }
 
     let bootstrap_asts = read_bootstrap_makefile(targets, working_dir)?;
-    // sarun: bootstrap captured the current MAKELEVEL above. Bump env
-    // for any recipe-spawned sub-make so it sees the next level.
-    // SAFETY: single-threaded at this point in the pipeline.
-    {
-        let level = std::env::var("MAKELEVEL")
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or(0);
-        unsafe {
-            std::env::set_var("MAKELEVEL", (level + 1).to_string());
-        }
-    }
+    // sarun: this make's MAKELEVEL is whatever the seed env carried; a
+    // recipe-spawned sub-make must see the NEXT level. We don't bump the process
+    // env (that's a shared global write across concurrent in-process makes) —
+    // the +1 is emitted into the export prefix below so children pick it up
+    // through their subshell env.
+    let child_makelevel = seed_env
+        .iter()
+        .find(|(k, _)| k == "MAKELEVEL")
+        .and_then(|(_, v)| v.to_str())
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(0)
+        + 1;
     {
         let _frame = ev.enter(FrameType::Phase, bytes::Bytes::from_static(b"*bootstrap*"), Loc::default());
         ev.in_bootstrap();
@@ -316,12 +339,16 @@ fn run_kati(
         nodes = make_dep(&mut ev, dep_targets)?;
     }
 
-    // sarun: stage explicit (and, under .EXPORT_ALL_VARIABLES, every)
-    // make-defined variable into the process env so recipes — which n2
-    // runs via brush_n2_executor IN-PROCESS, inheriting the parent env
-    // — see the right bindings without us having to re-bake them into
-    // each ninja recipe's command line. Mirrors what main.rs does for
-    // the standalone rkati path.
+    // sarun: build the make's exported environment as a non-echoed shell prefix
+    // (`export NAME='val'` / `unset NAME`) rather than staging it into the
+    // process env. In a box, every recipe — and every recursive `$(MAKE)` — runs
+    // in-process through a brush subshell; many of those makes share ONE engine
+    // process, so a `std::env::set_var` here would (a) be a data race against
+    // sibling makes building their own subshells and (b) leak one make's exports
+    // into another. exec.rs prepends this prefix to each recipe's subshell and
+    // func.rs prepends it to `$(shell)`, so exports reach children through the
+    // per-subshell env instead. The standalone rkati binary leaves this empty and
+    // keeps the std::env path (one OS process per make, where that's correct).
     if ev.export_all_vars {
         let all = ev.get_symbol_names(|v| {
             !matches!(
@@ -333,8 +360,65 @@ fn run_kati(
             ev.exports.entry(sym).or_insert(true);
         }
     }
+    fn emit_export(prefix: &mut Vec<u8>, name: &[u8], value: &[u8]) {
+        prefix.extend_from_slice(b"export ");
+        prefix.extend_from_slice(name);
+        prefix.extend_from_slice(b"='");
+        for &b in value {
+            if b == b'\'' {
+                prefix.extend_from_slice(b"'\\''");
+            } else {
+                prefix.push(b);
+            }
+        }
+        prefix.extend_from_slice(b"'\n");
+    }
+    let mut prefix: Vec<u8> = Vec::new();
+    // MAKELEVEL is exported to children at the NEXT level (computed above from
+    // the seed env, never from a process-global bump).
+    emit_export(&mut prefix, b"MAKELEVEL", child_makelevel.to_string().as_bytes());
+    // GNU make exports ENVIRONMENT-origin variables to children by default. The
+    // recipe subshell inherits the engine process env, but a NESTED make's
+    // environment additions (its parent's exports, carried in via seed_env) are
+    // NOT in that process env — so re-export the make's inherited env here, with
+    // current values, so recipes and recursive sub-makes see them. Skip the
+    // shell-managed vars brush maintains itself (PWD/OLDPWD/SHLVL/_) and
+    // MAKELEVEL (emitted above), and skip anything the makefile explicitly
+    // `unexport`ed.
+    // MAKEFLAGS is make-managed and is also the jobserver's advertisement
+    // channel (jobserver::advertise writes it into the process env so forked
+    // tools like `gcc -flto=jobserver` inherit it). Don't re-export the stale
+    // seed value here — that would clobber the advertised one in recipes.
+    const SHELL_MANAGED: &[&[u8]] = &[b"PWD", b"OLDPWD", b"SHLVL", b"_", b"MAKELEVEL", b"MAKEFLAGS"];
+    fn is_sh_name(n: &[u8]) -> bool {
+        !n.is_empty()
+            && (n[0].is_ascii_alphabetic() || n[0] == b'_')
+            && n.iter().all(|&b| b.is_ascii_alphanumeric() || b == b'_')
+    }
+    for (k, _) in seed_env {
+        let kb = k.as_bytes();
+        // Names that aren't valid shell identifiers (e.g. exported bash
+        // functions like `BASH_FUNC_x%%`) can't be set via `export NAME=` and
+        // would break the prefix — the subshell already inherits them anyway.
+        if SHELL_MANAGED.contains(&kb) || !is_sh_name(kb) {
+            continue;
+        }
+        let sym = intern(kb.to_vec());
+        if ev.exports.get(&sym) == Some(&false) {
+            continue; // explicitly unexported
+        }
+        let value = if let Some(v) = ev.lookup_var(sym)? {
+            use kati::expr::Evaluable;
+            v.read().eval_to_buf(&mut ev)?
+        } else {
+            bytes::Bytes::new()
+        };
+        emit_export(&mut prefix, kb, &value);
+    }
+    // Explicitly `export`ed make variables (override any env-origin value above)
+    // and explicit `unexport`s.
     for (name, export) in ev.exports.clone() {
-        let key = std::ffi::OsString::from_vec(name.as_bytes().to_vec());
+        let nb = name.as_bytes();
         if export {
             let value = if let Some(v) = ev.lookup_var(name)? {
                 use kati::expr::Evaluable;
@@ -342,20 +426,14 @@ fn run_kati(
             } else {
                 bytes::Bytes::new()
             };
-            // SAFETY: single-threaded; recipes haven't started.
-            unsafe {
-                std::env::set_var(
-                    &key,
-                    <std::ffi::OsStr as OsStrExt>::from_bytes(&value),
-                );
-            }
+            emit_export(&mut prefix, &nb, &value);
         } else {
-            // SAFETY: see above.
-            unsafe {
-                std::env::remove_var(&key);
-            }
+            prefix.extend_from_slice(b"unset ");
+            prefix.extend_from_slice(&nb);
+            prefix.push(b'\n');
         }
     }
+    ev.box_export_prefix = bytes::Bytes::from(prefix);
 
     // sarun: emit the build_edges provenance frame BEFORE exec so the
     // UI's build target pane is populated immediately, even for
@@ -623,7 +701,10 @@ pub fn make_main(argv: &[String]) -> i32 {
     // sarun: shadow/main() path — working dir is the process cwd (already
     // chdir'd for -C above), so this matches the Evaluator's own default.
     let shadow_cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
-    let run_result = match run_kati(&targets, &cl_vars, &makefile, &shadow_cwd) {
+    // Shadow/main() path is one OS process per make — seed from the process env.
+    let seed_env: Vec<(std::ffi::OsString, std::ffi::OsString)> =
+        std::env::vars_os().collect();
+    let run_result = match run_kati(&targets, &cl_vars, &makefile, &shadow_cwd, &seed_env) {
         Ok(r) => r,
         Err(e) => {
             // Recipe failure already printed its `*** [target] Error N`; just
@@ -679,6 +760,12 @@ pub fn make_main(argv: &[String]) -> i32 {
 pub fn make_builtin(
     argv: &[String],
     base_cwd: &std::path::Path,
+    // The brush subshell's exported env, captured by MakeBuiltin::execute. This
+    // carries the PARENT make's exports (applied to the subshell via the recipe
+    // prefix), so a recursive `$(MAKE)` inherits them WITHOUT any make ever
+    // touching the shared process env. NOT std::env — concurrent in-process makes
+    // would race on that.
+    seed_env: &[(std::ffi::OsString, std::ffi::OsString)],
     mut out: impl std::io::Write,
     mut err: impl std::io::Write,
     recipe_out: Box<dyn std::io::Write>,
@@ -796,7 +883,7 @@ pub fn make_builtin(
     // generated content visible, but a builtin can't re-exec the brush process.
     // Instead we drop the makefile cache (so the regenerated include is re-read)
     // and re-run kati, up to a small cap — matching SARUN_KATI_REMAKE_DEPTH.
-    let mut result = run_kati(&targets, &cl_vars, &makefile, &working_dir);
+    let mut result = run_kati(&targets, &cl_vars, &makefile, &working_dir, seed_env);
     let mut remake_depth = 0u32;
     while matches!(&result, Ok(r) if r.remake_active) && remake_depth < 5 {
         remake_depth += 1;
@@ -807,7 +894,7 @@ pub fn make_builtin(
         // forever).
         kati::file_cache::clear();
         kati::fileutil::clear_glob_cache();
-        result = run_kati(&targets, &cl_vars, &makefile, &working_dir);
+        result = run_kati(&targets, &cl_vars, &makefile, &working_dir, seed_env);
     }
 
     kati::exec::set_recipe_out(prev_out);

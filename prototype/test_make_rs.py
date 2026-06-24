@@ -636,6 +636,35 @@ def main():
         check(res == b"VAL=[yes]\n",
               f"case18: 2nd make saw the file the 1st made (no stale glob cache); "
               f"result.txt={res!r} (want b'VAL=[yes]\\n'; stale cache → b'VAL=[]\\n')")
+
+        # ── CASE 19: `export` reaches a recursive sub-make AND its recipe env ──
+        # A parent `export FOO` must reach a recursive $(MAKE): both as a make
+        # variable ($(FOO)) and in the sub-make's RECIPE shell environment
+        # ($$FOO). In a box many makes share one engine process, so exports can't
+        # go through std::env (a data race + cross-make leak); they ride each
+        # recipe's brush subshell via a non-echoed export prefix instead. This
+        # checks BOTH halves — and that an UN-exported var does NOT leak ($$BAR
+        # empty). Pre-env-fix the recipe shell env was empty (env=[]).
+        ex = work / "exp"
+        shutil.rmtree(ex, ignore_errors=True)
+        ex.mkdir(parents=True, exist_ok=True)
+        (ex / "Makefile").write_text(
+            "export FOO := exported_val\n"
+            "BAR := private_val\n"
+            "all:\n\t@$(MAKE) -f sub.mk\n")
+        (ex / "sub.mk").write_text(
+            "all:\n\t@echo \"var=[$(FOO)] env=[$$FOO] bar_env=[$$BAR]\" > out.txt\n")
+        r = subprocess.run(
+            [str(BIN), "run", "-b", "MAKE19", "-C", str(ex), "--", "make"],
+            capture_output=True, text=True, timeout=180)
+        check(r.returncode == 0,
+              f"case19: export box exits 0 (got {r.returncode}: {r.stderr[-600:]})")
+        sp19 = latest_sqlar(m)
+        eo = m.sqlar_content(sp19, str((ex / "out.txt").resolve()).lstrip("/"))
+        check(eo == b"var=[exported_val] env=[exported_val] bar_env=[]\n",
+              f"case19: export reached the sub-make as a var AND its recipe env, "
+              f"and the non-exported var did NOT leak; out.txt={eo!r} "
+              f"(want b'var=[exported_val] env=[exported_val] bar_env=[]\\n')")
     finally:
         if eng is not None and eng.poll() is None:
             eng.terminate()

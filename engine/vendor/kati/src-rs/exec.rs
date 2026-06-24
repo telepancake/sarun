@@ -213,6 +213,12 @@ struct RunReq {
     /// recipe runs at the right cwd on its worker thread (explicit, not via a
     /// make-thread thread-local the worker wouldn't see).
     cwd: Bytes,
+    /// sarun: the make's exported-variable prefix (`export NAME='val'` / `unset
+    /// NAME` lines), applied to each command's subshell as a non-echoed prefix so
+    /// the make's `export`s reach recipes (and recursive sub-makes) through the
+    /// per-subshell env rather than a process-global `std::env` write. Empty for
+    /// the standalone rkati path (Evaluator::box_export_prefix is unset there).
+    box_prefix: Bytes,
     /// The pre-run output timestamp to record as this node's result on success.
     result_ts: ExecStatus,
 }
@@ -257,7 +263,11 @@ fn run_node_commands(
     let mut out = Vec::new();
     let mut ignored = Vec::new();
     let mut failure = None;
-    let prefix = exports_prefix(&req.exports);
+    // The make's global export prefix (box mode) runs first, then the target's
+    // own exported rule vars, then the command. Both are applied to the subshell
+    // but never echoed.
+    let mut prefix = req.box_prefix.to_vec();
+    prefix.extend_from_slice(&exports_prefix(&req.exports));
     let cwd = req.cwd;
     for command in req.commands {
         if command.echo {
@@ -421,9 +431,10 @@ impl<'a> Executor<'a> {
             return Ok((output_ts, None));
         }
         let cwd = Bytes::from(self.ce.ev.working_dir.as_os_str().as_bytes().to_vec());
+        let box_prefix = self.ce.ev.box_export_prefix.clone();
         Ok((
             output_ts,
-            Some(RunReq { output, commands, exports, cwd, result_ts: output_ts }),
+            Some(RunReq { output, commands, exports, cwd, box_prefix, result_ts: output_ts }),
         ))
     }
 

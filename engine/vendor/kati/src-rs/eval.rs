@@ -279,6 +279,16 @@ pub struct Evaluator {
     /// The remake-the-makefile loop in main.rs checks for rules
     /// producing these names and builds + re-parses if any apply.
     pub pending_remake_includes: Vec<(Loc, OsString)>,
+    /// sarun: in the in-process box, exported make variables can't be staged
+    /// into the process environment (`std::env::set_var`) — many makes share one
+    /// engine process, so that global write is a data race (UB) AND leaks one
+    /// make's exports into another. Instead the engine builds a non-echoed shell
+    /// prefix (`export NAME='val'` / `unset NAME`, newline-terminated) here, and
+    /// the executor (recipes) and `$(shell)` prepend it to the command run in the
+    /// brush subshell, so exports reach children through the per-subshell env.
+    /// Empty for the standalone rkati binary, which keeps the `std::env` path
+    /// (one OS process per make, where that's correct).
+    pub box_export_prefix: Bytes,
     symbols_for_eval: HashSet<Symbol>,
 
     in_rule: bool,
@@ -331,6 +341,7 @@ impl Evaluator {
             oneshell: false,
             delete_on_error: false,
             pending_remake_includes: Vec::new(),
+            box_export_prefix: Bytes::new(),
             symbols_for_eval: HashSet::new(),
 
             in_rule: false,
@@ -634,8 +645,9 @@ impl Evaluator {
                 let loc = self.loc.clone().unwrap_or_default();
                 let shell = self.get_shell()?;
                 let shellflag = self.get_shell_flag();
+                let box_prefix = self.box_export_prefix.clone();
                 let (_exit, output, _fc) =
-                    crate::func::shell_func_impl(&shell, shellflag, &cmd_buf, &loc)?;
+                    crate::func::shell_func_impl(&shell, shellflag, &cmd_buf, &loc, &box_prefix)?;
                 result = Variable::with_simple_string(
                     output,
                     origin,
