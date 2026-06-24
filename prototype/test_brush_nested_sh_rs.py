@@ -88,7 +88,8 @@ def main():
     host_paths = [Path(p) for p in ("/root/top.txt", "/root/nested.txt",
                                     "/root/vars.txt", "/root/bad.txt",
                                     "/root/neg.txt", "/root/f.txt",
-                                    "/root/bash.txt", "/root/shbad.txt")]
+                                    "/root/bash.txt", "/root/shbad.txt",
+                                    "/root/dashdash.txt")]
     for h in host_paths: h.unlink(missing_ok=True)
     try:
         eng = subprocess.Popen([str(BIN), "serve"],
@@ -300,6 +301,29 @@ def main():
             shbad = None
         check(shbad in (None, b""),
               f"case9: shbad.txt NOT written under sh-mode (content={shbad!r})")
+
+        # ── CASE 10: glibc popen's `sh -c -- CMD` option terminator ────────
+        # glibc's popen(3)/system(3) exec `/bin/sh -c -- COMMAND` — the `--`
+        # guards a command beginning with `-` from being parsed as a flag. The
+        # brush-sh shim must skip that `--`, else SCRIPT becomes the literal
+        # `--` and brush runs it as a command ("command not found: --"). Any box
+        # recipe that shells out via popen/system (e.g. busybox's
+        # scripts/basic/split-include `popen("find * ...")`) hits this. We feed
+        # the exact argv shape directly — no compiler needed.
+        r = subprocess.run(
+            [str(BIN), "run", "-b", "DASHDASH", "--",
+             "sh", "-c",
+             "/bin/sh -c -- 'echo OK > /root/dashdash.txt'"],
+            capture_output=True, text=True, timeout=120)
+        check(r.returncode == 0,
+              f"case10: `sh -c -- CMD` exits 0 (got {r.returncode}: "
+              f"{r.stderr[-300:]})")
+        check("command not found: --" not in r.stderr,
+              f"case10: the `--` terminator was NOT run as a command "
+              f"({r.stderr[-200:]!r})")
+        sp10 = latest_sqlar(m)
+        check(m.sqlar_content(sp10, "root/dashdash.txt") == b"OK\n",
+              "case10: recipe after `-c --` actually ran (dashdash.txt is 'OK')")
 
         # ── CASE 4 (negative): non-brush box ───────────────────────────────
         # No -b → no shadow binds, no SARUN_BRUSH_SH. The nested /bin/sh is the
