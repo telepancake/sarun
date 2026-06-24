@@ -5,6 +5,7 @@ mod depfile;
 mod eval;
 pub mod graph; // sarun: pub so the engine can walk the build graph for build_edges
 mod hash;
+mod jobserver; // sarun: GNU-make jobserver client (bounds parallelism to a shared pool)
 pub mod load;
 pub mod parse;
 pub mod process; // sarun: pub so the engine can install the in-process executor hook

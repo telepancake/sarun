@@ -105,6 +105,22 @@ fn default_parallelism() -> anyhow::Result<usize> {
     Ok(usize::from(par))
 }
 
+/// sarun: parallelism for an embedded (in-process executor) build. With a shared
+/// jobserver advertised in MAKEFLAGS, allow up to N concurrent recipes — the pool
+/// does the real bounding (and is shared with recursive makes and forked tools).
+/// Without a jobserver, stay serial: embedded brush recipes run concurrently only
+/// under the pool's accounting. A non-embedded build keeps n2's normal default.
+fn embedded_parallelism() -> anyhow::Result<usize> {
+    if crate::process::executor().is_none() {
+        return default_parallelism();
+    }
+    if crate::jobserver::Client::from_env().is_some() {
+        Ok(crate::jobserver::Client::jobs_hint().unwrap_or(default_parallelism()?))
+    } else {
+        Ok(1)
+    }
+}
+
 /// Run a tool as specified by the `-t` flag`.
 fn subtool(args: &mut BuildArgs, tool: &str) -> anyhow::Result<Option<i32>> {
     match tool {
@@ -232,12 +248,9 @@ fn run_impl() -> anyhow::Result<i32> {
         Err(exit) => return Ok(exit),
     };
 
-    // sarun: when the in-process executor is active, FORCE serial (-j1). Recipes
-    // run through the embedded brush which mutates process-global cwd/fds; the
-    // cross-recipe race under parallelism is deferred, so serial is the
-    // conservative correct default (see process.rs::set_executor).
+    // sarun: pick embedded parallelism the same way run_state does.
     if crate::process::executor().is_some() {
-        args.options.parallelism = 1;
+        args.options.parallelism = embedded_parallelism()?;
     }
 
     match build(args)? {
@@ -278,13 +291,7 @@ pub fn run_state(state: load::State, targets: &[String]) -> anyhow::Result<i32> 
     let progress: &dyn Progress = &dumb_console;
 
     let mut options = work::Options::default();
-    // In-process executor ⇒ serial, same reasoning as run_impl (recipes mutate
-    // process-global cwd/fds through embedded brush).
-    options.parallelism = if crate::process::executor().is_some() {
-        1
-    } else {
-        default_parallelism()?
-    };
+    options.parallelism = embedded_parallelism()?;
 
     let mut work = work::Work::new(
         state.graph,
