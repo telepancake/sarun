@@ -165,7 +165,9 @@ pub fn read_file_with_nul(path: &Path) -> std::io::Result<Vec<u8>> {
     // causes us to allocate a buffer the size of the file, then grow it to push
     // the nul, copying the entire file(!).  So instead create a buffer of the
     // right size up front.
-    let mut file = std::fs::File::open(path)?;
+    // sarun: resolve against the logical build dir so the in-process `ninja`
+    // builtin reads build files and depfiles from the brush context's dir.
+    let mut file = std::fs::File::open(crate::graph::resolve_cwd(path))?;
     let size = file.metadata()?.len() as usize;
     let mut bytes = Vec::with_capacity(size + 1);
     unsafe {

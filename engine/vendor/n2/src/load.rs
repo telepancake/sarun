@@ -268,7 +268,9 @@ pub fn read(build_filename: &str) -> anyhow::Result<State> {
         if let Some(builddir) = &loader.builddir {
             db_path = Path::new(&builddir).join(db_path);
             if let Some(parent) = db_path.parent() {
-                std::fs::create_dir_all(parent)?;
+                // sarun: resolve against the logical build dir (db::open also
+                // resolves, but the parent dir must exist before it opens).
+                std::fs::create_dir_all(graph::resolve_cwd(parent))?;
             }
         };
         db::open(&db_path, &mut loader.graph, &mut hashes)

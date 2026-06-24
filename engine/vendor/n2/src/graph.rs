@@ -345,11 +345,43 @@ pub enum MTime {
     Stamp(SystemTime),
 }
 
+thread_local! {
+    // sarun: a logical build directory. When set, relative paths n2 stats are
+    // resolved against it instead of the PROCESS cwd, so the in-process `ninja`
+    // builtin can build a tree at the brush context's dir (or `-C <dir>`)
+    // without chdir'ing the engine. Default None → process cwd, unchanged.
+    static N2_CWD: std::cell::RefCell<Option<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// sarun: set (or clear) the thread-local logical build dir, returning the
+/// previous value so a nested build can save/restore it.
+pub fn set_cwd(cwd: Option<std::path::PathBuf>) -> Option<std::path::PathBuf> {
+    N2_CWD.with(|c| std::mem::replace(&mut *c.borrow_mut(), cwd))
+}
+
+/// sarun: the current logical build dir (None ⇒ process cwd). Used to carry the
+/// dir onto a per-recipe worker thread and to derive the recipe's run cwd.
+pub fn get_cwd() -> Option<std::path::PathBuf> {
+    N2_CWD.with(|c| c.borrow().clone())
+}
+
+/// sarun: resolve a path for filesystem access against the logical build dir.
+pub fn resolve_cwd(path: &Path) -> std::path::PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    N2_CWD.with(|c| match &*c.borrow() {
+        Some(base) => base.join(path),
+        None => path.to_path_buf(),
+    })
+}
+
 /// stat() an on-disk path, producing its MTime.
 pub fn stat(path: &Path) -> std::io::Result<MTime> {
     // TODO: On Windows, use FindFirstFileEx()/FindNextFile() to get timestamps per
     //       directory, for better stat perf.
-    Ok(match std::fs::metadata(path) {
+    Ok(match std::fs::metadata(resolve_cwd(path)) {
         Ok(meta) => MTime::Stamp(meta.modified().unwrap()),
         Err(err) => {
             if err.kind() == std::io::ErrorKind::NotFound {
