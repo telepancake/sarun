@@ -100,12 +100,17 @@ pub enum RedirectStderr {
     DevNull,
 }
 
-pub fn get_timestamp(filename: &[u8]) -> Result<Option<SystemTime>> {
-    let filename = <OsStr as OsStrExt>::from_bytes(filename);
-    if !std::fs::exists(filename)? {
+/// sarun: `base` is the Evaluator's logical working dir; a relative target/input
+/// name is stat'd against it instead of the process cwd, so a sub-make run with
+/// -C (working_dir != process cwd) checks staleness of its files in the RIGHT
+/// directory. Absolute names pass through; base == process cwd is unchanged.
+pub fn get_timestamp(filename: &[u8], base: &Path) -> Result<Option<SystemTime>> {
+    let p = Path::new(<OsStr as OsStrExt>::from_bytes(filename));
+    let path = if p.is_absolute() { p.to_path_buf() } else { base.join(p) };
+    if !std::fs::exists(&path)? {
         return Ok(None);
     }
-    let metadata = std::fs::metadata(filename)?;
+    let metadata = std::fs::metadata(&path)?;
     Ok(Some(metadata.modified()?))
 }
 
