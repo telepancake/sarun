@@ -36,6 +36,7 @@ pub mod find;
 pub mod flags;
 pub mod func;
 pub mod io;
+pub mod jobserver;
 pub mod loc;
 pub mod ninja;
 pub mod parser;

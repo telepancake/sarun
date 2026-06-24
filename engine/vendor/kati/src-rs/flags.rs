@@ -106,6 +106,11 @@ pub struct Flags {
     pub working_dir: Option<OsString>, // -C <dir>
     pub num_cpus: usize,
     pub num_jobs: usize,
+    // sarun: true when -j was given explicitly on the command line (vs the
+    // num_jobs default of CPU count). The parallel executor only fans out when
+    // -j>1 was actually requested — so a plain `make` (and the serial corpus)
+    // stays serial, exactly like GNU make.
+    pub jobs_explicit: bool,
     pub remote_num_jobs: usize,
     pub subkati_args: Vec<OsString>,
     pub targets: Vec<crate::symtab::Symbol>,
@@ -252,6 +257,7 @@ impl Flags {
                             panic!("Invalid -j flag: {}", arg.to_string_lossy());
                         };
                         flags.num_jobs = num_jobs;
+                        flags.jobs_explicit = true;
                     } else if let Some(arg) =
                         parse_command_line_option_with_arg("--remote_num_jobs", &arg, &mut iter)
                     {

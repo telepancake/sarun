@@ -415,17 +415,15 @@ def main():
               f"case10: no `ninja` process row — ran via the in-process builtin "
               f"(count={count_basename(sp10, 'ninja')})")
 
-        # ── CASE 11: multiple recursive sub-makes share the process safely ──
-        # NOT a parallelism test: kati's exec.rs is a single-threaded recipe
-        # loop and the exec path never consumes -j (num_jobs only feeds ninja
-        # generation), so `-j2` is a no-op here and the two sub-makes run
-        # SEQUENTIALLY on one thread. What this checks is the de-globalization
-        # that PARALLELISM WOULD LATER DEPEND ON: two independent recursive
-        # $(MAKE)s in the same process must not clobber each other's per-Evaluator
-        # state (vars + working_dir) and the reentrant recipe runner must not
-        # deadlock on re-entry. Both outputs appear; no `make` row; engine lives.
-        # (True race-freedom under concurrency is untestable until the in-process
-        # executor's forced -j1 is lifted — see the jobserver gap.)
+        # ── CASE 11: parallel recursive sub-makes share the process safely ──
+        # `make -j2` runs the two recursive $(MAKE)s CONCURRENTLY (kati's parallel
+        # scheduler dispatches the `a` and `b` recipes to two worker threads,
+        # bounded by the slip pool). Each sub-make builds in its own subdir at the
+        # right cwd (the recipe cwd is threaded explicitly to the worker). This
+        # exercises the de-globalization for real: two Evaluators on two threads
+        # must not clobber each other's per-instance state, and the reentrant
+        # recipe runner must not deadlock. Both outputs appear; no `make` row;
+        # engine lives.
         for d, txt in (("p1", "one"), ("p2", "two")):
             pd = work / d
             shutil.rmtree(pd, ignore_errors=True)
