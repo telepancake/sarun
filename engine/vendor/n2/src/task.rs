@@ -26,6 +26,9 @@ pub struct FinishedTask {
     pub buildid: BuildId,
     pub span: (Instant, Instant),
     pub result: TaskResult,
+    /// sarun: the jobserver token this task held (None ⇒ the implicit token),
+    /// returned to the work loop so it can release it to the shared pool.
+    pub token: Option<u8>,
 }
 
 /// The result of running a build step.
@@ -213,7 +216,12 @@ impl Runner {
         self.running > 0
     }
 
-    pub fn start(&mut self, id: BuildId, build: &Build) {
+    /// Number of tasks currently running.
+    pub fn running(&self) -> usize {
+        self.running
+    }
+
+    pub fn start(&mut self, id: BuildId, build: &Build, token: Option<u8>) {
         let cmdline = build.cmdline.clone().unwrap();
         let depfile = build.depfile.clone().map(PathBuf::from);
         let rspfile = build.rspfile.clone();
@@ -252,6 +260,7 @@ impl Runner {
                 buildid: id,
                 span: (start, finish),
                 result,
+                token,
             };
             // The send will only fail if the receiver disappeared, e.g. due to shutting down.
             let _ = tx.send(Message::Done(task));

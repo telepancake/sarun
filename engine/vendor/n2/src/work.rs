@@ -706,6 +706,10 @@ impl<'a> Work<'a> {
         signal::register_sigint();
         let mut tasks_failed = 0;
         let mut runner = task::Runner::new(self.options.parallelism);
+        // sarun: the shared jobserver, if our parent advertised one. When present
+        // it — not just `parallelism` — bounds how many recipes run at once, and
+        // the same pool is shared with recursive makes and forked tools.
+        let jobserver = crate::jobserver::Client::from_env();
         while self.build_states.unfinished() {
             self.progress.update(&self.build_states.counts);
 
@@ -721,14 +725,36 @@ impl<'a> Work<'a> {
 
             let mut made_progress = false;
             while runner.can_start_more() {
+                // sarun: jobserver gate. The first concurrent task runs on our
+                // implicit token (every client may run one job for free — this is
+                // what keeps the protocol deadlock-free under recursion); each
+                // additional task must claim a token from the shared pool. If the
+                // pool is momentarily empty we stop starting and wait for a
+                // running task to finish and release one.
+                let token = if runner.running() == 0 {
+                    None
+                } else if let Some(js) = &jobserver {
+                    match js.try_acquire() {
+                        Some(t) => Some(t),
+                        None => break,
+                    }
+                } else {
+                    None
+                };
                 let id = match self.build_states.pop_queued() {
                     Some(id) => id,
-                    None => break,
+                    None => {
+                        // No queued work after all — return the token we claimed.
+                        if let (Some(js), Some(t)) = (&jobserver, token) {
+                            js.release(t);
+                        }
+                        break;
+                    }
                 };
                 let build = &self.graph.builds[id];
                 self.build_states.set(id, build, BuildState::Running);
                 self.create_parent_dirs(build.outs())?;
-                runner.start(id, build);
+                runner.start(id, build, token);
                 self.progress.task_started(id, build);
                 made_progress = true;
             }
@@ -769,6 +795,10 @@ impl<'a> Work<'a> {
             let task = runner.wait(|id, line| {
                 self.progress.task_output(id, line);
             });
+            // sarun: return this task's jobserver token to the shared pool.
+            if let (Some(js), Some(t)) = (&jobserver, task.token) {
+                js.release(t);
+            }
             let build = &self.graph.builds[task.buildid];
             if trace::enabled() {
                 let desc = progress::build_message(build);
