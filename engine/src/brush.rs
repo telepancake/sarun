@@ -2426,8 +2426,19 @@ pub fn set_box_recipe_cwd(cwd: Option<std::path::PathBuf>) -> Option<std::path::
 
 /// Run one n2 recipe through embedded brush, merging stdout+stderr into
 /// `output_cb` (n2's contract). Returns the recipe's exit code.
+/// How a run-through-brush command's stderr (fd 2) is handled.
+pub enum RecipeStderr {
+    /// Merge fd 2 into fd 1 → the captured output (recipe / n2 contract).
+    Merge,
+    /// Leave fd 2 on the shell's default (the box's real fd 2 = FUSE stderr
+    /// sink / terminal); only fd 1 is captured. Matches `$(shell …)`.
+    Inherit,
+    /// Discard fd 2 (`2>/dev/null`).
+    Null,
+}
+
 pub fn run_recipe_in_process(cmdline: &str, output_cb: &mut dyn FnMut(&[u8])) -> i32 {
-    run_recipe_in_process_opt(cmdline, output_cb, true)
+    run_recipe_in_process_opt(cmdline, output_cb, true, RecipeStderr::Merge)
 }
 
 /// Like [`run_recipe_in_process`] but gates bundled stream/filter coreutils.
@@ -2438,6 +2449,7 @@ pub fn run_recipe_in_process_opt(
     cmdline: &str,
     output_cb: &mut dyn FnMut(&[u8]),
     bundle_coreutils: bool,
+    stderr: RecipeStderr,
 ) -> i32 {
     let recipe = double_trailing_backslash(unwrap_sh_c(cmdline));
     let Some(rt) = n2_runtime() else {
@@ -2472,15 +2484,30 @@ pub fn run_recipe_in_process_opt(
                     return 127;
                 }
             };
-            // Point brush's fd 1 AND fd 2 at the pipe write end (merged).
-            // Coreutil builtins write through brush's logical OpenFiles;
-            // forked binaries inherit fd 1/2 — both land on the pipe.
-            let w2 = match writer.try_clone() {
-                Ok(w) => w,
-                Err(e) => { eprintln!("sarun-engine n2: pipe clone: {e}"); return 127; }
-            };
+            // fd 1 → the pipe write end (captured into output_cb). Coreutil
+            // builtins write through brush's logical OpenFiles; forked binaries
+            // inherit fd 1 — both land on the pipe. fd 2 depends on `stderr`:
+            //  - Merge:   fd 2 → the same pipe (recipe / n2: merged output).
+            //  - Inherit: leave fd 2 on the shell default (box real fd 2 =
+            //             FUSE stderr sink) — $(shell) captures stdout only.
+            //  - Null:    fd 2 → /dev/null.
+            match stderr {
+                RecipeStderr::Merge => {
+                    let w2 = match writer.try_clone() {
+                        Ok(w) => w,
+                        Err(e) => { eprintln!("sarun-engine n2: pipe clone: {e}"); return 127; }
+                    };
+                    shell.open_files_mut().set_fd(2, brush_core::openfiles::OpenFile::from(w2));
+                }
+                RecipeStderr::Inherit => {}
+                RecipeStderr::Null => {
+                    if let Ok(devnull) = std::fs::OpenOptions::new().write(true).open("/dev/null") {
+                        shell.open_files_mut()
+                            .set_fd(2, brush_core::openfiles::OpenFile::from(devnull));
+                    }
+                }
+            }
             shell.open_files_mut().set_fd(1, brush_core::openfiles::OpenFile::from(writer));
-            shell.open_files_mut().set_fd(2, brush_core::openfiles::OpenFile::from(w2));
             let prog = match shell.parse_string(recipe_owned.clone()) {
                 Ok(p) => p,
                 Err(e) => {

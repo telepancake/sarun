@@ -287,7 +287,9 @@ fn run_node_commands(
             Bytes::from(v)
         };
         let (ok, o, code) =
-            if let Some((code, o)) = run_with_installed_runner(shell, shellflag, &run_input, &cwd) {
+            if let Some((code, o)) =
+                run_with_installed_runner(shell, shellflag, &run_input, &cwd, RedirectStderr::Stdout)
+            {
                 (code == 0, o, code)
             } else {
                 match run_command(shell, shellflag, &run_input, RedirectStderr::Stdout) {

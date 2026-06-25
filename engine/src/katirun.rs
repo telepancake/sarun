@@ -554,7 +554,7 @@ fn emit_build_edges_kati(roots: &[NamedDepNode]) {
 /// as gnu make / standalone rkati do. Process-global + idempotent (last wins);
 /// safe to call from both the shadow entry and the builtin.
 fn install_make_recipe_runner() {
-    kati::fileutil::install_recipe_runner(Arc::new(|shell, _shellflag, cmd, cwd, output_cb| {
+    kati::fileutil::install_recipe_runner(Arc::new(|shell, _shellflag, cmd, cwd, redirect_stderr, output_cb| {
         use kati::fileutil::RecipeRunnerDecision;
         let shell_base = std::path::Path::new(std::ffi::OsStr::from_bytes(shell))
             .file_name()
@@ -579,7 +579,16 @@ fn install_make_recipe_runner() {
         // util's translate!() returns the raw key (e.g. cp's
         // `cp-error-cannot-stat`). For make recipes we accept the
         // fork+exec overhead in exchange for bash-compatible stderr.
-        let code = crate::brush::run_recipe_in_process_opt(&s, output_cb, false);
+        // Map kati's stderr disposition to brush's fd-2 handling: recipes
+        // (RedirectStderr::Stdout) merge stderr into the captured output; a
+        // $(shell ...) (RedirectStderr::None) keeps stderr on the box's real
+        // fd 2 (terminal/sink) and captures only stdout; DevNull discards it.
+        let stderr_mode = match redirect_stderr {
+            kati::fileutil::RedirectStderr::Stdout => crate::brush::RecipeStderr::Merge,
+            kati::fileutil::RedirectStderr::None => crate::brush::RecipeStderr::Inherit,
+            kati::fileutil::RedirectStderr::DevNull => crate::brush::RecipeStderr::Null,
+        };
+        let code = crate::brush::run_recipe_in_process_opt(&s, output_cb, false, stderr_mode);
         crate::brush::set_box_recipe_cwd(prev);
         RecipeRunnerDecision::Ran { code }
     }));

@@ -15,7 +15,8 @@ limitations under the License.
 */
 
 use std::io::Read;
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::process::ExitStatusExt;
 use std::{
     collections::HashMap,
     ffi::{CStr, CString, OsStr},
@@ -58,6 +59,7 @@ pub type RecipeRunner = Arc<
             &[u8], /* shellflag */
             &[u8], /* cmd */
             &[u8], /* recipe cwd (the make's working_dir, as path bytes) */
+            RedirectStderr, /* stderr disposition (merge into output / inherit / discard) */
             &mut dyn FnMut(&[u8]),
         ) -> RecipeRunnerDecision
         + Send
@@ -84,13 +86,16 @@ pub fn run_with_installed_runner(
     shellflag: &[u8],
     cmd: &[u8],
     cwd: &[u8],
+    redirect_stderr: RedirectStderr,
 ) -> Option<(i32, Vec<u8>)> {
     // sarun: clone the runner Arc and RELEASE the lock before invoking it. The
     // runner may run a recursive in-process make whose recipes re-enter here;
     // holding this non-reentrant lock across the call would deadlock.
     let runner = RECIPE_RUNNER.lock().as_ref()?.clone();
     let mut out = Vec::new();
-    match runner(shell, shellflag, cmd, cwd, &mut |b| out.extend_from_slice(b)) {
+    match runner(shell, shellflag, cmd, cwd, redirect_stderr, &mut |b| {
+        out.extend_from_slice(b)
+    }) {
         RecipeRunnerDecision::Ran { code } => Some((code, out)),
         RecipeRunnerDecision::Passthrough => None,
     }
@@ -126,6 +131,25 @@ pub fn run_command(
     cmd: &Bytes,
     redirect_stderr: RedirectStderr,
 ) -> Result<(ExitStatus, Vec<u8>)> {
+    // sarun: route through the in-process runner (embedded brush) before
+    // fork+exec'ing /bin/sh — so $(shell ...), regen, and any other run_command
+    // caller run in-process exactly like recipes do, instead of forking a shell
+    // (which would re-exec the engine as a separate process). The runner honors
+    // `redirect_stderr` (merge into the captured output / inherit to the box's
+    // stderr / discard) so $(shell) keeps stdout-capture + stderr-to-terminal.
+    // cwd is the process cwd — matching the fork path, which inherits it too.
+    // Declines (Passthrough / no runner) fall through to the classic fork below.
+    {
+        let cwd = std::env::current_dir()
+            .map(|p| p.into_os_string().into_vec())
+            .unwrap_or_default();
+        if let Some((code, output)) =
+            run_with_installed_runner(shell, shellflag, cmd, &cwd, redirect_stderr)
+        {
+            return Ok((ExitStatus::from_raw((code & 0xff) << 8), output));
+        }
+    }
+
     let mut cmd_with_shell;
     let args = if !shell.starts_with(b"/") || memchr2(b' ', b'$', shell).is_some() {
         let cmd_escaped = crate::strutil::escape_shell(cmd);
