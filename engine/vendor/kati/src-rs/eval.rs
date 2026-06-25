@@ -646,8 +646,11 @@ impl Evaluator {
                 let shell = self.get_shell()?;
                 let shellflag = self.get_shell_flag();
                 let box_prefix = self.box_export_prefix.clone();
+                let cwd = std::os::unix::ffi::OsStrExt::as_bytes(
+                    self.working_dir.as_os_str()).to_vec();
                 let (_exit, output, _fc) =
-                    crate::func::shell_func_impl(&shell, shellflag, &cmd_buf, &loc, &box_prefix)?;
+                    crate::func::shell_func_impl(&shell, shellflag, &cmd_buf, &loc,
+                                                 &box_prefix, &cwd)?;
                 result = Variable::with_simple_string(
                     output,
                     origin,

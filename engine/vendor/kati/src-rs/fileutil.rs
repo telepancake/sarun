@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use std::io::Read;
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::ExitStatusExt;
 use std::{
     collections::HashMap,
@@ -129,6 +129,7 @@ pub fn run_command(
     shell: &[u8],
     shellflag: &[u8],
     cmd: &Bytes,
+    cwd: &[u8],
     redirect_stderr: RedirectStderr,
 ) -> Result<(ExitStatus, Vec<u8>)> {
     // sarun: route through the in-process runner (embedded brush) before
@@ -137,14 +138,13 @@ pub fn run_command(
     // (which would re-exec the engine as a separate process). The runner honors
     // `redirect_stderr` (merge into the captured output / inherit to the box's
     // stderr / discard) so $(shell) keeps stdout-capture + stderr-to-terminal.
-    // cwd is the process cwd — matching the fork path, which inherits it too.
-    // Declines (Passthrough / no runner) fall through to the classic fork below.
-    {
-        let cwd = std::env::current_dir()
-            .map(|p| p.into_os_string().into_vec())
-            .unwrap_or_default();
+    // `cwd` is the make's LOGICAL working dir (the Evaluator's working_dir): an
+    // in-process sub-make never chdir's the process, so $(shell) must run in this
+    // dir, not the process cwd. Declines (Passthrough / no runner) fall through
+    // to the fork below, which is also pinned to `cwd`.
+    if !cwd.is_empty() {
         if let Some((code, output)) =
-            run_with_installed_runner(shell, shellflag, cmd, &cwd, redirect_stderr)
+            run_with_installed_runner(shell, shellflag, cmd, cwd, redirect_stderr)
         {
             return Ok((ExitStatus::from_raw((code & 0xff) << 8), output));
         }
@@ -178,6 +178,11 @@ pub fn run_command(
 
     let mut cmd = Command::new(args[0]);
     cmd.args(&args[1..]);
+    // Pin the forked shell to the make's logical working dir (an in-process
+    // sub-make doesn't chdir the process), so $(shell) sees the right cwd.
+    if !cwd.is_empty() {
+        cmd.current_dir(<OsStr as OsStrExt>::from_bytes(cwd));
+    }
 
     let (mut reader, writer) = os_pipe::pipe()?;
     match redirect_stderr {
