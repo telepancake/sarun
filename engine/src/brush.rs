@@ -1827,6 +1827,15 @@ fn send_nested_pipeline_records(records: Vec<Value>) {
     crate::runner::send_nested_prov(format!("{msg}\n").as_bytes());
 }
 
+/// Send one `brush_prov_done` after a complete-command finishes: the engine
+/// stamps done_ts + exit_code on the pipelines with these uids, so a reader can
+/// show per-pipeline wall time and tell running from finished.
+fn send_pipeline_done(uids: &[u64], code: i32, done_ts: f64) {
+    if uids.is_empty() { return; }
+    let msg = json!({"type": "brush_prov_done", "uids": uids, "code": code, "done_ts": done_ts});
+    crate::runner::send_nested_prov(format!("{msg}\n").as_bytes());
+}
+
 /// Build the brush shell, apply set-flags, parse, and execute the script.
 /// Mirrors run_brush: same parse/execute discipline and visible-failure rule.
 async fn run_brush_script(script: String, shell_name: String,
@@ -1922,15 +1931,17 @@ fn stamp_pipeline_records(
     seq: &mut i64,
     spawn_ts: f64,
     nested: bool,
-) -> (Vec<Value>, u64) {
+) -> (Vec<Value>, u64, Vec<u64>) {
     let parent_uid = current_pipeline_uid();
     let mut recs = vec![];
+    let mut uids = vec![];
     let mut frame_uid = 0u64;
     for mut rec in complete_command_records(complete) {
         let uid = next_pipeline_uid();
         if frame_uid == 0 {
             frame_uid = uid;
         }
+        uids.push(uid);
         if let Value::Object(ref mut m) = rec {
             m.insert("uid".to_string(), json!(uid));
             m.insert("parent_uid".to_string(), json!(parent_uid));
@@ -1943,7 +1954,15 @@ fn stamp_pipeline_records(
         recs.push(rec);
         *seq += 1;
     }
-    (recs, frame_uid)
+    (recs, frame_uid, uids)
+}
+
+/// Wall-clock seconds since the epoch (for pipeline spawn/done timestamps).
+fn now_secs() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
 }
 
 async fn run_nested_pipelines(
@@ -1957,7 +1976,7 @@ async fn run_nested_pipelines(
         let spawn_ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs_f64()).unwrap_or(0.0);
-        let (recs, frame_uid) = stamp_pipeline_records(&complete, &mut seq, spawn_ts, true);
+        let (recs, frame_uid, uids) = stamp_pipeline_records(&complete, &mut seq, spawn_ts, true);
         send_nested_pipeline_records(recs);
         let one = brush_parser::ast::Program { complete_commands: vec![complete] };
         // Push this complete-command's frame as the current pipeline so anything
@@ -1968,6 +1987,7 @@ async fn run_nested_pipelines(
         match r {
             Ok(result) => {
                 last_code = u8::from(result.exit_code) as i32;
+                send_pipeline_done(&uids, last_code, now_secs());
                 // Honor terminal control flow BETWEEN complete-commands: `set -e`
                 // (errexit raises ExitShell) and an explicit `exit` must stop the
                 // script here, not fall through to the next newline-separated
@@ -2375,7 +2395,7 @@ async fn run_brush(conn_fd: i32, script: String) -> i32 {
         let spawn_ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs_f64()).unwrap_or(0.0);
-        let (recs, frame_uid) = stamp_pipeline_records(&complete, &mut seq, spawn_ts, false);
+        let (recs, frame_uid, uids) = stamp_pipeline_records(&complete, &mut seq, spawn_ts, false);
         for rec in &recs {
             send_prov(conn_fd, rec);
         }
@@ -2384,7 +2404,10 @@ async fn run_brush(conn_fd: i32, script: String) -> i32 {
         let r = shell.run_program(one, &params).await;
         set_current_pipeline_uid(prev_uid);
         match r {
-            Ok(result) => last_code = u8::from(result.exit_code) as i32,
+            Ok(result) => {
+                last_code = u8::from(result.exit_code) as i32;
+                send_pipeline_done(&uids, last_code, now_secs());
+            }
             Err(e) => {
                 eprintln!("sarun-engine inner: -b brush execution error \
                            (NO /bin/sh fallback): {e}");

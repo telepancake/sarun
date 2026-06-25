@@ -4862,6 +4862,23 @@ fn build_pipeline_tree(rows: Vec<Value>) -> Vec<Value> {
     out
 }
 
+/// Human-readable pipeline wall time: sub-second as `123ms`, else `1.23s` /
+/// `12.3s`, minutes as `3m04s`. Negative/zero → `0ms`.
+fn fmt_dur(secs: f64) -> String {
+    if secs <= 0.0 {
+        return "0ms".to_string();
+    }
+    if secs < 1.0 {
+        return format!("{}ms", (secs * 1000.0).round() as i64);
+    }
+    if secs < 60.0 {
+        return format!("{secs:.2}s");
+    }
+    let m = (secs / 60.0) as i64;
+    let s = (secs - (m as f64) * 60.0).round() as i64;
+    format!("{m}m{s:02}s")
+}
+
 fn pipelines_lines(app: &App) -> Vec<Line<'static>> {
     if app.pipelines.is_empty() {
         return vec![Line::from(Span::styled(
@@ -4883,6 +4900,16 @@ fn pipelines_lines(app: &App) -> Vec<Line<'static>> {
         } else {
             Style::default().fg(Color::Cyan)
         };
+        // Wall time / running indicator: done_ts==0 means the pipeline hasn't been
+        // marked finished — in-flight on a live box (and the prime suspect for a
+        // hang). Otherwise show [spawn_ts, done_ts] elapsed.
+        let spawn_ts = row.get("spawn_ts").and_then(Value::as_f64).unwrap_or(0.0);
+        let done_ts = row.get("done_ts").and_then(Value::as_f64).unwrap_or(0.0);
+        let (dur_txt, dur_style) = if done_ts > 0.0 && spawn_ts > 0.0 {
+            (fmt_dur(done_ts - spawn_ts), Style::default().fg(Color::DarkGray))
+        } else {
+            ("• run".to_string(), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+        };
         // Tree indent: depth-1 levels of "│ " then a "└ " elbow (a nested
         // pipeline hangs off its parent). Depth 0 (roots) get no indent.
         let depth = row.get("depth").and_then(Value::as_i64).unwrap_or(0).max(0) as usize;
@@ -4895,6 +4922,7 @@ fn pipelines_lines(app: &App) -> Vec<Line<'static>> {
             Span::styled(format!("{:>4}  ", id),
                          Style::default().fg(Color::DarkGray)),
             Span::styled(format!("{mark}  "), mark_style),
+            Span::styled(format!("{dur_txt:>7}  "), dur_style),
             Span::styled(format!("p{pipeline:<2}  "),
                          Style::default().fg(Color::DarkGray)),
         ];
@@ -4949,6 +4977,22 @@ fn pipeline_detail_lines(app: &App) -> Vec<Line<'static>> {
     if let Some(st) = spawn_ts {
         lines.push(Line::from(vec![Span::styled("spawn_ts  ", label),
                                     Span::raw(format!("{st:.6}"))]));
+    }
+    // Wall time + exit: done_ts==0 means still running (or never marked).
+    let done_ts = row.get("done_ts").and_then(Value::as_f64).unwrap_or(0.0);
+    let exit_code = row.get("exit_code").and_then(Value::as_i64).unwrap_or(-1);
+    if done_ts > 0.0 {
+        let dur = done_ts - spawn_ts.unwrap_or(done_ts);
+        lines.push(Line::from(vec![Span::styled("wall      ", label),
+                                    Span::styled(fmt_dur(dur), val)]));
+        lines.push(Line::from(vec![Span::styled("exit      ", label),
+                                    Span::styled(exit_code.to_string(),
+                                        if exit_code == 0 { val }
+                                        else { Style::default().fg(Color::Red).add_modifier(Modifier::BOLD) })]));
+    } else {
+        lines.push(Line::from(vec![Span::styled("state     ", label),
+            Span::styled("running (not yet finished)",
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))]));
     }
     lines.push(Line::from(vec![Span::styled("cmd       ", label),
                                 Span::styled(cmd.to_string(), val)]));

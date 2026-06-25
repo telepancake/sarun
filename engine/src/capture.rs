@@ -60,9 +60,14 @@ CREATE TABLE IF NOT EXISTS rdev(name TEXT PRIMARY KEY, dev INT);
 --   the uid of the pipeline that ENCLOSED this one in-process (0 = a root), so a
 --   reader can render the otherwise-flat log as a tree (make → recipe → sh -c →
 --   …; xargs/subshells nest under their spawner). Both 0 for legacy boxes.
+--   done_ts: wall-clock instant the pipeline's complete-command finished (0 ==
+--   still running / never marked); exit_code: its status (-1 until done). The
+--   [spawn_ts, done_ts] span is the pipeline's wall time; done_ts==0 on a LIVE
+--   box means in-flight (useful for spotting a hang).
 CREATE TABLE IF NOT EXISTS brushprov(id INTEGER PRIMARY KEY AUTOINCREMENT,
  ts REAL, cmd TEXT, record TEXT, pipeline INT, spawn_ts REAL, nested INT DEFAULT 0,
- uid INT DEFAULT 0, parent_uid INT DEFAULT 0);
+ uid INT DEFAULT 0, parent_uid INT DEFAULT 0, done_ts REAL DEFAULT 0,
+ exit_code INT DEFAULT -1);
 -- Phase 1 embedded-ninja: one row per parsed n2/ninja build edge, captured when
 -- the box's `ninja` (vendored n2 in-process) loads build.ninja — INCLUDING
 -- up-to-date targets that never execute. `outs`/`ins` are JSON arrays of
@@ -1015,6 +1020,19 @@ impl BoxState {
              VALUES(?1,?2,?3,?4,?5,1,?6,?7)",
             params![ts, cmd, record_json, pipeline, spawn_ts, uid, parent_uid]);
         conn.last_insert_rowid()
+    }
+
+    /// D9 pipeline completion: stamp done_ts + exit_code on the brushprov rows
+    /// with these uids (the pipelines of one just-finished complete-command).
+    /// `uid` is the box-assigned per-pipeline id; matching is scoped to this box.
+    pub fn mark_brushprov_done(&self, uids: &[i64], code: i64, done_ts: f64) {
+        if uids.is_empty() { return; }
+        let conn = self.conn.lock().unwrap();
+        for uid in uids {
+            let _ = conn.execute(
+                "UPDATE brushprov SET done_ts=?1, exit_code=?2 WHERE uid=?3 AND uid!=0",
+                params![done_ts, code, uid]);
+        }
     }
 
     /// Record one oaita-proxy API call into this box's `api_log` table.
