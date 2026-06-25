@@ -528,6 +528,19 @@ impl BoxState {
         if let Some(id) = self.proc_cache.lock().unwrap().get(&(tgid, start)) {
             return *id;
         }
+        // A vanished pid reads back identity-less: tgid_of falls back to the raw
+        // pid, parse_stat yields start=0, and exe/argv are empty. NEVER mint a
+        // blank (tgid,0) row from that — it would be filed as a distinct
+        // incarnation from the process's real (tgid,real_start) record and win
+        // nothing. Reuse this tgid's last LIVE incarnation if we recorded one
+        // (e.g. the write handler characterized the writer while it was alive);
+        // only if we never saw it alive at all do we fall back to the bare tgid.
+        if start == 0 && exe.is_empty() && argv.is_empty() {
+            if let Some((_, rid)) = self.proc_current.lock().unwrap().get(&tgid) {
+                return *rid;
+            }
+            return tgid as i64;
+        }
         // -e env capture: read /proc/<pid>/environ now (before any lock, before the
         // process can exit). The pid (thread id) shares the tgid's environ.
         let env_json = if self.env_capture() { Self::read_environ_json(pid) }
