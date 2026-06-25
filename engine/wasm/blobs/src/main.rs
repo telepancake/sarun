@@ -26,6 +26,8 @@ fn run(util: &str, args: Vec<OsString>) -> i32 {
         return 99;
     }
     let code = match util {
+        "head" => uu_head::uumain(args.into_iter()),
+        "tail" => uu_tail::uumain(args.into_iter()),
         "nl" => uu_nl::uumain(args.into_iter()),
         "cut" => uu_cut::uumain(args.into_iter()),
         "tr" => uu_tr::uumain(args.into_iter()),
@@ -76,7 +78,7 @@ fn main() {
 fn is_applet(name: &str) -> bool {
     matches!(
         name,
-        "nl" | "cut"
+        "head" | "tail" | "nl" | "cut"
             | "tr"
             | "uniq"
             | "sort"

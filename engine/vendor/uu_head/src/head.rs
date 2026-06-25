@@ -14,6 +14,17 @@ use std::num::TryFromIntError;
 #[cfg(unix)]
 use std::os::fd::BorrowedFd;
 use std::path::{Path, PathBuf};
+
+/// Backing descriptor for the logical-I/O entry points. On unix it is a real
+/// `BorrowedFd` — the native in-process builtin passes the shell `OpenFile`'s fd
+/// for the seek/splice fast paths. On wasm there are no process fds (the blob
+/// runs under wasmi with WASI stdio), so it degrades to an uninhabited
+/// placeholder and every fd fast path is `#[cfg(unix)]`-gated; the wasm `uumain`
+/// passes `None`. Keeps ONE signature that compiles on both targets.
+#[cfg(unix)]
+type LogicalFd<'a> = BorrowedFd<'a>;
+#[cfg(not(unix))]
+type LogicalFd<'a> = core::marker::PhantomData<&'a ()>;
 use thiserror::Error;
 use uucore::display::Quotable;
 use uucore::error::{FromIo, UError, UResult, USimpleError};
@@ -455,7 +466,7 @@ fn uu_head(
     options: &HeadOptions,
     out: &mut dyn Write,
     stdin: &mut dyn Read,
-    stdin_fd: Option<BorrowedFd<'_>>,
+    stdin_fd: Option<LogicalFd<'_>>,
 ) -> UResult<()> {
     let mut first = true;
     // sarun: per-file errors are ACCUMULATED and returned (mirroring the uu_cat
@@ -572,9 +583,9 @@ fn uu_head(
 pub fn head(
     args: impl uucore::Args,
     out: &mut dyn Write,
-    out_fd: Option<BorrowedFd<'_>>,
+    out_fd: Option<LogicalFd<'_>>,
     stdin: &mut dyn Read,
-    stdin_fd: Option<BorrowedFd<'_>>,
+    stdin_fd: Option<LogicalFd<'_>>,
 ) -> UResult<()> {
     // `head` has no fd-to-fd fast path; the output descriptor is irrelevant.
     let _ = out_fd;
@@ -592,6 +603,7 @@ pub fn head(
 /// brush builtin must NOT route through here — it calls [`head`] directly with
 /// the shell's logical sink/source (and their backing fds, when any), so it
 /// never touches process-global stdio.
+#[cfg(unix)]
 #[uucore::main]
 pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     let stdout = io::stdout();
@@ -603,6 +615,18 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     let out_fd = Some(unsafe { BorrowedFd::borrow_raw(1) });
     let in_fd = Some(unsafe { BorrowedFd::borrow_raw(0) });
     head(args, &mut out, out_fd, &mut input, in_fd)
+}
+
+/// wasm has no process fds; the WASI host backs fd 0/1. Drive `head` with no
+/// backing descriptor — it falls to the portable read/write path.
+#[cfg(not(unix))]
+#[uucore::main]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    let stdin = io::stdin();
+    let mut input = stdin.lock();
+    head(args, &mut out, None, &mut input, None)
 }
 
 #[cfg(test)]

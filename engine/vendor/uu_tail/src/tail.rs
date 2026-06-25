@@ -154,6 +154,15 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     }
 }
 
+/// Backing descriptor for the logical-I/O entry. Real `BorrowedFd` on unix;
+/// an uninhabited placeholder on wasm (the blob runs under wasmi with WASI
+/// stdio, no process fds). `tail` ignores it on both, so this only keeps the
+/// signature compiling for both targets. See PORTING-WASM.md.
+#[cfg(unix)]
+type LogicalFd<'a> = std::os::fd::BorrowedFd<'a>;
+#[cfg(not(unix))]
+type LogicalFd<'a> = core::marker::PhantomData<&'a ()>;
+
 /// Logical entry point for the in-process brush `tail` builtin.
 ///
 /// Drives `tail` against the shell's logical output sink (via [`LogicalStdout`]
@@ -166,10 +175,10 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
 pub fn tail(
     args: impl uucore::Args,
     out: &mut dyn Write,
-    out_fd: Option<std::os::fd::BorrowedFd<'_>>,
+    out_fd: Option<LogicalFd<'_>>,
     err: &mut dyn Write,
     stdin: &mut dyn Read,
-    stdin_fd: Option<std::os::fd::BorrowedFd<'_>>,
+    stdin_fd: Option<LogicalFd<'_>>,
 ) -> UResult<()> {
     let _ = (out_fd, stdin_fd);
     TAIL_ERR.with(|b| b.borrow_mut().clear());

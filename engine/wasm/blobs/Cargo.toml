@@ -28,6 +28,8 @@ uucore     = { path = "../../vendor/uucore", features = ["entries"] }
 # cat/head/tail/wc carry the unix-only logical-fd (splice) patch; they need the
 # fd-param gating before they compile to wasm (see PORTING-WASM.md) and are added
 # back as each is ported. The set below compiles to WASI as-is.
+uu_head     = { path = "../../vendor/uu_head" }
+uu_tail     = { path = "../../vendor/uu_tail" }
 uu_nl       = { path = "../../vendor/uu_nl" }
 uu_cut      = { path = "../../vendor/uu_cut" }
 uu_tr       = { path = "../../vendor/uu_tr" }
