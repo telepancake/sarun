@@ -1697,6 +1697,15 @@ impl Filesystem for Overlay {
         // writer, not per write op.
         if wpid != h.inner.last_pid || h.inner.last_tgid == 0 {
             h.inner.last_tgid = tgid_of(wpid);
+            // Characterize the writer NOW, while it is alive (blocked in this
+            // write()). release() runs at fd-close, which for a short-lived
+            // EXTERNAL writer (gcc/sed/conf — its own tgid, not the long-lived
+            // brush --inner) is its exit; reading /proc there would find nothing.
+            // Recording it here populates proc_current, so the release-time
+            // writer_for(last_tgid) reuses this live row instead of a blank one.
+            if let Some(b) = self.box_of(h.inner.box_id) {
+                b.writer_for(h.inner.last_tgid);
+            }
         }
         h.inner.last_pid = wpid;
         let Some(f) = h.inner.file.as_ref() else {
