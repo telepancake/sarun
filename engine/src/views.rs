@@ -301,13 +301,25 @@ fn source_outputs(sid: i64) -> (Vec<Value>, Vec<Subject>) {
     (rows_out, subjects)
 }
 
-fn source_procs(sid: i64) -> (Vec<Value>, Vec<Subject>) {
+fn source_procs(sid: i64, running_only: bool) -> (Vec<Value>, Vec<Subject>) {
     // The flat process list and its DFS-flattened tree with depth/connector,
     // built once here on the engine side. Mirrors the old client-side
     // build_proc_tree but the ancestor `lookup` is a plain function call
     // instead of an RPC round-trip per process.
     let procs_v = discover::processes(sid);
-    let procs: Vec<Value> = procs_v.as_array().cloned().unwrap_or_default();
+    let mut procs: Vec<Value> = procs_v.as_array().cloned().unwrap_or_default();
+    // running_only (live box, default): keep only rows whose process (tgid, col 1)
+    // is still alive — a pidfd probe (control::pid_alive), no stored liveness. The
+    // surviving tgids ARE the filter; build_proc_tree still pulls their ancestors
+    // as connectors. The caller only sets this for a live box.
+    if running_only {
+        use std::collections::HashMap;
+        let mut alive: HashMap<i64, bool> = HashMap::new();
+        procs.retain(|p| {
+            let tgid = p.as_array().and_then(|a| a.get(1)).and_then(Value::as_i64).unwrap_or(0);
+            tgid > 0 && *alive.entry(tgid).or_insert_with(|| crate::control::pid_alive(tgid as i32))
+        });
+    }
     let roots: std::collections::HashSet<i64> = discover::proc_roots(sid)
         .as_array().cloned().unwrap_or_default()
         .iter().filter_map(Value::as_i64).collect();
@@ -510,7 +522,7 @@ fn rebuild_idx(view: &mut View) {
 pub type Registry = HashMap<u64, View>;
 
 pub fn open(reg: &mut Registry, next_id: &mut u64,
-            kind_s: &str, sid: i64, filter_v: &Value) -> Value {
+            kind_s: &str, sid: i64, filter_v: &Value, procs_running_only: bool) -> Value {
     let Some(kind) = Kind::parse(kind_s) else {
         return json!({"ok": false, "error": format!("unknown view kind {kind_s:?}")});
     };
@@ -520,7 +532,7 @@ pub fn open(reg: &mut Registry, next_id: &mut u64,
             (s, ViewAux::Changes(a))
         }
         Kind::Procs => {
-            let (s, a) = source_procs(sid);
+            let (s, a) = source_procs(sid, procs_running_only);
             (s, ViewAux::Procs(a))
         }
         Kind::Outputs => {
