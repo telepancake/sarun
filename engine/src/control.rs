@@ -50,8 +50,21 @@ pub struct Shared {
     pub api_proxy: Option<std::sync::Arc<crate::oaita::proxy::Proxy>>,
 }
 
-fn pidfd_open(pid: i32) -> i32 {
+/// Open a pidfd for `pid` (>=0 on success). A live `pid` yields a valid fd; a
+/// dead one fails (ESRCH). The caller closes it. Reused as a liveness probe.
+pub(crate) fn pidfd_open(pid: i32) -> i32 {
     unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as i32 }
+}
+
+/// True if `pid` (a HOST pid/tgid) is currently alive — a pidfd probe.
+pub(crate) fn pid_alive(pid: i32) -> bool {
+    let fd = pidfd_open(pid);
+    if fd >= 0 {
+        unsafe { libc::close(fd); }
+        true
+    } else {
+        false
+    }
 }
 fn pidfd_signal(pidfd: i32, sig: i32) {
     unsafe { libc::syscall(libc::SYS_pidfd_send_signal, pidfd, sig,
@@ -1335,9 +1348,14 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
             let sid = args.get(1).and_then(|v| v.as_i64()
                 .or_else(|| v.as_str().and_then(|s| s.parse().ok()))).unwrap_or(0);
             let filter = args.get(2).cloned().unwrap_or(Value::Null);
+            // arg 3: running-only (procs). Default true — the most informative for
+            // a LIVE box. Only filters when the box is actually live (a finished
+            // box shows its full history). Liveness reuses box_runpids.
+            let running_only = args.get(3).and_then(Value::as_bool).unwrap_or(true);
             let mut s = lock(state);
+            let live = s.box_runpids.contains_key(&sid);
             let Shared { views, next_view_id, .. } = &mut *s;
-            crate::views::open(views, next_view_id, kind, sid, &filter)
+            crate::views::open(views, next_view_id, kind, sid, &filter, running_only && live)
         }
         "view.window" => {
             let vid = args.first().and_then(Value::as_u64).unwrap_or(0);
