@@ -1,11 +1,21 @@
 [package]
-name="mmapspike"
-version="0.0.0"
-edition="2021"
+name = "sarun-mmap-demo"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
 [dependencies]
 libc = "0.2"
+wasmi = { version = "2.0.0-beta.3", features = ["simd", "wat"] }
+
+# Sparse file-backed store + hole-punching (storage mechanic).
 [[bin]]
-name="m"
-path="src/main.rs"
+name = "sparse"
+path = "src/main.rs"
+
+# wasmi linear memory backed by an mmap'd file, via public new_static (zero-copy).
+[[bin]]
+name = "linmem"
+path = "src/linmem.rs"
 
 [workspace]

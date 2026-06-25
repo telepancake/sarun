@@ -52,7 +52,8 @@ fds — the isolation is intrinsic. So:
 | the host's suspend machinery needs **no WASI** | the demo's import is a plain `wasmi::func_wrap` + `Caller`; `wasi-common` is not involved |
 | the **real coreutils blob runs on our own hand-written preview1 host** with in-memory stdio (zero syscalls for I/O), byte-parity | `engine/wasm/host` — `runblob <blob> seq/tr/sort/head/tail/uniq/nl/cut` |
 | **single-file suspend/resume across a full teardown** (snapshot linear memory to one file, drop everything, restore + rewind, finish) | `engine/wasm/asyncify-demo` `snapshot` bin |
-| **mmap'd file as live store, used as-is, kept sparse by hole-punching** (zero-copy, persists across unmap/remap) | `engine/wasm/mmap-demo` |
+| **mmap'd file as live store, used as-is, kept sparse by hole-punching** (zero-copy, persists across unmap/remap) | `engine/wasm/mmap-demo` `sparse` bin |
+| **wasmi linear memory IS an mmap'd file** via public `Memory::new_static` (zero-copy, no patch) | `engine/wasm/mmap-demo` `linmem` bin |
 
 ### Operational notes
 
@@ -106,13 +107,14 @@ The engine's host is **plain wasmi imports**, not `wasi-common`:
   drops cache only) so the file's real footprint tracks live pages. The mmap +
   sparse + hole-punch mechanic is proven (`mmap-demo`); the snapshot roundtrip is
   proven (`asyncify-demo snapshot`).
-- **Open items for real-blob checkpoint:** (1) **export mutable globals**
-  (`__stack_pointer`, …) at blob-build time so they go in the header — the blob has
-  one mutable i32 global (the shadow-stack pointer), currently unexported. (2)
-  **wasmi has no hook to back linear memory with mmap'd storage** (it owns
-  `CoreMemory` internally); making guest memory truly mmap-as-is needs a wasmi
-  patch (vendor+patch, like the other upstreams). Until then guest memory
-  checkpoints as a copy; host fd/pipe buffers are mmap-as-is today.
+- **Real-blob checkpoint is build-flags, not a runtime patch.** wasmi backs a
+  linear memory with our buffer via the public `Memory::new_static(&'static mut
+  [u8])` (a static buffer grows up to its capacity) — proven (`mmap-demo linmem`):
+  the guest writes straight into the mmap'd file, zero-copy. So:
+  (1) build blobs with `wasm-ld --import-memory` (module imports `env.memory`) and
+      `--export=__stack_pointer` (so the one mutable global is snapshottable);
+  (2) host mmaps the file sized to max pages (sparse), `new_static`s it as
+      `env.memory`. No wasmi patch; no wasm3 (it `malloc`s its memory too).
 
 ### Two halves of the Unix surface
 

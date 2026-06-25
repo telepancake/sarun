@@ -35,12 +35,20 @@ view into this one file, so the running system mutates the file in place. Unused
 linear-memory pages (a blob using 2 MiB of a 4 GiB-capable space) and freed pipe
 bytes are hole-punched, so the file's real footprint tracks live pages.
 
-## The remaining blocker (honest)
+## No blocker: wasmi backs memory with our buffer (the `linmem` bin)
 
-wasmi 2.0 owns its linear-memory buffer internally (`CoreMemory`, grown via
-`Vec`/`Box<[u8]>`); it exposes `data`/`data_mut`/`data_ptr`/`grow` but **no hook
-to back a memory with host-provided (mmap'd) storage**. So "the file is the live
-linear memory" needs a wasmi patch (vendor + patch, like brush/uu_*/n2/kati) to
-accept an external memory backing. Until then a checkpoint of guest memory is a
-copy into the file rather than zero-copy. The host fd table / pipe buffers can be
-mmap-as-is today (they're our own allocations).
+wasmi 2.0 has a public **bring-your-own-buffer** API — `Memory::new_static(ctx,
+ty, buf: &'static mut [u8])` — and a static buffer can grow up to its capacity.
+So "the file *is* the live linear memory" needs **no wasmi patch**: mmap the
+backing file, hand the region to `new_static`, and define it as the module's
+imported memory. `linmem` proves it — a guest's store lands directly in the file
+(zero-copy). (wasm3 would NOT have helped: it `malloc`s its memory internally too;
+`m3_GetMemory` is access-only.)
+
+Recipe for a real blob:
+- build with `wasm-ld --import-memory` so the module imports `env.memory` (and
+  `--export=__stack_pointer` so the mutable global can be snapshotted);
+- host mmaps the file sized to the memory's max pages (sparse), `new_static`s it,
+  defines it as `env.memory`; growth uses more of the (sparse) region;
+- checkpoint = `msync`; resume = `mmap` + `new_static` + restore globals +
+  `start_rewind`; unused pages hole-punched.
