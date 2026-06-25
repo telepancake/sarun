@@ -480,6 +480,9 @@ struct App {
     /// Pipelines pane: show ONLY in-flight pipelines (done_ts==0) — the live /
     /// stuck set on a running box. Toggled with `f`.
     pipe_running_only: bool,
+    /// Procs pane: show ONLY processes still alive (engine-side pidfd probe) on a
+    /// live box. Defaults true (most informative); toggled with `f` to show all.
+    proc_running_only: bool,
     /// Phase 1 build edges for the currently-loaded box (one row per
     /// `build_edges` entry; same "full list, no windowing" reasoning).
     build_edges: Vec<Value>,
@@ -637,7 +640,7 @@ impl App {
             outputs_view: None, outputs_view_sid: None,
             outputs_total: 0,
             outputs_window_start: 0,
-            rules: vec![], pipelines: vec![], pipelines_flat: vec![], pipe_tree: true, pipe_running_only: false, build_edges: vec![],
+            rules: vec![], pipelines: vec![], pipelines_flat: vec![], pipe_tree: true, pipe_running_only: false, proc_running_only: true, build_edges: vec![],
             sel_session: 0,
             sel_change: 0,
             sel_proc: 0, sel_pipeline: 0, sel_edge: 0,
@@ -929,7 +932,7 @@ impl App {
         self.close_processes_view();
         let Some(sid) = self.cur_sid_i64() else { return };
         let filter = filter_to_json(self.f_procs.active());
-        match rpc(&self.sock, "view.open", json!(["procs", sid, filter])) {
+        match rpc(&self.sock, "view.open", json!(["procs", sid, filter, self.proc_running_only])) {
             Ok(v) => {
                 self.processes_view = v.get("view_id").and_then(Value::as_u64);
                 self.processes_total =
@@ -1334,6 +1337,17 @@ impl App {
     /// baked into each row), so the UI no longer rebuilds the tree per
     /// keystroke — that was the multi-second-per-keypress death spiral on a
     /// box with millions of processes.
+    /// `f` on Procs: toggle showing only alive processes (live box) vs all.
+    fn toggle_proc_running_only(&mut self) {
+        self.proc_running_only = !self.proc_running_only;
+        self.load_processes();
+        self.status = if self.proc_running_only {
+            "procs: running only".to_string()
+        } else {
+            "procs: all".to_string()
+        };
+    }
+
     fn load_processes(&mut self) {
         self.close_processes_view();
         self.processes.clear();
@@ -1342,7 +1356,7 @@ impl App {
         self.sel_proc = 0;
         let Some(sid) = self.cur_sid_i64() else { return };
         let filter = filter_to_json(self.f_procs.active());
-        match rpc(&self.sock, "view.open", json!(["procs", sid, filter])) {
+        match rpc(&self.sock, "view.open", json!(["procs", sid, filter, self.proc_running_only])) {
             Ok(v) => {
                 self.processes_view = v.get("view_id").and_then(Value::as_u64);
                 self.processes_total =
@@ -4009,7 +4023,7 @@ enum PaneAction {
     ApplyHunk, DiscardHunk, ApplyFile, DiscardFile, ApplyAll, DiscardAll,
     ConfirmKill, ConfirmDelete, ConfirmDissolve,
     NewRule, DeleteRule, StartRename,
-    ToggleFilter, Refresh, ActionMenu, ToggleTree, ToggleRunningOnly,
+    ToggleFilter, Refresh, ActionMenu, ToggleTree, ToggleRunningOnly, ToggleProcRunning,
 }
 
 /// The main-loop pane keymap. ORDER MATTERS, and reproduces the original inline
@@ -4045,6 +4059,7 @@ const PANE_ACTION_KEYS: &[(Key, PaneGate, PaneAction, Option<&str>)] = &[
     (Key::Char('Z'), PaneGate::Any,             PaneAction::ConfirmDissolve, Some("dissolve box (y/n)")),
     (Key::Char('t'), PaneGate::On(Pane::Pipelines), PaneAction::ToggleTree,  Some("toggle tree / flat chronological (on Pipes)")),
     (Key::Char('f'), PaneGate::On(Pane::Pipelines), PaneAction::ToggleRunningOnly, Some("toggle running-only (on Pipes)")),
+    (Key::Char('f'), PaneGate::On(Pane::Processes), PaneAction::ToggleProcRunning, Some("toggle running-only (on Procs)")),
     (Key::Char('n'), PaneGate::On(Pane::Rules), PaneAction::NewRule,         Some("new rule (on Rules)")),
     (Key::Char('d'), PaneGate::On(Pane::Rules), PaneAction::DeleteRule,      Some("delete rule (on Rules)")),
     (Key::Char('d'), PaneGate::Any,             PaneAction::Detach,          Some("detach (leaves the engine running)")),
@@ -4064,6 +4079,7 @@ fn run_pane_action(app: &mut App, action: PaneAction) {
         PaneAction::NextPane => app.next_pane(),
         PaneAction::ToggleTree => app.toggle_pipeline_tree(),
         PaneAction::ToggleRunningOnly => app.toggle_pipeline_running_only(),
+        PaneAction::ToggleProcRunning => app.toggle_proc_running_only(),
         PaneAction::Open => {
             if app.focus == Pane::Rules {
                 let cur = app.rules.get(app.sel_rule).cloned().unwrap_or_default();
@@ -7447,7 +7463,7 @@ mod tests {
             outputs_view: None, outputs_view_sid: None,
             outputs_total: 0,
             outputs_window_start: 0,
-            rules: vec![], pipelines: vec![], pipelines_flat: vec![], pipe_tree: true, pipe_running_only: false, build_edges: vec![],
+            rules: vec![], pipelines: vec![], pipelines_flat: vec![], pipe_tree: true, pipe_running_only: false, proc_running_only: true, build_edges: vec![],
             sel_session: 0,
             sel_change: 0,
             sel_proc: 0, sel_pipeline: 0, sel_edge: 0,
