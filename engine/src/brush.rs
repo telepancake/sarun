@@ -1934,11 +1934,16 @@ async fn run_nested_pipelines(
 // build-id), so size+content is the robust signal available — distinct programs
 // differ in size (cheap reject) and a real shell never collides.
 //
-// CONSERVATIVE: anything we can't confidently interpret in POSIX sh-mode (bash
-// invocations, interactive shells, unusual flags, unreadable scripts) returns
-// None and falls through to the normal fork path — so snooping can only ever
-// skip a redundant fork, never change behavior. bash keeps the fork path so it
-// gets its own bash-mode shell on reentry.
+// MODE BY NAME: `bash` → extended dialect, `sh`/`dash` → POSIX. The cloned
+// subshell is built in the box's sh_mode; for a `bash` invocation the snoop
+// flips the single `sh_mode` option (the only thing build_box_shell varies by
+// mode), which parser_options()/is_keyword() re-read at parse time.
+//
+// CONSERVATIVE: anything we can't confidently parse (interactive shells, options
+// we don't model like `-o NAME`/`-i`/`-l`, unreadable scripts) returns None and
+// falls through to the normal fork path — so snooping can only ever skip a
+// redundant fork, never change behavior. Those fork cases re-enter brush_sh,
+// which has the full flag parser and a real interactive REPL.
 
 const SELF_HEAD: usize = 4096;
 
@@ -2007,13 +2012,17 @@ fn shebang_interp(path: &std::path::Path) -> Option<std::path::PathBuf> {
     Some(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&token)))
 }
 
-/// A snoopable POSIX-sh invocation extracted from a self-exe shell argv.
+/// A snoopable shell invocation extracted from a self-exe shell argv.
 struct Snoop {
     script: String,
     dollar0: String,
     positional: Vec<String>,
     /// Simple set-flags (`-e`/`-u`/`-x`/…) to apply via `set` before running.
     set_flags: Vec<String>,
+    /// Invoked as `bash` (→ extended dialect) vs `sh`/`dash` (→ POSIX). The only
+    /// option `build_box_shell` varies by mode is `sh_mode`, so the snoop just
+    /// flips that one field on the cloned subshell — see run().
+    bash_mode: bool,
 }
 
 /// Set-flag characters we model precisely enough to replay via `set`. Anything
@@ -2021,18 +2030,17 @@ struct Snoop {
 const SNOOP_SET_FLAGS: &str = "euxvfnhmbCa";
 
 /// Decide whether `resolved` + `argv` (argv[0] = the shell name as invoked) is
-/// an in-process-snoopable POSIX-sh invocation. Returns None (→ fork) for bash,
-/// odd flags, or anything we can't parse confidently. Mirrors brush_sh's
-/// `-c`/script/`--` handling (including the popen `sh -c -- CMD` terminator).
+/// an in-process-snoopable shell invocation. Returns None (→ fork) for odd flags
+/// or anything we can't parse confidently. Mirrors brush_sh's `-c`/script/`--`
+/// handling (including the popen `sh -c -- CMD` terminator) and its mode-by-name
+/// rule (`bash` → extended; `sh`/`dash` → POSIX).
 fn parse_snoop(resolved: &std::path::Path, argv: &[String]) -> Option<Snoop> {
     let arg0 = argv.first()?;
     let direct = is_self_exe(resolved);
     if direct {
         let base = std::path::Path::new(arg0)
             .file_name().and_then(|s| s.to_str()).unwrap_or("");
-        if base == "bash" {
-            return None; // fork bash so it gets its own bash-mode shell
-        }
+        let bash_mode = base == "bash";
         let mut i = 1usize;
         let mut set_flags = vec![];
         let mut have_c = false;
@@ -2063,7 +2071,7 @@ fn parse_snoop(resolved: &std::path::Path, argv: &[String]) -> Option<Snoop> {
             i += 1;
             let dollar0 = argv.get(i).cloned().unwrap_or_else(|| arg0.clone());
             let positional = if i < argv.len() { argv[i + 1..].to_vec() } else { vec![] };
-            return Some(Snoop { script, dollar0, positional, set_flags });
+            return Some(Snoop { script, dollar0, positional, set_flags, bash_mode });
         }
         // `sh [-flags] SCRIPT [args]` — read SCRIPT from disk.
         let path = argv.get(i)?;
@@ -2073,20 +2081,22 @@ fn parse_snoop(resolved: &std::path::Path, argv: &[String]) -> Option<Snoop> {
             dollar0: path.clone(),
             positional: argv.get(i + 1..).unwrap_or(&[]).to_vec(),
             set_flags,
+            bash_mode,
         });
     }
     // Shebang form: `./configure` etc. whose `#!` interpreter is our binary.
     let interp = shebang_interp(resolved)?;
-    let ibase = interp.file_name().and_then(|s| s.to_str()).unwrap_or("");
-    if ibase == "bash" || !is_self_exe(&interp) {
+    if !is_self_exe(&interp) {
         return None;
     }
+    let ibase = interp.file_name().and_then(|s| s.to_str()).unwrap_or("");
     let script = std::fs::read_to_string(resolved).ok()?;
     Some(Snoop {
         script,
         dollar0: resolved.to_string_lossy().into_owned(),
         positional: argv.get(1..).unwrap_or(&[]).to_vec(),
         set_flags: vec![],
+        bash_mode: ibase == "bash",
     })
 }
 
@@ -2124,6 +2134,18 @@ impl brush_core::commands::ExecInterposer<brush_core::extensions::DefaultShellEx
             static SNOOP_PID: AtomicU32 = AtomicU32::new(0x4000_0000);
             let synth = SNOOP_PID.fetch_add(1, Ordering::Relaxed);
             sub.set_snoop_identity(snoop.dollar0, snoop.positional, synth);
+
+            // Mode by invocation name. The cloned subshell was built in the box's
+            // POSIX sh_mode; `bash …` wants the extended dialect (`[[ ]]`, arrays,
+            // bash keywords). `build_box_shell` varies ONLY `sh_mode` between its
+            // sh and bash shells (it never sets `.posix(...)`, and nothing else is
+            // derived from the mode), and `parser_options()`/`is_keyword()` re-read
+            // `sh_mode` at parse time — so flipping this one field is exactly
+            // equivalent to having built a bash-mode shell. `set` flags and the
+            // script below are then parsed in the right dialect.
+            if snoop.bash_mode {
+                sub.options_mut().sh_mode = false;
+            }
 
             // Replay simple set-flags (-e/-u/-x…) via `set`, like run_brush_script.
             if !snoop.set_flags.is_empty() {
