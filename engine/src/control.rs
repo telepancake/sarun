@@ -253,6 +253,31 @@ fn brush_prov_nested(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Val
     json!({"ok": true, "recorded": n})
 }
 
+/// D9 pipeline completion. After a pipeline's complete-command finishes, the box
+/// sends one message carrying the completed pipelines' `uids`, the `code`, and
+/// the `done_ts` (wall clock), plus ITS OWN pidfd (resolve-the-box like
+/// brush_prov_nested). We stamp done_ts + exit_code on those brushprov rows so a
+/// reader can show per-pipeline wall time and tell running (done_ts==0) from
+/// finished. Best-effort; one-shot reply.
+fn brush_prov_done(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
+    let host_pid = peer_pidfd.map(host_pid_from_pidfd).filter(|p| *p > 0).unwrap_or(0);
+    if let Some(fd) = peer_pidfd { unsafe { libc::close(fd); } }
+    let Some(id) = derive_parent_box(state, host_pid) else {
+        return json!({"ok": false, "error": "no enclosing box"});
+    };
+    let uids: Vec<i64> = msg.get("uids").and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_i64).collect()).unwrap_or_default();
+    let code = msg.get("code").and_then(Value::as_i64).unwrap_or(0);
+    let done_ts = msg.get("done_ts").and_then(Value::as_f64).unwrap_or(0.0);
+    let ov = lock(state).overlay.clone();
+    if let Some(ov) = ov.as_ref() {
+        if let Some(b) = ov.live_box(id) {
+            b.mark_brushprov_done(&uids, code, done_ts);
+        }
+    }
+    json!({"ok": true})
+}
+
 /// Phase 1 embedded-ninja `build_edges` verb. The shadowed `ninja` (vendored n2,
 /// in-process) sends ONE message carrying the FULL parsed build graph — every
 /// edge {outs, ins, cmd}, INCLUDING up-to-date targets that never execute — plus
@@ -1931,6 +1956,12 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
             // the enclosing box from /proc ancestry. NOT a box channel — record
             // and reply once, then the connection closes. The pidfd is consumed.
             brush_prov_nested(&state, &msg, peer_pidfd.take())
+        } else if msg.get("type").and_then(Value::as_str) == Some("brush_prov_done") {
+            // D9 pipeline completion: a one-shot control message emitted after a
+            // pipeline's complete-command finishes, carrying its OWN pidfd (like
+            // brush_prov_nested) so we resolve the box, then stamp done_ts +
+            // exit_code on the matching brushprov rows (by uid).
+            brush_prov_done(&state, &msg, peer_pidfd.take())
         } else if msg.get("type").and_then(Value::as_str) == Some("build_edges") {
             // Phase 1 embedded-ninja: a one-shot control message from the
             // shadowed `ninja` (vendored n2) carrying its OWN pidfd, resolved to
