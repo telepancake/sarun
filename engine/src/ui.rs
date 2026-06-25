@@ -1387,6 +1387,9 @@ impl App {
             Ok(Value::Array(rows)) => {
                 self.pipelines_flat = rows;
                 self.rebuild_pipeline_view();
+                // Open at the TAIL: the most recent pipelines are what you watch
+                // on a live box, so the last `height` rows fill the screen.
+                self.sel_pipeline = self.pipelines.len().saturating_sub(1);
             }
             Ok(_) => {}
             Err(e) => self.status = format!("brushprov: {e}"),
@@ -1444,7 +1447,10 @@ impl App {
         self.sel_edge = 0;
         let Some(sid) = self.cur_sid_i64() else { return };
         match rpc(&self.sock, "build_edges", json!([sid])) {
-            Ok(Value::Array(rows)) => self.build_edges = rows,
+            Ok(Value::Array(rows)) => {
+                self.build_edges = rows;
+                self.sel_edge = self.build_edges.len().saturating_sub(1); // open at tail
+            }
             Ok(_) => {}
             Err(e) => self.status = format!("build_edges: {e}"),
         }
@@ -2889,14 +2895,22 @@ fn session_flag(status: &str) -> (&'static str, Color) {
     }
 }
 
-fn sessions_lines(app: &App) -> Vec<Line<'static>> {
+fn sessions_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     // Columns mirror the prototype's #s-tab: F | Name | PID | Cmd | Age.
     // Sessions are nested under parents via the dotted display path — render
     // them as a DFS-ordered tree, indenting children under their parent.
     // (Same shape as the prototype's _rebuild_sessions; we walk a sorted-by-
     // path order which gives DFS automatically for any well-formed forest.)
+    //
+    // Columns size to the pane: F/PID/Age are fixed-small, Name is modest, and
+    // Cmd takes the rest so the list fills the terminal width.
+    let (name_w, pid_w, age_w) = (24usize, 6usize, 6usize);
+    let usable = (width as usize).saturating_sub(2); // inside the block borders
+    // F + 4 single-space separators are the fixed overhead.
+    let fixed = 1 + 4 + name_w + pid_w + age_w;
+    let cmd_w = usable.saturating_sub(fixed).max(8);
     let mut out = vec![Line::from(Span::styled(
-        format!("{:<1} {:<24} {:<6} {:<24} {:>8}",
+        format!("{:<1} {:<name_w$} {:<pid_w$} {:<cmd_w$} {:>age_w$}",
                 "F", "Name", "PID", "Cmd", "Age"),
         Style::default().add_modifier(Modifier::BOLD),
     ))];
@@ -2935,12 +2949,12 @@ fn sessions_lines(app: &App) -> Vec<Line<'static>> {
         let cmd = s.get("cmd").and_then(Value::as_array)
             .map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" "))
             .unwrap_or_default();
-        let cmd24: String = cmd.chars().take(24).collect();
+        let cmdc: String = cmd.chars().take(cmd_w).collect();
         let started = s.get("started").and_then(Value::as_f64).unwrap_or(0.0);
         let age = if started > 0.0 { fmt_age(started) } else { String::new() };
         let pid_str = if pid > 0 { pid.to_string() } else { String::new() };
-        let name_col = format!("{indent}{basename}");
-        let text = format!("{flag:<1} {name_col:<24} {pid_str:<6} {cmd24:<24} {age:>8}");
+        let name_col: String = format!("{indent}{basename}").chars().take(name_w).collect();
+        let text = format!("{flag:<1} {name_col:<name_w$} {pid_str:<pid_w$} {cmdc:<cmd_w$} {age:>age_w$}");
         let line = if i == app.sel_session {
             Line::from(Span::styled(text, Style::default().fg(Color::Black).bg(Color::Cyan)))
         } else {
@@ -4407,7 +4421,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         let skip_right = embed_pty;
         match app.focus {
             Pane::Sessions => {
-                let lines = sessions_lines(app);
+                let lines = sessions_lines(app, left.width);
                 let scroll = scroll_for_cursor(app.sel_session + 1, lines.len(), left.height);
                 let p = Paragraph::new(Text::from(lines))
                     .block(block(title("sarun · boxes", lf), lf))
