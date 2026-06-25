@@ -170,11 +170,13 @@ fn record_brush_prov(state: &State, ov: &Option<crate::overlay::Overlay>,
     // (e.g. a redirect target's writer) can be materialized long after its pipeline.
     let seq = rec.get("seq").and_then(Value::as_i64).unwrap_or(0);
     let spawn_ts = rec.get("spawn_ts").and_then(Value::as_f64).unwrap_or(0.0);
+    let uid = rec.get("uid").and_then(Value::as_i64).unwrap_or(0);
+    let parent_uid = rec.get("parent_uid").and_then(Value::as_i64).unwrap_or(0);
     let record_json = rec.to_string();
     let mut prov_id = 0i64;
     if let Some(ov) = ov.as_ref() {
         if let Some(b) = ov.live_box(id) {
-            prov_id = b.add_brushprov(&cmd, &record_json, seq, spawn_ts);
+            prov_id = b.add_brushprov(&cmd, &record_json, seq, spawn_ts, uid, parent_uid);
             // Remember this pipeline's output-redirect targets for the exact
             // file→process linkage made at teardown.
             let targets: Vec<String> = rec.get("out_targets")
@@ -218,11 +220,13 @@ fn brush_prov_nested(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Val
         let cmd = rec.get("cmd").and_then(Value::as_str).unwrap_or("").to_string();
         let seq = rec.get("seq").and_then(Value::as_i64).unwrap_or(0);
         let spawn_ts = rec.get("spawn_ts").and_then(Value::as_f64).unwrap_or(0.0);
+        let uid = rec.get("uid").and_then(Value::as_i64).unwrap_or(0);
+        let parent_uid = rec.get("parent_uid").and_then(Value::as_i64).unwrap_or(0);
         let record_json = rec.to_string();
         let mut prov_id = 0i64;
         if let Some(ov) = ov.as_ref() {
             if let Some(b) = ov.live_box(id) {
-                prov_id = b.add_brushprov_nested(&cmd, &record_json, seq, spawn_ts);
+                prov_id = b.add_brushprov_nested(&cmd, &record_json, seq, spawn_ts, uid, parent_uid);
                 // D9 brush-IS-the-shell: a nested pipeline's literal output
                 // targets are written by descendants of the top-level brush
                 // --inner (via the brush-sh shim → caller → recipe-process
