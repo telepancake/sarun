@@ -1369,14 +1369,18 @@ async fn build_box_shell_full(
     let cwd = cwd.unwrap_or_else(|| {
         std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"))
     });
-    brush_core::Shell::builder()
+    let mut shell = brush_core::Shell::builder()
         .sh_mode(sh_mode)
         .interactive(interactive)
         .builtins(box_builtins_opt(bundle_coreutils))
         .shell_name(shell_name.unwrap_or_default())
         .shell_args(positional.unwrap_or_default())
         .working_dir(cwd)
-        .build().await
+        .build().await?;
+    // sarun: snoop self-shadowed /bin/sh scripts in-process instead of forking
+    // ourselves. Inherited by every subshell clone (recipes, nested, -exec).
+    shell.set_exec_interposer(std::sync::Arc::new(SnoopInterposer));
+    Ok(shell)
 }
 
 /// dup2 the box's FUSE stdout/stderr sinks onto fd 1/2 so brush and every forked
@@ -1868,10 +1872,23 @@ async fn run_brush_script(script: String, shell_name: String,
         }
     };
     let params = shell.default_exec_params();
+    run_nested_pipelines(&mut shell, prog, &params).await
+}
+
+/// Run `prog`'s complete-commands one at a time on `shell`, emitting one nested
+/// provenance record-set per pipeline BEFORE running it (execution order, the
+/// same contract as run_brush). Shared by the forked brush-sh shim (fresh
+/// shell, default params) and the in-process snoop (cloned shell, the caller's
+/// params — so its logical fds/redirects carry through). On a brush execution
+/// error there is NO /bin/sh fallback: the error is visible and the run stops.
+async fn run_nested_pipelines(
+    shell: &mut brush_core::Shell,
+    prog: brush_parser::ast::Program,
+    params: &brush_core::ExecutionParameters,
+) -> i32 {
     let mut last_code = 0i32;
     let mut seq = 0i64;
     for complete in prog.complete_commands {
-        // Emit provenance BEFORE running, matching run_brush's ordering contract.
         let spawn_ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs_f64()).unwrap_or(0.0);
@@ -1887,7 +1904,7 @@ async fn run_brush_script(script: String, shell_name: String,
         }
         send_nested_pipeline_records(recs);
         let one = brush_parser::ast::Program { complete_commands: vec![complete] };
-        match shell.run_program(one, &params).await {
+        match shell.run_program(one, params).await {
             Ok(result) => last_code = u8::from(result.exit_code) as i32,
             Err(e) => {
                 eprintln!("sarun-engine brush-sh: execution error \
@@ -1897,6 +1914,244 @@ async fn run_brush_script(script: String, shell_name: String,
         }
     }
     last_code
+}
+
+// ── in-process script snooping (sarun exec interposer) ───────────────────────
+// When a box brush shell is about to fork an external command that resolves to
+// our OWN bind-shadowed binary (/bin/sh, /usr/bin/sh, … served as the engine;
+// see runner shadowing + overlay.rs), forking would just re-exec sarun and
+// re-enter brush. Instead we interpret the script IN-PROCESS on a clone of the
+// calling shell, preserving its logical fds (carried in `params`) and emitting
+// the same nested provenance the fork path would (run_nested_pipelines). This is
+// installed on EVERY box shell by build_box_shell_full; brush-core consults it
+// at SimpleCommand::execute's external-exec point. find/xargs `-exec` are
+// covered too — they dispatch through run_argv → execute.
+//
+// SELF-DETECTION is box-side and needs no host config: the shadow serves the
+// engine binary's CONTENT and SIZE but keeps the FUSE path's own inode, so an
+// inode comparison is useless. We compare a candidate's size + leading bytes
+// against our own /proc/self/exe. The binary is musl-static + stripped (no
+// build-id), so size+content is the robust signal available — distinct programs
+// differ in size (cheap reject) and a real shell never collides.
+//
+// CONSERVATIVE: anything we can't confidently interpret in POSIX sh-mode (bash
+// invocations, interactive shells, unusual flags, unreadable scripts) returns
+// None and falls through to the normal fork path — so snooping can only ever
+// skip a redundant fork, never change behavior. bash keeps the fork path so it
+// gets its own bash-mode shell on reentry.
+
+const SELF_HEAD: usize = 4096;
+
+/// `(size, leading bytes)` of our own executable, read once from /proc/self/exe.
+/// `None` (→ snooping disabled, we fork) if it can't be read.
+fn self_exe_image() -> Option<&'static (u64, Vec<u8>)> {
+    use std::io::Read;
+    use std::sync::OnceLock;
+    static IMG: OnceLock<Option<(u64, Vec<u8>)>> = OnceLock::new();
+    IMG.get_or_init(|| {
+        let md = std::fs::metadata("/proc/self/exe").ok()?;
+        let size = md.len();
+        let mut f = std::fs::File::open("/proc/self/exe").ok()?;
+        let want = std::cmp::min(size as usize, SELF_HEAD);
+        let mut head = vec![0u8; want];
+        f.read_exact(&mut head).ok()?;
+        Some((size, head))
+    })
+    .as_ref()
+}
+
+/// True if `path` IS our running binary — same size AND same leading bytes.
+/// The size check is a cheap stat (fast reject for the gcc/cc1/sed storm); the
+/// head read happens only when the size already matches (i.e. it's plausibly
+/// the shadowed engine binary).
+fn is_self_exe(path: &std::path::Path) -> bool {
+    use std::io::Read;
+    let Some((size, head)) = self_exe_image() else {
+        return false;
+    };
+    let Ok(md) = std::fs::metadata(path) else {
+        return false;
+    };
+    if md.len() != *size {
+        return false;
+    }
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut buf = vec![0u8; head.len()];
+    if f.read_exact(&mut buf).is_err() {
+        return false;
+    }
+    buf == *head
+}
+
+/// The interpreter path from a `#!` shebang line (first whitespace-delimited
+/// token), or None if `path` has no shebang / can't be read.
+fn shebang_interp(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    use std::io::Read;
+    use std::os::unix::ffi::OsStrExt;
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut head = [0u8; 256];
+    let n = f.read(&mut head).ok()?;
+    let rest = head[..n].strip_prefix(b"#!")?;
+    let end = rest.iter().position(|&b| b == b'\n').unwrap_or(rest.len());
+    let token: Vec<u8> = rest[..end]
+        .iter()
+        .copied()
+        .skip_while(|&b| b == b' ' || b == b'\t')
+        .take_while(|&b| b != b' ' && b != b'\t')
+        .collect();
+    if token.is_empty() {
+        return None;
+    }
+    Some(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&token)))
+}
+
+/// A snoopable POSIX-sh invocation extracted from a self-exe shell argv.
+struct Snoop {
+    script: String,
+    dollar0: String,
+    positional: Vec<String>,
+    /// Simple set-flags (`-e`/`-u`/`-x`/…) to apply via `set` before running.
+    set_flags: Vec<String>,
+}
+
+/// Set-flag characters we model precisely enough to replay via `set`. Anything
+/// outside this set (e.g. `-o NAME`, `-i`, `-l`) makes us decline → fork.
+const SNOOP_SET_FLAGS: &str = "euxvfnhmbCa";
+
+/// Decide whether `resolved` + `argv` (argv[0] = the shell name as invoked) is
+/// an in-process-snoopable POSIX-sh invocation. Returns None (→ fork) for bash,
+/// odd flags, or anything we can't parse confidently. Mirrors brush_sh's
+/// `-c`/script/`--` handling (including the popen `sh -c -- CMD` terminator).
+fn parse_snoop(resolved: &std::path::Path, argv: &[String]) -> Option<Snoop> {
+    let arg0 = argv.first()?;
+    let direct = is_self_exe(resolved);
+    if direct {
+        let base = std::path::Path::new(arg0)
+            .file_name().and_then(|s| s.to_str()).unwrap_or("");
+        if base == "bash" {
+            return None; // fork bash so it gets its own bash-mode shell
+        }
+        let mut i = 1usize;
+        let mut set_flags = vec![];
+        let mut have_c = false;
+        while i < argv.len() {
+            let a = &argv[i];
+            if a == "--" { i += 1; break; }
+            if a == "-" { break; } // stdin marker: ends flags, operand follows
+            if a == "-c" { have_c = true; i += 1; break; }
+            if let Some(rest) = a.strip_prefix('-') {
+                if rest.is_empty()
+                    || !rest.chars().all(|c| c == 'c' || SNOOP_SET_FLAGS.contains(c))
+                {
+                    return None; // an option we don't model precisely → fork
+                }
+                for c in rest.chars() {
+                    if c == 'c' { have_c = true; } else { set_flags.push(format!("-{c}")); }
+                }
+                i += 1;
+                if have_c { break; }
+                continue;
+            }
+            break; // first non-flag operand
+        }
+        if have_c {
+            // popen / `sh -c -- CMD` insert a `--` terminator before SCRIPT.
+            if argv.get(i).map(String::as_str) == Some("--") { i += 1; }
+            let script = argv.get(i)?.clone();
+            i += 1;
+            let dollar0 = argv.get(i).cloned().unwrap_or_else(|| arg0.clone());
+            let positional = if i < argv.len() { argv[i + 1..].to_vec() } else { vec![] };
+            return Some(Snoop { script, dollar0, positional, set_flags });
+        }
+        // `sh [-flags] SCRIPT [args]` — read SCRIPT from disk.
+        let path = argv.get(i)?;
+        let script = std::fs::read_to_string(path).ok()?;
+        return Some(Snoop {
+            script,
+            dollar0: path.clone(),
+            positional: argv.get(i + 1..).unwrap_or(&[]).to_vec(),
+            set_flags,
+        });
+    }
+    // Shebang form: `./configure` etc. whose `#!` interpreter is our binary.
+    let interp = shebang_interp(resolved)?;
+    let ibase = interp.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    if ibase == "bash" || !is_self_exe(&interp) {
+        return None;
+    }
+    let script = std::fs::read_to_string(resolved).ok()?;
+    Some(Snoop {
+        script,
+        dollar0: resolved.to_string_lossy().into_owned(),
+        positional: argv.get(1..).unwrap_or(&[]).to_vec(),
+        set_flags: vec![],
+    })
+}
+
+/// sarun's exec interposer: interpret self-shadowed `/bin/sh` scripts in-process
+/// (see the section comment above). A ZST — registered on every box shell.
+pub(crate) struct SnoopInterposer;
+
+impl brush_core::commands::ExecInterposer<brush_core::extensions::DefaultShellExtensions>
+    for SnoopInterposer
+{
+    fn wants(&self, resolved: &std::path::Path) -> bool {
+        if is_self_exe(resolved) {
+            return true;
+        }
+        // A `#!`-script whose interpreter is our binary (e.g. ./configure).
+        shebang_interp(resolved).is_some_and(|i| is_self_exe(&i))
+    }
+
+    fn run<'a>(
+        &'a self,
+        mut sub: brush_core::Shell,
+        resolved: std::path::PathBuf,
+        argv: Vec<String>,
+        params: brush_core::ExecutionParameters,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Option<brush_core::ExecutionResult>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            let snoop = parse_snoop(&resolved, &argv)?; // None → decline (fork)
+
+            // A unique synthetic $$/BASHPID per snooped script, so concurrent
+            // in-process scripts get distinct `conftest$$`-style temp files even
+            // though they share one OS process.
+            static SNOOP_PID: AtomicU32 = AtomicU32::new(0x4000_0000);
+            let synth = SNOOP_PID.fetch_add(1, Ordering::Relaxed);
+            sub.set_snoop_identity(snoop.dollar0, snoop.positional, synth);
+
+            // Replay simple set-flags (-e/-u/-x…) via `set`, like run_brush_script.
+            if !snoop.set_flags.is_empty() {
+                let mut cmd = String::from("set");
+                for f in &snoop.set_flags {
+                    cmd.push(' ');
+                    cmd.push_str(f);
+                }
+                let src = brush_core::SourceInfo { source: "<snoop flags>".into(), start: None };
+                if sub.run_string(cmd, &src, &params).await.is_err() {
+                    return Some(brush_core::ExecutionResult::new(2));
+                }
+            }
+
+            let prog = match sub.parse_string(snoop.script) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!(
+                        "sarun-engine brush-sh (snooped): cannot parse this script \
+                         (NO /bin/sh fallback): {e}"
+                    );
+                    return Some(brush_core::ExecutionResult::new(2));
+                }
+            };
+            let code = run_nested_pipelines(&mut sub, prog, &params).await;
+            Some(brush_core::ExecutionResult::new(code as u8))
+        })
+    }
 }
 
 /// Interactive REPL for `sh -i`/`bash -i` inside a `-b` box: reedline backend

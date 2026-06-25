@@ -247,6 +247,8 @@ impl<SE: extensions::ShellExtensions> Default for Shell<SE> {
             depth: 0,
             name: None,
             args: vec![],
+            synthetic_pid: None,
+            exec_interposer: None,
             version: None,
             product_display_str: None,
             call_stack: callstack::CallStack::new(),

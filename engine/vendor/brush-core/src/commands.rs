@@ -133,6 +133,33 @@ impl CommandArg {
     }
 }
 
+/// sarun (NOT upstream brush): an embedder-supplied hook consulted at the
+/// external-exec point of [`SimpleCommand::execute`]. It lets the embedder run a
+/// resolved external command IN-PROCESS instead of forking it — sarun uses this
+/// to interpret a `/bin/sh` script that resolves to its own bind-shadowed binary
+/// (forking it would only re-enter brush) without losing provenance or the
+/// caller's logical fds. Installed via [`Shell::set_exec_interposer`]; inherited
+/// by subshell clones, so nested execs interpose too.
+pub trait ExecInterposer<SE: extensions::ShellExtensions>: Send + Sync {
+    /// Cheap, synchronous filter run on EVERY external exec BEFORE the shell is
+    /// cloned: does this resolved path want in-process handling? Keep it to a
+    /// stat-sized check — anything heavier taxes every forked command.
+    fn wants(&self, resolved: &Path) -> bool;
+
+    /// Run the command in-process on the provided subshell clone (which carries
+    /// the caller's env/cwd/fds plus a clone of this interposer, so commands the
+    /// script itself spawns interpose too). `params` carries the caller's
+    /// per-command redirects. Returns the command's [`ExecutionResult`], or
+    /// `None` to decline after closer inspection (caller then forks normally).
+    fn run<'a>(
+        &'a self,
+        sub: Shell<SE>,
+        resolved: PathBuf,
+        argv: Vec<String>,
+        params: ExecutionParameters,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<ExecutionResult>> + Send + 'a>>;
+}
+
 /// Encapsulates a possibly-owned reference to a `Shell` for command execution.
 pub enum ShellForCommand<'a, SE: extensions::ShellExtensions> {
     /// The command is run in the same shell as its parent; the provided
@@ -474,6 +501,9 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
             };
 
             if let Some(path) = path {
+                if let Some(result) = self.try_interpose_exec(&path).await {
+                    return Ok(self.finish_interposed(result));
+                }
                 self.execute_via_external(&path)
             } else {
                 // Bash updates $_ even when the command is not found, so mirror
@@ -489,8 +519,46 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
             }
         } else {
             let command_name = PathBuf::from(self.command_name.clone());
+            if let Some(result) = self.try_interpose_exec(command_name.as_path()).await {
+                return Ok(self.finish_interposed(result));
+            }
             self.execute_via_external(command_name.as_path())
         }
+    }
+
+    /// sarun (NOT upstream brush): consult the embedder's exec interposer before
+    /// forking an external command. If the interposer's cheap `wants()` filter
+    /// matches the resolved path and its `run()` handles the command in-process,
+    /// return its `ExecutionResult`; `None` means "not interposed — fork".
+    ///
+    /// `wants()` runs on EVERY external exec, so it must be cheap (a stat-sized
+    /// check); the shell is only cloned when it returns true. This is how sarun
+    /// runs a `/bin/sh` script that resolves to its own bind-shadowed binary
+    /// in-process instead of re-forking+re-execing itself, while preserving the
+    /// caller's logical fds (passed via `params`) and emitting provenance.
+    async fn try_interpose_exec(&self, resolved: &Path) -> Option<ExecutionResult> {
+        let interposer = self.shell.exec_interposer.clone()?;
+        if !interposer.wants(resolved) {
+            return None;
+        }
+        let sub: Shell<SE> = (*self.shell).clone();
+        let argv: Vec<String> = self.args.iter().map(ToString::to_string).collect();
+        let params = self.params.clone();
+        interposer
+            .run(sub, resolved.to_path_buf(), argv, params)
+            .await
+    }
+
+    /// Finish an interposed (in-process) command: mirror `execute_via_external`'s
+    /// `$_` update + optional `post_execute` hook, then wrap the result.
+    fn finish_interposed(self, result: ExecutionResult) -> ExecutionSpawnResult {
+        let mut shell = self.shell;
+        let last_arg = Self::take_last_arg(&self.args);
+        shell.update_last_arg_variable(last_arg);
+        if let Some(post_execute) = self.post_execute {
+            let _ = post_execute(&mut shell);
+        }
+        ExecutionSpawnResult::Completed(result)
     }
 
     /// Extracts the owned string representation of the last argument of a

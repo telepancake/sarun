@@ -105,6 +105,21 @@ pub struct Shell<SE: extensions::ShellExtensions = extensions::DefaultShellExten
     /// Positional shell arguments (not including shell name).
     args: Vec<String>,
 
+    /// sarun: synthetic process id to report as `$$`/`BASHPID` instead of the
+    /// real `std::process::id()`. `None` = use the real pid. Set on a SNOOPED
+    /// script's subshell (a `#!`/`sh`-invocation run in-process rather than
+    /// forked) so it behaves like a distinct process — e.g. `./configure`'s
+    /// `conftest$$` temp files stay unique across concurrent snooped scripts
+    /// that all share one OS process.
+    pub(crate) synthetic_pid: Option<u32>,
+
+    /// sarun (NOT upstream brush): optional embedder hook consulted before
+    /// forking an external command (see [`crate::commands::ExecInterposer`]).
+    /// `Arc` so subshell clones share it — nested execs interpose too.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) exec_interposer:
+        Option<std::sync::Arc<dyn crate::commands::ExecInterposer<SE>>>,
+
     /// Shell version
     version: Option<String>,
 
@@ -162,6 +177,10 @@ impl<SE: extensions::ShellExtensions> Clone for Shell<SE> {
             last_pipeline_statuses: self.last_pipeline_statuses.clone(),
             name: self.name.clone(),
             args: self.args.clone(),
+            // A subshell inherits its parent's $$ (POSIX). A SNOOPED script is
+            // given a fresh synthetic_pid explicitly after cloning.
+            synthetic_pid: self.synthetic_pid,
+            exec_interposer: self.exec_interposer.clone(),
             version: self.version.clone(),
             product_display_str: self.product_display_str.clone(),
             call_stack: {
@@ -216,6 +235,8 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
             options: runtime_options,
             name: options.shell_name,
             args: options.shell_args.unwrap_or_default(),
+            synthetic_pid: None,
+            exec_interposer: None,
             version: options.shell_version,
             product_display_str: options.shell_product_display_str,
             working_dir: options.working_dir.map_or_else(std::env::current_dir, Ok)?,
@@ -260,6 +281,38 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
 }
 
 impl<SE: extensions::ShellExtensions> Shell<SE> {
+    /// sarun (NOT upstream brush): stamp a SNOOPED script's subshell with the
+    /// identity a freshly-forked interpreter would have had — `$0`, the
+    /// positional parameters, and a unique synthetic `$$`/`BASHPID`. Used by the
+    /// script-snooping path in `commands.rs`, which runs a `#!`/`sh`-invocation
+    /// in-process (in this cloned subshell) rather than forking our own binary.
+    pub fn set_snoop_identity(
+        &mut self,
+        dollar0: String,
+        positional: Vec<String>,
+        synth: u32,
+    ) {
+        self.name = Some(dollar0);
+        self.args = positional;
+        self.synthetic_pid = Some(synth);
+        // BASHPID is a stored global (set once to the real pid at init); update
+        // it so the snooped script's `$BASHPID` matches its synthetic `$$`.
+        let mut bashpid = crate::variables::ShellVariable::new(
+            crate::variables::ShellValue::String(synth.to_string()),
+        );
+        bashpid.treat_as_integer();
+        let _ = self.env.set_global("BASHPID", bashpid);
+    }
+
+    /// sarun (NOT upstream brush): install the embedder's exec interposer (see
+    /// [`crate::commands::ExecInterposer`]). Subshell clones inherit it.
+    pub fn set_exec_interposer(
+        &mut self,
+        interposer: std::sync::Arc<dyn crate::commands::ExecInterposer<SE>>,
+    ) {
+        self.exec_interposer = Some(interposer);
+    }
+
     /// Increments the interactive line offset in the shell by the indicated number
     /// of lines.
     ///

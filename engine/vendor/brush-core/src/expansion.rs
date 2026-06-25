@@ -1888,7 +1888,15 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                 Expansion::from(self.shell.options().option_flags())
             }
             brush_parser::word::SpecialParameter::ProcessId => {
-                Expansion::from(std::process::id().to_string())
+                // sarun: a snooped script (run in-process, not forked) reports its
+                // synthetic pid as $$ so it behaves like a distinct process
+                // (e.g. unique conftest$$ temp files); else the real process id.
+                Expansion::from(
+                    self.shell
+                        .synthetic_pid
+                        .unwrap_or_else(std::process::id)
+                        .to_string(),
+                )
             }
             brush_parser::word::SpecialParameter::LastBackgroundProcessId => {
                 if let Some(job) = self.shell.jobs().current_job()
