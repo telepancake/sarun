@@ -512,8 +512,16 @@ impl BoxState {
     /// cwd, argv). A vanished pid yields zeros/empties, never panics.
     fn read_prov(pid: u32) -> (u32, i64, u32, String, String, Vec<String>) {
         let tgid = Self::tgid_of(pid);
-        let (ppid, start) = Self::parse_stat(pid);
-        let proc_ = |f: &str| format!("/proc/{pid}/{f}");
+        // Identify by the PROCESS (tgid), not the writing thread: FUSE reports the
+        // writing thread's TID, and an in-process box runs many pipelines on
+        // spawned worker threads (recipes / $(shell)) that share one tgid but each
+        // have their OWN thread start_time. Keying identity on the tid's start_time
+        // would mint a near-duplicate row per thread for a single process. Read
+        // start/ppid/exe/cwd/argv from the tgid so all threads collapse to one row
+        // (and matches how the ROOT row's start is read — start_time_of(tgid)).
+        let ident = if tgid != 0 { tgid } else { pid };
+        let (ppid, start) = Self::parse_stat(ident);
+        let proc_ = |f: &str| format!("/proc/{ident}/{f}");
         let exe = std::fs::read_link(proc_("exe"))
             .map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
         let cwd = std::fs::read_link(proc_("cwd"))
