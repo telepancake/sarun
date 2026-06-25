@@ -584,6 +584,7 @@ pub fn shell_func_impl(
     cmd: &Bytes,
     loc: &Loc,
     box_prefix: &[u8],
+    cwd: &[u8],
 ) -> Result<(i32, Bytes, Option<FindCommand>)> {
     log!("ShellFunc: {:?}", cmd);
 
@@ -606,7 +607,7 @@ pub fn shell_func_impl(
         Bytes::from(v)
     };
     let cmd = &cmd;
-    let (status, output) = run_command(shell, shellflag, cmd, RedirectStderr::None)?;
+    let (status, output) = run_command(shell, shellflag, cmd, cwd, RedirectStderr::None)?;
     let output = Bytes::from(format_for_command_substitution(output));
 
     if let Some(exit_code) = status.code() {
@@ -707,7 +708,8 @@ fn shell_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> 
     let shellflag = ev.get_shell_flag();
     let box_prefix = ev.box_export_prefix.clone();
 
-    let (exit_code, output, fc) = shell_func_impl(&shell, shellflag, &cmd, &loc, &box_prefix)?;
+    let (exit_code, output, fc) = shell_func_impl(&shell, shellflag, &cmd, &loc, &box_prefix,
+                        ev.working_dir.as_os_str().as_bytes())?;
     out.put_slice(&output);
     if should_store_command_result(&cmd) {
         COMMAND_RESULTS.lock().push(CommandResult {
@@ -750,7 +752,8 @@ fn shell_no_rerun_func(
     let shellflag = ev.get_shell_flag();
     let box_prefix = ev.box_export_prefix.clone();
 
-    let (exit_code, output, _) = shell_func_impl(&shell, shellflag, &cmd, &loc, &box_prefix)?;
+    let (exit_code, output, _) = shell_func_impl(&shell, shellflag, &cmd, &loc, &box_prefix,
+                        ev.working_dir.as_os_str().as_bytes())?;
     out.put_slice(&output);
     set_shell_status_var(exit_code);
     Ok(())

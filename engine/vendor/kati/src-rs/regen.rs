@@ -415,10 +415,16 @@ impl StampChecker {
         }
 
         collect_stats_with_slow_report!("shell time (regen)", &sr.cmd);
+        // regen runs at the top level (makefile staleness check), so the process
+        // cwd is the right working dir for these $(shell) results.
+        let cwd = std::env::current_dir()
+            .map(|p| <std::ffi::OsString as std::os::unix::ffi::OsStringExt>::into_vec(p.into_os_string()))
+            .unwrap_or_default();
         let (_status, output) = run_command(
             sr.shell.as_bytes(),
             sr.shellflag.as_bytes(),
             &cmd,
+            &cwd,
             crate::fileutil::RedirectStderr::DevNull,
         )?;
         let output = format_for_command_substitution(output);

@@ -292,7 +292,7 @@ fn run_node_commands(
             {
                 (code == 0, o, code)
             } else {
-                match run_command(shell, shellflag, &run_input, RedirectStderr::Stdout) {
+                match run_command(shell, shellflag, &run_input, &cwd, RedirectStderr::Stdout) {
                     Ok((status, o)) => (status.success(), o, status.code().unwrap_or(1)),
                     Err(e) => (false, format!("{e}\n").into_bytes(), 1),
                 }
