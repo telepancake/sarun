@@ -483,9 +483,18 @@ struct App {
     /// Procs pane: show ONLY processes still alive (engine-side pidfd probe) on a
     /// live box. Defaults true (most informative); toggled with `f` to show all.
     proc_running_only: bool,
-    /// Phase 1 build edges for the currently-loaded box (one row per
-    /// `build_edges` entry; same "full list, no windowing" reasoning).
+    /// Phase 1 build edges for the currently-loaded box, AS DISPLAYED — the
+    /// `edges_running_only` filter applied to `build_edges_flat`. Indexed by
+    /// `sel_edge`; the detail pane reads `build_edges[sel_edge]`.
     build_edges: Vec<Value>,
+    /// Every fetched build edge (one row per `build_edges` entry; full list, no
+    /// windowing). `build_edges` is the filtered view derived from this.
+    build_edges_flat: Vec<Value>,
+    /// Targets pane: on a LIVE box, show ONLY the edges currently building
+    /// (started_ts>0 && ended_ts==0). Defaults true (most informative for a
+    /// running build); ignored for a finished box (running is meaningless then,
+    /// so all edges show). Toggled with `f`.
+    edges_running_only: bool,
     sel_session: usize,
     sel_change: usize,
     sel_proc: usize,
@@ -640,7 +649,7 @@ impl App {
             outputs_view: None, outputs_view_sid: None,
             outputs_total: 0,
             outputs_window_start: 0,
-            rules: vec![], pipelines: vec![], pipelines_flat: vec![], pipe_tree: true, pipe_running_only: false, proc_running_only: true, build_edges: vec![],
+            rules: vec![], pipelines: vec![], pipelines_flat: vec![], pipe_tree: true, pipe_running_only: false, proc_running_only: true, build_edges: vec![], build_edges_flat: vec![], edges_running_only: true,
             sel_session: 0,
             sel_change: 0,
             sel_proc: 0, sel_pipeline: 0, sel_edge: 0,
@@ -687,6 +696,17 @@ impl App {
             .and_then(|s| s.get("session_id"))
             .and_then(Value::as_str)
             .map(String::from)
+    }
+
+    /// Whether the currently-selected box is still running (its recipes can be
+    /// in flight). Gates the targets pane's running-only filter: on a finished
+    /// box "running" is meaningless, so all edges show regardless of the toggle.
+    fn cur_session_live(&self) -> bool {
+        self.sessions
+            .get(self.sel_session)
+            .and_then(|s| s.get("status"))
+            .and_then(Value::as_str)
+            == Some("running")
     }
 
     fn cur_change_path(&self) -> Option<String> {
@@ -1458,16 +1478,65 @@ impl App {
     /// targets that never executed.
     fn load_build_edges(&mut self) {
         self.build_edges.clear();
+        self.build_edges_flat.clear();
         self.sel_edge = 0;
         let Some(sid) = self.cur_sid_i64() else { return };
         match rpc(&self.sock, "build_edges", json!([sid])) {
             Ok(Value::Array(rows)) => {
-                self.build_edges = rows;
+                self.build_edges_flat = rows;
+                self.rebuild_edge_view();
                 self.sel_edge = self.build_edges.len().saturating_sub(1); // open at tail
             }
             Ok(_) => {}
             Err(e) => self.status = format!("build_edges: {e}"),
         }
+    }
+
+    /// Rebuild the displayed `build_edges` from `build_edges_flat`. On a live box
+    /// with `edges_running_only`, keep only the edges currently building
+    /// (started_ts>0 && ended_ts==0) — the running / stuck set you watch on a
+    /// hung build. A finished box shows all edges (running is meaningless then).
+    fn rebuild_edge_view(&mut self) {
+        let filter = self.edges_running_only && self.cur_session_live();
+        self.build_edges = if filter {
+            self.build_edges_flat.iter()
+                .filter(|r| edge_running(r))
+                .cloned().collect()
+        } else {
+            self.build_edges_flat.clone()
+        };
+        if !self.build_edges.is_empty() && self.sel_edge >= self.build_edges.len() {
+            self.sel_edge = self.build_edges.len() - 1;
+        }
+    }
+
+    /// Re-fetch build edges without jumping the cursor to the tail — used by the
+    /// live event path (`build_edges` events) so the running-only view tracks a
+    /// running build as recipes start and finish. `rebuild_edge_view` clamps the
+    /// selection into the (possibly shrunk) filtered set.
+    fn refresh_build_edges_preserving_cursor(&mut self) {
+        let Some(sid) = self.cur_sid_i64() else { return };
+        if let Ok(Value::Array(rows)) = rpc(&self.sock, "build_edges", json!([sid])) {
+            self.build_edges_flat = rows;
+            self.rebuild_edge_view();
+            if self.sel_edge >= self.build_edges.len() {
+                self.sel_edge = self.build_edges.len().saturating_sub(1);
+            }
+        }
+    }
+
+    /// `f` on Targets: toggle showing only the edges currently building (live
+    /// box) vs every parsed edge.
+    fn toggle_edge_running_only(&mut self) {
+        self.edges_running_only = !self.edges_running_only;
+        self.sel_edge = 0;
+        self.rebuild_edge_view();
+        self.sel_edge = self.build_edges.len().saturating_sub(1);
+        self.status = if self.edges_running_only {
+            "targets: running only".to_string()
+        } else {
+            "targets: all".to_string()
+        };
     }
 
     /// Advance sel_proc to the first non-connector row in the window. Without
@@ -2505,6 +2574,17 @@ impl App {
                         Pane::Sessions => self.refresh_recent_changes(),
                         _ => {}
                     }
+                }
+            }
+            // Build-edge events: the executor recorded new edges or stamped an
+            // edge's run-state transition (started / finished). On the Targets
+            // pane for this box, re-fetch so the running-only view tracks the
+            // live build (which targets are in flight, which just finished).
+            Some("build_edges") => {
+                let sid = ev.get("session_id").and_then(Value::as_str);
+                if sid.is_some() && sid == self.cur_sid().as_deref()
+                    && self.focus == Pane::BuildEdges {
+                    self.refresh_build_edges_preserving_cursor();
                 }
             }
             // Consolidation events from the Python prototype's engine (the
@@ -4024,6 +4104,7 @@ enum PaneAction {
     ConfirmKill, ConfirmDelete, ConfirmDissolve,
     NewRule, DeleteRule, StartRename,
     ToggleFilter, Refresh, ActionMenu, ToggleTree, ToggleRunningOnly, ToggleProcRunning,
+    ToggleEdgeRunning,
 }
 
 /// The main-loop pane keymap. ORDER MATTERS, and reproduces the original inline
@@ -4060,6 +4141,7 @@ const PANE_ACTION_KEYS: &[(Key, PaneGate, PaneAction, Option<&str>)] = &[
     (Key::Char('t'), PaneGate::On(Pane::Pipelines), PaneAction::ToggleTree,  Some("toggle tree / flat chronological (on Pipes)")),
     (Key::Char('f'), PaneGate::On(Pane::Pipelines), PaneAction::ToggleRunningOnly, Some("toggle running-only (on Pipes)")),
     (Key::Char('f'), PaneGate::On(Pane::Processes), PaneAction::ToggleProcRunning, Some("toggle running-only (on Procs)")),
+    (Key::Char('f'), PaneGate::On(Pane::BuildEdges), PaneAction::ToggleEdgeRunning, Some("toggle running-only (on Targets)")),
     (Key::Char('n'), PaneGate::On(Pane::Rules), PaneAction::NewRule,         Some("new rule (on Rules)")),
     (Key::Char('d'), PaneGate::On(Pane::Rules), PaneAction::DeleteRule,      Some("delete rule (on Rules)")),
     (Key::Char('d'), PaneGate::Any,             PaneAction::Detach,          Some("detach (leaves the engine running)")),
@@ -4080,6 +4162,7 @@ fn run_pane_action(app: &mut App, action: PaneAction) {
         PaneAction::ToggleTree => app.toggle_pipeline_tree(),
         PaneAction::ToggleRunningOnly => app.toggle_pipeline_running_only(),
         PaneAction::ToggleProcRunning => app.toggle_proc_running_only(),
+        PaneAction::ToggleEdgeRunning => app.toggle_edge_running_only(),
         PaneAction::Open => {
             if app.focus == Pane::Rules {
                 let cur = app.rules.get(app.sel_rule).cloned().unwrap_or_default();
@@ -4918,6 +5001,16 @@ fn build_pipeline_tree(rows: Vec<Value>) -> Vec<Value> {
     out
 }
 
+/// Whether a build_edges row is CURRENTLY building: its recipe started
+/// (started_ts>0) but hasn't been marked finished (ended_ts==0). Edges that
+/// never ran (up-to-date / phony) have started_ts==0 → not running. Shared by
+/// the targets running-only filter and the row renderer so both agree.
+fn edge_running(row: &Value) -> bool {
+    let started = row.get("started_ts").and_then(Value::as_f64).unwrap_or(0.0);
+    let ended = row.get("ended_ts").and_then(Value::as_f64).unwrap_or(0.0);
+    started > 0.0 && ended == 0.0
+}
+
 /// Human-readable pipeline wall time: sub-second as `123ms`, else `1.23s` /
 /// `12.3s`, minutes as `3m04s`. Negative/zero → `0ms`.
 fn fmt_dur(secs: f64) -> String {
@@ -5091,11 +5184,33 @@ fn build_edges_lines(app: &App) -> Vec<Line<'static>> {
             .unwrap_or_default();
         let cmd_opt = row.get("cmd").and_then(Value::as_str);
         let phony = cmd_opt.is_none() || cmd_opt == Some("");
-        let mark = if phony { "P" } else { "R" };
-        let mark_style = if phony {
-            Style::default().fg(Color::DarkGray)
+        // Run-state: started_ts>0 && ended_ts==0 → building now; both set →
+        // finished (show wall time, red on a non-zero exit); neither → never ran
+        // (up-to-date / phony). The marker doubles as the state column.
+        let started = row.get("started_ts").and_then(Value::as_f64).unwrap_or(0.0);
+        let ended = row.get("ended_ts").and_then(Value::as_f64).unwrap_or(0.0);
+        let exit = row.get("exit_code").and_then(Value::as_i64);
+        let running = edge_running(row);
+        let (mark, mark_style) = if running {
+            ("•", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+        } else if phony {
+            ("P", Style::default().fg(Color::DarkGray))
         } else {
-            Style::default().fg(Color::Green)
+            ("R", Style::default().fg(Color::Green))
+        };
+        // Wall-time / state column, mirroring the pipelines pane.
+        let (dur_txt, dur_style) = if running {
+            ("• run".to_string(), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+        } else if started > 0.0 && ended > 0.0 {
+            let failed = exit.map(|c| c != 0).unwrap_or(false);
+            let style = if failed {
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            (fmt_dur(ended - started), style)
+        } else {
+            (String::new(), Style::default().fg(Color::DarkGray))
         };
         let head = outs.first().cloned().unwrap_or_else(|| "(unnamed)".into());
         let extra = if outs.len() > 1 {
@@ -5103,6 +5218,7 @@ fn build_edges_lines(app: &App) -> Vec<Line<'static>> {
         } else { String::new() };
         let mut spans = vec![
             Span::styled(format!("{mark}  "), mark_style),
+            Span::styled(format!("{dur_txt:>7}  "), dur_style),
             Span::styled(head, Style::default().add_modifier(Modifier::BOLD)),
             Span::styled(extra, Style::default().fg(Color::DarkGray)),
         ];
@@ -5258,12 +5374,34 @@ fn build_edge_detail_lines(app: &App) -> Vec<Line<'static>> {
         .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from))
                           .collect::<Vec<_>>()).unwrap_or_default();
     let cmd = row.get("cmd").and_then(Value::as_str).unwrap_or("");
+    let started = row.get("started_ts").and_then(Value::as_f64).unwrap_or(0.0);
+    let ended = row.get("ended_ts").and_then(Value::as_f64).unwrap_or(0.0);
+    let exit = row.get("exit_code").and_then(Value::as_i64);
     let label = Style::default().fg(Color::DarkGray);
+    // Run-state line: building / finished (wall time + exit) / not run.
+    let (state_txt, state_style) = if started > 0.0 && ended == 0.0 {
+        ("building…".to_string(),
+         Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+    } else if started > 0.0 && ended > 0.0 {
+        let code = exit.unwrap_or(0);
+        let txt = format!("done in {} (exit {code})", fmt_dur(ended - started));
+        let style = if code != 0 {
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Green)
+        };
+        (txt, style)
+    } else {
+        ("not run (up-to-date / phony)".to_string(),
+         Style::default().fg(Color::DarkGray))
+    };
     let mut lines = vec![
         Line::from(vec![Span::styled("id        ", label),
                         Span::raw(id.to_string())]),
         Line::from(vec![Span::styled("ts        ", label),
                         Span::raw(format!("{ts:.6}"))]),
+        Line::from(vec![Span::styled("state     ", label),
+                        Span::styled(state_txt, state_style)]),
         Line::from(""),
         Line::from(Span::styled("outputs", Style::default().fg(Color::Green)
                                                    .add_modifier(Modifier::BOLD))),
@@ -7463,7 +7601,7 @@ mod tests {
             outputs_view: None, outputs_view_sid: None,
             outputs_total: 0,
             outputs_window_start: 0,
-            rules: vec![], pipelines: vec![], pipelines_flat: vec![], pipe_tree: true, pipe_running_only: false, proc_running_only: true, build_edges: vec![],
+            rules: vec![], pipelines: vec![], pipelines_flat: vec![], pipe_tree: true, pipe_running_only: false, proc_running_only: true, build_edges: vec![], build_edges_flat: vec![], edges_running_only: true,
             sel_session: 0,
             sel_change: 0,
             sel_proc: 0, sel_pipeline: 0, sel_edge: 0,
@@ -8268,6 +8406,21 @@ mod tests {
         assert_eq!(at(1), ("inner", 1));
         assert_eq!(at(2), ("echo deep", 2));
         assert_eq!(at(3), ("sibling", 0));
+    }
+
+    /// The targets running-only predicate: an edge is "building" iff its recipe
+    /// started but hasn't been marked finished. Up-to-date / phony edges (never
+    /// started) and finished edges (ended_ts set) are not running.
+    #[test]
+    fn edge_running_predicate_tracks_started_not_ended() {
+        // building: started, not yet ended.
+        assert!(edge_running(&json!({"started_ts": 100.0, "ended_ts": 0.0})));
+        // finished: both stamped.
+        assert!(!edge_running(&json!({"started_ts": 100.0, "ended_ts": 101.0})));
+        // never ran (up-to-date / phony): no started_ts at all (NULL → 0).
+        assert!(!edge_running(&json!({"outs": ["all"], "cmd": null})));
+        // never ran, explicit zeros.
+        assert!(!edge_running(&json!({"started_ts": 0.0, "ended_ts": 0.0})));
     }
 
     /// Legacy rows (uid 0 / parent_uid 0) stay a flat depth-0 list.

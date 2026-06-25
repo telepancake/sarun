@@ -1836,6 +1836,21 @@ fn send_pipeline_done(uids: &[u64], code: i32, done_ts: f64) {
     crate::runner::send_nested_prov(format!("{msg}\n").as_bytes());
 }
 
+/// Report a build edge's run-state transition to the engine, so the targets
+/// pane can show only the targets CURRENTLY building (started but not ended)
+/// and each target's wall time. The engine matches the box's `build_edges` row
+/// by `out` (kati: the node's primary output == outs[0]) or `cmd` (n2: the
+/// exact recipe cmdline == the stored cmd). `phase` is "start" or "done";
+/// `code` is only meaningful for "done". Best-effort (same broker path as the
+/// per-pipeline provenance); a failure leaves the recipe running unchanged.
+pub fn send_build_edge_state(out: Option<&str>, cmd: Option<&str>, phase: &str, code: i32) {
+    let mut m = json!({"type": "build_edge_state", "state": phase, "ts": now_secs()});
+    if let Some(o) = out { m["out"] = json!(o); }
+    if let Some(c) = cmd { m["cmd"] = json!(c); }
+    if phase == "done" { m["code"] = json!(code); }
+    crate::runner::send_nested_prov(format!("{m}\n").as_bytes());
+}
+
 /// Build the brush shell, apply set-flags, parse, and execute the script.
 /// Mirrors run_brush: same parse/execute discipline and visible-failure rule.
 async fn run_brush_script(script: String, shell_name: String,
@@ -2687,7 +2702,12 @@ pub fn n2_executor(cmdline: &str, output_cb: &mut dyn FnMut(&[u8])) -> n2::proce
     // shell runs the command from the build dir (this thread's BOX_RECIPE_CWD
     // is otherwise unset). Restore on the way out.
     let prev = set_box_recipe_cwd(n2::graph::get_cwd());
+    // Mark this edge running for the targets pane (matched by its exact cmdline,
+    // which n2 also stored as the build_edges row's `cmd`). Phony / up-to-date
+    // edges never reach the executor, so they're correctly left un-started.
+    send_build_edge_state(None, Some(cmdline), "start", 0);
     let code = run_recipe_in_process(cmdline, output_cb);
+    send_build_edge_state(None, Some(cmdline), "done", code);
     set_box_recipe_cwd(prev);
     if code == 0 {
         n2::process::Termination::Success
