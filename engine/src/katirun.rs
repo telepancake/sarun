@@ -592,6 +592,17 @@ fn install_make_recipe_runner() {
         crate::brush::set_box_recipe_cwd(prev);
         RecipeRunnerDecision::Ran { code }
     }));
+    // Report each node's recipe run-state to the engine, keyed by the node's
+    // primary output (== the build_edges row's outs[0]), so the targets pane
+    // shows only the targets currently building and their wall time.
+    kati::fileutil::install_edge_reporter(Arc::new(|output: &[u8], phase, code| {
+        let out = String::from_utf8_lossy(output);
+        let p = match phase {
+            kati::fileutil::EdgePhase::Start => "start",
+            kati::fileutil::EdgePhase::Done => "done",
+        };
+        crate::brush::send_build_edge_state(Some(&out), None, p, code);
+    }));
 }
 
 /// The embedded-make entrypoint. `argv` is the FULL process argv (argv[0] is

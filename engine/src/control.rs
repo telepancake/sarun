@@ -325,6 +325,38 @@ fn build_edges(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
     json!({"ok": true, "recorded": n})
 }
 
+/// A single build edge's run-state transition (started / finished), sent by the
+/// in-process make/ninja executor as it enters and leaves each recipe (carrying
+/// its OWN pidfd, resolved to the enclosing box exactly like `build_edges`). We
+/// stamp `started_ts` / `ended_ts`+`exit_code` on the matching `build_edges`
+/// row, so the targets pane can show only the targets currently building and
+/// each target's wall time. One-shot control reply.
+fn build_edge_state(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
+    let host_pid = peer_pidfd.map(host_pid_from_pidfd).filter(|p| *p > 0).unwrap_or(0);
+    if let Some(fd) = peer_pidfd { unsafe { libc::close(fd); } }
+    let Some(id) = derive_parent_box(state, host_pid) else {
+        return json!({"ok": false, "error": "no enclosing box"});
+    };
+    let phase = msg.get("state").and_then(Value::as_str).unwrap_or("");
+    let out = msg.get("out").and_then(Value::as_str);
+    let cmd = msg.get("cmd").and_then(Value::as_str);
+    let ts = msg.get("ts").and_then(Value::as_f64).unwrap_or(0.0);
+    let code = msg.get("code").and_then(Value::as_i64).unwrap_or(0);
+    let ov = lock(state).overlay.clone();
+    if let Some(ov) = ov.as_ref() {
+        if let Some(b) = ov.live_box(id) {
+            match phase {
+                "start" => b.mark_build_edge_started(out, cmd, ts),
+                "done"  => b.mark_build_edge_done(out, cmd, code, ts),
+                _ => {}
+            }
+        }
+    }
+    broadcast(state, &json!({"type": "build_edges",
+                            "session_id": id.to_string(), "edge_state": phase}));
+    json!({"ok": true})
+}
+
 pub fn broadcast(state: &State, ev: &Value) {
     let data = format!("{ev}\n");
     let mut s = lock(state);
@@ -1985,6 +2017,11 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
             // shadowed `ninja` (vendored n2) carrying its OWN pidfd, resolved to
             // the enclosing box by /proc ancestry exactly like brush_prov_nested.
             build_edges(&state, &msg, peer_pidfd.take())
+        } else if msg.get("type").and_then(Value::as_str) == Some("build_edge_state") {
+            // A single edge's run-state transition (started / finished), sent by
+            // the in-process make/ninja executor around each recipe — stamps the
+            // box's build_edges row so the targets pane shows live build progress.
+            build_edge_state(&state, &msg, peer_pidfd.take())
         } else {
             dispatch(&state, &msg)
         };
