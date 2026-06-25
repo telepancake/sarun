@@ -1373,7 +1373,9 @@ impl App {
         self.sel_pipeline = 0;
         let Some(sid) = self.cur_sid_i64() else { return };
         match rpc(&self.sock, "brushprov", json!([sid])) {
-            Ok(Value::Array(rows)) => self.pipelines = rows,
+            // Order into a parent→child tree (depth stamped per row) so the pane
+            // renders the in-process pipeline log as a tree, not a flat list.
+            Ok(Value::Array(rows)) => self.pipelines = build_pipeline_tree(rows),
             Ok(_) => {}
             Err(e) => self.status = format!("brushprov: {e}"),
         }
@@ -4775,6 +4777,58 @@ fn bold_count(n: usize) -> String {
 /// One line per pipeline row: a single-letter origin marker (T = top-level,
 /// N = nested-shim), the seq index, and the command. The pipeline's full
 /// parsed structure + linked process row ids live in the detail pane.
+/// Reorder flat `brushprov` rows into DFS pre-order by (uid, parent_uid),
+/// stamping a `depth` on each so the Pipelines pane renders as a tree (make →
+/// recipe → sh -c → …). Roots are rows with parent_uid 0 or a parent not in the
+/// set; siblings keep brushprov-id (execution) order. Legacy rows (uid 0) all
+/// fall out as depth-0 roots, so old archives render as the previous flat list.
+fn build_pipeline_tree(rows: Vec<Value>) -> Vec<Value> {
+    use std::collections::{HashMap, HashSet};
+    let uid_of = |r: &Value| r.get("uid").and_then(Value::as_i64).unwrap_or(0);
+    let puid_of = |r: &Value| r.get("parent_uid").and_then(Value::as_i64).unwrap_or(0);
+    let present: HashSet<i64> = rows.iter().map(&uid_of).filter(|&u| u != 0).collect();
+    let mut children: HashMap<i64, Vec<usize>> = HashMap::new();
+    let mut roots: Vec<usize> = vec![];
+    for (i, r) in rows.iter().enumerate() {
+        let p = puid_of(r);
+        if p != 0 && present.contains(&p) {
+            children.entry(p).or_default().push(i);
+        } else {
+            roots.push(i);
+        }
+    }
+    let mut out = Vec::with_capacity(rows.len());
+    let mut visited = HashSet::new();
+    // Iterative DFS pre-order (push reversed so siblings pop in id order).
+    let mut stack: Vec<(usize, usize)> = roots.iter().rev().map(|&i| (i, 0usize)).collect();
+    while let Some((i, depth)) = stack.pop() {
+        if !visited.insert(i) {
+            continue;
+        }
+        let mut r = rows[i].clone();
+        if let Some(o) = r.as_object_mut() {
+            o.insert("depth".into(), json!(depth));
+        }
+        out.push(r);
+        if let Some(kids) = children.get(&uid_of(&rows[i])) {
+            for &k in kids.iter().rev() {
+                stack.push((k, depth + 1));
+            }
+        }
+    }
+    // Any orphan/cycle leftovers: append flat (depth 0) so nothing is dropped.
+    for (i, r) in rows.into_iter().enumerate() {
+        if !visited.contains(&i) {
+            let mut r = r;
+            if let Some(o) = r.as_object_mut() {
+                o.insert("depth".into(), json!(0));
+            }
+            out.push(r);
+        }
+    }
+    out
+}
+
 fn pipelines_lines(app: &App) -> Vec<Line<'static>> {
     if app.pipelines.is_empty() {
         return vec![Line::from(Span::styled(
@@ -4796,14 +4850,25 @@ fn pipelines_lines(app: &App) -> Vec<Line<'static>> {
         } else {
             Style::default().fg(Color::Cyan)
         };
+        // Tree indent: depth-1 levels of "│ " then a "└ " elbow (a nested
+        // pipeline hangs off its parent). Depth 0 (roots) get no indent.
+        let depth = row.get("depth").and_then(Value::as_i64).unwrap_or(0).max(0) as usize;
+        let indent = if depth == 0 {
+            String::new()
+        } else {
+            format!("{}└ ", "│ ".repeat(depth - 1))
+        };
         let mut spans = vec![
             Span::styled(format!("{:>4}  ", id),
                          Style::default().fg(Color::DarkGray)),
             Span::styled(format!("{mark}  "), mark_style),
             Span::styled(format!("p{pipeline:<2}  "),
                          Style::default().fg(Color::DarkGray)),
-            Span::raw(cmd.to_string()),
         ];
+        if !indent.is_empty() {
+            spans.push(Span::styled(indent, Style::default().fg(Color::DarkGray)));
+        }
+        spans.push(Span::raw(cmd.to_string()));
         if nprocs > 0 {
             spans.push(Span::styled(format!("  ·  {nprocs} proc{}",
                 if nprocs == 1 { "" } else { "s" }),
@@ -8048,5 +8113,39 @@ mod tests {
         // the command text we ran must be visible on the pane.
         assert!(buf.contains("tr") && buf.contains("echo hi"),
             "rendered pane does not surface the recorded cmd:\n{buf}");
+    }
+
+    /// build_pipeline_tree reorders flat brushprov rows into DFS pre-order by
+    /// (uid, parent_uid) and stamps depth — the basis for the tree render.
+    #[test]
+    fn pipeline_tree_nests_by_parent_uid() {
+        let rows = vec![
+            json!({"id":1,"uid":10,"parent_uid":0,"cmd":"recipe"}),
+            json!({"id":2,"uid":11,"parent_uid":10,"cmd":"inner"}),
+            json!({"id":3,"uid":12,"parent_uid":11,"cmd":"echo deep"}),
+            json!({"id":4,"uid":20,"parent_uid":0,"cmd":"sibling"}),
+        ];
+        let tree = build_pipeline_tree(rows);
+        let at = |i: usize| {
+            (tree[i].get("cmd").and_then(Value::as_str).unwrap(),
+             tree[i].get("depth").and_then(Value::as_i64).unwrap())
+        };
+        // DFS pre-order: recipe → inner → echo deep, then the sibling root.
+        assert_eq!(at(0), ("recipe", 0));
+        assert_eq!(at(1), ("inner", 1));
+        assert_eq!(at(2), ("echo deep", 2));
+        assert_eq!(at(3), ("sibling", 0));
+    }
+
+    /// Legacy rows (uid 0 / parent_uid 0) stay a flat depth-0 list.
+    #[test]
+    fn pipeline_tree_legacy_rows_stay_flat() {
+        let rows = vec![
+            json!({"id":1,"uid":0,"parent_uid":0,"cmd":"a"}),
+            json!({"id":2,"uid":0,"parent_uid":0,"cmd":"b"}),
+        ];
+        let tree = build_pipeline_tree(rows);
+        assert_eq!(tree.len(), 2);
+        assert!(tree.iter().all(|r| r.get("depth").and_then(Value::as_i64) == Some(0)));
     }
 }
