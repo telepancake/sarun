@@ -1881,6 +1881,71 @@ async fn run_brush_script(script: String, shell_name: String,
 /// shell, default params) and the in-process snoop (cloned shell, the caller's
 /// params — so its logical fds/redirects carry through). On a brush execution
 /// error there is NO /bin/sh fallback: the error is visible and the run stops.
+// ── pipeline provenance nesting (parent links for the UI tree) ───────────────
+// Every in-process pipeline brush logs gets a process-global unique `uid`, and
+// records the `parent_uid` of the pipeline that ENCLOSED it (0 = a root). The
+// "current pipeline" is a per-thread value pushed around each pipeline's run, so
+// a nested shell (snooped `sh -c`), a recipe's sub-pipelines, and `-exec`/xargs
+// children chain under their parent — letting the UI render the otherwise-flat
+// pipeline log as a tree (make → recipe → sh -c → …). Crossing a worker-thread
+// boundary (recipes/$(shell) run on a spawned brush thread) is handled by
+// capturing the parent uid before the spawn and re-establishing it on the new
+// thread via set_current_pipeline_uid.
+static NEXT_PIPELINE_UID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+thread_local! {
+    static CURRENT_PIPELINE_UID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// A fresh process-global pipeline uid.
+fn next_pipeline_uid() -> u64 {
+    NEXT_PIPELINE_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The pipeline uid currently executing on THIS thread (0 = none/root).
+fn current_pipeline_uid() -> u64 {
+    CURRENT_PIPELINE_UID.with(std::cell::Cell::get)
+}
+
+/// Set this thread's current-pipeline uid, returning the previous value. Callers
+/// save/restore around a pipeline's run so nesting chains correctly; the cross-
+/// thread recipe/$(shell) path uses it to seed the worker thread's parent.
+pub fn set_current_pipeline_uid(uid: u64) -> u64 {
+    CURRENT_PIPELINE_UID.with(|c| c.replace(uid))
+}
+
+/// Stamp uid/parent_uid/seq/spawn_ts (+ `nested` when set) onto one complete-
+/// command's pipeline records; returns (records, frame_uid). The frame_uid is
+/// the first pipeline's uid — used as the parent for anything this complete-
+/// command spawns in-process, so e.g. a recipe's `sh -c` nests under the recipe.
+fn stamp_pipeline_records(
+    complete: &brush_parser::ast::CompoundList,
+    seq: &mut i64,
+    spawn_ts: f64,
+    nested: bool,
+) -> (Vec<Value>, u64) {
+    let parent_uid = current_pipeline_uid();
+    let mut recs = vec![];
+    let mut frame_uid = 0u64;
+    for mut rec in complete_command_records(complete) {
+        let uid = next_pipeline_uid();
+        if frame_uid == 0 {
+            frame_uid = uid;
+        }
+        if let Value::Object(ref mut m) = rec {
+            m.insert("uid".to_string(), json!(uid));
+            m.insert("parent_uid".to_string(), json!(parent_uid));
+            m.insert("seq".to_string(), json!(*seq));
+            m.insert("spawn_ts".to_string(), json!(spawn_ts));
+            if nested {
+                m.insert("nested".to_string(), json!(true));
+            }
+        }
+        recs.push(rec);
+        *seq += 1;
+    }
+    (recs, frame_uid)
+}
+
 async fn run_nested_pipelines(
     shell: &mut brush_core::Shell,
     prog: brush_parser::ast::Program,
@@ -1892,19 +1957,15 @@ async fn run_nested_pipelines(
         let spawn_ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs_f64()).unwrap_or(0.0);
-        let mut recs = vec![];
-        for mut rec in complete_command_records(&complete) {
-            if let Value::Object(ref mut m) = rec {
-                m.insert("seq".to_string(), json!(seq));
-                m.insert("spawn_ts".to_string(), json!(spawn_ts));
-                m.insert("nested".to_string(), json!(true));
-            }
-            recs.push(rec);
-            seq += 1;
-        }
+        let (recs, frame_uid) = stamp_pipeline_records(&complete, &mut seq, spawn_ts, true);
         send_nested_pipeline_records(recs);
         let one = brush_parser::ast::Program { complete_commands: vec![complete] };
-        match shell.run_program(one, params).await {
+        // Push this complete-command's frame as the current pipeline so anything
+        // it runs in-process (a snooped sh -c, …) records it as parent.
+        let prev_uid = set_current_pipeline_uid(frame_uid);
+        let r = shell.run_program(one, params).await;
+        set_current_pipeline_uid(prev_uid);
+        match r {
             Ok(result) => {
                 last_code = u8::from(result.exit_code) as i32;
                 // Honor terminal control flow BETWEEN complete-commands: `set -e`
@@ -2314,16 +2375,15 @@ async fn run_brush(conn_fd: i32, script: String) -> i32 {
         let spawn_ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs_f64()).unwrap_or(0.0);
-        for mut rec in complete_command_records(&complete) {
-            if let Value::Object(ref mut m) = rec {
-                m.insert("seq".to_string(), json!(seq));
-                m.insert("spawn_ts".to_string(), json!(spawn_ts));
-            }
-            send_prov(conn_fd, &rec);
-            seq += 1;
+        let (recs, frame_uid) = stamp_pipeline_records(&complete, &mut seq, spawn_ts, false);
+        for rec in &recs {
+            send_prov(conn_fd, rec);
         }
         let one = brush_parser::ast::Program { complete_commands: vec![complete] };
-        match shell.run_program(one, &params).await {
+        let prev_uid = set_current_pipeline_uid(frame_uid);
+        let r = shell.run_program(one, &params).await;
+        set_current_pipeline_uid(prev_uid);
+        match r {
             Ok(result) => last_code = u8::from(result.exit_code) as i32,
             Err(e) => {
                 eprintln!("sarun-engine inner: -b brush execution error \
@@ -2485,6 +2545,9 @@ pub fn run_recipe_in_process_opt(
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| std::path::PathBuf::from("/"));
     let recipe_owned = recipe.clone();
+    // Capture the enclosing pipeline uid on THIS thread so the recipe/$(shell)
+    // pipelines (which run on the spawned brush thread below) nest under it.
+    let parent_uid = current_pipeline_uid();
     // Run brush on a worker thread so this (n2 scheduler) thread can drain the
     // pipe concurrently — a finite pipe buffer would otherwise deadlock. Large
     // stack: a recipe can be a recursive in-process make whose kati parse/eval
@@ -2493,6 +2556,8 @@ pub fn run_recipe_in_process_opt(
         .stack_size(64 * 1024 * 1024)
         .spawn(move || {
         rt.block_on(async move {
+            // Seed this worker thread's current pipeline from the captured parent.
+            set_current_pipeline_uid(parent_uid);
             let mut shell = match build_box_shell_full(
                 true, None, None, Some(cwd), false, bundle_coreutils,
             ).await {
@@ -2535,14 +2600,12 @@ pub fn run_recipe_in_process_opt(
                 }
             };
             let params = shell.default_exec_params();
-            match shell.run_program(prog, &params).await {
-                Ok(result) => u8::from(result.exit_code) as i32,
-                Err(e) => {
-                    eprintln!("sarun-engine n2: recipe execution error \
-                               (NO /bin/sh fallback): {e}");
-                    1
-                }
-            }
+            // Route through run_nested_pipelines so the recipe's own pipelines are
+            // logged (as nested prov rows) and become tree nodes — the recipe's
+            // `sh -c …` then nests under it — and so `set -e`/`exit` between the
+            // recipe's statements is honored. Each pipeline records parent_uid =
+            // the enclosing pipeline (the make/recipe that spawned this one).
+            run_nested_pipelines(&mut shell, prog, &params).await
             // shell and PipeWriter clones drop here → write end closed → drain sees EOF.
         })
     }).expect("spawn brush recipe thread");

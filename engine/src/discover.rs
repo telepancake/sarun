@@ -301,8 +301,13 @@ pub fn brushprov(box_id: i64) -> Value {
     // still read.
     let nested_col = if has_col(&conn, "brushprov", "nested")
                      { "nested" } else { "0" };
+    // uid/parent_uid are newer Rust-engine columns (pipeline-tree nesting); a
+    // sqlar written before them selects 0 so old archives still read flat.
+    let uid_col = if has_col(&conn, "brushprov", "uid") { "uid" } else { "0" };
+    let puid_col = if has_col(&conn, "brushprov", "parent_uid") { "parent_uid" } else { "0" };
     if let Ok(mut st) = conn.prepare(&format!(
-        "SELECT id,ts,cmd,record,pipeline,spawn_ts,{nested_col} FROM brushprov ORDER BY id")) {
+        "SELECT id,ts,cmd,record,pipeline,spawn_ts,{nested_col},{uid_col},{puid_col} \
+         FROM brushprov ORDER BY id")) {
         let it = st.query_map([], |r| {
             let rec: String = r.get(3)?;
             Ok(json!({
@@ -312,6 +317,8 @@ pub fn brushprov(box_id: i64) -> Value {
                 "pipeline": r.get::<_, Option<i64>>(4)?,
                 "spawn_ts": r.get::<_, Option<f64>>(5)?,
                 "nested": r.get::<_, Option<i64>>(6)?.unwrap_or(0) != 0,
+                "uid": r.get::<_, Option<i64>>(7)?.unwrap_or(0),
+                "parent_uid": r.get::<_, Option<i64>>(8)?.unwrap_or(0),
             }))
         });
         if let Ok(it) = it { for row in it.flatten() { rows.push(row); } }

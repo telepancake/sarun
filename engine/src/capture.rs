@@ -56,8 +56,13 @@ CREATE TABLE IF NOT EXISTS rdev(name TEXT PRIMARY KEY, dev INT);
 --   nested: 1 for a recipe a NESTED shell ran (a `sh -c` the box's command
 --   spawned, captured via the brush-sh shim) vs 0 for a TOP-LEVEL pipeline the
 --   box's own embedded brush ran. Queryable so a reader can tell the two apart.
+--   uid: a process-global unique id the box assigns each pipeline. parent_uid:
+--   the uid of the pipeline that ENCLOSED this one in-process (0 = a root), so a
+--   reader can render the otherwise-flat log as a tree (make → recipe → sh -c →
+--   …; xargs/subshells nest under their spawner). Both 0 for legacy boxes.
 CREATE TABLE IF NOT EXISTS brushprov(id INTEGER PRIMARY KEY AUTOINCREMENT,
- ts REAL, cmd TEXT, record TEXT, pipeline INT, spawn_ts REAL, nested INT DEFAULT 0);
+ ts REAL, cmd TEXT, record TEXT, pipeline INT, spawn_ts REAL, nested INT DEFAULT 0,
+ uid INT DEFAULT 0, parent_uid INT DEFAULT 0);
 -- Phase 1 embedded-ninja: one row per parsed n2/ninja build edge, captured when
 -- the box's `ninja` (vendored n2 in-process) loads build.ninja — INCLUDING
 -- up-to-date targets that never execute. `outs`/`ins` are JSON arrays of
@@ -969,15 +974,15 @@ impl BoxState {
     /// pipeline (set_current_pipeline) so subsequently-recorded brush-descendant
     /// processes are stamped with it.
     pub fn add_brushprov(&self, cmd: &str, record_json: &str, pipeline: i64,
-                         spawn_ts: f64) -> i64 {
+                         spawn_ts: f64, uid: i64, parent_uid: i64) -> i64 {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs_f64()).unwrap_or(0.0);
         let conn = self.conn.lock().unwrap();
         let _ = conn.execute(
-            "INSERT INTO brushprov(ts,cmd,record,pipeline,spawn_ts) \
-             VALUES(?1,?2,?3,?4,?5)",
-            params![ts, cmd, record_json, pipeline, spawn_ts]);
+            "INSERT INTO brushprov(ts,cmd,record,pipeline,spawn_ts,uid,parent_uid) \
+             VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![ts, cmd, record_json, pipeline, spawn_ts, uid, parent_uid]);
         conn.last_insert_rowid()
     }
 
@@ -992,15 +997,15 @@ impl BoxState {
     /// forest-ancestry guard (the nested-shim's descendants chain up through
     /// the box's brush --inner, so the guard accepts them).
     pub fn add_brushprov_nested(&self, cmd: &str, record_json: &str, pipeline: i64,
-                                spawn_ts: f64) -> i64 {
+                                spawn_ts: f64, uid: i64, parent_uid: i64) -> i64 {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs_f64()).unwrap_or(0.0);
         let conn = self.conn.lock().unwrap();
         let _ = conn.execute(
-            "INSERT INTO brushprov(ts,cmd,record,pipeline,spawn_ts,nested) \
-             VALUES(?1,?2,?3,?4,?5,1)",
-            params![ts, cmd, record_json, pipeline, spawn_ts]);
+            "INSERT INTO brushprov(ts,cmd,record,pipeline,spawn_ts,nested,uid,parent_uid) \
+             VALUES(?1,?2,?3,?4,?5,1,?6,?7)",
+            params![ts, cmd, record_json, pipeline, spawn_ts, uid, parent_uid]);
         conn.last_insert_rowid()
     }
 
