@@ -1,0 +1,24 @@
+# sarun wasm host: a hand-written wasi_snapshot_preview1 over a virtual fd table.
+#
+# NOT wasi-common. The fd table is engine-owned: a backing is an in-memory buffer
+# (syscall-free) today; kernel fds, blob<->blob in-memory pipes, and the box's
+# logical streams slot in behind the same enum. Every import is a plain wasmi
+# func_wrap closure, so the blocking ones can become asyncify suspend points the
+# same way engine/wasm/asyncify-demo shows. See engine/wasm/PORTING-WASM.md.
+[package]
+name = "sarun-wasm-host"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "runblob"
+path = "src/main.rs"
+
+[dependencies]
+wasmi = { version = "2.0.0-beta.3", features = ["simd"] }
+
+[workspace]

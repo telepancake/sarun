@@ -50,6 +50,7 @@ fds — the isolation is intrinsic. So:
 | binaryen `wasm-opt --asyncify` present | `apt-get install binaryen` (108) |
 | **suspend a guest at a host import and resume it**, asyncified, under wasmi | `engine/wasm/asyncify-demo` — unwind on first import entry, rewind to resume, asserts the resumed result |
 | the host's suspend machinery needs **no WASI** | the demo's import is a plain `wasmi::func_wrap` + `Caller`; `wasi-common` is not involved |
+| the **real coreutils blob runs on our own hand-written preview1 host** with in-memory stdio (zero syscalls for I/O), byte-parity | `engine/wasm/host` — `runblob <blob> seq/tr/sort/head/tail/uniq/nl/cut` |
 
 ### Operational notes
 
@@ -104,6 +105,21 @@ The engine's host is **plain wasmi imports**, not `wasi-common`:
 This replaces the earlier per-crate `cfg`-gate + `LogicalFd` placeholder approach
 (used for head/tail) with a single shim, shrinking the per-crate diff toward
 pristine. head/tail will be migrated onto `syscompat`.
+
+### Asyncify scope (measured, not assumed)
+
+Keep the `asyncify-imports` allowlist to the genuinely-blocking imports
+(`fd_read`/`fd_write`/`poll_oneoff`/`splice`); never list trivial ones
+(`clock_*`/`random_get`/`args_*`/stat/chmod return inline). But **measured**: for
+the coreutils blob, scoping the allowlist to `fd_read`/`fd_write` only shaved
+~0.5% (8.10 → 8.06 MB) — because `fd_write` is reachable from nearly every
+function, so asyncify instruments most of the call graph regardless. The real
+cost is the ~2× blow-up (3.8 → 8 MB) of making a write-pervasive program fully
+suspendable. So the actual levers are: **asyncify is opt-in per blob** (normal
+runs use the 3.8 MB plain blob; only checkpointed blobs get instrumented), and
+`asyncify-onlylist`/`removelist` to bound *which functions* are suspendable if we
+only need suspension at specific points. The import allowlist is correct hygiene,
+just not where the bytes are.
 
 ## The per-crate porting recipe
 

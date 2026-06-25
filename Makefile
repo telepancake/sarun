@@ -46,16 +46,21 @@ WASM_OPT_FEATURES := --enable-simd --enable-bulk-memory --enable-sign-ext \
   --enable-mutable-globals --enable-nontrapping-float-to-int \
   --enable-multivalue --enable-reference-types
 WASM_BLOB := engine/wasm/blobs/target/wasm32-wasip1/release/coreutils.wasm
+# Only the blocking imports may unwind. Listing trivial imports (clock/random/
+# args/stat) would needlessly widen the instrumented set. NB: asyncify still ~2x's
+# the module because fd_write is reachable almost everywhere — so asyncify is the
+# opt-in CHECKPOINT-CAPABLE variant; normal runs use the plain blob. See PORTING-WASM.md.
+WASM_ASYNCIFY_IMPORTS := --pass-arg=asyncify-imports@wasi_snapshot_preview1.fd_read,wasi_snapshot_preview1.fd_write
 
 .PHONY: wasm-blobs
 wasm-blobs: ## Build the wasm coreutils blob (run in-process via wasmi) + asyncify it
 	@command -v wasm-opt >/dev/null || { echo "wasm-blobs needs binaryen (apt-get install -y binaryen)"; exit 1; }
 	rustup target add wasm32-wasip1
 	cd engine/wasm/blobs && cargo build --release --target wasm32-wasip1
-	wasm-opt $(WASM_OPT_FEATURES) --asyncify $(WASM_BLOB) \
+	wasm-opt $(WASM_OPT_FEATURES) --asyncify $(WASM_ASYNCIFY_IMPORTS) $(WASM_BLOB) \
 	  -o engine/wasm/blobs/target/wasm32-wasip1/release/coreutils.asyncify.wasm
-	@echo "→ $(WASM_BLOB)"
-	@echo "→ engine/wasm/blobs/target/wasm32-wasip1/release/coreutils.asyncify.wasm (asyncified)"
+	@echo "→ $(WASM_BLOB) (plain; normal runs)"
+	@echo "→ engine/wasm/blobs/target/wasm32-wasip1/release/coreutils.asyncify.wasm (checkpoint-capable)"
 
 .PHONY: engine
 engine: ## Build the engine (fully-static musl binary; cargo-zigbuild + zig)

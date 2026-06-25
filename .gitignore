@@ -17,3 +17,4 @@ __pycache__/
 /engine/wasm/blobs/target/
 /engine/wasm/asyncify-demo/target/
 /engine/wasm/asyncify-demo/run.wasm
+/engine/wasm/host/target/
