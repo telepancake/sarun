@@ -13,3 +13,5 @@ __pycache__/
 /Cargo.lock
 /src/
 /target/
+# wasm blob build output (engine/wasm/blobs is its own cargo crate)
+/engine/wasm/blobs/target/

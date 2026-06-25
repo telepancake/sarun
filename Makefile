@@ -33,11 +33,29 @@ run: ## Start sarun (the engine binary + UI; build it first with `make engine`)
 deps: ## Install system packages (FUSE, bubblewrap; iproute2 + tshark for net tests)
 	apt-get install -y libfuse3-dev fuse3 pkg-config bubblewrap gcc
 	apt-get install -y iproute2 tshark   # only needed by test_net_rs.py
+	apt-get install -y binaryen          # wasm-opt --asyncify (make wasm-blobs)
 
 # ---- Build ----------------------------------------------------------------
 #
 # The only build: a fully-static musl binary via cargo-zigbuild + ziglang (no
 # apt toolchain). The cargo default target is musl (engine/.cargo/config.toml).
+
+# Feature flags the rust wasm toolchain emits that binaryen 108 must be told to
+# accept, or `wasm-opt` dies with "error validating input". See PORTING-WASM.md.
+WASM_OPT_FEATURES := --enable-simd --enable-bulk-memory --enable-sign-ext \
+  --enable-mutable-globals --enable-nontrapping-float-to-int \
+  --enable-multivalue --enable-reference-types
+WASM_BLOB := engine/wasm/blobs/target/wasm32-wasip1/release/coreutils.wasm
+
+.PHONY: wasm-blobs
+wasm-blobs: ## Build the wasm coreutils blob (run in-process via wasmi) + asyncify it
+	@command -v wasm-opt >/dev/null || { echo "wasm-blobs needs binaryen (apt-get install -y binaryen)"; exit 1; }
+	rustup target add wasm32-wasip1
+	cd engine/wasm/blobs && cargo build --release --target wasm32-wasip1
+	wasm-opt $(WASM_OPT_FEATURES) --asyncify $(WASM_BLOB) \
+	  -o engine/wasm/blobs/target/wasm32-wasip1/release/coreutils.asyncify.wasm
+	@echo "→ $(WASM_BLOB)"
+	@echo "→ engine/wasm/blobs/target/wasm32-wasip1/release/coreutils.asyncify.wasm (asyncified)"
 
 .PHONY: engine
 engine: ## Build the engine (fully-static musl binary; cargo-zigbuild + zig)

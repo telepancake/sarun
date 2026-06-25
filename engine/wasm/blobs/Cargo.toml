@@ -1,0 +1,50 @@
+# sarun wasm coreutils blob.
+#
+# This builds the vendored uutils coreutils into a SINGLE wasm32-wasip1 module
+# that dispatches on argv[0] (busybox-style). The engine runs it in-process via
+# wasmi with a WASI host that maps the guest's stdio/cwd to the box's pipeline.
+#
+# Unlike the native in-process builtins (engine/src/brush.rs), the wasm blob does
+# NOT cosplay a brush builtin: it is an ordinary program using normal argv/stdio.
+# The wasm sandbox provides the per-util isolation the logical-I/O patches used to
+# fake, so the blob calls each util's plain `uumain` (the standalone entry the
+# vendored forks retain) — no logical-I/O / logical-cwd surgery.
+#
+# Only utils that compile cleanly to WASI live here today. Unix-heavy utils
+# (chmod/chown/install/id/ln/touch + stat reads) and the C-dep / mmap utils
+# (expr/onig, tac/memmap) need the custom-host-import port — see PORTING-WASM.md.
+[package]
+name = "sarun-wasm-coreutils"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "coreutils"
+path = "src/main.rs"
+
+[dependencies]
+uucore     = { path = "../../vendor/uucore", features = ["entries"] }
+# cat/head/tail/wc carry the unix-only logical-fd (splice) patch; they need the
+# fd-param gating before they compile to wasm (see PORTING-WASM.md) and are added
+# back as each is ported. The set below compiles to WASI as-is.
+uu_nl       = { path = "../../vendor/uu_nl" }
+uu_cut      = { path = "../../vendor/uu_cut" }
+uu_tr       = { path = "../../vendor/uu_tr" }
+uu_uniq     = { path = "../../vendor/uu_uniq" }
+uu_sort     = { path = "../../vendor/uu_sort" }
+uu_basename = { path = "../../vendor/uu_basename" }
+uu_dirname  = { path = "../../vendor/uu_dirname" }
+uu_seq      = { path = "../../vendor/uu_seq" }
+
+# Redirect every transitive `uucore` (the vendored uu_* depend on it by version)
+# to the one vendored copy, exactly as engine/Cargo.toml does.
+[patch.crates-io]
+uucore = { path = "../../vendor/uucore" }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
