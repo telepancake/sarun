@@ -1,0 +1,11 @@
+[package]
+name="mmapspike"
+version="0.0.0"
+edition="2021"
+[dependencies]
+libc = "0.2"
+[[bin]]
+name="m"
+path="src/main.rs"
+
+[workspace]

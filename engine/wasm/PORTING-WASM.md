@@ -52,6 +52,7 @@ fds — the isolation is intrinsic. So:
 | the host's suspend machinery needs **no WASI** | the demo's import is a plain `wasmi::func_wrap` + `Caller`; `wasi-common` is not involved |
 | the **real coreutils blob runs on our own hand-written preview1 host** with in-memory stdio (zero syscalls for I/O), byte-parity | `engine/wasm/host` — `runblob <blob> seq/tr/sort/head/tail/uniq/nl/cut` |
 | **single-file suspend/resume across a full teardown** (snapshot linear memory to one file, drop everything, restore + rewind, finish) | `engine/wasm/asyncify-demo` `snapshot` bin |
+| **mmap'd file as live store, used as-is, kept sparse by hole-punching** (zero-copy, persists across unmap/remap) | `engine/wasm/mmap-demo` |
 
 ### Operational notes
 
@@ -91,15 +92,27 @@ The engine's host is **plain wasmi imports**, not `wasi-common`:
   guest's `asyncify_start_unwind`/`start_rewind` exports. Only the **blocking**
   imports (`fd_read`/`fd_write`/`poll`/`splice`) are suspend candidates; trivial
   ones return inline.
-- **Whole-system checkpoint = one backing file.** To checkpoint: unwind every
-  running blob, **barrier** until all have unwound (each parked at a clean import
-  boundary, state in linear memory), then write **one file** = `{per-process:
-  linear memory + mutable globals + parked-import id} ⧺ {host fd table: in-memory
-  pipe contents + cursors}`. Resume = load it, rebuild instances, restore
-  memory/globals, `start_rewind`, re-enter. Proven across a full teardown
-  (`asyncify-demo` `snapshot`). Open item: real blobs must **export mutable
-  globals** (`__stack_pointer`, …) so they can be snapshotted/restored — the demo
-  guest has none.
+- **Whole-system checkpoint = one backing file, used as-is (mmap, no
+  serialization).** To checkpoint: unwind every running blob, **barrier** until
+  all have unwound (each parked at a clean import boundary, state in linear
+  memory), then the file is already current — `msync`. Layout: a fixed-layout
+  header (mutable globals incl. `__stack_pointer`, fd-table metadata, pipe ring
+  offsets/cursors), then page-aligned per-process **linear-memory** regions, then
+  file-backed **pipe buffers**. Each instance's linear memory and each in-memory
+  pipe is an `mmap(MAP_SHARED)` view into this one file, so the system mutates the
+  file in place; resume = `mmap` it back, `start_rewind`, re-enter. Unused
+  linear-memory pages and freed pipe bytes are **hole-punched**
+  (`fallocate(PUNCH_HOLE)`, or `madvise(MADV_REMOVE)` on tmpfs; `MADV_DONTNEED`
+  drops cache only) so the file's real footprint tracks live pages. The mmap +
+  sparse + hole-punch mechanic is proven (`mmap-demo`); the snapshot roundtrip is
+  proven (`asyncify-demo snapshot`).
+- **Open items for real-blob checkpoint:** (1) **export mutable globals**
+  (`__stack_pointer`, …) at blob-build time so they go in the header — the blob has
+  one mutable i32 global (the shadow-stack pointer), currently unexported. (2)
+  **wasmi has no hook to back linear memory with mmap'd storage** (it owns
+  `CoreMemory` internally); making guest memory truly mmap-as-is needs a wasmi
+  patch (vendor+patch, like the other upstreams). Until then guest memory
+  checkpoints as a copy; host fd/pipe buffers are mmap-as-is today.
 
 ### Two halves of the Unix surface
 

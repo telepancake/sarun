@@ -18,3 +18,4 @@ __pycache__/
 /engine/wasm/asyncify-demo/target/
 /engine/wasm/asyncify-demo/run.wasm
 /engine/wasm/host/target/
+/engine/wasm/mmap-demo/target/
