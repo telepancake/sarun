@@ -247,10 +247,20 @@ fn exports_prefix(exports: &[(Bytes, Bytes)]) -> Vec<u8> {
 /// What a worker produced running a node's recipe.
 struct NodeRun {
     output: Symbol,
-    out: Vec<u8>,
     ignored: Vec<(Symbol, i32)>,
     failure: Option<(Symbol, i32)>,
     result_ts: ExecStatus,
+}
+
+/// sarun: a worker→main message. Recipe output is streamed LIVE as `Chunk`s (so
+/// a long-running or hung recipe's output appears immediately, not buffered
+/// until the node finishes), then one `Done` carries the node's result. At cap 1
+/// (serial) the byte order is identical to collecting-then-emitting, so the
+/// rkati↔make corpus is unaffected; under -j output interleaves per chunk, like
+/// GNU make without -O.
+enum RunMsg {
+    Chunk(Vec<u8>),
+    Done(NodeRun, Option<u8>),
 }
 
 /// Run a node's concrete commands in sequence on a worker thread, capturing the
@@ -259,8 +269,8 @@ fn run_node_commands(
     shell: &[u8],
     shellflag: &'static [u8],
     req: RunReq,
+    emit: &mut dyn FnMut(&[u8]),
 ) -> NodeRun {
-    let mut out = Vec::new();
     let mut ignored = Vec::new();
     let mut failure = None;
     // The make's global export prefix (box mode) runs first, then the target's
@@ -271,8 +281,9 @@ fn run_node_commands(
     let cwd = req.cwd;
     for command in req.commands {
         if command.echo {
-            out.extend_from_slice(&command.cmd);
-            out.push(b'\n');
+            // Echo LIVE, before running, so a hung command's line shows at once.
+            emit(&command.cmd);
+            emit(b"\n");
         }
         if FLAGS.is_dry_run {
             continue;
@@ -286,18 +297,19 @@ fn run_node_commands(
             v.extend_from_slice(&command.cmd);
             Bytes::from(v)
         };
-        let (ok, o, code) =
-            if let Some((code, o)) =
-                run_with_installed_runner(shell, shellflag, &run_input, &cwd, RedirectStderr::Stdout)
+        // In-process runner streams output straight to `emit` (live, mid-command);
+        // the fork fallback captures then we emit it per-command.
+        let (ok, code) =
+            if let Some(code) = run_with_installed_runner(
+                shell, shellflag, &run_input, &cwd, RedirectStderr::Stdout, emit)
             {
-                (code == 0, o, code)
+                (code == 0, code)
             } else {
                 match run_command(shell, shellflag, &run_input, &cwd, RedirectStderr::Stdout) {
-                    Ok((status, o)) => (status.success(), o, status.code().unwrap_or(1)),
-                    Err(e) => (false, format!("{e}\n").into_bytes(), 1),
+                    Ok((status, o)) => { emit(&o); (status.success(), status.code().unwrap_or(1)) }
+                    Err(e) => { emit(format!("{e}\n").as_bytes()); (false, 1) }
                 }
             };
-        out.extend_from_slice(&o);
         if !ok {
             if command.ignore_error {
                 ignored.push((command.output, code));
@@ -307,7 +319,7 @@ fn run_node_commands(
             }
         }
     }
-    NodeRun { output: req.output, out, ignored, failure, result_ts: req.result_ts }
+    NodeRun { output: req.output, ignored, failure, result_ts: req.result_ts }
 }
 
 impl<'a> Executor<'a> {
@@ -560,7 +572,7 @@ impl<'a> Executor<'a> {
         }
         let mut run_queue: BinaryHeap<Ready> = BinaryHeap::new();
         let mut reqs: HashMap<Symbol, RunReq> = HashMap::new();
-        let (tx, rx) = std::sync::mpsc::channel::<(NodeRun, Option<u8>)>();
+        let (tx, rx) = std::sync::mpsc::channel::<RunMsg>();
         let mut running = 0usize;
         let mut failed: Option<i32> = None;
         let mut done_count = 0usize;
@@ -608,8 +620,11 @@ impl<'a> Executor<'a> {
                 std::thread::Builder::new()
                     .stack_size(64 * 1024 * 1024)
                     .spawn(move || {
-                        let r = run_node_commands(&shell, shellflag, req);
-                        let _ = txc.send((r, slip));
+                        // Stream each output chunk to the main thread LIVE (it owns
+                        // the RECIPE_OUT sink); then the final result.
+                        let mut emit = |b: &[u8]| { let _ = txc.send(RunMsg::Chunk(b.to_vec())); };
+                        let r = run_node_commands(&shell, shellflag, req, &mut emit);
+                        let _ = txc.send(RunMsg::Done(r, slip));
                     })
                     .expect("spawn recipe worker");
                 running += 1;
@@ -630,13 +645,18 @@ impl<'a> Executor<'a> {
                 }
                 break;
             }
-            // 4. Wait for a recipe to finish; emit its output, handle failure.
-            let (run, slip) = rx.recv().unwrap();
+            // 4. Drain worker messages: emit output chunks LIVE; a Done marks a
+            // node finished (handle failure, release its slip). Chunks from
+            // concurrent nodes interleave (like GNU make without -O); at cap 1
+            // there's one worker, so the byte order is unchanged.
+            let (run, slip) = match rx.recv().unwrap() {
+                RunMsg::Chunk(b) => { emit_recipe_output(&b); continue; }
+                RunMsg::Done(run, slip) => (run, slip),
+            };
             running -= 1;
             if let (Some(c), Some(t)) = (&client, slip) {
                 c.release(t);
             }
-            emit_recipe_output(&run.out);
             for (o, c) in &run.ignored {
                 emit_recipe_err(&format!("[{o}] Error {c} (ignored)"));
             }
