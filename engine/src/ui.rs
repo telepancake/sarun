@@ -477,6 +477,9 @@ struct App {
     /// Pipelines pane view: true = hierarchical tree (parent_uid nesting),
     /// false = flat chronological. Toggled with `t`.
     pipe_tree: bool,
+    /// Pipelines pane: show ONLY in-flight pipelines (done_ts==0) — the live /
+    /// stuck set on a running box. Toggled with `f`.
+    pipe_running_only: bool,
     /// Phase 1 build edges for the currently-loaded box (one row per
     /// `build_edges` entry; same "full list, no windowing" reasoning).
     build_edges: Vec<Value>,
@@ -634,7 +637,7 @@ impl App {
             outputs_view: None, outputs_view_sid: None,
             outputs_total: 0,
             outputs_window_start: 0,
-            rules: vec![], pipelines: vec![], pipelines_flat: vec![], pipe_tree: true, build_edges: vec![],
+            rules: vec![], pipelines: vec![], pipelines_flat: vec![], pipe_tree: true, pipe_running_only: false, build_edges: vec![],
             sel_session: 0,
             sel_change: 0,
             sel_proc: 0, sel_pipeline: 0, sel_edge: 0,
@@ -1393,10 +1396,19 @@ impl App {
     /// Rebuild the displayed `pipelines` from `pipelines_flat` per `pipe_tree`:
     /// a parent→child tree (depth stamped) or the flat chronological list.
     fn rebuild_pipeline_view(&mut self) {
-        self.pipelines = if self.pipe_tree {
-            build_pipeline_tree(self.pipelines_flat.clone())
+        // Optionally keep only in-flight pipelines (done_ts==0) — the running /
+        // stuck set on a live box.
+        let src: Vec<Value> = if self.pipe_running_only {
+            self.pipelines_flat.iter()
+                .filter(|r| r.get("done_ts").and_then(Value::as_f64).unwrap_or(0.0) == 0.0)
+                .cloned().collect()
         } else {
             self.pipelines_flat.clone()
+        };
+        self.pipelines = if self.pipe_tree {
+            build_pipeline_tree(src)
+        } else {
+            src
         };
         if !self.pipelines.is_empty() && self.sel_pipeline >= self.pipelines.len() {
             self.sel_pipeline = self.pipelines.len() - 1;
@@ -1410,6 +1422,18 @@ impl App {
         self.rebuild_pipeline_view();
         self.status = format!("pipelines: {} view",
             if self.pipe_tree { "tree" } else { "flat chronological" });
+    }
+
+    /// `f`: toggle showing only in-flight (running) pipelines — done_ts==0.
+    fn toggle_pipeline_running_only(&mut self) {
+        self.pipe_running_only = !self.pipe_running_only;
+        self.sel_pipeline = 0;
+        self.rebuild_pipeline_view();
+        self.status = if self.pipe_running_only {
+            "pipelines: running only".to_string()
+        } else {
+            "pipelines: all".to_string()
+        };
     }
 
     /// Load the embedded-ninja build edges for the currently-selected box.
@@ -3971,7 +3995,7 @@ enum PaneAction {
     ApplyHunk, DiscardHunk, ApplyFile, DiscardFile, ApplyAll, DiscardAll,
     ConfirmKill, ConfirmDelete, ConfirmDissolve,
     NewRule, DeleteRule, StartRename,
-    ToggleFilter, Refresh, ActionMenu, ToggleTree,
+    ToggleFilter, Refresh, ActionMenu, ToggleTree, ToggleRunningOnly,
 }
 
 /// The main-loop pane keymap. ORDER MATTERS, and reproduces the original inline
@@ -4006,6 +4030,7 @@ const PANE_ACTION_KEYS: &[(Key, PaneGate, PaneAction, Option<&str>)] = &[
     (Key::Char('D'), PaneGate::Any,             PaneAction::ConfirmDelete,   Some("delete box + captures (y/n)")),
     (Key::Char('Z'), PaneGate::Any,             PaneAction::ConfirmDissolve, Some("dissolve box (y/n)")),
     (Key::Char('t'), PaneGate::On(Pane::Pipelines), PaneAction::ToggleTree,  Some("toggle tree / flat chronological (on Pipes)")),
+    (Key::Char('f'), PaneGate::On(Pane::Pipelines), PaneAction::ToggleRunningOnly, Some("toggle running-only (on Pipes)")),
     (Key::Char('n'), PaneGate::On(Pane::Rules), PaneAction::NewRule,         Some("new rule (on Rules)")),
     (Key::Char('d'), PaneGate::On(Pane::Rules), PaneAction::DeleteRule,      Some("delete rule (on Rules)")),
     (Key::Char('d'), PaneGate::Any,             PaneAction::Detach,          Some("detach (leaves the engine running)")),
@@ -4024,6 +4049,7 @@ fn run_pane_action(app: &mut App, action: PaneAction) {
         PaneAction::MoveUp => app.move_up(),
         PaneAction::NextPane => app.next_pane(),
         PaneAction::ToggleTree => app.toggle_pipeline_tree(),
+        PaneAction::ToggleRunningOnly => app.toggle_pipeline_running_only(),
         PaneAction::Open => {
             if app.focus == Pane::Rules {
                 let cur = app.rules.get(app.sel_rule).cloned().unwrap_or_default();
@@ -7407,7 +7433,7 @@ mod tests {
             outputs_view: None, outputs_view_sid: None,
             outputs_total: 0,
             outputs_window_start: 0,
-            rules: vec![], pipelines: vec![], pipelines_flat: vec![], pipe_tree: true, build_edges: vec![],
+            rules: vec![], pipelines: vec![], pipelines_flat: vec![], pipe_tree: true, pipe_running_only: false, build_edges: vec![],
             sel_session: 0,
             sel_change: 0,
             sel_proc: 0, sel_pipeline: 0, sel_edge: 0,
