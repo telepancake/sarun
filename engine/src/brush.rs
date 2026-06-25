@@ -1905,7 +1905,17 @@ async fn run_nested_pipelines(
         send_nested_pipeline_records(recs);
         let one = brush_parser::ast::Program { complete_commands: vec![complete] };
         match shell.run_program(one, params).await {
-            Ok(result) => last_code = u8::from(result.exit_code) as i32,
+            Ok(result) => {
+                last_code = u8::from(result.exit_code) as i32;
+                // Honor terminal control flow BETWEEN complete-commands: `set -e`
+                // (errexit raises ExitShell) and an explicit `exit` must stop the
+                // script here, not fall through to the next newline-separated
+                // statement. (Within one `;`-list the CompoundList executor
+                // already breaks; this covers the cross-statement case.)
+                if !result.is_normal_flow() {
+                    break;
+                }
+            }
             Err(e) => {
                 eprintln!("sarun-engine brush-sh: execution error \
                            (NO /bin/sh fallback): {e}");
@@ -2142,13 +2152,21 @@ impl brush_core::commands::ExecInterposer<brush_core::extensions::DefaultShellEx
         mut sub: brush_core::Shell,
         resolved: std::path::PathBuf,
         argv: Vec<String>,
-        params: brush_core::ExecutionParameters,
+        mut params: brush_core::ExecutionParameters,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Option<brush_core::ExecutionResult>> + Send + 'a>,
     > {
         Box::pin(async move {
             use std::sync::atomic::{AtomicU32, Ordering};
             let snoop = parse_snoop(&resolved, &argv)?; // None → decline (fork)
+
+            // A snooped script is a fresh execution context, like a forked shell:
+            // its OWN `set -e` governs its commands. The caller's params carry
+            // `suppress_errexit=true` when this `sh -c …` sits in a conditional
+            // (LHS of `&&`/`||`, an `if`, a `!`-pipeline) — that suppresses the
+            // PARENT shell's errexit and must NOT leak in and disable the child's.
+            // The fds carried in params are kept; only this flag is reset.
+            params.suppress_errexit = false;
 
             // A unique synthetic $$/BASHPID per snooped script, so concurrent
             // in-process scripts get distinct `conftest$$`-style temp files even
