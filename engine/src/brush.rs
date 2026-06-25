@@ -1939,11 +1939,13 @@ async fn run_nested_pipelines(
 // flips the single `sh_mode` option (the only thing build_box_shell varies by
 // mode), which parser_options()/is_keyword() re-read at parse time.
 //
-// CONSERVATIVE: anything we can't confidently parse (interactive shells, options
-// we don't model like `-o NAME`/`-i`/`-l`, unreadable scripts) returns None and
-// falls through to the normal fork path — so snooping can only ever skip a
-// redundant fork, never change behavior. Those fork cases re-enter brush_sh,
-// which has the full flag parser and a real interactive REPL.
+// CONSERVATIVE: anything we can't confidently parse (interactive `-i` shells,
+// `-l`/`--login`, any `--long` option, an unknown short flag, an unreadable
+// script) returns None and falls through to the normal fork path — so snooping
+// can only ever skip a redundant fork, never change behavior. Those fork cases
+// re-enter brush_sh, which has the full flag parser and a real interactive REPL.
+// Launch flags we DO model: `-e/-u/-x/-v/-f/-n/-h/-m/-b/-C/-a` (and their `+`
+// forms) and `-o NAME`/`+o NAME`, all replayed via `set` on the subshell.
 
 const SELF_HEAD: usize = 4096;
 
@@ -2025,8 +2027,9 @@ struct Snoop {
     bash_mode: bool,
 }
 
-/// Set-flag characters we model precisely enough to replay via `set`. Anything
-/// outside this set (e.g. `-o NAME`, `-i`, `-l`) makes us decline → fork.
+/// Single-letter set-flag characters we replay via `set` (both `-X` to enable
+/// and `+X` to disable). `-o NAME`/`+o NAME` are handled separately. Flags
+/// outside all of these (e.g. `-i`, `-l`, `--long`) make us decline → fork.
 const SNOOP_SET_FLAGS: &str = "euxvfnhmbCa";
 
 /// Decide whether `resolved` + `argv` (argv[0] = the shell name as invoked) is
@@ -2049,6 +2052,16 @@ fn parse_snoop(resolved: &std::path::Path, argv: &[String]) -> Option<Snoop> {
             if a == "--" { i += 1; break; }
             if a == "-" { break; } // stdin marker: ends flags, operand follows
             if a == "-c" { have_c = true; i += 1; break; }
+            // `-o NAME` / `+o NAME`: a named option (pipefail, errexit, …). Take
+            // the name and replay it verbatim via `set` (the two tokens become
+            // `set … -o pipefail`). Missing name → decline (fork; brush_sh errors).
+            if a == "-o" || a == "+o" {
+                let name = argv.get(i + 1)?;
+                set_flags.push(a.clone());
+                set_flags.push(name.clone());
+                i += 2;
+                continue;
+            }
             if let Some(rest) = a.strip_prefix('-') {
                 if rest.is_empty()
                     || !rest.chars().all(|c| c == 'c' || SNOOP_SET_FLAGS.contains(c))
@@ -2060,6 +2073,15 @@ fn parse_snoop(resolved: &std::path::Path, argv: &[String]) -> Option<Snoop> {
                 }
                 i += 1;
                 if have_c { break; }
+                continue;
+            }
+            // `+`-prefixed bundle (`+e`, `+x`, …): turn options OFF via `set +X`.
+            if let Some(rest) = a.strip_prefix('+') {
+                if rest.is_empty() || !rest.chars().all(|c| SNOOP_SET_FLAGS.contains(c)) {
+                    return None;
+                }
+                for c in rest.chars() { set_flags.push(format!("+{c}")); }
+                i += 1;
                 continue;
             }
             break; // first non-flag operand
