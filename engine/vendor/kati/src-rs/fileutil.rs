@@ -81,22 +81,24 @@ pub fn install_recipe_runner(f: RecipeRunner) {
 /// Run `cmd` through the installed in-process runner, if any. Returns
 /// `Some((exit_code, merged_output))` when the hook handled the command,
 /// `None` when no hook is installed OR the hook declined.
+/// `out_cb` receives the command's output bytes AS THEY ARRIVE — a recipe caller
+/// streams them straight to the box stdout (live, even mid-command), while a
+/// capturing caller ($(shell)/regen) accumulates them into a Vec. Returns the
+/// exit code, or `None` when no hook is installed / it declined.
 pub fn run_with_installed_runner(
     shell: &[u8],
     shellflag: &[u8],
     cmd: &[u8],
     cwd: &[u8],
     redirect_stderr: RedirectStderr,
-) -> Option<(i32, Vec<u8>)> {
+    out_cb: &mut dyn FnMut(&[u8]),
+) -> Option<i32> {
     // sarun: clone the runner Arc and RELEASE the lock before invoking it. The
     // runner may run a recursive in-process make whose recipes re-enter here;
     // holding this non-reentrant lock across the call would deadlock.
     let runner = RECIPE_RUNNER.lock().as_ref()?.clone();
-    let mut out = Vec::new();
-    match runner(shell, shellflag, cmd, cwd, redirect_stderr, &mut |b| {
-        out.extend_from_slice(b)
-    }) {
-        RecipeRunnerDecision::Ran { code } => Some((code, out)),
+    match runner(shell, shellflag, cmd, cwd, redirect_stderr, out_cb) {
+        RecipeRunnerDecision::Ran { code } => Some(code),
         RecipeRunnerDecision::Passthrough => None,
     }
 }
@@ -143,8 +145,9 @@ pub fn run_command(
     // dir, not the process cwd. Declines (Passthrough / no runner) fall through
     // to the fork below, which is also pinned to `cwd`.
     if !cwd.is_empty() {
-        if let Some((code, output)) =
-            run_with_installed_runner(shell, shellflag, cmd, cwd, redirect_stderr)
+        let mut output = Vec::new();
+        if let Some(code) = run_with_installed_runner(
+            shell, shellflag, cmd, cwd, redirect_stderr, &mut |b| output.extend_from_slice(b))
         {
             return Ok((ExitStatus::from_raw((code & 0xff) << 8), output));
         }
