@@ -15,3 +15,5 @@ __pycache__/
 /target/
 # wasm blob build output (engine/wasm/blobs is its own cargo crate)
 /engine/wasm/blobs/target/
+/engine/wasm/asyncify-demo/target/
+/engine/wasm/asyncify-demo/run.wasm

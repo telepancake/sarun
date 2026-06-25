@@ -48,6 +48,8 @@ fds — the isolation is intrinsic. So:
 | `wasm-opt --asyncify` output still runs under wasmi | asyncified blob runs `tr`/`sort` identically |
 | wasmi + wasmi_wasi build **static-musl** via `cargo zigbuild` | statically-linked ELF produced |
 | binaryen `wasm-opt --asyncify` present | `apt-get install binaryen` (108) |
+| **suspend a guest at a host import and resume it**, asyncified, under wasmi | `engine/wasm/asyncify-demo` — unwind on first import entry, rewind to resume, asserts the resumed result |
+| the host's suspend machinery needs **no WASI** | the demo's import is a plain `wasmi::func_wrap` + `Caller`; `wasi-common` is not involved |
 
 ### Operational notes
 
@@ -63,6 +65,45 @@ fds — the isolation is intrinsic. So:
   emits, or it dies with "error validating input":
   `--enable-simd --enable-bulk-memory --enable-sign-ext --enable-mutable-globals
   --enable-nontrapping-float-to-int --enable-multivalue --enable-reference-types`.
+
+## The host design (settled by the demo)
+
+The engine's host is **plain wasmi imports**, not `wasi-common`:
+
+- **Virtual fd table, host-owned.** An fd is an engine handle whose backing is a
+  real kernel fd *or* a purely in-process object (an in-memory pipe between two
+  blobs, an in-memory file) — so a blob→blob pipeline moves data with **no
+  syscalls**, and the engine sees every byte (provenance) and can checkpoint
+  cleanly. `fd_read`/`fd_write`/`fd_seek`/`splice`/`path_open`/stat all `match`
+  on the backing.
+- **`splice` is polymorphic over backing**, not kernel-only: (kernel,kernel)+pipe
+  → real `splice(2)`; in-memory → buffer handoff/`memcpy`; mixed → read-then-write.
+  Nothing Unix is "excluded" — it's supplied from stable wasi, or as a host import
+  the engine services against the real fds/overlay.
+- **We implement preview1 ourselves** as wasmi imports against that fd table
+  (reusing only WASI's ABI constant/struct definitions so guest std stays
+  byte-compatible), plus custom imports (splice, overlay chmod/chown, provenance
+  taps). `wasi-common`/`wasmi_wasi` was only the bootstrap for the leaf-util proof.
+- **Asyncify suspend** is driven host-side exactly as `asyncify-demo` shows: the
+  import writes the asyncify control struct into guest memory and calls the
+  guest's `asyncify_start_unwind`/`start_rewind` exports. Every host import is a
+  potential suspend point — that's "asyncify over the blob *and its imports*".
+
+### Two halves of the Unix surface
+
+- **Guest side — `syscompat` shim crate.** Vendored code changes `std::os::unix`
+  → `syscompat::unix` (mechanical path swap, logic + call sites unchanged).
+  `syscompat` is `pub use std::os::unix::*` on Unix (zero native change); on wasm
+  it supplies the equivalents: re-export stable wasi `OsStrExt`; reimplement the
+  nightly-gated `FileTypeExt`/`MetadataExt`/`OpenOptionsExt` and the absent
+  `PermissionsExt`/uid/gid with the **same method names** (so call sites compile),
+  backed by host imports. Proven: one import path compiles unchanged on both
+  targets.
+- **Host side — the virtual fd table + custom preview1, above.**
+
+This replaces the earlier per-crate `cfg`-gate + `LogicalFd` placeholder approach
+(used for head/tail) with a single shim, shrinking the per-crate diff toward
+pristine. head/tail will be migrated onto `syscompat`.
 
 ## The per-crate porting recipe
 
