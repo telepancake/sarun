@@ -102,6 +102,43 @@ pub fn run_with_installed_runner(
         RecipeRunnerDecision::Passthrough => None,
     }
 }
+
+// sarun: optional hook reporting a node's recipe run-state transitions so the
+// embedding engine can stamp the box's `build_edges` row (started_ts /
+// ended_ts + exit_code) and the UI can show only the targets CURRENTLY
+// building (and each target's wall time). Decoupled exactly like RECIPE_RUNNER:
+// kati calls `report_edge` around each node's recipe; sarun installs a closure
+// that ships the transition to the engine. No-op (rkati standalone) when none
+// is installed. `output` is the node's primary output name (== the first entry
+// of the build_edges row's `outs` array, the engine's match key).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgePhase {
+    /// Recipe is about to run (its first concrete command is starting).
+    Start,
+    /// Recipe finished; `code` is the exit status (0 = success).
+    Done,
+}
+
+pub type EdgeReporter =
+    Arc<dyn Fn(&[u8] /* output */, EdgePhase, i32 /* exit code */) + Send + Sync + 'static>;
+
+static EDGE_REPORTER: parking_lot::Mutex<Option<EdgeReporter>> =
+    parking_lot::Mutex::new(None);
+
+/// Install the build-edge run-state reporter. Idempotent; last call wins.
+pub fn install_edge_reporter(f: EdgeReporter) {
+    *EDGE_REPORTER.lock() = Some(f);
+}
+
+/// Report a build edge run-state transition through the installed reporter, if
+/// any. Best-effort: no reporter → no-op. The reporter Arc is cloned and the
+/// lock released before the call (the reporter may do I/O / re-enter kati).
+pub fn report_edge(output: &[u8], phase: EdgePhase, code: i32) {
+    let r = EDGE_REPORTER.lock().clone();
+    if let Some(r) = r {
+        r(output, phase, code);
+    }
+}
 use parking_lot::Mutex;
 
 use crate::log;

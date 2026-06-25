@@ -1067,6 +1067,54 @@ impl BoxState {
         conn.last_insert_rowid()
     }
 
+    /// Mark a build edge as STARTED running. The edge is identified by either
+    /// its primary output `out` (kati: == outs[0]) or its exact recipe `cmd`
+    /// (n2: == the stored cmdline). The FIRST matching edge that hasn't started
+    /// is stamped — outputs/cmdlines are effectively unique per edge, so this
+    /// resolves the one running edge. Best-effort (an unmatched key is a no-op).
+    pub fn mark_build_edge_started(&self, out: Option<&str>, cmd: Option<&str>, ts: f64) {
+        let conn = self.conn.lock().unwrap();
+        if let Some(out) = out {
+            let _ = conn.execute(
+                "UPDATE build_edges SET started_ts=?1 WHERE id=(\
+                   SELECT id FROM build_edges \
+                   WHERE json_extract(outs,'$[0]')=?2 AND started_ts IS NULL \
+                   ORDER BY id LIMIT 1)",
+                params![ts, out]);
+        } else if let Some(cmd) = cmd {
+            let _ = conn.execute(
+                "UPDATE build_edges SET started_ts=?1 WHERE id=(\
+                   SELECT id FROM build_edges \
+                   WHERE cmd=?2 AND started_ts IS NULL \
+                   ORDER BY id LIMIT 1)",
+                params![ts, cmd]);
+        }
+    }
+
+    /// Mark a build edge as FINISHED (the first started-but-not-ended edge with
+    /// this output/cmd key), stamping `ended_ts` + `exit_code`. Best-effort.
+    pub fn mark_build_edge_done(&self, out: Option<&str>, cmd: Option<&str>,
+                                code: i64, ts: f64) {
+        let conn = self.conn.lock().unwrap();
+        if let Some(out) = out {
+            let _ = conn.execute(
+                "UPDATE build_edges SET ended_ts=?1, exit_code=?2 WHERE id=(\
+                   SELECT id FROM build_edges \
+                   WHERE json_extract(outs,'$[0]')=?3 \
+                     AND started_ts IS NOT NULL AND ended_ts IS NULL \
+                   ORDER BY id LIMIT 1)",
+                params![ts, code, out]);
+        } else if let Some(cmd) = cmd {
+            let _ = conn.execute(
+                "UPDATE build_edges SET ended_ts=?1, exit_code=?2 WHERE id=(\
+                   SELECT id FROM build_edges \
+                   WHERE cmd=?3 \
+                     AND started_ts IS NOT NULL AND ended_ts IS NULL \
+                   ORDER BY id LIMIT 1)",
+                params![ts, code, cmd]);
+        }
+    }
+
     pub fn set_meta(&self, key: &str, value: &str) {
         let conn = self.conn.lock().unwrap();
         let _ = conn.execute(

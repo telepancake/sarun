@@ -279,6 +279,17 @@ fn run_node_commands(
     let mut prefix = req.box_prefix.to_vec();
     prefix.extend_from_slice(&exports_prefix(&req.exports));
     let cwd = req.cwd;
+    // sarun: report this edge's run-state to the engine so the targets pane can
+    // show only the targets currently building (and their wall time). Only edges
+    // that actually run a recipe are reported — dry-run and command-less (phony /
+    // up-to-date) nodes are correctly left un-started. `req.output` is the node's
+    // primary output (== build_edges.outs[0], the engine's match key).
+    let output = req.output;
+    let report = !FLAGS.is_dry_run && !req.commands.is_empty();
+    if report {
+        crate::fileutil::report_edge(output.as_bytes().as_ref(),
+                                     crate::fileutil::EdgePhase::Start, 0);
+    }
     for command in req.commands {
         if command.echo {
             // Echo LIVE, before running, so a hung command's line shows at once.
@@ -319,7 +330,12 @@ fn run_node_commands(
             }
         }
     }
-    NodeRun { output: req.output, ignored, failure, result_ts: req.result_ts }
+    if report {
+        let code = failure.map(|(_, c)| c).unwrap_or(0);
+        crate::fileutil::report_edge(output.as_bytes().as_ref(),
+                                     crate::fileutil::EdgePhase::Done, code);
+    }
+    NodeRun { output, ignored, failure, result_ts: req.result_ts }
 }
 
 impl<'a> Executor<'a> {
