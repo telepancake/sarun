@@ -3,13 +3,6 @@
 version = 4
 
 [[package]]
-name = "async-spike"
-version = "0.0.0"
-dependencies = [
- "wasmi",
-]
-
-[[package]]
 name = "bitflags"
 version = "2.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -92,6 +85,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dfbc457d0c7a0759a614551b11a6409e5951f6c7537be1f1b7682b9ae9230368"
 dependencies = [
  "proc-macro2",
+]
+
+[[package]]
+name = "sarun-asyncify-demo"
+version = "0.0.0"
+dependencies = [
+ "wasmi",
 ]
 
 [[package]]

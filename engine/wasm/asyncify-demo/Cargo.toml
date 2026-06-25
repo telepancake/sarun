@@ -1,11 +1,20 @@
 [package]
-name="async-spike"
-version="0.0.0"
-edition="2021"
+name = "sarun-asyncify-demo"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
 [dependencies]
 wasmi = { version = "2.0.0-beta.3", features = ["simd"] }
+
+# In-process suspend then resume (one Store).
 [[bin]]
-name="spike"
-path="src/main.rs"
+name = "suspend-resume"
+path = "src/main.rs"
+
+# Suspend -> snapshot to ONE file -> full teardown -> restore -> resume.
+[[bin]]
+name = "snapshot"
+path = "src/snapshot.rs"
 
 [workspace]

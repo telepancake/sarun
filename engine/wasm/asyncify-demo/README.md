@@ -9,7 +9,8 @@ Run it:
 
 ```
 wasm-opt --asyncify --pass-arg=asyncify-imports@host.op run.wat -o run.wasm
-cargo run --release            # prints the suspend -> resume trace, asserts 42
+cargo run --release --bin suspend-resume   # in-process: suspend then resume, asserts 42
+cargo run --release --bin snapshot         # suspend -> ONE file -> teardown -> restore -> resume
 ```
 
 ## What it shows
@@ -35,3 +36,19 @@ import** and the guest's asyncify exports — so the engine's host (the virtual 
 table: `fd_read`/`fd_write`/`splice`/privileged ops, each a wasmi import) can be
 a suspend point the same way. WASI's role is only guest-side (letting std file/IO
 compile); it plays no part in the suspend machinery.
+
+## Single-backing-file checkpoint (`snapshot` bin)
+
+The whole-system checkpoint: signal every running blob to asyncify-unwind, then
+**barrier** until *all* have unwound (each parked at a clean import boundary with
+its state in linear memory). Only then write **one file** =
+`{per-process: linear memory + mutable globals + parked-import id} ⧺ {host fd
+table: in-memory pipe contents + cursors}`. Resume = load the file, rebuild each
+instance, restore memory/globals, `asyncify_start_rewind`, re-enter.
+
+`snapshot` proves the core across a **full teardown** (drop engine+store+instance,
+then a fresh one restores and finishes). Caveat it surfaces: the demo guest's
+state is *only* linear memory; real blobs also have mutable globals (notably
+`__stack_pointer` for the C shadow stack) that must be in the file too — and those
+aren't exported by default, so the blob build must export them (wasm-opt) to
+snapshot/restore them.

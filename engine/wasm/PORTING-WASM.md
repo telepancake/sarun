@@ -51,6 +51,7 @@ fds — the isolation is intrinsic. So:
 | **suspend a guest at a host import and resume it**, asyncified, under wasmi | `engine/wasm/asyncify-demo` — unwind on first import entry, rewind to resume, asserts the resumed result |
 | the host's suspend machinery needs **no WASI** | the demo's import is a plain `wasmi::func_wrap` + `Caller`; `wasi-common` is not involved |
 | the **real coreutils blob runs on our own hand-written preview1 host** with in-memory stdio (zero syscalls for I/O), byte-parity | `engine/wasm/host` — `runblob <blob> seq/tr/sort/head/tail/uniq/nl/cut` |
+| **single-file suspend/resume across a full teardown** (snapshot linear memory to one file, drop everything, restore + rewind, finish) | `engine/wasm/asyncify-demo` `snapshot` bin |
 
 ### Operational notes
 
@@ -87,8 +88,18 @@ The engine's host is **plain wasmi imports**, not `wasi-common`:
   taps). `wasi-common`/`wasmi_wasi` was only the bootstrap for the leaf-util proof.
 - **Asyncify suspend** is driven host-side exactly as `asyncify-demo` shows: the
   import writes the asyncify control struct into guest memory and calls the
-  guest's `asyncify_start_unwind`/`start_rewind` exports. Every host import is a
-  potential suspend point — that's "asyncify over the blob *and its imports*".
+  guest's `asyncify_start_unwind`/`start_rewind` exports. Only the **blocking**
+  imports (`fd_read`/`fd_write`/`poll`/`splice`) are suspend candidates; trivial
+  ones return inline.
+- **Whole-system checkpoint = one backing file.** To checkpoint: unwind every
+  running blob, **barrier** until all have unwound (each parked at a clean import
+  boundary, state in linear memory), then write **one file** = `{per-process:
+  linear memory + mutable globals + parked-import id} ⧺ {host fd table: in-memory
+  pipe contents + cursors}`. Resume = load it, rebuild instances, restore
+  memory/globals, `start_rewind`, re-enter. Proven across a full teardown
+  (`asyncify-demo` `snapshot`). Open item: real blobs must **export mutable
+  globals** (`__stack_pointer`, …) so they can be snapshotted/restored — the demo
+  guest has none.
 
 ### Two halves of the Unix surface
 
