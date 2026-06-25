@@ -469,6 +469,14 @@ struct App {
     /// entry; engine returns the full list — these are bounded by what
     /// brush actually ran, so no windowing needed).
     pipelines: Vec<Value>,
+    /// The raw chronological (brushprov-id-ordered) pipeline rows, as the engine
+    /// returned them. `pipelines` above is the DISPLAY order derived from this:
+    /// hierarchical tree when `pipe_tree`, else this flat list. Kept so the `t`
+    /// toggle can rebuild without a re-fetch.
+    pipelines_flat: Vec<Value>,
+    /// Pipelines pane view: true = hierarchical tree (parent_uid nesting),
+    /// false = flat chronological. Toggled with `t`.
+    pipe_tree: bool,
     /// Phase 1 build edges for the currently-loaded box (one row per
     /// `build_edges` entry; same "full list, no windowing" reasoning).
     build_edges: Vec<Value>,
@@ -626,7 +634,7 @@ impl App {
             outputs_view: None, outputs_view_sid: None,
             outputs_total: 0,
             outputs_window_start: 0,
-            rules: vec![], pipelines: vec![], build_edges: vec![],
+            rules: vec![], pipelines: vec![], pipelines_flat: vec![], pipe_tree: true, build_edges: vec![],
             sel_session: 0,
             sel_change: 0,
             sel_proc: 0, sel_pipeline: 0, sel_edge: 0,
@@ -1373,12 +1381,35 @@ impl App {
         self.sel_pipeline = 0;
         let Some(sid) = self.cur_sid_i64() else { return };
         match rpc(&self.sock, "brushprov", json!([sid])) {
-            // Order into a parent→child tree (depth stamped per row) so the pane
-            // renders the in-process pipeline log as a tree, not a flat list.
-            Ok(Value::Array(rows)) => self.pipelines = build_pipeline_tree(rows),
+            Ok(Value::Array(rows)) => {
+                self.pipelines_flat = rows;
+                self.rebuild_pipeline_view();
+            }
             Ok(_) => {}
             Err(e) => self.status = format!("brushprov: {e}"),
         }
+    }
+
+    /// Rebuild the displayed `pipelines` from `pipelines_flat` per `pipe_tree`:
+    /// a parent→child tree (depth stamped) or the flat chronological list.
+    fn rebuild_pipeline_view(&mut self) {
+        self.pipelines = if self.pipe_tree {
+            build_pipeline_tree(self.pipelines_flat.clone())
+        } else {
+            self.pipelines_flat.clone()
+        };
+        if !self.pipelines.is_empty() && self.sel_pipeline >= self.pipelines.len() {
+            self.sel_pipeline = self.pipelines.len() - 1;
+        }
+    }
+
+    /// `t`: toggle the Pipelines pane between hierarchical tree and flat
+    /// chronological order.
+    fn toggle_pipeline_tree(&mut self) {
+        self.pipe_tree = !self.pipe_tree;
+        self.rebuild_pipeline_view();
+        self.status = format!("pipelines: {} view",
+            if self.pipe_tree { "tree" } else { "flat chronological" });
     }
 
     /// Load the embedded-ninja build edges for the currently-selected box.
@@ -3940,7 +3971,7 @@ enum PaneAction {
     ApplyHunk, DiscardHunk, ApplyFile, DiscardFile, ApplyAll, DiscardAll,
     ConfirmKill, ConfirmDelete, ConfirmDissolve,
     NewRule, DeleteRule, StartRename,
-    ToggleFilter, Refresh, ActionMenu,
+    ToggleFilter, Refresh, ActionMenu, ToggleTree,
 }
 
 /// The main-loop pane keymap. ORDER MATTERS, and reproduces the original inline
@@ -3974,6 +4005,7 @@ const PANE_ACTION_KEYS: &[(Key, PaneGate, PaneAction, Option<&str>)] = &[
     (Key::Char('K'), PaneGate::Any,             PaneAction::ConfirmKill,     Some("kill box (SIGTERM, y/n)")),
     (Key::Char('D'), PaneGate::Any,             PaneAction::ConfirmDelete,   Some("delete box + captures (y/n)")),
     (Key::Char('Z'), PaneGate::Any,             PaneAction::ConfirmDissolve, Some("dissolve box (y/n)")),
+    (Key::Char('t'), PaneGate::On(Pane::Pipelines), PaneAction::ToggleTree,  Some("toggle tree / flat chronological (on Pipes)")),
     (Key::Char('n'), PaneGate::On(Pane::Rules), PaneAction::NewRule,         Some("new rule (on Rules)")),
     (Key::Char('d'), PaneGate::On(Pane::Rules), PaneAction::DeleteRule,      Some("delete rule (on Rules)")),
     (Key::Char('d'), PaneGate::Any,             PaneAction::Detach,          Some("detach (leaves the engine running)")),
@@ -3991,6 +4023,7 @@ fn run_pane_action(app: &mut App, action: PaneAction) {
         PaneAction::MoveDown => app.move_down(),
         PaneAction::MoveUp => app.move_up(),
         PaneAction::NextPane => app.next_pane(),
+        PaneAction::ToggleTree => app.toggle_pipeline_tree(),
         PaneAction::Open => {
             if app.focus == Pane::Rules {
                 let cur = app.rules.get(app.sel_rule).cloned().unwrap_or_default();
@@ -7330,7 +7363,7 @@ mod tests {
             outputs_view: None, outputs_view_sid: None,
             outputs_total: 0,
             outputs_window_start: 0,
-            rules: vec![], pipelines: vec![], build_edges: vec![],
+            rules: vec![], pipelines: vec![], pipelines_flat: vec![], pipe_tree: true, build_edges: vec![],
             sel_session: 0,
             sel_change: 0,
             sel_proc: 0, sel_pipeline: 0, sel_edge: 0,
