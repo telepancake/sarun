@@ -17,4 +17,12 @@ path = "src/main.rs"
 name = "snapshot"
 path = "src/snapshot.rs"
 
+
+# Cross-process / cross-namespace resume: `migrate save <f>` parks the running
+# guest into file <f> and exits; `migrate load <f>` (a DIFFERENT process, possibly
+# in a different namespace) resumes it to completion from <f>.
+[[bin]]
+name = "migrate"
+path = "src/migrate.rs"
+
 [workspace]

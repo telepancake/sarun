@@ -11,6 +11,8 @@ Run it:
 wasm-opt --asyncify --pass-arg=asyncify-imports@host.op run.wat -o run.wasm
 cargo run --release --bin suspend-resume   # in-process: suspend then resume, asserts 42
 cargo run --release --bin snapshot         # suspend -> ONE file -> teardown -> restore -> resume
+cargo run --release --bin migrate save /tmp/m.bin   # park running guest into a file (process A)
+cargo run --release --bin migrate load /tmp/m.bin   # resume it in ANOTHER process / namespace (process B)
 ```
 
 ## What it shows

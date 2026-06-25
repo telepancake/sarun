@@ -54,6 +54,7 @@ fds — the isolation is intrinsic. So:
 | **single-file suspend/resume across a full teardown** (snapshot linear memory to one file, drop everything, restore + rewind, finish) | `engine/wasm/asyncify-demo` `snapshot` bin |
 | **mmap'd file as live store, used as-is, kept sparse by hole-punching** (zero-copy, persists across unmap/remap) | `engine/wasm/mmap-demo` `sparse` bin |
 | **wasmi linear memory IS an mmap'd file** via public `Memory::new_static` (zero-copy, no patch) | `engine/wasm/mmap-demo` `linmem` bin |
+| **a running wasm function migrates across OS processes AND fresh namespaces** (park in one process, resume in another under unshare user+mount+net) | `engine/wasm/asyncify-demo` `migrate` bin |
 
 ### Operational notes
 
@@ -146,6 +147,29 @@ runs use the 3.8 MB plain blob; only checkpointed blobs get instrumented), and
 `asyncify-onlylist`/`removelist` to bound *which functions* are suspendable if we
 only need suspension at specific points. The import allowlist is correct hygiene,
 just not where the bytes are.
+
+### Migrating a running function across processes / namespaces
+
+The point of the asyncify + single-file design: execution can move between the
+box process and the engine process (different namespaces) at any import boundary.
+
+- The **continuation is the file**: linear memory (holds the asyncify call-stack),
+  the `__stack_pointer`/`__asyncify_data` values (linear-memory **offsets**, not
+  host pointers), globals, and the host fd-table state. Process A unwinds → the
+  continuation is fully in the shared mmap; A signals B; B rewinds → the same
+  function continues in B. Back-and-forth = repeat at each import boundary.
+- **Position-independent**, so a different process maps it at its own address, in
+  its own namespaces, and resumes — proven (`migrate`, resumer under `unshare
+  --user --mount --net`).
+- **fds aren't namespaced** → a `memfd` shared `MAP_SHARED` (or brokered over
+  `SARUN_BROKER`) is visible on both sides of the box↔engine boundary; with
+  `new_static` over that memfd in both, the continuation lives in shared memory and
+  a handoff is just a signal + rewind (no copy).
+- The resuming process runs **its own** host imports, so an import's effects
+  execute in **that** process's namespace: a builtin's fs op resumes in the box's
+  mount ns; a privileged/host op (real `splice`, overlay `chmod`, MITM proxy, slip
+  pool) resumes in the engine's ns. Execution migrates to whichever side holds the
+  right namespace, does the work, migrates back.
 
 ## The per-crate porting recipe
 
