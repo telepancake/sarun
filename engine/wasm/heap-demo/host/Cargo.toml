@@ -1,0 +1,12 @@
+[package]
+name = "heap-host"
+version = "0.0.0"
+edition = "2021"
+publish = false
+[dependencies]
+wasmi = { version = "2.0.0-beta.3", features = ["simd"] }
+libc = "0.2"
+[[bin]]
+name = "heaphost"
+path = "src/main.rs"
+[workspace]

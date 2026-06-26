@@ -55,6 +55,7 @@ fds — the isolation is intrinsic. So:
 | **mmap'd file as live store, used as-is, kept sparse by hole-punching** (zero-copy, persists across unmap/remap) | `engine/wasm/mmap-demo` `sparse` bin |
 | **wasmi linear memory IS an mmap'd file** via public `Memory::new_static` (zero-copy, no patch) | `engine/wasm/mmap-demo` `linmem` bin |
 | **a running wasm function migrates across OS processes AND fresh namespaces** (park in one process, resume in another under unshare user+mount+net) | `engine/wasm/asyncify-demo` `migrate` bin |
+| **sliced tmpfs + host-owned allocator + `fallocate` reclaim** (per-process 1 GiB chunks of one sparse file; free returns pages to the OS) | `engine/wasm/heap-demo` |
 
 ### Operational notes
 
@@ -147,6 +148,24 @@ runs use the 3.8 MB plain blob; only checkpointed blobs get instrumented), and
 `asyncify-onlylist`/`removelist` to bound *which functions* are suspendable if we
 only need suspension at specific points. The import allowlist is correct hygiene,
 just not where the bytes are.
+
+### Memory model: sliced file, host-owned heap, OS reclaim
+
+- **One sparse backing file, sliced per process.** Pick a max per-process heap
+  (e.g. 1 GiB); `ftruncate` the file to `NPROC * max`; each process gets `mmap`'d
+  chunk `i*max` handed to `Memory::new_static` as its own 0-based linear memory.
+  Sparse, so only touched pages cost — a 2 GiB logical file showed 0 blocks until use.
+- **Host owns the heap.** The blob's `#[global_allocator]` is a trampoline to
+  `host_alloc`/`host_dealloc` imports (memory imported, `__heap_base` exported), so
+  the host has the exact live-set — no guessing the allocator's internals. (This is
+  the "supply alloc callbacks" answer: allocation is in-module by default, but we
+  *override* it so the host is the source of truth.)
+- **Free returns pages to the OS.** On `dealloc` the host coalesces and
+  `fallocate(PUNCH_HOLE)`s the freed block's page-aligned range (+ `MADV_DONTNEED`
+  for RSS). Proven (`heap-demo`): alloc 64 MiB → blocks jump; free → blocks drop.
+  Coarse path: on blob exit, `munmap` + punch the whole chunk. No compaction
+  (linear-memory pointers are absolute). Perf note: import-per-alloc is fine for
+  the mechanism; a hot path wants a hybrid (in-wasm fast path + host trim).
 
 ### Migrating a running function across processes / namespaces
 
