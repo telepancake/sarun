@@ -174,6 +174,18 @@ impl Flags {
                 b"-c" => flags.is_syntax_check_only = true,
                 b"-i" => flags.is_dry_run = true,
                 b"-s" => flags.is_silent_mode = true,
+                // sarun: standard GNU make flags that real (esp. recursive `-j`)
+                // builds pass — either directly or via `$(MAKE)` — but that don't
+                // change WHAT kati builds. Accept them as no-ops instead of
+                // erroring: the in-process make never prints "Entering directory"
+                // banners and already serializes each recipe's output, so the
+                // directory/output-sync/trace switches have nothing to do here.
+                // (Catch-all below also handles the `--output-sync=…`/`-O…` and
+                // `-w`-bundled spellings.) Letting them through keeps a makefile
+                // that works under GNU make working under sarun.
+                b"-w" | b"--print-directory" | b"--no-print-directory" => {}
+                b"-O" | b"--output-sync" => {}
+                b"--trace" => {}
                 b"-d" => flags.enable_debug = true,
                 b"--kati_stats" => flags.enable_stat_logs = true,
                 b"--warn" => flags.enable_kati_warnings = true,
@@ -312,8 +324,24 @@ impl Flags {
                         parse_command_line_option_with_arg("--mem_profile", &arg, &mut iter)
                     {
                         flags.memory_profile_path = Some(arg)
+                    } else if arg.as_bytes().starts_with(b"--output-sync=")
+                        || (arg.as_bytes().starts_with(b"-O") && arg.as_bytes().len() > 2)
+                    {
+                        // GNU make `--output-sync=TYPE` / `-OTYPE`: kati already
+                        // serializes each recipe's output, so the sync mode is a
+                        // no-op here.
                     } else if arg.as_bytes().starts_with(b"-") {
-                        panic!("Unknown flag: {}", arg.to_string_lossy());
+                        // sarun: an unknown flag must NEVER crash the in-process
+                        // make (a panic on a worker thread would take down the
+                        // whole build, and under `-j` cascade into sibling makes).
+                        // kati doesn't implement every GNU make option; warn once
+                        // and ignore, rather than the upstream `panic!`. The flag
+                        // still rides `should_propagate` into `$(MAKE)` so a deeper
+                        // tool that DOES understand it isn't starved.
+                        eprintln!(
+                            "sarun make: ignoring unsupported flag: {}",
+                            arg.to_string_lossy()
+                        );
                     } else if arg.as_bytes().contains(&b'=') {
                         flags.cl_vars.push(Bytes::from(arg.as_bytes().to_vec()));
                     } else {

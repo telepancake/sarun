@@ -103,6 +103,21 @@ fn kati_argv(argv: &[String]) -> Result<Vec<OsString>, String> {
                 out.push(OsString::from(a));
                 i += 1;
             }
+            // Cosmetic GNU make flags kati now accepts as no-ops: -w (print
+            // "Entering directory" banners — the in-process make emits none) and
+            // -O / -O<type> (output-sync — recipes are already serialized). Their
+            // LONG spellings (--no-print-directory / --output-sync) ride the
+            // `--` pass-through below; these short forms would otherwise hit the
+            // unknown-short-flag reject. A recursive `$(MAKE)` propagates them
+            // constantly, so refusing them breaks ordinary parallel builds.
+            "-w" | "-O" => {
+                out.push(OsString::from(a));
+                i += 1;
+            }
+            _ if a.starts_with("-O") => {
+                out.push(OsString::from(a));
+                i += 1;
+            }
             _ if a.starts_with("--") => {
                 // Pass long flags kati's own parser will accept; if kati rejects
                 // it, kati panics with "Unknown flag", which surfaces visibly.
