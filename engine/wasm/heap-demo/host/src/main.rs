@@ -1,100 +1,70 @@
-//! Host owns the heap. A tmpfs file is sliced into per-process 1 GiB chunks; each
-//! chunk is mmap'd and handed to wasmi as the instance's linear memory
-//! (new_static). The guest's allocator calls host_alloc/host_dealloc, so the host
-//! tracks the exact live-set and `fallocate(PUNCH_HOLE)`s freed pages back to the
-//! OS. Memory grows lazily within the sparse chunk; only touched pages cost.
+//! Host-owned heap using the REAL `dlmalloc` crate (pure-Rust, no C dep), not a
+//! hand-rolled allocator. Each process gets a 1 GiB sparse tmpfs slice mmap'd as
+//! its linear memory (new_static); the guest's #[global_allocator] calls
+//! host_alloc/host_dealloc -> this dlmalloc; dlmalloc's platform hooks
+//! (`free`/`free_part`) return freed pages to the OS via fallocate(PUNCH_HOLE) on
+//! the tmpfs file. That hook IS the "single line for MADV_REMOVE/punch".
+//!
+//! Startup: pre-grow the guest memory to a working cap once and punch it, so the
+//! region is sparse and dlmalloc never cores into ungrown memory (no grow/zero
+//! hazard mid-run). dlmalloc then owns [heap_base, cap).
 
-use std::collections::BTreeMap;
+use std::cell::Cell;
 use std::os::fd::AsRawFd;
+use dlmalloc::{Allocator, Dlmalloc};
 use wasmi::{Caller, Engine, Extern, Linker, Memory, MemoryType, Module, Store, Val};
 
 const PAGE: u64 = 4096;
-const WPAGE: u64 = 65536;          // wasm page
-const CHUNK: u64 = 1 << 30;        // 1 GiB per process
+const WPAGE: u64 = 65536;
+const SLICE: u64 = 1 << 30;      // 1 GiB address space per process (sparse)
+const GROWN: u64 = 128 << 20;    // pre-grown+punched working cap for this demo
 const NPROC: u64 = 2;
+const BIG: i32 = 64 * 1024 * 1024;
 
 fn up(x: u64, a: u64) -> u64 { (x + a - 1) / a * a }
 fn down(x: u64, a: u64) -> u64 { x / a * a }
+fn blocks(p: &str) -> u64 { use std::os::unix::fs::MetadataExt; std::fs::metadata(p).map(|m| m.blocks()).unwrap_or(0) }
+fn mib(b: u64) -> u64 { b * 512 / (1024 * 1024) }
 
-/// Host-owned heap over [base, CHUNK) of one process's linear memory.
-struct Heap {
-    base: u64,
-    brk: u64,
-    free: BTreeMap<u64, u64>, // offset -> size (within linear memory)
-}
-impl Heap {
-    fn new() -> Self { Heap { base: 0, brk: 0, free: BTreeMap::new() } }
-    fn set_base(&mut self, b: u64) { self.base = b; self.brk = b; }
-    fn alloc(&mut self, size: u64, align: u64) -> u64 {
-        let size = up(size.max(1), 16);
-        let align = align.max(16);
-        // first-fit reuse
-        let mut take = None;
-        for (&off, &sz) in self.free.iter() {
-            if off % align == 0 && sz >= size { take = Some((off, sz)); break; }
+fn punch(fd: i32, file_off: u64, off: u64, end: u64) {
+    let ps = up(off, PAGE);
+    let pe = down(end, PAGE);
+    if pe > ps {
+        unsafe {
+            libc::fallocate(fd, libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                            (file_off + ps) as libc::off_t, (pe - ps) as libc::off_t);
         }
-        if let Some((off, sz)) = take {
-            self.free.remove(&off);
-            if sz > size { self.free.insert(off + size, sz - size); }
-            return off;
-        }
-        let off = up(self.brk, align);
-        self.brk = off + size;
-        off
-    }
-    /// Free [off,size); coalesce; return the page-aligned inner range to punch.
-    fn dealloc(&mut self, off: u64, size: u64) -> Option<(u64, u64)> {
-        let size = up(size.max(1), 16);
-        let mut start = off;
-        let mut end = off + size;
-        if let Some((&lo, &ls)) = self.free.range(..start).next_back() {
-            if lo + ls == start { start = lo; self.free.remove(&lo); }
-        }
-        if let Some(&rs) = self.free.get(&end) {
-            let e = end; end += rs; self.free.remove(&e);
-        }
-        self.free.insert(start, end - start);
-        let ps = up(start, PAGE);
-        let pe = down(end, PAGE);
-        if pe > ps { Some((ps, pe - ps)) } else { None }
     }
 }
 
-struct Proc { fd: i32, file_off: u64, map: *mut u8, mem: Option<Memory>, heap: Heap }
+/// dlmalloc platform: hand it sparse core from the slice; release == punch.
+struct SliceAlloc { base: usize, fd: i32, file_off: u64, heap_start: u64, cap: u64, brk: Cell<u64> }
 
-fn blocks(path: &str) -> u64 {
-    use std::os::unix::fs::MetadataExt;
-    std::fs::metadata(path).map(|m| m.blocks()).unwrap_or(0)
-}
-fn mib(b: u64) -> u64 { b * 512 / (1024 * 1024) } // 512B blocks -> MiB
-
-fn punch(fd: i32, map: *mut u8, file_off: u64, lin_off: u64, len: u64) {
-    unsafe {
-        libc::fallocate(fd, libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
-                        (file_off + lin_off) as libc::off_t, len as libc::off_t);
-        libc::madvise(map.add(lin_off as usize) as *mut libc::c_void, len as usize, libc::MADV_DONTNEED);
+unsafe impl Allocator for SliceAlloc {
+    fn alloc(&self, size: usize) -> (*mut u8, usize, u32) {
+        let size = up(size as u64, PAGE);
+        let off = up(self.brk.get(), PAGE);
+        if off + size > self.cap { return (core::ptr::null_mut(), 0, 0); } // within pre-grown cap
+        self.brk.set(off + size);
+        ((self.base + off as usize) as *mut u8, size as usize, 0)
     }
+    fn remap(&self, _p: *mut u8, _o: usize, _n: usize, _mv: bool) -> *mut u8 { core::ptr::null_mut() }
+    fn free_part(&self, ptr: *mut u8, oldsize: usize, newsize: usize) -> bool {
+        let off = ptr as usize as u64 - self.base as u64;
+        punch(self.fd, self.file_off, off + newsize as u64, off + oldsize as u64);
+        true
+    }
+    fn free(&self, ptr: *mut u8, size: usize) -> bool {
+        let off = ptr as usize as u64 - self.base as u64;
+        punch(self.fd, self.file_off, off, off + size as u64);
+        true
+    }
+    fn can_release_part(&self, _flags: u32) -> bool { true }
+    fn allocates_zeros(&self) -> bool { true } // fresh tmpfs + punched + wasmi-zeroed all read zero
+    fn page_size(&self) -> usize { PAGE as usize }
 }
 
-fn link(linker: &mut Linker<Proc>) {
-    linker.func_wrap("env", "host_alloc", |mut c: Caller<Proc>, size: i32, align: i32| -> i32 {
-        let off = c.data_mut().heap.alloc(size as u64, align as u64);
-        let need = off + up((size as u64).max(1), 16);
-        let mem = c.data().mem.unwrap();
-        let cur = mem.size(&c) * WPAGE;
-        if need > cur {
-            let add = up(need - cur, WPAGE) / WPAGE;
-            let _ = mem.grow(&mut c, add);
-        }
-        off as i32
-    }).unwrap();
-    linker.func_wrap("env", "host_dealloc", |mut c: Caller<Proc>, ptr: i32, size: i32, _align: i32| {
-        if let Some((lin_off, len)) = c.data_mut().heap.dealloc(ptr as u64, size as u64) {
-            let (fd, fo, map) = { let p = c.data(); (p.fd, p.file_off, p.map) };
-            punch(fd, map, fo, lin_off, len);
-        }
-    }).unwrap();
-}
+struct Proc { base: usize, dl: Dlmalloc<SliceAlloc> }
 
 fn main() {
     let wasm_path = std::env::args().nth(1)
@@ -102,46 +72,62 @@ fn main() {
     let wasm = std::fs::read(&wasm_path).expect("guest wasm (build it first)");
     let path = "/dev/shm/sarun-heaps.bin";
     let f = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(path).unwrap();
-    f.set_len(NPROC * CHUNK).unwrap(); // sparse: 2 GiB logical, 0 blocks
+    f.set_len(NPROC * SLICE).unwrap();
     let fd = f.as_raw_fd();
-    println!("file: {} ({} GiB logical, {} blocks)", path, NPROC * CHUNK >> 30, blocks(path));
-
     let engine = Engine::default();
-    let big: i32 = 64 * 1024 * 1024; // 64 MiB allocation per process
+    println!("file: {} GiB logical, {} MiB blocks (sparse), real allocator = dlmalloc crate",
+             NPROC * SLICE >> 30, mib(blocks(path)));
 
     for i in 0..NPROC {
-        let file_off = i * CHUNK;
+        let file_off = i * SLICE;
         let p = unsafe {
-            libc::mmap(std::ptr::null_mut(), CHUNK as usize, libc::PROT_READ | libc::PROT_WRITE,
+            libc::mmap(std::ptr::null_mut(), SLICE as usize, libc::PROT_READ | libc::PROT_WRITE,
                        libc::MAP_SHARED, fd, file_off as libc::off_t)
         };
-        assert!(p != libc::MAP_FAILED, "mmap chunk {i}");
-        let buf: &'static mut [u8] = unsafe { std::slice::from_raw_parts_mut(p as *mut u8, CHUNK as usize) };
+        assert!(p != libc::MAP_FAILED);
+        let base = p as usize;
+        let buf: &'static mut [u8] = unsafe { std::slice::from_raw_parts_mut(p as *mut u8, SLICE as usize) };
 
         let module = Module::new(&engine, &wasm[..]).unwrap();
-        let mut store = Store::new(&engine, Proc { fd, file_off, map: p as *mut u8, mem: None, heap: Heap::new() });
+        // SliceAlloc filled in after we know heap_base.
+        let dl = Dlmalloc::new_with_allocator(SliceAlloc {
+            base, fd, file_off, heap_start: 0, cap: GROWN, brk: Cell::new(0),
+        });
+        let mut store = Store::new(&engine, Proc { base, dl });
         let mut linker: Linker<Proc> = Linker::new(&engine);
-        link(&mut linker);
-        let ty = MemoryType::new(128, Some(16384)); // 8 MiB min, 1 GiB max
+        linker.func_wrap("env", "host_alloc", |mut c: Caller<Proc>, size: i32, align: i32| -> i32 {
+            let base = c.data().base;
+            let p = unsafe { c.data_mut().dl.malloc(size as usize, (align.max(1)) as usize) };
+            if p.is_null() { return 0; }
+            (p as usize - base) as i32
+        }).unwrap();
+        linker.func_wrap("env", "host_dealloc", |mut c: Caller<Proc>, ptr: i32, size: i32, align: i32| {
+            let base = c.data().base;
+            unsafe { c.data_mut().dl.free((base + ptr as usize) as *mut u8, size as usize, (align.max(1)) as usize) };
+        }).unwrap();
+
+        let ty = MemoryType::new(128, Some(16384)); // 8 MiB min, 1 GiB max; buffer is the 1 GiB mmap
         let mem = Memory::new_static(&mut store, ty, buf).unwrap();
         linker.define("env", "memory", mem).unwrap();
         let inst = linker.instantiate_and_start(&mut store, &module).unwrap();
-
         let heap_base = match inst.get_export(&store, "__heap_base").unwrap() {
-            Extern::Global(g) => match g.get(&store) { Val::I32(v) => v as u64, _ => panic!() },
-            _ => panic!(),
+            Extern::Global(g) => match g.get(&store) { Val::I32(v) => v as u64, _ => panic!() }, _ => panic!(),
         };
-        store.data_mut().heap.set_base(heap_base);
-        store.data_mut().mem = Some(mem);
+
+        // Pre-grow guest memory to the working cap, then punch [heap_base,cap) sparse.
+        let cur = mem.size(&store) * WPAGE;
+        if GROWN > cur { mem.grow(&mut store, (GROWN - cur) / WPAGE).unwrap(); }
+        punch(fd, file_off, heap_base, GROWN);
+        // hand dlmalloc its core window
+        { let a = store.data().dl.allocator(); a.brk.set(heap_base); /* heap_start implicit via brk */ }
 
         let alloc_touch = inst.get_typed_func::<i32, i32>(&store, "alloc_touch").unwrap();
         let free_buf = inst.get_typed_func::<(i32, i32), ()>(&store, "free_buf").unwrap();
-
-        println!("\n[proc {i}] heap_base={heap_base:#x}; blocks before alloc: {} MiB", mib(blocks(path)));
-        let ptr = alloc_touch.call(&mut store, big).unwrap();
-        println!("[proc {i}] alloc_touch(64 MiB) -> off {ptr:#x}; blocks now: {} MiB", mib(blocks(path)));
-        free_buf.call(&mut store, (ptr, big)).unwrap();
-        println!("[proc {i}] free_buf -> punched; blocks now: {} MiB", mib(blocks(path)));
+        println!("\n[proc {i}] heap_base={heap_base:#x}; after pre-grow+punch: {} MiB blocks", mib(blocks(path)));
+        let ptr = alloc_touch.call(&mut store, BIG).unwrap();
+        println!("[proc {i}] alloc_touch(64 MiB) -> off {ptr:#x}; blocks: {} MiB", mib(blocks(path)));
+        free_buf.call(&mut store, (ptr, BIG)).unwrap();
+        println!("[proc {i}] free_buf -> dlmalloc free hook punched; blocks: {} MiB", mib(blocks(path)));
     }
-    println!("\nfinal file blocks: {} MiB (logical size still {} GiB, sparse)", mib(blocks(path)), NPROC * CHUNK >> 30);
+    println!("\nfinal: {} MiB blocks for a {} GiB-logical file", mib(blocks(path)), NPROC * SLICE >> 30);
 }

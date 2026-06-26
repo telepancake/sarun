@@ -55,7 +55,7 @@ fds — the isolation is intrinsic. So:
 | **mmap'd file as live store, used as-is, kept sparse by hole-punching** (zero-copy, persists across unmap/remap) | `engine/wasm/mmap-demo` `sparse` bin |
 | **wasmi linear memory IS an mmap'd file** via public `Memory::new_static` (zero-copy, no patch) | `engine/wasm/mmap-demo` `linmem` bin |
 | **a running wasm function migrates across OS processes AND fresh namespaces** (park in one process, resume in another under unshare user+mount+net) | `engine/wasm/asyncify-demo` `migrate` bin |
-| **sliced tmpfs + host-owned allocator + `fallocate` reclaim** (per-process 1 GiB chunks of one sparse file; free returns pages to the OS) | `engine/wasm/heap-demo` |
+| **sliced tmpfs + REAL `dlmalloc` crate host-side + `fallocate` reclaim** (per-process arenas; dlmalloc's free hook punches freed pages to the OS) | `engine/wasm/heap-demo` |
 
 ### Operational notes
 

@@ -27,9 +27,15 @@ cd ../host && cargo run --release
 
 ## Honest notes
 
-- The host-owned allocator means an import crossing per alloc/free — fine for the
-  mechanism, but a hot allocation path would want a hybrid (in-wasm allocator for
-  small/fast allocations; host import only for large blocks or a periodic trim
-  that punches fully-dead page runs). The reclaim primitive is the same either way.
-- A real blob opts in by setting its `#[global_allocator]` to this trampoline.
-- Reclaim is page-granular (can't compact — linear-memory pointers are absolute).
+- Real allocator (the `dlmalloc` crate), not hand-rolled; we only supply the ~6
+  platform hooks, and the release hook is the punch. jemalloc/mimalloc would work
+  too (jemalloc via `extent_hooks` purge with no patch; mimalloc via a one-line
+  decommit-madvise change) but both are C deps — dlmalloc keeps it pure-Rust/musl.
+- Import crossing per alloc/free — fine for the mechanism; a hot path wants a
+  hybrid (in-wasm fast path + host trim). A real blob opts in via `#[global_allocator]`.
+- Reclaim is page-granular (no compaction — linear-memory pointers are absolute).
+- On tmpfs use `fallocate(PUNCH_HOLE)`/`MADV_REMOVE`; `MADV_DONTNEED` does NOT free
+  tmpfs backing (verified).
+- The startup pre-grow zeroes the cap (wasmi zeros static memory); we punch it
+  immediately. A 1-line wasmi "don't zero a caller-owned static buffer" patch would
+  remove that transient and allow a full 1 GiB cap cheaply.
