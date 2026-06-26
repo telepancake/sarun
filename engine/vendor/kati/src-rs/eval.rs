@@ -1033,10 +1033,22 @@ impl Evaluator {
         collect_stats_with_slow_report!("included makefiles", &filename);
 
         let Some(mk) = file_cache::get_makefile(&filename, &self.working_dir)? else {
+            // sarun: show the ABSOLUTE path we actually looked for (the name
+            // resolved against the make's logical working_dir), not just the
+            // bare relative name — so a wrong `$(dir …)`/`-C`/include-path is
+            // diagnosable from the error alone instead of guessing what the
+            // relative name expanded against.
+            let p = std::path::Path::new(&filename);
+            let resolved = if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                self.working_dir.join(p)
+            };
             error_loc!(
                 self.loc.as_ref(),
-                "{} does not exist",
-                filename.to_string_lossy()
+                "{} does not exist (looked for {})",
+                filename.to_string_lossy(),
+                resolved.display()
             );
         };
 
