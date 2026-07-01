@@ -615,6 +615,20 @@ pub fn set_filter(reg: &mut Registry, view_id: u64, filter_v: &Value) -> Value {
     json!({"total": view.idx.len()})
 }
 
+pub fn find(reg: &Registry, view_id: u64, target_id: i64) -> Value {
+    let Some(view) = reg.get(&view_id) else {
+        return json!({"ok": false, "error": "unknown view_id"});
+    };
+    for (pos, &i) in view.idx.iter().enumerate() {
+        if let Some(id) = view.source[i].get("id").and_then(Value::as_i64) {
+            if id == target_id {
+                return json!({"ok": true, "pos": pos});
+            }
+        }
+    }
+    json!({"ok": false, "error": "not found"})
+}
+
 pub fn close(reg: &mut Registry, view_id: u64) -> Value {
     reg.remove(&view_id);
     json!({"ok": true})

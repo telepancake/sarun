@@ -2884,14 +2884,17 @@ impl App {
     /// Turn a view's filter off, keeping its clauses for next time (a generated
     /// "ids" filter is dropped). Mirrors Python `_clear_filter`.
     fn clear_filter(&mut self, v: FilterView) {
+        let anchor_id = self.selected_item_id(v);
         let f = self.view_filter_mut(v);
         if f.generated {
             f.clauses.clear();
         }
         f.on = false;
         f.generated = false;
-        self.reset_view_cursor(v);
         self.push_view_filter(v);
+        if let Some(aid) = anchor_id {
+            self.scroll_view_to_id(v, aid);
+        }
         self.status = "filter cleared".into();
     }
 
@@ -2915,6 +2918,60 @@ impl App {
             FilterView::Outputs => self.sel_output = 0,
             FilterView::Pipelines => self.sel_pipeline = 0,
             FilterView::BuildEdges => self.sel_edge = 0,
+        }
+    }
+
+    fn selected_item_id(&self, v: FilterView) -> Option<i64> {
+        let row: Option<&Value> = match v {
+            FilterView::Changes => self.changes.get(self.sel_change),
+            FilterView::Procs => self.processes.get(self.sel_proc),
+            FilterView::Outputs => self.outputs.get(self.sel_output),
+            FilterView::Pipelines => self.pipelines.get(self.sel_pipeline),
+            FilterView::BuildEdges => self.build_edges.get(self.sel_edge),
+        };
+        row.and_then(|r| r.get("id").and_then(Value::as_i64))
+    }
+
+    fn view_id_for(&self, v: FilterView) -> Option<u64> {
+        match v {
+            FilterView::Changes => self.changes_view,
+            FilterView::Procs => self.processes_view,
+            FilterView::Outputs => self.outputs_view,
+            FilterView::Pipelines => self.pipelines_view,
+            FilterView::BuildEdges => self.edges_view,
+        }
+    }
+
+    fn scroll_view_to_id(&mut self, v: FilterView, target_id: i64) {
+        let Some(vid) = self.view_id_for(v) else { return };
+        let pos = match rpc(&self.sock, "view.find", json!([vid, target_id])) {
+            Ok(r) if r.get("ok").and_then(Value::as_bool) == Some(true) =>
+                r.get("pos").and_then(Value::as_u64).unwrap_or(0) as usize,
+            _ => return,
+        };
+        let half = WINDOW_SIZE / 2;
+        let start = pos.saturating_sub(half);
+        match v {
+            FilterView::Changes => {
+                self.fetch_changes_window(start);
+                self.sel_change = pos.saturating_sub(self.changes_window_start);
+            }
+            FilterView::Procs => {
+                self.fetch_processes_window(start);
+                self.sel_proc = pos.saturating_sub(self.processes_window_start);
+            }
+            FilterView::Outputs => {
+                self.fetch_outputs_window(start);
+                self.sel_output = pos.saturating_sub(self.outputs_window_start);
+            }
+            FilterView::Pipelines => {
+                self.fetch_pipelines_window(start);
+                self.sel_pipeline = pos.saturating_sub(self.pipelines_window_start);
+            }
+            FilterView::BuildEdges => {
+                self.fetch_edges_window(start);
+                self.sel_edge = pos.saturating_sub(self.edges_window_start);
+            }
         }
     }
 

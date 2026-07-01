@@ -1408,6 +1408,12 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
             let mut s = lock(state);
             crate::views::set_filter(&mut s.views, vid, &filter)
         }
+        "view.find" => {
+            let vid = args.first().and_then(Value::as_u64).unwrap_or(0);
+            let target_id = args.get(1).and_then(Value::as_i64).unwrap_or(-1);
+            let s = lock(state);
+            crate::views::find(&s.views, vid, target_id)
+        }
         "view.close" => {
             let vid = args.first().and_then(Value::as_u64).unwrap_or(0);
             let mut s = lock(state);
