@@ -40,7 +40,7 @@ CREATE TABLE IF NOT EXISTS process(id INTEGER PRIMARY KEY AUTOINCREMENT,
  env_id INT, root INT DEFAULT 0, brush_pipeline_id INT, UNIQUE(tgid, start));
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS outputs(id INTEGER PRIMARY KEY AUTOINCREMENT,
- ts REAL, process_id INT, stream INT, content BLOB);
+ ts REAL, process_id INT, stream INT, content BLOB, brush_pipeline_id INT);
 -- Rust-engine extensions (additive; the Python readers ignore them):
 CREATE TABLE IF NOT EXISTS xattr(name TEXT, key TEXT, value BLOB,
  PRIMARY KEY(name,key));
@@ -170,6 +170,10 @@ pub struct BoxState {
     // pipeline's process, so stamping that file's last_writer process row with the
     // pipeline id needs no timing/clock comparison at all.
     brush_links: Mutex<Vec<(i64, Vec<String>)>>,
+    // The brushprov row id of the currently-executing pipeline (0 = none).
+    // Set by record_brush_prov, cleared by brush_prov_done. Used by
+    // add_output to stamp each output row with its pipeline.
+    cur_brush_pipeline: std::sync::atomic::AtomicI64,
 }
 
 impl BoxState {
@@ -404,6 +408,7 @@ impl BoxState {
             is_brush: std::sync::atomic::AtomicBool::new(false),
             brush_host_tgid: std::sync::atomic::AtomicU32::new(0),
             brush_links: Mutex::new(vec![]),
+            cur_brush_pipeline: std::sync::atomic::AtomicI64::new(0),
             is_api: std::sync::atomic::AtomicBool::new(false),
             is_tap: std::sync::atomic::AtomicBool::new(false),
         })
@@ -967,17 +972,24 @@ impl BoxState {
         self.kinds.write().unwrap().insert(rel.to_string(), Entry::Whiteout);
     }
 
+    pub fn set_cur_brush_pipeline(&self, id: i64) {
+        self.cur_brush_pipeline.store(id, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Append one captured stdout/stderr write to the outputs table, attributed
     /// to the writing process (stream 0=stdout, 1=stderr).
     pub fn add_output(&self, stream: i32, pid: u32, content: &[u8]) {
         let writer = self.writer_for(pid);
+        let pipeline = self.cur_brush_pipeline.load(std::sync::atomic::Ordering::Relaxed);
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs_f64()).unwrap_or(0.0);
         let conn = self.conn.lock().unwrap();
         let _ = conn.execute(
-            "INSERT INTO outputs(ts,process_id,stream,content) VALUES(?1,?2,?3,?4)",
-            rusqlite::params![ts, writer, stream, content]);
+            "INSERT INTO outputs(ts,process_id,stream,content,brush_pipeline_id) \
+             VALUES(?1,?2,?3,?4,?5)",
+            rusqlite::params![ts, writer, stream, content,
+                              if pipeline > 0 { Some(pipeline) } else { None::<i64> }]);
     }
 
     /// Record one D9 brush-shell provenance frame: the exact command string

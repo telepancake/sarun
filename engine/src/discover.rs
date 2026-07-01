@@ -434,34 +434,39 @@ pub fn proc_pipeline(box_id: i64, row_id: i64) -> Value {
 }
 
 /// Output→pipeline: find the brushprov pipeline that produced output `output_id`.
-/// First tries the process→pipeline parent walk (brush_pipeline_id). If that
-/// fails (zero-process in-process builtins), falls back to timestamp
-/// correlation: the pipeline whose [spawn_ts, done_ts] contains the output's ts.
+/// Uses the output's own brush_pipeline_id column (stamped at capture time).
+/// Falls back to the process→pipeline parent walk when the column is NULL
+/// (pre-column data or forked children whose parent has the link).
 pub fn output_pipeline(box_id: i64, output_id: i64) -> Value {
     let Some(c) = open_ro(box_id) else { return Value::Null };
-    let (process_id, out_ts): (Option<i64>, f64) = match c.query_row(
-        "SELECT process_id,ts FROM outputs WHERE id=?1", [output_id],
-        |r| Ok((r.get(0)?, r.get(1)?))) {
+    let bp_col = if has_col(&c, "outputs", "brush_pipeline_id")
+                 { "brush_pipeline_id" } else { "NULL" };
+    let q = format!("SELECT process_id,{bp_col} FROM outputs WHERE id=?1");
+    let (process_id, bp_id): (Option<i64>, Option<i64>) = match c.query_row(
+        &q, [output_id], |r| Ok((r.get(0)?, r.get(1)?))) {
         Ok(v) => v,
         Err(_) => return Value::Null,
     };
+    if let Some(bp) = bp_id {
+        if let Ok(v) = c.query_row(
+            "SELECT id,ts,cmd,record,pipeline FROM brushprov WHERE id=?1",
+            [bp], |r| {
+                let rec: String = r.get(3)?;
+                Ok(json!({
+                    "id": r.get::<_, i64>(0)?, "ts": r.get::<_, f64>(1)?,
+                    "cmd": r.get::<_, String>(2)?,
+                    "record": serde_json::from_str::<Value>(&rec).unwrap_or(Value::Null),
+                    "pipeline": r.get::<_, Option<i64>>(4)?,
+                }))
+            }) {
+            return v;
+        }
+    }
     if let Some(pid) = process_id {
         let v = proc_pipeline(box_id, pid);
         if !v.is_null() { return v; }
     }
-    c.query_row(
-        "SELECT id,ts,cmd,record,pipeline FROM brushprov \
-         WHERE spawn_ts <= ?1 AND (done_ts >= ?1 OR done_ts = 0) \
-         ORDER BY spawn_ts DESC LIMIT 1",
-        [out_ts], |r| {
-            let rec: String = r.get(3)?;
-            Ok(json!({
-                "id": r.get::<_, i64>(0)?, "ts": r.get::<_, f64>(1)?,
-                "cmd": r.get::<_, String>(2)?,
-                "record": serde_json::from_str::<Value>(&rec).unwrap_or(Value::Null),
-                "pipeline": r.get::<_, Option<i64>>(4)?,
-            }))
-        }).unwrap_or(Value::Null)
+    Value::Null
 }
 
 /// D9 brush↔process linkage, pipeline→processes direction: the process row ids

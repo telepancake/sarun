@@ -190,6 +190,7 @@ fn record_brush_prov(state: &State, ov: &Option<crate::overlay::Overlay>,
     if let Some(ov) = ov.as_ref() {
         if let Some(b) = ov.live_box(id) {
             prov_id = b.add_brushprov(&cmd, &record_json, seq, spawn_ts, uid, parent_uid);
+            b.set_cur_brush_pipeline(prov_id);
             // Remember this pipeline's output-redirect targets for the exact
             // file→process linkage made at teardown.
             let targets: Vec<String> = rec.get("out_targets")
@@ -286,6 +287,7 @@ fn brush_prov_done(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value
     if let Some(ov) = ov.as_ref() {
         if let Some(b) = ov.live_box(id) {
             b.mark_brushprov_done(&uids, code, done_ts);
+            b.set_cur_brush_pipeline(0);
         }
     }
     json!({"ok": true})
