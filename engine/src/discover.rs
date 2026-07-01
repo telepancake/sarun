@@ -435,12 +435,14 @@ pub fn proc_pipeline(box_id: i64, row_id: i64) -> Value {
 
 /// Output→pipeline: find the brushprov pipeline that produced output `output_id`.
 /// Uses the output's own brush_pipeline_id column (stamped at capture time).
-/// Falls back to the process→pipeline parent walk when the column is NULL
-/// (pre-column data or forked children whose parent has the link).
+/// Falls back to the process→pipeline parent walk ONLY when the column does
+/// not exist (pre-column data). When the column exists but is NULL, the output
+/// genuinely has no pipeline — guessing via process ancestry produces wrong
+/// results for in-process builtins whose process_id is the shared brush root.
 pub fn output_pipeline(box_id: i64, output_id: i64) -> Value {
     let Some(c) = open_ro(box_id) else { return Value::Null };
-    let bp_col = if has_col(&c, "outputs", "brush_pipeline_id")
-                 { "brush_pipeline_id" } else { "NULL" };
+    let has_bp_col = has_col(&c, "outputs", "brush_pipeline_id");
+    let bp_col = if has_bp_col { "brush_pipeline_id" } else { "NULL" };
     let q = format!("SELECT process_id,{bp_col} FROM outputs WHERE id=?1");
     let (process_id, bp_id): (Option<i64>, Option<i64>) = match c.query_row(
         &q, [output_id], |r| Ok((r.get(0)?, r.get(1)?))) {
@@ -462,9 +464,14 @@ pub fn output_pipeline(box_id: i64, output_id: i64) -> Value {
             return v;
         }
     }
-    if let Some(pid) = process_id {
-        let v = proc_pipeline(box_id, pid);
-        if !v.is_null() { return v; }
+    // Only fall back to process-tree walk when the column doesn't exist at
+    // all (old data). If the column exists but is NULL, the output was not
+    // attributed to any pipeline at capture time — don't guess.
+    if !has_bp_col {
+        if let Some(pid) = process_id {
+            let v = proc_pipeline(box_id, pid);
+            if !v.is_null() { return v; }
+        }
     }
     Value::Null
 }
