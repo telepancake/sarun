@@ -2577,6 +2577,20 @@ pub fn run_recipe_in_process_opt(
         Ok(p) => p,
         Err(e) => { output_cb(format!("sarun-engine n2: pipe: {e}\n").as_bytes()); return 127; }
     };
+    // Separate pipe for stderr when Inherit: we capture it here instead of
+    // letting it go through the FUSE sink (which would attribute it to
+    // whatever cur_brush_pipeline happens to be set when the FUSE handler
+    // runs — a race with the next pipeline's prov). After the recipe thread
+    // joins, we replay the captured stderr to the real fd 2 so it still
+    // reaches the terminal, but the timing is no longer racy.
+    let (stderr_reader, stderr_writer) = if matches!(stderr, RecipeStderr::Inherit) {
+        match std::io::pipe() {
+            Ok((r, w)) => (Some(r), Some(w)),
+            Err(_) => (None, None),
+        }
+    } else {
+        (None, None)
+    };
 
     let cwd = BOX_RECIPE_CWD
         .with(|c| c.borrow().clone())
@@ -2620,7 +2634,11 @@ pub fn run_recipe_in_process_opt(
                     };
                     shell.open_files_mut().set_fd(2, brush_core::openfiles::OpenFile::from(w2));
                 }
-                RecipeStderr::Inherit => {}
+                RecipeStderr::Inherit => {
+                    if let Some(ew) = stderr_writer {
+                        shell.open_files_mut().set_fd(2, brush_core::openfiles::OpenFile::from(ew));
+                    }
+                }
                 RecipeStderr::Null => {
                     if let Ok(devnull) = std::fs::OpenOptions::new().write(true).open("/dev/null") {
                         shell.open_files_mut()
@@ -2673,7 +2691,22 @@ pub fn run_recipe_in_process_opt(
     if !line_buf.is_empty() {
         emit_bash_compat(&line_buf, output_cb);
     }
-    exec.join().unwrap_or(127)
+    let code = exec.join().unwrap_or(127);
+    // Replay captured stderr to the real fd 2 AFTER the recipe thread has
+    // finished (so the write end is closed and we can drain to EOF). This
+    // happens while cur_brush_pipeline still points to THIS recipe's
+    // pipeline — the next recipe's prov hasn't been sent yet — so the
+    // engine's FUSE/pty handler attributes the output correctly.
+    if let Some(mut er) = stderr_reader {
+        let mut ebuf = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut er, &mut ebuf);
+        if !ebuf.is_empty() {
+            use std::io::Write;
+            let _ = std::io::stderr().write_all(&ebuf);
+            let _ = std::io::stderr().flush();
+        }
+    }
+    code
 }
 
 /// Rewrite `error: command not found: NAME` → `/bin/sh: line 1: NAME: command
