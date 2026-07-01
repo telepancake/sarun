@@ -31,6 +31,14 @@ pub type EventQ = Arc<Mutex<VecDeque<(i64, String, &'static str)>>>;
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sqlar(name TEXT PRIMARY KEY, mode INT, mtime INT,
  sz INT, data BLOB, opaque INT DEFAULT 0, writer INT, last_writer INT);
+-- review.rs's recent_changes/box_summary (the live \"recently changed\" panel
+-- in the boxes view) run `ORDER BY mtime DESC LIMIT n` on every overlay event
+-- while that panel is focused — i.e. once per file the box writes. Without an
+-- index SQLite can't satisfy that ordering from an index scan and falls back
+-- to a full table scan + sort every single call, so a build touching thousands
+-- of files pays an O(n) sqlar scan per file written (O(n^2) over the build) —
+-- this is what actually made a ~1min native build take ~20min in a box.
+CREATE INDEX IF NOT EXISTS idx_sqlar_mtime ON sqlar(mtime);
 CREATE TABLE IF NOT EXISTS provenance(path TEXT PRIMARY KEY, pid INT, ppid INT,
  exe TEXT, argv TEXT);
 CREATE TABLE IF NOT EXISTS env(id INTEGER PRIMARY KEY AUTOINCREMENT,
