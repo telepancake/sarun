@@ -1,7 +1,9 @@
 use clap::Parser;
 use std::{borrow::Cow, os::unix::process::CommandExt};
 
-use brush_core::{ErrorKind, ExecutionExitCode, ExecutionResult, builtins, commands};
+use brush_core::{
+    ErrorKind, ExecutionControlFlow, ExecutionExitCode, ExecutionResult, builtins, commands,
+};
 
 /// Exec the provided command.
 #[derive(Parser)]
@@ -55,7 +57,25 @@ impl builtins::Command for ExecCommand {
                 ..Default::default()
             };
 
-            return cmd_cmd.execute(context).await;
+            // sarun: a real exec(2) never returns to the calling script on
+            // success — code following `exec CMD` only runs if CMD couldn't
+            // be launched at all. Delegating to `command` here (required
+            // because a brush "subshell" isn't its own OS process, so truly
+            // replacing the process image would take down whatever embeds
+            // it) DOES return control to the caller once CMD finishes. Left
+            // alone, that resumes the script exactly where a real exec would
+            // never have resumed it — corrupting scripts that pair `exec`
+            // with trailing "could not exec" fallback/cleanup code, a common
+            // idiom (e.g. autoconf's shell-reexec bootstrap hits its own
+            // "could not re-execute" + `exit 255` path even though the
+            // delegated command ran to completion). Force the same
+            // "terminate this script now" control flow the `exit` builtin
+            // uses, carrying the delegated command's exit code, so the
+            // caller observes what a real successful exec would have
+            // produced: no further statements execute.
+            let mut result = cmd_cmd.execute(context).await?;
+            result.next_control_flow = ExecutionControlFlow::ExitShell;
+            return Ok(result);
         }
 
         let mut argv0 = Cow::Borrowed(self.name_for_argv0.as_ref().unwrap_or(&self.args[0]));
