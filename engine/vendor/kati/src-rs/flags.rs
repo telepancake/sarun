@@ -76,6 +76,7 @@ pub struct Flags {
     pub use_find_emulator: bool,
     pub color_warnings: bool,
     pub no_builtin_rules: bool,
+    pub no_builtin_variables: bool,
     pub no_ninja_prelude: bool,
     pub use_ninja_phony_output: bool,
     pub use_ninja_validations: bool,
@@ -104,6 +105,7 @@ pub struct Flags {
     pub ninja_dir: Option<OsString>,
     pub ninja_suffix: OsString,
     pub working_dir: Option<OsString>, // -C <dir>
+    pub include_dirs: Vec<OsString>,   // -I / --include-dir
     pub num_cpus: usize,
     pub num_jobs: usize,
     // sarun: true when -j was given explicitly on the command line (vs the
@@ -158,8 +160,28 @@ impl Flags {
 
         if let Some(makeflags) = env::var_os("MAKEFLAGS") {
             for tok in crate::strutil::word_scanner(makeflags.as_bytes()) {
-                if !tok.starts_with(b"-") && tok.contains(&b'=') {
+                if let Some(dir) = tok.strip_prefix(b"--include-dir=") {
+                    flags.include_dirs.push(OsString::from_vec(dir.to_vec()));
+                } else if tok == b"--no-builtin-rules" || tok == b"--no_builtin_rules" {
+                    flags.no_builtin_rules = true;
+                } else if tok == b"--no-builtin-variables" || tok == b"--no_builtin_variables" {
+                    flags.no_builtin_variables = true;
+                } else if tok == b"-s" || tok == b"--silent" || tok == b"--quiet" {
+                    flags.is_silent_mode = true;
+                } else if !tok.starts_with(b"-") && tok.contains(&b'=') {
                     flags.cl_vars.push(Bytes::from(tok.to_vec()));
+                } else if !tok.starts_with(b"-") && !tok.contains(&b'=') && tok.iter().all(|&b| b.is_ascii_alphabetic()) {
+                    // GNU make encodes short flags as a bare letter-word in
+                    // MAKEFLAGS (e.g. "rRs" for -r -R -s). Parse the
+                    // semantically important ones.
+                    for &ch in tok {
+                        match ch {
+                            b'r' => flags.no_builtin_rules = true,
+                            b'R' => flags.no_builtin_variables = true,
+                            b's' => flags.is_silent_mode = true,
+                            _ => {}
+                        }
+                    }
                 }
             }
         }
@@ -174,6 +196,9 @@ impl Flags {
                 b"-c" => flags.is_syntax_check_only = true,
                 b"-i" => flags.is_dry_run = true,
                 b"-s" => flags.is_silent_mode = true,
+                b"-r" => flags.no_builtin_rules = true,
+                b"-R" => flags.no_builtin_variables = true,
+                b"-w" | b"-k" | b"-n" => {} // accepted, semantically no-op in kati
                 b"-d" => flags.enable_debug = true,
                 b"--kati_stats" => flags.enable_stat_logs = true,
                 b"--warn" => flags.enable_kati_warnings = true,
@@ -230,6 +255,10 @@ impl Flags {
                 _ => {
                     if let Some(arg) = parse_command_line_option_with_arg("-C", &arg, &mut iter) {
                         flags.working_dir = Some(arg);
+                    } else if let Some(arg) = parse_command_line_option_with_arg("-I", &arg, &mut iter) {
+                        flags.include_dirs.push(arg);
+                    } else if let Some(arg) = parse_command_line_option_with_arg("--include-dir", &arg, &mut iter) {
+                        flags.include_dirs.push(arg);
                     } else if let Some(arg) =
                         parse_command_line_option_with_arg("--dump_include_graph", &arg, &mut iter)
                     {
