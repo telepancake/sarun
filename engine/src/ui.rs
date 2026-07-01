@@ -1493,6 +1493,37 @@ impl App {
         }
     }
 
+    fn refresh_pipelines_preserving_cursor(&mut self) {
+        let Some(sid) = self.cur_sid_i64() else { return };
+        let pinned_id = self.pipelines.get(self.sel_pipeline)
+            .and_then(|p| p.get("id").and_then(Value::as_i64));
+        let saved_start = self.pipelines_window_start;
+        let saved_sel = self.sel_pipeline;
+        self.close_pipelines_view();
+        let filter = filter_to_json(self.f_pipelines.active());
+        match rpc(&self.sock, "view.open", json!(["pipelines", sid, filter])) {
+            Ok(v) => {
+                self.pipelines_view = v.get("view_id").and_then(Value::as_u64);
+                self.pipelines_total =
+                    v.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
+                self.pipelines_view_sid = Some(sid);
+            }
+            Err(e) => { self.status = format!("view.open pipelines: {e}"); return; }
+        }
+        let tail_start = if self.f_pipelines.on {
+            0
+        } else {
+            self.pipelines_total.saturating_sub(WINDOW_SIZE)
+        };
+        self.fetch_pipelines_window(saved_start.max(tail_start));
+        let restored = pinned_id.and_then(|want| {
+            self.pipelines.iter().position(|p|
+                p.get("id").and_then(Value::as_i64) == Some(want))
+        });
+        self.sel_pipeline = restored
+            .unwrap_or_else(|| saved_sel.min(self.pipelines.len().saturating_sub(1)));
+    }
+
     fn push_pipelines_filter(&mut self) {
         let Some(vid) = self.pipelines_view else { return };
         let filter = filter_to_json(self.f_pipelines.active());
@@ -2766,10 +2797,13 @@ impl App {
                     }
                 }
             }
-            // Build-edge events: the executor recorded new edges or stamped an
-            // edge's run-state transition (started / finished). On the Targets
-            // pane for this box, re-fetch so the running-only view tracks the
-            // live build (which targets are in flight, which just finished).
+            Some("brush_prov") => {
+                let sid = ev.get("session_id").and_then(Value::as_str);
+                if sid.is_some() && sid == self.cur_sid().as_deref()
+                    && self.focus == Pane::Pipelines {
+                    self.refresh_pipelines_preserving_cursor();
+                }
+            }
             Some("build_edges") => {
                 let sid = ev.get("session_id").and_then(Value::as_str);
                 if sid.is_some() && sid == self.cur_sid().as_deref()
