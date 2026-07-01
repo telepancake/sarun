@@ -2266,14 +2266,14 @@ impl App {
                 }
             }
             Pane::Processes => self.move_proc_cursor(1),
-            Pane::Outputs => self.move_output_cursor(1),
+            Pane::Outputs => { self.move_output_cursor(1); self.right_scroll = 0; }
             Pane::Rules => {
                 if self.sel_rule + 1 < self.rules.len() {
                     self.sel_rule += 1;
                 }
             }
-            Pane::Pipelines => self.move_pipeline_cursor(1),
-            Pane::BuildEdges => self.move_edge_cursor(1),
+            Pane::Pipelines => { self.move_pipeline_cursor(1); self.right_scroll = 0; }
+            Pane::BuildEdges => { self.move_edge_cursor(1); self.right_scroll = 0; }
             Pane::Flows => {
                 if self.sel_flow + 1 < self.flows.len() {
                     self.sel_flow += 1;
@@ -2325,10 +2325,10 @@ impl App {
                 }
             }
             Pane::Processes => self.move_proc_cursor(-1),
-            Pane::Outputs => self.move_output_cursor(-1),
+            Pane::Outputs => { self.move_output_cursor(-1); self.right_scroll = 0; }
             Pane::Rules => self.sel_rule = self.sel_rule.saturating_sub(1),
-            Pane::Pipelines => self.move_pipeline_cursor(-1),
-            Pane::BuildEdges => self.move_edge_cursor(-1),
+            Pane::Pipelines => { self.move_pipeline_cursor(-1); self.right_scroll = 0; }
+            Pane::BuildEdges => { self.move_edge_cursor(-1); self.right_scroll = 0; }
             Pane::Flows => {
                 if self.sel_flow > 0 {
                     self.sel_flow -= 1;
@@ -2394,15 +2394,15 @@ impl App {
             Pane::Processes => {
                 for _ in 0..n { self.move_proc_cursor(step); }
             }
-            Pane::Outputs => self.page_output_cursor(delta),
+            Pane::Outputs => { self.page_output_cursor(delta); self.right_scroll = 0; }
             Pane::Rules => {
                 let total = self.rules.len();
                 if total == 0 { return; }
                 let cur = self.sel_rule as isize;
                 self.sel_rule = (cur + delta).clamp(0, total as isize - 1) as usize;
             }
-            Pane::Pipelines => self.page_pipeline_cursor(delta),
-            Pane::BuildEdges => self.page_edge_cursor(delta),
+            Pane::Pipelines => { self.page_pipeline_cursor(delta); self.right_scroll = 0; }
+            Pane::BuildEdges => { self.page_edge_cursor(delta); self.right_scroll = 0; }
             Pane::Flows => {
                 let total = self.flows.len();
                 if total == 0 { return; }
