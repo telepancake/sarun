@@ -213,6 +213,38 @@ impl Target for ProcFilterTarget {
     }
 }
 
+pub struct PipelineFilterTarget {
+    pub row_id: i64,
+    pub cmd: String,
+}
+
+impl Target for PipelineFilterTarget {
+    fn match_one(&self, m: &Match) -> bool {
+        match m.kind.as_str() {
+            "ids" => ids_of(&m.pattern).contains(&self.row_id),
+            "cmd" => glob_match(&m.pattern, &self.cmd),
+            _ => false,
+        }
+    }
+}
+
+pub struct EdgeFilterTarget {
+    pub row_id: i64,
+    pub targets: Vec<String>,
+    pub cmd: String,
+}
+
+impl Target for EdgeFilterTarget {
+    fn match_one(&self, m: &Match) -> bool {
+        match m.kind.as_str() {
+            "ids" => ids_of(&m.pattern).contains(&self.row_id),
+            "target" => self.targets.iter().any(|t| path_match(&m.pattern, t)),
+            "cmd" => glob_match(&m.pattern, &self.cmd),
+            _ => false,
+        }
+    }
+}
+
 /// Generic, target-agnostic left-to-right boolean fold (mirrors `eval_clauses`).
 /// First enabled clause seeds (its join ignored); each negates then folds with
 /// and/or; disabled clauses skip; no enabled clause → false.

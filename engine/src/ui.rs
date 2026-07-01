@@ -162,6 +162,8 @@ fn spawn_subscriber(sock: &str, tx: mpsc::Sender<Value>) {
 /// SUBJECT_KINDS / FILE_KINDS and FILTERABLE.
 const FILE_FILTER_KINDS: &[&str] = &["path", "box", "exe", "cwd", "arg"];
 const SUBJECT_FILTER_KINDS: &[&str] = &["box", "exe", "cwd", "arg"];
+const PIPELINE_FILTER_KINDS: &[&str] = &["cmd"];
+const EDGE_FILTER_KINDS: &[&str] = &["target", "cmd"];
 
 /// Which list view a '/' filter applies to. Sessions/Hunks/Rules/Help/Pty are
 /// not filterable.
@@ -170,18 +172,24 @@ enum FilterView {
     Changes,
     Procs,
     Outputs,
+    Pipelines,
+    BuildEdges,
 }
 
 impl FilterView {
     fn kinds(self) -> &'static [&'static str] {
         match self {
             FilterView::Changes => FILE_FILTER_KINDS,
+            FilterView::Pipelines => PIPELINE_FILTER_KINDS,
+            FilterView::BuildEdges => EDGE_FILTER_KINDS,
             _ => SUBJECT_FILTER_KINDS,
         }
     }
     fn default_kind(self) -> &'static str {
         match self {
             FilterView::Changes => "path",
+            FilterView::Pipelines => "cmd",
+            FilterView::BuildEdges => "target",
             _ => "exe",
         }
     }
@@ -465,15 +473,17 @@ struct App {
     outputs_total: usize,
     outputs_window_start: usize,
     rules: Vec<String>,    // raw filerules lines (apply/discard/passthrough <glob>)
-    /// D9 pipelines for the currently-loaded box (one row per `brushprov`
-    /// entry; engine returns the full list — these are bounded by what
-    /// brush actually ran, so no windowing needed).
+    /// D9 pipelines for the currently-loaded box — the DISPLAY window,
+    /// after server-side filtering + client-side running_only + tree.
     pipelines: Vec<Value>,
-    /// The raw chronological (brushprov-id-ordered) pipeline rows, as the engine
-    /// returned them. `pipelines` above is the DISPLAY order derived from this:
-    /// hierarchical tree when `pipe_tree`, else this flat list. Kept so the `t`
-    /// toggle can rebuild without a re-fetch.
+    /// The current window of server-filtered rows (before client-side
+    /// running_only / tree transforms). `pipelines` above is derived from
+    /// this via `rebuild_pipeline_view`.
     pipelines_flat: Vec<Value>,
+    pipelines_view: Option<u64>,
+    pipelines_view_sid: Option<i64>,
+    pipelines_total: usize,
+    pipelines_window_start: usize,
     /// Pipelines pane view: true = hierarchical tree (parent_uid nesting),
     /// false = flat chronological. Toggled with `t`.
     pipe_tree: bool,
@@ -483,13 +493,16 @@ struct App {
     /// Procs pane: show ONLY processes still alive (engine-side pidfd probe) on a
     /// live box. Defaults true (most informative); toggled with `f` to show all.
     proc_running_only: bool,
-    /// Phase 1 build edges for the currently-loaded box, AS DISPLAYED — the
-    /// `edges_running_only` filter applied to `build_edges_flat`. Indexed by
-    /// `sel_edge`; the detail pane reads `build_edges[sel_edge]`.
+    /// Build edges AS DISPLAYED — after server-side filtering + client-side
+    /// running_only. Indexed by `sel_edge`.
     build_edges: Vec<Value>,
-    /// Every fetched build edge (one row per `build_edges` entry; full list, no
-    /// windowing). `build_edges` is the filtered view derived from this.
+    /// The current window of server-filtered rows (before client-side
+    /// running_only). `build_edges` is derived from this via `rebuild_edge_view`.
     build_edges_flat: Vec<Value>,
+    edges_view: Option<u64>,
+    edges_view_sid: Option<i64>,
+    edges_total: usize,
+    edges_window_start: usize,
     /// Targets pane: on a LIVE box, show ONLY the edges currently building
     /// (started_ts>0 && ended_ts==0). Defaults true (most informative for a
     /// running build); ignored for a finished box (running is meaningless then,
@@ -519,6 +532,8 @@ struct App {
     f_changes: ViewFilter,
     f_procs: ViewFilter,
     f_outputs: ViewFilter,
+    f_pipelines: ViewFilter,
+    f_edges: ViewFilter,
     #[cfg_attr(test, allow(dead_code))]
     should_quit: bool,
     /// True iff focus is currently on the RIGHT pane of the active view
@@ -649,7 +664,12 @@ impl App {
             outputs_view: None, outputs_view_sid: None,
             outputs_total: 0,
             outputs_window_start: 0,
-            rules: vec![], pipelines: vec![], pipelines_flat: vec![], pipe_tree: true, pipe_running_only: false, proc_running_only: true, build_edges: vec![], build_edges_flat: vec![], edges_running_only: true,
+            rules: vec![], pipelines: vec![], pipelines_flat: vec![],
+            pipelines_view: None, pipelines_view_sid: None, pipelines_total: 0, pipelines_window_start: 0,
+            pipe_tree: true, pipe_running_only: false, proc_running_only: true,
+            build_edges: vec![], build_edges_flat: vec![],
+            edges_view: None, edges_view_sid: None, edges_total: 0, edges_window_start: 0,
+            edges_running_only: true,
             sel_session: 0,
             sel_change: 0,
             sel_proc: 0, sel_pipeline: 0, sel_edge: 0,
@@ -667,6 +687,8 @@ impl App {
             f_changes: ViewFilter::default(),
             f_procs: ViewFilter::default(),
             f_outputs: ViewFilter::default(),
+            f_pipelines: ViewFilter::default(),
+            f_edges: ViewFilter::default(),
             should_quit: false,
             ptys: vec![], sel_pty: 0, pty_esc_at: None, right_focused: false, right_scroll: 0, pty_in_right: false, menu_nav: false, menu_sel: 0,
             structd: StructState::default(),
@@ -806,6 +828,8 @@ impl App {
         self.changes_view_sid = None;
         self.processes_view_sid = None;
         self.outputs_view_sid = None;
+        self.pipelines_view_sid = None;
+        self.edges_view_sid = None;
     }
 
     /// After (re)loading the changes view, advance sel_change to the first
@@ -1409,32 +1433,80 @@ impl App {
         self.load_processes();
     }
 
-    /// Load the brush pipelines for the currently-selected box. Each row
-    /// is one `brushprov` entry: cmd + parsed structure + which process
-    /// rows brush spawned for it (the D9 pipeline→processes linkage).
-    /// Full list (no windowing) — bounded by what brush actually ran.
     fn load_pipelines(&mut self) {
+        self.close_pipelines_view();
         self.pipelines.clear();
+        self.pipelines_flat.clear();
+        self.pipelines_total = 0;
+        self.pipelines_window_start = 0;
         self.sel_pipeline = 0;
         let Some(sid) = self.cur_sid_i64() else { return };
-        match rpc(&self.sock, "brushprov", json!([sid])) {
-            Ok(Value::Array(rows)) => {
-                self.pipelines_flat = rows;
-                self.rebuild_pipeline_view();
-                // Open at the TAIL: the most recent pipelines are what you watch
-                // on a live box, so the last `height` rows fill the screen.
-                self.sel_pipeline = self.pipelines.len().saturating_sub(1);
+        let filter = filter_to_json(self.f_pipelines.active());
+        match rpc(&self.sock, "view.open", json!(["pipelines", sid, filter])) {
+            Ok(v) => {
+                self.pipelines_view = v.get("view_id").and_then(Value::as_u64);
+                self.pipelines_total =
+                    v.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
+                self.pipelines_view_sid = Some(sid);
             }
-            Ok(_) => {}
-            Err(e) => self.status = format!("brushprov: {e}"),
+            Err(e) => { self.status = format!("view.open pipelines: {e}"); return; }
+        }
+        self.fetch_pipelines_window(0);
+        self.sel_pipeline = self.pipelines.len().saturating_sub(1);
+    }
+
+    fn load_pipelines_if_needed(&mut self) {
+        let cur = self.cur_sid_i64();
+        if cur.is_some() && self.pipelines_view_sid == cur {
+            return;
+        }
+        self.load_pipelines();
+    }
+
+    fn fetch_pipelines_window(&mut self, start: usize) {
+        let Some(vid) = self.pipelines_view else { return };
+        let start = start.min(self.pipelines_total.saturating_sub(1).max(0));
+        match rpc(&self.sock, "view.window",
+                  json!([vid, start, WINDOW_SIZE])) {
+            Ok(v) => {
+                self.pipelines_window_start =
+                    v.get("start").and_then(Value::as_u64).unwrap_or(start as u64) as usize;
+                self.pipelines_total =
+                    v.get("total").and_then(Value::as_u64)
+                        .unwrap_or(self.pipelines_total as u64) as usize;
+                self.pipelines_flat = v.get("rows").and_then(Value::as_array).cloned()
+                    .unwrap_or_default();
+            }
+            Err(e) => self.status = format!("view.window pipelines: {e}"),
+        }
+        self.rebuild_pipeline_view();
+    }
+
+    fn close_pipelines_view(&mut self) {
+        if let Some(vid) = self.pipelines_view.take() {
+            let _ = rpc(&self.sock, "view.close", json!([vid]));
+        }
+    }
+
+    fn push_pipelines_filter(&mut self) {
+        let Some(vid) = self.pipelines_view else { return };
+        let filter = filter_to_json(self.f_pipelines.active());
+        match rpc(&self.sock, "view.filter", json!([vid, filter])) {
+            Ok(v) => {
+                self.pipelines_total =
+                    v.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
+                self.pipelines_window_start = 0;
+                self.sel_pipeline = 0;
+                self.fetch_pipelines_window(0);
+            }
+            Err(e) => self.status = format!("view.filter pipelines: {e}"),
         }
     }
 
     /// Rebuild the displayed `pipelines` from `pipelines_flat` per `pipe_tree`:
     /// a parent→child tree (depth stamped) or the flat chronological list.
+    /// Client-side post-processing on top of the server-filtered window.
     fn rebuild_pipeline_view(&mut self) {
-        // Optionally keep only in-flight pipelines (done_ts==0) — the running /
-        // stuck set on a live box.
         let src: Vec<Value> = if self.pipe_running_only {
             self.pipelines_flat.iter()
                 .filter(|r| r.get("done_ts").and_then(Value::as_f64).unwrap_or(0.0) == 0.0)
@@ -1473,29 +1545,80 @@ impl App {
         };
     }
 
-    /// Load the embedded-ninja build edges for the currently-selected box.
-    /// Each row is one parsed edge: outs / ins / cmd. Includes up-to-date
-    /// targets that never executed.
     fn load_build_edges(&mut self) {
+        self.close_edges_view();
         self.build_edges.clear();
         self.build_edges_flat.clear();
+        self.edges_total = 0;
+        self.edges_window_start = 0;
         self.sel_edge = 0;
         let Some(sid) = self.cur_sid_i64() else { return };
-        match rpc(&self.sock, "build_edges", json!([sid])) {
-            Ok(Value::Array(rows)) => {
-                self.build_edges_flat = rows;
-                self.rebuild_edge_view();
-                self.sel_edge = self.build_edges.len().saturating_sub(1); // open at tail
+        let filter = filter_to_json(self.f_edges.active());
+        match rpc(&self.sock, "view.open", json!(["build_edges", sid, filter])) {
+            Ok(v) => {
+                self.edges_view = v.get("view_id").and_then(Value::as_u64);
+                self.edges_total =
+                    v.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
+                self.edges_view_sid = Some(sid);
             }
-            Ok(_) => {}
-            Err(e) => self.status = format!("build_edges: {e}"),
+            Err(e) => { self.status = format!("view.open build_edges: {e}"); return; }
+        }
+        self.fetch_edges_window(0);
+        self.sel_edge = self.build_edges.len().saturating_sub(1);
+    }
+
+    fn load_edges_if_needed(&mut self) {
+        let cur = self.cur_sid_i64();
+        if cur.is_some() && self.edges_view_sid == cur {
+            return;
+        }
+        self.load_build_edges();
+    }
+
+    fn fetch_edges_window(&mut self, start: usize) {
+        let Some(vid) = self.edges_view else { return };
+        let start = start.min(self.edges_total.saturating_sub(1).max(0));
+        match rpc(&self.sock, "view.window",
+                  json!([vid, start, WINDOW_SIZE])) {
+            Ok(v) => {
+                self.edges_window_start =
+                    v.get("start").and_then(Value::as_u64).unwrap_or(start as u64) as usize;
+                self.edges_total =
+                    v.get("total").and_then(Value::as_u64)
+                        .unwrap_or(self.edges_total as u64) as usize;
+                self.build_edges_flat = v.get("rows").and_then(Value::as_array).cloned()
+                    .unwrap_or_default();
+            }
+            Err(e) => self.status = format!("view.window build_edges: {e}"),
+        }
+        self.rebuild_edge_view();
+    }
+
+    fn close_edges_view(&mut self) {
+        if let Some(vid) = self.edges_view.take() {
+            let _ = rpc(&self.sock, "view.close", json!([vid]));
+        }
+    }
+
+    fn push_edges_filter(&mut self) {
+        let Some(vid) = self.edges_view else { return };
+        let filter = filter_to_json(self.f_edges.active());
+        match rpc(&self.sock, "view.filter", json!([vid, filter])) {
+            Ok(v) => {
+                self.edges_total =
+                    v.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
+                self.edges_window_start = 0;
+                self.sel_edge = 0;
+                self.fetch_edges_window(0);
+            }
+            Err(e) => self.status = format!("view.filter build_edges: {e}"),
         }
     }
 
     /// Rebuild the displayed `build_edges` from `build_edges_flat`. On a live box
     /// with `edges_running_only`, keep only the edges currently building
-    /// (started_ts>0 && ended_ts==0) — the running / stuck set you watch on a
-    /// hung build. A finished box shows all edges (running is meaningless then).
+    /// (started_ts>0 && ended_ts==0). Client-side post-processing on the
+    /// server-filtered window.
     fn rebuild_edge_view(&mut self) {
         let filter = self.edges_running_only && self.cur_session_live();
         self.build_edges = if filter {
@@ -1516,12 +1639,21 @@ impl App {
     /// selection into the (possibly shrunk) filtered set.
     fn refresh_build_edges_preserving_cursor(&mut self) {
         let Some(sid) = self.cur_sid_i64() else { return };
-        if let Ok(Value::Array(rows)) = rpc(&self.sock, "build_edges", json!([sid])) {
-            self.build_edges_flat = rows;
-            self.rebuild_edge_view();
-            if self.sel_edge >= self.build_edges.len() {
-                self.sel_edge = self.build_edges.len().saturating_sub(1);
+        self.close_edges_view();
+        let filter = filter_to_json(self.f_edges.active());
+        match rpc(&self.sock, "view.open", json!(["build_edges", sid, filter])) {
+            Ok(v) => {
+                self.edges_view = v.get("view_id").and_then(Value::as_u64);
+                self.edges_total =
+                    v.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
+                self.edges_view_sid = Some(sid);
             }
+            Err(e) => { self.status = format!("view.open build_edges: {e}"); return; }
+        }
+        let start = self.edges_window_start;
+        self.fetch_edges_window(start);
+        if self.sel_edge >= self.build_edges.len() {
+            self.sel_edge = self.build_edges.len().saturating_sub(1);
         }
     }
 
@@ -2258,8 +2390,8 @@ impl App {
             Pane::Outputs   => { self.nav(Pane::Outputs);   self.load_outputs_if_needed(); }
             Pane::ApiLogs   => { self.nav(Pane::ApiLogs);   self.load_api_logs_if_needed(); }
             Pane::Flows     => { self.focus = Pane::Flows;      self.load_flows(); }
-            Pane::Pipelines => { self.focus = Pane::Pipelines;  self.load_pipelines(); }
-            Pane::BuildEdges=> { self.focus = Pane::BuildEdges; self.load_build_edges(); }
+            Pane::Pipelines => { self.nav(Pane::Pipelines);  self.load_pipelines_if_needed(); }
+            Pane::BuildEdges=> { self.nav(Pane::BuildEdges); self.load_edges_if_needed(); }
             Pane::Help      => { self.focus = Pane::Help; self.out_scroll = 0; }
             other           => { self.focus = other; }
         }
@@ -2616,6 +2748,8 @@ impl App {
             FilterView::Changes => &self.f_changes,
             FilterView::Procs => &self.f_procs,
             FilterView::Outputs => &self.f_outputs,
+            FilterView::Pipelines => &self.f_pipelines,
+            FilterView::BuildEdges => &self.f_edges,
         }
     }
     fn view_filter_mut(&mut self, v: FilterView) -> &mut ViewFilter {
@@ -2623,6 +2757,8 @@ impl App {
             FilterView::Changes => &mut self.f_changes,
             FilterView::Procs => &mut self.f_procs,
             FilterView::Outputs => &mut self.f_outputs,
+            FilterView::Pipelines => &mut self.f_pipelines,
+            FilterView::BuildEdges => &mut self.f_edges,
         }
     }
 
@@ -2633,6 +2769,8 @@ impl App {
             Pane::Changes => Some(FilterView::Changes),
             Pane::Processes => Some(FilterView::Procs),
             Pane::Outputs => Some(FilterView::Outputs),
+            Pane::Pipelines => Some(FilterView::Pipelines),
+            Pane::BuildEdges => Some(FilterView::BuildEdges),
             _ => None,
         }
     }
@@ -2707,6 +2845,8 @@ impl App {
             FilterView::Changes => self.push_changes_filter(),
             FilterView::Procs => self.push_procs_filter(),
             FilterView::Outputs => self.push_outputs_filter(),
+            FilterView::Pipelines => self.push_pipelines_filter(),
+            FilterView::BuildEdges => self.push_edges_filter(),
         }
     }
 
@@ -2715,6 +2855,8 @@ impl App {
             FilterView::Changes => self.sel_change = 0,
             FilterView::Procs => self.sel_proc = 0,
             FilterView::Outputs => self.sel_output = 0,
+            FilterView::Pipelines => self.sel_pipeline = 0,
+            FilterView::BuildEdges => self.sel_edge = 0,
         }
     }
 
@@ -2780,6 +2922,26 @@ impl App {
                 let pid = row.get("process_id").and_then(Value::as_i64)?;
                 Some(vec![pid])
             }
+            (FilterView::Outputs, FilterView::Pipelines) => {
+                let o = self.visible_outputs();
+                let row = o.get(self.sel_output)?;
+                let pid = row.get("process_id").and_then(Value::as_i64)?;
+                for pl in &self.pipelines_flat {
+                    if let Some(procs) = pl.get("processes").and_then(Value::as_array) {
+                        if procs.iter().any(|p| p.as_i64() == Some(pid)) {
+                            let plid = pl.get("id").and_then(Value::as_i64)?;
+                            return Some(vec![plid]);
+                        }
+                    }
+                }
+                None
+            }
+            (FilterView::Pipelines, FilterView::Outputs) | (FilterView::Pipelines, FilterView::Procs) => {
+                let row = self.pipelines.get(self.sel_pipeline)?;
+                let procs = row.get("processes").and_then(Value::as_array)?;
+                let ids: Vec<i64> = procs.iter().filter_map(Value::as_i64).collect();
+                if ids.is_empty() { None } else { Some(ids) }
+            }
             _ => None,
         }
     }
@@ -2794,6 +2956,8 @@ impl App {
             Pane::Changes => Some(FilterView::Changes),
             Pane::Processes => Some(FilterView::Procs),
             Pane::Outputs => Some(FilterView::Outputs),
+            Pane::Pipelines => Some(FilterView::Pipelines),
+            Pane::BuildEdges => Some(FilterView::BuildEdges),
             _ => None,
         };
         if let (Some(src), Some(dest)) = (self.focus_filter_view(), dest) {
@@ -3990,8 +4154,8 @@ fn view_of_pane(p: Pane) -> Option<(char, &'static str, FilterView)> {
                        => Some(('c', "changes",  FilterView::Changes)),
         Pane::Processes => Some(('p', "procs",   FilterView::Procs)),
         Pane::Outputs   => Some(('o', "outputs", FilterView::Outputs)),
-        Pane::Pipelines => Some(('l', "pipes",   FilterView::Changes /* unused */)),
-        Pane::BuildEdges => Some(('g', "build",  FilterView::Changes /* unused */)),
+        Pane::Pipelines => Some(('l', "pipes",   FilterView::Pipelines)),
+        Pane::BuildEdges => Some(('g', "build",  FilterView::BuildEdges)),
         Pane::Rules     => Some(('e', "rules",   FilterView::Changes /* unused */)),
         Pane::Flows | Pane::Packets
                         => Some(('f', "flows",   FilterView::Changes /* unused */)),
@@ -7601,7 +7765,12 @@ mod tests {
             outputs_view: None, outputs_view_sid: None,
             outputs_total: 0,
             outputs_window_start: 0,
-            rules: vec![], pipelines: vec![], pipelines_flat: vec![], pipe_tree: true, pipe_running_only: false, proc_running_only: true, build_edges: vec![], build_edges_flat: vec![], edges_running_only: true,
+            rules: vec![], pipelines: vec![], pipelines_flat: vec![],
+            pipelines_view: None, pipelines_view_sid: None, pipelines_total: 0, pipelines_window_start: 0,
+            pipe_tree: true, pipe_running_only: false, proc_running_only: true,
+            build_edges: vec![], build_edges_flat: vec![],
+            edges_view: None, edges_view_sid: None, edges_total: 0, edges_window_start: 0,
+            edges_running_only: true,
             sel_session: 0,
             sel_change: 0,
             sel_proc: 0, sel_pipeline: 0, sel_edge: 0,
@@ -7619,6 +7788,8 @@ mod tests {
             f_changes: ViewFilter::default(),
             f_procs: ViewFilter::default(),
             f_outputs: ViewFilter::default(),
+            f_pipelines: ViewFilter::default(),
+            f_edges: ViewFilter::default(),
             should_quit: false,
             ptys: vec![], sel_pty: 0, pty_esc_at: None, right_focused: false, right_scroll: 0, pty_in_right: false, menu_nav: false, menu_sel: 0,
             structd: StructState::default(),
