@@ -133,12 +133,17 @@ pub fn safe_remove_file(
             Some(false)
         }
         Err(e) => {
-            if e.kind() == std::io::ErrorKind::PermissionDenied {
+            if e.kind() == std::io::ErrorKind::NotFound && options.force {
+                // TOCTOU: file vanished between symlink_metadata and unlink.
+                // With -f, treat as success (matches GNU rm behavior).
+                Some(false)
+            } else if e.kind() == std::io::ErrorKind::PermissionDenied {
                 show_error!("cannot remove {}: Permission denied", path.quote());
+                Some(true)
             } else {
                 let _ = show_removal_error(e, path);
+                Some(true)
             }
-            Some(true)
         }
     }
 }
@@ -164,10 +169,14 @@ pub fn safe_remove_empty_dir(
             Some(false)
         }
         Err(e) => {
-            let e =
-                e.map_err_context(|| translate!("rm-error-cannot-remove", "file" => path.quote()));
-            show_error!("{e}");
-            Some(true)
+            if e.kind() == std::io::ErrorKind::NotFound && options.force {
+                Some(false)
+            } else {
+                let e =
+                    e.map_err_context(|| translate!("rm-error-cannot-remove", "file" => path.quote()));
+                show_error!("{e}");
+                Some(true)
+            }
         }
     }
 }
@@ -278,6 +287,9 @@ pub fn safe_remove_dir_recursive(
         }
         Ok(metadata) => metadata.permissions().mode(),
         Err(e) => {
+            if e.kind() == std::io::ErrorKind::NotFound && options.force {
+                return false;
+            }
             return show_removal_error(e, path);
         }
     };

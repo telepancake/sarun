@@ -946,16 +946,19 @@ fn remove_file(path: &Path, options: &Options, progress_bar: Option<&ProgressBar
                 verbose_removed_file(path, options);
             }
             Err(e) => {
-                if e.kind() == io::ErrorKind::PermissionDenied {
+                if e.kind() == io::ErrorKind::NotFound && options.force {
+                    // TOCTOU: file vanished between symlink_metadata and
+                    // remove. With -f, treat as success (GNU rm behavior).
+                } else if e.kind() == io::ErrorKind::PermissionDenied {
                     // GNU compatibility (rm/fail-eacces.sh)
                     show_error!(
                         "{}",
                         RmError::CannotRemovePermissionDenied(path.as_os_str().to_os_string())
                     );
+                    return true;
                 } else {
                     return show_removal_error(e, path);
                 }
-                return true;
             }
         }
     }
