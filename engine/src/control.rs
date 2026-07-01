@@ -1182,6 +1182,10 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
             (Some(id), Some(rid)) => discover::proc_pipeline(id, rid),
             _ => Value::Null,
         },
+        "output_pipeline" => match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
+            (Some(id), Some(oid)) => discover::output_pipeline(id, oid),
+            _ => Value::Null,
+        },
         "pipeline_procs" => match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
             (Some(id), Some(pid)) => discover::pipeline_procs(id, pid),
             _ => json!([]),

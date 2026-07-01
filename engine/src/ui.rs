@@ -2983,9 +2983,9 @@ impl App {
             (FilterView::Outputs, FilterView::Pipelines) => {
                 let o = self.visible_outputs();
                 let row = o.get(self.sel_output)?;
-                let pid = row.get("process_id").and_then(Value::as_i64)?;
+                let oid = row.get("id").and_then(Value::as_i64)?;
                 let sid = self.cur_sid()?;
-                let pl = rpc(&self.sock, "proc_pipeline", json!([sid, pid])).ok()?;
+                let pl = rpc(&self.sock, "output_pipeline", json!([sid, oid])).ok()?;
                 let plid = pl.get("id").and_then(Value::as_i64)?;
                 Some(vec![plid])
             }
