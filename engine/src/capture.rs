@@ -992,6 +992,32 @@ impl BoxState {
                               if pipeline > 0 { Some(pipeline) } else { None::<i64> }]);
     }
 
+    /// Insert output with an explicit pipeline id (bypassing cur_brush_pipeline).
+    /// Used by the recipe_stderr control path: stderr captured from a $(shell)
+    /// recipe is sent through the control channel with the pipeline's uid; the
+    /// handler resolves the brushprov row id and calls this.
+    pub fn add_output_attributed(&self, stream: i32, content: &[u8], pipeline_id: i64) {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64()).unwrap_or(0.0);
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute(
+            "INSERT INTO outputs(ts,process_id,stream,content,brush_pipeline_id) \
+             VALUES(?1,NULL,?2,?3,?4)",
+            rusqlite::params![ts, stream, content,
+                              if pipeline_id > 0 { Some(pipeline_id) } else { None::<i64> }]);
+    }
+
+    /// Look up the brushprov row id for a given uid. Returns 0 if not found.
+    pub fn brushprov_id_for_uid(&self, uid: i64) -> i64 {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT id FROM brushprov WHERE uid=?1",
+            params![uid],
+            |row| row.get(0),
+        ).unwrap_or(0)
+    }
+
     /// Record one D9 brush-shell provenance frame: the exact command string
     /// plus the full parsed-structure JSON the embedded brush shell reported.
     /// Returns the inserted brushprov row id (0 on failure). `pipeline` is the

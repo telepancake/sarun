@@ -1836,6 +1836,22 @@ fn send_pipeline_done(uids: &[u64], code: i32, done_ts: f64) {
     crate::runner::send_nested_prov(format!("{msg}\n").as_bytes());
 }
 
+/// Send captured stderr from a $(shell) recipe through the control channel,
+/// bypassing the FUSE/pty path entirely. The engine resolves the brushprov row
+/// from the uids and inserts the output with the correct pipeline attribution.
+fn send_recipe_stderr(content: &[u8], uids: &[u64]) {
+    if content.is_empty() { return; }
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(content);
+    let msg = json!({
+        "type": "recipe_stderr",
+        "content": b64,
+        "uids": uids,
+        "stream": 2
+    });
+    crate::runner::send_nested_prov(format!("{msg}\n").as_bytes());
+}
+
 /// Report a build edge's run-state transition to the engine, so the targets
 /// pane can show only the targets CURRENTLY building (started but not ended)
 /// and each target's wall time. The engine matches the box's `build_edges` row
@@ -1896,7 +1912,8 @@ async fn run_brush_script(script: String, shell_name: String,
         }
     };
     let params = shell.default_exec_params();
-    run_nested_pipelines(&mut shell, prog, &params).await
+    let (code, _uids) = run_nested_pipelines(&mut shell, prog, &params).await;
+    code
 }
 
 /// Run `prog`'s complete-commands one at a time on `shell`, emitting one nested
@@ -1984,18 +2001,18 @@ async fn run_nested_pipelines(
     shell: &mut brush_core::Shell,
     prog: brush_parser::ast::Program,
     params: &brush_core::ExecutionParameters,
-) -> i32 {
+) -> (i32, Vec<u64>) {
     let mut last_code = 0i32;
     let mut seq = 0i64;
+    let mut all_uids: Vec<u64> = Vec::new();
     for complete in prog.complete_commands {
         let spawn_ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs_f64()).unwrap_or(0.0);
         let (recs, frame_uid, uids) = stamp_pipeline_records(&complete, &mut seq, spawn_ts, true);
+        all_uids.extend_from_slice(&uids);
         send_nested_pipeline_records(recs);
         let one = brush_parser::ast::Program { complete_commands: vec![complete] };
-        // Push this complete-command's frame as the current pipeline so anything
-        // it runs in-process (a snooped sh -c, …) records it as parent.
         let prev_uid = set_current_pipeline_uid(frame_uid);
         let r = shell.run_program(one, params).await;
         set_current_pipeline_uid(prev_uid);
@@ -2003,11 +2020,6 @@ async fn run_nested_pipelines(
             Ok(result) => {
                 last_code = u8::from(result.exit_code) as i32;
                 send_pipeline_done(&uids, last_code, now_secs());
-                // Honor terminal control flow BETWEEN complete-commands: `set -e`
-                // (errexit raises ExitShell) and an explicit `exit` must stop the
-                // script here, not fall through to the next newline-separated
-                // statement. (Within one `;`-list the CompoundList executor
-                // already breaks; this covers the cross-statement case.)
                 if !result.is_normal_flow() {
                     break;
                 }
@@ -2015,11 +2027,11 @@ async fn run_nested_pipelines(
             Err(e) => {
                 eprintln!("sarun-engine brush-sh: execution error \
                            (NO /bin/sh fallback): {e}");
-                return 1;
+                return (1, all_uids);
             }
         }
     }
-    last_code
+    (last_code, all_uids)
 }
 
 // ── in-process script snooping (sarun exec interposer) ───────────────────────
@@ -2306,7 +2318,7 @@ impl brush_core::commands::ExecInterposer<brush_core::extensions::DefaultShellEx
                     return Some(brush_core::ExecutionResult::new(2));
                 }
             };
-            let code = run_nested_pipelines(&mut sub, prog, &params).await;
+            let (code, _uids) = run_nested_pipelines(&mut sub, prog, &params).await;
             Some(brush_core::ExecutionResult::new(code as u8))
         })
     }
@@ -2577,12 +2589,12 @@ pub fn run_recipe_in_process_opt(
         Ok(p) => p,
         Err(e) => { output_cb(format!("sarun-engine n2: pipe: {e}\n").as_bytes()); return 127; }
     };
-    // Separate pipe for stderr when Inherit: we capture it here instead of
-    // letting it go through the FUSE sink (which would attribute it to
-    // whatever cur_brush_pipeline happens to be set when the FUSE handler
-    // runs — a race with the next pipeline's prov). After the recipe thread
-    // joins, we replay the captured stderr to the real fd 2 so it still
-    // reaches the terminal, but the timing is no longer racy.
+    // Separate pipe for stderr when Inherit: capture it here instead of
+    // letting it go through the FUSE/pty sink (which races with
+    // cur_brush_pipeline). After the recipe thread joins, the captured
+    // bytes are sent through the control channel (recipe_stderr) with
+    // the pipeline uids, so the engine inserts them with the correct
+    // brush_pipeline_id — no pty race.
     let (stderr_reader, stderr_writer) = if matches!(stderr, RecipeStderr::Inherit) {
         match std::io::pipe() {
             Ok((r, w)) => (Some(r), Some(w)),
@@ -2616,21 +2628,14 @@ pub fn run_recipe_in_process_opt(
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("sarun-engine n2: brush init failed: {e}");
-                    return 127;
+                    return (127, vec![]);
                 }
             };
-            // fd 1 → the pipe write end (captured into output_cb). Coreutil
-            // builtins write through brush's logical OpenFiles; forked binaries
-            // inherit fd 1 — both land on the pipe. fd 2 depends on `stderr`:
-            //  - Merge:   fd 2 → the same pipe (recipe / n2: merged output).
-            //  - Inherit: leave fd 2 on the shell default (box real fd 2 =
-            //             FUSE stderr sink) — $(shell) captures stdout only.
-            //  - Null:    fd 2 → /dev/null.
             match stderr {
                 RecipeStderr::Merge => {
                     let w2 = match writer.try_clone() {
                         Ok(w) => w,
-                        Err(e) => { eprintln!("sarun-engine n2: pipe clone: {e}"); return 127; }
+                        Err(e) => { eprintln!("sarun-engine n2: pipe clone: {e}"); return (127, vec![]); }
                     };
                     shell.open_files_mut().set_fd(2, brush_core::openfiles::OpenFile::from(w2));
                 }
@@ -2652,7 +2657,7 @@ pub fn run_recipe_in_process_opt(
                 Err(e) => {
                     eprintln!("sarun-engine n2: cannot parse recipe \
                                (NO /bin/sh fallback): {e}");
-                    return 2;
+                    return (2, vec![]);
                 }
             };
             let params = shell.default_exec_params();
@@ -2691,19 +2696,12 @@ pub fn run_recipe_in_process_opt(
     if !line_buf.is_empty() {
         emit_bash_compat(&line_buf, output_cb);
     }
-    let code = exec.join().unwrap_or(127);
-    // Replay captured stderr to the real fd 2 AFTER the recipe thread has
-    // finished (so the write end is closed and we can drain to EOF). This
-    // happens while cur_brush_pipeline still points to THIS recipe's
-    // pipeline — the next recipe's prov hasn't been sent yet — so the
-    // engine's FUSE/pty handler attributes the output correctly.
+    let (code, uids) = exec.join().unwrap_or((127, vec![]));
     if let Some(mut er) = stderr_reader {
         let mut ebuf = Vec::new();
         let _ = std::io::Read::read_to_end(&mut er, &mut ebuf);
         if !ebuf.is_empty() {
-            use std::io::Write;
-            let _ = std::io::stderr().write_all(&ebuf);
-            let _ = std::io::stderr().flush();
+            send_recipe_stderr(&ebuf, &uids);
         }
     }
     code
