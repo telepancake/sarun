@@ -256,6 +256,7 @@ fn brush_prov_nested(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Val
                               .collect())
                     .unwrap_or_default();
                 b.on_brush_prov(prov_id, targets);
+                b.set_cur_brush_pipeline(prov_id);
             }
         }
         broadcast(state, &json!({"type": "brush_prov",
@@ -287,7 +288,6 @@ fn brush_prov_done(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value
     if let Some(ov) = ov.as_ref() {
         if let Some(b) = ov.live_box(id) {
             b.mark_brushprov_done(&uids, code, done_ts);
-            b.set_cur_brush_pipeline(0);
         }
     }
     json!({"ok": true})

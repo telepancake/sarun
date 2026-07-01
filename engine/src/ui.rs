@@ -5271,8 +5271,15 @@ fn pipelines_lines(app: &App) -> Vec<Line<'static>> {
         // hang). Otherwise show [spawn_ts, done_ts] elapsed.
         let spawn_ts = row.get("spawn_ts").and_then(Value::as_f64).unwrap_or(0.0);
         let done_ts = row.get("done_ts").and_then(Value::as_f64).unwrap_or(0.0);
+        let exit_code = row.get("exit_code").and_then(Value::as_i64).unwrap_or(-1);
+        let failed = done_ts > 0.0 && exit_code != 0;
         let (dur_txt, dur_style) = if done_ts > 0.0 && spawn_ts > 0.0 {
-            (fmt_dur(done_ts - spawn_ts), Style::default().fg(Color::DarkGray))
+            let style = if failed {
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            (fmt_dur(done_ts - spawn_ts), style)
         } else {
             ("• run".to_string(), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
         };
@@ -5295,7 +5302,12 @@ fn pipelines_lines(app: &App) -> Vec<Line<'static>> {
         if !indent.is_empty() {
             spans.push(Span::styled(indent, Style::default().fg(Color::DarkGray)));
         }
-        spans.push(Span::raw(cmd.to_string()));
+        let cmd_style = if failed {
+            Style::default().fg(Color::Red)
+        } else {
+            Style::default()
+        };
+        spans.push(Span::styled(cmd.to_string(), cmd_style));
         if nprocs > 0 {
             spans.push(Span::styled(format!("  ·  {nprocs} proc{}",
                 if nprocs == 1 { "" } else { "s" }),
