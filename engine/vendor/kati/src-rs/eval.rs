@@ -17,6 +17,7 @@ limitations under the License.
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
+use std::os::unix::ffi::OsStrExt;
 use std::io::BufWriter;
 use std::os::unix::ffi::OsStringExt;
 use std::sync::{Arc, LazyLock, Weak};
@@ -259,6 +260,12 @@ pub struct Evaluator {
     /// process — and concurrent instances in different directories don't race
     /// on it. Seeded from the process cwd so standalone rkati is unchanged.
     pub working_dir: std::path::PathBuf,
+    /// sarun: GNU make's `-I`/`--include-dir` search path. When `include`
+    /// can't find a file relative to working_dir, it tries each of these
+    /// directories in order (matching GNU make's include-search semantics).
+    /// Populated from the command-line `-I` and from `--include-dir=` in
+    /// MAKEFLAGS (the kernel build adds `--include-dir=$(abs_srctree)`).
+    pub include_dirs: Vec<std::path::PathBuf>,
     pub rules: Vec<Rule>,
     pub exports: HashMap<Symbol, bool>,
     /// sarun: set when the makefile names `.EXPORT_ALL_VARIABLES` as a
@@ -335,6 +342,7 @@ impl Evaluator {
             rule_vars: HashMap::new(),
             global_vars: Arc::new(Mutex::new(Vec::new())),
             working_dir: std::env::current_dir().unwrap_or_default(),
+            include_dirs: Vec::new(),
             rules: Vec::new(),
             exports: HashMap::new(),
             export_all_vars: false,
@@ -1076,7 +1084,32 @@ impl Evaluator {
         let pats = stmt.expr.eval_to_buf(self)?;
         for pat in word_scanner(&pats) {
             let pat = pats.slice_ref(pat);
-            let files = crate::fileutil::glob(pat.clone(), &self.working_dir);
+            let mut files = crate::fileutil::glob(pat.clone(), &self.working_dir);
+
+            // sarun: GNU make's -I / --include-dir search. When the file
+            // isn't found relative to the working directory, try each
+            // include_dir in order — the kernel build relies on this
+            // (MAKEFLAGS += --include-dir=$(abs_srctree)) for sub-makes
+            // whose working dir differs from the source tree.
+            if !std::path::Path::new(std::ffi::OsStr::from_bytes(&pat)).is_absolute() {
+                let missing = match files.as_ref() {
+                    Err(_) => true,
+                    Ok(v) => v.is_empty(),
+                };
+                if missing {
+                    for idir in &self.include_dirs {
+                        let try_files = crate::fileutil::glob(pat.clone(), idir);
+                        let found = match try_files.as_ref() {
+                            Err(_) => false,
+                            Ok(v) => !v.is_empty(),
+                        };
+                        if found {
+                            files = try_files;
+                            break;
+                        }
+                    }
+                }
+            }
 
             if stmt.should_exist {
                 let missing = match files.as_ref() {
@@ -1084,12 +1117,6 @@ impl Evaluator {
                     Ok(v) => v.is_empty(),
                 };
                 if missing {
-                    // sarun: defer "missing required include" to the remake
-                    // loop in main.rs. If a rule for this file is discovered
-                    // by the end of parse, main will build it and re-parse
-                    // the makefile (mirroring GNU make's
-                    // remake-the-makefile-then-re-exec behavior). If no rule
-                    // exists, main raises the error after the loop settles.
                     let loc = self.loc.clone().unwrap_or_default();
                     self.pending_remake_includes
                         .push((loc, OsString::from_vec(pat.to_vec())));

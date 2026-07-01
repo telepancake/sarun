@@ -36,7 +36,6 @@ use bytes::{BufMut, BytesMut};
 use kati::dep::{NamedDepNode, make_dep};
 use kati::eval::{Evaluator, FrameType};
 use kati::expr::Value;
-use kati::flags::FLAGS;
 use kati::loc::Loc;
 use kati::symtab::{Symbol, intern, join_symbols};
 use kati::var::{VarOrigin, Variable};
@@ -75,20 +74,31 @@ fn kati_argv(argv: &[String]) -> Result<Vec<OsString>, String> {
     while i < argv.len() {
         let a = &argv[i];
         match a.as_str() {
-            // -f FILE / -C DIR: kati understands both (it reads -f and -C). Pass
-            // through verbatim (kati's -C does the chdir; we also chdir below so
-            // the build_edges + n2 cwd match).
-            "-f" | "-C" => {
+            // -f FILE / -C DIR / -I DIR: kati understands all three. Pass
+            // through verbatim.
+            "-f" | "-C" | "-I" => {
                 out.push(OsString::from(a));
                 if let Some(v) = argv.get(i + 1) {
                     out.push(OsString::from(v));
                 }
                 i += 2;
             }
-            // Combined -fFILE / -CDIR.
-            _ if a.starts_with("-f") || a.starts_with("-C") => {
+            // Combined -fFILE / -CDIR / -IDIR.
+            _ if a.starts_with("-f") || a.starts_with("-C") || a.starts_with("-I") => {
                 out.push(OsString::from(a));
                 i += 1;
+            }
+            // --include-dir=DIR (GNU make long form of -I).
+            _ if a.starts_with("--include-dir") => {
+                out.push(OsString::from(a));
+                if a == "--include-dir" {
+                    if let Some(v) = argv.get(i + 1) {
+                        out.push(OsString::from(v));
+                    }
+                    i += 2;
+                } else {
+                    i += 1;
+                }
             }
             // -jN parallelism: kati parses -j (used only to seed $(MAKE)); n2 runs
             // serial anyway under the in-process executor. Pass numeric forms.
@@ -96,10 +106,12 @@ fn kati_argv(argv: &[String]) -> Result<Vec<OsString>, String> {
                 out.push(OsString::from(a));
                 i += 1;
             }
-            // -s silent / -k keep-going-ish flags kati doesn't model: drop quietly
-            // is WRONG per D9. We accept the handful kati's flags.rs knows (-s),
-            // and refuse anything else that looks like an unknown dash-flag.
-            "-s" => {
+            // Short flags kati's flags.rs knows or that we handle above.
+            // -s silent, -r no-builtin-rules, -R no-builtin-variables,
+            // -w print-directory, -k keep-going (currently no-op in kati
+            // but accepted so the kernel's MAKEFLAGS-inherited flags don't
+            // error), -n/-i dry-run. Refuse anything else.
+            "-s" | "-r" | "-R" | "-w" | "-k" | "-n" | "-i" => {
                 out.push(OsString::from(a));
                 i += 1;
             }
@@ -132,11 +144,15 @@ fn kati_argv(argv: &[String]) -> Result<Vec<OsString>, String> {
 fn read_bootstrap_makefile(
     targets: &[Symbol],
     working_dir: &std::path::Path,
+    no_builtin_rules: bool,
+    no_builtin_variables: bool,
 ) -> anyhow::Result<Arc<Mutex<Vec<kati::stmt::Stmt>>>> {
     let mut bootstrap = BytesMut::new();
-    bootstrap.put_slice(b"CC?=cc\n");
-    bootstrap.put_slice(b"CXX?=g++\n");
-    bootstrap.put_slice(b"AR?=ar\n");
+    if !no_builtin_variables {
+        bootstrap.put_slice(b"CC?=cc\n");
+        bootstrap.put_slice(b"CXX?=g++\n");
+        bootstrap.put_slice(b"AR?=ar\n");
+    }
     // sarun: report GNU make 4.3 (matches our compat target); Makefiles
     // gated on `ifeq ($(MAKE_VERSION),4.x)` see what they expect.
     bootstrap.put_slice(b"MAKE_VERSION?=4.3\n");
@@ -152,7 +168,7 @@ fn read_bootstrap_makefile(
     }
     bootstrap.put_slice(b"KATI?=ckati\n");
     bootstrap.put_slice(b"SHELL=/bin/sh\n");
-    if !FLAGS.no_builtin_rules {
+    if !no_builtin_rules {
         bootstrap.put_slice(b".c.o:\n");
         bootstrap.put_slice(b"\t$(CC) $(CFLAGS) $(CPPFLAGS) $(TARGET_ARCH) -c -o $@ $<\n");
         bootstrap.put_slice(b".cc.o:\n");
@@ -206,6 +222,9 @@ fn run_kati(
     // variables here — many makes share one engine process, so that would mix
     // their environments.
     seed_env: &[(std::ffi::OsString, std::ffi::OsString)],
+    include_dirs: &[OsString],
+    no_builtin_rules: bool,
+    no_builtin_variables: bool,
 ) -> anyhow::Result<RunKatiResult> {
     let mut ev = Evaluator::new();
     // sarun: the Evaluator seeds working_dir from the process cwd; override it
@@ -213,6 +232,10 @@ fn run_kati(
     // process cwd; for the in-process builtin it's the make's dir resolved from
     // -C against the brush context's cwd (no process chdir).
     ev.working_dir = working_dir.to_path_buf();
+    ev.include_dirs = include_dirs.iter().map(|d| {
+        let p = std::path::Path::new(d);
+        if p.is_absolute() { p.to_path_buf() } else { working_dir.join(p) }
+    }).collect();
     ev.start()?;
 
     // sarun: GNU make's MAKEFILE_LIST has no leading space — the main
@@ -259,7 +282,7 @@ fn run_kati(
         )?;
     }
 
-    let bootstrap_asts = read_bootstrap_makefile(targets, working_dir)?;
+    let bootstrap_asts = read_bootstrap_makefile(targets, working_dir, no_builtin_rules, no_builtin_variables)?;
     // sarun: this make's MAKELEVEL is whatever the seed env carried; a
     // recipe-spawned sub-make must see the NEXT level. We don't bump the process
     // env (that's a shared global write across concurrent in-process makes) —
@@ -718,13 +741,14 @@ pub fn make_main(argv: &[String]) -> i32 {
     //    corpus tests.
     let targets: Vec<Symbol> = flags.targets.clone();
     let cl_vars: Vec<bytes::Bytes> = flags.cl_vars.clone();
+    let include_dirs: Vec<OsString> = flags.include_dirs.clone();
     // sarun: shadow/main() path — working dir is the process cwd (already
     // chdir'd for -C above), so this matches the Evaluator's own default.
     let shadow_cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
     // Shadow/main() path is one OS process per make — seed from the process env.
     let seed_env: Vec<(std::ffi::OsString, std::ffi::OsString)> =
         std::env::vars_os().collect();
-    let run_result = match run_kati(&targets, &cl_vars, &makefile, &shadow_cwd, &seed_env) {
+    let run_result = match run_kati(&targets, &cl_vars, &makefile, &shadow_cwd, &seed_env, &include_dirs, flags.no_builtin_rules, flags.no_builtin_variables) {
         Ok(r) => r,
         Err(e) => {
             // Recipe failure already printed its `*** [target] Error N`; just
@@ -878,6 +902,7 @@ pub fn make_builtin(
 
     let targets: Vec<Symbol> = flags.targets.clone();
     let cl_vars: Vec<bytes::Bytes> = flags.cl_vars.clone();
+    let include_dirs: Vec<OsString> = flags.include_dirs.clone();
 
     // Each `$(MAKE)` is logically a fresh make PROCESS — it must see the current
     // filesystem, not a snapshot another make took earlier. But unlike the
@@ -903,7 +928,7 @@ pub fn make_builtin(
     // generated content visible, but a builtin can't re-exec the brush process.
     // Instead we drop the makefile cache (so the regenerated include is re-read)
     // and re-run kati, up to a small cap — matching SARUN_KATI_REMAKE_DEPTH.
-    let mut result = run_kati(&targets, &cl_vars, &makefile, &working_dir, seed_env);
+    let mut result = run_kati(&targets, &cl_vars, &makefile, &working_dir, seed_env, &include_dirs, flags.no_builtin_rules, flags.no_builtin_variables);
     let mut remake_depth = 0u32;
     while matches!(&result, Ok(r) if r.remake_active) && remake_depth < 5 {
         remake_depth += 1;
@@ -914,7 +939,7 @@ pub fn make_builtin(
         // forever).
         kati::file_cache::clear();
         kati::fileutil::clear_glob_cache();
-        result = run_kati(&targets, &cl_vars, &makefile, &working_dir, seed_env);
+        result = run_kati(&targets, &cl_vars, &makefile, &working_dir, seed_env, &include_dirs, flags.no_builtin_rules, flags.no_builtin_variables);
     }
 
     kati::exec::set_recipe_out(prev_out);
