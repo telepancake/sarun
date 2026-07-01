@@ -168,6 +168,19 @@ fn read_bootstrap_makefile(
     }
     bootstrap.put_slice(b"KATI?=ckati\n");
     bootstrap.put_slice(b"SHELL=/bin/sh\n");
+    // sarun: GNU make 4.x advertises its optional features via the special
+    // .FEATURES var; e.g. the Linux kernel's top Makefile gates on
+    // `$(filter undefine,$(.FEATURES))` and bails out with "GNU Make >= 3.82
+    // is required" if it's empty. Kati implements (or accepts as syntax)
+    // each of these — undefine directive, target-specific vars, .ONESHELL,
+    // .SECONDEXPANSION, .DELETE_ON_ERROR, else-if, shortest-stem pattern
+    // matching, order-only prerequisites — so advertise them; anything kati
+    // doesn't actually implement would surface as its own visible error
+    // elsewhere, not silently no-op because of a missing .FEATURES token.
+    bootstrap.put_slice(
+        b".FEATURES?=target-specific order-only second-expansion else-if \
+          shortest-stem undefine oneshell\n",
+    );
     if !no_builtin_rules {
         bootstrap.put_slice(b".c.o:\n");
         bootstrap.put_slice(b"\t$(CC) $(CFLAGS) $(CPPFLAGS) $(TARGET_ARCH) -c -o $@ $<\n");
@@ -225,6 +238,13 @@ fn run_kati(
     include_dirs: &[OsString],
     no_builtin_rules: bool,
     no_builtin_variables: bool,
+    // sarun: the long-form (`--foo`) flags this make was invoked with, verbatim
+    // (see extract_long_flags). GNU make reflects command-line flags into
+    // $(MAKEFLAGS) so a Makefile can detect them (e.g. the kernel top Makefile's
+    // `$(filter --no-print-directory,$(MAKEFLAGS))` __sub-make guard). Kati
+    // doesn't do this automatically — without it that filter never matches and
+    // a self-recursing `$(MAKE)` rule spins forever.
+    cmdline_flags: &[OsString],
 ) -> anyhow::Result<RunKatiResult> {
     let mut ev = Evaluator::new();
     // sarun: the Evaluator seeds working_dir from the process cwd; override it
@@ -271,15 +291,33 @@ fn run_kati(
     // value so $(MAKEFLAGS) — and any sub-make that inherits it — sees the
     // jobserver. This is the one var that legitimately rides std::env (the
     // jobserver's existing design); a single read of a near-constant value.
-    if let Some(mf) = std::env::var_os("MAKEFLAGS") {
-        let v = bytes::Bytes::from(mf.as_bytes().to_vec());
-        let val = Arc::new(Value::Literal(None, v.clone()));
-        ev.set_global_var(
-            intern(b"MAKEFLAGS".to_vec()),
-            Variable::new_recursive(val, VarOrigin::Environment, Some(ev.current_frame()), None, v),
-            false,
-            None,
-        )?;
+    //
+    // sarun: also fold in this invocation's own long-form command-line flags
+    // (cmdline_flags), the way GNU make reflects argv into MAKEFLAGS for
+    // Makefiles that inspect it (see the cmdline_flags doc comment on
+    // run_kati). Without this, a Makefile's `$(filter --foo,$(MAKEFLAGS))`
+    // guard never matches even though --foo was passed on the command line.
+    {
+        let mut mf = BytesMut::new();
+        if let Some(env_mf) = std::env::var_os("MAKEFLAGS") {
+            mf.put_slice(env_mf.as_bytes());
+        }
+        for f in cmdline_flags {
+            if !mf.is_empty() {
+                mf.put_u8(b' ');
+            }
+            mf.put_slice(f.as_bytes());
+        }
+        if !mf.is_empty() {
+            let v = mf.freeze();
+            let val = Arc::new(Value::Literal(None, v.clone()));
+            ev.set_global_var(
+                intern(b"MAKEFLAGS".to_vec()),
+                Variable::new_recursive(val, VarOrigin::Environment, Some(ev.current_frame()), None, v),
+                false,
+                None,
+            )?;
+        }
     }
 
     let bootstrap_asts = read_bootstrap_makefile(targets, working_dir, no_builtin_rules, no_builtin_variables)?;
@@ -564,6 +602,15 @@ fn emit_build_edges_kati(roots: &[NamedDepNode]) {
     crate::runner::send_nested_prov(format!("{msg}\n").as_bytes());
 }
 
+/// The long-form (`--foo`, `--foo=bar`) flags from a make invocation's
+/// ORIGINAL argv, in order — used to fold this make's own command-line flags
+/// into $(MAKEFLAGS) (see run_kati's cmdline_flags doc comment). Deliberately
+/// reads the caller's real argv, not the synthesized kati_argv() (which
+/// injects `--ninja`, a sarun-internal detail no Makefile should observe).
+fn extract_long_flags(argv: &[String]) -> Vec<OsString> {
+    argv.iter().skip(1).filter(|a| a.starts_with("--")).map(OsString::from).collect()
+}
+
 /// Install brush as kati's in-process recipe runner so kati::exec::exec runs
 /// every recipe IN-PROCESS via embedded brush (NO fork+exec of /bin/sh per
 /// recipe). Merged stdout+stderr flow through brush's pipe machinery to the
@@ -748,7 +795,8 @@ pub fn make_main(argv: &[String]) -> i32 {
     // Shadow/main() path is one OS process per make — seed from the process env.
     let seed_env: Vec<(std::ffi::OsString, std::ffi::OsString)> =
         std::env::vars_os().collect();
-    let run_result = match run_kati(&targets, &cl_vars, &makefile, &shadow_cwd, &seed_env, &include_dirs, flags.no_builtin_rules, flags.no_builtin_variables) {
+    let cmdline_flags = extract_long_flags(argv);
+    let run_result = match run_kati(&targets, &cl_vars, &makefile, &shadow_cwd, &seed_env, &include_dirs, flags.no_builtin_rules, flags.no_builtin_variables, &cmdline_flags) {
         Ok(r) => r,
         Err(e) => {
             // Recipe failure already printed its `*** [target] Error N`; just
@@ -928,7 +976,8 @@ pub fn make_builtin(
     // generated content visible, but a builtin can't re-exec the brush process.
     // Instead we drop the makefile cache (so the regenerated include is re-read)
     // and re-run kati, up to a small cap — matching SARUN_KATI_REMAKE_DEPTH.
-    let mut result = run_kati(&targets, &cl_vars, &makefile, &working_dir, seed_env, &include_dirs, flags.no_builtin_rules, flags.no_builtin_variables);
+    let cmdline_flags = extract_long_flags(argv);
+    let mut result = run_kati(&targets, &cl_vars, &makefile, &working_dir, seed_env, &include_dirs, flags.no_builtin_rules, flags.no_builtin_variables, &cmdline_flags);
     let mut remake_depth = 0u32;
     while matches!(&result, Ok(r) if r.remake_active) && remake_depth < 5 {
         remake_depth += 1;
@@ -939,7 +988,7 @@ pub fn make_builtin(
         // forever).
         kati::file_cache::clear();
         kati::fileutil::clear_glob_cache();
-        result = run_kati(&targets, &cl_vars, &makefile, &working_dir, seed_env, &include_dirs, flags.no_builtin_rules, flags.no_builtin_variables);
+        result = run_kati(&targets, &cl_vars, &makefile, &working_dir, seed_env, &include_dirs, flags.no_builtin_rules, flags.no_builtin_variables, &cmdline_flags);
     }
 
     kati::exec::set_recipe_out(prev_out);

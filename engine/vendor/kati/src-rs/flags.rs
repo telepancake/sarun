@@ -199,6 +199,12 @@ impl Flags {
                 b"-r" => flags.no_builtin_rules = true,
                 b"-R" => flags.no_builtin_variables = true,
                 b"-w" | b"-k" | b"-n" => {} // accepted, semantically no-op in kati
+                // sarun: GNU make's long forms of -w/its inverse. The kernel's
+                // top Makefile passes --no-print-directory to every sub-make
+                // (see the __sub-make dance around MAKEFLAGS); without an
+                // accepted arm here kati's catch-all below panics with
+                // "Unknown flag" on the very first recursive invocation.
+                b"--print-directory" | b"--no-print-directory" => {}
                 b"-d" => flags.enable_debug = true,
                 b"--kati_stats" => flags.enable_stat_logs = true,
                 b"--warn" => flags.enable_kati_warnings = true,
