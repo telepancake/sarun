@@ -1451,9 +1451,13 @@ impl App {
             }
             Err(e) => { self.status = format!("view.open pipelines: {e}"); return; }
         }
-        let tail_start = self.pipelines_total.saturating_sub(WINDOW_SIZE);
-        self.fetch_pipelines_window(tail_start);
-        self.sel_pipeline = self.pipelines.len().saturating_sub(1);
+        if self.f_pipelines.on {
+            self.fetch_pipelines_window(0);
+        } else {
+            let tail_start = self.pipelines_total.saturating_sub(WINDOW_SIZE);
+            self.fetch_pipelines_window(tail_start);
+            self.sel_pipeline = self.pipelines.len().saturating_sub(1);
+        }
     }
 
     fn load_pipelines_if_needed(&mut self) {
@@ -1564,9 +1568,13 @@ impl App {
             }
             Err(e) => { self.status = format!("view.open build_edges: {e}"); return; }
         }
-        let tail_start = self.edges_total.saturating_sub(WINDOW_SIZE);
-        self.fetch_edges_window(tail_start);
-        self.sel_edge = self.build_edges.len().saturating_sub(1);
+        if self.f_edges.on {
+            self.fetch_edges_window(0);
+        } else {
+            let tail_start = self.edges_total.saturating_sub(WINDOW_SIZE);
+            self.fetch_edges_window(tail_start);
+            self.sel_edge = self.build_edges.len().saturating_sub(1);
+        }
     }
 
     fn load_edges_if_needed(&mut self) {
@@ -2976,15 +2984,10 @@ impl App {
                 let o = self.visible_outputs();
                 let row = o.get(self.sel_output)?;
                 let pid = row.get("process_id").and_then(Value::as_i64)?;
-                for pl in &self.pipelines_flat {
-                    if let Some(procs) = pl.get("processes").and_then(Value::as_array) {
-                        if procs.iter().any(|p| p.as_i64() == Some(pid)) {
-                            let plid = pl.get("id").and_then(Value::as_i64)?;
-                            return Some(vec![plid]);
-                        }
-                    }
-                }
-                None
+                let sid = self.cur_sid()?;
+                let pl = rpc(&self.sock, "proc_pipeline", json!([sid, pid])).ok()?;
+                let plid = pl.get("id").and_then(Value::as_i64)?;
+                Some(vec![plid])
             }
             (FilterView::Pipelines, FilterView::Outputs) | (FilterView::Pipelines, FilterView::Procs) => {
                 let row = self.pipelines.get(self.sel_pipeline)?;
