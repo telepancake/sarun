@@ -1836,18 +1836,16 @@ fn send_pipeline_done(uids: &[u64], code: i32, done_ts: f64) {
     crate::runner::send_nested_prov(format!("{msg}\n").as_bytes());
 }
 
-/// Send captured stderr from a $(shell) recipe through the control channel,
-/// bypassing the FUSE/pty path entirely. The engine resolves the brushprov row
-/// from the uids and inserts the output with the correct pipeline attribution.
-fn send_recipe_stderr(content: &[u8], uids: &[u64]) {
-    if content.is_empty() { return; }
-    use base64::Engine as _;
-    let b64 = base64::engine::general_purpose::STANDARD.encode(content);
+/// After a $(shell) recipe finishes, fix the attribution on output rows the
+/// FUSE handler captured with the wrong (racy) brush_pipeline_id. The stderr
+/// flowed through fd 2 → FUSE normally for live backread; this message tells
+/// the engine to UPDATE those rows' brush_pipeline_id to the correct value.
+fn send_recipe_fixup(uids: &[u64], start_ts: f64) {
+    if uids.is_empty() { return; }
     let msg = json!({
-        "type": "recipe_stderr",
-        "content": b64,
+        "type": "recipe_fixup",
         "uids": uids,
-        "stream": 2
+        "start_ts": start_ts
     });
     crate::runner::send_nested_prov(format!("{msg}\n").as_bytes());
 }
@@ -2589,20 +2587,8 @@ pub fn run_recipe_in_process_opt(
         Ok(p) => p,
         Err(e) => { output_cb(format!("sarun-engine n2: pipe: {e}\n").as_bytes()); return 127; }
     };
-    // Separate pipe for stderr when Inherit: capture it here instead of
-    // letting it go through the FUSE/pty sink (which races with
-    // cur_brush_pipeline). After the recipe thread joins, the captured
-    // bytes are sent through the control channel (recipe_stderr) with
-    // the pipeline uids, so the engine inserts them with the correct
-    // brush_pipeline_id — no pty race.
-    let (stderr_reader, stderr_writer) = if matches!(stderr, RecipeStderr::Inherit) {
-        match std::io::pipe() {
-            Ok((r, w)) => (Some(r), Some(w)),
-            Err(_) => (None, None),
-        }
-    } else {
-        (None, None)
-    };
+    let recipe_start_ts = now_secs();
+    let is_inherit = matches!(stderr, RecipeStderr::Inherit);
 
     let cwd = BOX_RECIPE_CWD
         .with(|c| c.borrow().clone())
@@ -2640,9 +2626,10 @@ pub fn run_recipe_in_process_opt(
                     shell.open_files_mut().set_fd(2, brush_core::openfiles::OpenFile::from(w2));
                 }
                 RecipeStderr::Inherit => {
-                    if let Some(ew) = stderr_writer {
-                        shell.open_files_mut().set_fd(2, brush_core::openfiles::OpenFile::from(ew));
-                    }
+                    // Leave fd 2 on the shell default (box's real fd 2 = FUSE
+                    // stderr sink). Stderr flows through the existing capture
+                    // path for live backread. Attribution is fixed retroactively
+                    // after the recipe finishes (send_recipe_fixup).
                 }
                 RecipeStderr::Null => {
                     if let Ok(devnull) = std::fs::OpenOptions::new().write(true).open("/dev/null") {
@@ -2697,12 +2684,8 @@ pub fn run_recipe_in_process_opt(
         emit_bash_compat(&line_buf, output_cb);
     }
     let (code, uids) = exec.join().unwrap_or((127, vec![]));
-    if let Some(mut er) = stderr_reader {
-        let mut ebuf = Vec::new();
-        let _ = std::io::Read::read_to_end(&mut er, &mut ebuf);
-        if !ebuf.is_empty() {
-            send_recipe_stderr(&ebuf, &uids);
-        }
+    if is_inherit && !uids.is_empty() {
+        send_recipe_fixup(&uids, recipe_start_ts);
     }
     code
 }

@@ -992,20 +992,17 @@ impl BoxState {
                               if pipeline > 0 { Some(pipeline) } else { None::<i64> }]);
     }
 
-    /// Insert output with an explicit pipeline id (bypassing cur_brush_pipeline).
-    /// Used by the recipe_stderr control path: stderr captured from a $(shell)
-    /// recipe is sent through the control channel with the pipeline's uid; the
-    /// handler resolves the brushprov row id and calls this.
-    pub fn add_output_attributed(&self, stream: i32, content: &[u8], pipeline_id: i64) {
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs_f64()).unwrap_or(0.0);
+    /// Retroactively fix brush_pipeline_id on stderr output rows captured by the
+    /// FUSE handler during a $(shell) recipe. The FUSE path wrote these rows with
+    /// whatever cur_brush_pipeline was set at the time (racy); this stamps them
+    /// with the correct pipeline. Scoped by timestamp (recipe start → now) and
+    /// stream=1 (stderr).
+    pub fn fixup_output_attribution(&self, start_ts: f64, pipeline_id: i64) {
         let conn = self.conn.lock().unwrap();
         let _ = conn.execute(
-            "INSERT INTO outputs(ts,process_id,stream,content,brush_pipeline_id) \
-             VALUES(?1,NULL,?2,?3,?4)",
-            rusqlite::params![ts, stream, content,
-                              if pipeline_id > 0 { Some(pipeline_id) } else { None::<i64> }]);
+            "UPDATE outputs SET brush_pipeline_id=?1 \
+             WHERE ts >= ?2 AND stream = 1 AND brush_pipeline_id IS NOT ?1",
+            rusqlite::params![pipeline_id, start_ts]);
     }
 
     /// Look up the brushprov row id for a given uid. Returns 0 if not found.

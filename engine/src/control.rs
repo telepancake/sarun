@@ -293,28 +293,20 @@ fn brush_prov_done(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value
     json!({"ok": true})
 }
 
-/// Recipe stderr: captured stderr bytes from a $(shell) recipe, sent through the
-/// control channel with the pipeline uids so we can attribute the output to the
-/// correct brushprov row. The box-side captures stderr into a pipe (instead of
-/// letting it go through the FUSE/pty path which races with cur_brush_pipeline),
-/// then sends it here after the recipe thread joins. One-shot control reply.
-fn recipe_stderr(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
+/// Recipe fixup: after a $(shell) recipe finishes, the box sends the pipeline
+/// uids and the recipe's start timestamp. We retroactively fix the
+/// brush_pipeline_id on stderr output rows that the FUSE handler captured
+/// during the recipe with a wrong (racy) attribution. The stderr flowed
+/// through fd 2 normally for live backread — this just fixes the DB linkage.
+fn recipe_fixup(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
     let host_pid = peer_pidfd.map(host_pid_from_pidfd).filter(|p| *p > 0).unwrap_or(0);
     if let Some(fd) = peer_pidfd { unsafe { libc::close(fd); } }
     let Some(id) = derive_parent_box(state, host_pid) else {
         return json!({"ok": false, "error": "no enclosing box"});
     };
-    let content_b64 = msg.get("content").and_then(Value::as_str).unwrap_or("");
-    let content = match base64::engine::general_purpose::STANDARD.decode(content_b64) {
-        Ok(c) => c,
-        Err(_) => return json!({"ok": false, "error": "bad base64"}),
-    };
-    if content.is_empty() {
-        return json!({"ok": true});
-    }
     let uids: Vec<i64> = msg.get("uids").and_then(Value::as_array)
         .map(|a| a.iter().filter_map(Value::as_i64).collect()).unwrap_or_default();
-    let stream = msg.get("stream").and_then(Value::as_i64).unwrap_or(2) as i32;
+    let start_ts = msg.get("start_ts").and_then(Value::as_f64).unwrap_or(0.0);
     let ov = lock(state).overlay.clone();
     if let Some(ov) = ov.as_ref() {
         if let Some(b) = ov.live_box(id) {
@@ -322,7 +314,9 @@ fn recipe_stderr(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
                 .map(|u| b.brushprov_id_for_uid(*u))
                 .find(|id| *id > 0)
                 .unwrap_or(0);
-            b.add_output_attributed(stream, &content, pipeline_id);
+            if pipeline_id > 0 {
+                b.fixup_output_attribution(start_ts, pipeline_id);
+            }
         }
     }
     json!({"ok": true})
@@ -2059,8 +2053,8 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
             // brush_prov_nested) so we resolve the box, then stamp done_ts +
             // exit_code on the matching brushprov rows (by uid).
             brush_prov_done(&state, &msg, peer_pidfd.take())
-        } else if msg.get("type").and_then(Value::as_str) == Some("recipe_stderr") {
-            recipe_stderr(&state, &msg, peer_pidfd.take())
+        } else if msg.get("type").and_then(Value::as_str) == Some("recipe_fixup") {
+            recipe_fixup(&state, &msg, peer_pidfd.take())
         } else if msg.get("type").and_then(Value::as_str) == Some("build_edges") {
             // Phase 1 embedded-ninja: a one-shot control message from the
             // shadowed `ninja` (vendored n2) carrying its OWN pidfd, resolved to
