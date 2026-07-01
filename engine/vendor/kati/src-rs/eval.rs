@@ -1104,7 +1104,24 @@ impl Evaluator {
                             Ok(v) => !v.is_empty(),
                         };
                         if found {
-                            files = try_files;
+                            // glob() strips the base prefix, returning
+                            // relative paths. Resolve them against the
+                            // include_dir so do_include opens the right file
+                            // (not working_dir).
+                            let idir_bytes = idir.as_os_str().as_bytes();
+                            if let Ok(v) = try_files.as_ref() {
+                                files = std::sync::Arc::new(Ok(v.iter()
+                                    .map(|f| {
+                                        let mut abs = bytes::BytesMut::with_capacity(
+                                            idir_bytes.len() + 1 + f.len(),
+                                        );
+                                        abs.extend_from_slice(idir_bytes);
+                                        abs.extend_from_slice(b"/");
+                                        abs.extend_from_slice(f);
+                                        abs.freeze()
+                                    })
+                                    .collect()));
+                            }
                             break;
                         }
                     }
