@@ -401,21 +401,36 @@ pub fn build_edges(box_id: i64) -> Value {
 /// D9 brush↔process linkage, process→pipeline direction: the brushprov pipeline
 /// row that spawned process `row_id` (its exact cmd + parsed structure), or Null
 /// if that process was not spawned by a brush pipeline (or the box isn't -b).
+/// Walks up the process tree (parent_id) when the direct process lacks a
+/// brush_pipeline_id — output writers are often grandchildren of the pipeline
+/// command (e.g. `rm` forked by a shell forked by make).
 pub fn proc_pipeline(box_id: i64, row_id: i64) -> Value {
     let Some(c) = open_ro(box_id) else { return Value::Null };
-    c.query_row(
-        "SELECT bp.id,bp.ts,bp.cmd,bp.record,bp.pipeline \
-         FROM process p JOIN brushprov bp ON p.brush_pipeline_id=bp.id \
-         WHERE p.id=?1",
-        [row_id], |r| {
-            let rec: String = r.get(3)?;
-            Ok(json!({
-                "id": r.get::<_, i64>(0)?, "ts": r.get::<_, f64>(1)?,
-                "cmd": r.get::<_, String>(2)?,
-                "record": serde_json::from_str::<Value>(&rec).unwrap_or(Value::Null),
-                "pipeline": r.get::<_, Option<i64>>(4)?,
-            }))
-        }).unwrap_or(Value::Null)
+    let mut cur = row_id;
+    for _ in 0..64 {
+        if let Ok(v) = c.query_row(
+            "SELECT bp.id,bp.ts,bp.cmd,bp.record,bp.pipeline \
+             FROM process p JOIN brushprov bp ON p.brush_pipeline_id=bp.id \
+             WHERE p.id=?1",
+            [cur], |r| {
+                let rec: String = r.get(3)?;
+                Ok(json!({
+                    "id": r.get::<_, i64>(0)?, "ts": r.get::<_, f64>(1)?,
+                    "cmd": r.get::<_, String>(2)?,
+                    "record": serde_json::from_str::<Value>(&rec).unwrap_or(Value::Null),
+                    "pipeline": r.get::<_, Option<i64>>(4)?,
+                }))
+            }) {
+            return v;
+        }
+        match c.query_row(
+            "SELECT parent_id FROM process WHERE id=?1", [cur],
+            |r| r.get::<_, Option<i64>>(0)) {
+            Ok(Some(pid)) if pid != cur => cur = pid,
+            _ => break,
+        }
+    }
+    Value::Null
 }
 
 /// D9 brush↔process linkage, pipeline→processes direction: the process row ids

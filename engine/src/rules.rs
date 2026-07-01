@@ -129,6 +129,22 @@ pub fn glob_match(pat: &str, s: &str) -> bool {
     glob::globmatch(pat, s)
 }
 
+/// Glob a command string. A bare pattern without glob metacharacters is wrapped
+/// in `*...*` so that e.g. `rm` matches `rm -rf /foo`. A pattern that already
+/// contains `*`, `?`, `[`, or `{` is used as-is.
+pub fn cmd_match(pat: &str, s: &str) -> bool {
+    let pat = pat.trim();
+    if pat.is_empty() { return false; }
+    let has_glob = pat.contains('*') || pat.contains('?')
+                || pat.contains('[') || pat.contains('{');
+    if has_glob {
+        glob::globmatch(pat, s)
+    } else {
+        let wrapped = format!("*{pat}*");
+        glob::globmatch(&wrapped, s)
+    }
+}
+
 /// Glob a change's ABSOLUTE path. A bare/relative pattern matches at any depth
 /// (`**/` prefix); a leading `/` anchors at the root. Mirrors `_path_match`.
 pub fn path_match(pat: &str, rel: &str) -> bool {
@@ -222,7 +238,7 @@ impl Target for PipelineFilterTarget {
     fn match_one(&self, m: &Match) -> bool {
         match m.kind.as_str() {
             "ids" => ids_of(&m.pattern).contains(&self.row_id),
-            "cmd" => glob_match(&m.pattern, &self.cmd),
+            "cmd" => cmd_match(&m.pattern, &self.cmd),
             _ => false,
         }
     }
@@ -239,7 +255,7 @@ impl Target for EdgeFilterTarget {
         match m.kind.as_str() {
             "ids" => ids_of(&m.pattern).contains(&self.row_id),
             "target" => self.targets.iter().any(|t| path_match(&m.pattern, t)),
-            "cmd" => glob_match(&m.pattern, &self.cmd),
+            "cmd" => cmd_match(&m.pattern, &self.cmd),
             _ => false,
         }
     }
