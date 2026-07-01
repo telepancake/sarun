@@ -1451,7 +1451,8 @@ impl App {
             }
             Err(e) => { self.status = format!("view.open pipelines: {e}"); return; }
         }
-        self.fetch_pipelines_window(0);
+        let tail_start = self.pipelines_total.saturating_sub(WINDOW_SIZE);
+        self.fetch_pipelines_window(tail_start);
         self.sel_pipeline = self.pipelines.len().saturating_sub(1);
     }
 
@@ -1563,7 +1564,8 @@ impl App {
             }
             Err(e) => { self.status = format!("view.open build_edges: {e}"); return; }
         }
-        self.fetch_edges_window(0);
+        let tail_start = self.edges_total.saturating_sub(WINDOW_SIZE);
+        self.fetch_edges_window(tail_start);
         self.sel_edge = self.build_edges.len().saturating_sub(1);
     }
 
@@ -1766,6 +1768,81 @@ impl App {
             }
             // connector: keep stepping in the same direction.
         }
+    }
+
+    fn move_pipeline_cursor(&mut self, delta: isize) {
+        if self.pipelines_total == 0 { return; }
+        let step: isize = if delta > 0 { 1 } else { -1 };
+        let mut global = self.pipelines_window_start + self.sel_pipeline;
+        let new_global = global as isize + step;
+        if new_global < 0 || new_global as usize >= self.pipelines_total {
+            return;
+        }
+        global = new_global as usize;
+        let win_end = self.pipelines_window_start + self.pipelines.len();
+        if global < self.pipelines_window_start || global >= win_end {
+            let quarter = WINDOW_SIZE / 4;
+            let new_start = global.saturating_sub(
+                if step > 0 { quarter } else { WINDOW_SIZE - quarter });
+            self.fetch_pipelines_window(new_start);
+        }
+        self.sel_pipeline = global.saturating_sub(self.pipelines_window_start);
+    }
+
+    fn move_edge_cursor(&mut self, delta: isize) {
+        if self.edges_total == 0 { return; }
+        let step: isize = if delta > 0 { 1 } else { -1 };
+        let mut global = self.edges_window_start + self.sel_edge;
+        let new_global = global as isize + step;
+        if new_global < 0 || new_global as usize >= self.edges_total {
+            return;
+        }
+        global = new_global as usize;
+        let win_end = self.edges_window_start + self.build_edges.len();
+        if global < self.edges_window_start || global >= win_end {
+            let quarter = WINDOW_SIZE / 4;
+            let new_start = global.saturating_sub(
+                if step > 0 { quarter } else { WINDOW_SIZE - quarter });
+            self.fetch_edges_window(new_start);
+        }
+        self.sel_edge = global.saturating_sub(self.edges_window_start);
+    }
+
+    fn page_pipeline_cursor(&mut self, delta: isize) {
+        let n = delta.unsigned_abs();
+        let step: isize = if delta > 0 { 1 } else { -1 };
+        for _ in 0..n { self.move_pipeline_cursor(step); }
+    }
+
+    fn page_edge_cursor(&mut self, delta: isize) {
+        let n = delta.unsigned_abs();
+        let step: isize = if delta > 0 { 1 } else { -1 };
+        for _ in 0..n { self.move_edge_cursor(step); }
+    }
+
+    fn move_output_cursor(&mut self, delta: isize) {
+        if self.outputs_total == 0 { return; }
+        let step: isize = if delta > 0 { 1 } else { -1 };
+        let global = self.outputs_window_start + self.sel_output;
+        let new_global = global as isize + step;
+        if new_global < 0 || new_global as usize >= self.outputs_total {
+            return;
+        }
+        let global = new_global as usize;
+        let win_end = self.outputs_window_start + self.outputs.len();
+        if global < self.outputs_window_start || global >= win_end {
+            let quarter = WINDOW_SIZE / 4;
+            let new_start = global.saturating_sub(
+                if step > 0 { quarter } else { WINDOW_SIZE - quarter });
+            self.fetch_outputs_window(new_start);
+        }
+        self.sel_output = global.saturating_sub(self.outputs_window_start);
+    }
+
+    fn page_output_cursor(&mut self, delta: isize) {
+        let n = delta.unsigned_abs();
+        let step: isize = if delta > 0 { 1 } else { -1 };
+        for _ in 0..n { self.move_output_cursor(step); }
     }
 
     /// Load the captured flows for the selected box: one RPC, full list
@@ -2150,26 +2227,14 @@ impl App {
                 }
             }
             Pane::Processes => self.move_proc_cursor(1),
-            Pane::Outputs => {
-                if self.sel_output + 1 < self.outputs.len() {
-                    self.sel_output += 1;
-                }
-            }
+            Pane::Outputs => self.move_output_cursor(1),
             Pane::Rules => {
                 if self.sel_rule + 1 < self.rules.len() {
                     self.sel_rule += 1;
                 }
             }
-            Pane::Pipelines => {
-                if self.sel_pipeline + 1 < self.pipelines.len() {
-                    self.sel_pipeline += 1;
-                }
-            }
-            Pane::BuildEdges => {
-                if self.sel_edge + 1 < self.build_edges.len() {
-                    self.sel_edge += 1;
-                }
-            }
+            Pane::Pipelines => self.move_pipeline_cursor(1),
+            Pane::BuildEdges => self.move_edge_cursor(1),
             Pane::Flows => {
                 if self.sel_flow + 1 < self.flows.len() {
                     self.sel_flow += 1;
@@ -2221,10 +2286,10 @@ impl App {
                 }
             }
             Pane::Processes => self.move_proc_cursor(-1),
-            Pane::Outputs => self.sel_output = self.sel_output.saturating_sub(1),
+            Pane::Outputs => self.move_output_cursor(-1),
             Pane::Rules => self.sel_rule = self.sel_rule.saturating_sub(1),
-            Pane::Pipelines => self.sel_pipeline = self.sel_pipeline.saturating_sub(1),
-            Pane::BuildEdges => self.sel_edge = self.sel_edge.saturating_sub(1),
+            Pane::Pipelines => self.move_pipeline_cursor(-1),
+            Pane::BuildEdges => self.move_edge_cursor(-1),
             Pane::Flows => {
                 if self.sel_flow > 0 {
                     self.sel_flow -= 1;
@@ -2290,30 +2355,15 @@ impl App {
             Pane::Processes => {
                 for _ in 0..n { self.move_proc_cursor(step); }
             }
-            Pane::Outputs => {
-                let total = self.outputs.len();
-                if total == 0 { return; }
-                let cur = self.sel_output as isize;
-                self.sel_output = (cur + delta).clamp(0, total as isize - 1) as usize;
-            }
+            Pane::Outputs => self.page_output_cursor(delta),
             Pane::Rules => {
                 let total = self.rules.len();
                 if total == 0 { return; }
                 let cur = self.sel_rule as isize;
                 self.sel_rule = (cur + delta).clamp(0, total as isize - 1) as usize;
             }
-            Pane::Pipelines => {
-                let total = self.pipelines.len();
-                if total == 0 { return; }
-                let cur = self.sel_pipeline as isize;
-                self.sel_pipeline = (cur + delta).clamp(0, total as isize - 1) as usize;
-            }
-            Pane::BuildEdges => {
-                let total = self.build_edges.len();
-                if total == 0 { return; }
-                let cur = self.sel_edge as isize;
-                self.sel_edge = (cur + delta).clamp(0, total as isize - 1) as usize;
-            }
+            Pane::Pipelines => self.page_pipeline_cursor(delta),
+            Pane::BuildEdges => self.page_edge_cursor(delta),
             Pane::Flows => {
                 let total = self.flows.len();
                 if total == 0 { return; }
