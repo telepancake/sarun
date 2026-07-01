@@ -129,20 +129,34 @@ pub fn glob_match(pat: &str, s: &str) -> bool {
     glob::globmatch(pat, s)
 }
 
+/// True if `pat` contains shell-glob metacharacters (`*`, `?`, `[`, `{`) —
+/// i.e. the caller wrote an actual glob, not a bare literal.
+fn has_glob_meta(pat: &str) -> bool {
+    pat.contains('*') || pat.contains('?') || pat.contains('[') || pat.contains('{')
+}
+
+/// Wrap a bare (no glob metacharacters) pattern in `*...*` so it reads as a
+/// substring search; a pattern that already contains glob syntax is left as
+/// written. Factored out of `cmd_match` so callers that want the same "typed
+/// text = fuzzy substring" UX for a DIFFERENT matcher (e.g. an interactive
+/// path/exe/cwd filter, as opposed to a precise persisted apply/discard rule)
+/// can opt into it without duplicating the glob-detection logic.
+pub fn wrap_bare_as_substring(pat: &str) -> String {
+    let pat = pat.trim();
+    if pat.is_empty() || has_glob_meta(pat) {
+        pat.to_string()
+    } else {
+        format!("*{pat}*")
+    }
+}
+
 /// Glob a command string. A bare pattern without glob metacharacters is wrapped
 /// in `*...*` so that e.g. `rm` matches `rm -rf /foo`. A pattern that already
 /// contains `*`, `?`, `[`, or `{` is used as-is.
 pub fn cmd_match(pat: &str, s: &str) -> bool {
     let pat = pat.trim();
     if pat.is_empty() { return false; }
-    let has_glob = pat.contains('*') || pat.contains('?')
-                || pat.contains('[') || pat.contains('{');
-    if has_glob {
-        glob::globmatch(pat, s)
-    } else {
-        let wrapped = format!("*{pat}*");
-        glob::globmatch(&wrapped, s)
-    }
+    glob::globmatch(&wrap_bare_as_substring(pat), s)
 }
 
 /// Glob a change's ABSOLUTE path. A bare/relative pattern matches at any depth

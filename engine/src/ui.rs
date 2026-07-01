@@ -370,8 +370,26 @@ impl ClauseRow {
         }
     }
     fn to_clause(&self) -> Clause {
+        // The '/' filter is an interactive SEARCH box, not a precise rule
+        // editor (that's the separate RuleForm modal, which writes raw glob
+        // text straight to the persisted .sarunrules and must NOT go through
+        // this wrapping — an apply/discard automation rule has to keep
+        // matching exactly what its author typed). "cmd" already reads as a
+        // substring search via `cmd_match`; "ids" is an internally-generated
+        // comma-list, never user-typed. Every other kind (path/exe/cwd/box/
+        // arg/target) is matched via a precise glob matcher shared with the
+        // real rules engine, so a bare "gzread" would otherwise only match a
+        // file literally named "gzread" — not "gzread.lo" — which is not
+        // what someone typing into a search box expects. Wrap it here, at
+        // the UI boundary, so the precise matcher itself (and real rules)
+        // stay untouched.
+        let pattern = if matches!(self.kind.as_str(), "cmd" | "ids") {
+            self.pattern.trim().to_string()
+        } else {
+            crate::rules::wrap_bare_as_substring(self.pattern.trim())
+        };
         Clause {
-            m: Match { kind: self.kind.clone(), pattern: self.pattern.trim().to_string() },
+            m: Match { kind: self.kind.clone(), pattern },
             join: self.join,
             negate: self.negate,
             enabled: self.enabled,
