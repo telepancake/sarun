@@ -29,13 +29,15 @@ use serde_json::Value;
 use serde_json::json;
 
 use crate::discover;
-use crate::rules::{Clause, Join, Match, PathTarget, ProcFilterTarget, Subject, eval_clauses};
+use crate::rules::{Clause, Join, Match, PathTarget, ProcFilterTarget, PipelineFilterTarget, EdgeFilterTarget, Subject, eval_clauses};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
     Changes,
     Procs,
     Outputs,
+    Pipelines,
+    BuildEdges,
 }
 
 impl Kind {
@@ -44,6 +46,8 @@ impl Kind {
             "changes" => Some(Kind::Changes),
             "procs" => Some(Kind::Procs),
             "outputs" => Some(Kind::Outputs),
+            "pipelines" => Some(Kind::Pipelines),
+            "build_edges" => Some(Kind::BuildEdges),
             _ => None,
         }
     }
@@ -68,6 +72,8 @@ pub enum ViewAux {
     Changes(Vec<Vec<i64>>),    // writer ids per row index
     Procs(Vec<Subject>),       // subject per row index
     Outputs(Vec<Subject>),     // subject per row index
+    Pipelines,                 // filter targets extracted from rows inline
+    BuildEdges,                // filter targets extracted from rows inline
 }
 
 // ── building source rows per kind ────────────────────────────────────────────
@@ -452,6 +458,16 @@ fn build_proc_tree(procs: &[Value], roots: &std::collections::HashSet<i64>, sid:
     out
 }
 
+fn source_pipelines(sid: i64) -> Vec<Value> {
+    let v = discover::brushprov(sid);
+    v.as_array().cloned().unwrap_or_default()
+}
+
+fn source_build_edges(sid: i64) -> Vec<Value> {
+    let v = discover::build_edges(sid);
+    v.as_array().cloned().unwrap_or_default()
+}
+
 // ── filter parsing + application ────────────────────────────────────────────
 
 fn parse_filter(v: &Value) -> Option<Vec<Clause>> {
@@ -511,6 +527,25 @@ fn rebuild_idx(view: &mut View) {
                 if eval_clauses(&t, clauses) { Some(i) } else { None }
             }).collect();
         }
+        (Kind::Pipelines, _) => {
+            view.idx = view.source.iter().enumerate().filter_map(|(i, r)| {
+                let row_id = r.get("id").and_then(Value::as_i64).unwrap_or(-1);
+                let cmd = r.get("cmd").and_then(Value::as_str).unwrap_or("").to_string();
+                let t = PipelineFilterTarget { row_id, cmd };
+                if eval_clauses(&t, clauses) { Some(i) } else { None }
+            }).collect();
+        }
+        (Kind::BuildEdges, _) => {
+            view.idx = view.source.iter().enumerate().filter_map(|(i, r)| {
+                let row_id = r.get("id").and_then(Value::as_i64).unwrap_or(-1);
+                let targets = r.get("outs").and_then(Value::as_array)
+                    .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
+                    .unwrap_or_default();
+                let cmd = r.get("cmd").and_then(Value::as_str).unwrap_or("").to_string();
+                let t = EdgeFilterTarget { row_id, targets, cmd };
+                if eval_clauses(&t, clauses) { Some(i) } else { None }
+            }).collect();
+        }
         // (kind, aux) are constructed in lockstep in `open`, so the cross
         // arms are unreachable — fall back to the unfiltered set defensively.
         _ => view.idx = (0..view.source.len()).collect(),
@@ -538,6 +573,14 @@ pub fn open(reg: &mut Registry, next_id: &mut u64,
         Kind::Outputs => {
             let (s, a) = source_outputs(sid);
             (s, ViewAux::Outputs(a))
+        }
+        Kind::Pipelines => {
+            let s = source_pipelines(sid);
+            (s, ViewAux::Pipelines)
+        }
+        Kind::BuildEdges => {
+            let s = source_build_edges(sid);
+            (s, ViewAux::BuildEdges)
         }
     };
     let filter = parse_filter(filter_v);
