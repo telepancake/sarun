@@ -146,6 +146,7 @@ fn read_bootstrap_makefile(
     working_dir: &std::path::Path,
     no_builtin_rules: bool,
     no_builtin_variables: bool,
+    makelevel: u32,
 ) -> anyhow::Result<Arc<Mutex<Vec<kati::stmt::Stmt>>>> {
     let mut bootstrap = BytesMut::new();
     if !no_builtin_variables {
@@ -156,16 +157,11 @@ fn read_bootstrap_makefile(
     // sarun: report GNU make 4.3 (matches our compat target); Makefiles
     // gated on `ifeq ($(MAKE_VERSION),4.x)` see what they expect.
     bootstrap.put_slice(b"MAKE_VERSION?=4.3\n");
-    // sarun: MAKELEVEL tracks recursion across sub-makes. Initialize
-    // from env (default 0) so $(MAKELEVEL) is defined for the top
-    // makefile; the bump-for-children happens in the recipe-runner.
-    {
-        let level = std::env::var("MAKELEVEL")
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or(0);
-        bootstrap.put_slice(format!("MAKELEVEL:={level}\n").as_bytes());
-    }
+    // sarun: MAKELEVEL tracks recursion across sub-makes. The caller passes
+    // the level from the make's OWN inherited environment (seed_env) — many
+    // in-process makes share one process env, so reading std::env here gave
+    // every nested $(MAKE) level 0.
+    bootstrap.put_slice(format!("MAKELEVEL:={makelevel}\n").as_bytes());
     bootstrap.put_slice(b"KATI?=ckati\n");
     bootstrap.put_slice(b"SHELL=/bin/sh\n");
     // sarun: GNU make 4.x advertises its optional features via the special
@@ -350,19 +346,19 @@ fn run_kati(
         }
     }
 
-    let bootstrap_asts = read_bootstrap_makefile(targets, working_dir, no_builtin_rules, no_builtin_variables)?;
     // sarun: this make's MAKELEVEL is whatever the seed env carried; a
     // recipe-spawned sub-make must see the NEXT level. We don't bump the process
     // env (that's a shared global write across concurrent in-process makes) —
     // the +1 is emitted into the export prefix below so children pick it up
     // through their subshell env.
-    let child_makelevel = seed_env
+    let makelevel = seed_env
         .iter()
         .find(|(k, _)| k == "MAKELEVEL")
         .and_then(|(_, v)| v.to_str())
         .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(0)
-        + 1;
+        .unwrap_or(0);
+    let child_makelevel = makelevel + 1;
+    let bootstrap_asts = read_bootstrap_makefile(targets, working_dir, no_builtin_rules, no_builtin_variables, makelevel)?;
     {
         let _frame = ev.enter(FrameType::Phase, bytes::Bytes::from_static(b"*bootstrap*"), Loc::default());
         ev.in_bootstrap();

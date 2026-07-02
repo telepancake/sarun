@@ -782,6 +782,39 @@ def main():
         check(eo22 == b"script-ran\nrecipe-done\n",
               f"case22: nested sh ran with fresh options under a set -e recipe; "
               f"result.txt={eo22!r} (want b'script-ran\\nrecipe-done\\n')")
+
+        # ── CASE 23: order-only prereq existence probes the make's OWN dir ────
+        # The scheduler skips an order-only prerequisite that already exists —
+        # but it probed the PROCESS cwd, not the make's logical working dir.
+        # In a box every in-process `make -C sub` keeps the engine's cwd, so a
+        # SAME-NAMED file in the box's start dir made the sub-make's order-only
+        # prereq look already-built and it was silently never generated; its
+        # consumer then failed ("not generating needed file" — immediately
+        # under -j, serially whenever no other edge built it). The decoy
+        # gen.txt below sits in the START dir; the real one must be built in
+        # sub/.
+        oo = work / "oo"
+        shutil.rmtree(oo, ignore_errors=True)
+        (oo / "sub").mkdir(parents=True, exist_ok=True)
+        (oo / "gen.txt").write_text("decoy-from-parent\n")
+        (oo / "Makefile").write_text("all:\n\t@$(MAKE) -C sub\n")
+        (oo / "sub/Makefile").write_text(
+            "all: out.txt\n"
+            "out.txt: | gen.txt\n"
+            "\t@cat gen.txt > out.txt\n"
+            "gen.txt:\n"
+            "\t@echo made-in-sub > gen.txt\n")
+        r = subprocess.run(
+            [str(BIN), "run", "-b", "MAKE23", "-C", str(oo), "--", "make"],
+            capture_output=True, text=True, timeout=180)
+        check(r.returncode == 0,
+              f"case23: order-only box exits 0 (got {r.returncode}: "
+              f"{r.stderr[-600:]})")
+        sp23 = latest_sqlar(m)
+        oo23 = m.sqlar_content(sp23, str((oo / "sub/out.txt").resolve()).lstrip("/"))
+        check(oo23 == b"made-in-sub\n",
+              f"case23: order-only prereq built in the sub-make's OWN dir "
+              f"(not skipped for the parent's decoy); out.txt={oo23!r}")
     finally:
         if eng is not None and eng.poll() is None:
             eng.terminate()

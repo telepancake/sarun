@@ -18,6 +18,7 @@ use std::{
     collections::HashMap,
     ffi::OsStr,
     os::unix::ffi::OsStrExt,
+    path::Path,
     sync::Arc,
     time::SystemTime,
 };
@@ -276,8 +277,22 @@ fn run_node_commands(
     // The make's global export prefix (box mode) runs first, then the target's
     // own exported rule vars, then the command. Both are applied to the subshell
     // but never echoed.
-    let mut prefix = req.box_prefix.to_vec();
-    prefix.extend_from_slice(&exports_prefix(&req.exports));
+    //
+    // sarun: ONLY when SHELL is a POSIX sh — the prefix is `export …` shell
+    // text. With a custom SHELL (e.g. the corpus's `SHELL=/usr/bin/printf`),
+    // that text would be pasted into the command handed to the custom program
+    // (visibly corrupting it); GNU make passes exports to such recipes through
+    // the child ENVIRONMENT, which the fork path inherits from the process
+    // anyway.
+    let shell_base = std::path::Path::new(OsStr::from_bytes(shell))
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    let posix_shell = matches!(shell_base, "sh" | "bash" | "dash" | "ash" | "ksh" | "zsh");
+    let mut prefix = if posix_shell { req.box_prefix.to_vec() } else { Vec::new() };
+    if posix_shell {
+        prefix.extend_from_slice(&exports_prefix(&req.exports));
+    }
     let cwd = req.cwd;
     // sarun: report this edge's run-state to the engine so the targets pane can
     // show only the targets currently building (and their wall time). Only edges
@@ -374,7 +389,20 @@ impl<'a> Executor<'a> {
         let mut build_deps: Vec<Symbol> = Vec::new();
         for (_, d) in order {
             let dout = d.lock().output;
-            if std::fs::exists(OsStr::from_bytes(&dout.as_bytes())).unwrap_or(false) {
+            // sarun: resolve the existence probe against the make's logical
+            // working_dir, NOT the process cwd — an in-process sub-make's cwd
+            // differs (`make -C sub` in a box), and a same-named file in the
+            // process cwd made the order-only prerequisite look already-built,
+            // so it was silently never generated (its consumer then failed —
+            // under -j immediately, serially whenever no other edge built it).
+            let dbytes = dout.as_bytes();
+            let dpath = Path::new(OsStr::from_bytes(&dbytes));
+            let dpath = if dpath.is_absolute() {
+                dpath.to_path_buf()
+            } else {
+                self.ce.ev.working_dir.join(dpath)
+            };
+            if std::fs::exists(&dpath).unwrap_or(false) {
                 continue;
             }
             if visiting.contains(&dout) {
