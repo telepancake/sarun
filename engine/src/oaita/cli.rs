@@ -26,7 +26,9 @@ oaita — a resumable OpenAI-compatible chat client (folder-of-turn-files).
 USAGE:
   oaita gen   NAME [--model M] [--base-url URL] [--api-key K] [--capabilities T]
   oaita call  NAME [--tool-context N] [--sarun PATH] [--no-sandbox]
-  oaita run   NAME [--max-steps N] [--depth N] [--inbox] [...common gen flags]
+  oaita run   NAME [--on BOX] [--max-steps N] [--depth N] [...common gen flags]
+              --on BOX: run the session's sandbox ON TOP of an existing box
+              (its files are the agent's world; writes layer above it)
   oaita tail  NAME
   oaita add   NAME [--type ROLE] [--id TURNID] [--from NAME] [--flags F] [--number N]
   oaita where               (print where oaita.toml is looked up)
@@ -82,6 +84,11 @@ struct Parsed {
     /// Internal: sub-agent nesting depth. `ask` (driver.rs::act_script)
     /// passes the bumped value when spawning a child.
     pub depth: Option<u32>,
+    /// `--on BOX`: parent the session's wrapper box onto this existing box
+    /// (dotted session id — same mechanism `oci run` uses to stack a
+    /// container on an image). The agent then works on top of that box's
+    /// files; its writes layer above them, reviewable like any box.
+    pub on: Option<String>,
 }
 
 fn parse(args: &[String]) -> Result<Parsed, String> {
@@ -95,6 +102,7 @@ fn parse(args: &[String]) -> Result<Parsed, String> {
         slug: None, sender: None, flags: String::new(), number: None,
         inbox: false,
         depth: None,
+        on: None,
     };
     let mut it = args.iter().peekable();
     while let Some(a) = it.next() {
@@ -110,6 +118,7 @@ fn parse(args: &[String]) -> Result<Parsed, String> {
                 .ok_or_else(|| "missing N after --max-steps".to_string())?
                 .parse().map_err(|e| format!("--max-steps: {e}"))?),
             "--inbox" => p.inbox = true,
+            "--on" => p.on = it.next().cloned(),
             "--depth" => p.depth = Some(it.next()
                 .ok_or_else(|| "missing N after --depth".to_string())?
                 .parse().map_err(|e| format!("--depth: {e}"))?),
@@ -203,7 +212,14 @@ fn spawn_in_box(p: &Parsed, original_args: &[String]) -> i32 {
     let target = match crate::oaita::turns::target_segment(&p.name) {
         Ok(t) => t, Err(e) => { eprintln!("{e}"); return 2; }
     };
-    let target_box = crate::oaita::exec::box_name(&target);
+    // `--on BOX` parents the wrapper box onto an existing box via a dotted
+    // session id (engine resolves the prefix as the parent — the same
+    // stacking `oci run` uses on image layers).
+    let target_box = match &p.on {
+        Some(parent) => format!("{parent}.{}",
+                                crate::oaita::exec::box_name(&target)),
+        None => crate::oaita::exec::box_name(&target),
+    };
     // Outer `sarun run` runs in the CURRENT context (host, or a parent box):
     // /proc/self/exe in-box, else current_exe(). The `--` payload runs in the
     // NEW box, so it is always /proc/self/exe.

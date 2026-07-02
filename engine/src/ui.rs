@@ -435,6 +435,9 @@ enum Action {
     /// Api pane: run `oaita local` on a PTY — download a tiny tool-capable
     /// model + CPU runtime and serve a local OpenAI-compatible endpoint.
     OaitaLocalPty,
+    /// Launcher / sessions menu: run an oaita agent session whose sandbox
+    /// is parented ON TOP of the selected box (`oaita run --on BOX NAME`).
+    OaitaOnSelectedBox,
 }
 
 /// One editable line of the '/' clause editor (mirrors Python ClauseRow): the
@@ -6800,6 +6803,14 @@ fn open_pty_menu(app: &mut App) {
             hint: "", action: Action::RunSelectedImage,
         });
     }
+    if let Some(name) = app.sessions.get(app.sel_session)
+        .and_then(|r| r.get("name").and_then(Value::as_str))
+    {
+        items.push(ActionItem {
+            label: format!("oaita agent session ON box '{name}'…"),
+            hint: "", action: Action::OaitaOnSelectedBox,
+        });
+    }
     items.push(ActionItem {
         label: "Custom command…".into(),
         hint: "", action: Action::PtyNewCustom,
@@ -7413,6 +7424,8 @@ fn pane_action_menu(app: &App) -> Option<(String, Vec<ActionItem>)> {
                 mk("Discard ALL changes", "x/F8", Action::DiscardBox),
                 mk("Rename box",        "r/F6",   Action::StartRename),
                 mk("New box from image…", "F7",   Action::NewFromImage),
+                mk("oaita agent session on this box…", "",
+                   Action::OaitaOnSelectedBox),
             ];
             // Loaded image boxes additionally offer a container shell.
             if app.oci_images.iter().any(|(n, _)| path.ends_with(n.as_str())) {
@@ -7532,6 +7545,19 @@ fn run_action(app: &mut App, a: Action) {
         }
         Action::OaitaLocalPty  => {
             app.open_pty(vec![self_exe(), "oaita".into(), "local".into()]);
+        }
+        Action::OaitaOnSelectedBox => {
+            // Editable prefill: the user appends the SESSION name (the turn
+            // folder to drive) and Enter runs the agent in a box parented
+            // on the selected box.
+            let name = app.sessions.get(app.sel_session)
+                .and_then(|r| r.get("name").and_then(Value::as_str));
+            match name {
+                Some(n) => app.modal = Some(Modal::PtyCmd {
+                    buf: format!("sarun oaita run --on {n} "),
+                }),
+                None => app.status = "no box selected".into(),
+            }
         }
         Action::PtyKill        => app.pty_kill(),
         Action::PtyEmbedToggle => {
@@ -9388,6 +9414,38 @@ mod tests {
         app.launch_net = (app.launch_net + 1) % NET_MODES.len();
         app.launch_net = (app.launch_net + 1) % NET_MODES.len();
         assert_eq!(NET_MODES[app.launch_net], "tap");
+    }
+
+    /// With a box selected, the launcher (and the sessions menu) offer an
+    /// oaita agent session parented on that box; picking it pre-fills the
+    /// editable `oaita run --on BOX ` command.
+    #[test]
+    fn launcher_offers_oaita_session_on_selected_box() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = headless_app();
+        app.sessions = vec![serde_json::json!({
+            "path": "WORK", "name": "WORK", "session_id": "7",
+        })];
+        open_pty_menu(&mut app);
+        let sel_oaita = match &app.modal {
+            Some(Modal::Launcher { items, .. }) => items.iter()
+                .position(|i| i.label.contains("oaita agent session ON box 'WORK'"))
+                .expect("launcher must offer the oaita-on-box entry"),
+            _ => panic!("launcher expected"),
+        };
+        if let Some(Modal::Launcher { sel, .. }) = app.modal.as_mut() {
+            *sel = sel_oaita;
+        }
+        handle_modal_key(&mut app, KeyCode::Enter, KeyModifiers::empty());
+        let Some(Modal::PtyCmd { buf }) = &app.modal else {
+            panic!("picking the entry must open the editable prompt");
+        };
+        assert_eq!(buf, "sarun oaita run --on WORK ");
+        // the sessions context menu carries the same action
+        app.focus = Pane::Sessions;
+        let (_, items) = pane_action_menu(&app).unwrap();
+        assert!(items.iter().any(|i|
+            matches!(i.action, Action::OaitaOnSelectedBox)));
     }
 
     /// Restricted host (no CLONE_NEWNET): the launcher must not offer a
