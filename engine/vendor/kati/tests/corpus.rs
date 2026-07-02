@@ -485,8 +485,28 @@ fn corpus_pass_rate() {
         );
     }
 
-    // The serial pass never fails the suite by default — its purpose is to print
-    // a number. To enforce a minimum pass rate, set KATI_COMPAT_MIN=N.
+    // sarun: the serial corpus is a HARD gate — every case not marked
+    // `# TODO` must match GNU make byte-for-byte (post-normalization), so a
+    // kati fix pinned by a testcase cannot silently regress. Runs filtered
+    // with KATI_CORPUS_ONLY skip this (a partial run has no meaningful tally).
+    if only.is_none() {
+        assert_eq!(
+            tally.fail, 0,
+            "kati compat regression: {} non-TODO case(s) diverge from GNU make: {:?}",
+            tally.fail, failures
+        );
+        // An unexpected PASS is stale bookkeeping: the case's `# TODO` header
+        // no longer reflects reality, and the behavior it pins could regress
+        // invisibly. Un-TODO the case (or fix the header) to re-arm it.
+        assert_eq!(
+            tally.xfail_unexpected_pass, 0,
+            "stale TODO header(s): {} case(s) now PASS but are still marked \
+             expected-fail — remove their `# TODO` so they're enforced: {:?}",
+            tally.xfail_unexpected_pass, tally.xpass_names
+        );
+    }
+
+    // Optional stricter floor (e.g. CI ratcheting): KATI_COMPAT_MIN=N.
     if let Ok(min) = std::env::var("KATI_COMPAT_MIN") {
         let min: usize = min.parse().expect("KATI_COMPAT_MIN must be integer");
         assert!(

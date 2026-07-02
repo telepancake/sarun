@@ -73,6 +73,16 @@ fn read_bootstrap_makefile(targets: &[Symbol]) -> Result<Arc<Mutex<Vec<Stmt>>>> 
     }
     bootstrap.put_slice(b"KATI?=ckati\n");
     bootstrap.put_slice(b"SHELL=/bin/sh\n");
+    // sarun: GNU make 4.x advertises its optional features via .FEATURES;
+    // makefiles gate on it (the Linux kernel bails out without `undefine`).
+    // Same list the engine's embedded-make bootstrap advertises (katirun.rs)
+    // — kati implements (or accepts as syntax) each token. GNU's value starts
+    // with the same tokens in the same order, so $(filter …,$(.FEATURES))
+    // output is corpus-comparable.
+    bootstrap.put_slice(
+        b".FEATURES?=target-specific order-only second-expansion else-if \
+          shortest-stem undefine oneshell\n",
+    );
 
     if !FLAGS.no_builtin_rules {
         bootstrap.put_slice(b".c.o:\n");
@@ -359,6 +369,23 @@ fn run(targets: &[Symbol], cl_vars: &Vec<Bytes>, orig_args: OsString) -> Result<
         for (sym, _name) in all {
             if !ev.exports.contains_key(&sym) {
                 ev.exports.insert(sym, true);
+            }
+        }
+    }
+
+    // sarun: GNU make ALWAYS passes MAKEFLAGS to children through the
+    // environment, including makefile-level appends (`MAKEFLAGS += --foo`) —
+    // the Linux kernel's `MAKEFLAGS += --include-dir=$(abs_srctree)` only
+    // works in the re-invoked sub-make via env. Export the FINAL evaluated
+    // value; skip when empty so a plain run doesn't grow an empty env var.
+    {
+        if let Some(v) = ev.lookup_var(intern("MAKEFLAGS"))? {
+            let value = v.read().eval_to_buf(&mut ev)?;
+            if !value.is_empty() {
+                // SAFETY: single-threaded at this point in the pipeline.
+                unsafe {
+                    std::env::set_var("MAKEFLAGS", OsStr::from_bytes(&value));
+                }
             }
         }
     }

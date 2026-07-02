@@ -1,4 +1,5 @@
-# TODO: Fix this. Maybe $(wildcard) always runs at eval-phase.
+# (was TODO) TODO: Fix this. Maybe $(wildcard) always runs at eval-phase.
+# sarun: passes with rkati vs GNU make 4.3 (rule-word glob expansion made the behaviors agree) — un-TODO'd so the corpus gate enforces it.
 
 # GNU make 4 agrees with ckati.
 MAKEVER:=$(shell make --version | grep "Make [0-9]" | sed -E 's/.*Make ([0-9]).*/\1/')

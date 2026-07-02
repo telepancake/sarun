@@ -1,4 +1,5 @@
-# TODO: it overrides "export A" and exports(?) "override B"
+# (was TODO) TODO: it overrides "export A" and exports(?) "override B"
+# sarun: passes with rkati vs GNU make 4.3 — un-TODO'd so the corpus gate enforces it.
 # ninja: can't export variable with space in name (by bash).
 
 override export A:=override_A
