@@ -5418,9 +5418,11 @@ fn fkey_labels(app: &App) -> [&'static str; 11] {
         "Menu",     // F9 (menubar nav)
         "Quit",     // F10  — always
         // F11: split/un-split. The label flips with `pty_in_right`
-        // so the user can read what F11 will DO next.
+        // so the user can read what F11 will DO next. With no PTY there
+        // is nothing to split — dim it (F2 is THE create-a-PTY key;
+        // don't show the same button twice).
         if pty_pane { "Embed" }
-        else if !any_pty { "Pty+" }
+        else if !any_pty { "·" }
         else if app.pty_in_right { "Solo" }
         else { "Split" },
     ];
@@ -7534,7 +7536,7 @@ fn run_action(app: &mut App, a: Action) {
         Action::PtyKill        => app.pty_kill(),
         Action::PtyEmbedToggle => {
             if app.ptys.is_empty() {
-                open_pty_menu(app);
+                app.status = "no PTY to split — F2 opens one".into();
             } else {
                 app.pty_in_right = !app.pty_in_right;
                 app.right_focused = app.pty_in_right;
@@ -8112,11 +8114,12 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                         3 => { app.next_pane(); }
                         11 => {
                             // Embed the active PTY into the focused view's
-                            // RIGHT column (or un-embed). No-op when no PTY
-                            // is open; opens a fresh prompt in that case
-                            // so the toggle does something visible.
+                            // RIGHT column (or un-embed). With no PTY there
+                            // is nothing to split — point at F2 instead of
+                            // duplicating it (the fkeybar dims F11 too).
                             if app.ptys.is_empty() {
-                                open_pty_menu(&mut app);
+                                app.status =
+                                    "no PTY to split — F2 opens one".into();
                             } else {
                                 app.pty_in_right = !app.pty_in_right;
                                 // Right-focus follows the embedded PTY so
