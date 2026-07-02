@@ -679,7 +679,7 @@ fn extract_long_flags(argv: &[String]) -> Vec<OsString> {
 /// as gnu make / standalone rkati do. Process-global + idempotent (last wins);
 /// safe to call from both the shadow entry and the builtin.
 fn install_make_recipe_runner() {
-    kati::fileutil::install_recipe_runner(Arc::new(|shell, _shellflag, cmd, cwd, redirect_stderr, output_cb| {
+    kati::fileutil::install_recipe_runner(Arc::new(|shell, _shellflag, prefix, cmd, cwd, redirect_stderr, output_cb| {
         use kati::fileutil::RecipeRunnerDecision;
         let shell_base = std::path::Path::new(std::ffi::OsStr::from_bytes(shell))
             .file_name()
@@ -692,6 +692,7 @@ fn install_make_recipe_runner() {
         let s = std::str::from_utf8(cmd)
             .map(std::borrow::Cow::Borrowed)
             .unwrap_or_else(|_| String::from_utf8_lossy(cmd));
+        let p = String::from_utf8_lossy(prefix);
         // The recipe cwd is threaded EXPLICITLY from kati (the make's working_dir)
         // rather than read from a make-thread thread-local — under -j the recipe
         // runs on a worker thread that wouldn't see it. Set it for THIS worker
@@ -713,20 +714,30 @@ fn install_make_recipe_runner() {
             kati::fileutil::RedirectStderr::None => crate::brush::RecipeStderr::Inherit,
             kati::fileutil::RedirectStderr::DevNull => crate::brush::RecipeStderr::Null,
         };
-        let code = crate::brush::run_recipe_in_process_opt(&s, output_cb, false, stderr_mode);
+        let code = crate::brush::run_recipe_in_process_prefixed(&p, &s, output_cb, false, stderr_mode);
         crate::brush::set_box_recipe_cwd(prev);
         RecipeRunnerDecision::Ran { code }
     }));
     // Report each node's recipe run-state to the engine, keyed by the node's
     // primary output (== the build_edges row's outs[0]), so the targets pane
     // shows only the targets currently building and their wall time.
-    kati::fileutil::install_edge_reporter(Arc::new(|output: &[u8], phase, code| {
+    kati::fileutil::install_edge_reporter(Arc::new(|output: &[u8], phase, code, excerpt: &[u8]| {
         let out = String::from_utf8_lossy(output);
         let p = match phase {
             kati::fileutil::EdgePhase::Start => "start",
             kati::fileutil::EdgePhase::Done => "done",
         };
-        crate::brush::send_build_edge_state(Some(&out), None, p, code);
+        // Tag this worker thread with the edge whose recipe is about to run
+        // (cleared on Done): every pipeline the recipe spawns records
+        // `edge_out`, the exact edge → pipeline causal link the UI's
+        // cross-navigation follows.
+        crate::brush::set_box_recipe_edge(match phase {
+            kati::fileutil::EdgePhase::Start => Some(out.to_string()),
+            kati::fileutil::EdgePhase::Done => None,
+        });
+        let ex = String::from_utf8_lossy(excerpt);
+        crate::brush::send_build_edge_state(Some(&out), None, p, code,
+                                            if ex.is_empty() { None } else { Some(&ex) });
     }));
 }
 

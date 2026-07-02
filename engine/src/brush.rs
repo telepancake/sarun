@@ -1857,11 +1857,13 @@ fn send_recipe_fixup(uids: &[u64], start_ts: f64) {
 /// exact recipe cmdline == the stored cmd). `phase` is "start" or "done";
 /// `code` is only meaningful for "done". Best-effort (same broker path as the
 /// per-pipeline provenance); a failure leaves the recipe running unchanged.
-pub fn send_build_edge_state(out: Option<&str>, cmd: Option<&str>, phase: &str, code: i32) {
+pub fn send_build_edge_state(out: Option<&str>, cmd: Option<&str>, phase: &str, code: i32,
+                             excerpt: Option<&str>) {
     let mut m = json!({"type": "build_edge_state", "state": phase, "ts": now_secs()});
     if let Some(o) = out { m["out"] = json!(o); }
     if let Some(c) = cmd { m["cmd"] = json!(c); }
     if phase == "done" { m["code"] = json!(code); }
+    if let Some(x) = excerpt { m["excerpt"] = json!(x); }
     crate::runner::send_nested_prov(format!("{m}\n").as_bytes());
 }
 
@@ -1979,6 +1981,9 @@ fn stamp_pipeline_records(
             m.insert("spawn_ts".to_string(), json!(spawn_ts));
             if nested {
                 m.insert("nested".to_string(), json!(true));
+            }
+            if let Some(edge) = current_recipe_edge() {
+                m.insert("edge_out".to_string(), json!(edge));
             }
         }
         recs.push(rec);
@@ -2568,6 +2573,25 @@ pub fn set_box_recipe_cwd(cwd: Option<std::path::PathBuf>) -> Option<std::path::
     BOX_RECIPE_CWD.with(|c| std::mem::replace(&mut *c.borrow_mut(), cwd))
 }
 
+thread_local! {
+    /// The build edge (primary output name) whose recipe THIS thread is
+    /// currently running — set by katirun's edge reporter around each recipe,
+    /// re-seeded onto the spawned brush thread like the pipeline uid. Every
+    /// pipeline record stamped while it's set carries `edge_out`, giving the
+    /// UI an EXACT edge → pipelines → processes/outputs causal chain (the
+    /// previous linkage guessed by execution-time windows).
+    static BOX_RECIPE_EDGE: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+pub fn set_box_recipe_edge(edge: Option<String>) -> Option<String> {
+    BOX_RECIPE_EDGE.with(|c| std::mem::replace(&mut *c.borrow_mut(), edge))
+}
+
+fn current_recipe_edge() -> Option<String> {
+    BOX_RECIPE_EDGE.with(|c| c.borrow().clone())
+}
+
 /// Run one n2 recipe through embedded brush, merging stdout+stderr into
 /// `output_cb` (n2's contract). Returns the recipe's exit code.
 /// How a run-through-brush command's stderr (fd 2) is handled.
@@ -2595,6 +2619,21 @@ pub fn run_recipe_in_process_opt(
     bundle_coreutils: bool,
     stderr: RecipeStderr,
 ) -> i32 {
+    run_recipe_in_process_prefixed("", cmdline, output_cb, bundle_coreutils, stderr)
+}
+
+/// Like run_recipe_in_process_opt, with a make export PREFIX that runs in the
+/// SAME shell before the recipe but is NOT recorded as pipeline provenance —
+/// it's sarun plumbing (the make's `export NAME='…'` lines), and recording it
+/// buried every recipe's real pipelines under hundreds of export rows.
+pub fn run_recipe_in_process_prefixed(
+    prefix: &str,
+    cmdline: &str,
+    output_cb: &mut dyn FnMut(&[u8]),
+    bundle_coreutils: bool,
+    stderr: RecipeStderr,
+) -> i32 {
+    let prefix_owned = prefix.to_string();
     let recipe = double_trailing_backslash(unwrap_sh_c(cmdline));
     let Some(rt) = n2_runtime() else {
         output_cb(b"sarun-engine n2: no tokio runtime\n");
@@ -2616,6 +2655,8 @@ pub fn run_recipe_in_process_opt(
     // Capture the enclosing pipeline uid on THIS thread so the recipe/$(shell)
     // pipelines (which run on the spawned brush thread below) nest under it.
     let parent_uid = current_pipeline_uid();
+    // Same for the running edge tag (set by katirun's edge reporter).
+    let recipe_edge = current_recipe_edge();
     // Run brush on a worker thread so this (n2 scheduler) thread can drain the
     // pipe concurrently — a finite pipe buffer would otherwise deadlock. Large
     // stack: a recipe can be a recursive in-process make whose kati parse/eval
@@ -2626,6 +2667,7 @@ pub fn run_recipe_in_process_opt(
         rt.block_on(async move {
             // Seed this worker thread's current pipeline from the captured parent.
             set_current_pipeline_uid(parent_uid);
+            set_box_recipe_edge(recipe_edge);
             let mut shell = match build_box_shell_full(
                 true, None, None, Some(cwd), false, bundle_coreutils,
             ).await {
@@ -2657,6 +2699,17 @@ pub fn run_recipe_in_process_opt(
                 }
             }
             shell.open_files_mut().set_fd(1, brush_core::openfiles::OpenFile::from(writer));
+            // Apply the make's export prefix to THIS shell, provenance-free:
+            // run_string sets the vars/exports without emitting pipeline
+            // records (only run_nested_pipelines below records).
+            if !prefix_owned.is_empty() {
+                let src = brush_core::SourceInfo {
+                    source: "<make exports>".into(), start: None };
+                let params = shell.default_exec_params();
+                if shell.run_string(prefix_owned.clone(), &src, &params).await.is_err() {
+                    eprintln!("sarun-engine make: export prefix failed to apply");
+                }
+            }
             let prog = match shell.parse_string(recipe_owned.clone()) {
                 Ok(p) => p,
                 Err(e) => {
@@ -2737,9 +2790,9 @@ pub fn n2_executor(cmdline: &str, output_cb: &mut dyn FnMut(&[u8])) -> n2::proce
     // Mark this edge running for the targets pane (matched by its exact cmdline,
     // which n2 also stored as the build_edges row's `cmd`). Phony / up-to-date
     // edges never reach the executor, so they're correctly left un-started.
-    send_build_edge_state(None, Some(cmdline), "start", 0);
+    send_build_edge_state(None, Some(cmdline), "start", 0, None);
     let code = run_recipe_in_process(cmdline, output_cb);
-    send_build_edge_state(None, Some(cmdline), "done", code);
+    send_build_edge_state(None, Some(cmdline), "done", code, None);
     set_box_recipe_cwd(prev);
     if code == 0 {
         n2::process::Termination::Success

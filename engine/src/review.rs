@@ -326,12 +326,50 @@ pub fn box_summary(id: i64, limit: i64) -> Value {
         }
     }
 
+    // Failures front and center: build edges that ran and exited non-zero
+    // (with their captured output excerpt) and failed pipelines. This is the
+    // box overview's "what broke" section — a failed `make` box otherwise
+    // buries the one interesting recipe under thousands of healthy rows.
+    let mut failures = vec![];
+    if has_table(&conn, "build_edges") {
+        if let Ok(mut st) = conn.prepare(
+            "SELECT json_extract(outs,'$[0]'), exit_code, \
+                    COALESCE(output_excerpt,'') \
+             FROM build_edges \
+             WHERE exit_code IS NOT NULL AND exit_code != 0 \
+             ORDER BY id DESC LIMIT ?1") {
+            if let Ok(it) = st.query_map([limit], |r| Ok(json!({
+                "kind": "edge",
+                "label": r.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                "code": r.get::<_, i64>(1)?,
+                "excerpt": r.get::<_, String>(2)?,
+            }))) {
+                for row in it.flatten() { failures.push(row); }
+            }
+        }
+    }
+    if has_table(&conn, "brushprov") {
+        if let Ok(mut st) = conn.prepare(
+            "SELECT cmd, exit_code FROM brushprov \
+             WHERE exit_code > 0 ORDER BY id DESC LIMIT ?1") {
+            if let Ok(it) = st.query_map([limit], |r| Ok(json!({
+                "kind": "pipeline",
+                "label": r.get::<_, String>(0)?,
+                "code": r.get::<_, i64>(1)?,
+                "excerpt": "",
+            }))) {
+                for row in it.flatten() { failures.push(row); }
+            }
+        }
+    }
+
     json!({
         "outputs":   outputs,
         "changes":   changes,
         "processes": processes,
         "pipelines": pipelines,
         "edges":     edges,
+        "failures":  failures,
     })
 }
 
@@ -377,19 +415,23 @@ fn map_ids_conn(conn: &Connection, from: &str, ids: &[i64], to: &str) -> Vec<i64
             "SELECT id FROM process WHERE brush_pipeline_id IN ({inlist})")),
         ("pipeline", "edge") => {
             if !has_table(conn, "build_edges") { return vec![]; }
+            // Exact link: pipelines are stamped with the edge whose recipe
+            // spawned them (record JSON `edge_out` == the edge's outs[0]).
             query(format!(
                 "SELECT DISTINCT e.id FROM build_edges e, brushprov b \
-                 WHERE b.id IN ({inlist}) AND e.started_ts IS NOT NULL \
-                   AND b.spawn_ts >= e.started_ts - 0.05 \
-                   AND (e.ended_ts IS NULL OR b.spawn_ts <= e.ended_ts + 0.05)"))
+                 WHERE b.id IN ({inlist}) \
+                   AND json_extract(b.record,'$.edge_out') IS NOT NULL \
+                   AND json_extract(b.record,'$.edge_out') = \
+                       json_extract(e.outs,'$[0]')"))
         }
         ("edge", "pipeline") => {
             if !has_table(conn, "build_edges") { return vec![]; }
             query(format!(
                 "SELECT DISTINCT b.id FROM brushprov b, build_edges e \
-                 WHERE e.id IN ({inlist}) AND e.started_ts IS NOT NULL \
-                   AND b.spawn_ts >= e.started_ts - 0.05 \
-                   AND (e.ended_ts IS NULL OR b.spawn_ts <= e.ended_ts + 0.05)"))
+                 WHERE e.id IN ({inlist}) \
+                   AND json_extract(b.record,'$.edge_out') IS NOT NULL \
+                   AND json_extract(b.record,'$.edge_out') = \
+                       json_extract(e.outs,'$[0]')"))
         }
         ("process", "edge") => {
             let pipes = map_ids_conn(conn, "process", ids, "pipeline");
@@ -401,6 +443,45 @@ fn map_ids_conn(conn: &Connection, from: &str, ids: &[i64], to: &str) -> Vec<i64
         }
         _ => vec![],
     }
+}
+
+/// The causal neighborhood of one pipeline (brushprov row): the pipeline
+/// that STARTED it (parent_uid chain, one hop), the pipelines IT started,
+/// and the build edge whose recipe it belongs to (record.edge_out). This is
+/// the "this started that" context the Pipelines detail pane shows so a
+/// failure can be walked up to its root cause without guessing.
+pub fn pipeline_context(id: i64, prov_id: i64) -> Value {
+    let Some(conn) = open_ro(id) else { return json!({}) };
+    let Ok((uid, parent_uid, edge_out)) = conn.query_row(
+        "SELECT uid, parent_uid,                 COALESCE(json_extract(record,'$.edge_out'),'')          FROM brushprov WHERE id=?1",
+        [prov_id],
+        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?)))
+    else { return json!({}) };
+    let one = |sql: &str, key: i64| -> Value {
+        conn.query_row(sql, [key], |r| Ok(json!({
+            "id": r.get::<_, i64>(0)?,
+            "cmd": r.get::<_, String>(1)?,
+            "exit_code": r.get::<_, i64>(2)?,
+        }))).unwrap_or(Value::Null)
+    };
+    let parent = if parent_uid > 0 {
+        one("SELECT id, cmd, exit_code FROM brushprov WHERE uid=?1", parent_uid)
+    } else { Value::Null };
+    let mut children = vec![];
+    if uid > 0 {
+        if let Ok(mut st) = conn.prepare(
+            "SELECT id, cmd, exit_code FROM brushprov              WHERE parent_uid=?1 ORDER BY id LIMIT 40") {
+            if let Ok(it) = st.query_map([uid], |r| Ok(json!({
+                "id": r.get::<_, i64>(0)?,
+                "cmd": r.get::<_, String>(1)?,
+                "exit_code": r.get::<_, i64>(2)?,
+            }))) {
+                for row in it.flatten() { children.push(row); }
+            }
+        }
+    }
+    json!({"parent": parent, "children": children, "edge_out": edge_out})
 }
 
 /// Cheap "does this sqlar have a given table" probe — Python-engine

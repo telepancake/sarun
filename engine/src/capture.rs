@@ -1143,24 +1143,26 @@ impl BoxState {
     /// Mark a build edge as FINISHED (the first started-but-not-ended edge with
     /// this output/cmd key), stamping `ended_ts` + `exit_code`. Best-effort.
     pub fn mark_build_edge_done(&self, out: Option<&str>, cmd: Option<&str>,
-                                code: i64, ts: f64) {
+                                code: i64, ts: f64, excerpt: Option<&str>) {
         let conn = self.conn.lock().unwrap();
         if let Some(out) = out {
             let _ = conn.execute(
-                "UPDATE build_edges SET ended_ts=?1, exit_code=?2 WHERE id=(\
+                "UPDATE build_edges SET ended_ts=?1, exit_code=?2, \
+                        output_excerpt=?4 WHERE id=(\
                    SELECT id FROM build_edges \
                    WHERE json_extract(outs,'$[0]')=?3 \
                      AND started_ts IS NOT NULL AND ended_ts IS NULL \
                    ORDER BY id LIMIT 1)",
-                params![ts, code, out]);
+                params![ts, code, out, excerpt]);
         } else if let Some(cmd) = cmd {
             let _ = conn.execute(
-                "UPDATE build_edges SET ended_ts=?1, exit_code=?2 WHERE id=(\
+                "UPDATE build_edges SET ended_ts=?1, exit_code=?2, \
+                        output_excerpt=?4 WHERE id=(\
                    SELECT id FROM build_edges \
                    WHERE cmd=?3 \
                      AND started_ts IS NOT NULL AND ended_ts IS NULL \
                    ORDER BY id LIMIT 1)",
-                params![ts, code, cmd]);
+                params![ts, code, cmd, excerpt]);
         }
     }
 

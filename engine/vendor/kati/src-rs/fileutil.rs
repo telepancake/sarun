@@ -57,6 +57,7 @@ pub type RecipeRunner = Arc<
     dyn Fn(
             &[u8], /* shell */
             &[u8], /* shellflag */
+            &[u8], /* prov-free prefix (make's export lines — run, not recorded) */
             &[u8], /* cmd */
             &[u8], /* recipe cwd (the make's working_dir, as path bytes) */
             RedirectStderr, /* stderr disposition (merge into output / inherit / discard) */
@@ -88,6 +89,11 @@ pub fn install_recipe_runner(f: RecipeRunner) {
 pub fn run_with_installed_runner(
     shell: &[u8],
     shellflag: &[u8],
+    // The make's export prefix — the runner applies it to the recipe's shell
+    // WITHOUT recording its lines as pipeline provenance (it's engine
+    // plumbing, not user commands; recording it buried real pipelines under
+    // hundreds of `export …` rows per recipe).
+    prefix: &[u8],
     cmd: &[u8],
     cwd: &[u8],
     redirect_stderr: RedirectStderr,
@@ -97,7 +103,7 @@ pub fn run_with_installed_runner(
     // runner may run a recursive in-process make whose recipes re-enter here;
     // holding this non-reentrant lock across the call would deadlock.
     let runner = RECIPE_RUNNER.lock().as_ref()?.clone();
-    match runner(shell, shellflag, cmd, cwd, redirect_stderr, out_cb) {
+    match runner(shell, shellflag, prefix, cmd, cwd, redirect_stderr, out_cb) {
         RecipeRunnerDecision::Ran { code } => Some(code),
         RecipeRunnerDecision::Passthrough => None,
     }
@@ -119,8 +125,11 @@ pub enum EdgePhase {
     Done,
 }
 
-pub type EdgeReporter =
-    Arc<dyn Fn(&[u8] /* output */, EdgePhase, i32 /* exit code */) + Send + Sync + 'static>;
+pub type EdgeReporter = Arc<
+    dyn Fn(&[u8] /* output */, EdgePhase, i32 /* exit code */,
+           &[u8] /* recipe output excerpt (tail ~1KB; empty on Start) */)
+        + Send + Sync + 'static,
+>;
 
 static EDGE_REPORTER: parking_lot::Mutex<Option<EdgeReporter>> =
     parking_lot::Mutex::new(None);
@@ -133,10 +142,10 @@ pub fn install_edge_reporter(f: EdgeReporter) {
 /// Report a build edge run-state transition through the installed reporter, if
 /// any. Best-effort: no reporter → no-op. The reporter Arc is cloned and the
 /// lock released before the call (the reporter may do I/O / re-enter kati).
-pub fn report_edge(output: &[u8], phase: EdgePhase, code: i32) {
+pub fn report_edge(output: &[u8], phase: EdgePhase, code: i32, excerpt: &[u8]) {
     let r = EDGE_REPORTER.lock().clone();
     if let Some(r) = r {
-        r(output, phase, code);
+        r(output, phase, code, excerpt);
     }
 }
 use parking_lot::Mutex;
@@ -171,6 +180,22 @@ pub fn run_command(
     cwd: &[u8],
     redirect_stderr: RedirectStderr,
 ) -> Result<(ExitStatus, Vec<u8>)> {
+    run_command_prefixed(shell, shellflag, b"", cmd, cwd, redirect_stderr)
+}
+
+/// run_command with a make export PREFIX handed to the in-process runner
+/// SEPARATELY (applied to the subshell, not recorded as pipeline provenance);
+/// the fork fallback prepends it to the input text. $(shell …) in box mode
+/// uses this so its provenance shows the user's command, not the make's
+/// export plumbing.
+pub fn run_command_prefixed(
+    shell: &[u8],
+    shellflag: &[u8],
+    prefix: &[u8],
+    cmd: &Bytes,
+    cwd: &[u8],
+    redirect_stderr: RedirectStderr,
+) -> Result<(ExitStatus, Vec<u8>)> {
     // sarun: route through the in-process runner (embedded brush) before
     // fork+exec'ing /bin/sh — so $(shell ...), regen, and any other run_command
     // caller run in-process exactly like recipes do, instead of forking a shell
@@ -184,11 +209,21 @@ pub fn run_command(
     if !cwd.is_empty() {
         let mut output = Vec::new();
         if let Some(code) = run_with_installed_runner(
-            shell, shellflag, cmd, cwd, redirect_stderr, &mut |b| output.extend_from_slice(b))
+            shell, shellflag, prefix, cmd, cwd, redirect_stderr,
+            &mut |b| output.extend_from_slice(b))
         {
             return Ok((ExitStatus::from_raw((code & 0xff) << 8), output));
         }
     }
+    // Fork fallback: the prefix rides the input text (a real sh applies it
+    // the same way; nothing records provenance on this path).
+    let cmd_prefixed: Bytes;
+    let cmd = if prefix.is_empty() { cmd } else {
+        let mut v = prefix.to_vec();
+        v.extend_from_slice(cmd);
+        cmd_prefixed = Bytes::from(v);
+        &cmd_prefixed
+    };
 
     let mut cmd_with_shell;
     let args = if !shell.starts_with(b"/") || memchr2(b' ', b'$', shell).is_some() {

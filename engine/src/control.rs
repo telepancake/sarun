@@ -373,12 +373,13 @@ fn build_edge_state(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Valu
     let cmd = msg.get("cmd").and_then(Value::as_str);
     let ts = msg.get("ts").and_then(Value::as_f64).unwrap_or(0.0);
     let code = msg.get("code").and_then(Value::as_i64).unwrap_or(0);
+    let excerpt = msg.get("excerpt").and_then(Value::as_str);
     let ov = lock(state).overlay.clone();
     if let Some(ov) = ov.as_ref() {
         if let Some(b) = ov.live_box(id) {
             match phase {
                 "start" => b.mark_build_edge_started(out, cmd, ts),
-                "done"  => b.mark_build_edge_done(out, cmd, code, ts),
+                "done"  => b.mark_build_edge_done(out, cmd, code, ts, excerpt),
                 _ => {}
             }
         }
@@ -1370,6 +1371,16 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
                 Some(id) => crate::review::box_summary(id, limit),
                 None => json!({"outputs":[], "changes":[], "processes":[],
                                "pipelines":[], "edges":[]}),
+            }
+        }
+        // The causal neighborhood of one pipeline: parent, children, owning
+        // edge. args: [sid, brushprov_row_id].
+        "review.pipeline_context" => {
+            let id = arg_sid(args);
+            let prov_id = args.get(1).and_then(Value::as_i64).unwrap_or(-1);
+            match id {
+                Some(id) => crate::review::pipeline_context(id, prov_id),
+                None => json!({}),
             }
         }
         // Map provenance row ids between the process / pipeline / edge

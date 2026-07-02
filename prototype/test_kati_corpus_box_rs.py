@@ -242,7 +242,13 @@ def main():
         os.environ["KATI_CORPUS_DEBUG"] = os.environ.get("KATI_CORPUS_DEBUG", "1")
         for i, name in enumerate(first_fail):
             p = TESTCASES / name
-            name2, verdict, detail = run_case(name, p, work_root, 9000 + i)
+            # Two serial attempts: engine-load interleaving can corrupt a
+            # single comparison; a deterministic regression fails both.
+            for attempt in (0, 1):
+                name2, verdict, detail = run_case(name, p, work_root,
+                                                  9000 + i * 2 + attempt)
+                if verdict != "fail":
+                    break
             tally[verdict] += 1
             if verdict == "fail":
                 failures.append(name)

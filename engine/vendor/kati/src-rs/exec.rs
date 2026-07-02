@@ -303,8 +303,21 @@ fn run_node_commands(
     let report = !FLAGS.is_dry_run && !req.commands.is_empty();
     if report {
         crate::fileutil::report_edge(output.as_bytes().as_ref(),
-                                     crate::fileutil::EdgePhase::Start, 0);
+                                     crate::fileutil::EdgePhase::Start, 0, b"");
     }
+    // Keep the TAIL ~1KB of the recipe's merged output for the edge row's
+    // excerpt — on failure the error text is at the end of the stream.
+    let excerpt = std::cell::RefCell::new(Vec::<u8>::new());
+    let mut emit = |b: &[u8]| {
+        {
+            let mut x = excerpt.borrow_mut();
+            x.extend_from_slice(b);
+            let overflow = x.len().saturating_sub(1024);
+            if overflow > 0 { x.drain(..overflow); }
+        }
+        emit(b)
+    };
+    let emit = &mut emit as &mut dyn FnMut(&[u8]);
     for command in req.commands {
         if command.echo {
             // Echo LIVE, before running, so a hung command's line shows at once.
@@ -314,23 +327,23 @@ fn run_node_commands(
         if FLAGS.is_dry_run {
             continue;
         }
-        // Run input = the exports prefix + the command (the prefix is applied to
-        // the subshell but not echoed above).
-        let run_input: Bytes = if prefix.is_empty() {
-            command.cmd.clone()
-        } else {
-            let mut v = prefix.clone();
-            v.extend_from_slice(&command.cmd);
-            Bytes::from(v)
-        };
-        // In-process runner streams output straight to `emit` (live, mid-command);
-        // the fork fallback captures then we emit it per-command.
+        // In-process runner gets the exports prefix SEPARATELY (it applies it
+        // to the recipe's shell without recording it as pipeline provenance);
+        // the fork fallback prepends it to the input as before.
         let (ok, code) =
             if let Some(code) = run_with_installed_runner(
-                shell, shellflag, &run_input, &cwd, RedirectStderr::Stdout, emit)
+                shell, shellflag, &prefix, &command.cmd, &cwd,
+                RedirectStderr::Stdout, emit)
             {
                 (code == 0, code)
             } else {
+                let run_input: Bytes = if prefix.is_empty() {
+                    command.cmd.clone()
+                } else {
+                    let mut v = prefix.clone();
+                    v.extend_from_slice(&command.cmd);
+                    Bytes::from(v)
+                };
                 match run_command(shell, shellflag, &run_input, &cwd, RedirectStderr::Stdout) {
                     Ok((status, o)) => { emit(&o); (status.success(), status.code().unwrap_or(1)) }
                     Err(e) => { emit(format!("{e}\n").as_bytes()); (false, 1) }
@@ -348,7 +361,8 @@ fn run_node_commands(
     if report {
         let code = failure.map(|(_, c)| c).unwrap_or(0);
         crate::fileutil::report_edge(output.as_bytes().as_ref(),
-                                     crate::fileutil::EdgePhase::Done, code);
+                                     crate::fileutil::EdgePhase::Done, code,
+                                     &excerpt.borrow());
     }
     NodeRun { output, ignored, failure, result_ts: req.result_ts }
 }

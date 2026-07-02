@@ -5563,6 +5563,7 @@ fn box_detail_lines(app: &App, area: Rect) -> Vec<Line<'static>> {
     let procs    = g_arr("processes");
     let pipes    = g_arr("pipelines");
     let edges    = g_arr("edges");
+    let failures = g_arr("failures");
 
     // Size the sections to the pane: split the rows below the 6-line head
     // evenly across the non-empty sections (each also spends 2 lines on
@@ -5570,7 +5571,7 @@ fn box_detail_lines(app: &App, area: Rect) -> Vec<Line<'static>> {
     let inner_w = (area.width as usize).saturating_sub(2).max(20);
     let inner_h = (area.height as usize).saturating_sub(2);
     let nonempty = [!changes.is_empty(), !outputs.is_empty(), !procs.is_empty(),
-                    !pipes.is_empty(), !edges.is_empty()]
+                    !pipes.is_empty(), !edges.is_empty(), !failures.is_empty()]
         .iter().filter(|b| **b).count().max(1);
     let budget = ((inner_h.saturating_sub(6) / nonempty).saturating_sub(2)).max(3);
 
@@ -5693,10 +5694,49 @@ fn box_detail_lines(app: &App, area: Rect) -> Vec<Line<'static>> {
         out.push(Line::from(""));
     };
 
+    // What broke, before anything else: failed build edges (with the first
+    // line of their captured output) and failed pipelines. `g` (build) + '!'
+    // filters to these; the edge detail pane has the full excerpt.
+    let render_failures_section = |out: &mut Vec<Line<'static>>, rows: &[Value]| {
+        if rows.is_empty() { return; }
+        out.push(Line::from(Span::styled(
+            format!("── FAILURES ── ('!' in build/pipes/outputs filters to errors)"),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))));
+        for r in rows.iter().take(budget).rev() {
+            let label = r.get("label").and_then(Value::as_str).unwrap_or("");
+            let code = r.get("code").and_then(Value::as_i64).unwrap_or(0);
+            let kind = r.get("kind").and_then(Value::as_str).unwrap_or("");
+            let mark = if kind == "edge" { "E" } else { "P" };
+            let label_short: String = label.chars()
+                .map(|c| if c == '\n' { ' ' } else { c })
+                .take(inner_w.saturating_sub(14)).collect();
+            out.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(format!("✗{mark} "), Style::default().fg(Color::Red)),
+                Span::styled(label_short, bold),
+                Span::styled(format!("  exit {code}"),
+                    Style::default().fg(Color::Red)),
+            ]));
+            // First non-empty excerpt line — usually the compiler/tool error.
+            if let Some(el) = r.get("excerpt").and_then(Value::as_str)
+                .and_then(|e| e.lines().rev().find(|l| !l.trim().is_empty())
+                               .map(String::from)) {
+                let el: String = el.chars().take(inner_w.saturating_sub(6)).collect();
+                out.push(Line::from(vec![
+                    Span::raw("     "),
+                    Span::styled(el, Style::default().fg(Color::Red)
+                                                     .add_modifier(Modifier::DIM)),
+                ]));
+            }
+        }
+        out.push(Line::from(""));
+    };
+
     // Order: outputs first (what just printed), then changes (files /
     // xattrs that just landed), then processes (who did it), then the
     // brush / build views below for context. Empty sections drop out
     // so a vanilla (non-brush) box's right pane stays tight.
+    render_failures_section(&mut out, &failures);
     render_outputs_section(&mut out, &outputs);
     render_changes_section(&mut out, &changes);
     render_processes_section(&mut out, &procs);
@@ -5944,6 +5984,62 @@ fn pipeline_detail_lines(app: &App) -> Vec<Line<'static>> {
             Span::styled("(none linked — brush ran this in-process)",
                          Style::default().fg(Color::DarkGray)
                                           .add_modifier(Modifier::ITALIC))]));
+    }
+    // Causal neighborhood — the "this started that" chain: the pipeline that
+    // spawned this one, the pipelines it spawned, and the build edge whose
+    // recipe it belongs to. One small RPC keyed off the selected row.
+    if let Some(sid) = app.cur_sid() {
+        if let Ok(ctx) = rpc(&app.sock, "review.pipeline_context", json!([sid, id])) {
+            let fmt_one = |v: &Value| -> Option<(String, i64)> {
+                let cmd = v.get("cmd").and_then(Value::as_str)?;
+                let code = v.get("exit_code").and_then(Value::as_i64).unwrap_or(-1);
+                let one_line: String = cmd.chars()
+                    .map(|c| if c == '\n' { ' ' } else { c })
+                    .take(100).collect();
+                Some((one_line, code))
+            };
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "── started by / starts ──",
+                Style::default().fg(Color::DarkGray))));
+            match ctx.get("parent").and_then(|p| fmt_one(p)) {
+                Some((pcmd, pcode)) => {
+                    lines.push(Line::from(vec![
+                        Span::styled("↑ ", Style::default().fg(Color::Cyan)),
+                        Span::raw(pcmd),
+                        if pcode > 0 {
+                            Span::styled(format!("  exit {pcode}"),
+                                Style::default().fg(Color::Red))
+                        } else { Span::raw("") },
+                    ]));
+                }
+                None => lines.push(Line::from(Span::styled(
+                    "↑ (top of its shell — nothing started this)",
+                    Style::default().fg(Color::DarkGray)))),
+            }
+            let edge_out = ctx.get("edge_out").and_then(Value::as_str).unwrap_or("");
+            if !edge_out.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::styled("⚒ ", Style::default().fg(Color::Green)),
+                    Span::styled("recipe of build edge  ", label),
+                    Span::styled(edge_out.to_string(), val),
+                ]));
+            }
+            if let Some(children) = ctx.get("children").and_then(Value::as_array) {
+                for c in children {
+                    if let Some((ccmd, ccode)) = fmt_one(c) {
+                        lines.push(Line::from(vec![
+                            Span::styled("↳ ", Style::default().fg(Color::Cyan)),
+                            Span::raw(ccmd),
+                            if ccode > 0 {
+                                Span::styled(format!("  exit {ccode}"),
+                                    Style::default().fg(Color::Red))
+                            } else { Span::raw("") },
+                        ]));
+                    }
+                }
+            }
+        }
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
@@ -6226,6 +6322,24 @@ fn build_edge_detail_lines(app: &App) -> Vec<Line<'static>> {
         // Wrap-friendly: just hand the whole cmd to the paragraph; ratatui
         // re-wraps at the pane width via wrap: trim:false.
         lines.push(Line::from(cmd.to_string()));
+    }
+    // The recipe's captured output (first ~1KB, stderr+stdout merged) — THE
+    // thing you need when the edge failed. Red-tinted on failure so the
+    // error text stands out; the full stream lives in the Outputs view.
+    let excerpt = row.get("output_excerpt").and_then(Value::as_str).unwrap_or("");
+    if !excerpt.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "output (tail ~1KB — full stream in Outputs)",
+            Style::default().add_modifier(Modifier::BOLD))));
+        let body_style = if exit.unwrap_or(0) != 0 {
+            Style::default().fg(Color::Red)
+        } else {
+            Style::default()
+        };
+        for l in excerpt.lines() {
+            lines.push(Line::from(Span::styled(l.to_string(), body_style)));
+        }
     }
     lines
 }

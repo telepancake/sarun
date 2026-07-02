@@ -33,7 +33,7 @@ use crate::{
     eval::{Evaluator, ExportAllowed, FrameType},
     expr::{Evaluable, Value},
     file_cache::add_extra_file_dep,
-    fileutil::{RedirectStderr, run_command},
+    fileutil::{RedirectStderr, run_command_prefixed},
     find::FindCommand,
     flags::FLAGS,
     kati_warn_loc,
@@ -596,18 +596,11 @@ pub fn shell_func_impl(
     }
 
     collect_stats_with_slow_report!("func shell time", OsStr::from_bytes(cmd));
-    // box mode: prepend the make's exported-var prefix so $(shell) sees the
-    // make's `export`s (in-process, where we can't stage them into the process
-    // env). Applied to the run subshell, never to the find-emulator parse above.
-    let cmd: Bytes = if box_prefix.is_empty() {
-        cmd.clone()
-    } else {
-        let mut v = box_prefix.to_vec();
-        v.extend_from_slice(cmd);
-        Bytes::from(v)
-    };
-    let cmd = &cmd;
-    let (status, output) = run_command(shell, shellflag, cmd, cwd, RedirectStderr::None)?;
+    // box mode: the make's exported-var prefix rides SEPARATELY so the
+    // in-process runner applies it to the subshell without recording it as
+    // pipeline provenance ($(shell)'s recorded cmd is the user's command).
+    let (status, output) = run_command_prefixed(
+        shell, shellflag, box_prefix, cmd, cwd, RedirectStderr::None)?;
     let output = Bytes::from(format_for_command_substitution(output));
 
     if let Some(exit_code) = status.code() {
