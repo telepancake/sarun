@@ -22,6 +22,7 @@ mod capture;
 mod exec_wrappers;
 mod find_builtin;
 mod xargs_builtin;
+mod containers_conf;
 mod control;
 mod discover;
 // Dockerfile/Containerfile parser for `sarun oci build` / `oci run`. Lands

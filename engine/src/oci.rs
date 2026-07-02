@@ -2488,6 +2488,42 @@ async fn fetch(reference: &str) -> Result<PulledImage> {
 }
 
 async fn fetch_registry(reference: &str) -> Result<PulledImage> {
+    // Respect the host's /etc/containers/registries.conf: short-name
+    // aliases, unqualified-search-registries, and location/mirror/blocked
+    // remaps. Candidates are tried in order (mirrors before their primary)
+    // so a policy-mandated local mirror is used without the user having to
+    // spell it out. With no config this yields exactly the old behavior
+    // (docker.io + library/ via the oci-client defaults).
+    let resolved = crate::containers_conf::ContainersConf::load()
+        .resolve(reference);
+    if let Some(msg) = resolved.blocked {
+        bail!("{msg}");
+    }
+    let mut last_err: Option<anyhow::Error> = None;
+    for cand in &resolved.candidates {
+        match pull_one(&cand.reference).await {
+            Ok(img) => {
+                if cand.reference != reference && !cand.via.is_empty() {
+                    eprintln!("sarun oci: '{reference}' → '{}' ({})",
+                              cand.reference, cand.via);
+                }
+                return Ok(img);
+            }
+            Err(e) => {
+                let e = e.context(format!("pull '{}'{}", cand.reference,
+                    if cand.via.is_empty() { String::new() }
+                    else { format!(" ({})", cand.via) }));
+                last_err = Some(match last_err {
+                    Some(prev) => e.context(format!("{prev:#}")),
+                    None => e,
+                });
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow!("no pull candidates for '{reference}'")))
+}
+
+async fn pull_one(reference: &str) -> Result<PulledImage> {
     let r = Reference::from_str(reference)
         .with_context(|| format!("parse reference '{reference}'"))?;
     let client = Client::new(ClientConfig::default());
