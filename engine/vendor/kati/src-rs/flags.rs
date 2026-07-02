@@ -151,6 +151,48 @@ impl Flags {
     /// in-process `make` builtin). The global FLAGS still supplies the
     /// immutable mode-switches; per-instance INPUTS (makefile/targets/cl_vars/
     /// working_dir) come from a local Flags so concurrent makes don't collide.
+    /// sarun: fold an inherited MAKEFLAGS value into this Flags — GNU make's
+    /// env-to-sub-make flag channel (--include-dir, -rR/-s letter words,
+    /// VAR=val overrides). from_args applies the PROCESS env's MAKEFLAGS; an
+    /// embedder whose makes carry their environment out-of-band (the
+    /// in-process `make` builtin's seed_env — many makes share one process
+    /// env) calls this again with the make's OWN inherited value, which is
+    /// where e.g. the Linux kernel's `MAKEFLAGS += --include-dir=$(abs_srctree)`
+    /// actually arrives.
+    pub fn apply_makeflags(&mut self, makeflags: &[u8]) {
+        for tok in crate::strutil::word_scanner(makeflags) {
+            if let Some(dir) = tok.strip_prefix(b"--include-dir=") {
+                let dir = OsString::from_vec(dir.to_vec());
+                if !self.include_dirs.contains(&dir) {
+                    self.include_dirs.push(dir);
+                }
+            } else if tok == b"--no-builtin-rules" || tok == b"--no_builtin_rules" {
+                self.no_builtin_rules = true;
+            } else if tok == b"--no-builtin-variables" || tok == b"--no_builtin_variables" {
+                self.no_builtin_variables = true;
+            } else if tok == b"-s" || tok == b"--silent" || tok == b"--quiet" {
+                self.is_silent_mode = true;
+            } else if !tok.starts_with(b"-") && tok.contains(&b'=') {
+                let var = Bytes::from(tok.to_vec());
+                if !self.cl_vars.contains(&var) {
+                    self.cl_vars.push(var);
+                }
+            } else if !tok.starts_with(b"-") && !tok.contains(&b'=') && tok.iter().all(|&b| b.is_ascii_alphabetic()) {
+                // GNU make encodes short flags as a bare letter-word in
+                // MAKEFLAGS (e.g. "rRs" for -r -R -s). Parse the
+                // semantically important ones.
+                for &ch in tok {
+                    match ch {
+                        b'r' => self.no_builtin_rules = true,
+                        b'R' => self.no_builtin_variables = true,
+                        b's' => self.is_silent_mode = true,
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
     pub fn from_args(args: Vec<OsString>) -> Flags {
         let mut iter = args.into_iter();
         let mut flags = Flags::default();
@@ -159,31 +201,7 @@ impl Flags {
         flags.num_cpus = flags.num_jobs;
 
         if let Some(makeflags) = env::var_os("MAKEFLAGS") {
-            for tok in crate::strutil::word_scanner(makeflags.as_bytes()) {
-                if let Some(dir) = tok.strip_prefix(b"--include-dir=") {
-                    flags.include_dirs.push(OsString::from_vec(dir.to_vec()));
-                } else if tok == b"--no-builtin-rules" || tok == b"--no_builtin_rules" {
-                    flags.no_builtin_rules = true;
-                } else if tok == b"--no-builtin-variables" || tok == b"--no_builtin_variables" {
-                    flags.no_builtin_variables = true;
-                } else if tok == b"-s" || tok == b"--silent" || tok == b"--quiet" {
-                    flags.is_silent_mode = true;
-                } else if !tok.starts_with(b"-") && tok.contains(&b'=') {
-                    flags.cl_vars.push(Bytes::from(tok.to_vec()));
-                } else if !tok.starts_with(b"-") && !tok.contains(&b'=') && tok.iter().all(|&b| b.is_ascii_alphabetic()) {
-                    // GNU make encodes short flags as a bare letter-word in
-                    // MAKEFLAGS (e.g. "rRs" for -r -R -s). Parse the
-                    // semantically important ones.
-                    for &ch in tok {
-                        match ch {
-                            b'r' => flags.no_builtin_rules = true,
-                            b'R' => flags.no_builtin_variables = true,
-                            b's' => flags.is_silent_mode = true,
-                            _ => {}
-                        }
-                    }
-                }
-            }
+            flags.apply_makeflags(makeflags.as_bytes());
         }
 
         while let Some(arg) = iter.next() {

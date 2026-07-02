@@ -285,24 +285,54 @@ fn run_kati(
             None,
         )?;
     }
-    // MAKEFLAGS is the jobserver's channel: jobserver::advertise() wrote the
-    // current `--jobserver-auth=…` into the PROCESS env just before this call
-    // (in make_builtin), which is AFTER seed_env was captured. Pull the live
-    // value so $(MAKEFLAGS) — and any sub-make that inherits it — sees the
-    // jobserver. This is the one var that legitimately rides std::env (the
-    // jobserver's existing design); a single read of a near-constant value.
+    // sarun: $(MAKEFLAGS) is composed from three sources:
     //
-    // sarun: also fold in this invocation's own long-form command-line flags
-    // (cmdline_flags), the way GNU make reflects argv into MAKEFLAGS for
-    // Makefiles that inspect it (see the cmdline_flags doc comment on
-    // run_kati). Without this, a Makefile's `$(filter --foo,$(MAKEFLAGS))`
-    // guard never matches even though --foo was passed on the command line.
+    //  * The make's OWN inherited environment (seed_env) — this is how a
+    //    parent make's flags reach a sub-make in GNU make. For the shadow
+    //    path seed_env IS the process env; for the in-process builtin it's
+    //    the brush subshell env carrying the PARENT make's export prefix
+    //    (which now includes MAKEFLAGS, see below) — e.g. the Linux kernel's
+    //    `MAKEFLAGS += --include-dir=$(abs_srctree)` arrives here, NOT in the
+    //    shared process env.
+    //
+    //  * The live jobserver advertisement: jobserver::advertise() wrote the
+    //    current `--jobserver-auth=…` into the PROCESS env just before this
+    //    call (in make_builtin), which is AFTER seed_env was captured. Graft
+    //    any process-env tokens missing from the seed value so $(MAKEFLAGS) —
+    //    and any sub-make/`gcc -flto=jobserver` that inherits it — sees the
+    //    jobserver. (When seed_env == process env this is a no-op.)
+    //
+    //  * This invocation's own long-form command-line flags (cmdline_flags),
+    //    the way GNU make reflects argv into MAKEFLAGS for Makefiles that
+    //    inspect it (see the cmdline_flags doc comment on run_kati). Without
+    //    this, a Makefile's `$(filter --foo,$(MAKEFLAGS))` guard never
+    //    matches even though --foo was passed on the command line.
     {
         let mut mf = BytesMut::new();
+        let seed_mf = seed_env
+            .iter()
+            .find(|(k, _)| k == "MAKEFLAGS")
+            .map(|(_, v)| v.as_bytes().to_vec())
+            .unwrap_or_default();
+        mf.put_slice(&seed_mf);
+        let has_word = |mf: &BytesMut, w: &[u8]| {
+            kati::strutil::word_scanner(&mf[..]).any(|t| t == w)
+        };
         if let Some(env_mf) = std::env::var_os("MAKEFLAGS") {
-            mf.put_slice(env_mf.as_bytes());
+            let env_mf = env_mf.as_bytes().to_vec();
+            for tok in kati::strutil::word_scanner(&env_mf) {
+                if !has_word(&mf, tok) {
+                    if !mf.is_empty() {
+                        mf.put_u8(b' ');
+                    }
+                    mf.put_slice(tok);
+                }
+            }
         }
         for f in cmdline_flags {
+            if has_word(&mf, f.as_bytes()) {
+                continue;
+            }
             if !mf.is_empty() {
                 mf.put_u8(b' ');
             }
@@ -492,6 +522,23 @@ fn run_kati(
             prefix.extend_from_slice(b"unset ");
             prefix.extend_from_slice(&nb);
             prefix.push(b'\n');
+        }
+    }
+    // GNU make ALWAYS passes MAKEFLAGS to children through the environment —
+    // including makefile-level appends like the kernel's
+    // `MAKEFLAGS += --include-dir=$(abs_srctree)`. Emit the FINAL evaluated
+    // value (composed above with the seed env and the live jobserver
+    // advertisement) so an in-process sub-make's seed_env carries it; without
+    // this, flags a makefile appended for its sub-makes died at the shared
+    // process-env boundary and e.g. the kernel's out-of-tree second pass
+    // failed `include scripts/Kbuild.include`.
+    {
+        use kati::expr::Evaluable;
+        if let Some(v) = ev.lookup_var(intern(b"MAKEFLAGS".to_vec()))? {
+            let value = v.read().eval_to_buf(&mut ev)?;
+            if !value.is_empty() {
+                emit_export(&mut prefix, b"MAKEFLAGS", &value);
+            }
         }
     }
     ev.box_export_prefix = bytes::Bytes::from(prefix);
@@ -899,7 +946,14 @@ pub fn make_builtin(
         }
     };
     let _ = kati::flags::install_args(kargv.clone());
-    let flags = kati::flags::Flags::from_args(kargv);
+    let mut flags = kati::flags::Flags::from_args(kargv);
+    // from_args folded in the PROCESS env's MAKEFLAGS — but this make's real
+    // inherited MAKEFLAGS rides seed_env (the subshell env carrying the parent
+    // make's export prefix), which is where a parent's
+    // `MAKEFLAGS += --include-dir=…` / `-rR` actually arrive. Fold it in too.
+    if let Some((_, mf)) = seed_env.iter().find(|(k, _)| k == "MAKEFLAGS") {
+        flags.apply_makeflags(mf.as_bytes());
+    }
 
     // Resolve -C against the context cwd (NO process chdir). flags.working_dir
     // is kati's parsed -C value.

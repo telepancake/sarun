@@ -665,6 +665,60 @@ def main():
               f"case19: export reached the sub-make as a var AND its recipe env, "
               f"and the non-exported var did NOT leak; out.txt={eo!r} "
               f"(want b'var=[exported_val] env=[exported_val] bar_env=[]\\n')")
+
+        # ── CASE 20: MAKEFLAGS-appended flags reach a recursive sub-make ──────
+        # The Linux kernel's top Makefile (mini-replica here, the v5.6 shape)
+        # detects srctree != objtree, does `MAKEFLAGS += --include-dir=$(srctree)`
+        # + `export sub_make_done := 1`, and re-invokes itself; the second pass
+        # relies on the ENVIRONMENT MAKEFLAGS carrying --include-dir so its bare
+        # `include scripts/Kbuild.include` resolves from the source tree. In a
+        # box every $(MAKE) is an in-process builtin sharing ONE process env, so
+        # MAKEFLAGS must ride the per-recipe export prefix (and be re-parsed
+        # from the sub-make's seed env). Pre-fix the second pass died with
+        # "scripts/Kbuild.include: No such file or directory" (the user-visible
+        # kernel-build failure).
+        kb = work / "kbuild"
+        shutil.rmtree(kb, ignore_errors=True)
+        (kb / "linux/scripts").mkdir(parents=True, exist_ok=True)
+        (kb / "Makefile").write_text("all:\n\t$(MAKE) -f linux/Makefile foo\n")
+        (kb / "linux/Makefile").write_text(
+            "ifneq ($(sub_make_done),1)\n"
+            "MAKEFLAGS += -rR\n"
+            "abs_objtree := $(CURDIR)\n"
+            "abs_srctree := $(realpath $(dir $(lastword $(MAKEFILE_LIST))))\n"
+            "ifneq ($(abs_srctree),$(abs_objtree))\n"
+            "MAKEFLAGS += --include-dir=$(abs_srctree)\n"
+            "need-sub-make := 1\n"
+            "endif\n"
+            "export abs_srctree abs_objtree\n"
+            "export sub_make_done := 1\n"
+            "ifeq ($(need-sub-make),1)\n"
+            "$(filter-out _all sub-make $(lastword $(MAKEFILE_LIST)), "
+            "$(MAKECMDGOALS)) _all: sub-make\n"
+            "\t@:\n"
+            "sub-make:\n"
+            "\t$(Q)$(MAKE) -C $(abs_objtree) -f $(abs_srctree)/Makefile "
+            "$(MAKECMDGOALS)\n"
+            "endif\n"
+            "endif\n"
+            "ifeq ($(need-sub-make),)\n"
+            "include scripts/Kbuild.include\n"
+            "foo:\n"
+            "\t@echo built-foo mark=$(KBUILD_MARK) > $(abs_srctree)/../kb.txt\n"
+            "endif\n")
+        (kb / "linux/scripts/Kbuild.include").write_text("KBUILD_MARK := yes\n")
+        r = subprocess.run(
+            [str(BIN), "run", "-b", "MAKE20", "-C", str(kb), "--", "make"],
+            capture_output=True, text=True, timeout=180)
+        check(r.returncode == 0,
+              f"case20: kbuild sub-make box exits 0 (got {r.returncode}: "
+              f"{r.stderr[-600:]})")
+        sp20 = latest_sqlar(m)
+        ko = m.sqlar_content(sp20, str((kb / "kb.txt").resolve()).lstrip("/"))
+        check(ko == b"built-foo mark=yes\n",
+              f"case20: second pass found scripts/Kbuild.include via the "
+              f"MAKEFLAGS-inherited --include-dir; kb.txt={ko!r} "
+              f"(want b'built-foo mark=yes\\n')")
     finally:
         if eng is not None and eng.poll() is None:
             eng.terminate()
