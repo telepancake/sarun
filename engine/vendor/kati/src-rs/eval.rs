@@ -949,6 +949,13 @@ impl Evaluator {
             }
         }
 
+        // sarun: GNU make expands shell wildcards in target and prerequisite
+        // lists when the makefile is read — e.g. the Linux kernel's
+        //   xen-hypercalls.h: … $(srctree)/include/xen/interface/xen*.h
+        // Expand any word containing glob metacharacters against the logical
+        // working dir; a pattern with no matches stays literal (GNU behavior).
+        self.expand_rule_globs(&mut rule);
+
         log!("Rule: {:?}", rule);
         match self.get_allow_rules()? {
             RulesAllowed::Warning => {
@@ -970,6 +977,42 @@ impl Evaluator {
         self.rules.push(rule);
         self.in_rule = true;
         Ok(())
+    }
+
+    /// GNU make wildcard expansion for rule target / prerequisite words (NOT
+    /// %-patterns — those lists are left alone unless a word carries actual
+    /// glob metacharacters). Matches replace the word in place, sorted (libc
+    /// glob's default, same as GNU); a non-matching pattern stays literal.
+    fn expand_rule_globs(&self, rule: &mut crate::rule::Rule) {
+        fn has_meta(b: &[u8]) -> bool {
+            b.iter().any(|c| matches!(c, b'*' | b'?' | b'['))
+        }
+        let expand = |list: &mut Vec<Symbol>| {
+            if !list.iter().any(|s| has_meta(&s.as_bytes())) {
+                return;
+            }
+            let mut out: Vec<Symbol> = Vec::with_capacity(list.len());
+            for s in list.iter() {
+                let b = s.as_bytes();
+                if !has_meta(&b) {
+                    out.push(*s);
+                    continue;
+                }
+                let files = crate::fileutil::glob(b.clone(), &self.working_dir);
+                match files.as_ref() {
+                    Ok(v) if !v.is_empty() => {
+                        for f in v {
+                            out.push(intern(f.clone()));
+                        }
+                    }
+                    _ => out.push(*s),
+                }
+            }
+            *list = out;
+        };
+        expand(&mut rule.outputs);
+        expand(&mut rule.inputs);
+        expand(&mut rule.order_only_inputs);
     }
 
     pub fn eval_command(&mut self, stmt: &CommandStmt) -> Result<()> {
