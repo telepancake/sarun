@@ -432,6 +432,9 @@ enum Action {
     /// Selected sessions row is a loaded image: prompt a PTY running
     /// `<exe> oci run <name>` (a container shell on that image).
     RunSelectedImage,
+    /// Api pane: run `oaita local` on a PTY — download a tiny tool-capable
+    /// model + CPU runtime and serve a local OpenAI-compatible endpoint.
+    OaitaLocalPty,
 }
 
 /// One editable line of the '/' clause editor (mirrors Python ClauseRow): the
@@ -626,6 +629,10 @@ struct App {
     /// load_api_logs_if_needed; refreshed on `api_log_added` notifications.
     api_log_rows: Vec<Value>,
     api_log_loaded_sid: Option<String>,
+    /// Endpoint summary / getting-started lines for the Api pane's empty
+    /// state (endpoint_note_lines). Computed when the pane loads — not per
+    /// frame — because it reads oaita.toml from disk.
+    api_endpoint_note: Vec<String>,
     sel_rule: usize,
     hunk_scroll: u16,
     out_scroll: u16,
@@ -829,6 +836,7 @@ impl App {
             sel_api_log: 0,
             api_log_rows: vec![],
             api_log_loaded_sid: None,
+            api_endpoint_note: vec![],
             sel_rule: 0,
             hunk_scroll: 0,
             out_scroll: 0,
@@ -2333,7 +2341,17 @@ impl App {
     /// Pull this box's `api_log` table directly (no view machinery — the
     /// rows are bounded by the number of LLM calls a box has made, and
     /// the table fits comfortably in one fetch). One row per row.
+    /// Refresh the Api pane's endpoint summary from oaita.toml (shown in
+    /// the empty state so "how do I get an endpoint?" answers itself).
+    fn refresh_api_endpoint_note(&mut self) {
+        let cfg = crate::oaita::config::Config::load();
+        self.api_endpoint_note =
+            endpoint_note_lines(cfg.resolve().ok()
+                .map(|(model, base_url, _)| (model, base_url)));
+    }
+
     fn load_api_logs(&mut self) {
+        self.refresh_api_endpoint_note();
         let Some(sid) = self.cur_sid() else { return };
         match rpc(&self.sock, "api_log", json!([sid])) {
             Ok(v) => {
@@ -4402,8 +4420,13 @@ fn api_log_index_lines(app: &App) -> Vec<Line<'static>> {
         Style::default().add_modifier(Modifier::BOLD),
     ))];
     if app.api_log_rows.is_empty() {
-        out.push(Line::from("(no API calls — this box wasn't launched with --api, \
-                             or hasn't made one yet)"));
+        if app.api_endpoint_note.is_empty() {
+            out.push(Line::from("(no API calls — this box wasn't launched \
+                                 with --api, or hasn't made one yet)"));
+        }
+        for l in &app.api_endpoint_note {
+            out.push(Line::from(l.clone()));
+        }
         return out;
     }
     for (i, r) in app.api_log_rows.iter().enumerate() {
@@ -5376,7 +5399,7 @@ fn fkey_labels(app: &App) -> [&'static str; 11] {
     // available and dims to "·" when it isn't.
     let has_menu = matches!(app.focus,
         Pane::Sessions | Pane::Changes | Pane::Hunks
-        | Pane::Rules | Pane::Pty);
+        | Pane::Rules | Pane::Pty | Pane::ApiLogs);
     let mut f: [&'static str; 11] = [
         "Help",     // F1   — always
         if pty_pane { "PtyNext" } else { "Pty+" },  // F2
@@ -6792,6 +6815,34 @@ fn open_pty_menu(app: &mut App) {
     app.modal = Some(Modal::Launcher { items, sel: 0 });
 }
 
+/// The Api pane's empty-state text: what the configured endpoint is, or —
+/// when none is configured — how to get one without leaving the UI
+/// (`oaita local`, reachable from this pane's F4 action menu). Pure so the
+/// tests can pin both worlds; `resolved` is (model, base_url) from
+/// oaita.toml when it has one.
+fn endpoint_note_lines(resolved: Option<(String, String)>) -> Vec<String> {
+    match resolved {
+        Some((model, base_url)) => vec![
+            "(no API calls yet)".to_string(),
+            format!("endpoint: {base_url}"),
+            format!("model:    {model}"),
+            String::new(),
+            "calls appear here for boxes launched with --api".to_string(),
+            "(e.g. `sarun oaita run NAME`)".to_string(),
+        ],
+        None => vec![
+            "(no endpoint configured — nothing to log yet)".to_string(),
+            String::new(),
+            "F4 → \"Set up a LOCAL endpoint\" downloads a tiny tool-capable \
+             model + CPU runtime".to_string(),
+            "and serves it on localhost (`sarun oaita local`) — no external \
+             endpoint or key needed.".to_string(),
+            format!("Or configure one by hand: {}",
+                    crate::paths::oaita_config_path().display()),
+        ],
+    }
+}
+
 /// Launcher network modes, cycled in place with `n` (index = App.launch_net).
 const NET_MODES: [&str; 3] = ["tap", "host", "off"];
 
@@ -7401,6 +7452,11 @@ fn pane_action_menu(app: &App) -> Option<(String, Vec<ActionItem>)> {
                 mk("Embed in pane",   "F11",  Action::PtyEmbedToggle),
             ]))
         }
+        Pane::ApiLogs => Some(("API calls".into(), vec![
+            mk("Open call detail",   "Enter", Action::OpenSelection),
+            mk("Set up a LOCAL endpoint & serve it (oaita local)", "",
+               Action::OaitaLocalPty),
+        ])),
         // Procs / Outputs / Pipelines / BuildEdges: no destructive ops
         // worth grouping into a menu today; the popup would be just
         // "Open" → same as Enter. Defer until there's something to
@@ -7471,6 +7527,9 @@ fn run_action(app: &mut App, a: Action) {
                 None => app.status =
                     "selected box is not a loaded image".into(),
             }
+        }
+        Action::OaitaLocalPty  => {
+            app.open_pty(vec![self_exe(), "oaita".into(), "local".into()]);
         }
         Action::PtyKill        => app.pty_kill(),
         Action::PtyEmbedToggle => {
@@ -9229,6 +9288,7 @@ mod tests {
             sel_api_log: 0,
             api_log_rows: vec![],
             api_log_loaded_sid: None,
+            api_endpoint_note: vec![],
             sel_rule: 0,
             hunk_scroll: 0,
             out_scroll: 0,
@@ -9449,6 +9509,33 @@ mod tests {
         }
         assert!(app.load_job.is_none(), "job must complete");
         assert!(app.status.contains("oci load"), "failure surfaced: {}", app.status);
+    }
+
+    /// The Api pane must surface `oaita local`: an unconfigured endpoint
+    /// renders the how-to (pointing at the F4 action), and the action menu
+    /// carries the entry that launches it on a PTY.
+    #[test]
+    fn api_pane_surfaces_oaita_local() {
+        let mut app = headless_app();
+        app.focus = Pane::ApiLogs;
+        app.api_endpoint_note = endpoint_note_lines(None);
+        let buf = render_to_string(&app, 110, 30).unwrap();
+        assert!(buf.contains("no endpoint configured"), "{buf}");
+        assert!(buf.contains("oaita local"), "empty state must name the \
+                 zero-endpoint on-ramp:\n{buf}");
+        // configured endpoint: summary instead of the how-to
+        app.api_endpoint_note = endpoint_note_lines(Some(
+            ("qwen3".into(), "http://127.0.0.1:18181/v1".into())));
+        let buf = render_to_string(&app, 110, 30).unwrap();
+        assert!(buf.contains("http://127.0.0.1:18181/v1"), "{buf}");
+        assert!(buf.contains("--api"), "{buf}");
+        // action menu carries the launcher entry
+        let (title, items) = pane_action_menu(&app).expect("Api pane menu");
+        assert!(title.contains("API"), "{title}");
+        assert!(items.iter().any(|i|
+            matches!(i.action, Action::OaitaLocalPty)
+            && i.label.contains("LOCAL endpoint")),
+            "menu must offer oaita local");
     }
 
     #[test]
