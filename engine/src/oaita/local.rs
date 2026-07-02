@@ -43,7 +43,14 @@ USAGE:
   --runtime-url URL  llama.cpp release zip (default: latest CPU ubuntu-x64)
   --setup-only     download + write config, don't start the server
   --write-config   overwrite an existing oaita.toml (backed up to .bak)
-  --force          re-download even if files exist";
+  --force          re-download even if files exist
+  --no-box         run on the host directly instead of inside a sarun box
+
+By default the download + server run INSIDE a sarun box named
+'oaita-local' (host-shared network, so the endpoint is 127.0.0.1 as
+usual): the model/runtime writes are captured like any box's — review
+them in the UI, apply to keep them on the host, discard to drop the
+whole thing. Requires a running engine; --no-box skips the box.";
 
 pub fn cmd_local(args: &[String]) -> i32 {
     let mut port = DEFAULT_PORT;
@@ -53,6 +60,8 @@ pub fn cmd_local(args: &[String]) -> i32 {
     let mut setup_only = false;
     let mut write_config = false;
     let mut force = false;
+    let mut no_box = false;
+    let mut inbox = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let mut val = |flag: &str| {
@@ -78,21 +87,66 @@ pub fn cmd_local(args: &[String]) -> i32 {
             "--setup-only" => setup_only = true,
             "--write-config" => write_config = true,
             "--force" => force = true,
+            "--no-box" => no_box = true,
+            // Internal: set by the box re-exec below — we ARE the in-box
+            // payload; do the work directly.
+            "--inbox" => inbox = true,
             "-h" | "--help" => { println!("{USAGE}"); return 0; }
             other => { eprintln!("oaita local: unknown flag {other:?}\n{USAGE}");
                        return 2; }
         }
     }
     let dir = dir.unwrap_or_else(|| crate::paths::oaita_state_home().join("local"));
+    // Default: do the download + serve INSIDE a sarun box so the writes are
+    // captured (review → apply to keep, discard to drop). The config file is
+    // written host-side first — it's the pointer the host's oaita needs
+    // either way. Host-shared network so the endpoint is 127.0.0.1 as usual.
+    if !inbox && !no_box {
+        if !engine_running() {
+            eprintln!("oaita local: no running engine (needed to run the \
+                       download in a box) — start `sarun` or `sarun serve`, \
+                       or pass --no-box to download onto the host directly");
+            return 1;
+        }
+        if let Err(e) = ensure_config(port, write_config) {
+            eprintln!("oaita local: {e:#}");
+            return 1;
+        }
+        let this = std::env::current_exe()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "sarun".into());
+        let mut cmd = std::process::Command::new(&this);
+        cmd.args(["run", "--net", "host", "oaita-local", "--",
+                  &this, "oaita", "local", "--inbox",
+                  "--port", &port.to_string(),
+                  "--model-url", &model_url,
+                  "--dir"]).arg(&dir);
+        if let Some(u) = &runtime_url { cmd.args(["--runtime-url", u]); }
+        if setup_only { cmd.arg("--setup-only"); }
+        if force { cmd.arg("--force"); }
+        eprintln!("oaita local: running in box 'oaita-local' — writes are \
+                   captured; apply the box to keep the model/runtime, \
+                   discard to drop them");
+        return match cmd.status() {
+            Ok(st) => st.code().unwrap_or(1),
+            Err(e) => { eprintln!("oaita local: spawn box: {e}"); 1 }
+        };
+    }
     match run(&dir, port, &model_url, runtime_url.as_deref(),
-              setup_only, write_config, force) {
+              setup_only, write_config && !inbox, force, inbox) {
         Ok(()) => 0,
         Err(e) => { eprintln!("oaita local: {e:#}"); 1 }
     }
 }
 
+/// Whether the engine's control socket answers (a box run needs it).
+fn engine_running() -> bool {
+    std::os::unix::net::UnixStream::connect(crate::paths::sock_path()).is_ok()
+}
+
 fn run(dir: &Path, port: u16, model_url: &str, runtime_url: Option<&str>,
-       setup_only: bool, write_config: bool, force: bool) -> Result<()> {
+       setup_only: bool, write_config: bool, force: bool, inbox: bool)
+       -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("mkdir {dir:?}"))?;
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()
         .context("tokio runtime")?;
@@ -114,22 +168,29 @@ fn run(dir: &Path, port: u16, model_url: &str, runtime_url: Option<&str>,
             Some(u) => u.to_string(),
             None => rt.block_on(latest_runtime_url())?,
         };
-        let zip_path = dir.join("runtime.zip");
-        rt.block_on(fetch_to(&url, &zip_path, "runtime"))?;
-        let n = extract_runtime(&zip_path, dir)?;
-        let _ = std::fs::remove_file(&zip_path);
+        // Keep the URL's own extension: extract_runtime routes zip vs tar.gz
+        // by filename.
+        let arch_name = url_filename(&url).unwrap_or_else(|| "runtime.tar.gz".into());
+        let arch_path = dir.join(&arch_name);
+        rt.block_on(fetch_to(&url, &arch_path, "runtime"))?;
+        let n = extract_runtime(&arch_path, dir)?;
+        let _ = std::fs::remove_file(&arch_path);
         if !server.is_file() {
             bail!("archive extracted ({n} files) but no llama-server in it — \
-                   pass --runtime-url with a llama.cpp *cpu/ubuntu-x64* zip, \
-                   or drop a llama-server binary into {}", dir.display());
+                   pass --runtime-url with a llama.cpp *bin-ubuntu-x64* \
+                   archive, or drop a llama-server binary into {}",
+                  dir.display());
         }
         eprintln!("runtime ready: {} ({n} files)", server.display());
     } else {
         eprintln!("runtime already present: {}", server.display());
     }
 
-    // 3. config
-    ensure_config(port, write_config)?;
+    // 3. config — host-side concern; the box wrapper already wrote it (a
+    //    second write here would only show up as a spurious box change).
+    if !inbox {
+        ensure_config(port, write_config)?;
+    }
 
     if setup_only {
         eprintln!("setup complete — start the server later with `oaita local`");
@@ -193,16 +254,20 @@ async fn latest_runtime_url() -> Result<String> {
             llama.cpp release — pass --runtime-url explicitly"))
 }
 
-/// Pick the plain-CPU linux/x64 zip out of a llama.cpp release's asset list
-/// (skipping cuda/vulkan/sycl/hip/arm builds).
+/// Pick the plain-CPU linux/x64 archive out of a llama.cpp release's asset
+/// list — e.g. `llama-b9860-bin-ubuntu-x64.tar.gz` (older releases shipped
+/// .zip; both are accepted) — skipping every accelerator/other-arch build.
 fn pick_runtime_asset(release: &serde_json::Value) -> Option<String> {
     let assets = release.get("assets")?.as_array()?;
     let bad = ["cuda", "vulkan", "sycl", "hip", "rocm", "arm64", "s390x",
-               "musa", "kompute"];
+               "musa", "kompute", "openvino", "opencl", "android", "win",
+               "macos", "xcframework", "cudart", "-ui."];
     assets.iter().find_map(|a| {
         let name = a.get("name")?.as_str()?.to_ascii_lowercase();
         let linux_x64 = (name.contains("ubuntu") || name.contains("linux"))
-            && name.contains("x64") && name.ends_with(".zip");
+            && name.contains("x64")
+            && (name.ends_with(".zip") || name.ends_with(".tar.gz")
+                || name.ends_with(".tgz"));
         if linux_x64 && !bad.iter().any(|b| name.contains(b)) {
             a.get("browser_download_url")?.as_str().map(str::to_string)
         } else {
@@ -211,31 +276,60 @@ fn pick_runtime_asset(release: &serde_json::Value) -> Option<String> {
     })
 }
 
-/// Flatten the useful payload of a llama.cpp release zip (server binary +
-/// its shared libs live under build/bin/) into `dir`. Returns files written.
-fn extract_runtime(zip_path: &Path, dir: &Path) -> Result<usize> {
-    let f = std::fs::File::open(zip_path).context("open runtime zip")?;
-    let mut z = zip::ZipArchive::new(f).context("read runtime zip")?;
+/// The payload worth keeping from a runtime archive: the server + every
+/// shared lib it links; demos/tools/docs are skipped.
+fn keep_runtime_file(name: &str) -> bool {
+    name == "llama-server" || (name.starts_with("lib") && name.contains(".so"))
+}
+
+fn install_runtime_file(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
+    let dest = dir.join(name);
+    std::fs::write(&dest, bytes).with_context(|| format!("write {dest:?}"))?;
+    #[cfg(unix)] {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dest,
+            std::fs::Permissions::from_mode(0o755)).ok();
+    }
+    Ok(())
+}
+
+/// Flatten the useful payload of a llama.cpp release archive (server binary
+/// + its shared libs live under build/bin/) into `dir`. Handles both the
+/// current .tar.gz assets and the older .zip ones. Returns files written.
+fn extract_runtime(archive: &Path, dir: &Path) -> Result<usize> {
+    let is_zip = archive.extension().is_some_and(|e| e == "zip");
     let mut n = 0;
-    for i in 0..z.len() {
-        let mut e = z.by_index(i).context("zip entry")?;
-        if e.is_dir() { continue; }
-        let name = Path::new(e.name()).file_name()
-            .and_then(|s| s.to_str()).unwrap_or("").to_string();
-        // The server + every shared lib it links; skip demos/tests/docs.
-        let want = name == "llama-server"
-            || (name.starts_with("lib") && name.contains(".so"));
-        if !want { continue; }
-        let dest = dir.join(&name);
-        let mut buf = Vec::new();
-        e.read_to_end(&mut buf).context("read zip entry")?;
-        std::fs::write(&dest, &buf).with_context(|| format!("write {dest:?}"))?;
-        #[cfg(unix)] {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&dest,
-                std::fs::Permissions::from_mode(0o755)).ok();
+    if is_zip {
+        let f = std::fs::File::open(archive).context("open runtime archive")?;
+        let mut z = zip::ZipArchive::new(f).context("read runtime zip")?;
+        for i in 0..z.len() {
+            let mut e = z.by_index(i).context("zip entry")?;
+            if e.is_dir() { continue; }
+            let name = Path::new(e.name()).file_name()
+                .and_then(|s| s.to_str()).unwrap_or("").to_string();
+            if !keep_runtime_file(&name) { continue; }
+            let mut buf = Vec::new();
+            e.read_to_end(&mut buf).context("read zip entry")?;
+            install_runtime_file(dir, &name, &buf)?;
+            n += 1;
         }
-        n += 1;
+    } else {
+        let f = std::fs::File::open(archive).context("open runtime archive")?;
+        let gz = flate2::read::GzDecoder::new(f);
+        let mut t = tar::Archive::new(gz);
+        for e in t.entries().context("read runtime tar")? {
+            let mut e = e.context("tar entry")?;
+            if !e.header().entry_type().is_file() { continue; }
+            let name = e.path().ok()
+                .and_then(|p| p.file_name()
+                    .and_then(|s| s.to_str()).map(str::to_string))
+                .unwrap_or_default();
+            if !keep_runtime_file(&name) { continue; }
+            let mut buf = Vec::new();
+            e.read_to_end(&mut buf).context("read tar entry")?;
+            install_runtime_file(dir, &name, &buf)?;
+            n += 1;
+        }
     }
     Ok(n)
 }
@@ -340,22 +434,77 @@ mod tests {
     use super::*;
 
     #[test]
-    fn asset_picker_prefers_plain_cpu_linux_zip() {
-        let rel: serde_json::Value = serde_json::json!({
-            "assets": [
-                {"name": "llama-b9999-bin-ubuntu-x64-cuda-12.zip",
-                 "browser_download_url": "https://x/cuda.zip"},
-                {"name": "llama-b9999-bin-macos-arm64.zip",
-                 "browser_download_url": "https://x/mac.zip"},
-                {"name": "llama-b9999-bin-ubuntu-vulkan-x64.zip",
-                 "browser_download_url": "https://x/vulkan.zip"},
-                {"name": "llama-b9999-bin-ubuntu-x64.zip",
-                 "browser_download_url": "https://x/cpu.zip"},
-            ]
-        });
+    fn asset_picker_finds_the_cpu_asset_in_a_real_release() {
+        // the VERBATIM asset list of llama.cpp release b9860 (tar.gz era) —
+        // the picker must land on plain bin-ubuntu-x64 and nothing else.
+        let names = [
+            "llama-b9860-bin-macos-arm64.tar.gz",
+            "llama-b9860-bin-macos-x64.tar.gz",
+            "llama-b9860-xcframework.zip",
+            "llama-b9860-bin-ubuntu-x64.tar.gz",
+            "llama-b9860-bin-ubuntu-arm64.tar.gz",
+            "llama-b9860-bin-ubuntu-s390x.tar.gz",
+            "llama-b9860-bin-ubuntu-vulkan-x64.tar.gz",
+            "llama-b9860-bin-ubuntu-vulkan-arm64.tar.gz",
+            "llama-b9860-bin-ubuntu-rocm-7.2-x64.tar.gz",
+            "llama-b9860-bin-ubuntu-openvino-2026.2.1-x64.tar.gz",
+            "llama-b9860-bin-ubuntu-sycl-fp32-x64.tar.gz",
+            "llama-b9860-bin-ubuntu-sycl-fp16-x64.tar.gz",
+            "llama-b9860-bin-android-arm64.tar.gz",
+            "llama-b9860-bin-win-cpu-x64.zip",
+            "llama-b9860-bin-win-cuda-12.4-x64.zip",
+            "cudart-llama-bin-win-cuda-12.4-x64.zip",
+            "llama-b9860-ui.tar.gz",
+        ];
+        let assets: Vec<serde_json::Value> = names.iter().map(|n|
+            serde_json::json!({"name": n,
+                               "browser_download_url": format!("https://x/{n}")}))
+            .collect();
+        let rel = serde_json::json!({"assets": assets});
+        assert_eq!(pick_runtime_asset(&rel).as_deref(),
+                   Some("https://x/llama-b9860-bin-ubuntu-x64.tar.gz"));
+        // older zip-era releases still resolve
+        let rel = serde_json::json!({"assets": [
+            {"name": "llama-b4000-bin-ubuntu-x64.zip",
+             "browser_download_url": "https://x/cpu.zip"}]});
         assert_eq!(pick_runtime_asset(&rel).as_deref(), Some("https://x/cpu.zip"));
         let none: serde_json::Value = serde_json::json!({"assets": []});
         assert!(pick_runtime_asset(&none).is_none());
+    }
+
+    #[test]
+    fn runtime_extraction_handles_tar_gz() {
+        use std::io::Write as _;
+        let tmp = std::env::temp_dir()
+            .join(format!("oaita-local-tgz-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let tp = tmp.join("rt.tar.gz");
+        {
+            let f = std::fs::File::create(&tp).unwrap();
+            let gz = flate2::write::GzEncoder::new(f, Default::default());
+            let mut t = tar::Builder::new(gz);
+            for (name, body) in [
+                ("build/bin/llama-server", b"ELF".as_slice()),
+                ("build/bin/libggml-base.so", b"ELF".as_slice()),
+                ("build/bin/llama-cli", b"ELF".as_slice()),
+                ("README.md", b"docs".as_slice()),
+            ] {
+                let mut h = tar::Header::new_gnu();
+                h.set_size(body.len() as u64);
+                h.set_mode(0o755);
+                h.set_cksum();
+                t.append_data(&mut h, name, body).unwrap();
+            }
+            t.into_inner().unwrap().finish().unwrap().flush().unwrap();
+        }
+        let out = tmp.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let n = extract_runtime(&tp, &out).unwrap();
+        assert_eq!(n, 2, "server + lib; no cli/docs");
+        assert!(out.join("llama-server").is_file());
+        assert!(out.join("libggml-base.so").is_file());
+        assert!(!out.join("llama-cli").exists());
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
