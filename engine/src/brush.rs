@@ -2274,6 +2274,24 @@ impl brush_core::commands::ExecInterposer<brush_core::extensions::DefaultShellEx
             // The fds carried in params are kept; only this flag is reset.
             params.suppress_errexit = false;
 
+            // Same principle for the `set` flags themselves: the cloned subshell
+            // carries the CALLER's option state, but a real `sh script.sh` is a
+            // fresh process with default options — a recipe prefix's `set -e`
+            // must not govern the script's commands (kbuild's cmd macro runs
+            // every recipe under `set -e`, and headers_install.sh relies on
+            // inspecting unifdef's exit 1 rather than dying on it). Reset the
+            // per-invocation `set` flags to sh defaults; the script's own argv
+            // flags (snoop.set_flags) are replayed below.
+            {
+                let o = sub.options_mut();
+                o.exit_on_nonzero_command_exit = false;
+                o.treat_unset_variables_as_error = false;
+                o.print_commands_and_arguments = false;
+                o.print_shell_input_lines = false;
+                o.disable_filename_globbing = false;
+                o.do_not_execute_commands = false;
+            }
+
             // A unique synthetic $$/BASHPID per snooped script, so concurrent
             // in-process scripts get distinct `conftest$$`-style temp files even
             // though they share one OS process.

@@ -754,6 +754,34 @@ def main():
         check(co == b"conf=yes\n",
               f"case21: required include regenerated via the %.conf pattern "
               f"rule (remake loop); conf.txt={co!r}")
+
+        # ── CASE 22: a recipe's `set -e` must NOT leak into a nested sh ───────
+        # kbuild's cmd macro runs every recipe under `set -e`, then invokes
+        # `$(CONFIG_SHELL) scripts/headers_install.sh …`, which deliberately
+        # lets unifdef exit 1 (output-changed) and inspects $?. The in-process
+        # snooped `sh script.sh` cloned the caller's shell WITH its errexit, so
+        # the script died at unifdef's benign exit 1 and `make headers` failed
+        # on the first header unifdef modified. A nested sh is a fresh shell:
+        # default options, only its own argv flags apply.
+        ee = work / "errexit"
+        shutil.rmtree(ee, ignore_errors=True)
+        ee.mkdir(parents=True, exist_ok=True)
+        (ee / "script.sh").write_text(
+            "false\n"
+            "[ $? -gt 1 ] && exit 1\n"
+            "echo script-ran > result.txt\n")
+        (ee / "Makefile").write_text(
+            "all:\n\t@set -e; sh script.sh; echo recipe-done >> result.txt\n")
+        r = subprocess.run(
+            [str(BIN), "run", "-b", "MAKE22", "-C", str(ee), "--", "make"],
+            capture_output=True, text=True, timeout=180)
+        check(r.returncode == 0,
+              f"case22: errexit box exits 0 (got {r.returncode}: {r.stderr[-600:]})")
+        sp22 = latest_sqlar(m)
+        eo22 = m.sqlar_content(sp22, str((ee / "result.txt").resolve()).lstrip("/"))
+        check(eo22 == b"script-ran\nrecipe-done\n",
+              f"case22: nested sh ran with fresh options under a set -e recipe; "
+              f"result.txt={eo22!r} (want b'script-ran\\nrecipe-done\\n')")
     finally:
         if eng is not None and eng.poll() is None:
             eng.terminate()
