@@ -565,6 +565,18 @@ struct App {
     /// currently rendered. Reset to 0 on every view switch (so each
     /// view's right pane starts at the top, the prototype's behavior).
     right_scroll: u16,
+    /// Upper bound for `right_scroll` — the right pane's wrapped content
+    /// rows minus its visible viewport, recomputed by draw() every frame
+    /// (a Cell because draw takes &App). The j/k/PgUp/PgDn handlers clamp
+    /// against it so the detail body stops at its last line instead of
+    /// scrolling into blank space.
+    right_scroll_max: std::cell::Cell<u16>,
+    /// The Outputs right pane's cursor-follow scroll, recomputed by
+    /// draw() every frame: while the LEFT list is focused the transcript
+    /// auto-scrolls to keep the selected write visible. Tab into the
+    /// right pane seeds `right_scroll` from it, so manual scrolling
+    /// starts where the view already was instead of jumping to the top.
+    out_follow_scroll: std::cell::Cell<u16>,
     /// When true, the focused view's RIGHT column hosts the currently
     /// selected PTY (`ptys[sel_pty]`) instead of the normal detail
     /// body. Lets the user watch a live shell next to the boxes /
@@ -708,7 +720,7 @@ impl App {
             f_pipelines: ViewFilter::default(),
             f_edges: ViewFilter::default(),
             should_quit: false,
-            ptys: vec![], sel_pty: 0, pty_esc_at: None, right_focused: false, right_scroll: 0, pty_in_right: false, menu_nav: false, menu_sel: 0,
+            ptys: vec![], sel_pty: 0, pty_esc_at: None, right_focused: false, right_scroll: 0, right_scroll_max: std::cell::Cell::new(0), out_follow_scroll: std::cell::Cell::new(0), pty_in_right: false, menu_nav: false, menu_sel: 0,
             structd: StructState::default(),
             sel_hunk: 0,
             struct_rx: None,
@@ -2257,7 +2269,10 @@ impl App {
         // Hunks doesn't go through here (its own keymap drives the diff
         // scroll); right_pane_scrollable() filters Hunks out.
         if self.right_focused && self.right_pane_scrollable() {
-            self.right_scroll = self.right_scroll.saturating_add(1);
+            self.right_scroll = self
+                .right_scroll
+                .saturating_add(1)
+                .min(self.right_scroll_max.get());
             return;
         }
         match self.focus {
@@ -2383,7 +2398,12 @@ impl App {
         let step: isize = if delta > 0 { 1 } else { -1 };
         if self.right_focused && self.right_pane_scrollable() {
             let n16 = n as u16;
-            if step > 0 { self.right_scroll = self.right_scroll.saturating_add(n16); }
+            if step > 0 {
+                self.right_scroll = self
+                    .right_scroll
+                    .saturating_add(n16)
+                    .min(self.right_scroll_max.get());
+            }
             else { self.right_scroll = self.right_scroll.saturating_sub(n16); }
             return;
         }
@@ -2523,7 +2543,17 @@ impl App {
             Pane::Pty => self.focus = Pane::Sessions,
             _ if self.right_pane_scrollable() => {
                 self.right_focused = !self.right_focused;
-                if !self.right_focused { self.right_scroll = 0; }
+                if self.right_focused {
+                    // Outputs: pick up manual scrolling from wherever the
+                    // cursor-follow left the transcript — no jump to top.
+                    if self.focus == Pane::Outputs {
+                        self.right_scroll = self.out_follow_scroll.get();
+                    }
+                } else if self.focus != Pane::Outputs {
+                    // Outputs keeps its scroll — the follow-mode render
+                    // ignores right_scroll and re-seeds on the next Tab.
+                    self.right_scroll = 0;
+                }
             }
             _ => {}
         }
@@ -3734,8 +3764,12 @@ fn processes_lines(app: &App) -> Vec<Line<'static>> {
 /// stderr lines render red; the selected entry's lines also get bold +
 /// grey23 background. Out-of-window bytes get rolled up as
 /// "… N earlier" / "… N more" elision lines.
-fn outputs_lines(app: &App) -> Vec<Line<'static>> {
+/// Returns the transcript lines plus the index of the FIRST line of the
+/// selected write, so the render can keep the selection scrolled into view
+/// while the left list is focused.
+fn outputs_lines(app: &App) -> (Vec<Line<'static>>, usize) {
     let mut out: Vec<Line<'static>> = Vec::new();
+    let mut sel_line = 0usize;
     // Header: total counts per stream — quick orientation.
     let (mut nout, mut nerr) = (0i64, 0i64);
     for o in &app.outputs {
@@ -3749,7 +3783,7 @@ fn outputs_lines(app: &App) -> Vec<Line<'static>> {
         Style::default().add_modifier(Modifier::BOLD))));
     if app.output_segs.is_empty() {
         out.push(Line::from("(no captured output)"));
-        return out;
+        return (out, sel_line);
     }
     // Selected entry's id (used to drive the gutter mark and the window
     // centre). sel_output indexes the OUTPUTS index list, which lines up
@@ -3799,6 +3833,7 @@ fn outputs_lines(app: &App) -> Vec<Line<'static>> {
             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
         } else { Style::default().add_modifier(Modifier::DIM) };
         let gutter = if is_sel { "▌ " } else { "  " };
+        if is_sel && sel_line == 0 { sel_line = out.len(); }
         let lines: Vec<&str> = vis.split('\n').collect();
         let last_idx = lines.len().saturating_sub(1);
         for (i, ln) in lines.iter().enumerate() {
@@ -3814,7 +3849,7 @@ fn outputs_lines(app: &App) -> Vec<Line<'static>> {
             format!("  … {} more", fmt_bytes((total - end) as i64)),
             Style::default().add_modifier(Modifier::DIM))));
     }
-    out
+    (out, sel_line)
 }
 
 /// OUTPUTS index (left pane). Columns mirror the prototype's #out-tab:
@@ -4301,6 +4336,15 @@ fn scroll_for_cursor(cursor_line: usize, n_lines: usize, rect_h: u16) -> u16 {
     let third = visible / 3;
     let want = cursor_line.saturating_sub(third);
     want.min(n_lines.saturating_sub(visible)) as u16
+}
+
+/// Display rows `lines` occupy in a `Wrap { trim: false }` Paragraph of inner
+/// width `inner_w` — each Line takes ceil(width / inner_w) rows (min 1).
+/// Paragraph's vertical scroll offset counts these wrapped rows, so scroll
+/// bounds must be computed in the same space.
+fn wrapped_rows(lines: &[Line], inner_w: u16) -> usize {
+    let w = (inner_w as usize).max(1);
+    lines.iter().map(|l| l.width().div_ceil(w).max(1)).sum()
 }
 
 /// Mirrors the prototype's _keybar: a row of view-key chips (b/c/p/o/e),
@@ -4805,7 +4849,17 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         // the Hunks path uses for the diff body.
         let lf = !app.right_focused;
         let rf = app.right_focused;
-        let rscroll = app.right_scroll;
+        // Clamp the manual right-pane scroll to the detail body's real extent
+        // (in wrapped-row space, which is what Paragraph::scroll skips) and
+        // publish the bound so the key handlers stop at the last line instead
+        // of scrolling into blank space.
+        let clamp_rscroll = |lines: &[Line]| -> u16 {
+            let visible = (right.height as usize).saturating_sub(2);
+            let total = wrapped_rows(lines, right.width.saturating_sub(2));
+            let max = total.saturating_sub(visible).min(u16::MAX as usize) as u16;
+            app.right_scroll_max.set(max);
+            app.right_scroll.min(max)
+        };
         // F11 embed mode: swap the RIGHT column for the active PTY's
         // screen. Renders a thin title strip + the vt100 grid, like the
         // full-screen Pane::Pty path but constrained to the right area.
@@ -4852,9 +4906,11 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                     .block(block(title("sarun · boxes", lf), lf))
                     .scroll((scroll, 0));
                 f.render_widget(p, left);
-                let detail = Paragraph::new(Text::from(box_detail_lines(app)))
+                let dl = box_detail_lines(app);
+                let rs = clamp_rscroll(&dl);
+                let detail = Paragraph::new(Text::from(dl))
                     .block(block(title("BOX · DETAIL", rf), rf))
-                    .scroll((rscroll, 0))
+                    .scroll((rs, 0))
                     .wrap(Wrap { trim: false });
                 if !skip_right { f.render_widget(detail, right); }
             }
@@ -4865,9 +4921,11 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                     .block(block(title("PROCESSES", lf), lf))
                     .scroll((scroll, 0));
                 f.render_widget(p, left);
-                let detail = Paragraph::new(Text::from(proc_detail_lines(app)))
+                let dl = proc_detail_lines(app);
+                let rs = clamp_rscroll(&dl);
+                let detail = Paragraph::new(Text::from(dl))
                     .block(block(title("ENVIRONMENT · DETAIL", rf), rf))
-                    .scroll((rscroll, 0))
+                    .scroll((rs, 0))
                     .wrap(Wrap { trim: false });
                 if !skip_right { f.render_widget(detail, right); }
             }
@@ -4878,9 +4936,24 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                     .block(block(title("OUTPUTS", lf), lf))
                     .scroll((scroll, 0));
                 f.render_widget(p, left);
-                let out = Paragraph::new(Text::from(outputs_lines(app)))
+                let (out_lines, sel_line) = outputs_lines(app);
+                let inner_w = right.width.saturating_sub(2);
+                let visible = (right.height as usize).saturating_sub(2);
+                let total = wrapped_rows(&out_lines, inner_w);
+                let max = total.saturating_sub(visible).min(u16::MAX as usize) as u16;
+                app.right_scroll_max.set(max);
+                // While the LEFT list drives, follow the selected write:
+                // scroll the transcript (in wrapped-row space) so the
+                // selection sits ~1/3 down. Tab'd into the right pane, the
+                // user's manual scroll wins (clamped to the body's extent).
+                let cursor_row = wrapped_rows(&out_lines[..sel_line.min(out_lines.len())], inner_w);
+                let third = visible / 3;
+                let follow = (cursor_row.saturating_sub(third)).min(max as usize) as u16;
+                app.out_follow_scroll.set(follow);
+                let rs = if rf { app.right_scroll.min(max) } else { follow };
+                let out = Paragraph::new(Text::from(out_lines))
                     .block(block(title("OUTPUT · stdout/stderr", rf), rf))
-                    .scroll((rscroll, 0))
+                    .scroll((rs, 0))
                     .wrap(Wrap { trim: false });
                 if !skip_right { f.render_widget(out, right); }
             }
@@ -4891,9 +4964,11 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                     .block(block(title("PIPELINES · brush", lf), lf))
                     .scroll((scroll, 0));
                 f.render_widget(p, left);
-                let detail = Paragraph::new(Text::from(pipeline_detail_lines(app)))
+                let dl = pipeline_detail_lines(app);
+                let rs = clamp_rscroll(&dl);
+                let detail = Paragraph::new(Text::from(dl))
                     .block(block(title("PIPELINE · DETAIL", rf), rf))
-                    .scroll((rscroll, 0))
+                    .scroll((rs, 0))
                     .wrap(Wrap { trim: false });
                 if !skip_right { f.render_widget(detail, right); }
             }
@@ -4904,9 +4979,11 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                     .block(block(title("BUILD EDGES · ninja/make", lf), lf))
                     .scroll((scroll, 0));
                 f.render_widget(p, left);
-                let detail = Paragraph::new(Text::from(build_edge_detail_lines(app)))
+                let dl = build_edge_detail_lines(app);
+                let rs = clamp_rscroll(&dl);
+                let detail = Paragraph::new(Text::from(dl))
                     .block(block(title("EDGE · DETAIL", rf), rf))
-                    .scroll((rscroll, 0))
+                    .scroll((rs, 0))
                     .wrap(Wrap { trim: false });
                 if !skip_right { f.render_widget(detail, right); }
             }
@@ -4918,9 +4995,11 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                     .scroll((scroll, 0))
                     .wrap(Wrap { trim: false });
                 f.render_widget(p, left);
-                let detail = Paragraph::new(Text::from(rule_detail_lines(app)))
+                let dl = rule_detail_lines(app);
+                let rs = clamp_rscroll(&dl);
+                let detail = Paragraph::new(Text::from(dl))
                     .block(block(title("WHAT IT MATCHES", rf), rf))
-                    .scroll((rscroll, 0))
+                    .scroll((rs, 0))
                     .wrap(Wrap { trim: false });
                 if !skip_right { f.render_widget(detail, right); }
             }
@@ -4931,9 +5010,11 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                     .block(block(title("FLOWS · -n captured", lf), lf))
                     .scroll((scroll, 0));
                 f.render_widget(p, left);
-                let detail = Paragraph::new(Text::from(flow_detail_lines(app)))
+                let dl = flow_detail_lines(app);
+                let rs = clamp_rscroll(&dl);
+                let detail = Paragraph::new(Text::from(dl))
                     .block(block(title("FLOW · DETAIL (tshark -V)", rf), rf))
-                    .scroll((rscroll, 0))
+                    .scroll((rs, 0))
                     .wrap(Wrap { trim: false });
                 if !skip_right { f.render_widget(detail, right); }
             }
@@ -4946,9 +5027,11 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                         lf))
                     .scroll((scroll, 0));
                 f.render_widget(p, left);
-                let detail = Paragraph::new(Text::from(packet_detail_lines(app)))
+                let dl = packet_detail_lines(app);
+                let rs = clamp_rscroll(&dl);
+                let detail = Paragraph::new(Text::from(dl))
                     .block(block(title("PACKET · DETAIL (tshark -V)", rf), rf))
-                    .scroll((rscroll, 0))
+                    .scroll((rs, 0))
                     .wrap(Wrap { trim: false });
                 if !skip_right { f.render_widget(detail, right); }
             }
@@ -4959,9 +5042,11 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                     .block(block(title("API LOG · oaita proxy", lf), lf))
                     .scroll((scroll, 0));
                 f.render_widget(p, left);
-                let detail = Paragraph::new(Text::from(api_log_detail_lines(app)))
+                let dl = api_log_detail_lines(app);
+                let rs = clamp_rscroll(&dl);
+                let detail = Paragraph::new(Text::from(dl))
                     .block(block(title("CALL · request + response", rf), rf))
-                    .scroll((rscroll, 0))
+                    .scroll((rs, 0))
                     .wrap(Wrap { trim: false });
                 if !skip_right { f.render_widget(detail, right); }
             }
@@ -7965,7 +8050,7 @@ mod tests {
             f_pipelines: ViewFilter::default(),
             f_edges: ViewFilter::default(),
             should_quit: false,
-            ptys: vec![], sel_pty: 0, pty_esc_at: None, right_focused: false, right_scroll: 0, pty_in_right: false, menu_nav: false, menu_sel: 0,
+            ptys: vec![], sel_pty: 0, pty_esc_at: None, right_focused: false, right_scroll: 0, right_scroll_max: std::cell::Cell::new(0), out_follow_scroll: std::cell::Cell::new(0), pty_in_right: false, menu_nav: false, menu_sel: 0,
             structd: StructState::default(),
             sel_hunk: 0,
             struct_rx: None,
