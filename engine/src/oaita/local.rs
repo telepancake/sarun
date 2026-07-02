@@ -54,9 +54,9 @@ Two boxed phases, no host network in either by default. DOWNLOAD runs
 in box 'OAITA-LOCAL' under tap networking — egress via the engine's
 proxied stack, files captured until an explicit `sarun OAITA-LOCAL
 apply`. SERVE runs in box 'OAITA-SERVE' with its OWN isolated netns;
-the endpoint is bridged to the host through the engine as a unix
-socket ({runtime_home}/svc-oaita-local.sock — oaita.toml points there)
-so no netns is ever shared. --net host switches both phases to the
+the endpoint is bridged through the engine's control socket (oaita.toml
+gets base_url = \"svc://oaita-local#/v1\") so no netns — and no extra
+socket — is ever involved. --net host switches both phases to the
 host netns (plain http://127.0.0.1 endpoint) for environments without
 netns privileges. Requires a running engine; --no-box does everything
 directly on the host instead.";
@@ -147,9 +147,7 @@ pub fn cmd_local(args: &[String]) -> i32 {
         let base_url = if net == "host" {
             format!("http://127.0.0.1:{port}/v1")
         } else {
-            format!("unix://{}#/v1",
-                    crate::paths::runtime_home()
-                        .join(format!("svc-{SVC_NAME}.sock")).display())
+            format!("svc://{SVC_NAME}#/v1")
         };
         if let Err(e) = ensure_config(&base_url, write_config) {
             eprintln!("oaita local: {e:#}");
@@ -583,9 +581,8 @@ fn serve(dir: &Path, model: &Path, port: u16, svc: Option<&str>) -> Result<()> {
             eprintln!();
             match svc {
                 Some(name) => eprintln!(
-                    "ready — endpoint bridged to the host at \
-                     {}/svc-{name}.sock (this box's network stays isolated)",
-                    crate::paths::runtime_home().display()),
+                    "ready — endpoint bridged through the engine as \
+                     svc://{name} (this box's network stays isolated)"),
                 None => eprintln!(
                     "ready — local OpenAI-compatible endpoint: \
                      http://127.0.0.1:{port}/v1"),
@@ -750,15 +747,15 @@ mod tests {
         // parses as the Config the rest of oaita reads
         let v: toml::Value = c.parse().unwrap();
         assert_eq!(v.get("api_key").and_then(|x| x.as_str()), Some("sk-local"));
-        // the bridged (isolated-box) endpoint form parses as a Unix endpoint
+        // the bridged (isolated-box) endpoint form parses as a Svc endpoint
         // with the base path in the fragment
-        let c = local_config("unix:///run/user/1/slopbox/svc-oaita-local.sock#/v1");
+        let c = local_config("svc://oaita-local#/v1");
         let v: toml::Value = c.parse().unwrap();
         let url = v.get("base_url").and_then(|x| x.as_str()).unwrap();
         match crate::oaita::client::Endpoint::parse_url(url).unwrap() {
-            crate::oaita::client::Endpoint::Unix { path } =>
-                assert_eq!(path, "/run/user/1/slopbox/svc-oaita-local.sock"),
-            other => panic!("expected Unix endpoint, got {other:?}"),
+            crate::oaita::client::Endpoint::Svc { name } =>
+                assert_eq!(name, "oaita-local"),
+            other => panic!("expected Svc endpoint, got {other:?}"),
         }
     }
 

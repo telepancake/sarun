@@ -34,12 +34,14 @@ pub enum Endpoint {
     Broker(String),
     /// Real http(s) URL. The port defaults to 80/443 by scheme.
     Tcp { scheme: String, host: String, port: u16 },
-    /// HTTP over a host UNIX socket: `unix://<abs-path>[#<base-path>]`.
-    /// Used for engine-bridged in-box services (`svc.serve` — e.g. the
-    /// `oaita local` llama-server box): the endpoint never touches any
-    /// netns, host or box. The optional fragment carries the API base
-    /// path (e.g. `#/v1`) since a socket path has no URL path of its own.
-    Unix { path: String },
+    /// HTTP over an engine-bridged in-box service: `svc://<name>[#<base>]`.
+    /// Dials the engine's own control socket, tags the conn `svc.dial`,
+    /// and the engine splices it onto the named service's parked
+    /// `svc.serve` slot (e.g. the `oaita local` llama-server box). No
+    /// netns is touched anywhere, host or box. The optional fragment
+    /// carries the API base path (e.g. `#/v1`) — a service name has no
+    /// URL path of its own.
+    Svc { name: String },
 }
 
 impl Endpoint {
@@ -62,12 +64,12 @@ impl Endpoint {
         // at send time. We don't need a full URL parser for this.
         let (scheme, rest) = url.split_once("://")
             .ok_or_else(|| format!("base_url missing scheme: {url:?}"))?;
-        if scheme.eq_ignore_ascii_case("unix") {
-            let path = rest.split('#').next().unwrap_or(rest);
-            if path.is_empty() {
-                return Err(format!("unix base_url missing socket path: {url:?}"));
+        if scheme.eq_ignore_ascii_case("svc") {
+            let name = rest.split('#').next().unwrap_or(rest);
+            if name.is_empty() {
+                return Err(format!("svc base_url missing service name: {url:?}"));
             }
-            return Ok(Endpoint::Unix { path: path.to_string() });
+            return Ok(Endpoint::Svc { name: name.to_string() });
         }
         let host_port = rest.split('/').next().unwrap_or("");
         let (host, port) = match host_port.rsplit_once(':') {
@@ -84,9 +86,9 @@ impl Endpoint {
 /// dispatch the base_url's path prefix matters (so we honour …/v1); UDS
 /// dispatch ignores it (engine routes by the path it sees).
 fn base_path(url: &str) -> &str {
-    // unix:// endpoints: the socket path IS the "host"; the API base path
-    // rides in the fragment (unix:///run/x.sock#/v1).
-    if url.len() >= 7 && url[..7].eq_ignore_ascii_case("unix://") {
+    // svc:// endpoints: the service name is not a URL path; the API base
+    // path rides in the fragment (svc://oaita-local#/v1).
+    if url.len() >= 6 && url[..6].eq_ignore_ascii_case("svc://") {
         return match url.find('#') {
             Some(i) => &url[i + 1..],
             None => "/",
@@ -207,7 +209,7 @@ impl Client {
             .map_err(|e| format!("encode body: {e}"))?;
         let host_header = match &self.endpoint {
             Endpoint::Broker(_) => "oaita-proxy".to_string(),
-            Endpoint::Unix { .. } => "localhost".to_string(),
+            Endpoint::Svc { .. } => "localhost".to_string(),
             Endpoint::Tcp { host, port, scheme } => {
                 let default = (scheme == "https" && *port == 443)
                            || (scheme == "http" && *port == 80);
@@ -257,9 +259,20 @@ impl Client {
                 tokio::spawn(async move { let _ = conn.await; });
                 sender.send_request(req).await.map_err(|e| format!("send: {e}"))
             }
-            Endpoint::Unix { path } => {
-                let stream = UnixStream::connect(path).await
-                    .map_err(|e| format!("dial {path}: {e}"))?;
+            Endpoint::Svc { name } => {
+                // The engine's own control socket, conn tagged svc.dial —
+                // the engine splices us onto the service's parked slot.
+                let sock = crate::paths::sock_path();
+                let mut stream = UnixStream::connect(&sock).await
+                    .map_err(|e| format!("dial engine {}: {e}", sock.display()))?;
+                stream.write_all(
+                    format!("{{\"type\":\"svc.dial\",\"name\":\"{name}\"}}\n")
+                        .as_bytes()).await
+                    .map_err(|e| format!("svc.dial header: {e}"))?;
+                let line = read_line_async(&mut stream).await?;
+                if !line.contains("\"ok\":true") {
+                    return Err(format!("svc.dial {name}: {line}"));
+                }
                 let (mut sender, conn) = hyper::client::conn::http1::handshake(
                     TokioIo::new(stream)).await
                     .map_err(|e| format!("handshake: {e}"))?;
@@ -290,6 +303,23 @@ impl Client {
             }
         }
     }
+}
+
+/// Read one '\n'-terminated line, one byte at a time — the HTTP stream
+/// begins right behind it and must not be swallowed by a buffered reader.
+async fn read_line_async(s: &mut UnixStream) -> Result<String, String> {
+    use tokio::io::AsyncReadExt;
+    let mut out = Vec::new();
+    let mut b = [0u8; 1];
+    loop {
+        match s.read(&mut b).await {
+            Ok(0) => return Err("engine closed the svc conn".into()),
+            Ok(_) if b[0] == b'\n' => break,
+            Ok(_) => out.push(b[0]),
+            Err(e) => return Err(format!("svc read: {e}")),
+        }
+    }
+    String::from_utf8(out).map_err(|e| e.to_string())
 }
 
 fn find_double_newline(buf: &[u8]) -> Option<usize> {

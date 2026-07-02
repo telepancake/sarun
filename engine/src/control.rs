@@ -2073,7 +2073,39 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
             if writer.write_all(b"{\"ok\":true,\"r\":\"parked\"}\n").is_err() {
                 return;
             }
-            svc_park(name, writer);
+            SVC_PARKED.lock().unwrap()
+                .entry(name.to_string()).or_default().push_back(writer);
+            return;
+        }
+        // svc.dial: the host-side half — THIS connection becomes a raw
+        // stream spliced onto a parked svc.serve slot of the named service.
+        // Rides the ordinary control socket (like pty_spawn / api.proxy);
+        // no extra listener or socket file exists for services.
+        if msg.get("type").and_then(Value::as_str) == Some("svc.dial") {
+            if let Some(fd) = peer_pidfd.take() { unsafe { libc::close(fd); } }
+            let Some(name) = msg.get("name").and_then(Value::as_str) else {
+                let _ = writer.write_all(
+                    b"{\"ok\":false,\"error\":\"svc.dial: missing name\"}\n");
+                return;
+            };
+            // Bytes the dialer pipelined right behind its dial line must
+            // reach the service too.
+            let prebuffered = reader.buffer().to_vec();
+            drop(reader);
+            let Some(mut slot) = svc_pair(name) else {
+                let _ = writer.write_all(format!(
+                    "{{\"ok\":false,\"error\":\"svc.dial: no live \
+                     '{name}' service (is its box running?)\"}}\n")
+                    .as_bytes());
+                return;
+            };
+            if writer.write_all(b"{\"ok\":true,\"r\":\"svc\"}\n").is_err() {
+                return;
+            }
+            if !prebuffered.is_empty() && slot.write_all(&prebuffered).is_err() {
+                return;
+            }
+            svc_splice(writer, slot);
             return;
         }
         // budget.grant: add `amount` to a box's pool. Additive — resume
@@ -2311,57 +2343,22 @@ fn svc_name_ok(name: &str) -> bool {
         && !name.starts_with('.')
 }
 
-fn svc_sock_path(name: &str) -> std::path::PathBuf {
-    crate::paths::runtime_home().join(format!("svc-{name}.sock"))
-}
-
 static SVC_PARKED: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<
         String, std::collections::VecDeque<UnixStream>>>>
     = std::sync::LazyLock::new(Default::default);
-static SVC_LISTENING: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashSet<String>>>
-    = std::sync::LazyLock::new(Default::default);
 
-/// Park one accept slot for `name` and make sure the host-side listener
-/// socket exists.
-fn svc_park(name: &str, conn: UnixStream) {
-    SVC_PARKED.lock().unwrap()
-        .entry(name.to_string()).or_default().push_back(conn);
-    let mut listening = SVC_LISTENING.lock().unwrap();
-    if listening.contains(name) { return; }
-    let path = svc_sock_path(name);
-    let _ = std::fs::remove_file(&path);
-    let listener = match UnixListener::bind(&path) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("sarun-engine: svc {name}: bind {}: {e}", path.display());
-            return;
+/// Pop the first LIVE parked slot for `name` (a dead slot — its box exited
+/// — fails the "paired" write and the next one is tried).
+fn svc_pair(name: &str) -> Option<UnixStream> {
+    loop {
+        let slot = SVC_PARKED.lock().unwrap()
+            .get_mut(name).and_then(|q| q.pop_front())?;
+        let mut slot = slot;
+        if slot.write_all(b"{\"ok\":true,\"r\":\"paired\"}\n").is_ok() {
+            return Some(slot);
         }
-    };
-    listening.insert(name.to_string());
-    let name = name.to_string();
-    std::thread::spawn(move || {
-        for host in listener.incoming() {
-            let Ok(host) = host else { continue };
-            // Pair with the first LIVE parked slot.
-            loop {
-                let slot = SVC_PARKED.lock().unwrap()
-                    .get_mut(&name).and_then(|q| q.pop_front());
-                let Some(mut boxc) = slot else {
-                    eprintln!("sarun-engine: svc {name}: no parked box slot \
-                               — dropping host client (is the service box \
-                               still running?)");
-                    break;
-                };
-                if boxc.write_all(b"{\"ok\":true,\"r\":\"paired\"}\n").is_err() {
-                    continue; // dead slot; try the next
-                }
-                svc_splice(host, boxc);
-                break;
-            }
-        }
-    });
+    }
 }
 
 /// Bidirectional byte splice between two blocking UnixStreams; each side's
