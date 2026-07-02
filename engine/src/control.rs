@@ -2049,6 +2049,33 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
             });
             return;
         }
+        // svc.serve: a box-side process PARKS this connection as one accept
+        // slot of a named in-box service. The engine listens on a host UDS
+        // ({runtime_home}/svc-<name>.sock); each host client that connects
+        // is paired with a parked slot (the slot gets one "paired" line,
+        // then both streams are spliced byte-for-byte). This is the inbound
+        // path INTO a box that the tap stack deliberately doesn't have: an
+        // in-box server (e.g. `oaita local`'s llama-server) becomes
+        // host-reachable over sockets alone — no netns is ever shared.
+        if msg.get("type").and_then(Value::as_str) == Some("svc.serve") {
+            if let Some(fd) = peer_pidfd.take() { unsafe { libc::close(fd); } }
+            let Some(name) = msg.get("name").and_then(Value::as_str) else {
+                let _ = writer.write_all(
+                    b"{\"ok\":false,\"error\":\"svc.serve: missing name\"}\n");
+                return;
+            };
+            if !svc_name_ok(name) {
+                let _ = writer.write_all(
+                    b"{\"ok\":false,\"error\":\"svc.serve: bad name\"}\n");
+                return;
+            }
+            drop(reader);
+            if writer.write_all(b"{\"ok\":true,\"r\":\"parked\"}\n").is_err() {
+                return;
+            }
+            svc_park(name, writer);
+            return;
+        }
         // budget.grant: add `amount` to a box's pool. Additive — resume
         // extends it, doesn't reset. The box is identified either by
         // display name (`box: "OAITA-X..."`) when the caller knows the
@@ -2271,6 +2298,87 @@ pub fn is_box_name(s: &str) -> bool {
 /// engine-side). `NAME` alone selects; `patch` prints the unified diff; `apply`
 /// / `discard` act on the whole box; `rename NEW` renames. Mirrors the Python
 /// `slopbox NAME patch|apply|discard|rename`.
+// ── svc: engine-spliced host↔box service streams ────────────────────────────
+// State is engine-global (one namespace of service names). Parked slots are
+// plain blocking UnixStreams; the splice is two copy threads per paired
+// stream. A dead slot (box exited) is detected at pairing time — the
+// "paired" line write fails — and the next slot is tried.
+
+fn svc_name_ok(name: &str) -> bool {
+    !name.is_empty() && name.len() <= 64
+        && name.chars().all(|c| c.is_ascii_alphanumeric()
+                             || c == '-' || c == '_' || c == '.')
+        && !name.starts_with('.')
+}
+
+fn svc_sock_path(name: &str) -> std::path::PathBuf {
+    crate::paths::runtime_home().join(format!("svc-{name}.sock"))
+}
+
+static SVC_PARKED: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<
+        String, std::collections::VecDeque<UnixStream>>>>
+    = std::sync::LazyLock::new(Default::default);
+static SVC_LISTENING: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<String>>>
+    = std::sync::LazyLock::new(Default::default);
+
+/// Park one accept slot for `name` and make sure the host-side listener
+/// socket exists.
+fn svc_park(name: &str, conn: UnixStream) {
+    SVC_PARKED.lock().unwrap()
+        .entry(name.to_string()).or_default().push_back(conn);
+    let mut listening = SVC_LISTENING.lock().unwrap();
+    if listening.contains(name) { return; }
+    let path = svc_sock_path(name);
+    let _ = std::fs::remove_file(&path);
+    let listener = match UnixListener::bind(&path) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("sarun-engine: svc {name}: bind {}: {e}", path.display());
+            return;
+        }
+    };
+    listening.insert(name.to_string());
+    let name = name.to_string();
+    std::thread::spawn(move || {
+        for host in listener.incoming() {
+            let Ok(host) = host else { continue };
+            // Pair with the first LIVE parked slot.
+            loop {
+                let slot = SVC_PARKED.lock().unwrap()
+                    .get_mut(&name).and_then(|q| q.pop_front());
+                let Some(mut boxc) = slot else {
+                    eprintln!("sarun-engine: svc {name}: no parked box slot \
+                               — dropping host client (is the service box \
+                               still running?)");
+                    break;
+                };
+                if boxc.write_all(b"{\"ok\":true,\"r\":\"paired\"}\n").is_err() {
+                    continue; // dead slot; try the next
+                }
+                svc_splice(host, boxc);
+                break;
+            }
+        }
+    });
+}
+
+/// Bidirectional byte splice between two blocking UnixStreams; each side's
+/// EOF shuts down the peer's write half so HTTP keep-alive teardown works.
+fn svc_splice(a: UnixStream, b: UnixStream) {
+    let (Ok(mut ar), Ok(mut bw)) = (a.try_clone(), b.try_clone()) else { return };
+    std::thread::spawn(move || {
+        let _ = std::io::copy(&mut ar, &mut bw);
+        let _ = bw.shutdown(std::net::Shutdown::Write);
+    });
+    let (mut br, mut aw) = (b, a);
+    std::thread::spawn(move || {
+        let _ = std::io::copy(&mut br, &mut aw);
+        let _ = aw.shutdown(std::net::Shutdown::Write);
+    });
+}
+
 pub fn cli_box_op(argv: &[String]) -> i32 {
     let name = argv[0].as_str();
     let op = argv.get(1).map(String::as_str);

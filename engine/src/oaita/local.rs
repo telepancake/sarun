@@ -50,14 +50,16 @@ USAGE:
                    proxied per-box stack, no host netns) or host (for
                    environments without netns privileges)
 
-Two boxed phases. DOWNLOAD runs in box 'OAITA-LOCAL' under tap
-networking — no host network is shared and the fetched files stay
-captured in the box until an explicit `sarun OAITA-LOCAL apply`.
-SERVE then runs in box 'OAITA-SERVE', which shares the host netns for
-one reason only: the endpoint must answer on the host's 127.0.0.1
-(the tap stack has no inbound path). The server makes no outbound
-connections; its writes are captured. Requires a running engine;
---no-box does everything directly on the host instead.";
+Two boxed phases, no host network in either by default. DOWNLOAD runs
+in box 'OAITA-LOCAL' under tap networking — egress via the engine's
+proxied stack, files captured until an explicit `sarun OAITA-LOCAL
+apply`. SERVE runs in box 'OAITA-SERVE' with its OWN isolated netns;
+the endpoint is bridged to the host through the engine as a unix
+socket ({runtime_home}/svc-oaita-local.sock — oaita.toml points there)
+so no netns is ever shared. --net host switches both phases to the
+host netns (plain http://127.0.0.1 endpoint) for environments without
+netns privileges. Requires a running engine; --no-box does everything
+directly on the host instead.";
 
 pub fn cmd_local(args: &[String]) -> i32 {
     let mut port = DEFAULT_PORT;
@@ -69,6 +71,7 @@ pub fn cmd_local(args: &[String]) -> i32 {
     let mut force = false;
     let mut no_box = false;
     let mut inbox = false;
+    let mut svc: Option<String> = None;
     let mut net = "tap".to_string();
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -105,27 +108,18 @@ pub fn cmd_local(args: &[String]) -> i32 {
             // Internal: set by the box re-exec below — we ARE the in-box
             // payload; do the work directly.
             "--inbox" => inbox = true,
+            // Internal: in-box serve should bridge the server out through
+            // the engine (svc.serve slots) under this service name.
+            "--svc" => match val("--svc") {
+                Ok(v) => svc = Some(v),
+                Err(e) => { eprintln!("oaita local: {e}"); return 2; }
+            },
             "-h" | "--help" => { println!("{USAGE}"); return 0; }
             other => { eprintln!("oaita local: unknown flag {other:?}\n{USAGE}");
                        return 2; }
         }
     }
-    let dir = dir.unwrap_or_else(|| {
-        let d = crate::paths::oaita_local_dir();
-        // Courtesy migration from the short-lived first default (inside
-        // state_home — which the overlay hides from boxes, so the boxed
-        // download couldn't use it). Host-side rename; nothing re-downloads.
-        if !inbox {
-            let legacy = crate::paths::oaita_state_home().join("local");
-            if legacy.is_dir() && !d.exists() {
-                if std::fs::rename(&legacy, &d).is_ok() {
-                    eprintln!("oaita local: moved existing download {} → {}",
-                              legacy.display(), d.display());
-                }
-            }
-        }
-        d
-    });
+    let dir = dir.unwrap_or_else(crate::paths::oaita_local_dir);
     // Default: box everything, with the network matched to each phase.
     //
     // DOWNLOAD phase — a box under the DEFAULT tap network: egress goes
@@ -147,7 +141,17 @@ pub fn cmd_local(args: &[String]) -> i32 {
                        or pass --no-box to download onto the host directly");
             return 1;
         }
-        if let Err(e) = ensure_config(port, write_config) {
+        // Endpoint the host's oaita will use. Isolated serve (the default)
+        // is bridged out over the engine's svc socket — HTTP over a host
+        // UDS, no netns anywhere. --net host keeps the plain TCP endpoint.
+        let base_url = if net == "host" {
+            format!("http://127.0.0.1:{port}/v1")
+        } else {
+            format!("unix://{}#/v1",
+                    crate::paths::runtime_home()
+                        .join(format!("svc-{SVC_NAME}.sock")).display())
+        };
+        if let Err(e) = ensure_config(&base_url, write_config) {
             eprintln!("oaita local: {e:#}");
             return 1;
         }
@@ -192,24 +196,36 @@ pub fn cmd_local(args: &[String]) -> i32 {
             return 0;
         }
         let mut cmd = std::process::Command::new(&this);
-        cmd.args(["run", "--net", "host", "OAITA-SERVE", "--",
+        cmd.args(["run", "--net", &net, "OAITA-SERVE", "--",
                   &this, "oaita", "local", "--inbox",
                   "--port", &port.to_string(),
                   "--model-url", &model_url,
                   "--dir"]).arg(&dir);
-        eprintln!("oaita local: serving from box 'OAITA-SERVE' (host \
-                   loopback shared for the endpoint; writes captured)");
+        if net == "host" {
+            eprintln!("oaita local: serving from box 'OAITA-SERVE' (host \
+                       loopback shared for the endpoint; writes captured)");
+        } else {
+            cmd.args(["--svc", SVC_NAME]);
+            eprintln!("oaita local: serving from box 'OAITA-SERVE' \
+                       (net={net}, fully isolated) — endpoint bridged over \
+                       the engine to {base_url}");
+        }
         return match cmd.status() {
             Ok(st) => st.code().unwrap_or(1),
             Err(e) => { eprintln!("oaita local: spawn box: {e}"); 1 }
         };
     }
     match run(&dir, port, &model_url, runtime_url.as_deref(),
-              setup_only, write_config && !inbox, force, inbox) {
+              setup_only, write_config && !inbox, force, inbox,
+              svc.as_deref()) {
         Ok(()) => 0,
         Err(e) => { eprintln!("oaita local: {e:#}"); 1 }
     }
 }
+
+/// The engine-side service name for the bridged endpoint (host socket
+/// {runtime_home}/svc-<name>.sock).
+const SVC_NAME: &str = "oaita-local";
 
 /// Whether the engine's control socket answers (a box run needs it).
 fn engine_running() -> bool {
@@ -217,8 +233,8 @@ fn engine_running() -> bool {
 }
 
 fn run(dir: &Path, port: u16, model_url: &str, runtime_url: Option<&str>,
-       setup_only: bool, write_config: bool, force: bool, inbox: bool)
-       -> Result<()> {
+       setup_only: bool, write_config: bool, force: bool, inbox: bool,
+       svc: Option<&str>) -> Result<()> {
     // Tolerate a raw EEXIST: under the box's FUSE overlay, mkdir of a dir
     // that exists host-side can report EEXIST while the follow-up stat that
     // std's create_dir_all uses to excuse it doesn't line up.
@@ -268,7 +284,7 @@ fn run(dir: &Path, port: u16, model_url: &str, runtime_url: Option<&str>,
     // 3. config — host-side concern; the box wrapper already wrote it (a
     //    second write here would only show up as a spurious box change).
     if !inbox {
-        ensure_config(port, write_config)?;
+        ensure_config(&format!("http://127.0.0.1:{port}/v1"), write_config)?;
     }
 
     if setup_only {
@@ -277,7 +293,7 @@ fn run(dir: &Path, port: u16, model_url: &str, runtime_url: Option<&str>,
     }
 
     // 4. serve (foreground; Ctrl-C stops it)
-    serve(dir, &model_path, port)
+    serve(dir, &model_path, port, svc)
 }
 
 /// GET `url` streaming to `dest` (via .part + rename), with coarse progress
@@ -288,12 +304,7 @@ fn run(dir: &Path, port: u16, model_url: &str, runtime_url: Option<&str>,
 /// this the boxed download would fail TLS (rustls ships its own roots and
 /// ignores /etc/ssl). Also honors SSL_CERT_FILE.
 fn http_client() -> Result<reqwest::Client> {
-    // http/1.1 only: inside a tap box the engine's MITM proxy speaks
-    // HTTP/1.1 on the upstream side; ALPN-negotiated h2 through it breaks
-    // mid-stream on large bodies.
-    let mut b = reqwest::Client::builder()
-        .user_agent("sarun-oaita-local")
-        .http1_only();
+    let mut b = reqwest::Client::builder().user_agent("sarun-oaita-local");
     let mut bundles: Vec<PathBuf> = vec![
         "/etc/ssl/certs/ca-certificates.crt".into(),
         "/etc/pki/tls/certs/ca-bundle.crt".into(),
@@ -439,16 +450,16 @@ fn extract_runtime(archive: &Path, dir: &Path) -> Result<usize> {
 }
 
 /// The oaita.toml contents pointing at the local server.
-fn local_config(port: u16) -> String {
+fn local_config(base_url: &str) -> String {
     format!("# written by `oaita local` — a llama.cpp server on this machine.\n\
              model = \"local\"\n\
-             base_url = \"http://127.0.0.1:{port}/v1\"\n\
+             base_url = \"{base_url}\"\n\
              api_key = \"sk-local\"\n")
 }
 
 /// Write oaita.toml for the local endpoint. An existing config is left
 /// alone unless --write-config (then backed up to oaita.toml.bak first).
-fn ensure_config(port: u16, overwrite: bool) -> Result<()> {
+fn ensure_config(base_url: &str, overwrite: bool) -> Result<()> {
     let p = crate::paths::oaita_config_path();
     if p.is_file() && !overwrite {
         eprintln!("keeping existing {} (use --write-config to point it at \
@@ -463,14 +474,77 @@ fn ensure_config(port: u16, overwrite: bool) -> Result<()> {
         std::fs::copy(&p, &bak).with_context(|| format!("backup to {bak:?}"))?;
         eprintln!("backed up existing config to {}", bak.display());
     }
-    std::fs::write(&p, local_config(port)).with_context(|| format!("write {p:?}"))?;
+    std::fs::write(&p, local_config(base_url))
+        .with_context(|| format!("write {p:?}"))?;
     eprintln!("wrote {}", p.display());
     Ok(())
 }
 
+/// One svc.serve accept slot: park a broker connection with the engine,
+/// wait for a host client to be paired onto it, then splice it to the
+/// in-box llama-server over box-local loopback. Loops forever (each thread
+/// serves streams sequentially; run a few for concurrency).
+fn svc_bridge_loop(broker: String, name: String, port: u16) {
+    loop {
+        let Ok(mut conn) = crate::runner::broker_dial(&broker) else {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            continue;
+        };
+        if conn.write_all(
+            format!("{{\"type\":\"svc.serve\",\"name\":\"{name}\"}}\n")
+                .as_bytes()).is_err()
+        {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            continue;
+        }
+        // Two engine lines: "parked" now, "paired" when a host client
+        // arrives. Byte-wise reads — anything after the second newline is
+        // already the spliced stream's payload and must not be swallowed
+        // by a buffered reader.
+        if read_line_bytewise(&mut conn).is_none() { continue; }
+        if read_line_bytewise(&mut conn).is_none() { continue; }
+        let Ok(srv) = std::net::TcpStream::connect(("127.0.0.1", port)) else {
+            // Server gone mid-flight; drop the paired stream (host client
+            // sees EOF) and retry parking.
+            continue;
+        };
+        splice_streams(conn, srv);
+    }
+}
+
+fn read_line_bytewise(s: &mut impl Read) -> Option<String> {
+    let mut out = Vec::new();
+    let mut b = [0u8; 1];
+    loop {
+        match s.read(&mut b) {
+            Ok(0) | Err(_) => return None,
+            Ok(_) if b[0] == b'\n' => break,
+            Ok(_) => out.push(b[0]),
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// Splice an engine (Unix) stream and the local TCP server stream both
+/// ways; returns when both directions are done so the slot can re-park.
+fn splice_streams(uds: std::os::unix::net::UnixStream,
+                  tcp: std::net::TcpStream) {
+    let (Ok(mut ur), Ok(mut tw)) = (uds.try_clone(), tcp.try_clone()) else { return };
+    let t = std::thread::spawn(move || {
+        let _ = std::io::copy(&mut ur, &mut tw);
+        let _ = tw.shutdown(std::net::Shutdown::Write);
+    });
+    let (mut tr, mut uw) = (tcp, uds);
+    let _ = std::io::copy(&mut tr, &mut uw);
+    let _ = uw.shutdown(std::net::Shutdown::Write);
+    let _ = t.join();
+}
+
 /// Run llama-server in the foreground on `port`, announce readiness once
-/// /health answers, and wait until it exits (Ctrl-C).
-fn serve(dir: &Path, model: &Path, port: u16) -> Result<()> {
+/// /health answers, and wait until it exits (Ctrl-C). With `svc`, also
+/// bridge the endpoint out through the engine (svc.serve slots) so the
+/// host reaches it over a UDS while this box keeps its isolated netns.
+fn serve(dir: &Path, model: &Path, port: u16, svc: Option<&str>) -> Result<()> {
     let server = dir.join("llama-server");
     eprintln!("starting {} on 127.0.0.1:{port} …", server.display());
     let mut child = std::process::Command::new(&server)
@@ -496,9 +570,26 @@ fn serve(dir: &Path, model: &Path, port: u16) -> Result<()> {
         }
         if std::time::Instant::now() > deadline { break; }
         if health_ok(&url) {
+            if let Some(name) = svc {
+                let Ok(broker) = std::env::var("SARUN_BROKER") else {
+                    bail!("--svc given but SARUN_BROKER is not set — \
+                           the bridge only works from inside a box");
+                };
+                for _ in 0..4 {
+                    let (b, n) = (broker.clone(), name.to_string());
+                    std::thread::spawn(move || svc_bridge_loop(b, n, port));
+                }
+            }
             eprintln!();
-            eprintln!("ready — local OpenAI-compatible endpoint: \
-                       http://127.0.0.1:{port}/v1");
+            match svc {
+                Some(name) => eprintln!(
+                    "ready — endpoint bridged to the host at \
+                     {}/svc-{name}.sock (this box's network stays isolated)",
+                    crate::paths::runtime_home().display()),
+                None => eprintln!(
+                    "ready — local OpenAI-compatible endpoint: \
+                     http://127.0.0.1:{port}/v1"),
+            }
             eprintln!("try:   sarun oaita gen demo   (then `sarun oaita add \
                        demo`, `sarun oaita run demo`)");
             eprintln!("the UI's Api pane shows the traffic; Ctrl-C here \
@@ -653,12 +744,22 @@ mod tests {
 
     #[test]
     fn local_config_points_oaita_at_the_local_server() {
-        let c = local_config(18181);
+        let c = local_config("http://127.0.0.1:18181/v1");
         assert!(c.contains("base_url = \"http://127.0.0.1:18181/v1\""));
         assert!(c.contains("model = \"local\""));
         // parses as the Config the rest of oaita reads
         let v: toml::Value = c.parse().unwrap();
         assert_eq!(v.get("api_key").and_then(|x| x.as_str()), Some("sk-local"));
+        // the bridged (isolated-box) endpoint form parses as a Unix endpoint
+        // with the base path in the fragment
+        let c = local_config("unix:///run/user/1/slopbox/svc-oaita-local.sock#/v1");
+        let v: toml::Value = c.parse().unwrap();
+        let url = v.get("base_url").and_then(|x| x.as_str()).unwrap();
+        match crate::oaita::client::Endpoint::parse_url(url).unwrap() {
+            crate::oaita::client::Endpoint::Unix { path } =>
+                assert_eq!(path, "/run/user/1/slopbox/svc-oaita-local.sock"),
+            other => panic!("expected Unix endpoint, got {other:?}"),
+        }
     }
 
     #[test]
