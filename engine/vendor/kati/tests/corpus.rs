@@ -97,7 +97,7 @@ fn kati_norms() -> Vec<Norm> {
         // rkati's output. Apply the same strips the make-side does.
         norm(r"make(?:\[\d+\])?: (Entering|Leaving) directory[^\n]*\n", ""),
         norm(r"make(?:\[\d+\])?: ", ""),
-        norm(r"\*kati\*[^\n]*", ""),
+        norm(r"\*kati\*[^\n]*\n?", ""),
         norm(r"c?kati: ", ""),
         norm(r"/bin/(ba)?sh: line 1: ", ""),
         // sarun: dash form `/bin/sh: N: cmd: ...` (recipe shell-error

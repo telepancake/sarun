@@ -478,7 +478,20 @@ impl<'a> Executor<'a> {
             (g.has_rule, g.is_phony)
         };
         if !has_rule && output_timestamp.is_none() && !is_phony {
-            if let Some(nb) = graph[&sym].dependents.first().map(|d| d.as_bytes()) {
+            if let Some(dep_sym) = graph[&sym].dependents.first() {
+                // Diagnosis aid: name the RULE whose prerequisite list produced
+                // this target — a bad expansion (joined words, wrong subst) is
+                // otherwise untraceable in a big build. The `*kati*:` prefix is
+                // stripped by the corpus normalizers, so GNU-parity holds.
+                if let Some(pn) = graph.get(dep_sym) {
+                    if let Some(loc) = pn.node.lock().loc.clone() {
+                        crate::exec::emit_recipe_err(&format!(
+                            "*kati*: note: '{output}' comes from the \
+                             prerequisite list of the rule for '{dep_sym}' \
+                             at {loc}"));
+                    }
+                }
+                let nb = dep_sym.as_bytes();
                 error!(
                     "*** No rule to make target '{output}', needed by '{}'.",
                     String::from_utf8_lossy(&nb)

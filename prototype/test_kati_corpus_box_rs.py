@@ -76,7 +76,7 @@ KATI_NORMS = _norms([
     (r"sarun-engine: box \d+[^\n]*\n", ""),
     (r"make(?:\[\d+\])?: (Entering|Leaving) directory[^\n]*\n", ""),
     (r"make(?:\[\d+\])?: ", ""),
-    (r"\*kati\*[^\n]*", ""),
+    (r"\*kati\*[^\n]*\n?", ""),
     (r"c?kati: ", ""),
     (r"/bin/(ba)?sh: line 1: ", ""),
     (r"/bin/(ba)?sh: \d+: ", ""),
