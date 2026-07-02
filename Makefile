@@ -56,15 +56,22 @@ engine: ## Build the engine (fully-static musl binary; cargo-zigbuild + zig)
 # heavy and hermetic, so it has its own target.
 
 .PHONY: test
-test: ## Run the test suite (pytest-xdist; build the engine first; excludes test_oci.py)
+test: ## Run the test suite (pytest-xdist; build the engine first; excludes test_oci.py + the box corpus)
 	cd prototype && uv run --with pytest --with pytest-xdist --with pytest-timeout \
 	  --with "wcmatch>=8.4" --with "python-magic>=0.4" \
 	  pytest -q -p no:cacheprovider -n auto --dist=loadscope \
-	  --timeout=180 --timeout-method=signal --ignore=test_oci.py
+	  --timeout=180 --timeout-method=signal --ignore=test_oci.py \
+	  --ignore=test_kati_corpus_box_rs.py
 
 .PHONY: test-oci
 test-oci: ## Run the hermetic OCI tests (synthetic archive; real engine; needs `make engine`)
 	prototype/test_oci.py
+
+.PHONY: test-kati-box
+test-kati-box: ## The FULL kati conformance corpus through real -b boxes vs GNU make (needs `make engine`; ~10 min)
+	cd prototype && uv run --with "pyfuse3>=3.2" --with "trio>=0.22" \
+	  --with "wcmatch>=8.4" --with "python-magic>=0.4" \
+	  python test_kati_corpus_box_rs.py
 
 .PHONY: test-contract
 test-contract: ## Syscall-level (strace) contract test for the native builtins (needs `make engine` + strace)
