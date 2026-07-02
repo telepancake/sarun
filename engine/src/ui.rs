@@ -852,6 +852,9 @@ impl App {
     /// Sessions-view right pane; the views lazy-load when the user
     /// actually navigates to those panes via the letter chips.
     fn on_box_cursor_moved(&mut self) {
+        // A new box's detail body starts at the top — a stale scroll from the
+        // previous box would show a random middle slice.
+        self.right_scroll = 0;
         self.refresh_recent_changes();
         // Drop any old per-box state so the next focus on Changes /
         // Hunks / Procs / Outputs forces a fresh load_*_if_needed.
@@ -1060,7 +1063,10 @@ impl App {
     fn refresh_recent_changes(&mut self) {
         let Some(sid) = self.cur_sid() else { return };
         self.box_summary = serde_json::json!(null);
-        if let Ok(v) = rpc(&self.sock, "review.box_summary", json!([sid, 8])) {
+        // 40 per kind: enough rows that the detail pane's height-scaled
+        // sections stay full on a tall terminal (box_detail_lines trims each
+        // section to its share of the pane).
+        if let Ok(v) = rpc(&self.sock, "review.box_summary", json!([sid, 40])) {
             self.box_summary = v;
         }
     }
@@ -2298,11 +2304,12 @@ impl App {
                     self.hunk_scroll = self.hunk_scroll.saturating_add(1);
                 }
             }
-            Pane::Processes => self.move_proc_cursor(1),
+            Pane::Processes => { self.move_proc_cursor(1); self.right_scroll = 0; }
             Pane::Outputs => { self.move_output_cursor(1); self.right_scroll = 0; }
             Pane::Rules => {
                 if self.sel_rule + 1 < self.rules.len() {
                     self.sel_rule += 1;
+                    self.right_scroll = 0;
                 }
             }
             Pane::Pipelines => { self.move_pipeline_cursor(1); self.right_scroll = 0; }
@@ -2326,6 +2333,7 @@ impl App {
             Pane::ApiLogs => {
                 if self.sel_api_log + 1 < self.api_log_rows.len() {
                     self.sel_api_log += 1;
+                    self.right_scroll = 0;
                 }
             }
         }
@@ -2357,9 +2365,12 @@ impl App {
                     self.hunk_scroll = self.hunk_scroll.saturating_sub(1);
                 }
             }
-            Pane::Processes => self.move_proc_cursor(-1),
+            Pane::Processes => { self.move_proc_cursor(-1); self.right_scroll = 0; }
             Pane::Outputs => { self.move_output_cursor(-1); self.right_scroll = 0; }
-            Pane::Rules => self.sel_rule = self.sel_rule.saturating_sub(1),
+            Pane::Rules => {
+                self.sel_rule = self.sel_rule.saturating_sub(1);
+                self.right_scroll = 0;
+            }
             Pane::Pipelines => { self.move_pipeline_cursor(-1); self.right_scroll = 0; }
             Pane::BuildEdges => { self.move_edge_cursor(-1); self.right_scroll = 0; }
             Pane::Flows => {
@@ -2380,6 +2391,7 @@ impl App {
             Pane::Pty => {}
             Pane::ApiLogs => {
                 self.sel_api_log = self.sel_api_log.saturating_sub(1);
+                self.right_scroll = 0;
             }
         }
     }
@@ -2431,6 +2443,7 @@ impl App {
             }
             Pane::Processes => {
                 for _ in 0..n { self.move_proc_cursor(step); }
+                self.right_scroll = 0;
             }
             Pane::Outputs => { self.page_output_cursor(delta); self.right_scroll = 0; }
             Pane::Rules => {
@@ -2438,6 +2451,7 @@ impl App {
                 if total == 0 { return; }
                 let cur = self.sel_rule as isize;
                 self.sel_rule = (cur + delta).clamp(0, total as isize - 1) as usize;
+                self.right_scroll = 0;
             }
             Pane::Pipelines => { self.page_pipeline_cursor(delta); self.right_scroll = 0; }
             Pane::BuildEdges => { self.page_edge_cursor(delta); self.right_scroll = 0; }
@@ -2479,6 +2493,7 @@ impl App {
                 if total == 0 { return; }
                 let cur = self.sel_api_log as isize;
                 self.sel_api_log = (cur + delta).clamp(0, total as isize - 1) as usize;
+                self.right_scroll = 0;
             }
         }
     }
@@ -2954,9 +2969,16 @@ impl App {
             .map(ClauseRow::to_clause)
             .collect();
         if clauses.iter().any(|c| c.enabled) {
+            // Keep the cursor on the same row when it survives the new filter
+            // (scroll_view_to_id is a no-op when the id was filtered out —
+            // the cursor then rests at the top of the filtered list).
+            let anchor_id = self.selected_item_id(v);
             *self.view_filter_mut(v) = ViewFilter { clauses, on: true, generated: false };
             self.reset_view_cursor(v);
             self.push_view_filter(v);
+            if let Some(aid) = anchor_id {
+                self.scroll_view_to_id(v, aid);
+            }
             self.status = "filter applied".into();
         } else {
             self.status = "filter: no enabled clause".into();
@@ -2990,6 +3012,121 @@ impl App {
             FilterView::Outputs => self.push_outputs_filter(),
             FilterView::Pipelines => self.push_pipelines_filter(),
             FilterView::BuildEdges => self.push_edges_filter(),
+        }
+    }
+
+    /// Jump the cursor of view `v` to global position `pos`: fetch a window
+    /// centered on it and set the in-window selection. Shared by
+    /// scroll_view_to_id and the Home/End keys.
+    fn goto_view_pos(&mut self, v: FilterView, pos: usize) {
+        let half = WINDOW_SIZE / 2;
+        let start = pos.saturating_sub(half);
+        match v {
+            FilterView::Changes => {
+                self.fetch_changes_window(start);
+                self.sel_change = pos.saturating_sub(self.changes_window_start);
+            }
+            FilterView::Procs => {
+                self.fetch_processes_window(start);
+                self.sel_proc = pos.saturating_sub(self.processes_window_start);
+            }
+            FilterView::Outputs => {
+                self.fetch_outputs_window(start);
+                self.sel_output = pos.saturating_sub(self.outputs_window_start);
+            }
+            FilterView::Pipelines => {
+                self.fetch_pipelines_window(start);
+                self.sel_pipeline = pos.saturating_sub(self.pipelines_window_start);
+            }
+            FilterView::BuildEdges => {
+                self.fetch_edges_window(start);
+                self.sel_edge = pos.saturating_sub(self.edges_window_start);
+            }
+        }
+    }
+
+    /// Home / End: jump to the first / last row of the focused list (or the
+    /// top / bottom of a right-focused detail body).
+    #[cfg_attr(test, allow(dead_code))]
+    fn move_home(&mut self) { self.move_extreme(false); }
+    #[cfg_attr(test, allow(dead_code))]
+    fn move_end(&mut self) { self.move_extreme(true); }
+
+    fn move_extreme(&mut self, end: bool) {
+        if self.right_focused && self.right_pane_scrollable() {
+            self.right_scroll = if end { self.right_scroll_max.get() } else { 0 };
+            return;
+        }
+        // (view, total) for the windowed lists; the small in-memory lists
+        // are handled per-pane below.
+        let goto = |app: &mut Self, v: FilterView, total: usize| {
+            if total == 0 { return; }
+            app.goto_view_pos(v, if end { total - 1 } else { 0 });
+        };
+        match self.focus {
+            Pane::Sessions => {
+                if self.sessions.is_empty() { return; }
+                let new = if end { self.sessions.len() - 1 } else { 0 };
+                if new != self.sel_session {
+                    self.sel_session = new;
+                    self.on_box_cursor_moved();
+                }
+            }
+            Pane::Changes => {
+                goto(self, FilterView::Changes, self.changes_total);
+                self.load_hunks();
+            }
+            Pane::Processes => {
+                goto(self, FilterView::Procs, self.processes_total);
+                // The first/last row can be a structural connector the cursor
+                // shouldn't land on; nudge off it in the inward direction.
+                let is_connector = self.processes.get(self.sel_proc)
+                    .and_then(|r| r.get("connector").and_then(Value::as_bool))
+                    .unwrap_or(false);
+                if is_connector { self.move_proc_cursor(if end { -1 } else { 1 }); }
+            }
+            Pane::Outputs => { goto(self, FilterView::Outputs, self.outputs_total); self.right_scroll = 0; }
+            Pane::Pipelines => { goto(self, FilterView::Pipelines, self.pipelines_total); self.right_scroll = 0; }
+            Pane::BuildEdges => { goto(self, FilterView::BuildEdges, self.edges_total); self.right_scroll = 0; }
+            Pane::Rules => {
+                if self.rules.is_empty() { return; }
+                self.sel_rule = if end { self.rules.len() - 1 } else { 0 };
+            }
+            Pane::Flows => {
+                if self.flows.is_empty() { return; }
+                let new = if end { self.flows.len() - 1 } else { 0 };
+                if new != self.sel_flow {
+                    self.sel_flow = new;
+                    self.right_scroll = 0;
+                    self.load_flow_detail();
+                }
+            }
+            Pane::Packets => {
+                if self.packets.is_empty() { return; }
+                let new = if end { self.packets.len() - 1 } else { 0 };
+                if new != self.sel_packet {
+                    self.sel_packet = new;
+                    self.right_scroll = 0;
+                    self.load_packet_detail();
+                }
+            }
+            Pane::ApiLogs => {
+                if self.api_log_rows.is_empty() { return; }
+                self.sel_api_log = if end { self.api_log_rows.len() - 1 } else { 0 };
+            }
+            Pane::Hunks => {
+                if end {
+                    let n = self.hunk_indices().len();
+                    if n > 1 { self.sel_hunk = n - 1; }
+                } else {
+                    self.sel_hunk = 0;
+                    self.hunk_scroll = 0;
+                }
+            }
+            Pane::Help => {
+                if !end { self.out_scroll = 0; }
+            }
+            Pane::Pty => {}
         }
     }
 
@@ -3031,30 +3168,7 @@ impl App {
                 r.get("pos").and_then(Value::as_u64).unwrap_or(0) as usize,
             _ => return,
         };
-        let half = WINDOW_SIZE / 2;
-        let start = pos.saturating_sub(half);
-        match v {
-            FilterView::Changes => {
-                self.fetch_changes_window(start);
-                self.sel_change = pos.saturating_sub(self.changes_window_start);
-            }
-            FilterView::Procs => {
-                self.fetch_processes_window(start);
-                self.sel_proc = pos.saturating_sub(self.processes_window_start);
-            }
-            FilterView::Outputs => {
-                self.fetch_outputs_window(start);
-                self.sel_output = pos.saturating_sub(self.outputs_window_start);
-            }
-            FilterView::Pipelines => {
-                self.fetch_pipelines_window(start);
-                self.sel_pipeline = pos.saturating_sub(self.pipelines_window_start);
-            }
-            FilterView::BuildEdges => {
-                self.fetch_edges_window(start);
-                self.sel_edge = pos.saturating_sub(self.edges_window_start);
-            }
-        }
+        self.goto_view_pos(v, pos);
     }
 
     /// The current procs WINDOW — already filtered + tree-flattened by the
@@ -3099,43 +3213,73 @@ impl App {
     /// Resolve the destination row ids for an src→dest cross-navigation against
     /// the CURRENT cursor (Python `_nav_ids`). None for transitions that don't
     /// auto-filter.
+    ///
+    /// Every pair works: the source row is first resolved to ids in one of the
+    /// three provenance domains — "process" (process row ids), "pipeline"
+    /// (brushprov row ids), "edge" (build_edges row ids) — then translated to
+    /// the destination view's domain with `review.map_ids` when they differ.
+    /// Procs / Outputs / Changes all filter on process ids (outputs' "ids"
+    /// matches process_id; changes' writer ids ARE process row ids).
     fn nav_ids(&self, src: FilterView, dest: FilterView) -> Option<Vec<i64>> {
         let sid = self.cur_sid()?;
-        match (src, dest) {
-            (FilterView::Changes, FilterView::Procs) => {
+        // 1. The source cursor's ids + their domain.
+        let (from, ids): (&str, Vec<i64>) = match src {
+            FilterView::Changes => {
                 let rel = self.cur_change_path()?;
-                let ids = self.change_writer_ids(&sid, &rel);
-                if ids.is_empty() { None } else { Some(ids) }
+                ("process", self.change_writer_ids(&sid, &rel))
             }
-            (FilterView::Procs, FilterView::Changes) | (FilterView::Procs, FilterView::Outputs) => {
+            FilterView::Procs => {
                 let p = self.visible_processes();
                 let row = p.get(self.sel_proc)?;
                 let rid = row.as_array().and_then(|x| x.first()).and_then(Value::as_i64)?;
-                Some(vec![rid])
+                ("process", vec![rid])
             }
-            (FilterView::Outputs, FilterView::Procs) => {
+            FilterView::Outputs => {
                 let o = self.visible_outputs();
                 let row = o.get(self.sel_output)?;
-                let pid = row.get("process_id").and_then(Value::as_i64)?;
-                Some(vec![pid])
+                // For the pipelines destination the output's OWN pipeline is
+                // more precise than "all pipelines of its process".
+                if dest == FilterView::Pipelines {
+                    let oid = row.get("id").and_then(Value::as_i64)?;
+                    let pl = rpc(&self.sock, "output_pipeline", json!([sid, oid])).ok()?;
+                    let plid = pl.get("id").and_then(Value::as_i64)?;
+                    ("pipeline", vec![plid])
+                } else {
+                    let pid = row.get("process_id").and_then(Value::as_i64)?;
+                    ("process", vec![pid])
+                }
             }
-            (FilterView::Outputs, FilterView::Pipelines) => {
-                let o = self.visible_outputs();
-                let row = o.get(self.sel_output)?;
-                let oid = row.get("id").and_then(Value::as_i64)?;
-                let sid = self.cur_sid()?;
-                let pl = rpc(&self.sock, "output_pipeline", json!([sid, oid])).ok()?;
-                let plid = pl.get("id").and_then(Value::as_i64)?;
-                Some(vec![plid])
-            }
-            (FilterView::Pipelines, FilterView::Outputs) | (FilterView::Pipelines, FilterView::Procs) => {
+            FilterView::Pipelines => {
                 let row = self.pipelines.get(self.sel_pipeline)?;
-                let procs = row.get("processes").and_then(Value::as_array)?;
-                let ids: Vec<i64> = procs.iter().filter_map(Value::as_i64).collect();
-                if ids.is_empty() { None } else { Some(ids) }
+                if dest == FilterView::BuildEdges {
+                    let plid = row.get("id").and_then(Value::as_i64)?;
+                    ("pipeline", vec![plid])
+                } else {
+                    let procs = row.get("processes").and_then(Value::as_array)?;
+                    ("process", procs.iter().filter_map(Value::as_i64).collect())
+                }
             }
-            _ => None,
-        }
+            FilterView::BuildEdges => {
+                let row = self.build_edges.get(self.sel_edge)?;
+                ("edge", vec![row.get("id").and_then(Value::as_i64)?])
+            }
+        };
+        if ids.is_empty() { return None; }
+        // 2. Translate to the destination's domain.
+        let to = match dest {
+            FilterView::Pipelines => "pipeline",
+            FilterView::BuildEdges => "edge",
+            _ => "process",
+        };
+        let ids = if from == to {
+            ids
+        } else {
+            let m = rpc(&self.sock, "review.map_ids", json!([sid, from, ids, to])).ok()?;
+            m.as_array()
+                .map(|a| a.iter().filter_map(Value::as_i64).collect())
+                .unwrap_or_default()
+        };
+        if ids.is_empty() { None } else { Some(ids) }
     }
 
     /// Cross-pane navigation to `dest` (Python `_nav`): install a GENERATED
@@ -4906,7 +5050,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                     .block(block(title("sarun · boxes", lf), lf))
                     .scroll((scroll, 0));
                 f.render_widget(p, left);
-                let dl = box_detail_lines(app);
+                let dl = box_detail_lines(app, right);
                 let rs = clamp_rscroll(&dl);
                 let detail = Paragraph::new(Text::from(dl))
                     .block(block(title("BOX · DETAIL", rf), rf))
@@ -5147,7 +5291,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
 /// the prototype's _update_box_detail (lines 11086-11137): label/path bold
 /// colored by status, then status / cmd / pid·age labels, then a change
 /// count line and a small preview of recent paths.
-fn box_detail_lines(app: &App) -> Vec<Line<'static>> {
+fn box_detail_lines(app: &App, area: Rect) -> Vec<Line<'static>> {
     let Some(s) = app.sessions.get(app.sel_session) else {
         return vec![Line::from(Span::styled("(no slopbox selected)",
             Style::default().add_modifier(Modifier::DIM)))];
@@ -5192,18 +5336,38 @@ fn box_detail_lines(app: &App) -> Vec<Line<'static>> {
     ];
     // Five-list summary: the engine packs newest-first outputs / changes /
     // processes / pipelines / build-edges into review.box_summary on each
-    // session switch. Sections are headed with a dim "── label · N ──" and
+    // session switch. Sections are headed with a dim "── label ──" and
     // hidden when empty (so a non-brush box doesn't show "── pipelines ──").
-    let header = |title: &str, n: usize| Line::from(vec![
-        Span::styled(format!("── {title} · "), dim),
-        Span::styled(n.to_string(), Style::default().fg(Color::Cyan)
-                                                    .add_modifier(Modifier::BOLD)),
-        Span::styled(" ──", dim),
-    ]);
+    //
+    // Pull each list out of the bundle first (empty defaults if the bundle is
+    // null — happens momentarily on session switch before the RPC returns) so
+    // the per-section row budget can be computed from what's actually there.
+    let g_arr = |k: &str| app.box_summary.get(k)
+        .and_then(Value::as_array).cloned().unwrap_or_default();
+    let changes  = g_arr("changes");
+    let outputs  = g_arr("outputs");
+    let procs    = g_arr("processes");
+    let pipes    = g_arr("pipelines");
+    let edges    = g_arr("edges");
+
+    // Size the sections to the pane: split the rows below the 6-line head
+    // evenly across the non-empty sections (each also spends 2 lines on
+    // header + trailing blank), floor 3 so a tiny pane still shows something.
+    let inner_w = (area.width as usize).saturating_sub(2).max(20);
+    let inner_h = (area.height as usize).saturating_sub(2);
+    let nonempty = [!changes.is_empty(), !outputs.is_empty(), !procs.is_empty(),
+                    !pipes.is_empty(), !edges.is_empty()]
+        .iter().filter(|b| **b).count().max(1);
+    let budget = ((inner_h.saturating_sub(6) / nonempty).saturating_sub(2)).max(3);
+
+    let header = |title: &str| Line::from(
+        Span::styled(format!("── {title} ──"), dim));
+    // Each section renders its newest `budget` rows OLDEST-FIRST (newest at
+    // the bottom, like a log tail) — the engine hands them newest-first.
     let render_changes_section = |out: &mut Vec<Line<'static>>, rows: &[Value]| {
         if rows.is_empty() { return; }
-        out.push(header("recent changes", rows.len()));
-        for c in rows {
+        out.push(header("recent changes"));
+        for c in rows.iter().take(budget).rev() {
             let kind = c.get("kind").and_then(Value::as_str).unwrap_or("");
             let path = c.get("path").and_then(Value::as_str).unwrap_or("");
             let (glyph, col) = match kind {
@@ -5235,8 +5399,8 @@ fn box_detail_lines(app: &App) -> Vec<Line<'static>> {
     };
     let render_outputs_section = |out: &mut Vec<Line<'static>>, rows: &[Value]| {
         if rows.is_empty() { return; }
-        out.push(header("recent outputs", rows.len()));
-        for r in rows {
+        out.push(header("recent outputs"));
+        for r in rows.iter().take(budget).rev() {
             let stream = r.get("stream").and_then(Value::as_i64).unwrap_or(0);
             let len = r.get("len").and_then(Value::as_i64).unwrap_or(0);
             let preview = r.get("preview").and_then(Value::as_str).unwrap_or("");
@@ -5244,7 +5408,7 @@ fn box_detail_lines(app: &App) -> Vec<Line<'static>> {
             let tag_col = if stream == 1 { Color::Red } else { Color::Green };
             let one_line: String = preview.chars()
                 .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
-                .take(80).collect();
+                .take(inner_w.saturating_sub(16)).collect();
             out.push(Line::from(vec![
                 Span::raw("  "),
                 Span::styled(tag.to_string(), Style::default().fg(tag_col)),
@@ -5256,8 +5420,8 @@ fn box_detail_lines(app: &App) -> Vec<Line<'static>> {
     };
     let render_processes_section = |out: &mut Vec<Line<'static>>, rows: &[Value]| {
         if rows.is_empty() { return; }
-        out.push(header("recent processes", rows.len()));
-        for r in rows {
+        out.push(header("recent processes"));
+        for r in rows.iter().take(budget).rev() {
             let tgid = r.get("tgid").and_then(Value::as_i64).unwrap_or(0);
             let argv0 = r.get("argv0").and_then(Value::as_str).unwrap_or("");
             let exe = r.get("exe").and_then(Value::as_str).unwrap_or("");
@@ -5275,15 +5439,15 @@ fn box_detail_lines(app: &App) -> Vec<Line<'static>> {
     };
     let render_pipelines_section = |out: &mut Vec<Line<'static>>, rows: &[Value]| {
         if rows.is_empty() { return; }
-        out.push(header("recent pipelines", rows.len()));
-        for r in rows {
+        out.push(header("recent pipelines"));
+        for r in rows.iter().take(budget).rev() {
             let cmd = r.get("cmd").and_then(Value::as_str).unwrap_or("");
             let nested = r.get("nested").and_then(Value::as_bool) == Some(true);
             let mark = if nested { "N" } else { "T" };
             let mark_style = if nested {
                 Style::default().fg(Color::Magenta)
             } else { Style::default().fg(Color::Cyan) };
-            let trimmed: String = cmd.chars().take(72).collect();
+            let trimmed: String = cmd.chars().take(inner_w.saturating_sub(4)).collect();
             out.push(Line::from(vec![
                 Span::raw("  "),
                 Span::styled(format!("{mark} "), mark_style),
@@ -5294,8 +5458,8 @@ fn box_detail_lines(app: &App) -> Vec<Line<'static>> {
     };
     let render_edges_section = |out: &mut Vec<Line<'static>>, rows: &[Value]| {
         if rows.is_empty() { return; }
-        out.push(header("recent build edges", rows.len()));
-        for r in rows {
+        out.push(header("recent build edges"));
+        for r in rows.iter().take(budget).rev() {
             let target = r.get("out").and_then(Value::as_str).unwrap_or("(unnamed)");
             let n = r.get("n_outs").and_then(Value::as_i64).unwrap_or(1);
             let cmd = r.get("cmd").and_then(Value::as_str).unwrap_or("");
@@ -5314,16 +5478,6 @@ fn box_detail_lines(app: &App) -> Vec<Line<'static>> {
         }
         out.push(Line::from(""));
     };
-
-    // Pull each list out of the bundle (empty defaults if the bundle is
-    // null — happens momentarily on session switch before the RPC returns).
-    let g_arr = |k: &str| app.box_summary.get(k)
-        .and_then(Value::as_array).cloned().unwrap_or_default();
-    let changes  = g_arr("changes");
-    let outputs  = g_arr("outputs");
-    let procs    = g_arr("processes");
-    let pipes    = g_arr("pipelines");
-    let edges    = g_arr("edges");
 
     // Order: outputs first (what just printed), then changes (files /
     // xattrs that just landed), then processes (who did it), then the
@@ -6974,6 +7128,8 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                     KeyCode::Up => app.move_up(),
                     KeyCode::PageDown => app.page_down(),
                     KeyCode::PageUp => app.page_up(),
+                    KeyCode::Home => app.move_home(),
+                    KeyCode::End => app.move_end(),
                     // pane switches; c/p/o cross-navigate (install a generated
                     // ids filter on the destination from the cursor).
                     // Every letter chip snaps focus back to the LEFT list and

@@ -1372,6 +1372,21 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
                                "pipelines":[], "edges":[]}),
             }
         }
+        // Map provenance row ids between the process / pipeline / edge
+        // domains — the cross-pane generated filter's id translation.
+        // args: [sid, from_kind, [ids...], to_kind] → [ids...].
+        "review.map_ids" => {
+            let id = arg_sid(args);
+            let from = args.get(1).and_then(Value::as_str).unwrap_or("");
+            let ids: Vec<i64> = args.get(2).and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(Value::as_i64).collect())
+                .unwrap_or_default();
+            let to = args.get(3).and_then(Value::as_str).unwrap_or("");
+            match id {
+                Some(id) => crate::review::map_ids(id, from, &ids, to),
+                None => json!([]),
+            }
+        }
         // Bulk decorate: one RPC for a whole window of changes-pane rows
         // (kind / stale / is_text per row) — the UI uses this to label the
         // changes list with +/~/- glyphs and the `!` stale marker without a

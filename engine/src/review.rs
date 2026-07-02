@@ -335,6 +335,74 @@ pub fn box_summary(id: i64, limit: i64) -> Value {
     })
 }
 
+/// Map provenance row ids between the three linked domains — "process"
+/// (process table row ids), "pipeline" (brushprov row ids) and "edge"
+/// (build_edges row ids) — for the cross-pane generated filters. Every list
+/// view keys its "ids" filter off one of these: procs use process row ids
+/// directly, outputs match on process_id, changes' writer ids ARE process
+/// row ids, pipelines and build-edges use their own row ids.
+///
+/// Links: process.brush_pipeline_id ↔ brushprov.id is a direct key. There is
+/// no edge↔pipeline key in the schema, so that hop is the edge's EXECUTION
+/// WINDOW: brushprov rows whose spawn_ts falls inside [started_ts, ended_ts]
+/// (open-ended while the recipe is still running; an edge that never ran has
+/// no members). process↔edge composes the two hops via pipelines.
+pub fn map_ids(id: i64, from: &str, ids: &[i64], to: &str) -> Value {
+    fn ids_json(v: Vec<i64>) -> Value { json!(v) }
+    if ids.is_empty() { return json!([]); }
+    if from == to { return json!(ids); }
+    let Some(conn) = open_ro(id) else { return json!([]) };
+    ids_json(map_ids_conn(&conn, from, ids, to))
+}
+
+fn map_ids_conn(conn: &Connection, from: &str, ids: &[i64], to: &str) -> Vec<i64> {
+    if ids.is_empty() || from == to {
+        return ids.to_vec();
+    }
+    let inlist = ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+    let query = |sql: String| -> Vec<i64> {
+        conn.prepare(&sql).ok().and_then(|mut st| {
+            st.query_map([], |r| r.get::<_, i64>(0)).ok()
+                .map(|it| it.flatten().collect())
+        }).unwrap_or_default()
+    };
+    // Small slack on the window ends: the edge started/done stamps and the
+    // pipeline's spawn_ts are written by different threads around the same
+    // instant.
+    match (from, to) {
+        ("process", "pipeline") => query(format!(
+            "SELECT DISTINCT brush_pipeline_id FROM process \
+             WHERE id IN ({inlist}) AND brush_pipeline_id > 0")),
+        ("pipeline", "process") => query(format!(
+            "SELECT id FROM process WHERE brush_pipeline_id IN ({inlist})")),
+        ("pipeline", "edge") => {
+            if !has_table(conn, "build_edges") { return vec![]; }
+            query(format!(
+                "SELECT DISTINCT e.id FROM build_edges e, brushprov b \
+                 WHERE b.id IN ({inlist}) AND e.started_ts IS NOT NULL \
+                   AND b.spawn_ts >= e.started_ts - 0.05 \
+                   AND (e.ended_ts IS NULL OR b.spawn_ts <= e.ended_ts + 0.05)"))
+        }
+        ("edge", "pipeline") => {
+            if !has_table(conn, "build_edges") { return vec![]; }
+            query(format!(
+                "SELECT DISTINCT b.id FROM brushprov b, build_edges e \
+                 WHERE e.id IN ({inlist}) AND e.started_ts IS NOT NULL \
+                   AND b.spawn_ts >= e.started_ts - 0.05 \
+                   AND (e.ended_ts IS NULL OR b.spawn_ts <= e.ended_ts + 0.05)"))
+        }
+        ("process", "edge") => {
+            let pipes = map_ids_conn(conn, "process", ids, "pipeline");
+            map_ids_conn(conn, "pipeline", &pipes, "edge")
+        }
+        ("edge", "process") => {
+            let pipes = map_ids_conn(conn, "edge", ids, "pipeline");
+            map_ids_conn(conn, "pipeline", &pipes, "process")
+        }
+        _ => vec![],
+    }
+}
+
 /// Cheap "does this sqlar have a given table" probe — Python-engine
 /// archives won't have brushprov / build_edges / xattr; old sarun
 /// archives won't have one or the other. Saves a noisy SQLITE_ERROR.
