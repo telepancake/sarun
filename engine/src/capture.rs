@@ -76,6 +76,12 @@ CREATE TABLE IF NOT EXISTS brushprov(id INTEGER PRIMARY KEY AUTOINCREMENT,
  ts REAL, cmd TEXT, record TEXT, pipeline INT, spawn_ts REAL, nested INT DEFAULT 0,
  uid INT DEFAULT 0, parent_uid INT DEFAULT 0, done_ts REAL DEFAULT 0,
  exit_code INT DEFAULT -1);
+-- brushprov_id_for_uid / mark_brushprov_done key on uid; without this index
+-- every pipeline event scans the whole (record-JSON-heavy) table, and a big
+-- build's brushprov grows past 100k rows — the per-recipe uid scans were the
+-- dominant engine cost of the kernel's `make headers` (~60k page reads per
+-- header, O(n^2) over the build).
+CREATE INDEX IF NOT EXISTS idx_brushprov_uid ON brushprov(uid);
 -- Phase 1 embedded-ninja: one row per parsed n2/ninja build edge, captured when
 -- the box's `ninja` (vendored n2 in-process) loads build.ninja — INCLUDING
 -- up-to-date targets that never execute. `outs`/`ins` are JSON arrays of
