@@ -171,6 +171,10 @@ bzip2-rs = "0.1"
 # blob's bytes hash to the digest its descriptor claims). Already in the tree
 # transitively via oci-client; named directly so the verification is explicit.
 sha2 = "0.10"
+# `oaita local` unpacks the llama.cpp CPU-runtime release archives (zip).
+# deflate-only via the flate2 backend already in the tree — no new C deps,
+# static-musl unaffected.
+zip = { version = "2", default-features = false, features = ["deflate"] }
 # Key-based cosign signature verification (configured public key). Pure-Rust
 # RustCrypto ECDSA P-256 + PEM SPKI key parsing — no OpenSSL/C, static-musl safe.
 p256 = { version = "0.13", features = ["ecdsa", "pem"] }

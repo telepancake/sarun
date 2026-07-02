@@ -30,6 +30,9 @@ USAGE:
   oaita tail  NAME
   oaita add   NAME [--type ROLE] [--id TURNID] [--from NAME] [--flags F] [--number N]
   oaita where               (print where oaita.toml is looked up)
+  oaita local [--port N] [--setup-only] [--write-config] [...]
+              download a tiny tool-capable model + CPU llama.cpp runtime and
+              serve it locally — no external endpoint or API key needed
 
 NAME may be a dot-stitched spec 'a.b.c' — writes go to the LAST segment;
 earlier segments are PREPENDED as context (composition, not hierarchy).
@@ -51,6 +54,7 @@ pub fn main(argv: &[String]) -> i32 {
         "tail" => cmd_tail(&rest),
         "add" => cmd_add(&rest),
         "where" => cmd_where(),
+        "local" => crate::oaita::local::cmd_local(&rest),
         "-h" | "--help" => { println!("{USAGE}"); 0 }
         other => { eprintln!("oaita: unknown subcommand {other:?}\n{USAGE}"); 2 }
     }
