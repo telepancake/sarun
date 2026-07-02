@@ -26,6 +26,17 @@ pub fn globmatch(pat: &str, s: &str) -> bool {
     false
 }
 
+/// Whole-string match where the subject is plain TEXT, not a path: `*` and
+/// `?` cross `/` like any other character. Implemented by mapping `/` in
+/// both pattern and subject to a private sentinel byte (0x1f, never present
+/// in either), which neutralises the matcher's path-segment special-casing
+/// while keeping literal `/` in a pattern matching literal `/` in the text.
+pub fn textmatch(pat: &str, s: &str) -> bool {
+    const SENTINEL: char = '\u{1f}';
+    globmatch(&pat.replace('/', &SENTINEL.to_string()),
+              &s.replace('/', &SENTINEL.to_string()))
+}
+
 // ── brace expansion ──────────────────────────────────────────────────────────
 // {a,b}c → [ac, bc]; nested braces and multiple groups expand combinatorially.
 // A `{` with no matching `}` or no top-level comma is treated literally (the

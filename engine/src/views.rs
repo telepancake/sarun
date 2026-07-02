@@ -515,7 +515,7 @@ fn rebuild_idx(view: &mut View) {
                 }
                 let rid = r.get("rid").and_then(Value::as_i64).unwrap_or(-1);
                 let subject = subjects.get(i).cloned().unwrap_or_default();
-                let t = ProcFilterTarget { row_id: rid, subject };
+                let t = ProcFilterTarget { row_id: rid, subject, err: false };
                 if eval_clauses(&t, clauses) { Some(i) } else { None }
             }).collect();
         }
@@ -523,7 +523,8 @@ fn rebuild_idx(view: &mut View) {
             view.idx = view.source.iter().enumerate().filter_map(|(i, r)| {
                 let pid = r.get("process_id").and_then(Value::as_i64).unwrap_or(-1);
                 let subject = subjects.get(i).cloned().unwrap_or_default();
-                let t = ProcFilterTarget { row_id: pid, subject };
+                let err = r.get("stream").and_then(Value::as_i64) == Some(1);
+                let t = ProcFilterTarget { row_id: pid, subject, err };
                 if eval_clauses(&t, clauses) { Some(i) } else { None }
             }).collect();
         }
@@ -531,7 +532,8 @@ fn rebuild_idx(view: &mut View) {
             view.idx = view.source.iter().enumerate().filter_map(|(i, r)| {
                 let row_id = r.get("id").and_then(Value::as_i64).unwrap_or(-1);
                 let cmd = r.get("cmd").and_then(Value::as_str).unwrap_or("").to_string();
-                let t = PipelineFilterTarget { row_id, cmd };
+                let err = r.get("exit_code").and_then(Value::as_i64).unwrap_or(-1) > 0;
+                let t = PipelineFilterTarget { row_id, cmd, err };
                 if eval_clauses(&t, clauses) { Some(i) } else { None }
             }).collect();
         }
@@ -542,7 +544,8 @@ fn rebuild_idx(view: &mut View) {
                     .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
                     .unwrap_or_default();
                 let cmd = r.get("cmd").and_then(Value::as_str).unwrap_or("").to_string();
-                let t = EdgeFilterTarget { row_id, targets, cmd };
+                let err = r.get("exit_code").and_then(Value::as_i64).unwrap_or(0) != 0;
+                let t = EdgeFilterTarget { row_id, targets, cmd, err };
                 if eval_clauses(&t, clauses) { Some(i) } else { None }
             }).collect();
         }

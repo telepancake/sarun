@@ -153,10 +153,15 @@ pub fn wrap_bare_as_substring(pat: &str) -> String {
 /// Glob a command string. A bare pattern without glob metacharacters is wrapped
 /// in `*...*` so that e.g. `rm` matches `rm -rf /foo`. A pattern that already
 /// contains `*`, `?`, `[`, or `{` is used as-is.
+///
+/// Commands are TEXT, not paths: `*` crosses `/` (and newlines) here, unlike
+/// the path-glob used for file kinds. Without this, `export*` fails to match
+/// `export PATH='/usr/bin…'` — the trailing `*` can't cross the first slash —
+/// and a cmd filter silently misses almost every real command line.
 pub fn cmd_match(pat: &str, s: &str) -> bool {
     let pat = pat.trim();
     if pat.is_empty() { return false; }
-    glob::globmatch(&wrap_bare_as_substring(pat), s)
+    glob::textmatch(&wrap_bare_as_substring(pat), s)
 }
 
 /// Glob a change's ABSOLUTE path. A bare/relative pattern matches at any depth
@@ -212,9 +217,12 @@ pub struct PathTarget<'a> {
 }
 
 /// A process row under evaluation (procs-pane filter, mirrors ProcFilterTarget).
+/// `err` powers the single-key errors-only toggle: for an outputs row it is
+/// "stream == stderr"; a plain procs row has no error notion (false).
 pub struct ProcFilterTarget {
     pub row_id: i64,
     pub subject: Subject,
+    pub err: bool,
 }
 
 pub trait Target {
@@ -238,6 +246,7 @@ impl Target for ProcFilterTarget {
     fn match_one(&self, m: &Match) -> bool {
         match m.kind.as_str() {
             "ids" => ids_of(&m.pattern).contains(&self.row_id),
+            "err" => self.err,
             _ => self.subject.subject_match(m),
         }
     }
@@ -246,6 +255,8 @@ impl Target for ProcFilterTarget {
 pub struct PipelineFilterTarget {
     pub row_id: i64,
     pub cmd: String,
+    /// The pipeline finished with a non-zero exit code (errors-only toggle).
+    pub err: bool,
 }
 
 impl Target for PipelineFilterTarget {
@@ -253,6 +264,7 @@ impl Target for PipelineFilterTarget {
         match m.kind.as_str() {
             "ids" => ids_of(&m.pattern).contains(&self.row_id),
             "cmd" => cmd_match(&m.pattern, &self.cmd),
+            "err" => self.err,
             _ => false,
         }
     }
@@ -262,6 +274,8 @@ pub struct EdgeFilterTarget {
     pub row_id: i64,
     pub targets: Vec<String>,
     pub cmd: String,
+    /// The edge ran and finished with a non-zero exit code (errors-only toggle).
+    pub err: bool,
 }
 
 impl Target for EdgeFilterTarget {
@@ -270,6 +284,7 @@ impl Target for EdgeFilterTarget {
             "ids" => ids_of(&m.pattern).contains(&self.row_id),
             "target" => self.targets.iter().any(|t| path_match(&m.pattern, t)),
             "cmd" => cmd_match(&m.pattern, &self.cmd),
+            "err" => self.err,
             _ => false,
         }
     }

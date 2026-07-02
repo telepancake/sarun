@@ -195,6 +195,23 @@ impl FilterView {
     }
 }
 
+/// Cap on the Backspace go-back stack; oldest snapshots drop off first.
+const NAV_HISTORY_CAP: usize = 32;
+
+/// One entry of the Backspace go-back stack (see App::nav_history).
+#[derive(Clone)]
+struct NavSnapshot {
+    pane: Pane,
+    /// The pane's '/' filter at snapshot time (filterable views only).
+    filter: Option<ViewFilter>,
+    /// Global cursor position (window_start + in-window selection for the
+    /// engine-windowed views; the plain index for in-memory lists).
+    cursor: usize,
+    right_scroll: u16,
+    right_focused: bool,
+    err_only: bool,
+}
+
 /// Per-view '/' filter state (mirrors the Python `_view_filters[v]` dict).
 #[derive(Clone, Default)]
 struct ViewFilter {
@@ -571,6 +588,18 @@ struct App {
     /// against it so the detail body stops at its last line instead of
     /// scrolling into blank space.
     right_scroll_max: std::cell::Cell<u16>,
+    /// Backspace go-back stack: one snapshot per view SWITCH (letter chips,
+    /// cross-navs, Enter drill-downs), capped at NAV_HISTORY_CAP — oldest
+    /// dropped first. Each snapshot carries enough to restore the view as it
+    /// was: its '/' filter, errors-only lens, global cursor position, and
+    /// the right pane's focus + scroll.
+    nav_history: Vec<NavSnapshot>,
+    /// Single-key errors-only view toggle ('!'): when true, the FOCUSED
+    /// view's engine filter gets an extra `err` clause AND-ed onto whatever
+    /// the user's '/' filter selects — outputs keep only stderr writes,
+    /// pipelines / build-edges keep only non-zero exits. Cleared on every
+    /// view switch (it is a transient lens, not a persisted filter).
+    err_only: bool,
     /// The Outputs right pane's cursor-follow scroll, recomputed by
     /// draw() every frame: while the LEFT list is focused the transcript
     /// auto-scrolls to keep the selected write visible. Tab into the
@@ -720,7 +749,7 @@ impl App {
             f_pipelines: ViewFilter::default(),
             f_edges: ViewFilter::default(),
             should_quit: false,
-            ptys: vec![], sel_pty: 0, pty_esc_at: None, right_focused: false, right_scroll: 0, right_scroll_max: std::cell::Cell::new(0), out_follow_scroll: std::cell::Cell::new(0), pty_in_right: false, menu_nav: false, menu_sel: 0,
+            ptys: vec![], sel_pty: 0, pty_esc_at: None, right_focused: false, right_scroll: 0, right_scroll_max: std::cell::Cell::new(0), out_follow_scroll: std::cell::Cell::new(0), err_only: false, nav_history: vec![], pty_in_right: false, menu_nav: false, menu_sel: 0,
             structd: StructState::default(),
             sel_hunk: 0,
             struct_rx: None,
@@ -1562,7 +1591,7 @@ impl App {
 
     fn push_pipelines_filter(&mut self) {
         let Some(vid) = self.pipelines_view else { return };
-        let filter = filter_to_json(self.f_pipelines.active());
+        let filter = self.filter_json_for(FilterView::Pipelines);
         match rpc(&self.sock, "view.filter", json!([vid, filter])) {
             Ok(v) => {
                 self.pipelines_total =
@@ -1679,7 +1708,7 @@ impl App {
 
     fn push_edges_filter(&mut self) {
         let Some(vid) = self.edges_view else { return };
-        let filter = filter_to_json(self.f_edges.active());
+        let filter = self.filter_json_for(FilterView::BuildEdges);
         match rpc(&self.sock, "view.filter", json!([vid, filter])) {
             Ok(v) => {
                 self.edges_total =
@@ -2205,9 +2234,47 @@ impl App {
     }
 
     /// Push the local f_outputs filter to the engine view, then refetch.
+    /// True for the views where an errors-only lens is meaningful.
+    fn err_capable(v: FilterView) -> bool {
+        matches!(v, FilterView::Outputs | FilterView::Pipelines | FilterView::BuildEdges)
+    }
+
+    /// The wire filter for view `v`: the user's '/' clauses, plus a synthetic
+    /// `err` clause AND-ed on while the errors-only toggle is lit.
+    fn filter_json_for(&self, v: FilterView) -> Value {
+        let base = filter_to_json(self.view_filter(v).active());
+        if !(self.err_only && Self::err_capable(v)) {
+            return base;
+        }
+        let mut arr = match base { Value::Array(a) => a, _ => vec![] };
+        arr.push(json!({"kind": "err", "pattern": "1", "join": "and",
+                        "negate": false, "enabled": true}));
+        Value::Array(arr)
+    }
+
+    /// '!' — flip the errors-only lens on the focused view (no-op elsewhere).
+    #[cfg_attr(test, allow(dead_code))]
+    fn toggle_err_only(&mut self) {
+        let Some(v) = self.focus_filter_view() else {
+            self.status = "errors-only: not applicable here".into();
+            return;
+        };
+        if !Self::err_capable(v) {
+            self.status = "errors-only: not applicable here".into();
+            return;
+        }
+        self.err_only = !self.err_only;
+        self.push_view_filter(v);
+        self.status = if self.err_only {
+            "showing ERRORS only ('!' to clear)".into()
+        } else {
+            "errors-only off".into()
+        };
+    }
+
     fn push_outputs_filter(&mut self) {
         let Some(vid) = self.outputs_view else { return };
-        let filter = filter_to_json(self.f_outputs.active());
+        let filter = self.filter_json_for(FilterView::Outputs);
         match rpc(&self.sock, "view.filter", json!([vid, filter])) {
             Ok(v) => {
                 self.outputs_total =
@@ -2520,11 +2587,145 @@ impl App {
         self.right_scroll = 0;
     }
 
+    /// The FilterView backing a pane's LIST, if any (like focus_filter_view
+    /// but for an arbitrary pane — the go-back stack restores non-focused
+    /// panes).
+    fn pane_filter_view(pane: Pane) -> Option<FilterView> {
+        match pane {
+            Pane::Changes | Pane::Hunks => Some(FilterView::Changes),
+            Pane::Processes => Some(FilterView::Procs),
+            Pane::Outputs => Some(FilterView::Outputs),
+            Pane::Pipelines => Some(FilterView::Pipelines),
+            Pane::BuildEdges => Some(FilterView::BuildEdges),
+            _ => None,
+        }
+    }
+
+    /// The focused pane's GLOBAL cursor position (window-relative selection
+    /// plus the window start for the engine-windowed views).
+    fn current_cursor_global(&self) -> usize {
+        match self.focus {
+            Pane::Sessions => self.sel_session,
+            Pane::Changes | Pane::Hunks => self.changes_window_start + self.sel_change,
+            Pane::Processes => self.processes_window_start + self.sel_proc,
+            Pane::Outputs => self.outputs_window_start + self.sel_output,
+            Pane::Pipelines => self.pipelines_window_start + self.sel_pipeline,
+            Pane::BuildEdges => self.edges_window_start + self.sel_edge,
+            Pane::Rules => self.sel_rule,
+            Pane::Flows => self.sel_flow,
+            Pane::Packets => self.sel_packet,
+            Pane::ApiLogs => self.sel_api_log,
+            Pane::Help | Pane::Pty => 0,
+        }
+    }
+
+    /// Record the CURRENT view on the go-back stack (called just before a
+    /// view switch). Oldest entries drop once the stack exceeds its cap.
+    fn push_history(&mut self) {
+        if matches!(self.focus, Pane::Help | Pane::Pty) {
+            return; // full-screen panes aren't list views worth returning to
+        }
+        let snap = NavSnapshot {
+            pane: self.focus,
+            filter: Self::pane_filter_view(self.focus)
+                .map(|v| self.view_filter(v).clone()),
+            cursor: self.current_cursor_global(),
+            right_scroll: self.right_scroll,
+            right_focused: self.right_focused,
+            err_only: self.err_only,
+        };
+        self.nav_history.push(snap);
+        if self.nav_history.len() > NAV_HISTORY_CAP {
+            let excess = self.nav_history.len() - NAV_HISTORY_CAP;
+            self.nav_history.drain(..excess);
+        }
+    }
+
+    /// Backspace — pop the go-back stack and restore that view wholesale:
+    /// focus, its '/' filter + errors-only lens (re-synced to the engine),
+    /// the cursor position, and the right pane's focus + scroll.
+    #[cfg_attr(test, allow(dead_code))]
+    fn go_back(&mut self) {
+        let Some(snap) = self.nav_history.pop() else {
+            self.status = "back: no earlier view".into();
+            return;
+        };
+        self.focus = snap.pane;
+        // Load the pane's data (same loads go_to_pane does, WITHOUT nav() —
+        // a restore must not install a fresh cross-nav filter).
+        match snap.pane {
+            Pane::Changes | Pane::Hunks => self.load_changes_if_needed(),
+            Pane::Processes => self.load_processes_if_needed(),
+            Pane::Outputs => self.load_outputs_if_needed(),
+            Pane::Pipelines => self.load_pipelines_if_needed(),
+            Pane::BuildEdges => self.load_edges_if_needed(),
+            Pane::ApiLogs => self.load_api_logs_if_needed(),
+            Pane::Flows => self.load_flows(),
+            _ => {}
+        }
+        self.err_only = snap.err_only;
+        if let Some(v) = Self::pane_filter_view(snap.pane) {
+            if let Some(f) = snap.filter.clone() {
+                *self.view_filter_mut(v) = f;
+            }
+            self.push_view_filter(v);
+            self.goto_view_pos(v, snap.cursor);
+            if matches!(snap.pane, Pane::Changes | Pane::Hunks) {
+                self.load_hunks();
+            }
+        } else {
+            match snap.pane {
+                Pane::Sessions => {
+                    let n = self.sessions.len();
+                    if n > 0 {
+                        self.sel_session = snap.cursor.min(n - 1);
+                        self.on_box_cursor_moved();
+                    }
+                }
+                Pane::Rules => {
+                    self.sel_rule =
+                        snap.cursor.min(self.rules.len().saturating_sub(1));
+                }
+                Pane::Flows => {
+                    if !self.flows.is_empty() {
+                        self.sel_flow = snap.cursor.min(self.flows.len() - 1);
+                        self.load_flow_detail();
+                    }
+                }
+                Pane::Packets => {
+                    if !self.packets.is_empty() {
+                        self.sel_packet = snap.cursor.min(self.packets.len() - 1);
+                        self.load_packet_detail();
+                    }
+                }
+                Pane::ApiLogs => {
+                    self.sel_api_log =
+                        snap.cursor.min(self.api_log_rows.len().saturating_sub(1));
+                }
+                _ => {}
+            }
+        }
+        self.right_focused = snap.right_focused;
+        self.right_scroll = snap.right_scroll;
+        self.status = "← back".into();
+    }
+
     /// Switch to a top-level pane (the `PANE_KEYS` accelerators route here via
     /// `dispatch_menubar_key`). The filterable views (changes/procs/outputs/api)
     /// go through `nav` so cross-pane filters resolve; the rest set focus and
     /// load their data. PTY is handled in the dispatcher (its selection logic).
     fn go_to_pane(&mut self, pane: Pane) {
+        if pane != self.focus {
+            // The errors-only lens is transient: leaving the view drops it
+            // (and re-syncs the old view's engine filter without the lens).
+            if self.err_only {
+                self.err_only = false;
+                if let Some(v) = self.focus_filter_view() {
+                    self.push_view_filter(v);
+                }
+            }
+            self.push_history();
+        }
         self.snap_left();
         match pane {
             Pane::Changes   => { self.nav(Pane::Changes);   self.load_changes_if_needed(); }
@@ -2578,15 +2779,21 @@ impl App {
     fn open(&mut self) {
         match self.focus {
             Pane::Sessions => {
+                self.push_history();
                 self.load_changes();
                 self.focus = Pane::Changes;
             }
             Pane::Changes => {
+                self.push_history();
                 self.load_hunks();
                 self.focus = Pane::Hunks;
             }
-            // Flows → Packets drill-down on Enter; Esc/Backspace pops back.
-            Pane::Flows => self.open_packets(),
+            // Flows → Packets drill-down on Enter; Esc pops back (Backspace
+            // is the global go-back, which lands on the same view anyway).
+            Pane::Flows => {
+                self.push_history();
+                self.open_packets();
+            }
             Pane::Hunks | Pane::Processes | Pane::Outputs | Pane::Rules
             | Pane::Pipelines | Pane::BuildEdges | Pane::Packets
             | Pane::Help | Pane::Pty | Pane::ApiLogs => {}
@@ -4361,11 +4568,17 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal) {
             ))];
             for (i, r) in rows.iter().enumerate() {
                 let cur = i == *sel;
+                // Toggle chips always SHOW their label — off is dimmed, on is
+                // bright — so an empty box doesn't leave the field a mystery.
                 let mark = |on: bool, label: &str, f: ClauseField| -> Span<'static> {
                     let active = cur && *field == f;
-                    let txt = format!("[{}]", if on { label } else { " " });
-                    let mut st = Style::default();
-                    if active { st = st.fg(Color::Black).bg(Color::Cyan); }
+                    let txt = format!("[{label}]");
+                    let mut st = if on {
+                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().add_modifier(Modifier::DIM)
+                    };
+                    if active { st = Style::default().fg(Color::Black).bg(Color::Cyan); }
                     Span::styled(txt, st)
                 };
                 let joinlbl = if i == 0 { "   ".to_string() } else { match r.join { Join::And => "and".into(), Join::Or => "or ".into() } };
@@ -4403,7 +4616,8 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal) {
             }
             body.push(Line::from(""));
             body.push(Line::from(Span::styled(
-                "←/→ field · space toggle · type pattern · n new row · ^s apply · esc clear",
+                "←/→ field · space toggles on/not (and cycles kind) · type pattern \
+                 · n new row · ^s apply · esc clear",
                 Style::default().fg(Color::Gray),
             )));
             (" filter ", body)
@@ -7130,6 +7344,8 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                     KeyCode::PageUp => app.page_up(),
                     KeyCode::Home => app.move_home(),
                     KeyCode::End => app.move_end(),
+                    // '!' — errors-only lens on the focused list view.
+                    KeyCode::Char('!') => app.toggle_err_only(),
                     // pane switches; c/p/o cross-navigate (install a generated
                     // ids filter on the destination from the cursor).
                     // Every letter chip snaps focus back to the LEFT list and
@@ -7143,7 +7359,8 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                         dispatch_menubar_key(&mut app, c),
                     // Esc / Backspace from the packet drill-down pops back
                     // to the flows list, keeping its cursor + detail state.
-                    KeyCode::Esc | KeyCode::Backspace if app.focus == Pane::Packets =>
+                    KeyCode::Backspace => app.go_back(),
+                    KeyCode::Esc if app.focus == Pane::Packets =>
                         app.close_packets(),
                     KeyCode::Esc => {
                         // esc clears a generated (cross-nav) filter on the focused pane.
@@ -8143,10 +8360,10 @@ mod tests {
             m: Match { kind: "exe".into(), pattern: "**/echo".into() },
             join: Join::And, negate: false, enabled: true,
         };
-        let yes = ProcFilterTarget { row_id: 1,
+        let yes = ProcFilterTarget { row_id: 1, err: false,
             subject: Subject { box_name: "B".into(), exe: "/bin/echo".into(),
                                cwd: "/".into(), argv: vec!["echo".into(), "hi".into()] } };
-        let no = ProcFilterTarget { row_id: 2,
+        let no = ProcFilterTarget { row_id: 2, err: false,
             subject: Subject { exe: "/bin/cat".into(), ..Default::default() } };
         assert!(eval_clauses(&yes, std::slice::from_ref(&exe_clause)));
         assert!(!eval_clauses(&no, std::slice::from_ref(&exe_clause)));
@@ -8206,7 +8423,7 @@ mod tests {
             f_pipelines: ViewFilter::default(),
             f_edges: ViewFilter::default(),
             should_quit: false,
-            ptys: vec![], sel_pty: 0, pty_esc_at: None, right_focused: false, right_scroll: 0, right_scroll_max: std::cell::Cell::new(0), out_follow_scroll: std::cell::Cell::new(0), pty_in_right: false, menu_nav: false, menu_sel: 0,
+            ptys: vec![], sel_pty: 0, pty_esc_at: None, right_focused: false, right_scroll: 0, right_scroll_max: std::cell::Cell::new(0), out_follow_scroll: std::cell::Cell::new(0), err_only: false, nav_history: vec![], pty_in_right: false, menu_nav: false, menu_sel: 0,
             structd: StructState::default(),
             sel_hunk: 0,
             struct_rx: None,
