@@ -81,6 +81,15 @@ pub fn cosign_config_path() -> PathBuf {
     config_home().join("cosign.toml")
 }
 
+/// Where `oaita local` keeps its model + CPU runtime. Deliberately OUTSIDE
+/// sarun's own app dirs: the overlay self-hides data/config/state/runtime
+/// homes from boxes, and this payload is downloaded INSIDE a box by default
+/// — it must be a path a box can write (captured) and an apply lands on the
+/// host at the same location the host-side server then reads.
+pub fn oaita_local_dir() -> PathBuf {
+    home("XDG_DATA_HOME", ".local/share").join("oaita-local")
+}
+
 /// `images.toml` — the UI's base-image catalog (the hierarchical picker's
 /// groups + tags). Optional: when absent the picker uses a built-in curated
 /// list of common distro bases.

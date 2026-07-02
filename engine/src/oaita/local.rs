@@ -38,19 +38,26 @@ USAGE:
               [--setup-only] [--write-config] [--force]
 
   --port N         listen port for the local server (default 18181)
-  --dir DIR        where model+runtime live (default {state_home}/oaita/local)
+  --dir DIR        where model+runtime live (default $XDG_DATA_HOME/oaita-local
+                   — outside sarun's own dirs, which boxes cannot see)
   --model-url URL  GGUF to fetch (default Qwen3-0.6B-Q8_0 from Hugging Face)
   --runtime-url URL  llama.cpp release zip (default: latest CPU ubuntu-x64)
   --setup-only     download + write config, don't start the server
   --write-config   overwrite an existing oaita.toml (backed up to .bak)
   --force          re-download even if files exist
-  --no-box         run on the host directly instead of inside a sarun box
+  --no-box         run on the host directly instead of inside sarun boxes
+  --net MODE       network for the DOWNLOAD box: tap (default; engine's
+                   proxied per-box stack, no host netns) or host (for
+                   environments without netns privileges)
 
-By default the download + server run INSIDE a sarun box named
-'oaita-local' (host-shared network, so the endpoint is 127.0.0.1 as
-usual): the model/runtime writes are captured like any box's — review
-them in the UI, apply to keep them on the host, discard to drop the
-whole thing. Requires a running engine; --no-box skips the box.";
+Two boxed phases. DOWNLOAD runs in box 'OAITA-LOCAL' under tap
+networking — no host network is shared and the fetched files stay
+captured in the box until an explicit `sarun OAITA-LOCAL apply`.
+SERVE then runs in box 'OAITA-SERVE', which shares the host netns for
+one reason only: the endpoint must answer on the host's 127.0.0.1
+(the tap stack has no inbound path). The server makes no outbound
+connections; its writes are captured. Requires a running engine;
+--no-box does everything directly on the host instead.";
 
 pub fn cmd_local(args: &[String]) -> i32 {
     let mut port = DEFAULT_PORT;
@@ -62,6 +69,7 @@ pub fn cmd_local(args: &[String]) -> i32 {
     let mut force = false;
     let mut no_box = false;
     let mut inbox = false;
+    let mut net = "tap".to_string();
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let mut val = |flag: &str| {
@@ -88,6 +96,12 @@ pub fn cmd_local(args: &[String]) -> i32 {
             "--write-config" => write_config = true,
             "--force" => force = true,
             "--no-box" => no_box = true,
+            "--net" => match val("--net") {
+                Ok(v) if ["tap", "host", "off"].contains(&v.as_str()) => net = v,
+                Ok(v) => { eprintln!("oaita local: --net wants tap|host, \
+                                      got {v:?}"); return 2; }
+                Err(e) => { eprintln!("oaita local: {e}"); return 2; }
+            },
             // Internal: set by the box re-exec below — we ARE the in-box
             // payload; do the work directly.
             "--inbox" => inbox = true,
@@ -96,11 +110,36 @@ pub fn cmd_local(args: &[String]) -> i32 {
                        return 2; }
         }
     }
-    let dir = dir.unwrap_or_else(|| crate::paths::oaita_state_home().join("local"));
-    // Default: do the download + serve INSIDE a sarun box so the writes are
-    // captured (review → apply to keep, discard to drop). The config file is
-    // written host-side first — it's the pointer the host's oaita needs
-    // either way. Host-shared network so the endpoint is 127.0.0.1 as usual.
+    let dir = dir.unwrap_or_else(|| {
+        let d = crate::paths::oaita_local_dir();
+        // Courtesy migration from the short-lived first default (inside
+        // state_home — which the overlay hides from boxes, so the boxed
+        // download couldn't use it). Host-side rename; nothing re-downloads.
+        if !inbox {
+            let legacy = crate::paths::oaita_state_home().join("local");
+            if legacy.is_dir() && !d.exists() {
+                if std::fs::rename(&legacy, &d).is_ok() {
+                    eprintln!("oaita local: moved existing download {} → {}",
+                              legacy.display(), d.display());
+                }
+            }
+        }
+        d
+    });
+    // Default: box everything, with the network matched to each phase.
+    //
+    // DOWNLOAD phase — a box under the DEFAULT tap network: egress goes
+    // through the engine's own proxied stack (per-flow policy, flows/pcap
+    // visible in the UI), the host netns is never shared, and the fetched
+    // bytes are captured in the box for review. Nothing is trusted yet, so
+    // nothing gets host access. The phase ends with an explicit apply —
+    // 0.6 GB lands on the host only after the user says so.
+    //
+    // SERVE phase — its own box, and the ONLY reason it shares the host
+    // netns (--net host) is inbound reachability: the endpoint must answer
+    // on the host's 127.0.0.1 and the tap stack has no inbound path into a
+    // box. The server makes no outbound connections; its writes are still
+    // captured.
     if !inbox && !no_box {
         if !engine_running() {
             eprintln!("oaita local: no running engine (needed to run the \
@@ -115,18 +154,51 @@ pub fn cmd_local(args: &[String]) -> i32 {
         let this = std::env::current_exe()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|_| "sarun".into());
+        let model_file = url_filename(&model_url).unwrap_or_default();
+        let ready = !force
+            && dir.join(&model_file).is_file()
+            && dir.join("llama-server").is_file();
+        if !ready {
+            let mut cmd = std::process::Command::new(&this);
+            cmd.args(["run", "--net", &net, "OAITA-LOCAL", "--",
+                      &this, "oaita", "local", "--inbox", "--setup-only",
+                      "--port", &port.to_string(),
+                      "--model-url", &model_url,
+                      "--dir"]).arg(&dir);
+            if let Some(u) = &runtime_url { cmd.args(["--runtime-url", u]); }
+            if force { cmd.arg("--force"); }
+            eprintln!("oaita local: downloading in box 'OAITA-LOCAL' \
+                       (net={net} — no host network shared); the files stay \
+                       captured in the box");
+            match cmd.status() {
+                Ok(st) if st.success() => {
+                    eprintln!();
+                    eprintln!("downloads captured in box 'OAITA-LOCAL'. \
+                               Review it (UI or `sarun OAITA-LOCAL patch`), \
+                               then:");
+                    eprintln!("  sarun OAITA-LOCAL apply   # land the files \
+                               in {}", dir.display());
+                    eprintln!("  sarun oaita local         # start the \
+                               server (its own box, host loopback)");
+                    return if setup_only { 0 } else { 0 };
+                }
+                Ok(st) => return st.code().unwrap_or(1),
+                Err(e) => { eprintln!("oaita local: spawn box: {e}"); return 1; }
+            }
+        }
+        if setup_only {
+            eprintln!("oaita local: files + config already in place \
+                       ({})", dir.display());
+            return 0;
+        }
         let mut cmd = std::process::Command::new(&this);
-        cmd.args(["run", "--net", "host", "oaita-local", "--",
+        cmd.args(["run", "--net", "host", "OAITA-SERVE", "--",
                   &this, "oaita", "local", "--inbox",
                   "--port", &port.to_string(),
                   "--model-url", &model_url,
                   "--dir"]).arg(&dir);
-        if let Some(u) = &runtime_url { cmd.args(["--runtime-url", u]); }
-        if setup_only { cmd.arg("--setup-only"); }
-        if force { cmd.arg("--force"); }
-        eprintln!("oaita local: running in box 'oaita-local' — writes are \
-                   captured; apply the box to keep the model/runtime, \
-                   discard to drop them");
+        eprintln!("oaita local: serving from box 'OAITA-SERVE' (host \
+                   loopback shared for the endpoint; writes captured)");
         return match cmd.status() {
             Ok(st) => st.code().unwrap_or(1),
             Err(e) => { eprintln!("oaita local: spawn box: {e}"); 1 }
@@ -147,7 +219,14 @@ fn engine_running() -> bool {
 fn run(dir: &Path, port: u16, model_url: &str, runtime_url: Option<&str>,
        setup_only: bool, write_config: bool, force: bool, inbox: bool)
        -> Result<()> {
-    std::fs::create_dir_all(dir).with_context(|| format!("mkdir {dir:?}"))?;
+    // Tolerate a raw EEXIST: under the box's FUSE overlay, mkdir of a dir
+    // that exists host-side can report EEXIST while the follow-up stat that
+    // std's create_dir_all uses to excuse it doesn't line up.
+    match std::fs::create_dir_all(dir) {
+        Ok(()) => {}
+        Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {}
+        Err(e) => return Err(e).with_context(|| format!("mkdir {dir:?}")),
+    }
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()
         .context("tokio runtime")?;
 
@@ -203,11 +282,38 @@ fn run(dir: &Path, port: u16, model_url: &str, runtime_url: Option<&str>,
 
 /// GET `url` streaming to `dest` (via .part + rename), with coarse progress
 /// on stderr. Follows redirects (Hugging Face resolves to a CDN).
+/// HTTP client for the downloads. On top of the compiled-in webpki roots,
+/// trust the SYSTEM CA bundle when one is present: inside a tap-net box the
+/// engine MITMs HTTPS with a CA it injects into the box's bundle — without
+/// this the boxed download would fail TLS (rustls ships its own roots and
+/// ignores /etc/ssl). Also honors SSL_CERT_FILE.
+fn http_client() -> Result<reqwest::Client> {
+    // http/1.1 only: inside a tap box the engine's MITM proxy speaks
+    // HTTP/1.1 on the upstream side; ALPN-negotiated h2 through it breaks
+    // mid-stream on large bodies.
+    let mut b = reqwest::Client::builder()
+        .user_agent("sarun-oaita-local")
+        .http1_only();
+    let mut bundles: Vec<PathBuf> = vec![
+        "/etc/ssl/certs/ca-certificates.crt".into(),
+        "/etc/pki/tls/certs/ca-bundle.crt".into(),
+    ];
+    if let Ok(p) = std::env::var("SSL_CERT_FILE") {
+        if !p.is_empty() { bundles.insert(0, p.into()); }
+    }
+    for p in bundles {
+        let Ok(bytes) = std::fs::read(&p) else { continue };
+        if let Ok(certs) = reqwest::Certificate::from_pem_bundle(&bytes) {
+            for c in certs { b = b.add_root_certificate(c); }
+        }
+        break; // first readable bundle wins (they're alternatives)
+    }
+    b.build().context("http client")
+}
+
 async fn fetch_to(url: &str, dest: &Path, label: &str) -> Result<()> {
     eprintln!("downloading {label}: {url}");
-    let client = reqwest::Client::builder()
-        .user_agent("sarun-oaita-local")
-        .build().context("http client")?;
+    let client = http_client()?;
     let mut resp = client.get(url).send().await
         .with_context(|| format!("GET {url}"))?
         .error_for_status()
@@ -240,9 +346,7 @@ async fn fetch_to(url: &str, dest: &Path, label: &str) -> Result<()> {
 /// Resolve the latest llama.cpp CPU runtime zip for this platform from the
 /// GitHub releases API.
 async fn latest_runtime_url() -> Result<String> {
-    let client = reqwest::Client::builder()
-        .user_agent("sarun-oaita-local")
-        .build().context("http client")?;
+    let client = http_client()?;
     let body = client.get(RUNTIME_RELEASES_API).send().await
         .context("GET releases")?
         .error_for_status().context("GET releases")?

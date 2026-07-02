@@ -285,29 +285,71 @@ fn run_poll_loop(rt: Arc<StackRuntime>, tap_fd: OwnedFd,
     let mut claimed: HashSet<SocketHandle> = HashSet::new();
     let mut rx_map: std::collections::HashMap<SocketHandle, std::sync::mpsc::Sender<Vec<u8>>>
         = Default::default();
+    // Box-bound bytes waiting for send-buffer room, per socket. smoltcp's
+    // send_slice is a PARTIAL write (returns bytes enqueued) and can_send
+    // goes false whenever the window/buffer is full — a large response
+    // (model download, big file) WILL back up here. Anything not queued is
+    // held and re-tried each tick; dropping it instead corrupts the stream
+    // mid-flight (a TLS box sees "bad record mac" ~48 KiB in).
+    let mut tx_pending: std::collections::HashMap<SocketHandle, VecDeque<u8>>
+        = Default::default();
+    // Sockets whose writer closed while bytes were still pending: the FIN
+    // must go out AFTER the tail bytes, so the close is deferred until the
+    // pending buffer drains.
+    let mut close_pending: HashSet<SocketHandle> = HashSet::new();
 
     loop {
         // 1. Drain control commands.
         while let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
                 Cmd::Write { handle, data } => {
-                    let s = sockets.get_mut::<tcp::Socket>(handle);
-                    // A send_slice error here means box-bound bytes were lost
-                    // (closed/aborted socket); surface so a truncated response
-                    // isn't a silent mystery.
-                    if s.can_send() {
-                        if let Err(e) = s.send_slice(&data) {
-                            eprintln!("sarun-engine: net: tcp send_slice: {e}");
-                        }
-                    }
+                    tx_pending.entry(handle).or_default().extend(data);
                 }
                 Cmd::Close { handle } => {
-                    let s = sockets.get_mut::<tcp::Socket>(handle);
-                    s.close();
+                    if tx_pending.get(&handle).is_some_and(|b| !b.is_empty()) {
+                        close_pending.insert(handle);
+                    } else {
+                        let s = sockets.get_mut::<tcp::Socket>(handle);
+                        s.close();
+                    }
                 }
                 Cmd::RegisterRx { handle, tx } => { rx_map.insert(handle, tx); }
             }
         }
+
+        // 1b. Flush pending box-bound bytes into whatever room the sockets
+        //     have. A send error means the socket is gone (closed/aborted) —
+        //     the remaining bytes are undeliverable; surface, don't loop.
+        tx_pending.retain(|h, buf| {
+            if !sockets.iter().any(|(handle, _)| handle == *h) {
+                return false;
+            }
+            let s = sockets.get_mut::<tcp::Socket>(*h);
+            while !buf.is_empty() && s.can_send() {
+                let (a, b) = buf.as_slices();
+                let chunk: &[u8] = if a.is_empty() { b } else { a };
+                match s.send_slice(chunk) {
+                    Ok(0) => break,
+                    Ok(n) => { buf.drain(..n); }
+                    Err(e) => {
+                        eprintln!("sarun-engine: net: tcp send_slice: {e} \
+                                   ({} box-bound bytes dropped)", buf.len());
+                        buf.clear();
+                        break;
+                    }
+                }
+            }
+            !buf.is_empty()
+        });
+        close_pending.retain(|h| {
+            if tx_pending.get(h).is_some_and(|b| !b.is_empty()) {
+                return true;
+            }
+            if sockets.iter().any(|(handle, _)| handle == *h) {
+                sockets.get_mut::<tcp::Socket>(*h).close();
+            }
+            false
+        });
 
         // 2. Drive smoltcp. poll() returns a bool "did anything change",
         //    not a Result — discarding it is correct (we poll on a fixed tick).
