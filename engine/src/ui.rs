@@ -723,6 +723,13 @@ struct App {
     launch_net: usize,
     /// Launcher option: record the environment (`-e`) in box-shell launches.
     launch_env: bool,
+    /// tap_available() result, held on App so the render path stays pure
+    /// (and tests can exercise both worlds without faking privileges).
+    tap_ok: bool,
+    /// One-shot: the launcher already bumped tap → host for this session
+    /// because tap is unavailable. Never re-bump — a user who cycles back
+    /// to tap on purpose (e.g. to see the marker) is not fought.
+    net_auto_bumped: bool,
     /// In-flight background `oci.load` (image pull), at most one at a time.
     /// Drained by pump_load() each tick; the status line shows a spinner
     /// while it runs so the UI never blocks on a registry.
@@ -839,6 +846,8 @@ impl App {
             oci_images: vec![],
             launch_net: 0,
             launch_env: false,
+            tap_ok: tap_available(),
+            net_auto_bumped: false,
             load_job: None,
             structd: StructState::default(),
             sel_hunk: 0,
@@ -4871,18 +4880,36 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
                 ]
             };
             let mut opts = vec![];
-            opts.extend(chip("n", format!("network: {}",
-                NET_MODES[app.launch_net].to_uppercase()), app.launch_net != 0));
+            let tap_dead = !app.tap_ok && app.launch_net == 0;
+            let net_label = if tap_dead {
+                "network: TAP ✗ unavailable here".to_string()
+            } else {
+                format!("network: {}", NET_MODES[app.launch_net].to_uppercase())
+            };
+            if tap_dead {
+                opts.push(Span::styled("[n] ",
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
+                opts.push(Span::styled(net_label,
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)));
+                opts.push(Span::raw("   "));
+            } else {
+                opts.extend(chip("n", net_label, app.launch_net != 0));
+            }
             opts.extend(chip("e", format!("record env: {}",
                 if app.launch_env { "ON" } else { "off" }), app.launch_env));
+            let net_hint = if app.tap_ok {
+                "n cycles network (tap → host → off)"
+            } else {
+                "n cycles network (tap ✗ no CLONE_NEWNET here → host → off)"
+            };
             let mut body = vec![
                 Line::from(Span::styled("New PTY — where should it run?",
                     Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
                 Line::from(""),
                 Line::from(opts),
                 Line::from(Span::styled(
-                    "n cycles network (tap → host → off) · e toggles env \
-                     capture — applied to box/container launches",
+                    format!("{net_hint} · e toggles env capture — applied \
+                             to box/container launches"),
                     Style::default().fg(Color::DarkGray))),
                 Line::from(""),
             ];
@@ -6752,11 +6779,46 @@ fn open_pty_menu(app: &mut App) {
         label: "Custom command…".into(),
         hint: "", action: Action::PtyNewCustom,
     });
+    // Don't offer a default that can't work here: when the netns probe says
+    // tap is unavailable, pre-select host ONCE and say so. The tap chip
+    // stays in the cycle, visibly marked, so nothing fails silently and a
+    // deliberate re-pick is still possible.
+    if !app.tap_ok && app.launch_net == 0 && !app.net_auto_bumped {
+        app.launch_net = 1;
+        app.net_auto_bumped = true;
+        app.status = "tap networking unavailable here (no CLONE_NEWNET) — \
+                      network: HOST pre-selected".into();
+    }
     app.modal = Some(Modal::Launcher { items, sel: 0 });
 }
 
 /// Launcher network modes, cycled in place with `n` (index = App.launch_net).
 const NET_MODES: [&str; 3] = ["tap", "host", "off"];
+
+/// Whether tap networking can work here at all: probe unshare(CLONE_NEWNET)
+/// in a throwaway child (fork → unshare → _exit; nothing else runs in the
+/// child, so forking the threaded TUI is safe). Restricted environments
+/// (unprivileged containers, some CI) refuse CLONE_NEWNET — the launcher
+/// uses this to pre-select host networking and MARK tap as unavailable
+/// instead of offering an option that fails after launch. Probed once.
+fn tap_available() -> bool {
+    static PROBE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *PROBE.get_or_init(|| unsafe {
+        match libc::fork() {
+            0 => {
+                let ok = libc::unshare(libc::CLONE_NEWNET) == 0;
+                libc::_exit(if ok { 0 } else { 1 });
+            }
+            -1 => true, // probe impossible — don't claim unavailability
+            pid => {
+                let mut st = 0;
+                while libc::waitpid(pid, &mut st, 0) == -1
+                    && *libc::__errno_location() == libc::EINTR {}
+                libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 0
+            }
+        }
+    })
+}
 
 /// The `run` / `oci run` flags the launcher's current toggles translate to.
 /// `env` is only meaningful for `sarun run` (oci run has no -e).
@@ -9184,6 +9246,8 @@ mod tests {
             oci_images: vec![],
             launch_net: 0,
             launch_env: false,
+            tap_ok: true,
+            net_auto_bumped: false,
             load_job: None,
             structd: StructState::default(),
             sel_hunk: 0,
@@ -9261,6 +9325,37 @@ mod tests {
         app.launch_net = (app.launch_net + 1) % NET_MODES.len();
         app.launch_net = (app.launch_net + 1) % NET_MODES.len();
         assert_eq!(NET_MODES[app.launch_net], "tap");
+    }
+
+    /// Restricted host (no CLONE_NEWNET): the launcher must not offer a
+    /// default that fails after launch — host is pre-selected with a status
+    /// note, and cycling back to tap shows a visible unavailability marker
+    /// instead of pretending it will work.
+    #[test]
+    fn launcher_marks_tap_unavailable_and_preselects_host() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = headless_app();
+        app.tap_ok = false;
+        open_pty_menu(&mut app);
+        assert_eq!(NET_MODES[app.launch_net], "host",
+                   "host must be pre-selected when tap can't work");
+        assert!(app.status.contains("tap networking unavailable"),
+                "why must be stated: {}", app.status);
+        let buf = render_to_string(&app, 100, 30).unwrap();
+        assert!(buf.contains("network: HOST"), "{buf}");
+        assert!(buf.contains("tap ✗"), "cycle hint must mark tap:\n{buf}");
+        // deliberately cycle back to tap (host → off → tap): honored, marked
+        handle_modal_key(&mut app, KeyCode::Char('n'), KeyModifiers::empty());
+        handle_modal_key(&mut app, KeyCode::Char('n'), KeyModifiers::empty());
+        assert_eq!(NET_MODES[app.launch_net], "tap");
+        let buf = render_to_string(&app, 100, 30).unwrap();
+        assert!(buf.contains("TAP ✗ unavailable here"),
+                "tap chip must carry the marker:\n{buf}");
+        // reopening the launcher must NOT fight the deliberate choice
+        app.modal = None;
+        open_pty_menu(&mut app);
+        assert_eq!(NET_MODES[app.launch_net], "tap",
+                   "auto-bump is one-shot");
     }
 
     /// The image picker is a HIERARCHY (groups → tags → pull), seeded from
