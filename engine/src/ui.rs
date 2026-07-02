@@ -340,6 +340,13 @@ enum Modal {
     /// Free-text image reference entry — the picker's escape hatch (and the
     /// "enter tag…" leaf, which pre-fills `buf` with "image:").
     ImageRef { buf: String },
+    /// The Pty+ launcher: destination rows (like ActionMenu) PLUS visible
+    /// option chips the user cycles in place — `n` network mode (tap/host/
+    /// off), `e` record-env — instead of aborting and retyping a command
+    /// line to change a flag. The chosen options live on App (launch_net /
+    /// launch_env) so they persist across launches this session and are
+    /// applied to whichever destination Enter picks.
+    Launcher { items: Vec<ActionItem>, sel: usize },
 }
 
 /// One level of the image-picker menu stack.
@@ -710,6 +717,12 @@ struct App {
     /// sessions context menu's "container shell" entry. Empty against an
     /// engine without the `oci.images` verb.
     oci_images: Vec<(String, String)>,
+    /// Launcher option: network mode index into NET_MODES (0 tap · 1 host ·
+    /// 2 off). Cycled with `n` in the Pty+ launcher; applied to box-shell
+    /// and container launches. Persists for the session.
+    launch_net: usize,
+    /// Launcher option: record the environment (`-e`) in box-shell launches.
+    launch_env: bool,
     /// In-flight background `oci.load` (image pull), at most one at a time.
     /// Drained by pump_load() each tick; the status line shows a spinner
     /// while it runs so the UI never blocks on a registry.
@@ -824,6 +837,8 @@ impl App {
             should_quit: false,
             ptys: vec![], sel_pty: 0, pty_esc_at: None, right_focused: false, right_scroll: 0, right_scroll_max: std::cell::Cell::new(0), out_follow_scroll: std::cell::Cell::new(0), err_only: false, nav_history: vec![], pty_in_right: false, menu_nav: false, menu_sel: 0,
             oci_images: vec![],
+            launch_net: 0,
+            launch_env: false,
             load_job: None,
             structd: StructState::default(),
             sel_hunk: 0,
@@ -2995,8 +3010,13 @@ impl App {
     /// PTYs can coexist; each is appended to `ptys` and becomes the
     /// active selection.
     #[cfg_attr(test, allow(dead_code))]
-    fn open_pty(&mut self, argv: Vec<String>) {
+    fn open_pty(&mut self, mut argv: Vec<String>) {
         if argv.is_empty() { self.status = "pty: empty command".into(); return; }
+        // The engine's PTY does no PATH lookup, so a bare `sarun` wouldn't
+        // resolve — expand it to this very binary here. This keeps the
+        // visible prompt default a readable `sarun run -b -- ` instead of
+        // leaking the full install path into the dialog.
+        if argv[0] == "sarun" { argv[0] = self_exe(); }
         // Initial size: best guess from the actual terminal. The loop
         // calls fit_active_pty() once per redraw and resizes again
         // when the layout changes (split vs full-screen, embed
@@ -4699,11 +4719,12 @@ fn help_lines() -> Vec<Line<'static>> {
 }
 
 /// Render the active modal centered over the body. Returns the area consumed.
-fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal) {
+fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
     let w = (area.width * 7 / 10).clamp(20, area.width);
     let want = match modal {
         Modal::Search { rows, .. } => (rows.len() as u16) + 6,
         Modal::ActionMenu { items, .. } => (items.len() as u16) + 5,
+        Modal::Launcher { items, .. } => (items.len() as u16) + 8,
         // rows can wrap (mirror/alias resolution details are long), so
         // budget up to two display rows per item.
         Modal::ImagePicker { stack, .. } => stack.last()
@@ -4798,7 +4819,8 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal) {
                 Line::from("runs on the HOST as typed (no box, no capture) — \
                             a bare `bash` is a host shell; keep the \
                             `sarun run -b -- CMD` prefix to run CMD in a \
-                            fresh captured box · Enter run · Esc cancel"),
+                            fresh captured box (`sarun` expands to this \
+                            binary) · Enter run · Esc cancel"),
             ],
         ),
         Modal::ActionMenu { title, items, sel } => {
@@ -4831,6 +4853,59 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal) {
                 "↑/↓ move · Enter run · Esc cancel",
                 Style::default().fg(Color::Gray))));
             (" actions ", body)
+        }
+        Modal::Launcher { items, sel } => {
+            // Option chips first — visible, toggleable state, not flags to
+            // remember. The active value is bold; the key cycles it in place.
+            let chip = |key: &str, label: String, on: bool| {
+                let st = if on {
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Yellow)
+                };
+                vec![
+                    Span::styled(format!("[{key}] "),
+                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                    Span::styled(label, st),
+                    Span::raw("   "),
+                ]
+            };
+            let mut opts = vec![];
+            opts.extend(chip("n", format!("network: {}",
+                NET_MODES[app.launch_net].to_uppercase()), app.launch_net != 0));
+            opts.extend(chip("e", format!("record env: {}",
+                if app.launch_env { "ON" } else { "off" }), app.launch_env));
+            let mut body = vec![
+                Line::from(Span::styled("New PTY — where should it run?",
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
+                Line::from(""),
+                Line::from(opts),
+                Line::from(Span::styled(
+                    "n cycles network (tap → host → off) · e toggles env \
+                     capture — applied to box/container launches",
+                    Style::default().fg(Color::DarkGray))),
+                Line::from(""),
+            ];
+            let lw = items.iter().map(|i| i.label.chars().count())
+                              .max().unwrap_or(20).max(20);
+            for (i, it) in items.iter().enumerate() {
+                let active = i == *sel;
+                let style = if active {
+                    Style::default().fg(Color::Black).bg(Color::Cyan)
+                } else {
+                    Style::default()
+                };
+                body.push(Line::from(vec![
+                    Span::styled(format!("  {:<lw$}", it.label, lw = lw), style),
+                    Span::styled(format!("  {}", it.hint),
+                        Style::default().fg(Color::DarkGray)),
+                ]));
+            }
+            body.push(Line::from(""));
+            body.push(Line::from(Span::styled(
+                "↑/↓ move · Enter launch · Esc cancel",
+                Style::default().fg(Color::Gray))));
+            (" new PTY ", body)
         }
         Modal::ImagePicker { crumbs, stack } => {
             let mut body = vec![
@@ -5704,7 +5779,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     );
 
     if let Some(m) = &app.modal {
-        draw_modal(f, body, m);
+        draw_modal(f, body, m, app);
     }
 }
 
@@ -6625,10 +6700,12 @@ fn pty_default_cmd() -> String {
             return l.to_string();
         }
     }
-    // Absolute path to this very binary: `<…>/sarun run -b --` drops the
-    // user into a brush shell inside a fresh box. They can add a NAME or
-    // change the trailing command before pressing Enter.
-    format!("{} run -b -- ", self_exe())
+    // `sarun run -b --` drops the user into a brush shell inside a fresh
+    // box; they can add a NAME or a trailing command before pressing Enter.
+    // open_pty expands the bare `sarun` to this binary's absolute path at
+    // spawn time (the engine PTY does no PATH lookup), so the prompt stays
+    // readable instead of showing the full install path.
+    "sarun run -b -- ".to_string()
 }
 
 /// Absolute path to this very binary (the engine's PTY does no PATH lookup —
@@ -6675,10 +6752,18 @@ fn open_pty_menu(app: &mut App) {
         label: "Custom command…".into(),
         hint: "", action: Action::PtyNewCustom,
     });
-    app.modal = Some(Modal::ActionMenu {
-        title: "New PTY — where should it run?".into(),
-        items, sel: 0,
-    });
+    app.modal = Some(Modal::Launcher { items, sel: 0 });
+}
+
+/// Launcher network modes, cycled in place with `n` (index = App.launch_net).
+const NET_MODES: [&str; 3] = ["tap", "host", "off"];
+
+/// The `run` / `oci run` flags the launcher's current toggles translate to.
+/// `env` is only meaningful for `sarun run` (oci run has no -e).
+fn launch_flags(app: &App, env: bool) -> Vec<String> {
+    let mut f = vec!["--net".to_string(), NET_MODES[app.launch_net].to_string()];
+    if env && app.launch_env { f.push("-e".into()); }
+    f
 }
 
 /// One curated catalog group: display name, unqualified image name (resolved
@@ -7287,28 +7372,40 @@ fn run_action(app: &mut App, a: Action) {
         Action::MoveRuleDown   => app.move_rule(1),
         Action::PtyNew         => open_pty_menu(app),
         Action::PtyNewBoxShell => {
-            app.open_pty(vec![self_exe(), "run".into(), "-b".into(), "--".into()]);
+            let mut argv = vec![self_exe(), "run".into(), "-b".into()];
+            argv.extend(launch_flags(app, true));
+            argv.push("--".into());
+            app.open_pty(argv);
         }
         Action::PtyNewHostShell => {
             let sh = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
             app.open_pty(vec![sh]);
         }
         Action::PtyNewCustom   => {
-            app.modal = Some(Modal::PtyCmd { buf: pty_default_cmd() });
+            // The saved/default prompt, with the launcher's current toggles
+            // spliced into the `run` flags so they carry over into editing.
+            let buf = pty_default_cmd().replacen(
+                " run -b ",
+                &format!(" run -b {} ", launch_flags(app, true).join(" ")),
+                1);
+            app.modal = Some(Modal::PtyCmd { buf });
         }
         Action::NewFromImage   => app.open_image_picker(),
         Action::RunSelectedImage => {
-            // Pre-filled, editable: Enter starts a container on the selected
-            // image box (real rootfs, real shell — not a brush box).
+            // Straight in: a container on the selected image box (its real
+            // rootfs and default CMD — not a brush box, nothing to type).
             let name = app.sessions.get(app.sel_session)
                 .and_then(|r| r.get("path").and_then(Value::as_str))
                 .and_then(|p| app.oci_images.iter()
                     .find(|(n, _)| p.ends_with(n.as_str()))
                     .map(|(n, _)| n.clone()));
             match name {
-                Some(name) => app.modal = Some(Modal::PtyCmd {
-                    buf: format!("{} oci run {name} -- ", self_exe()),
-                }),
+                Some(name) => {
+                    let mut argv = vec![self_exe(), "oci".into(), "run".into()];
+                    argv.extend(launch_flags(app, false));
+                    argv.push(name);
+                    app.open_pty(argv);
+                }
                 None => app.status =
                     "selected box is not a loaded image".into(),
             }
@@ -7477,6 +7574,39 @@ fn handle_modal_key(app: &mut App, code: crossterm::event::KeyCode,
             }
             _ => app.modal = Some(Modal::ActionMenu { title, items, sel }),
         },
+        Modal::Launcher { items, mut sel } => match code {
+            KeyCode::Esc => app.status = "launcher cancelled".into(),
+            KeyCode::Up => {
+                if sel > 0 { sel -= 1; }
+                app.modal = Some(Modal::Launcher { items, sel });
+            }
+            KeyCode::Down => {
+                if sel + 1 < items.len() { sel += 1; }
+                app.modal = Some(Modal::Launcher { items, sel });
+            }
+            KeyCode::Home => app.modal = Some(Modal::Launcher { items, sel: 0 }),
+            KeyCode::End => {
+                let last = items.len().saturating_sub(1);
+                app.modal = Some(Modal::Launcher { items, sel: last });
+            }
+            // The visible option chips: cycle in place, stay in the modal —
+            // no abort/retype to change a launch flag.
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                app.launch_net = (app.launch_net + 1) % NET_MODES.len();
+                app.modal = Some(Modal::Launcher { items, sel });
+            }
+            KeyCode::Char('e') | KeyCode::Char('E') => {
+                app.launch_env = !app.launch_env;
+                app.modal = Some(Modal::Launcher { items, sel });
+            }
+            KeyCode::Enter => {
+                if let Some(it) = items.get(sel) {
+                    let act = it.action;
+                    run_action(app, act);
+                }
+            }
+            _ => app.modal = Some(Modal::Launcher { items, sel }),
+        },
         Modal::ImagePicker { mut crumbs, mut stack } => match code {
             KeyCode::Esc => app.status = "image picker cancelled".into(),
             KeyCode::Up => {
@@ -7522,9 +7652,13 @@ fn handle_modal_key(app: &mut App, code: crossterm::event::KeyCode,
                     }
                     Some((_, PickNext::Pull(rf))) => app.start_image_load(rf),
                     Some((_, PickNext::RunLocal(name))) => {
-                        app.modal = Some(Modal::PtyCmd {
-                            buf: format!("{} oci run {name} -- ", self_exe()),
-                        });
+                        // Straight into a container PTY on the loaded image
+                        // (its default CMD) — no command line to understand.
+                        let mut argv =
+                            vec![self_exe(), "oci".into(), "run".into()];
+                        argv.extend(launch_flags(app, false));
+                        argv.push(name);
+                        app.open_pty(argv);
                     }
                     Some((_, PickNext::EnterRef(prefix))) => {
                         app.modal = Some(Modal::ImageRef { buf: prefix });
@@ -8149,16 +8283,17 @@ mod tests {
         }
         assert_eq!(pty_default_cmd(), "sarun run -b -- make",
                    "configured login command must be used verbatim");
-        // … and with no config it falls back to `<this-binary> run -b --`
-        // — an absolute path so the engine's PTY (which execvp's argv[0]
-        // directly, no shell lookup) can find it without `sarun` on PATH.
+        // … and with no config it falls back to a READABLE `sarun run -b --`
+        // (no full install path leaking into the dialog); open_pty expands
+        // the bare `sarun` to this binary's absolute path at spawn time
+        // because the engine's PTY execvp's argv[0] with no PATH lookup.
         std::fs::remove_file(cfgdir.join("pty_command")).unwrap();
         let d = pty_default_cmd();
         assert!(d.contains("run -b --"),
                 "fallback should drop into a fresh brush-mode box, got {d:?}");
         let head = d.split_whitespace().next().unwrap_or("");
-        assert!(head.starts_with('/'),
-                "fallback head should be an absolute path, got {head:?}");
+        assert_eq!(head, "sarun",
+                   "fallback head must be the readable placeholder");
         unsafe {
             match prev_xdg { Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
                              None => std::env::remove_var("XDG_CONFIG_HOME") }
@@ -9047,6 +9182,8 @@ mod tests {
             should_quit: false,
             ptys: vec![], sel_pty: 0, pty_esc_at: None, right_focused: false, right_scroll: 0, right_scroll_max: std::cell::Cell::new(0), out_follow_scroll: std::cell::Cell::new(0), err_only: false, nav_history: vec![], pty_in_right: false, menu_nav: false, menu_sel: 0,
             oci_images: vec![],
+            launch_net: 0,
+            launch_env: false,
             load_job: None,
             structd: StructState::default(),
             sel_hunk: 0,
@@ -9070,18 +9207,60 @@ mod tests {
     fn pty_menu_offers_named_destinations() {
         let mut app = headless_app();
         open_pty_menu(&mut app);
-        let Some(Modal::ActionMenu { title, items, .. }) = &app.modal else {
-            panic!("Pty+ must open the chooser menu");
+        let Some(Modal::Launcher { items, .. }) = &app.modal else {
+            panic!("Pty+ must open the launcher");
         };
-        assert!(title.contains("New PTY"), "title: {title}");
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
         assert!(labels.iter().any(|l| l.contains("NEW box")), "{labels:?}");
         assert!(labels.iter().any(|l| l.contains("image")), "{labels:?}");
         assert!(labels.iter().any(|l| l.contains("Host shell")), "{labels:?}");
         assert!(labels.iter().any(|l| l.contains("Custom")), "{labels:?}");
-        // Render: the choices must actually be visible.
+        // Render: the choices AND the option chips must be visible.
         let buf = render_to_string(&app, 100, 30).unwrap();
         assert!(buf.contains("Host shell"), "menu not rendered:\n{buf}");
+        assert!(buf.contains("network: TAP"), "net chip missing:\n{buf}");
+        assert!(buf.contains("record env: off"), "env chip missing:\n{buf}");
+    }
+
+    /// The launcher's option chips cycle IN PLACE — no abort/relaunch to
+    /// change the network mode — and the chosen flags land in the argv the
+    /// destinations build (visible via the Custom prompt prefill).
+    #[test]
+    fn launcher_toggles_cycle_in_place_and_reach_the_argv() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = headless_app();
+        open_pty_menu(&mut app);
+        // n: tap → host; e: env on. The modal must stay open throughout.
+        handle_modal_key(&mut app, KeyCode::Char('n'), KeyModifiers::empty());
+        handle_modal_key(&mut app, KeyCode::Char('e'), KeyModifiers::empty());
+        assert!(matches!(app.modal, Some(Modal::Launcher { .. })));
+        assert_eq!(NET_MODES[app.launch_net], "host");
+        assert!(app.launch_env);
+        let buf = render_to_string(&app, 100, 30).unwrap();
+        assert!(buf.contains("network: HOST"), "chip must show new mode:\n{buf}");
+        assert!(buf.contains("record env: ON"), "chip must show env on:\n{buf}");
+        assert_eq!(launch_flags(&app, true),
+                   vec!["--net", "host", "-e"]);
+        assert_eq!(launch_flags(&app, false), vec!["--net", "host"]);
+        // Custom command prefill carries the toggles into the editable line.
+        let sel_custom = match &app.modal {
+            Some(Modal::Launcher { items, .. }) =>
+                items.iter().position(|i| i.label.contains("Custom")).unwrap(),
+            _ => unreachable!(),
+        };
+        if let Some(Modal::Launcher { sel, .. }) = app.modal.as_mut() {
+            *sel = sel_custom;
+        }
+        handle_modal_key(&mut app, KeyCode::Enter, KeyModifiers::empty());
+        let Some(Modal::PtyCmd { buf }) = &app.modal else {
+            panic!("Custom must open the command prompt");
+        };
+        assert!(buf.contains("run -b --net host -e -- "), "prefill: {buf}");
+        assert!(buf.starts_with("sarun "), "no opaque full path: {buf}");
+        // full cycle wraps: host → off → tap
+        app.launch_net = (app.launch_net + 1) % NET_MODES.len();
+        app.launch_net = (app.launch_net + 1) % NET_MODES.len();
+        assert_eq!(NET_MODES[app.launch_net], "tap");
     }
 
     /// The image picker is a HIERARCHY (groups → tags → pull), seeded from

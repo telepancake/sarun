@@ -313,7 +313,14 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
         if net_mode == crate::net::NetMode::Tap {
             match crate::net::tap::create_netns_tap() {
                 Ok(fd) => Some(fd),
-                Err(e) => { eprintln!("sarun-engine: tap setup failed: {e}"); return 1; }
+                Err(e) => {
+                    eprintln!("sarun-engine: tap setup failed: {e}");
+                    eprintln!("hint: tap needs netns privileges \
+                               (CLONE_NEWNET); on hosts without them pass \
+                               `--net host` (-N) to share the host network \
+                               or `--net off` for none");
+                    return 1;
+                }
             }
         } else { None };
     let pidfd = pidfd_open(std::process::id() as i32);
