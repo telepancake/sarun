@@ -719,6 +719,41 @@ def main():
               f"case20: second pass found scripts/Kbuild.include via the "
               f"MAKEFLAGS-inherited --include-dir; kb.txt={ko!r} "
               f"(want b'built-foo mark=yes\\n')")
+
+        # ── CASE 21: VPATH source resolution + pattern-rule remade include ────
+        # Two kernel-build essentials in one makefile: (a) a REQUIRED
+        # `include gen.conf` whose file doesn't exist at parse time and is
+        # produced by a PATTERN rule (`%.conf:`) — GNU's remake-the-makefile
+        # loop must accept pattern-rule producers (the kernel's
+        # `%/auto.conf: $(KCONFIG_CONFIG)` → syncconfig); (b) `VPATH := sub`
+        # resolving the prerequisite `src.c` to sub/src.c and rewriting $< to
+        # the found path (the kernel's out-of-tree `VPATH := $(srctree)`).
+        vp = work / "vpath"
+        shutil.rmtree(vp, ignore_errors=True)
+        (vp / "sub").mkdir(parents=True, exist_ok=True)
+        (vp / "sub/src.c").write_text("payload-from-vpath\n")
+        (vp / "Makefile").write_text(
+            "VPATH := sub\n"
+            "include gen.conf\n"
+            "all: out.txt\n"
+            "\t@echo conf=$(CONF) > conf.txt\n"
+            "out.txt: src.c\n"
+            "\t@cp $< $@\n"
+            "%.conf:\n"
+            "\t@echo 'CONF := yes' > $@\n")
+        r = subprocess.run(
+            [str(BIN), "run", "-b", "MAKE21", "-C", str(vp), "--", "make"],
+            capture_output=True, text=True, timeout=180)
+        check(r.returncode == 0,
+              f"case21: vpath box exits 0 (got {r.returncode}: {r.stderr[-600:]})")
+        sp21 = latest_sqlar(m)
+        vo = m.sqlar_content(sp21, str((vp / "out.txt").resolve()).lstrip("/"))
+        co = m.sqlar_content(sp21, str((vp / "conf.txt").resolve()).lstrip("/"))
+        check(vo == b"payload-from-vpath\n",
+              f"case21: $< resolved through VPATH to sub/src.c; out.txt={vo!r}")
+        check(co == b"conf=yes\n",
+              f"case21: required include regenerated via the %.conf pattern "
+              f"rule (remake loop); conf.txt={co!r}")
     finally:
         if eng is not None and eng.poll() is None:
             eng.terminate()

@@ -419,6 +419,13 @@ struct DepBuilder<'a> {
     done: HashMap<Symbol, Arc<Mutex<DepNode>>>,
     phony: HashSet<Symbol>,
     restat: HashSet<Symbol>,
+    // sarun: GNU make's VPATH directory-search list (the $(VPATH) variable's
+    // final value, split on ':' / whitespace). A relative prerequisite with no
+    // rule of its own that doesn't exist in the working dir is looked up in
+    // these directories and REWRITTEN to the found path (so $^/$< and the
+    // executor's stat see the real file) — the Linux kernel's out-of-tree
+    // builds (`VPATH := $(srctree)`) resolve every source file this way.
+    vpath_dirs: Vec<Bytes>,
     depfile_var_name: Symbol,
     implicit_outputs_var_name: Symbol,
     ninja_pool_var_name: Symbol,
@@ -436,6 +443,24 @@ struct PickedRuleInfo {
 impl<'a> DepBuilder<'a> {
     fn new(ev: &'a mut Evaluator) -> Result<Self> {
         let rule_vars = std::mem::take(&mut ev.rule_vars);
+        // The final value of $(VPATH), evaluated once here — GNU make also
+        // uses the value in effect after reading all makefiles.
+        let vpath_dirs: Vec<Bytes> = {
+            let mut dirs = Vec::new();
+            if let Some(v) = ev.lookup_var(intern(b"VPATH".to_vec()))? {
+                let val = {
+                    use crate::expr::Evaluable;
+                    v.read().eval_to_buf(ev)?
+                };
+                for part in val
+                    .split(|&b| b == b':' || b == b' ' || b == b'\t')
+                    .filter(|p| !p.is_empty())
+                {
+                    dirs.push(val.slice_ref(part));
+                }
+            }
+            dirs
+        };
         let mut ret = Self {
             ev,
             rules: HashMap::new(),
@@ -455,6 +480,7 @@ impl<'a> DepBuilder<'a> {
             ninja_pool_var_name: intern(".KATI_NINJA_POOL"),
             validations_var_name: intern(".KATI_VALIDATIONS"),
             tags_var_name: intern(".KATI_TAGS"),
+            vpath_dirs,
         };
         let _tr = ScopedTimeReporter::new("make dep (populate)");
         ret.populate_rules()?;
@@ -647,6 +673,47 @@ impl<'a> DepBuilder<'a> {
             self.ev.working_dir.join(p)
         };
         std::fs::exists(&path).is_ok_and(|v| v)
+    }
+
+    /// GNU make directory search: a relative prerequisite that has no rule of
+    /// its own, isn't phony, and doesn't exist in the working dir is searched
+    /// for in the VPATH directories; the first hit rewrites the prerequisite
+    /// to `dir/name` (matching GNU's behavior for files that don't need to be
+    /// rebuilt — the common case VPATH exists for: out-of-tree source files).
+    fn vpath_resolve(&self, sym: Symbol) -> Option<Symbol> {
+        if self.vpath_dirs.is_empty() {
+            return None;
+        }
+        let bytes = sym.as_bytes();
+        if bytes.is_empty() || bytes.starts_with(b"/") {
+            return None;
+        }
+        if self.rules.contains_key(&sym) || self.phony.contains(&sym) {
+            return None;
+        }
+        let rel = std::path::Path::new(OsStr::from_bytes(&bytes));
+        if std::fs::exists(self.ev.working_dir.join(rel)).is_ok_and(|v| v) {
+            return None;
+        }
+        for dir in &self.vpath_dirs {
+            let mut cand = bytes::BytesMut::with_capacity(dir.len() + 1 + bytes.len());
+            cand.extend_from_slice(dir);
+            if !dir.ends_with(b"/") {
+                cand.extend_from_slice(b"/");
+            }
+            cand.extend_from_slice(&bytes);
+            let cand = cand.freeze();
+            let p = std::path::Path::new(OsStr::from_bytes(&cand));
+            let abs = if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                self.ev.working_dir.join(p)
+            };
+            if std::fs::exists(&abs).is_ok_and(|v| v) {
+                return Some(intern(cand));
+            }
+        }
+        None
     }
 
     fn get_rule_inputs(&self, s: Symbol) -> Option<(Vec<Symbol>, Loc)> {
@@ -867,6 +934,10 @@ impl<'a> DepBuilder<'a> {
                     // `$(obj)/%: $(src)/%_shipped` can't recurse forever
                     // (foo → foo_shipped → foo_shipped_shipped → …).
                     let buildable = self.exists(sym)
+                        // sarun: a prerequisite findable through VPATH counts
+                        // as existing for implicit-rule selection, as in GNU
+                        // make's directory search.
+                        || self.vpath_resolve(sym).is_some()
                         || (allow_chain
                             && self.has_producing_rule_except(sym, &rule.output_patterns));
                     if !buildable {
@@ -1370,6 +1441,23 @@ impl<'a> DepBuilder<'a> {
             }
         }
 
+        // sarun: VPATH directory search — rewrite unresolvable relative
+        // prerequisites to their VPATH hit BEFORE recursing, and reflect the
+        // rewrite in actual_inputs so $^/$< and the executor's mtime checks
+        // see the found path (GNU make's prerequisite path substitution).
+        {
+            let mut node = n.lock();
+            for i in node.actual_inputs.iter_mut() {
+                if let Some(resolved) = self.vpath_resolve(*i) {
+                    *i = resolved;
+                }
+            }
+            for i in node.actual_order_only_inputs.iter_mut() {
+                if let Some(resolved) = self.vpath_resolve(*i) {
+                    *i = resolved;
+                }
+            }
+        }
         let actual_inputs = n.lock().actual_inputs.clone();
         for input in actual_inputs {
             let c = self.build_plan(input, Some(output))?;

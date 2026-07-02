@@ -405,7 +405,19 @@ fn run_kati(
         let pending = std::mem::take(&mut ev.pending_remake_includes);
         for (loc, name) in &pending {
             let sym = intern(name.as_bytes().to_vec());
-            if ev.rules.iter().any(|r| r.outputs.contains(&sym)) {
+            // A rule can produce the missing include either literally or via a
+            // PATTERN target — the kernel regenerates include/config/auto.conf
+            // through `%/auto.conf %/auto.conf.cmd: $(KCONFIG_CONFIG)`.
+            let producible = ev.rules.iter().any(|r| {
+                r.outputs.contains(&sym)
+                    || r.output_patterns.iter().any(|p| {
+                        kati::strutil::Pattern::new(bytes::Bytes::from(
+                            p.as_bytes().to_vec(),
+                        ))
+                        .matches(&name.as_bytes())
+                    })
+            });
+            if producible {
                 remake_targets.push(sym);
             } else {
                 let pat_str = String::from_utf8_lossy(name.as_bytes());

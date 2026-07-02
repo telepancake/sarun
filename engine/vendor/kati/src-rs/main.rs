@@ -235,7 +235,16 @@ fn run(targets: &[Symbol], cl_vars: &Vec<Bytes>, orig_args: OsString) -> Result<
         let pending = std::mem::take(&mut ev.pending_remake_includes);
         for (loc, name) in &pending {
             let sym = intern(name.as_bytes().to_vec());
-            if ev.rules.iter().any(|r| r.outputs.contains(&sym)) {
+            // Literal or PATTERN-rule producible (e.g. the kernel's
+            // `%/auto.conf %/auto.conf.cmd: $(KCONFIG_CONFIG)`).
+            let producible = ev.rules.iter().any(|r| {
+                r.outputs.contains(&sym)
+                    || r.output_patterns.iter().any(|p| {
+                        kati::strutil::Pattern::new(bytes::Bytes::from(p.as_bytes().to_vec()))
+                            .matches(name.as_bytes())
+                    })
+            });
+            if producible {
                 remake_targets.push(sym);
             } else {
                 // Missing required include with no matching rule. Emit a
