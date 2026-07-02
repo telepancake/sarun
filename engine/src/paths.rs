@@ -81,6 +81,13 @@ pub fn cosign_config_path() -> PathBuf {
     config_home().join("cosign.toml")
 }
 
+/// `images.toml` — the UI's base-image catalog (the hierarchical picker's
+/// groups + tags). Optional: when absent the picker uses a built-in curated
+/// list of common distro bases.
+pub fn images_config_path() -> PathBuf {
+    config_home().join("images.toml")
+}
+
 /// Where oaita sessions live: one folder per session under here. Mirrors the
 /// Python prototype's `$XDG_STATE_HOME/oaita/<name>/` layout but lives under
 /// sarun's own state root so removing sarun's state removes oaita's too.

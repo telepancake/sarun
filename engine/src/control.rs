@@ -1740,6 +1740,25 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
                 Err(e) => return json!({"ok": false, "error": format!("{e:#}")}),
             }
         }
+        // Loaded images, for the UI's base-image picker: the TOP box of each
+        // installed layer chain (the one carrying the image config), with the
+        // reference it was pulled as. Cheap metadata scan, no registry I/O.
+        "oci.images" => {
+            let boxes = crate::discover::discover();
+            Value::Array(boxes.iter()
+                .filter(|(_, b)| b.meta.contains_key("oci_config"))
+                .filter_map(|(id, b)| {
+                    let reference = b.meta.get("oci_reference")?;
+                    Some(json!({
+                        "id": id,
+                        "name": b.name,
+                        "reference": reference,
+                        "digest": b.meta.get("oci_manifest_digest")
+                                        .cloned().unwrap_or_default(),
+                    }))
+                })
+                .collect())
+        }
         "oci.resolve" => {
             let Some(reference) = args.first().and_then(Value::as_str) else {
                 return json!({"ok": false, "error": "oci.resolve: missing reference"});

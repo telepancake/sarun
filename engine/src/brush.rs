@@ -1802,6 +1802,9 @@ pub fn brush_sh(argv: &[String]) -> i32 {
         // inside a box (out of scope here).
         eprintln!("sarun-engine brush-sh: requires -c SCRIPT or a script path \
                    (interactive nested shell is out of scope inside a brush box)");
+        eprintln!("hint: for an interactive shell in a fresh box, start it from \
+                   the HOST instead: `sarun run -b --` (in the UI: Pty+ → \
+                   \"Shell in a new box\")");
         return 2;
     }
 

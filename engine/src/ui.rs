@@ -328,6 +328,57 @@ enum Modal {
         items: Vec<ActionItem>,
         sel: usize,
     },
+    /// Hierarchical base-image picker: pick a container image to load as an
+    /// at-rest box stack, without knowing reference syntax. Levels are a
+    /// stack of menus (Enter descends / activates, Backspace or Esc pops);
+    /// `crumbs` mirror the descent for the title bar. Content comes from
+    /// the loaded-image list, the curated catalog ({config_home}/images.toml
+    /// or built-in defaults), and /etc/containers/registries.conf short-name
+    /// aliases — leaves show WHERE the pull will actually go (mirror/alias
+    /// resolution) so policy-required mirrors are visible before committing.
+    ImagePicker { crumbs: Vec<String>, stack: Vec<PickLevel> },
+    /// Free-text image reference entry — the picker's escape hatch (and the
+    /// "enter tag…" leaf, which pre-fills `buf` with "image:").
+    ImageRef { buf: String },
+}
+
+/// One level of the image-picker menu stack.
+#[derive(Clone)]
+struct PickLevel {
+    items: Vec<PickItem>,
+    sel: usize,
+}
+
+/// One image-picker row: what it shows and what Enter does.
+#[derive(Clone)]
+struct PickItem {
+    label: String,
+    /// Right-hand annotation: where the pick resolves to (registry, mirror,
+    /// alias target) or a short description for submenus.
+    detail: String,
+    next: PickNext,
+}
+
+#[derive(Clone)]
+enum PickNext {
+    /// Descend into a submenu.
+    Menu(Vec<PickItem>),
+    /// Pull + install this reference as an at-rest box stack (background
+    /// `oci.load`; the UI stays live and shows a spinner in the status line).
+    Pull(String),
+    /// An already-loaded image box: open a PTY prompt pre-filled with
+    /// `<exe> oci run <name> -- ` so Enter starts a container on it.
+    RunLocal(String),
+    /// Open the free-text reference modal pre-filled with this prefix.
+    EnterRef(String),
+}
+
+/// A background `oci.load` (image pull) in flight — see App::start_image_load
+/// / App::pump_load.
+struct LoadJob {
+    rx: mpsc::Receiver<Result<String, String>>,
+    label: String,
+    spin: usize,
 }
 
 /// One row inside Modal::ActionMenu. `hint` shows the global key that
@@ -361,6 +412,19 @@ enum Action {
     PtyNew,
     PtyKill,
     PtyEmbedToggle,
+    /// Pty+ chooser entries: a discoverable menu instead of one raw command
+    /// prompt (typing `bash` into that prompt runs on the HOST; inside a
+    /// brush box a nested interactive shell is refused — both surprised
+    /// users. The menu makes each destination explicit.)
+    PtyNewBoxShell,
+    PtyNewHostShell,
+    PtyNewCustom,
+    /// Open the hierarchical base-image picker (new box from a container
+    /// image; respects /etc/containers/registries.conf).
+    NewFromImage,
+    /// Selected sessions row is a loaded image: prompt a PTY running
+    /// `<exe> oci run <name>` (a container shell on that image).
+    RunSelectedImage,
 }
 
 /// One editable line of the '/' clause editor (mirrors Python ClauseRow): the
@@ -641,6 +705,15 @@ struct App {
     /// out-of-window Esc flushes the queued Esc into the box (so vi-mode
     /// Esc and brush-interactive's bindings keep working).
     pty_esc_at: Option<std::time::Instant>,
+    /// Loaded OCI images (name, reference) — refreshed with the sessions
+    /// list; feeds the image picker's "Loaded images" branch and the
+    /// sessions context menu's "container shell" entry. Empty against an
+    /// engine without the `oci.images` verb.
+    oci_images: Vec<(String, String)>,
+    /// In-flight background `oci.load` (image pull), at most one at a time.
+    /// Drained by pump_load() each tick; the status line shows a spinner
+    /// while it runs so the UI never blocks on a registry.
+    load_job: Option<LoadJob>,
     /// Off-loop structural-diff state for the selected BINARY change.
     structd: StructState,
     /// Hunk cursor within the diff pane (index into the hunk list); used for
@@ -750,6 +823,8 @@ impl App {
             f_edges: ViewFilter::default(),
             should_quit: false,
             ptys: vec![], sel_pty: 0, pty_esc_at: None, right_focused: false, right_scroll: 0, right_scroll_max: std::cell::Cell::new(0), out_follow_scroll: std::cell::Cell::new(0), err_only: false, nav_history: vec![], pty_in_right: false, menu_nav: false, menu_sel: 0,
+            oci_images: vec![],
+            load_job: None,
             structd: StructState::default(),
             sel_hunk: 0,
             struct_rx: None,
@@ -820,6 +895,87 @@ impl App {
             }
             Ok(_) => self.sessions.clear(),
             Err(e) => self.status = format!("session_dicts: {e}"),
+        }
+        // Loaded-image metadata rides along with every sessions refresh (a
+        // cheap engine-side meta scan). Errors (older engine) leave it empty.
+        self.oci_images = match rpc(&self.sock, "oci.images", json!([])) {
+            Ok(Value::Array(a)) => a.iter().filter_map(|v| {
+                let name = v.get("name").and_then(Value::as_str)?;
+                let rf = v.get("reference").and_then(Value::as_str)?;
+                Some((name.to_string(), rf.to_string()))
+            }).collect(),
+            _ => vec![],
+        };
+    }
+
+    /// Open the hierarchical base-image picker (Sessions F7 / action menu /
+    /// the Pty+ chooser). Built fresh each time so registries.conf edits and
+    /// newly loaded images show up without restarting the UI.
+    fn open_image_picker(&mut self) {
+        let conf = crate::containers_conf::ContainersConf::load();
+        let items = build_image_picker(&conf, &image_catalog(), &self.oci_images);
+        self.modal = Some(Modal::ImagePicker {
+            crumbs: vec![],
+            stack: vec![PickLevel { items, sel: 0 }],
+        });
+        self.status = if conf.sources.is_empty() {
+            "image picker · no /etc/containers/registries.conf — docker.io defaults".into()
+        } else {
+            format!("image picker · registries.conf: {}",
+                    conf.sources.iter().map(|p| p.display().to_string())
+                        .collect::<Vec<_>>().join(", "))
+        };
+    }
+
+    /// Kick a background `oci.load` for `reference`. The pull happens on its
+    /// own thread against the engine (which itself pulls host-side); the UI
+    /// keeps running and pump_load() reports the outcome.
+    fn start_image_load(&mut self, reference: String) {
+        if self.load_job.is_some() {
+            self.status = "an image load is already running".into();
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let sock = self.sock.clone();
+        let refc = reference.clone();
+        std::thread::spawn(move || {
+            let res = rpc(&sock, "oci.load", json!([refc])).map(|r| {
+                let name = r.get("top_name").and_then(Value::as_str).unwrap_or("?");
+                let n = r.get("n_layers").and_then(Value::as_i64).unwrap_or(0);
+                format!("loaded '{refc}' → box '{name}' ({n} layers) · \
+                         Pty+ → \"Container from image…\" to start it")
+            });
+            let _ = tx.send(res);
+        });
+        self.load_job = Some(LoadJob { rx, label: reference, spin: 0 });
+    }
+
+    /// Drain a finished image load; animate the status spinner while one is
+    /// still pending. Called once per main-loop tick (like pump_struct).
+    fn pump_load(&mut self) {
+        let Some(job) = self.load_job.as_mut() else { return };
+        match job.rx.try_recv() {
+            Ok(Ok(msg)) => {
+                self.load_job = None;
+                self.status = msg;
+                self.refresh_sessions();
+            }
+            Ok(Err(e)) => {
+                let label = job.label.clone();
+                self.load_job = None;
+                self.status = format!("oci load '{label}': {e}");
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                job.spin = job.spin.wrapping_add(1);
+                let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
+                self.status = format!("{} pulling {} …",
+                    frames[job.spin / 2 % frames.len()], job.label);
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                let label = job.label.clone();
+                self.load_job = None;
+                self.status = format!("oci load '{label}': worker died");
+            }
         }
     }
 
@@ -4548,6 +4704,10 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal) {
     let want = match modal {
         Modal::Search { rows, .. } => (rows.len() as u16) + 6,
         Modal::ActionMenu { items, .. } => (items.len() as u16) + 5,
+        // rows can wrap (mirror/alias resolution details are long), so
+        // budget up to two display rows per item.
+        Modal::ImagePicker { stack, .. } => stack.last()
+            .map(|l| l.items.len() as u16 * 2).unwrap_or(0) + 6,
         _ => 7,
     };
     let hgt = want.min(area.height);
@@ -4635,8 +4795,10 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal) {
             vec![
                 Line::from(format!("{buf}_")),
                 Line::from(""),
-                Line::from("any command — e.g. `bash` or `sarun run -b -- make` · \
-                            Enter run · Esc cancel"),
+                Line::from("runs on the HOST as typed (no box, no capture) — \
+                            a bare `bash` is a host shell; keep the \
+                            `sarun run -b -- CMD` prefix to run CMD in a \
+                            fresh captured box · Enter run · Esc cancel"),
             ],
         ),
         Modal::ActionMenu { title, items, sel } => {
@@ -4670,6 +4832,52 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal) {
                 Style::default().fg(Color::Gray))));
             (" actions ", body)
         }
+        Modal::ImagePicker { crumbs, stack } => {
+            let mut body = vec![
+                Line::from(Span::styled(
+                    if crumbs.is_empty() { "Pick a base image".to_string() }
+                    else { crumbs.join(" › ") },
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
+                Line::from(""),
+            ];
+            let level = stack.last();
+            let items: &[PickItem] = level.map(|l| l.items.as_slice())
+                .unwrap_or(&[]);
+            let sel = level.map(|l| l.sel).unwrap_or(0);
+            let lw = items.iter().map(|i| i.label.chars().count())
+                          .max().unwrap_or(24).max(24);
+            for (i, it) in items.iter().enumerate() {
+                let active = i == sel;
+                let style = if active {
+                    Style::default().fg(Color::Black).bg(Color::Cyan)
+                } else {
+                    Style::default()
+                };
+                let marker = if matches!(it.next, PickNext::Menu(_)) { "▸" }
+                             else { " " };
+                body.push(Line::from(vec![
+                    Span::styled(format!("  {:<lw$} {marker}", it.label, lw = lw),
+                                 style),
+                    Span::styled(format!("  {}", it.detail),
+                        Style::default().fg(Color::DarkGray)),
+                ]));
+            }
+            body.push(Line::from(""));
+            body.push(Line::from(Span::styled(
+                "↑/↓ move · Enter pick/descend · Backspace up · Esc cancel",
+                Style::default().fg(Color::Gray))));
+            (" new box from image ", body)
+        }
+        Modal::ImageRef { buf } => (
+            " image reference ",
+            vec![
+                Line::from(format!("{buf}_")),
+                Line::from(""),
+                Line::from("e.g. ubuntu:24.04 · ghcr.io/org/img:tag · \
+                            oci-archive:/path.tar — short names resolve via \
+                            /etc/containers · Enter pull · Esc cancel"),
+            ],
+        ),
     };
     let p = Paragraph::new(Text::from(body))
         .block(
@@ -5075,6 +5283,7 @@ fn fkey_labels(app: &App) -> [&'static str; 11] {
         if hunks || changes { "Apply" } else { "·" },  // F5
         if sessions { "Rename" } else { "·" }, // F6
         if pty_pane { "PtyNew" }
+        else if sessions { "Image+" }
         else if rules { "NewRule" }
         else { "·" }, // F7
         if pty_pane { "PtyKill" }
@@ -6419,11 +6628,195 @@ fn pty_default_cmd() -> String {
     // Absolute path to this very binary: `<…>/sarun run -b --` drops the
     // user into a brush shell inside a fresh box. They can add a NAME or
     // change the trailing command before pressing Enter.
-    let exe = std::env::current_exe()
+    format!("{} run -b -- ", self_exe())
+}
+
+/// Absolute path to this very binary (the engine's PTY does no PATH lookup —
+/// it execvp's argv[0] as given, so prompts and menu entries always use the
+/// full path).
+fn self_exe() -> String {
+    std::env::current_exe()
         .ok()
         .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "sarun".to_string());
-    format!("{exe} run -b -- ")
+        .unwrap_or_else(|| "sarun".to_string())
+}
+
+/// The Pty+ chooser: each destination spelled out instead of one raw command
+/// prompt. (Previously Pty+ opened a prompt pre-filled with the full sarun
+/// path; typing `bash` over it ran on the HOST — or, appended, tripped the
+/// brush box's no-nested-interactive-shell refusal. Neither was guessable.)
+fn open_pty_menu(app: &mut App) {
+    let host_shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+    let mut items = vec![
+        ActionItem {
+            label: "Shell in a NEW box (captured; sarun run -b)".into(),
+            hint: "", action: Action::PtyNewBoxShell,
+        },
+        ActionItem {
+            label: "Container from image… (pick a base image)".into(),
+            hint: "", action: Action::NewFromImage,
+        },
+        ActionItem {
+            label: format!("Host shell — {host_shell} (NOT captured)"),
+            hint: "", action: Action::PtyNewHostShell,
+        },
+    ];
+    if app.sessions.get(app.sel_session)
+        .and_then(|r| r.get("path").and_then(Value::as_str))
+        .map(|p| app.oci_images.iter().any(|(n, _)| p.ends_with(n)))
+        .unwrap_or(false)
+    {
+        items.push(ActionItem {
+            label: "Container shell on the SELECTED image box".into(),
+            hint: "", action: Action::RunSelectedImage,
+        });
+    }
+    items.push(ActionItem {
+        label: "Custom command…".into(),
+        hint: "", action: Action::PtyNewCustom,
+    });
+    app.modal = Some(Modal::ActionMenu {
+        title: "New PTY — where should it run?".into(),
+        items, sel: 0,
+    });
+}
+
+/// One curated catalog group: display name, unqualified image name (resolved
+/// through registries.conf at display/pull time), and the tags offered.
+struct CatalogGroup {
+    name: String,
+    image: String,
+    tags: Vec<String>,
+}
+
+/// The base-image catalog: `{config_home}/images.toml` when present
+/// (`[[group]] name/image/tags`), else a built-in curated shortlist of
+/// common distro bases — a hierarchy to descend, not a registry dump and
+/// not a single take-it-or-leave-it image.
+fn image_catalog() -> Vec<CatalogGroup> {
+    if let Ok(s) = std::fs::read_to_string(crate::paths::images_config_path()) {
+        if let Ok(v) = s.parse::<toml::Value>() {
+            let groups: Vec<CatalogGroup> = v.get("group")
+                .and_then(|g| g.as_array())
+                .map(|arr| arr.iter().filter_map(|g| {
+                    Some(CatalogGroup {
+                        name: g.get("name")?.as_str()?.to_string(),
+                        image: g.get("image")?.as_str()?.to_string(),
+                        tags: g.get("tags").and_then(|t| t.as_array())
+                            .map(|a| a.iter()
+                                .filter_map(|s| s.as_str().map(str::to_string))
+                                .collect())
+                            .unwrap_or_else(|| vec!["latest".into()]),
+                    })
+                }).collect())
+                .unwrap_or_default();
+            if !groups.is_empty() { return groups; }
+        }
+    }
+    let mk = |name: &str, image: &str, tags: &[&str]| CatalogGroup {
+        name: name.into(), image: image.into(),
+        tags: tags.iter().map(|s| s.to_string()).collect(),
+    };
+    vec![
+        mk("Ubuntu",   "ubuntu",     &["24.04", "22.04", "latest"]),
+        mk("Debian",   "debian",     &["12", "stable-slim", "latest"]),
+        mk("Alpine",   "alpine",     &["3.21", "3.20", "latest"]),
+        mk("Fedora",   "fedora",     &["42", "41", "latest"]),
+        mk("Rocky Linux", "rockylinux", &["9", "8"]),
+        mk("BusyBox",  "busybox",    &["latest", "musl"]),
+    ]
+}
+
+/// Annotate an unqualified image ref with where it will ACTUALLY be pulled
+/// from under the host's registries.conf (mirror / alias / search registry).
+fn resolve_detail(conf: &crate::containers_conf::ContainersConf, rf: &str) -> String {
+    let r = conf.resolve(rf);
+    if let Some(b) = &r.blocked { return format!("BLOCKED: {b}"); }
+    let s = match r.candidates.first() {
+        Some(c) if c.via.is_empty() => c.reference.clone(),
+        Some(c) => format!("{} ({})", c.reference, c.via),
+        None => "unresolvable".into(),
+    };
+    // Keep the row on one line — the reference (which already names the
+    // mirror/alias host) matters more than the tail of the note.
+    if s.chars().count() > 60 {
+        format!("{}…", s.chars().take(59).collect::<String>())
+    } else {
+        s
+    }
+}
+
+/// Build the image picker's top level: loaded images first (instant, no
+/// network), then the curated catalog, then registries.conf short-name
+/// aliases, then the free-text escape hatch.
+fn build_image_picker(
+    conf: &crate::containers_conf::ContainersConf,
+    catalog: &[CatalogGroup],
+    local: &[(String, String)],
+) -> Vec<PickItem> {
+    let mut top = Vec::new();
+    if !local.is_empty() {
+        let items = local.iter().map(|(name, rf)| PickItem {
+            label: name.clone(),
+            detail: format!("{rf} · loaded — Enter: container shell"),
+            next: PickNext::RunLocal(name.clone()),
+        }).collect();
+        top.push(PickItem {
+            label: format!("Loaded images ({})", local.len()),
+            detail: "already installed — start a container, no pull".into(),
+            next: PickNext::Menu(items),
+        });
+    }
+    for g in catalog {
+        let mut items: Vec<PickItem> = g.tags.iter().map(|t| {
+            let rf = format!("{}:{t}", g.image);
+            PickItem {
+                label: rf.clone(),
+                detail: resolve_detail(conf, &rf),
+                next: PickNext::Pull(rf),
+            }
+        }).collect();
+        items.push(PickItem {
+            label: format!("{}:<other tag>…", g.image),
+            detail: "type a tag".into(),
+            next: PickNext::EnterRef(format!("{}:", g.image)),
+        });
+        top.push(PickItem {
+            label: g.name.clone(),
+            detail: resolve_detail(conf, &format!("{}:{}",
+                g.image, g.tags.first().map(String::as_str).unwrap_or("latest"))),
+            next: PickNext::Menu(items),
+        });
+    }
+    if !conf.aliases.is_empty() {
+        let items = conf.aliases.iter().map(|(short, target)| PickItem {
+            label: short.clone(),
+            detail: format!("→ {target}"),
+            next: PickNext::Menu(vec![
+                PickItem {
+                    label: format!("{short}:latest"),
+                    detail: resolve_detail(conf, &format!("{short}:latest")),
+                    next: PickNext::Pull(format!("{short}:latest")),
+                },
+                PickItem {
+                    label: format!("{short}:<tag>…"),
+                    detail: "type a tag".into(),
+                    next: PickNext::EnterRef(format!("{short}:")),
+                },
+            ]),
+        }).collect();
+        top.push(PickItem {
+            label: format!("Short names ({}) — registries.conf", conf.aliases.len()),
+            detail: "aliases from /etc/containers".into(),
+            next: PickNext::Menu(items),
+        });
+    }
+    top.push(PickItem {
+        label: "Enter reference…".into(),
+        detail: "e.g. ghcr.io/org/img:tag or oci-archive:/path.tar".into(),
+        next: PickNext::EnterRef(String::new()),
+    });
+    top
 }
 
 /// Split a typed command line into argv, honoring single and double quotes
@@ -6814,12 +7207,19 @@ fn pane_action_menu(app: &App) -> Option<(String, Vec<ActionItem>)> {
             let row = app.sessions.get(app.sel_session);
             let path = row.and_then(|r| r.get("path").and_then(Value::as_str))
                 .unwrap_or("").to_string();
-            Some((title("Box", &path), vec![
+            let mut items = vec![
                 mk("Open changes view", "Enter",  Action::OpenSelection),
                 mk("Apply ALL changes", "a/F5",   Action::ApplyBox),
                 mk("Discard ALL changes", "x/F8", Action::DiscardBox),
                 mk("Rename box",        "r/F6",   Action::StartRename),
-            ]))
+                mk("New box from image…", "F7",   Action::NewFromImage),
+            ];
+            // Loaded image boxes additionally offer a container shell.
+            if app.oci_images.iter().any(|(n, _)| path.ends_with(n.as_str())) {
+                items.push(mk("Container shell on this image", "",
+                              Action::RunSelectedImage));
+            }
+            Some((title("Box", &path), items))
         }
         Pane::Changes => {
             let row = app.changes.get(app.sel_change);
@@ -6885,13 +7285,38 @@ fn run_action(app: &mut App, a: Action) {
         Action::DeleteRule     => app.delete_rule(),
         Action::MoveRuleUp     => app.move_rule(-1),
         Action::MoveRuleDown   => app.move_rule(1),
-        Action::PtyNew         => {
+        Action::PtyNew         => open_pty_menu(app),
+        Action::PtyNewBoxShell => {
+            app.open_pty(vec![self_exe(), "run".into(), "-b".into(), "--".into()]);
+        }
+        Action::PtyNewHostShell => {
+            let sh = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+            app.open_pty(vec![sh]);
+        }
+        Action::PtyNewCustom   => {
             app.modal = Some(Modal::PtyCmd { buf: pty_default_cmd() });
+        }
+        Action::NewFromImage   => app.open_image_picker(),
+        Action::RunSelectedImage => {
+            // Pre-filled, editable: Enter starts a container on the selected
+            // image box (real rootfs, real shell — not a brush box).
+            let name = app.sessions.get(app.sel_session)
+                .and_then(|r| r.get("path").and_then(Value::as_str))
+                .and_then(|p| app.oci_images.iter()
+                    .find(|(n, _)| p.ends_with(n.as_str()))
+                    .map(|(n, _)| n.clone()));
+            match name {
+                Some(name) => app.modal = Some(Modal::PtyCmd {
+                    buf: format!("{} oci run {name} -- ", self_exe()),
+                }),
+                None => app.status =
+                    "selected box is not a loaded image".into(),
+            }
         }
         Action::PtyKill        => app.pty_kill(),
         Action::PtyEmbedToggle => {
             if app.ptys.is_empty() {
-                app.modal = Some(Modal::PtyCmd { buf: pty_default_cmd() });
+                open_pty_menu(app);
             } else {
                 app.pty_in_right = !app.pty_in_right;
                 app.right_focused = app.pty_in_right;
@@ -6914,7 +7339,7 @@ fn dispatch_menubar_key(app: &mut App, k: char) {
             }
             app.focus = Pane::Pty;
         } else {
-            app.modal = Some(Modal::PtyCmd { buf: pty_default_cmd() });
+            open_pty_menu(app);
         }
         return;
     }
@@ -7052,6 +7477,84 @@ fn handle_modal_key(app: &mut App, code: crossterm::event::KeyCode,
             }
             _ => app.modal = Some(Modal::ActionMenu { title, items, sel }),
         },
+        Modal::ImagePicker { mut crumbs, mut stack } => match code {
+            KeyCode::Esc => app.status = "image picker cancelled".into(),
+            KeyCode::Up => {
+                if let Some(l) = stack.last_mut() {
+                    if l.sel > 0 { l.sel -= 1; }
+                }
+                app.modal = Some(Modal::ImagePicker { crumbs, stack });
+            }
+            KeyCode::Down => {
+                if let Some(l) = stack.last_mut() {
+                    if l.sel + 1 < l.items.len() { l.sel += 1; }
+                }
+                app.modal = Some(Modal::ImagePicker { crumbs, stack });
+            }
+            KeyCode::Home => {
+                if let Some(l) = stack.last_mut() { l.sel = 0; }
+                app.modal = Some(Modal::ImagePicker { crumbs, stack });
+            }
+            KeyCode::End => {
+                if let Some(l) = stack.last_mut() {
+                    l.sel = l.items.len().saturating_sub(1);
+                }
+                app.modal = Some(Modal::ImagePicker { crumbs, stack });
+            }
+            KeyCode::Backspace | KeyCode::Left => {
+                // Pop one level; from the top level, close.
+                if stack.len() > 1 {
+                    stack.pop();
+                    crumbs.pop();
+                    app.modal = Some(Modal::ImagePicker { crumbs, stack });
+                } else {
+                    app.status = "image picker cancelled".into();
+                }
+            }
+            KeyCode::Enter | KeyCode::Right => {
+                let cur = stack.last()
+                    .and_then(|l| l.items.get(l.sel)).cloned();
+                match cur.map(|it| (it.label, it.next)) {
+                    Some((label, PickNext::Menu(items))) => {
+                        crumbs.push(label);
+                        stack.push(PickLevel { items, sel: 0 });
+                        app.modal = Some(Modal::ImagePicker { crumbs, stack });
+                    }
+                    Some((_, PickNext::Pull(rf))) => app.start_image_load(rf),
+                    Some((_, PickNext::RunLocal(name))) => {
+                        app.modal = Some(Modal::PtyCmd {
+                            buf: format!("{} oci run {name} -- ", self_exe()),
+                        });
+                    }
+                    Some((_, PickNext::EnterRef(prefix))) => {
+                        app.modal = Some(Modal::ImageRef { buf: prefix });
+                    }
+                    None => app.modal =
+                        Some(Modal::ImagePicker { crumbs, stack }),
+                }
+            }
+            _ => app.modal = Some(Modal::ImagePicker { crumbs, stack }),
+        },
+        Modal::ImageRef { mut buf } => match code {
+            KeyCode::Enter => {
+                let rf = buf.trim().to_string();
+                if rf.is_empty() {
+                    app.status = "image reference cancelled".into();
+                } else {
+                    app.start_image_load(rf);
+                }
+            }
+            KeyCode::Esc => app.status = "image reference cancelled".into(),
+            KeyCode::Backspace => {
+                buf.pop();
+                app.modal = Some(Modal::ImageRef { buf });
+            }
+            KeyCode::Char(c) => {
+                buf.push(c);
+                app.modal = Some(Modal::ImageRef { buf });
+            }
+            _ => app.modal = Some(Modal::ImageRef { buf }),
+        },
     }
 }
 
@@ -7103,6 +7606,8 @@ fn run_interactive(sock: &str) -> Result<(), String> {
             // drain a finished structural-diff worker result, and animate the
             // spinner while one is still pending.
             app.pump_struct();
+            // drain a finished background image pull (oci.load) the same way.
+            app.pump_load();
             if app.structd.pending && app.structd.full_lines.is_none() {
                 app.structd.spin = app.structd.spin.wrapping_add(1);
             }
@@ -7253,7 +7758,7 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                         continue;
                     }
                     if matches!(k.code, KeyCode::F(7)) {
-                        app.modal = Some(Modal::PtyCmd { buf: pty_default_cmd() });
+                        open_pty_menu(&mut app);
                         continue;
                     }
                     if matches!(k.code, KeyCode::F(8)) { app.pty_kill(); continue; }
@@ -7348,7 +7853,7 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                 if let KeyCode::F(n) = k.code {
                     match n {
                         1 => { app.snap_left(); app.focus = Pane::Help; app.out_scroll = 0; }
-                        2 => { app.modal = Some(Modal::PtyCmd { buf: pty_default_cmd() }); }
+                        2 => { open_pty_menu(&mut app); }
                         3 => { app.next_pane(); }
                         11 => {
                             // Embed the active PTY into the focused view's
@@ -7356,7 +7861,7 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                             // is open; opens a fresh prompt in that case
                             // so the toggle does something visible.
                             if app.ptys.is_empty() {
-                                app.modal = Some(Modal::PtyCmd { buf: pty_default_cmd() });
+                                open_pty_menu(&mut app);
                             } else {
                                 app.pty_in_right = !app.pty_in_right;
                                 // Right-focus follows the embedded PTY so
@@ -7393,6 +7898,9 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                             if app.focus == Pane::Rules {
                                 app.modal = Some(Modal::RuleForm {
                                     buf: String::new(), editing: None });
+                            } else if app.focus == Pane::Sessions {
+                                // "Image+" — new box from a container image.
+                                app.open_image_picker();
                             }
                         }
                         8 => {
@@ -8538,6 +9046,8 @@ mod tests {
             f_edges: ViewFilter::default(),
             should_quit: false,
             ptys: vec![], sel_pty: 0, pty_esc_at: None, right_focused: false, right_scroll: 0, right_scroll_max: std::cell::Cell::new(0), out_follow_scroll: std::cell::Cell::new(0), err_only: false, nav_history: vec![], pty_in_right: false, menu_nav: false, menu_sel: 0,
+            oci_images: vec![],
+            load_job: None,
             structd: StructState::default(),
             sel_hunk: 0,
             struct_rx: None,
@@ -8552,6 +9062,119 @@ mod tests {
             packets_stream: -1,
             pending_prompt: None,
         }
+    }
+
+    /// The Pty+ entry point must be a discoverable chooser, not a raw
+    /// command prompt: box shell / image container / host shell / custom.
+    #[test]
+    fn pty_menu_offers_named_destinations() {
+        let mut app = headless_app();
+        open_pty_menu(&mut app);
+        let Some(Modal::ActionMenu { title, items, .. }) = &app.modal else {
+            panic!("Pty+ must open the chooser menu");
+        };
+        assert!(title.contains("New PTY"), "title: {title}");
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert!(labels.iter().any(|l| l.contains("NEW box")), "{labels:?}");
+        assert!(labels.iter().any(|l| l.contains("image")), "{labels:?}");
+        assert!(labels.iter().any(|l| l.contains("Host shell")), "{labels:?}");
+        assert!(labels.iter().any(|l| l.contains("Custom")), "{labels:?}");
+        // Render: the choices must actually be visible.
+        let buf = render_to_string(&app, 100, 30).unwrap();
+        assert!(buf.contains("Host shell"), "menu not rendered:\n{buf}");
+    }
+
+    /// The image picker is a HIERARCHY (groups → tags → pull), seeded from
+    /// the curated catalog + registries.conf aliases + loaded images, with
+    /// leaf details showing where the pull actually resolves (mirror/alias).
+    #[test]
+    fn image_picker_tree_respects_registries_conf() {
+        let mut conf = crate::containers_conf::ContainersConf::default();
+        assert!(conf.merge_toml(r#"
+            unqualified-search-registries = ["docker.io"]
+            [aliases]
+            "corp/tool" = "registry.corp.example/tool"
+            [[registry]]
+            prefix = "docker.io"
+            location = "docker.io"
+            [[registry.mirror]]
+            location = "mirror.corp.example/hub"
+        "#));
+        let catalog = image_catalog(); // built-in defaults in tests
+        let local = vec![("ubuntu-24.04".to_string(),
+                          "docker.io/library/ubuntu:24.04".to_string())];
+        let top = build_image_picker(&conf, &catalog, &local);
+        let label = |it: &PickItem| it.label.clone();
+        // top level: loaded images, every catalog group, aliases, escape hatch
+        assert!(top.iter().any(|i| i.label.starts_with("Loaded images")));
+        for g in &catalog {
+            assert!(top.iter().any(|i| i.label == g.name), "missing {}", g.name);
+        }
+        assert!(top.iter().any(|i| i.label.contains("Short names")));
+        assert!(top.iter().any(|i| i.label == "Enter reference…"));
+        // descend Ubuntu: tags are leaves whose detail shows the MIRROR
+        let ubuntu = top.iter().find(|i| i.label == "Ubuntu").unwrap();
+        let PickNext::Menu(tags) = &ubuntu.next else { panic!("group must nest") };
+        let first = tags.first().unwrap();
+        assert!(matches!(first.next, PickNext::Pull(_)), "{}", label(first));
+        assert!(first.detail.contains("mirror.corp.example/hub"),
+                "leaf must surface the mirror: {}", first.detail);
+        // each group ends with an enter-a-tag escape hatch
+        assert!(matches!(tags.last().unwrap().next, PickNext::EnterRef(_)));
+        // aliases branch resolves through the alias target
+        let al = top.iter().find(|i| i.label.contains("Short names")).unwrap();
+        let PickNext::Menu(als) = &al.next else { panic!() };
+        assert!(als.iter().any(|a| a.label == "corp/tool"),
+                "{:?}", als.iter().map(|a| &a.label).collect::<Vec<_>>());
+        // loaded image leaf runs locally, no pull
+        let loaded = top.iter().find(|i| i.label.starts_with("Loaded")).unwrap();
+        let PickNext::Menu(ls) = &loaded.next else { panic!() };
+        assert!(matches!(&ls[0].next, PickNext::RunLocal(n) if n == "ubuntu-24.04"));
+
+        // and the modal renders: group names + resolution detail visible
+        let mut app = headless_app();
+        app.modal = Some(Modal::ImagePicker {
+            crumbs: vec![],
+            stack: vec![PickLevel { items: top, sel: 0 }],
+        });
+        let buf = render_to_string(&app, 110, 35).unwrap();
+        assert!(buf.contains("Ubuntu"), "picker not rendered:\n{buf}");
+        assert!(buf.contains("Enter reference"), "escape hatch missing:\n{buf}");
+    }
+
+    /// Picker keyboard model: Enter descends into a group, Backspace pops,
+    /// Enter on a tag leaf starts a (background) pull — headless, so the rpc
+    /// fails, but the modal must close and the job slot must be taken.
+    #[test]
+    fn image_picker_descend_and_pull() {
+        let conf = crate::containers_conf::ContainersConf::default();
+        let top = build_image_picker(&conf, &image_catalog(), &[]);
+        let mut app = headless_app();
+        app.modal = Some(Modal::ImagePicker {
+            crumbs: vec![],
+            stack: vec![PickLevel { items: top, sel: 0 }],
+        });
+        // sel 0 = first catalog group (no loaded images) → descend
+        handle_modal_key(&mut app, crossterm::event::KeyCode::Enter,
+                         crossterm::event::KeyModifiers::empty());
+        let Some(Modal::ImagePicker { crumbs, stack }) = &app.modal else {
+            panic!("Enter on a group must descend");
+        };
+        assert_eq!(crumbs.len(), 1);
+        assert_eq!(stack.len(), 2);
+        // Enter on the first tag leaf → background load kicked, modal closed
+        handle_modal_key(&mut app, crossterm::event::KeyCode::Enter,
+                         crossterm::event::KeyModifiers::empty());
+        assert!(app.modal.is_none(), "leaf pick must close the picker");
+        assert!(app.load_job.is_some(), "leaf pick must start a load job");
+        // pump until the (failing, no engine) job reports
+        for _ in 0..500 {
+            app.pump_load();
+            if app.load_job.is_none() { break; }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(app.load_job.is_none(), "job must complete");
+        assert!(app.status.contains("oci load"), "failure surfaced: {}", app.status);
     }
 
     #[test]
