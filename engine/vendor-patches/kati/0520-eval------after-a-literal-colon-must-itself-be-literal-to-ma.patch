@@ -1,0 +1,98 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Fri, 03 Jul 2026 16:41:38 +0000
+Subject: [PATCH] eval: '=' after a literal colon must itself be literal to make a TSV
+
+GNU only treats '=' after the colon as a target-specific assignment
+when the '=' was present at read time. An '=' that only APPEARS via
+expansion — test: A$(EQ)B — names a prerequisite ('A=B'); a line with
+no literal colon at all ($(TSV) expanding to 'test: A=PASS') is
+re-scanned in full. RuleStmt now carries colon_literal from the parser
+and eval_rule restricts the separator scan to ';' when the colon was
+literal and no literal '=' followed. Retires equal_in_target.mk.
+
+Corpus 404/410 fail=0 xfail=6 xpass=0; box corpus PASS.
+
+---
+diff --git a/src-rs/eval.rs b/src-rs/eval.rs
+index 0959f62..3dae458 100644
+--- a/src-rs/eval.rs
++++ b/src-rs/eval.rs
+@@ -971,7 +971,15 @@ impl Evaluator {
+         // It is an assignment when either after_targets contains an assignment token
+         // or separator is an assignment token, but only if there is no ';' before the
+         // first assignment token.
+-        let mut separator_pos = memchr2(b'=', b';', &after_targets);
++        // GNU only honors an `=` after a LITERAL colon when the `=` itself
++        // was literal (stmt.sep); an `=` appearing via expansion names a
++        // prerequisite. A line with no literal colon (the whole rule came
++        // from one expansion) is re-scanned in full.
++        let mut separator_pos = if stmt.colon_literal && stmt.sep == RuleSep::Null {
++            memchr(b';', &after_targets)
++        } else {
++            memchr2(b'=', b';', &after_targets)
++        };
+         let separator = if let Some(separator_pos) = separator_pos {
+             Some(after_targets[separator_pos])
+         } else if stmt.sep == RuleSep::Eq || stmt.sep == RuleSep::FinalEq {
+diff --git a/src-rs/parser.rs b/src-rs/parser.rs
+index 512289d..2e86b4e 100644
+--- a/src-rs/parser.rs
++++ b/src-rs/parser.rs
+@@ -261,7 +261,7 @@ impl Parser {
+         self.after_rule = true;
+         self.out_stmts
+             .lock()
+-            .push(RuleStmt::new(rule_loc, rule_lhs, rule_sep, rule_rhs));
++            .push(RuleStmt::new(rule_loc, rule_lhs, rule_sep, rule_rhs, sep.is_some()));
+         Ok(())
+     }
+ 
+diff --git a/src-rs/stmt.rs b/src-rs/stmt.rs
+index d4f70f4..d39d1b2 100644
+--- a/src-rs/stmt.rs
++++ b/src-rs/stmt.rs
+@@ -78,6 +78,12 @@ pub struct RuleStmt {
+     pub lhs: Arc<Value>,
+     pub sep: RuleSep,
+     pub rhs: Option<Arc<Value>>,
++    /// True when the rule's `:` was literal in the makefile line. GNU only
++    /// treats `=` after the colon as a target-specific assignment when the
++    /// `=` was there at read time; an `=` that only APPEARS via expansion
++    /// (`test: A$(EQ)B`) names a prerequisite. A line with no literal colon
++    /// at all ($(TSV) expanding to `test: A=PASS`) is fully re-scanned.
++    pub colon_literal: bool,
+ }
+ 
+ impl Statement for RuleStmt {
+@@ -105,13 +111,20 @@ impl Debug for RuleStmt {
+ }
+ 
+ impl RuleStmt {
+-    pub fn new(loc: Loc, lhs: Arc<Value>, sep: RuleSep, rhs: Option<Arc<Value>>) -> Arc<RuleStmt> {
++    pub fn new(
++        loc: Loc,
++        lhs: Arc<Value>,
++        sep: RuleSep,
++        rhs: Option<Arc<Value>>,
++        colon_literal: bool,
++    ) -> Arc<RuleStmt> {
+         Arc::new(RuleStmt {
+             loc,
+             orig: Bytes::new(),
+             lhs,
+             sep,
+             rhs,
++            colon_literal,
+         })
+     }
+ }
+diff --git a/testcase/equal_in_target.mk b/testcase/equal_in_target.mk
+index e1624eb..faf532c 100644
+--- a/testcase/equal_in_target.mk
++++ b/testcase/equal_in_target.mk
+@@ -1,4 +1,3 @@
+-# TODO fix parser. no rule to make target "test"?
+ TSV:=test: A=PASS
+ A_EQ_B:=A=B
+ EQ==
