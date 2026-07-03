@@ -58,7 +58,7 @@ engine: ## Build the engine (fully-static musl binary; cargo-zigbuild + zig)
 .PHONY: test
 test: ## Run the test suite (pytest-xdist; build the engine first; excludes test_oci.py + the box corpus)
 	cd prototype && uv run --with pytest --with pytest-xdist --with pytest-timeout \
-	  --with "wcmatch>=8.4" --with "python-magic>=0.4" \
+	  --with "wcmatch>=8.4" --with "python-magic>=0.4" --with "pyte>=0.8" \
 	  pytest -q -p no:cacheprovider -n auto --dist=loadscope \
 	  --timeout=180 --timeout-method=signal --ignore=test_oci.py \
 	  --ignore=test_kati_corpus_box_rs.py

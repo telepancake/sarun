@@ -210,6 +210,10 @@ struct NavSnapshot {
     right_scroll: u16,
     right_focused: bool,
     err_only: bool,
+    /// Vars pane: the query the snapshot was taken under (restored on
+    /// go-back — the item-follow chain rewinds query by query).
+    vars_query: (String, String),
+    vars_any: bool,
 }
 
 /// Per-view '/' filter state (mirrors the Python `_view_filters[v]` dict).
@@ -2585,6 +2589,11 @@ impl App {
 
     #[cfg_attr(test, allow(dead_code))]
     fn move_down(&mut self) {
+        // Vars detail focused: move over its navigable items, not a scroll.
+        if self.right_focused && self.focus == Pane::Vars {
+            self.var_item_move(1);
+            return;
+        }
         // Right-pane focused: scroll the detail body, not the left list.
         // Hunks doesn't go through here (its own keymap drives the diff
         // scroll); right_pane_scrollable() filters Hunks out.
@@ -2905,6 +2914,8 @@ impl App {
             right_scroll: self.right_scroll,
             right_focused: self.right_focused,
             err_only: self.err_only,
+            vars_query: self.vars_query.clone(),
+            vars_any: self.vars_any,
         };
         self.nav_history.push(snap);
         if self.nav_history.len() > NAV_HISTORY_CAP {
@@ -2975,6 +2986,8 @@ impl App {
                         snap.cursor.min(self.api_log_rows.len().saturating_sub(1));
                 }
                 Pane::Vars => {
+                    self.vars_query = snap.vars_query.clone();
+                    self.vars_any = snap.vars_any;
                     self.load_vars();
                     self.sel_var =
                         snap.cursor.min(self.vars_rows.len().saturating_sub(1));
