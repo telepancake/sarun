@@ -609,6 +609,23 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
         crate::net::NetMode::Host => { /* leave the launcher's netns */ }
         crate::net::NetMode::Tap => { /* already in our own TAP netns */ }
     }
+    // Tap boxes: a caller *_proxy env var pointing at LOOPBACK is
+    // guaranteed dead inside the box — 127.0.0.1 in the box netns is the
+    // box itself, and tap flows are transparently proxied by the engine
+    // anyway. Leaking it silently blackholes every proxy-honoring HTTP
+    // client (Chromium in the carbonyl image dialed the host's local
+    // agent proxy and got ERR_PROXY_CONNECTION_FAILED instead of loading
+    // anything). Non-loopback proxy values are kept — they may be
+    // reachable through the tap.
+    if net_mode == crate::net::NetMode::Tap {
+        for k in ["http_proxy", "https_proxy", "ftp_proxy", "all_proxy",
+                  "HTTP_PROXY", "HTTPS_PROXY", "FTP_PROXY", "ALL_PROXY"] {
+            if std::env::var(k).is_ok_and(|v| v.contains("127.0.0.")
+                || v.contains("localhost") || v.contains("[::1]")) {
+                bwrap.env_remove(k);
+            }
+        }
+    }
     if !ca_pem.is_empty() {
         // CA bundle for the engine's MITM. The engine writes a single
         // host-side bundle once at startup (paths::api_box_ca_pem_path);
