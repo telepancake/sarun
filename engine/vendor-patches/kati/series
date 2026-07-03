@@ -50,3 +50,4 @@
 0500-dep--double-colon-rules-as-independent-per-part-nodes.patch
 0510-parser--load-directive--expr--recipe-function-args-keep-shel.patch
 0520-eval------after-a-literal-colon-must-itself-be-literal-to-ma.patch
+0530-dep--per-part-double-colon-nodes-bind----from-their-own-stat.patch

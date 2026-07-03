@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Fri, 03 Jul 2026 16:52:58 +0000
+Subject: [PATCH] dep: per-part double-colon nodes bind $* from their own static pattern
+
+xyz:: %z: %a and xyz:: x%: a% carry different stems; the per-part
+split was copying the parent's merged output_pattern into every part,
+so $* in part 1 used part 2's pattern. Each part now prefers its own
+rule's output pattern. Retires
+multi_explicit_output_patterns_double_colon.mk.
+
+Corpus 405/410 fail=0 xfail=5 xpass=0; box corpus PASS.
+
+---
+diff --git a/src-rs/dep.rs b/src-rs/dep.rs
+index 920df3c..1d22f94 100644
+--- a/src-rs/dep.rs
++++ b/src-rs/dep.rs
+@@ -1711,7 +1711,10 @@ impl<'a> DepBuilder<'a> {
+                         c.cmds = r.cmds.clone();
+                         c.has_rule = true;
+                         c.dollar_at = Some(output);
+-                        c.output_pattern = n.lock().output_pattern;
++                        // Each :: part binds $* from ITS OWN static-pattern
++                        // (xyz:: %z: %a and xyz:: x%: a% have different stems).
++                        c.output_pattern = r.output_patterns.first().copied()
++                            .or_else(|| n.lock().output_pattern);
+                         c.rule_vars = rule_vars_snapshot.clone();
+                         c.actual_inputs =
+                             apply_output_pattern(r, output, &r.inputs);
+diff --git a/testcase/multi_explicit_output_patterns_double_colon.mk b/testcase/multi_explicit_output_patterns_double_colon.mk
+index c89efb9..4b585c5 100644
+--- a/testcase/multi_explicit_output_patterns_double_colon.mk
++++ b/testcase/multi_explicit_output_patterns_double_colon.mk
+@@ -1,4 +1,3 @@
+-# TODO: Fix
+ 
+ test: xyz
+ 
