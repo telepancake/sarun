@@ -941,6 +941,24 @@ def main():
         check(cvo == b"D=[/pfx] V=[aa bb] o=[command line]\n",
               f"case25: command-line vars (incl. a spaced value) reach the "
               f"sub-make with command-line origin; got {cvo!r}")
+        # ── CASE 26: `make -f -` — makefile on stdin ──────────────────────────
+        # automake's dependency-tracking bootstrap pipes a sed-filtered
+        # Makefile through `$MAKE -f - am--depfiles`; without stdin-makefile
+        # support every autoconf-generated config.status fails.
+        sm = work / "stdinmk"
+        shutil.rmtree(sm, ignore_errors=True)
+        sm.mkdir(parents=True, exist_ok=True)
+        r = subprocess.run(
+            [str(BIN), "run", "-b", "MAKE26", "-C", str(sm), "--", "sh", "-c",
+             'printf "x:\n\t@echo stdin-mk > result.txt\n" | make -f - x'],
+            capture_output=True, text=True, timeout=180)
+        check(r.returncode == 0,
+              f"case26: stdin-makefile box exits 0 (got {r.returncode}: "
+              f"{r.stderr[-400:]})")
+        sp26 = latest_sqlar(m)
+        so = m.sqlar_content(sp26, str((sm / "result.txt").resolve()).lstrip("/"))
+        check(so == b"stdin-mk\n",
+              f"case26: `make -f -` built from the piped makefile; got {so!r}")
     finally:
         if eng is not None and eng.poll() is None:
             eng.terminate()

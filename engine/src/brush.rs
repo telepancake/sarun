@@ -1203,8 +1203,11 @@ impl brush_core::builtins::SimpleCommand for MakeBuiltin {
         let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
         let recipe_out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
         let recipe_err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
+        let stdin: Option<Box<dyn std::io::Read>> =
+            context.try_fd(0).map(|f| Box::new(f) as Box<dyn std::io::Read>);
         let code = crate::katirun::make_builtin(
             &argv, &cwd, &seed_env, out, err, Box::new(recipe_out), Box::new(recipe_err),
+            stdin,
         );
         Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
     }

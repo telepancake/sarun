@@ -948,6 +948,28 @@ pub(crate) fn start_activity_reporting() {
     });
 }
 
+/// GNU `make -f -`: the makefile arrives on STDIN (automake's depfiles
+/// bootstrap pipes a sed-filtered Makefile through `$MAKE -f - am--depfiles`).
+/// Spool it to a private temp file and hand kati that path; the caller
+/// passes the LOGICAL stdin (the builtin's fd 0) or the process stdin
+/// (shadow path). Returns the temp path to use as the makefile.
+fn spool_stdin_makefile(
+    stdin: &mut dyn std::io::Read,
+) -> std::io::Result<std::ffi::OsString> {
+    use std::io::Write as _;
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "sarun-stdin-makefile-{}-{n}.mk",
+        std::process::id()
+    ));
+    let mut buf = Vec::new();
+    stdin.read_to_end(&mut buf)?;
+    let mut f = std::fs::File::create(&path)?;
+    f.write_all(&buf)?;
+    Ok(path.into_os_string())
+}
+
 fn install_make_recipe_runner() {
     install_var_recorder();
     start_activity_reporting();
@@ -1102,6 +1124,14 @@ pub fn make_main(argv: &[String]) -> i32 {
     // 4. kati needs a makefile; if none was given on the argv, discover the
     //    default like real make/kati (GNUmakefile / makefile / Makefile).
     let makefile: OsString = match flags.makefile.lock().clone() {
+        // `-f -`: the makefile arrives on stdin (automake depfiles bootstrap).
+        Some(m) if m == "-" => match spool_stdin_makefile(&mut std::io::stdin()) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("sarun-engine make: cannot read makefile from stdin: {e}");
+                return 2;
+            }
+        },
         Some(m) => m,
         None => {
             let mut found = None;
@@ -1256,6 +1286,8 @@ pub fn make_builtin(
     mut err: impl std::io::Write,
     recipe_out: Box<dyn std::io::Write>,
     recipe_err: Box<dyn std::io::Write>,
+    // The builtin's logical stdin (fd 0), for `make -f -`.
+    mut stdin: Option<Box<dyn std::io::Read>>,
 ) -> i32 {
     install_make_recipe_runner();
 
@@ -1318,6 +1350,22 @@ pub fn make_builtin(
     // working dir. Stored as the name kati interns (relative); the fs read
     // resolves it against working_dir (Evaluator.working_dir / file_cache).
     let makefile: OsString = match flags.makefile.lock().clone() {
+        // `-f -`: the makefile arrives on the builtin's LOGICAL stdin.
+        Some(m) if m == "-" => {
+            let spooled = match stdin.as_mut() {
+                Some(inp) => spool_stdin_makefile(inp),
+                None => Err(std::io::Error::other("no stdin available")),
+            };
+            match spooled {
+                Ok(p) => p,
+                Err(e) => {
+                    let _ = writeln!(
+                        err,
+                        "sarun-engine make: cannot read makefile from stdin: {e}");
+                    return 2;
+                }
+            }
+        }
         Some(m) => m,
         None => {
             let mut found = None;
