@@ -293,14 +293,7 @@ fn declare_service(dir: &Path) {
 fn run(dir: &Path, port: u16, model_url: &str, runtime_url: Option<&str>,
        setup_only: bool, write_config: bool, force: bool, inbox: bool,
        svc: Option<&str>) -> Result<()> {
-    // Tolerate a raw EEXIST: under the box's FUSE overlay, mkdir of a dir
-    // that exists host-side can report EEXIST while the follow-up stat that
-    // std's create_dir_all uses to excuse it doesn't line up.
-    match std::fs::create_dir_all(dir) {
-        Ok(()) => {}
-        Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {}
-        Err(e) => return Err(e).with_context(|| format!("mkdir {dir:?}")),
-    }
+    std::fs::create_dir_all(dir).with_context(|| format!("mkdir {dir:?}"))?;
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()
         .context("tokio runtime")?;
     let server = dir.join("llama-server");
