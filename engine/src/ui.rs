@@ -685,8 +685,13 @@ struct App {
     right_scroll_max: std::cell::Cell<u16>,
     /// Vars view: query (name glob, value glob), loaded rows, cursor.
     vars_query: (String, String),
+    /// Single-term query: match name OR value (the forgiving default).
+    vars_any: bool,
     vars_rows: Vec<Value>,
     sel_var: usize,
+    /// Cursor over the detail pane's navigable items (refs + history rows)
+    /// when the right pane is focused.
+    sel_var_item: usize,
     /// Backspace go-back stack: one snapshot per view SWITCH (letter chips,
     /// cross-navs, Enter drill-downs), capped at NAV_HISTORY_CAP — oldest
     /// dropped first. Each snapshot carries enough to restore the view as it
@@ -871,7 +876,7 @@ impl App {
             f_pipelines: ViewFilter::default(),
             f_edges: ViewFilter::default(),
             should_quit: false,
-            ptys: vec![], sel_pty: 0, pty_esc_at: None, right_focused: false, right_scroll: 0, right_scroll_max: std::cell::Cell::new(0), out_follow_scroll: std::cell::Cell::new(0), err_only: false, nav_history: vec![], vars_query: (String::new(), String::new()), vars_rows: vec![], sel_var: 0, pty_in_right: false, menu_nav: false, menu_sel: 0,
+            ptys: vec![], sel_pty: 0, pty_esc_at: None, right_focused: false, right_scroll: 0, right_scroll_max: std::cell::Cell::new(0), out_follow_scroll: std::cell::Cell::new(0), err_only: false, nav_history: vec![], vars_query: (String::new(), String::new()), vars_any: false, vars_rows: vec![], sel_var: 0, sel_var_item: 0, pty_in_right: false, menu_nav: false, menu_sel: 0,
             oci_images: vec![],
             launch_net: 0,
             launch_env: false,
@@ -1305,12 +1310,14 @@ impl App {
         self.vars_rows.clear();
         self.sel_var = 0;
         let Some(sid) = self.cur_sid() else { return };
+        self.sel_var_item = 0;
         let (n, v) = self.vars_query.clone();
         if n.is_empty() && v.is_empty() {
             self.status = "vars: press '/' and type a NAME (or NAME VALUE) query".into();
             return;
         }
-        match rpc(&self.sock, "review.makevars", json!([sid, n, v, 800])) {
+        match rpc(&self.sock, "review.makevars",
+                  json!([sid, n, v, 800, self.vars_any])) {
             Ok(rows) => {
                 self.vars_rows = rows.as_array().cloned().unwrap_or_default();
                 self.status = format!("vars: {} assignment(s)", self.vars_rows.len());
@@ -2646,6 +2653,7 @@ impl App {
             Pane::Vars => {
                 if self.sel_var + 1 < self.vars_rows.len() {
                     self.sel_var += 1;
+                    self.sel_var_item = 0;
                     self.right_scroll = 0;
                 }
             }
@@ -2654,6 +2662,10 @@ impl App {
 
     #[cfg_attr(test, allow(dead_code))]
     fn move_up(&mut self) {
+        if self.right_focused && self.focus == Pane::Vars {
+            self.var_item_move(-1);
+            return;
+        }
         if self.right_focused && self.right_pane_scrollable() {
             self.right_scroll = self.right_scroll.saturating_sub(1);
             return;
@@ -2708,6 +2720,7 @@ impl App {
             }
             Pane::Vars => {
                 self.sel_var = self.sel_var.saturating_sub(1);
+                self.sel_var_item = 0;
                 self.right_scroll = 0;
             }
         }
@@ -2817,6 +2830,7 @@ impl App {
                 if total == 0 { return; }
                 let cur = self.sel_var as isize;
                 self.sel_var = (cur + delta).clamp(0, total as isize - 1) as usize;
+                self.sel_var_item = 0;
                 self.right_scroll = 0;
             }
         }
@@ -3064,9 +3078,66 @@ impl App {
                 self.push_history();
                 self.open_packets();
             }
+            // Enter on the Vars list focuses the detail's navigable items;
+            // Enter on a focused item follows it (re-query a dereferenced
+            // name, or jump to another assignment of this variable).
+            Pane::Vars => {
+                if !self.right_focused {
+                    if !var_detail(self).1.is_empty() {
+                        self.right_focused = true;
+                        self.sel_var_item = 0;
+                        self.var_item_move(0);
+                    }
+                    return;
+                }
+                self.var_item_act();
+            }
             Pane::Hunks | Pane::Processes | Pane::Outputs | Pane::Rules
             | Pane::Pipelines | Pane::BuildEdges | Pane::Packets
-            | Pane::Help | Pane::Pty | Pane::ApiLogs | Pane::Vars => {}
+            | Pane::Help | Pane::Pty | Pane::ApiLogs => {}
+        }
+    }
+
+    /// Move the Vars detail-item cursor and keep it in view.
+    fn var_item_move(&mut self, delta: isize) {
+        let (_, items) = var_detail(self);
+        if items.is_empty() {
+            return;
+        }
+        let cur = self.sel_var_item.min(items.len() - 1) as isize;
+        let ni = (cur + delta).clamp(0, items.len() as isize - 1) as usize;
+        self.sel_var_item = ni;
+        // keep the selected item's line in the visible window (approximate:
+        // draw clamps against right_scroll_max)
+        let line = items[ni].0 as u16;
+        if line < self.right_scroll {
+            self.right_scroll = line;
+        } else if line > self.right_scroll + 20 {
+            self.right_scroll = line - 20;
+        }
+    }
+
+    /// Act on the selected Vars detail item.
+    fn var_item_act(&mut self) {
+        let (_, items) = var_detail(self);
+        let Some((_, action)) = items.get(self.sel_var_item.min(
+            items.len().saturating_sub(1))) else { return };
+        match action {
+            VarNavAction::Query(name) => {
+                let name = name.clone();
+                self.push_history();
+                self.vars_any = true;
+                self.vars_query = (name.clone(), name);
+                self.right_focused = false;
+                self.right_scroll = 0;
+                self.load_vars();
+            }
+            VarNavAction::Jump(idx) => {
+                self.sel_var = *idx;
+                self.sel_var_item = 0;
+                self.right_focused = false;
+                self.right_scroll = 0;
+            }
         }
     }
 
@@ -3418,7 +3489,7 @@ impl App {
     #[cfg_attr(test, allow(dead_code))]
     fn toggle_filter(&mut self) {
         if self.focus == Pane::Vars {
-            let seed = if self.vars_query.1.is_empty() {
+            let seed = if self.vars_any || self.vars_query.1.is_empty() {
                 self.vars_query.0.clone()
             } else {
                 format!("{} {}", self.vars_query.0, self.vars_query.1)
@@ -3759,22 +3830,8 @@ impl App {
                 ("edge", vec![row.get("id").and_then(Value::as_i64)?])
             }
         };
-        if ids.is_empty() { return None; }
         // 2. Translate to the destination's domain.
-        let to = match dest {
-            FilterView::Pipelines => "pipeline",
-            FilterView::BuildEdges => "edge",
-            _ => "process",
-        };
-        let ids = if from == to {
-            ids
-        } else {
-            let m = rpc(&self.sock, "review.map_ids", json!([sid, from, ids, to])).ok()?;
-            m.as_array()
-                .map(|a| a.iter().filter_map(Value::as_i64).collect())
-                .unwrap_or_default()
-        };
-        if ids.is_empty() { None } else { Some(ids) }
+        self.translate_ids(from, ids, dest)
     }
 
     /// Cross-pane navigation to `dest` (Python `_nav`): install a GENERATED
@@ -3791,41 +3848,84 @@ impl App {
             Pane::BuildEdges => Some(FilterView::BuildEdges),
             _ => None,
         };
+        // Vars is not a FilterView, but a selected assignment carries its
+        // execution context (recipe edge / pipeline) — cross-navigate on it.
+        if self.focus == Pane::Vars && let Some(dest) = dest {
+            let src = self.vars_rows.get(self.sel_var).and_then(|r| {
+                if let Some(eid) = r.get("edge_id").and_then(Value::as_i64) {
+                    Some(("edge", vec![eid]))
+                } else {
+                    r.get("pipeline_id").and_then(Value::as_i64)
+                        .map(|pid| ("pipeline", vec![pid]))
+                }
+            });
+            let ids = src.and_then(|(from, ids)| self.translate_ids(from, ids, dest));
+            self.install_nav_filter(dest, ids);
+            self.focus = dest_pane;
+            return;
+        }
         if let (Some(src), Some(dest)) = (self.focus_filter_view(), dest) {
             if src != dest {
                 let ids = self.nav_ids(src, dest);
-                let touched = match ids {
-                    Some(ids) => {
-                        let pat = ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
-                        *self.view_filter_mut(dest) = ViewFilter {
-                            clauses: vec![Clause {
-                                m: Match { kind: "ids".into(), pattern: pat },
-                                join: Join::And,
-                                negate: false,
-                                enabled: true,
-                            }],
-                            on: true,
-                            generated: true,
-                        };
-                        self.reset_view_cursor(dest);
-                        true
-                    }
-                    None => {
-                        if self.view_filter(dest).generated {
-                            *self.view_filter_mut(dest) = ViewFilter::default();
-                            self.reset_view_cursor(dest);
-                            true
-                        } else { false }
-                    }
-                };
-                // Push the new (or cleared) generated filter to the engine
-                // view — without this the local f_* flips but the engine's
-                // materialized idx still reflects the old filter and the
-                // pane shows stale rows.
-                if touched { self.push_view_filter(dest); }
+                self.install_nav_filter(dest, ids);
             }
         }
         self.focus = dest_pane;
+    }
+
+    /// Install a GENERATED "ids" filter on `dest` (or drop a stale generated
+    /// one when this nav produced none) and push it to the engine view —
+    /// without the push the local f_* flips but the engine's materialized idx
+    /// still reflects the old filter and the pane shows stale rows.
+    fn install_nav_filter(&mut self, dest: FilterView, ids: Option<Vec<i64>>) {
+        let touched = match ids {
+            Some(ids) => {
+                let pat = ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+                *self.view_filter_mut(dest) = ViewFilter {
+                    clauses: vec![Clause {
+                        m: Match { kind: "ids".into(), pattern: pat },
+                        join: Join::And,
+                        negate: false,
+                        enabled: true,
+                    }],
+                    on: true,
+                    generated: true,
+                };
+                self.reset_view_cursor(dest);
+                true
+            }
+            None => {
+                if self.view_filter(dest).generated {
+                    *self.view_filter_mut(dest) = ViewFilter::default();
+                    self.reset_view_cursor(dest);
+                    true
+                } else { false }
+            }
+        };
+        if touched { self.push_view_filter(dest); }
+    }
+
+    /// Translate provenance-domain row ids to `dest`'s domain (review.map_ids
+    /// when they differ). None when nothing maps.
+    fn translate_ids(
+        &self, from: &str, ids: Vec<i64>, dest: FilterView,
+    ) -> Option<Vec<i64>> {
+        if ids.is_empty() { return None; }
+        let sid = self.cur_sid()?;
+        let to = match dest {
+            FilterView::Pipelines => "pipeline",
+            FilterView::BuildEdges => "edge",
+            _ => "process",
+        };
+        let ids = if from == to {
+            ids
+        } else {
+            let m = rpc(&self.sock, "review.map_ids", json!([sid, from, ids, to])).ok()?;
+            m.as_array()
+                .map(|a| a.iter().filter_map(Value::as_i64).collect())
+                .unwrap_or_default()
+        };
+        if ids.is_empty() { None } else { Some(ids) }
     }
 }
 
@@ -4501,31 +4601,58 @@ fn outputs_lines(app: &App) -> (Vec<Line<'static>>, usize) {
 /// VARS index (left pane): Name | Where (assignment loc / shell context) |
 /// Value (truncated). Rows are the current query's matches in assignment
 /// order; '/' re-queries.
+/// The assignment's site, unambiguous: a make row's "Makefile:88" joined
+/// with the make's working dir ("/src/blah/aa/Makefile:88"); shell rows
+/// keep their recipe/pipeline loc.
+fn makevar_site(r: &Value) -> String {
+    let loc = r.get("loc").and_then(Value::as_str).unwrap_or("");
+    let mk = r.get("make").and_then(Value::as_str).unwrap_or("");
+    if mk.starts_with('/') && !loc.is_empty() && !loc.starts_with('/') {
+        format!("{mk}/{loc}")
+    } else {
+        loc.to_string()
+    }
+}
+
+/// Keep the TAIL of a long site path — the filename:line end is the
+/// discriminating part.
+fn tail_trunc(s: &str, max: usize) -> String {
+    let n = s.chars().count();
+    if n <= max {
+        return s.to_string();
+    }
+    let skip = n - (max - 1);
+    format!("…{}", s.chars().skip(skip).collect::<String>())
+}
+
 fn vars_index_lines(app: &App) -> Vec<Line<'static>> {
     let (qn, qv) = &app.vars_query;
+    let q = if app.vars_any {
+        format!("query: name-or-value~[{qn}]   ('/' to change)")
+    } else {
+        format!("query: name~[{qn}] value~[{qv}]   ('/' to change)")
+    };
     let mut out = vec![Line::from(Span::styled(
-        format!("query: name~[{qn}] value~[{qv}]   ('/' to change)"),
-        Style::default().add_modifier(Modifier::BOLD),
+        q, Style::default().add_modifier(Modifier::BOLD),
     ))];
     if app.vars_rows.is_empty() {
         out.push(Line::from(if qn.is_empty() && qv.is_empty() {
-            "press '/' and type a NAME (or NAME VALUE) query"
+            "press '/' and type a query — a word matches variable names AND values"
         } else {
-            "(no recorded assignments match — run the build in this box first?)"
+            "(no recorded assignments match — was the box run with --vars?)"
         }));
         return out;
     }
     for (i, r) in app.vars_rows.iter().enumerate() {
         let name = r.get("name").and_then(Value::as_str).unwrap_or("");
-        let loc = r.get("loc").and_then(Value::as_str).unwrap_or("");
         let val = r.get("value").and_then(Value::as_str).unwrap_or("");
         let mk = r.get("make").and_then(Value::as_str).unwrap_or("");
         let shellish = mk.starts_with("sh");
         let one: String = val.chars()
-            .map(|c| if c == '\n' { ' ' } else { c }).take(48).collect();
+            .map(|c| if c == '\n' { ' ' } else { c }).take(44).collect();
         let name_s: String = name.chars().take(22).collect();
-        let loc_s: String = loc.chars().take(28).collect();
-        let text = format!("{:<22} {:<28} {}", name_s, loc_s, one);
+        let site = tail_trunc(&makevar_site(r), 40);
+        let text = format!("{:<22} {:<40} {}", name_s, site, one);
         let line = if i == app.sel_var {
             Line::from(Span::styled(text, Style::default().fg(Color::Black).bg(Color::Cyan)))
         } else if shellish {
@@ -4538,28 +4665,85 @@ fn vars_index_lines(app: &App) -> Vec<Line<'static>> {
     out
 }
 
-/// VARS detail (right pane): the selected assignment in full, then every
-/// other recorded assignment of the SAME name (its history) — the value
-/// chain the query surfaced, oldest first.
-fn var_detail_lines(app: &App) -> Vec<Line<'static>> {
+/// One actionable item in the VARS detail pane (Tab focuses the pane,
+/// ↑/↓ move over these, Enter acts).
+enum VarNavAction {
+    /// Re-query the Vars view for this variable name (walk the deref chain).
+    Query(String),
+    /// Jump the left cursor to this vars_rows index (assignment history).
+    Jump(usize),
+}
+
+/// VARS detail (right pane): the selected assignment in full — its site,
+/// build context, the assignment AS WRITTEN plus the variables it
+/// dereferences (each navigable: Enter re-queries that name), and every
+/// other recorded assignment of the SAME name (each navigable: Enter jumps
+/// to it). Returns the lines and the navigable items (line index + action).
+fn var_detail(app: &App) -> (Vec<Line<'static>>, Vec<(usize, VarNavAction)>) {
     let Some(row) = app.vars_rows.get(app.sel_var) else {
-        return vec![Line::from(Span::styled(
+        return (vec![Line::from(Span::styled(
             "(no assignment selected)",
-            Style::default().add_modifier(Modifier::DIM)))];
+            Style::default().add_modifier(Modifier::DIM)))], vec![]);
     };
     let dim = Style::default().add_modifier(Modifier::DIM);
     let bold = Style::default().add_modifier(Modifier::BOLD);
     let name = row.get("name").and_then(Value::as_str).unwrap_or("");
-    let loc = row.get("loc").and_then(Value::as_str).unwrap_or("");
     let mk = row.get("make").and_then(Value::as_str).unwrap_or("");
     let val = row.get("value").and_then(Value::as_str).unwrap_or("");
+    let rhs = row.get("rhs").and_then(Value::as_str).unwrap_or("");
+    let refs = row.get("refs").and_then(Value::as_str).unwrap_or("");
+    let edge_out = row.get("edge_out").and_then(Value::as_str).unwrap_or("");
     let mut out = vec![
         Line::from(vec![Span::styled("name   ", dim), Span::styled(name.to_string(), bold)]),
-        Line::from(vec![Span::styled("where  ", dim), Span::raw(loc.to_string())]),
+        Line::from(vec![Span::styled("site   ", dim), Span::raw(makevar_site(row))]),
         Line::from(vec![Span::styled("make   ", dim), Span::raw(mk.to_string())]),
-        Line::from(""),
-        Line::from(Span::styled("value", bold)),
     ];
+    if !edge_out.is_empty() {
+        out.push(Line::from(vec![
+            Span::styled("target ", dim),
+            Span::styled(format!("⚒ {edge_out}"), Style::default().fg(Color::Yellow)),
+            Span::styled("   (g/p/o/c cross-navigate)", dim),
+        ]));
+    } else if row.get("pipeline_id").and_then(Value::as_i64).is_some() {
+        let uid = row.get("uid").and_then(Value::as_i64).unwrap_or(0);
+        out.push(Line::from(vec![
+            Span::styled("pipe   ", dim),
+            Span::styled(format!("#{uid}"), Style::default().fg(Color::Yellow)),
+            Span::styled("   (g/p/o/c cross-navigate)", dim),
+        ]));
+    }
+    let mut items: Vec<(usize, VarNavAction)> = vec![];
+    let hl = |on: bool, text: String, base: Style| {
+        if on {
+            Span::styled(text, Style::default().fg(Color::Black).bg(Color::Cyan))
+        } else {
+            Span::styled(text, base)
+        }
+    };
+    let focused = app.right_focused;
+    if !rhs.is_empty() {
+        out.push(Line::from(""));
+        out.push(Line::from(Span::styled("assignment (as written)", bold)));
+        for l in rhs.lines() {
+            out.push(Line::from(l.to_string()));
+        }
+        let ref_names: Vec<&str> =
+            refs.split_whitespace().filter(|r| *r != name).collect();
+        if !ref_names.is_empty() {
+            out.push(Line::from(Span::styled(
+                "dereferences (Tab then ↑/↓ + Enter to follow)", dim)));
+            for rn in ref_names {
+                let on = focused && items.len() == app.sel_var_item;
+                out.push(Line::from(vec![
+                    Span::raw("  "),
+                    hl(on, format!("→ {rn}"), Style::default().fg(Color::Cyan)),
+                ]));
+                items.push((out.len() - 1, VarNavAction::Query(rn.to_string())));
+            }
+        }
+    }
+    out.push(Line::from(""));
+    out.push(Line::from(Span::styled("value", bold)));
     for l in val.lines() {
         out.push(Line::from(l.to_string()));
     }
@@ -4568,21 +4752,25 @@ fn var_detail_lines(app: &App) -> Vec<Line<'static>> {
     }
     out.push(Line::from(""));
     out.push(Line::from(Span::styled(
-        format!("── every recorded assignment of {name} ──"), dim)));
-    for r in &app.vars_rows {
+        format!("── every recorded assignment of {name} (Enter jumps) ──"), dim)));
+    for (ri, r) in app.vars_rows.iter().enumerate() {
         if r.get("name").and_then(Value::as_str) != Some(name) {
             continue;
         }
-        let loc = r.get("loc").and_then(Value::as_str).unwrap_or("");
+        let site = tail_trunc(&makevar_site(r), 38);
         let v = r.get("value").and_then(Value::as_str).unwrap_or("");
         let one: String = v.chars()
-            .map(|c| if c == '\n' { ' ' } else { c }).take(90).collect();
+            .map(|c| if c == '\n' { ' ' } else { c }).take(80).collect();
+        let on = focused && items.len() == app.sel_var_item;
+        let cur = if ri == app.sel_var { "▶" } else { " " };
         out.push(Line::from(vec![
-            Span::styled(format!("{loc:<30} "), Style::default().fg(Color::Cyan)),
+            Span::raw(cur.to_string()),
+            hl(on, format!("{site:<38} "), Style::default().fg(Color::Cyan)),
             Span::raw(one),
         ]));
+        items.push((out.len() - 1, VarNavAction::Jump(ri)));
     }
-    out
+    (out, items)
 }
 
 fn api_log_index_lines(app: &App) -> Vec<Line<'static>> {
@@ -5020,7 +5208,7 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
             vec![
                 Line::from(format!("{buf}_")),
                 Line::from(""),
-                Line::from("NAME [VALUE] — text globs, bare word = substring                             · Enter search · Esc cancel"),
+                Line::from("one word matches NAME or VALUE (substring); two words = NAME VALUE; globs ok · Enter · Esc"),
             ],
         ),
         Modal::PtyCmd { buf } => {
@@ -5959,7 +6147,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                     .block(block(title("VARS · provenance", lf), lf))
                     .scroll((scroll, 0));
                 f.render_widget(p, left);
-                let dl = var_detail_lines(app);
+                let (dl, _items) = var_detail(app);
                 let rs = clamp_rscroll(&dl);
                 let detail = Paragraph::new(Text::from(dl))
                     .block(block(title("VARIABLE · value + history", rf), rf))
@@ -7918,11 +8106,17 @@ fn handle_modal_key(app: &mut App, code: crossterm::event::KeyCode,
         },
         Modal::VarQuery { mut buf } => match code {
             KeyCode::Enter => {
+                // One term searches name OR value (the forgiving default);
+                // two terms are NAME then VALUE, ANDed.
                 let mut it = buf.split_whitespace();
-                app.vars_query = (
-                    it.next().unwrap_or("").to_string(),
-                    it.next().unwrap_or("").to_string(),
-                );
+                let a = it.next().unwrap_or("").to_string();
+                let b = it.next().unwrap_or("").to_string();
+                app.vars_any = !a.is_empty() && b.is_empty();
+                app.vars_query = if app.vars_any {
+                    (a.clone(), a)
+                } else {
+                    (a, b)
+                };
                 app.load_vars();
             }
             KeyCode::Esc => {}
@@ -9606,7 +9800,7 @@ mod tests {
             f_pipelines: ViewFilter::default(),
             f_edges: ViewFilter::default(),
             should_quit: false,
-            ptys: vec![], sel_pty: 0, pty_esc_at: None, right_focused: false, right_scroll: 0, right_scroll_max: std::cell::Cell::new(0), out_follow_scroll: std::cell::Cell::new(0), err_only: false, nav_history: vec![], vars_query: (String::new(), String::new()), vars_rows: vec![], sel_var: 0, pty_in_right: false, menu_nav: false, menu_sel: 0,
+            ptys: vec![], sel_pty: 0, pty_esc_at: None, right_focused: false, right_scroll: 0, right_scroll_max: std::cell::Cell::new(0), out_follow_scroll: std::cell::Cell::new(0), err_only: false, nav_history: vec![], vars_query: (String::new(), String::new()), vars_any: false, vars_rows: vec![], sel_var: 0, sel_var_item: 0, pty_in_right: false, menu_nav: false, menu_sel: 0,
             oci_images: vec![],
             launch_net: 0,
             launch_env: false,
