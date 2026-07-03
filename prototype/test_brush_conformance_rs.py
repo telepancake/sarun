@@ -53,6 +53,11 @@ echo "[${#v}] [${v:2:3}] [${v:5}] [${v: -3}] [${v:1:-2}]"''',
 echo "[${v^^}] [${v,,}] [${v^}] [${v,}]"''',
     "pe_indirect": '''real=hello; name=real
 echo "[${!name}]"''',
+    "lineno": '''echo "L1=$LINENO"
+echo "L2=$LINENO"
+as_lineno_1=$LINENO as_lineno_1a=$as_lineno_1
+as_lineno_2=$LINENO as_lineno_2a=$as_lineno_2
+eval "test \\"x$as_lineno_1$as_lineno_1a\\" != \\"x$as_lineno_2$as_lineno_2a\\"" && test "x`expr $as_lineno_1 + 1`" = "x$as_lineno_2" && echo LINENO-works''',
     "pe_unset_err": '''(set -u; echo "${undefined_var}") 2>/dev/null; echo "rc=$?"''',
     # ── arrays ─────────────────────────────────────────────────────────────
     "arr_basic": '''a=(one two three)

@@ -218,6 +218,12 @@ impl<SE: extensions::ShellExtensions> AsMut<Self> for Shell<SE> {
 }
 
 impl<SE: extensions::ShellExtensions> Shell<SE> {
+    /// Mutable call stack — the interpreter records the current execution
+    /// position here so $LINENO tracks the running statement.
+    pub fn call_stack_mut(&mut self) -> &mut crate::callstack::CallStack {
+        &mut self.call_stack
+    }
+
     /// Returns a new shell instance created with the given options.
     /// Does *not* load any configuration files (e.g., bashrc).
     ///

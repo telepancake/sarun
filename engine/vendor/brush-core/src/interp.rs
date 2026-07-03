@@ -231,6 +231,7 @@ impl Execute for ast::Program {
         let mut result = ExecutionResult::success();
 
         for command in &self.complete_commands {
+            record_source_position(shell, command);
             // Execute the command and handle any errors without immediately propagating them.
             // This allows interactive shells to continue executing subsequent commands even after
             // errors.
@@ -256,6 +257,20 @@ impl Execute for ast::Program {
     }
 }
 
+/// Record the statement's source position on the current call frame so
+/// $LINENO (and BASH_LINENO) track execution, as bash does. Best-effort:
+/// nodes without location info leave the previous position in place.
+fn record_source_position(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    node: &impl brush_parser::ast::SourceLocation,
+) {
+    if let Some(span) = node.location() {
+        if let Some(frame) = shell.call_stack_mut().current_frame_mut() {
+            frame.current = Some(std::sync::Arc::new((*span.start).clone()));
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl Execute for ast::CompoundList {
     async fn execute(
@@ -266,6 +281,7 @@ impl Execute for ast::CompoundList {
         let mut result = ExecutionResult::success();
 
         for ast::CompoundListItem(ao_list, sep) in &self.0 {
+            record_source_position(shell, ao_list);
             let run_async = matches!(sep, ast::SeparatorOperator::Async);
 
             if run_async {

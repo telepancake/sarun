@@ -1916,7 +1916,12 @@ async fn run_brush_script(script: String, shell_name: String,
         }
     };
     let params = shell.default_exec_params();
+    // A base call frame so $LINENO (frame-tracked execution position) works
+    // at script top level — brush pushes one in its own source_file path,
+    // but we parse/run the script ourselves.
+    shell.call_stack_mut().push_command_string();
     let (code, _uids) = run_nested_pipelines(&mut shell, prog, &params).await;
+    shell.call_stack_mut().pop();
     // bash fires the EXIT trap when the (non-interactive) shell finishes —
     // including after an explicit `exit`. brush-core has the hook; the
     // engine has to call it.
@@ -2347,7 +2352,9 @@ impl brush_core::commands::ExecInterposer<brush_core::extensions::DefaultShellEx
                     return Some(brush_core::ExecutionResult::new(2));
                 }
             };
+            sub.call_stack_mut().push_command_string();
             let (code, _uids) = run_nested_pipelines(&mut sub, prog, &params).await;
+            sub.call_stack_mut().pop();
             // The nested shell terminates here — fire its EXIT trap, as
             // bash does for a script run via `sh file.sh`. With the CALLER's
             // params: a redirected `bash s.sh > f` must trap into f.

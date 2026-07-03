@@ -411,6 +411,12 @@ impl CallStack {
         self.frames.front()
     }
 
+    /// Mutable access to the current (topmost) call frame — used by the
+    /// interpreter to record the execution position ($LINENO).
+    pub fn current_frame_mut(&mut self) -> Option<&mut Frame> {
+        self.frames.front_mut()
+    }
+
     /// Returns the position in the current (topmost) call frame in the stack,
     /// expressed as a new `SourceInfo`. Note that this may not be identical
     /// to that frame's `SourceInfo` since it may include an offset representing
