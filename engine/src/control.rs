@@ -677,6 +677,13 @@ fn arg_sid(args: &[Value]) -> Option<i64> {
 
 /// Unconditionally remove a box: drop it from the overlay, delete its sqlar +
 /// backing + pool blobs, broadcast session_removed. The `delete` verb's body.
+/// Whether any box stacks ON `id` (i.e. `id` is a parent). A box with children
+/// must not be raw-reaped — that would orphan them; delete cascades and the
+/// auto-drop skips such boxes.
+fn has_children(id: i64) -> bool {
+    discover::discover().values().any(|b| b.parent == Some(id))
+}
+
 fn reap(state: &State, id: i64) {
     if let Some(ov) = lock(state).overlay.clone() {
         ov.remove_box(id);
@@ -706,9 +713,26 @@ fn reap(state: &State, id: i64) {
 /// on-disk handle racing the serve thread. Only the dissolving box itself must
 /// be stopped (its archive is rewritten by finalize).
 fn dissolve(state: &State, id: i64) -> Value {
-    if lock(state).box_pids.contains_key(&id) {
-        return json!({"ok": false, "error": "box is running; stop it first"});
-    }
+    free_box(state, id, true)
+}
+
+/// Free box `id`, KEEPING any boxes stacked on it — the shared core of both
+/// `dissolve` and `delete`. Whatever the box contributed to its children's
+/// merged view is copied DOWN into each child that lacks its own entry (so the
+/// children read exactly what they saw before), then the children are
+/// re-parented onto this box's own parent, then the box is reaped. This is why
+/// neither operation can ever orphan/corrupt a child.
+///
+/// `finalize` decides only what happens to THIS box's OWN changes:
+///   - dissolve (`true`):  materialize rule-matched paths to the host, discard
+///     the rest (finalize_by_rules).
+///   - delete (`false`):   discard the box's own writes entirely — they never
+///     reach the host; only the copied-down content survives, in the children.
+///
+/// A running box is refused when work needs its blobs stable (a finalize, or a
+/// copy-down to children). A leaf delete (no children, no finalize) is a plain
+/// reap and may proceed even while running — matching the old raw `delete`.
+fn free_box(state: &State, id: i64, finalize: bool) -> Value {
     let boxes = discover::discover();
     let Some(me) = boxes.get(&id) else {
         return json!({"ok": false, "error": "no slopbox"});
@@ -716,10 +740,14 @@ fn dissolve(state: &State, id: i64) -> Value {
     let grandparent = me.parent;
     let children: Vec<i64> = boxes.values()
         .filter(|b| b.parent == Some(id)).map(|b| b.box_id).collect();
+    if lock(state).box_pids.contains_key(&id)
+        && (finalize || !children.is_empty()) {
+        return json!({"ok": false, "error": "box is running; stop it first"});
+    }
     let ov = lock(state).overlay.clone();
     // Copy-down: snapshot this box's contributed view into each child that has
-    // no entry of its own, so dissolving the parent doesn't change what the
-    // child sees. A live child's copy-down goes through its live BoxState.
+    // no entry of its own, so freeing the parent doesn't change what the child
+    // sees. A live child's copy-down goes through its live BoxState.
     // Fail-closed: if any copy errors, free nothing.
     if !children.is_empty() {
         let paths = crate::review::changed_paths(id);
@@ -735,18 +763,23 @@ fn dissolve(state: &State, id: i64) -> Value {
             }
         }
     }
-    // finalize: apply rule-matched changes to the host, discard the rest
-    // (fail-closed — if applying errored, don't free the box).
-    let fin = crate::review::finalize_by_rules(
-        id, &crate::review::NestCtx::new(ov.clone()));
-    if fin.get("errors").and_then(Value::as_array).map(|a| !a.is_empty())
-        .unwrap_or(false) {
-        return json!({"ok": false, "error": "finalize had errors; nothing freed",
-                      "finalize_errors": fin.get("errors").cloned()});
-    }
-    // Re-parent the children onto the dissolving box's own parent. For a LIVE
-    // child write the meta through its BoxState (one connection); for one at
-    // rest write the on-disk sqlar. Also update the overlay's in-RAM parent.
+    // This box's own changes: finalize by rules (dissolve) or discard (delete).
+    // Fail-closed on a finalize error — don't free the box.
+    let fin = if finalize {
+        let fin = crate::review::finalize_by_rules(
+            id, &crate::review::NestCtx::new(ov.clone()));
+        if fin.get("errors").and_then(Value::as_array).map(|a| !a.is_empty())
+            .unwrap_or(false) {
+            return json!({"ok": false, "error": "finalize had errors; nothing freed",
+                          "finalize_errors": fin.get("errors").cloned()});
+        }
+        fin
+    } else {
+        json!({})
+    };
+    // Re-parent the children onto this box's own parent. For a LIVE child write
+    // the meta through its BoxState (one connection); for one at rest write the
+    // on-disk sqlar. Also update the overlay's in-RAM parent.
     //
     // Closure carry-down: if THIS box held `no_host_fallback` (an OCI image's
     // --no-parent rootfs base is the only box that does), it was the bottom that
@@ -797,6 +830,11 @@ fn box_is_running(state: &State, id: i64) -> bool {
 
 /// After apply/discard, reap the box if it has no remaining changes.
 fn drop_if_empty(state: &State, id: i64) {
+    // Never auto-reap a box that other boxes stack on — dropping it would
+    // orphan them (they read their inherited files THROUGH this layer). An
+    // empty parent is a harmless empty layer; leave it until a real delete
+    // (which cascades) or dissolve (which re-parents) removes it.
+    if has_children(id) { return; }
     if crate::review::session_changes(id).as_array().map(|a| a.is_empty())
         .unwrap_or(false) {
         reap(state, id);
@@ -1368,7 +1406,13 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
         }
         "rescan" => json!(null),   // discovery is always fresh; nothing to do
         "delete" => match arg_sid(args) {
-            Some(id) => { reap(state, id); json!({"ok": true, "sid": id.to_string()}) }
+            // Free the box, KEEPING any boxes stacked on it: children have this
+            // box's view copied down into them and are re-parented onto the
+            // grandparent, so their merged view is unchanged. Unlike dissolve,
+            // this box's OWN writes are discarded (not finalized to the host).
+            // A raw reap here would orphan the children — so delete never does
+            // one when children exist, and never destroys a box not named.
+            Some(id) => free_box(state, id, false),
             None => json!({"ok": false}),
         },
         "open_files" => json!([]),

@@ -3731,23 +3731,30 @@ impl App {
     /// else the single cursored box. Returns the (ok, err) counts. Used by the
     /// destructive box ops so a selection acts on all marked boxes at once.
     #[cfg_attr(test, allow(dead_code))]
-    fn box_op_over_selection(&mut self, verb: &str) -> (usize, usize) {
+    fn box_op_over_selection(&mut self, verb: &str) -> (usize, usize, Option<String>) {
         let marks = self.marked_here();
-        let targets: Vec<String> = if !marks.is_empty()
+        let mut targets: Vec<String> = if !marks.is_empty()
             && self.mark_scope == Some(Pane::Sessions) {
             marks
         } else {
             self.cur_sid().into_iter().collect()
         };
+        // DEEPEST-FIRST: sessions are path-sorted (ancestor before descendant),
+        // so reversing removes children before their parents. The engine keeps
+        // any children (copy-down + re-parent) regardless of order, so this is
+        // only an efficiency choice — deleting a child before its parent spares
+        // the parent a pointless copy-down into a box that's about to go too.
+        targets.reverse();
         let (mut ok, mut err) = (0usize, 0usize);
+        let mut last_err = None;
         for id in &targets {
             match rpc(&self.sock, verb, json!([id])) {
                 Ok(_) => ok += 1,
-                Err(_) => err += 1,
+                Err(e) => { err += 1; last_err = Some(e); }
             }
         }
         self.clear_marks();
-        (ok, err)
+        (ok, err, last_err)
     }
 
     /// "the selected box" or "N selected boxes" — for the destructive-op
@@ -3763,26 +3770,29 @@ impl App {
 
     #[cfg_attr(test, allow(dead_code))]
     fn kill(&mut self) {
-        let (ok, err) = self.box_op_over_selection("kill");
+        let (ok, err, why) = self.box_op_over_selection("kill");
         self.status = if err == 0 { format!("sent SIGTERM to {ok} box(es)") }
-                      else { format!("killed {ok}, {err} failed") };
+                      else { format!("killed {ok}, {err} failed: {}",
+                                     why.unwrap_or_default()) };
         self.refresh_sessions();
     }
 
     #[cfg_attr(test, allow(dead_code))]
     fn delete(&mut self) {
-        let (ok, err) = self.box_op_over_selection("delete");
+        let (ok, err, why) = self.box_op_over_selection("delete");
         self.status = if err == 0 { format!("deleted {ok} box(es)") }
-                      else { format!("deleted {ok}, {err} failed") };
+                      else { format!("deleted {ok}, {err} failed: {}",
+                                     why.unwrap_or_default()) };
         self.refresh_sessions();
         self.load_changes();
     }
 
     #[cfg_attr(test, allow(dead_code))]
     fn dissolve(&mut self) {
-        let (ok, err) = self.box_op_over_selection("dissolve");
+        let (ok, err, why) = self.box_op_over_selection("dissolve");
         self.status = if err == 0 { format!("dissolved {ok} box(es)") }
-                      else { format!("dissolved {ok}, {err} failed") };
+                      else { format!("dissolved {ok}, {err} failed: {}",
+                                     why.unwrap_or_default()) };
         self.refresh_sessions();
         self.load_changes();
     }
@@ -6283,7 +6293,7 @@ const PANE_ACTION_KEYS: &[(Key, PaneGate, PaneAction, Option<&str>)] = &[
     (Key::Char('A'), PaneGate::Any,             PaneAction::ApplyAll,        Some("apply ALL the box's changes")),
     (Key::Char('X'), PaneGate::Any,             PaneAction::DiscardAll,      Some("discard ALL the box's changes")),
     (Key::Char('K'), PaneGate::Any,             PaneAction::ConfirmKill,     Some("kill box (SIGTERM, y/n)")),
-    (Key::Char('D'), PaneGate::Any,             PaneAction::ConfirmDelete,   Some("delete box + captures (y/n)")),
+    (Key::Char('D'), PaneGate::Any,             PaneAction::ConfirmDelete,   Some("delete box + captures (nested child boxes kept) (y/n)")),
     (Key::Char('Z'), PaneGate::Any,             PaneAction::ConfirmDissolve, Some("dissolve box (y/n)")),
     (Key::Char('t'), PaneGate::On(Pane::Pipelines), PaneAction::ToggleTree,  Some("toggle tree / flat chronological (on Pipes)")),
     (Key::Char('f'), PaneGate::On(Pane::Pipelines), PaneAction::ToggleRunningOnly, Some("toggle running-only (on Pipes)")),
@@ -6331,7 +6341,8 @@ fn run_pane_action(app: &mut App, action: PaneAction) {
             action: ConfirmAction::Kill,
         }),
         PaneAction::ConfirmDelete => app.modal = Some(Modal::Confirm {
-            prompt: format!("Delete {} and their captures?",
+            prompt: format!("Delete {} and their captures? (any nested child \
+                             boxes are kept, re-homed onto the parent)",
                             app.box_op_scope_label()),
             action: ConfirmAction::Delete,
         }),
