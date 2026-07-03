@@ -64,6 +64,11 @@ pub struct DepNode {
     pub tags_var: Option<Var>,
     pub output_pattern: Option<Symbol>,
     pub loc: Option<Loc>,
+    /// Diagnosis for a rule-less node: WHY each candidate implicit rule was
+    /// rejected (its pattern + the first unbuildable prerequisite). Printed
+    /// with the "No rule to make target" error so a big build's failure is
+    /// traceable without -d spelunking.
+    pub no_rule_notes: Vec<String>,
 }
 
 impl DepNode {
@@ -75,6 +80,7 @@ impl DepNode {
             order_onlys: Vec::new(),
             validations: Vec::new(),
             has_rule: false,
+            no_rule_notes: Vec::new(),
             is_default_target: false,
             is_phony,
             is_restat,
@@ -1024,6 +1030,52 @@ impl<'a> DepBuilder<'a> {
         Some(found)
     }
 
+    /// For a target no rule matched: list each implicit rule whose output
+    /// pattern DOES match and the first prerequisite that disqualified it
+    /// (missing file, nothing to build it with). Empty when no pattern even
+    /// matches the name.
+    fn explain_no_rule(&mut self, output: Symbol) -> Vec<String> {
+        let output_str = output.as_bytes();
+        let mut notes = vec![];
+        for rule in self.implicit_rules.get(&output_str) {
+            for output_pattern in &rule.output_patterns {
+                let pat = Pattern::new(output_pattern.as_bytes());
+                if !pat.matches(&output_str) {
+                    continue;
+                }
+                let mut why = String::new();
+                for input in &rule.inputs {
+                    let buf = pat.append_subst(&output_str, &input.as_bytes());
+                    let sym = intern(buf);
+                    if !self.exists(sym)
+                        && self.vpath_resolve(sym).is_none()
+                        && !self.has_producing_rule_except(sym, &rule.output_patterns)
+                    {
+                        why = format!(
+                            "needs '{sym}', which does not exist and has no rule");
+                        break;
+                    }
+                }
+                if why.is_empty() {
+                    why = "prerequisites unbuildable through this chain".into();
+                }
+                let loc = rule.loc.clone();
+                notes.push(format!(
+                    "candidate pattern rule '{output_pattern}: {}' at {loc} rejected: {why}",
+                    rule.inputs
+                        .iter()
+                        .map(|i| i.to_string())
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                ));
+                if notes.len() >= 4 {
+                    return notes;
+                }
+            }
+        }
+        notes
+    }
+
     fn pick_rule(&mut self, output: Symbol, n: &Arc<Mutex<DepNode>>) -> Option<PickedRuleInfo> {
         let rule_merger = self.lookup_rule_merger(output);
         let mut vars = self.lookup_rule_vars(output);
@@ -1222,6 +1274,11 @@ impl<'a> DepBuilder<'a> {
         self.done.insert(output, n.clone());
 
         let Some(mut picked_rule_info) = self.pick_rule(output, &n) else {
+            // No rule found. Record WHY the matching implicit rules were
+            // rejected so the eventual "No rule to make target" error can
+            // explain itself.
+            let notes = self.explain_no_rule(output);
+            n.lock().no_rule_notes = notes;
             return Ok(n);
         };
         if let Some(merger) = &picked_rule_info.merger

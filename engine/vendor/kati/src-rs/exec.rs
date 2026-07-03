@@ -478,6 +478,9 @@ impl<'a> Executor<'a> {
             (g.has_rule, g.is_phony)
         };
         if !has_rule && output_timestamp.is_none() && !is_phony {
+            for note in &n.lock().no_rule_notes {
+                crate::exec::emit_recipe_err(&format!("*kati*: note: {note}"));
+            }
             if let Some(dep_sym) = graph[&sym].dependents.first() {
                 // Diagnosis aid: name the RULE whose prerequisite list produced
                 // this target — a bad expansion (joined words, wrong subst) is
