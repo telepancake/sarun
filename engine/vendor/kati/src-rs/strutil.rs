@@ -237,6 +237,15 @@ impl Pattern {
         if self.percent_index.is_some() && subst.contains(&b'%') {
             return self.append_subst(s, subst);
         }
+        // GNU substitution-reference semantics ($(V:suf=rep) ==
+        // $(patsubst %suf,%rep,$(V))): only a word that ENDS WITH the
+        // suffix is rewritten; any other word passes through UNCHANGED.
+        // Trimming-then-appending unconditionally rewrote 'aa' under
+        // ':xbb=bb' into 'aabb'. (An empty suffix still matches every
+        // word — $(V:=.o) appends, as GNU does.)
+        if !s.ends_with(&self.pat[..]) {
+            return s.clone();
+        }
         let s = trim_suffix(s, &self.pat);
         let mut ret = BytesMut::with_capacity(s.len() + subst.len());
         ret.put_slice(s);
