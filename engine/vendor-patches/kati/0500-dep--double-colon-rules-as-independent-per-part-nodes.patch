@@ -1,0 +1,204 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Fri, 03 Jul 2026 16:11:37 +0000
+Subject: [PATCH] dep: double-colon rules as independent per-part nodes
+
+GNU make 4.13: each :: rule for a target is an independent entry with
+its own prereqs and commands, considered in declaration order. The
+merged single-node shape ran every part's prereqs before ANY part's
+commands and concatenated the commands, reordering side effects (a
+cmd-less 'all:: prereq' part dragged its subtree ahead of earlier
+echo-bearing parts).
+
+Split at plan time: the real node becomes a command-less aggregator
+whose deps are synthetic phony per-part nodes (target::N), each chained
+order-only to its predecessor (GNU serializes same-target :: parts even
+under -j; the chain edge is direct so it never leaks into $|). $@,
+$*'s stem and $?'s target-mtime expand through the new dollar_at field
+so a part still names the REAL target. Known approximation: parts are
+phony, so a FILE target's parts rerun even when individually fresh.
+
+The sarun_sweep_double_colon_static testcase TODO is retired; corpus
+401/410 fail=0 xpass=0.
+
+---
+diff --git a/src-rs/command.rs b/src-rs/command.rs
+index bcff384..a000455 100644
+--- a/src-rs/command.rs
++++ b/src-rs/command.rs
+@@ -95,9 +95,14 @@ impl AutoCommandVar {
+         let current_dep_node = self.current_dep_node.lock();
+         let current_dep_node = current_dep_node.as_ref().unwrap().lock();
+ 
++        // Synthetic per-part double-colon nodes (`target::N`) carry the REAL
++        // target in dollar_at; every $@-derived expansion uses it.
++        let effective_output = current_dep_node
++            .dollar_at
++            .unwrap_or(current_dep_node.output);
+         match &self.typ {
+             AutoCommand::At => {
+-                out.put_slice(&current_dep_node.output.as_bytes());
++                out.put_slice(&effective_output.as_bytes());
+             }
+             AutoCommand::Less => {
+                 if let Some(ai) = current_dep_node.actual_inputs.first() {
+@@ -122,7 +127,7 @@ impl AutoCommandVar {
+             AutoCommand::Star => {
+                 if let Some(output_pattern) = &current_dep_node.output_pattern {
+                     let pat = Pattern::new(output_pattern.as_bytes());
+-                    out.put_slice(pat.stem(&current_dep_node.output.as_bytes()))
++                    out.put_slice(pat.stem(&effective_output.as_bytes()))
+                 }
+             }
+             AutoCommand::Question { found_new_inputs } => {
+@@ -143,9 +148,9 @@ impl AutoCommandVar {
+                             }
+                         }
+                         ww.write(b"$(test -e");
+-                        ww.write(&current_dep_node.output.as_bytes());
++                        ww.write(&effective_output.as_bytes());
+                         ww.write(b"&& echo -newer");
+-                        ww.write(&current_dep_node.output.as_bytes());
++                        ww.write(&effective_output.as_bytes());
+                         ww.write(b")) && export KATI_NEW_INPUTS");
+                         ev.delayed_output_commands.push(def.freeze());
+                         *found_new_inputs.lock() = true;
+@@ -153,7 +158,7 @@ impl AutoCommandVar {
+                 } else {
+                     let mut ww = WordWriter::new(out);
+                     let target_age = ExecStatus::Timestamp(get_timestamp(
+-                        &current_dep_node.output.as_bytes(),
++                        &effective_output.as_bytes(),
+                         &ev.working_dir,
+                     )?);
+                     for ai in current_dep_node.actual_inputs.iter() {
+diff --git a/src-rs/dep.rs b/src-rs/dep.rs
+index c8a6e39..920df3c 100644
+--- a/src-rs/dep.rs
++++ b/src-rs/dep.rs
+@@ -64,6 +64,9 @@ pub struct DepNode {
+     pub tags_var: Option<Var>,
+     pub output_pattern: Option<Symbol>,
+     pub loc: Option<Loc>,
++    /// For a synthetic per-part double-colon node (`target::N`): the REAL
++    /// target name — what `$@` (and `$?`'s target mtime) must expand to.
++    pub dollar_at: Option<Symbol>,
+     /// Diagnosis for a rule-less node: WHY each candidate implicit rule was
+     /// rejected (its pattern + the first unbuildable prerequisite). Printed
+     /// with the "No rule to make target" error so a big build's failure is
+@@ -94,6 +97,7 @@ impl DepNode {
+             tags_var: None,
+             output_pattern: None,
+             loc: None,
++            dollar_at: None,
+         }))
+     }
+ }
+@@ -1357,6 +1361,7 @@ impl<'a> DepBuilder<'a> {
+         }
+         let output_str = output.as_bytes();
+ 
++        let dc_merger = picked_rule_info.merger.clone();
+         picked_rule_info
+             .merger
+             .unwrap_or_else(RuleMerger::new)
+@@ -1668,6 +1673,87 @@ impl<'a> DepBuilder<'a> {
+                 }
+             }
+         }
++        // sarun: double-colon rules are INDEPENDENT entries (GNU make 4.13):
++        // each `::` part carries its own prereqs + commands and same-target
++        // parts are considered in declaration order. The merged single-node
++        // shape ran EVERY part's prereqs before ANY part's commands (and
++        // concatenated the commands), reordering side effects. Split: this
++        // node becomes a command-less aggregator whose deps are synthetic
++        // per-part nodes (`target::N`), each chained order-only to its
++        // predecessor (GNU serializes same-target :: parts even under -j).
++        // `$@` inside a part still names the REAL target via dollar_at.
++        // Approximation: parts are phony, so a FILE target's parts rerun
++        // even when up to date (per-part mtime staleness isn't modeled).
++        if let Some(m) = &dc_merger {
++            let (is_dc, dc_rules) = {
++                let g = m.lock();
++                (g.is_double_colon, g.rules.clone())
++            };
++            if is_dc && dc_rules.len() > 1 && !is_special_target(&output) {
++                let rule_vars_snapshot = self.cur_rule_vars.as_ref().map(|rv| {
++                    let v = Vars::new();
++                    v.merge_from(rv);
++                    Arc::new(v)
++                });
++                {
++                    let mut node = n.lock();
++                    node.cmds.clear();
++                    node.actual_inputs.clear();
++                    node.actual_order_only_inputs.clear();
++                }
++                let mut prev: Option<(Symbol, Arc<Mutex<DepNode>>)> = None;
++                for (i, r) in dc_rules.iter().enumerate() {
++                    let child_sym =
++                        intern(format!("{output}::{i}").into_bytes());
++                    let child = DepNode::new(child_sym, true, false);
++                    {
++                        let mut c = child.lock();
++                        c.cmds = r.cmds.clone();
++                        c.has_rule = true;
++                        c.dollar_at = Some(output);
++                        c.output_pattern = n.lock().output_pattern;
++                        c.rule_vars = rule_vars_snapshot.clone();
++                        c.actual_inputs =
++                            apply_output_pattern(r, output, &r.inputs);
++                        c.actual_order_only_inputs = apply_output_pattern(
++                            r, output, &r.order_only_inputs);
++                        for s in c.actual_inputs.iter_mut() {
++                            if let Some(res) = self.vpath_resolve(*s)
++                                .or_else(|| self.libpattern_resolve(*s)) {
++                                *s = res;
++                            }
++                        }
++                        for s in c.actual_order_only_inputs.iter_mut() {
++                            if let Some(res) = self.vpath_resolve(*s)
++                                .or_else(|| self.libpattern_resolve(*s)) {
++                                *s = res;
++                            }
++                        }
++                        c.loc = r.cmd_loc.clone().or(Some(r.loc.clone()));
++                    }
++                    self.done.insert(child_sym, child.clone());
++                    // Wire the child's deps here — a done-map hit in
++                    // build_plan returns the node as-is, so nobody else will.
++                    let ins = child.lock().actual_inputs.clone();
++                    for input in ins {
++                        let cn = self.build_plan(input, Some(child_sym))?;
++                        child.lock().deps.push((input, cn));
++                    }
++                    let oo = child.lock().actual_order_only_inputs.clone();
++                    for input in oo {
++                        let cn = self.build_plan(input, Some(child_sym))?;
++                        child.lock().order_onlys.push((input, cn));
++                    }
++                    // Declaration-order chain, as a direct edge so the
++                    // synthetic name never shows up in the part's `$|`.
++                    if let Some((psym, pnode)) = prev {
++                        child.lock().order_onlys.push((psym, pnode));
++                    }
++                    n.lock().actual_inputs.push(child_sym);
++                    prev = Some((child_sym, child));
++                }
++            }
++        }
+         let actual_inputs = n.lock().actual_inputs.clone();
+         for input in actual_inputs {
+             let c = self.build_plan(input, Some(output))?;
+diff --git a/testcase/sarun_sweep_double_colon_static.mk b/testcase/sarun_sweep_double_colon_static.mk
+index 167f8cc..bdb84e4 100644
+--- a/testcase/sarun_sweep_double_colon_static.mk
++++ b/testcase/sarun_sweep_double_colon_static.mk
+@@ -1,7 +1,3 @@
+-# TODO: double-colon parts must be INDEPENDENT dep nodes — each ::
+-# rule with its own prereqs/commands, run in declaration order. kati merges
+-# them into one node, so a part with prerequisites is reordered ahead of
+-# the command-bearing parts. Needs per-part DepNodes.
+ # Systematic sweep: double-colon rules (both run, in order) and static
+ # pattern rules (stem binding).
+ all:: 
