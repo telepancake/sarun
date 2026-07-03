@@ -1775,6 +1775,7 @@ impl<'a> DepBuilder<'a> {
 }
 
 pub fn make_dep(ev: &mut Evaluator, targets: Vec<Symbol>) -> Result<Vec<NamedDepNode>> {
+    let _act = crate::fileutil::ActivityGuard::new("dependency analysis".into());
     let mut db = DepBuilder::new(ev)?;
     let _tr = ScopedTimeReporter::new("make dep (build)");
     db.build(targets)

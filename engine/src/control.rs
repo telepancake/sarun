@@ -411,6 +411,32 @@ fn make_vars(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
     json!({"ok": true})
 }
 
+/// `box_activity` frame: the box's live in-flight builtin work (kati
+/// recipes / $(shell) / parse phases with ages) — stored ephemerally on the
+/// BoxState for the UI's "what is it doing" feed.
+fn box_activity(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
+    let host_pid = peer_pidfd.map(host_pid_from_pidfd).filter(|p| *p > 0).unwrap_or(0);
+    if let Some(fd) = peer_pidfd { unsafe { libc::close(fd); } }
+    let Some(id) = derive_parent_box(state, host_pid) else {
+        return json!({"ok": false, "error": "no enclosing box"});
+    };
+    let items: Vec<(String, u64)> = msg.get("items")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(|it| {
+            let arr = it.as_array()?;
+            Some((arr.first()?.as_str()?.to_string(),
+                  arr.get(1).and_then(Value::as_u64).unwrap_or(0)))
+        }).collect())
+        .unwrap_or_default();
+    let ov = lock(state).overlay.clone();
+    if let Some(ov) = ov.as_ref() {
+        if let Some(b) = ov.live_box(id) {
+            *b.activity.lock().unwrap() = items;
+        }
+    }
+    json!({"ok": true})
+}
+
 fn build_edge_state(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
     let host_pid = peer_pidfd.map(host_pid_from_pidfd).filter(|p| *p > 0).unwrap_or(0);
     if let Some(fd) = peer_pidfd { unsafe { libc::close(fd); } }
@@ -1423,7 +1449,23 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
             let id = arg_sid(args);
             let limit = args.get(1).and_then(Value::as_i64).unwrap_or(20);
             match id {
-                Some(id) => crate::review::box_summary(id, limit),
+                Some(id) => {
+                    let mut v = crate::review::box_summary(id, limit);
+                    // Live in-flight builtin activity (recipes / $(shell) /
+                    // parse) from the box's watchdog feed — engine memory,
+                    // not the DB; a hung box shows WHAT it's chewing on.
+                    let ov = lock(state).overlay.clone();
+                    if let Some(b) = ov.as_ref().and_then(|ov| ov.live_box(id)) {
+                        let items: Vec<Value> = b.activity.lock().unwrap()
+                            .iter()
+                            .map(|(d, age)| json!({"desc": d, "age": age}))
+                            .collect();
+                        if !items.is_empty() {
+                            v["activity"] = json!(items);
+                        }
+                    }
+                    v
+                }
                 None => json!({"outputs":[], "changes":[], "processes":[],
                                "pipelines":[], "edges":[]}),
             }
@@ -2309,6 +2351,8 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
             build_edges(&state, &msg, peer_pidfd.take())
         } else if msg.get("type").and_then(Value::as_str) == Some("make_vars") {
             make_vars(&state, &msg, peer_pidfd.take())
+        } else if msg.get("type").and_then(Value::as_str) == Some("box_activity") {
+            box_activity(&state, &msg, peer_pidfd.take())
         } else if msg.get("type").and_then(Value::as_str) == Some("build_edge_state") {
             // A single edge's run-state transition (started / finished), sent by
             // the in-process make/ninja executor around each recipe — stamps the

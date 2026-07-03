@@ -153,6 +153,11 @@ pub struct BoxState {
     // start_time a NEW row, never a dedup into a stale incarnation (PID-reuse proof).
     proc_cache: Mutex<HashMap<(u32, i64), i64>>,
     proc_current: Mutex<HashMap<u32, (i64, i64)>>,
+    /// Live in-flight builtin activity (kati recipes / \$(shell) / parse
+    /// phases), pushed by the box's watchdog as `box_activity` frames:
+    /// (description, age seconds, received-at unix ts). Ephemeral — a UI
+    /// inspection feed, not capture.
+    pub activity: Mutex<Vec<(String, u64)>>,
     // The box's root runner tgids (the bubble-walk boundary): the host pid(s) of
     // each `sarun -- cmd` launch into this box. A PPid chain stops when it reaches
     // one of these (never walk above a launch into the runner's host ancestry).
@@ -430,6 +435,7 @@ impl BoxState {
             kinds: RwLock::new(HashMap::new()),
             event_sink: Mutex::new(None),
             proc_cache: Mutex::new(HashMap::new()),
+            activity: Mutex::new(Vec::new()),
             proc_current: Mutex::new(HashMap::new()),
             roots: Mutex::new(std::collections::HashSet::new()),
             parent: std::sync::atomic::AtomicI64::new(0),

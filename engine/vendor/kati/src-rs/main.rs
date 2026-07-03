@@ -115,6 +115,13 @@ fn read_bootstrap_makefile(targets: &[Symbol]) -> Result<Arc<Mutex<Vec<Stmt>>>> 
 }
 
 fn run(targets: &[Symbol], cl_vars: &Vec<Bytes>, orig_args: OsString) -> Result<i32> {
+    // Standalone rkati: a builtin silently busy for 5+ minutes gets a
+    // STALL line on stderr naming exactly what it is running.
+    kati::fileutil::start_stall_watchdog(
+        std::env::var("SARUN_STALL_SECS").ok()
+            .and_then(|s| s.parse().ok()).unwrap_or(300),
+        std::sync::Arc::new(|line| eprintln!("{line}")),
+    );
     let start_time = std::time::SystemTime::now();
 
     if FLAGS.generate_ninja && (FLAGS.regen || FLAGS.dump_kati_stamp) {

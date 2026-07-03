@@ -742,6 +742,8 @@ list of the rule for '{output}' at {loc}"));
                         // Stream each output chunk to the main thread LIVE (it owns
                         // the RECIPE_OUT sink); then the final result.
                         let mut emit = |b: &[u8]| { let _ = txc.send(RunMsg::Chunk(b.to_vec())); };
+                        let _act = crate::fileutil::ActivityGuard::new(
+                            format!("recipe of '{}'", req.output));
                         let r = run_node_commands(&shell, shellflag, req, &mut emit);
                         let _ = txc.send(RunMsg::Done(r, slip));
                     })

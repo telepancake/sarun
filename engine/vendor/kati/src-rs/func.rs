@@ -596,6 +596,9 @@ pub fn shell_func_impl(
     }
 
     collect_stats_with_slow_report!("func shell time", OsStr::from_bytes(cmd));
+    let _act = crate::fileutil::ActivityGuard::new(format!(
+        "$(shell {})",
+        String::from_utf8_lossy(&cmd[..cmd.len().min(120)])));
     // box mode: the make's exported-var prefix rides SEPARATELY so the
     // in-process runner applies it to the subshell without recording it as
     // pipeline provenance ($(shell)'s recorded cmd is the user's command).

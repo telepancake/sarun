@@ -394,6 +394,82 @@ pub fn clear_glob_cache() {
 // them into the box's capture database so wrong-value hunts are a query, not
 // a rerun with trace flags. Same Arc-clone-then-release pattern as the other
 // hooks (the callback may allocate / send frames).
+// ── stall watchdog ───────────────────────────────────────────────────────────
+// Long-running in-process work registers WHAT it is doing (per thread);
+// a watchdog (installed by the embedding engine / rkati main) reports any
+// entry that has been running past a threshold — a silent 5-minute stall in
+// a recipe / $(shell) / parse is a diagnosability bug, not patience.
+pub static ACTIVITY: LazyLock<
+    parking_lot::Mutex<HashMap<std::thread::ThreadId, Vec<(String, std::time::Instant)>>>,
+> = LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+/// RAII: registers `desc` as this thread's current activity; drop pops it
+/// (restoring the enclosing activity, e.g. the recipe a $(shell) runs under).
+pub struct ActivityGuard;
+
+impl ActivityGuard {
+    pub fn new(desc: String) -> ActivityGuard {
+        ACTIVITY
+            .lock()
+            .entry(std::thread::current().id())
+            .or_default()
+            .push((desc, std::time::Instant::now()));
+        ActivityGuard
+    }
+}
+
+impl Drop for ActivityGuard {
+    fn drop(&mut self) {
+        let tid = std::thread::current().id();
+        let mut a = ACTIVITY.lock();
+        if let Some(v) = a.get_mut(&tid) {
+            v.pop();
+            if v.is_empty() {
+                a.remove(&tid);
+            }
+        }
+    }
+}
+
+/// Snapshot of every thread's CURRENT activity: (description, age seconds),
+/// innermost entry per thread. For the engine's live "what is this box
+/// doing" feed.
+pub fn activity_snapshot() -> Vec<(String, u64)> {
+    let now = std::time::Instant::now();
+    ACTIVITY
+        .lock()
+        .values()
+        .filter_map(|stack| stack.last())
+        .map(|(d, t)| (d.clone(), now.duration_since(*t).as_secs()))
+        .collect()
+}
+
+/// Start the watchdog (idempotent). Every 30s, any activity older than
+/// `stall_secs` is reported through `report` (once per interval, with its
+/// age) — the report callback decides where it lands (recipe stderr).
+pub fn start_stall_watchdog(stall_secs: u64, report: Arc<dyn Fn(&str) + Send + Sync>) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(move || {
+        std::thread::Builder::new()
+            .name("kati-stall-watchdog".into())
+            .spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_secs(30));
+                let now = std::time::Instant::now();
+                for stack in ACTIVITY.lock().values() {
+                    if let Some((desc, since)) = stack.last() {
+                        let age = now.duration_since(*since).as_secs();
+                        if age >= stall_secs {
+                            report(&format!(
+                                "*kati*: STALL? {age}s without completing: {desc}"
+                            ));
+                        }
+                    }
+                }
+            })
+            .ok();
+    });
+}
+
 /// (name, loc, expanded value, make working dir, UNEXPANDED rhs text,
 ///  assignment op ("=" ":=" "+=" "?=" "!="), variable origin (get_origin_str))
 pub type VarAssignHook =

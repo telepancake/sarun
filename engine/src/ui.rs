@@ -6798,6 +6798,37 @@ fn box_detail_lines(app: &App, area: Rect) -> Vec<Line<'static>> {
     // xattrs that just landed), then processes (who did it), then the
     // brush / build views below for context. Empty sections drop out
     // so a vanilla (non-brush) box's right pane stays tight.
+    // Live in-flight builtin activity (the box's watchdog feed): what the
+    // embedded makes/shells are chewing on RIGHT NOW and for how long —
+    // the "running builtins" tree a stuck box otherwise lacks. Ages ≥5min
+    // go loud red.
+    {
+        let acts = app.box_summary.get("activity")
+            .and_then(Value::as_array).cloned().unwrap_or_default();
+        if !acts.is_empty() {
+            out.push(Line::from(Span::styled(
+                "── IN FLIGHT ── (builtins running now — updated every 30s)",
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))));
+            for a in acts.iter().take(8) {
+                let desc = a.get("desc").and_then(Value::as_str).unwrap_or("");
+                let age = a.get("age").and_then(Value::as_u64).unwrap_or(0);
+                let desc_short: String = desc.chars()
+                    .map(|c| if c == '\n' { ' ' } else { c })
+                    .take(inner_w.saturating_sub(12)).collect();
+                let age_style = if age >= 300 {
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Yellow)
+                };
+                out.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(format!("{age:>4}s "), age_style),
+                    Span::raw(desc_short),
+                ]));
+            }
+            out.push(Line::from(""));
+        }
+    }
     render_failures_section(&mut out, &failures);
     render_outputs_section(&mut out, &outputs);
     render_changes_section(&mut out, &changes);
