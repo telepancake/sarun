@@ -805,13 +805,24 @@ pub(crate) fn cap_text(mut s: String, max: usize) -> String {
 
 fn install_var_recorder() {
     kati::fileutil::install_var_assign_hook(Arc::new(
-        |name, loc, value, make_dir, rhs| {
+        |name, loc, value, make_dir, rhs, op, origin| {
             if !vartrace_enabled() {
                 return;
             }
             let v = cap_text(String::from_utf8_lossy(value).into_owned(), 4096);
             let rhs_s = cap_text(String::from_utf8_lossy(rhs).into_owned(), 1024);
             let refs = extract_var_refs(&rhs_s);
+            // Compact flags: the assignment op, plus the variable's origin
+            // when it isn't the ordinary makefile case ("file").
+            let flags = match origin {
+                "file" => op.to_string(),
+                "environment" => format!("{op} env"),
+                "environment override" => format!("{op} env!"),
+                "command line" => format!("{op} cmd"),
+                "override" => format!("{op} ovr"),
+                "automatic" => format!("{op} auto"),
+                other => format!("{op} {other}"),
+            };
             // A builtin sub-make parses on the invoking recipe's thread, so
             // the recipe-edge / pipeline context links its assignments to the
             // spawning edge; a top-level (shadow-process) make has neither.
@@ -826,6 +837,7 @@ fn install_var_recorder() {
                 "refs": refs,
                 "edge": edge,
                 "uid": uid,
+                "flags": flags,
             }));
         },
     ));

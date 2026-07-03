@@ -111,9 +111,12 @@ CREATE TABLE IF NOT EXISTS build_edges(id INTEGER PRIMARY KEY AUTOINCREMENT,
 -- rhs is the UNEXPANDED assignment text and refs the space-joined variable
 -- names it dereferences — how the assignment looked and what fed it, so the
 -- Vars view can walk the chain. Both capped at capture time (frugal).
+-- flags is a compact what-kind-of-assignment tag: the make op (:= = +=
+-- ?= !=) plus origin when notable (env cmd ovr auto), or sh / sh x for
+-- shell rows (x = exported).
 CREATE TABLE IF NOT EXISTS makevar(id INTEGER PRIMARY KEY AUTOINCREMENT,
  ts REAL, name TEXT, loc TEXT, value TEXT, make_dir TEXT,
- edge_out TEXT, uid INT, rhs TEXT, refs TEXT,
+ edge_out TEXT, uid INT, rhs TEXT, refs TEXT, flags TEXT,
  UNIQUE(name, loc, value, make_dir));
 CREATE INDEX IF NOT EXISTS idx_makevar_name ON makevar(name);
 CREATE TABLE IF NOT EXISTS api_log(id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1142,10 +1145,10 @@ impl BoxState {
         for r in rows {
             let _ = conn.execute(
                 "INSERT OR IGNORE INTO makevar\
-                 (ts,name,loc,value,make_dir,edge_out,uid,rhs,refs) \
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                 (ts,name,loc,value,make_dir,edge_out,uid,rhs,refs,flags) \
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
                 params![ts, r.name, r.loc, r.value, r.make_dir, r.edge_out,
-                        r.uid, r.rhs, r.refs]);
+                        r.uid, r.rhs, r.refs, r.flags]);
         }
     }
 

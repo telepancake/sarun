@@ -758,9 +758,17 @@ impl Evaluator {
             // definition loc — `+=` must point at the append, not the `:=`.
             let loc = stmt.loc().to_string();
             let val = g.string().unwrap_or(std::borrow::Cow::Borrowed(b""));
+            let op = match stmt.op {
+                AssignOp::Eq => "=",
+                AssignOp::ColonEq => ":=",
+                AssignOp::PlusEq => "+=",
+                AssignOp::QuestionEq => "?=",
+                AssignOp::BangEq => "!=",
+            };
             crate::fileutil::report_var_assign(
                 &lhs.as_bytes(), &loc, &val,
-                self.working_dir.as_os_str().as_bytes(), &stmt.orig_rhs);
+                self.working_dir.as_os_str().as_bytes(), &stmt.orig_rhs,
+                op, crate::var::get_origin_str(g.origin()));
         }
         Ok(())
     }

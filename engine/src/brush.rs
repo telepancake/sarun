@@ -2647,6 +2647,7 @@ pub(crate) fn install_shell_var_recorder() {
                     "refs": refs,
                     "edge": edge,
                     "uid": uid,
+                    "flags": if exported { "sh x" } else { "sh" },
                 }));
             },
         ));

@@ -399,7 +399,7 @@ pub fn makevars(
     // filters key on, so the UI can navigate without another round-trip.
     let Ok(mut st) = conn.prepare(
         "SELECT m.id, m.name, m.loc, m.value, m.make_dir, m.rhs, m.refs,
-                m.edge_out, m.uid,
+                m.edge_out, m.uid, m.flags,
                 (SELECT e.id FROM build_edges e
                   WHERE json_extract(e.outs,'$[0]') = m.edge_out LIMIT 1),
                 (SELECT p.id FROM brushprov p WHERE p.uid = m.uid LIMIT 1)
@@ -411,9 +411,10 @@ pub fn makevars(
         r.get::<_, String>(3)?, r.get::<_, String>(4)?,
         r.get::<_, Option<String>>(5)?, r.get::<_, Option<String>>(6)?,
         r.get::<_, Option<String>>(7)?, r.get::<_, Option<i64>>(8)?,
-        r.get::<_, Option<i64>>(9)?, r.get::<_, Option<i64>>(10)?,
+        r.get::<_, Option<String>>(9)?,
+        r.get::<_, Option<i64>>(10)?, r.get::<_, Option<i64>>(11)?,
     ))) else { return json!([]) };
-    for (rid, name, loc, value, make_dir, rhs, refs, edge_out, uid,
+    for (rid, name, loc, value, make_dir, rhs, refs, edge_out, uid, flags,
          edge_id, pipeline_id) in it.flatten()
     {
         let name_ok = name_pat.is_empty()
@@ -426,6 +427,7 @@ pub fn makevars(
                         "value": value, "make": make_dir,
                         "rhs": rhs.unwrap_or_default(),
                         "refs": refs.unwrap_or_default(),
+                        "flags": flags.unwrap_or_default(),
                         "edge_out": edge_out, "uid": uid,
                         "edge_id": edge_id, "pipeline_id": pipeline_id}));
         if out.len() as i64 >= limit { break; }

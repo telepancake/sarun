@@ -376,6 +376,8 @@ pub struct MakeVarRow {
     pub rhs: String,
     /// Space-joined variable names the rhs dereferences.
     pub refs: String,
+    /// Compact assignment-kind tag (op + notable origin, or sh / sh x).
+    pub flags: String,
 }
 
 /// `make_vars` frame: a batch of makefile variable assignments from a box's
@@ -397,6 +399,7 @@ fn make_vars(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
             uid: r.get("uid").and_then(Value::as_i64).unwrap_or(0),
             rhs: r.get("rhs").and_then(Value::as_str).unwrap_or("").to_string(),
             refs: r.get("refs").and_then(Value::as_str).unwrap_or("").to_string(),
+            flags: r.get("flags").and_then(Value::as_str).unwrap_or("").to_string(),
         })).collect())
         .unwrap_or_default();
     let ov = lock(state).overlay.clone();

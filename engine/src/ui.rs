@@ -4239,10 +4239,16 @@ fn cd_info_lines(app: &App) -> Vec<Line<'static>> {
 }
 
 fn changes_lines(app: &App) -> Vec<Line<'static>> {
-    let mut out = vec![Line::from(Span::styled(
-        format!("{:<1} {:>10}  {}", "", "SIZE", "PATH"),
-        Style::default().add_modifier(Modifier::BOLD),
-    ))];
+    let mut out = vec![
+        Line::from(Span::styled(
+            "flags: + created  ~ modified  - deleted  @ xattr  ! stale-vs-host",
+            Style::default().add_modifier(Modifier::DIM),
+        )),
+        Line::from(Span::styled(
+            format!("{:<1} {:>10}  {}", "", "SIZE", "PATH"),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+    ];
     let vis = app.visible_changes();
     if vis.is_empty() {
         let empty_msg = if app.changes_total == 0 {
@@ -4645,9 +4651,22 @@ fn vars_index_lines(app: &App) -> Vec<Line<'static>> {
     } else {
         format!("query: name~[{qn}] value~[{qv}]   ('/' to change)")
     };
-    let mut out = vec![Line::from(Span::styled(
-        q, Style::default().add_modifier(Modifier::BOLD),
-    ))];
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let mut out = vec![
+        Line::from(Span::styled(
+            q, Style::default().add_modifier(Modifier::BOLD),
+        )),
+        // The FLAGS legend — every flag the column can show, spelled out.
+        Line::from(Span::styled(
+            "flags: := simple  = recursive  += append  ?= if-unset  != shell-assign  \
+env/cmd/ovr/auto origin  sh script (x exported)",
+            dim,
+        )),
+        Line::from(Span::styled(
+            format!("{:<26} {:<9} {}", "NAME", "FLAGS", "VALUE"),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+    ];
     if app.vars_rows.is_empty() {
         out.push(Line::from(if qn.is_empty() && qv.is_empty() {
             "press '/' and type a query — a word matches variable names AND values"
@@ -4659,13 +4678,12 @@ fn vars_index_lines(app: &App) -> Vec<Line<'static>> {
     for (i, r) in app.vars_rows.iter().enumerate() {
         let name = r.get("name").and_then(Value::as_str).unwrap_or("");
         let val = r.get("value").and_then(Value::as_str).unwrap_or("");
-        let mk = r.get("make").and_then(Value::as_str).unwrap_or("");
-        let shellish = mk.starts_with("sh");
+        let flags = r.get("flags").and_then(Value::as_str).unwrap_or("");
+        let shellish = flags.starts_with("sh");
         let one: String = val.chars()
-            .map(|c| if c == '\n' { ' ' } else { c }).take(44).collect();
-        let name_s: String = name.chars().take(22).collect();
-        let site = tail_trunc(&makevar_site(r), 40);
-        let text = format!("{:<22} {:<40} {}", name_s, site, one);
+            .map(|c| if c == '\n' { ' ' } else { c }).take(80).collect();
+        let name_s: String = name.chars().take(26).collect();
+        let text = format!("{:<26} {:<9} {}", name_s, flags, one);
         let line = if i == app.sel_var {
             Line::from(Span::styled(text, Style::default().fg(Color::Black).bg(Color::Cyan)))
         } else if shellish {
@@ -4710,6 +4728,11 @@ fn var_detail(app: &App) -> (Vec<Line<'static>>, Vec<(usize, VarNavAction)>) {
         Line::from(vec![Span::styled("name   ", dim), Span::styled(name.to_string(), bold)]),
         Line::from(vec![Span::styled("site   ", dim), Span::raw(makevar_site(row))]),
         Line::from(vec![Span::styled("make   ", dim), Span::raw(mk.to_string())]),
+        Line::from(vec![
+            Span::styled("flags  ", dim),
+            Span::raw(row.get("flags").and_then(Value::as_str)
+                .unwrap_or("").to_string()),
+        ]),
     ];
     if !edge_out.is_empty() {
         out.push(Line::from(vec![
@@ -6163,7 +6186,8 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
             }
             Pane::Vars => {
                 let lines = vars_index_lines(app);
-                let scroll = scroll_for_cursor(app.sel_var + 1, lines.len(), left.height);
+                // +3 header rows: query line, flags legend, column header.
+                let scroll = scroll_for_cursor(app.sel_var + 3, lines.len(), left.height);
                 let p = Paragraph::new(Text::from(lines))
                     .block(block(title("VARS · provenance", lf), lf))
                     .scroll((scroll, 0));
@@ -6183,7 +6207,8 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
             // banner, and the diff body below it.
             _ => {
                 let lines = changes_lines(app);
-                let scroll = scroll_for_cursor(app.sel_change + 1, lines.len(), left.height);
+                // +2 header rows: the flags legend + the column header.
+                let scroll = scroll_for_cursor(app.sel_change + 2, lines.len(), left.height);
                 let p = Paragraph::new(Text::from(lines))
                     .block(block(
                         title("changes", app.focus == Pane::Changes),

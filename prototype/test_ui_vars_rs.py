@@ -100,7 +100,9 @@ def main():
         send("DERIVED"); send("\r", 1.0)
         txt = screen()
         check("DERIVED" in txt and "uivars_work/Makefile:3" in txt,
-              "result row shows the FULL site (dir-joined Makefile:3)")
+              "detail shows the FULL site (dir-joined Makefile:3)")
+        check("flags: :=" in txt and "NAME" in txt and "FLAGS" in txt,
+              "list has a FLAGS column with its legend at the top")
         check("pre-$(ORIG_VAR)-$(OTHER)" in txt,
               "detail shows the assignment as written (unexpanded rhs)")
         check("→ ORIG_VAR" in txt and "→ OTHER" in txt,
@@ -110,12 +112,12 @@ def main():
         val_bg = ""
         for row in range(40):
             line = "".join(vt.buffer[row][c].data for c in range(160))
-            if "pre-aa bb-" in line:
-                col = line.index("pre-aa bb-")
+            col = line.find("pre-aa bb-", 72)   # right pane only
+            if col >= 0:
                 val_bg = vt.buffer[row][col].bg
                 break
-        check(val_bg not in ("", "default"),
-              f"value text is painted with a background (bg={val_bg!r})")
+        check(val_bg not in ("", "default", "00cdcd"),  # not selection-cyan
+              f"value body is painted with its own background (bg={val_bg!r})")
         send("\r", 0.8)          # focus detail items (first = ORIG_VAR)
         send("j", 0.5)           # second item = OTHER
         send("\r", 1.0)          # follow it

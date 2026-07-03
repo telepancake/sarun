@@ -850,8 +850,8 @@ def main():
         con = sqlite3.connect(f"file:{sp24}?mode=ro", uri=True)
         try:
             mv = list(con.execute(
-                "SELECT name, loc, value, make_dir, rhs, refs, edge_out, uid "
-                "FROM makevar ORDER BY id"))
+                "SELECT name, loc, value, make_dir, rhs, refs, edge_out, uid, "
+                "flags FROM makevar ORDER BY id"))
         finally:
             con.close()
         def mv_row(name, loc_sub, value, make_sub):
@@ -887,6 +887,18 @@ def main():
               f"(edge_out={subrow[6] if subrow else None!r})")
         check(not any("PATH" == row[0] for row in mv),
               f"case24: export-prefix replay is suppressed (no PATH rows)")
+        approw = mv_row("ORIG_VAR", "Makefile:2", "aa bb", "vars")
+        exprow = mv_row("EXPVAR", "recipe of all",
+                        "exported from-shell aa bb", "sh export")
+        check(approw is not None and approw[8] == "+=",
+              f"case24: += flagged as append "
+              f"(flags={approw[8] if approw else None!r})")
+        check(srow is not None and srow[8] == "sh",
+              f"case24: shell scalar flagged sh "
+              f"(flags={srow[8] if srow else None!r})")
+        check(exprow is not None and exprow[8] == "sh x",
+              f"case24: export-builtin assignment flagged 'sh x' "
+              f"(flags={exprow[8] if exprow else None!r})")
         # Same build WITHOUT --vars: silence.
         r = subprocess.run(
             [str(BIN), "run", "-b", "MAKE24B", "-C", str(vt), "--", "make"],

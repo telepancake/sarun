@@ -394,9 +394,10 @@ pub fn clear_glob_cache() {
 // them into the box's capture database so wrong-value hunts are a query, not
 // a rerun with trace flags. Same Arc-clone-then-release pattern as the other
 // hooks (the callback may allocate / send frames).
-/// (name, loc, expanded value, make working dir, UNEXPANDED rhs text)
+/// (name, loc, expanded value, make working dir, UNEXPANDED rhs text,
+///  assignment op ("=" ":=" "+=" "?=" "!="), variable origin (get_origin_str))
 pub type VarAssignHook =
-    Arc<dyn Fn(&[u8], &str, &[u8], &[u8], &[u8]) + Send + Sync + 'static>;
+    Arc<dyn Fn(&[u8], &str, &[u8], &[u8], &[u8], &str, &str) + Send + Sync + 'static>;
 
 static VAR_ASSIGN_HOOK: parking_lot::Mutex<Option<VarAssignHook>> =
     parking_lot::Mutex::new(None);
@@ -407,9 +408,10 @@ pub fn install_var_assign_hook(f: VarAssignHook) {
 
 pub fn report_var_assign(
     name: &[u8], loc: &str, value: &[u8], make_dir: &[u8], rhs: &[u8],
+    op: &str, origin: &str,
 ) {
     let h = VAR_ASSIGN_HOOK.lock().clone();
     if let Some(h) = h {
-        h(name, loc, value, make_dir, rhs);
+        h(name, loc, value, make_dir, rhs, op, origin);
     }
 }
