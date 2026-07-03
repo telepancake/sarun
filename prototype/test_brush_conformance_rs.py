@@ -162,6 +162,9 @@ echo to-three >&3
 exec 3>&-
 cat fd3.txt; rm -f fd3.txt''',
     # ── builtins ───────────────────────────────────────────────────────────
+    "tail_legacy_n": '''printf 'a\nb\nc\nd\n' > tl.txt
+tail -2 tl.txt
+rm -f tl.txt''',
     "printf_fmt": '''printf '%05d|%-6s|%x|%%\\n' 42 ab 255
 printf '%s,' a b c; echo
 printf -v var 'got:%d' 9; echo "$var"''',
@@ -188,6 +191,7 @@ echo "out=[$v]"
 # Known divergences: name -> reason. VISIBLE debt, not silent skips —
 # an xpass (fixed entry still listed) fails the suite so this can't rot.
 XFAIL = {
+
     # $! is empty after backgrounding a SUBSHELL — `( cmd ) &` doesn't
     # register a job pid. autoconf guards its uses, but bash sets it.
     "bg_subshell_pid": "$! empty after ( cmd ) & — background subshell job",

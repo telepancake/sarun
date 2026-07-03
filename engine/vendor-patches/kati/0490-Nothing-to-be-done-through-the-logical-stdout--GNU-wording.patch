@@ -1,0 +1,25 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Fri, 03 Jul 2026 15:20:01 +0000
+Subject: [PATCH] Nothing-to-be-done through the logical stdout, GNU wording
+
+println! wrote the process fd, escaping the caller's redirects (make > m.out leaked the line), and the kati: prefix diverged from GNU's 'make: Nothing to be done for X.' that tools grep for. Route via emit_recipe_output.
+
+---
+diff --git a/src-rs/exec.rs b/src-rs/exec.rs
+index 111b674..bff8dde 100644
+--- a/src-rs/exec.rs
++++ b/src-rs/exec.rs
+@@ -890,7 +890,11 @@ pub fn exec_opts(
+         for (sym, root) in roots {
+             let node = root.lock();
+             if node.cmds.is_empty() {
+-                println!("kati: Nothing to be done for `{sym}'.")
++                // Through the LOGICAL stdout (the recipe sink) — println!
++                // writes the process fd and escapes the caller's redirects;
++                // and GNU's wording, which makefiles/tools grep for.
++                emit_recipe_output(
++                    format!("make: Nothing to be done for '{sym}'.\n").as_bytes())
+             }
+         }
+     }

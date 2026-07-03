@@ -46,3 +46,4 @@
 0460-kati-consider-rule-less-prerequisites-LAZILY-like-GNU-make.patch
 0470-kati-honor-.NOTPARALLEL-serialize-the-make-even-under-j-jobs.patch
 0480-diagnosability-live-IN-FLIGHT-builtin-activity-5-minute-stal.patch
+0490-Nothing-to-be-done-through-the-logical-stdout--GNU-wording.patch
