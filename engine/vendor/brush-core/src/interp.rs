@@ -720,9 +720,15 @@ impl Execute for ast::CompoundCommand {
                     }
                 };
 
+                // sarun: bash fires a subshell's own EXIT trap when the
+                // subshell terminates — including via an explicit `exit`.
+                // The trap must not clobber the subshell's exit code.
+                let sub_code = subshell_result.exit_code;
+                let _ = subshell.on_exit_with_params(params).await;
+
                 // Preserve the subshell's exit code, but don't honor any of its requests to exit
                 // the shell, break out of loops, etc.
-                Ok(ExecutionResult::from(subshell_result.exit_code))
+                Ok(ExecutionResult::from(sub_code))
             }
             Self::ForClause(f) => f.execute(shell, params).await,
             Self::CaseClause(c) => c.execute(shell, params).await,

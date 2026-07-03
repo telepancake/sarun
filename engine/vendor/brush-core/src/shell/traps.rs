@@ -7,9 +7,19 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
     ///
     /// This currently includes invoking the `EXIT` trap handler, if any.
     pub async fn on_exit(&mut self) -> Result<(), error::Error> {
+        let params = self.default_exec_params();
+        self.on_exit_with_params(&params).await
+    }
+
+    /// Like `on_exit`, but the trap handler runs with the CALLER's execution
+    /// parameters — a redirected nested shell's EXIT trap must write to the
+    /// redirected fds, not the shell's base ones.
+    pub async fn on_exit_with_params(
+        &mut self,
+        params: &ExecutionParameters,
+    ) -> Result<(), error::Error> {
         if self.traps.handles(TrapSignal::Exit) {
-            self.invoke_trap_handler(TrapSignal::Exit, &self.default_exec_params())
-                .await?;
+            self.invoke_trap_handler(TrapSignal::Exit, params).await?;
         }
 
         Ok(())

@@ -1362,15 +1362,22 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                 let expanded_offset = min(expanded_offset, expanded_parameter_len);
 
                 let end_offset = if let Some(length) = length {
-                    let mut expanded_length = length.eval(self.shell, self.params, false).await?;
+                    let expanded_length = length.eval(self.shell, self.params, false).await?;
                     if expanded_length < 0 {
-                        expanded_length += expanded_parameter_len;
+                        // bash: a NEGATIVE length is an absolute end offset
+                        // from the END of the value — ${v:1:-2} ends at
+                        // len-2, not offset+(len-2).
+                        std::cmp::max(
+                            expanded_parameter_len + expanded_length,
+                            expanded_offset,
+                        )
+                    } else {
+                        let expanded_length = min(
+                            expanded_length,
+                            expanded_parameter_len - expanded_offset,
+                        );
+                        expanded_offset + expanded_length
                     }
-
-                    let expanded_length =
-                        min(expanded_length, expanded_parameter_len - expanded_offset);
-
-                    expanded_offset + expanded_length
                 } else {
                     expanded_parameter_len
                 };

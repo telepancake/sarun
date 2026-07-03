@@ -1917,6 +1917,10 @@ async fn run_brush_script(script: String, shell_name: String,
     };
     let params = shell.default_exec_params();
     let (code, _uids) = run_nested_pipelines(&mut shell, prog, &params).await;
+    // bash fires the EXIT trap when the (non-interactive) shell finishes —
+    // including after an explicit `exit`. brush-core has the hook; the
+    // engine has to call it.
+    let _ = shell.on_exit().await;
     code
 }
 
@@ -2344,6 +2348,10 @@ impl brush_core::commands::ExecInterposer<brush_core::extensions::DefaultShellEx
                 }
             };
             let (code, _uids) = run_nested_pipelines(&mut sub, prog, &params).await;
+            // The nested shell terminates here — fire its EXIT trap, as
+            // bash does for a script run via `sh file.sh`. With the CALLER's
+            // params: a redirected `bash s.sh > f` must trap into f.
+            let _ = sub.on_exit_with_params(&params).await;
             Some(brush_core::ExecutionResult::new(code as u8))
         })
     }
@@ -2793,7 +2801,11 @@ pub fn run_recipe_in_process_prefixed(
             // `sh -c …` then nests under it — and so `set -e`/`exit` between the
             // recipe's statements is honored. Each pipeline records parent_uid =
             // the enclosing pipeline (the make/recipe that spawned this one).
-            run_nested_pipelines(&mut shell, prog, &params).await
+            let r = run_nested_pipelines(&mut shell, prog, &params).await;
+            // A recipe line is its own shell: fire its EXIT trap (into the
+            // recipe's captured output), as bash-per-recipe-line would.
+            let _ = shell.on_exit_with_params(&params).await;
+            r
             // shell and PipeWriter clones drop here → write end closed → drain sees EOF.
         })
     }).expect("spawn brush recipe thread");
