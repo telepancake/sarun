@@ -129,6 +129,11 @@ p=$!
 test -n "$p" && echo "bg-pid-set"
 wait $p
 echo "waited=$?"''',
+    "trap_not_inherited_by_child_sh": '''rm -f trapmark
+trap 'echo parent-exit; touch trapmark' EXIT
+sh -c 'echo child-ran'
+if test -f trapmark; then echo "LEAK: child fired parent trap"; else echo no-leak; fi
+rm -f trapmark''',
     "trap_exit_rc": '''(trap 'echo t' EXIT; exit 7); echo "rc=$?"''',
     # ── set -e / -u / pipefail ─────────────────────────────────────────────
     "errexit_basic": '''(set -e; false; echo not-reached); echo "rc=$?"

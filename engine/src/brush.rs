@@ -2301,6 +2301,12 @@ impl brush_core::commands::ExecInterposer<brush_core::extensions::DefaultShellEx
             // inspecting unifdef's exit 1 rather than dying on it). Reset the
             // per-invocation `set` flags to sh defaults; the script's own argv
             // flags (snoop.set_flags) are replayed below.
+            // A real `sh script.sh` is a FRESH PROCESS: it inherits NO trap
+            // handlers. The clone carries the caller's traps — firing e.g.
+            // configure's EXIT trap (`rm -f -r conftest* …`) at every
+            // snooped child's exit deleted files the caller had just
+            // generated.
+            sub.traps_mut().clear_all_handlers();
             {
                 let o = sub.options_mut();
                 o.exit_on_nonzero_command_exit = false;

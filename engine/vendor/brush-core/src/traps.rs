@@ -224,6 +224,13 @@ impl TrapHandlerConfig {
         );
     }
 
+    /// Removes ALL registered trap handlers — a freshly exec'd shell (a
+    /// snooped `sh script` running in-process) starts with no traps, unlike
+    /// a subshell clone.
+    pub fn clear_all_handlers(&mut self) {
+        self.handlers.clear();
+    }
+
     /// Removes handlers for a trap signal.
     ///
     /// # Arguments
