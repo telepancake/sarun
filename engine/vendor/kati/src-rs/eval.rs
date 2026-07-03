@@ -42,6 +42,23 @@ use crate::symtab::{ALLOW_RULES_SYM, KATI_READONLY_SYM, MAKEFILE_LIST, SHELL_SYM
 use crate::var::{Var, VarOrigin, Variable, Vars};
 use crate::{collect_stats_with_slow_report, error, error_loc, file_cache, log, warn_loc};
 
+/// Minimal JSON string escaping for the trace records (no serde dep here).
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 pub enum RulesAllowed {
     Allowed,
     Warning,
@@ -74,6 +91,7 @@ pub enum FrameType {
 #[derive(Debug)]
 pub struct Frame {
     frame_type: FrameType,
+    #[allow(dead_code)]
     parent: Option<Weak<Frame>>,
     name: Bytes,
     location: Option<Loc>,
@@ -101,6 +119,7 @@ impl Frame {
         self.children.lock().push(child);
     }
 
+    #[allow(dead_code)]
     fn print_json_trace(&self, tf: &mut dyn std::io::Write, indent: usize) -> Result<()> {
         if self.frame_type == FrameType::Root {
             return Ok(());
@@ -308,7 +327,6 @@ pub struct Evaluator {
     trace: bool,
     stack: Arc<Mutex<Vec<Arc<Frame>>>>,
     assignment_tracefile: Option<Box<dyn std::io::Write>>,
-    assignment_sep: String,
 
     pub avoid_io: bool,
     // This value tracks the nest level of make expressions. For
@@ -368,7 +386,6 @@ impl Evaluator {
                 Bytes::from_static(b"*root*"),
             ))])),
             assignment_tracefile: None,
-            assignment_sep: "\n".to_string(),
 
             avoid_io: false,
             eval_depth: 0,
@@ -512,24 +529,38 @@ impl Evaluator {
             return Ok(());
         };
 
+        // sarun: the trace is JSONL — one self-contained record per line,
+        // written with a single write() call so concurrent in-process makes
+        // (which all share stderr / the file) interleave at line granularity
+        // instead of shredding a header/footer-framed document. A make that
+        // never touches a traced variable emits NOTHING. Each record carries
+        // \"make\" (the emitting make's working dir) to tell the streams apart.
         if filename == "-" {
             self.assignment_tracefile = Some(Box::new(std::io::stderr()));
         } else {
-            let f = std::fs::File::create(filename)?;
-            let w = BufWriter::new(f);
-            self.assignment_tracefile = Some(Box::new(w));
+            // Append, don't truncate: every nested make re-opens the file.
+            let f = std::fs::OpenOptions::new().create(true).append(true)
+                .open(filename)?;
+            self.assignment_tracefile = Some(Box::new(f));
         }
-
-        let tf = self.assignment_tracefile.as_mut().unwrap();
-        writeln!(tf, "{{")?;
-        write!(tf, "  \"assignments\": [")?;
         Ok(())
     }
 
     pub fn finish(&mut self) -> Result<()> {
         if let Some(tf) = self.assignment_tracefile.as_mut() {
-            write!(tf, " \n ]\n")?;
-            writeln!(tf, "}}")?;
+            tf.flush()?;
+        }
+        Ok(())
+    }
+
+    /// One JSONL trace record, emitted with a single write for line-atomic
+    /// interleaving across concurrent makes. `extra` fields come pre-escaped.
+    fn trace_emit(&mut self, body: String) -> Result<()> {
+        let make_dir = json_escape(&self.working_dir.to_string_lossy());
+        let line = format!("{{\"make\": \"{make_dir}\", {body}}}\n");
+        if let Some(tf) = self.assignment_tracefile.as_mut() {
+            tf.write_all(line.as_bytes())?;
+            tf.flush()?;
         }
         Ok(())
     }
@@ -1307,64 +1338,43 @@ impl Evaluator {
         if !self.is_traced(name) {
             return Ok(());
         }
-        let current_frame = self.current_frame();
-        let Some(tf) = self.assignment_tracefile.as_mut() else {
-            return Ok(());
+        let frame = {
+            let f = self.current_frame();
+            let mut desc = String::from_utf8_lossy(&f.name).into_owned();
+            if let Some(loc) = &f.location {
+                desc = format!("{desc} @ {loc}");
+            }
+            json_escape(&desc)
         };
-        write!(tf, "{}", self.assignment_sep)?;
-        self.assignment_sep = ",\n".to_string();
-        writeln!(tf, "    {{")?;
-        writeln!(tf, "      \"name\": \"{name}\",")?;
-        writeln!(tf, "      \"operation\": \"{operation}\",")?;
-        writeln!(tf, "      \"defined\": {},", var.is_some())?;
-        writeln!(tf, "      \"reference_stack\": [")?;
-        current_frame.print_json_trace(tf, 8)?;
-        writeln!(tf, "      ]")?;
-        write!(tf, "    }}")?;
-        Ok(())
+        let body = format!(
+            "\"name\": \"{name}\", \"op\": \"{operation}\", \
+             \"defined\": {}, \"frame\": \"{frame}\"",
+            var.is_some());
+        self.trace_emit(body)
     }
 
     pub fn trace_variable_assign(&mut self, name: &Symbol, var: &Var) -> Result<()> {
         if !self.is_traced(name) {
             return Ok(());
         }
-        let Some(tf) = self.assignment_tracefile.as_mut() else {
-            return Ok(());
-        };
-        write!(tf, "{}", self.assignment_sep)?;
-        self.assignment_sep = ",\n".to_string();
-        writeln!(tf, "    {{")?;
-        writeln!(tf, "      \"name\": \"{name}\",")?;
-        writeln!(tf, "      \"operation\": \"assign\",")?;
-        // sarun: emit the assignment LOCATION and the value's SOURCE form as
-        // readable strings (was the Variable's Rust debug dump — unusable for
-        // the "where did this value go wrong" hunt the trace exists for).
-        {
+        let (loc, value) = {
             let g = var.read();
-            if let Some(loc) = g.loc().as_ref() {
-                writeln!(tf, "      \"loc\": \"{loc}\",")?;
-            }
+            let loc = g.loc().as_ref().map(|l| l.to_string()).unwrap_or_default();
             let val = g.string().unwrap_or(std::borrow::Cow::Borrowed(b"?"));
-            let escaped: String = String::from_utf8_lossy(&val)
-                .chars()
-                .flat_map(|c| match c {
-                    '"' => vec!['\\', '"'],
-                    '\\' => vec!['\\', '\\'],
-                    '\n' => vec!['\\', 'n'],
-                    '\t' => vec!['\\', 't'],
-                    c => vec![c],
-                })
-                .collect();
-            writeln!(tf, "      \"value\": \"{escaped}\"")?;
-        }
-        if let Some(definition) = var.read().definition().clone() {
-            writeln!(tf, ",")?;
-            writeln!(tf, "      \"value_stack\": [")?;
-            definition.print_json_trace(tf, 8)?;
-            writeln!(tf, "      ]")?;
-        }
-        write!(tf, "    }}")?;
-        Ok(())
+            // Truncate huge values: a single write() stays line-atomic on
+            // pipes only up to PIPE_BUF, and nobody debugs a 100KB value by
+            // reading it whole.
+            let mut vs = String::from_utf8_lossy(&val).into_owned();
+            if vs.len() > 2000 {
+                vs.truncate(2000);
+                vs.push_str("…");
+            }
+            (json_escape(&loc), json_escape(&vs))
+        };
+        let body = format!(
+            "\"name\": \"{name}\", \"op\": \"assign\", \
+             \"loc\": \"{loc}\", \"value\": \"{value}\"");
+        self.trace_emit(body)
     }
 
     pub fn lookup_var_for_eval(&mut self, name: Symbol) -> Result<Option<Var>> {

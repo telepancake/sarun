@@ -741,6 +741,34 @@ fn install_make_recipe_runner() {
     }));
 }
 
+/// GNU-shaped `make --help` text for the embedded make: the options the
+/// embedded kati actually understands (anything else errors visibly, per the
+/// no-fallback rule). Printed by both the shadow and builtin entries.
+const MAKE_HELP: &str = "\
+Usage: make [options] [target] ...\n\
+Options (supported by sarun's embedded make):\n\
+  -C DIRECTORY                Change to DIRECTORY before doing anything.\n\
+  -f FILE                     Read FILE as a makefile.\n\
+  -j [N]                      Allow N jobs at once.\n\
+  -I DIRECTORY, --include-dir=DIRECTORY\n\
+                              Search DIRECTORY for included makefiles.\n\
+  -k                          Keep going when some targets can't be made.\n\
+  -n                          Don't actually run any recipe; just print them.\n\
+  -s, --silent, --quiet       Don't echo recipes.\n\
+  -r, --no-builtin-rules      Disable the built-in implicit rules.\n\
+  -R, --no-builtin-variables  Disable the built-in variable settings.\n\
+  -w, --print-directory / --no-print-directory\n\
+                              Print (or not) the working directory.\n\
+  -v, --version               Print the version number and exit.\n\
+  -h, --help                  Print this message and exit.\n\
+  NAME=VALUE                  Set variable NAME to VALUE.\n\
+Diagnostics:\n\
+  --dump_variable_assignment_trace=-  --variable_assignment_trace_filter=NAME\n\
+                              Trace every assignment/lookup of NAME (stderr).\n\
+\n\
+This is sarun's embedded make (kati); unsupported GNU make flags fail\n\
+visibly rather than falling back to a real make.\n";
+
 /// The embedded-make entrypoint. `argv` is the FULL process argv (argv[0] is
 /// `make`/`gmake`). Returns the process exit code.
 pub fn make_main(argv: &[String]) -> i32 {
@@ -761,6 +789,10 @@ pub fn make_main(argv: &[String]) -> i32 {
             println!("License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>");
             println!("This is free software: you are free to change and redistribute it.");
             println!("There is NO WARRANTY, to the extent permitted by law.");
+            return 0;
+        }
+        if a == "--help" || a == "-h" {
+            print!("{MAKE_HELP}");
             return 0;
         }
     }
@@ -941,6 +973,10 @@ pub fn make_builtin(
             let _ = writeln!(out, "License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>");
             let _ = writeln!(out, "This is free software: you are free to change and redistribute it.");
             let _ = writeln!(out, "There is NO WARRANTY, to the extent permitted by law.");
+            return 0;
+        }
+        if a == "--help" || a == "-h" {
+            let _ = write!(out, "{MAKE_HELP}");
             return 0;
         }
     }
