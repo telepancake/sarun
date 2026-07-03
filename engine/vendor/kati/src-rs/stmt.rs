@@ -418,3 +418,40 @@ impl UndefineStmt {
         })
     }
 }
+
+// sarun: the `vpath` DIRECTIVE (GNU: `vpath PATTERN DIRS`, `vpath PATTERN`
+// to clear one pattern, bare `vpath` to clear all). Evaluated in makefile
+// order; the accumulated pattern list drives dep.rs's directory search.
+pub struct VpathStmt {
+    loc: Loc,
+    orig: Bytes,
+    pub expr: Arc<Value>,
+}
+
+impl Statement for VpathStmt {
+    fn loc(&self) -> Loc {
+        self.loc.clone()
+    }
+    fn orig(&self) -> Bytes {
+        self.orig.clone()
+    }
+    fn eval(&self, ev: &mut Evaluator) -> Result<()> {
+        ev.eval_vpath(self)
+    }
+}
+
+impl Debug for VpathStmt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "VpathStmt({:?})", self.expr)
+    }
+}
+
+impl VpathStmt {
+    pub fn new(loc: Loc, expr: Arc<Value>) -> Arc<VpathStmt> {
+        Arc::new(VpathStmt {
+            loc,
+            orig: Bytes::new(),
+            expr,
+        })
+    }
+}

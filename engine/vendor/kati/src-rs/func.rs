@@ -776,6 +776,17 @@ fn call_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> R
         ));
     }
     let mut sv = Vec::new();
+    // GNU sets $(0) to the name of the function being expanded.
+    sv.push(ScopedGlobalVar::new(
+        ev.global_vars.clone(),
+        intern(b"0".to_vec()),
+        Variable::with_simple_string(
+            func_name_buf.clone(),
+            VarOrigin::Automatic,
+            None,
+            None,
+        ),
+    )?);
     let mut i = 1;
     loop {
         let tmpvar_name_sym = intern(format!("{i}"));

@@ -261,6 +261,9 @@ static USED_UNDEFINED_VARS: LazyLock<Mutex<HashSet<Symbol>>> =
 
 pub struct Evaluator {
     pub rule_vars: HashMap<Symbol, Arc<Vars>>,
+    /// sarun: accumulated `vpath PATTERN DIRS` directive entries, in
+    /// makefile order — consumed by dep.rs's directory search.
+    pub vpath_patterns: Vec<(Bytes, Vec<Bytes>)>,
     /// sarun: per-instance global variable bindings, indexed by Symbol id.
     /// Moved off the process-global symbol table (symtab `symbol_data`) so each
     /// Evaluator — i.e. each make invocation — owns its OWN global namespace.
@@ -358,6 +361,7 @@ impl Evaluator {
     pub fn new() -> Self {
         let ev = Self {
             rule_vars: HashMap::new(),
+            vpath_patterns: Vec::new(),
             global_vars: Arc::new(Mutex::new(Vec::new())),
             working_dir: std::env::current_dir().unwrap_or_default(),
             include_dirs: Vec::new(),
@@ -1257,6 +1261,33 @@ impl Evaluator {
             }
         }
 
+        Ok(())
+    }
+
+    /// `vpath PATTERN DIRS` appends a pattern-scoped search entry;
+    /// `vpath PATTERN` clears that pattern's entries; bare `vpath` clears
+    /// everything. DIRS split on colons and whitespace, like GNU.
+    pub fn eval_vpath(&mut self, stmt: &crate::stmt::VpathStmt) -> Result<()> {
+        self.loc = Some(stmt.loc());
+        self.in_rule = false;
+        let line = stmt.expr.eval_to_buf(self)?;
+        let mut words = word_scanner(&line);
+        let Some(pat) = words.next() else {
+            self.vpath_patterns.clear();
+            return Ok(());
+        };
+        let pat = line.slice_ref(pat);
+        let mut dirs: Vec<Bytes> = vec![];
+        for w in words {
+            for part in w.split(|&b| b == b':').filter(|p| !p.is_empty()) {
+                dirs.push(line.slice_ref(part));
+            }
+        }
+        if dirs.is_empty() {
+            self.vpath_patterns.retain(|(p, _)| p != &pat);
+        } else {
+            self.vpath_patterns.push((pat, dirs));
+        }
         Ok(())
     }
 

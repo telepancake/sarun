@@ -411,6 +411,10 @@ struct DepBuilder<'a> {
     suffix_rules: SuffixRuleMap,
 
     first_rule: Option<Symbol>,
+    // GNU's known-suffix list (.SUFFIXES; defaults below). Used for the
+    // explicit-rule $* stem: a target ending in a known suffix gets
+    // `target minus suffix` as its stem, exactly like GNU make.
+    known_suffixes: Vec<Bytes>,
     // sarun: set when `.SECONDEXPANSION:` was seen. Triggers a second
     // pass of prereq expansion when building targets, where `$$...`
     // tokens that survived the first parse get re-evaluated against the
@@ -426,6 +430,8 @@ struct DepBuilder<'a> {
     // executor's stat see the real file) — the Linux kernel's out-of-tree
     // builds (`VPATH := $(srctree)`) resolve every source file this way.
     vpath_dirs: Vec<Bytes>,
+    // `vpath PATTERN DIRS` directive entries (pattern-scoped search).
+    vpath_patterns: Vec<(Bytes, Vec<Bytes>)>,
     depfile_var_name: Symbol,
     implicit_outputs_var_name: Symbol,
     ninja_pool_var_name: Symbol,
@@ -461,6 +467,7 @@ impl<'a> DepBuilder<'a> {
             }
             dirs
         };
+        let vpath_patterns = ev.vpath_patterns.clone();
         let mut ret = Self {
             ev,
             rules: HashMap::new(),
@@ -471,6 +478,14 @@ impl<'a> DepBuilder<'a> {
             suffix_rules: HashMap::new(),
 
             first_rule: None,
+            // GNU make's default suffix list (src/default.c default_suffixes).
+            known_suffixes: [
+                ".out", ".a", ".ln", ".o", ".c", ".cc", ".C", ".cpp", ".p",
+                ".f", ".F", ".m", ".r", ".y", ".l", ".ym", ".yl", ".s",
+                ".S", ".mod", ".sym", ".def", ".h", ".info", ".dvi", ".tex",
+                ".texinfo", ".texi", ".txinfo", ".w", ".ch", ".web", ".sh",
+                ".elc", ".el",
+            ].iter().map(|s| Bytes::from_static(s.as_bytes())).collect(),
             secondexpansion: false,
             done: HashMap::new(),
             phony: HashSet::new(),
@@ -481,6 +496,7 @@ impl<'a> DepBuilder<'a> {
             validations_var_name: intern(".KATI_VALIDATIONS"),
             tags_var_name: intern(".KATI_TAGS"),
             vpath_dirs,
+            vpath_patterns,
         };
         let _tr = ScopedTimeReporter::new("make dep (populate)");
         ret.populate_rules()?;
@@ -509,6 +525,14 @@ impl<'a> DepBuilder<'a> {
         if let Some((targets, _loc)) = self.get_rule_inputs(intern(".SUFFIXES")) {
             if targets.is_empty() {
                 self.suffix_rules.clear();
+                self.known_suffixes.clear();
+            } else {
+                for t in &targets {
+                    let b = Bytes::copy_from_slice(&t.as_bytes());
+                    if !self.known_suffixes.contains(&b) {
+                        self.known_suffixes.push(b);
+                    }
+                }
             }
             // sarun: `.SUFFIXES: .foo` adds suffixes to make's list. Kati
             // doesn't actually drive suffix-rule lookup the same way, but
@@ -681,7 +705,7 @@ impl<'a> DepBuilder<'a> {
     /// to `dir/name` (matching GNU's behavior for files that don't need to be
     /// rebuilt — the common case VPATH exists for: out-of-tree source files).
     fn vpath_resolve(&self, sym: Symbol) -> Option<Symbol> {
-        if self.vpath_dirs.is_empty() {
+        if self.vpath_dirs.is_empty() && self.vpath_patterns.is_empty() {
             return None;
         }
         let bytes = sym.as_bytes();
@@ -695,7 +719,15 @@ impl<'a> DepBuilder<'a> {
         if std::fs::exists(self.ev.working_dir.join(rel)).is_ok_and(|v| v) {
             return None;
         }
-        for dir in &self.vpath_dirs {
+        // Search order: the VPATH variable's directories, then matching
+        // `vpath PATTERN` entries in makefile order.
+        let pattern_dirs: Vec<&Bytes> = self
+            .vpath_patterns
+            .iter()
+            .filter(|(p, _)| Pattern::new(p.clone()).matches(&bytes))
+            .flat_map(|(_, dirs)| dirs.iter())
+            .collect();
+        for dir in self.vpath_dirs.iter().chain(pattern_dirs.into_iter()) {
             let mut cand = bytes::BytesMut::with_capacity(dir.len() + 1 + bytes.len());
             cand.extend_from_slice(dir);
             if !dir.ends_with(b"/") {
@@ -1206,6 +1238,27 @@ impl<'a> DepBuilder<'a> {
             .unwrap_or_else(RuleMerger::new)
             .lock()
             .fill_dep_node(output, &picked_rule_info.pattern_rule, &n);
+
+        // GNU sets $* for EXPLICIT rules too: when the target ends in a
+        // known suffix (.SUFFIXES), the stem is the target minus that
+        // suffix. Model it as a %suffix output pattern so AutoCommand::Star
+        // computes the same stem it does for pattern rules.
+        {
+            let mut node = n.lock();
+            if node.output_pattern.is_none() {
+                let ob = output.as_bytes();
+                let base_start = ob.iter().rposition(|&c| c == b'/').map_or(0, |i| i + 1);
+                if let Some(dot) = ob[base_start..].iter().rposition(|&c| c == b'.') {
+                    let sufx = &ob[base_start + dot..];
+                    if self.known_suffixes.iter().any(|k| k == sufx) {
+                        let mut pat = BytesMut::with_capacity(sufx.len() + 1);
+                        pat.put_u8(b'%');
+                        pat.put_slice(sufx);
+                        node.output_pattern = Some(intern(pat.freeze()));
+                    }
+                }
+            }
+        }
 
         let mut sv = Vec::new();
         let frame = self.ev.enter(

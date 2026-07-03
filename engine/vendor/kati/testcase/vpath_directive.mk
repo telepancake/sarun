@@ -1,5 +1,3 @@
-# TODO: Implement vpath.
-
 vpath %.c dir
 
 test: bar

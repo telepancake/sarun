@@ -633,6 +633,17 @@ impl Parser {
         self.create_export(line, false)
     }
 
+    fn parse_vpath(&mut self, line: Bytes) -> Result<()> {
+        let loc = self.loc.clone();
+        let mut mutable_loc = loc.clone();
+        let expr = parse_expr(&mut mutable_loc, line, ParseExprOpt::Normal)?;
+        self.out_stmts
+            .lock()
+            .push(crate::stmt::VpathStmt::new(loc, expr));
+        self.after_rule = false;
+        Ok(())
+    }
+
     fn parse_undefine(&mut self, line: Bytes) -> Result<()> {
         if line.is_empty() {
             error_loc!(Some(&self.loc), "*** empty variable name.");
@@ -690,6 +701,7 @@ impl Parser {
             b"export" => self.parse_export(rest)?,
             b"unexport" => self.parse_unexport(&rest)?,
             b"undefine" => self.parse_undefine(rest)?,
+            b"vpath" => self.parse_vpath(rest)?,
             _ => return Ok(false),
         }
         Ok(true)
