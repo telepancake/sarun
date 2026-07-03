@@ -18,8 +18,10 @@ use anyhow::{anyhow, bail, Context, Result};
 
 /// Default model: Qwen3-0.6B, the smallest broadly-available instruct model
 /// with real tool-calling support in llama.cpp's chat templates (--jinja).
-const DEFAULT_MODEL_URL: &str = "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/\
-                                 resolve/main/Qwen3-0.6B-Q8_0.gguf";
+/// Q4_K_M quant (~378 MiB — roughly half the Q8_0's 610 MiB) from unsloth,
+/// which publishes the sub-Q8 quants the official Qwen repo omits.
+const DEFAULT_MODEL_URL: &str = "https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/\
+                                 resolve/main/Qwen3-0.6B-Q4_K_M.gguf";
 
 /// Latest-release metadata for the CPU runtime; the ubuntu-x64 CPU asset is
 /// picked out of it (see pick_runtime_asset).
@@ -40,7 +42,7 @@ USAGE:
   --port N         listen port for the local server (default 18181)
   --dir DIR        where model+runtime live (default $XDG_DATA_HOME/oaita-local
                    — outside sarun's own dirs, which boxes cannot see)
-  --model-url URL  GGUF to fetch (default Qwen3-0.6B-Q8_0 from Hugging Face)
+  --model-url URL  GGUF to fetch (default Qwen3-0.6B-Q4_K_M, ~378 MiB, HF)
   --runtime-url URL  llama.cpp release zip (default: latest CPU ubuntu-x64)
   --setup-only     alias for the default (download only; never serves)
   --write-config   overwrite an existing oaita.toml (backed up to .bak)
@@ -608,8 +610,12 @@ fn serve(dir: &Path, model: &Path, port: u16, svc: Option<&str>) -> Result<()> {
     eprintln!("starting {} on 127.0.0.1:{port} …", server.display());
     let mut child = std::process::Command::new(&server)
         .arg("-m").arg(model)
+        // 32k context: the oaita agent harness prompt + tool schemas alone
+        // is ~4k tokens, and tool-result turns accumulate — 8k overflowed
+        // after a couple of steps (llama.cpp then errors mid-stream). Qwen3
+        // handles 32k natively; the KV cache for a 0.6B model is modest.
         .args(["--host", "127.0.0.1", "--port", &port.to_string(),
-               "--jinja", "-c", "8192"])
+               "--jinja", "-c", "32768"])
         // extracted shared libs sit next to the binary
         .env("LD_LIBRARY_PATH", dir)
         .spawn()
