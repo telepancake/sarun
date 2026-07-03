@@ -1,7 +1,0 @@
-
-define nl
-
-
-endef
-
-$(nl)

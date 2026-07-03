@@ -1,1 +1,0 @@
-$(info $(MAKE_VERSION))

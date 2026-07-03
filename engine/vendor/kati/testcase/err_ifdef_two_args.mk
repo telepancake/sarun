@@ -1,2 +1,0 @@
-ifdef a b
-endif
