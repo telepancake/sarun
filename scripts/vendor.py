@@ -208,7 +208,11 @@ def working_delta(name, baseline):
             skip = "/.stamp" in line or "/target/" in line
         if not skip:
             kept.append(line)
-    return "\n".join(kept)
+    joined = "\n".join(kept)
+    # a diff must end with a newline or `git apply` sees a corrupt patch
+    if joined and not joined.endswith("\n"):
+        joined += "\n"
+    return joined
 
 
 def cmd_diff(name):
