@@ -18,6 +18,54 @@ diffs, never upstream source.
 root (for git sources with a `subdir`, relative to that subdir). Files the
 patches *create* are not listed — they arrive with the series.
 
+## The garden path (day-to-day commands)
+
+Everything below is `scripts/vendor.py` (also: `scripts/vendor.py help`).
+The loop is always: **edit the assembled tree, then capture**. You never edit
+patch files by hand on the happy path.
+
+**Change vendored code (new logical change):**
+
+```bash
+make vendor                                  # assemble (no-op when stamped)
+$EDITOR engine/vendor/<crate>/src/…          # hack until build+tests are green
+python3 scripts/vendor.py diff <crate>       # review your delta vs the series
+python3 scripts/vendor.py refresh <crate> -m "what and why"   # mint NNNN-*.patch
+python3 scripts/vendor.py check <crate>      # series reproduces the tree — commit
+git add engine/vendor-patches/<crate> && git commit
+```
+
+**Fix up the most recent patch instead of minting a new one:**
+
+```bash
+python3 scripts/vendor.py refresh <crate> --amend
+```
+
+**Add a new external codebase:**
+
+```bash
+python3 scripts/vendor.py add <crate> --version 1.2.3            # crates.io
+python3 scripts/vendor.py add <crate> --git URL --commit HASH [--subdir DIR]
+# → pins it in vendor.toml, writes vendor-patches/<crate>/{files,series},
+#   assembles the pristine tree. Prune dev-only trees from `files` if wanted,
+#   then hack + refresh as above.
+```
+
+**Update an existing external codebase:**
+
+```bash
+$EDITOR engine/vendor.toml        # bump version+sha256 / commit
+make vendor                       # reapplies the series onto the new base
+# a patch that no longer applies fails LOUDLY with re-spin instructions;
+# fix that one patch, rerun. Never fold patches while re-spinning.
+```
+
+`refresh` restamps the assembled tree, so a following `make vendor`/`make
+engine` won't clobber what you're running; `check <crate>` is the proof the
+series reproduces it. `--force [crate]` reassembles from scratch (also the
+undo button: delete a bad patch from `series`, `--force`, and the tree is
+back to the recorded state).
+
 ## What is vendored, and how it is consumed
 
 | crate | upstream | pinned at | wired into the engine via | what we changed |

@@ -109,11 +109,17 @@ are the quick check for UI/logic/rules changes.
 patched forks so they run as in-process brush builtins. `engine/vendor/` is
 GENERATED — assembled by `make vendor` (`scripts/vendor.py`) from pinned
 pristine upstreams (`engine/vendor.toml`) plus a never-squashed patch series
-per crate (`engine/vendor-patches/<crate>/`); never edit or commit assembled
-source. The model, per-crate provenance, and the update procedure are in
-`engine/vendor-patches/README.md`; the how-to-port guide is
-`engine/vendor-patches/PORTING-STORY.md`. Read those before touching a
-vendored crate.
+per crate (`engine/vendor-patches/<crate>/`); never edit or commit a patch
+by hand on the happy path. The day-to-day loop:
+
+    make vendor                                  # assemble
+    $EDITOR engine/vendor/<crate>/…              # hack until green
+    python3 scripts/vendor.py refresh <crate> -m "subject"   # mint the patch
+    python3 scripts/vendor.py check <crate>      # proof, then commit vendor-patches/
+
+`vendor.py diff` reviews the delta, `refresh --amend` folds into the last
+patch, `add` pins a new upstream, editing `vendor.toml` + `make vendor`
+updates one. Full garden path: `engine/vendor-patches/README.md`.
 
 ## Branch / workflow
 
