@@ -1825,6 +1825,12 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
                 })
                 .collect())
         }
+        // Is a named svc.serve service live (≥1 parked accept slot)? Used by
+        // `oaita local` to poll readiness / idempotency without racing.
+        "svc.up" => {
+            let name = args.first().and_then(Value::as_str).unwrap_or("");
+            json!({"up": svc_has(name)})
+        }
         "oci.resolve" => {
             let Some(reference) = args.first().and_then(Value::as_str) else {
                 return json!({"ok": false, "error": "oci.resolve: missing reference"});
@@ -2415,6 +2421,14 @@ static SVC_PARKED: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<
         String, std::collections::VecDeque<UnixStream>>>>
     = std::sync::LazyLock::new(Default::default);
+
+/// Whether a named svc.serve service currently has ≥1 parked accept slot
+/// (i.e. its box is up and bridging). The serving box parks several slots
+/// and re-parks after each pairing, so this reliably reflects "up" under
+/// the sequential calls an agent makes.
+pub fn svc_has(name: &str) -> bool {
+    SVC_PARKED.lock().unwrap().get(name).is_some_and(|q| !q.is_empty())
+}
 
 /// Pop the first LIVE parked slot for `name` (a dead slot — its box exited
 /// — fails the "paired" write and the next one is tried).
