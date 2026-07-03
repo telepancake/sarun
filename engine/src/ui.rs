@@ -468,6 +468,11 @@ enum Action {
     DiscardHunk,
     ApplyBox,
     DiscardBox,
+    /// Box removal from the context menu, mirroring the K / D keys: dissolve
+    /// (finalize by rules, keep children, remove) and kill (SIGTERM). Both
+    /// open a Confirm modal so they're never a one-keystroke accident.
+    DissolveBox,
+    KillBox,
     StartRename,
     EditRule,
     NewRule,
@@ -577,7 +582,6 @@ enum ClauseField {
 #[cfg_attr(test, allow(dead_code))]
 enum ConfirmAction {
     Kill,
-    Delete,
     Dissolve,
 }
 
@@ -3788,15 +3792,6 @@ impl App {
         self.refresh_sessions();
     }
 
-    #[cfg_attr(test, allow(dead_code))]
-    fn delete(&mut self) {
-        let (ok, err, why) = self.box_op_over_selection("delete");
-        self.status = if err == 0 { format!("deleted {ok} box(es)") }
-                      else { format!("deleted {ok}, {err} failed: {}",
-                                     why.unwrap_or_default()) };
-        self.refresh_sessions();
-        self.load_changes();
-    }
 
     #[cfg_attr(test, allow(dead_code))]
     fn dissolve(&mut self) {
@@ -3813,7 +3808,6 @@ impl App {
     fn run_confirm(&mut self, action: ConfirmAction) {
         match action {
             ConfirmAction::Kill => self.kill(),
-            ConfirmAction::Delete => self.delete(),
             ConfirmAction::Dissolve => self.dissolve(),
         }
     }
@@ -6265,7 +6259,7 @@ enum PaneAction {
     Quit, Detach,
     MoveDown, MoveUp, NextPane, Open,
     ApplyHunk, DiscardHunk, ApplyFile, DiscardFile, ApplyAll, DiscardAll,
-    ConfirmKill, ConfirmDelete, ConfirmDissolve,
+    ConfirmKill, ConfirmDissolve,
     NewRule, DeleteRule, StartRename,
     ToggleFilter, Refresh, ActionMenu, ToggleTree, ToggleRunningOnly, ToggleProcRunning,
     ToggleEdgeRunning,
@@ -6304,8 +6298,7 @@ const PANE_ACTION_KEYS: &[(Key, PaneGate, PaneAction, Option<&str>)] = &[
     (Key::Char('A'), PaneGate::Any,             PaneAction::ApplyAll,        Some("apply ALL the box's changes")),
     (Key::Char('X'), PaneGate::Any,             PaneAction::DiscardAll,      Some("discard ALL the box's changes")),
     (Key::Char('K'), PaneGate::Any,             PaneAction::ConfirmKill,     Some("kill box (SIGTERM, y/n)")),
-    (Key::Char('D'), PaneGate::Any,             PaneAction::ConfirmDelete,   Some("delete box + captures (nested child boxes kept) (y/n)")),
-    (Key::Char('Z'), PaneGate::Any,             PaneAction::ConfirmDissolve, Some("dissolve box (y/n)")),
+    (Key::Char('D'), PaneGate::Any,             PaneAction::ConfirmDissolve, Some("delete box: finalize changes by file-rules, keep child boxes (y/n)")),
     (Key::Char('t'), PaneGate::On(Pane::Pipelines), PaneAction::ToggleTree,  Some("toggle tree / flat chronological (on Pipes)")),
     (Key::Char('f'), PaneGate::On(Pane::Pipelines), PaneAction::ToggleRunningOnly, Some("toggle running-only (on Pipes)")),
     (Key::Char('f'), PaneGate::On(Pane::Processes), PaneAction::ToggleProcRunning, Some("toggle running-only (on Procs)")),
@@ -6351,14 +6344,10 @@ fn run_pane_action(app: &mut App, action: PaneAction) {
             prompt: format!("Kill (SIGTERM) {}?", app.box_op_scope_label()),
             action: ConfirmAction::Kill,
         }),
-        PaneAction::ConfirmDelete => app.modal = Some(Modal::Confirm {
-            prompt: format!("Delete {} and their captures? (any nested child \
-                             boxes are kept, re-homed onto the parent)",
-                            app.box_op_scope_label()),
-            action: ConfirmAction::Delete,
-        }),
         PaneAction::ConfirmDissolve => app.modal = Some(Modal::Confirm {
-            prompt: format!("Dissolve {} (unmount/cleanup)?",
+            prompt: format!("Delete {}? Changes are finalized by your \
+                             file-rules (apply-matched → host, the rest \
+                             discarded); any nested child boxes are kept.",
                             app.box_op_scope_label()),
             action: ConfirmAction::Dissolve,
         }),
@@ -6526,6 +6515,7 @@ fn fkey_labels(app: &App) -> [&'static str; 11] {
         if pty_pane { "PtyKill" }
         else if hunks || changes { "Discard" }
         else if rules { "DelRule" }
+        else if sessions { "Delete" }   // box: dissolve (keep children)
         else { "·" }, // F8
         "Menu",     // F9 (menubar nav)
         "Quit",     // F10  — always
@@ -8874,8 +8864,11 @@ fn pane_action_menu(app: &App) -> Option<(String, Vec<ActionItem>)> {
                 .unwrap_or("").to_string();
             let mut items = vec![
                 mk("Open changes view", "Enter",  Action::OpenSelection),
-                mk("Apply ALL changes", "a/F5",   Action::ApplyBox),
-                mk("Discard ALL changes", "x/F8", Action::DiscardBox),
+                mk("Apply ALL changes to host", "a", Action::ApplyBox),
+                mk("Delete box (finalize by rules, keep child boxes)", "D",
+                   Action::DissolveBox),
+                mk("Discard ALL changes", "x",    Action::DiscardBox),
+                mk("Kill (SIGTERM)",    "K",      Action::KillBox),
                 mk("Rename box",        "r/F6",   Action::StartRename),
                 mk("New box from image…", "F7",   Action::NewFromImage),
                 mk("oaita agent session on this box…", "",
@@ -8950,6 +8943,17 @@ fn run_action(app: &mut App, a: Action) {
         Action::DiscardHunk    => app.discard_hunk(),
         Action::ApplyBox       => app.apply(),
         Action::DiscardBox     => app.discard(),
+        Action::DissolveBox    => app.modal = Some(Modal::Confirm {
+            prompt: format!("Delete {}? Changes are finalized by your \
+                             file-rules (apply-matched → host, the rest \
+                             discarded); any nested child boxes are kept.",
+                            app.box_op_scope_label()),
+            action: ConfirmAction::Dissolve,
+        }),
+        Action::KillBox        => app.modal = Some(Modal::Confirm {
+            prompt: format!("Kill (SIGTERM) {}?", app.box_op_scope_label()),
+            action: ConfirmAction::Kill,
+        }),
         Action::StartRename    => app.renaming = Some(String::new()),
         Action::EditRule       => {
             let cur = app.rules.get(app.sel_rule).cloned().unwrap_or_default();
@@ -9863,6 +9867,18 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                             if app.focus == Pane::Hunks { app.discard_hunk(); }
                             else if app.focus == Pane::Changes { app.discard(); }
                             else if app.focus == Pane::Rules { app.delete_rule(); }
+                            else if app.focus == Pane::Sessions {
+                                // Box "Delete" = dissolve (finalize by rules,
+                                // keep children); guarded by a Confirm modal.
+                                app.modal = Some(Modal::Confirm {
+                                    prompt: format!("Delete {}? Changes are \
+                                        finalized by your file-rules \
+                                        (apply-matched → host, the rest \
+                                        discarded); any nested child boxes \
+                                        are kept.", app.box_op_scope_label()),
+                                    action: ConfirmAction::Dissolve,
+                                });
+                            }
                         }
                         9 => {
                             // F9 enters menu-nav mode: highlight a
@@ -10883,7 +10899,7 @@ mod tests {
         // open a Confirm for delete; the box must still be present.
         app.modal = Some(Modal::Confirm {
             prompt: "Delete?".into(),
-            action: ConfirmAction::Delete,
+            action: ConfirmAction::Dissolve,
         });
         let buf = render_to_string(&app, 100, 30).unwrap();
         assert!(buf.contains("confirm"), "confirm modal title missing:\n{buf}");
@@ -10893,7 +10909,7 @@ mod tests {
             "box should still exist while only the modal is open"
         );
         // running the guarded action actually deletes it.
-        app.run_confirm(ConfirmAction::Delete);
+        app.run_confirm(ConfirmAction::Dissolve);
         assert!(
             !app.sessions.iter().any(|s| s.get("session_id").and_then(Value::as_str) == Some(&sid)),
             "box should be gone after the confirmed delete; status={}",
@@ -11679,28 +11695,27 @@ mod tests {
         // a cancel key ('n') clears the modal and notes "cancelled".
         let mut app = headless_app();
         app.modal = Some(Modal::Confirm {
-            prompt: "Delete?".into(), action: ConfirmAction::Delete });
+            prompt: "Delete?".into(), action: ConfirmAction::Dissolve });
         handle_modal_key(&mut app, KeyCode::Char('n'), none);
         assert!(app.modal.is_none(), "'n' should dismiss the Confirm modal");
         assert_eq!(app.status, "cancelled");
         // Esc is also a cancel key in the table.
         app.modal = Some(Modal::Confirm {
-            prompt: "Delete?".into(), action: ConfirmAction::Delete });
+            prompt: "Delete?".into(), action: ConfirmAction::Dissolve });
         handle_modal_key(&mut app, KeyCode::Esc, none);
         assert!(app.modal.is_none(), "Esc should dismiss the Confirm modal");
         // a key NOT in the table re-arms the modal (the old `_ =>` arm).
         app.modal = Some(Modal::Confirm {
-            prompt: "Delete?".into(), action: ConfirmAction::Delete });
+            prompt: "Delete?".into(), action: ConfirmAction::Dissolve });
         handle_modal_key(&mut app, KeyCode::Char('z'), none);
         assert!(matches!(app.modal, Some(Modal::Confirm { .. })),
                 "an unbound key must leave the Confirm modal up");
 
         // ── per-pane action keys (PANE_ACTION_KEYS) ──
-        // 'K' opens a Kill Confirm; 'D' a Delete Confirm; 'Z' a Dissolve one.
+        // 'K' opens a Kill Confirm; 'D' the box-delete (dissolve) Confirm.
         for (key, want) in [
             ('K', ConfirmAction::Kill),
-            ('D', ConfirmAction::Delete),
-            ('Z', ConfirmAction::Dissolve),
+            ('D', ConfirmAction::Dissolve),
         ] {
             let mut app = headless_app();
             app.focus = Pane::Sessions;
