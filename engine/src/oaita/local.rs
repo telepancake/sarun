@@ -469,9 +469,30 @@ fn install_runtime_file(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Flatten the useful payload of a llama.cpp release archive (server binary
-/// + its shared libs live under build/bin/) into `dir`. Handles both the
-/// current .tar.gz assets and the older .zip ones. Returns files written.
+/// Basename of an archive path.
+fn base_of(p: &str) -> String {
+    Path::new(p).file_name().and_then(|s| s.to_str())
+        .unwrap_or("").to_string()
+}
+
+/// Recreate a (flattened) symlink `name -> target-basename` in `dir`. The
+/// SONAME chain a llama.cpp release ships (`libfoo.so.0 -> libfoo.so.0.1.2`)
+/// is same-directory relative, so flattening keeps it valid.
+fn install_symlink(dir: &Path, name: &str, target: &str) -> Result<()> {
+    let p = dir.join(name);
+    let _ = std::fs::remove_file(&p);
+    std::os::unix::fs::symlink(base_of(target), &p)
+        .with_context(|| format!("symlink {name} -> {target}"))?;
+    Ok(())
+}
+
+/// Flatten the useful payload of a llama.cpp release archive (the server
+/// binary + its shared libs live under build/bin/) into `dir`. Handles the
+/// current .tar.gz assets and the older .zip ones — AND the SONAME symlinks
+/// (`libfoo.so.0 -> libfoo.so.0.1.2`): the binary's DT_NEEDED names the
+/// symlink, so dropping it (as "not a regular file") is exactly why
+/// llama-server failed with `libllama-common.so.0: cannot open shared
+/// object file`. Returns entries written.
 fn extract_runtime(archive: &Path, dir: &Path) -> Result<usize> {
     let is_zip = archive.extension().is_some_and(|e| e == "zip");
     let mut n = 0;
@@ -481,12 +502,16 @@ fn extract_runtime(archive: &Path, dir: &Path) -> Result<usize> {
         for i in 0..z.len() {
             let mut e = z.by_index(i).context("zip entry")?;
             if e.is_dir() { continue; }
-            let name = Path::new(e.name()).file_name()
-                .and_then(|s| s.to_str()).unwrap_or("").to_string();
+            let name = base_of(e.name());
             if !keep_runtime_file(&name) { continue; }
+            let is_link = e.unix_mode().is_some_and(|m| m & 0o170000 == 0o120000);
             let mut buf = Vec::new();
             e.read_to_end(&mut buf).context("read zip entry")?;
-            install_runtime_file(dir, &name, &buf)?;
+            if is_link {
+                install_symlink(dir, &name, &String::from_utf8_lossy(&buf))?;
+            } else {
+                install_runtime_file(dir, &name, &buf)?;
+            }
             n += 1;
         }
     } else {
@@ -495,16 +520,23 @@ fn extract_runtime(archive: &Path, dir: &Path) -> Result<usize> {
         let mut t = tar::Archive::new(gz);
         for e in t.entries().context("read runtime tar")? {
             let mut e = e.context("tar entry")?;
-            if !e.header().entry_type().is_file() { continue; }
+            let et = e.header().entry_type();
             let name = e.path().ok()
                 .and_then(|p| p.file_name()
                     .and_then(|s| s.to_str()).map(str::to_string))
                 .unwrap_or_default();
             if !keep_runtime_file(&name) { continue; }
-            let mut buf = Vec::new();
-            e.read_to_end(&mut buf).context("read tar entry")?;
-            install_runtime_file(dir, &name, &buf)?;
-            n += 1;
+            if et.is_symlink() {
+                if let Ok(Some(link)) = e.link_name() {
+                    install_symlink(dir, &name, &link.to_string_lossy())?;
+                    n += 1;
+                }
+            } else if et.is_file() {
+                let mut buf = Vec::new();
+                e.read_to_end(&mut buf).context("read tar entry")?;
+                install_runtime_file(dir, &name, &buf)?;
+                n += 1;
+            }
         }
     }
     Ok(n)
@@ -744,7 +776,9 @@ mod tests {
             let mut t = tar::Builder::new(gz);
             for (name, body) in [
                 ("build/bin/llama-server", b"ELF".as_slice()),
-                ("build/bin/libggml-base.so", b"ELF".as_slice()),
+                // real SONAME file + the versioned symlink the binary links
+                // against (libllama-common.so.0), which used to be dropped.
+                ("build/bin/libllama-common.so.0.1.2", b"ELF".as_slice()),
                 ("build/bin/llama-cli", b"ELF".as_slice()),
                 ("README.md", b"docs".as_slice()),
             ] {
@@ -754,15 +788,29 @@ mod tests {
                 h.set_cksum();
                 t.append_data(&mut h, name, body).unwrap();
             }
+            // the SONAME symlink: libllama-common.so.0 -> ...so.0.1.2
+            let mut hl = tar::Header::new_gnu();
+            hl.set_entry_type(tar::EntryType::Symlink);
+            hl.set_size(0);
+            hl.set_mode(0o777);
+            t.append_link(&mut hl, "build/bin/libllama-common.so.0",
+                          "libllama-common.so.0.1.2").unwrap();
             t.into_inner().unwrap().finish().unwrap().flush().unwrap();
         }
         let out = tmp.join("out");
         std::fs::create_dir_all(&out).unwrap();
         let n = extract_runtime(&tp, &out).unwrap();
-        assert_eq!(n, 2, "server + lib; no cli/docs");
+        assert_eq!(n, 3, "server + real lib + SONAME symlink; no cli/docs");
         assert!(out.join("llama-server").is_file());
-        assert!(out.join("libggml-base.so").is_file());
+        assert!(out.join("libllama-common.so.0.1.2").is_file());
         assert!(!out.join("llama-cli").exists());
+        // THE fix: the versioned SONAME symlink is preserved and resolves,
+        // so the loader finds libllama-common.so.0.
+        let link = out.join("libllama-common.so.0");
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink(),
+                "SONAME must be a symlink");
+        assert!(std::fs::read(&link).is_ok(),
+                "SONAME symlink must resolve to the real lib");
         std::fs::remove_dir_all(&tmp).ok();
     }
 
