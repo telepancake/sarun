@@ -692,6 +692,16 @@ struct App {
     edges_running_only: bool,
     sel_session: usize,
     sel_change: usize,
+    /// Multi-select marks for batch apply/discard/delete on the Boxes and
+    /// Changes lists. Keys are stable row identities (a box's session_id, or a
+    /// change's path) so they survive re-sorts / window refreshes. `mark_scope`
+    /// records WHICH list the marks belong to (marks only apply when the
+    /// focused pane matches). `mark_anchor` is the cursor index the last Space
+    /// set, used by the `[` / `]` range-fill. Space toggles, `[`/`]` fill the
+    /// range from the anchor to the cursor, Esc clears.
+    marks: std::collections::HashSet<String>,
+    mark_scope: Option<Pane>,
+    mark_anchor: Option<usize>,
     sel_proc: usize,
     sel_pipeline: usize,
     sel_edge: usize,
@@ -927,6 +937,9 @@ impl App {
             edges_running_only: true,
             sel_session: 0,
             sel_change: 0,
+            marks: std::collections::HashSet::new(),
+            mark_scope: None,
+            mark_anchor: None,
             sel_proc: 0, sel_pipeline: 0, sel_edge: 0,
             sel_output: 0,
             sel_api_log: 0,
@@ -3531,7 +3544,161 @@ impl App {
         Value::Null
     }
 
+    // ── multi-select (Space / [ / ] / Esc) ─────────────────────────────────
+    //
+    // Selection is only meaningful on the two lists that carry batchable rows:
+    // Boxes (Sessions) and Changes. Everywhere else Space/[/] are no-ops.
+
+    /// The focused pane IF it supports multi-select, else None.
+    fn selectable_pane(&self) -> Option<Pane> {
+        match self.focus {
+            Pane::Sessions | Pane::Changes => Some(self.focus),
+            _ => None,
+        }
+    }
+
+    /// Stable row keys (in display order) for the focused selectable list:
+    /// box session_ids for Sessions, change paths for Changes.
+    fn mark_row_keys(&self) -> Vec<String> {
+        match self.focus {
+            Pane::Sessions => self.sessions.iter()
+                .filter_map(|s| s.get("session_id").and_then(Value::as_str)
+                    .map(String::from)).collect(),
+            Pane::Changes => self.visible_changes().iter()
+                .filter_map(|c| c.get("path").and_then(Value::as_str)
+                    .map(String::from)).collect(),
+            _ => vec![],
+        }
+    }
+
+    /// Cursor index within the focused selectable list.
+    fn mark_cursor(&self) -> usize {
+        match self.focus {
+            Pane::Sessions => self.sel_session,
+            Pane::Changes => self.sel_change,
+            _ => 0,
+        }
+    }
+
+    /// Marks belong to one list at a time: switching lists (or boxes, for
+    /// Changes) drops a stale selection so a batch action never spans lists.
+    fn ensure_mark_scope(&mut self) {
+        if self.mark_scope != Some(self.focus) {
+            self.marks.clear();
+            self.mark_anchor = None;
+            self.mark_scope = self.selectable_pane();
+        }
+    }
+
+    /// Space — toggle the cursor row's mark and set it as the range anchor.
+    fn toggle_mark(&mut self) {
+        if self.selectable_pane().is_none() {
+            self.status = "select works on the Boxes and Changes lists".into();
+            return;
+        }
+        self.ensure_mark_scope();
+        let idx = self.mark_cursor();
+        if let Some(k) = self.mark_row_keys().get(idx).cloned() {
+            if !self.marks.remove(&k) { self.marks.insert(k); }
+            self.mark_anchor = Some(idx);
+            self.status = format!("{} selected", self.marks.len());
+        }
+    }
+
+    /// `[` / `]` — fill the inclusive range between the anchor (last Space, or
+    /// the cursor if none) and the current cursor. Both brackets do the same
+    /// symmetric fill; the anchor then moves to the cursor so ranges chain.
+    fn range_mark(&mut self) {
+        if self.selectable_pane().is_none() { return; }
+        self.ensure_mark_scope();
+        let keys = self.mark_row_keys();
+        let cur = self.mark_cursor();
+        let anchor = self.mark_anchor.unwrap_or(cur);
+        let (lo, hi) = (anchor.min(cur), anchor.max(cur));
+        if let Some(slice) = keys.get(lo..=hi) {
+            for k in slice { self.marks.insert(k.clone()); }
+        }
+        self.mark_anchor = Some(cur);
+        self.status = format!("{} selected", self.marks.len());
+    }
+
+    /// Esc — drop an active selection. Returns true if it consumed the Esc
+    /// (i.e. there was a selection to clear), so the caller doesn't also run
+    /// Esc's other duties (clearing a generated filter).
+    fn clear_marks(&mut self) -> bool {
+        if self.marks.is_empty() { return false; }
+        self.marks.clear();
+        self.mark_anchor = None;
+        self.mark_scope = None;
+        self.status = "selection cleared".into();
+        true
+    }
+
+    /// The marked keys (display order) IF the marks belong to the focused pane
+    /// and there are any — else empty (callers fall back to the cursor row).
+    fn marked_here(&self) -> Vec<String> {
+        if self.mark_scope == Some(self.focus) && !self.marks.is_empty() {
+            self.mark_row_keys().into_iter()
+                .filter(|k| self.marks.contains(k)).collect()
+        } else {
+            vec![]
+        }
+    }
+
+    /// Whether row key `k` is marked in the focused pane (render gutter).
+    fn is_marked(&self, k: &str) -> bool {
+        self.mark_scope == Some(self.focus) && self.marks.contains(k)
+    }
+
+    /// Batch apply/discard over marked BOXES (Sessions) or marked CHANGES
+    /// (paths within the current box). `discard` picks the verb. Returns true
+    /// if it handled a selection (caller then skips the single-row path).
+    fn batch_apply_discard(&mut self, discard: bool) -> bool {
+        let marks = self.marked_here();
+        if marks.is_empty() { return false; }
+        let verb = if discard { "review.discard" } else { "review.apply" };
+        let word = if discard { "discarded" } else { "applied" };
+        let key = if discard { "discarded" } else { "applied" };
+        match self.mark_scope {
+            Some(Pane::Changes) => {
+                // All marked paths in ONE call against the current box.
+                let Some(sid) = self.cur_sid() else { return true; };
+                match rpc(&self.sock, verb, json!([sid, Value::Array(
+                    marks.iter().map(|p| Value::String(p.clone())).collect())])) {
+                    Ok(r) => {
+                        let n = r.get(key).and_then(Value::as_array)
+                            .map(|a| a.len()).unwrap_or(marks.len());
+                        self.status = format!("{word} {n} change(s) in {} file(s)",
+                            marks.len());
+                    }
+                    Err(e) => self.status = format!("{verb}: {e}"),
+                }
+            }
+            Some(Pane::Sessions) => {
+                // Each marked box, applied/discarded whole (null selector).
+                let (mut ok, mut err) = (0usize, 0usize);
+                for id in &marks {
+                    match rpc(&self.sock, verb, json!([id, Value::Null])) {
+                        Ok(_) => ok += 1,
+                        Err(_) => err += 1,
+                    }
+                }
+                self.status = if err == 0 {
+                    format!("{word} all changes in {ok} box(es)")
+                } else {
+                    format!("{word} {ok} box(es), {err} failed")
+                };
+            }
+            _ => return false,
+        }
+        self.clear_marks();
+        self.refresh_sessions();
+        self.load_changes();
+        true
+    }
+
     fn apply(&mut self) {
+        if self.batch_apply_discard(false) { return; }
         let Some(sid) = self.cur_sid() else { return };
         let sel = self.review_selector();
         match rpc(&self.sock, "review.apply", json!([sid, sel])) {
@@ -3546,6 +3713,7 @@ impl App {
     }
 
     fn discard(&mut self) {
+        if self.batch_apply_discard(true) { return; }
         let Some(sid) = self.cur_sid() else { return };
         let sel = self.review_selector();
         match rpc(&self.sock, "review.discard", json!([sid, sel])) {
@@ -3559,34 +3727,62 @@ impl App {
         self.load_changes();
     }
 
+    /// Run a per-box engine verb over the marked boxes (Sessions scope) if any,
+    /// else the single cursored box. Returns the (ok, err) counts. Used by the
+    /// destructive box ops so a selection acts on all marked boxes at once.
+    #[cfg_attr(test, allow(dead_code))]
+    fn box_op_over_selection(&mut self, verb: &str) -> (usize, usize) {
+        let marks = self.marked_here();
+        let targets: Vec<String> = if !marks.is_empty()
+            && self.mark_scope == Some(Pane::Sessions) {
+            marks
+        } else {
+            self.cur_sid().into_iter().collect()
+        };
+        let (mut ok, mut err) = (0usize, 0usize);
+        for id in &targets {
+            match rpc(&self.sock, verb, json!([id])) {
+                Ok(_) => ok += 1,
+                Err(_) => err += 1,
+            }
+        }
+        self.clear_marks();
+        (ok, err)
+    }
+
+    /// "the selected box" or "N selected boxes" — for the destructive-op
+    /// confirm prompts, so the user sees the batch size before confirming.
+    fn box_op_scope_label(&self) -> String {
+        let marks = self.marked_here();
+        if !marks.is_empty() && self.mark_scope == Some(Pane::Sessions) {
+            format!("{} selected box(es)", marks.len())
+        } else {
+            "the selected box".to_string()
+        }
+    }
+
     #[cfg_attr(test, allow(dead_code))]
     fn kill(&mut self) {
-        let Some(sid) = self.cur_sid() else { return };
-        match rpc(&self.sock, "kill", json!([sid])) {
-            Ok(_) => self.status = format!("sent SIGTERM to box {sid}"),
-            Err(e) => self.status = format!("kill: {e}"),
-        }
+        let (ok, err) = self.box_op_over_selection("kill");
+        self.status = if err == 0 { format!("sent SIGTERM to {ok} box(es)") }
+                      else { format!("killed {ok}, {err} failed") };
         self.refresh_sessions();
     }
 
     #[cfg_attr(test, allow(dead_code))]
     fn delete(&mut self) {
-        let Some(sid) = self.cur_sid() else { return };
-        match rpc(&self.sock, "delete", json!([sid])) {
-            Ok(_) => self.status = format!("deleted box {sid}"),
-            Err(e) => self.status = format!("delete: {e}"),
-        }
+        let (ok, err) = self.box_op_over_selection("delete");
+        self.status = if err == 0 { format!("deleted {ok} box(es)") }
+                      else { format!("deleted {ok}, {err} failed") };
         self.refresh_sessions();
         self.load_changes();
     }
 
     #[cfg_attr(test, allow(dead_code))]
     fn dissolve(&mut self) {
-        let Some(sid) = self.cur_sid() else { return };
-        match rpc(&self.sock, "dissolve", json!([sid])) {
-            Ok(_) => self.status = format!("dissolved box {sid}"),
-            Err(e) => self.status = format!("dissolve: {e}"),
-        }
+        let (ok, err) = self.box_op_over_selection("dissolve");
+        self.status = if err == 0 { format!("dissolved {ok} box(es)") }
+                      else { format!("dissolved {ok}, {err} failed") };
         self.refresh_sessions();
         self.load_changes();
     }
@@ -4361,12 +4557,12 @@ fn sessions_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     // Cmd takes the rest so the list fills the terminal width.
     let (name_w, pid_w, age_w) = (24usize, 6usize, 6usize);
     let usable = (width as usize).saturating_sub(2); // inside the block borders
-    // F + 4 single-space separators are the fixed overhead.
-    let fixed = 1 + 4 + name_w + pid_w + age_w;
+    // sel-marker + F + 4 single-space separators are the fixed overhead.
+    let fixed = 1 + 1 + 4 + name_w + pid_w + age_w;
     let cmd_w = usable.saturating_sub(fixed).max(8);
     let mut out = vec![Line::from(Span::styled(
-        format!("{:<1} {:<name_w$} {:<pid_w$} {:<cmd_w$} {:>age_w$}",
-                "F", "Name", "PID", "Cmd", "Age"),
+        format!("{:<1}{:<1} {:<name_w$} {:<pid_w$} {:<cmd_w$} {:>age_w$}",
+                "", "F", "Name", "PID", "Cmd", "Age"),
         Style::default().add_modifier(Modifier::BOLD),
     ))];
     if app.sessions.is_empty() {
@@ -4409,9 +4605,14 @@ fn sessions_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         let age = if started > 0.0 { fmt_age(started) } else { String::new() };
         let pid_str = if pid > 0 { pid.to_string() } else { String::new() };
         let name_col: String = format!("{indent}{basename}").chars().take(name_w).collect();
-        let text = format!("{flag:<1} {name_col:<name_w$} {pid_str:<pid_w$} {cmdc:<cmd_w$} {age:>age_w$}");
+        let marked = app.is_marked(&g("session_id"));
+        let mark = if marked { MARK_GLYPH } else { " " };
+        let text = format!("{mark}{flag:<1} {name_col:<name_w$} {pid_str:<pid_w$} {cmdc:<cmd_w$} {age:>age_w$}");
         let line = if i == app.sel_session {
             Line::from(Span::styled(text, Style::default().fg(Color::Black).bg(Color::Cyan)))
+        } else if marked {
+            Line::from(Span::styled(text,
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)))
         } else {
             Line::from(Span::styled(text, Style::default().fg(color)))
         };
@@ -4428,6 +4629,9 @@ fn tree_indent(depth: usize) -> String { "  ".repeat(depth) }
 /// Marker prefixed to a row that belongs to a collapsed single-child chain
 /// (see `collapse_chains`). Three vertical dots — the run reads as one spine.
 const CHAIN_MARK: &str = "⋮";
+
+/// Gutter glyph for a multi-selected (marked) row in the Boxes / Changes lists.
+const MARK_GLYPH: &str = "◆";
 
 /// Single-child-chain collapse for a DFS-ordered depth sequence — shared by the
 /// hierarchical panes (sessions / processes / changes). A node that is an only
@@ -4497,7 +4701,7 @@ fn changes_lines(app: &App, width: u16) -> Vec<Line<'static>> {
 ! - stale vs host",
         width);
     out.push(Line::from(Span::styled(
-        format!("{:<1} {:>10}  {}", "", "SIZE", "PATH"),
+        format!("{:<1}{:<1} {:>10}  {}", "", "", "SIZE", "PATH"),
         Style::default().add_modifier(Modifier::BOLD),
     )));
     let vis = app.visible_changes();
@@ -4543,19 +4747,24 @@ fn changes_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         let (cdepth, collapsed) = collapse[i];
         let indent = format!("{}{}", tree_indent(cdepth),
                              if collapsed { CHAIN_MARK } else { "" });
+        let path = c.get("path").and_then(Value::as_str).unwrap_or("");
+        let marked = !connector && app.is_marked(path);
+        let mk = if marked { MARK_GLYPH } else { " " };
         let line = if connector {
-            let text = format!("{:<1} {:>10}  {indent}{name}/", "", "");
+            let text = format!("{:<1}{:<1} {:>10}  {indent}{name}/", "", "", "");
             Line::from(Span::styled(text,
                 Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM)))
         } else if i == app.sel_change {
             let sz = if size > 0 { fmt_bytes(size) } else { String::new() };
             let stale_mark = if stale { "!" } else { "" };
-            let text = format!("{glyph}{stale_mark:<1} {sz:>10}  {indent}{name}");
+            let text = format!("{mk}{glyph}{stale_mark:<1} {sz:>10}  {indent}{name}");
             Line::from(Span::styled(text,
                 Style::default().fg(Color::Black).bg(Color::Cyan)))
         } else {
             let sz = if size > 0 { fmt_bytes(size) } else { String::new() };
             let mut spans = vec![
+                Span::styled(mk.to_string(),
+                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
                 Span::styled(glyph.to_string(), Style::default().fg(color)),
             ];
             if stale {
@@ -6039,6 +6248,7 @@ enum PaneAction {
     NewRule, DeleteRule, StartRename,
     ToggleFilter, Refresh, ActionMenu, ToggleTree, ToggleRunningOnly, ToggleProcRunning,
     ToggleEdgeRunning,
+    ToggleMark, RangeMark,
 }
 
 /// The main-loop pane keymap. ORDER MATTERS, and reproduces the original inline
@@ -6065,7 +6275,10 @@ const PANE_ACTION_KEYS: &[(Key, PaneGate, PaneAction, Option<&str>)] = &[
     (Key::Char('a'), PaneGate::On(Pane::Hunks), PaneAction::ApplyHunk,       None),
     (Key::Char('x'), PaneGate::On(Pane::Hunks), PaneAction::DiscardHunk,     None),
     (Key::Char('d'), PaneGate::On(Pane::Hunks), PaneAction::DiscardHunk,     None),
-    (Key::Char('a'), PaneGate::Any,             PaneAction::ApplyFile,       Some("apply selected change / whole box")),
+    (Key::Char(' '), PaneGate::Any,             PaneAction::ToggleMark,      Some("select/unselect row (Boxes/Changes) for batch a/x/D")),
+    (Key::Char('['), PaneGate::Any,             PaneAction::RangeMark,       Some("select range: anchor (Space) → cursor")),
+    (Key::Char(']'), PaneGate::Any,             PaneAction::RangeMark,       None),
+    (Key::Char('a'), PaneGate::Any,             PaneAction::ApplyFile,       Some("apply selected change / whole box (or all selected)")),
     (Key::Char('x'), PaneGate::Any,             PaneAction::DiscardFile,     Some("discard selected change / whole box")),
     (Key::Char('A'), PaneGate::Any,             PaneAction::ApplyAll,        Some("apply ALL the box's changes")),
     (Key::Char('X'), PaneGate::Any,             PaneAction::DiscardAll,      Some("discard ALL the box's changes")),
@@ -6105,6 +6318,8 @@ fn run_pane_action(app: &mut App, action: PaneAction) {
                 app.open();
             }
         }
+        PaneAction::ToggleMark => app.toggle_mark(),
+        PaneAction::RangeMark => app.range_mark(),
         PaneAction::ApplyHunk => app.apply_hunk(),
         PaneAction::DiscardHunk => app.discard_hunk(),
         PaneAction::ApplyFile => app.apply(),
@@ -6112,15 +6327,17 @@ fn run_pane_action(app: &mut App, action: PaneAction) {
         PaneAction::ApplyAll => app.apply_all(),
         PaneAction::DiscardAll => app.discard_all(),
         PaneAction::ConfirmKill => app.modal = Some(Modal::Confirm {
-            prompt: "Kill (SIGTERM) the selected box?".into(),
+            prompt: format!("Kill (SIGTERM) {}?", app.box_op_scope_label()),
             action: ConfirmAction::Kill,
         }),
         PaneAction::ConfirmDelete => app.modal = Some(Modal::Confirm {
-            prompt: "Delete the selected box and its captures?".into(),
+            prompt: format!("Delete {} and their captures?",
+                            app.box_op_scope_label()),
             action: ConfirmAction::Delete,
         }),
         PaneAction::ConfirmDissolve => app.modal = Some(Modal::Confirm {
-            prompt: "Dissolve the selected box (unmount/cleanup)?".into(),
+            prompt: format!("Dissolve {} (unmount/cleanup)?",
+                            app.box_op_scope_label()),
             action: ConfirmAction::Dissolve,
         }),
         PaneAction::NewRule => app.modal = Some(Modal::RuleForm {
@@ -9576,10 +9793,14 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                     KeyCode::Esc if app.focus == Pane::Packets =>
                         app.close_packets(),
                     KeyCode::Esc => {
-                        // esc clears a generated (cross-nav) filter on the focused pane.
-                        if let Some(v) = app.focus_filter_view() {
-                            if app.view_filter(v).generated {
-                                app.clear_filter(v);
+                        // esc first drops an active multi-select; only if there
+                        // was none does it fall through to clearing a generated
+                        // (cross-nav) filter on the focused pane.
+                        if !app.clear_marks() {
+                            if let Some(v) = app.focus_filter_view() {
+                                if app.view_filter(v).generated {
+                                    app.clear_filter(v);
+                                }
                             }
                         }
                     }
@@ -10674,6 +10895,9 @@ mod tests {
             edges_running_only: true,
             sel_session: 0,
             sel_change: 0,
+            marks: std::collections::HashSet::new(),
+            mark_scope: None,
+            mark_anchor: None,
             sel_proc: 0, sel_pipeline: 0, sel_edge: 0,
             sel_output: 0,
             sel_api_log: 0,
@@ -11112,6 +11336,56 @@ mod tests {
         assert!(buf.contains("gpt-4o") && buf.contains("http://h:1/v1"), "{buf}");
         assert!(!buf.contains("sk-secret"), "api_key must be masked:\n{buf}");
         assert!(buf.contains("•"), "masked key must render dots:\n{buf}");
+    }
+
+    /// Multi-select on the Boxes list: Space toggles, `[`/`]` range-fill from
+    /// the anchor, the gutter renders the mark, Esc clears, and marks are
+    /// scoped to one list (switching panes drops them).
+    #[test]
+    fn multiselect_toggle_range_clear_and_scope() {
+        let mut app = headless_app();
+        app.focus = Pane::Sessions;
+        app.sessions = (0..5).map(|i| serde_json::json!({
+            "session_id": i.to_string(), "name": format!("b{i}"),
+            "path": format!("b{i}"), "status": "done",
+        })).collect();
+        let keys = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        // Space marks the cursor row (idx 0), which becomes the anchor.
+        app.sel_session = 0;
+        app.toggle_mark();
+        assert_eq!(app.marked_here(), keys(&["0"]));
+
+        // Cursor to idx 3, `]` fills the inclusive anchor→cursor range.
+        app.sel_session = 3;
+        app.range_mark();
+        assert_eq!(app.marked_here(), keys(&["0", "1", "2", "3"]));
+
+        // Space again un-marks the cursor row (idx 2).
+        app.sel_session = 2;
+        app.toggle_mark();
+        assert_eq!(app.marked_here(), keys(&["0", "1", "3"]));
+
+        // The gutter glyph renders for marked rows.
+        let buf = render_to_string(&app, 100, 20).unwrap();
+        assert!(buf.contains(MARK_GLYPH), "marked rows show the glyph:\n{buf}");
+
+        // Esc clears the selection (and reports it consumed the Esc).
+        assert!(app.clear_marks());
+        assert!(app.marked_here().is_empty());
+        assert!(!app.clear_marks(), "nothing to clear the second time");
+
+        // Marks are scoped: a Sessions mark is invisible on the Changes list.
+        app.sel_session = 0;
+        app.toggle_mark();
+        assert_eq!(app.marked_here().len(), 1);
+        app.focus = Pane::Changes;
+        assert!(app.marked_here().is_empty(), "marks are per-list");
+
+        // A non-selectable pane just declines.
+        app.focus = Pane::Help;
+        app.toggle_mark();
+        assert!(app.status.contains("Boxes and Changes"));
     }
 
     #[test]
