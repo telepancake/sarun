@@ -490,6 +490,10 @@ enum Action {
     /// Selected sessions row is a loaded image: prompt a PTY running
     /// `<exe> oci run <name>` (a container shell on that image).
     RunSelectedImage,
+    /// Launcher: carbonyl (Chromium in the terminal) in a NEW tap box —
+    /// the URL prompt is the PtyCmd modal pre-filled with the full
+    /// `oci run` command, URL left to finish.
+    BrowserCarbonyl,
     /// Api pane: run `oaita local` on a PTY — download a tiny tool-capable
     /// model + CPU runtime and serve a local OpenAI-compatible endpoint.
     OaitaLocalPty,
@@ -7694,6 +7698,29 @@ fn pty_default_cmd() -> String {
     "sarun run -b -- ".to_string()
 }
 
+/// The carbonyl image, pinned by multi-arch manifest-list digest (the
+/// upstream 0.0.3 release; tags are mutable, digests are the pin).
+const CARBONYL_IMAGE: &str = "docker.io/fathyb/carbonyl@sha256:\
+77b3686f46a16375004985b522cef8f66e27fabc4a7d80209609bbb20fdfb362";
+
+/// The launcher's carbonyl command for the PtyCmd prompt, URL left for the
+/// user to finish. A supplied CMD replaces the image's entrypoint+cmd
+/// wholesale (runner.rs's no-cmd path is the only one that reads them), so
+/// the entrypoint's own flags are repeated here. `--user-data-dir` is what
+/// makes Chromium honor the SPKI allowlist; the allowlist is how the
+/// browser trusts the MITM root (net/ca.rs::root_spki_sha256_b64).
+fn carbonyl_cmd(flags: &[String], spki: Option<&str>) -> String {
+    let mut s = format!(
+        "sarun oci run {} {CARBONYL_IMAGE} -- /carbonyl/carbonyl \
+         --no-sandbox --disable-dev-shm-usage --user-data-dir=/carbonyl/data",
+        flags.join(" "));
+    if let Some(k) = spki {
+        s.push_str(&format!(" --ignore-certificate-errors-spki-list={k}"));
+    }
+    s.push_str(" https://");
+    s
+}
+
 /// Absolute path to this very binary (the engine's PTY does no PATH lookup —
 /// it execvp's argv[0] as given, so prompts and menu entries always use the
 /// full path).
@@ -7718,6 +7745,10 @@ fn open_pty_menu(app: &mut App) {
         ActionItem {
             label: "Container from image… (pick a base image)".into(),
             hint: "", action: Action::NewFromImage,
+        },
+        ActionItem {
+            label: "Browser — carbonyl in a NEW box (tap; flows captured)".into(),
+            hint: "", action: Action::BrowserCarbonyl,
         },
         ActionItem {
             label: format!("Host shell — {host_shell} (NOT captured)"),
@@ -8071,8 +8102,14 @@ impl PtyPane {
         // env, so `bash -i` lands SHELL/HOME/PATH-less. We ship our own.
         let cwd = std::env::current_dir().ok()
             .map(|p| p.to_string_lossy().into_owned());
-        let env: std::collections::BTreeMap<String, String> =
+        let mut env: std::collections::BTreeMap<String, String> =
             std::env::vars().collect();
+        // The child talks to the embedded wezterm-term emulator, not the
+        // host terminal — advertise the EMULATOR's capabilities, not the
+        // inherited ones. TUI children (carbonyl among them) sniff these
+        // two to pick a color depth.
+        env.insert("TERM".into(), "xterm-256color".into());
+        env.insert("COLORTERM".into(), "truecolor".into());
         let mut s = UnixStream::connect(sock).map_err(|e| format!("connect: {e}"))?;
         let req = json!({
             "type": "pty_spawn",
@@ -8156,6 +8193,21 @@ impl PtyPane {
     }
 
     /// Send raw keystroke bytes to the child (FRAME_PTY_DATA, client→engine).
+    /// True when the CHILD asked for mouse reporting (SGR/X10/any-event).
+    /// The pane's mouse capture is gated on this so a plain shell keeps
+    /// the OUTER terminal's native click-drag selection (a deliberate
+    /// property of the frameless PTY body — see draw()).
+    fn mouse_grabbed(&self) -> bool {
+        self.terminal.is_mouse_grabbed()
+    }
+
+    /// Feed one mouse event (grid-local 0-based coords) to the emulator;
+    /// it encodes per the protocol the child requested and replies via the
+    /// PtyResponseWriter like any DSR.
+    fn send_mouse(&mut self, ev: tattoy_wezterm_term::MouseEvent) {
+        let _ = self.terminal.mouse_event(ev);
+    }
+
     fn send_input(&mut self, bytes: &[u8]) {
         let frame = crate::frames::encode(crate::frames::FRAME_PTY_DATA, bytes);
         let mut w = self.writer.lock().unwrap();
@@ -8285,6 +8337,90 @@ fn read_one_line(s: &mut UnixStream) -> Result<String, String> {
 
 /// Translate a crossterm key event into the bytes a terminal would send to the
 /// child PTY (the input encoding the pane forwards as FRAME_PTY_DATA).
+/// Screen rect of the visible PTY grid. Mirrors draw()'s layout with the
+/// same Layout solves (menubar/cmdline/fkeybar/status strips, the 45/55
+/// horizontal split, the 1-row PTY title strip) — the same contract
+/// fit_active_pty() keeps for sizes, extended to origins for mouse
+/// translation. None when no PTY is on screen.
+fn pty_grid_rect(app: &App, term_cols: u16, term_rows: u16) -> Option<Rect> {
+    if app.ptys.is_empty() { return None; }
+    let root = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(3),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(Rect { x: 0, y: 0, width: term_cols, height: term_rows });
+    let body = root[1];
+    let area = if app.focus == Pane::Pty {
+        body
+    } else if app.pty_in_right {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+            .split(body);
+        cols[1]
+    } else {
+        return None;
+    };
+    let split = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(1)])
+        .split(area);
+    Some(split[1])
+}
+
+/// crossterm mouse event → the emulator's event, grid-local. None when the
+/// event is outside the grid or of no interest (e.g. bare Moved without a
+/// button — children that want any-event tracking still get Drag moves).
+fn mouse_to_pty_event(m: crossterm::event::MouseEvent, grid: Rect)
+    -> Option<tattoy_wezterm_term::MouseEvent>
+{
+    use crossterm::event::MouseButton as CB;
+    use crossterm::event::MouseEventKind as CK;
+    use tattoy_wezterm_term::input::{MouseButton, MouseEventKind};
+    if m.column < grid.x || m.row < grid.y
+        || m.column >= grid.x + grid.width || m.row >= grid.y + grid.height {
+        return None;
+    }
+    let btn = |b: CB| match b {
+        CB::Left => MouseButton::Left,
+        CB::Right => MouseButton::Right,
+        CB::Middle => MouseButton::Middle,
+    };
+    let (kind, button) = match m.kind {
+        CK::Down(b) => (MouseEventKind::Press, btn(b)),
+        CK::Up(b) => (MouseEventKind::Release, btn(b)),
+        CK::Drag(b) => (MouseEventKind::Move, btn(b)),
+        CK::Moved => (MouseEventKind::Move, MouseButton::None),
+        CK::ScrollUp => (MouseEventKind::Press, MouseButton::WheelUp(1)),
+        CK::ScrollDown => (MouseEventKind::Press, MouseButton::WheelDown(1)),
+        CK::ScrollLeft => (MouseEventKind::Press, MouseButton::WheelLeft(1)),
+        CK::ScrollRight => (MouseEventKind::Press, MouseButton::WheelRight(1)),
+    };
+    let mut mods = tattoy_wezterm_term::KeyModifiers::NONE;
+    if m.modifiers.contains(crossterm::event::KeyModifiers::SHIFT) {
+        mods |= tattoy_wezterm_term::KeyModifiers::SHIFT;
+    }
+    if m.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
+        mods |= tattoy_wezterm_term::KeyModifiers::CTRL;
+    }
+    if m.modifiers.contains(crossterm::event::KeyModifiers::ALT) {
+        mods |= tattoy_wezterm_term::KeyModifiers::ALT;
+    }
+    Some(tattoy_wezterm_term::MouseEvent {
+        kind, button,
+        x: (m.column - grid.x) as usize,
+        y: (m.row - grid.y) as i64,
+        x_pixel_offset: 0,
+        y_pixel_offset: 0,
+        modifiers: mods,
+    })
+}
+
 fn key_to_pty_bytes(code: crossterm::event::KeyCode,
                     mods: crossterm::event::KeyModifiers) -> Option<Vec<u8>> {
     use crossterm::event::KeyCode;
@@ -8495,6 +8631,12 @@ fn run_action(app: &mut App, a: Action) {
                 None => app.status =
                     "selected box is not a loaded image".into(),
             }
+        }
+        Action::BrowserCarbonyl => {
+            let spki = crate::net::ca::root_spki_sha256_b64().ok();
+            app.modal = Some(Modal::PtyCmd {
+                buf: carbonyl_cmd(&launch_flags(app, false), spki.as_deref()),
+            });
         }
         Action::OaitaLocalPty  => {
             app.open_pty(vec![self_exe(), "oaita".into(), "local".into()]);
@@ -8995,6 +9137,7 @@ fn run_interactive(sock: &str) -> Result<(), String> {
     let backend = CrosstermBackend::new(out);
     let mut term = Terminal::new(backend).map_err(|e| e.to_string())?;
 
+    let mut mouse_captured = false;
     let res = (|| -> Result<(), String> {
         loop {
             // drain live events
@@ -9036,10 +9179,40 @@ fn run_interactive(sock: &str) -> Result<(), String> {
             if app.should_quit {
                 break;
             }
+            // Mouse capture tracks the CHILD's wish, not the pane's mere
+            // presence: only while the visible PTY's child has mouse
+            // reporting on (carbonyl, vim-with-mouse) do we steal the
+            // outer terminal's mouse; otherwise native click-drag
+            // selection keeps working (see the frameless-body comment in
+            // draw()).
+            let want_mouse = {
+                let (tc, tr) = terminal::size().unwrap_or((80, 24));
+                pty_grid_rect(&app, tc, tr).is_some()
+                    && app.cur_pty().is_some_and(|p| p.mouse_grabbed())
+            };
+            if want_mouse != mouse_captured {
+                let r = if want_mouse {
+                    execute!(term.backend_mut(), event::EnableMouseCapture)
+                } else {
+                    execute!(term.backend_mut(), event::DisableMouseCapture)
+                };
+                if r.is_ok() { mouse_captured = want_mouse; }
+            }
             if !event::poll(Duration::from_millis(200)).map_err(|e| e.to_string())? {
                 continue;
             }
             let ev = event::read().map_err(|e| e.to_string())?;
+            if let Event::Mouse(m) = ev {
+                let (tc, tr) = terminal::size().unwrap_or((80, 24));
+                if let Some(grid) = pty_grid_rect(&app, tc, tr) {
+                    if let Some(pev) = mouse_to_pty_event(m, grid) {
+                        if let Some(pty) = app.cur_pty_mut() {
+                            pty.send_mouse(pev);
+                        }
+                    }
+                }
+                continue;
+            }
             if let Event::Resize(c, r) = ev {
                 // Immediate resize on terminal-resize event. The
                 // per-iteration fit_active_pty also catches this on
@@ -9422,6 +9595,9 @@ fn run_interactive(sock: &str) -> Result<(), String> {
     // waiters get NoOnce instead of timing out.
     let _ = rpc(sock, "prompts.ui_active", json!([false]));
     terminal::disable_raw_mode().map_err(|e| e.to_string())?;
+    if mouse_captured {
+        let _ = execute!(term.backend_mut(), event::DisableMouseCapture);
+    }
     execute!(term.backend_mut(), terminal::LeaveAlternateScreen).map_err(|e| e.to_string())?;
     term.show_cursor().map_err(|e| e.to_string())?;
     res
@@ -9550,6 +9726,58 @@ mod tests {
         assert!(shell_split("   ").is_empty());
     }
 
+    #[test]
+    fn carbonyl_cmd_pins_digest_and_survives_cmd_override() {
+        // (1) digest-pinned image, not a mutable tag; (2) the entrypoint
+        // flags repeated, because an explicit `oci run ... -- CMD` REPLACES
+        // entrypoint+cmd (runner.rs reads them only on the no-cmd path);
+        // (3) --user-data-dir present, without which Chromium ignores the
+        // SPKI allowlist; (4) a URL stub last, for the user to finish.
+        let flags = vec!["--net".to_string(), "tap".to_string()];
+        let c = carbonyl_cmd(&flags, Some("AbC="));
+        assert!(c.starts_with(
+            "sarun oci run --net tap docker.io/fathyb/carbonyl@sha256:"),
+            "digest-pinned oci run, got {c:?}");
+        assert!(c.contains(" -- /carbonyl/carbonyl "),
+            "explicit CMD must name the binary path, got {c:?}");
+        for flag in ["--no-sandbox", "--disable-dev-shm-usage",
+                     "--user-data-dir=/carbonyl/data",
+                     "--ignore-certificate-errors-spki-list=AbC="] {
+            assert!(c.contains(flag), "missing {flag} in {c:?}");
+        }
+        assert!(c.ends_with(" https://"), "URL stub last, got {c:?}");
+        // No SPKI (CA unreadable): still a working command, the user just
+        // gets the interstitial instead of silent trust.
+        let c = carbonyl_cmd(&flags, None);
+        assert!(!c.contains("spki"), "no empty spki flag: {c:?}");
+        assert!(c.ends_with(" https://"));
+    }
+
+    #[test]
+    fn mouse_translates_grid_local_and_rejects_outside() {
+        use crossterm::event::{MouseButton as CB, MouseEvent as CM,
+                               MouseEventKind as CK, KeyModifiers as KM};
+        let grid = Rect { x: 10, y: 2, width: 20, height: 10 };
+        let ev = |col, row, kind| CM { kind, column: col, row,
+                                       modifiers: KM::empty() };
+        // Inside: coords become 0-based grid-local.
+        let p = mouse_to_pty_event(ev(10, 2, CK::Down(CB::Left)), grid)
+            .expect("top-left corner is inside");
+        assert_eq!((p.x, p.y), (0, 0));
+        let p = mouse_to_pty_event(ev(29, 11, CK::Up(CB::Right)), grid)
+            .expect("bottom-right corner is inside");
+        assert_eq!((p.x, p.y), (19, 9));
+        // Outside on every edge: swallowed, never forwarded.
+        for (c, r) in [(9, 5), (30, 5), (15, 1), (15, 12)] {
+            assert!(mouse_to_pty_event(ev(c, r, CK::Moved), grid).is_none(),
+                    "({c},{r}) is outside the grid");
+        }
+        // Wheel maps to the emulator convention: Press + WheelUp/Down.
+        use tattoy_wezterm_term::input::{MouseButton, MouseEventKind};
+        let p = mouse_to_pty_event(ev(15, 5, CK::ScrollUp), grid).unwrap();
+        assert!(matches!(p.kind, MouseEventKind::Press));
+        assert!(matches!(p.button, MouseButton::WheelUp(1)));
+    }
     #[test]
     fn pty_default_cmd_is_configurable_not_enforced() {
         // A saved "login command" in the config wins …

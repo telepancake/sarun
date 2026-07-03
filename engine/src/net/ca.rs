@@ -34,6 +34,20 @@ pub struct Leaf {
     pub key_der: Vec<u8>,
 }
 
+/// base64(SHA-256(SubjectPublicKeyInfo)) of the MITM root — the token
+/// Chromium's `--ignore-certificate-errors-spki-list` matches against.
+/// Chromium/NSS reads neither the overlay-served CA bundle nor
+/// SSL_CERT_FILE, so a Chromium in a MITM'd box is told to trust this one
+/// key instead. Loads (or first-mints) the same persisted CA the engine
+/// serves, so UI-side callers agree with the engine byte-for-byte.
+pub fn root_spki_sha256_b64() -> anyhow::Result<String> {
+    use base64::Engine as _;
+    use sha2::Digest as _;
+    let ca = Ca::load_or_create()?;
+    Ok(base64::engine::general_purpose::STANDARD
+        .encode(sha2::Sha256::digest(ca.key.public_key_der())))
+}
+
 fn cert_path() -> PathBuf { paths::data_home().join("ca.pem") }
 fn key_path() -> PathBuf { paths::data_home().join("ca.key") }
 
