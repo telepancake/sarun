@@ -304,35 +304,60 @@ fn run_kati(
     //    this, a Makefile's `$(filter --foo,$(MAKEFLAGS))` guard never
     //    matches even though --foo was passed on the command line.
     {
-        let mut mf = BytesMut::new();
+        // Merge the three flag sources SECTION-WISE: MAKEFLAGS is
+        // `flag-words [-- var-definitions]` (GNU carries command-line
+        // variable overrides after `--`, space-escaped) — naive word
+        // appends would land flags inside the variable section.
         let seed_mf = seed_env
             .iter()
             .find(|(k, _)| k == "MAKEFLAGS")
             .map(|(_, v)| v.as_bytes().to_vec())
             .unwrap_or_default();
-        mf.put_slice(&seed_mf);
-        let has_word = |mf: &BytesMut, w: &[u8]| {
-            kati::strutil::word_scanner(&mf[..]).any(|t| t == w)
-        };
+        let (mut fwords, mut fvars) = kati::flags::Flags::split_makeflags(&seed_mf);
         if let Some(env_mf) = std::env::var_os("MAKEFLAGS") {
-            let env_mf = env_mf.as_bytes().to_vec();
-            for tok in kati::strutil::word_scanner(&env_mf) {
-                if !has_word(&mf, tok) {
-                    if !mf.is_empty() {
-                        mf.put_u8(b' ');
-                    }
-                    mf.put_slice(tok);
+            let (ew, evs) = kati::flags::Flags::split_makeflags(env_mf.as_bytes());
+            for t in ew {
+                if !fwords.contains(&t) {
+                    fwords.push(t);
+                }
+            }
+            for v in evs {
+                if !fvars.contains(&v) {
+                    fvars.push(v);
                 }
             }
         }
         for f in cmdline_flags {
-            if has_word(&mf, f.as_bytes()) {
-                continue;
+            let b = bytes::Bytes::copy_from_slice(f.as_bytes());
+            if !fwords.contains(&b) {
+                fwords.push(b);
             }
+        }
+        // THIS invocation's command-line variables propagate to sub-makes
+        // through the `--` section, exactly like GNU (`make DESTDIR=/x
+        // install` must mean DESTDIR=/x in every sub-make — losing it sent
+        // `install -d` at un-prefixed system paths).
+        for v in cl_vars {
+            if !fvars.contains(v) {
+                fvars.push(v.clone());
+            }
+        }
+        let mut mf = BytesMut::new();
+        for w in &fwords {
             if !mf.is_empty() {
                 mf.put_u8(b' ');
             }
-            mf.put_slice(f.as_bytes());
+            mf.put_slice(w);
+        }
+        if !fvars.is_empty() {
+            if !mf.is_empty() {
+                mf.put_u8(b' ');
+            }
+            mf.put_slice(b"--");
+            for v in &fvars {
+                mf.put_u8(b' ');
+                mf.put_slice(&kati::flags::Flags::quote_for_makeflags(v));
+            }
         }
         if !mf.is_empty() {
             let v = mf.freeze();

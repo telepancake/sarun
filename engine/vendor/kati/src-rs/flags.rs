@@ -159,8 +159,86 @@ impl Flags {
     /// env) calls this again with the make's OWN inherited value, which is
     /// where e.g. the Linux kernel's `MAKEFLAGS += --include-dir=$(abs_srctree)`
     /// actually arrives.
+    /// GNU-style quoting for a variable definition carried in MAKEFLAGS'
+    /// `--` section: backslash-escape whitespace and backslash, double `$`.
+    pub fn quote_for_makeflags(v: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(v.len() + 8);
+        for &b in v {
+            match b {
+                b' ' | b'\t' | b'\\' => {
+                    out.push(b'\\');
+                    out.push(b);
+                }
+                b'$' => {
+                    out.push(b'$');
+                    out.push(b'$');
+                }
+                _ => out.push(b),
+            }
+        }
+        out
+    }
+
+    /// Split a MAKEFLAGS value into (flag words, `--`-section variable
+    /// definitions). Variable definitions are unescaped (the inverse of
+    /// quote_for_makeflags); the split on the separator and on definition
+    /// boundaries honors backslash escapes.
+    pub fn split_makeflags(makeflags: &[u8]) -> (Vec<Bytes>, Vec<Bytes>) {
+        let mut flags: Vec<Bytes> = vec![];
+        let mut vars: Vec<Bytes> = vec![];
+        let mut in_vars = false;
+        let mut cur: Vec<u8> = vec![];
+        let mut i = 0;
+        while i <= makeflags.len() {
+            let b = makeflags.get(i).copied();
+            match b {
+                Some(b'\\') if in_vars && i + 1 < makeflags.len() => {
+                    cur.push(makeflags[i + 1]);
+                    i += 2;
+                    continue;
+                }
+                Some(b'$') if in_vars && makeflags.get(i + 1) == Some(&b'$') => {
+                    cur.push(b'$');
+                    i += 2;
+                    continue;
+                }
+                Some(b' ') | Some(b'\t') | None => {
+                    if !cur.is_empty() {
+                        if !in_vars && cur == b"--" {
+                            in_vars = true;
+                        } else if in_vars && cur.contains(&b'=') {
+                            vars.push(Bytes::from(std::mem::take(&mut cur)));
+                        } else {
+                            // A word without '=' is a SWITCH wherever it
+                            // appears — a makefile-level `MAKEFLAGS += --foo`
+                            // textually lands after the `--` section, and
+                            // GNU still treats it as a flag.
+                            flags.push(Bytes::from(std::mem::take(&mut cur)));
+                        }
+                        cur.clear();
+                    }
+                    if b.is_none() {
+                        break;
+                    }
+                }
+                Some(c) => cur.push(c),
+            }
+            i += 1;
+        }
+        (flags, vars)
+    }
+
     pub fn apply_makeflags(&mut self, makeflags: &[u8]) {
-        for tok in crate::strutil::word_scanner(makeflags) {
+        // GNU carries command-line variable overrides after a `--`
+        // separator, space-escaped. Fold them into cl_vars and keep only
+        // the flag words for the token loop below.
+        let (flag_words, var_defs) = Flags::split_makeflags(makeflags);
+        for var in var_defs {
+            if !self.cl_vars.contains(&var) {
+                self.cl_vars.push(var);
+            }
+        }
+        for tok in flag_words.iter().map(|f| &f[..]) {
             if let Some(dir) = tok.strip_prefix(b"--include-dir=") {
                 let dir = OsString::from_vec(dir.to_vec());
                 if !self.include_dirs.contains(&dir) {

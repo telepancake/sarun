@@ -914,6 +914,33 @@ def main():
         check(n_off == 0,
               f"case24: variable tracing is OFF by default ({n_off} rows "
               f"recorded without --vars)")
+        # ── CASE 25: command-line vars propagate to sub-makes (MAKEFLAGS --) ──
+        # `make install DESTDIR=/x` must mean DESTDIR=/x in EVERY sub-make —
+        # GNU carries command-line overrides in MAKEFLAGS after a `--`
+        # separator, space-escaped. Losing them un-prefixed every install
+        # path ("install: cannot create directory"). Values with spaces must
+        # survive the round-trip and keep command-line origin (beating ?=).
+        cv = work / "clvars"
+        shutil.rmtree(cv, ignore_errors=True)
+        (cv / "sub").mkdir(parents=True, exist_ok=True)
+        (cv / "Makefile").write_text("all:\n\t@$(MAKE) -s -C sub show\n")
+        (cv / "sub/Makefile").write_text(
+            "DESTDIR ?= lost\n"
+            "show:\n"
+            "\t@echo \"D=[$(DESTDIR)] V=[$(V)] o=[$(origin DESTDIR)]\" "
+            "> $(RESULT)\n")
+        r = subprocess.run(
+            [str(BIN), "run", "-b", "MAKE25", "-C", str(cv), "--",
+             "make", "DESTDIR=/pfx", "V=aa bb", f"RESULT={cv}/out.txt"],
+            capture_output=True, text=True, timeout=180)
+        check(r.returncode == 0,
+              f"case25: cl-vars box exits 0 (got {r.returncode}: "
+              f"{r.stderr[-600:]})")
+        sp25 = latest_sqlar(m)
+        cvo = m.sqlar_content(sp25, str((cv / "out.txt").resolve()).lstrip("/"))
+        check(cvo == b"D=[/pfx] V=[aa bb] o=[command line]\n",
+              f"case25: command-line vars (incl. a spaced value) reach the "
+              f"sub-make with command-line origin; got {cvo!r}")
     finally:
         if eng is not None and eng.poll() is None:
             eng.terminate()
