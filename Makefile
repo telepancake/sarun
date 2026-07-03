@@ -77,6 +77,12 @@ test-kati-box: ## The FULL kati conformance corpus through real -b boxes vs GNU 
 	  --with "wcmatch>=8.4" --with "python-magic>=0.4" \
 	  python test_kati_corpus_box_rs.py
 
+.PHONY: test-integ
+test-integ: ## Real-project builds (GNU hello autoconf + cmake) through -b boxes (needs `make engine`; also in `make test`)
+	cd prototype && uv run --with "pyfuse3>=3.2" --with "trio>=0.22" \
+	  --with "wcmatch>=8.4" --with "python-magic>=0.4" \
+	  python test_integration_builds_rs.py
+
 .PHONY: test-contract
 test-contract: ## Syscall-level (strace) contract test for the native builtins (needs `make engine` + strace)
 	uv run --with pytest python engine/test_builtin_contract.py
