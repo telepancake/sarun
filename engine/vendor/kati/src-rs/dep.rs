@@ -710,6 +710,64 @@ impl<'a> DepBuilder<'a> {
     /// for in the VPATH directories; the first hit rewrites the prerequisite
     /// to `dir/name` (matching GNU's behavior for files that don't need to be
     /// rebuilt — the common case VPATH exists for: out-of-tree source files).
+    /// GNU's link-library prerequisites: a prereq of the form `-lNAME` is
+    /// resolved by trying each pattern in $(.LIBPATTERNS) (default
+    /// `lib%.so lib%.a`) against the working dir, the VPATH/vpath search
+    /// path, and the default system library directories; the first hit
+    /// rewrites the prerequisite.
+    fn libpattern_resolve(&mut self, sym: Symbol) -> Option<Symbol> {
+        let bytes = sym.as_bytes();
+        let name = bytes.strip_prefix(b"-l")?;
+        if name.is_empty() {
+            return None;
+        }
+        let patterns: Vec<Vec<u8>> = {
+            use crate::expr::Evaluable;
+            let v = self
+                .ev
+                .lookup_var(intern(".LIBPATTERNS"))
+                .ok()
+                .flatten()
+                .and_then(|v| v.read().eval_to_buf(self.ev).ok());
+            match &v {
+                Some(buf) if !buf.is_empty() => {
+                    word_scanner(buf).map(<[u8]>::to_vec).collect()
+                }
+                _ => vec![b"lib%.so".to_vec(), b"lib%.a".to_vec()],
+            }
+        };
+        for pat in &patterns {
+            let Some(pct) = pat.iter().position(|&b| b == b'%') else {
+                continue;
+            };
+            let mut cand = Vec::with_capacity(pat.len() + name.len());
+            cand.extend_from_slice(&pat[..pct]);
+            cand.extend_from_slice(name);
+            cand.extend_from_slice(&pat[pct + 1..]);
+            let cand_str = OsStr::from_bytes(&cand);
+            // 1. the make's working directory
+            if self.ev.working_dir.join(cand_str).is_file() {
+                return Some(intern(cand));
+            }
+            // 2. the VPATH / vpath search path
+            let cand_sym = intern(cand.clone());
+            if let Some(found) = self.vpath_resolve(cand_sym) {
+                return Some(found);
+            }
+            // 3. GNU's default library directories
+            for dir in ["/lib", "/usr/lib", "/usr/local/lib"] {
+                let p = std::path::Path::new(dir).join(cand_str);
+                if p.is_file() {
+                    let mut full = dir.as_bytes().to_vec();
+                    full.push(b'/');
+                    full.extend_from_slice(&cand);
+                    return Some(intern(full));
+                }
+            }
+        }
+        None
+    }
+
     fn vpath_resolve(&self, sym: Symbol) -> Option<Symbol> {
         if self.vpath_dirs.is_empty() && self.vpath_patterns.is_empty() {
             return None;
@@ -1592,12 +1650,16 @@ impl<'a> DepBuilder<'a> {
         {
             let mut node = n.lock();
             for i in node.actual_inputs.iter_mut() {
-                if let Some(resolved) = self.vpath_resolve(*i) {
+                if let Some(resolved) = self.vpath_resolve(*i)
+                    .or_else(|| self.libpattern_resolve(*i))
+                {
                     *i = resolved;
                 }
             }
             for i in node.actual_order_only_inputs.iter_mut() {
-                if let Some(resolved) = self.vpath_resolve(*i) {
+                if let Some(resolved) = self.vpath_resolve(*i)
+                    .or_else(|| self.libpattern_resolve(*i))
+                {
                     *i = resolved;
                 }
             }
